@@ -525,7 +525,7 @@ test("host logging form refreshes its revision after an ambiguous persisted save
   };
   const dom = vm.createContext({ TextEncoder, URL, Error,
     document: { createElement: (name) => new Element(name) } });
-  for (const source of ["src/model.ts", "src/ui.ts", "src/pages.ts", "src/management-policy.ts", "src/csrf-policy.ts", "src/settings.ts", "src/updater.ts"]) {
+  for (const source of ["src/model.ts", "src/ui.ts", "src/pages.ts", "src/management-policy.ts", "src/csrf-policy.ts", "src/client_directory.ts", "src/settings.ts", "src/updater.ts"]) {
     vm.runInContext(ts.transpile(readFileSync(source, "utf8"), { target: ts.ScriptTarget.ES2022 }), dom);
     if (source === "src/settings.ts") {
       vm.runInContext("Amaterasu.renderHostMetricsSettings = () => {}; Amaterasu.renderHostMetricsDashboard = () => {};", dom);
@@ -1075,7 +1075,7 @@ test("history form keeps retention controls visible and saves them while recordi
   };
   const dom = vm.createContext({ TextEncoder, URL, Error,
     document: { createElement: (name) => new Element(name) } });
-  for (const source of ["src/model.ts", "src/ui.ts", "src/pages.ts", "src/management-policy.ts", "src/csrf-policy.ts", "src/settings.ts", "src/updater.ts"]) {
+  for (const source of ["src/model.ts", "src/ui.ts", "src/pages.ts", "src/management-policy.ts", "src/csrf-policy.ts", "src/client_directory.ts", "src/settings.ts", "src/updater.ts"]) {
     vm.runInContext(ts.transpile(readFileSync(source, "utf8"), { target: ts.ScriptTarget.ES2022 }), dom);
     vm.runInContext("Object.assign(globalThis, Amaterasu)", dom);
     vm.runInContext("globalThis.renderHostMetricsSettings = () => {}; globalThis.renderHostMetricsDashboard = () => {}; globalThis.renderSystemTraySettings = () => {};", dom);
@@ -1668,7 +1668,7 @@ test("input form confirms cleanup-pending save, then reloads after a revision co
     TextEncoder, URL, Error,
     document: { createElement: (name) => new Element(name) },
   });
-  for (const source of ["src/model.ts", "src/ui.ts", "src/pages.ts", "src/management-policy.ts", "src/csrf-policy.ts", "src/settings.ts", "src/updater.ts"]) {
+  for (const source of ["src/model.ts", "src/ui.ts", "src/pages.ts", "src/management-policy.ts", "src/csrf-policy.ts", "src/client_directory.ts", "src/settings.ts", "src/updater.ts"]) {
     vm.runInContext(ts.transpile(readFileSync(source, "utf8"), {
       target: ts.ScriptTarget.ES2022,
     }), dom);
@@ -2275,7 +2275,7 @@ test("paired-client form preserves drafts on conflict and opaque fields after re
     document: { createElement: (name) => new Element(name) },
     window: { confirm: () => true },
   });
-  for (const source of ["src/model.ts", "src/ui.ts", "src/pages.ts", "src/management-policy.ts", "src/csrf-policy.ts", "src/settings.ts", "src/updater.ts"]) {
+  for (const source of ["src/model.ts", "src/ui.ts", "src/pages.ts", "src/management-policy.ts", "src/csrf-policy.ts", "src/client_directory.ts", "src/settings.ts", "src/updater.ts"]) {
     vm.runInContext(ts.transpile(readFileSync(source, "utf8"), {
       target: ts.ScriptTarget.ES2022,
     }), dom);
@@ -2350,15 +2350,18 @@ test("paired-client form preserves drafts on conflict and opaque fields after re
   });
   await new Promise(setImmediate);
   const pairingArea = find(content, (node) => node.className === "settings-area-pairing");
-  const fec = find(pairingArea, (node) => node.name === `fec_${"a".repeat(64)}`);
-  const ds4BackClick = find(pairingArea, (node) => node.name === "ds4_back_as_touchpad_click");
-  const save = find(pairingArea, (node) => node.tagName === "button" && node.textContent === "Save");
+  const clientCard = (name) => find(pairingArea, (node) =>
+    node.className === "client-settings-card" && node.textContent.includes(name));
+  const livingRoomCard = clientCard("Living room");
+  const fec = find(livingRoomCard, (node) => node.name === `fec_${"a".repeat(64)}`);
+  const ds4BackClick = find(livingRoomCard, (node) => node.name === "ds4_back_as_touchpad_click");
+  const save = find(livingRoomCard, (node) => node.tagName === "button" && node.textContent === "Save");
   assert.ok(fec);
   assert.ok(ds4BackClick);
   assert.equal(ds4BackClick.value, "false");
   assert.equal(ds4BackClick.attributes.get("aria-label"), "DS4 Back as touchpad click override for Living room");
   assert.ok(save);
-  const keybindings = find(pairingArea, (node) => node.name === "keybindings");
+  const keybindings = find(livingRoomCard, (node) => node.name === "keybindings");
   assert.equal(keybindings.value, "[65,66,65,67]");
   keybindings.value = "[true,0]";
   save.fire("click");
@@ -2366,21 +2369,21 @@ test("paired-client form preserves drafts on conflict and opaque fields after re
   assert.equal(updates, 0);
   keybindings.value = "[]";
   assert.match(pairingArea.textContent, /Advanced input and encoding/);
-  const presetMode = find(pairingArea, (node) => node.name === "sw_preset_mode");
-  const presetValue = find(pairingArea, (node) => node.name === "sw_preset_value");
+  const presetMode = find(livingRoomCard, (node) => node.name === "sw_preset_mode");
+  const presetValue = find(livingRoomCard, (node) => node.name === "sw_preset_value");
   assert.equal(presetMode.value, "value");
   assert.equal(presetValue.value, "");
   assert.equal(presetValue.disabled, false);
-  const tuneMode = find(pairingArea, (node) => node.name === "sw_tune_mode");
-  const tuneValue = find(pairingArea, (node) => node.name === "sw_tune_value");
+  const tuneMode = find(livingRoomCard, (node) => node.name === "sw_tune_mode");
+  const tuneValue = find(livingRoomCard, (node) => node.name === "sw_tune_value");
   assert.equal(tuneMode.value, "inherit");
   assert.equal(tuneValue.disabled, true);
   tuneMode.value = "value";
   tuneMode.fire("change");
   assert.equal(tuneValue.disabled, false);
   tuneValue.value = "  film,zerolatency  ";
-  find(pairingArea, (node) => node.name === "min_threads").value = "2";
-  assert.equal(find(pairingArea, (node) => node.name === "encoder_backend").value, "software");
+  find(livingRoomCard, (node) => node.name === "min_threads").value = "2";
+  assert.equal(find(livingRoomCard, (node) => node.name === "encoder_backend").value, "software");
   fec.value = "35";
   const otherClientFec = find(pairingArea, (node) => node.name === `fec_${"b".repeat(64)}`);
   otherClientFec.value = "42";
@@ -2395,10 +2398,10 @@ test("paired-client form preserves drafts on conflict and opaque fields after re
   clientSearch.value = "";
   clientSearch.fire("input");
   assert.equal(firstCard.hidden, false);
-  find(pairingArea, (node) => node.name === "native_pen_touch").value = "true";
-  find(pairingArea, (node) => node.name === "keybindings").value = "[]";
+  find(livingRoomCard, (node) => node.name === "native_pen_touch").value = "true";
+  find(livingRoomCard, (node) => node.name === "keybindings").value = "[]";
   for (const [key, value] of Object.entries({high_resolution_scrolling: "false", always_send_scancodes: "false", key_rightalt_to_key_win: "true", key_repeat_delay: "0", key_repeat_frequency: "0"}))
-    find(pairingArea, (node) => node.name === key).value = value;
+    find(livingRoomCard, (node) => node.name === key).value = value;
   save.fire("click");
   await new Promise(setImmediate);
   assert.equal(updates, 1);
@@ -2406,12 +2409,12 @@ test("paired-client form preserves drafts on conflict and opaque fields after re
   assert.equal(find(pairingArea, (node) => node.name === `fec_${"b".repeat(64)}`), otherClientFec);
   assert.equal(otherClientFec.value, "42", "saving one client must preserve another client's draft");
   assert.match(notices.at(-1), /Stored overrides confirmed.*Active stream application is not confirmed/);
-  assert.equal(find(pairingArea, (node) => node.name === "sw_preset_mode").value, "value");
-  assert.equal(find(pairingArea, (node) => node.name === "sw_preset_value").value, "");
-  assert.equal(find(pairingArea, (node) => node.name === "sw_tune_value").value, "  film,zerolatency  ");
-  const freshSave = find(pairingArea, (node) => node.tagName === "button" && node.textContent === "Save");
+  assert.equal(find(livingRoomCard, (node) => node.name === "sw_preset_mode").value, "value");
+  assert.equal(find(livingRoomCard, (node) => node.name === "sw_preset_value").value, "");
+  assert.equal(find(livingRoomCard, (node) => node.name === "sw_tune_value").value, "  film,zerolatency  ");
+  const freshSave = find(livingRoomCard, (node) => node.tagName === "button" && node.textContent === "Save");
   for (const [key, value] of Object.entries({keybindings: "[]", high_resolution_scrolling: "false", always_send_scancodes: "false", key_rightalt_to_key_win: "true", key_repeat_delay: "0", key_repeat_frequency: "0"})) {
-    const control = find(pairingArea, (node) => node.name === key);
+    const control = find(livingRoomCard, (node) => node.name === key);
     assert.equal(control.value, value);
     control.value = "";
   }
@@ -2430,7 +2433,7 @@ test("paired-client form preserves drafts on conflict and opaque fields after re
   assert.doesNotMatch(pairingArea.textContent, /cannot preserve/);
   const remainingDraft = find(pairingArea, (node) => node.name === `fec_${"b".repeat(64)}`);
   remainingDraft.value = "42";
-  const remove = find(pairingArea, (node) => node.tagName === "button" && node.textContent === "Remove device");
+  const remove = find(clientCard("Living room"), (node) => node.tagName === "button" && node.textContent === "Remove device");
   assert.ok(remove, "paired client should expose removal even when its overrides are unsupported");
   remove.fire("click");
   await new Promise(setImmediate);
@@ -2952,7 +2955,7 @@ test("Moonlight host form reloads its revision and listener status after a persi
     TextEncoder, URL, Error,
     document: { createElement: (tagName) => new Element(tagName) },
   });
-  for (const source of ["src/model.ts", "src/ui.ts", "src/pages.ts", "src/management-policy.ts", "src/csrf-policy.ts", "src/settings.ts", "src/updater.ts"]) {
+  for (const source of ["src/model.ts", "src/ui.ts", "src/pages.ts", "src/management-policy.ts", "src/csrf-policy.ts", "src/client_directory.ts", "src/settings.ts", "src/updater.ts"]) {
     vm.runInContext(ts.transpile(readFileSync(source, "utf8"), {
       target: ts.ScriptTarget.ES2022,
     }), dom);
@@ -3358,7 +3361,7 @@ test("Steam form reloads normalized Linux settings and explains the enabled poli
     TextEncoder, URL, Error,
     document: { createElement: (name) => new Element(name) },
   });
-  for (const source of ["src/model.ts", "src/ui.ts", "src/pages.ts", "src/management-policy.ts", "src/csrf-policy.ts", "src/settings.ts", "src/updater.ts"]) {
+  for (const source of ["src/model.ts", "src/ui.ts", "src/pages.ts", "src/management-policy.ts", "src/csrf-policy.ts", "src/client_directory.ts", "src/settings.ts", "src/updater.ts"]) {
     vm.runInContext(ts.transpile(readFileSync(source, "utf8"), {
       target: ts.ScriptTarget.ES2022,
     }), dom);

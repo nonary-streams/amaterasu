@@ -2563,6 +2563,7 @@ namespace Amaterasu {
     onSaveBusy: (busy: boolean) => void = () => {},
   ): () => Promise<void> {
     const pairingLoads = new PairingClientsLoadGate();
+    let removeClientFromDirectory: (key: string) => void = () => {};
     async function loadPairing(rebase?: PairingRebaseSource): Promise<void> {
       if (!rebase) pairingArea.replaceChildren(el("p", "muted", "Loading paired clients…"));
       try {
@@ -2913,7 +2914,7 @@ namespace Amaterasu {
                 const index = rows.findIndex((row) => row.client.certificate_id === client.certificate_id);
                 if (index !== -1) rows.splice(index, 1);
                 revisionBadge.textContent = `Revision ${settings.revision}`;
-                filterClients();
+                removeClientFromDirectory(client.certificate_id);
                 context.notify(`${client.name} was removed from paired devices. Existing stream termination is not confirmed.`);
               } catch (error) {
                 if (!context.content.isConnected) return;
@@ -3053,6 +3054,7 @@ namespace Amaterasu {
           card,
         })), rebase?.search.value ?? "");
         const clientSearch = directory.search;
+        removeClientFromDirectory = directory.remove;
         pairingArea.replaceChildren(
           panel(
             "Paired client overrides",

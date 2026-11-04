@@ -6304,6 +6304,99 @@ var Amaterasu;
 })(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
 (function (Amaterasu) {
+    function sortClientDirectoryEntries(entries, query, sort, locale) {
+        const needle = query.trim().toLocaleLowerCase(locale);
+        const collator = new Intl.Collator(locale, { sensitivity: "base", numeric: true });
+        return entries
+            .filter((entry) => !needle || entry.searchText.toLocaleLowerCase(locale).includes(needle))
+            .slice()
+            .sort((left, right) => {
+            if (sort === "recent") {
+                const leftDate = Number.isSafeInteger(left.pairedAt) ? left.pairedAt : 0;
+                const rightDate = Number.isSafeInteger(right.pairedAt) ? right.pairedAt : 0;
+                if (leftDate !== rightDate)
+                    return rightDate - leftDate;
+            }
+            return collator.compare(left.name, right.name) || left.key.localeCompare(right.key);
+        });
+    }
+    Amaterasu.sortClientDirectoryEntries = sortClientDirectoryEntries;
+    function createClientDirectory(entries, initialQuery = "", locale) {
+        let directoryEntries = [...entries];
+        const search = document.createElement("input");
+        search.type = "search";
+        search.name = "client_search";
+        search.placeholder = "Search paired clients";
+        search.value = initialQuery;
+        search.setAttribute("data-draft-ignore", "");
+        const sort = document.createElement("select");
+        sort.name = "client_sort";
+        sort.value = "recent";
+        sort.setAttribute("data-draft-ignore", "");
+        const recent = document.createElement("option");
+        recent.value = "recent";
+        recent.textContent = "Recently paired";
+        const name = document.createElement("option");
+        name.value = "name";
+        name.textContent = "Name";
+        sort.append(recent, name);
+        const count = document.createElement("p");
+        count.className = "muted client-search-summary";
+        count.setAttribute("role", "status");
+        count.setAttribute("aria-live", "polite");
+        count.setAttribute("aria-atomic", "true");
+        const empty = document.createElement("p");
+        empty.className = "muted client-search-empty";
+        const list = document.createElement("div");
+        list.className = "client-settings-list";
+        const searchLabel = document.createElement("label");
+        searchLabel.className = "field";
+        const searchText = document.createElement("span");
+        searchText.className = "field-label";
+        searchText.textContent = "Search paired clients";
+        searchLabel.append(searchText, search);
+        const sortLabel = document.createElement("label");
+        sortLabel.className = "field";
+        const sortText = document.createElement("span");
+        sortText.className = "field-label";
+        sortText.textContent = "Sort by";
+        sortLabel.append(sortText, sort);
+        const controls = document.createElement("div");
+        controls.className = "client-search";
+        controls.append(searchLabel, sortLabel, count);
+        const update = () => {
+            const visible = sortClientDirectoryEntries(directoryEntries, search.value, sort.value, locale);
+            count.textContent = visible.length + " of " + directoryEntries.length + " paired clients";
+            empty.hidden = visible.length !== 0;
+            empty.textContent = directoryEntries.length === 0
+                ? "No paired clients remain."
+                : "No paired clients match this search.";
+            for (const entry of directoryEntries)
+                entry.card.hidden = !visible.includes(entry);
+            list.replaceChildren(...visible.map((entry) => entry.card));
+            for (const entry of directoryEntries) {
+                if (!visible.includes(entry))
+                    list.append(entry.card);
+            }
+        };
+        search.addEventListener("input", update);
+        sort.addEventListener("change", update);
+        update();
+        const element = document.createElement("section");
+        element.append(controls, empty, list);
+        return {
+            element,
+            search,
+            remove: (key) => {
+                directoryEntries = directoryEntries.filter((entry) => entry.key !== key);
+                update();
+            },
+        };
+    }
+    Amaterasu.createClientDirectory = createClientDirectory;
+})(Amaterasu || (Amaterasu = {}));
+var Amaterasu;
+(function (Amaterasu) {
     function settingsTextLiteral(value) {
         return typeof Amaterasu.literalText === "function" ? Amaterasu.literalText(value) : value;
     }
@@ -8542,6 +8635,7 @@ var Amaterasu;
     }
     function createPairedClientEditor(context, pairingArea, draftTracker = () => null, onSaveBusy = () => { }) {
         const pairingLoads = new PairingClientsLoadGate();
+        let removeClientFromDirectory = () => { };
         async function loadPairing(rebase) {
             if (!rebase)
                 pairingArea.replaceChildren(Amaterasu.el("p", "muted", "Loading paired clients…"));
@@ -8834,7 +8928,7 @@ var Amaterasu;
                                 if (index !== -1)
                                     rows.splice(index, 1);
                                 revisionBadge.textContent = `Revision ${settings.revision}`;
-                                filterClients();
+                                removeClientFromDirectory(client.certificate_id);
                                 context.notify(`${client.name} was removed from paired devices. Existing stream termination is not confirmed.`);
                             }
                             catch (error) {
@@ -8865,7 +8959,10 @@ var Amaterasu;
                     }, "danger");
                     remove.disabled = !context.api.allows("pairing.admin");
                     clientSaveControls.push({ control: remove, allowed: !remove.disabled });
-                    const identity = Amaterasu.el("summary", "client-settings-summary", Amaterasu.el("span", "client-settings-name", settingsTextLiteral(client.name)), Amaterasu.el("small", "muted", settingsTextLiteral(`${client.client_id} · certificate ${client.certificate_id.slice(0, 12)}…`)));
+                    const pairedDate = client.paired_at > 0
+                        ? "Paired " + new Date(client.paired_at * 1000).toLocaleDateString()
+                        : "Pair date unavailable";
+                    const identity = Amaterasu.el("summary", "client-settings-summary", Amaterasu.el("span", "client-settings-name", settingsTextLiteral(client.name)), Amaterasu.el("small", "muted", settingsTextLiteral(client.client_id + " · " + pairedDate + " · certificate " + client.certificate_id.slice(0, 12) + "…")));
                     const audioSettings = Amaterasu.el("details", "client-settings-group", Amaterasu.el("summary", "", "Audio"), Amaterasu.el("div", "form-grid", Amaterasu.field("Audio streaming", streamAudio), Amaterasu.field("Audio capture endpoint", audioSinkMode), Amaterasu.field("Specific endpoint ID", audioSinkId), Amaterasu.field("Virtual audio sink", virtualSinkMode), Amaterasu.field("Virtual sink ID or name", virtualSinkSelector), Amaterasu.field("Capture audio without changing default outputs", captureOnly)));
                     const inputSettings = Amaterasu.el("details", "client-settings-group", Amaterasu.el("summary", "", "Input"), Amaterasu.el("div", "form-grid", Amaterasu.field("Controller input", controller), Amaterasu.field("Gamepad profile", gamepad), Amaterasu.field("Keyboard input", keyboard), Amaterasu.field("Mouse input", mouse), Amaterasu.field("Native pen and touch", nativePenTouch), Amaterasu.field("DS4 Back as touchpad click", ds4BackAsTouchpadClick), Amaterasu.field("Motion selects DS4", motionAsDs4), Amaterasu.field("Touchpad selects DS4", touchpadAsDs4), Amaterasu.field("DS5 random MAC", ds5InputtinoRandomizeMac), Amaterasu.field("Proton DualSense compatibility", protonDualsenseCompatibility)));
                     const advancedSettings = Amaterasu.el("details", "client-settings-group", Amaterasu.el("summary", "", "Advanced input and encoding"), Amaterasu.el("div", "form-grid", ...advancedInput.fields, ...softwareEncoder.fields, ...nvencSettings.fields));
@@ -8931,30 +9028,16 @@ var Amaterasu;
                         controls.forEach((control, index) => rebaseBaselines.set(control, pairingStateSignature(latestStates[index])));
                     }
                 }
-                const clientSearch = Amaterasu.input("client_search", "", "search");
-                clientSearch.setAttribute("data-draft-ignore", "");
-                clientSearch.placeholder = "Search clients";
-                if (rebase)
-                    clientSearch.value = rebase.search.value;
-                const searchSummary = Amaterasu.el("p", "muted client-search-summary");
-                searchSummary.setAttribute("role", "status");
-                const noMatches = Amaterasu.el("p", "muted client-search-empty", "No paired clients match this search.");
-                function filterClients() {
-                    const query = clientSearch.value.trim().toLocaleLowerCase();
-                    let visible = 0;
-                    for (const { client, card } of rows) {
-                        const identity = `${client.name} ${client.client_id} ${client.certificate_id}`.toLocaleLowerCase();
-                        card.hidden = !!query && !identity.includes(query);
-                        if (!card.hidden)
-                            visible++;
-                    }
-                    searchSummary.textContent = `${visible} of ${rows.length} paired clients`;
-                    noMatches.hidden = visible !== 0;
-                    noMatches.textContent = rows.length === 0 ? "No paired clients remain." : "No paired clients match this search.";
-                }
-                clientSearch.addEventListener("input", filterClients);
-                filterClients();
-                pairingArea.replaceChildren(Amaterasu.panel("Paired client overrides", Amaterasu.el("p", "muted", "Open a client to review its streaming overrides. Saves confirm the stored pairing revision; input preferences apply when the next stream acquires its input lease."), Amaterasu.el("div", "client-search", Amaterasu.field("Search paired clients", clientSearch), searchSummary), noMatches, Amaterasu.el("div", "client-settings-list", ...rows.map(({ card }) => card)), Amaterasu.el("div", "actions", revisionBadge)));
+                const directory = Amaterasu.createClientDirectory(rows.map(({ client, card }) => ({
+                    key: client.certificate_id,
+                    name: client.name,
+                    searchText: client.name + " " + client.client_id + " " + client.certificate_id,
+                    pairedAt: client.paired_at,
+                    card,
+                })), rebase?.search.value ?? "");
+                const clientSearch = directory.search;
+                removeClientFromDirectory = directory.remove;
+                pairingArea.replaceChildren(Amaterasu.panel("Paired client overrides", Amaterasu.el("p", "muted", "Open a client to review its streaming overrides. Saves confirm the stored pairing revision; input preferences apply when the next stream acquires its input lease."), directory.element, Amaterasu.el("div", "actions", revisionBadge)));
                 if (rebase) {
                     draftTracker()?.markSaved(rebaseBaselines);
                     context.notify("Latest paired devices loaded. Your non-conflicting edits are still unsaved.");
