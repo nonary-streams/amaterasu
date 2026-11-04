@@ -5,11 +5,11 @@ import vm from "node:vm";
 import ts from "typescript";
 
 class Element {
-  constructor(tagName) { this.tagName = tagName; this.children = []; this.listeners = new Map(); this.isConnected = false; }
+  constructor(tagName) { this.tagName = tagName; this.children = []; this.listeners = new Map(); this.attributes = {}; this.isConnected = false; }
   setConnected(value) { this.isConnected = value; for (const child of this.children) child?.setConnected?.(value); }
   append(...children) { for (const child of children) { if (child == null) continue; this.children.push(child); child?.setConnected?.(this.isConnected); } }
   replaceChildren(...children) { for (const child of this.children) child?.setConnected?.(false); this.children = []; this.append(...children); }
-  setAttribute() {}
+  setAttribute(name, value) { this.attributes[name] = String(value); }
   addEventListener(event, callback) { this.listeners.set(event, callback); }
   click() { this.listeners.get("click")?.(); }
   get textContent() { return this.children.map((child) => typeof child === "string" ? child : child?.textContent ?? "").join(""); }
@@ -62,6 +62,9 @@ test("host logs read every chunk, preserve UTF-8 and search the full snapshot", 
   const target = new Element("div"); target.setConnected(true);
   renderHostLogs({api}, target);
   await wait(() => target.textContent.includes("older log segments were discarded"));
+  const followStatus = find(target, (element) => element.textContent === "Following");
+  assert.equal(followStatus.attributes.role, "status");
+  assert.equal(followStatus.attributes["aria-live"], "polite");
   assert.ok(calls.filter((call) => call.route === "host-logs/read").length > 1);
   assert.ok(calls.some((call) => call.route === "host-logs/close"));
   const search = find(target, (element) => element.name === "host_log_search");

@@ -203,6 +203,9 @@ namespace Amaterasu {
     const status = el("p", "muted recorded-session-range-status");
     const legend = el("p", "muted live-session-legend");
     const charts = el("div");
+    const exportButton = button("Download chart data (CSV)", () => downloadChartCsv(), "quiet");
+    const exportStatus = el("p", "muted");
+    exportStatus.setAttribute("role", "status");
     const choices: { minutes: number | null; node: HTMLButtonElement }[] = [];
     type Mode = "combined" | "live" | "recorded";
     const sourceChoices: { mode: Mode; node: HTMLButtonElement }[] = [];
@@ -214,16 +217,25 @@ namespace Amaterasu {
     let rounded = false;
     let retentionSeconds = 300;
     let maxPoints = 300;
+    let currentPoints: ChartSample[] = [];
+    let currentSession: HistorySessionSummary | null = null;
 
     function draw(): void {
       for (const choice of sourceChoices) choice.node.setAttribute("aria-pressed", String(choice.mode === mode));
       for (const choice of choices) choice.node.setAttribute("aria-pressed", String(choice.minutes === range));
-      if (!live) { charts.replaceChildren(); return; }
+      if (!live) {
+        currentPoints = [];
+        exportButton.disabled = true;
+        charts.replaceChildren();
+        return;
+      }
       const latestLive = live.samples.at(-1);
       liveSummary.textContent = latestLive
         ? `Latest live rate: ${historyValue(latestLive.actual_fps, "fps")} · ${historyValue(latestLive.actual_bitrate_kbps / 1000, "Mbit/s")} · host observation ${new Date(latestLive.recorded_at_unix * 1000).toLocaleString()}.${rounded ? " Very large counters are rounded for display." : ""}`
         : "Latest live rate: waiting for two host counter readings.";
       if (mode === "recorded" && !recorded) {
+        currentPoints = [];
+        exportButton.disabled = true;
         status.textContent = historyNote || "Recorded history is unavailable. Select Live only to see current observations.";
         legend.textContent = "";
         charts.replaceChildren();
@@ -235,6 +247,8 @@ namespace Amaterasu {
       const newest = points.length ? Math.max(...points.map((sample) => sample.recorded_at_unix)) : 0;
       const selectedRange = range;
       const selected = selectedRange === null ? points : points.filter((sample) => sample.recorded_at_unix >= newest - selectedRange * 60);
+      currentPoints = selected;
+      exportButton.disabled = selected.length === 0;
       const recordedCount = points.filter((sample) => sample.chart_source === "recorded").length;
       const liveCount = points.filter((sample) => sample.chart_source === "live").length;
       const description = mode === "combined" ? `${recordedCount} recorded · ${liveCount} live.`
@@ -252,6 +266,34 @@ namespace Amaterasu {
         recordedChart("Encoder latency", "ms", selected, (sample) => sample.encode_latency_ms ?? null, chartSource),
         recordedChart("Observed video sequence gaps", "gaps", selected, (sample) => sample.dropped_frames, chartSource)));
     }
+
+    function downloadChartCsv(): void {
+      if (!currentSession || !currentPoints.length) return;
+      const columns = ["session_id", "recorded_at_unix", "observed_at", "source", "frames_sent", "bytes_sent",
+        "dropped_frames", "actual_fps", "actual_bitrate_kbps", "encode_latency_ms"] as const;
+      const rows = currentPoints.map((sample) => [
+        sample.session_id,
+        sample.recorded_at_unix,
+        new Date(sample.recorded_at_unix * 1000).toISOString(),
+        sample.chart_source ?? (mode === "live" ? "live" : "recorded"),
+        sample.frames_sent,
+        sample.bytes_sent,
+        sample.dropped_frames,
+        sample.actual_fps,
+        sample.actual_bitrate_kbps,
+        sample.encode_latency_ms,
+      ]);
+      const csvCell = (value: unknown): string => `"${String(value ?? "").replaceAll(String.fromCharCode(34), String.fromCharCode(34, 34))}"`;
+      const csv = [columns, ...rows].map((row) => row.map(csvCell).join(",")).join("\r\n") + "\r\n";
+      const objectUrl = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" }));
+      const link = document.createElement("a");
+      const safeId = currentSession.session_id.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 80) || "stream";
+      link.href = objectUrl;
+      link.download = `amaterasu-stream-${safeId}.csv`;
+      link.click();
+      window.setTimeout(() => URL.revokeObjectURL(objectUrl), 0);
+      exportStatus.textContent = `Downloaded ${currentPoints.length} chart samples as CSV.`;
+    }
     for (const [nextMode, label] of [["combined", "History + live"], ["live", "Live only"], ["recorded", "Recorded only"]] as const) {
       const node = button(label, () => { mode = nextMode; draw(); }, "recorded-range-button");
       sourceChoices.push({mode:nextMode, node});
@@ -264,8 +306,9 @@ namespace Amaterasu {
     }
     const element = el("article", "live-session-card", heading,
       el("p", "muted", "Host-side accepted media and observed sequence gaps; client delivery is not confirmed."),
-      liveSummary, sourceControls, controls, status, legend, charts);
+      liveSummary, sourceControls, controls, status, legend, charts, exportButton, exportStatus);
     return { element, update(session, nextLive, nextRecorded, nextNote, nextRounded, nextRetention, nextMaximum) {
+      currentSession = session;
       live = nextLive;
       recorded = nextRecorded;
       historyNote = nextNote;

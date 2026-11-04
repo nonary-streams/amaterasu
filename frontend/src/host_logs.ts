@@ -40,6 +40,8 @@ namespace Amaterasu {
     let exportGeneration = 0;
     let exportBusy = false;
     const following = el("span", "muted", "Following");
+    following.setAttribute("role", "status");
+    following.setAttribute("aria-live", "polite");
     const status = el("p", "muted");
     status.setAttribute("role", "status");
     const progress = el("p", "muted");

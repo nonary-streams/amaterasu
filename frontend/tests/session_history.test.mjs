@@ -198,3 +198,32 @@ test("live charts join only non-overlapping host-time intervals and keep current
   assert.equal(unsafe.liveCount,0);
   assert.match(unsafe.note,/cannot be safely joined/);
 });
+
+test("live chart export follows the selected source and includes source labels", async () => {
+  const session = detail().session;
+  session.session_id = "stream/with unsafe name";
+  const live = {...detail(), sample_count:2, samples_truncated:false, events:[], event_count:0, events_truncated:false,
+    samples:[detail().samples[1], detail().samples[2]].map((sample, index)=>({...sample, session_id:session.session_id,
+      recorded_at_unix:101 + index, interval_start_unix_ms:101_000 + index * 1000, chart_source:"live"}))};
+  live.session.session_id = session.session_id;
+  const recorded = {...detail(), samples:[detail().samples[0]].map((sample)=>({...sample,session_id:session.session_id}))};
+  const card = sandbox.Amaterasu.createLiveSessionCard();
+  card.update(session, live, recorded, "", false, 300, 20);
+  const exportButton = find(card.element, (element)=>element.tagName === "button" && element.textContent === "Download chart data (CSV)");
+  assert.equal(exportButton.disabled, false);
+  exportButton.click();
+  let csv = await downloaded.text();
+  assert.match(csv, /"session_id","recorded_at_unix","observed_at","source"/);
+  assert.match(csv, /"stream\/with unsafe name"/);
+  assert.match(csv, /"recorded"/);
+  assert.match(csv, /"live"/);
+  assert.match(anchor.download, /^amaterasu-stream-stream_with_unsafe_name\.csv$/);
+  assert.match(card.element.textContent, /Downloaded 3 chart samples as CSV/);
+
+  find(card.element, (element)=>element.tagName === "button" && element.textContent === "Live only").click();
+  exportButton.click();
+  csv = await downloaded.text();
+  assert.equal(csv.trim().split("\r\n").length, 3);
+  assert.equal((csv.match(/"live"/g) ?? []).length, 2);
+  assert.equal((csv.match(/"recorded"/g) ?? []).length, 0);
+});
