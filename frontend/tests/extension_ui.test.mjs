@@ -10,7 +10,7 @@ class Element {
   append(...children) { for (const child of children) { if (child && typeof child === "object") child.parent = this; this.children.push(child); } }
   remove() { if (this.parent) this.parent.children = this.parent.children.filter((child) => child !== this); this.parent = null; }
   replaceChildren(...children) { this.children = []; this.append(...children); }
-  setAttribute(name, value) { this.attributes[name] = value; }
+  setAttribute(name, value) { this.attributes[name] = value; if (name === "placeholder") this.placeholder = value; }
   getAttribute(name) { return this.attributes[name] ?? null; }
   removeAttribute(name) { delete this.attributes[name]; }
   addEventListener(type, callback, options = {}) {
@@ -31,14 +31,24 @@ class Element {
   }
 }
 
-function setupConsumer({ features = ["ui.controls/1", "ui.forms/1", "ui.forms/2"], withUi = true } = {}) {
+function setupConsumer({ features = ["ui.controls/1", "ui.forms/1", "ui.forms/2", "ui.controls/2"], withUi = true } = {}) {
   let registered;
   const document = { activeElement: null, createElement(tag) { const element = new Element(tag); element.ownerDocument = this; return element; } };
+  const localeAttributeFormatters = [];
+  let testLocale = "fr-CA";
   const context = vm.createContext({
     document,
     window: { AmaterasuExtensions: { v1: { register(_id, page) { registered = page; } } } },
     AbortController,
   });
+  context.Amaterasu = {
+    setLocalizedAttribute(target, attribute, source) { target.setAttribute(attribute, context.translateText(source)); },
+    setLocalizedAttributeFormatter(target, attribute, format) {
+      const refresh = () => target.setAttribute(attribute, format(testLocale));
+      localeAttributeFormatters.push(refresh);
+      refresh();
+    },
+  };
   context.localizedTextNode = (text) => text;
   context.localeFormattedTextNode = (format) => format("fr-CA");
   context.translateText = (text) => text;
@@ -53,7 +63,10 @@ function setupConsumer({ features = ["ui.controls/1", "ui.forms/1", "ui.forms/2"
   vm.runInContext(readFileSync(new URL("../../examples/web-extension/controls.js", import.meta.url), "utf8"), context);
   const container = new Element("main");
   const cleanup = registered.mount(container, sdk);
-  return { container, cleanup, controller, sdk, context };
+  return {
+    container, cleanup, controller, sdk, context,
+    setLocale(locale) { testLocale = locale; localeAttributeFormatters.forEach((refresh) => refresh()); },
+  };
 }
 
 test("independent plugin consumer gets accessible native controls and lifecycle cleanup", () => {
@@ -87,6 +100,14 @@ test("a ui.forms/1 consumer remains compatible with a host that lacks ui.forms/2
   assert.equal(page.container.children.length, 2);
   assert.equal(page.sdk.features.includes("ui.forms/2"), false);
   assert.equal(page.container.children[0].children[1].checked, true);
+  page.cleanup();
+});
+
+test("existing controls remain available when a host does not advertise ui.controls/2", () => {
+  const page = setupConsumer({ features: ["ui.controls/1", "ui.forms/1", "ui.forms/2"] });
+  assert.equal(page.container.children.length, 2);
+  assert.equal(page.sdk.features.includes("ui.controls/2"), false);
+  assert.equal(typeof page.sdk.ui.toggle, "function");
   page.cleanup();
 });
 
@@ -322,6 +343,134 @@ test("runtime field state patches update accessibility in place and preserve foc
   assert.equal(changes.slider, 1);
 
   toggle.dispose(); select.dispose(); radio.dispose(); slider.dispose(); page.cleanup();
+});
+
+test("generic text and number fields validate user edits and preserve accessible state updates", () => {
+  const page = setupConsumer();
+  const textChanges = [];
+  const text = page.sdk.ui.textField({
+    label: { source: "Display name", translations: { fr: "Nom affiché" } },
+    placeholder: { source: "Enter a name", translations: { fr: "Saisir un nom" } },
+    value: "Ami", maxLength: 8, required: true, onChange: (value) => textChanges.push(value),
+  });
+  const textInput = text.element.children[1];
+  assert.equal(text.element.children[0].children[0], "Nom affiché");
+  assert.equal(text.element.children[0].htmlFor, textInput.id);
+  assert.equal(textInput.placeholder, "Saisir un nom");
+  page.setLocale("de");
+  assert.equal(textInput.placeholder, "Enter a name");
+  page.setLocale("fr-CA");
+  assert.equal(textInput.placeholder, "Saisir un nom");
+  assert.equal(textInput.maxLength, 8);
+  textInput.focus();
+  const textListener = textInput.listeners.input[0];
+  text.setState({ readOnly: true, help: "Locked while saving.", error: "Name rejected." });
+  assert.equal(page.context.document.activeElement, textInput);
+  assert.equal(text.element.children[1], textInput);
+  assert.equal(textInput.attributes["aria-readonly"], "true");
+  assert.equal(textInput.attributes["aria-invalid"], "true");
+  assert.equal(textListener.signal.aborted, false);
+  textInput.value = "Changed"; textInput.dispatch("input");
+  assert.equal(text.value(), "Ami");
+  assert.deepEqual(textChanges, []);
+  text.setState({ readOnly: false, help: null, error: null });
+  textInput.value = "Mika"; textInput.dispatch("input");
+  assert.equal(text.value(), "Mika");
+  assert.deepEqual(textChanges, ["Mika"]);
+  assert.throws(() => text.setValue("This name is much too long"), /maximum length/);
+  assert.equal(text.value(), "Mika");
+
+  const numberChanges = [];
+  const number = page.sdk.ui.numberField({ label: "Frame rate", value: 4, minimum: 0, maximum: 10, step: 2, onChange: (value) => numberChanges.push(value) });
+  const numberInput = number.element.children[1];
+  assert.equal(numberInput.type, "number");
+  assert.equal(numberInput.min, "0");
+  assert.equal(numberInput.max, "10");
+  assert.equal(numberInput.step, "2");
+  numberInput.value = "5"; numberInput.dispatch("input");
+  assert.equal(numberInput.attributes["aria-invalid"], "true");
+  numberInput.focus();
+  number.setState({ help: "Still editing.", error: null });
+  assert.equal(numberInput.attributes["aria-invalid"], "true");
+  assert.equal(page.context.document.activeElement, numberInput);
+  assert.throws(() => number.value(), /valid number/);
+  assert.deepEqual(numberChanges, []);
+  assert.throws(() => number.setValue(5), /limits and step/);
+  assert.equal(numberInput.value, "5");
+  number.setValue(6);
+  assert.equal(number.value(), 6);
+  assert.equal(numberInput.attributes["aria-invalid"], undefined);
+  numberInput.focus();
+  const numberListener = numberInput.listeners.input[0];
+  number.setState({ disabled: true, required: true, help: "Use an even frame rate.", error: "Unsupported rate." });
+  assert.equal(number.element.children[1], numberInput);
+  assert.equal(page.context.document.activeElement, numberInput);
+  assert.equal(numberInput.disabled, true);
+  assert.equal(numberInput.required, true);
+  assert.equal(numberInput.attributes["aria-invalid"], "true");
+  assert.equal(numberInput.attributes["aria-describedby"].split(" ").length, 2);
+  assert.equal(numberListener.signal.aborted, false);
+  numberInput.value = "8"; numberInput.dispatch("input");
+  assert.equal(number.value(), 6);
+  assert.deepEqual(numberChanges, []);
+  number.setState({ disabled: false, required: false, help: null, error: null });
+  numberInput.value = "8"; numberInput.dispatch("input");
+  assert.equal(number.value(), 8);
+  assert.deepEqual(numberChanges, [8]);
+  assert.throws(() => page.sdk.ui.numberField({ label: "Invalid", value: 3, minimum: 0, maximum: 10, step: 2 }), /limits, step, or value/);
+  text.dispose(); number.dispose(); page.cleanup();
+});
+
+test("action buttons expose accessible busy state, preserve callbacks, and dispose listeners", async () => {
+  const page = setupConsumer();
+  let resolveAction;
+  let calls = 0;
+  let reenter = false;
+  let button;
+  const action = page.sdk.ui.button({
+    label: { source: "Refresh catalog", translations: { fr: "Actualiser le catalogue" } },
+    variant: "primary", help: "Reload current data.", onClick: () => {
+      calls++;
+      if (reenter) button.dispatch("click");
+      return new Promise((resolve) => { resolveAction = resolve; });
+    },
+  });
+  button = action.element.children[0];
+  assert.equal(button.tagName, "BUTTON");
+  assert.equal(button.type, "button");
+  assert.equal(button.children[0], "Actualiser le catalogue");
+  assert.equal(button.className, "button primary plugin-action-button");
+  assert.ok(button.attributes["aria-describedby"]);
+  button.focus();
+  const clickListener = button.listeners.click[0];
+  reenter = true;
+  button.dispatch("click");
+  assert.equal(action.busy(), true);
+  action.setState({ busy: false });
+  assert.equal(action.busy(), true);
+  assert.equal(button.disabled, true);
+  assert.equal(button.attributes["aria-busy"], "true");
+  assert.equal(page.context.document.activeElement, button);
+  button.dispatch("click");
+  assert.equal(calls, 1);
+  resolveAction();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(action.busy(), false);
+  assert.equal(button.disabled, false);
+  assert.equal(button.attributes["aria-busy"], undefined);
+  assert.equal(clickListener.signal.aborted, false);
+
+  action.setState({ disabled: true, error: "Refresh failed." });
+  assert.equal(button.disabled, true);
+  assert.equal(button.attributes["aria-invalid"], undefined);
+  assert.equal(action.element.children.at(-1).attributes.role, "alert");
+  action.setState({ disabled: false, error: null });
+  assert.equal(button.disabled, false);
+  action.dispose();
+  assert.equal(clickListener.signal.aborted, true);
+  button.dispatch("click");
+  assert.equal(calls, 1);
+  page.cleanup();
 });
 
 test("choice controls update options transactionally without firing change callbacks", () => {

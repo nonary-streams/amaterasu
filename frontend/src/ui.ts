@@ -381,12 +381,24 @@ namespace Amaterasu {
     };
   }
 
-  function isValidSliderValue(value: number, minimum: number, maximum: number, integer: boolean, step: number | "any"): boolean {
-    if (!Number.isFinite(value) || value < minimum || value > maximum || (integer && !Number.isSafeInteger(value))) return false;
+  export function isValidNumberControlValue(
+    value: number,
+    minimum?: number,
+    maximum?: number,
+    step: number | "any" = "any",
+    integer = false,
+  ): boolean {
+    if (!Number.isFinite(value) || minimum !== undefined && value < minimum || maximum !== undefined && value > maximum ||
+        (integer && !Number.isSafeInteger(value))) return false;
     if (step === "any") return true;
-    const stepCount = (value - minimum) / step;
+    if (!Number.isFinite(step) || step <= 0) return false;
+    const stepCount = (value - (minimum ?? 0)) / step;
     return Number.isFinite(stepCount) &&
       Math.abs(stepCount - Math.round(stepCount)) <= Number.EPSILON * Math.max(1, Math.abs(stepCount)) * 4;
+  }
+
+  function isValidSliderValue(value: number, minimum: number, maximum: number, integer: boolean, step: number | "any"): boolean {
+    return isValidNumberControlValue(value, minimum, maximum, step, integer);
   }
 
   export function sectionHeading(

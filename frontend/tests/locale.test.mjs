@@ -365,6 +365,12 @@ test("locale changes translate existing UI text nodes and the browser title", ()
   runtimeContext.Amaterasu.setLocalizedTextContent(asyncStatus, "Session updated.");
   const menu = new FakeElement("button");
   runtimeContext.Amaterasu.setLocalizedAttribute(menu, "aria-label", "Toggle navigation");
+  const localizedPlaceholder = new FakeElement("input");
+  runtimeContext.Amaterasu.setLocalizedAttributeFormatter(
+    localizedPlaceholder,
+    "placeholder",
+    (activeLocale) => activeLocale === "fr" ? "Saisir un nom" : activeLocale === "de" ? "Namen eingeben" : "Enter a name",
+  );
   const clientOverride = new FakeElement("input");
   runtimeContext.Amaterasu.setLocalizedAttributeTemplate(
     clientOverride,
@@ -391,6 +397,7 @@ test("locale changes translate existing UI text nodes and the browser title", ()
   root.append(explicitNotice);
   root.append(asyncStatus);
   root.append(menu);
+  root.append(localizedPlaceholder);
   root.append(clientOverride);
   root.append(clientDirectoryRoot);
   root.append(dateLabel);
@@ -404,6 +411,7 @@ test("locale changes translate existing UI text nodes and the browser title", ()
   assert.equal(noticeTextNode.nodeValue, "Session updated.");
   assert.equal(asyncStatus.children[0].nodeValue, "Session updated.");
   assert.equal(menu.getAttribute("aria-label"), "Toggle navigation");
+  assert.equal(localizedPlaceholder.getAttribute("placeholder"), "Enter a name");
   assert.equal(clientOverride.getAttribute("aria-label"), "FEC percentage override for Overview");
   assert.equal(dateTextNode.nodeValue, date.toLocaleString("en"));
   const directoryText = (node) => (node.children ?? [])
@@ -428,6 +436,7 @@ test("locale changes translate existing UI text nodes and the browser title", ()
     locale.translateLocaleMessage("Session updated.", locale.localeMessagesFor("de")),
   );
   assert.equal(menu.getAttribute("aria-label"), "Navigation umschalten");
+  assert.equal(localizedPlaceholder.getAttribute("placeholder"), "Namen eingeben");
   assert.equal(
     clientOverride.getAttribute("aria-label"),
     `${locale.translateLocaleMessage("FEC percentage", locale.localeMessagesFor("de"))} für Overview überschreiben`,
@@ -447,6 +456,7 @@ test("locale changes translate existing UI text nodes and the browser title", ()
   assert.equal(noticeTextNode.nodeValue, "Session updated.");
   assert.equal(asyncStatus.children[0].nodeValue, "Session updated.");
   assert.equal(menu.getAttribute("aria-label"), "Toggle navigation");
+  assert.equal(localizedPlaceholder.getAttribute("placeholder"), "Enter a name");
   assert.equal(clientOverride.getAttribute("aria-label"), "FEC percentage override for Overview");
   assert.equal(dateTextNode.nodeValue, date.toLocaleString("en"));
   assert.equal(directoryText(searchLabel), "Search paired clients");
