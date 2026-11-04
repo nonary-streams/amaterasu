@@ -221,6 +221,7 @@ function fixture() {
   const state = { steam, lutris, playnite };
   const calls = [];
   const conflictNext = new Set();
+  const conflictOverrides = new Map();
   const permissions = new Set(["configuration.read", "configuration.write", "steam.read"]);
   const apiError = (code) => vm.runInContext(`new Amaterasu.ApiError("provider error", ${JSON.stringify(code)}, 409)`, context);
   const status = {
@@ -238,7 +239,7 @@ function fixture() {
       if (operation === "settings") return ordinary(state[provider]);
       if (operation === "status") return ordinary(status[provider]);
       if (provider === "steam" && operation === "list")
-        return { revision: 1, games: [{ app_id: 10, name: "Known game", installed: true }], next_after: null, scanning: false, complete: true };
+        return { revision: 1, games: [{ app_id: 10, name: "Known game", installed: true }], next_after: body.after ? null : 10, scanning: false, complete: true };
       if (operation === "refresh") return { ok: true };
       if (operation === "settings_update") {
         if (conflictNext.delete(provider)) {
@@ -246,6 +247,7 @@ function fixture() {
           if (provider === "steam") state[provider].values.auto_sync = false;
           if (provider === "lutris") state[provider].values.auto_sync = false;
           if (provider === "playnite") state[provider].values.auto_sync = true;
+          Object.assign(state[provider].values, conflictOverrides.get(provider) ?? {});
           throw apiError("revision_conflict");
         }
         const values = { ...body };
@@ -267,7 +269,7 @@ function fixture() {
     notify(message) { notices.push(message); },
     registerDraftGuard(isDirty, dispose) { draftGuard = { isDirty, dispose }; },
   });
-  return { context, content, state, calls, conflictNext, permissions, api, notices, get draftGuard() { return draftGuard; } };
+  return { context, content, state, calls, conflictNext, conflictOverrides, permissions, api, notices, get draftGuard() { return draftGuard; } };
 }
 function areaFor(f, provider) {
   return find(f.content, node => node.className === `settings-area-${provider}`);
@@ -334,7 +336,7 @@ test("Steam picker cancel, revisioned save, legacy retention, and conflict draft
   submit(form);
   await tick();
   form = formFor(f, "steam");
-  assert.match(areaFor(f, "steam").textContent, /draft is preserved/);
+  assert.match(areaFor(f, "steam").textContent, /rebased/);
   assert.match(areaFor(f, "steam").textContent, /Revision 3/);
   assert.equal(inputNamed(form, "steam_auto_sync").checked, true);
   assert.equal(inputNamed(form, "steam_recent_games").value, "5");
@@ -392,7 +394,7 @@ test("Lutris ordered editor retains unknown items, saves, and rebases a conflict
   submit(form);
   await tick();
   form = formFor(f, "lutris");
-  assert.match(areaFor(f, "lutris").textContent, /draft is preserved/);
+  assert.match(areaFor(f, "lutris").textContent, /rebased/);
   assert.match(areaFor(f, "lutris").textContent, /Revision 3/);
   assert.equal(inputNamed(form, "lutris_auto_sync").checked, true);
   assert.equal(f.state.lutris.values.auto_sync, false);
@@ -452,9 +454,9 @@ test("Playnite list editors save exact values and keep edits visible through con
   submit(form);
   await tick();
   form = formFor(f, "playnite");
-  assert.match(areaFor(f, "playnite").textContent, /draft is preserved/);
+  assert.match(areaFor(f, "playnite").textContent, /rebased/);
   assert.match(areaFor(f, "playnite").textContent, /Revision 3/);
-  assert.equal(inputNamed(form, "playnite_auto_sync").checked, false);
+  assert.equal(inputNamed(form, "playnite_auto_sync").checked, true);
   assert.equal(f.state.playnite.values.auto_sync, true);
   assert.equal(f.draftGuard.isDirty(), true);
   assert.equal(buttonNamed(f.content, "Refresh")?.disabled, true);
@@ -477,8 +479,18 @@ test("Steam save locks every editor control until a delayed provider update and 
   let startedUpdate;
   const started = new Promise(resolve => { startedUpdate = resolve; });
   const gate = new Promise(resolve => { releaseUpdate = resolve; });
+  let releaseList;
+  let startedList;
+  const listStarted = new Promise(resolve => { startedList = resolve; });
+  const listGate = new Promise(resolve => { releaseList = resolve; });
+  let holdNextPage = true;
   const post = f.api.post.bind(f.api);
   f.api.post = async (route, body = {}) => {
+    if (route === "steam/list" && body.after === 10 && holdNextPage) {
+      holdNextPage = false;
+      startedList();
+      await listGate;
+    }
     if (route === "steam/settings_update") {
       startedUpdate();
       await gate;
@@ -486,6 +498,8 @@ test("Steam save locks every editor control until a delayed provider update and 
     return post(route, body);
   };
 
+  buttonNamed(form, "Load more games").click();
+  await listStarted;
   submit(form);
   await started;
   assert.equal(autoSync.disabled, true);
@@ -493,6 +507,9 @@ test("Steam save locks every editor control until a delayed provider update and 
   assert.equal(buttonNamed(form, "Cancel").disabled, true);
   const picker = find(form, node => node.className === "steam-exclusion-picker");
   assert.equal(picker.querySelectorAll("input").filter(node => !node.hidden).every(node => node.disabled), true);
+  releaseList();
+  await tick();
+  assert.equal(picker.querySelectorAll("input[type=checkbox]").every(node => node.disabled), true);
   releaseUpdate();
   await tick();
   assert.equal(f.state.steam.values.auto_sync, false);
@@ -522,6 +539,8 @@ test("failed revision-conflict readback keeps the draft through retry, then canc
   await tick();
   const alert = find(areaFor(f, "steam"), node => node.getAttribute("role") === "alert");
   assert.ok(alert);
+  assert.equal(f.draftGuard.isDirty(), true);
+  assert.equal(buttonNamed(f.content, "Refresh")?.disabled, true);
   buttonNamed(alert, "Try again").click();
   await tick();
   form = formFor(f, "steam");
@@ -585,7 +604,11 @@ test("successful provider save with failed readback reload preserves submitted v
   await tick();
   form = formFor(f, "lutris");
   assert.equal(inputNamed(form, "lutris_auto_sync").checked, false);
-  assert.match(areaFor(f, "lutris").textContent, /draft is preserved/);
+  assert.match(areaFor(f, "lutris").textContent, /Overlapping fields: auto_sync/);
+  assert.equal(f.draftGuard.isDirty(), true);
+  assert.equal(buttonNamed(form, "Save Lutris settings").disabled, true);
+  buttonNamed(form, "Review and keep latest values").click();
+  assert.equal(buttonNamed(form, "Save Lutris settings").disabled, false);
   f.draftGuard.dispose();
 });
 
@@ -603,4 +626,39 @@ test("provider editors are disposed when settings navigation leaves the page", a
   f.draftGuard.dispose();
   assert.equal(steamPicker.children.length, 0);
   assert.ok(listEditors.every(editor => editor.children.length === 0));
+});
+
+
+test("Steam conflict rebases unrelated latest fields and requires an explicit choice for overlap", async () => {
+  const f = fixture();
+  await tick();
+  f.conflictNext.add("steam");
+  f.conflictOverrides.set("steam", { recent_games: 10 });
+  let form = formFor(f, "steam");
+  inputNamed(form, "steam_recent_games").value = "5";
+  inputNamed(form, "steam_recent_games").fire("input");
+  inputNamed(form, "steam_auto_sync").checked = false;
+  inputNamed(form, "steam_auto_sync").fire("change");
+  submit(form);
+  await tick();
+
+  form = formFor(f, "steam");
+  assert.equal(inputNamed(form, "steam_auto_sync").checked, false);
+  assert.equal(inputNamed(form, "steam_recent_games").value, "10");
+  assert.match(areaFor(f, "steam").textContent, /Overlapping fields: auto_sync, recent_games/);
+  const save = buttonNamed(form, "Save Steam settings");
+  assert.equal(save.disabled, true);
+  assert.equal(f.draftGuard.isDirty(), true);
+  assert.equal(buttonNamed(f.content, "Refresh")?.disabled, true);
+
+  buttonNamed(form, "Overwrite overlapping fields").click();
+  assert.equal(inputNamed(form, "steam_recent_games").value, "5");
+  assert.equal(inputNamed(form, "steam_auto_sync").checked, false);
+  assert.equal(save.disabled, false);
+  submit(form);
+  await tick();
+  assert.equal(f.state.steam.values.recent_games, 5);
+  assert.equal(f.state.steam.values.auto_sync, false);
+  assert.equal(f.draftGuard.isDirty(), false);
+  f.draftGuard.dispose();
 });

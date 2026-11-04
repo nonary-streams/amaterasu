@@ -23,6 +23,7 @@ namespace Amaterasu {
     node: HTMLElement;
     value(): SteamExclusion[];
     setValue(values: readonly SteamExclusion[]): void;
+    setDisabled(disabled: boolean): void;
     dispose(): void;
   }
 
@@ -118,6 +119,29 @@ namespace Amaterasu {
     const saved = document.createElement("div");
     saved.className = "steam-exclusion-saved";
     steamPickerSetAttribute(saved, "aria-label", "Current Steam exclusions");
+    const manualAdd = document.createElement("form");
+    manualAdd.className = "steam-exclusion-manual-add";
+    const manualId = document.createElement("input");
+    manualId.type = "text";
+    manualId.inputMode = "numeric";
+    steamPickerSetAttribute(manualId, "aria-label", "Steam app ID to exclude");
+    steamPickerSetAttribute(manualId, "placeholder", "Optional Steam app ID");
+    const manualName = document.createElement("input");
+    manualName.type = "text";
+    steamPickerSetAttribute(manualName, "aria-label", "Steam game name to exclude");
+    steamPickerSetAttribute(manualName, "placeholder", "Game name");
+    const manualAddButton = document.createElement("button");
+    manualAddButton.type = "submit";
+    manualAddButton.className = "button secondary";
+    steamPickerSetText(manualAddButton, "Add exclusion");
+    const manualAddStatus = document.createElement("p");
+    manualAddStatus.setAttribute("role", "status");
+    manualAddStatus.setAttribute("aria-live", "polite");
+    manualAdd.append(manualId, manualName, manualAddButton, manualAddStatus);
+    const warning = document.createElement("p");
+    warning.className = "steam-exclusion-warning";
+    warning.setAttribute("role", "status");
+    warning.setAttribute("aria-live", "polite");
     const results = document.createElement("div");
     steamPickerSetAttribute(results, "aria-label", "Steam games");
     const more = document.createElement("button");
@@ -141,6 +165,7 @@ namespace Amaterasu {
     let loadError = "";
     let revisionChanged = false;
     let revisionRetries = 0;
+    let disabled = false;
     let disposed = false;
 
     const MAX_EXCLUSIONS = 256;
@@ -152,16 +177,16 @@ namespace Amaterasu {
     signalDraft();
 
     function renderStatus(): void {
+      status.removeAttribute("title");
+      status.removeAttribute("aria-label");
       if (!api.allows("steam.read")) {
         steamPickerSetText(status, "Steam discovery is unavailable without steam.read permission. Saved exclusions can still be edited.");
         more.hidden = true;
-        return;
-      }
-      if (loading) {
+      } else if (loading) {
         steamPickerSetText(status, "Loading Steam games…");
       } else if (loadError) {
         steamPickerSetText(status, "Steam games could not be loaded. Your current draft is preserved.");
-        status.setAttribute("title", loadError);
+        steamPickerSetAttribute(status, "title", loadError);
       } else if (revision === null) {
         steamPickerSetText(status, "Steam game list has not been loaded.");
       } else {
@@ -174,14 +199,16 @@ namespace Amaterasu {
           matchingCount: steamPickerLiteral(String(matching)),
           exclusionCount: steamPickerLiteral(String(draft.length)),
         });
-        const warning = scanWarning || (revisionChanged
-          ? "The Steam list changed while paging; restarted at the latest revision."
-          : "");
-        if (warning) steamPickerSetAttribute(status, "title", warning);
       }
+      const warnings = [scanWarning, revisionChanged
+        ? "The Steam list changed while paging; restarted at the latest revision."
+        : ""].filter(Boolean);
+      steamPickerSetText(warning, warnings.join(" "));
+      warning.hidden = warnings.length === 0;
       more.hidden = (!loadError && after === null) || disposed || !api.allows("steam.read");
-      more.disabled = loading || disposed;
+      more.disabled = disabled || loading || disposed;
       steamPickerSetText(more, loadError ? "Retry loading games" : "Load more games");
+      root.setAttribute("aria-busy", String(loading));
     }
 
     function renderSaved(): void {
@@ -192,11 +219,13 @@ namespace Amaterasu {
         const idInput = document.createElement("input");
         idInput.type = "text";
         idInput.inputMode = "numeric";
+        idInput.setAttribute("data-focus-key", "saved-" + index + "-id");
+        idInput.disabled = disabled;
         idInput.value = entry.id ?? "";
         steamPickerSetAttribute(idInput, "aria-label", "Edit excluded Steam app ID");
         steamPickerSetAttribute(idInput, "placeholder", "Optional Steam app ID");
         idInput.addEventListener("input", () => {
-          if (disposed) return;
+          if (disposed || disabled) return;
           const id = idInput.value.trim();
           if (id) draft[index] = { ...draft[index], id };
           else {
@@ -212,29 +241,40 @@ namespace Amaterasu {
         const name = document.createElement("input");
         name.type = "text";
         name.value = entry.name ?? "";
+        name.setAttribute("data-focus-key", "saved-" + index + "-name");
+        name.disabled = disabled;
         steamPickerSetAttribute(name, "aria-label", entry.id
           ? "Edit excluded Steam game name"
           : "Edit name-only Steam exclusion");
         name.addEventListener("input", () => {
-          if (disposed) return;
-          draft[index] = { ...draft[index], name: name.value };
+          if (disposed || disabled) return;
+          const current = draft[index];
+          if (!current) return;
+          const nextName = name.value.trim();
+          if (nextName) draft[index] = { ...current, name: name.value };
+          else {
+            const { name: _oldName, ...withoutName } = current;
+            draft[index] = withoutName;
+          }
           signalDraft();
           onChange(draft.map((value) => ({ ...value })));
           renderStatus();
         }, { signal: lifecycle.signal });
         const remove = document.createElement("button");
         remove.type = "button";
+        remove.setAttribute("data-focus-key", "saved-" + index + "-remove");
+        remove.disabled = disabled;
         remove.className = "button secondary";
         steamPickerSetText(remove, "Remove exclusion");
         steamPickerSetTemplate(remove, "aria-label", "Remove exclusion {index}", {
           index: steamPickerLiteral(String(index + 1)),
         });
         remove.addEventListener("click", () => {
-          if (disposed) return;
+          if (disposed || disabled) return;
           draft = draft.filter((_, currentIndex) => currentIndex !== index);
           signalDraft();
           onChange(draft.map((value) => ({ ...value })));
-          render();
+          render(true);
         }, { signal: lifecycle.signal });
         row.append(idInput, name, remove);
         saved.append(row);
@@ -251,9 +291,11 @@ namespace Amaterasu {
         label.className = "steam-exclusion-option";
         const checkbox = document.createElement("input");
         checkbox.type = "checkbox";
+        checkbox.setAttribute("data-focus-key", "game-" + game.app_id);
+        checkbox.disabled = disabled;
         checkbox.checked = selected.has(String(game.app_id));
         checkbox.addEventListener("change", () => {
-          if (disposed) return;
+          if (disposed || disabled) return;
           const id = String(game.app_id);
           draft = draft.filter((entry) => entry.id !== id);
           if (checkbox.checked) {
@@ -266,7 +308,7 @@ namespace Amaterasu {
           }
           signalDraft();
           onChange(draft.map((entry) => ({ ...entry })));
-          render();
+          render(true);
         }, { signal: lifecycle.signal });
         const name = document.createElement("span");
         name.textContent = game.name;
@@ -290,15 +332,33 @@ namespace Amaterasu {
       }
     }
 
-    function render(): void {
+    function render(preserveFocus = false): void {
       if (disposed) return;
+      const active = preserveFocus ? document.activeElement as (HTMLElement & { selectionStart?: number | null; selectionEnd?: number | null }) | null : null;
+      const focusKey = active && root.contains(active) ? active.getAttribute("data-focus-key") : null;
+      const selectionStart = active?.selectionStart ?? null;
+      const selectionEnd = active?.selectionEnd ?? null;
+      search.disabled = disabled;
+      manualId.disabled = disabled;
+      manualName.disabled = disabled;
+      manualAddButton.disabled = disabled;
       renderStatus();
       renderSaved();
       renderResults();
+      if (focusKey) {
+        const replacement = allElements(root).find((element) => element.getAttribute("data-focus-key") === focusKey) as (HTMLElement & { setSelectionRange?: (start: number, end: number) => void }) | undefined;
+        replacement?.focus();
+        if (replacement && selectionStart !== null && selectionEnd !== null)
+          replacement.setSelectionRange?.(selectionStart, selectionEnd);
+      }
+    }
+
+    function allElements(parent: Element): Element[] {
+      return [parent, ...Array.from(parent.children).flatMap((child) => allElements(child))];
     }
 
     async function load(): Promise<void> {
-      if (disposed || !api.allows("steam.read") || loading) return;
+      if (disposed || disabled || !api.allows("steam.read") || loading) return;
       loading = true;
       loadError = "";
       renderStatus();
@@ -364,16 +424,46 @@ namespace Amaterasu {
           : error instanceof Error ? error.message : "Unable to load Steam games.";
       } finally {
         loading = false;
-        if (!disposed) render();
+        if (!disposed) render(true);
       }
     }
 
-    search.addEventListener("input", render, { signal: lifecycle.signal });
+    search.setAttribute("data-focus-key", "search");
+    manualId.setAttribute("data-focus-key", "manual-id");
+    manualName.setAttribute("data-focus-key", "manual-name");
+    search.addEventListener("input", () => { if (!disabled) render(true); }, { signal: lifecycle.signal });
+    manualAdd.addEventListener("submit", (event) => {
+      event.preventDefault();
+      if (disposed || disabled) return;
+      const id = manualId.value.trim();
+      const name = manualName.value.trim();
+      if (!id && !name) {
+        steamPickerSetText(manualAddStatus, "Enter a Steam app ID or game name.");
+        return;
+      }
+      if (draft.length >= MAX_EXCLUSIONS) {
+        steamPickerSetText(manualAddStatus, "You can exclude up to 256 Steam games. Remove an exclusion before adding another.");
+        return;
+      }
+      if (id && draft.some((entry) => entry.id === id)) {
+        steamPickerSetText(manualAddStatus, "That Steam app ID is already excluded.");
+        return;
+      }
+      draft.push({ ...(id ? { id } : {}), ...(name ? { name } : {}) });
+      manualId.value = "";
+      manualName.value = "";
+      steamPickerSetText(manualAddStatus, "Exclusion added.");
+      signalDraft();
+      onChange(draft.map((entry) => ({ ...entry })));
+      render(true);
+      manualName.focus();
+    }, { signal: lifecycle.signal });
     more.addEventListener("click", () => {
+      if (disposed || disabled) return;
       if (loadError) revisionRetries = 0;
       void load();
     }, { signal: lifecycle.signal });
-    root.append(heading, help, savedLabel, saved, search, status, results, more, draftSignal);
+    root.append(heading, help, savedLabel, saved, search, status, results, more, draftSignal, manualAdd, warning);
     render();
     void load();
     return {
@@ -384,6 +474,11 @@ namespace Amaterasu {
         if (!Array.isArray(values)) throw new Error("Steam exclusions must be a list.");
         draft = values.map((entry) => ({ ...entry }));
         signalDraft();
+        render(true);
+      },
+      setDisabled(value) {
+        if (disposed) return;
+        disabled = Boolean(value);
         render();
       },
       dispose() {

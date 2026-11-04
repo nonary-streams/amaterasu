@@ -3339,6 +3339,7 @@ test("Steam form reloads normalized Linux settings and explains the enabled poli
     addEventListener(name, callback) { this.listeners.set(name, callback); }
     dispatchEvent(event) { this.listeners.get(event.type)?.(event); return true; }
     setAttribute() {}
+    removeAttribute() {}
     reportValidity() { return true; }
     setCustomValidity() {}
     get options() { return this.children.filter((child) => child?.tagName === "option"); }

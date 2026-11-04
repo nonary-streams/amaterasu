@@ -10,6 +10,7 @@ class Element {
   replaceChildren(...children) { this.children = [...children]; }
   setAttribute(name, value) { this.attributes.set(name, String(value)); }
   getAttribute(name) { return this.attributes.get(name) ?? null; }
+  removeAttribute(name) { this.attributes.delete(name); }
   addEventListener(name, callback) { this.listeners.set(name, callback); }
   dispatchEvent(event) { this.listeners.get(event.type)?.(event); return true; }
   textContent(value) {

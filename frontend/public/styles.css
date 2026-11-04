@@ -768,6 +768,23 @@ td small {
   display: grid;
   gap: 6px;
 }
+.steam-exclusion-manual-add {
+  display: grid;
+  grid-template-columns: minmax(120px, 0.45fr) minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+}
+.steam-exclusion-manual-add input {
+  min-width: 0;
+  margin: 0;
+}
+.steam-exclusion-manual-add [role="status"] {
+  grid-column: 1 / -1;
+  margin: 0;
+}
+.steam-exclusion-warning {
+  margin: 0;
+}
 .steam-exclusion-saved-item {
   display: grid;
   grid-template-columns: minmax(120px, 0.45fr) minmax(0, 1fr) auto;

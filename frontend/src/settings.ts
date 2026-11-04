@@ -3114,6 +3114,35 @@ namespace Amaterasu {
     return !needle || parts.join(" ").toLocaleLowerCase().includes(needle);
   }
 
+  type PendingProviderDraft = {
+    baseline: Record<string, unknown>;
+    submitted: Record<string, unknown>;
+    latest?: Record<string, unknown>;
+    merged?: Record<string, unknown>;
+    overlaps: string[];
+    reviewed: boolean;
+  };
+
+  function rebaseProviderDraft(
+    pending: PendingProviderDraft,
+    latest: Record<string, unknown>,
+  ): { merged: Record<string, unknown>; overlaps: string[] } {
+    const merged = { ...latest };
+    const overlaps: string[] = [];
+    for (const field of Object.keys(pending.submitted)) {
+      const baselineValue = pending.baseline[field];
+      const submittedValue = pending.submitted[field];
+      const latestValue = latest[field];
+      if (sameConfigurationValue(submittedValue, baselineValue)) continue;
+      if (!sameConfigurationValue(latestValue, baselineValue)) {
+        overlaps.push(field);
+        continue;
+      }
+      merged[field] = submittedValue;
+    }
+    return { merged, overlaps };
+  }
+
   export function renderSettings(context: PageContext): void {
     const area = el("div", "settings-area-registered");
     const sessionExtensionsArea = el("div", "settings-area-session-extensions");
@@ -3143,12 +3172,43 @@ namespace Amaterasu {
     const historyLoads = new HistorySettingsLoadGate();
     const pairingArea = el("div", "settings-area-pairing");
     let drafts: DraftTracker | null = null;
+    const pendingProviderDrafts = new Map<string, PendingProviderDraft>();
     let clientSaveBusy = false;
     const updateDraftStatus = () => {
-      const dirty = drafts?.isDirty() ?? false;
+      const dirty = (drafts?.isDirty() ?? false) || pendingProviderDrafts.size > 0;
       refreshSettings.disabled = dirty || clientSaveBusy;
       dirtyNotice.hidden = !dirty && !clientSaveBusy;
       settingsSetLocalizedTextContent(dirtyNotice, clientSaveBusy ? "Saving changes…" : "Unsaved changes");
+    };
+    const configureProviderConflictReview = (
+      provider: string,
+      status: HTMLElement,
+      save: HTMLButtonElement,
+      applyValues: (values: Record<string, unknown>) => void,
+    ): void => {
+      const pending = pendingProviderDrafts.get(provider);
+      if (!pending || pending.overlaps.length === 0) return;
+      save.disabled = true;
+      const message = el("p", "error", `Overlapping fields: ${pending.overlaps.join(", ")}. Latest values are kept until you choose an action.`);
+      const review = button("Review and keep latest values", () => {
+        pending.reviewed = true;
+        save.disabled = !context.api.allows("configuration.write");
+        message.textContent = `Reviewed overlapping fields: ${pending.overlaps.join(", ")}. Latest values will be saved.`;
+        review.disabled = true;
+        overwrite.disabled = true;
+      }, "secondary");
+      const overwrite = button("Overwrite overlapping fields", () => {
+        const merged = { ...(pending.merged ?? pending.latest ?? {}) };
+        for (const field of pending.overlaps) merged[field] = pending.submitted[field];
+        pending.merged = merged;
+        pending.reviewed = true;
+        applyValues(merged);
+        save.disabled = !context.api.allows("configuration.write");
+        message.textContent = `Overwriting overlapping fields: ${pending.overlaps.join(", ")}. Review the draft before saving.`;
+        review.disabled = true;
+        overwrite.disabled = true;
+      }, "secondary");
+      status.append(message, review, overwrite);
     };
     const loadPairing = createPairedClientEditor(context, pairingArea, () => drafts, (busy) => {
       clientSaveBusy = busy;
@@ -3297,7 +3357,7 @@ namespace Amaterasu {
     );
     if (context.registerDraftGuard) {
       drafts = trackDrafts(categoryContent, updateDraftStatus);
-      context.registerDraftGuard(() => clientSaveBusy || (drafts?.isDirty() ?? false), () => {
+      context.registerDraftGuard(() => clientSaveBusy || pendingProviderDrafts.size > 0 || (drafts?.isDirty() ?? false), () => {
         steamLoads.invalidate();
         lutrisLoads.invalidate();
         playniteLoads.invalidate();
@@ -3607,6 +3667,18 @@ namespace Amaterasu {
         if (loaded === null) return;
         const { value: settings, generation } = loaded;
         if (!context.content.isConnected) return;
+        const pendingDraft = pendingProviderDrafts.get("steam");
+        if (pendingDraft) {
+          const rebased = rebaseProviderDraft(pendingDraft, settings.values as unknown as Record<string, unknown>);
+          pendingDraft.latest = settings.values as unknown as Record<string, unknown>;
+          pendingDraft.merged = rebased.merged;
+          pendingDraft.overlaps = rebased.overlaps;
+          pendingDraft.reviewed = rebased.overlaps.length === 0;
+          draftValues = rebased.merged as SteamSettings["values"];
+          draftNotice = rebased.overlaps.length
+            ? "Conflicting fields need review. Non-overlapping edits were rebased."
+            : "Settings changed elsewhere. Non-overlapping edits were rebased; review before saving again.";
+        }
         const valuesForForm = settings.values;
         const form = el("form", "settings-form");
         const enabled = input("steam_enabled", "", "checkbox");
@@ -3666,7 +3738,11 @@ namespace Amaterasu {
         save.disabled = !context.api.allows("configuration.write");
         let actionInProgress = false;
         const cancel = button(settingsTextMessage("Cancel"), () => {
-          if (!actionInProgress) void loadSteam();
+          if (!actionInProgress) {
+            pendingProviderDrafts.delete("steam");
+            updateDraftStatus();
+            void loadSteam();
+          }
         }, "secondary");
         form.append(
           field(
@@ -3731,9 +3807,22 @@ namespace Amaterasu {
                 ),
               };
               requestedValues = values;
+              const existingPending = pendingProviderDrafts.get("steam");
+              if (existingPending?.overlaps.length && !existingPending.reviewed)
+                throw new Error("Review overlapping fields before saving again.");
+              pendingProviderDrafts.set("steam", {
+                baseline: settings.values as unknown as Record<string, unknown>,
+                submitted: values as unknown as Record<string, unknown>,
+                overlaps: [],
+                reviewed: true,
+              });
+              updateDraftStatus();
               setSettingsFormDisabled(form, true);
+              exclusions.setDisabled(true);
               saveStarted = true;
               const saved = await saveSteamSettings(context.api, settings, values);
+              pendingProviderDrafts.delete("steam");
+              updateDraftStatus();
               await loadSteam();
               context.notify(!values.enabled && saved.values.enabled
                 ? settingsTextMessage("Steam settings saved and confirmed. Steam discovery remains enabled by Linux host policy; scan status is shown below.")
@@ -3755,6 +3844,7 @@ namespace Amaterasu {
             } finally {
               actionInProgress = false;
               if (form.isConnected) setSettingsFormDisabled(form, false);
+              exclusions.setDisabled(false);
               cancel.disabled = false;
             }
           });
@@ -3771,6 +3861,16 @@ namespace Amaterasu {
           settingsSetDraftNumber(recentGames, draftValues.recent_games);
           settingsSetDraftNumber(recentMaxAgeDays, draftValues.recent_max_age_days);
           exclusions.setValue(draftValues.exclude_games);
+          configureProviderConflictReview("steam", status, save, (values) => {
+            settingsSetDraftCheckbox(enabled, values.enabled as boolean);
+            settingsSetDraftCheckbox(autoSync, values.auto_sync as boolean);
+            settingsSetDraftCheckbox(includeTools, values.include_tools as boolean);
+            settingsSetDraftCheckbox(syncAllInstalled, values.sync_all_installed as boolean);
+            settingsSetDraftCheckbox(autosyncRemoveUninstalled, values.autosync_remove_uninstalled as boolean);
+            settingsSetDraftNumber(recentGames, values.recent_games as number);
+            settingsSetDraftNumber(recentMaxAgeDays, values.recent_max_age_days as number);
+            exclusions.setValue(values.exclude_games as SteamSettings["values"]["exclude_games"]);
+          });
         }
         void loadSteamRuntimeStatus(runtimeStatus, context, settings, generation);
       } catch (error) {
@@ -3794,6 +3894,18 @@ namespace Amaterasu {
         if (loaded === null) return;
         const { settings, runtime } = loaded.value;
         if (!context.content.isConnected) return;
+        const pendingDraft = pendingProviderDrafts.get("lutris");
+        if (pendingDraft) {
+          const rebased = rebaseProviderDraft(pendingDraft, settings.values as unknown as Record<string, unknown>);
+          pendingDraft.latest = settings.values as unknown as Record<string, unknown>;
+          pendingDraft.merged = rebased.merged;
+          pendingDraft.overlaps = rebased.overlaps;
+          pendingDraft.reviewed = rebased.overlaps.length === 0;
+          draftValues = rebased.merged as LutrisSettings["values"];
+          draftNotice = rebased.overlaps.length
+            ? "Conflicting fields need review. Non-overlapping edits were rebased."
+            : "Settings changed elsewhere. Non-overlapping edits were rebased; review before saving again.";
+        }
         const valuesForForm = settings.values;
         const form = el("form", "settings-form");
         const enabled = input("lutris_enabled", "", "checkbox");
@@ -3842,7 +3954,11 @@ namespace Amaterasu {
         save.disabled = !context.api.allows("configuration.write");
         let actionInProgress = false;
         const cancel = button(settingsTextMessage("Cancel"), () => {
-          if (!actionInProgress) void loadLutris();
+          if (!actionInProgress) {
+            pendingProviderDrafts.delete("lutris");
+            updateDraftStatus();
+            void loadLutris();
+          }
         }, "secondary");
         const refresh = button(
           "Refresh now",
@@ -3909,9 +4025,21 @@ namespace Amaterasu {
                 exclude_games: parseLutrisExclusions(JSON.stringify(exclusions.values())),
               };
               requestedValues = values;
+              const existingPending = pendingProviderDrafts.get("lutris");
+              if (existingPending?.overlaps.length && !existingPending.reviewed)
+                throw new Error("Review overlapping fields before saving again.");
+              pendingProviderDrafts.set("lutris", {
+                baseline: settings.values as unknown as Record<string, unknown>,
+                submitted: values as unknown as Record<string, unknown>,
+                overlaps: [],
+                reviewed: true,
+              });
+              updateDraftStatus();
               setSettingsFormDisabled(form, true);
               saveStarted = true;
               await saveLutrisSettings(context.api, settings, values);
+              pendingProviderDrafts.delete("lutris");
+              updateDraftStatus();
               await loadLutris();
               context.notify(settingsTextMessage("Lutris settings saved and confirmed. Scan status is shown below."));
             } catch (error) {
@@ -3951,6 +4079,13 @@ namespace Amaterasu {
           settingsSetDraftCheckbox(removeUninstalled, draftValues.autosync_remove_uninstalled);
           settingsSetDraftCheckbox(includeSteam, draftValues.include_steam);
           exclusions.setValues(draftValues.exclude_games);
+          configureProviderConflictReview("lutris", saveStatus, save, (values) => {
+            settingsSetDraftCheckbox(enabled, values.enabled as boolean);
+            settingsSetDraftCheckbox(autoSync, values.auto_sync as boolean);
+            settingsSetDraftCheckbox(removeUninstalled, values.autosync_remove_uninstalled as boolean);
+            settingsSetDraftCheckbox(includeSteam, values.include_steam as boolean);
+            exclusions.setValues(values.exclude_games as LutrisSettings["values"]["exclude_games"]);
+          });
         }
       } catch (error) {
         if (context.content.isConnected)
@@ -3972,6 +4107,18 @@ namespace Amaterasu {
         if (loaded === null) return;
         const { settings, runtime } = loaded;
         if (!context.content.isConnected) return;
+        const pendingDraft = pendingProviderDrafts.get("playnite");
+        if (pendingDraft) {
+          const rebased = rebaseProviderDraft(pendingDraft, settings.values as unknown as Record<string, unknown>);
+          pendingDraft.latest = settings.values as unknown as Record<string, unknown>;
+          pendingDraft.merged = rebased.merged;
+          pendingDraft.overlaps = rebased.overlaps;
+          pendingDraft.reviewed = rebased.overlaps.length === 0;
+          draftValues = rebased.merged as PlayniteSettings["values"];
+          draftNotice = rebased.overlaps.length
+            ? "Conflicting fields need review. Non-overlapping edits were rebased."
+            : "Settings changed elsewhere. Non-overlapping edits were rebased; review before saving again.";
+        }
         const valuesForForm = settings.values;
         const form = el("form", "settings-form");
         const enabled = input("playnite_enabled", "", "checkbox");
@@ -4095,7 +4242,11 @@ namespace Amaterasu {
         save.disabled = !context.api.allows("configuration.write");
         let actionInProgress = false;
         const cancel = button(settingsTextMessage("Cancel"), () => {
-          if (!actionInProgress) void loadPlaynite();
+          if (!actionInProgress) {
+            pendingProviderDrafts.delete("playnite");
+            updateDraftStatus();
+            void loadPlaynite();
+          }
         }, "secondary");
         const refresh = button(
           "Refresh now",
@@ -4257,9 +4408,21 @@ namespace Amaterasu {
                 ),
               });
               requestedValues = values;
+              const existingPending = pendingProviderDrafts.get("playnite");
+              if (existingPending?.overlaps.length && !existingPending.reviewed)
+                throw new Error("Review overlapping fields before saving again.");
+              pendingProviderDrafts.set("playnite", {
+                baseline: settings.values as unknown as Record<string, unknown>,
+                submitted: values as unknown as Record<string, unknown>,
+                overlaps: [],
+                reviewed: true,
+              });
+              updateDraftStatus();
               setSettingsFormDisabled(form, true);
               saveStarted = true;
               await savePlayniteSettings(context.api, settings, values);
+              pendingProviderDrafts.delete("playnite");
+              updateDraftStatus();
               await loadPlaynite();
               context.notify(settingsTextMessage("Playnite settings saved and confirmed. Runtime status is shown below."));
             } catch (error) {
@@ -4311,6 +4474,25 @@ namespace Amaterasu {
           syncPlugins.setValues(draftValues.sync_plugins);
           excludePlugins.setValues(draftValues.exclude_plugins);
           excludeGames.setValues(draftValues.exclude_games);
+          configureProviderConflictReview("playnite", saveStatus, save, (values) => {
+            settingsSetDraftCheckbox(enabled, values.enabled as boolean);
+            settingsSetDraftCheckbox(autoSync, values.auto_sync as boolean);
+            settingsSetDraftCheckbox(syncAllInstalled, values.sync_all_installed as boolean);
+            settingsSetDraftCheckbox(removeUninstalled, values.autosync_remove_uninstalled as boolean);
+            settingsSetDraftNumber(deleteAfterDays, values.autosync_delete_after_days as number);
+            settingsSetDraftCheckbox(requireReplacement, values.autosync_require_replacement as boolean);
+            settingsSetDraftNumber(focusAttempts, values.focus_attempts as number);
+            settingsSetDraftNumber(focusTimeoutSecs, values.focus_timeout_secs as number);
+            settingsSetDraftCheckbox(focusExitOnFirst, values.focus_exit_on_first as boolean);
+            settingsSetDraftCheckbox(fullscreenEntryEnabled, values.fullscreen_entry_enabled as boolean);
+            settingsSetDraftNumber(recentGames, values.recent_games as number);
+            settingsSetDraftNumber(recentMaxAgeDays, values.recent_max_age_days as number);
+            syncCategories.setValues(values.sync_categories as string[]);
+            excludeCategories.setValues(values.exclude_categories as string[]);
+            syncPlugins.setValues(values.sync_plugins as string[]);
+            excludePlugins.setValues(values.exclude_plugins as string[]);
+            excludeGames.setValues(values.exclude_games as string[]);
+          });
         }
       } catch (error) {
         if (context.content.isConnected)

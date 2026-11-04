@@ -4,6 +4,8 @@ import test from "node:test";
 import vm from "node:vm";
 import ts from "typescript";
 
+const documentState = { activeElement: null };
+
 class Node {
   constructor(tag) {
     this.tagName = tag;
@@ -18,15 +20,30 @@ class Node {
     this.disabled = false;
     this.className = "";
     this.autocomplete = "";
+    this.parentNode = null;
+    this.selectionStart = 0;
+    this.selectionEnd = 0;
   }
-  append(...children) { this.children.push(...children); }
+  append(...children) {
+    for (const child of children) {
+      if (typeof child !== "string") child.parentNode = this;
+      this.children.push(child);
+    }
+  }
   replaceChildren(...children) {
-    this.children = [...children];
+    for (const child of this.children) if (typeof child !== "string") child.parentNode = null;
+    this.children = [];
+    this.append(...children);
     this.textContent = children.map(child => typeof child === "string" ? child : child.textContent ?? "").join("");
   }
+  contains(target) { return target === this || this.children.some(child => typeof child !== "string" && child.contains(target)); }
   setAttribute(name, value) { this.attributes.set(name, value); }
+  removeAttribute(name) { this.attributes.delete(name); }
+  getAttribute(name) { return this.attributes.get(name) ?? null; }
   addEventListener(name, listener) { this.listeners.set(name, listener); }
-  click() { this.listeners.get("click")?.(); }
+  focus() { documentState.activeElement = this; }
+  setSelectionRange(start, end) { this.selectionStart = start; this.selectionEnd = end; }
+  click() { this.listeners.get("click")?.({ type: "click" }); }
   dispatchEvent(event) { this.listeners.get(event.type)?.(event); return true; }
   removeEventListener() {}
 }
@@ -49,6 +66,7 @@ const ctx = {
     },
   },
   document: {
+    get activeElement() { return documentState.activeElement; },
     createElement: tag => new Node(tag),
     createTextNode: source => Object.assign(new Node("#text"), { textContent: source }),
   },
@@ -63,7 +81,7 @@ const create = (initial, api, onChange = () => {}) =>
 const tick = async () => { for (let i = 0; i < 30; i++) await new Promise(resolve => setTimeout(resolve, 0)); };
 const all = (node, predicate) => [
   ...(predicate(node) ? [node] : []),
-  ...node.children.flatMap(child => all(child, predicate)),
+  ...node.children.flatMap(child => typeof child === "string" ? [] : all(child, predicate)),
 ];
 const find = (node, predicate) => all(node, predicate)[0];
 
@@ -220,4 +238,114 @@ test("steam.read unavailable shows an access message", async () => {
   await tick();
   assert.match(picker.node.children[5].textContent, /steam.read permission/);
   assert.deepEqual(JSON.parse(JSON.stringify(picker.value())), [{ id: "42", name: "Preserved" }]);
+});
+
+test("manual add edits saved exclusions without steam.read and removes a blank optional name", async () => {
+  let calls = 0;
+  const changes = [];
+  const picker = create([{ id: "9", name: "Old title" }], {
+    allows: () => false,
+    async post() { calls += 1; throw new Error("must not call"); },
+  }, value => changes.push(value));
+  await tick();
+  const name = find(picker.node, node => node.tagName === "input" && node.attributes.get("aria-label") === "Edit excluded Steam game name");
+  name.value = "  ";
+  name.listeners.get("input")?.();
+  assert.deepEqual(JSON.parse(JSON.stringify(picker.value())), [{ id: "9" }]);
+
+  const manualId = find(picker.node, node => node.tagName === "input" && node.attributes.get("aria-label") === "Steam app ID to exclude");
+  const manualName = find(picker.node, node => node.tagName === "input" && node.attributes.get("aria-label") === "Steam game name to exclude");
+  manualName.value = "  Manual title ";
+  const form = find(picker.node, node => node.tagName === "form" && node.className === "steam-exclusion-manual-add");
+  form.dispatchEvent({ type: "submit", preventDefault() {} });
+  assert.deepEqual(JSON.parse(JSON.stringify(picker.value())), [{ id: "9" }, { name: "Manual title" }]);
+  assert.equal(manualId.value, "");
+  assert.equal(manualName.value, "");
+  assert.equal(changes.length, 2);
+  assert.equal(calls, 0);
+});
+
+test("manual add enforces the 256 exclusion cap", async () => {
+  const picker = create(Array.from({ length: 256 }, (_, index) => ({ name: "Saved " + index })), {
+    allows: () => false,
+    async post() { throw new Error("must not call"); },
+  });
+  await tick();
+  const manualName = find(picker.node, node => node.tagName === "input" && node.attributes.get("aria-label") === "Steam game name to exclude");
+  manualName.value = "One too many";
+  const form = find(picker.node, node => node.tagName === "form" && node.className === "steam-exclusion-manual-add");
+  form.dispatchEvent({ type: "submit", preventDefault() {} });
+  assert.equal(picker.value().length, 256);
+  assert.match(find(picker.node, node => node.tagName === "p" && node.attributes.get("aria-live") === "polite" && node.textContent.includes("up to 256")).textContent, /up to 256/);
+});
+
+test("setDisabled persists through delayed list completion and blocks change handlers", async () => {
+  let resolve;
+  const picker = create([], {
+    allows: () => true,
+    post: () => new Promise(done => { resolve = done; }),
+  });
+  picker.setDisabled(true);
+  assert.equal(picker.node.children[7].disabled, true);
+  const externalFocus = new Node("input");
+  externalFocus.focus();
+  resolve({ revision: 1, games: [{ app_id: 8, name: "Late result" }], next_after: null, scanning: false, complete: true });
+  await tick();
+  const box = find(picker.node, node => node.tagName === "input" && node.type === "checkbox");
+  assert.equal(box.disabled, true);
+  assert.equal(documentState.activeElement, externalFocus);
+  box.checked = true;
+  box.listeners.get("change")?.();
+  assert.deepEqual(JSON.parse(JSON.stringify(picker.value())), []);
+  picker.setDisabled(false);
+  assert.equal(find(picker.node, node => node.tagName === "input" && node.type === "checkbox").disabled, false);
+});
+
+test("checkbox rerender restores its stable focus target and saved input caret", async () => {
+  const picker = create([], {
+    allows: () => true,
+    async post() {
+      return { revision: 1, games: [{ app_id: 10, name: "Focus target" }], next_after: null, scanning: false, complete: true };
+    },
+  });
+  await tick();
+  const box = find(picker.node, node => node.tagName === "input" && node.type === "checkbox");
+  box.focus();
+  box.checked = true;
+  box.listeners.get("change")?.();
+  const nextBox = find(picker.node, node => node.tagName === "input" && node.type === "checkbox");
+  assert.notEqual(nextBox, box);
+  assert.equal(documentState.activeElement, nextBox);
+
+  const savedName = find(picker.node, node => node.tagName === "input" && node.attributes.get("aria-label") === "Edit excluded Steam game name");
+  savedName.focus();
+  savedName.selectionStart = 3;
+  savedName.selectionEnd = 5;
+  picker.setValue([{ name: "Focused draft" }]);
+  const replacement = find(picker.node, node => node.tagName === "input" && node.attributes.get("aria-label") === "Edit name-only Steam exclusion");
+  assert.equal(documentState.activeElement, replacement);
+  assert.equal(replacement.selectionStart, 3);
+  assert.equal(replacement.selectionEnd, 5);
+});
+
+test("incomplete and revision restart warnings are visible and stale status labels clear", async () => {
+  let call = 0;
+  const picker = create([], {
+    allows: () => true,
+    async post() {
+      call += 1;
+      if (call === 1) return { revision: 1, games: [], next_after: 1, scanning: false, complete: true };
+      if (call === 2) return { revision: 2, games: [], next_after: null, scanning: true, complete: false };
+      return { revision: 2, games: [], next_after: null, scanning: false, complete: false };
+    },
+  });
+  await tick();
+  picker.node.children[7].click();
+  await tick();
+  const warning = find(picker.node, node => node.className === "steam-exclusion-warning");
+  assert.equal(warning.hidden, false);
+  assert.match(warning.textContent, /scan is incomplete/);
+  assert.match(warning.textContent, /restarted at the latest revision/);
+  assert.equal(picker.node.children[5].attributes.get("aria-label"), "0 matching loaded games; 0 exclusions");
+  assert.equal(picker.node.children[5].attributes.has("title"), false);
 });
