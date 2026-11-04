@@ -183,6 +183,10 @@ test("application overrides preserve unrelated values, guard structural edits, a
   await settle();
   assert.equal(guard(), false);
   assert.equal(nodes.filter(n => n.tag === "editor").length, 1);
+  const chooser = nodes.find(n => n.tag === "details");
+  assert.equal(chooser.children[0].tag, "summary");
+  assert.equal(chooser.children[0].children[0], "Add override");
+  assert.equal(chooser.children[1].children.some(n => n.tag === "p"), true, "inherited hint has its own block");
   nodes.find(n => n.tag === "button" && n.children[0] === "Remove override").listeners.click();
   assert.equal(guard(), true);
   assert.equal(runtime.Amaterasu.applicationPluginOverridesDirty(area), true);

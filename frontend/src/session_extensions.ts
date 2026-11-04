@@ -199,10 +199,10 @@ namespace Amaterasu {
           let baseline = JSON.stringify(document.values);
           const options = descriptor.options.filter((option) => Array.isArray(option.allowed_scopes) && option.allowed_scopes.includes("application"));
           const entries = new Map<string, { editor: ExtensionFieldEditor }>();
-          const form = el("form", "settings-form");
-          const fields = el("fieldset");
+          const form = el("form", "settings-form catalog-plugin-overrides-form");
+          const fields = el("fieldset", "catalog-plugin-overrides-fields");
           fields.disabled = !context.api.allows("configuration.write");
-          const rows = el("div");
+          const rows = el("div", "catalog-plugin-overrides-rows");
           const search = input("", "", "search");
           search.placeholder = "Search settings";
           search.setAttribute("aria-label", "Search plugin settings");
@@ -210,7 +210,7 @@ namespace Amaterasu {
           const choices = el("select");
           choices.setAttribute("aria-label", "Setting to override");
           choices.setAttribute("data-draft-ignore", "");
-          const inherited = el("small", "muted");
+          const inherited = el("p", "muted catalog-plugin-overrides-inherited");
           const describeInherited = () => {
             if (!effectiveAvailable) { inherited.textContent = "Reload the application editor to refresh inherited values."; return; }
             const effective = document.effective[choices.value];
@@ -241,7 +241,7 @@ namespace Amaterasu {
               : extensionFieldEditor(option.definition, value, option.choice_labels);
             const controls = editor.node.matches("input,select,textarea") ? [editor.node] : Array.from(editor.node.querySelectorAll("input,select,textarea"));
             if (controls.length === 1) controls[0]!.setAttribute("aria-label", option.label);
-            const row = el("fieldset", "session-extension-option", el("legend", "field-label", literalText(option.label)), editor.node);
+            const row = el("fieldset", "session-extension-option catalog-plugin-override-row", el("legend", "field-label", literalText(option.label)), editor.node);
             if (option.help) row.append(el("small", "muted", literalText(option.help)));
             row.append(button("Remove override", () => { entries.delete(option.id); row.remove(); refreshChoices(); }));
             entries.set(option.id, { editor });
@@ -271,7 +271,11 @@ namespace Amaterasu {
           const status = el("div");
           const save = el("button", "button primary", "Save plugin overrides");
           save.type = "submit";
-          fields.append(rows, search, choices, inherited, add, save);
+          const chooser = el("details", "catalog-override-chooser catalog-plugin-override-chooser",
+            el("summary", "", "Add override"),
+            el("div", "catalog-plugin-override-chooser-content", search, choices, inherited, add));
+          const actions = el("div", "catalog-plugin-overrides-actions", save);
+          fields.append(rows, chooser, actions);
           form.append(fields, status);
           form.addEventListener("submit", (event) => {
             event.preventDefault();
