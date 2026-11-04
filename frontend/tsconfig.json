@@ -20,6 +20,7 @@
     "src/list_editor.ts",
     "src/theme.ts",
     "src/catalog.ts",
+    "src/steam_exclusion_picker.ts",
     "src/management-policy.ts",
     "src/csrf-policy.ts",
     "src/client_directory.ts",
