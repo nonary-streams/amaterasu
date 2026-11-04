@@ -103,6 +103,12 @@ ANNOUNCE, then PLAY. Session tokens, targets, CSeq progression, launch epochs an
 pending completion tickets are checked explicitly. SETUP reports the allocated
 server ports. ANNOUNCE acceptance commits only a supported prepared profile.
 
+The first two simultaneous transports on an address use UDP ports at base +9
+through +14. Remote clients need inbound access to that range; existing rules
+for only base +9 through +11 cover one client. Further admissions fail until
+a slot is available. A reserved slot is reused only after its prior transport
+confirms cleanup.
+
 PLAY arms the owned media session. It does not claim capture is already active:
 Moonlight opens control after RTSP completes. The session library waits for
 control authentication before opening capture, with bounded startup and rollback.

@@ -217,12 +217,14 @@ impl Settings {
         let binds = self.media_binds_by_family(base_port)?;
         // Hold every provider-owned UDP handle until the complete set has been
         // checked. Per-session transport admission performs its own later bind.
-        let mut sockets = Vec::with_capacity(binds.len() * 3);
-        for bind in binds
-            .iter()
-            .flat_map(|family| [family.video, family.control, family.audio])
-        {
-            sockets.push(network.bind_udp(bind).map_err(|_| "udp_bind_failed")?);
+        let mut sockets = Vec::with_capacity(binds.len() * 6);
+        for family in binds {
+            for offset in [0, 3] {
+                for mut bind in [family.video, family.control, family.audio] {
+                    bind.set_port(bind.port() + offset);
+                    sockets.push(network.bind_udp(bind).map_err(|_| "udp_bind_failed")?);
+                }
+            }
         }
         Ok(())
     }
@@ -2509,7 +2511,7 @@ mod tests {
             .expect("find an available local UDP bind set");
         settings
             .probe_media_binds(base_port)
-            .expect("all six family-specific UDP sockets bind together");
+            .expect("both family-specific UDP port sets bind together");
 
         let occupied_address = SocketAddr::new(
             IpAddr::V6(if allow_remote {
@@ -2517,7 +2519,7 @@ mod tests {
             } else {
                 Ipv6Addr::LOCALHOST
             }),
-            base_port + VIDEO_OFFSET,
+            base_port + VIDEO_OFFSET + 3,
         );
         let blocker = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP)).unwrap();
         blocker.set_only_v6(true).unwrap();

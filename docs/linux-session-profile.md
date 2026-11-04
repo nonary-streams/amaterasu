@@ -207,8 +207,9 @@ Rules, matching NVHTTP's and RTSP's own network settings:
 
 * The base port is 1029 through 65514. NVHTTP's HTTPS listener is `base - 5`,
   RTSP is `base + 21`, and the video, control and audio UDP ports are `base + 9`,
-  `base + 10` and `base + 11`. With the default base 47989 that is 47984, 48010
-  and 47998 through 48000.
+  `base + 10` and `base + 11` for the first client; a second client uses UDP
+  `base + 12` through `base + 14`. With the default base 47989 that is HTTPS
+  47984, RTSP 48010 and UDP 47998 through 48003.
 * A concrete address (for example the host's LAN address) enables remote binding
   only on that one address. A concrete loopback address only moves the ports.
 * A wildcard (`0.0.0.0`, `::`) is rejected unless `--allow-remote` is also given.

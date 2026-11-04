@@ -232,6 +232,15 @@ impl Controller {
         let url = format!("rtspenc://{local}/launch-{ticket:016x}");
         let expires = deadline;
         let media_binds = self.media_binds_for_open(local.ip());
+        if media_binds.is_none()
+            && self
+                .active_network_base_port
+                .or(self.listener_base_port)
+                .is_some()
+        {
+            rpc::complete(runtime, request, error("media_port_capacity_exhausted"));
+            return;
+        }
         let mut record = Record {
             id: ticket,
             owner: caller,

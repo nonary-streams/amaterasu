@@ -57,11 +57,12 @@ the broker process. Global policy updates reach every context, while scoped
 settings, held input, controller slots and feedback remain independent. Legacy
 unbound input and Windows input retain exclusive behavior.
 
-The first transport reserves configured UDP endpoints. Further clients on the
-same admitted local address request ephemeral ports through the selected Network
-provider. RTSP advertises the actual provider ports. Pending admission and
-uncertain teardown retain their reservations; socket reuse does not route client
-traffic.
+The first transport reserves configured UDP endpoints at base +9 through +11.
+The second transport on that admitted local address uses base +12 through +14
+through the selected Network provider. RTSP advertises the actual provider
+ports. Remote access requires firewall rules for both triplets. Pending admission
+and uncertain teardown retain their reservations; a third admission fails until
+a slot is available, and socket reuse does not route client traffic.
 
 Named PipeWire CPU frames can be resized and letterboxed independently for each
 client. Video and absolute input share the exact fitted rectangle, including

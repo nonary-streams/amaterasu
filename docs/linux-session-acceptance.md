@@ -84,7 +84,7 @@ Rules for every native check:
    `--wait-restored` with a stated number of seconds. A run that cannot restore stops and
    reports; it does not try a different backend or change host-wide configuration.
 7. **Loopback sockets only** with ephemeral ports. The live host owns the default
-   Moonlight ports (47984, 47989, 47990, 48010 and UDP 47998 to 48000). Remote-bind tests
+   Moonlight ports (47984, 47989, 47990, 48010 and UDP 47998 to 48003). Remote-bind tests
    are separate `#[ignore]`d cases with a stated reason. Never add firewall rules.
 8. **Disk.** Stop and tell the integrator if `/home` has under 12 GB free. `preflight`
    fails below that.

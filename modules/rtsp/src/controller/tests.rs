@@ -1268,13 +1268,13 @@ pub(super) fn free_base_port() -> u16 {
         let Ok(_tcp_v6) = TcpListener::bind((Ipv6Addr::LOCALHOST, rtsp_port)) else {
             continue;
         };
-        let udp_v4 = (9..=11)
+        let udp_v4 = (9..=14)
             .map(|offset| UdpSocket::bind((Ipv4Addr::LOCALHOST, base + offset)))
             .collect::<std::io::Result<Vec<_>>>();
         let Ok(_udp_v4) = udp_v4 else {
             continue;
         };
-        let udp_v6 = (9..=11)
+        let udp_v6 = (9..=14)
             .map(|offset| UdpSocket::bind((Ipv6Addr::LOCALHOST, base + offset)))
             .collect::<std::io::Result<Vec<_>>>();
         if udp_v6.is_ok() {

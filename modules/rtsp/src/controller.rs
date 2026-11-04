@@ -543,27 +543,28 @@ impl Controller {
         &self,
         local_address: IpAddr,
     ) -> Option<crate::model::MediaBinds> {
-        let mut binds = self
+        let binds = self
             .active_network_base_port
             .or(self.listener_base_port)
             .and_then(|port| self.settings.media_binds_on(port, local_address).ok())?;
-        // The configured ports belong to the first transport on this address.
-        // Each later transport asks the selected network provider for its own
-        // endpoints, which RTSP advertises from the provider's Prepare readback.
-        // Keep the address occupied through pending opens and uncertain cleanup;
-        // a terminal label alone does not prove that its sockets have retired.
-        let occupied = self.records.values().any(|record| {
-            record
-                .media_binds
-                .is_some_and(|reserved| reserved.video.ip() == binds.video.ip())
-                && (!record.state.terminal() || !record.cleanup_confirmed)
-        });
-        if occupied {
-            binds.video.set_port(0);
-            binds.control.set_port(0);
-            binds.audio.set_port(0);
+        // Reserve predictable ports for the two concurrent NVHTTP clients so
+        // administrators can permit a bounded UDP range through the firewall.
+        // Keep a slot occupied until cleanup is confirmed, including pending
+        // opens and failed or uncertain retirement.
+        for offset in [0, 3] {
+            let mut candidate = binds;
+            candidate.video.set_port(binds.video.port() + offset);
+            candidate.control.set_port(binds.control.port() + offset);
+            candidate.audio.set_port(binds.audio.port() + offset);
+            let occupied = self.records.values().any(|record| {
+                record.media_binds == Some(candidate)
+                    && (!record.state.terminal() || !record.cleanup_confirmed)
+            });
+            if !occupied {
+                return Some(candidate);
+            }
         }
-        Some(binds)
+        None
     }
 
     pub(super) fn advertised_local_for_peer(

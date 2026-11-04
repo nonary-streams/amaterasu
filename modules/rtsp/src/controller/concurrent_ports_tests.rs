@@ -258,7 +258,7 @@ fn concurrent_clients_negotiate_distinct_provider_ports_and_survive_peer_teardow
                 serde_json::from_value(endpoint.prepares[1][field].clone()).unwrap();
             assert_eq!(fixed.ip(), address);
             assert_ne!(fixed.port(), 0);
-            assert_eq!(additional, SocketAddr::new(address, 0));
+            assert_eq!(additional, SocketAddr::new(address, fixed.port() + 3));
         }
         assert_eq!(
             first_addresses
@@ -280,7 +280,7 @@ fn concurrent_clients_negotiate_distinct_provider_ports_and_survive_peer_teardow
             .network
             .bind_udp(SocketAddr::new(address, 0))
             .unwrap();
-        for (index, destination) in first_addresses.into_iter().enumerate() {
+        for (index, destination) in first_addresses.iter().copied().enumerate() {
             sender.send_to(b"first", destination).unwrap();
             receive(&endpoint.lanes[&first_session][index], b"first");
             assert_eq!(
@@ -296,6 +296,10 @@ fn concurrent_clients_negotiate_distinct_provider_ports_and_survive_peer_teardow
         assert!(controller.records[&first].cleanup_confirmed);
         assert!(controller.records[&first].state.terminal());
         assert!(!endpoint.lanes.contains_key(&first_session));
+        let reusable = controller.media_binds_for_open(address).unwrap();
+        assert_eq!(reusable.video, first_addresses[1]);
+        assert_eq!(reusable.audio, first_addresses[0]);
+        assert_eq!(reusable.control, first_addresses[2]);
         for (index, destination) in second_addresses.into_iter().enumerate() {
             sender.send_to(b"second survives", destination).unwrap();
             receive(&endpoint.lanes[&second_session][index], b"second survives");
@@ -305,10 +309,10 @@ fn concurrent_clients_negotiate_distinct_provider_ports_and_survive_peer_teardow
 }
 
 #[test]
-fn pending_and_uncertain_transport_reservations_keep_additional_binds_ephemeral() {
+fn pending_and_uncertain_transport_reservations_keep_distinct_bounded_ports() {
     let _guard = super::tests::NETWORK_TEST_LOCK.lock().unwrap();
     let address = IpAddr::V4(Ipv4Addr::LOCALHOST);
-    let (mut controller, _endpoint, runtime) = fixture(address);
+    let (mut controller, endpoint, runtime) = fixture(address);
     let first = admit(&mut controller, &runtime, address, 1);
     let fixed = controller.records[&first].media_binds.unwrap();
     assert_ne!(fixed.video.port(), 0);
@@ -323,14 +327,67 @@ fn pending_and_uncertain_transport_reservations_keep_additional_binds_ephemeral(
                 additional.control.port(),
                 additional.audio.port()
             ],
-            [0; 3]
+            [
+                fixed.video.port() + 3,
+                fixed.control.port() + 3,
+                fixed.audio.port() + 3
+            ]
         );
         assert_eq!(additional.video.ip(), address);
     }
+    controller.records.get_mut(&first).unwrap().state = State::Preparing;
+    let second = admit(&mut controller, &runtime, address, 2);
+    assert!(controller.media_binds_for_open(address).is_none());
+    controller.open(
+        OpenRequest {
+            request: 3,
+            caller: "amaterasu.nvhttp".into(),
+            config: request(address, 3),
+            deadline: 5_000,
+            display_preflight_deadline: None,
+        },
+        0,
+        &runtime,
+        false,
+    );
+    assert_eq!(
+        endpoint.completed.last().unwrap()["code"],
+        "capacity_exceeded"
+    );
+    assert_eq!(controller.records.len(), 2);
+    controller.records.get_mut(&first).unwrap().state = State::Failed;
+    controller.records.get_mut(&second).unwrap().state = State::Closed;
+    let prepare_count = endpoint.prepares.len();
+    controller.open(
+        OpenRequest {
+            request: 4,
+            caller: "amaterasu.nvhttp".into(),
+            config: request(address, 4),
+            deadline: 5_000,
+            display_preflight_deadline: None,
+        },
+        0,
+        &runtime,
+        false,
+    );
+    assert_eq!(
+        endpoint.completed.last().unwrap()["code"],
+        "media_port_capacity_exhausted"
+    );
+    assert_eq!(controller.records.len(), 2);
+    assert_eq!(endpoint.prepares.len(), prepare_count);
     controller
         .records
         .get_mut(&first)
         .unwrap()
         .cleanup_confirmed = true;
-    assert_eq!(controller.media_binds_for_open(address), Some(fixed));
+    let replacement = admit(&mut controller, &runtime, address, 5);
+    assert_eq!(controller.records[&replacement].media_binds, Some(fixed));
+    controller
+        .records
+        .get_mut(&second)
+        .unwrap()
+        .cleanup_confirmed = true;
+    let second_slot = controller.media_binds_for_open(address).unwrap();
+    assert_eq!(second_slot.video.port(), fixed.video.port() + 3);
 }
