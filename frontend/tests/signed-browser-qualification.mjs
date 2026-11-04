@@ -747,7 +747,11 @@ async function initial(options) {
     window.confirm = () => true;
     [...card.querySelectorAll('button')].find(button => button.textContent.trim() === 'Remove device').click();
   })()`);
-  await wait(devices, "!document.querySelector('.client-settings-card') && document.body.textContent.includes('No paired clients remain.')", "native device removal readback");
+  await wait(
+    devices,
+    "(() => { const empty = document.querySelector('.client-search-empty'); return !document.querySelector('.client-settings-card') && !!empty && !empty.hidden; })()",
+    "native device removal readback",
+  );
   check(observed.some((request) => request.path === "/v1/pairing/unpair" && request.status === 200),
     "native browser device removal request missing");
   await debuggerClient.command("Target.closeTarget", { targetId: devices.targetId });
