@@ -639,3 +639,16 @@ test("catalog covers wait for attachment, bound concurrent transfers, and skip r
   for (const art of arts) art.children[0]?.fire("load");
   assert.equal(revoked.length, 6);
 });
+
+test("unchanged unknown encoder and frame generation options survive a save", () => {
+  const model = context.Amaterasu;
+  const saved = { nvenc_twopass: "future-pass", nvenc_split_encode: "future-split", frame_generation_provider: "future-provider", frame_generation_mode: "future-mode" };
+  const fields = new FormData();
+  for (const [key, value] of Object.entries(saved)) fields.set(key, value);
+  const encoder = model.parseCatalogNvencSettingsOverrides(fields, saved);
+  const session = model.parseCatalogSessionPolicyOverrides(fields, {}, saved);
+  for (const key of ["nvenc_twopass", "nvenc_split_encode"]) assert.equal(encoder[key], saved[key]);
+  for (const key of ["frame_generation_provider", "frame_generation_mode"]) assert.equal(session[key], saved[key]);
+  fields.set("nvenc_twopass", "different-invalid-value");
+  assert.throws(() => model.parseCatalogNvencSettingsOverrides(fields, saved));
+});

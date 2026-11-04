@@ -1540,3 +1540,16 @@ polyline.host-metric-chart-line { fill: none; }
 .button.catalog-select { position: absolute; z-index: 2; top: 8px; left: 8px; width: 32px; height: 32px; min-height: 32px; padding: 0; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); color: var(--fg); font-size: 18px; line-height: 1; }
 .button.catalog-select[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
 .app-card.is-selected .button.catalog-open { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent); }
+
+.catalog-override-active { display: grid; gap: .75rem; }
+.catalog-override-row { display: flex; align-items: start; gap: 1rem; padding: .9rem; border: 1px solid var(--border, #555); border-radius: .5rem; }
+.catalog-override-row[hidden] { display: none; }
+.catalog-override-row-content { flex: 1; min-width: 0; display: grid; gap: .5rem; }
+.catalog-override-chooser { margin-top: 1rem; }
+.catalog-override-chooser summary { cursor: pointer; font-weight: 600; }
+.catalog-override-chooser input[type="search"] { margin: .75rem 0; width: 100%; }
+.catalog-override-catalog { display: grid; gap: .75rem; }
+.catalog-override-group { display: flex; flex-wrap: wrap; gap: .5rem; }
+.catalog-override-group[hidden], .catalog-override-choice[hidden] { display: none; }
+.catalog-override-group h4 { flex-basis: 100%; margin: 0; }
+.catalog-override-draft-marker { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }

@@ -484,6 +484,7 @@ namespace Amaterasu {
 
   export function parseCatalogNvencSettingsOverrides(
     data: FormData,
+    current?: Entry["config_overrides"],
   ): CatalogNvencSettingsOverrides {
     const text = (name: keyof CatalogNvencSettingsOverrides) => String(data.get(name) ?? "").trim();
     const integer = (name: "nvenc_preset" | "nvenc_vbv_increase", minimum: number, maximum: number): number | null => {
@@ -506,7 +507,7 @@ namespace Amaterasu {
     const enumeration = <T extends string>(name: "nvenc_twopass" | "nvenc_split_encode", choices: readonly T[]): T | null => {
       const value = text(name);
       if (value === "") return null;
-      if ((choices as readonly string[]).includes(value)) return value as T;
+      if ((choices as readonly string[]).includes(value) || value === current?.[name]) return value as T;
       throw new Error(`${name} has an unsupported value.`);
     };
     return {
@@ -716,7 +717,7 @@ namespace Amaterasu {
     if (
       currentValue != null &&
       !allowedValues.includes(currentValue as T) &&
-      value === catalogSavedUnsupportedEnumValueToken(allowedValues)
+      (value === currentValue || value === catalogSavedUnsupportedEnumValueToken(allowedValues))
     ) return currentValue as T;
     if (!allowedValues.includes(value as T))
       throw new Error(`${label} must be one of the supported values.`);
@@ -1018,7 +1019,13 @@ namespace Amaterasu {
     const editor = el("div");
     const editorDrafts = context.registerDraftGuard ? trackDrafts(editor) : null;
     let editorSaving = false;
-    if (editorDrafts) context.registerDraftGuard?.(() => editorSaving || editorDrafts.isDirty(), editorDrafts.dispose);
+    const catalogDraftDirty = () => {
+      const form = editor.querySelector<HTMLElement>(".editor-form");
+      return !!form && !!editorDrafts?.isDirty(form);
+    };
+    let pluginArea: HTMLElement | null = null;
+    const pluginDirty = () => !!pluginArea && typeof applicationPluginOverridesDirty === "function" && applicationPluginOverridesDirty(pluginArea);
+    if (editorDrafts) context.registerDraftGuard?.(() => editorSaving || catalogDraftDirty() || pluginDirty(), editorDrafts.dispose);
     let editorGeneration = 0;
     const status = el("div");
     const selectionCount = el("span", "muted");
@@ -1361,10 +1368,6 @@ namespace Amaterasu {
       }), "primary");
       launch.disabled = typeof api.allowsLaunchAction !== "function" || !api.allowsLaunchAction("start");
       const actions = [launch, edit];
-      const pluginSettings = button("Plugin settings", () =>
-        showSessionExtensionSettings(context, { kind: "application", id: row.id }, `${row.entry.name} plugin settings`));
-      pluginSettings.disabled = !api.allows("configuration.read");
-      actions.push(pluginSettings);
       if (providerLaunch) {
         const configure = button(
           "Streaming settings",
@@ -1473,7 +1476,12 @@ namespace Amaterasu {
         notify("Wait for the application save to finish.");
         return false;
       }
-      if (editorDrafts?.isDirty() && !window.confirm("Discard your unsaved application changes?")) return false;
+      if (pluginArea && typeof applicationPluginOverridesSaving === "function" && applicationPluginOverridesSaving(pluginArea)) {
+        notify("Wait for the plugin override save to finish.");
+        return false;
+      }
+      if ((catalogDraftDirty() || pluginDirty()) && !window.confirm("Discard your unsaved application and plugin changes?")) return false;
+      pluginArea = null;
       editorGeneration += 1;
       editor.replaceChildren();
       return true;
@@ -1618,6 +1626,8 @@ namespace Amaterasu {
           ...inputCompatibilityFields, ...advancedInput.fields),
         catalogEditorDisclosure("Encoder", "Override software and NVENC encoder settings.",
           ...softwareEncoder.fields, ...nvencSettingsFields));
+      const overrides = catalogOverrideEditor(catalogOverrideSections(Array.from(form.children) as HTMLElement[]), { ...row.entry.config_overrides });
+      form.replaceChildren(overrides.node);
       revealInvalidEditorControls(form);
       const feedback = el("div");
       const save = el("button", "button primary", "Save streaming settings");
@@ -1627,6 +1637,10 @@ namespace Amaterasu {
       form.addEventListener("submit", (event) => {
         event.preventDefault();
         if (!form.reportValidity()) return;
+        if (pluginDirty()) {
+          feedback.replaceChildren(el("p", "notice error", "Save plugin overrides before saving this application, or cancel to discard them."));
+          return;
+        }
         void runAction(save, feedback, async () => {
           const config_overrides = mergeCatalogConfigOverrides(
             row.entry.config_overrides,
@@ -1639,13 +1653,14 @@ namespace Amaterasu {
               capabilities,
               row.entry.config_overrides,
             ),
-            parseCatalogNvencSettingsOverrides(new FormData(form)),
+            parseCatalogNvencSettingsOverrides(new FormData(form), row.entry.config_overrides),
             parseCatalogInputCompatibilityOverrides(new FormData(form)),
             {
               dd_refresh_rate_option: parseCatalogRefreshRateOptionOverride(new FormData(form)),
               display_policy: parseDisplayPolicyOverrideMap(displayPolicy.value, "application"),
             },
           );
+          for (const key of overrides.removed) delete (config_overrides as Record<string, unknown>)[key];
           editorSaving = true;
           const unlock = lockEditorControls(form);
           try {
@@ -1712,8 +1727,10 @@ namespace Amaterasu {
             "The Playnite game identity and provider-managed launch metadata stay unchanged.",
           ),
           el("div", "catalog-editor-layout", cover.figure, form),
+          el("section", "catalog-editor-section", el("h3", "", "Plugin overrides"), pluginArea = el("div")),
         ),
       );
+      if (typeof renderApplicationPluginOverrides === "function") renderApplicationPluginOverrides(context, pluginArea, row.id);
       showCatalogArtwork(api, row.entry.artwork, cover.art, content, () => { cover.fallback.hidden = true; }, row.id);
       editor.scrollIntoView({ behavior: "smooth", block: "start" });
       fec.focus();
@@ -1751,6 +1768,10 @@ namespace Amaterasu {
       form.addEventListener("submit", (event) => {
         event.preventDefault();
         if (!form.reportValidity()) return;
+        if (pluginDirty()) {
+          feedback.replaceChildren(el("p", "notice error", "Save plugin overrides before saving this application, or cancel to discard them."));
+          return;
+        }
         void runAction(save, feedback, async () => {
           const entry = entryFromForm(new FormData(form), runtimeStatus.recognized_profiles);
           Object.assign(entry, parseCatalogApplicationDisplaySettings(new FormData(form)));
@@ -1763,9 +1784,10 @@ namespace Amaterasu {
               capabilities,
               row?.entry.config_overrides,
             ),
-            parseCatalogNvencSettingsOverrides(new FormData(form)),
+            parseCatalogNvencSettingsOverrides(new FormData(form), row?.entry.config_overrides),
             parseCatalogInputCompatibilityOverrides(new FormData(form)),
           );
+          for (const key of catalogRemovedOverrides.get(form) ?? []) delete (entry.config_overrides as Record<string, unknown>)[key];
           editorSaving = true;
           const unlock = lockEditorControls(form);
           try {
@@ -1793,8 +1815,10 @@ namespace Amaterasu {
             "Save launch metadata for this host. Adding an entry does not launch it.",
           ),
           cover ? el("div", "catalog-editor-layout", cover.figure, form) : form,
+          el("section", "catalog-editor-section", el("h3", "", "Plugin overrides"), pluginArea = el("div", "", ...(row ? [] : [el("p", "muted", "Plugin overrides are available after creating this application.")]))),
         ),
       );
+      if (row && typeof renderApplicationPluginOverrides === "function") renderApplicationPluginOverrides(context, pluginArea, row.id);
       if (cover && row) showCatalogArtwork(api, row.entry.artwork, cover.art, content, () => { cover.fallback.hidden = true; }, row.id);
       editor.scrollIntoView({ behavior: "smooth", block: "start" });
       form.querySelector("input")?.focus();
@@ -1825,6 +1849,81 @@ namespace Amaterasu {
       el("div", "catalog-editor-disclosure-content", ...children));
   }
 
+  // Controls remain in the form so the established parsers and conditional
+  // controls retain their behavior when their rows are hidden.
+  function catalogOverrideEditor(sections: Array<{ area: string; fields: HTMLElement[] }>, saved: Record<string, unknown>): { node: HTMLElement; removed: Set<string> } {
+    const removed = new Set<string>();
+    const active = el("div", "catalog-override-active");
+    const empty = el("p", "muted", "No settings overridden. This application inherits its settings.");
+    const search = input("", "", "search");
+    search.placeholder = "Search settings";
+    search.setAttribute("data-draft-ignore", "");
+    search.setAttribute("aria-label", "Search available overrides");
+    const list = el("div", "catalog-override-catalog");
+    const marker = input("", "", "text");
+    marker.className = "catalog-override-draft-marker";
+    marker.tabIndex = -1;
+    marker.setAttribute("aria-hidden", "true");
+    const rows: Array<{ area: string; label: string; row: HTMLElement; choice: HTMLButtonElement; selected: boolean }> = [];
+    const mapping: Record<string, string> = { encoder_backend: "encoder", audio_sink_mode: "audio_sink", virtual_sink_mode: "virtual_sink", sw_preset_mode: "sw_preset", sw_tune_mode: "sw_tune", display_output: "display-output", virtual_screen: "virtual-screen", virtual_display_mode: "virtual-display-mode", virtual_display_layout: "virtual-display-layout" };
+    for (const section of sections) {
+      const group = el("div", "catalog-override-group", el("h4", "", section.area));
+      list.append(group);
+      for (let index = 0; index < section.fields.length; index++) {
+        const fieldNode = section.fields[index]!;
+        const first = fieldNode.querySelector<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>("input,select,textarea");
+        if (!first) continue;
+        const key = mapping[first.name] ?? first.name;
+        const parts = [fieldNode];
+        if ((key === "sw_preset" || key === "sw_tune") && section.fields[index + 1]) parts.push(section.fields[++index]!);
+        const controls = parts.flatMap(part => Array.from(part.querySelectorAll<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>("input,select,textarea")));
+        const label = fieldNode.querySelector(".field-label")?.textContent?.trim() || key;
+        const row = el("div", "catalog-override-row");
+        const choice = button(label, () => { item.selected = true; removed.delete(key); marker.value += "+"; update(); first.focus(); });
+        choice.className = "button secondary catalog-override-choice";
+        const remove = button("Remove", () => {
+          item.selected = false;
+          removed.add(key);
+          for (const control of controls) {
+            if (control instanceof HTMLSelectElement) control.value = Array.from(control.options).some(option => option.value === "inherit") ? "inherit" : "";
+            else control.value = control.name === "display_policy" ? "{}" : "";
+            control.dispatchEvent(new Event("change", { bubbles: true }));
+          }
+          marker.value += "-";
+          update();
+        }, "secondary");
+        remove.setAttribute("aria-label", `Remove ${label} override`);
+        row.append(el("div", "catalog-override-row-content", ...parts), remove);
+        const item = { area: section.area, label, row, choice, selected: Object.hasOwn(saved, key) && saved[key] != null };
+        rows.push(item);
+        active.append(row);
+        group.append(choice);
+      }
+    }
+    function update(): void {
+      const query = search.value.trim().toLocaleLowerCase();
+      for (const item of rows) {
+        item.row.hidden = !item.selected;
+        item.choice.hidden = item.selected || !`${item.area} ${item.label}`.toLocaleLowerCase().includes(query);
+      }
+      for (const group of Array.from(list.children) as HTMLElement[]) group.hidden = !group.querySelector("button:not([hidden])");
+      empty.hidden = rows.some(item => item.selected);
+    }
+    search.addEventListener("input", update);
+    const node = el("section", "catalog-editor-section catalog-overrides",
+      el("div", "catalog-editor-heading", el("h3", "", "Settings overrides"), el("p", "muted", "Only selected settings override the host defaults. Remove an override to inherit.")),
+      marker, empty, active, el("details", "catalog-override-chooser", el("summary", "", "Add override"), search, list));
+    update();
+    return { node, removed };
+  }
+
+  function catalogOverrideSections(sections: HTMLElement[]): Array<{ area: string; fields: HTMLElement[] }> {
+    return sections.map(section => ({
+      area: section.querySelector("h3, summary strong")?.textContent?.trim() ?? "Settings",
+      fields: Array.from((section.querySelector(".catalog-editor-disclosure-content") ?? section).children).filter((child): child is HTMLElement => child instanceof HTMLElement && !child.classList.contains("catalog-editor-heading")),
+    }));
+  }
+
   function revealInvalidEditorControls(form: HTMLFormElement): void {
     form.addEventListener("invalid", (event) => {
       let details = (event.target as HTMLElement | null)?.closest("details");
@@ -1834,6 +1933,8 @@ namespace Amaterasu {
       }
     }, true);
   }
+
+  const catalogRemovedOverrides = new WeakMap<HTMLFormElement, Set<string>>();
 
   function entryForm(
     entry: Entry | undefined,
@@ -2123,6 +2224,11 @@ namespace Amaterasu {
       catalogEditorDisclosure("Encoder", "Override software and NVENC encoder settings.",
         ...softwareEncoder.fields, ...nvencSettingsFields),
     );
+    const sections = Array.from(form.children).slice(2) as HTMLElement[];
+    const overrides = catalogOverrideEditor(catalogOverrideSections(sections), { ...entry, ...entry?.config_overrides });
+    for (const section of sections) section.remove();
+    form.append(overrides.node);
+    catalogRemovedOverrides.set(form, overrides.removed);
     revealInvalidEditorControls(form);
     showKind();
     return form;
