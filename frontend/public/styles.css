@@ -1542,12 +1542,6 @@ input[type="checkbox"], input[type="radio"] { min-height: 0; }
 @media (max-width: 600px) {
   .catalog-editor-layout { grid-template-columns: minmax(0, 1fr); gap: 0; }
   .catalog-editor-cover { width: min(120px, 45%); margin-top: 16px; }
-  .catalog-editor-nav { top: 4px; margin: 0 -4px 16px; padding: 6px; border-radius: 10px; }
-  .catalog-editor-nav::after { display: none; }
-  .catalog-editor-section { padding: 14px; border-radius: 11px; }
-  .catalog-editor-disclosure { padding: 0; }
-  .catalog-editor-disclosure > summary { padding-left: 14px; }
-  .catalog-editor-disclosure-content { padding: 14px; }
 }
 .catalog-editor-disclosure > summary { display: grid; gap: 4px; padding: 4px 0; cursor: pointer; }
 .catalog-editor-disclosure > summary strong { font-size: 16px; }
@@ -2106,3 +2100,12 @@ input, textarea, select {
 .catalog-override-group { padding: 10px 0; border-top: 1px solid var(--line); }
 .catalog-override-group h4 { color: var(--selected-accent); font-family: var(--font-display); }
 .catalog-override-choice { border-radius: 999px; }
+
+@media (max-width: 600px) {
+  .editor-form > .catalog-editor-nav { top: 4px; margin: 0 -4px 16px; padding: 6px; border-radius: 10px; }
+  .editor-form > .catalog-editor-nav::after { display: none; }
+  .editor-form > .catalog-editor-section { padding: 14px; border-radius: 11px; }
+  .editor-form > .catalog-editor-disclosure { padding: 0; }
+  .editor-form > .catalog-editor-disclosure > summary { padding-left: 14px; }
+  .editor-form > .catalog-editor-disclosure .catalog-editor-disclosure-content { padding: 14px; }
+}

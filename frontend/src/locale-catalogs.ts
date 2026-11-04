@@ -76,7 +76,7 @@ namespace Amaterasu {
     "Identity",
     "Launch",
     "Settings overrides",
-    "Blank values inherit host defaults. Select only the settings this application should override.",
+    "Inheritance is field-specific. Use the field's Inherit option or placeholder; Automatic audio selection and exact empty encoder strings are explicit choices.",
   ] as const;
 
   const SHELL_MESSAGE_KEYS = [
@@ -151,8 +151,7 @@ namespace Amaterasu {
         "Идентичност",
         "Стартиране",
         "Замени на настройките",
-        "Празните стойности наследяват настройките на хоста. Изберете само настройките, които това приложение трябва да замени.",
-      ],
+        "Наследяването зависи от полето. Използвайте опцията или подсказката „Inherit“; автоматичният аудио избор и точните празни низове за кодиране са изрични стойности.",      ],
     },
     cs: {
       base: [
@@ -210,8 +209,7 @@ namespace Amaterasu {
         "Identita",
         "Spuštění",
         "Přepsání nastavení",
-        "Prázdné hodnoty přebírají nastavení hostitele. Vyberte pouze nastavení, která má tato aplikace přepsat.",
-      ],
+        "Dědění závisí na poli. Použijte volbu nebo nápovědu Inherit; automatický výběr zvuku a přesné prázdné řetězce kodéru jsou výslovné hodnoty.",      ],
     },
     de: {
       base: [
@@ -269,8 +267,7 @@ namespace Amaterasu {
         "Identität",
         "Start",
         "Einstellungsüberschreibungen",
-        "Leere Werte übernehmen die Host-Standardeinstellungen. Wähle nur Einstellungen aus, die diese Anwendung überschreiben soll.",
-      ],
+        "Die Vererbung hängt vom Feld ab. Nutze die Option oder den Hinweis „Inherit“; automatische Audioauswahl und exakt leere Encoder-Zeichenfolgen sind ausdrückliche Werte.",      ],
     },
     es: {
       base: [
@@ -328,8 +325,7 @@ namespace Amaterasu {
         "Identidad",
         "Inicio",
         "Anulaciones de ajustes",
-        "Los valores vacíos heredan los valores predeterminados del host. Selecciona solo los ajustes que esta aplicación debe anular.",
-      ],
+        "La herencia depende del campo. Usa la opción o la indicación Inherit; la selección de audio automática y las cadenas de codificador exactamente vacías son valores explícitos.",      ],
     },
     fr: {
       base: [
@@ -387,8 +383,7 @@ namespace Amaterasu {
         "Identité",
         "Lancement",
         "Remplacements des paramètres",
-        "Les valeurs vides héritent des valeurs par défaut de l’hôte. Sélectionnez uniquement les paramètres à remplacer pour cette application.",
-      ],
+        "L’héritage dépend de chaque champ. Utilisez son option ou son indication « Inherit » ; la sélection audio automatique et les chaînes d’encodeur exactement vides sont des choix explicites.",      ],
     },
     hu: {
       base: [
@@ -446,8 +441,7 @@ namespace Amaterasu {
         "Identitás",
         "Indítás",
         "Beállítás-felülbírálások",
-        "Az üres értékek a gazdagép alapértékeit öröklik. Csak azokat a beállításokat válaszd ki, amelyeket az alkalmazás felülír.",
-      ],
+        "Az öröklés mezőnként eltér. Használd az Inherit lehetőséget vagy súgót; az automatikus hangválasztás és a pontosan üres kódolósztring kifejezett érték.",      ],
     },
     it: {
       base: [
@@ -505,8 +499,7 @@ namespace Amaterasu {
         "Identità",
         "Avvio",
         "Override impostazioni",
-        "I valori vuoti ereditano le impostazioni predefinite dell’host. Seleziona solo le impostazioni che questa applicazione deve sovrascrivere.",
-      ],
+        "L’ereditarietà dipende dal campo. Usa l’opzione o il suggerimento Inherit; la selezione audio automatica e le stringhe encoder esattamente vuote sono valori espliciti.",      ],
     },
     ja: {
       base: [
@@ -563,8 +556,7 @@ namespace Amaterasu {
         "ID 情報",
         "起動",
         "設定の上書き",
-        "空の値はホストの既定値を継承します。このアプリで上書きする設定だけを選択してください。",
-      ],
+        "継承の扱いは項目ごとに異なります。項目の Inherit 選択肢またはヒントを確認してください。音声の自動選択と空文字列のエンコーダー値は明示的な設定です。",      ],
     },
     ko: {
       base: [
@@ -621,8 +613,7 @@ namespace Amaterasu {
         "ID 정보",
         "실행",
         "설정 재정의",
-        "빈 값은 호스트 기본값을 상속합니다. 이 애플리케이션에서 재정의할 설정만 선택하세요.",
-      ],
+        "상속 방식은 필드마다 다릅니다. 필드의 Inherit 옵션이나 안내를 사용하세요. 자동 오디오 선택과 정확히 빈 인코더 문자열은 명시적 값입니다.",      ],
     },
     pl: {
       base: [
@@ -680,8 +671,7 @@ namespace Amaterasu {
         "Tożsamość",
         "Uruchamianie",
         "Nadpisania ustawień",
-        "Puste wartości dziedziczą ustawienia hosta. Wybierz tylko ustawienia, które ta aplikacja ma nadpisywać.",
-      ],
+        "Dziedziczenie zależy od pola. Użyj opcji lub podpowiedzi Inherit; automatyczny wybór dźwięku i dokładnie puste ciągi kodera są wartościami jawnymi.",      ],
     },
     pt: {
       base: [
@@ -739,8 +729,7 @@ namespace Amaterasu {
         "Identidade",
         "Arranque",
         "Substituições de definições",
-        "Os valores vazios herdam as predefinições do anfitrião. Selecione apenas as definições que esta aplicação deve substituir.",
-      ],
+        "A herança depende do campo. Use a opção ou a indicação Inherit; a seleção automática de áudio e as cadeias de codificação exatamente vazias são escolhas explícitas.",      ],
     },
     pt_BR: {
       base: [
@@ -787,8 +776,7 @@ namespace Amaterasu {
         "Identidade",
         "Inicialização",
         "Substituições de configurações",
-        "Valores vazios herdam os padrões do host. Selecione apenas as configurações que este aplicativo deve substituir.",
-      ],
+        "A herança depende do campo. Use a opção ou a indicação Inherit; a seleção automática de áudio e as strings de codificador exatamente vazias são escolhas explícitas.",      ],
     },
     ru: {
       base: [
@@ -845,8 +833,7 @@ namespace Amaterasu {
         "Идентификация",
         "Запуск",
         "Переопределения настроек",
-        "Пустые значения наследуют настройки хоста. Выберите только параметры, которые нужно переопределить для этого приложения.",
-      ],
+        "Наследование зависит от поля. Используйте вариант или подсказку Inherit; автоматический выбор аудио и точно пустые строки кодировщика являются явными значениями.",      ],
     },
     sv: {
       base: [
@@ -903,8 +890,7 @@ namespace Amaterasu {
         "Identitet",
         "Start",
         "Inställningsöverskridningar",
-        "Tomma värden ärver värdens standardinställningar. Välj bara de inställningar som appen ska åsidosätta.",
-      ],
+        "Arvet beror på fältet. Använd fältets Inherit-val eller platshållare; automatiskt ljudval och exakt tomma kodarsträngar är uttryckliga värden.",      ],
     },
     tr: {
       base: [
@@ -961,8 +947,7 @@ namespace Amaterasu {
         "Kimlik",
         "Başlatma",
         "Ayar geçersiz kılmaları",
-        "Boş değerler ana makine varsayılanlarını devralır. Yalnızca bu uygulamanın geçersiz kılması gereken ayarları seçin.",
-      ],
+        "Devralma alan bazında değişir. Alanın Inherit seçeneğini veya ipucunu kullanın; otomatik ses seçimi ve tamamen boş kodlayıcı dizeleri açık değerlerdir.",      ],
     },
     uk: {
       base: [
@@ -1020,8 +1005,7 @@ namespace Amaterasu {
         "Ідентифікація",
         "Запуск",
         "Перевизначення налаштувань",
-        "Порожні значення успадковують налаштування хоста. Виберіть лише параметри, які потрібно перевизначити для цієї програми.",
-      ],
+        "Успадкування залежить від поля. Використовуйте варіант або підказку Inherit; автоматичний вибір аудіо й точно порожні рядки кодера є явними значеннями.",      ],
     },
     vi: {
       base: [
@@ -1079,8 +1063,7 @@ namespace Amaterasu {
         "Danh tính",
         "Khởi chạy",
         "Ghi đè cài đặt",
-        "Giá trị trống kế thừa mặc định của máy chủ. Chỉ chọn cài đặt mà ứng dụng này cần ghi đè.",
-      ],
+        "Cách kế thừa tùy theo trường. Hãy dùng tùy chọn hoặc gợi ý Inherit của trường; lựa chọn âm thanh tự động và chuỗi bộ mã hóa rỗng chính xác là giá trị tường minh.",      ],
     },
     zh: {
       base: [
@@ -1136,8 +1119,7 @@ namespace Amaterasu {
         "身份",
         "启动",
         "设置覆盖",
-        "空值会继承主机默认值。仅选择此应用需要覆盖的设置。",
-      ],
+        "继承方式因字段而异。请使用字段的 Inherit 选项或提示；自动音频选择和精确的空编码器字符串都是明确值。",      ],
     },
     zh_TW: {
       base: [
@@ -1181,8 +1163,7 @@ namespace Amaterasu {
         "識別資訊",
         "啟動",
         "設定覆寫",
-        "空白值會繼承主機預設值。只選擇此應用程式需要覆寫的設定。",
-      ],
+        "繼承方式依欄位而異。請使用欄位的 Inherit 選項或提示；自動音訊選擇與完全空白的編碼器字串都是明確值。",      ],
     },
   };
 

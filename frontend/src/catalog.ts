@@ -1862,8 +1862,10 @@ namespace Amaterasu {
   }
 
   function catalogEditorSection(title: string, description: string, ...children: HTMLElement[]): HTMLElement {
+    const heading = el("h3", "", title);
+    heading.tabIndex = -1;
     return el("section", "catalog-editor-section",
-      el("div", "catalog-editor-heading", el("h3", "", title), el("p", "muted", description)),
+      el("div", "catalog-editor-heading", heading, el("p", "muted", description)),
       ...children);
   }
 
@@ -1886,7 +1888,10 @@ namespace Amaterasu {
         if (item.target.tagName.toLowerCase() === "details")
           (item.target as HTMLDetailsElement).open = true;
         if (item.reveal) item.reveal.open = true;
-        item.target.scrollIntoView({ behavior: "smooth", block: "start" });
+        const reduceMotion = typeof window !== "undefined" &&
+          typeof window.matchMedia === "function" &&
+          window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+        item.target.scrollIntoView({ behavior: reduceMotion ? "auto" : "smooth", block: "start" });
         const focusTarget = item.reveal?.querySelector("summary") ??
           (item.target.tagName.toLowerCase() === "details"
             ? item.target.querySelector("summary")
@@ -1962,7 +1967,7 @@ namespace Amaterasu {
     }
     search.addEventListener("input", update);
     const node = el("section", "catalog-editor-section catalog-overrides",
-      el("div", "catalog-editor-heading", el("h3", "", catalogTextMessage("Settings overrides")), el("p", "muted", catalogTextMessage("Blank values inherit host defaults. Select only the settings this application should override."))),
+      el("div", "catalog-editor-heading", el("h3", "", catalogTextMessage("Settings overrides")), el("p", "muted", catalogTextMessage("Inheritance is field-specific. Use the field's Inherit option or placeholder; Automatic audio selection and exact empty encoder strings are explicit choices."))),
       marker, empty, active, el("details", "catalog-override-chooser", el("summary", "", "Add override"), search, list));
     update();
     return { node, removed };

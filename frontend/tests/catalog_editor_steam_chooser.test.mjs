@@ -30,7 +30,7 @@ class Element {
   showModal() { this.open = true; }
   close() { this.open = false; }
   focus() { if (this.document) this.document.activeElement = this; }
-  scrollIntoView() {}
+  scrollIntoView(options) { this.scrollIntoViewOptions = options; }
   reportValidity() { return true; }
   remove() { if (this.parentElement) this.parentElement.children = this.parentElement.children.filter(child => child !== this); this.parentElement = null; this.setConnected(false); }
   get classList() { return { contains: name => (this.className ?? "").split(" ").includes(name) }; }
@@ -78,6 +78,7 @@ function find(node, predicate) {
 }
 function setup(canReadSteam, saveBehavior = async () => ({ ok: true, revision: 12 }), steamDirectory = "/games/chosen", steamListBehavior = null) {
   let steamRead = canReadSteam;
+  let prefersReducedMotion = false;
   let disposePage = () => {};
   const document = { activeElement: null, body: null, createElement(tag) {
     if (tag === "input") return new InputElement(tag, this);
@@ -91,6 +92,7 @@ function setup(canReadSteam, saveBehavior = async () => ({ ok: true, revision: 1
     FormData: EditorFormData, TextEncoder, URL, Error, Event, AbortController, Set, Map,
     HTMLElement: Element, HTMLInputElement: InputElement, HTMLTextAreaElement: TextareaElement,
     HTMLSelectElement: SelectElement, MutationObserver, document,
+    window: { matchMedia: () => ({ matches: prefersReducedMotion }) },
   });
   for (const source of ["src/model.ts", "src/ui.ts", "src/pages.ts", "src/settings.ts", "src/steam_game_chooser.ts", "src/catalog.ts"]) {
     vm.runInContext(ts.transpile(readFileSync(source, "utf8"), { target: ts.ScriptTarget.ES2022 }), context);
@@ -137,6 +139,7 @@ function setup(canReadSteam, saveBehavior = async () => ({ ok: true, revision: 1
     get steamSignal() { return steamSignal; },
     get entry() { return entry; }, set entry(value) { entry = value; },
     get catalogRevision() { return catalogRevision; },
+    setReducedMotion(value) { prefersReducedMotion = value; },
   };
 }
 async function openEditor(page) {
@@ -157,18 +160,53 @@ test("application editor navigation reveals launch and inherited settings withou
   const navigation = find(form, node => node.tagName === "nav" && node.getAttribute("aria-label") === "Application editor sections");
   assert.ok(navigation);
   assert.match(navigation.textContent, /Identity.*Launch.*Settings overrides/);
+  const identityHeading = find(form, node => node.tagName === "h3" && node.textContent === "Identity");
+  page.setReducedMotion(true);
+  find(navigation, node => node.tagName === "button" && node.textContent === "Identity").fire("click");
+  assert.equal(identityHeading.tabIndex, -1);
+  assert.equal(page.document.activeElement, identityHeading);
+  assert.equal(find(form, node => node.id === "catalog-editor-identity").scrollIntoViewOptions.behavior, "auto");
   const launch = find(form, node => node.tagName === "details" && node.id === "catalog-editor-launch");
   assert.equal(launch.open, false);
+  page.setReducedMotion(false);
   find(navigation, node => node.tagName === "button" && node.textContent === "Launch").fire("click");
   assert.equal(launch.open, true);
+  assert.equal(launch.scrollIntoViewOptions.behavior, "smooth");
   assert.equal(page.document.activeElement, launch.querySelector("summary"));
+  const overrideSection = find(form, node => node.id === "catalog-editor-overrides");
   const overrides = find(form, node => node.tagName === "details" && node.className.includes("catalog-override-chooser"));
+  page.setReducedMotion(true);
   find(navigation, node => node.tagName === "button" && node.textContent === "Settings overrides").fire("click");
+  assert.equal(overrideSection.scrollIntoViewOptions.behavior, "auto");
   assert.equal(overrides.open, true);
   assert.equal(page.document.activeElement, overrides.querySelector("summary"));
-  assert.match(form.textContent, /Blank values inherit host defaults/);
+  assert.match(form.textContent, /Inheritance is field-specific/);
+  assert.match(form.textContent, /exact empty encoder strings are explicit choices/);
   assert.equal(name.value, "Untouched editor draft");
   assert.equal(named(form, "steam_id").value, "77");
+  assert.equal(page.calls.some(call => call.route === "catalog/update"), false);
+});
+
+test("override guidance matches explicit empty encoder strings and automatic audio selection", async () => {
+  const page = setup(true);
+  const form = await openEditor(page);
+  assert.match(form.textContent, /Inheritance is field-specific/);
+  const softwareMode = named(form, "sw_preset_mode");
+  const softwareValue = named(form, "sw_preset_value");
+  assert.deepEqual(softwareMode.children.map(option => option.textContent), ["Inherit", "Exact string (including empty)"]);
+  softwareMode.value = "value";
+  softwareMode.fire("change");
+  assert.equal(softwareValue.disabled, false);
+  assert.equal(softwareValue.value, "");
+  const audioMode = named(form, "audio_sink_mode");
+  assert.deepEqual(audioMode.children.map(option => option.textContent), [
+    "Inherit host endpoint", "Automatic/default endpoint", "Specific endpoint ID",
+  ]);
+  audioMode.value = "automatic";
+  audioMode.fire("change");
+  assert.equal(audioMode.value, "automatic");
+  const virtualMode = named(form, "virtual_sink_mode");
+  assert.ok(virtualMode.children.some(option => option.textContent === "Clear inherited virtual sink"));
   assert.equal(page.calls.some(call => call.route === "catalog/update"), false);
 });
 
