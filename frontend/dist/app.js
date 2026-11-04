@@ -5528,6 +5528,18 @@ var Amaterasu;
 })(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
 (function (Amaterasu) {
+    function refreshLutrisProvider(api) {
+        return api.post("lutris/refresh");
+    }
+    Amaterasu.refreshLutrisProvider = refreshLutrisProvider;
+    async function refreshPlayniteProvider(api) {
+        await api.post("playnite/refresh");
+        return api.post("playnite/status");
+    }
+    Amaterasu.refreshPlayniteProvider = refreshPlayniteProvider;
+})(Amaterasu || (Amaterasu = {}));
+var Amaterasu;
+(function (Amaterasu) {
     let nextListEditorId = 0;
     function listEditorSetText(target, source) {
         if (typeof Amaterasu.setLocalizedTextContent === "function")
@@ -12416,7 +12428,7 @@ var Amaterasu;
                     }
                 }, "secondary");
                 const refresh = Amaterasu.button("Refresh now", () => Amaterasu.runAction(refresh, refreshStatus, async () => {
-                    const updated = await context.api.post("lutris/refresh");
+                    const updated = await Amaterasu.refreshLutrisProvider(context.api);
                     if (!runtimeStatus.isConnected || !lutrisLoads.isCurrent(loaded.generation))
                         return;
                     runtimeStatus.className = updated.last_error ? "error" : "muted";
@@ -12630,8 +12642,7 @@ var Amaterasu;
                     }
                 }, "secondary");
                 const refresh = Amaterasu.button("Refresh now", () => Amaterasu.runAction(refresh, refreshStatus, async () => {
-                    await context.api.post("playnite/refresh");
-                    const updated = await context.api.post("playnite/status");
+                    const updated = await Amaterasu.refreshPlayniteProvider(context.api);
                     if (!runtimeStatus.isConnected)
                         return;
                     currentRuntime = updated;
@@ -13697,38 +13708,116 @@ var Amaterasu;
             { name: "playnite", label: "Playnite", description: "Sync a Playnite library and provider-managed applications.", scope: "configuration.read" },
         ];
         let generation = 0;
+        const activeRefreshes = new Set();
+        let currentCards = [];
         const rtxHdrArea = Amaterasu.el("div");
-        context.content.append(Amaterasu.sectionHeading("Integrations", "Connect and manage integrations on this host.", Amaterasu.button("Refresh", load)), rtxHdrArea, area);
+        const refreshStatuses = Amaterasu.button(Amaterasu.localizedMessage("Refresh statuses"), load);
+        context.content.append(Amaterasu.sectionHeading("Integrations", "Connect and manage integrations on this host.", refreshStatuses), rtxHdrArea, area);
         async function load() {
             const request = ++generation;
+            refreshStatuses.disabled = true;
             Amaterasu.renderRtxHdrIntegration(context, rtxHdrArea);
             const cards = providers.map((provider) => {
-                const status = Amaterasu.el("div", "integration-status", Amaterasu.el("p", "muted", "Loading provider status…"));
-                const settings = Amaterasu.button("Configure", () => context.navigate("settings/integrations"));
+                const status = Amaterasu.el("div", "integration-status", Amaterasu.el("p", "muted", Amaterasu.localizedMessage("Loading provider status...")));
+                const feedback = Amaterasu.el("div", "integration-action-status");
+                const settings = Amaterasu.button(Amaterasu.localizedMessage("Configure"), () => context.navigate("settings/integrations"));
                 settings.disabled = !context.api.allows("configuration.read");
                 const actions = Amaterasu.el("div", "actions", settings);
-                if (provider.name === "steam" && context.api.allows("steam.read"))
-                    actions.append(Amaterasu.button("Browse games", () => context.navigate("steam")));
-                const card = Amaterasu.el("section", "panel integration-card", Amaterasu.el("h2", "", provider.label), Amaterasu.el("p", "muted", provider.description), status, actions);
-                return { provider, status, card };
+                let refreshButton = null;
+                if (provider.name === "steam" && context.api.allows("steam.read")) {
+                    actions.append(Amaterasu.button(Amaterasu.localizedMessage("Manage Steam library"), () => context.navigate("steam")));
+                }
+                else if (provider.name !== "steam") {
+                    refreshButton = Amaterasu.button(Amaterasu.localizedMessage("Refresh now"), () => refreshProvider(provider.name));
+                    refreshButton.disabled = true;
+                    refreshButton.hidden = !context.api.allows("configuration.write");
+                    actions.append(refreshButton);
+                }
+                const card = Amaterasu.el("section", "panel integration-card", Amaterasu.el("h2", "", provider.label), Amaterasu.el("p", "muted", Amaterasu.literalText(provider.description)), status, actions, feedback);
+                const item = {
+                    provider, status, feedback, card, refreshButton, providerStatus: null,
+                    setProviderStatus(value) {
+                        item.providerStatus = value && typeof value === "object" && !Array.isArray(value)
+                            ? value : null;
+                        if (refreshButton)
+                            refreshButton.disabled = !canRefresh(provider.name, item.providerStatus) ||
+                                !context.api.allows("configuration.write");
+                    },
+                };
+                return item;
             });
+            currentCards = cards;
             area.replaceChildren(...cards.map((item) => item.card));
-            await Promise.all(cards.map(async ({ provider, status }) => {
-                if (!context.api.allows(provider.scope)) {
-                    status.replaceChildren(Amaterasu.badge("Unavailable"), Amaterasu.el("p", "muted", "This account cannot read this provider's status."));
-                    return;
-                }
-                try {
-                    const summary = summarizeProvider(provider.name, await context.api.post(`${provider.name}/status`));
-                    if (!context.content.isConnected || request !== generation)
+            try {
+                await Promise.all(cards.map(async ({ provider, status, setProviderStatus }) => {
+                    if (!context.api.allows(provider.scope)) {
+                        status.replaceChildren(Amaterasu.badge("Unavailable"), Amaterasu.el("p", "muted", Amaterasu.localizedMessage("This account cannot read this provider's status.")));
                         return;
-                    status.replaceChildren(Amaterasu.badge(summary.state, summary.tone), Amaterasu.el("p", "muted", Amaterasu.literalText(summary.detail)));
-                }
-                catch (error) {
-                    if (context.content.isConnected && request === generation)
-                        status.replaceChildren(Amaterasu.errorPanel(error));
-                }
-            }));
+                    }
+                    try {
+                        const value = await context.api.post(`${provider.name}/status`);
+                        if (!context.content.isConnected || request !== generation)
+                            return;
+                        const summary = summarizeProvider(provider.name, value);
+                        status.replaceChildren(Amaterasu.badge(Amaterasu.localizedMessage(summary.state), summary.tone), Amaterasu.el("p", "muted", Amaterasu.literalText(summary.detail)));
+                        setProviderStatus(value);
+                    }
+                    catch (error) {
+                        if (context.content.isConnected && request === generation)
+                            status.replaceChildren(Amaterasu.errorPanel(error));
+                    }
+                }));
+            }
+            finally {
+                if (context.content.isConnected && request === generation)
+                    refreshStatuses.disabled = false;
+            }
+        }
+        function canRefresh(name, status) {
+            if (activeRefreshes.has(name))
+                return false;
+            if (!status || status.ok !== true || status.settings_ready !== true || status.enabled !== true)
+                return false;
+            if (name === "lutris")
+                return status.platform_supported === true && status.available === true && status.refresh_pending !== true;
+            if (name === "playnite")
+                return status.playnite_running === true && status.snapshot_pending !== true;
+            return false;
+        }
+        async function refreshProvider(name) {
+            const item = currentCards.find((candidate) => candidate.provider.name === name);
+            if (!item?.refreshButton || item.refreshButton.disabled)
+                return;
+            const target = item.refreshButton;
+            if (activeRefreshes.has(name))
+                return;
+            activeRefreshes.add(name);
+            try {
+                await Amaterasu.runAction(target, item.feedback, async () => {
+                    try {
+                        const updated = name === "lutris"
+                            ? await Amaterasu.refreshLutrisProvider(context.api)
+                            : await Amaterasu.refreshPlayniteProvider(context.api);
+                        if (!context.content.isConnected || item.card.parentElement !== area)
+                            return;
+                        const summary = summarizeProvider(name, updated);
+                        item.status.replaceChildren(Amaterasu.badge(Amaterasu.localizedMessage(summary.state), summary.tone), Amaterasu.el("p", "muted", Amaterasu.literalText(summary.detail)));
+                        item.setProviderStatus(updated);
+                    }
+                    catch (error) {
+                        item.setProviderStatus(null);
+                        throw error;
+                    }
+                });
+            }
+            finally {
+                activeRefreshes.delete(name);
+                if (context.content.isConnected && item.card.parentElement === area)
+                    target.disabled = !context.api.allows("configuration.write") ||
+                        !canRefresh(name, item.providerStatus);
+                else if (context.content.isConnected)
+                    void load();
+            }
         }
         void load();
     }
