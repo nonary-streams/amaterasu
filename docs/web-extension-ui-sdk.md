@@ -8,7 +8,8 @@ remain the only authority for `sdk.call`.
 Hosts that implement the base controls advertise `ui.controls/1` in the
 additive `sdk.features` list and supply `sdk.ui` with `sdk.ui.version === 1`.
 The form field options and dynamic choices are an additive `ui.forms/1` feature.
-Both feature checks are optional in SDK v1 so pages can detect older hosts:
+Runtime field state updates through `setState()` are an additive `ui.forms/2`
+feature. Feature checks are optional in SDK v1 so pages can detect older hosts:
 
 ```js
 if (!sdk.features?.includes("ui.controls/1") ||
@@ -17,7 +18,7 @@ if (!sdk.features?.includes("ui.controls/1") ||
 }
 ```
 
-Existing SDK v1 pages continue to run on older hosts. New pages that need only base controls can check `ui.controls/1`; pages that use form metadata or `setChoices()` must also check `ui.forms/1`. The UI contract provides `toggle`, `select`, `radioGroup`, and `slider`.
+Existing SDK v1 pages continue to run on older hosts. New pages that need only base controls can check `ui.controls/1`; pages that use form metadata or `setChoices()` must also check `ui.forms/1`; pages that call `setState()` must check `ui.forms/2`. An older host without `ui.forms/2` continues to provide the original controls and their creation-time options. The UI contract provides `toggle`, `select`, `radioGroup`, and `slider`.
 Each factory accepts common `disabled`, `readOnly`, `required`, `help`, and
 `error` options. `help` and `error` use the same localized text format as labels;
 the SDK connects them with `aria-describedby`, sets `aria-invalid` for errors,
@@ -32,8 +33,27 @@ keyboard shortcuts intact and blocks value-changing keys on the range input.
 `help` and `error` text sit outside the clickable label and are associated with
 the control through `aria-describedby`. `setValue()` remains available for
 programmatic updates.
-Each factory returns a control with `element`, `value()`, `setValue(value)`, and
-`dispose()`. Choice controls also provide `setChoices(choices, value?)`. The current
+Each factory returns a control with `element`, `value()`, `setValue(value)`,
+`setState(patch)`, and `dispose()`. `setState()` applies a partial update: omitted
+properties stay unchanged, boolean properties accept `true` or `false`, and pass
+`null` for `help` or `error` to clear that description. Invalid patches fail before
+changing the control. State updates modify the existing nodes and listeners, so
+focus and control identity are preserved. Disabling the currently focused native
+control lets the browser move focus according to its disabled-control behavior.
+A page using `setState()` should require `ui.forms/2` before mounting:
+
+```js
+if (!sdk.features?.includes("ui.forms/2")) {
+  throw new Error("This host does not support dynamic form state.");
+}
+
+const automatic = sdk.ui.toggle({ label: "Automatic quality", value: true });
+automatic.setState({ disabled: true, help: "Saving…", error: null });
+// On completion, clear the transient state and show any validation error.
+automatic.setState({ disabled: false, help: null, error: validationError ?? null });
+```
+
+Choice controls also provide `setChoices(choices, value?)`. The current
 selection is retained unless a new value is supplied; if the current value is not
 in the new list, the update fails without changing the control. A radio group's
 focused choice remains focused if it survives replacement; if it is removed, focus

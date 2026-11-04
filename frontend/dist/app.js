@@ -4021,6 +4021,7 @@ var Amaterasu;
         let currentValue = selected;
         let currentOptions = options;
         let controls = [];
+        let currentBehavior = { ...behavior };
         let choiceController = new AbortController();
         const dispose = () => {
             if (disposed)
@@ -4041,12 +4042,28 @@ var Amaterasu;
         labelNode.id = `amaterasu-radio-label-${nextRadioGroupId}`;
         const optionsNode = el("div", "radio-options");
         group.setAttribute("aria-labelledby", labelNode.id);
-        if (behavior.disabled)
-            group.setAttribute("aria-disabled", "true");
-        if (behavior.readOnly)
-            group.setAttribute("aria-readonly", "true");
-        if (behavior.required)
-            group.setAttribute("aria-required", "true");
+        const applyBehavior = () => {
+            if (currentBehavior.disabled)
+                group.setAttribute("aria-disabled", "true");
+            else
+                group.removeAttribute("aria-disabled");
+            if (currentBehavior.readOnly)
+                group.setAttribute("aria-readonly", "true");
+            else
+                group.removeAttribute("aria-readonly");
+            if (currentBehavior.required)
+                group.setAttribute("aria-required", "true");
+            else
+                group.removeAttribute("aria-required");
+            for (const control of controls) {
+                control.disabled = currentBehavior.disabled === true;
+                control.required = currentBehavior.required === true;
+                if (currentBehavior.readOnly)
+                    control.setAttribute("aria-readonly", "true");
+                else
+                    control.removeAttribute("aria-readonly");
+            }
+        };
         group.append(labelNode, optionsNode);
         const render = () => {
             choiceController.abort();
@@ -4054,18 +4071,18 @@ var Amaterasu;
             controls = currentOptions.map((option) => {
                 const control = input(name, option.value, "radio");
                 control.checked = option.value === currentValue;
-                control.disabled = behavior.disabled === true;
-                control.required = behavior.required === true;
-                if (behavior.readOnly)
+                control.disabled = currentBehavior.disabled === true;
+                control.required = currentBehavior.required === true;
+                if (currentBehavior.readOnly)
                     control.setAttribute("aria-readonly", "true");
                 control.addEventListener("click", (event) => {
-                    if (behavior.readOnly) {
+                    if (currentBehavior.readOnly) {
                         event.preventDefault();
                         event.stopImmediatePropagation();
                     }
                 }, { capture: true, signal: choiceController.signal });
                 control.addEventListener("keydown", (event) => {
-                    if (!behavior.readOnly || event.ctrlKey || event.metaKey || event.altKey)
+                    if (!currentBehavior.readOnly || event.ctrlKey || event.metaKey || event.altKey)
                         return;
                     const index = controls.indexOf(control);
                     const focusIndex = event.key === "ArrowDown" || event.key === "ArrowRight" ? (index + 1) % controls.length
@@ -4084,7 +4101,7 @@ var Amaterasu;
                     }
                 }, { capture: true, signal: choiceController.signal });
                 control.addEventListener("change", (event) => {
-                    if (behavior.disabled || behavior.readOnly) {
+                    if (currentBehavior.disabled || currentBehavior.readOnly) {
                         for (const peer of controls)
                             peer.checked = peer.value === currentValue;
                         event.preventDefault();
@@ -4103,6 +4120,7 @@ var Amaterasu;
             optionsNode.replaceChildren(...currentOptions.map((option, index) => el("label", "radio-option", controls[index], el("span", "", option.label))));
         };
         render();
+        applyBehavior();
         return {
             node: group,
             get controls() { return controls; },
@@ -4113,6 +4131,10 @@ var Amaterasu;
                 currentValue = value;
                 for (const control of controls)
                     control.checked = control.value === value;
+            },
+            setBehavior: (nextBehavior) => {
+                currentBehavior = { ...nextBehavior };
+                applyBehavior();
             },
             setChoices: (nextOptions, nextValue = currentValue) => {
                 if (disposed)
@@ -4167,6 +4189,18 @@ var Amaterasu;
         const controller = new AbortController();
         let disposed = false;
         let currentValue = value;
+        let currentBehavior = { disabled: options.disabled === true, readOnly: options.readOnly === true, required: options.required === true };
+        const applyBehavior = () => {
+            for (const control of [range, number]) {
+                control.disabled = currentBehavior.disabled;
+                control.required = currentBehavior.required;
+                if (currentBehavior.readOnly)
+                    control.setAttribute("aria-readonly", "true");
+                else
+                    control.removeAttribute("aria-readonly");
+            }
+            number.readOnly = currentBehavior.readOnly;
+        };
         const dispose = () => {
             if (disposed)
                 return;
@@ -4190,27 +4224,27 @@ var Amaterasu;
             range.value = String(currentValue);
         };
         range.addEventListener("click", (event) => {
-            if (options.readOnly) {
+            if (currentBehavior.readOnly) {
                 event.preventDefault();
                 event.stopImmediatePropagation();
             }
         }, { capture: true, signal: controller.signal });
         range.addEventListener("pointerdown", (event) => {
-            if (options.readOnly) {
+            if (currentBehavior.readOnly) {
                 event.preventDefault();
                 event.stopImmediatePropagation();
             }
         }, { capture: true, signal: controller.signal });
         range.addEventListener("keydown", (event) => {
             const valueMutationKey = ["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Home", "End", "PageUp", "PageDown"].includes(event.key);
-            if (options.readOnly && valueMutationKey) {
+            if (currentBehavior.readOnly && valueMutationKey) {
                 event.preventDefault();
                 event.stopImmediatePropagation();
             }
         }, { capture: true, signal: controller.signal });
         for (const control of [range, number]) {
             control.addEventListener("input", (event) => {
-                if (options.disabled || options.readOnly) {
+                if (currentBehavior.disabled || currentBehavior.readOnly) {
                     restoreCurrentValue();
                     event.preventDefault();
                     event.stopImmediatePropagation();
@@ -4249,6 +4283,10 @@ var Amaterasu;
             range,
             number,
             value: () => readValue(number),
+            setBehavior: (nextBehavior) => {
+                currentBehavior = { disabled: nextBehavior.disabled === true, readOnly: nextBehavior.readOnly === true, required: nextBehavior.required === true };
+                applyBehavior();
+            },
             setValue: (nextValue) => {
                 if (!isValidSliderValue(nextValue, minimum, maximum, integer, step))
                     throw new Error(`Slider value must be between ${minimum} and ${maximum} on step ${step}.`);
@@ -16676,7 +16714,7 @@ var Amaterasu;
         if (options.onChange !== undefined && typeof options.onChange !== "function")
             throw new Error("Invalid plugin UI change callback.");
     }
-    function extensionUiControl(element, read, write, controller, parentSignal, release = () => { }, updateChoices) {
+    function extensionUiControl(element, read, write, controller, parentSignal, release = () => { }, updateChoices, updateState) {
         let disposed = false;
         const dispose = () => {
             if (disposed)
@@ -16695,6 +16733,8 @@ var Amaterasu;
             value: read,
             setValue: (value) => { if (!disposed)
                 write(value); },
+            setState: (patch) => { if (!disposed)
+                updateState?.(patch); },
             dispose,
         };
         if (updateChoices) {
@@ -16703,39 +16743,110 @@ var Amaterasu;
         }
         return Object.freeze(control);
     }
-    function extensionUiFieldDescriptions(element, controls, options) {
-        const descriptionIds = [];
-        if (options.help !== undefined) {
-            const help = Amaterasu.el("small", "plugin-control-help", extensionUiTextNode(options.help));
-            help.id = `amaterasu-plugin-ui-description-${++nextExtensionUiDescriptionId}`;
-            descriptionIds.push(help.id);
-            element.append(help);
-        }
-        if (options.error !== undefined) {
-            const error = Amaterasu.el("small", "plugin-control-error", extensionUiTextNode(options.error));
-            error.id = `amaterasu-plugin-ui-description-${++nextExtensionUiDescriptionId}`;
-            error.setAttribute("role", "alert");
-            descriptionIds.push(error.id);
-            element.append(error);
-        }
-        const apply = (updatedControls) => {
-            for (const control of updatedControls) {
-                if (descriptionIds.length)
-                    control.setAttribute("aria-describedby", descriptionIds.join(" "));
-                if (options.error !== undefined)
+    function extensionUiFieldState(element, controls, state, applyControlState) {
+        const createDescription = (kind, text, id) => {
+            const description = Amaterasu.el("small", `plugin-control-${kind}`, extensionUiTextNode(text));
+            description.id = id ?? `amaterasu-plugin-ui-description-${++nextExtensionUiDescriptionId}`;
+            if (kind === "error")
+                description.setAttribute("role", "alert");
+            return description;
+        };
+        let activeControls = [...controls];
+        let helpNode = state.help === undefined ? null : createDescription("help", state.help);
+        let errorNode = state.error === undefined ? null : createDescription("error", state.error);
+        const sync = () => {
+            applyControlState(state);
+            const descriptionIds = [helpNode?.id, errorNode?.id].filter((id) => !!id).join(" ");
+            for (const control of activeControls) {
+                if (descriptionIds)
+                    control.setAttribute("aria-describedby", descriptionIds);
+                else
+                    control.removeAttribute("aria-describedby");
+                if (state.error !== undefined)
                     control.setAttribute("aria-invalid", "true");
-                if (options.required)
+                else
+                    control.removeAttribute("aria-invalid");
+                if (state.required)
                     control.setAttribute("aria-required", "true");
+                else
+                    control.removeAttribute("aria-required");
             }
             if (element.getAttribute("role") === "radiogroup") {
-                if (options.error !== undefined)
+                if (state.error !== undefined)
                     element.setAttribute("aria-invalid", "true");
-                if (options.required)
+                else
+                    element.removeAttribute("aria-invalid");
+                if (state.required)
                     element.setAttribute("aria-required", "true");
+                else
+                    element.removeAttribute("aria-required");
             }
         };
-        apply(controls);
-        return apply;
+        if (helpNode)
+            element.append(helpNode);
+        if (errorNode)
+            element.append(errorNode);
+        sync();
+        const updateState = ((patch) => {
+            if (!patch || typeof patch !== "object" || Array.isArray(patch))
+                throw new Error("Invalid plugin UI state patch.");
+            const allowed = ["disabled", "readOnly", "required", "help", "error"];
+            if (Object.keys(patch).some((key) => !allowed.includes(key)))
+                throw new Error("Unknown plugin UI state option.");
+            const next = { ...state };
+            for (const key of ["disabled", "readOnly", "required"]) {
+                const value = patch[key];
+                if (value !== undefined) {
+                    if (typeof value !== "boolean")
+                        throw new Error(`Invalid plugin UI ${key} state.`);
+                    next[key] = value;
+                }
+            }
+            const hasHelp = Object.prototype.hasOwnProperty.call(patch, "help") && patch.help !== undefined;
+            const hasError = Object.prototype.hasOwnProperty.call(patch, "error") && patch.error !== undefined;
+            let nextHelpNode = helpNode;
+            let nextErrorNode = errorNode;
+            if (hasHelp) {
+                const help = patch.help;
+                if (help === null) {
+                    next.help = undefined;
+                    nextHelpNode = null;
+                }
+                else if (help !== undefined) {
+                    next.help = help;
+                    nextHelpNode = createDescription("help", help, helpNode?.id);
+                }
+            }
+            if (hasError) {
+                const error = patch.error;
+                if (error === null) {
+                    next.error = undefined;
+                    nextErrorNode = null;
+                }
+                else if (error !== undefined) {
+                    next.error = error;
+                    nextErrorNode = createDescription("error", error, errorNode?.id);
+                }
+            }
+            const commitDescription = (current, prepared) => {
+                if (current && prepared) {
+                    current.replaceChildren(...Array.from(prepared.childNodes));
+                    return current;
+                }
+                current?.remove();
+                if (prepared)
+                    element.append(prepared);
+                return prepared;
+            };
+            if (hasHelp)
+                helpNode = commitDescription(helpNode, nextHelpNode);
+            if (hasError)
+                errorNode = commitDescription(errorNode, nextErrorNode);
+            Object.assign(state, next);
+            sync();
+        });
+        updateState.refreshControls = (nextControls) => { activeControls = [...nextControls]; sync(); };
+        return updateState;
     }
     function createExtensionUiV1(signal) {
         if (!signal || typeof signal.addEventListener !== "function")
@@ -16754,19 +16865,19 @@ var Amaterasu;
                 const controller = makeController();
                 const checkbox = Amaterasu.input("", "", "checkbox");
                 checkbox.checked = options.value;
-                checkbox.disabled = options.disabled === true;
-                checkbox.required = options.required === true;
-                if (options.readOnly)
-                    checkbox.setAttribute("aria-readonly", "true");
                 let currentValue = options.value;
+                const state = {
+                    disabled: options.disabled === true, readOnly: options.readOnly === true, required: options.required === true,
+                    help: options.help, error: options.error,
+                };
                 checkbox.addEventListener("click", (event) => {
-                    if (options.readOnly) {
+                    if (state.readOnly) {
                         event.preventDefault();
                         event.stopImmediatePropagation();
                     }
                 }, { capture: true, signal: controller.signal });
                 checkbox.addEventListener("change", (event) => {
-                    if (options.disabled || options.readOnly) {
+                    if (state.disabled || state.readOnly) {
                         checkbox.checked = currentValue;
                         event.preventDefault();
                         event.stopImmediatePropagation();
@@ -16776,13 +16887,20 @@ var Amaterasu;
                     options.onChange?.(currentValue);
                 }, { signal: controller.signal });
                 const element = Amaterasu.el("div", "field plugin-control plugin-toggle", extensionUiControlLabel(options.label, checkbox), checkbox);
-                extensionUiFieldDescriptions(element, [checkbox], options);
+                const setState = extensionUiFieldState(element, [checkbox], state, (next) => {
+                    checkbox.disabled = next.disabled;
+                    checkbox.required = next.required;
+                    if (next.readOnly)
+                        checkbox.setAttribute("aria-readonly", "true");
+                    else
+                        checkbox.removeAttribute("aria-readonly");
+                });
                 return extensionUiControl(element, () => checkbox.checked, (value) => {
                     if (typeof value !== "boolean")
                         throw new Error("Toggle value must be boolean.");
                     currentValue = value;
                     checkbox.checked = value;
-                }, controller, signal);
+                }, controller, signal, undefined, undefined, setState);
             },
             select(options) {
                 if (!options || typeof options.label !== "string" && typeof options.label !== "object")
@@ -16793,6 +16911,10 @@ var Amaterasu;
                 const select = Amaterasu.el("select", "");
                 let choices = [...options.choices];
                 let currentValue = options.value;
+                const state = {
+                    disabled: options.disabled === true, readOnly: options.readOnly === true, required: options.required === true,
+                    help: options.help, error: options.error,
+                };
                 const makeChoiceOptions = (nextChoices) => nextChoices.map((choice) => {
                     const option = Amaterasu.el("option", "", extensionUiTextNode(choice.label));
                     option.value = choice.value;
@@ -16800,24 +16922,20 @@ var Amaterasu;
                 });
                 select.replaceChildren(...makeChoiceOptions(choices));
                 select.value = currentValue;
-                select.disabled = options.disabled === true;
-                select.required = options.required === true;
-                if (options.readOnly)
-                    select.setAttribute("aria-readonly", "true");
                 select.addEventListener("click", (event) => {
-                    if (options.readOnly) {
+                    if (state.readOnly) {
                         event.preventDefault();
                         event.stopImmediatePropagation();
                     }
                 }, { capture: true, signal: controller.signal });
                 select.addEventListener("keydown", (event) => {
-                    if (options.readOnly && extensionUiReadOnlyKeyMutation(event)) {
+                    if (state.readOnly && extensionUiReadOnlyKeyMutation(event)) {
                         event.preventDefault();
                         event.stopImmediatePropagation();
                     }
                 }, { capture: true, signal: controller.signal });
                 select.addEventListener("change", (event) => {
-                    if (options.disabled || options.readOnly) {
+                    if (state.disabled || state.readOnly) {
                         select.value = currentValue;
                         event.preventDefault();
                         event.stopImmediatePropagation();
@@ -16827,7 +16945,14 @@ var Amaterasu;
                     options.onChange?.(currentValue);
                 }, { signal: controller.signal });
                 const element = Amaterasu.el("div", "field plugin-control", extensionUiControlLabel(options.label, select), select);
-                extensionUiFieldDescriptions(element, [select], options);
+                const setState = extensionUiFieldState(element, [select], state, (next) => {
+                    select.disabled = next.disabled;
+                    select.required = next.required;
+                    if (next.readOnly)
+                        select.setAttribute("aria-readonly", "true");
+                    else
+                        select.removeAttribute("aria-readonly");
+                });
                 const setChoices = (nextChoices, value) => {
                     const nextValue = value ?? currentValue;
                     extensionUiChoices(nextChoices, nextValue);
@@ -16843,7 +16968,7 @@ var Amaterasu;
                         throw new Error("Unsupported select value.");
                     currentValue = value;
                     select.value = value;
-                }, controller, signal, () => { }, setChoices);
+                }, controller, signal, () => { }, setChoices, setState);
             },
             radioGroup(options) {
                 if (!options || typeof options.label !== "string" && typeof options.label !== "object")
@@ -16851,35 +16976,47 @@ var Amaterasu;
                 validateExtensionUiFieldOptions(options);
                 extensionUiChoices(options.choices, options.value);
                 const controller = makeController();
-                const group = Amaterasu.radioGroup(extensionUiTextNode(options.label), options.choices.map((choice) => ({ value: choice.value, label: extensionUiTextNode(choice.label) })), options.value, (value) => options.onChange?.(value), controller.signal, { disabled: options.disabled, readOnly: options.readOnly, required: options.required });
-                const applyDescriptions = extensionUiFieldDescriptions(group.node, [...group.controls, group.node], options);
+                const state = {
+                    disabled: options.disabled === true, readOnly: options.readOnly === true, required: options.required === true,
+                    help: options.help, error: options.error,
+                };
+                const group = Amaterasu.radioGroup(extensionUiTextNode(options.label), options.choices.map((choice) => ({ value: choice.value, label: extensionUiTextNode(choice.label) })), options.value, (value) => options.onChange?.(value), controller.signal, { disabled: state.disabled, readOnly: state.readOnly, required: state.required });
+                const setState = extensionUiFieldState(group.node, [...group.controls, group.node], state, (next) => {
+                    group.setBehavior({ disabled: next.disabled, readOnly: next.readOnly, required: next.required });
+                });
                 const setChoices = (nextChoices, value) => {
                     const selected = value ?? group.value();
                     extensionUiChoices(nextChoices, selected);
                     const localized = nextChoices.map((choice) => ({ value: choice.value, label: extensionUiTextNode(choice.label) }));
                     group.setChoices(localized, selected);
-                    applyDescriptions([...group.controls, group.node]);
+                    setState.refreshControls([...group.controls, group.node]);
                 };
-                return extensionUiControl(group.node, group.value, group.setValue, controller, signal, group.dispose, setChoices);
+                return extensionUiControl(group.node, group.value, group.setValue, controller, signal, group.dispose, setChoices, setState);
             },
             slider(options) {
                 if (!options || typeof options.label !== "string" && typeof options.label !== "object")
                     throw new Error("Invalid plugin slider.");
                 validateExtensionUiFieldOptions(options);
                 const controller = makeController();
+                const state = {
+                    disabled: options.disabled === true, readOnly: options.readOnly === true, required: options.required === true,
+                    help: options.help, error: options.error,
+                };
                 const label = extensionUiLabel(options.label);
                 const slider = Amaterasu.boundedSlider(options.minimum, options.maximum, options.value, typeof options.label === "string" ? options.label : options.label.source, false, "plugin-slider-inputs", {
                     step: options.step ?? "any",
                     onChange: options.onChange,
                     signal: controller.signal,
                     accessibleLabel: label,
-                    disabled: options.disabled,
-                    readOnly: options.readOnly,
-                    required: options.required,
+                    disabled: state.disabled,
+                    readOnly: state.readOnly,
+                    required: state.required,
                 });
                 const element = Amaterasu.el("div", "field plugin-control plugin-slider", label, slider.node);
-                extensionUiFieldDescriptions(element, [slider.range, slider.number], options);
-                return extensionUiControl(element, slider.value, slider.setValue, controller, signal, slider.dispose);
+                const setState = extensionUiFieldState(element, [slider.range, slider.number], state, (next) => {
+                    slider.setBehavior({ disabled: next.disabled, readOnly: next.readOnly, required: next.required });
+                });
+                return extensionUiControl(element, slider.value, slider.setValue, controller, signal, slider.dispose, undefined, setState);
             },
         };
         return Object.freeze(ui);
@@ -17003,7 +17140,7 @@ var Amaterasu;
             const sdk = Object.freeze({
                 version: 1,
                 signal: controller.signal,
-                features: Object.freeze(["ui.controls/1", "ui.forms/1"]),
+                features: Object.freeze(["ui.controls/1", "ui.forms/1", "ui.forms/2"]),
                 ui: Amaterasu.createExtensionUiV1(controller.signal),
                 call: (method, payload = {}) => {
                     if (controller.signal.aborted || !aliases.has(method))

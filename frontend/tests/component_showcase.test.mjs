@@ -14,6 +14,7 @@ class Element {
   replaceChildren(...children) { this.children = children; }
   setAttribute(name, value) { this.attributes[name] = String(value); }
   getAttribute(name) { return this.attributes[name] ?? null; }
+  removeAttribute(name) { delete this.attributes[name]; }
   addEventListener(type, callback, options = {}) {
     (this.listeners[type] ??= []).push({ callback, signal: options.signal });
   }

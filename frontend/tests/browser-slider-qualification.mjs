@@ -156,6 +156,20 @@ try {
   await evaluate(`document.querySelector('.plugin-slider input[type=range]').focus()`);
   for (const type of ["keyDown", "keyUp"]) await command("Input.dispatchKeyEvent", { type, key: "ArrowRight", code: "ArrowRight", windowsVirtualKeyCode: 39, nativeVirtualKeyCode: 39 }, sessionId);
   assert.equal(await evaluate(`window.readOnlySlider.value()`), 5);
+  await evaluate(`
+    window.runtimeToggleChanges = 0;
+    window.runtimeToggle = window.formUi.toggle({ label: "Async toggle", value: true, onChange() { window.runtimeToggleChanges++; } });
+    document.body.replaceChildren(window.runtimeToggle.element);
+    window.runtimeToggleInput = window.runtimeToggle.element.querySelector('input');
+    window.runtimeToggleInput.focus();
+    window.runtimeToggle.setState({ readOnly: true, required: true, help: "Loaded asynchronously.", error: "Validation failed." });
+  `);
+  assert.deepEqual(await evaluate(`({ same: window.runtimeToggle.element.querySelector('input') === window.runtimeToggleInput, focused: document.activeElement === window.runtimeToggleInput, readonly: window.runtimeToggleInput.getAttribute('aria-readonly'), required: window.runtimeToggleInput.required, invalid: window.runtimeToggleInput.getAttribute('aria-invalid'), descriptions: window.runtimeToggleInput.getAttribute('aria-describedby').split(' ').length, value: window.runtimeToggle.value() })`), { same: true, focused: true, readonly: "true", required: true, invalid: "true", descriptions: 2, value: true });
+  await evaluate(`window.runtimeToggle.setState({ readOnly: false, required: false, help: null, error: null, disabled: true })`);
+  assert.equal(await evaluate(`window.runtimeToggleInput.disabled`), true);
+  await evaluate(`window.runtimeToggle.setState({ disabled: false }); window.runtimeToggleInput.focus(); window.runtimeToggleInput.click()`);
+  assert.deepEqual(await evaluate(`({ same: window.runtimeToggle.element.querySelector('input') === window.runtimeToggleInput, focused: document.activeElement === window.runtimeToggleInput, descriptions: window.runtimeToggleInput.getAttribute('aria-describedby'), value: window.runtimeToggle.value(), changes: window.runtimeToggleChanges })`), { same: true, focused: true, descriptions: null, value: false, changes: 1 });
+  console.log("PASS: runtime field-state updates preserve focused controls and listeners across async validation states");
   console.log("PASS: readonly slider preserves number-field copy, blocks native edits/range changes, and readonly radios remain keyboard-discoverable");
   console.log("PASS: form labels/descriptions, readonly keyboard shortcuts, and radio focus survive real browser interactions");
   console.log("PASS: plugin forms retain accessible states and descriptions across dynamic choices");

@@ -88,6 +88,7 @@ namespace Amaterasu {
     value(): string;
     setValue(value: string): void;
     setChoices(options: readonly RadioGroupOption[], value?: string): void;
+    setBehavior(behavior: RadioGroupBehavior): void;
     dispose(): void;
   }
 
@@ -116,6 +117,7 @@ namespace Amaterasu {
     let currentValue = selected;
     let currentOptions = options;
     let controls: HTMLInputElement[] = [];
+    let currentBehavior: RadioGroupBehavior = { ...behavior };
     let choiceController = new AbortController();
     const dispose = (): void => {
       if (disposed) return;
@@ -133,10 +135,16 @@ namespace Amaterasu {
     labelNode.id = `amaterasu-radio-label-${nextRadioGroupId}`;
     const optionsNode = el("div", "radio-options");
     group.setAttribute("aria-labelledby", labelNode.id);
-    if (behavior.disabled) group.setAttribute("aria-disabled", "true");
-    if (behavior.readOnly) group.setAttribute("aria-readonly", "true");
-    if (behavior.required) group.setAttribute("aria-required", "true");
-
+    const applyBehavior = (): void => {
+      if (currentBehavior.disabled) group.setAttribute("aria-disabled", "true"); else group.removeAttribute("aria-disabled");
+      if (currentBehavior.readOnly) group.setAttribute("aria-readonly", "true"); else group.removeAttribute("aria-readonly");
+      if (currentBehavior.required) group.setAttribute("aria-required", "true"); else group.removeAttribute("aria-required");
+      for (const control of controls) {
+        control.disabled = currentBehavior.disabled === true;
+        control.required = currentBehavior.required === true;
+        if (currentBehavior.readOnly) control.setAttribute("aria-readonly", "true"); else control.removeAttribute("aria-readonly");
+      }
+    };
     group.append(labelNode, optionsNode);
     const render = (): void => {
       choiceController.abort();
@@ -144,17 +152,17 @@ namespace Amaterasu {
       controls = currentOptions.map((option) => {
         const control = input(name, option.value, "radio");
         control.checked = option.value === currentValue;
-        control.disabled = behavior.disabled === true;
-        control.required = behavior.required === true;
-        if (behavior.readOnly) control.setAttribute("aria-readonly", "true");
+        control.disabled = currentBehavior.disabled === true;
+        control.required = currentBehavior.required === true;
+        if (currentBehavior.readOnly) control.setAttribute("aria-readonly", "true");
         control.addEventListener("click", (event) => {
-          if (behavior.readOnly) {
+          if (currentBehavior.readOnly) {
             event.preventDefault();
             event.stopImmediatePropagation();
           }
         }, { capture: true, signal: choiceController.signal });
         control.addEventListener("keydown", (event) => {
-          if (!behavior.readOnly || event.ctrlKey || event.metaKey || event.altKey) return;
+          if (!currentBehavior.readOnly || event.ctrlKey || event.metaKey || event.altKey) return;
           const index = controls.indexOf(control);
           const focusIndex = event.key === "ArrowDown" || event.key === "ArrowRight" ? (index + 1) % controls.length
             : event.key === "ArrowUp" || event.key === "ArrowLeft" ? (index + controls.length - 1) % controls.length
@@ -172,7 +180,7 @@ namespace Amaterasu {
           }
         }, { capture: true, signal: choiceController.signal });
         control.addEventListener("change", (event) => {
-          if (behavior.disabled || behavior.readOnly) {
+          if (currentBehavior.disabled || currentBehavior.readOnly) {
             for (const peer of controls) peer.checked = peer.value === currentValue;
             event.preventDefault();
             event.stopImmediatePropagation();
@@ -189,6 +197,7 @@ namespace Amaterasu {
         el("label", "radio-option", controls[index], el("span", "", option.label))));
     };
     render();
+    applyBehavior();
     return {
       node: group,
       get controls() { return controls; },
@@ -197,6 +206,10 @@ namespace Amaterasu {
         if (!currentOptions.some((option) => option.value === value)) throw new Error("Unsupported radio group value.");
         currentValue = value;
         for (const control of controls) control.checked = control.value === value;
+      },
+      setBehavior: (nextBehavior) => {
+        currentBehavior = { ...nextBehavior };
+        applyBehavior();
       },
       setChoices: (nextOptions, nextValue = currentValue) => {
         if (disposed) return;
@@ -220,6 +233,7 @@ namespace Amaterasu {
     number: HTMLInputElement;
     value(): number;
     setValue(value: number): void;
+    setBehavior(behavior: Pick<BoundedSliderOptions, "disabled" | "readOnly" | "required">): void;
     dispose(): void;
   }
 
@@ -276,6 +290,15 @@ namespace Amaterasu {
     const controller = new AbortController();
     let disposed = false;
     let currentValue = value;
+    let currentBehavior = { disabled: options.disabled === true, readOnly: options.readOnly === true, required: options.required === true };
+    const applyBehavior = (): void => {
+      for (const control of [range, number]) {
+        control.disabled = currentBehavior.disabled;
+        control.required = currentBehavior.required;
+        if (currentBehavior.readOnly) control.setAttribute("aria-readonly", "true"); else control.removeAttribute("aria-readonly");
+      }
+      number.readOnly = currentBehavior.readOnly;
+    };
     const dispose = (): void => {
       if (disposed) return;
       disposed = true;
@@ -297,18 +320,18 @@ namespace Amaterasu {
       range.value = String(currentValue);
     };
     range.addEventListener("click", (event) => {
-      if (options.readOnly) { event.preventDefault(); event.stopImmediatePropagation(); }
+      if (currentBehavior.readOnly) { event.preventDefault(); event.stopImmediatePropagation(); }
     }, { capture: true, signal: controller.signal });
     range.addEventListener("pointerdown", (event) => {
-      if (options.readOnly) { event.preventDefault(); event.stopImmediatePropagation(); }
+      if (currentBehavior.readOnly) { event.preventDefault(); event.stopImmediatePropagation(); }
     }, { capture: true, signal: controller.signal });
     range.addEventListener("keydown", (event) => {
       const valueMutationKey = ["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Home", "End", "PageUp", "PageDown"].includes(event.key);
-      if (options.readOnly && valueMutationKey) { event.preventDefault(); event.stopImmediatePropagation(); }
+      if (currentBehavior.readOnly && valueMutationKey) { event.preventDefault(); event.stopImmediatePropagation(); }
     }, { capture: true, signal: controller.signal });
     for (const control of [range, number]) {
       control.addEventListener("input", (event) => {
-        if (options.disabled || options.readOnly) {
+        if (currentBehavior.disabled || currentBehavior.readOnly) {
           restoreCurrentValue();
           event.preventDefault();
           event.stopImmediatePropagation();
@@ -336,6 +359,10 @@ namespace Amaterasu {
       range,
       number,
       value: () => readValue(number),
+      setBehavior: (nextBehavior) => {
+        currentBehavior = { disabled: nextBehavior.disabled === true, readOnly: nextBehavior.readOnly === true, required: nextBehavior.required === true };
+        applyBehavior();
+      },
       setValue: (nextValue) => {
         if (!isValidSliderValue(nextValue, minimum, maximum, integer, step))
           throw new Error(`Slider value must be between ${minimum} and ${maximum} on step ${step}.`);

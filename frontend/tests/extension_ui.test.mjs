@@ -6,7 +6,9 @@ import ts from "typescript";
 
 class Element {
   constructor(tag = "div") { this.tagName = tag.toUpperCase(); this.children = []; this.attributes = {}; this.listeners = {}; this.value = ""; this.checked = false; this.validity = { valid: true }; this.textContent = ""; this.hidden = false; this.disabled = false; this.required = false; }
-  append(...children) { this.children.push(...children); }
+  get childNodes() { return this.children; }
+  append(...children) { for (const child of children) { if (child && typeof child === "object") child.parent = this; this.children.push(child); } }
+  remove() { if (this.parent) this.parent.children = this.parent.children.filter((child) => child !== this); this.parent = null; }
   replaceChildren(...children) { this.children = []; this.append(...children); }
   setAttribute(name, value) { this.attributes[name] = value; }
   getAttribute(name) { return this.attributes[name] ?? null; }
@@ -29,7 +31,7 @@ class Element {
   }
 }
 
-function setupConsumer({ features = ["ui.controls/1", "ui.forms/1"], withUi = true } = {}) {
+function setupConsumer({ features = ["ui.controls/1", "ui.forms/1", "ui.forms/2"], withUi = true } = {}) {
   let registered;
   const document = { activeElement: null, createElement(tag) { const element = new Element(tag); element.ownerDocument = this; return element; } };
   const context = vm.createContext({
@@ -78,6 +80,14 @@ test("an SDK v1 consumer renders a fallback when an older host lacks UI features
   const page = setupConsumer({ features: ["ui.controls/1"], withUi: true });
   assert.equal(page.container.children.length, 1);
   assert.equal(page.container.children[0].textContent, "This host does not support the reusable controls in this page.");
+});
+
+test("a ui.forms/1 consumer remains compatible with a host that lacks ui.forms/2", () => {
+  const page = setupConsumer({ features: ["ui.controls/1", "ui.forms/1"] });
+  assert.equal(page.container.children.length, 2);
+  assert.equal(page.sdk.features.includes("ui.forms/2"), false);
+  assert.equal(page.container.children[0].children[1].checked, true);
+  page.cleanup();
 });
 
 test("control instances dispose idempotently when the host lifecycle aborts", () => {
@@ -212,6 +222,106 @@ test("disabled and read-only controls reject user changes but allow programmatic
   const disabled = page.sdk.ui.toggle({ label: "Unavailable", value: false, disabled: true });
   assert.equal(disabled.element.children[1].disabled, true);
   toggle.dispose(); select.dispose(); disabled.dispose(); page.cleanup();
+});
+
+test("runtime field state patches update accessibility in place and preserve focus and listeners", () => {
+  const page = setupConsumer();
+  const changes = { toggle: 0, select: 0, radio: 0, slider: 0 };
+  const toggle = page.sdk.ui.toggle({ label: "Runtime toggle", value: true, onChange: () => changes.toggle++ });
+  const checkbox = toggle.element.children[1];
+  checkbox.focus();
+  const checkboxListener = checkbox.listeners.change[0];
+  toggle.setState({ readOnly: true, required: true, help: { source: "Toggle help", translations: { fr: "Aide" } }, error: "Toggle error" });
+  assert.equal(toggle.element.children[1], checkbox);
+  assert.equal(page.context.document.activeElement, checkbox);
+  assert.equal(checkbox.disabled, false);
+  assert.equal(checkbox.required, true);
+  assert.equal(checkbox.attributes["aria-readonly"], "true");
+  assert.equal(checkbox.attributes["aria-invalid"], "true");
+  assert.equal(checkbox.attributes["aria-describedby"].split(" ").length, 2);
+  assert.equal(toggle.element.children[2].children[0], "Aide");
+  assert.equal(toggle.element.children[3].attributes.role, "alert");
+  assert.equal(checkboxListener.signal.aborted, false);
+  assert.throws(() => toggle.setState({ disabled: true, error: { source: "Bad", translations: { "fr-CA": "" } } }), /translations/);
+  assert.equal(checkbox.disabled, false);
+  assert.equal(toggle.element.children.at(-1).children[0], "Toggle error");
+  checkbox.checked = false;
+  checkbox.dispatch("change");
+  assert.equal(toggle.value(), true);
+  assert.equal(changes.toggle, 0);
+  toggle.setState({ readOnly: false, required: false, help: null, error: null });
+  assert.equal(page.context.document.activeElement, checkbox);
+  assert.equal(checkbox.attributes["aria-describedby"], undefined);
+  assert.equal(checkbox.attributes["aria-invalid"], undefined);
+  checkbox.checked = false;
+  checkbox.dispatch("change");
+  assert.equal(changes.toggle, 1);
+
+  const select = page.sdk.ui.select({ label: "Runtime select", choices: [{ value: "a", label: "A" }, { value: "b", label: "B" }], value: "a", onChange: () => changes.select++ });
+  const selectNode = select.element.children[1];
+  selectNode.focus();
+  const selectListener = selectNode.listeners.change[0];
+  select.setState({ disabled: true, required: true, help: "Select help" });
+  assert.equal(select.element.children[1], selectNode);
+  assert.equal(page.context.document.activeElement, selectNode);
+  assert.equal(selectNode.disabled, true);
+  assert.equal(selectNode.required, true);
+  assert.equal(selectListener.signal.aborted, false);
+  selectNode.value = "b"; selectNode.dispatch("change");
+  assert.equal(select.value(), "a");
+  assert.equal(changes.select, 0);
+  select.setState({ disabled: false, required: false, help: null });
+  selectNode.value = "b"; selectNode.dispatch("change");
+  assert.equal(select.value(), "b");
+  assert.equal(changes.select, 1);
+
+  const radio = page.sdk.ui.radioGroup({ label: "Runtime radio", choices: [{ value: "x", label: "X" }, { value: "y", label: "Y" }], value: "x", onChange: () => changes.radio++ });
+  const radioGroup = radio.element;
+  const radioInput = radioGroup.children[1].children[0].children[0];
+  radioInput.focus();
+  const radioListener = radioInput.listeners.change[0];
+  radio.setState({ readOnly: true, required: true, error: "Select a preset" });
+  assert.equal(radio.element, radioGroup);
+  assert.equal(radioGroup.children[1].children[0].children[0], radioInput);
+  assert.equal(page.context.document.activeElement, radioInput);
+  assert.equal(radioInput.attributes["aria-readonly"], "true");
+  assert.equal(radioGroup.attributes["aria-required"], "true");
+  assert.equal(radioListener.signal.aborted, false);
+  radio.setChoices([{ value: "x", label: "X" }, { value: "z", label: "Z" }]);
+  const replacementRadio = radioGroup.children[1].children[0].children[0];
+  assert.equal(replacementRadio.attributes["aria-invalid"], "true");
+  assert.equal(replacementRadio.attributes["aria-describedby"].split(" ").length, 1);
+  replacementRadio.checked = false; replacementRadio.dispatch("change");
+  assert.equal(radio.value(), "x");
+  assert.equal(changes.radio, 0);
+  radio.setState({ readOnly: false, required: false, error: null });
+  replacementRadio.checked = false;
+  const nextRadio = radioGroup.children[1].children[1].children[0];
+  nextRadio.checked = true; nextRadio.dispatch("change");
+  assert.equal(radio.value(), "z");
+  assert.equal(changes.radio, 1);
+
+  const slider = page.sdk.ui.slider({ label: "Runtime slider", minimum: 0, maximum: 10, step: 1, value: 5, onChange: () => changes.slider++ });
+  const [range, number] = slider.element.children[1].children;
+  number.focus();
+  const numberListener = number.listeners.input[0];
+  slider.setState({ readOnly: true, required: true, help: "Slider help", error: "Slider error" });
+  assert.equal(slider.element.children[1].children[0], range);
+  assert.equal(slider.element.children[1].children[1], number);
+  assert.equal(page.context.document.activeElement, number);
+  assert.equal(number.readOnly, true);
+  assert.equal(range.required, true);
+  assert.equal(number.attributes["aria-describedby"].split(" ").length, 2);
+  assert.equal(numberListener.signal.aborted, false);
+  number.value = "8"; number.dispatch("input");
+  assert.equal(number.value, "5");
+  assert.equal(changes.slider, 0);
+  slider.setState({ readOnly: false, required: false, help: null, error: null });
+  number.value = "8"; number.dispatch("input");
+  assert.equal(slider.value(), 8);
+  assert.equal(changes.slider, 1);
+
+  toggle.dispose(); select.dispose(); radio.dispose(); slider.dispose(); page.cleanup();
 });
 
 test("choice controls update options transactionally without firing change callbacks", () => {

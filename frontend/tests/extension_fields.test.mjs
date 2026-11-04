@@ -13,6 +13,7 @@ function editorEnvironment() {
     listeners = {};
     attributes = {};
     setAttribute(name, value) { this.attributes[name] = value; }
+    removeAttribute(name) { delete this.attributes[name]; }
     replaceChildren(...children) { this.children = []; this.append(...children); }
     get lastElementChild() { return this.children.filter((child) => child instanceof Element).at(-1); }
     append(...children) { this.children.push(...children); for (const child of children) if (child instanceof Element) child.parent = this; }
