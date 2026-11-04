@@ -141,8 +141,8 @@ test("setting policy guidance and save feedback distinguish persistence from app
   const env = fixture({ kind: "host" });
   await settle();
   const guidance = env.nodes.filter(node => node.tag === "small").map(node => node.children[0]);
-  assert.ok(guidance.includes("Used when the next stream is prepared."));
-  assert.ok(guidance.includes("Used when the next session is prepared."));
+  assert.ok(guidance.includes("Requires a new or resumed stream."));
+  assert.ok(guidance.includes("Requires a new application session."));
   env.nodes.find(node => node.tag === "form").listeners.submit({ preventDefault() {} });
   await Promise.all(env.pending);
   assert.deepEqual(env.notifications, ["Plugin settings saved. Application to an active session or stream is not confirmed."]);

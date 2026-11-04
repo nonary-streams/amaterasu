@@ -25,8 +25,8 @@ namespace Amaterasu {
 
   function sessionExtensionApplyPolicyHelp(policy: string): string {
     switch (policy) {
-      case "next_session": return "Used when the next session is prepared.";
-      case "next_stream": return "Used when the next stream is prepared.";
+      case "next_session": return "Requires a new application session.";
+      case "next_stream": return "Requires a new or resumed stream.";
       case "live_action": return "May apply during an active session or stream; saving does not confirm application.";
       default: return "Application timing is not available.";
     }
