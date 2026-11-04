@@ -122,7 +122,10 @@ try {
 
   await evaluate(`
     const networkTab = document.querySelector('[data-tab-id="network"]');
-    networkTab.focus();
+    window.networkInput = document.createElement("input");
+    window.networkContent.append(window.networkInput);
+    window.tabsHandle.select("network");
+    window.networkInput.focus();
     window.networkTabBeforeUpdate = networkTab;
     window.tabsHandle.setTabs([
       { id: "network", label: { source: "Network", translations: { fr: "Network FR" } }, content: window.networkContent },
@@ -130,13 +133,28 @@ try {
       { id: "disabled", label: "Disabled", content: window.disabledContent, disabled: true },
     ]);
   `);
-  assert.deepEqual(await evaluate(`({active:window.tabsHandle.active(), same:document.querySelector('[data-tab-id="network"]')===window.networkTabBeforeUpdate, focus:document.activeElement.getAttribute("data-tab-id"), changes:window.tabChanges})`),
-    { active: "general", same: true, focus: "network", changes: ["network", "general", "network"] });
+  assert.deepEqual(await evaluate(`({active:window.tabsHandle.active(), same:document.querySelector('[data-tab-id="network"]')===window.networkTabBeforeUpdate, focusedInput:document.activeElement===window.networkInput, contentStable:window.networkContent.firstElementChild===window.networkInput, changes:window.tabChanges})`),
+    { active: "network", same: true, focusedInput: true, contentStable: true, changes: ["network", "general", "network"] });
 
-  await evaluate(`window.tabsHandle.select("network"); document.querySelector('[data-tab-id="network"]').focus(); window.tabsHandle.setDisabled("network", true);`);
+  await evaluate(`window.tabsHandle.select("network"); window.networkInput.focus(); window.tabsHandle.setDisabled("network", true);`);
   assert.deepEqual(await evaluate(`({active:window.tabsHandle.active(), focused:document.activeElement.getAttribute("data-tab-id"), disabled:document.querySelector('[data-tab-id="network"]').disabled, changes:window.tabChanges})`),
     { active: "general", focused: "general", disabled: true, changes: ["network", "general", "network"] });
-  await evaluate(`window.tabsHandle.setDisabled("network", false); Amaterasu.applyLocale("fr");`);
+  await evaluate(`
+    window.blankGroupNameRejected = false;
+    try { window.tabsApi.tabs({ label: "  ", tabs: [{ id: "x", label: "X", content: document.createElement("div") }] }); }
+    catch { window.blankGroupNameRejected = true; }
+    window.blankTabNameRejected = false;
+    try { window.tabsHandle.setTabs([{ id: "x", label: " ", content: document.createElement("div") }]); }
+    catch { window.blankTabNameRejected = true; }
+    window.allTabsDisabledStable = window.tabsHandle.active() === "general";
+    window.tabsHandle.setDisabled("general", true);
+    window.allTabsDisabled = window.tabsHandle.active() === null &&
+      [...window.tabsHandle.element.querySelectorAll('[role="tab"]')].every(tab => tab.disabled && tab.tabIndex === -1);
+    window.tabsHandle.setDisabled("network", false);
+  `);
+  assert.deepEqual(await evaluate(`({blankGroup:window.blankGroupNameRejected,blankTab:window.blankTabNameRejected,stable:window.allTabsDisabledStable,allDisabled:window.allTabsDisabled,active:window.tabsHandle.active(),selected:document.querySelector('[data-tab-id="network"]').getAttribute("aria-selected"),tabIndex:document.querySelector('[data-tab-id="network"]').tabIndex})`),
+    { blankGroup: true, blankTab: true, stable: true, allDisabled: true, active: "network", selected: "true", tabIndex: 0 });
+  await evaluate(`window.tabsHandle.setDisabled("general", false); window.tabsHandle.select("general"); Amaterasu.applyLocale("fr");`);
   assert.deepEqual(await evaluate(`({label:window.tabsHandle.element.querySelector(".plugin-tabs-label").textContent, general:document.querySelector('[data-tab-id="general"]').textContent, network:document.querySelector('[data-tab-id="network"]').textContent, active:window.tabsHandle.active()})`),
     { label: "Settings sections FR", general: "General", network: "Network FR", active: "general" });
   await evaluate(`Amaterasu.applyLocale("en");`);

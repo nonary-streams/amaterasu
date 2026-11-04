@@ -36,7 +36,10 @@ namespace Amaterasu {
   let nextExtensionUiTabsId = 0;
 
   function validateExtensionUiTabText(value: ExtensionUiText): void {
-    if (typeof value === "string") return;
+    if (typeof value === "string") {
+      if (!value.trim()) throw new Error("Plugin tab labels cannot be empty.");
+      return;
+    }
     if (!value || typeof value !== "object" || typeof value.source !== "string" || !value.source.trim())
       throw new Error("Invalid plugin tab label.");
     const translations = value.translations ?? {};
@@ -140,7 +143,15 @@ namespace Amaterasu {
         };
         const commitTabs = (nextTabs: readonly ExtensionUiTabItem[], requested: string | undefined): void => {
           validateExtensionUiTabs(nextTabs);
-          const focusedId = entries.find((entry) => entry.button === document.activeElement)?.id ?? null;
+          const focusedElement = document.activeElement instanceof HTMLElement && element.contains(document.activeElement)
+            ? document.activeElement
+            : null;
+          const focusedTabId = focusedElement
+            ? entries.find((entry) => entry.button === focusedElement)?.id ?? null
+            : null;
+          const focusedPanelId = focusedElement
+            ? entries.find((entry) => entry.panel.contains(focusedElement))?.id ?? null
+            : null;
           const nextActiveId = chooseNextActive(requested, nextTabs);
           const currentById = new Map(entries.map((entry) => [entry.id, entry]));
           const nextEntries = nextTabs.map((tab) => {
@@ -161,16 +172,25 @@ namespace Amaterasu {
             const tab = nextTabs[index]!;
             entry.button.replaceChildren(extensionUiTabsText(tab.label));
             entry.button.disabled = entry.disabled;
-            entry.panel.replaceChildren(tab.content);
-            tablist.append(entry.button);
-            panels.append(entry.panel);
+            if (entry.panel.childNodes.length !== 1 || entry.panel.firstElementChild !== tab.content)
+              entry.panel.replaceChildren(tab.content);
+            if (tablist.children[index] !== entry.button)
+              tablist.insertBefore(entry.button, tablist.children[index] ?? null);
+            if (panels.children[index] !== entry.panel)
+              panels.insertBefore(entry.panel, panels.children[index] ?? null);
           }
           entries = nextEntries;
           activeId = nextActiveId;
           updateSelection();
-          if (focusedId !== null && document.activeElement === document.body) {
-            const focusTarget = entries.find((entry) => entry.id === focusedId && !entry.disabled) ?? enabledEntry(activeId);
-            focusTarget?.button.focus();
+          if (focusedElement && focusedElement.isConnected && document.activeElement === document.body) {
+            const panelFocusStillVisible = focusedPanelId !== null && focusedPanelId === activeId &&
+              entries.some((entry) => entry.id === focusedPanelId && entry.panel.contains(focusedElement));
+            if (panelFocusStillVisible) focusedElement.focus();
+            else {
+              const focusedTab = focusedTabId === null ? undefined : entries.find((entry) => entry.id === focusedTabId && !entry.disabled);
+              if (focusedTab) focusedTab.button.focus();
+              else if (focusedPanelId !== null || focusedTabId !== null) enabledEntry(activeId)?.button.focus();
+            }
           }
         };
         const activate = (id: string, focus: boolean, notify: boolean): void => {
@@ -227,10 +247,11 @@ namespace Amaterasu {
           const entry = entries.find((candidate) => candidate.id === id);
           if (!entry) throw new Error("Unknown plugin tab.");
           if (entry.disabled === disabled) return;
-          const focused = document.activeElement === entry.button;
+          const focused = document.activeElement === entry.button || entry.panel.contains(document.activeElement);
           entry.disabled = disabled;
           entry.button.disabled = disabled;
           if (disabled && activeId === id) activeId = firstEnabled()?.id ?? null;
+          else if (!disabled && activeId === null) activeId = id;
           updateSelection();
           if (focused) enabledEntry(activeId)?.button.focus();
         };

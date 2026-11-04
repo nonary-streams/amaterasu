@@ -147,7 +147,8 @@ the ends; Home and End move to the first and last enabled tabs. Clicks and keybo
 activation call onChange when the selection changes. Programmatic select(id),
 setTabs(), and setDisabled() do not call onChange. Selecting an unknown or disabled
 tab throws. If the active tab becomes disabled or is removed, the first enabled
-tab becomes active; all-disabled sets have no active panel. Updating tabs reuses
+tab becomes active; all-disabled sets have no active panel, and re-enabling a tab
+selects it when none is active. Updating tabs reuses
 surviving tab and panel nodes and preserves tab focus when possible. dispose()
 removes event listeners, and the page lifecycle signal disposes the control on
 navigation.
