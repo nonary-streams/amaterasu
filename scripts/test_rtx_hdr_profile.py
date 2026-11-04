@@ -27,7 +27,14 @@ TUNING = {
     "rtx_hdr_middle_gray": 65,
     "rtx_hdr_contrast": -25,
     "rtx_hdr_saturation": 35,
+    "rtx_hdr_sdr_brightness": 25,
+    "rtx_hdr_foreground_only": True,
+    "rtx_hdr_fullscreen_only": True,
     "rtx_hdr_debanding": False,
+}
+SLIDERS = {
+    "rtx_hdr_peak_brightness", "rtx_hdr_middle_gray", "rtx_hdr_contrast",
+    "rtx_hdr_saturation", "rtx_hdr_sdr_brightness",
 }
 
 
@@ -89,6 +96,13 @@ def main() -> None:
         assert all(response["kind"] == "result" for response in responses), responses
         listing, current, changed, stale, invalid, reloaded = [response["payload"] for response in responses]
         assert listing["ok"] and PROVIDER in [item["provider"] for item in listing["items"]], listing
+        descriptor = next(item for item in listing["items"] if item["provider"] == PROVIDER)
+        options = {option["id"]: option for option in descriptor["options"]}
+        assert options["rtx_hdr_enable"]["apply_policy"] == "next_session", options
+        for option in TUNING.keys() - {"rtx_hdr_enable"}:
+            assert options[option]["apply_policy"] == "live_action", (option, options)
+        for option in SLIDERS:
+            assert options[option]["presentation"] == "slider", (option, options)
         assert current["ok"] and current["revision"] == 0 and not current["effective"]["rtx_hdr_enable"]["value"], current
         assert changed["ok"] and changed["revision"] == 1, changed
         assert not stale["ok"] and stale["error"]["code"] == "revision_conflict", stale
