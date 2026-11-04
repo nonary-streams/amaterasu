@@ -6649,7 +6649,7 @@ var Amaterasu;
         const saved = document.createElement("div");
         saved.className = "steam-exclusion-saved";
         steamPickerSetAttribute(saved, "aria-label", "Current Steam exclusions");
-        const manualAdd = document.createElement("form");
+        const manualAdd = document.createElement("div");
         manualAdd.className = "steam-exclusion-manual-add";
         const manualId = document.createElement("input");
         manualId.type = "text";
@@ -6661,7 +6661,7 @@ var Amaterasu;
         steamPickerSetAttribute(manualName, "aria-label", "Steam game name to exclude");
         steamPickerSetAttribute(manualName, "placeholder", "Game name");
         const manualAddButton = document.createElement("button");
-        manualAddButton.type = "submit";
+        manualAddButton.type = "button";
         manualAddButton.className = "button secondary";
         steamPickerSetText(manualAddButton, "Add exclusion");
         const manualAddStatus = document.createElement("p");
@@ -6733,7 +6733,14 @@ var Amaterasu;
             const warnings = [scanWarning, revisionChanged
                     ? "The Steam list changed while paging; restarted at the latest revision."
                     : ""].filter(Boolean);
-            steamPickerSetText(warning, warnings.join(" "));
+            warning.replaceChildren();
+            warnings.forEach((source, index) => {
+                if (index > 0)
+                    warning.append(document.createTextNode(" "));
+                const item = document.createElement("span");
+                steamPickerSetText(item, source);
+                warning.append(item);
+            });
             warning.hidden = warnings.length === 0;
             more.hidden = (!loadError && after === null) || disposed || !api.allows("steam.read");
             more.disabled = disabled || loading || disposed;
@@ -6811,6 +6818,12 @@ var Amaterasu;
                     signalDraft();
                     onChange(draft.map((value) => ({ ...value })));
                     render(true);
+                    const nextFocusKey = draft[index]
+                        ? `saved-${index}-remove`
+                        : draft.length
+                            ? `saved-${draft.length - 1}-remove`
+                            : "manual-id";
+                    allElements(root).find((element) => element.getAttribute?.("data-focus-key") === nextFocusKey)?.focus();
                 }, { signal: lifecycle.signal });
                 row.append(idInput, name, remove);
                 saved.append(row);
@@ -6889,7 +6902,7 @@ var Amaterasu;
             }
         }
         function allElements(parent) {
-            return [parent, ...Array.from(parent.children).flatMap((child) => allElements(child))];
+            return [parent, ...Array.from(parent.children ?? []).flatMap((child) => allElements(child))];
         }
         async function load() {
             if (disposed || disabled || !api.allows("steam.read") || loading)
@@ -6970,8 +6983,7 @@ var Amaterasu;
         manualName.setAttribute("data-focus-key", "manual-name");
         search.addEventListener("input", () => { if (!disabled)
             render(true); }, { signal: lifecycle.signal });
-        manualAdd.addEventListener("submit", (event) => {
-            event.preventDefault();
+        const addManualExclusion = () => {
             if (disposed || disabled)
                 return;
             const id = manualId.value.trim();
@@ -6996,7 +7008,15 @@ var Amaterasu;
             onChange(draft.map((entry) => ({ ...entry })));
             render(true);
             manualName.focus();
-        }, { signal: lifecycle.signal });
+        };
+        manualAddButton.addEventListener("click", addManualExclusion, { signal: lifecycle.signal });
+        for (const field of [manualId, manualName])
+            field.addEventListener("keydown", (event) => {
+                if (event.key !== "Enter")
+                    return;
+                event.preventDefault();
+                addManualExclusion();
+            }, { signal: lifecycle.signal });
         more.addEventListener("click", () => {
             if (disposed || disabled)
                 return;
@@ -10157,12 +10177,8 @@ var Amaterasu;
                 overwrite.disabled = true;
             }, "secondary");
             const overwrite = Amaterasu.button("Overwrite overlapping fields", () => {
-                const merged = { ...(pending.merged ?? pending.latest ?? {}) };
-                for (const field of pending.overlaps)
-                    merged[field] = pending.submitted[field];
-                pending.merged = merged;
                 pending.reviewed = true;
-                applyValues(merged);
+                applyValues(pending.submitted, pending.overlaps);
                 save.disabled = !context.api.allows("configuration.write");
                 message.textContent = `Overwriting overlapping fields: ${pending.overlaps.join(", ")}. Review the draft before saving.`;
                 review.disabled = true;
@@ -10731,15 +10747,24 @@ var Amaterasu;
                     settingsSetDraftNumber(recentGames, draftValues.recent_games);
                     settingsSetDraftNumber(recentMaxAgeDays, draftValues.recent_max_age_days);
                     exclusions.setValue(draftValues.exclude_games);
-                    configureProviderConflictReview("steam", status, save, (values) => {
-                        settingsSetDraftCheckbox(enabled, values.enabled);
-                        settingsSetDraftCheckbox(autoSync, values.auto_sync);
-                        settingsSetDraftCheckbox(includeTools, values.include_tools);
-                        settingsSetDraftCheckbox(syncAllInstalled, values.sync_all_installed);
-                        settingsSetDraftCheckbox(autosyncRemoveUninstalled, values.autosync_remove_uninstalled);
-                        settingsSetDraftNumber(recentGames, values.recent_games);
-                        settingsSetDraftNumber(recentMaxAgeDays, values.recent_max_age_days);
-                        exclusions.setValue(values.exclude_games);
+                    configureProviderConflictReview("steam", status, save, (values, fields) => {
+                        const selected = new Set(fields);
+                        if (selected.has("enabled"))
+                            settingsSetDraftCheckbox(enabled, values.enabled);
+                        if (selected.has("auto_sync"))
+                            settingsSetDraftCheckbox(autoSync, values.auto_sync);
+                        if (selected.has("include_tools"))
+                            settingsSetDraftCheckbox(includeTools, values.include_tools);
+                        if (selected.has("sync_all_installed"))
+                            settingsSetDraftCheckbox(syncAllInstalled, values.sync_all_installed);
+                        if (selected.has("autosync_remove_uninstalled"))
+                            settingsSetDraftCheckbox(autosyncRemoveUninstalled, values.autosync_remove_uninstalled);
+                        if (selected.has("recent_games"))
+                            settingsSetDraftNumber(recentGames, values.recent_games);
+                        if (selected.has("recent_max_age_days"))
+                            settingsSetDraftNumber(recentMaxAgeDays, values.recent_max_age_days);
+                        if (selected.has("exclude_games"))
+                            exclusions.setValue(values.exclude_games);
                     });
                 }
                 void loadSteamRuntimeStatus(runtimeStatus, context, settings, generation);
@@ -10914,12 +10939,18 @@ var Amaterasu;
                     settingsSetDraftCheckbox(removeUninstalled, draftValues.autosync_remove_uninstalled);
                     settingsSetDraftCheckbox(includeSteam, draftValues.include_steam);
                     exclusions.setValues(draftValues.exclude_games);
-                    configureProviderConflictReview("lutris", saveStatus, save, (values) => {
-                        settingsSetDraftCheckbox(enabled, values.enabled);
-                        settingsSetDraftCheckbox(autoSync, values.auto_sync);
-                        settingsSetDraftCheckbox(removeUninstalled, values.autosync_remove_uninstalled);
-                        settingsSetDraftCheckbox(includeSteam, values.include_steam);
-                        exclusions.setValues(values.exclude_games);
+                    configureProviderConflictReview("lutris", saveStatus, save, (values, fields) => {
+                        const selected = new Set(fields);
+                        if (selected.has("enabled"))
+                            settingsSetDraftCheckbox(enabled, values.enabled);
+                        if (selected.has("auto_sync"))
+                            settingsSetDraftCheckbox(autoSync, values.auto_sync);
+                        if (selected.has("autosync_remove_uninstalled"))
+                            settingsSetDraftCheckbox(removeUninstalled, values.autosync_remove_uninstalled);
+                        if (selected.has("include_steam"))
+                            settingsSetDraftCheckbox(includeSteam, values.include_steam);
+                        if (selected.has("exclude_games"))
+                            exclusions.setValues(values.exclude_games);
                     });
                 }
             }

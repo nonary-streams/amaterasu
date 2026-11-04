@@ -3184,7 +3184,7 @@ namespace Amaterasu {
       provider: string,
       status: HTMLElement,
       save: HTMLButtonElement,
-      applyValues: (values: Record<string, unknown>) => void,
+      applyValues: (values: Record<string, unknown>, fields: readonly string[]) => void,
     ): void => {
       const pending = pendingProviderDrafts.get(provider);
       if (!pending || pending.overlaps.length === 0) return;
@@ -3198,11 +3198,8 @@ namespace Amaterasu {
         overwrite.disabled = true;
       }, "secondary");
       const overwrite = button("Overwrite overlapping fields", () => {
-        const merged = { ...(pending.merged ?? pending.latest ?? {}) };
-        for (const field of pending.overlaps) merged[field] = pending.submitted[field];
-        pending.merged = merged;
         pending.reviewed = true;
-        applyValues(merged);
+        applyValues(pending.submitted, pending.overlaps);
         save.disabled = !context.api.allows("configuration.write");
         message.textContent = `Overwriting overlapping fields: ${pending.overlaps.join(", ")}. Review the draft before saving.`;
         review.disabled = true;
@@ -3861,15 +3858,16 @@ namespace Amaterasu {
           settingsSetDraftNumber(recentGames, draftValues.recent_games);
           settingsSetDraftNumber(recentMaxAgeDays, draftValues.recent_max_age_days);
           exclusions.setValue(draftValues.exclude_games);
-          configureProviderConflictReview("steam", status, save, (values) => {
-            settingsSetDraftCheckbox(enabled, values.enabled as boolean);
-            settingsSetDraftCheckbox(autoSync, values.auto_sync as boolean);
-            settingsSetDraftCheckbox(includeTools, values.include_tools as boolean);
-            settingsSetDraftCheckbox(syncAllInstalled, values.sync_all_installed as boolean);
-            settingsSetDraftCheckbox(autosyncRemoveUninstalled, values.autosync_remove_uninstalled as boolean);
-            settingsSetDraftNumber(recentGames, values.recent_games as number);
-            settingsSetDraftNumber(recentMaxAgeDays, values.recent_max_age_days as number);
-            exclusions.setValue(values.exclude_games as SteamSettings["values"]["exclude_games"]);
+          configureProviderConflictReview("steam", status, save, (values, fields) => {
+            const selected = new Set(fields);
+            if (selected.has("enabled")) settingsSetDraftCheckbox(enabled, values.enabled as boolean);
+            if (selected.has("auto_sync")) settingsSetDraftCheckbox(autoSync, values.auto_sync as boolean);
+            if (selected.has("include_tools")) settingsSetDraftCheckbox(includeTools, values.include_tools as boolean);
+            if (selected.has("sync_all_installed")) settingsSetDraftCheckbox(syncAllInstalled, values.sync_all_installed as boolean);
+            if (selected.has("autosync_remove_uninstalled")) settingsSetDraftCheckbox(autosyncRemoveUninstalled, values.autosync_remove_uninstalled as boolean);
+            if (selected.has("recent_games")) settingsSetDraftNumber(recentGames, values.recent_games as number);
+            if (selected.has("recent_max_age_days")) settingsSetDraftNumber(recentMaxAgeDays, values.recent_max_age_days as number);
+            if (selected.has("exclude_games")) exclusions.setValue(values.exclude_games as SteamSettings["values"]["exclude_games"]);
           });
         }
         void loadSteamRuntimeStatus(runtimeStatus, context, settings, generation);
@@ -4079,12 +4077,13 @@ namespace Amaterasu {
           settingsSetDraftCheckbox(removeUninstalled, draftValues.autosync_remove_uninstalled);
           settingsSetDraftCheckbox(includeSteam, draftValues.include_steam);
           exclusions.setValues(draftValues.exclude_games);
-          configureProviderConflictReview("lutris", saveStatus, save, (values) => {
-            settingsSetDraftCheckbox(enabled, values.enabled as boolean);
-            settingsSetDraftCheckbox(autoSync, values.auto_sync as boolean);
-            settingsSetDraftCheckbox(removeUninstalled, values.autosync_remove_uninstalled as boolean);
-            settingsSetDraftCheckbox(includeSteam, values.include_steam as boolean);
-            exclusions.setValues(values.exclude_games as LutrisSettings["values"]["exclude_games"]);
+          configureProviderConflictReview("lutris", saveStatus, save, (values, fields) => {
+            const selected = new Set(fields);
+            if (selected.has("enabled")) settingsSetDraftCheckbox(enabled, values.enabled as boolean);
+            if (selected.has("auto_sync")) settingsSetDraftCheckbox(autoSync, values.auto_sync as boolean);
+            if (selected.has("autosync_remove_uninstalled")) settingsSetDraftCheckbox(removeUninstalled, values.autosync_remove_uninstalled as boolean);
+            if (selected.has("include_steam")) settingsSetDraftCheckbox(includeSteam, values.include_steam as boolean);
+            if (selected.has("exclude_games")) exclusions.setValues(values.exclude_games as LutrisSettings["values"]["exclude_games"]);
           });
         }
       } catch (error) {

@@ -16,14 +16,16 @@ const transpiledPicker = ts.transpile(
 );
 
 function html() {
-  return `<!doctype html><meta charset="utf-8"><main id="mount"></main><button id="outside">Outside</button>
+  return `<!doctype html><meta charset="utf-8"><form id="settings"><main id="mount"></main><button id="save" type="submit">Save settings</button></form><button id="outside">Outside</button>
 <script>
+window.__saveRequests = 0;
+document.querySelector("#settings").addEventListener("submit", event => { event.preventDefault(); window.__saveRequests++; });
 window.Amaterasu = {
   localizedMessage: value => ({kind:"localized", value}),
   literalText: value => ({kind:"literal", value}),
   textValueNode: value => document.createTextNode(typeof value === "string" ? value : value.value),
-  translateText: value => value,
-  setLocalizedTextContent(target, value) { target.replaceChildren(document.createTextNode(value)); target.dataset.localeText=value; },
+  translateText: value => window.__translations?.[value] ?? value,
+  setLocalizedTextContent(target, value) { target.replaceChildren(document.createTextNode(this.translateText(value))); target.dataset.localeText=value; },
   setLocalizedAttribute(target, name, value) { target.setAttribute(name,value); target.setAttribute("data-locale-"+name,value); },
   setLocalizedAttributeTemplate(target, name, source, values) {
     target.setAttribute(name, source.replace(/\\{(\\w+)\\}/g, (_, key) => values[key].value));
@@ -193,9 +195,34 @@ test("Chromium permits manual exclusions without discovery and omits cleared opt
   const {cdp} = browser;
   await cdp.evaluate(`window.__picker.dispose(); window.__pendingLists=[]; window.__api.permissions.clear(); window.__createPicker([]); true`);
   assert.equal(await cdp.evaluate(`document.querySelector('.steam-exclusion-picker [role=status]').textContent.includes('steam.read')`), true);
-  await cdp.evaluate(`document.querySelector('[aria-label="Steam app ID to exclude"]').value='42'; document.querySelector('[aria-label="Steam game name to exclude"]').value='Optional'; document.querySelector('.steam-exclusion-manual-add').requestSubmit(); true`);
+  await cdp.evaluate(`document.querySelector('[aria-label="Steam app ID to exclude"]').value='42'; document.querySelector('[aria-label="Steam game name to exclude"]').value='Optional'; document.querySelector('.steam-exclusion-manual-add button').click(); true`);
   assert.deepEqual(await cdp.evaluate(`window.__picker.value()`), [{id:"42",name:"Optional"}]);
+  assert.equal(await cdp.evaluate(`window.__saveRequests`), 0);
   await cdp.evaluate(`(()=>{const name=document.querySelector('.steam-exclusion-saved input[aria-label="Edit excluded Steam game name"]'); name.value=''; name.dispatchEvent(new Event('input',{bubbles:true})); return true})()`);
   assert.deepEqual(await cdp.evaluate(`window.__picker.value()`), [{id:"42"}]);
+  await cdp.evaluate(`(()=>{const name=document.querySelector('[aria-label="Steam game name to exclude"]'); name.value='Name from Enter'; name.focus(); return true})()`);
+  await cdp.command("Input.dispatchKeyEvent", {type:"keyDown", key:"Enter", code:"Enter", windowsVirtualKeyCode:13});
+  await cdp.command("Input.dispatchKeyEvent", {type:"keyUp", key:"Enter", code:"Enter", windowsVirtualKeyCode:13});
+  await tick();
+  assert.deepEqual(await cdp.evaluate(`window.__picker.value()`), [{id:"42"},{name:"Name from Enter"}]);
+  assert.equal(await cdp.evaluate(`window.__saveRequests`), 0);
   assert.equal(await cdp.evaluate(`window.__pendingLists.length`), 0);
+});
+
+
+test("Chromium focuses manual entry after removing the last row and translates combined warnings", async t => {
+  if (!browser) return t.skip("Chromium browser setup unavailable.");
+  const {cdp} = browser;
+  await cdp.evaluate(`window.__picker.dispose(); window.__pendingLists=[]; window.__api.permissions.add("steam.read"); window.__translations={"Steam scan is incomplete; existing exclusions are preserved.":"FR: analyse incomplète", "The Steam list changed while paging; restarted at the latest revision.":"FR: reprise après changement"}; window.__createPicker([{id:"91",name:"Only row"}]); true`);
+  await cdp.evaluate(`window.__resolveList(0,{revision:1,games:[],next_after:32,scanning:false,complete:false}); true`);
+  await tick();
+  await cdp.evaluate(`document.querySelector('.steam-exclusion-saved button').focus(); document.querySelector('.steam-exclusion-saved button').click(); true`);
+  assert.equal(await cdp.evaluate(`document.activeElement.dataset.focusKey`), "manual-id");
+  await cdp.evaluate(`document.querySelector('.steam-exclusion-picker > button').click(); true`);
+  await cdp.evaluate(`window.__resolveList(1,{revision:2,games:[],next_after:64,scanning:false,complete:false}); true`);
+  await tick();
+  assert.equal(await cdp.evaluate(`window.__pendingLists.length`), 3);
+  await cdp.evaluate(`window.__resolveList(2,{revision:2,games:[],next_after:null,scanning:false,complete:false}); true`);
+  await tick();
+  assert.equal(await cdp.evaluate(`document.querySelector('.steam-exclusion-warning').textContent`), "FR: analyse incomplète FR: reprise après changement");
 });

@@ -29,6 +29,7 @@ class Node {
       if (typeof child !== "string") child.parentNode = this;
       this.children.push(child);
     }
+    this.textContent = this.children.map(child => typeof child === "string" ? child : child.textContent ?? "").join("");
   }
   replaceChildren(...children) {
     for (const child of this.children) if (typeof child !== "string") child.parentNode = null;
@@ -256,8 +257,8 @@ test("manual add edits saved exclusions without steam.read and removes a blank o
   const manualId = find(picker.node, node => node.tagName === "input" && node.attributes.get("aria-label") === "Steam app ID to exclude");
   const manualName = find(picker.node, node => node.tagName === "input" && node.attributes.get("aria-label") === "Steam game name to exclude");
   manualName.value = "  Manual title ";
-  const form = find(picker.node, node => node.tagName === "form" && node.className === "steam-exclusion-manual-add");
-  form.dispatchEvent({ type: "submit", preventDefault() {} });
+  const add = find(picker.node, node => node.tagName === "button" && node.textContent === "Add exclusion");
+  add.click();
   assert.deepEqual(JSON.parse(JSON.stringify(picker.value())), [{ id: "9" }, { name: "Manual title" }]);
   assert.equal(manualId.value, "");
   assert.equal(manualName.value, "");
@@ -273,8 +274,8 @@ test("manual add enforces the 256 exclusion cap", async () => {
   await tick();
   const manualName = find(picker.node, node => node.tagName === "input" && node.attributes.get("aria-label") === "Steam game name to exclude");
   manualName.value = "One too many";
-  const form = find(picker.node, node => node.tagName === "form" && node.className === "steam-exclusion-manual-add");
-  form.dispatchEvent({ type: "submit", preventDefault() {} });
+  const add = find(picker.node, node => node.tagName === "button" && node.textContent === "Add exclusion");
+  add.click();
   assert.equal(picker.value().length, 256);
   assert.match(find(picker.node, node => node.tagName === "p" && node.attributes.get("aria-live") === "polite" && node.textContent.includes("up to 256")).textContent, /up to 256/);
 });
@@ -348,4 +349,15 @@ test("incomplete and revision restart warnings are visible and stale status labe
   assert.match(warning.textContent, /restarted at the latest revision/);
   assert.equal(picker.node.children[5].attributes.get("aria-label"), "0 matching loaded games; 0 exclusions");
   assert.equal(picker.node.children[5].attributes.has("title"), false);
+});
+
+
+test("removing the final saved exclusion moves focus to manual entry", async () => {
+  const picker = create([{ id: "42", name: "Only row" }], { allows: () => false, async post() { throw new Error("must not call"); } });
+  await tick();
+  const remove = find(picker.node, node => node.tagName === "button" && node.attributes.get("aria-label") === "Remove exclusion 1");
+  remove.focus();
+  remove.click();
+  assert.equal(documentState.activeElement.attributes.get("data-focus-key"), "manual-id");
+  assert.deepEqual(JSON.parse(JSON.stringify(picker.value())), []);
 });

@@ -119,7 +119,7 @@ namespace Amaterasu {
     const saved = document.createElement("div");
     saved.className = "steam-exclusion-saved";
     steamPickerSetAttribute(saved, "aria-label", "Current Steam exclusions");
-    const manualAdd = document.createElement("form");
+    const manualAdd = document.createElement("div");
     manualAdd.className = "steam-exclusion-manual-add";
     const manualId = document.createElement("input");
     manualId.type = "text";
@@ -131,7 +131,7 @@ namespace Amaterasu {
     steamPickerSetAttribute(manualName, "aria-label", "Steam game name to exclude");
     steamPickerSetAttribute(manualName, "placeholder", "Game name");
     const manualAddButton = document.createElement("button");
-    manualAddButton.type = "submit";
+    manualAddButton.type = "button";
     manualAddButton.className = "button secondary";
     steamPickerSetText(manualAddButton, "Add exclusion");
     const manualAddStatus = document.createElement("p");
@@ -203,7 +203,13 @@ namespace Amaterasu {
       const warnings = [scanWarning, revisionChanged
         ? "The Steam list changed while paging; restarted at the latest revision."
         : ""].filter(Boolean);
-      steamPickerSetText(warning, warnings.join(" "));
+      warning.replaceChildren();
+      warnings.forEach((source, index) => {
+        if (index > 0) warning.append(document.createTextNode(" "));
+        const item = document.createElement("span");
+        steamPickerSetText(item, source);
+        warning.append(item);
+      });
       warning.hidden = warnings.length === 0;
       more.hidden = (!loadError && after === null) || disposed || !api.allows("steam.read");
       more.disabled = disabled || loading || disposed;
@@ -275,6 +281,12 @@ namespace Amaterasu {
           signalDraft();
           onChange(draft.map((value) => ({ ...value })));
           render(true);
+          const nextFocusKey = draft[index]
+            ? `saved-${index}-remove`
+            : draft.length
+              ? `saved-${draft.length - 1}-remove`
+              : "manual-id";
+          (allElements(root).find((element) => element.getAttribute?.("data-focus-key") === nextFocusKey) as HTMLElement | undefined)?.focus();
         }, { signal: lifecycle.signal });
         row.append(idInput, name, remove);
         saved.append(row);
@@ -354,7 +366,7 @@ namespace Amaterasu {
     }
 
     function allElements(parent: Element): Element[] {
-      return [parent, ...Array.from(parent.children).flatMap((child) => allElements(child))];
+      return [parent, ...Array.from(parent.children ?? []).flatMap((child) => allElements(child))];
     }
 
     async function load(): Promise<void> {
@@ -432,8 +444,7 @@ namespace Amaterasu {
     manualId.setAttribute("data-focus-key", "manual-id");
     manualName.setAttribute("data-focus-key", "manual-name");
     search.addEventListener("input", () => { if (!disabled) render(true); }, { signal: lifecycle.signal });
-    manualAdd.addEventListener("submit", (event) => {
-      event.preventDefault();
+    const addManualExclusion = (): void => {
       if (disposed || disabled) return;
       const id = manualId.value.trim();
       const name = manualName.value.trim();
@@ -457,7 +468,14 @@ namespace Amaterasu {
       onChange(draft.map((entry) => ({ ...entry })));
       render(true);
       manualName.focus();
-    }, { signal: lifecycle.signal });
+    };
+    manualAddButton.addEventListener("click", addManualExclusion, { signal: lifecycle.signal });
+    for (const field of [manualId, manualName])
+      field.addEventListener("keydown", (event) => {
+        if ((event as KeyboardEvent).key !== "Enter") return;
+        event.preventDefault();
+        addManualExclusion();
+      }, { signal: lifecycle.signal });
     more.addEventListener("click", () => {
       if (disposed || disabled) return;
       if (loadError) revisionRetries = 0;

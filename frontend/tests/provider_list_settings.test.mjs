@@ -650,15 +650,49 @@ test("Steam conflict rebases unrelated latest fields and requires an explicit ch
   assert.equal(save.disabled, true);
   assert.equal(f.draftGuard.isDirty(), true);
   assert.equal(buttonNamed(f.content, "Refresh")?.disabled, true);
+  inputNamed(form, "steam_include_tools").checked = true;
+  inputNamed(form, "steam_include_tools").fire("change");
 
   buttonNamed(form, "Overwrite overlapping fields").click();
   assert.equal(inputNamed(form, "steam_recent_games").value, "5");
   assert.equal(inputNamed(form, "steam_auto_sync").checked, false);
+  assert.equal(inputNamed(form, "steam_include_tools").checked, true);
   assert.equal(save.disabled, false);
   submit(form);
   await tick();
   assert.equal(f.state.steam.values.recent_games, 5);
   assert.equal(f.state.steam.values.auto_sync, false);
+  assert.equal(f.state.steam.values.include_tools, true);
+  assert.equal(f.draftGuard.isDirty(), false);
+  f.draftGuard.dispose();
+});
+
+
+test("Steam keep-latest review preserves edits made while the conflict decision is visible", async () => {
+  const f = fixture();
+  await tick();
+  f.conflictNext.add("steam");
+  f.conflictOverrides.set("steam", { recent_games: 10 });
+  let form = formFor(f, "steam");
+  inputNamed(form, "steam_recent_games").value = "5";
+  inputNamed(form, "steam_recent_games").fire("input");
+  inputNamed(form, "steam_auto_sync").checked = false;
+  inputNamed(form, "steam_auto_sync").fire("change");
+  submit(form);
+  await tick();
+
+  form = formFor(f, "steam");
+  inputNamed(form, "steam_include_tools").checked = true;
+  inputNamed(form, "steam_include_tools").fire("change");
+  buttonNamed(form, "Review and keep latest values").click();
+  assert.equal(inputNamed(form, "steam_recent_games").value, "10");
+  assert.equal(inputNamed(form, "steam_auto_sync").checked, false);
+  assert.equal(inputNamed(form, "steam_include_tools").checked, true);
+  submit(form);
+  await tick();
+  assert.equal(f.state.steam.values.recent_games, 10);
+  assert.equal(f.state.steam.values.auto_sync, false);
+  assert.equal(f.state.steam.values.include_tools, true);
   assert.equal(f.draftGuard.isDirty(), false);
   f.draftGuard.dispose();
 });
