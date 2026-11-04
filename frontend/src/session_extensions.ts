@@ -90,8 +90,6 @@ namespace Amaterasu {
             const isOverride = Object.hasOwn(document.values, option.id);
             const editorValue = isOverride ? document.values[option.id] : effective.value;
             const isSlider = option.presentation === "slider";
-            if (option.presentation != null && option.presentation !== "keybinding" && !isSlider)
-              throw new Error("Unsupported extension setting presentation.");
             const editor = option.presentation === "keybinding"
               ? extensionKeybindingSettingEditor(option.definition, editorValue)
               : isSlider ? extensionSliderEditor(option.definition, editorValue, option.label)

@@ -459,6 +459,15 @@ older value into a plugin scope is a provider-owned migration, not an implicit
 consumer fallback. Retained data does not confer permission to read a record
 or apply an effect.
 
+The management frontend renders provider descriptors with its own typed editors;
+providers do not supply HTML or JavaScript. The optional `slider` presentation
+hint selects a paired range and number editor for a bounded numeric definition.
+The current frontend falls back to the typed editor for an unrecognized hint;
+an unsupported definition still fails validation. Frontends released before
+slider support reject this hint, so deploy a compatible frontend with a host or
+provider that publishes it. Descriptor admission itself must understand the
+hint before it can be published.
+
 The coordinator can select `journal_in_runtime_state: true` instead of an
 absolute `journal_path`. This requires the existing
 `amaterasu.host-state-context/1` grant and places its journal in the worker's

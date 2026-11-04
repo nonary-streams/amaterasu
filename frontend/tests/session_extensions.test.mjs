@@ -158,3 +158,18 @@ test("live and unknown policy guidance does not claim runtime application", asyn
   await settle();
   assert.ok(unknown.nodes.some(node => node.tag === "small" && node.children[0] === "Application timing is not available."));
 });
+
+
+test("a future presentation hint falls back to its typed editor and saves edits", async () => {
+  const env = fixture({ kind: "application", id: "game" }, true, {});
+  env.descriptor.options[0].presentation = "future_control";
+  await settle();
+  assert.equal(env.editors.length, 1);
+  assert.equal(env.editors[0].definition.type, "boolean");
+  env.editors[0].value = () => true;
+  env.editors[0].node.listeners.input();
+  env.nodes.find(node => node.tag === "form").listeners.submit({ preventDefault() {} });
+  await Promise.all(env.pending);
+  assert.equal(env.calls.find(([route]) => route.endsWith("/settings_update"))[1].values.enabled, true);
+  assert.deepEqual(env.errors, []);
+});
