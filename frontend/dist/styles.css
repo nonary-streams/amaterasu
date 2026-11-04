@@ -709,6 +709,44 @@ td small {
   font-size: 12px;
   color: #d2dbe8;
 }
+.list-editor {
+  min-width: 0;
+  margin: 0 0 19px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+.list-editor legend {
+  padding: 0 7px;
+  color: #d2dbe8;
+  font-size: 12px;
+}
+.list-editor-items {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  margin: 0 0 10px;
+  padding-left: 28px;
+}
+.list-editor-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 9px;
+}
+.list-editor-input[aria-invalid="true"] {
+  border-color: var(--danger);
+}
+.list-editor-status:empty {
+  display: none;
+}
+.list-editor-status {
+  margin: 0 0 10px;
+  font-size: 12px;
+}
+.list-editor .button {
+  min-height: 40px;
+}
 .field small {
   font-size: 10px;
 }

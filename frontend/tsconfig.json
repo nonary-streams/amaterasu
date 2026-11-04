@@ -17,6 +17,7 @@
     "src/api.ts",
     "src/locale-catalogs.ts",
     "src/ui.ts",
+    "src/list_editor.ts",
     "src/theme.ts",
     "src/catalog.ts",
     "src/management-policy.ts",
