@@ -42,9 +42,32 @@ namespace Amaterasu {
     else target.textContent = source;
   }
 
+  function steamPickerSetTextTemplate(
+    target: Element,
+    source: string,
+    values: Readonly<Record<string, TextValue>>,
+  ): void {
+    const format = (locale: string): string => {
+      let rendered = typeof Amaterasu.translateText === "function"
+        ? Amaterasu.translateText(source) : source;
+      const formatter = new Intl.NumberFormat(locale);
+      for (const [name, value] of Object.entries(values)) {
+        const raw = typeof value === "string" ? value : value.value;
+        const formatted = /^\d+$/.test(raw) ? formatter.format(Number(raw)) : raw;
+        rendered = rendered.replaceAll(`{${name}}`, () => formatted);
+      }
+      return rendered;
+    };
+    if (typeof Amaterasu.localeFormattedTextNode === "function") {
+      target.replaceChildren(Amaterasu.localeFormattedTextNode(format));
+    } else {
+      steamPickerSetText(target, format("en"));
+    }
+  }
+
   function steamPickerSetAttribute(
     target: Element,
-    attribute: "aria-label" | "placeholder",
+    attribute: "aria-label" | "placeholder" | "title",
     source: string,
   ): void {
     if (typeof Amaterasu.setLocalizedAttribute === "function")
@@ -90,6 +113,11 @@ namespace Amaterasu {
     const status = document.createElement("p");
     status.setAttribute("role", "status");
     status.setAttribute("aria-live", "polite");
+    const savedLabel = document.createElement("h4");
+    steamPickerSetText(savedLabel, "Current exclusions");
+    const saved = document.createElement("div");
+    saved.className = "steam-exclusion-saved";
+    steamPickerSetAttribute(saved, "aria-label", "Current Steam exclusions");
     const results = document.createElement("div");
     steamPickerSetAttribute(results, "aria-label", "Steam games");
     const more = document.createElement("button");
@@ -112,7 +140,10 @@ namespace Amaterasu {
     let scanWarning = "";
     let loadError = "";
     let revisionChanged = false;
+    let revisionRetries = 0;
     let disposed = false;
+
+    const MAX_EXCLUSIONS = 256;
 
     function signalDraft(): void {
       draftSignal.value = JSON.stringify(draft);
@@ -122,30 +153,92 @@ namespace Amaterasu {
 
     function renderStatus(): void {
       if (!api.allows("steam.read")) {
-        steamPickerSetText(status, "Steam list unavailable: steam.read permission is required. Existing exclusions are unchanged.");
+        steamPickerSetText(status, "Steam discovery is unavailable without steam.read permission. Saved exclusions can still be edited.");
         more.hidden = true;
         return;
       }
       if (loading) {
         steamPickerSetText(status, "Loading Steam games…");
       } else if (loadError) {
-        steamPickerSetText(status, `${loadError} Your current draft is preserved.`);
+        steamPickerSetText(status, "Steam games could not be loaded. Your current draft is preserved.");
+        status.setAttribute("title", loadError);
       } else if (revision === null) {
         steamPickerSetText(status, "Steam game list has not been loaded.");
       } else {
-        const unavailable = draft.filter((entry) =>
-          entry.id && !games.some((game) => String(game.app_id) === entry.id),
-        );
-        steamPickerSetText(status,
-          `${games.filter((game) => game.name.toLocaleLowerCase().includes(search.value.trim().toLocaleLowerCase())).length} matching loaded games · ${draft.length} exclusions` +
-          (unavailable.length
-            ? ` · ${unavailable.length} existing ID exclusion(s) are not in this list and will be preserved`
-            : "") +
-          (revisionChanged ? " · The Steam list changed while paging; restarted at the latest revision." : "") +
-          (scanWarning ? ` · ${scanWarning}` : ""));
+        const matching = games.filter((game) => game.name.toLocaleLowerCase().includes(search.value.trim().toLocaleLowerCase())).length;
+        steamPickerSetTextTemplate(status, "{matchingCount} matching loaded games · {exclusionCount} exclusions", {
+          matchingCount: steamPickerLiteral(String(matching)),
+          exclusionCount: steamPickerLiteral(String(draft.length)),
+        });
+        steamPickerSetTemplate(status, "aria-label", "{matchingCount} matching loaded games; {exclusionCount} exclusions", {
+          matchingCount: steamPickerLiteral(String(matching)),
+          exclusionCount: steamPickerLiteral(String(draft.length)),
+        });
+        const warning = scanWarning || (revisionChanged
+          ? "The Steam list changed while paging; restarted at the latest revision."
+          : "");
+        if (warning) steamPickerSetAttribute(status, "title", warning);
       }
-      more.hidden = after === null || loading || disposed || !api.allows("steam.read");
+      more.hidden = (!loadError && after === null) || disposed || !api.allows("steam.read");
       more.disabled = loading || disposed;
+      steamPickerSetText(more, loadError ? "Retry loading games" : "Load more games");
+    }
+
+    function renderSaved(): void {
+      saved.replaceChildren();
+      draft.forEach((entry, index) => {
+        const row = document.createElement("div");
+        row.className = "steam-exclusion-saved-item";
+        const idInput = document.createElement("input");
+        idInput.type = "text";
+        idInput.inputMode = "numeric";
+        idInput.value = entry.id ?? "";
+        steamPickerSetAttribute(idInput, "aria-label", "Edit excluded Steam app ID");
+        steamPickerSetAttribute(idInput, "placeholder", "Optional Steam app ID");
+        idInput.addEventListener("input", () => {
+          if (disposed) return;
+          const id = idInput.value.trim();
+          if (id) draft[index] = { ...draft[index], id };
+          else {
+            const current = draft[index];
+            if (!current) return;
+            const { id: _oldId, ...withoutId } = current;
+            draft[index] = withoutId;
+          }
+          signalDraft();
+          onChange(draft.map((value) => ({ ...value })));
+          renderStatus();
+        }, { signal: lifecycle.signal });
+        const name = document.createElement("input");
+        name.type = "text";
+        name.value = entry.name ?? "";
+        steamPickerSetAttribute(name, "aria-label", entry.id
+          ? "Edit excluded Steam game name"
+          : "Edit name-only Steam exclusion");
+        name.addEventListener("input", () => {
+          if (disposed) return;
+          draft[index] = { ...draft[index], name: name.value };
+          signalDraft();
+          onChange(draft.map((value) => ({ ...value })));
+          renderStatus();
+        }, { signal: lifecycle.signal });
+        const remove = document.createElement("button");
+        remove.type = "button";
+        remove.className = "button secondary";
+        steamPickerSetText(remove, "Remove exclusion");
+        steamPickerSetTemplate(remove, "aria-label", "Remove exclusion {index}", {
+          index: steamPickerLiteral(String(index + 1)),
+        });
+        remove.addEventListener("click", () => {
+          if (disposed) return;
+          draft = draft.filter((_, currentIndex) => currentIndex !== index);
+          signalDraft();
+          onChange(draft.map((value) => ({ ...value })));
+          render();
+        }, { signal: lifecycle.signal });
+        row.append(idInput, name, remove);
+        saved.append(row);
+      });
     }
 
     function renderResults(): void {
@@ -163,10 +256,17 @@ namespace Amaterasu {
           if (disposed) return;
           const id = String(game.app_id);
           draft = draft.filter((entry) => entry.id !== id);
-          if (checkbox.checked) draft.push({ id, name: game.name });
+          if (checkbox.checked) {
+            if (draft.length >= MAX_EXCLUSIONS) {
+              checkbox.checked = false;
+              steamPickerSetText(status, "You can exclude up to 256 Steam games. Remove an exclusion before adding another.");
+              return;
+            }
+            draft.push({ id, name: game.name });
+          }
           signalDraft();
           onChange(draft.map((entry) => ({ ...entry })));
-          renderStatus();
+          render();
         }, { signal: lifecycle.signal });
         const name = document.createElement("span");
         name.textContent = game.name;
@@ -174,7 +274,9 @@ namespace Amaterasu {
         steamPickerSetTemplate(id, "aria-label", "Steam app {appId}", {
           appId: steamPickerLiteral(String(game.app_id)),
         });
-        id.textContent = `Steam app ${game.app_id}`;
+        steamPickerSetTextTemplate(id, "Steam app {appId}", {
+          appId: steamPickerLiteral(String(game.app_id)),
+        });
         label.append(checkbox, name, id);
         results.append(label);
       }
@@ -191,6 +293,7 @@ namespace Amaterasu {
     function render(): void {
       if (disposed) return;
       renderStatus();
+      renderSaved();
       renderResults();
     }
 
@@ -203,7 +306,7 @@ namespace Amaterasu {
         const reply = await api.post<SteamListReply>("steam/list", {
           ...(revision !== null ? { revision } : {}),
           ...(after !== null ? { after } : {}),
-          limit: 50,
+          limit: 32,
         });
         if (disposed) return;
         if (!Number.isSafeInteger(reply.revision) || reply.revision < 0 ||
@@ -213,7 +316,11 @@ namespace Amaterasu {
           throw new Error("Steam game list response is invalid.");
         }
         if (revision !== null && reply.revision !== revision) {
-          // Cursors belong to one snapshot. Discard pages, but retain the dirty draft.
+          // Cursors belong to one snapshot. Bound retries if the list keeps changing.
+          if (revisionRetries >= 2) {
+            throw new Error("Steam game list kept changing. Retry loading games to try again.");
+          }
+          revisionRetries += 1;
           revision = null;
           after = null;
           games = [];
@@ -223,6 +330,7 @@ namespace Amaterasu {
           return;
         }
 
+        revisionRetries = 0;
         revision = reply.revision;
         const uniqueGames = new Map(games.map((game) => [game.app_id, game]));
         for (const game of reply.games) {
@@ -239,7 +347,21 @@ namespace Amaterasu {
             : "";
       } catch (error) {
         if (disposed) return;
-        loadError = error instanceof Error ? error.message : "Unable to load Steam games.";
+        const revisionConflict = typeof error === "object" && error !== null &&
+          "code" in error && error.code === "revision_conflict";
+        if (revisionConflict && revisionRetries < 2) {
+          revisionRetries += 1;
+          revision = null;
+          after = null;
+          games = [];
+          revisionChanged = true;
+          loading = false;
+          await load();
+          return;
+        }
+        loadError = revisionConflict
+          ? "Steam game list kept changing. Retry loading games to try again."
+          : error instanceof Error ? error.message : "Unable to load Steam games.";
       } finally {
         loading = false;
         if (!disposed) render();
@@ -247,8 +369,11 @@ namespace Amaterasu {
     }
 
     search.addEventListener("input", render, { signal: lifecycle.signal });
-    more.addEventListener("click", () => { void load(); }, { signal: lifecycle.signal });
-    root.append(heading, help, search, status, results, more, draftSignal);
+    more.addEventListener("click", () => {
+      if (loadError) revisionRetries = 0;
+      void load();
+    }, { signal: lifecycle.signal });
+    root.append(heading, help, savedLabel, saved, search, status, results, more, draftSignal);
     render();
     void load();
     return {

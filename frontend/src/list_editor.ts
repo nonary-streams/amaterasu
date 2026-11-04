@@ -20,6 +20,7 @@ namespace Amaterasu {
     text: string;
     value: Value | undefined;
     valid: boolean;
+    validationMessage?: string;
   }
 
   let nextListEditorId = 0;
@@ -38,6 +39,27 @@ namespace Amaterasu {
     if (typeof Amaterasu.setLocalizedAttribute === "function")
       Amaterasu.setLocalizedAttribute(target, attribute, source);
     else target.setAttribute(attribute, source);
+  }
+
+  function listEditorSetTextTemplate(
+    target: Element,
+    source: string,
+    values: Readonly<Record<string, TextValue>>,
+  ): void {
+    const format = (locale: string): string => {
+      let rendered = typeof Amaterasu.translateText === "function"
+        ? Amaterasu.translateText(source) : source;
+      const formatter = new Intl.NumberFormat(locale);
+      for (const [name, value] of Object.entries(values)) {
+        const raw = typeof value === "string" ? value : value.value;
+        const formatted = /^\d+$/.test(raw) ? formatter.format(Number(raw)) : raw;
+        rendered = rendered.replaceAll(`{${name}}`, () => formatted);
+      }
+      return rendered;
+    };
+    if (typeof Amaterasu.localeFormattedTextNode === "function")
+      target.replaceChildren(Amaterasu.localeFormattedTextNode(format));
+    else target.textContent = format("en");
   }
 
   function listEditorSetTemplate(
@@ -148,13 +170,21 @@ namespace Amaterasu {
         input.type = "text";
         input.className = "list-editor-input";
         input.value = entry.text;
+        const errorElement = document.createElement("small");
+        errorElement.id = `amaterasu-list-editor-error-${id}-${index}`;
+        errorElement.className = "list-editor-error";
+        listEditorSetText(errorElement, entry.validationMessage ?? "");
+        if (!entry.valid) input.setAttribute("aria-invalid", "true");
         listEditorSetTemplate(input, "{label}, item {index}", {
           label: typeof Amaterasu.localizedMessage === "function"
             ? Amaterasu.localizedMessage(options.label) : options.label,
           index: typeof Amaterasu.literalText === "function"
             ? Amaterasu.literalText(String(index + 1)) : String(index + 1),
         });
-        input.setAttribute("aria-describedby", [description?.id, status.id].filter(Boolean).join(" "));
+        input.setAttribute(
+          "aria-describedby",
+          [description?.id, status.id, errorElement.id].filter(Boolean).join(" "),
+        );
         input.addEventListener("input", () => {
           entry.text = input.value;
           signalDraft();
@@ -165,16 +195,21 @@ namespace Amaterasu {
           } catch (error) {
             entry.value = undefined;
             entry.valid = false;
-            input.setAttribute("aria-invalid", "true");
             const message = error && typeof error === "object" && "message" in error
               ? (error as { message?: unknown }).message
               : undefined;
-            setStatus(typeof message === "string" ? message : "This value is invalid.");
+            entry.validationMessage = typeof message === "string"
+              ? message : "This value is invalid.";
+            input.setAttribute("aria-invalid", "true");
+            listEditorSetText(errorElement, entry.validationMessage);
+            setStatus(entry.validationMessage);
             return;
           }
           entry.value = value;
           entry.valid = true;
+          entry.validationMessage = undefined;
           input.removeAttribute("aria-invalid");
+          listEditorSetText(errorElement, "");
           setStatus("");
           publish();
         }, { signal: rowController.signal });
@@ -196,7 +231,7 @@ namespace Amaterasu {
           renderRows(Math.min(index, entries.length - 1));
           publish();
         }, { signal: rowController.signal });
-        item.append(input, remove);
+        item.append(input, remove, errorElement);
         list.append(item);
       });
       add.disabled = entries.length >= maxItems;
@@ -208,7 +243,10 @@ namespace Amaterasu {
 
     add.addEventListener("click", () => {
       if (entries.length >= maxItems) {
-        setStatus(`This list can contain at most ${maxItems} items.`);
+        listEditorSetTextTemplate(status, "This list can contain at most {maxItems} items.", {
+          maxItems: typeof Amaterasu.literalText === "function"
+            ? Amaterasu.literalText(String(maxItems)) : String(maxItems),
+        });
         return;
       }
       entries.push({ text: "", value: undefined, valid: false });

@@ -128,6 +128,50 @@ test("invalid edits are announced and excluded from readable values until correc
   assert.deepEqual(editor.values(), ["other.plugin"]);
 });
 
+test("invalid row indicators and messages survive add and remove rerenders", () => {
+  const editor = context.Amaterasu.accessibleListEditor({
+    label: "Plugin IDs",
+    values: ["first.plugin", "second.plugin"],
+    formatValue: value => value,
+    parseValue: value => {
+      if (!/^[a-z.]+$/.test(value)) throw new Error("Use lowercase plugin IDs.");
+      return value;
+    },
+  });
+  inputs(editor)[1].value = "INVALID VALUE";
+  inputs(editor)[1].dispatch("input");
+  assert.equal(inputs(editor)[1].getAttribute("aria-invalid"), "true");
+  assert.equal(editor.element.children[1].children[1].children[2].textContent, "Use lowercase plugin IDs.");
+
+  editor.element.children[3].dispatch("click");
+  assert.equal(inputs(editor)[1].getAttribute("aria-invalid"), "true");
+  assert.equal(editor.element.children[1].children[1].children[2].textContent, "Use lowercase plugin IDs.");
+
+  buttons(editor)[0].dispatch("click");
+  assert.equal(inputs(editor)[0].getAttribute("aria-invalid"), "true");
+  assert.equal(editor.element.children[1].children[0].children[2].textContent, "Use lowercase plugin IDs.");
+  assert.match(inputs(editor)[0].getAttribute("aria-describedby"), /amaterasu-list-editor-error-/);
+  assert.equal(editor.element.children[2].textContent, "");
+  editor.dispose();
+});
+
+test("dispose detaches editor nodes and prevents stale controls from acting", () => {
+  const editor = context.Amaterasu.accessibleListEditor({
+    label: "Categories",
+    values: ["original"],
+    formatValue: value => value,
+    parseValue: value => value,
+  });
+  const add = editor.element.children[3];
+  const input = inputs(editor)[0];
+  editor.dispose();
+  add.dispatch("click");
+  input.value = "stale update";
+  input.dispatch("input");
+  assert.equal(editor.element.children.length, 0);
+  assert.throws(() => editor.setValues(["new"]), /disposed/);
+});
+
 test("editor enforces item bounds and updates from replacement values", () => {
   const editor = context.Amaterasu.accessibleListEditor({
     label: "Categories", values: ["one"], maxItems: 1,

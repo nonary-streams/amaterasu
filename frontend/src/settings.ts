@@ -37,6 +37,16 @@ namespace Amaterasu {
     settingsDispatchDraftEvent(control, "input");
   }
 
+  function setSettingsFormDisabled(form: HTMLElement, disabled: boolean): void {
+    const visit = (node: Element): void => {
+      if (!node || typeof node.tagName !== "string") return;
+      if (["INPUT", "BUTTON", "SELECT", "TEXTAREA"].includes(node.tagName))
+        (node as Element & { disabled: boolean }).disabled = disabled;
+      for (const child of Array.from(node.children)) visit(child);
+    };
+    visit(form);
+  }
+
   function settingsLocalizedAttributeTemplate(
     target: Element,
     source: string,
@@ -3287,7 +3297,18 @@ namespace Amaterasu {
     );
     if (context.registerDraftGuard) {
       drafts = trackDrafts(categoryContent, updateDraftStatus);
-      context.registerDraftGuard(() => clientSaveBusy || (drafts?.isDirty() ?? false), drafts.dispose);
+      context.registerDraftGuard(() => clientSaveBusy || (drafts?.isDirty() ?? false), () => {
+        steamLoads.invalidate();
+        lutrisLoads.invalidate();
+        playniteLoads.invalidate();
+        activeSteamExclusionPicker?.dispose();
+        activeSteamExclusionPicker = null;
+        activeLutrisExclusionEditor?.dispose();
+        activeLutrisExclusionEditor = null;
+        for (const editor of activePlayniteListEditors) editor.dispose();
+        activePlayniteListEditors = [];
+        drafts?.dispose();
+      });
     }
     renderManagementPolicy(context, managementArea);
     renderCsrfPolicy(context, csrfArea);
@@ -3710,6 +3731,7 @@ namespace Amaterasu {
                 ),
               };
               requestedValues = values;
+              setSettingsFormDisabled(form, true);
               saveStarted = true;
               const saved = await saveSteamSettings(context.api, settings, values);
               await loadSteam();
@@ -3719,19 +3741,20 @@ namespace Amaterasu {
             } catch (error) {
               if (saveStarted) {
                 const conflict = error instanceof ApiError && error.code === "revision_conflict";
-                const nextDraft = conflict ? requestedValues ?? undefined : undefined;
+                const nextDraft = requestedValues ?? undefined;
                 const notice = conflict
                   ? "Settings changed elsewhere. Your draft is preserved; review it before saving again."
-                  : "Steam save could not be confirmed. The latest saved values were reloaded.";
+                  : "Steam save could not be confirmed. Your submitted draft is preserved for review against the latest saved values.";
                 await loadSteam(nextDraft, notice);
                 context.notify(settingsTextMessage(conflict
                   ? "Steam settings changed elsewhere. Your draft is preserved for review."
-                  : "Steam save could not be confirmed. Review the latest values before saving again."));
+                  : "Steam save could not be confirmed. Review your preserved draft against the latest saved values before saving again."));
                 return;
               }
               throw error;
             } finally {
               actionInProgress = false;
+              if (form.isConnected) setSettingsFormDisabled(form, false);
               cancel.disabled = false;
             }
           });
@@ -3752,7 +3775,7 @@ namespace Amaterasu {
         void loadSteamRuntimeStatus(runtimeStatus, context, settings, generation);
       } catch (error) {
         if (context.content.isConnected)
-          steamArea.replaceChildren(errorPanel(error, loadSteam));
+          steamArea.replaceChildren(errorPanel(error, () => { void loadSteam(draftValues, draftNotice); }));
       }
     }
     async function loadLutris(
@@ -3886,6 +3909,7 @@ namespace Amaterasu {
                 exclude_games: parseLutrisExclusions(JSON.stringify(exclusions.values())),
               };
               requestedValues = values;
+              setSettingsFormDisabled(form, true);
               saveStarted = true;
               await saveLutrisSettings(context.api, settings, values);
               await loadLutris();
@@ -3893,19 +3917,20 @@ namespace Amaterasu {
             } catch (error) {
               if (saveStarted) {
                 const conflict = error instanceof ApiError && error.code === "revision_conflict";
-                const nextDraft = conflict ? requestedValues ?? undefined : undefined;
+                const nextDraft = requestedValues ?? undefined;
                 const notice = conflict
                   ? "Settings changed elsewhere. Your draft is preserved; review it before saving again."
-                  : "Lutris save could not be confirmed. The latest saved values were reloaded.";
+                  : "Lutris save could not be confirmed. Your submitted draft is preserved for review against the latest saved values.";
                 await loadLutris(nextDraft, notice);
                 context.notify(settingsTextMessage(conflict
                   ? "Lutris settings changed elsewhere. Your draft is preserved for review."
-                  : "Lutris save could not be confirmed. Review the latest values before saving again."));
+                  : "Lutris save could not be confirmed. Review your preserved draft against the latest saved values before saving again."));
                 return;
               }
               throw error;
             } finally {
               actionInProgress = false;
+              if (form.isConnected) setSettingsFormDisabled(form, false);
               cancel.disabled = false;
             }
           });
@@ -3929,7 +3954,7 @@ namespace Amaterasu {
         }
       } catch (error) {
         if (context.content.isConnected)
-          lutrisArea.replaceChildren(errorPanel(error, loadLutris));
+          lutrisArea.replaceChildren(errorPanel(error, () => { void loadLutris(draftValues, draftNotice); }));
       }
     }
     async function loadPlaynite(
@@ -4027,7 +4052,7 @@ namespace Amaterasu {
         ): AccessibleListEditor<string> => {
           const control = accessibleListEditor<string>({
             label,
-            description: `Add, edit, or remove ${label.toLocaleLowerCase()}. Unknown values are kept in their current order.`,
+            description: "Add, edit, or remove list values. Unknown values are kept in their current order.",
             values,
             maxItems: 256,
             formatValue: (value) => value,
@@ -4232,6 +4257,7 @@ namespace Amaterasu {
                 ),
               });
               requestedValues = values;
+              setSettingsFormDisabled(form, true);
               saveStarted = true;
               await savePlayniteSettings(context.api, settings, values);
               await loadPlaynite();
@@ -4244,14 +4270,15 @@ namespace Amaterasu {
                 return;
               }
               if (saveStarted) {
-                await loadPlaynite(undefined,
-                  "Playnite save could not be confirmed. The latest saved values were reloaded.");
-                context.notify(settingsTextMessage("Playnite save could not be confirmed. Review the latest values before saving again."));
+                await loadPlaynite(requestedValues ?? undefined,
+                  "Playnite save could not be confirmed. Your draft is preserved for review against the latest saved values.");
+                context.notify(settingsTextMessage("Playnite save could not be confirmed. Review your preserved draft against the latest saved values before saving again."));
                 return;
               }
               throw error;
             } finally {
               actionInProgress = false;
+              if (form.isConnected) setSettingsFormDisabled(form, false);
               cancel.disabled = false;
             }
           });
@@ -4287,7 +4314,7 @@ namespace Amaterasu {
         }
       } catch (error) {
         if (context.content.isConnected)
-          playniteArea.replaceChildren(errorPanel(error, loadPlaynite));
+          playniteArea.replaceChildren(errorPanel(error, () => { void loadPlaynite(draftValues, draftNotice); }));
       }
     }
     async function loadHistorySettings(): Promise<void> {

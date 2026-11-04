@@ -221,6 +221,7 @@ function fixture() {
   const state = { steam, lutris, playnite };
   const calls = [];
   const conflictNext = new Set();
+  const permissions = new Set(["configuration.read", "configuration.write", "steam.read"]);
   const apiError = (code) => vm.runInContext(`new Amaterasu.ApiError("provider error", ${JSON.stringify(code)}, 409)`, context);
   const status = {
     steam: { settings_ready: true, enabled: true, game_count: 2, scanning: false, complete: true, warnings: [], warning_count: 0 },
@@ -228,7 +229,7 @@ function fixture() {
     playnite: { ok: true, settings_ready: true, enabled: true, auto_sync: true, playnite_running: true, playnite_paths: [], snapshot_pending: false, snapshot_game_count: 2, launchable_game_count: 2, active_provider_launches: 0, catalog_sync: null, last_error: null, revision: 1 },
   };
   const api = {
-    allows(scope) { return ["configuration.read", "configuration.write", "steam.read"].includes(scope); },
+    allows(scope) { return permissions.has(scope); },
     async post(route, body = {}) {
       calls.push([route, ordinary(body)]);
       const match = /^(steam|lutris|playnite)\/(settings|settings_update|status|list|refresh)$/.exec(route);
@@ -266,7 +267,7 @@ function fixture() {
     notify(message) { notices.push(message); },
     registerDraftGuard(isDirty, dispose) { draftGuard = { isDirty, dispose }; },
   });
-  return { context, content, state, calls, conflictNext, notices, get draftGuard() { return draftGuard; } };
+  return { context, content, state, calls, conflictNext, permissions, api, notices, get draftGuard() { return draftGuard; } };
 }
 function areaFor(f, provider) {
   return find(f.content, node => node.className === `settings-area-${provider}`);
@@ -462,4 +463,144 @@ test("Playnite list editors save exact values and keep edits visible through con
   assert.equal(inputNamed(formFor(f, "playnite"), "playnite_auto_sync").checked, true);
   assert.equal(f.draftGuard.isDirty(), false);
   f.draftGuard.dispose();
+});
+
+
+test("Steam save locks every editor control until a delayed provider update and readback finish", async () => {
+  const f = fixture();
+  await tick();
+  const form = formFor(f, "steam");
+  const autoSync = inputNamed(form, "steam_auto_sync");
+  autoSync.checked = false;
+  autoSync.fire("change");
+  let releaseUpdate;
+  let startedUpdate;
+  const started = new Promise(resolve => { startedUpdate = resolve; });
+  const gate = new Promise(resolve => { releaseUpdate = resolve; });
+  const post = f.api.post.bind(f.api);
+  f.api.post = async (route, body = {}) => {
+    if (route === "steam/settings_update") {
+      startedUpdate();
+      await gate;
+    }
+    return post(route, body);
+  };
+
+  submit(form);
+  await started;
+  assert.equal(autoSync.disabled, true);
+  assert.equal(inputNamed(form, "steam_recent_games").disabled, true);
+  assert.equal(buttonNamed(form, "Cancel").disabled, true);
+  const picker = find(form, node => node.className === "steam-exclusion-picker");
+  assert.equal(picker.querySelectorAll("input").filter(node => !node.hidden).every(node => node.disabled), true);
+  releaseUpdate();
+  await tick();
+  assert.equal(f.state.steam.values.auto_sync, false);
+  assert.equal(inputNamed(formFor(f, "steam"), "steam_auto_sync").checked, false);
+  f.draftGuard.dispose();
+});
+
+test("failed revision-conflict readback keeps the draft through retry, then cancel restores latest values", async () => {
+  const f = fixture();
+  await tick();
+  f.conflictNext.add("steam");
+  let failSettingsRead = true;
+  const post = f.api.post.bind(f.api);
+  f.api.post = async (route, body = {}) => {
+    if (route === "steam/settings" && failSettingsRead) {
+      failSettingsRead = false;
+      throw f.context.ApiError
+        ? new f.context.ApiError("settings read failed", "forbidden", 403)
+        : new f.context.Amaterasu.ApiError("settings read failed", "forbidden", 403);
+    }
+    return post(route, body);
+  };
+  let form = formFor(f, "steam");
+  inputNamed(form, "steam_recent_games").value = "5";
+  inputNamed(form, "steam_recent_games").fire("input");
+  submit(form);
+  await tick();
+  const alert = find(areaFor(f, "steam"), node => node.getAttribute("role") === "alert");
+  assert.ok(alert);
+  buttonNamed(alert, "Try again").click();
+  await tick();
+  form = formFor(f, "steam");
+  assert.equal(inputNamed(form, "steam_recent_games").value, "5");
+  assert.equal(f.state.steam.values.recent_games, 20);
+  assert.equal(f.draftGuard.isDirty(), true);
+  buttonNamed(form, "Cancel").click();
+  await tick();
+  assert.equal(inputNamed(formFor(f, "steam"), "steam_recent_games").value, "20");
+  assert.equal(f.draftGuard.isDirty(), false);
+  f.draftGuard.dispose();
+});
+
+test("Steam saved exclusions remain editable without steam.read and picker disposal follows navigation", async () => {
+  const f = fixture();
+  await tick();
+  f.permissions.delete("steam.read");
+  const form = formFor(f, "steam");
+  const picker = find(form, node => node.className === "steam-exclusion-picker");
+  const rows = picker.children.find(node => node.className === "steam-exclusion-saved").children;
+  assert.equal(rows.length, 2);
+  assert.equal(rows[0].children[0].disabled, false);
+  rows[0].children[1].value = "Renamed legacy entry";
+  rows[0].children[1].fire("input");
+  rows[1].children[0].value = "998";
+  rows[1].children[0].fire("input");
+  assert.deepEqual(JSON.parse(inputNamed(form, "steam_exclusion_draft").value), [
+    { name: "Renamed legacy entry" }, { id: "998", name: "Unavailable legacy" },
+  ]);
+  rows[0].children[2].click();
+  assert.equal(f.draftGuard.isDirty(), true);
+  assert.deepEqual(f.calls.filter(([route]) => route === "steam/list").length, 1);
+  assert.deepEqual(ordinary(f.state.steam.values.exclude_games), [
+    { name: "Name-only legacy" }, { id: "999", name: "Unavailable legacy" },
+  ]);
+  f.draftGuard.dispose();
+  assert.equal(picker.children.length, 0);
+});
+
+test("successful provider save with failed readback reload preserves submitted values for review", async () => {
+  const f = fixture();
+  await tick();
+  let settingsReadsToFail = 2;
+  const post = f.api.post.bind(f.api);
+  f.api.post = async (route, body = {}) => {
+    if (route === "lutris/settings" && settingsReadsToFail > 0) {
+      settingsReadsToFail--;
+      throw new f.context.Amaterasu.ApiError("readback unavailable", "forbidden", 403);
+    }
+    return post(route, body);
+  };
+  let form = formFor(f, "lutris");
+  inputNamed(form, "lutris_auto_sync").checked = false;
+  inputNamed(form, "lutris_auto_sync").fire("change");
+  submit(form);
+  await tick();
+  assert.equal(f.state.lutris.revision, 2);
+  const alert = find(areaFor(f, "lutris"), node => node.getAttribute("role") === "alert");
+  assert.ok(alert);
+  buttonNamed(alert, "Try again").click();
+  await tick();
+  form = formFor(f, "lutris");
+  assert.equal(inputNamed(form, "lutris_auto_sync").checked, false);
+  assert.match(areaFor(f, "lutris").textContent, /draft is preserved/);
+  f.draftGuard.dispose();
+});
+
+test("provider editors are disposed when settings navigation leaves the page", async () => {
+  const f = fixture();
+  await tick();
+  const steamPicker = find(formFor(f, "steam"), node => node.className === "steam-exclusion-picker");
+  const listEditors = ["lutris", "playnite"].flatMap(provider => {
+    const form = formFor(f, provider);
+    return form.querySelectorAll("fieldset").filter(node => node.className === "list-editor");
+  });
+  assert.ok(steamPicker.children.length > 0);
+  assert.ok(listEditors.length > 0);
+  assert.ok(listEditors.every(editor => editor.children.length > 0));
+  f.draftGuard.dispose();
+  assert.equal(steamPicker.children.length, 0);
+  assert.ok(listEditors.every(editor => editor.children.length === 0));
 });
