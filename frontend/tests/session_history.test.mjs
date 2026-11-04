@@ -39,6 +39,19 @@ function detail() {
     events:[{session_id:"s1",recorded_at_unix:401,event_type:"stream_stopped",payload:{reason:"client"}}]};
 }
 
+async function exportLiveCsv(sessionId, timestamps) {
+  const source = detail();
+  const session = {...source.session, session_id:sessionId};
+  const live = {...source, session, sample_count:timestamps.length, samples:timestamps.map((timestamp, index)=>({
+    ...source.samples[index % source.samples.length], session_id:sessionId, recorded_at_unix:timestamp,
+    interval_start_unix_ms:timestamp * 1000, chart_source:"live",
+  }))};
+  const card = sandbox.Amaterasu.createLiveSessionCard();
+  card.update(session, live, null, "", false, Number.MAX_SAFE_INTEGER, 20);
+  find(card.element, (element)=>element.tagName === "button" && element.textContent === "Download chart data (CSV)").click();
+  return downloaded.text();
+}
+
 test("history charts preserve measured gaps, scale by time and export the complete returned subset", async () => {
   const source = detail();
   let closed = false;
@@ -215,6 +228,7 @@ test("live chart export follows the selected source and includes source labels",
   let csv = await downloaded.text();
   assert.match(csv, /"session_id","recorded_at_unix","observed_at","source"/);
   assert.match(csv, /"stream\/with unsafe name"/);
+  assert.ok(csv.includes('"stream/with unsafe name","101",'), `ordinary session ID unchanged\n${csv}`);
   assert.match(csv, /"recorded"/);
   assert.match(csv, /"live"/);
   assert.match(anchor.download, /^amaterasu-stream-stream_with_unsafe_name\.csv$/);
@@ -226,4 +240,23 @@ test("live chart export follows the selected source and includes source labels",
   assert.equal(csv.trim().split("\r\n").length, 3);
   assert.equal((csv.match(/"live"/g) ?? []).length, 2);
   assert.equal((csv.match(/"recorded"/g) ?? []).length, 0);
+});
+
+test("CSV export neutralizes formula-leading session IDs while preserving ordinary text", async () => {
+  for (const sessionId of ["=1+1", "+SUM(1,2)", "-1+2", "@SUM(1,2)", " \t=1+1", "\t=1+1"]) {
+    const csv = await exportLiveCsv(sessionId, [101]);
+    const escapedId = (`'${sessionId}`).replaceAll('"', '""');
+    assert.ok(csv.includes(`"${escapedId}","101",`), `formula-leading ID was not neutralized: ${JSON.stringify(sessionId)}\n${csv}`);
+  }
+});
+
+test("CSV export leaves observed_at blank for safe-integer timestamps outside Date limits", async () => {
+  const timestamps = [-8_640_000_000_001, -8_640_000_000_000, 8_640_000_000_000, 8_640_000_000_001];
+  assert.ok(timestamps.every(Number.isSafeInteger));
+  const csv = await exportLiveCsv("session-boundaries", timestamps);
+  assert.ok(csv.includes('"session-boundaries","-8640000000001","","live",'), csv);
+  const minimumDate = new Date(-8_640_000_000_000 * 1000).toISOString();
+  assert.ok(csv.includes(`"session-boundaries","-8640000000000","'${minimumDate}","live",`));
+  assert.ok(csv.includes(`"session-boundaries","8640000000000","'+275760-09-13T00:00:00.000Z","live",`));
+  assert.ok(csv.includes('"session-boundaries","8640000000001","","live",'));
 });
