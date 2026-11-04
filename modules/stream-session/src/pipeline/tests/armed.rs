@@ -256,6 +256,71 @@ fn selected_processing_rejects_legacy_stream_without_frozen_authority() {
 }
 
 #[test]
+fn processing_provider_context_reaches_video_without_changing_frozen_settings() {
+    let target = json!({"kind":"stream","host_epoch":"epoch","session_id":"session","stream_id":"stream","generation":1});
+    for enabled in [false, true] {
+        for (context, accepted) in [
+            (json!({"foreground_target":target}), true),
+            (
+                json!({"replacement_context":{"stream":"other-provider","generation":2}}),
+                true,
+            ),
+            (json!({"test_control":43}), false),
+            (
+                json!({"context":"x".repeat(amaterasu_module_sdk::extension_api::MAX_PROCESSING_CONFIGURATION_BYTES)}),
+                false,
+            ),
+        ] {
+            let mut host = Harness::new();
+            host.pipeline
+                .settings
+                .allowed_principals
+                .push("amaterasu.rtsp".into());
+            host.pipeline.settings.processing_plan = Some(crate::model::ProcessingPlanProvider {
+                provider: "example.gpu".into(),
+                control_service: "example.processing-control/1".into(),
+                processor_service: "example.gpu/1".into(),
+                omit_disabled: false,
+            });
+            host.broker.lifecycle_success = true;
+            host.broker.processing_plan_enabled = enabled;
+            host.broker.processing_plan_context = Some(context.clone());
+            let mut request = prepare();
+            request["video"]["codecs"] = json!(["h264", "hevc"]);
+            request["lifecycle_capture_mode"] = json!("external");
+            request["lifecycle_session_target"] = json!({"kind":"session","host_epoch":"epoch","session_id":"session","generation":1});
+            let id = host.response_from(1, "amaterasu.rtsp", request)["session"]
+                .as_u64()
+                .unwrap();
+            let mut launch = arm(id);
+            launch["configuration"]["lifecycle_capture_mode"] = json!("external");
+            launch["configuration"]["lifecycle_target"] = target.clone();
+            launch["configuration"]["configuration"]["video_stream_format"] = json!({"codec":"hevc","bit_depth":10,"dynamic_range":if enabled {"hdr"} else {"sdr"}});
+            assert_eq!(
+                host.response_from(2, "amaterasu.rtsp", launch)["state"],
+                "armed"
+            );
+            host.idle();
+            let open = host.broker.calls.iter().find(|call| {
+                call.service == "amaterasu.video/1" && call.payload["action"] == "open"
+            });
+            assert_eq!(open.is_some(), accepted, "enabled={enabled}");
+            if let Some(open) = open {
+                let mut expected = json!({"test_control":42});
+                expected
+                    .as_object_mut()
+                    .unwrap()
+                    .extend(context.as_object().unwrap().clone());
+                assert_eq!(
+                    open.payload["configuration"]["gpu_processing"]["settings"],
+                    expected
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn external_lifecycle_keeps_capture_and_input_and_retires_after_native_close() {
     for input in [false, true] {
         let mut host = Harness::new();

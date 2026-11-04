@@ -995,6 +995,7 @@ fn rtx_hdr_composition_is_explicit_and_authorizes_the_processor() {
         enabled.settings[provider.id]["runtime_directory"],
         json!(runtime)
     );
+    assert_eq!(enabled.settings[provider.id]["max_streams"], 2);
     assert!(
         enabled.settings[VIDEO_COMPONENT_ID]
             .get("require_frame_lease")

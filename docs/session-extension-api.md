@@ -231,6 +231,15 @@ coordinator caller and admitted request as usual. A source mode is a requirement
 not proof of the captured pixels. With external capture, the selected processor
 must independently reject frames whose format or color tagging is incompatible.
 
+The version-one `processing_intent` response's `processor_settings` may enrich
+the frozen settings with provider-owned context. Every frozen key and value,
+including complete nested values, must remain unchanged. Consumers use the
+public SDK `validate_processing_configuration` helper to check this and the
+16 KiB configuration bound, and separately enforce exact target, revision,
+selected processor and range requirements. They pass the validated enriched
+configuration to the selected processor; substituting the input snapshot would
+discard the provider's context. Added context grants no native authority.
+
 ## Composition protocol v2
 
 The public SDK defines a separately negotiated composition protocol for an

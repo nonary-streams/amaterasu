@@ -731,6 +731,9 @@ pub fn enable_rtx_hdr(policy: &mut RuntimeConfig, runtime_directory: &Path) -> P
         .get_mut(RTX_HDR_COMPONENT.id)
         .and_then(Value::as_object_mut)
         .ok_or("RTX HDR settings must be an object")?;
+    // The host admits two simultaneous clients. Keep the selected processor's
+    // default admission capacity consistent, preserving explicit operator limits.
+    provider_settings.entry("max_streams").or_insert(json!(2));
     let foreground_service = json!("amaterasu.foreground-context/1");
     if provider_settings
         .get("foreground_context_service")

@@ -189,7 +189,11 @@ impl ProcessingPreflightJob {
         if response.status != "succeeded"
             || response.target != self.target
             || response.revision != self.revision
-            || response.processor_settings != self.settings
+            || amaterasu_extension_api::validate_processing_configuration(
+                &self.settings,
+                &response.processor_settings,
+            )
+            .is_err()
             || response.processor_service != self.processor_service
             || (!response.enabled
                 && (response.source_hdr_required.is_some()
@@ -331,6 +335,22 @@ mod tests {
         let mut oversized = valid;
         oversized["unused"] = json!("x".repeat(MAX_RESPONSE_BYTES));
         assert!(job.parse_response(oversized).is_err());
+    }
+
+    #[test]
+    fn provider_context_enrichment_preserves_frozen_policy_and_target_checks() {
+        for enabled in [false, true] {
+            let (job, mut payload) = fixture();
+            payload["enabled"] = json!(enabled);
+            if !enabled {
+                payload["source_hdr_required"] = Value::Null;
+                payload["output_hdr_required"] = Value::Null;
+            }
+            payload["processor_settings"]["foreground_target"] = payload["target"].clone();
+            assert!(job.parse_response(payload.clone()).is_ok());
+            payload["processor_settings"]["enabled"] = json!(false);
+            assert!(job.parse_response(payload).is_err());
+        }
     }
 
     #[test]

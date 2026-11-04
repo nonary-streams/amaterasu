@@ -3,11 +3,13 @@ mod action_disposition;
 mod action_target;
 mod composition;
 mod launch_environment;
+mod processing_configuration;
 pub mod schemas;
 pub use action_disposition::*;
 pub use action_target::*;
 pub use composition::*;
 pub use launch_environment::*;
+pub use processing_configuration::*;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

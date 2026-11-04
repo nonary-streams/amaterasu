@@ -532,7 +532,11 @@ impl Pipeline {
                 && payload["target"] == json!(start.lifecycle_target)
                 && payload["revision"] == *revision
                 && payload["processor_service"] == plan.processor_service
-                && payload["processor_settings"] == *frozen
+                && amaterasu_module_sdk::extension_api::validate_processing_configuration(
+                    frozen,
+                    &payload["processor_settings"],
+                )
+                .is_ok()
                 && enabled.is_some()
                 && (payload["source_hdr_required"].is_null() || source.is_some())
                 && (payload["output_hdr_required"].is_null() || output.is_some())
@@ -558,7 +562,7 @@ impl Pipeline {
             // HDR output retains frame provenance checks even on bypass.
             if enabled != Some(false) || actual_output || !plan.omit_disabled {
                 record.gpu_processing = Some(json!({"service":plan.processor_service,
-                    "enabled":enabled.unwrap(), "settings":frozen,
+                    "enabled":enabled.unwrap(), "settings":payload["processor_settings"],
                     "source_hdr_required":required_source,
                     "live_settings":{"target":start.lifecycle_target,
                         "provider":plan.provider,"revision":revision}}));

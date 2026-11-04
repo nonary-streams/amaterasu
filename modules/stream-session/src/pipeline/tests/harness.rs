@@ -39,6 +39,7 @@ pub struct Broker {
     pub processing_plan_source_hdr: bool,
     pub processing_plan_bad_revision: bool,
     pub processing_plan_omit_ranges: bool,
+    pub processing_plan_context: Option<Value>,
     pub lifecycle_omit_consumer_confirmation: bool,
     pub lifecycle_observation_override: Option<Value>,
     pub lifecycle_input_target: Option<Value>,
@@ -478,12 +479,19 @@ impl Broker {
             assert_eq!(call.payload["method"], "processing_intent");
             assert_eq!(call.payload["interface_major"], 1);
             assert_eq!(call.payload["interface_minor"], 0);
+            let mut settings = call.payload["arguments"]["settings"].clone();
+            if let Some(context) = &self.processing_plan_context {
+                settings
+                    .as_object_mut()
+                    .unwrap()
+                    .extend(context.as_object().unwrap().clone());
+            }
             return json!({"status":"succeeded", "target":call.payload["arguments"]["target"],
                 "revision":if self.processing_plan_bad_revision {"wrong"} else {"r1"},
                 "enabled":self.processing_plan_enabled,
                 "source_hdr_required":if self.processing_plan_enabled && !self.processing_plan_omit_ranges {Some(self.processing_plan_source_hdr)} else {None},
                 "output_hdr_required":if self.processing_plan_enabled && !self.processing_plan_omit_ranges {Some(true)} else {None},
-                "processor_settings":call.payload["arguments"]["settings"],
+                "processor_settings":settings,
                 "processor_service":"example.gpu/1"});
         }
         let action = call.payload["action"].as_str().unwrap();
