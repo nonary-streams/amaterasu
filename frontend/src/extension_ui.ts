@@ -104,7 +104,16 @@ namespace Amaterasu {
     return translations[locale] ?? translations[locale.split("-")[0] ?? locale] ?? translateText(value.source);
   }
 
+  function extensionUiValidateLabel(value: ExtensionUiText): void {
+    if (typeof value === "string") {
+      if (!value.trim()) throw new Error("Plugin UI labels cannot be empty.");
+      return;
+    }
+    extensionUiTextForLocale(value, "en");
+  }
+
   function extensionUiTextNode(value: ExtensionUiText): Text | string {
+    extensionUiValidateLabel(value);
     if (typeof value === "string") return localizedTextNode(value);
     return localeFormattedTextNode((locale) => extensionUiTextForLocale(value, locale));
   }
@@ -115,10 +124,12 @@ namespace Amaterasu {
   }
 
   function extensionUiLabel(text: ExtensionUiText): HTMLElement {
+    extensionUiValidateLabel(text);
     return el("span", "field-label", extensionUiTextNode(text));
   }
 
   function extensionUiControlLabel(text: ExtensionUiText, control: HTMLElement): HTMLLabelElement {
+    extensionUiValidateLabel(text);
     const label = el("label", "field-label", extensionUiTextNode(text));
     const id = `amaterasu-plugin-ui-control-${++nextExtensionUiFieldId}`;
     control.id = id;
@@ -136,6 +147,7 @@ namespace Amaterasu {
         choices.some((choice) => !choice || typeof choice.value !== "string" || !choice.value || choice.value.length > 128) ||
         new Set(choices.map((choice) => choice.value)).size !== choices.length ||
         !choices.some((choice) => choice.value === selected)) throw new Error("Invalid plugin UI choices or value.");
+    for (const choice of choices) extensionUiValidateLabel(choice.label);
   }
 
 
@@ -545,6 +557,7 @@ namespace Amaterasu {
             options.variant !== undefined && !["primary", "secondary", "danger"].includes(options.variant))
           throw new Error("Invalid plugin action button.");
         validateExtensionUiFieldOptions(options);
+        extensionUiValidateLabel(options.label);
         const controller = makeController();
         const button = el("button", `button ${options.variant ?? "secondary"} plugin-action-button`, extensionUiTextNode(options.label));
         button.type = "button";

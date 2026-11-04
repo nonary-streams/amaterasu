@@ -127,6 +127,11 @@ try {
     ]);
     fallback.select('beta');
     betaInput.focus();
+    fallback.select('alpha');
+    const programmaticSelectionRestoresFocus =
+      document.activeElement === fallback.element.querySelector('[data-tab-id=alpha]');
+    fallback.select('beta');
+    betaInput.focus();
     const replacement = document.createElement('section');
     fallback.setTabs([
       { id: 'alpha', label: 'Alpha', content: alpha },
@@ -137,8 +142,8 @@ try {
       betaInput.isConnected === false;
     fallback.dispose();
     fallback.element.remove();
-    return { removedTab, replacedPanel };
-  })()`), { removedTab: true, replacedPanel: true });
+    return { removedTab, replacedPanel, programmaticSelectionRestoresFocus };
+  })()`), { removedTab: true, replacedPanel: true, programmaticSelectionRestoresFocus: true });
 
 
   await evaluate(`document.querySelector('[data-tab-id="general"]').focus()`);
@@ -193,6 +198,18 @@ try {
   assert.deepEqual(await evaluate(`({label:window.tabsHandle.element.querySelector(".plugin-tabs-label").textContent, general:document.querySelector('[data-tab-id="general"]').textContent, network:document.querySelector('[data-tab-id="network"]').textContent, active:window.tabsHandle.active()})`),
     { label: "Settings sections FR", general: "General", network: "Network FR", active: "general" });
   await evaluate(`Amaterasu.applyLocale("en");`);
+
+  assert.equal(await evaluate(`(() => {
+    let added = 0;
+    const trackedSignal = { aborted: false, addEventListener() { added++; }, removeEventListener() {} };
+    const api = Amaterasu.createExtensionUiTabsV1(trackedSignal);
+    try {
+      api.tabs({ label: "Tracked", tabs: [{ id: "valid", label: "Valid", content: document.createElement("div") }], activeId: "missing" });
+      return false;
+    } catch {
+      return added === 0;
+    }
+  })()`), true, "failed construction must not register a parent abort listener");
 
   assert.equal(await evaluate(`(() => { const invalid = document.createElement("section"); try {
     window.tabsHandle.setTabs([{id:"bad",label:"Bad",content:invalid}], "missing"); return false;

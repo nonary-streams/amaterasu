@@ -198,10 +198,14 @@ namespace Amaterasu {
           const entry = entries.find((candidate) => candidate.id === id);
           if (!entry) throw new Error("Unknown plugin tab.");
           if (entry.disabled) throw new Error("Cannot select a disabled plugin tab.");
-          const changed = activeId !== id;
+          const previousActiveId = activeId;
+          const changed = previousActiveId !== id;
+          const focusedPanelId = document.activeElement instanceof HTMLElement && element.contains(document.activeElement)
+            ? entries.find((candidate) => candidate.panel.contains(document.activeElement))?.id ?? null
+            : null;
           activeId = id;
           updateSelection();
-          if (focus) entry.button.focus();
+          if (focus || changed && focusedPanelId !== null && focusedPanelId === previousActiveId) entry.button.focus();
           if (changed && notify) options.onChange?.(id);
         };
         const moveFocus = (id: string): void => {
@@ -265,9 +269,9 @@ namespace Amaterasu {
           controller.abort();
           signal.removeEventListener("abort", dispose);
         };
+        commitTabs(options.tabs, options.activeId);
         if (signal.aborted) dispose();
         else signal.addEventListener("abort", dispose, { once: true });
-        commitTabs(options.tabs, options.activeId);
         return Object.freeze({
           element,
           active: () => activeId,

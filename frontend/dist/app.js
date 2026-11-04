@@ -20239,7 +20239,16 @@ var Amaterasu;
             throw new Error("Invalid plugin UI translations.");
         return translations[locale] ?? translations[locale.split("-")[0] ?? locale] ?? Amaterasu.translateText(value.source);
     }
+    function extensionUiValidateLabel(value) {
+        if (typeof value === "string") {
+            if (!value.trim())
+                throw new Error("Plugin UI labels cannot be empty.");
+            return;
+        }
+        extensionUiTextForLocale(value, "en");
+    }
     function extensionUiTextNode(value) {
+        extensionUiValidateLabel(value);
         if (typeof value === "string")
             return Amaterasu.localizedTextNode(value);
         return Amaterasu.localeFormattedTextNode((locale) => extensionUiTextForLocale(value, locale));
@@ -20251,9 +20260,11 @@ var Amaterasu;
             Amaterasu.setLocalizedAttributeFormatter(control, "placeholder", (locale) => extensionUiTextForLocale(value, locale));
     }
     function extensionUiLabel(text) {
+        extensionUiValidateLabel(text);
         return Amaterasu.el("span", "field-label", extensionUiTextNode(text));
     }
     function extensionUiControlLabel(text, control) {
+        extensionUiValidateLabel(text);
         const label = Amaterasu.el("label", "field-label", extensionUiTextNode(text));
         const id = `amaterasu-plugin-ui-control-${++nextExtensionUiFieldId}`;
         control.id = id;
@@ -20271,6 +20282,8 @@ var Amaterasu;
             new Set(choices.map((choice) => choice.value)).size !== choices.length ||
             !choices.some((choice) => choice.value === selected))
             throw new Error("Invalid plugin UI choices or value.");
+        for (const choice of choices)
+            extensionUiValidateLabel(choice.label);
     }
     function validateExtensionUiFieldOptions(options) {
         for (const name of ["disabled", "busy", "readOnly", "required"]) {
@@ -20707,6 +20720,7 @@ var Amaterasu;
                     options.variant !== undefined && !["primary", "secondary", "danger"].includes(options.variant))
                     throw new Error("Invalid plugin action button.");
                 validateExtensionUiFieldOptions(options);
+                extensionUiValidateLabel(options.label);
                 const controller = makeController();
                 const button = Amaterasu.el("button", `button ${options.variant ?? "secondary"} plugin-action-button`, extensionUiTextNode(options.label));
                 button.type = "button";
@@ -21138,10 +21152,14 @@ var Amaterasu;
                         throw new Error("Unknown plugin tab.");
                     if (entry.disabled)
                         throw new Error("Cannot select a disabled plugin tab.");
-                    const changed = activeId !== id;
+                    const previousActiveId = activeId;
+                    const changed = previousActiveId !== id;
+                    const focusedPanelId = document.activeElement instanceof HTMLElement && element.contains(document.activeElement)
+                        ? entries.find((candidate) => candidate.panel.contains(document.activeElement))?.id ?? null
+                        : null;
                     activeId = id;
                     updateSelection();
-                    if (focus)
+                    if (focus || changed && focusedPanelId !== null && focusedPanelId === previousActiveId)
                         entry.button.focus();
                     if (changed && notify)
                         options.onChange?.(id);
@@ -21230,11 +21248,11 @@ var Amaterasu;
                     controller.abort();
                     signal.removeEventListener("abort", dispose);
                 };
+                commitTabs(options.tabs, options.activeId);
                 if (signal.aborted)
                     dispose();
                 else
                     signal.addEventListener("abort", dispose, { once: true });
-                commitTabs(options.tabs, options.activeId);
                 return Object.freeze({
                     element,
                     active: () => activeId,

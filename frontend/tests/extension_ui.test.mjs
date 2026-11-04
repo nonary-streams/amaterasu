@@ -537,3 +537,23 @@ test("read-only radio groups and sliders expose required/error semantics and rej
   assert.ok(number.attributes["aria-describedby"]);
   radio.dispose(); slider.dispose(); page.cleanup();
 });
+
+
+test("fields, actions, and choices reject blank or whitespace-only accessible labels", () => {
+  const page = setupConsumer();
+  const blank = "  ";
+  const blankLocalized = { source: " \t ", translations: { fr: " " } };
+  const rejects = [
+    () => page.sdk.ui.toggle({ label: blank, value: false }),
+    () => page.sdk.ui.select({ label: blankLocalized, choices: [{ value: "a", label: "A" }], value: "a" }),
+    () => page.sdk.ui.select({ label: "Select", choices: [{ value: "a", label: blank }], value: "a" }),
+    () => page.sdk.ui.radioGroup({ label: blank, choices: [{ value: "a", label: "A" }], value: "a" }),
+    () => page.sdk.ui.radioGroup({ label: "Choice", choices: [{ value: "a", label: blankLocalized }], value: "a" }),
+    () => page.sdk.ui.textField({ label: blank, value: "" }),
+    () => page.sdk.ui.numberField({ label: blankLocalized, value: 0 }),
+    () => page.sdk.ui.slider({ label: blank, minimum: 0, maximum: 1, value: 0 }),
+    () => page.sdk.ui.button({ label: blankLocalized, onClick() {} }),
+  ];
+  for (const create of rejects) assert.throws(create, /label|text/i);
+  page.cleanup();
+});
