@@ -6,6 +6,7 @@ namespace Amaterasu {
 
   export interface ExtensionUiFieldOptions {
     disabled?: boolean;
+    busy?: boolean;
     readOnly?: boolean;
     required?: boolean;
     help?: ExtensionUiText;
@@ -14,10 +15,53 @@ namespace Amaterasu {
 
   export interface ExtensionUiFieldStatePatch {
     disabled?: boolean;
+    busy?: boolean;
     readOnly?: boolean;
     required?: boolean;
     help?: ExtensionUiText | null;
     error?: ExtensionUiText | null;
+  }
+
+  export interface ExtensionUiTextFieldOptions extends ExtensionUiFieldOptions {
+    label: ExtensionUiText;
+    value: string;
+    placeholder?: ExtensionUiText;
+    maxLength?: number;
+    onChange?: (value: string) => void;
+  }
+
+  export interface ExtensionUiNumberFieldOptions extends ExtensionUiFieldOptions {
+    label: ExtensionUiText;
+    value: number;
+    minimum?: number;
+    maximum?: number;
+    step?: number | "any";
+    placeholder?: ExtensionUiText;
+    onChange?: (value: number) => void;
+  }
+
+  export interface ExtensionUiActionStatePatch {
+    disabled?: boolean;
+    busy?: boolean;
+    help?: ExtensionUiText | null;
+    error?: ExtensionUiText | null;
+  }
+
+  export interface ExtensionUiActionOptions {
+    label: ExtensionUiText;
+    variant?: "primary" | "secondary" | "danger";
+    disabled?: boolean;
+    busy?: boolean;
+    help?: ExtensionUiText;
+    error?: ExtensionUiText;
+    onClick: (event: MouseEvent) => void | Promise<void>;
+  }
+
+  export interface ExtensionUiActionControl {
+    readonly element: HTMLElement;
+    busy(): boolean;
+    setState(patch: ExtensionUiActionStatePatch): void;
+    dispose(): void;
   }
 
   export interface ExtensionUiControl<T> {
@@ -43,6 +87,9 @@ namespace Amaterasu {
     select(options: ExtensionUiFieldOptions & { label: ExtensionUiText; choices: readonly ExtensionUiOption[]; value: string; onChange?: (value: string) => void }): ExtensionUiChoiceControl;
     radioGroup(options: ExtensionUiFieldOptions & { label: ExtensionUiText; choices: readonly ExtensionUiOption[]; value: string; onChange?: (value: string) => void }): ExtensionUiChoiceControl;
     slider(options: ExtensionUiFieldOptions & { label: ExtensionUiText; minimum: number; maximum: number; value: number; step?: number; onChange?: (value: number) => void }): ExtensionUiControl<number>;
+    textField(options: ExtensionUiTextFieldOptions): ExtensionUiControl<string>;
+    numberField(options: ExtensionUiNumberFieldOptions): ExtensionUiControl<number>;
+    button(options: ExtensionUiActionOptions): ExtensionUiActionControl;
   }
 
   let nextExtensionUiDescriptionId = 0;
@@ -55,6 +102,11 @@ namespace Amaterasu {
     if (Object.values(translations).some((translation) => typeof translation !== "string" || !translation.trim()))
       throw new Error("Invalid plugin UI translations.");
     return localeFormattedTextNode((locale) => translations[locale] ?? translations[locale.split("-")[0] ?? locale] ?? translateText(value.source));
+  }
+
+  function extensionUiTextContent(value: ExtensionUiText): string {
+    const node = extensionUiTextNode(value);
+    return typeof node === "string" ? node : node.textContent ?? "";
   }
 
   function extensionUiLabel(text: ExtensionUiText): HTMLElement {
@@ -81,8 +133,9 @@ namespace Amaterasu {
         !choices.some((choice) => choice.value === selected)) throw new Error("Invalid plugin UI choices or value.");
   }
 
+
   function validateExtensionUiFieldOptions(options: ExtensionUiFieldOptions & { onChange?: unknown }): void {
-    for (const name of ["disabled", "readOnly", "required"] as const) {
+    for (const name of ["disabled", "busy", "readOnly", "required"] as const) {
       const value = options[name];
       if (value !== undefined && typeof value !== "boolean") throw new Error(`Invalid plugin UI ${name} state.`);
     }
@@ -144,6 +197,7 @@ namespace Amaterasu {
 
   interface MutableExtensionUiFieldState {
     disabled: boolean;
+    busy: boolean;
     readOnly: boolean;
     required: boolean;
     help?: ExtensionUiText;
@@ -155,6 +209,7 @@ namespace Amaterasu {
     controls: readonly HTMLElement[],
     state: MutableExtensionUiFieldState,
     applyControlState: (state: MutableExtensionUiFieldState) => void,
+    supportsValidity = true,
   ): ((patch: ExtensionUiFieldStatePatch) => void) & { refreshControls(controls: readonly HTMLElement[]): void } {
     const createDescription = (kind: "help" | "error", text: ExtensionUiText, id?: string): HTMLElement => {
       const description = el("small", `plugin-control-${kind}`, extensionUiTextNode(text));
@@ -171,12 +226,14 @@ namespace Amaterasu {
       for (const control of activeControls) {
         if (descriptionIds) control.setAttribute("aria-describedby", descriptionIds);
         else control.removeAttribute("aria-describedby");
-        if (state.error !== undefined) control.setAttribute("aria-invalid", "true");
+        if (state.busy) control.setAttribute("aria-busy", "true");
+        else control.removeAttribute("aria-busy");
+        if (supportsValidity && state.error !== undefined) control.setAttribute("aria-invalid", "true");
         else control.removeAttribute("aria-invalid");
-        if (state.required) control.setAttribute("aria-required", "true");
+        if (supportsValidity && state.required) control.setAttribute("aria-required", "true");
         else control.removeAttribute("aria-required");
       }
-      if (element.getAttribute("role") === "radiogroup") {
+      if (supportsValidity && element.getAttribute("role") === "radiogroup") {
         if (state.error !== undefined) element.setAttribute("aria-invalid", "true");
         else element.removeAttribute("aria-invalid");
         if (state.required) element.setAttribute("aria-required", "true");
@@ -189,10 +246,10 @@ namespace Amaterasu {
 
     const updateState = ((patch): void => {
       if (!patch || typeof patch !== "object" || Array.isArray(patch)) throw new Error("Invalid plugin UI state patch.");
-      const allowed = ["disabled", "readOnly", "required", "help", "error"];
+      const allowed = ["disabled", "busy", "readOnly", "required", "help", "error"];
       if (Object.keys(patch).some((key) => !allowed.includes(key))) throw new Error("Unknown plugin UI state option.");
       const next = { ...state };
-      for (const key of ["disabled", "readOnly", "required"] as const) {
+      for (const key of ["disabled", "busy", "readOnly", "required"] as const) {
         const value = patch[key];
         if (value !== undefined) {
           if (typeof value !== "boolean") throw new Error(`Invalid plugin UI ${key} state.`);
@@ -250,7 +307,7 @@ namespace Amaterasu {
         checkbox.checked = options.value;
         let currentValue = options.value;
         const state: MutableExtensionUiFieldState = {
-          disabled: options.disabled === true, readOnly: options.readOnly === true, required: options.required === true,
+          disabled: options.disabled === true, busy: options.busy === true, readOnly: options.readOnly === true, required: options.required === true,
           help: options.help, error: options.error,
         };
         checkbox.addEventListener("click", (event) => {
@@ -287,7 +344,7 @@ namespace Amaterasu {
         let choices = [...options.choices];
         let currentValue = options.value;
         const state: MutableExtensionUiFieldState = {
-          disabled: options.disabled === true, readOnly: options.readOnly === true, required: options.required === true,
+          disabled: options.disabled === true, busy: options.busy === true, readOnly: options.readOnly === true, required: options.required === true,
           help: options.help, error: options.error,
         };
         const makeChoiceOptions = (nextChoices: readonly ExtensionUiOption[]): HTMLOptionElement[] =>
@@ -342,7 +399,7 @@ namespace Amaterasu {
         extensionUiChoices(options.choices, options.value);
         const controller = makeController();
         const state: MutableExtensionUiFieldState = {
-          disabled: options.disabled === true, readOnly: options.readOnly === true, required: options.required === true,
+          disabled: options.disabled === true, busy: options.busy === true, readOnly: options.readOnly === true, required: options.required === true,
           help: options.help, error: options.error,
         };
         const group = Amaterasu.radioGroup(
@@ -365,12 +422,172 @@ namespace Amaterasu {
         };
         return extensionUiControl(group.node, group.value, group.setValue, controller, signal, group.dispose, setChoices, setState);
       },
+      textField(options) {
+        if (!options || typeof options.label !== "string" && typeof options.label !== "object" || typeof options.value !== "string")
+          throw new Error("Invalid plugin text field.");
+        validateExtensionUiFieldOptions(options);
+        if (options.maxLength !== undefined && (!Number.isSafeInteger(options.maxLength) || options.maxLength < 1 || options.maxLength > 65536))
+          throw new Error("Invalid plugin text field maximum length.");
+        if (options.maxLength !== undefined && options.value.length > options.maxLength) throw new Error("Plugin text field value exceeds its maximum length.");
+        const controller = makeController();
+        const textInput = input("", options.value, "text");
+        if (options.placeholder !== undefined) textInput.placeholder = extensionUiTextContent(options.placeholder);
+        if (options.maxLength !== undefined) textInput.maxLength = options.maxLength;
+        let currentValue = options.value;
+        const state: MutableExtensionUiFieldState = {
+          disabled: options.disabled === true, busy: options.busy === true, readOnly: options.readOnly === true, required: options.required === true,
+          help: options.help, error: options.error,
+        };
+        textInput.addEventListener("input", (event) => {
+          if (state.disabled || state.readOnly) {
+            textInput.value = currentValue;
+            event.preventDefault();
+            event.stopImmediatePropagation();
+            return;
+          }
+          if (options.maxLength !== undefined && textInput.value.length > options.maxLength) {
+            textInput.value = currentValue;
+            textInput.setAttribute("aria-invalid", "true");
+            return;
+          }
+          currentValue = textInput.value;
+          if (state.error === undefined) textInput.removeAttribute("aria-invalid");
+          options.onChange?.(currentValue);
+        }, { capture: true, signal: controller.signal });
+        const element = el("div", "field plugin-control", extensionUiControlLabel(options.label, textInput), textInput);
+        const setState = extensionUiFieldState(element, [textInput], state, (next) => {
+          textInput.disabled = next.disabled;
+          textInput.readOnly = next.readOnly;
+          textInput.required = next.required;
+          if (next.readOnly) textInput.setAttribute("aria-readonly", "true"); else textInput.removeAttribute("aria-readonly");
+        });
+        return extensionUiControl(element, () => textInput.value, (value) => {
+          if (typeof value !== "string") throw new Error("Text field value must be a string.");
+          if (options.maxLength !== undefined && value.length > options.maxLength) throw new Error("Text field value exceeds its maximum length.");
+          currentValue = value;
+          textInput.value = value;
+          if (state.error === undefined) textInput.removeAttribute("aria-invalid");
+        }, controller, signal, undefined, undefined, setState);
+      },
+      numberField(options) {
+        if (!options || typeof options.label !== "string" && typeof options.label !== "object" || typeof options.value !== "number")
+          throw new Error("Invalid plugin number field.");
+        validateExtensionUiFieldOptions(options);
+        if (options.minimum !== undefined && !Number.isFinite(options.minimum) ||
+            options.maximum !== undefined && !Number.isFinite(options.maximum) ||
+            options.minimum !== undefined && options.maximum !== undefined && options.minimum > options.maximum ||
+            options.step !== undefined && options.step !== "any" && (!Number.isFinite(options.step) || options.step <= 0) ||
+            !Amaterasu.isValidNumberControlValue(options.value, options.minimum, options.maximum, options.step ?? "any"))
+          throw new Error("Invalid plugin number field limits, step, or value.");
+        const controller = makeController();
+        const numberInput = input("", String(options.value), "number");
+        if (options.minimum !== undefined) numberInput.min = String(options.minimum);
+        if (options.maximum !== undefined) numberInput.max = String(options.maximum);
+        numberInput.step = String(options.step ?? "any");
+        if (options.placeholder !== undefined) numberInput.placeholder = extensionUiTextContent(options.placeholder);
+        let currentValue = options.value;
+        const state: MutableExtensionUiFieldState = {
+          disabled: options.disabled === true, busy: options.busy === true, readOnly: options.readOnly === true, required: options.required === true,
+          help: options.help, error: options.error,
+        };
+        const readValue = (): number => {
+          const rawValue = numberInput.value;
+          const parsed = Number(rawValue);
+          if (!rawValue.trim() || !numberInput.validity.valid ||
+              !Amaterasu.isValidNumberControlValue(parsed, options.minimum, options.maximum, options.step ?? "any"))
+            throw new Error("Enter a valid number within the plugin field limits.");
+          return parsed;
+        };
+        numberInput.addEventListener("input", (event) => {
+          if (state.disabled || state.readOnly) {
+            numberInput.value = String(currentValue);
+            event.preventDefault();
+            event.stopImmediatePropagation();
+            return;
+          }
+          let nextValue: number;
+          try { nextValue = readValue(); }
+          catch {
+            numberInput.setAttribute("aria-invalid", "true");
+            return;
+          }
+          currentValue = nextValue;
+          if (state.error === undefined) numberInput.removeAttribute("aria-invalid");
+          options.onChange?.(currentValue);
+        }, { capture: true, signal: controller.signal });
+        const element = el("div", "field plugin-control", extensionUiControlLabel(options.label, numberInput), numberInput);
+        const setState = extensionUiFieldState(element, [numberInput], state, (next) => {
+          numberInput.disabled = next.disabled;
+          numberInput.readOnly = next.readOnly;
+          numberInput.required = next.required;
+          if (next.readOnly) numberInput.setAttribute("aria-readonly", "true"); else numberInput.removeAttribute("aria-readonly");
+        });
+        return extensionUiControl(element, readValue, (value) => {
+          if (typeof value !== "number" || !Amaterasu.isValidNumberControlValue(value, options.minimum, options.maximum, options.step ?? "any"))
+            throw new Error("Number field value must be finite and within its limits and step.");
+          numberInput.value = String(value);
+          if (Number(numberInput.value) !== value) throw new Error("Number field value cannot be represented by the input.");
+          currentValue = value;
+          if (state.error === undefined) numberInput.removeAttribute("aria-invalid");
+        }, controller, signal, undefined, undefined, setState);
+      },
+      button(options) {
+        if (!options || typeof options.label !== "string" && typeof options.label !== "object" || typeof options.onClick !== "function" ||
+            options.variant !== undefined && !["primary", "secondary", "danger"].includes(options.variant))
+          throw new Error("Invalid plugin action button.");
+        validateExtensionUiFieldOptions(options);
+        const controller = makeController();
+        const button = el("button", `button ${options.variant ?? "secondary"} plugin-action-button`, extensionUiTextNode(options.label));
+        button.type = "button";
+        const state: MutableExtensionUiFieldState = {
+          disabled: options.disabled === true, busy: options.busy === true, readOnly: false, required: false,
+          help: options.help, error: options.error,
+        };
+        let updateState = (_patch: ExtensionUiFieldStatePatch): void => {};
+        const element = el("div", "field plugin-control plugin-action", button);
+        const setFieldState = extensionUiFieldState(element, [button], state, (next) => {
+          button.disabled = next.disabled || next.busy;
+        }, false);
+        updateState = (patch) => {
+          if (!controller.signal.aborted) {
+            if (Object.keys(patch).some((key) => !["disabled", "busy", "help", "error"].includes(key)))
+              throw new Error("Unsupported plugin action button state.");
+            setFieldState(patch);
+          }
+        };
+        button.addEventListener("click", (event) => {
+          if (state.disabled || state.busy) return;
+          const result = options.onClick(event);
+          if (result && typeof (result as Promise<void>).then === "function") {
+            updateState({ busy: true });
+            void Promise.resolve(result).then(
+              () => updateState({ busy: false }),
+              (error) => { updateState({ busy: false }); throw error; },
+            );
+          }
+        }, { signal: controller.signal });
+        let disposed = false;
+        const dispose = (): void => {
+          if (disposed) return;
+          disposed = true;
+          controller.abort();
+          signal.removeEventListener("abort", dispose);
+        };
+        if (signal.aborted) dispose();
+        else signal.addEventListener("abort", dispose, { once: true });
+        return Object.freeze({
+          element,
+          busy: () => state.busy,
+          setState: (patch: ExtensionUiActionStatePatch) => { if (!disposed) updateState(patch); },
+          dispose,
+        });
+      },
       slider(options) {
         if (!options || typeof options.label !== "string" && typeof options.label !== "object") throw new Error("Invalid plugin slider.");
         validateExtensionUiFieldOptions(options);
         const controller = makeController();
         const state: MutableExtensionUiFieldState = {
-          disabled: options.disabled === true, readOnly: options.readOnly === true, required: options.required === true,
+          disabled: options.disabled === true, busy: options.busy === true, readOnly: options.readOnly === true, required: options.required === true,
           help: options.help, error: options.error,
         };
         const label = extensionUiLabel(options.label);

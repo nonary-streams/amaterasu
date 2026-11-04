@@ -169,6 +169,58 @@ try {
   assert.equal(await evaluate(`window.runtimeToggleInput.disabled`), true);
   await evaluate(`window.runtimeToggle.setState({ disabled: false }); window.runtimeToggleInput.focus(); window.runtimeToggleInput.click()`);
   assert.deepEqual(await evaluate(`({ same: window.runtimeToggle.element.querySelector('input') === window.runtimeToggleInput, focused: document.activeElement === window.runtimeToggleInput, descriptions: window.runtimeToggleInput.getAttribute('aria-describedby'), value: window.runtimeToggle.value(), changes: window.runtimeToggleChanges })`), { same: true, focused: true, descriptions: null, value: false, changes: 1 });
+  await evaluate(`
+    window.publicControlsController = new AbortController();
+    window.publicControls = Amaterasu.createExtensionUiV1(window.publicControlsController.signal);
+    window.textChanges = [];
+    window.textControl = window.publicControls.textField({ label: "Localized title", placeholder: "Enter title", value: "first", maxLength: 12, onChange(value) { window.textChanges.push(value); } });
+    window.numberChanges = [];
+    window.numberControl = window.publicControls.numberField({ label: "Localized count", value: 2, minimum: 0, maximum: 10, step: 2, onChange(value) { window.numberChanges.push(value); } });
+    window.actionCalls = 0;
+    window.finishAction = null;
+    window.actionControl = window.publicControls.button({ label: "Save now", variant: "primary", help: "Save the current values.", async onClick() { window.actionCalls++; await new Promise(resolve => { window.finishAction = resolve; }); } });
+    document.body.replaceChildren(window.textControl.element, window.numberControl.element, window.actionControl.element);
+    window.originalTextInput = window.textControl.element.querySelector('input');
+    window.originalNumberInput = window.numberControl.element.querySelector('input');
+    window.originalActionButton = window.actionControl.element.querySelector('button');
+    window.originalTextInput.focus();
+    window.textControl.setState({ readOnly: true, required: true, help: "Text loaded from the server.", error: "Title is invalid." });
+  `);
+  assert.deepEqual(await evaluate(`({ same: window.textControl.element.querySelector('input') === window.originalTextInput, focused: document.activeElement === window.originalTextInput, readonly: window.originalTextInput.readOnly, required: window.originalTextInput.required, invalid: window.originalTextInput.getAttribute('aria-invalid'), labels: window.originalTextInput.labels.length, descriptions: window.originalTextInput.getAttribute('aria-describedby').split(' ').map(id => document.getElementById(id)?.textContent), descriptionsOutsideLabel: [...window.textControl.element.querySelectorAll('.plugin-control-help, .plugin-control-error')].every(node => !node.closest('label')) })`), { same: true, focused: true, readonly: true, required: true, invalid: "true", labels: 1, descriptions: ["Text loaded from the server.", "Title is invalid."], descriptionsOutsideLabel: true });
+  await evaluate(`
+    const textBefore = window.textControl.value();
+    window.originalTextInput.value = "changed";
+    window.originalTextInput.dispatchEvent(new Event('input', { bubbles: true }));
+    window.textReadOnlyRestored = window.originalTextInput.value === textBefore && window.textChanges.length === 0;
+    window.textControl.setState({ readOnly: false, required: false, help: null, error: null });
+    window.originalTextInput.focus();
+    document.addEventListener('keydown', event => { if (event.target === window.originalTextInput && event.ctrlKey && event.key.toLowerCase() === 'c') window.textCopyPrevented = event.defaultPrevented; });
+  `);
+  for (const type of ["keyDown", "keyUp"]) await command("Input.dispatchKeyEvent", { type, key: "c", code: "KeyC", modifiers: 2, windowsVirtualKeyCode: 67, nativeVirtualKeyCode: 67 }, sessionId);
+  await evaluate(`window.originalTextInput.value = "updated"; window.originalTextInput.dispatchEvent(new Event('input', { bubbles: true }));`);
+  assert.deepEqual(await evaluate(`({ readonlyRestored: window.textReadOnlyRestored, copyPrevented: window.textCopyPrevented === true, value: window.textControl.value(), changes: window.textChanges, same: window.textControl.element.querySelector('input') === window.originalTextInput, focused: document.activeElement === window.originalTextInput })`), { readonlyRestored: true, copyPrevented: false, value: "updated", changes: ["updated"], same: true, focused: true });
+  await evaluate(`
+    window.originalNumberInput.value = "5";
+    window.originalNumberInput.dispatchEvent(new Event('input', { bubbles: true }));
+    window.numberInvalid = window.originalNumberInput.getAttribute('aria-invalid');
+    window.numberValueThrows = false; try { window.numberControl.value(); } catch { window.numberValueThrows = true; }
+    window.numberControl.setValue(6);
+    window.originalNumberInput.focus();
+    window.numberControl.setState({ disabled: true, required: true, help: "Choose an even number.", error: "Value must be even." });
+  `);
+  assert.deepEqual(await evaluate(`({ invalid: window.numberInvalid, throws: window.numberValueThrows, restored: window.originalNumberInput.value, value: window.numberControl.value(), same: window.numberControl.element.querySelector('input') === window.originalNumberInput, focused: document.activeElement === window.originalNumberInput, disabled: window.originalNumberInput.disabled, required: window.originalNumberInput.required, descriptionsResolve: window.originalNumberInput.getAttribute('aria-describedby').split(' ').every(id => !!document.getElementById(id)) })`), { invalid: "true", throws: true, restored: "6", value: 6, same: true, focused: true, disabled: true, required: true, descriptionsResolve: true });
+  await evaluate(`window.originalNumberInput.value = "8"; window.originalNumberInput.dispatchEvent(new Event('input', { bubbles: true })); window.numberDisabledRestored = window.originalNumberInput.value === "6" && window.numberChanges.length === 0; window.numberControl.setState({ disabled: false, required: false, help: null, error: null }); window.originalNumberInput.value = "8"; window.originalNumberInput.dispatchEvent(new Event('input', { bubbles: true }));`);
+  assert.deepEqual(await evaluate(`({ disabledRestored: window.numberDisabledRestored, value: window.numberControl.value(), changes: window.numberChanges, same: window.numberControl.element.querySelector('input') === window.originalNumberInput })`), { disabledRestored: true, value: 8, changes: [8], same: true });
+  await evaluate(`window.originalActionButton.focus(); window.originalActionButton.click();`);
+  assert.deepEqual(await evaluate(`({ calls: window.actionCalls, busy: window.actionControl.busy(), disabled: window.originalActionButton.disabled, ariaBusy: window.originalActionButton.getAttribute('aria-busy'), focused: document.activeElement === window.originalActionButton, descriptionsResolve: window.originalActionButton.getAttribute('aria-describedby').split(' ').every(id => !!document.getElementById(id)) })`), { calls: 1, busy: true, disabled: true, ariaBusy: "true", focused: true, descriptionsResolve: true });
+  await evaluate(`window.originalActionButton.click(); window.actionControl.setState({ help: "Saving now.", error: "Previous save failed." });`);
+  assert.deepEqual(await evaluate(`({ calls: window.actionCalls, busy: window.actionControl.busy(), errorRole: window.actionControl.element.querySelector('.plugin-control-error')?.getAttribute('role'), errorInvalid: window.originalActionButton.getAttribute('aria-invalid'), help: window.actionControl.element.querySelector('.plugin-control-help')?.textContent })`), { calls: 1, busy: true, errorRole: "alert", errorInvalid: null, help: "Saving now." });
+  await evaluate(`window.finishAction();`);
+  for (let attempt = 0; attempt < 100 && await evaluate(`window.actionControl.busy()`); attempt++) await new Promise(resolve => setTimeout(resolve, 10));
+  assert.deepEqual(await evaluate(`({ busy: window.actionControl.busy(), disabled: window.originalActionButton.disabled, same: window.actionControl.element.querySelector('button') === window.originalActionButton })`), { busy: false, disabled: false, same: true });
+  await evaluate(`window.actionControl.setState({ disabled: true }); window.actionControl.dispose(); window.originalActionButton.disabled = false; window.originalActionButton.click();`);
+  assert.equal(await evaluate(`window.actionCalls`), 1);
+  console.log("PASS: versioned text/number controls and actions preserve focus, accessible state associations, callbacks, and disposal in Chromium");
   console.log("PASS: runtime field-state updates preserve focused controls and listeners across async validation states");
   console.log("PASS: readonly slider preserves number-field copy, blocks native edits/range changes, and readonly radios remain keyboard-discoverable");
   console.log("PASS: form labels/descriptions, readonly keyboard shortcuts, and radio focus survive real browser interactions");
