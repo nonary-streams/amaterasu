@@ -28,6 +28,7 @@ class Element {
     for (const entry of this.listeners[type] ?? [])
       if (!entry.signal?.aborted) entry.callback({ type, target: this });
   }
+  dispatchEvent(event) { this.dispatch(event.type); return true; }
   focus() { this.focused = true; }
   querySelector(selector) { return selector === "input" ? this.children.find(child => child.tagName === "INPUT") : null; }
   get textContent() {
@@ -37,7 +38,14 @@ class Element {
 }
 const document = { createElement: tag => new Element(tag) };
 Object.defineProperty(Array.prototype, "item", { value(index) { return this[index] ?? null; } });
-const context = vm.createContext({ document, AbortController });
+const context = vm.createContext({
+  document, AbortController,
+  Event: class { constructor(type, init = {}) { this.type = type; this.bubbles = init.bubbles ?? false; } },
+  Amaterasu: {
+    localizedMessage: value => ({ kind: "localized", value }),
+    literalText: value => ({ kind: "literal", value }),
+  },
+});
 vm.runInContext(ts.transpile(readFileSync("src/list_editor.ts", "utf8"), {
   target: ts.ScriptTarget.ES2022,
   module: ts.ModuleKind.None,

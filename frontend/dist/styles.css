@@ -747,6 +747,50 @@ td small {
 .list-editor .button {
   min-height: 40px;
 }
+.steam-exclusion-picker {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--panel) 88%, transparent);
+}
+.steam-exclusion-picker h3 {
+  margin: 0;
+  font-size: 14px;
+}
+.steam-exclusion-picker p {
+  font-size: 12px;
+}
+.steam-exclusion-picker > input[type="search"] {
+  margin: 0;
+}
+.steam-exclusion-picker [role="status"] {
+  min-height: 1.5em;
+  font-size: 12px;
+}
+.steam-exclusion-option {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+}
+.steam-exclusion-option input[type="checkbox"] {
+  width: 18px;
+  height: 18px;
+  margin: 0;
+  padding: 0;
+  accent-color: var(--accent);
+}
+.steam-exclusion-option small {
+  color: var(--muted);
+  font-size: 11px;
+}
 .field small {
   font-size: 10px;
 }

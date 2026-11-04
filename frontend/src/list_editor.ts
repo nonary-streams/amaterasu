@@ -2,6 +2,7 @@ namespace Amaterasu {
   export interface AccessibleListEditorOptions<Value> {
     label: string;
     values: readonly Value[];
+    description?: string;
     formatValue(value: Value): string;
     parseValue(text: string): Value;
     onChange?(values: readonly Value[]): void;
@@ -22,6 +23,39 @@ namespace Amaterasu {
   }
 
   let nextListEditorId = 0;
+
+  function listEditorSetText(target: Element, source: string): void {
+    if (typeof Amaterasu.setLocalizedTextContent === "function")
+      Amaterasu.setLocalizedTextContent(target, source);
+    else target.textContent = source;
+  }
+
+  function listEditorSetAttribute(
+    target: Element,
+    attribute: "aria-label" | "placeholder",
+    source: string,
+  ): void {
+    if (typeof Amaterasu.setLocalizedAttribute === "function")
+      Amaterasu.setLocalizedAttribute(target, attribute, source);
+    else target.setAttribute(attribute, source);
+  }
+
+  function listEditorSetTemplate(
+    target: Element,
+    source: string,
+    values: Readonly<Record<string, TextValue>>,
+  ): void {
+    if (typeof Amaterasu.setLocalizedAttributeTemplate === "function")
+      Amaterasu.setLocalizedAttributeTemplate(target, "aria-label", source, values);
+    else {
+      let label = source;
+      for (const [name, value] of Object.entries(values)) {
+        const text = typeof value === "string" ? value : value.value;
+        label = label.replaceAll(`{${name}}`, () => text);
+      }
+      target.setAttribute("aria-label", label);
+    }
+  }
 
   /**
    * Create an ordered editor for string lists or caller-defined structured values.
@@ -44,10 +78,16 @@ namespace Amaterasu {
     const root = document.createElement("fieldset");
     root.className = "list-editor";
     const legend = document.createElement("legend");
-    legend.textContent = options.label;
+    listEditorSetText(legend, options.label);
+    const description = options.description ? document.createElement("small") : null;
+    if (description && options.description) {
+      description.id = `amaterasu-list-editor-description-${id}`;
+      description.className = "list-editor-description muted";
+      listEditorSetText(description, options.description);
+    }
     const list = document.createElement("ol");
     list.className = "list-editor-items";
-    list.setAttribute("aria-label", `${options.label} items`);
+    listEditorSetAttribute(list, "aria-label", `${options.label} items`);
     const status = document.createElement("p");
     status.id = `amaterasu-list-editor-status-${id}`;
     status.className = "list-editor-status muted";
@@ -56,7 +96,13 @@ namespace Amaterasu {
     const add = document.createElement("button");
     add.type = "button";
     add.className = "button secondary";
-    add.textContent = "Add item";
+    listEditorSetText(add, "Add item");
+    const draftSignal = document.createElement("input");
+    draftSignal.type = "text";
+    draftSignal.hidden = true;
+    draftSignal.tabIndex = -1;
+    draftSignal.setAttribute("aria-hidden", "true");
+    draftSignal.name = "list_editor_draft";
     const rootController = new AbortController();
     let rowController = new AbortController();
     let disposed = false;
@@ -66,7 +112,15 @@ namespace Amaterasu {
       valid: true,
     }));
 
-    root.append(legend, list, status, add);
+    root.append(legend);
+    if (description) root.append(description);
+    root.append(list, status, add, draftSignal);
+    draftSignal.value = JSON.stringify(entries.map((entry) => entry.text));
+
+    function signalDraft(): void {
+      draftSignal.value = JSON.stringify(entries.map((entry) => entry.text));
+      draftSignal.dispatchEvent(new Event("input", { bubbles: true }));
+    }
 
     function currentValues(): Value[] {
       if (entries.some((entry) => !entry.valid || entry.value === undefined))
@@ -80,7 +134,7 @@ namespace Amaterasu {
     }
 
     function setStatus(message: string): void {
-      status.textContent = message;
+      listEditorSetText(status, message);
     }
 
     function renderRows(focusIndex?: number): void {
@@ -94,10 +148,16 @@ namespace Amaterasu {
         input.type = "text";
         input.className = "list-editor-input";
         input.value = entry.text;
-        input.setAttribute("aria-label", `${options.label}, item ${index + 1}`);
-        input.setAttribute("aria-describedby", status.id);
+        listEditorSetTemplate(input, "{label}, item {index}", {
+          label: typeof Amaterasu.localizedMessage === "function"
+            ? Amaterasu.localizedMessage(options.label) : options.label,
+          index: typeof Amaterasu.literalText === "function"
+            ? Amaterasu.literalText(String(index + 1)) : String(index + 1),
+        });
+        input.setAttribute("aria-describedby", [description?.id, status.id].filter(Boolean).join(" "));
         input.addEventListener("input", () => {
           entry.text = input.value;
+          signalDraft();
           let value: Value;
           try {
             value = options.parseValue(input.value);
@@ -122,10 +182,16 @@ namespace Amaterasu {
         const remove = document.createElement("button");
         remove.type = "button";
         remove.className = "button secondary list-editor-remove";
-        remove.textContent = "Remove";
-        remove.setAttribute("aria-label", `Remove ${options.label} item ${index + 1}`);
+        listEditorSetText(remove, "Remove");
+        listEditorSetTemplate(remove, "Remove {label} item {index}", {
+          label: typeof Amaterasu.localizedMessage === "function"
+            ? Amaterasu.localizedMessage(options.label) : options.label,
+          index: typeof Amaterasu.literalText === "function"
+            ? Amaterasu.literalText(String(index + 1)) : String(index + 1),
+        });
         remove.addEventListener("click", () => {
           entries.splice(index, 1);
+          signalDraft();
           setStatus("");
           renderRows(Math.min(index, entries.length - 1));
           publish();
@@ -146,6 +212,7 @@ namespace Amaterasu {
         return;
       }
       entries.push({ text: "", value: undefined, valid: false });
+      signalDraft();
       setStatus("Enter a value for the new item.");
       renderRows(entries.length - 1);
     }, { signal: rootController.signal });
@@ -159,6 +226,7 @@ namespace Amaterasu {
         if (!Array.isArray(values) || values.length > maxItems)
           throw new Error(`The list can contain at most ${maxItems} items.`);
         entries = values.map((value) => ({ text: options.formatValue(value), value, valid: true }));
+        signalDraft();
         setStatus("");
         renderRows();
       },
