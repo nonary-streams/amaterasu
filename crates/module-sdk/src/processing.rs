@@ -3,7 +3,8 @@
 use crate::{ModuleResult, RuntimeClient, abi::*, media::native_contracts};
 use amaterasu_media::*;
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
+    collections::HashSet,
     ffi::c_void,
     panic::{AssertUnwindSafe, catch_unwind},
 };
@@ -74,6 +75,7 @@ pub trait GpuFrameProcessor: 'static {
     /// Atomically replace the active settings of a configured stream. Rejection
     /// must leave its prior settings usable. The negotiated output format and
     /// HDR metadata must remain unchanged. Copy settings needed after return.
+    /// A panic poisons the stream until it is explicitly cancelled.
     fn update_stream(&mut self, _stream: u64, _json: &[u8]) -> Result<(), Status> {
         Err(MEDIA_UNSUPPORTED)
     }
@@ -93,6 +95,25 @@ pub trait GpuFrameProcessor: 'static {
 struct Binding<P> {
     api: GpuProcessorApiV1_3,
     processor: RefCell<P>,
+    poisoned_streams: RefCell<HashSet<u64>>,
+    all_streams_poisoned: Cell<bool>,
+}
+
+const MAX_POISONED_STREAMS: usize = 64;
+
+impl<P> Binding<P> {
+    fn is_poisoned(&self, stream: u64) -> bool {
+        self.all_streams_poisoned.get() || self.poisoned_streams.borrow().contains(&stream)
+    }
+
+    fn poison(&self, stream: u64) {
+        let mut poisoned = self.poisoned_streams.borrow_mut();
+        if poisoned.len() >= MAX_POISONED_STREAMS && !poisoned.contains(&stream) {
+            self.all_streams_poisoned.set(true);
+        } else {
+            poisoned.insert(stream);
+        }
+    }
 }
 
 /// Transfers an effect to a runtime-owned table. The runtime releases it once,
@@ -123,6 +144,8 @@ pub fn into_gpu_binding<P: GpuFrameProcessor>(processor: P) -> *const GpuProcess
             update_stream: update::<P>,
         },
         processor: RefCell::new(processor),
+        poisoned_streams: RefCell::new(HashSet::new()),
+        all_streams_poisoned: Cell::new(false),
     });
     binding.api.base.base.base.base.context = (&mut *binding as *mut Binding<P>).cast();
     Box::into_raw(binding).cast()
@@ -149,13 +172,20 @@ unsafe extern "C" fn update<P: GpuFrameProcessor>(
         }
         // SAFETY: the binding is live and points to the SDK-owned context.
         let binding = unsafe { &*context.cast::<Binding<P>>() };
+        if binding.is_poisoned(stream) {
+            return STATUS_INTERNAL_ERROR;
+        }
         let Ok(mut processor) = binding.processor.try_borrow_mut() else {
             return MEDIA_BUSY;
         };
-        match processor.update_stream(stream, json) {
-            Ok(()) => STATUS_OK,
-            Err(status) if status != STATUS_OK => status,
-            Err(_) => STATUS_INTERNAL_ERROR,
+        match catch_unwind(AssertUnwindSafe(|| processor.update_stream(stream, json))) {
+            Ok(Ok(())) => STATUS_OK,
+            Ok(Err(status)) if status != STATUS_OK => status,
+            Ok(Err(_)) => STATUS_INTERNAL_ERROR,
+            Err(_) => {
+                binding.poison(stream);
+                STATUS_INTERNAL_ERROR
+            }
         }
     })
 }
@@ -181,6 +211,9 @@ unsafe extern "C" fn configure<P: GpuFrameProcessor>(
         }
         // SAFETY: the binding is live and points to the SDK-owned context.
         let binding = unsafe { &*context.cast::<Binding<P>>() };
+        if binding.is_poisoned(stream) {
+            return STATUS_INTERNAL_ERROR;
+        }
         let Ok(mut processor) = binding.processor.try_borrow_mut() else {
             return MEDIA_BUSY;
         };
@@ -203,6 +236,9 @@ unsafe extern "C" fn metadata<P: GpuFrameProcessor>(
         }
         // SAFETY: native binding and writable output remain live for this call.
         let binding = unsafe { &*context.cast::<Binding<P>>() };
+        if binding.is_poisoned(stream) {
+            return STATUS_INTERNAL_ERROR;
+        }
         let Ok(processor) = binding.processor.try_borrow() else {
             return MEDIA_BUSY;
         };
@@ -248,6 +284,9 @@ unsafe extern "C" fn process<P: GpuFrameProcessor>(
         // SAFETY: the native caller supplies a live table context and descriptor
         // for this synchronous call. No borrowed pointer survives the invocation.
         let (binding, input) = unsafe { (&*context.cast::<Binding<P>>(), &*input) };
+        if binding.is_poisoned(stream) {
+            return STATUS_INTERNAL_ERROR;
+        }
         if let Err(status) = input.validate() {
             return status;
         }
@@ -280,6 +319,7 @@ unsafe extern "C" fn cancel<P: GpuFrameProcessor>(context: *mut c_void, stream: 
         // SAFETY: a bound native table supplies its live context until release.
         let binding = unsafe { &*context.cast::<Binding<P>>() };
         binding.processor.borrow_mut().cancel(stream);
+        binding.poisoned_streams.borrow_mut().remove(&stream);
     });
 }
 

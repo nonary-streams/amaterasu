@@ -624,7 +624,9 @@ typedef struct {
 #define AMATERASU_GPU_PROCESSOR_API_V1_2_SIZE ((uint32_t)sizeof(AmaterasuGpuProcessorApiV1_2))
 /* v1.3 atomically replaces settings of an active configured stream. JSON has
  * the same size and borrowing rules as configure_stream. Failure leaves the
- * previous settings active and does not cancel the stream. Calls are serialized
+ * previous settings active and does not cancel the stream, except that an
+ * internal error is fatal: stop frame submission, retire downstream leases,
+ * then cancel the stream. Calls are serialized
  * with processing and retirement. Updates must preserve the negotiated output
  * format and HDR metadata. */
 #define AMATERASU_GPU_PROCESSOR_UPDATE_INTERFACE_MINOR 3u

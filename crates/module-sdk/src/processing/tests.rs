@@ -284,20 +284,135 @@ fn factory_checks_version_and_uses_authenticated_principal() {
     }
 }
 
-struct UpdatingEffect<const ALTERNATE: bool> {
-    settings: Rc<std::cell::RefCell<Vec<u8>>>,
+struct PitchEffect {
+    updated: bool,
+    state: Rc<State>,
     cancellations: Rc<Cell<u32>>,
 }
-impl<const ALTERNATE: bool> GpuFrameProcessor for UpdatingEffect<ALTERNATE> {
-    fn update_stream(&mut self, _: u64, json: &[u8]) -> Result<(), Status> {
-        if json == b"{}" {
-            return Err(MEDIA_BACKEND_ERROR);
-        }
-        *self.settings.borrow_mut() = json.to_vec();
-        Ok(())
+struct OffsetEffect {
+    offset: u32,
+    state: Rc<State>,
+    cancellations: Rc<Cell<u32>>,
+}
+
+struct PanickingUpdate {
+    changed: Rc<Cell<bool>>,
+    cancelled: Rc<Cell<bool>>,
+    calls: Rc<Cell<u32>>,
+}
+impl GpuFrameProcessor for PanickingUpdate {
+    fn update_stream(&mut self, _: u64, _: &[u8]) -> Result<(), Status> {
+        self.changed.set(true);
+        panic!("partially applied update")
     }
     fn process(&mut self, _: u64, _: GpuFrame<'_>) -> Result<GpuOutputFrame, Status> {
-        Err(MEDIA_UNSUPPORTED)
+        self.calls.set(self.calls.get() + 1);
+        Err(MEDIA_BACKEND_ERROR)
+    }
+    fn hdr_metadata(&self, _: u64) -> Option<HdrMetadata> {
+        self.calls.set(self.calls.get() + 1);
+        None
+    }
+    fn cancel(&mut self, _: u64) {
+        self.cancelled.set(true);
+    }
+    fn shutdown(&mut self) {
+        assert!(self.cancelled.get());
+    }
+}
+
+#[test]
+fn panicking_update_poison_prevents_partial_state_from_being_observed() {
+    let changed = Rc::new(Cell::new(false));
+    let cancelled = Rc::new(Cell::new(false));
+    let calls = Rc::new(Cell::new(0));
+    let raw = into_gpu_binding(PanickingUpdate {
+        changed: changed.clone(),
+        cancelled: cancelled.clone(),
+        calls: calls.clone(),
+    });
+    let api = unsafe { &*raw };
+    assert_eq!(
+        unsafe { update_gpu_stream(api, 7, b"{}") },
+        Err(STATUS_INTERNAL_ERROR)
+    );
+    assert!(changed.get());
+    assert_eq!(
+        unsafe { update_gpu_stream(api, 7, b"{}") },
+        Err(STATUS_INTERNAL_ERROR)
+    );
+    assert_eq!(
+        unsafe { process_gpu(api, 7, &input(), CAPTURE_FRAME_FRESH, |_| STATUS_OK) },
+        ProcessingOutcome::Failed(STATUS_INTERNAL_ERROR)
+    );
+    let table = unsafe { &*raw.cast::<GpuProcessorApiV1_1>() };
+    let mut metadata = HdrMetadata::default();
+    assert_eq!(
+        unsafe { (table.hdr_metadata)(api.base.context, 7, &mut metadata) },
+        STATUS_INTERNAL_ERROR
+    );
+    assert_eq!(calls.get(), 0);
+    unsafe {
+        (api.cancel_dmabuf_leases)(api.base.context, 7);
+        api.base.release.unwrap()(api.base.context);
+    }
+    assert!(cancelled.get());
+}
+
+#[test]
+fn poison_overflow_fails_closed_for_the_entire_binding() {
+    let cancelled = Rc::new(Cell::new(false));
+    let calls = Rc::new(Cell::new(0));
+    let raw = into_gpu_binding(PanickingUpdate {
+        changed: Rc::new(Cell::new(false)),
+        cancelled: cancelled.clone(),
+        calls: calls.clone(),
+    });
+    let api = unsafe { &*raw };
+    for stream in 0..=MAX_POISONED_STREAMS as u64 {
+        assert_eq!(
+            unsafe { update_gpu_stream(api, stream, b"{}") },
+            Err(STATUS_INTERNAL_ERROR)
+        );
+    }
+    unsafe { (api.cancel_dmabuf_leases)(api.base.context, 0) };
+    assert_eq!(
+        unsafe { process_gpu(api, 999, &input(), CAPTURE_FRAME_FRESH, |_| STATUS_OK) },
+        ProcessingOutcome::Failed(STATUS_INTERNAL_ERROR)
+    );
+    assert_eq!(calls.get(), 0);
+    unsafe { api.base.release.unwrap()(api.base.context) };
+}
+impl GpuFrameProcessor for PitchEffect {
+    fn update_stream(&mut self, _: u64, json: &[u8]) -> Result<(), Status> {
+        if json != br#"{"gain":2}"# {
+            return Err(MEDIA_BACKEND_ERROR);
+        }
+        self.updated = true;
+        Ok(())
+    }
+    fn process(&mut self, _: u64, input: GpuFrame<'_>) -> Result<GpuOutputFrame, Status> {
+        let mut frame = *input.frame();
+        frame.planes[0].pitch = if self.updated { 128 } else { 64 };
+        Ok(output(&self.state, frame))
+    }
+    fn cancel(&mut self, _: u64) {
+        self.cancellations.set(self.cancellations.get() + 1);
+    }
+    fn shutdown(&mut self) {}
+}
+impl GpuFrameProcessor for OffsetEffect {
+    fn update_stream(&mut self, _: u64, json: &[u8]) -> Result<(), Status> {
+        if json != br#"{"gain":2}"# {
+            return Err(MEDIA_BACKEND_ERROR);
+        }
+        self.offset = 64;
+        Ok(())
+    }
+    fn process(&mut self, _: u64, input: GpuFrame<'_>) -> Result<GpuOutputFrame, Status> {
+        let mut frame = *input.frame();
+        frame.planes[0].offset = self.offset;
+        Ok(output(&self.state, frame))
     }
     fn cancel(&mut self, _: u64) {
         self.cancellations.set(self.cancellations.get() + 1);
@@ -307,41 +422,58 @@ impl<const ALTERNATE: bool> GpuFrameProcessor for UpdatingEffect<ALTERNATE> {
 
 #[test]
 fn unchanged_update_consumer_supports_replacement_and_preserves_rejected_stream() {
-    fn exercise(
-        api: &GpuProcessorApi,
-        settings: &std::cell::RefCell<Vec<u8>>,
-        cancellations: &Cell<u32>,
-    ) {
+    fn exercise(api: &GpuProcessorApi, cancellations: &Cell<u32>, expected_after: (u32, u32)) {
+        fn observed(api: &GpuProcessorApi) -> (u32, u32) {
+            let mut layout = (0, 0);
+            assert_eq!(
+                unsafe {
+                    process_gpu(api, 7, &input(), CAPTURE_FRAME_FRESH, |frame| {
+                        layout = (frame.frame.planes[0].pitch, frame.frame.planes[0].offset);
+                        STATUS_OK
+                    })
+                },
+                ProcessingOutcome::Accepted
+            );
+            layout
+        }
+        assert_eq!(observed(api), (64, 0));
         assert_eq!(
             unsafe { update_gpu_stream(api, 7, br#"{"gain":2}"#) },
             Ok(())
         );
-        assert_eq!(settings.borrow().as_slice(), br#"{"gain":2}"#);
+        assert_eq!(observed(api), expected_after);
         assert_eq!(
             unsafe { update_gpu_stream(api, 7, b"{}") },
             Err(MEDIA_BACKEND_ERROR)
         );
-        assert_eq!(settings.borrow().as_slice(), br#"{"gain":2}"#);
+        assert_eq!(observed(api), expected_after);
         assert_eq!(
             unsafe { update_gpu_stream(api, 7, b"bad") },
             Err(STATUS_INVALID_ARGUMENT)
         );
         assert_eq!(cancellations.get(), 0);
     }
-    let settings = Rc::new(std::cell::RefCell::new(Vec::new()));
     let cancellations = Rc::new(Cell::new(0));
-    for raw in [
-        into_gpu_binding(UpdatingEffect::<false> {
-            settings: settings.clone(),
-            cancellations: cancellations.clone(),
-        }),
-        into_gpu_binding(UpdatingEffect::<true> {
-            settings: settings.clone(),
-            cancellations: cancellations.clone(),
-        }),
+    for (raw, expected_after) in [
+        (
+            into_gpu_binding(PitchEffect {
+                updated: false,
+                state: Rc::new(State::default()),
+                cancellations: cancellations.clone(),
+            }),
+            (128, 0),
+        ),
+        (
+            into_gpu_binding(OffsetEffect {
+                offset: 0,
+                state: Rc::new(State::default()),
+                cancellations: cancellations.clone(),
+            }),
+            (64, 64),
+        ),
     ] {
         let api = unsafe { &*raw };
-        exercise(api, &settings, &cancellations);
+        exercise(api, &cancellations, expected_after);
         let table = unsafe { &*raw.cast::<GpuProcessorApiV1_3>() };
         assert_eq!(
             unsafe { (table.update_stream)(api.base.context, 7, std::ptr::null(), 1) },

@@ -144,10 +144,11 @@ pub const GPU_PROCESSOR_UPDATE_INTERFACE_MINOR: u32 = 3;
 
 /// Atomic replacement of an active stream's configuration. The JSON has the
 /// same size and lifetime bounds as `configure_stream`. The call is serialized
-/// with processing and cancellation. A failed update leaves the previous
-/// configuration active and does not cancel the stream. Successful updates
-/// must preserve the negotiated output format and HDR metadata; changes that
-/// cannot satisfy those invariants must be rejected.
+/// with processing and cancellation. An ordinary rejected update leaves the
+/// previous configuration active and does not cancel the stream. An internal
+/// error is fatal: stop submissions, retire downstream leases, then cancel the
+/// stream. Successful updates must preserve the negotiated output format and
+/// HDR metadata; changes that cannot satisfy those invariants must be rejected.
 #[repr(C)]
 pub struct GpuProcessorApiV1_3 {
     pub base: GpuProcessorApiV1_2,

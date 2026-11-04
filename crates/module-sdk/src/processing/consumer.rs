@@ -55,7 +55,9 @@ pub unsafe fn configure_gpu_stream(
 
 /// Atomically replace settings for a configured stream. A rejected update
 /// leaves the stream active with its prior settings; this helper never cancels.
-/// Calls must be serialized with frame processing and stream retirement.
+/// Treat `STATUS_INTERNAL_ERROR` as fatal: stop submitting frames, retire
+/// downstream leases, then cancel the stream. Calls must be serialized with
+/// frame processing and stream retirement.
 ///
 /// # Safety
 /// `api` must be a live binding obtained with the GPU processor's typed
