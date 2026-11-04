@@ -41,6 +41,99 @@ pub struct ApiRequestOptions<'a> {
     pub interface_minor: u32,
 }
 
+/// Validated full settings for a new revision, scoped to the requested provider.
+pub struct LiveProviderSettings {
+    pub revision: String,
+    pub settings: Value,
+}
+
+/// Build a retryable live-settings admission for an exact stream and provider.
+/// Reuse the returned command unchanged if the admission response is lost.
+pub fn live_provider_settings_command(
+    options: RequestOptions<'_>,
+    target: crate::extension_api::LifecycleTarget,
+    provider: &str,
+) -> ModuleResult<Command> {
+    if !matches!(target, crate::extension_api::LifecycleTarget::Stream { .. })
+        || !serde_json::to_vec(&target).is_ok_and(|bytes| bytes.len() <= 1024)
+        || provider.is_empty()
+        || provider.len() > 128
+    {
+        return Err("invalid live settings target or provider".into());
+    }
+    let payload = serde_json::to_value(crate::extension_api::LiveProviderSettingsRequest {
+        operation: "read_live_provider_settings".into(),
+        target,
+        provider: provider.into(),
+    })
+    .map_err(|error| error.to_string())?;
+    Ok(Command::Request {
+        service: options.service.to_owned(),
+        payload,
+        timeout_ms: options.timeout_ms,
+        operation_id: options.operation_id.to_owned(),
+        parent: options.parent,
+    })
+}
+
+/// Validate a live-settings response against the trusted admitted stream and
+/// provider. `None` means the read is pending or the revision is unchanged.
+/// A returned update is an observation, not proof the consumer applied it.
+pub fn validate_live_provider_settings(
+    payload: &Value,
+    target: &crate::extension_api::LifecycleTarget,
+    provider: &str,
+    current_revision: &str,
+) -> ModuleResult<Option<LiveProviderSettings>> {
+    if !matches!(target, crate::extension_api::LifecycleTarget::Stream { .. })
+        || !serde_json::to_vec(target).is_ok_and(|bytes| bytes.len() <= 1024)
+        || provider.is_empty()
+        || provider.len() > 128
+        || current_revision.is_empty()
+        || current_revision.len() > 128
+    {
+        return Err("invalid live settings reference".into());
+    }
+    if payload.get("status").and_then(Value::as_str) == Some("pending") {
+        return Ok(None);
+    }
+    let settings = payload
+        .get("settings")
+        .ok_or("invalid live settings response")?;
+    if !settings.is_object()
+        || !serde_json::to_vec(settings).is_ok_and(|bytes| bytes.len() <= 16 * 1024)
+    {
+        return Err("invalid live settings response".into());
+    }
+    // Ignore extra top-level fields while validating the published response type.
+    let fields = ["status", "target", "provider", "revision", "settings"]
+        .into_iter()
+        .filter_map(|name| {
+            payload
+                .get(name)
+                .map(|value| (name.to_owned(), value.clone()))
+        })
+        .collect();
+    let response: crate::extension_api::LiveProviderSettingsResponse =
+        serde_json::from_value(Value::Object(fields))
+            .map_err(|_| "invalid live settings response")?;
+    if response.status != "succeeded"
+        || response.target != *target
+        || response.provider != provider
+        || response.revision.is_empty()
+        || response.revision.len() > 128
+    {
+        return Err("invalid live settings response".into());
+    }
+    if response.revision == current_revision {
+        return Ok(None);
+    }
+    Ok(Some(LiveProviderSettings {
+        revision: response.revision,
+        settings: response.settings,
+    }))
+}
+
 impl RuntimeClient {
     /// Read agreed preparation constraints for this consumer's admitted launch.
     /// The coordinator checks its explicit read grant and the launch owner and
@@ -90,14 +183,10 @@ impl RuntimeClient {
         target: crate::extension_api::LifecycleTarget,
         provider: &str,
     ) -> ModuleResult<u64> {
-        self.request_serialized(
-            options,
-            &crate::extension_api::LiveProviderSettingsRequest {
-                operation: "read_live_provider_settings".into(),
-                target,
-                provider: provider.into(),
-            },
-        )
+        match self.send(live_provider_settings_command(options, target, provider)?)? {
+            Response::Accepted { id } => Ok(id),
+            response => Err(unexpected_response(response)),
+        }
     }
 
     /// Queue a read of the generic context for a dispatched lifecycle
@@ -204,5 +293,90 @@ fn unexpected_response(response: Response) -> String {
     match response {
         Response::Error { code, message } => format!("{code}: {message}"),
         unexpected => format!("unexpected runtime response: {unexpected:?}"),
+    }
+}
+
+#[cfg(test)]
+mod live_settings_tests {
+    use super::*;
+    use crate::extension_api::LifecycleTarget;
+    use serde_json::json;
+
+    fn target() -> LifecycleTarget {
+        LifecycleTarget::Stream {
+            host_epoch: "epoch".into(),
+            session_id: "session".into(),
+            stream_id: "stream".into(),
+            generation: 1,
+        }
+    }
+
+    #[test]
+    fn command_preserves_retry_identity_and_exact_scope() {
+        let command = live_provider_settings_command(
+            RequestOptions {
+                service: "lifecycle",
+                timeout_ms: 5000,
+                operation_id: "op",
+                parent: Some(4),
+            },
+            target(),
+            "effect",
+        )
+        .unwrap();
+        match command {
+            Command::Request {
+                service,
+                timeout_ms,
+                operation_id,
+                parent,
+                payload,
+            } => {
+                assert_eq!(
+                    (service.as_str(), timeout_ms, operation_id.as_str(), parent),
+                    ("lifecycle", 5000, "op", Some(4))
+                );
+                assert_eq!(
+                    payload,
+                    json!({"operation":"read_live_provider_settings", "target":target(), "provider":"effect"})
+                );
+            }
+            _ => panic!("expected request"),
+        }
+    }
+
+    #[test]
+    fn validates_scope_revision_size_and_pending() {
+        let target = target();
+        let valid = json!({"status":"succeeded", "target":target, "provider":"effect", "revision":"new", "settings":{"gain":2}});
+        let validate =
+            |payload: &Value| validate_live_provider_settings(payload, &target, "effect", "old");
+        assert!(validate(&json!({"status":"pending"})).unwrap().is_none());
+        let update = validate(&valid).unwrap().unwrap();
+        assert_eq!(update.revision, "new");
+        assert_eq!(update.settings, json!({"gain":2}));
+        let mut changed = valid.clone();
+        changed["future_field"] = json!(true);
+        assert!(validate(&changed).unwrap().is_some());
+        changed["revision"] = json!("old");
+        assert!(validate(&changed).unwrap().is_none());
+        for (field, value) in [
+            ("provider", json!("other")),
+            ("target", json!({})),
+            ("revision", json!("")),
+            ("revision", json!("x".repeat(129))),
+            ("settings", json!([])),
+            ("settings", json!({"value":"x".repeat(16384)})),
+            ("status", json!("rejected")),
+        ] {
+            let mut invalid = valid.clone();
+            invalid[field] = value;
+            assert!(validate(&invalid).is_err(), "accepted invalid {field}");
+        }
+        let mut oversized = target.clone();
+        if let LifecycleTarget::Stream { stream_id, .. } = &mut oversized {
+            *stream_id = "x".repeat(1024);
+        }
+        assert!(validate_live_provider_settings(&valid, &oversized, "effect", "old").is_err());
     }
 }
