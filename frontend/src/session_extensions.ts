@@ -89,10 +89,10 @@ namespace Amaterasu {
             if (!effective) throw new Error("Missing effective extension setting.");
             const isOverride = Object.hasOwn(document.values, option.id);
             const editorValue = isOverride ? document.values[option.id] : effective.value;
-            const isSlider = option.presentation === "slider";
             const editor = option.presentation === "keybinding"
               ? extensionKeybindingSettingEditor(option.definition, editorValue)
-              : isSlider ? extensionSliderEditor(option.definition, editorValue, option.label)
+              : option.presentation === "slider" ? extensionSliderEditor(option.definition, editorValue, option.label)
+              : option.presentation === "radio_group" ? extensionRadioGroupEditor(option.definition, editorValue, option.label, option.choice_labels)
               : extensionFieldEditor(option.definition, editorValue, option.choice_labels);
             // Host settings are ordinary editable values. Scoped values may
             // inherit, but editing a control must always save that edit.
@@ -248,6 +248,7 @@ namespace Amaterasu {
             const editor = option.presentation === "keybinding"
               ? extensionKeybindingSettingEditor(option.definition, value)
               : option.presentation === "slider" ? extensionSliderEditor(option.definition, value, option.label)
+              : option.presentation === "radio_group" ? extensionRadioGroupEditor(option.definition, value, option.label, option.choice_labels)
               : extensionFieldEditor(option.definition, value, option.choice_labels);
             const controls = editor.node.matches("input,select,textarea") ? [editor.node] : Array.from(editor.node.querySelectorAll("input,select,textarea"));
             if (controls.length === 1) controls[0]!.setAttribute("aria-label", option.label);

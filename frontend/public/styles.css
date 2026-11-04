@@ -827,9 +827,39 @@ dialog::backdrop {
 .session-extension-option > select,
 .session-extension-option > input:not([type="checkbox"]) { width: min(100%, 420px); }
 .session-extension-option > small { line-height: 1.45; max-width: 680px; }
-.extension-slider { display: flex; align-items: center; gap: 12px; width: min(100%, 420px); }
-.extension-slider input[type="range"] { flex: 1; min-width: 0; }
-.extension-slider input[type="number"] { width: 7rem; }
+.extension-slider,
+.bounded-slider {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: min(100%, 420px);
+}
+.extension-slider input[type="range"],
+.bounded-slider input[type="range"] { flex: 1; min-width: 0; }
+.extension-slider input[type="number"],
+.bounded-slider input[type="number"] { width: 7rem; }
+.radio-group {
+  display: grid;
+  gap: 8px;
+  width: min(100%, 420px);
+}
+.radio-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  min-width: 0;
+  padding: 9px 11px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  cursor: pointer;
+}
+.radio-option input[type="radio"] {
+  flex: 0 0 auto;
+  margin: 3px 0 0;
+  accent-color: var(--accent);
+}
+.radio-option span { min-width: 0; overflow-wrap: anywhere; }
 .session-extension-inherit { display: flex; align-items: center; gap: 6px; font-size: 13px; }
 dialog p {
   font-size: 12px;

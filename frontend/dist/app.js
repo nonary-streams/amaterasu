@@ -3888,6 +3888,77 @@ var Amaterasu;
         return node;
     }
     Amaterasu.input = input;
+    let nextRadioGroupId = 0;
+    function radioGroup(label, options, selected, onChange = () => { }) {
+        if (!options.length || new Set(options.map((option) => option.value)).size !== options.length ||
+            !options.some((option) => option.value === selected))
+            throw new Error("Invalid radio group options or selection.");
+        const name = `amaterasu-radio-${++nextRadioGroupId}`;
+        const group = el("div", "radio-group");
+        group.setAttribute("role", "radiogroup");
+        group.setAttribute("aria-label", label);
+        const controls = [];
+        for (const option of options) {
+            const control = input(name, option.value, "radio");
+            control.checked = option.value === selected;
+            control.addEventListener("change", () => {
+                if (!control.checked)
+                    return;
+                for (const peer of controls)
+                    peer.checked = peer === control;
+                onChange(control.value);
+            });
+            group.append(el("label", "radio-option", control, el("span", "", option.label)));
+            controls.push(control);
+        }
+        return {
+            node: group,
+            value: () => controls.find((control) => control.checked)?.value ?? "",
+            setValue: (value) => {
+                if (!options.some((option) => option.value === value))
+                    throw new Error("Unsupported radio group value.");
+                for (const control of controls)
+                    control.checked = control.value === value;
+            },
+        };
+    }
+    Amaterasu.radioGroup = radioGroup;
+    function boundedSlider(minimum, maximum, value, label, integer = false, className = "bounded-slider") {
+        if (!Number.isFinite(minimum) || !Number.isFinite(maximum) || minimum >= maximum ||
+            (integer && (!Number.isSafeInteger(minimum) || !Number.isSafeInteger(maximum))) ||
+            !Number.isFinite(value) || value < minimum || value > maximum || (integer && !Number.isSafeInteger(value)))
+            throw new Error("Invalid bounded slider limits or value.");
+        const number = input("", String(value), "number");
+        const range = input("", "", "range");
+        for (const control of [number, range]) {
+            control.min = String(minimum);
+            control.max = String(maximum);
+            control.step = integer ? "1" : "any";
+        }
+        range.value = String(value);
+        range.setAttribute("aria-label", `${label} slider`);
+        number.setAttribute("aria-label", `${label} value`);
+        const validNumber = () => {
+            const parsed = Number(number.value);
+            return number.value !== "" && number.validity.valid && Number.isFinite(parsed) &&
+                parsed >= minimum && parsed <= maximum && (!integer || Number.isSafeInteger(parsed));
+        };
+        range.addEventListener("input", () => { number.value = range.value; });
+        number.addEventListener("input", () => { if (validNumber())
+            range.value = number.value; });
+        const node = el("div", className, range, number);
+        return {
+            node,
+            range,
+            number,
+            value: () => {
+                if (!validNumber())
+                    throw new Error(`Enter a valid number from ${minimum} to ${maximum}.`);
+                return Number(number.value);
+            },
+        };
+    }
+    Amaterasu.boundedSlider = boundedSlider;
     function sectionHeading(title, description, ...actions) {
         return el("header", "page-heading", el("div", "", el("h1", "", title), el("p", "muted", description)), el("div", "actions", ...actions));
     }
@@ -16211,36 +16282,27 @@ var Amaterasu;
         if ((definition.type !== "integer" && definition.type !== "decimal") ||
             typeof min !== "number" || !Number.isFinite(min) ||
             typeof max !== "number" || !Number.isFinite(max) || min >= max ||
-            (definition.type === "integer" && (!Number.isSafeInteger(min) || !Number.isSafeInteger(max))))
+            (definition.type === "integer" && (!Number.isSafeInteger(min) || !Number.isSafeInteger(max))) ||
+            typeof value !== "number")
             throw new Error("Invalid slider setting.");
-        const number = Amaterasu.input("", String(value), "number");
-        const slider = Amaterasu.input("", "", "range");
-        for (const control of [number, slider]) {
-            control.min = String(min);
-            control.max = String(max);
-            control.step = definition.type === "integer" ? "1" : "any";
-        }
-        slider.value = String(value);
-        slider.setAttribute("aria-label", `${label} slider`);
-        number.setAttribute("aria-label", `${label} value`);
-        const validNumber = () => {
-            const parsed = Number(number.value);
-            return number.value !== "" && number.validity.valid && Number.isFinite(parsed) &&
-                parsed >= min && parsed <= max && (definition.type !== "integer" || Number.isSafeInteger(parsed));
-        };
-        slider.addEventListener("input", () => { number.value = slider.value; });
-        number.addEventListener("input", () => { if (validNumber())
-            slider.value = number.value; });
-        return {
-            node: Amaterasu.el("div", "extension-slider", slider, number),
-            value: () => {
-                if (!validNumber())
-                    throw new Error(`Enter a valid number from ${min} to ${max}.`);
-                return Number(number.value);
-            },
-        };
+        const slider = Amaterasu.boundedSlider(min, max, value, label, definition.type === "integer", "extension-slider");
+        return { node: slider.node, value: slider.value };
     }
     Amaterasu.extensionSliderEditor = extensionSliderEditor;
+    function extensionRadioGroupEditor(definition, value, label, choiceLabels = {}) {
+        if (definition.type !== "enum" || !Array.isArray(definition.options) ||
+            typeof value !== "string" || !definition.options.includes(value))
+            throw new Error("Invalid radio group setting.");
+        const choices = definition.options.map((option) => ({
+            value: option,
+            label: typeof Amaterasu.literalText === "function"
+                ? Amaterasu.literalText(choiceLabels[option] ?? option)
+                : choiceLabels[option] ?? option,
+        }));
+        const control = Amaterasu.radioGroup(label, choices, value);
+        return { node: control.node, value: control.value };
+    }
+    Amaterasu.extensionRadioGroupEditor = extensionRadioGroupEditor;
     function extensionFieldEditor(definition, value, choiceLabels = {}) {
         switch (definition.type) {
             case "nullable": {
@@ -16705,11 +16767,11 @@ var Amaterasu;
                             throw new Error("Missing effective extension setting.");
                         const isOverride = Object.hasOwn(document.values, option.id);
                         const editorValue = isOverride ? document.values[option.id] : effective.value;
-                        const isSlider = option.presentation === "slider";
                         const editor = option.presentation === "keybinding"
                             ? Amaterasu.extensionKeybindingSettingEditor(option.definition, editorValue)
-                            : isSlider ? Amaterasu.extensionSliderEditor(option.definition, editorValue, option.label)
-                                : Amaterasu.extensionFieldEditor(option.definition, editorValue, option.choice_labels);
+                            : option.presentation === "slider" ? Amaterasu.extensionSliderEditor(option.definition, editorValue, option.label)
+                                : option.presentation === "radio_group" ? Amaterasu.extensionRadioGroupEditor(option.definition, editorValue, option.label, option.choice_labels)
+                                    : Amaterasu.extensionFieldEditor(option.definition, editorValue, option.choice_labels);
                         const inherit = scope.kind === "host" ? null : Amaterasu.input("", "", "checkbox");
                         if (inherit) {
                             inherit.checked = !isOverride;
@@ -16878,7 +16940,8 @@ var Amaterasu;
                         const editor = option.presentation === "keybinding"
                             ? Amaterasu.extensionKeybindingSettingEditor(option.definition, value)
                             : option.presentation === "slider" ? Amaterasu.extensionSliderEditor(option.definition, value, option.label)
-                                : Amaterasu.extensionFieldEditor(option.definition, value, option.choice_labels);
+                                : option.presentation === "radio_group" ? Amaterasu.extensionRadioGroupEditor(option.definition, value, option.label, option.choice_labels)
+                                    : Amaterasu.extensionFieldEditor(option.definition, value, option.choice_labels);
                         const controls = editor.node.matches("input,select,textarea") ? [editor.node] : Array.from(editor.node.querySelectorAll("input,select,textarea"));
                         if (controls.length === 1)
                             controls[0].setAttribute("aria-label", option.label);

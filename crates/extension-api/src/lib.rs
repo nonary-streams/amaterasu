@@ -582,6 +582,8 @@ pub enum OptionPresentation {
     Keybinding,
     /// A numeric slider paired with an editable numeric value.
     Slider,
+    /// An accessible radio group for an enum with an explicit choice set.
+    RadioGroup,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1417,6 +1419,15 @@ pub fn validate_descriptor(descriptor: &ExtensionDescriptor) -> Result<(), Strin
             .into_iter()
             .collect();
         amaterasu_configuration_schema::defaults(&fields)?;
+        if option.presentation == Some(OptionPresentation::RadioGroup) {
+            use amaterasu_configuration_schema::Definition;
+            if !matches!(&option.definition, Definition::Enum { options, .. } if options.len() >= 2)
+            {
+                return Err(
+                    "radio_group presentation requires an enum with at least two choices".into(),
+                );
+            }
+        }
         if option.presentation == Some(OptionPresentation::Slider) {
             use amaterasu_configuration_schema::Definition;
             // JavaScript clients must be able to represent every integer bound exactly.
@@ -1934,6 +1945,48 @@ mod tests {
         descriptor.options[0].definition =
             serde_json::from_value(json!({"type":"boolean","default":true})).unwrap();
         assert!(validate_descriptor(&descriptor).is_ok());
+    }
+
+    #[test]
+    fn radio_group_presentation_requires_enum_choices_and_round_trips() {
+        let method = MethodRef {
+            service: "example.provider/1".into(),
+            method: "validate".into(),
+            interface_major: 1,
+            interface_minor: 0,
+            schema_revision: 1,
+        };
+        let option: OptionDescriptor = serde_json::from_value(json!({
+            "id":"mode", "label":"Mode", "help":"Choose a mode.",
+            "definition":{"type":"enum","default":"steady","options":["steady","responsive"]},
+            "presentation":"radio_group", "allowed_scopes":["host"],
+            "apply_policy":"next_stream", "required_capabilities":[]
+        }))
+        .unwrap();
+        let mut descriptor = ExtensionDescriptor {
+            provider: "example.provider".into(),
+            display_name: None,
+            revision: 1,
+            options: vec![option],
+            actions: vec![],
+            capabilities: vec![],
+            settings_validate: method,
+        };
+        assert!(validate_descriptor(&descriptor).is_ok());
+        assert_eq!(
+            serde_json::to_value(&descriptor.options[0]).unwrap()["presentation"],
+            json!("radio_group")
+        );
+        descriptor.options[0].definition = serde_json::from_value(json!({
+            "type":"boolean", "default":true
+        }))
+        .unwrap();
+        assert!(validate_descriptor(&descriptor).is_err());
+        descriptor.options[0].definition = serde_json::from_value(json!({
+            "type":"enum", "default":"only", "options":["only"]
+        }))
+        .unwrap();
+        assert!(validate_descriptor(&descriptor).is_err());
     }
 
     #[test]

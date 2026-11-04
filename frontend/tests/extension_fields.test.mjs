@@ -41,6 +41,24 @@ test("enum choices show plugin labels while preserving wire values", () => {
   assert.equal(editor.value(), "late");
 });
 
+test("radio presentation exposes a labelled native radio group and keeps enum wire values", () => {
+  const { extensionRadioGroupEditor } = editorEnvironment();
+  const editor = extensionRadioGroupEditor({ type: "enum", default: "steady", options: ["steady", "responsive"] },
+    "steady", "Pacing", { steady: "Smooth pacing", responsive: "Lower latency" });
+  const [steady, responsive] = editor.node.children;
+  assert.equal(editor.node.attributes.role, "radiogroup");
+  assert.equal(editor.node.attributes["aria-label"], "Pacing");
+  assert.equal(steady.children[0].type, "radio");
+  assert.equal(steady.children[0].checked, true);
+  assert.equal(steady.children[1].children[0], "Smooth pacing");
+  assert.equal(responsive.children[0].value, "responsive");
+  responsive.children[0].checked = true;
+  responsive.children[0].dispatch("change");
+  assert.equal(editor.value(), "responsive");
+  assert.throws(() => extensionRadioGroupEditor({ type: "enum", options: ["a", "b"] }, "missing", "Pacing"), /Invalid radio/);
+  assert.throws(() => extensionRadioGroupEditor({ type: "boolean" }, true, "Enabled"), /Invalid radio/);
+});
+
 test("nested schema editors preserve false, zero and empty strings", () => {
   const create = editorEnvironment().extensionFieldEditor;
   const editor = create({ type: "object", default: {}, fields: {

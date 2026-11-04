@@ -71,6 +71,104 @@ namespace Amaterasu {
     return node;
   }
 
+  export interface RadioGroupOption {
+    value: string;
+    label: TextValue;
+  }
+
+  export interface RadioGroupControl {
+    node: HTMLElement;
+    value(): string;
+    setValue(value: string): void;
+  }
+
+  let nextRadioGroupId = 0;
+
+  // Native radio inputs keep arrow-key navigation and selection semantics.
+  // The labelled radiogroup also gives assistive technology a clear group name.
+  export function radioGroup(
+    label: string,
+    options: RadioGroupOption[],
+    selected: string,
+    onChange: (value: string) => void = () => {},
+  ): RadioGroupControl {
+    if (!options.length || new Set(options.map((option) => option.value)).size !== options.length ||
+        !options.some((option) => option.value === selected))
+      throw new Error("Invalid radio group options or selection.");
+    const name = `amaterasu-radio-${++nextRadioGroupId}`;
+    const group = el("div", "radio-group");
+    group.setAttribute("role", "radiogroup");
+    group.setAttribute("aria-label", label);
+    const controls: HTMLInputElement[] = [];
+    for (const option of options) {
+      const control = input(name, option.value, "radio");
+      control.checked = option.value === selected;
+      control.addEventListener("change", () => {
+        if (!control.checked) return;
+        for (const peer of controls) peer.checked = peer === control;
+        onChange(control.value);
+      });
+      group.append(el("label", "radio-option", control, el("span", "", option.label)));
+      controls.push(control);
+    }
+    return {
+      node: group,
+      value: () => controls.find((control) => control.checked)?.value ?? "",
+      setValue: (value) => {
+        if (!options.some((option) => option.value === value)) throw new Error("Unsupported radio group value.");
+        for (const control of controls) control.checked = control.value === value;
+      },
+    };
+  }
+
+  export interface BoundedSliderControl {
+    node: HTMLElement;
+    range: HTMLInputElement;
+    number: HTMLInputElement;
+    value(): number;
+  }
+
+  export function boundedSlider(
+    minimum: number,
+    maximum: number,
+    value: number,
+    label: string,
+    integer = false,
+    className = "bounded-slider",
+  ): BoundedSliderControl {
+    if (!Number.isFinite(minimum) || !Number.isFinite(maximum) || minimum >= maximum ||
+        (integer && (!Number.isSafeInteger(minimum) || !Number.isSafeInteger(maximum))) ||
+        !Number.isFinite(value) || value < minimum || value > maximum || (integer && !Number.isSafeInteger(value)))
+      throw new Error("Invalid bounded slider limits or value.");
+    const number = input("", String(value), "number");
+    const range = input("", "", "range");
+    for (const control of [number, range]) {
+      control.min = String(minimum);
+      control.max = String(maximum);
+      control.step = integer ? "1" : "any";
+    }
+    range.value = String(value);
+    range.setAttribute("aria-label", `${label} slider`);
+    number.setAttribute("aria-label", `${label} value`);
+    const validNumber = (): boolean => {
+      const parsed = Number(number.value);
+      return number.value !== "" && number.validity.valid && Number.isFinite(parsed) &&
+        parsed >= minimum && parsed <= maximum && (!integer || Number.isSafeInteger(parsed));
+    };
+    range.addEventListener("input", () => { number.value = range.value; });
+    number.addEventListener("input", () => { if (validNumber()) range.value = number.value; });
+    const node = el("div", className, range, number);
+    return {
+      node,
+      range,
+      number,
+      value: () => {
+        if (!validNumber()) throw new Error(`Enter a valid number from ${minimum} to ${maximum}.`);
+        return Number(number.value);
+      },
+    };
+  }
+
   export function sectionHeading(
     title: TextValue,
     description: TextValue,
