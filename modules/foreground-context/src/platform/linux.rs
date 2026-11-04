@@ -108,6 +108,9 @@ fn parse_properties(output: &str) -> Option<(u32, Option<bool>)> {
 pub fn observe() -> Option<Snapshot> {
     let session = std::env::var("XDG_SESSION_TYPE").ok();
     let display = std::env::var("DISPLAY").ok();
+    if session.as_deref() == Some("wayland") {
+        return kwin();
+    }
     if !local_x11_session(
         session.as_deref(),
         display.as_deref(),
@@ -149,6 +152,14 @@ fn process_start(pid: u32) -> Option<u64> {
 mod tests {
     use super::*;
     #[test]
+    #[ignore = "requires a running KWin session and its Python D-Bus dependencies"]
+    fn live_kwin_snapshot_is_bounded_and_consistent() {
+        let snapshot = kwin().expect("KWin did not supply a stable active window");
+        assert!(snapshot.validate().is_ok());
+        assert!(snapshot.fullscreen.is_some());
+    }
+
+    #[test]
     fn rejects_xwayland_remote_and_ambiguous_sessions() {
         assert!(local_x11_session(Some("x11"), Some(":0.1"), false));
         for (session, display, wayland) in [
@@ -179,4 +190,35 @@ mod tests {
             None
         );
     }
+}
+
+#[derive(serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct KwinObservation {
+    pid: u32,
+    fullscreen: bool,
+}
+
+fn kwin_observation() -> Option<KwinObservation> {
+    let output = run_helper(
+        "python3",
+        &["-c", include_str!("kwin.py")],
+        Duration::from_millis(210),
+    )?;
+    let observation: KwinObservation = serde_json::from_str(&output).ok()?;
+    (observation.pid != 0).then_some(observation)
+}
+
+fn kwin() -> Option<Snapshot> {
+    let first = kwin_observation()?;
+    let start = process_start(first.pid)?;
+    let executable = std::fs::read_link(format!("/proc/{}/exe", first.pid))
+        .ok()?
+        .into_os_string()
+        .into_string()
+        .ok()?;
+    if kwin_observation()? != first || process_start(first.pid)? != start {
+        return None;
+    }
+    new_snapshot(executable, Some(first.fullscreen))
 }
