@@ -13617,19 +13617,29 @@ var Amaterasu;
                 return;
             const columns = ["session_id", "recorded_at_unix", "observed_at", "source", "frames_sent", "bytes_sent",
                 "dropped_frames", "actual_fps", "actual_bitrate_kbps", "encode_latency_ms"];
-            const rows = currentPoints.map((sample) => [
-                sample.session_id,
-                sample.recorded_at_unix,
-                new Date(sample.recorded_at_unix * 1000).toISOString(),
-                sample.chart_source ?? (mode === "live" ? "live" : "recorded"),
-                sample.frames_sent,
-                sample.bytes_sent,
-                sample.dropped_frames,
-                sample.actual_fps,
-                sample.actual_bitrate_kbps,
-                sample.encode_latency_ms,
-            ]);
-            const csvCell = (value) => `"${String(value ?? "").replaceAll(String.fromCharCode(34), String.fromCharCode(34, 34))}"`;
+            const rows = currentPoints.map((sample) => {
+                const observedAt = new Date(sample.recorded_at_unix * 1000);
+                return [
+                    sample.session_id,
+                    sample.recorded_at_unix,
+                    Number.isFinite(observedAt.getTime()) ? observedAt.toISOString() : "",
+                    sample.chart_source ?? (mode === "live" ? "live" : "recorded"),
+                    sample.frames_sent,
+                    sample.bytes_sent,
+                    sample.dropped_frames,
+                    sample.actual_fps,
+                    sample.actual_bitrate_kbps,
+                    sample.encode_latency_ms,
+                ];
+            });
+            const formulaLeadingText = /^[\s\u0000-\u001f\u007f-\u009f]*[=+\-@]/u;
+            const unsafeLeadingControl = /^[\t\r\n]/;
+            const csvCell = (value) => {
+                const text = String(value ?? "");
+                const spreadsheetSafeText = typeof value === "string" &&
+                    (formulaLeadingText.test(text) || unsafeLeadingControl.test(text)) ? `'${text}` : text;
+                return `"${spreadsheetSafeText.replaceAll(String.fromCharCode(34), String.fromCharCode(34, 34))}"`;
+            };
             const csv = [columns, ...rows].map((row) => row.map(csvCell).join(",")).join("\r\n") + "\r\n";
             const objectUrl = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" }));
             const link = document.createElement("a");
