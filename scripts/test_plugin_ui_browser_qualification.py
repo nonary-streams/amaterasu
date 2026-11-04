@@ -1,0 +1,211 @@
+#!/usr/bin/env python3
+"""Opt-in real Chromium qualification for signed and reusable plugin UI controls.
+
+Runs a private loopback host, packages and stages a signed test web extension,
+and drives an owned Chromium over its loopback-only CDP endpoint. It changes no
+installed host, shared repository, firewall rule, or non-loopback listener.
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import hashlib
+import json
+from pathlib import Path
+import shutil
+import subprocess
+import tempfile
+import time
+
+from cryptography import x509
+from cryptography.hazmat.primitives import serialization
+
+from test_component_updates import CARGO, WORKSPACE, run
+import test_management_private_network as private
+from test_management_api import stop_console
+from test_network_accounts_extensions import PASSWORD, test_enrollment_and_tls
+from test_platform_modules import PlatformHarness
+from test_signed_browser_session import OwnedBrowser
+
+EXTENSION_ID = "plugin-ui-qualification"
+METHODS = WORKSPACE / "examples/web-extension/methods.json"
+FIXTURE = WORKSPACE / "frontend/tests/fixtures/plugin-ui-browser/example.js"
+BROWSER_DRIVER = WORKSPACE / "frontend/tests/signed-plugin-ui-browser-qualification.mjs"
+
+
+def configure_signed_extension(harness: PlatformHarness) -> str:
+    source = harness.directory / "plugin-ui-extension-source"
+    source.mkdir()
+    shutil.copy2(FIXTURE, source / "example.js")
+
+    secret = harness.directory / "plugin-ui-publisher-key"
+    secret.write_text("42" * 32)
+    secret.chmod(0o600)
+    methods = json.loads(METHODS.read_text())
+    methods_path = harness.directory / "plugin-ui-methods.json"
+    methods_path.write_text(json.dumps(methods))
+
+    binary = harness.artifacts / "amaterasu-web-extension"
+    bundle = harness.directory / "plugin-ui-extension-bundle"
+    packed = run(binary, "pack", source, bundle, EXTENSION_ID, "Plugin UI Qualification",
+                 "example.js", "1", str(int(time.time()) + 3600), secret, methods_path)
+    values = dict(line.split(": ", 1) for line in packed.splitlines() if ": " in line)
+    fingerprint = values["publisher fingerprint"]
+    public_key = values["publisher public key"]
+
+    staged_root = harness.directory / EXTENSION_ID
+    run(binary, "stage", bundle, staged_root, fingerprint, public_key)
+
+    bootstrap_path = harness.root / "bootstrap.json"
+    bootstrap = json.loads(bootstrap_path.read_text())
+    bootstrap["policy"]["settings"]["amaterasu.management"]["extensions"] = {
+        "entries": [{
+            "id": EXTENSION_ID,
+            "root": str(staged_root),
+            "trusted_keys": {fingerprint: public_key},
+            "methods": methods,
+        }],
+    }
+    policy = bootstrap["policy"]
+    policy["principals"]["example.extension-provider"] = {"provide": ["example.extension/1"]}
+    policy["principals"]["amaterasu.management"].setdefault("call", []).append("example.extension/1")
+    policy["api_methods"] = [{
+        "provider": "example.extension-provider",
+        "callers": ["amaterasu.management"],
+        "method": {
+            "service": "example.extension/1",
+            "method": "greet",
+            "interface_major": 1,
+            "interface_minor": 0,
+            "request": {"required": {"name": "string"}, "optional": {}, "allow_extra": False},
+            "response": {"required": {"message": "string"}, "optional": {}, "allow_extra": False},
+            "privilege": "user",
+        },
+    }]
+    bootstrap_path.write_text(json.dumps(bootstrap))
+    return hashlib.sha256(FIXTURE.read_bytes()).hexdigest()
+
+
+def enrollment_code(harness: PlatformHarness) -> str:
+    root = harness.root
+    if not root.is_absolute() or root.resolve() != root or root.stat().st_mode & 0o077:
+        raise AssertionError("private host root is not an absolute private directory")
+    command = {"op": "request", "service": "amaterasu.authentication/1",
+               "payload": {"action": "generate_enrollment_code"},
+               "timeout_ms": 2000, "operation_id": "plugin-ui.enrollment"}
+    result = subprocess.run(
+        [str(harness.host), "probe", str(root), json.dumps(command)],
+        capture_output=True, text=True, timeout=90,
+    )
+    if result.returncode != 0:
+        raise AssertionError("private host candidate/enrollment probe failed: " + result.stderr[-3000:])
+    try:
+        reply = json.loads(result.stdout)
+        payload = reply.get("payload", {})
+    except json.JSONDecodeError as error:
+        raise AssertionError("private host returned malformed enrollment data") from error
+    code = payload.get("code")
+    if reply.get("kind") != "result" or payload.get("ok") is not True or not isinstance(code, str):
+        raise AssertionError("private host returned no enrollment code")
+    return code
+
+
+def spki_pin(certificate_path: Path) -> str:
+    certificate = x509.load_pem_x509_certificate(certificate_path.read_bytes())
+    public = certificate.public_key().public_bytes(
+        serialization.Encoding.DER,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    return base64.b64encode(hashlib.sha256(public).digest()).decode("ascii")
+
+
+def run_browser(harness: PlatformHarness, api, chromium: str, asset_digest: str) -> None:
+    browser = OwnedBrowser(harness.directory / "plugin-ui-browser", chromium, spki_pin(certificate))
+    try:
+        debugger_url = browser.start()
+        payload = {
+            "debuggerUrl": debugger_url,
+            "origin": f"https://{api.host}:{api.port}",
+            "profile": str(browser.profile),
+            "spki": browser.spki,
+            "username": "admin",
+            "password": PASSWORD,
+            "assetPath": str(FIXTURE),
+            "assetSha256": asset_digest,
+        }
+        result = subprocess.run(
+            ["node", str(BROWSER_DRIVER)],
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if result.returncode != 0:
+            raise AssertionError("browser qualification failed: " + result.stderr[-3000:])
+        print(result.stdout.strip())
+    finally:
+        browser.close()
+
+
+def build_workspace() -> None:
+    result = subprocess.run(
+        [CARGO, "build", "--workspace", "--offline"],
+        cwd=WORKSPACE,
+        capture_output=True,
+        text=True,
+        timeout=900,
+    )
+    if result.returncode:
+        raise AssertionError(
+            "workspace build failed: " + result.stdout[-3000:] + result.stderr[-5000:]
+        )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--skip-build", action="store_true",
+                        help="use existing workspace binaries and frontend/dist")
+    parser.add_argument("--stage-only", action="store_true",
+                        help="pack and verify the signed fixture without starting a host/browser")
+    args = parser.parse_args()
+
+    chromium = None
+    if not args.stage_only:
+        chromium = shutil.which("chromium") or shutil.which("chromium-browser")
+        if not chromium:
+            raise SystemExit("Chromium is required; install chromium or chromium-browser and retry")
+
+    if not args.skip_build:
+        build_workspace()
+        npm = shutil.which("npm")
+        if not npm:
+            raise SystemExit("npm is required to build frontend assets")
+        run(npm, "--prefix", WORKSPACE / "frontend", "ci", "--offline")
+        run(npm, "--prefix", WORKSPACE / "frontend", "run", "build")
+
+    with tempfile.TemporaryDirectory(prefix="amaterasu-plugin-ui-browser-") as temporary:
+        harness = PlatformHarness(Path(temporary))
+        private.SERVER_ADDRESS = "127.0.0.1"
+        certificate = private.configure_host(harness)
+        asset_digest = configure_signed_extension(harness)
+        if args.stage_only:
+            print("PASS: signed web extension packaged and staged; browser delivery was not run")
+            return
+
+        package = harness.directory / "plugin-ui-platform"
+        run(harness.publisher, "pack-extension-example", harness.root, harness.artifacts, package, "1")
+        harness.stage(package)
+
+        code = enrollment_code(harness)
+        console = private.start_ready_console(harness)
+        try:
+            private.ready(console)
+            api = private.PeerTlsApi(console, certificate, private.SERVER_ADDRESS)
+            test_enrollment_and_tls(api, code)
+            run_browser(harness, api, chromium, asset_digest)
+        finally:
+            stop_console(console)
+
+
+if __name__ == "__main__":
+    main()
