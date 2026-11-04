@@ -23,7 +23,12 @@ Each factory accepts common `disabled`, `readOnly`, `required`, `help`, and
 the SDK connects them with `aria-describedby`, sets `aria-invalid` for errors,
 and exposes errors as alerts. Native controls enforce disabled and required
 states. Read-only controls remain focusable and expose `aria-readonly` while
-preventing user changes. Non-mutating keyboard shortcuts remain available.
+preventing user changes. Non-mutating keyboard shortcuts remain available. In a
+read-only radio group, Tab enters at the checked option; Arrow keys and Home/End
+move focus through choices without changing the checked value. Assistive technology
+support for `aria-readonly` on radiogroups varies, though option labels and checked
+state remain available. The paired read-only slider leaves its native number input
+keyboard shortcuts intact and blocks value-changing keys on the range input.
 `help` and `error` text sit outside the clickable label and are associated with
 the control through `aria-describedby`. `setValue()` remains available for
 programmatic updates.

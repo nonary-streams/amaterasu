@@ -154,9 +154,19 @@ namespace Amaterasu {
           }
         }, { capture: true, signal: choiceController.signal });
         control.addEventListener("keydown", (event) => {
-          const mutatingKey = !event.ctrlKey && !event.metaKey && !event.altKey &&
-            (event.key.length === 1 || ["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Home", "End", "PageUp", "PageDown", "Enter", " ", "Spacebar", "Backspace", "Delete"].includes(event.key));
-          if (behavior.readOnly && mutatingKey) {
+          if (!behavior.readOnly || event.ctrlKey || event.metaKey || event.altKey) return;
+          const index = controls.indexOf(control);
+          const focusIndex = event.key === "ArrowDown" || event.key === "ArrowRight" ? (index + 1) % controls.length
+            : event.key === "ArrowUp" || event.key === "ArrowLeft" ? (index + controls.length - 1) % controls.length
+            : event.key === "Home" ? 0 : event.key === "End" ? controls.length - 1 : -1;
+          if (focusIndex >= 0) {
+            event.preventDefault();
+            event.stopImmediatePropagation();
+            controls[focusIndex]?.focus();
+            return;
+          }
+          const mutatingKey = event.key.length === 1 || ["PageUp", "PageDown", "Enter", " ", "Spacebar", "Backspace", "Delete"].includes(event.key);
+          if (mutatingKey) {
             event.preventDefault();
             event.stopImmediatePropagation();
           }
@@ -292,10 +302,11 @@ namespace Amaterasu {
     range.addEventListener("pointerdown", (event) => {
       if (options.readOnly) { event.preventDefault(); event.stopImmediatePropagation(); }
     }, { capture: true, signal: controller.signal });
+    range.addEventListener("keydown", (event) => {
+      const valueMutationKey = ["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Home", "End", "PageUp", "PageDown"].includes(event.key);
+      if (options.readOnly && valueMutationKey) { event.preventDefault(); event.stopImmediatePropagation(); }
+    }, { capture: true, signal: controller.signal });
     for (const control of [range, number]) {
-      control.addEventListener("keydown", (event) => {
-        if (options.readOnly && event.key !== "Tab") { event.preventDefault(); event.stopImmediatePropagation(); }
-      }, { capture: true, signal: controller.signal });
       control.addEventListener("input", (event) => {
         if (options.disabled || options.readOnly) {
           restoreCurrentValue();

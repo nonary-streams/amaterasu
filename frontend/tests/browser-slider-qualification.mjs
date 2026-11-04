@@ -122,7 +122,13 @@ try {
     window.readOnlySelect = window.formUi.select({ label: "Locked mode", choices: [{value:"a",label:"Alpha"},{value:"b",label:"Beta"}], value: "a", readOnly: true, help: "Mode help.", error: "Mode error." });
     window.dynamicRadioChanges = 0;
     window.dynamicRadio = window.formUi.radioGroup({ label: "Dynamic preset", choices: [{value:"a",label:"Alpha"},{value:"b",label:"Beta"},{value:"c",label:"Gamma"}], value: "a", onChange() { window.dynamicRadioChanges++; } });
-    document.body.replaceChildren(window.readOnlySelect.element, window.dynamicRadio.element);
+    window.lockedRadioChanges = 0;
+    window.lockedRadio = window.formUi.radioGroup({ label: "Locked preset", choices: [{value:"x",label:"Xray"},{value:"y",label:"Yankee"}], value: "x", readOnly: true, onChange() { window.lockedRadioChanges++; } });
+    window.readOnlySlider = window.formUi.slider({ label: "Locked power", minimum: 0, maximum: 10, step: 1, value: 5, readOnly: true });
+    document.body.replaceChildren(window.readOnlySelect.element, window.dynamicRadio.element, window.lockedRadio.element, window.readOnlySlider.element);
+    document.addEventListener('keydown', event => {
+      if (event.ctrlKey && event.target === window.readOnlySlider.element.querySelector('input[type=number]')) { window.numberCopyObserved = true; window.numberCopyPrevented = event.defaultPrevented; }
+    });
     window.readOnlyKeys = [];
   `);
   await evaluate(`
@@ -133,12 +139,24 @@ try {
   `);
   assert.deepEqual(await evaluate(`window.readOnlyKeys`), [["c", false], ["ArrowDown", true]]);
   assert.deepEqual(await evaluate(`({ selected: document.querySelector('select').value, labelFor: document.querySelector('label[for]').htmlFor, controlId: document.querySelector('select').id, labels: document.querySelector('select').labels.length, descriptionsOutsideLabel: [...document.querySelectorAll('.plugin-control-help, .plugin-control-error')].every(node => !node.closest('label')), descriptionsResolve: [...document.querySelectorAll('select')].every(node => node.getAttribute('aria-describedby').split(' ').every(id => !!document.getElementById(id))) })`), { selected: "a", labelFor: "amaterasu-plugin-ui-control-3", controlId: "amaterasu-plugin-ui-control-3", labels: 1, descriptionsOutsideLabel: true, descriptionsResolve: true });
-  await evaluate(`document.querySelectorAll('input[type=radio]')[1].focus()`);
+  await evaluate(`window.dynamicRadio.element.querySelectorAll('input[type=radio]')[1].focus()`);
   assert.equal(await evaluate(`document.activeElement.value`), "b");
   await evaluate(`window.dynamicRadio.setChoices([{value:'c',label:'Gamma'},{value:'b',label:'Beta'},{value:'d',label:'Delta'}], 'c')`);
   assert.deepEqual(await evaluate(`({ focus: document.activeElement.value, selected: window.dynamicRadio.value(), changes: window.dynamicRadioChanges })`), { focus: "b", selected: "c", changes: 0 });
   await evaluate(`window.dynamicRadio.setChoices([{value:'a',label:'Alpha'},{value:'c',label:'Gamma'}], 'a')`);
   assert.deepEqual(await evaluate(`({ focus: document.activeElement.value, selected: window.dynamicRadio.value(), changes: window.dynamicRadioChanges })`), { focus: "a", selected: "a", changes: 0 });
+  await evaluate(`window.lockedRadio.element.querySelectorAll('input[type=radio]')[0].focus()`);
+  for (const type of ["keyDown", "keyUp"]) await command("Input.dispatchKeyEvent", { type, key: "ArrowRight", code: "ArrowRight", windowsVirtualKeyCode: 39, nativeVirtualKeyCode: 39 }, sessionId);
+  assert.deepEqual(await evaluate(`({ focused: document.activeElement.value, checked: [...window.lockedRadio.element.querySelectorAll('input[type=radio]')].map(control => control.checked), value: window.lockedRadio.value(), changes: window.lockedRadioChanges, readonly: window.lockedRadio.element.getAttribute('aria-readonly') })`), { focused: "y", checked: [true, false], value: "x", changes: 0, readonly: "true" });
+  await evaluate(`document.querySelector('.plugin-slider input[type=number]').focus()`);
+  for (const type of ["keyDown", "keyUp"]) await command("Input.dispatchKeyEvent", { type, key: "c", code: "KeyC", modifiers: 2, windowsVirtualKeyCode: 67, nativeVirtualKeyCode: 67 }, sessionId);
+  assert.deepEqual(await evaluate(`({ observed: window.numberCopyObserved === true, prevented: window.numberCopyPrevented })`), { observed: true, prevented: false });
+  for (const type of ["keyDown", "keyUp"]) await command("Input.dispatchKeyEvent", { type, key: "ArrowUp", code: "ArrowUp", windowsVirtualKeyCode: 38, nativeVirtualKeyCode: 38 }, sessionId);
+  assert.deepEqual(await evaluate(`({ value: document.querySelector('.plugin-slider input[type=number]').value, readOnly: document.querySelector('.plugin-slider input[type=number]').readOnly })`), { value: "5", readOnly: true });
+  await evaluate(`document.querySelector('.plugin-slider input[type=range]').focus()`);
+  for (const type of ["keyDown", "keyUp"]) await command("Input.dispatchKeyEvent", { type, key: "ArrowRight", code: "ArrowRight", windowsVirtualKeyCode: 39, nativeVirtualKeyCode: 39 }, sessionId);
+  assert.equal(await evaluate(`window.readOnlySlider.value()`), 5);
+  console.log("PASS: readonly slider preserves number-field copy, blocks native edits/range changes, and readonly radios remain keyboard-discoverable");
   console.log("PASS: form labels/descriptions, readonly keyboard shortcuts, and radio focus survive real browser interactions");
   console.log("PASS: plugin forms retain accessible states and descriptions across dynamic choices");
   console.log("PASS: shared and plugin sliders synchronize, enforce steps, expose callback errors, and dispose listeners");

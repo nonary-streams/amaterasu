@@ -15,6 +15,7 @@ class Element {
     const entry = { callback, signal: options.signal, capture: options.capture === true };
     (this.listeners[type] ??= []).push(entry);
   }
+  focus() { if (this.ownerDocument) this.ownerDocument.activeElement = this; }
   dispatch(type, extras = {}) {
     const event = { type, target: this, defaultPrevented: false, immediatePropagationStopped: false,
       preventDefault() { this.defaultPrevented = true; },
@@ -30,8 +31,9 @@ class Element {
 
 function setupConsumer({ features = ["ui.controls/1", "ui.forms/1"], withUi = true } = {}) {
   let registered;
+  const document = { activeElement: null, createElement(tag) { const element = new Element(tag); element.ownerDocument = this; return element; } };
   const context = vm.createContext({
-    document: { activeElement: null, createElement: (tag) => new Element(tag) },
+    document,
     window: { AmaterasuExtensions: { v1: { register(_id, page) { registered = page; } } } },
     AbortController,
   });
@@ -49,7 +51,7 @@ function setupConsumer({ features = ["ui.controls/1", "ui.forms/1"], withUi = tr
   vm.runInContext(readFileSync(new URL("../../examples/web-extension/controls.js", import.meta.url), "utf8"), context);
   const container = new Element("main");
   const cleanup = registered.mount(container, sdk);
-  return { container, cleanup, controller, sdk };
+  return { container, cleanup, controller, sdk, context };
 }
 
 test("independent plugin consumer gets accessible native controls and lifecycle cleanup", () => {
@@ -256,7 +258,14 @@ test("read-only radio groups and sliders expose required/error semantics and rej
   assert.ok(radio.element.attributes["aria-describedby"]);
   assert.equal(option.required, true);
   assert.equal(option.dispatch("keydown", { key: "c", ctrlKey: true }).defaultPrevented, false);
-  assert.equal(option.dispatch("keydown", { key: "ArrowDown" }).defaultPrevented, true);
+  const nextOption = radio.element.children[1].children[0].children[0];
+  option.focus();
+  const radioChangeEvent = option.dispatch("keydown", { key: "ArrowDown" });
+  assert.equal(radioChangeEvent.defaultPrevented, true);
+  assert.equal(page.context.document.activeElement, nextOption);
+  assert.equal(option.checked, false);
+  assert.equal(nextOption.checked, true);
+  assert.equal(radio.value(), "a");
 
   const slider = page.sdk.ui.slider({ label: "Power", minimum: 0, maximum: 10, step: 1, value: 5, readOnly: true, required: true, help: "Read only value." });
   const [range, number] = slider.element.children[1].children;
