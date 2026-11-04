@@ -6,6 +6,25 @@ and actions modules. The display-settings library is built independently and
 included by the operator in the same signed component set. The regular Linux
 session profile continues to omit those three modules.
 
+## Descriptor presentation compatibility
+
+`OptionPresentation::RadioGroup` serializes as the optional descriptor string
+`"radio_group"`. The browser frontend treats presentation hints as strings: an
+older frontend or an unknown hint falls back to the ordinary typed editor. The
+Rust descriptor model uses a closed enum, so a pre-radio-group Rust consumer
+rejects a descriptor containing `"radio_group"`. This includes an older
+release tool reading provider metadata and an older extension-registry module
+loading registry settings with that descriptor.
+
+Build the native package's release tool, extension-registry module, and
+radio-group descriptor metadata from a compatible source revision, then ship
+them together in the signed native component set. Web assets are independently
+signed and can be staged separately: either frontend version remains usable
+with the current registry because unknown browser hints fall back, and an older
+registry will not see the new hint until its native component/configuration is
+updated. Do not add `"radio_group"` to registry settings consumed by an older
+Rust enum decoder.
+
 Build compatible Amaterasu libraries, including `amaterasu-session-lifecycle`,
 `amaterasu-extension-registry`, `amaterasu-extension-actions`, the release tool,
 and host, into one artifact directory. Build `nonary.display-settings` in its

@@ -576,6 +576,9 @@ pub enum ProviderResponse {
 }
 
 /// An explicit editor hint; consumers do not infer editors from value shape.
+///
+/// This closed wire enum is embedded in registry settings. Adding a variant
+/// requires a compatible release tool and registry decoder before metadata uses it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OptionPresentation {
@@ -1987,6 +1990,45 @@ mod tests {
         }))
         .unwrap();
         assert!(validate_descriptor(&descriptor).is_err());
+    }
+
+    #[test]
+    fn pre_radio_group_rust_descriptor_consumers_reject_the_new_wire_hint() {
+        #[allow(dead_code)]
+        #[derive(Debug, serde::Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum LegacyOptionPresentation {
+            Keybinding,
+            Slider,
+        }
+
+        #[allow(dead_code)]
+        #[derive(Debug, serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct LegacyOptionDescriptor {
+            id: String,
+            label: String,
+            help: String,
+            definition: Value,
+            #[serde(default)]
+            choice_labels: BTreeMap<String, String>,
+            #[serde(default)]
+            presentation: Option<LegacyOptionPresentation>,
+            allowed_scopes: Vec<SettingScope>,
+            apply_policy: ApplyPolicy,
+            required_capabilities: Vec<String>,
+        }
+
+        let option: OptionDescriptor = serde_json::from_value(json!({
+            "id":"mode", "label":"Mode", "help":"Choose a mode.",
+            "definition":{"type":"enum","default":"steady","options":["steady","responsive"]},
+            "presentation":"radio_group", "allowed_scopes":["host"],
+            "apply_policy":"next_stream", "required_capabilities":[]
+        }))
+        .unwrap();
+        let wire_value = serde_json::to_value(option).unwrap();
+        let error = serde_json::from_value::<LegacyOptionDescriptor>(wire_value).unwrap_err();
+        assert!(error.to_string().contains("unknown variant `radio_group`"));
     }
 
     #[test]
