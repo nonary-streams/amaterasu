@@ -293,6 +293,33 @@ namespace Amaterasu {
     }
   }
 
+  // Cards are assembled before insertion. Defer reads until rendering finishes,
+  // and keep provider work bounded even when a library has many covers.
+  const catalogArtworkQueue: Array<() => Promise<void>> = [];
+  const catalogArtworkConcurrency = 4;
+  let catalogArtworkRunning = 0;
+  let catalogArtworkScheduled = false;
+
+  function scheduleCatalogArtwork(read: () => Promise<void>): void {
+    catalogArtworkQueue.push(read);
+    if (catalogArtworkScheduled) return;
+    catalogArtworkScheduled = true;
+    queueMicrotask(drainCatalogArtworkQueue);
+  }
+
+  function drainCatalogArtworkQueue(): void {
+    catalogArtworkScheduled = false;
+    while (catalogArtworkRunning < catalogArtworkConcurrency && catalogArtworkQueue.length) {
+      const read = catalogArtworkQueue.shift();
+      if (!read) break;
+      catalogArtworkRunning++;
+      void read().finally(() => {
+        catalogArtworkRunning--;
+        drainCatalogArtworkQueue();
+      });
+    }
+  }
+
   export function showCatalogArtwork(
     api: Pick<Api, "post" | "allows">,
     reference: Entry["artwork"],
@@ -307,33 +334,36 @@ namespace Amaterasu {
     if (!catalogId && reference.provider === "lutris" && !api.allows("lutris.read")) return;
     if (!catalogId && reference.provider === "external") return;
     const active = () => content.isConnected && art.isConnected;
-    const imageRead = catalogId
-      ? readCatalogArtwork(api, catalogId, reference.provider === "external" ? reference.reference.revision : reference.revision, active)
-      : reference.provider === "steam" ? readSteamArtwork(api, reference, active)
-      : reference.provider === "lutris" ? readLutrisArtwork(api, reference, active)
-      : Promise.reject(new Error("Catalog artwork identity is required."));
-    void imageRead.then((blob) => {
-      if (!content.isConnected || !art.isConnected) return;
-      const url = URL.createObjectURL(blob);
-      const image = el("img") as HTMLImageElement;
-      image.alt = "";
-      let released = false;
-      const observer = new MutationObserver(() => {
-        if (!content.isConnected || !art.isConnected) release();
-      });
-      const release = (): void => {
-        if (released) return;
-        released = true;
-        observer.disconnect();
-        URL.revokeObjectURL(url);
-      };
-      image.addEventListener("load", () => { release(); if (active()) onLoad?.(); }, { once: true });
-      image.addEventListener("error", () => { image.remove(); release(); }, { once: true });
-      observer.observe(document, { childList: true, subtree: true });
-      image.src = url;
-      art.prepend(image);
-    }).catch(() => {
-      // Keep initials when a provider image is missing or its revision changes.
+    scheduleCatalogArtwork(async () => {
+      if (!active()) return;
+      try {
+        const blob = await (catalogId
+          ? readCatalogArtwork(api, catalogId, reference.provider === "external" ? reference.reference.revision : reference.revision, active)
+          : reference.provider === "steam" ? readSteamArtwork(api, reference, active)
+          : reference.provider === "lutris" ? readLutrisArtwork(api, reference, active)
+          : Promise.reject(new Error("Catalog artwork identity is required.")));
+        if (!active()) return;
+        const url = URL.createObjectURL(blob);
+        const image = el("img") as HTMLImageElement;
+        image.alt = "";
+        let released = false;
+        const observer = new MutationObserver(() => {
+          if (!active()) release();
+        });
+        const release = (): void => {
+          if (released) return;
+          released = true;
+          observer.disconnect();
+          URL.revokeObjectURL(url);
+        };
+        image.addEventListener("load", () => { release(); if (active()) onLoad?.(); }, { once: true });
+        image.addEventListener("error", () => { image.remove(); release(); }, { once: true });
+        observer.observe(document, { childList: true, subtree: true });
+        image.src = url;
+        art.prepend(image);
+      } catch {
+        // Keep initials when a provider image is missing or its revision changes.
+      }
     });
   }
 

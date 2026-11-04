@@ -462,7 +462,7 @@ test("Lutris card refresh ignores stale A and revokes B on load or removal", asy
   const revoked = [];
   const observers = [];
   const artworkContext = vm.createContext({
-    atob, Blob, Error,
+    atob, Blob, Error, queueMicrotask,
     URL: {
       createObjectURL(blob) { created.push(blob); return `blob:${created.length}`; },
       revokeObjectURL(url) { revoked.push(url); },
@@ -498,13 +498,9 @@ test("Lutris card refresh ignores stale A and revokes B on load or removal", asy
   show(api, lutrisReference, oldArt, content);
   oldArt.isConnected = false;
   show(api, b, newArt, content);
+  await new Promise(setImmediate);
   pending.get(b.revision)({
     ok: true, game_id: 42, revision: b.revision, offset: 0,
-    next_offset: null, total_bytes: 1, mime_type: "image/png", data: "UQ==",
-  });
-  await new Promise(setImmediate);
-  pending.get(lutrisReference.revision)({
-    ok: true, game_id: 42, revision: lutrisReference.revision, offset: 0,
     next_offset: null, total_bytes: 1, mime_type: "image/png", data: "UQ==",
   });
   await new Promise(setImmediate);
@@ -516,6 +512,7 @@ test("Lutris card refresh ignores stale A and revokes B on load or removal", asy
 
   const removedArt = new Element();
   show(api, b, removedArt, content);
+  await new Promise(setImmediate);
   pending.get(b.revision)({
     ok: true, game_id: 42, revision: b.revision, offset: 0,
     next_offset: null, total_bytes: 1, mime_type: "image/png", data: "UQ==",
@@ -580,4 +577,65 @@ test("catalog artwork rejects changed revisions and releases on cancellation", a
   calls.length = 0;
   await assert.rejects(context.Amaterasu.readCatalogArtwork(api, id, "expected", () => false, token), /cancelled/);
   assert.deepEqual(calls, ["library/artwork_release"]);
+});
+
+test("catalog covers wait for attachment, bound concurrent transfers, and skip removed cards", async () => {
+  class Element {
+    constructor(connected = false) { this.isConnected = connected; this.children = []; this.listeners = new Map(); }
+    prepend(child) { this.children.unshift(child); }
+    addEventListener(type, listener) { this.listeners.set(type, listener); }
+    fire(type) { this.listeners.get(type)?.(); }
+    remove() {}
+  }
+  const revoked = [];
+  let nextUrl = 0;
+  const artworkContext = vm.createContext({
+    atob, Blob, Error, queueMicrotask,
+    crypto: { getRandomValues(bytes) { bytes.fill(++nextUrl); return bytes; } },
+    URL: { createObjectURL: () => `blob:${nextUrl}`, revokeObjectURL: (url) => revoked.push(url) },
+    document: { createElement: () => new Element() },
+    MutationObserver: class { constructor(callback) { this.callback = callback; } observe() {} disconnect() {} },
+  });
+  vm.runInContext(ts.transpile(readFileSync("src/ui.ts", "utf8"), { target: ts.ScriptTarget.ES2022 }), artworkContext);
+  vm.runInContext("Object.assign(globalThis, Amaterasu)", artworkContext);
+  vm.runInContext(ts.transpile(readFileSync("src/catalog.ts", "utf8"), { target: ts.ScriptTarget.ES2022 }), artworkContext);
+  const pending = [];
+  let reads = 0;
+  let releases = 0;
+  const api = {
+    allows: (scope) => scope === "catalog.read",
+    post(route, request) {
+      if (route === "library/artwork_release") { releases++; return Promise.resolve({ ok: true }); }
+      assert.equal(route, "library/artwork_read");
+      reads++;
+      return new Promise((resolve) => pending.push(() => resolve({
+        ok: true, revision: request.revision, offset: 0, next_offset: null,
+        total_bytes: 1, mime_type: "image/png", data: "UQ==",
+      })));
+    },
+  };
+  const content = new Element(true);
+  const arts = Array.from({ length: 7 }, () => new Element());
+  for (const [index, art] of arts.entries()) {
+    artworkContext.Amaterasu.showCatalogArtwork(api, reference, art, content, undefined,
+      `app-${(index + 1).toString(16).padStart(16, "0")}`);
+  }
+  assert.equal(reads, 0);
+  arts.forEach((art) => { art.isConnected = true; });
+  await new Promise(setImmediate);
+  assert.equal(reads, 4);
+  arts[4].isConnected = false;
+  pending.shift()();
+  await new Promise(setImmediate);
+  assert.equal(reads, 5);
+  assert.equal(arts[0].children.length, 1);
+  assert.equal(arts[4].children.length, 0);
+  while (pending.length) pending.shift()();
+  await new Promise(setImmediate);
+  while (pending.length) pending.shift()();
+  await new Promise(setImmediate);
+  assert.equal(reads, 6);
+  assert.equal(releases, 6);
+  for (const art of arts) art.children[0]?.fire("load");
+  assert.equal(revoked.length, 6);
 });
