@@ -1,0 +1,156 @@
+//! Trusted foreground-window observation. Missing evidence is reported as unavailable.
+mod platform;
+
+use amaterasu_module_sdk::foreground_context::{Request as Operation, SERVICE, Snapshot};
+use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};
+use serde::Deserialize;
+use serde_json::{Value, json};
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct Settings {
+    allowed_principals: Vec<String>,
+}
+
+impl Settings {
+    fn validate(&self) -> Result<(), &'static str> {
+        if self.allowed_principals.len() > 16
+            || self
+                .allowed_principals
+                .iter()
+                .any(|p| p.is_empty() || p.len() > 128 || p.chars().any(char::is_control))
+        {
+            return Err("invalid_settings");
+        }
+        Ok(())
+    }
+}
+
+fn new_snapshot(executable: String, fullscreen: Option<bool>) -> Option<Snapshot> {
+    let snapshot = Snapshot {
+        executable,
+        fullscreen,
+    };
+    snapshot.validate().ok()?;
+    Some(snapshot)
+}
+
+struct ForegroundModule {
+    runtime: RuntimeClient,
+    settings: Settings,
+}
+
+fn handle(
+    settings: &Settings,
+    caller: &str,
+    payload: Value,
+    observe: impl FnOnce() -> Option<Snapshot>,
+) -> Value {
+    if !settings
+        .allowed_principals
+        .iter()
+        .any(|principal| principal == caller)
+    {
+        return json!({"ok":false,"code":"forbidden"});
+    }
+    if payload != json!({"action":"snapshot"})
+        || serde_json::from_value::<Operation>(payload).is_err()
+    {
+        return json!({"ok":false,"code":"invalid_request"});
+    }
+    json!({"ok":true,"snapshot":observe()})
+}
+
+impl ManagedModule for ForegroundModule {
+    fn start(runtime: RuntimeClient) -> ModuleResult<Self> {
+        let Response::Result { payload } = runtime.send(Command::GetSettings {})? else {
+            return Err("foreground settings unavailable".into());
+        };
+        let settings: Settings =
+            serde_json::from_value(payload).map_err(|_| "invalid foreground settings")?;
+        settings.validate()?;
+        runtime.require_success(Command::Register {
+            service: SERVICE.into(),
+        })?;
+        Ok(Self { runtime, settings })
+    }
+
+    fn tick(&mut self) -> ModuleResult<()> {
+        match self.runtime.send(Command::Poll {})? {
+            Response::Pending => Ok(()),
+            Response::Request {
+                id,
+                caller,
+                service,
+                payload,
+                ..
+            } => {
+                if !matches!(
+                    self.runtime.send(Command::CheckRequest { request: id })?,
+                    Response::Ok
+                ) {
+                    return Ok(());
+                }
+                let result = if service == SERVICE {
+                    handle(&self.settings, &caller, payload, platform::observe)
+                } else {
+                    json!({"ok":false,"code":"invalid_service"})
+                };
+                match self.runtime.send(Command::Complete {
+                    request: id,
+                    payload: result,
+                })? {
+                    Response::Ok => Ok(()),
+                    Response::Error { code, .. }
+                        if code == "request_ended" || code == "not_found" =>
+                    {
+                        Ok(())
+                    }
+                    _ => Err("foreground completion failed".into()),
+                }
+            }
+            _ => Err("foreground poll failed".into()),
+        }
+    }
+}
+
+amaterasu_module_sdk::export_module!(ForegroundModule);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn authorization_precedes_observation_and_request_validation() {
+        let settings = Settings {
+            allowed_principals: vec!["consumer".into()],
+        };
+        let result = handle(&settings, "other", json!({"action":"snapshot"}), || {
+            panic!("unauthorized observation")
+        });
+        assert_eq!(result["code"], "forbidden");
+        let result = handle(
+            &settings,
+            "consumer",
+            json!({"action":"snapshot","extra":1}),
+            || panic!("invalid observation"),
+        );
+        assert_eq!(result["code"], "invalid_request");
+        assert_eq!(
+            handle(&settings, "consumer", json!({"action":"snapshot"}), || None),
+            json!({"ok":true,"snapshot":null})
+        );
+    }
+    #[test]
+    fn executable_identity_is_bounded() {
+        assert!(new_snapshot("".into(), None).is_none());
+        assert!(
+            new_snapshot(
+                "x".repeat(amaterasu_module_sdk::foreground_context::MAX_EXECUTABLE_BYTES + 1),
+                None
+            )
+            .is_none()
+        );
+        assert!(new_snapshot("bad\nname".into(), None).is_none());
+        assert!(new_snapshot("/usr/bin/game".into(), Some(true)).is_some());
+    }
+}
