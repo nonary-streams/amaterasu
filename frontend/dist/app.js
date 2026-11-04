@@ -915,12 +915,14 @@ var Amaterasu;
             return (this.role === "administrator" || this.role === "operator" || this.role === "token") &&
                 (this.scopes === null || this.scopes.includes(scope));
         }
-        async post(route, payload = {}, protectedRoute = true) {
+        async post(route, payload = {}, protectedRoute = true, signal) {
+            if (signal?.aborted)
+                throw new Error("The request was cancelled.");
             if (this.loggingOut) {
                 throw new ApiError("Sign out is already in progress.", "unauthorized", 401);
             }
             if (protectedRoute && this.cookieSession)
-                return this.postWithCookies(route, payload);
+                return this.postWithCookies(route, payload, signal);
             if (protectedRoute && !this.bearer)
                 throw new ApiError("Sign in to continue.", "unauthorized", 401);
             if (protectedRoute &&
@@ -928,19 +930,25 @@ var Amaterasu;
                 this.accessExpiresAt - Date.now() / 1000 <= 60) {
                 await this.refreshOrClear();
             }
+            if (signal?.aborted)
+                throw new Error("The request was cancelled.");
             if (protectedRoute && !this.bearer)
                 throw new ApiError("Sign in to continue.", "unauthorized", 401);
             const bearerUsed = this.bearer;
             const authGeneration = this.authGeneration;
             const tokenGeneration = this.tokenGeneration;
             try {
-                const response = await this.send(route, payload, protectedRoute, bearerUsed);
+                const response = await this.send(route, payload, protectedRoute, bearerUsed, false, signal);
+                if (signal?.aborted)
+                    throw new Error("The request was cancelled.");
                 if (this.loggingOut) {
                     throw new ApiError("Sign out is already in progress.", "unauthorized", 401);
                 }
                 return response;
             }
             catch (error) {
+                if (signal?.aborted)
+                    throw new Error("The request was cancelled.");
                 if (!protectedRoute ||
                     !(error instanceof ApiError) ||
                     error.code !== "unauthorized" ||
@@ -953,7 +961,11 @@ var Amaterasu;
                     await this.refreshOrClear();
                 if (authGeneration !== this.authGeneration || !this.bearer)
                     throw error;
-                const response = await this.send(route, payload, true, this.bearer);
+                if (signal?.aborted)
+                    throw new Error("The request was cancelled.");
+                const response = await this.send(route, payload, true, this.bearer, false, signal);
+                if (signal?.aborted)
+                    throw new Error("The request was cancelled.");
                 if (this.loggingOut) {
                     throw new ApiError("Sign out is already in progress.", "unauthorized", 401);
                 }
@@ -1065,22 +1077,28 @@ var Amaterasu;
                     this.cookieRefreshInFlight = null;
             }
         }
-        async postWithCookies(route, payload) {
+        async postWithCookies(route, payload, signal) {
             if (this.pendingCookieLogout())
                 throw new ApiError("Sign-out is still pending. Retry when the host is reachable.", "logout_unconfirmed", 503);
             if (this.accessExpiresAt - Date.now() / 1000 <= 60)
                 await this.refreshCookieSession();
+            if (signal?.aborted)
+                throw new Error("The request was cancelled.");
             if (!this.cookieSession || this.loggingOut)
                 throw new ApiError("Sign in to continue.", "unauthorized", 401);
             const generation = this.authGeneration;
             const tokenGeneration = this.tokenGeneration;
             try {
-                const reply = await this.send(route, payload, true, "", true);
+                const reply = await this.send(route, payload, true, "", true, signal);
+                if (signal?.aborted)
+                    throw new Error("The request was cancelled.");
                 if (generation !== this.authGeneration || this.loggingOut)
                     throw new ApiError("Sign in to continue.", "unauthorized", 401);
                 return reply;
             }
             catch (error) {
+                if (signal?.aborted)
+                    throw new Error("The request was cancelled.");
                 if (!(error instanceof ApiError) || error.status !== 401 ||
                     generation !== this.authGeneration || this.loggingOut)
                     throw error;
@@ -1088,13 +1106,19 @@ var Amaterasu;
                     await this.refreshCookieSession();
                 if (!this.cookieSession || generation !== this.authGeneration)
                     throw error;
+                if (signal?.aborted)
+                    throw new Error("The request was cancelled.");
                 try {
-                    const reply = await this.send(route, payload, true, "", true);
+                    const reply = await this.send(route, payload, true, "", true, signal);
+                    if (signal?.aborted)
+                        throw new Error("The request was cancelled.");
                     if (generation !== this.authGeneration || this.loggingOut)
                         throw new ApiError("Sign in to continue.", "unauthorized", 401);
                     return reply;
                 }
                 catch (retryError) {
+                    if (signal?.aborted)
+                        throw new Error("The request was cancelled.");
                     if (retryError instanceof ApiError &&
                         retryError.status === 401 &&
                         generation === this.authGeneration) {
@@ -1765,8 +1789,12 @@ var Amaterasu;
                 }
             }
         }
-        async send(route, payload, protectedRoute, bearer, cookieAuth = false) {
+        async send(route, payload, protectedRoute, bearer, cookieAuth = false, signal) {
+            if (signal?.aborted)
+                throw new Error("The request was cancelled.");
             const controller = new AbortController();
+            const abortRequest = () => controller.abort();
+            signal?.addEventListener("abort", abortRequest, { once: true });
             const timer = window.setTimeout(() => controller.abort(), 12_000);
             this.requests.add(controller);
             if (route === "auth/refresh" || route === "auth/browser/refresh")
@@ -1801,6 +1829,7 @@ var Amaterasu;
                 throw new Error("Could not reach the host. Check its address, connection, and allowed browser origin.");
             }
             finally {
+                signal?.removeEventListener("abort", abortRequest);
                 clearTimeout(timer);
                 this.requests.delete(controller);
                 this.refreshRequests.delete(controller);
@@ -4526,12 +4555,26 @@ var Amaterasu;
         else
             target.setAttribute(attribute, value);
     }
+    function steamChooserSetAttributeTemplate(target, attribute, source, values) {
+        if (typeof Amaterasu.setLocalizedAttributeTemplate === "function")
+            Amaterasu.setLocalizedAttributeTemplate(target, attribute, source, values);
+        else {
+            let rendered = source;
+            for (const [name, value] of Object.entries(values)) {
+                const literal = typeof value === "string" ? value : value.value;
+                rendered = rendered.replaceAll(`{${name}}`, () => literal);
+            }
+            target.setAttribute(attribute, rendered);
+        }
+    }
     const steamChooserPageSize = 16;
+    const steamChooserSearchMaxPages = 32;
     function validateSteamChooserReply(value) {
         if (!value || typeof value !== "object" || Array.isArray(value))
             throw new Error("Steam game discovery returned an invalid response.");
         const reply = value;
-        if (!Number.isSafeInteger(reply.revision) || !Array.isArray(reply.games) ||
+        if (!Number.isSafeInteger(reply.revision) || reply.revision < 0 ||
+            !Array.isArray(reply.games) || reply.games.length > steamChooserPageSize ||
             (reply.next_after !== null && !Number.isSafeInteger(reply.next_after)) ||
             typeof reply.scanning !== "boolean" || typeof reply.complete !== "boolean")
             throw new Error("Steam game discovery returned an invalid response.");
@@ -4540,64 +4583,152 @@ var Amaterasu;
             if (!value || typeof value !== "object" || Array.isArray(value))
                 throw new Error("Steam game discovery returned an invalid game.");
             const game = value;
+            const directory = typeof game.install_directory === "string" &&
+                game.install_directory.trim() !== "" ? game.install_directory : undefined;
             if (!Number.isSafeInteger(game.app_id) || game.app_id <= 0 ||
                 typeof game.name !== "string" || !game.name.trim() ||
                 seen.has(game.app_id) ||
                 (game.install_directory !== undefined && typeof game.install_directory !== "string"))
                 throw new Error("Steam game discovery returned an invalid game.");
             seen.add(game.app_id);
-            return { app_id: game.app_id, name: game.name,
-                ...(typeof game.install_directory === "string" ? { install_directory: game.install_directory } : {}) };
+            return {
+                app_id: game.app_id,
+                name: game.name,
+                ...(directory === undefined ? {} : { install_directory: directory }),
+            };
         });
         const nextAfter = reply.next_after;
         if (nextAfter !== null && nextAfter < 0)
             throw new Error("Steam game discovery returned an invalid cursor.");
-        return { revision: reply.revision, games, next_after: nextAfter,
-            scanning: reply.scanning, complete: reply.complete };
+        return {
+            revision: reply.revision,
+            games,
+            next_after: nextAfter,
+            scanning: reply.scanning,
+            complete: reply.complete,
+        };
     }
-    function chooseSteamGame(api) {
+    function steamChooserSetFocus(target) {
+        if (target.isConnected)
+            target.focus();
+    }
+    function chooseSteamGame(api, signal) {
         return new Promise((resolve) => {
+            if (signal?.aborted) {
+                resolve(null);
+                return;
+            }
+            const opener = document.activeElement;
             const dialog = Amaterasu.el("dialog", "steam-game-chooser-dialog");
             steamChooserSetAttribute(dialog, "aria-label", "Choose a Steam game");
             const status = Amaterasu.el("p", "steam-game-chooser-status");
             status.setAttribute("role", "status");
+            status.setAttribute("aria-live", "polite");
             const list = Amaterasu.el("ul", "steam-game-chooser-list");
+            steamChooserSetAttribute(list, "aria-label", "Steam games");
+            const searchInput = Amaterasu.input("steam_game_search");
+            searchInput.type = "search";
+            searchInput.maxLength = 128;
+            steamChooserSetAttribute(searchInput, "aria-label", "Search discovered games");
+            if (typeof Amaterasu.setLocalizedAttribute === "function")
+                Amaterasu.setLocalizedAttribute(searchInput, "placeholder", "Search by game name or app ID");
+            else
+                searchInput.placeholder = "Search by game name or app ID";
+            const searchButton = Amaterasu.button(steamChooserMessage("Search"), () => void searchGames());
+            const searchForm = Amaterasu.el("form", "steam-game-chooser-search", Amaterasu.field(steamChooserMessage("Search discovered games"), searchInput), searchButton);
             const previous = Amaterasu.button(steamChooserMessage("← Previous"), () => void showPage(pageIndex - 1));
             const next = Amaterasu.button(steamChooserMessage("Next →"), () => void showPage(pageIndex + 1), "primary");
+            const restart = Amaterasu.button(steamChooserMessage("Restart"), () => void restartDiscovery());
+            restart.hidden = true;
+            const clearSearch = Amaterasu.button(steamChooserMessage("Clear search"), () => {
+                searchInput.value = "";
+                activeSearchTerm = "";
+                pageIndex = 0;
+                cursors.length = 1;
+                list.replaceChildren();
+                restart.hidden = true;
+                void showPage(0);
+            });
+            clearSearch.hidden = true;
             const cancel = Amaterasu.button(steamChooserMessage("Cancel"), () => finish(null));
+            steamChooserSetAttribute(cancel, "aria-label", "Cancel");
             const pagination = Amaterasu.el("div", "actions steam-game-chooser-pagination", previous, next);
-            dialog.append(Amaterasu.el("h2", "", steamChooserMessage("Choose a Steam game")), Amaterasu.el("p", "muted", steamChooserMessage("Select a discovered game to use its Steam app ID and optional install directory.")), status, list, pagination, Amaterasu.el("div", "actions", cancel));
+            const recovery = Amaterasu.el("div", "actions steam-game-chooser-recovery", restart, clearSearch);
+            const heading = Amaterasu.el("h2", "", steamChooserMessage("Choose a Steam game"));
+            heading.id = "steam-game-chooser-title";
+            dialog.setAttribute("aria-labelledby", heading.id);
+            dialog.append(heading, Amaterasu.el("p", "muted", steamChooserMessage("Select a discovered game to use its Steam app ID and optional install directory.")), searchForm, status, list, pagination, recovery, Amaterasu.el("div", "actions", cancel));
             let settled = false;
             let loading = false;
+            let searching = false;
             let revision;
             let pageIndex = 0;
-            const cursors = [null];
+            let activeSearchTerm = "";
+            let cursors = [null];
             const finish = (selection) => {
                 if (settled)
                     return;
                 settled = true;
+                signal?.removeEventListener("abort", onAbort);
                 dialog.close();
                 dialog.remove();
+                if (opener)
+                    steamChooserSetFocus(opener);
                 resolve(selection);
             };
+            const onAbort = () => finish(null);
             const updatePager = (hasNext) => {
-                previous.disabled = loading || pageIndex === 0;
-                next.disabled = loading || !hasNext;
-                pagination.hidden = pageIndex === 0 && !hasNext;
+                previous.disabled = loading || searching || pageIndex === 0;
+                next.disabled = loading || searching || !hasNext;
+                pagination.hidden = searching || (pageIndex === 0 && !hasNext);
+                searchInput.disabled = loading || !api.allows("steam.read");
+                searchButton.disabled = loading || !api.allows("steam.read");
+                restart.disabled = loading;
+                clearSearch.hidden = !activeSearchTerm;
             };
-            async function showPage(requestedPage) {
-                if (settled || loading || requestedPage < 0 || requestedPage > pageIndex + 1)
+            const showRestart = (message) => {
+                list.replaceChildren();
+                steamChooserSetText(status, message);
+                restart.hidden = false;
+                updatePager(false);
+            };
+            const permissionLost = () => {
+                list.replaceChildren();
+                steamChooserSetText(status, "Steam discovery requires steam.read permission. You can enter a Steam app ID manually.");
+                restart.hidden = true;
+                updatePager(false);
+            };
+            const renderGames = (games) => {
+                list.replaceChildren();
+                for (const game of games) {
+                    const select = Amaterasu.button(steamChooserMessage("Select"), () => finish(game));
+                    steamChooserSetAttributeTemplate(select, "aria-label", "Select {name}", {
+                        name: typeof Amaterasu.literalText === "function"
+                            ? Amaterasu.literalText(game.name)
+                            : game.name,
+                    });
+                    const directory = game.install_directory;
+                    list.append(Amaterasu.el("li", "steam-game-chooser-item", Amaterasu.el("div", "steam-game-chooser-copy", Amaterasu.el("strong", "", typeof Amaterasu.literalText === "function"
+                        ? Amaterasu.literalText(game.name)
+                        : game.name), Amaterasu.el("span", "steam-game-chooser-details", steamChooserMessage("App ID "), String(game.app_id), " · ", steamChooserMessage(directory ? "Install directory" : "Install directory unavailable"), ...(directory ? [" ", typeof Amaterasu.literalText === "function"
+                            ? Amaterasu.literalText(directory)
+                            : directory] : []))), select));
+                }
+            };
+            const showPage = async (requestedPage) => {
+                if (settled || loading || searching || requestedPage < 0 ||
+                    requestedPage > pageIndex + 1)
                     return;
                 if (!api.allows("steam.read")) {
-                    steamChooserSetText(status, "Steam discovery requires steam.read permission. You can enter a Steam app ID manually.");
-                    list.replaceChildren();
-                    updatePager(false);
+                    permissionLost();
                     return;
                 }
                 loading = true;
+                searching = false;
                 pageIndex = requestedPage;
                 const cursor = cursors[pageIndex] ?? null;
                 list.replaceChildren();
+                restart.hidden = true;
                 steamChooserSetText(status, "Loading discovered Steam games…");
                 updatePager(false);
                 try {
@@ -4605,25 +4736,30 @@ var Amaterasu;
                         ...(revision !== undefined ? { revision } : {}),
                         ...(cursor !== null ? { after: cursor } : {}),
                         limit: steamChooserPageSize,
-                    });
-                    if (settled)
+                    }, true, signal);
+                    if (settled || signal?.aborted)
                         return;
+                    if (!api.allows("steam.read")) {
+                        permissionLost();
+                        return;
+                    }
                     const reply = validateSteamChooserReply(raw);
-                    if (revision !== undefined && reply.revision !== revision)
-                        throw new Error("Steam discovery changed while browsing. Close the chooser and try again.");
+                    if (revision !== undefined && reply.revision !== revision) {
+                        showRestart("Steam games changed while browsing. Restart to load the current list.");
+                        return;
+                    }
                     revision = reply.revision;
-                    if (reply.next_after !== null && cursor !== null && reply.next_after <= cursor)
-                        throw new Error("Steam game discovery returned an invalid cursor.");
+                    if (reply.next_after !== null &&
+                        ((cursor !== null && reply.next_after <= cursor) ||
+                            cursors.slice(0, pageIndex + 1).includes(reply.next_after))) {
+                        showRestart("Steam pagination could not continue. Restart to load the current list.");
+                        return;
+                    }
                     if (reply.next_after !== null)
                         cursors[pageIndex + 1] = reply.next_after;
                     else
                         cursors.length = pageIndex + 1;
-                    for (const game of reply.games) {
-                        const select = Amaterasu.button(steamChooserMessage("Select"), () => finish(game));
-                        steamChooserSetAttribute(select, "aria-label", `Select ${game.name}`);
-                        const directory = game.install_directory || "";
-                        list.append(Amaterasu.el("li", "steam-game-chooser-item", Amaterasu.el("div", "steam-game-chooser-copy", Amaterasu.el("strong", "", typeof Amaterasu.literalText === "function" ? Amaterasu.literalText(game.name) : game.name), Amaterasu.el("span", "steam-game-chooser-details", steamChooserMessage("App ID "), String(game.app_id), " · ", steamChooserMessage(directory ? "Install directory" : "Install directory unavailable"), ...(directory ? [" ", typeof Amaterasu.literalText === "function" ? Amaterasu.literalText(directory) : directory] : []))), select));
-                    }
+                    renderGames(reply.games);
                     steamChooserSetText(status, reply.games.length
                         ? "Choose a game to continue."
                         : reply.complete ? "No Steam games were discovered."
@@ -4632,34 +4768,208 @@ var Amaterasu;
                     updatePager(reply.next_after !== null);
                 }
                 catch (error) {
-                    if (settled)
+                    if (settled || signal?.aborted)
                         return;
-                    const code = error instanceof Amaterasu.ApiError ? error.code : "";
-                    steamChooserSetText(status, code === "forbidden" || code === "permission_denied"
-                        ? "Steam discovery requires steam.read permission. You can enter a Steam app ID manually."
-                        : "Steam games are unavailable. You can enter a Steam app ID manually.");
-                    list.replaceChildren();
-                    updatePager(false);
+                    if (!api.allows("steam.read")) {
+                        permissionLost();
+                        return;
+                    }
+                    if (error instanceof Amaterasu.ApiError && error.code === "revision_conflict") {
+                        showRestart("Steam games changed while browsing. Restart to load the current list.");
+                        return;
+                    }
+                    showRestart("Steam games are unavailable. Retry or enter a Steam app ID manually.");
                 }
                 finally {
                     loading = false;
-                    if (!settled)
+                    if (!settled && !signal?.aborted)
                         updatePager(cursors[pageIndex + 1] !== undefined);
                 }
+            };
+            const searchGames = async () => {
+                if (settled || loading || !searchInput.value.trim()) {
+                    if (!settled && !searchInput.value.trim())
+                        steamChooserSetText(status, "Enter a game name or app ID to search.");
+                    return;
+                }
+                if (!api.allows("steam.read")) {
+                    permissionLost();
+                    return;
+                }
+                const query = searchInput.value.trim().toLocaleLowerCase();
+                activeSearchTerm = query;
+                loading = true;
+                searching = true;
+                list.replaceChildren();
+                restart.hidden = true;
+                clearSearch.hidden = false;
+                steamChooserSetText(status, "Searching discovered Steam games…");
+                updatePager(false);
+                const matches = [];
+                const seenCursors = new Set();
+                let cursor = null;
+                let pagesRead = 0;
+                let complete = false;
+                try {
+                    while (pagesRead < steamChooserSearchMaxPages) {
+                        if (settled || signal?.aborted)
+                            return;
+                        if (!api.allows("steam.read")) {
+                            permissionLost();
+                            return;
+                        }
+                        const reply = validateSteamChooserReply(await api.post("steam/list", {
+                            ...(revision !== undefined ? { revision } : {}),
+                            ...(cursor !== null ? { after: cursor } : {}),
+                            limit: steamChooserPageSize,
+                        }, true, signal));
+                        if (settled || signal?.aborted)
+                            return;
+                        if (!api.allows("steam.read")) {
+                            permissionLost();
+                            return;
+                        }
+                        if (revision !== undefined && reply.revision !== revision) {
+                            showRestart("Steam games changed during search. Restart to search the current list.");
+                            return;
+                        }
+                        revision = reply.revision;
+                        pagesRead += 1;
+                        matches.push(...reply.games.filter((game) => game.name.toLocaleLowerCase().includes(query) ||
+                            String(game.app_id).includes(query)));
+                        if (reply.next_after === null) {
+                            complete = true;
+                            break;
+                        }
+                        if ((cursor !== null && reply.next_after <= cursor) ||
+                            seenCursors.has(reply.next_after)) {
+                            showRestart("Steam pagination could not continue. Restart to search the current list.");
+                            return;
+                        }
+                        seenCursors.add(reply.next_after);
+                        cursor = reply.next_after;
+                    }
+                    renderGames(matches);
+                    if (matches.length) {
+                        steamChooserSetText(status, complete
+                            ? "Search complete. Choose a game to continue."
+                            : "Search reached its page limit. Refine your search to continue.");
+                    }
+                    else {
+                        steamChooserSetText(status, complete
+                            ? "No Steam games matched. Try another search."
+                            : "Search reached its page limit. Refine your search to continue.");
+                    }
+                    restart.hidden = true;
+                    updatePager(false);
+                }
+                catch (error) {
+                    if (settled || signal?.aborted)
+                        return;
+                    if (!api.allows("steam.read")) {
+                        permissionLost();
+                        return;
+                    }
+                    if (error instanceof Amaterasu.ApiError && error.code === "revision_conflict") {
+                        showRestart("Steam games changed during search. Restart to search the current list.");
+                        return;
+                    }
+                    showRestart("Steam games are unavailable. Retry or enter a Steam app ID manually.");
+                }
+                finally {
+                    loading = false;
+                    if (!settled && !signal?.aborted)
+                        updatePager(false);
+                }
+            };
+            const restartDiscovery = async () => {
+                if (settled || loading)
+                    return;
+                revision = undefined;
+                pageIndex = 0;
+                cursors = [null];
+                const query = activeSearchTerm;
+                activeSearchTerm = "";
+                restart.hidden = true;
+                if (query) {
+                    searchInput.value = query;
+                    await searchGames();
+                }
+                else {
+                    await showPage(0);
+                }
+            };
+            searchForm.addEventListener("submit", (event) => {
+                event.preventDefault();
+                void searchGames();
+            });
+            dialog.addEventListener("cancel", (event) => {
+                event.preventDefault();
+                finish(null);
+            });
+            signal?.addEventListener("abort", onAbort, { once: true });
+            if (signal?.aborted) {
+                finish(null);
+                return;
             }
-            dialog.addEventListener("cancel", (event) => { event.preventDefault(); finish(null); });
             document.body.append(dialog);
             dialog.showModal();
             cancel.focus();
             if (api.allows("steam.read"))
                 void showPage(0);
-            else {
-                steamChooserSetText(status, "Steam discovery requires steam.read permission. You can enter a Steam app ID manually.");
-                updatePager(false);
-            }
+            else
+                permissionLost();
         });
     }
     Amaterasu.chooseSteamGame = chooseSteamGame;
+    function chooseSteamDirectoryChange(signal) {
+        return new Promise((resolve) => {
+            if (signal?.aborted) {
+                resolve(null);
+                return;
+            }
+            const opener = document.activeElement;
+            const dialog = Amaterasu.el("dialog", "steam-game-chooser-dialog");
+            steamChooserSetAttribute(dialog, "aria-label", "Review Steam install directory");
+            const heading = Amaterasu.el("h2", "", steamChooserMessage("Review Steam install directory"));
+            heading.id = "steam-directory-review-title";
+            dialog.setAttribute("aria-labelledby", heading.id);
+            const status = Amaterasu.el("p", "muted", steamChooserMessage("The selected game has no install directory. Your current directory may belong to another game."));
+            status.setAttribute("role", "status");
+            status.setAttribute("aria-live", "polite");
+            const keep = Amaterasu.button(steamChooserMessage("Keep current directory"), () => finish("keep"));
+            const clear = Amaterasu.button(steamChooserMessage("Clear current directory"), () => finish("clear"), "danger");
+            const review = Amaterasu.button(steamChooserMessage("Review fields"), () => finish("review"));
+            steamChooserSetAttribute(review, "aria-label", "Review fields");
+            dialog.append(heading, status, Amaterasu.el("p", "muted", steamChooserMessage("Choose how to handle the current directory, or review the Steam fields without applying this selection.")), Amaterasu.el("div", "actions", review, keep, clear));
+            let settled = false;
+            const finish = (choice) => {
+                if (settled)
+                    return;
+                settled = true;
+                signal?.removeEventListener("abort", onAbort);
+                dialog.close();
+                dialog.remove();
+                if (opener)
+                    steamChooserSetFocus(opener);
+                resolve(choice);
+            };
+            const onAbort = () => finish(null);
+            dialog.addEventListener("cancel", (event) => {
+                event.preventDefault();
+                finish("review");
+            });
+            signal?.addEventListener("abort", onAbort, { once: true });
+            if (signal?.aborted) {
+                finish(null);
+                return;
+            }
+            document.body.append(dialog);
+            dialog.showModal();
+            review.focus();
+        });
+    }
+    Amaterasu.chooseSteamDirectoryChange = chooseSteamDirectoryChange;
 })(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
 (function (Amaterasu) {
@@ -5420,6 +5730,7 @@ var Amaterasu;
         const editor = Amaterasu.el("div");
         const editorDrafts = context.registerDraftGuard ? Amaterasu.trackDrafts(editor) : null;
         let editorSaving = false;
+        let editorLifecycle = null;
         const catalogDraftDirty = () => {
             const form = editor.querySelector(".editor-form");
             return !!form && !!editorDrafts?.isDirty(form);
@@ -5427,7 +5738,11 @@ var Amaterasu;
         let pluginArea = null;
         const pluginDirty = () => !!pluginArea && typeof Amaterasu.applicationPluginOverridesDirty === "function" && Amaterasu.applicationPluginOverridesDirty(pluginArea);
         if (editorDrafts)
-            context.registerDraftGuard?.(() => editorSaving || catalogDraftDirty() || pluginDirty(), editorDrafts.dispose);
+            context.registerDraftGuard?.(() => editorSaving || catalogDraftDirty() || pluginDirty(), () => {
+                editorLifecycle?.abort();
+                editorLifecycle = null;
+                editorDrafts.dispose();
+            });
         let editorGeneration = 0;
         const status = Amaterasu.el("div");
         const selectionCount = Amaterasu.el("span", "muted");
@@ -5869,6 +6184,8 @@ var Amaterasu;
             }
             if ((catalogDraftDirty() || pluginDirty()) && !window.confirm("Discard your unsaved application and plugin changes?"))
                 return false;
+            editorLifecycle?.abort();
+            editorLifecycle = null;
             pluginArea = null;
             editorGeneration += 1;
             editor.replaceChildren();
@@ -6035,7 +6352,9 @@ var Amaterasu;
         }
         function renderEditor(row, runtimeStatus, capabilities) {
             const editRevision = revision;
-            const form = entryForm(row?.entry, runtimeStatus, capabilities, api);
+            const lifecycle = new AbortController();
+            editorLifecycle = lifecycle;
+            const form = entryForm(row?.entry, runtimeStatus, capabilities, api, lifecycle.signal);
             form.hidden = !api.allows("catalog.write");
             const feedback = Amaterasu.el("div");
             const save = Amaterasu.el("button", "button primary", row ? "Save changes" : "Add application");
@@ -6065,6 +6384,9 @@ var Amaterasu;
                             entry,
                             expected_revision: editRevision,
                         });
+                        lifecycle.abort();
+                        if (editorLifecycle === lifecycle)
+                            editorLifecycle = null;
                         editor.replaceChildren();
                         notify(catalogTextMessage(row ? "Application updated." : "Application added."));
                         reset();
@@ -6189,7 +6511,7 @@ var Amaterasu;
         }, true);
     }
     const catalogRemovedOverrides = new WeakMap();
-    function entryForm(entry, runtimeStatus, capabilities, api) {
+    function entryForm(entry, runtimeStatus, capabilities, api, lifecycle) {
         const form = Amaterasu.el("form", "editor-form");
         const name = Amaterasu.input("name", entry?.name ?? "");
         name.required = true;
@@ -6356,36 +6678,65 @@ var Amaterasu;
         const steamChooserStatus = Amaterasu.el("p", "muted");
         steamChooserStatus.setAttribute("role", "status");
         steamChooserStatus.hidden = true;
+        const setSteamChooserStatus = (message) => {
+            steamChooserStatus.hidden = false;
+            if (typeof Amaterasu.setLocalizedTextContent === "function")
+                Amaterasu.setLocalizedTextContent(steamChooserStatus, message);
+            else
+                steamChooserStatus.textContent = message;
+        };
         const chooseSteamGameButton = Amaterasu.button(catalogTextMessage("Choose a Steam game"), async () => {
-            if (!api.allows("catalog.write"))
+            if (!api.allows("catalog.write") || lifecycle.aborted || !form.isConnected)
                 return;
-            const selected = await Amaterasu.chooseSteamGame(api);
-            if (!selected)
+            const selected = await Amaterasu.chooseSteamGame(api, lifecycle);
+            if (!selected || lifecycle.aborted || !form.isConnected)
                 return;
-            if (!api.allows("catalog.write")) {
-                steamChooserStatus.hidden = false;
-                if (typeof Amaterasu.setLocalizedTextContent === "function")
-                    Amaterasu.setLocalizedTextContent(steamChooserStatus, "Catalog write permission changed; the selection was not applied.");
-                else
-                    steamChooserStatus.textContent = "Catalog write permission changed; the selection was not applied.";
+            if (!api.allows("catalog.write") || !api.allows("steam.read")) {
+                setSteamChooserStatus("A required permission changed; the selection was not applied.");
                 return;
             }
-            steamId.value = String(selected.app_id);
+            const selectedId = String(selected.app_id);
+            const directoryAvailable = selected.install_directory !== undefined &&
+                selected.install_directory.trim() !== "";
+            const changingGame = steamId.value !== selectedId;
+            let keepDirectory = false;
+            let clearDirectory = false;
+            if (!directoryAvailable && changingGame && steamInstallDir.value.trim() !== "") {
+                const choice = await Amaterasu.chooseSteamDirectoryChange(lifecycle);
+                if (!choice || lifecycle.aborted || !form.isConnected)
+                    return;
+                if (choice === "review") {
+                    setSteamChooserStatus("Selection was not applied. Review the Steam fields and choose again.");
+                    return;
+                }
+                if (!api.allows("catalog.write") || !api.allows("steam.read")) {
+                    setSteamChooserStatus("A required permission changed; the selection was not applied.");
+                    return;
+                }
+                keepDirectory = choice === "keep";
+                clearDirectory = choice === "clear";
+            }
+            steamId.value = selectedId;
             steamId.dispatchEvent(new Event("input", { bubbles: true }));
             steamId.dispatchEvent(new Event("change", { bubbles: true }));
-            if (selected.install_directory !== undefined) {
+            if (directoryAvailable) {
                 steamInstallDir.value = selected.install_directory;
                 steamInstallDir.dispatchEvent(new Event("input", { bubbles: true }));
                 steamInstallDir.dispatchEvent(new Event("change", { bubbles: true }));
             }
-            steamChooserStatus.hidden = false;
-            const status = selected.install_directory === undefined
-                ? "Steam game selected. Its install directory is unavailable; the existing directory was kept."
-                : "Steam game selected. Other application edits were kept.";
-            if (typeof Amaterasu.setLocalizedTextContent === "function")
-                Amaterasu.setLocalizedTextContent(steamChooserStatus, status);
-            else
-                steamChooserStatus.textContent = status;
+            else if (clearDirectory) {
+                steamInstallDir.value = "";
+                steamInstallDir.dispatchEvent(new Event("input", { bubbles: true }));
+                steamInstallDir.dispatchEvent(new Event("change", { bubbles: true }));
+            }
+            const status = directoryAvailable
+                ? "Steam game selected. Other application edits were kept."
+                : keepDirectory
+                    ? "Steam game selected. Kept the existing directory by choice."
+                    : clearDirectory
+                        ? "Steam game selected. Cleared the existing directory by choice."
+                        : "Steam game selected. Its install directory is unavailable; the existing directory was kept.";
+            setSteamChooserStatus(status);
         });
         catalogLocalizedAttribute(chooseSteamGameButton, "aria-label", "Choose a Steam game");
         const steamGameChooser = Amaterasu.el("div", "catalog-steam-chooser", chooseSteamGameButton, steamChooserStatus);

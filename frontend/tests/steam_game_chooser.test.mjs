@@ -4,6 +4,9 @@ import test from "node:test";
 import vm from "node:vm";
 import ts from "typescript";
 
+class FakeText {
+  constructor(text) { this.textContent = String(text); this.nodeType = 3; }
+}
 class FakeElement {
   children = [];
   attributes = new Map();
@@ -12,37 +15,84 @@ class FakeElement {
   hidden = false;
   disabled = false;
   open = false;
+  isConnected = false;
+  parentElement = null;
   constructor(tagName, document) { this.tagName = tagName.toUpperCase(); this.document = document; }
-  append(...children) { this.children.push(...children); }
-  replaceChildren(...children) { this.children = children; }
+  setConnected(connected) { this.isConnected = connected; for (const child of this.children) child?.setConnected?.(connected); }
+  append(...children) {
+    for (const child of children) {
+      if (child == null) continue;
+      if (typeof child === "object") child.parentElement = this;
+      this.children.push(child);
+      child?.setConnected?.(this.isConnected);
+    }
+  }
+  replaceChildren(...children) {
+    for (const child of this.children) child?.setConnected?.(false);
+    this.children = [];
+    this.append(...children);
+  }
   setAttribute(name, value) { this.attributes.set(name, String(value)); }
   getAttribute(name) { return this.attributes.get(name) ?? null; }
   addEventListener(type, callback) { const events = this.listeners.get(type) ?? []; events.push(callback); this.listeners.set(type, events); }
   dispatch(type, values = {}) {
     const event = { type, target: this, preventDefault() { this.defaultPrevented = true; }, ...values };
-    for (const callback of this.listeners.get(type) ?? []) callback(event);
+    for (const entry of this.listeners.get(type) ?? []) entry(event);
     return event;
   }
   click() { this.dispatch("click"); }
   focus() { this.document.activeElement = this; }
   showModal() { this.open = true; }
   close() { this.open = false; this.dispatch("close"); }
-  remove() { this.removed = true; }
+  remove() {
+    if (this.parentElement) this.parentElement.children = this.parentElement.children.filter(child => child !== this);
+    this.parentElement = null;
+    this.removed = true;
+    this.setConnected(false);
+  }
   get textContent() { return this.text + this.children.map((child) => child?.textContent ?? String(child)).join(""); }
-  set textContent(value) { this.text = String(value); this.children = []; }
+  set textContent(value) { this.text = String(value); this.replaceChildren(); }
 }
 class ApiError extends Error { constructor(message, code, status) { super(message); this.code = code; this.status = status; } }
 
-function setup(api) {
-  const document = { activeElement: null, body: null, createElement(tag) { return new FakeElement(tag, this); } };
+function setup(api, options = {}) {
+  const document = { activeElement: null, body: null, documentElement: null,
+    createElement(tag) { return new FakeElement(tag, this); },
+    createTextNode(text) { return new FakeText(text); },
+    querySelectorAll(selector) {
+      const name = selector.slice(1, -1).replace("data-locale-", "");
+      return all(this.documentElement).filter((node) => node instanceof FakeElement && node.attributes.has(`data-locale-${name}`));
+    },
+    createTreeWalker(root) {
+      const nodes = [];
+      const walk = (node) => {
+        if (node?.nodeType === 3) nodes.push(node);
+        else for (const child of node?.children ?? []) walk(child);
+      };
+      walk(root);
+      let index = 0;
+      return { nextNode() { return nodes[index++] ?? null; } };
+    },
+  };
+  document.documentElement = new FakeElement("html", document);
   document.body = new FakeElement("body", document);
-  const context = vm.createContext({ document, ApiError, AbortController, Error, Number, String, Object, Array, Set });
-  const source = ["src/ui.ts", "src/steam_game_chooser.ts"]
-    .map((file) => readFileSync(file, "utf8")).join("\n");
+  document.documentElement.append(document.body);
+  document.documentElement.setConnected(true);
+  const context = vm.createContext({
+    document, ApiError, AbortController, Error, Number, String, Object, Array, Set,
+    NodeFilter: { SHOW_TEXT: 4 },
+  });
+  const sources = options.liveLocale
+    ? ["src/locale-catalogs.ts", "src/ui.ts", "src/steam_game_chooser.ts", "src/locale.ts"]
+    : ["src/ui.ts", "src/steam_game_chooser.ts"];
+  const source = sources.map((file) => readFileSync(file, "utf8")).join("\n");
   vm.runInContext(ts.transpile(source, { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None }), context);
-  const pending = context.Amaterasu.chooseSteamGame(api);
-  const dialog = document.body.children[0];
-  return { pending, dialog, document };
+  const opener = new FakeElement("button", document);
+  document.body.append(opener);
+  opener.focus();
+  const pending = context.Amaterasu.chooseSteamGame(api, options.signal);
+  const dialog = document.body.children.find((node) => node instanceof FakeElement && node.tagName === "DIALOG");
+  return { pending, dialog, document, opener, context };
 }
 function all(node) { return [node, ...(node.children ?? []).filter((child) => child instanceof FakeElement).flatMap(all)]; }
 function button(dialog, label) { return all(dialog).find((node) => node.tagName === "BUTTON" && node.textContent === label); }
@@ -108,9 +158,129 @@ test("explicit selection returns optional directory without applying it to calle
   assert.deepEqual(editorDraft, { steam_id: "", steam_install_dir: "", title: "Unsaved title", arguments: ["--test"] });
 });
 
-test("browser cancel button resolves null", async () => {
+test("cancel restores opener focus", async () => {
   const view = setup({ allows: () => true, async post() { return page([]); } });
   await settle();
+  assert.equal(view.document.activeElement, button(view.dialog, "Cancel"));
   button(view.dialog, "Cancel").click();
   assert.equal(await view.pending, null);
+  assert.equal(view.document.activeElement, view.opener);
+});
+
+test("real empty-string install_directory is treated as unavailable", async () => {
+  const view = setup({ allows: () => true, async post() {
+    return page([{ app_id: 9, name: "Pathless", install_directory: "" }]);
+  } });
+  await settle();
+  button(view.dialog, "Select").click();
+  assert.deepEqual(JSON.parse(JSON.stringify(await view.pending)), { app_id: 9, name: "Pathless" });
+});
+
+test("search walks bounded pages of the actual steam/list API and filters by name or app ID", async () => {
+  const calls = [];
+  const firstGames = Array.from({ length: 16 }, (_, i) => ({ app_id: i + 1, name: `Other ${i + 1}` }));
+  const api = { allows: () => true, async post(route, payload) {
+    calls.push({ route, payload: { ...payload } });
+    if (calls.length === 1 || calls.length === 2) return page(firstGames, 16);
+    return page([{ app_id: 42, name: "Target game", install_directory: "/target" }]);
+  } };
+  const view = setup(api);
+  await settle();
+  const search = all(view.dialog).find((node) => node.name === "steam_game_search");
+  search.value = "target";
+  button(view.dialog, "Search").click();
+  await settle();
+  assert.equal(calls.length, 3);
+  assert.ok(calls.every((call) => call.route === "steam/list"));
+  assert.deepEqual(JSON.parse(JSON.stringify(calls[1].payload)), { revision: 7, limit: 16 });
+  assert.deepEqual(JSON.parse(JSON.stringify(calls[2].payload)), { revision: 7, after: 16, limit: 16 });
+  assert.equal(all(view.dialog).filter((node) => node.tagName === "BUTTON" && node.textContent === "Select").length, 1);
+  assert.match(view.dialog.textContent, /Target game/);
+  button(view.dialog, "Select").click();
+  assert.deepEqual(JSON.parse(JSON.stringify(await view.pending)), { app_id: 42, name: "Target game", install_directory: "/target" });
+});
+
+test("search stops at its page bound instead of scanning without limit", async () => {
+  let calls = 0;
+  const api = { allows: () => true, async post(_route, payload) {
+    calls++;
+    const pageNumber = Math.floor(calls === 1 ? 0 : (calls - 2) % 100) + 1;
+    return page([{ app_id: pageNumber, name: "No match" }], pageNumber * 16);
+  } };
+  const view = setup(api);
+  await settle();
+  const search = all(view.dialog).find((node) => node.name === "steam_game_search");
+  search.value = "absent";
+  button(view.dialog, "Search").click();
+  await settle();
+  assert.equal(calls, 33, "one browse request plus exactly 32 bounded search pages");
+  assert.match(view.dialog.textContent, /Search reached its page limit/);
+});
+
+test("stale pagination offers a clean restart using a new Steam revision", async () => {
+  const calls = [];
+  const api = { allows: () => true, async post(route, payload) {
+    calls.push({ route, payload: { ...payload } });
+    if (calls.length === 1) return page([{ app_id: 1, name: "Old page" }], 1, 7);
+    if (calls.length === 2) return page([{ app_id: 2, name: "Stale page" }], null, 8);
+    return page([{ app_id: 3, name: "Fresh page" }], null, 9);
+  } };
+  const view = setup(api);
+  await settle();
+  button(view.dialog, "Next →").click();
+  await settle();
+  assert.match(view.dialog.textContent, /changed while browsing/);
+  button(view.dialog, "Restart").click();
+  await settle();
+  assert.equal(view.dialog.textContent.includes("Fresh page"), true);
+  assert.deepEqual(JSON.parse(JSON.stringify(calls[2].payload)), { limit: 16 });
+});
+
+test("permission loss during a pending request suppresses its late response", async () => {
+  let allowed = true;
+  let resolvePage;
+  const pendingPage = new Promise(resolve => { resolvePage = resolve; });
+  const view = setup({ allows: scope => scope === "steam.read" && allowed, post: () => pendingPage });
+  await settle();
+  allowed = false;
+  resolvePage(page([{ app_id: 42, name: "Late secret" }]));
+  await settle();
+  assert.match(view.dialog.textContent, /steam.read permission/);
+  assert.doesNotMatch(view.dialog.textContent, /Late secret/);
+  button(view.dialog, "Cancel").click();
+  assert.equal(await view.pending, null);
+});
+
+test("editor signal abort closes the modal and ignores a delayed API response", async () => {
+  let resolvePage;
+  const pendingPage = new Promise(resolve => { resolvePage = resolve; });
+  const lifecycle = new AbortController();
+  let receivedSignal;
+  const view = setup({
+    allows: () => true,
+    post(_route, _payload, _protectedRoute, signal) { receivedSignal = signal; return pendingPage; },
+  }, { signal: lifecycle.signal });
+  await settle();
+  assert.equal(receivedSignal, lifecycle.signal);
+  lifecycle.abort();
+  assert.equal(await view.pending, null);
+  assert.equal(view.dialog.removed, true);
+  resolvePage(page([{ app_id: 42, name: "Late response" }]));
+  await settle();
+  assert.doesNotMatch(view.dialog.textContent, /Late response/);
+});
+
+test("localized dialog labels refresh in place and restore focus to the opener", async () => {
+  const view = setup({ allows: () => true, async post() { return page([]); } }, { liveLocale: true });
+  await settle();
+  const cancel = button(view.dialog, "Cancel");
+  assert.equal(cancel.getAttribute("aria-label"), "Cancel");
+  view.context.Amaterasu.applyLocale("de");
+  assert.equal(button(view.dialog, "Abbrechen"), cancel);
+  assert.equal(cancel.getAttribute("aria-label"), "Abbrechen");
+  view.context.Amaterasu.applyLocale("en");
+  assert.equal(button(view.dialog, "Cancel"), cancel);
+  cancel.click();
+  assert.equal(await view.pending, null);
+  assert.equal(view.document.activeElement, view.opener);
 });

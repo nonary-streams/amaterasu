@@ -292,7 +292,9 @@ namespace Amaterasu {
       route: string,
       payload: Payload = {},
       protectedRoute = true,
+      signal?: AbortSignal,
     ): Promise<T> {
+      if (signal?.aborted) throw new Error("The request was cancelled.");
       if (this.loggingOut) {
         throw new ApiError(
           "Sign out is already in progress.",
@@ -301,7 +303,7 @@ namespace Amaterasu {
         );
       }
       if (protectedRoute && this.cookieSession)
-        return this.postWithCookies<T>(route, payload);
+        return this.postWithCookies<T>(route, payload, signal);
       if (protectedRoute && !this.bearer)
         throw new ApiError("Sign in to continue.", "unauthorized", 401);
 
@@ -312,6 +314,7 @@ namespace Amaterasu {
       ) {
         await this.refreshOrClear();
       }
+      if (signal?.aborted) throw new Error("The request was cancelled.");
       if (protectedRoute && !this.bearer)
         throw new ApiError("Sign in to continue.", "unauthorized", 401);
 
@@ -324,7 +327,10 @@ namespace Amaterasu {
           payload,
           protectedRoute,
           bearerUsed,
+          false,
+          signal,
         );
+        if (signal?.aborted) throw new Error("The request was cancelled.");
         if (this.loggingOut) {
           throw new ApiError(
             "Sign out is already in progress.",
@@ -334,6 +340,7 @@ namespace Amaterasu {
         }
         return response;
       } catch (error) {
+        if (signal?.aborted) throw new Error("The request was cancelled.");
         if (
           !protectedRoute ||
           !(error instanceof ApiError) ||
@@ -349,7 +356,9 @@ namespace Amaterasu {
         // Reuse its pair instead of replaying a stale refresh token.
         if (tokenGeneration === this.tokenGeneration) await this.refreshOrClear();
         if (authGeneration !== this.authGeneration || !this.bearer) throw error;
-        const response = await this.send<T>(route, payload, true, this.bearer);
+        if (signal?.aborted) throw new Error("The request was cancelled.");
+        const response = await this.send<T>(route, payload, true, this.bearer, false, signal);
+        if (signal?.aborted) throw new Error("The request was cancelled.");
         if (this.loggingOut) {
           throw new ApiError(
             "Sign out is already in progress.",
@@ -482,7 +491,11 @@ namespace Amaterasu {
       }
     }
 
-    private async postWithCookies<T>(route: string, payload: Payload): Promise<T> {
+    private async postWithCookies<T>(
+      route: string,
+      payload: Payload,
+      signal?: AbortSignal,
+    ): Promise<T> {
       if (this.pendingCookieLogout())
         throw new ApiError(
           "Sign-out is still pending. Retry when the host is reachable.",
@@ -491,16 +504,19 @@ namespace Amaterasu {
         );
       if (this.accessExpiresAt - Date.now() / 1000 <= 60)
         await this.refreshCookieSession();
+      if (signal?.aborted) throw new Error("The request was cancelled.");
       if (!this.cookieSession || this.loggingOut)
         throw new ApiError("Sign in to continue.", "unauthorized", 401);
       const generation = this.authGeneration;
       const tokenGeneration = this.tokenGeneration;
       try {
-        const reply = await this.send<T>(route, payload, true, "", true);
+        const reply = await this.send<T>(route, payload, true, "", true, signal);
+        if (signal?.aborted) throw new Error("The request was cancelled.");
         if (generation !== this.authGeneration || this.loggingOut)
           throw new ApiError("Sign in to continue.", "unauthorized", 401);
         return reply;
       } catch (error) {
+        if (signal?.aborted) throw new Error("The request was cancelled.");
         if (
           !(error instanceof ApiError) || error.status !== 401 ||
           generation !== this.authGeneration || this.loggingOut
@@ -509,12 +525,15 @@ namespace Amaterasu {
           await this.refreshCookieSession();
         if (!this.cookieSession || generation !== this.authGeneration)
           throw error;
+        if (signal?.aborted) throw new Error("The request was cancelled.");
         try {
-          const reply = await this.send<T>(route, payload, true, "", true);
+          const reply = await this.send<T>(route, payload, true, "", true, signal);
+          if (signal?.aborted) throw new Error("The request was cancelled.");
           if (generation !== this.authGeneration || this.loggingOut)
             throw new ApiError("Sign in to continue.", "unauthorized", 401);
           return reply;
         } catch (retryError) {
+          if (signal?.aborted) throw new Error("The request was cancelled.");
           if (
             retryError instanceof ApiError &&
             retryError.status === 401 &&
@@ -1379,8 +1398,12 @@ namespace Amaterasu {
       protectedRoute: boolean,
       bearer: string,
       cookieAuth = false,
+      signal?: AbortSignal,
     ): Promise<T> {
+      if (signal?.aborted) throw new Error("The request was cancelled.");
       const controller = new AbortController();
+      const abortRequest = (): void => controller.abort();
+      signal?.addEventListener("abort", abortRequest, { once: true });
       const timer = window.setTimeout(() => controller.abort(), 12_000);
       this.requests.add(controller);
       if (route === "auth/refresh" || route === "auth/browser/refresh")
@@ -1414,6 +1437,7 @@ namespace Amaterasu {
           "Could not reach the host. Check its address, connection, and allowed browser origin.",
         );
       } finally {
+        signal?.removeEventListener("abort", abortRequest);
         clearTimeout(timer);
         this.requests.delete(controller);
         this.refreshRequests.delete(controller);
