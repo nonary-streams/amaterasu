@@ -173,13 +173,16 @@ test("Chromium renders status and alert feedback as safe live text with their re
   assert.equal(await cdp.evaluate("window.__xss === true"), false);
 
   await cdp.evaluate(`window.__status.setMessage("Working"); window.__status.setBusy(true);
-    window.__alert.setMessage("Done"); window.__alert.setSeverity("success"); true`);
+    window.__alert.setMessage("Connection lost. Retry required."); window.__alert.setSeverity("error"); true`);
   assert.deepEqual(await cdp.evaluate(`({status:window.__status.element.textContent,busy:window.__status.element.getAttribute('aria-busy'),alert:window.__alert.element.textContent,severity:window.__alert.element.dataset.severity})`), {
-    status:"Working", busy:"true", alert:"Done", severity:"success",
+    status:"Working", busy:"true", alert:"Connection lost. Retry required.", severity:"error",
   });
 
-  await cdp.evaluate(`window.__status.dispose(); window.__status.setMessage("Disposed update"); true`);
+  await cdp.evaluate(`window.__status.dispose(); window.__status.setMessage("Disposed update");
+    window.__status.setMessage({source:""}); window.__status.setBusy("invalid");
+    window.__alert.dispose(); window.__alert.setMessage(17); window.__alert.setSeverity("critical"); true`);
   assert.equal(await cdp.evaluate("window.__status.element.textContent"), "Working");
+  assert.equal(await cdp.evaluate("window.__alert.element.textContent"), "Connection lost. Retry required.");
 });
 
 test("Chromium exposes determinate and indeterminate native progress and blocks updates after abort", async t => {
@@ -212,8 +215,10 @@ test("Chromium exposes determinate and indeterminate native progress and blocks 
   });
 
   await cdp.evaluate(`window.__controller.abort();
-    window.__status.setMessage("After abort"); window.__alert.setMessage("After abort");
-    window.__determinate.setValue(3); window.__determinate.setMessage("After abort"); true`);
+    window.__status.setMessage("After abort"); window.__status.setMessage({source:""}); window.__status.setBusy("invalid");
+    window.__alert.setMessage("After abort"); window.__alert.setSeverity("critical");
+    window.__determinate.setValue(3); window.__determinate.setValue(Infinity);
+    window.__determinate.setMessage("After abort"); window.__determinate.setMessage({source:""}); true`);
   assert.deepEqual(await cdp.evaluate(`({status:window.__status.element.textContent,alert:window.__alert.element.textContent,value:window.__determinate.value(),renderedValue:window.__determinate.element.querySelector('progress').value,message:window.__determinate.element.querySelector('small').textContent})`), {
     status:"Before abort", alert:"Before abort", value:8, renderedValue:8, message:"Nearly finished",
   });
@@ -226,4 +231,32 @@ test("Chromium exposes determinate and indeterminate native progress and blocks 
   await cdp.evaluate("window.__controller.abort(); true");
   await cdp.evaluate(`(()=>{const input=window.__toggle.element.querySelector('input'); input.checked=false; input.dispatchEvent(new Event('change',{bubbles:true})); return true})()`);
   assert.equal(await cdp.evaluate("window.__changes"), 1);
+});
+
+
+test("Chromium allocates stable unique progress description IDs in creation order", async t => {
+  if (!browser) return t.skip("Chromium browser setup unavailable.");
+  const {cdp} = browser;
+  await cdp.evaluate(`window.__reset();
+    window.__firstProgress=window.__ui.progress({label:"First task",value:1});
+    window.__secondProgress=window.__ui.progress({label:"Second task",value:2});
+    window.__mount.append(window.__firstProgress.element,window.__secondProgress.element);
+    window.__firstProgress.setMessage("First description");
+    window.__secondProgress.setMessage("Second description"); true`);
+  const ids = await cdp.evaluate(`(()=>{
+    const first=window.__firstProgress.element.querySelector("progress");
+    const second=window.__secondProgress.element.querySelector("progress");
+    const firstId=first.getAttribute("aria-describedby");
+    const secondId=second.getAttribute("aria-describedby");
+    return {firstId,secondId,firstDescription:document.getElementById(firstId)?.textContent,secondDescription:document.getElementById(secondId)?.textContent,firstCount:document.querySelectorAll('[id="'+firstId+'"]').length,secondCount:document.querySelectorAll('[id="'+secondId+'"]').length};
+  })()`);
+  assert.notEqual(ids.firstId, ids.secondId);
+  assert.equal(ids.firstCount, 1);
+  assert.equal(ids.secondCount, 1);
+  assert.equal(ids.firstDescription, "First description");
+  assert.equal(ids.secondDescription, "Second description");
+  const before = await cdp.evaluate("window.__firstProgress.element.querySelector('progress').getAttribute('aria-describedby')");
+  await cdp.evaluate(`window.__ui.progress({label:"Third task",value:0,message:"Third description"}); window.__firstProgress.setMessage("Updated first description"); true`);
+  assert.equal(await cdp.evaluate("window.__firstProgress.element.querySelector('progress').getAttribute('aria-describedby')"), before);
+  assert.equal(await cdp.evaluate(`document.getElementById("${ids.firstId}").textContent`), "Updated first description");
 });

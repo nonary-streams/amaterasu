@@ -66,8 +66,10 @@ catalog. Setters update the existing element in place.
 A status is for non-urgent updates and uses a polite, atomic live region. Its
 optional `busy` flag defaults to false and is reflected through the accessible
 busy state. An alert is for important information that needs prompt attention
-and uses assertive alert semantics. Do not use alerts for each progress update.
-Severity describes the alert's meaning and maps to the host's theme styling.
+and uses assertive alert semantics. Reserve alerts for urgent, time-sensitive
+messages that need immediate attention; ordinary success notices and progress
+updates belong in a status region. Severity describes the alert's meaning and
+maps to the host's theme styling.
 The supported values are `info`, `success`, `warning`, and `error`; omitted
 severity defaults to `info`.
 

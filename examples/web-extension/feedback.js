@@ -15,8 +15,8 @@ window.AmaterasuExtensions.v1.register("feedback", {
       busy: true,
     });
     const alert = sdk.ui.alert({
-      message: "The connection was restored.",
-      severity: "success",
+      message: "The upload permission expired. Reconnect before retrying.",
+      severity: "error",
     });
     const progress = sdk.ui.progress({
       label: "Upload progress",
@@ -30,6 +30,8 @@ window.AmaterasuExtensions.v1.register("feedback", {
     progress.setValue(0);
     progress.setMessage("Uploading 3 files.");
     status.setMessage("Upload started.");
+    status.setBusy(false);
+    status.setMessage("Upload queued successfully.");
 
     return () => {
       status.dispose();

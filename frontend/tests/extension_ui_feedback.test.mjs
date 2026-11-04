@@ -133,13 +133,37 @@ test("handles stop mutating after dispose or host abort, and dispose is idempote
   status.dispose();
   status.setMessage("after");
   status.setBusy(true);
+  assert.doesNotThrow(() => status.setMessage(null));
+  assert.doesNotThrow(() => status.setBusy("invalid"));
   assert.deepEqual(status.element.children, ["before"]);
   assert.equal(status.element.getAttribute("aria-busy"), "false");
 
+  const disposedAlert = feedback.alert({ message: "before" });
+  disposedAlert.dispose();
+  assert.doesNotThrow(() => disposedAlert.setMessage(17));
+  assert.doesNotThrow(() => disposedAlert.setSeverity("critical"));
+  assert.deepEqual(disposedAlert.element.children, ["before"]);
+  assert.equal(disposedAlert.element.getAttribute("data-severity"), "info");
+
+  const disposedProgress = feedback.progress({ label: "Disposed", value: 2, message: "before" });
+  disposedProgress.dispose();
+  assert.doesNotThrow(() => disposedProgress.setValue(Infinity));
+  assert.doesNotThrow(() => disposedProgress.setMessage({ source: "" }));
+  assert.equal(disposedProgress.value(), 2);
+  assert.equal(disposedProgress.element.children[2].children[0], "before");
+
+  const abortedStatus = feedback.status({ message: "before abort" });
+  const abortedAlert = feedback.alert({ message: "before abort" });
   const progress = feedback.progress({ label: "Work", value: 2 });
   controller.abort();
-  progress.setValue(8);
-  progress.setMessage("Finished");
+  assert.doesNotThrow(() => abortedStatus.setMessage(17));
+  assert.doesNotThrow(() => abortedStatus.setBusy("invalid"));
+  assert.doesNotThrow(() => abortedAlert.setMessage(17));
+  assert.doesNotThrow(() => abortedAlert.setSeverity("critical"));
+  assert.doesNotThrow(() => progress.setValue(Infinity));
+  assert.doesNotThrow(() => progress.setMessage({ source: "" }));
+  assert.deepEqual(abortedStatus.element.children, ["before abort"]);
+  assert.deepEqual(abortedAlert.element.children, ["before abort"]);
   assert.equal(progress.value(), 2);
   assert.equal(progress.element.children[1].getAttribute("value"), "2");
   assert.throws(() => feedback.alert({ message: "late" }), /no longer active/);

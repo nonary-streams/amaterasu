@@ -113,10 +113,14 @@ namespace Amaterasu {
         feedbackSetMessage(element, options.message);
         let disposed = false;
         const handle = feedbackHandle<ExtensionUiFeedbackStatus>(element, signal, {
-          setMessage(message) { if (!disposed && !signal.aborted) feedbackSetMessage(element, message); },
+          setMessage(message) {
+            if (disposed || signal.aborted) return;
+            feedbackSetMessage(element, message);
+          },
           setBusy(busy) {
+            if (disposed || signal.aborted) return;
             if (typeof busy !== "boolean") throw new Error("Invalid plugin status busy state.");
-            if (!disposed && !signal.aborted) element.setAttribute("aria-busy", String(busy));
+            element.setAttribute("aria-busy", String(busy));
           },
         });
         const originalDispose = handle.dispose;
@@ -136,10 +140,14 @@ namespace Amaterasu {
         feedbackSetMessage(element, options.message);
         let disposed = false;
         const handle = feedbackHandle<ExtensionUiFeedbackAlert>(element, signal, {
-          setMessage(message) { if (!disposed && !signal.aborted) feedbackSetMessage(element, message); },
+          setMessage(message) {
+            if (disposed || signal.aborted) return;
+            feedbackSetMessage(element, message);
+          },
           setSeverity(nextSeverity) {
+            if (disposed || signal.aborted) return;
             if (!["info", "success", "warning", "error"].includes(nextSeverity)) throw new Error("Invalid plugin alert severity.");
-            if (!disposed && !signal.aborted) element.setAttribute("data-severity", nextSeverity);
+            element.setAttribute("data-severity", nextSeverity);
           },
         });
         const originalDispose = handle.dispose;
@@ -160,7 +168,9 @@ namespace Amaterasu {
         const element = makeElement("plugin-feedback-progress");
         const label = el("label", "plugin-feedback-label", feedbackTextNode(options.label));
         const progress = el("progress", "plugin-feedback-progressbar");
-        const progressId = `amaterasu-plugin-feedback-progress-${++nextExtensionUiFeedbackId}`;
+        const instanceId = ++nextExtensionUiFeedbackId;
+        const progressId = `amaterasu-plugin-feedback-progress-${instanceId}`;
+        const descriptionId = `amaterasu-plugin-feedback-description-${instanceId}`;
         progress.id = progressId;
         label.htmlFor = progressId;
         progress.max = maximum;
@@ -177,7 +187,7 @@ namespace Amaterasu {
         const content: HTMLElement[] = [label, progress];
         let messageNode: HTMLElement | null = options.message === undefined ? null : el("small", "plugin-feedback-message", feedbackTextNode(options.message));
         if (messageNode) {
-          messageNode.id = `amaterasu-plugin-feedback-description-${nextExtensionUiFeedbackId}`;
+          messageNode.id = descriptionId;
           progress.setAttribute("aria-describedby", messageNode.id);
           content.push(messageNode);
         }
@@ -187,14 +197,14 @@ namespace Amaterasu {
         const handle = feedbackHandle<ExtensionUiFeedbackProgress>(element, signal, {
           value: () => currentValue,
           setValue(value) {
-            if (value !== null && (typeof value !== "number" || !Number.isFinite(value))) throw new Error("Invalid plugin progress value.");
             if (disposed || signal.aborted) return;
+            if (value !== null && (typeof value !== "number" || !Number.isFinite(value))) throw new Error("Invalid plugin progress value.");
             currentValue = value === null ? null : Math.min(maximum, Math.max(0, value));
             syncValue(currentValue);
           },
           setMessage(message) {
-            if (message !== null) validateFeedbackMessage(message);
             if (disposed || signal.aborted) return;
+            if (message !== null) validateFeedbackMessage(message);
             if (message === null) {
               messageNode?.remove();
               messageNode = null;
@@ -203,7 +213,7 @@ namespace Amaterasu {
               messageNode.replaceChildren(feedbackTextNode(message));
             } else {
               messageNode = el("small", "plugin-feedback-message", feedbackTextNode(message));
-              messageNode.id = `amaterasu-plugin-feedback-description-${nextExtensionUiFeedbackId}`;
+              messageNode.id = descriptionId;
               progress.setAttribute("aria-describedby", messageNode.id);
               element.append(messageNode);
             }
