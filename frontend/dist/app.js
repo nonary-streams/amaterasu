@@ -14959,6 +14959,7 @@ var Amaterasu;
     const localizedTextSources = new WeakMap();
     const localizedTextFormatters = new WeakMap();
     const localizedAttributeTemplates = new WeakMap();
+    const localizedAttributeFormatters = new WeakMap();
     let currentPageTitle = null;
     const LOCALIZED_ATTRIBUTES = ["aria-label", "title", "placeholder"];
     function literalText(value) {
@@ -15107,11 +15108,24 @@ var Amaterasu;
     Amaterasu.textValueNode = textValueNode;
     function setLocalizedAttribute(target, attribute, source) {
         localizedAttributeTemplates.get(target)?.delete(attribute);
+        localizedAttributeFormatters.get(target)?.delete(attribute);
         target.setAttribute(attribute, translateText(source));
         target.setAttribute(`data-locale-${attribute}`, source);
     }
     Amaterasu.setLocalizedAttribute = setLocalizedAttribute;
+    function setLocalizedAttributeFormatter(target, attribute, format) {
+        if (typeof format !== "function")
+            throw new Error("Invalid localized attribute formatter.");
+        localizedAttributeTemplates.get(target)?.delete(attribute);
+        const formatters = localizedAttributeFormatters.get(target) ?? new Map();
+        formatters.set(attribute, format);
+        localizedAttributeFormatters.set(target, formatters);
+        target.setAttribute(attribute, format(activeIntlLocale()));
+        target.setAttribute(`data-locale-${attribute}`, "");
+    }
+    Amaterasu.setLocalizedAttributeFormatter = setLocalizedAttributeFormatter;
     function setLocalizedAttributeTemplate(target, attribute, source, values) {
+        localizedAttributeFormatters.get(target)?.delete(attribute);
         const templates = localizedAttributeTemplates.get(target) ?? new Map();
         templates.set(attribute, { source, values: { ...values } });
         localizedAttributeTemplates.set(target, templates);
@@ -15138,10 +15152,13 @@ var Amaterasu;
                 const source = element.getAttribute(`data-locale-${attribute}`);
                 if (source === null)
                     continue;
+                const formatter = localizedAttributeFormatters.get(element)?.get(attribute);
                 const template = localizedAttributeTemplates.get(element)?.get(attribute);
-                element.setAttribute(attribute, template
-                    ? formatLocalizedAttributeTemplate(template.source, template.values)
-                    : translateText(source));
+                element.setAttribute(attribute, formatter
+                    ? formatter(activeIntlLocale())
+                    : template
+                        ? formatLocalizedAttributeTemplate(template.source, template.values)
+                        : translateText(source));
             }
         }
     }
@@ -20212,19 +20229,26 @@ var Amaterasu;
 (function (Amaterasu) {
     let nextExtensionUiDescriptionId = 0;
     let nextExtensionUiFieldId = 0;
-    function extensionUiTextNode(value) {
+    function extensionUiTextForLocale(value, locale) {
         if (typeof value === "string")
-            return Amaterasu.localizedTextNode(value);
+            return Amaterasu.translateText(value);
         if (!value || typeof value.source !== "string" || !value.source.trim())
             throw new Error("Invalid plugin UI text.");
         const translations = value.translations ?? {};
         if (Object.values(translations).some((translation) => typeof translation !== "string" || !translation.trim()))
             throw new Error("Invalid plugin UI translations.");
-        return Amaterasu.localeFormattedTextNode((locale) => translations[locale] ?? translations[locale.split("-")[0] ?? locale] ?? Amaterasu.translateText(value.source));
+        return translations[locale] ?? translations[locale.split("-")[0] ?? locale] ?? Amaterasu.translateText(value.source);
     }
-    function extensionUiTextContent(value) {
-        const node = extensionUiTextNode(value);
-        return typeof node === "string" ? node : node.textContent ?? "";
+    function extensionUiTextNode(value) {
+        if (typeof value === "string")
+            return Amaterasu.localizedTextNode(value);
+        return Amaterasu.localeFormattedTextNode((locale) => extensionUiTextForLocale(value, locale));
+    }
+    function extensionUiSetPlaceholder(control, value) {
+        if (typeof value === "string")
+            Amaterasu.setLocalizedAttribute(control, "placeholder", value);
+        else
+            Amaterasu.setLocalizedAttributeFormatter(control, "placeholder", (locale) => extensionUiTextForLocale(value, locale));
     }
     function extensionUiLabel(text) {
         return Amaterasu.el("span", "field-label", extensionUiTextNode(text));
@@ -20286,7 +20310,7 @@ var Amaterasu;
         }
         return Object.freeze(control);
     }
-    function extensionUiFieldState(element, controls, state, applyControlState, supportsValidity = true) {
+    function extensionUiFieldState(element, controls, state, applyControlState, supportsValidity = true, hasIntrinsicBusy = () => false, hasIntrinsicInvalid = () => false) {
         const createDescription = (kind, text, id) => {
             const description = Amaterasu.el("small", `plugin-control-${kind}`, extensionUiTextNode(text));
             description.id = id ?? `amaterasu-plugin-ui-description-${++nextExtensionUiDescriptionId}`;
@@ -20305,11 +20329,11 @@ var Amaterasu;
                     control.setAttribute("aria-describedby", descriptionIds);
                 else
                     control.removeAttribute("aria-describedby");
-                if (state.busy)
+                if (state.busy || hasIntrinsicBusy())
                     control.setAttribute("aria-busy", "true");
                 else
                     control.removeAttribute("aria-busy");
-                if (supportsValidity && state.error !== undefined)
+                if (supportsValidity && (state.error !== undefined || hasIntrinsicInvalid()))
                     control.setAttribute("aria-invalid", "true");
                 else
                     control.removeAttribute("aria-invalid");
@@ -20551,7 +20575,7 @@ var Amaterasu;
                 const controller = makeController();
                 const textInput = Amaterasu.input("", options.value, "text");
                 if (options.placeholder !== undefined)
-                    textInput.placeholder = extensionUiTextContent(options.placeholder);
+                    extensionUiSetPlaceholder(textInput, options.placeholder);
                 if (options.maxLength !== undefined)
                     textInput.maxLength = options.maxLength;
                 let currentValue = options.value;
@@ -20615,7 +20639,7 @@ var Amaterasu;
                     numberInput.max = String(options.maximum);
                 numberInput.step = String(options.step ?? "any");
                 if (options.placeholder !== undefined)
-                    numberInput.placeholder = extensionUiTextContent(options.placeholder);
+                    extensionUiSetPlaceholder(numberInput, options.placeholder);
                 let currentValue = options.value;
                 const state = {
                     disabled: options.disabled === true, busy: options.busy === true, readOnly: options.readOnly === true, required: options.required === true,
@@ -20658,6 +20682,14 @@ var Amaterasu;
                         numberInput.setAttribute("aria-readonly", "true");
                     else
                         numberInput.removeAttribute("aria-readonly");
+                }, true, undefined, () => {
+                    try {
+                        readValue();
+                        return false;
+                    }
+                    catch {
+                        return true;
+                    }
                 });
                 return extensionUiControl(element, readValue, (value) => {
                     if (typeof value !== "number" || !Amaterasu.isValidNumberControlValue(value, options.minimum, options.maximum, options.step ?? "any"))
@@ -20682,28 +20714,46 @@ var Amaterasu;
                     disabled: options.disabled === true, busy: options.busy === true, readOnly: false, required: false,
                     help: options.help, error: options.error,
                 };
-                let updateState = (_patch) => { };
                 const element = Amaterasu.el("div", "field plugin-control plugin-action", button);
+                let pendingActions = 0;
+                let disposed = false;
                 const setFieldState = extensionUiFieldState(element, [button], state, (next) => {
-                    button.disabled = next.disabled || next.busy;
-                }, false);
-                updateState = (patch) => {
+                    button.disabled = next.disabled || next.busy || pendingActions > 0;
+                }, false, () => pendingActions > 0);
+                const updateState = (patch) => {
                     if (!controller.signal.aborted) {
                         if (Object.keys(patch).some((key) => !["disabled", "busy", "help", "error"].includes(key)))
                             throw new Error("Unsupported plugin action button state.");
                         setFieldState(patch);
                     }
                 };
+                const settleAction = (restoreFocus) => {
+                    pendingActions = Math.max(0, pendingActions - 1);
+                    if (!disposed) {
+                        setFieldState({});
+                        if (restoreFocus && !button.disabled && document.activeElement === document.body)
+                            button.focus();
+                    }
+                };
                 button.addEventListener("click", (event) => {
-                    if (state.disabled || state.busy)
+                    if (state.disabled || state.busy || pendingActions > 0)
                         return;
-                    const result = options.onClick(event);
-                    if (result && typeof result.then === "function") {
-                        updateState({ busy: true });
-                        void Promise.resolve(result).then(() => updateState({ busy: false }), (error) => { updateState({ busy: false }); throw error; });
+                    const restoreFocus = document.activeElement === button;
+                    pendingActions++;
+                    setFieldState({});
+                    try {
+                        const result = options.onClick(event);
+                        if (result && typeof result.then === "function") {
+                            void Promise.resolve(result).then(() => settleAction(restoreFocus), (error) => { settleAction(restoreFocus); throw error; });
+                        }
+                        else
+                            settleAction(restoreFocus);
+                    }
+                    catch (error) {
+                        settleAction(restoreFocus);
+                        throw error;
                     }
                 }, { signal: controller.signal });
-                let disposed = false;
                 const dispose = () => {
                     if (disposed)
                         return;
@@ -20717,7 +20767,7 @@ var Amaterasu;
                     signal.addEventListener("abort", dispose, { once: true });
                 return Object.freeze({
                     element,
-                    busy: () => state.busy,
+                    busy: () => state.busy || pendingActions > 0,
                     setState: (patch) => { if (!disposed)
                         updateState(patch); },
                     dispose,

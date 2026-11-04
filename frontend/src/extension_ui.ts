@@ -95,18 +95,23 @@ namespace Amaterasu {
   let nextExtensionUiDescriptionId = 0;
   let nextExtensionUiFieldId = 0;
 
-  function extensionUiTextNode(value: ExtensionUiText): Text | string {
-    if (typeof value === "string") return localizedTextNode(value);
+  function extensionUiTextForLocale(value: ExtensionUiText, locale: string): string {
+    if (typeof value === "string") return translateText(value);
     if (!value || typeof value.source !== "string" || !value.source.trim()) throw new Error("Invalid plugin UI text.");
     const translations = value.translations ?? {};
     if (Object.values(translations).some((translation) => typeof translation !== "string" || !translation.trim()))
       throw new Error("Invalid plugin UI translations.");
-    return localeFormattedTextNode((locale) => translations[locale] ?? translations[locale.split("-")[0] ?? locale] ?? translateText(value.source));
+    return translations[locale] ?? translations[locale.split("-")[0] ?? locale] ?? translateText(value.source);
   }
 
-  function extensionUiTextContent(value: ExtensionUiText): string {
-    const node = extensionUiTextNode(value);
-    return typeof node === "string" ? node : node.textContent ?? "";
+  function extensionUiTextNode(value: ExtensionUiText): Text | string {
+    if (typeof value === "string") return localizedTextNode(value);
+    return localeFormattedTextNode((locale) => extensionUiTextForLocale(value, locale));
+  }
+
+  function extensionUiSetPlaceholder(control: HTMLInputElement, value: ExtensionUiText): void {
+    if (typeof value === "string") Amaterasu.setLocalizedAttribute(control, "placeholder", value);
+    else Amaterasu.setLocalizedAttributeFormatter(control, "placeholder", (locale) => extensionUiTextForLocale(value, locale));
   }
 
   function extensionUiLabel(text: ExtensionUiText): HTMLElement {
@@ -210,6 +215,8 @@ namespace Amaterasu {
     state: MutableExtensionUiFieldState,
     applyControlState: (state: MutableExtensionUiFieldState) => void,
     supportsValidity = true,
+    hasIntrinsicBusy = (): boolean => false,
+    hasIntrinsicInvalid = (): boolean => false,
   ): ((patch: ExtensionUiFieldStatePatch) => void) & { refreshControls(controls: readonly HTMLElement[]): void } {
     const createDescription = (kind: "help" | "error", text: ExtensionUiText, id?: string): HTMLElement => {
       const description = el("small", `plugin-control-${kind}`, extensionUiTextNode(text));
@@ -226,9 +233,9 @@ namespace Amaterasu {
       for (const control of activeControls) {
         if (descriptionIds) control.setAttribute("aria-describedby", descriptionIds);
         else control.removeAttribute("aria-describedby");
-        if (state.busy) control.setAttribute("aria-busy", "true");
+        if (state.busy || hasIntrinsicBusy()) control.setAttribute("aria-busy", "true");
         else control.removeAttribute("aria-busy");
-        if (supportsValidity && state.error !== undefined) control.setAttribute("aria-invalid", "true");
+        if (supportsValidity && (state.error !== undefined || hasIntrinsicInvalid())) control.setAttribute("aria-invalid", "true");
         else control.removeAttribute("aria-invalid");
         if (supportsValidity && state.required) control.setAttribute("aria-required", "true");
         else control.removeAttribute("aria-required");
@@ -431,7 +438,7 @@ namespace Amaterasu {
         if (options.maxLength !== undefined && options.value.length > options.maxLength) throw new Error("Plugin text field value exceeds its maximum length.");
         const controller = makeController();
         const textInput = input("", options.value, "text");
-        if (options.placeholder !== undefined) textInput.placeholder = extensionUiTextContent(options.placeholder);
+        if (options.placeholder !== undefined) extensionUiSetPlaceholder(textInput, options.placeholder);
         if (options.maxLength !== undefined) textInput.maxLength = options.maxLength;
         let currentValue = options.value;
         const state: MutableExtensionUiFieldState = {
@@ -484,7 +491,7 @@ namespace Amaterasu {
         if (options.minimum !== undefined) numberInput.min = String(options.minimum);
         if (options.maximum !== undefined) numberInput.max = String(options.maximum);
         numberInput.step = String(options.step ?? "any");
-        if (options.placeholder !== undefined) numberInput.placeholder = extensionUiTextContent(options.placeholder);
+        if (options.placeholder !== undefined) extensionUiSetPlaceholder(numberInput, options.placeholder);
         let currentValue = options.value;
         const state: MutableExtensionUiFieldState = {
           disabled: options.disabled === true, busy: options.busy === true, readOnly: options.readOnly === true, required: options.required === true,
@@ -521,6 +528,8 @@ namespace Amaterasu {
           numberInput.readOnly = next.readOnly;
           numberInput.required = next.required;
           if (next.readOnly) numberInput.setAttribute("aria-readonly", "true"); else numberInput.removeAttribute("aria-readonly");
+        }, true, undefined, () => {
+          try { readValue(); return false; } catch { return true; }
         });
         return extensionUiControl(element, readValue, (value) => {
           if (typeof value !== "number" || !Amaterasu.isValidNumberControlValue(value, options.minimum, options.maximum, options.step ?? "any"))
@@ -543,30 +552,44 @@ namespace Amaterasu {
           disabled: options.disabled === true, busy: options.busy === true, readOnly: false, required: false,
           help: options.help, error: options.error,
         };
-        let updateState = (_patch: ExtensionUiFieldStatePatch): void => {};
         const element = el("div", "field plugin-control plugin-action", button);
+        let pendingActions = 0;
+        let disposed = false;
         const setFieldState = extensionUiFieldState(element, [button], state, (next) => {
-          button.disabled = next.disabled || next.busy;
-        }, false);
-        updateState = (patch) => {
+          button.disabled = next.disabled || next.busy || pendingActions > 0;
+        }, false, () => pendingActions > 0);
+        const updateState = (patch: ExtensionUiFieldStatePatch): void => {
           if (!controller.signal.aborted) {
             if (Object.keys(patch).some((key) => !["disabled", "busy", "help", "error"].includes(key)))
               throw new Error("Unsupported plugin action button state.");
             setFieldState(patch);
           }
         };
+        const settleAction = (restoreFocus: boolean): void => {
+          pendingActions = Math.max(0, pendingActions - 1);
+          if (!disposed) {
+            setFieldState({});
+            if (restoreFocus && !button.disabled && document.activeElement === document.body) button.focus();
+          }
+        };
         button.addEventListener("click", (event) => {
-          if (state.disabled || state.busy) return;
-          const result = options.onClick(event);
-          if (result && typeof (result as Promise<void>).then === "function") {
-            updateState({ busy: true });
-            void Promise.resolve(result).then(
-              () => updateState({ busy: false }),
-              (error) => { updateState({ busy: false }); throw error; },
-            );
+          if (state.disabled || state.busy || pendingActions > 0) return;
+          const restoreFocus = document.activeElement === button;
+          pendingActions++;
+          setFieldState({});
+          try {
+            const result = options.onClick(event);
+            if (result && typeof (result as Promise<void>).then === "function") {
+              void Promise.resolve(result).then(
+                () => settleAction(restoreFocus),
+                (error) => { settleAction(restoreFocus); throw error; },
+              );
+            } else settleAction(restoreFocus);
+          } catch (error) {
+            settleAction(restoreFocus);
+            throw error;
           }
         }, { signal: controller.signal });
-        let disposed = false;
         const dispose = (): void => {
           if (disposed) return;
           disposed = true;
@@ -577,7 +600,7 @@ namespace Amaterasu {
         else signal.addEventListener("abort", dispose, { once: true });
         return Object.freeze({
           element,
-          busy: () => state.busy,
+          busy: () => state.busy || pendingActions > 0,
           setState: (patch: ExtensionUiActionStatePatch) => { if (!disposed) updateState(patch); },
           dispose,
         });

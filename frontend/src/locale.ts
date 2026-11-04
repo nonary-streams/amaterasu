@@ -10,6 +10,10 @@ namespace Amaterasu {
       { source: string; values: Readonly<Record<string, TextValue>> }
     >
   >();
+  const localizedAttributeFormatters = new WeakMap<
+    Element,
+    Map<(typeof LOCALIZED_ATTRIBUTES)[number], (locale: string) => string>
+  >();
   let currentPageTitle: string | null = null;
   const LOCALIZED_ATTRIBUTES = ["aria-label", "title", "placeholder"] as const;
 
@@ -201,8 +205,23 @@ namespace Amaterasu {
     source: string,
   ): void {
     localizedAttributeTemplates.get(target)?.delete(attribute);
+    localizedAttributeFormatters.get(target)?.delete(attribute);
     target.setAttribute(attribute, translateText(source));
     target.setAttribute(`data-locale-${attribute}`, source);
+  }
+
+  export function setLocalizedAttributeFormatter(
+    target: Element,
+    attribute: (typeof LOCALIZED_ATTRIBUTES)[number],
+    format: (locale: string) => string,
+  ): void {
+    if (typeof format !== "function") throw new Error("Invalid localized attribute formatter.");
+    localizedAttributeTemplates.get(target)?.delete(attribute);
+    const formatters = localizedAttributeFormatters.get(target) ?? new Map();
+    formatters.set(attribute, format);
+    localizedAttributeFormatters.set(target, formatters);
+    target.setAttribute(attribute, format(activeIntlLocale()));
+    target.setAttribute(`data-locale-${attribute}`, "");
   }
 
   export function setLocalizedAttributeTemplate(
@@ -211,6 +230,7 @@ namespace Amaterasu {
     source: string,
     values: Readonly<Record<string, TextValue>>,
   ): void {
+    localizedAttributeFormatters.get(target)?.delete(attribute);
     const templates = localizedAttributeTemplates.get(target) ?? new Map();
     templates.set(attribute, { source, values: { ...values } });
     localizedAttributeTemplates.set(target, templates);
@@ -239,12 +259,15 @@ namespace Amaterasu {
       for (const element of document.querySelectorAll(`[data-locale-${attribute}]`)) {
         const source = element.getAttribute(`data-locale-${attribute}`);
         if (source === null) continue;
+        const formatter = localizedAttributeFormatters.get(element)?.get(attribute);
         const template = localizedAttributeTemplates.get(element)?.get(attribute);
         element.setAttribute(
           attribute,
-          template
-            ? formatLocalizedAttributeTemplate(template.source, template.values)
-            : translateText(source),
+          formatter
+            ? formatter(activeIntlLocale())
+            : template
+              ? formatLocalizedAttributeTemplate(template.source, template.values)
+              : translateText(source),
         );
       }
     }

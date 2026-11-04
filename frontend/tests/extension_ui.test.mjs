@@ -10,7 +10,7 @@ class Element {
   append(...children) { for (const child of children) { if (child && typeof child === "object") child.parent = this; this.children.push(child); } }
   remove() { if (this.parent) this.parent.children = this.parent.children.filter((child) => child !== this); this.parent = null; }
   replaceChildren(...children) { this.children = []; this.append(...children); }
-  setAttribute(name, value) { this.attributes[name] = value; }
+  setAttribute(name, value) { this.attributes[name] = value; if (name === "placeholder") this.placeholder = value; }
   getAttribute(name) { return this.attributes[name] ?? null; }
   removeAttribute(name) { delete this.attributes[name]; }
   addEventListener(type, callback, options = {}) {
@@ -34,11 +34,21 @@ class Element {
 function setupConsumer({ features = ["ui.controls/1", "ui.forms/1", "ui.forms/2", "ui.controls/2"], withUi = true } = {}) {
   let registered;
   const document = { activeElement: null, createElement(tag) { const element = new Element(tag); element.ownerDocument = this; return element; } };
+  const localeAttributeFormatters = [];
+  let testLocale = "fr-CA";
   const context = vm.createContext({
     document,
     window: { AmaterasuExtensions: { v1: { register(_id, page) { registered = page; } } } },
     AbortController,
   });
+  context.Amaterasu = {
+    setLocalizedAttribute(target, attribute, source) { target.setAttribute(attribute, context.translateText(source)); },
+    setLocalizedAttributeFormatter(target, attribute, format) {
+      const refresh = () => target.setAttribute(attribute, format(testLocale));
+      localeAttributeFormatters.push(refresh);
+      refresh();
+    },
+  };
   context.localizedTextNode = (text) => text;
   context.localeFormattedTextNode = (format) => format("fr-CA");
   context.translateText = (text) => text;
@@ -53,7 +63,10 @@ function setupConsumer({ features = ["ui.controls/1", "ui.forms/1", "ui.forms/2"
   vm.runInContext(readFileSync(new URL("../../examples/web-extension/controls.js", import.meta.url), "utf8"), context);
   const container = new Element("main");
   const cleanup = registered.mount(container, sdk);
-  return { container, cleanup, controller, sdk, context };
+  return {
+    container, cleanup, controller, sdk, context,
+    setLocale(locale) { testLocale = locale; localeAttributeFormatters.forEach((refresh) => refresh()); },
+  };
 }
 
 test("independent plugin consumer gets accessible native controls and lifecycle cleanup", () => {
@@ -344,6 +357,10 @@ test("generic text and number fields validate user edits and preserve accessible
   assert.equal(text.element.children[0].children[0], "Nom affiché");
   assert.equal(text.element.children[0].htmlFor, textInput.id);
   assert.equal(textInput.placeholder, "Saisir un nom");
+  page.setLocale("de");
+  assert.equal(textInput.placeholder, "Enter a name");
+  page.setLocale("fr-CA");
+  assert.equal(textInput.placeholder, "Saisir un nom");
   assert.equal(textInput.maxLength, 8);
   textInput.focus();
   const textListener = textInput.listeners.input[0];
@@ -372,12 +389,17 @@ test("generic text and number fields validate user edits and preserve accessible
   assert.equal(numberInput.step, "2");
   numberInput.value = "5"; numberInput.dispatch("input");
   assert.equal(numberInput.attributes["aria-invalid"], "true");
+  numberInput.focus();
+  number.setState({ help: "Still editing.", error: null });
+  assert.equal(numberInput.attributes["aria-invalid"], "true");
+  assert.equal(page.context.document.activeElement, numberInput);
   assert.throws(() => number.value(), /valid number/);
   assert.deepEqual(numberChanges, []);
   assert.throws(() => number.setValue(5), /limits and step/);
   assert.equal(numberInput.value, "5");
   number.setValue(6);
   assert.equal(number.value(), 6);
+  assert.equal(numberInput.attributes["aria-invalid"], undefined);
   numberInput.focus();
   const numberListener = numberInput.listeners.input[0];
   number.setState({ disabled: true, required: true, help: "Use an even frame rate.", error: "Unsupported rate." });
@@ -403,11 +425,17 @@ test("action buttons expose accessible busy state, preserve callbacks, and dispo
   const page = setupConsumer();
   let resolveAction;
   let calls = 0;
+  let reenter = false;
+  let button;
   const action = page.sdk.ui.button({
     label: { source: "Refresh catalog", translations: { fr: "Actualiser le catalogue" } },
-    variant: "primary", help: "Reload current data.", onClick: () => { calls++; return new Promise((resolve) => { resolveAction = resolve; }); },
+    variant: "primary", help: "Reload current data.", onClick: () => {
+      calls++;
+      if (reenter) button.dispatch("click");
+      return new Promise((resolve) => { resolveAction = resolve; });
+    },
   });
-  const button = action.element.children[0];
+  button = action.element.children[0];
   assert.equal(button.tagName, "BUTTON");
   assert.equal(button.type, "button");
   assert.equal(button.children[0], "Actualiser le catalogue");
@@ -415,7 +443,10 @@ test("action buttons expose accessible busy state, preserve callbacks, and dispo
   assert.ok(button.attributes["aria-describedby"]);
   button.focus();
   const clickListener = button.listeners.click[0];
+  reenter = true;
   button.dispatch("click");
+  assert.equal(action.busy(), true);
+  action.setState({ busy: false });
   assert.equal(action.busy(), true);
   assert.equal(button.disabled, true);
   assert.equal(button.attributes["aria-busy"], "true");

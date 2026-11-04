@@ -72,8 +72,9 @@ A radio group's focused choice remains focused if it survives replacement; if
 removed, focus moves to the selected choice. Programmatic choice updates do not
 call `onChange`.
 
-Text fields accept an optional localized `placeholder` and bounded `maxLength`.
-Number fields accept optional `minimum`, `maximum`, and positive `step` (or `"any"`);
+Text fields accept an optional localized `placeholder` that refreshes when the
+host locale changes, plus a bounded `maxLength`. Number fields accept
+optional `minimum`, `maximum`, and positive `step` (or "any");
 invalid or out-of-range edits do not fire `onChange`, and `value()` throws until
 the input is valid. Programmatic `setValue()` validates before changing the input.
 Both fields use native required/disabled/read-only behavior, localized labels and
