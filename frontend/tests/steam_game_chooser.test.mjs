@@ -214,7 +214,18 @@ test("search stops at its page bound instead of scanning without limit", async (
   button(view.dialog, "Search").click();
   await settle();
   assert.equal(calls, 33, "one browse request plus exactly 32 bounded search pages");
-  assert.match(view.dialog.textContent, /Search reached its page limit/);
+  assert.match(view.dialog.textContent, /Search stopped after the first 512 games/);
+  button(view.dialog, "Clear search").click();
+  await settle();
+  assert.equal(calls, 34, "clearing search returns to browse mode");
+  assert.equal(button(view.dialog, "Next →").disabled, false, "browse paging is available after clear");
+  button(view.dialog, "Next →").click();
+  await settle();
+  assert.equal(calls, 35, "later browse pages remain reachable beyond the search bound");
+  const chosen = all(view.dialog).find((node) => node.tagName === "BUTTON" && node.getAttribute("aria-label") === "Select No match");
+  assert.ok(chosen);
+  chosen.click();
+  assert.deepEqual(JSON.parse(JSON.stringify(await view.pending)), { app_id: 34, name: "No match" });
 });
 
 test("stale pagination offers a clean restart using a new Steam revision", async () => {
@@ -234,6 +245,48 @@ test("stale pagination offers a clean restart using a new Steam revision", async
   await settle();
   assert.equal(view.dialog.textContent.includes("Fresh page"), true);
   assert.deepEqual(JSON.parse(JSON.stringify(calls[2].payload)), { limit: 16 });
+});
+
+test("rejected revision_conflict offers restart and clears the stale revision", async () => {
+  const calls = [];
+  const api = { allows: () => true, async post(route, payload) {
+    calls.push({ route, payload: { ...payload } });
+    if (calls.length === 1) return page([{ app_id: 1, name: "Old" }], 1, 7);
+    if (calls.length === 2) throw new ApiError("revision changed", "revision_conflict", 409);
+    return page([{ app_id: 2, name: "Current" }], null, 8);
+  } };
+  const view = setup(api);
+  await settle();
+  button(view.dialog, "Next →").click();
+  await settle();
+  assert.match(view.dialog.textContent, /changed while browsing/);
+  button(view.dialog, "Restart").click();
+  await settle();
+  assert.deepEqual(JSON.parse(JSON.stringify(calls[2].payload)), { limit: 16 });
+  assert.match(view.dialog.textContent, /Current/);
+});
+
+test("back navigation and failed forward reload discard stale cursors", async () => {
+  const calls = [];
+  const api = { allows: () => true, async post(route, payload) {
+    calls.push({ route, payload: { ...payload } });
+    if (calls.length === 1) return page([{ app_id: 1, name: "One" }], 10, 7);
+    if (calls.length === 2) return page([{ app_id: 2, name: "Two" }], 20, 7);
+    if (calls.length === 3) return page([{ app_id: 1, name: "One again" }], 10, 7);
+    throw new Error("temporary failure");
+  } };
+  const view = setup(api);
+  await settle();
+  button(view.dialog, "Next →").click(); await settle();
+  button(view.dialog, "← Previous").click(); await settle();
+  button(view.dialog, "Next →").click(); await settle();
+  assert.deepEqual(JSON.parse(JSON.stringify(calls.map(call => call.payload))), [
+    { limit: 16 }, { revision: 7, after: 10, limit: 16 },
+    { revision: 7, limit: 16 }, { revision: 7, after: 10, limit: 16 },
+  ]);
+  assert.match(view.dialog.textContent, /Steam games are unavailable/);
+  assert.equal(button(view.dialog, "Next →").disabled, true);
+  assert.equal(button(view.dialog, "Restart").hidden, false);
 });
 
 test("permission loss during a pending request suppresses its late response", async () => {
@@ -283,4 +336,18 @@ test("localized dialog labels refresh in place and restore focus to the opener",
   cancel.click();
   assert.equal(await view.pending, null);
   assert.equal(view.document.activeElement, view.opener);
+});
+
+test("dynamic select aria label translates while keeping the game name literal", async () => {
+  const view = setup({ allows: () => true, async post() { return page([{ app_id: 7, name: "L'été Ω" }]); } }, { liveLocale: true });
+  await settle();
+  const select = all(view.dialog).find((node) => node.tagName === "BUTTON" && node.getAttribute("aria-label")?.includes("L'été Ω"));
+  assert.ok(select);
+  assert.equal(select.getAttribute("aria-label"), "Select L'été Ω");
+  view.context.Amaterasu.applyLocale("fr");
+  assert.equal(select.getAttribute("aria-label"), "Choisir le jeu L'été Ω");
+  view.context.Amaterasu.applyLocale("en");
+  assert.equal(select.getAttribute("aria-label"), "Select L'été Ω");
+  button(view.dialog, "Cancel").click();
+  await view.pending;
 });

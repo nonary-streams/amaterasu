@@ -142,6 +142,7 @@ namespace Amaterasu {
       const clearSearch = button(steamChooserMessage("Clear search"), () => {
         searchInput.value = "";
         activeSearchTerm = "";
+        searching = false;
         pageIndex = 0;
         cursors.length = 1;
         list.replaceChildren();
@@ -221,7 +222,7 @@ namespace Amaterasu {
                 ? Amaterasu.literalText(game.name)
                 : game.name),
               el("span", "steam-game-chooser-details",
-                steamChooserMessage("App ID "), String(game.app_id),
+                steamChooserMessage("App ID"), String(game.app_id),
                 " · ",
                 steamChooserMessage(directory ? "Install directory" : "Install directory unavailable"),
                 ...(directory ? [" ", typeof Amaterasu.literalText === "function"
@@ -241,6 +242,8 @@ namespace Amaterasu {
         searching = false;
         pageIndex = requestedPage;
         const cursor = cursors[pageIndex] ?? null;
+        // A failed reload must not leave a previously discovered next cursor usable.
+        cursors.length = pageIndex + 1;
         list.replaceChildren();
         restart.hidden = true;
         steamChooserSetText(status, "Loading discovered Steam games…");
@@ -360,11 +363,11 @@ namespace Amaterasu {
           if (matches.length) {
             steamChooserSetText(status, complete
               ? "Search complete. Choose a game to continue."
-              : "Search reached its page limit. Refine your search to continue.");
+              : "Search found matches in the first 512 games. Browse later pages or refine your search.");
           } else {
             steamChooserSetText(status, complete
               ? "No Steam games matched. Try another search."
-              : "Search reached its page limit. Refine your search to continue.");
+              : "Search stopped after the first 512 games. Browse later pages or refine your search.");
           }
           restart.hidden = true;
           updatePager(false);

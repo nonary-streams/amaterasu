@@ -1887,6 +1887,22 @@ var Amaterasu;
         "Delete",
         "Try again",
         "Unable to complete request",
+        "Choose a Steam game",
+        "Select",
+        "Search discovered games",
+        "Search by game name or app ID",
+        "Restart",
+        "Clear search",
+        "Keep current directory",
+        "Clear current directory",
+        "Review fields",
+        "Steam games",
+        "App ID",
+        "Install directory",
+        "Install directory unavailable",
+        "Select {name}",
+        "Search found matches in the first 512 games. Browse later pages or refine your search.",
+        "Search stopped after the first 512 games. Browse later pages or refine your search.",
     ];
     const SHELL_MESSAGE_KEYS = [
         "WORKSPACE",
@@ -1905,7 +1921,22 @@ var Amaterasu;
             ],
             ui: [
                 "← Предишна", "Следваща →", "Обновяване", "Запазване", "Отказ", "Затвори", "Търсене",
-                "Редактиране", "Изтриване", "Опитай отново", "Заявката не можа да бъде изпълнена",
+                "Редактиране", "Изтриване", "Опитай отново", "Заявката не можа да бъде изпълнена", "Избор на Steam игра",
+                "Избор",
+                "Търсене на открити игри",
+                "Търсене по име на игра или ID на приложение",
+                "Рестартиране",
+                "Изчистване на търсенето",
+                "Запазване на текущата папка",
+                "Изчистване на текущата папка",
+                "Преглед на полетата",
+                "Steam игри",
+                "ID на приложението",
+                "Папка за инсталиране",
+                "Папката за инсталиране не е налична",
+                "Избор на {name}",
+                "Намерени са съвпадения сред първите 512 игри. Прегледайте следващите страници или прецизирайте търсенето.",
+                "Търсенето спря след първите 512 игри. Прегледайте следващите страници или прецизирайте търсенето.",
             ],
         },
         cs: {
@@ -1917,7 +1948,22 @@ var Amaterasu;
             ],
             ui: [
                 "← Předchozí", "Další →", "Obnovit", "Uložit", "Zrušit", "Zavřít", "Hledat", "Upravit",
-                "Odstranit", "Zkusit znovu", "Požadavek se nepodařilo dokončit",
+                "Odstranit", "Zkusit znovu", "Požadavek se nepodařilo dokončit", "Vybrat hru na Steamu",
+                "Vybrat",
+                "Hledat nalezené hry",
+                "Hledat podle názvu hry nebo ID aplikace",
+                "Restartovat",
+                "Vymazat hledání",
+                "Ponechat aktuální složku",
+                "Vymazat aktuální složku",
+                "Zkontrolovat pole",
+                "Hry na Steamu",
+                "ID aplikace",
+                "Instalační složka",
+                "Instalační složka není dostupná",
+                "Vybrat {name}",
+                "Shody nalezeny mezi prvními 512 hrami. Projděte další stránky nebo upřesněte hledání.",
+                "Hledání se zastavilo po prvních 512 hrách. Projděte další stránky nebo upřesněte hledání.",
             ],
         },
         de: {
@@ -1929,7 +1975,22 @@ var Amaterasu;
             ],
             ui: [
                 "← Zurück", "Weiter →", "Aktualisieren", "Speichern", "Abbrechen", "Schließen", "Suchen",
-                "Bearbeiten", "Löschen", "Erneut versuchen", "Anfrage konnte nicht ausgeführt werden",
+                "Bearbeiten", "Löschen", "Erneut versuchen", "Anfrage konnte nicht ausgeführt werden", "Steam-Spiel auswählen",
+                "Auswählen",
+                "Entdeckte Spiele durchsuchen",
+                "Nach Spielname oder App-ID suchen",
+                "Neu starten",
+                "Suche löschen",
+                "Aktuelles Verzeichnis behalten",
+                "Aktuelles Verzeichnis löschen",
+                "Felder prüfen",
+                "Steam-Spiele",
+                "App-ID",
+                "Installationsverzeichnis",
+                "Installationsverzeichnis nicht verfügbar",
+                "{name} auswählen",
+                "Treffer in den ersten 512 Spielen gefunden. Durchsuche spätere Seiten oder grenze die Suche ein.",
+                "Suche nach den ersten 512 Spielen beendet. Durchsuche spätere Seiten oder grenze die Suche ein.",
             ],
         },
         es: {
@@ -1941,7 +2002,22 @@ var Amaterasu;
             ],
             ui: [
                 "← Anterior", "Siguiente →", "Actualizar", "Guardar", "Cancelar", "Cerrar", "Buscar", "Editar",
-                "Eliminar", "Intentar de nuevo", "No se pudo completar la solicitud",
+                "Eliminar", "Intentar de nuevo", "No se pudo completar la solicitud", "Elegir un juego de Steam",
+                "Seleccionar",
+                "Buscar juegos detectados",
+                "Buscar por nombre del juego o ID de aplicación",
+                "Reiniciar",
+                "Borrar búsqueda",
+                "Mantener el directorio actual",
+                "Borrar el directorio actual",
+                "Revisar campos",
+                "Juegos de Steam",
+                "ID de aplicación",
+                "Directorio de instalación",
+                "Directorio de instalación no disponible",
+                "Seleccionar {name}",
+                "Se encontraron coincidencias entre los primeros 512 juegos. Explora páginas posteriores o afina la búsqueda.",
+                "La búsqueda se detuvo tras los primeros 512 juegos. Explora páginas posteriores o afina la búsqueda.",
             ],
         },
         fr: {
@@ -1953,7 +2029,22 @@ var Amaterasu;
             ],
             ui: [
                 "← Précédent", "Suivant →", "Actualiser", "Enregistrer", "Annuler", "Fermer", "Rechercher",
-                "Modifier", "Supprimer", "Réessayer", "Impossible de terminer la requête",
+                "Modifier", "Supprimer", "Réessayer", "Impossible de terminer la requête", "Choisir un jeu Steam",
+                "Choisir",
+                "Rechercher les jeux détectés",
+                "Rechercher par nom de jeu ou ID d’application",
+                "Redémarrer",
+                "Effacer la recherche",
+                "Conserver le répertoire actuel",
+                "Effacer le répertoire actuel",
+                "Vérifier les champs",
+                "Jeux Steam",
+                "ID d’application",
+                "Répertoire d’installation",
+                "Répertoire d’installation indisponible",
+                "Choisir le jeu {name}",
+                "Des résultats ont été trouvés parmi les 512 premiers jeux. Parcourez les pages suivantes ou affinez la recherche.",
+                "La recherche s’est arrêtée après les 512 premiers jeux. Parcourez les pages suivantes ou affinez la recherche.",
             ],
         },
         hu: {
@@ -1965,7 +2056,22 @@ var Amaterasu;
             ],
             ui: [
                 "← Előző", "Következő →", "Frissítés", "Mentés", "Mégse", "Bezárás", "Keresés", "Szerkesztés",
-                "Törlés", "Próbálja újra", "A kérést nem sikerült végrehajtani",
+                "Törlés", "Próbálja újra", "A kérést nem sikerült végrehajtani", "Steam-játék kiválasztása",
+                "Kiválasztás",
+                "Felfedezett játékok keresése",
+                "Keresés játék neve vagy alkalmazásazonosító alapján",
+                "Újraindítás",
+                "Keresés törlése",
+                "Jelenlegi könyvtár megtartása",
+                "Jelenlegi könyvtár törlése",
+                "Mezők áttekintése",
+                "Steam-játékok",
+                "Alkalmazásazonosító",
+                "Telepítési könyvtár",
+                "A telepítési könyvtár nem érhető el",
+                "{name} kiválasztása",
+                "Találatok az első 512 játék között. Böngésszen tovább vagy pontosítsa a keresést.",
+                "A keresés az első 512 játék után leállt. Böngésszen tovább vagy pontosítsa a keresést.",
             ],
         },
         it: {
@@ -1977,7 +2083,22 @@ var Amaterasu;
             ],
             ui: [
                 "← Precedente", "Successivo →", "Aggiorna", "Salva", "Annulla", "Chiudi", "Cerca", "Modifica",
-                "Elimina", "Riprova", "Impossibile completare la richiesta",
+                "Elimina", "Riprova", "Impossibile completare la richiesta", "Scegli un gioco Steam",
+                "Seleziona",
+                "Cerca giochi rilevati",
+                "Cerca per nome del gioco o ID app",
+                "Riavvia",
+                "Cancella ricerca",
+                "Mantieni la cartella attuale",
+                "Cancella la cartella attuale",
+                "Rivedi i campi",
+                "Giochi Steam",
+                "ID app",
+                "Cartella di installazione",
+                "Cartella di installazione non disponibile",
+                "Seleziona {name}",
+                "Trovate corrispondenze tra i primi 512 giochi. Sfoglia le pagine successive o affina la ricerca.",
+                "Ricerca interrotta dopo i primi 512 giochi. Sfoglia le pagine successive o affina la ricerca.",
             ],
         },
         ja: {
@@ -1988,7 +2109,22 @@ var Amaterasu;
             ],
             ui: [
                 "← 前へ", "次へ →", "更新", "保存", "キャンセル", "閉じる", "検索", "編集", "削除", "再試行",
-                "リクエストを完了できませんでした",
+                "リクエストを完了できませんでした", "Steam ゲームを選択",
+                "選択",
+                "検出済みゲームを検索",
+                "ゲーム名またはアプリ ID で検索",
+                "再起動",
+                "検索をクリア",
+                "現在のディレクトリを保持",
+                "現在のディレクトリをクリア",
+                "項目を確認",
+                "Steam ゲーム",
+                "アプリ ID",
+                "インストール先",
+                "インストール先はありません",
+                "{name} を選択",
+                "最初の 512 件に一致するゲームがあります。後のページを表示するか、検索を絞り込んでください。",
+                "最初の 512 件で検索を終了しました。後のページを表示するか、検索を絞り込んでください。",
             ],
         },
         ko: {
@@ -1999,7 +2135,22 @@ var Amaterasu;
             ],
             ui: [
                 "← 이전", "다음 →", "새로 고침", "저장", "취소", "닫기", "검색", "편집", "삭제", "다시 시도",
-                "요청을 완료할 수 없습니다",
+                "요청을 완료할 수 없습니다", "Steam 게임 선택",
+                "선택",
+                "검색된 게임 찾기",
+                "게임 이름 또는 앱 ID로 검색",
+                "다시 시작",
+                "검색 지우기",
+                "현재 디렉터리 유지",
+                "현재 디렉터리 지우기",
+                "필드 검토",
+                "Steam 게임",
+                "앱 ID",
+                "설치 디렉터리",
+                "설치 디렉터리 없음",
+                "{name} 선택",
+                "처음 512개 게임에서 일치 항목을 찾았습니다. 이후 페이지를 둘러보거나 검색을 구체화하세요.",
+                "처음 512개 게임 뒤에 검색을 멈췄습니다. 이후 페이지를 둘러보거나 검색을 구체화하세요.",
             ],
         },
         pl: {
@@ -2011,7 +2162,22 @@ var Amaterasu;
             ],
             ui: [
                 "← Poprzednia", "Następna →", "Odśwież", "Zapisz", "Anuluj", "Zamknij", "Szukaj", "Edytuj", "Usuń",
-                "Spróbuj ponownie", "Nie można wykonać żądania",
+                "Spróbuj ponownie", "Nie można wykonać żądania", "Wybierz grę Steam",
+                "Wybierz",
+                "Szukaj wykrytych gier",
+                "Szukaj według nazwy gry lub ID aplikacji",
+                "Uruchom ponownie",
+                "Wyczyść wyszukiwanie",
+                "Zachowaj bieżący katalog",
+                "Wyczyść bieżący katalog",
+                "Sprawdź pola",
+                "Gry Steam",
+                "ID aplikacji",
+                "Katalog instalacji",
+                "Katalog instalacji jest niedostępny",
+                "Wybierz {name}",
+                "Znaleziono wyniki wśród pierwszych 512 gier. Przejrzyj dalsze strony lub zawęź wyszukiwanie.",
+                "Wyszukiwanie zatrzymało się po pierwszych 512 grach. Przejrzyj dalsze strony lub zawęź wyszukiwanie.",
             ],
         },
         pt: {
@@ -2023,7 +2189,22 @@ var Amaterasu;
             ],
             ui: [
                 "← Anterior", "Próxima →", "Atualizar", "Salvar", "Cancelar", "Fechar", "Pesquisar", "Editar",
-                "Excluir", "Tentar novamente", "Não foi possível concluir a solicitação",
+                "Excluir", "Tentar novamente", "Não foi possível concluir a solicitação", "Escolher jogo Steam",
+                "Selecionar",
+                "Pesquisar jogos detetados",
+                "Pesquisar por nome do jogo ou ID da aplicação",
+                "Reiniciar",
+                "Limpar pesquisa",
+                "Manter diretório atual",
+                "Limpar diretório atual",
+                "Rever campos",
+                "Jogos Steam",
+                "ID da aplicação",
+                "Diretório de instalação",
+                "Diretório de instalação indisponível",
+                "Selecionar {name}",
+                "Foram encontrados resultados nos primeiros 512 jogos. Explore páginas seguintes ou refine a pesquisa.",
+                "A pesquisa parou após os primeiros 512 jogos. Explore páginas seguintes ou refine a pesquisa.",
             ],
         },
         pt_BR: {
@@ -2036,6 +2217,11 @@ var Amaterasu;
             ui: [
                 "← Anterior", "Próxima →", "Atualizar", "Salvar", "Cancelar", "Fechar", "Pesquisar", "Editar",
                 "Excluir", "Tentar novamente", "Não foi possível concluir a solicitação",
+                "Escolher jogo do Steam", "Selecionar", "Pesquisar jogos descobertos", "Pesquisar por nome do jogo ou ID do aplicativo",
+                "Reiniciar", "Limpar pesquisa", "Manter diretório atual", "Limpar diretório atual", "Revisar campos", "Jogos do Steam",
+                "ID do aplicativo", "Diretório de instalação", "Diretório de instalação indisponível", "Selecionar {name}",
+                "Foram encontrados resultados nos primeiros 512 jogos. Navegue pelas páginas seguintes ou refine a pesquisa.",
+                "A pesquisa parou após os primeiros 512 jogos. Navegue pelas páginas seguintes ou refine a pesquisa.",
             ],
         },
         ru: {
@@ -2046,7 +2232,22 @@ var Amaterasu;
             ],
             ui: [
                 "← Назад", "Далее →", "Обновить", "Сохранить", "Отмена", "Закрыть", "Поиск", "Изменить", "Удалить",
-                "Повторить попытку", "Не удалось выполнить запрос",
+                "Повторить попытку", "Не удалось выполнить запрос", "Выбрать игру Steam",
+                "Выбрать",
+                "Поиск обнаруженных игр",
+                "Поиск по названию игры или ID приложения",
+                "Перезапустить",
+                "Очистить поиск",
+                "Оставить текущую папку",
+                "Очистить текущую папку",
+                "Проверить поля",
+                "Игры Steam",
+                "ID приложения",
+                "Папка установки",
+                "Папка установки недоступна",
+                "Выбрать {name}",
+                "Совпадения найдены среди первых 512 игр. Просмотрите следующие страницы или уточните запрос.",
+                "Поиск остановлен после первых 512 игр. Просмотрите следующие страницы или уточните запрос.",
             ],
         },
         sv: {
@@ -2057,7 +2258,22 @@ var Amaterasu;
             ],
             ui: [
                 "← Föregående", "Nästa →", "Uppdatera", "Spara", "Avbryt", "Stäng", "Sök", "Redigera", "Ta bort",
-                "Försök igen", "Det gick inte att slutföra begäran",
+                "Försök igen", "Det gick inte att slutföra begäran", "Välj ett Steam-spel",
+                "Välj",
+                "Sök bland upptäckta spel",
+                "Sök efter spelnamn eller app-ID",
+                "Starta om",
+                "Rensa sökning",
+                "Behåll aktuell katalog",
+                "Rensa aktuell katalog",
+                "Granska fält",
+                "Steam-spel",
+                "App-ID",
+                "Installationskatalog",
+                "Installationskatalog saknas",
+                "Välj {name}",
+                "Träffar hittades bland de första 512 spelen. Bläddra på senare sidor eller förfina sökningen.",
+                "Sökningen stoppades efter de första 512 spelen. Bläddra på senare sidor eller förfina sökningen.",
             ],
         },
         tr: {
@@ -2068,7 +2284,22 @@ var Amaterasu;
             ],
             ui: [
                 "← Önceki", "Sonraki →", "Yenile", "Kaydet", "İptal", "Kapat", "Ara", "Düzenle", "Sil", "Tekrar dene",
-                "İstek tamamlanamadı",
+                "İstek tamamlanamadı", "Steam oyunu seç",
+                "Seç",
+                "Bulunan oyunlarda ara",
+                "Oyun adına veya uygulama kimliğine göre ara",
+                "Yeniden başlat",
+                "Aramayı temizle",
+                "Geçerli dizini koru",
+                "Geçerli dizini temizle",
+                "Alanları gözden geçir",
+                "Steam oyunları",
+                "Uygulama kimliği",
+                "Yükleme dizini",
+                "Yükleme dizini kullanılamıyor",
+                "{name} oyununu seç",
+                "İlk 512 oyunda eşleşmeler bulundu. Sonraki sayfalara göz atın veya aramayı daraltın.",
+                "Arama ilk 512 oyundan sonra durdu. Sonraki sayfalara göz atın veya aramayı daraltın.",
             ],
         },
         uk: {
@@ -2080,7 +2311,22 @@ var Amaterasu;
             ],
             ui: [
                 "← Назад", "Далі →", "Оновити", "Зберегти", "Скасувати", "Закрити", "Пошук", "Редагувати", "Видалити",
-                "Спробувати знову", "Не вдалося виконати запит",
+                "Спробувати знову", "Не вдалося виконати запит", "Вибрати гру Steam",
+                "Вибрати",
+                "Пошук знайдених ігор",
+                "Пошук за назвою гри або ID програми",
+                "Перезапустити",
+                "Очистити пошук",
+                "Залишити поточний каталог",
+                "Очистити поточний каталог",
+                "Переглянути поля",
+                "Ігри Steam",
+                "ID програми",
+                "Каталог встановлення",
+                "Каталог встановлення недоступний",
+                "Вибрати {name}",
+                "Збіги знайдено серед перших 512 ігор. Перегляньте наступні сторінки або уточніть пошук.",
+                "Пошук зупинено після перших 512 ігор. Перегляньте наступні сторінки або уточніть пошук.",
             ],
         },
         vi: {
@@ -2092,7 +2338,22 @@ var Amaterasu;
             ],
             ui: [
                 "← Trước", "Tiếp →", "Làm mới", "Lưu", "Hủy", "Đóng", "Tìm kiếm", "Chỉnh sửa", "Xóa", "Thử lại",
-                "Không thể hoàn tất yêu cầu",
+                "Không thể hoàn tất yêu cầu", "Chọn trò chơi Steam",
+                "Chọn",
+                "Tìm trò chơi đã phát hiện",
+                "Tìm theo tên trò chơi hoặc ID ứng dụng",
+                "Khởi động lại",
+                "Xóa tìm kiếm",
+                "Giữ thư mục hiện tại",
+                "Xóa thư mục hiện tại",
+                "Xem lại các trường",
+                "Trò chơi Steam",
+                "ID ứng dụng",
+                "Thư mục cài đặt",
+                "Không có thư mục cài đặt",
+                "Chọn {name}",
+                "Đã tìm thấy kết quả trong 512 trò chơi đầu tiên. Hãy duyệt các trang sau hoặc thu hẹp tìm kiếm.",
+                "Đã dừng tìm kiếm sau 512 trò chơi đầu tiên. Hãy duyệt các trang sau hoặc thu hẹp tìm kiếm.",
             ],
         },
         zh: {
@@ -2102,7 +2363,22 @@ var Amaterasu;
                 "此语言会翻译导航菜单和部分标签；其他文本将以英语显示。",
             ],
             ui: [
-                "← 上一页", "下一页 →", "刷新", "保存", "取消", "关闭", "搜索", "编辑", "删除", "重试", "无法完成请求",
+                "← 上一页", "下一页 →", "刷新", "保存", "取消", "关闭", "搜索", "编辑", "删除", "重试", "无法完成请求", "选择 Steam 游戏",
+                "选择",
+                "搜索已发现的游戏",
+                "按游戏名称或应用 ID 搜索",
+                "重新开始",
+                "清除搜索",
+                "保留当前目录",
+                "清除当前目录",
+                "检查字段",
+                "Steam 游戏",
+                "应用 ID",
+                "安装目录",
+                "安装目录不可用",
+                "选择 {name}",
+                "前 512 个游戏中找到匹配项。请浏览后续页面或缩小搜索范围。",
+                "搜索已在前 512 个游戏后停止。请浏览后续页面或缩小搜索范围。",
             ],
         },
         zh_TW: {
@@ -2113,6 +2389,10 @@ var Amaterasu;
             ],
             ui: [
                 "← 上一頁", "下一頁 →", "重新整理", "儲存", "取消", "關閉", "搜尋", "編輯", "刪除", "重試", "無法完成要求",
+                "選擇 Steam 遊戲", "選擇", "搜尋已發現的遊戲", "依遊戲名稱或應用程式 ID 搜尋", "重新開始", "清除搜尋",
+                "保留目前目錄", "清除目前目錄", "檢查欄位", "Steam 遊戲", "應用程式 ID", "安裝目錄", "無法使用安裝目錄",
+                "選擇 {name}", "在前 512 個遊戲中找到相符項目。請瀏覽後續頁面或縮小搜尋範圍。",
+                "搜尋已在前 512 個遊戲後停止。請瀏覽後續頁面或縮小搜尋範圍。",
             ],
         },
     };
@@ -4643,6 +4923,7 @@ var Amaterasu;
             const clearSearch = Amaterasu.button(steamChooserMessage("Clear search"), () => {
                 searchInput.value = "";
                 activeSearchTerm = "";
+                searching = false;
                 pageIndex = 0;
                 cursors.length = 1;
                 list.replaceChildren();
@@ -4710,7 +4991,7 @@ var Amaterasu;
                     const directory = game.install_directory;
                     list.append(Amaterasu.el("li", "steam-game-chooser-item", Amaterasu.el("div", "steam-game-chooser-copy", Amaterasu.el("strong", "", typeof Amaterasu.literalText === "function"
                         ? Amaterasu.literalText(game.name)
-                        : game.name), Amaterasu.el("span", "steam-game-chooser-details", steamChooserMessage("App ID "), String(game.app_id), " · ", steamChooserMessage(directory ? "Install directory" : "Install directory unavailable"), ...(directory ? [" ", typeof Amaterasu.literalText === "function"
+                        : game.name), Amaterasu.el("span", "steam-game-chooser-details", steamChooserMessage("App ID"), String(game.app_id), " · ", steamChooserMessage(directory ? "Install directory" : "Install directory unavailable"), ...(directory ? [" ", typeof Amaterasu.literalText === "function"
                             ? Amaterasu.literalText(directory)
                             : directory] : []))), select));
                 }
@@ -4727,6 +5008,7 @@ var Amaterasu;
                 searching = false;
                 pageIndex = requestedPage;
                 const cursor = cursors[pageIndex] ?? null;
+                cursors.length = pageIndex + 1;
                 list.replaceChildren();
                 restart.hidden = true;
                 steamChooserSetText(status, "Loading discovered Steam games…");
@@ -4853,12 +5135,12 @@ var Amaterasu;
                     if (matches.length) {
                         steamChooserSetText(status, complete
                             ? "Search complete. Choose a game to continue."
-                            : "Search reached its page limit. Refine your search to continue.");
+                            : "Search found matches in the first 512 games. Browse later pages or refine your search.");
                     }
                     else {
                         steamChooserSetText(status, complete
                             ? "No Steam games matched. Try another search."
-                            : "Search reached its page limit. Refine your search to continue.");
+                            : "Search stopped after the first 512 games. Browse later pages or refine your search.");
                     }
                     restart.hidden = true;
                     updatePager(false);
