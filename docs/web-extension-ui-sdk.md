@@ -8,6 +8,8 @@ remain the only authority for `sdk.call`.
 The additive status, alert, and progress components are documented in the
 [feedback UI SDK guide](web-extension-ui-feedback.md); they use the separate
 `ui.feedback/1` capability while keeping `sdk.ui.version` at 1.
+The additive native modal dialog is documented in the
+[dialog UI SDK guide](web-extension-ui-dialog.md) under `ui.dialog/1`.
 
 Hosts that implement the base controls advertise `ui.controls/1` in the
 additive `sdk.features` list and supply `sdk.ui` with `sdk.ui.version === 1`.

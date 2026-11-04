@@ -21010,6 +21010,208 @@ var Amaterasu;
 })(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
 (function (Amaterasu) {
+    let nextExtensionUiDialogId = 0;
+    function extensionUiDialogTextNode(value) {
+        if (typeof value === "string") {
+            if (!value.trim())
+                throw new Error("Invalid plugin dialog text.");
+            return Amaterasu.localizedTextNode(value);
+        }
+        if (!value || typeof value !== "object" || typeof value.source !== "string" || !value.source.trim())
+            throw new Error("Invalid plugin dialog text.");
+        const translations = value.translations ?? {};
+        if (!translations || typeof translations !== "object" || Array.isArray(translations) ||
+            Object.values(translations).some((translation) => typeof translation !== "string" || !translation.trim()))
+            throw new Error("Invalid plugin dialog translations.");
+        return Amaterasu.localeFormattedTextNode((locale) => translations[locale] ?? translations[locale.split("-")[0] ?? locale] ?? Amaterasu.translateText(value.source));
+    }
+    function extensionUiDialogContent(content) {
+        if (content === undefined)
+            return [];
+        const values = Array.isArray(content) ? [...content] : [content];
+        return values.map((value) => {
+            if (typeof value === "string")
+                return document.createTextNode(value);
+            if (!value || typeof value !== "object" || value.ownerDocument !== document ||
+                ![1, 3, 11].includes(value.nodeType))
+                throw new Error("Dialog content must be text or a node owned by this document.");
+            return value;
+        });
+    }
+    function createExtensionUiDialogsV1(signal) {
+        if (!signal || typeof signal.addEventListener !== "function" || typeof signal.removeEventListener !== "function")
+            throw new Error("Plugin UI requires a lifecycle signal.");
+        if (signal.aborted)
+            throw new Error("Plugin page is no longer active.");
+        const dialogs = {
+            dialog(options) {
+                if (signal.aborted)
+                    throw new Error("Plugin page is no longer active.");
+                if (!options || typeof options !== "object" || Array.isArray(options))
+                    throw new Error("Invalid plugin dialog.");
+                if (options.onClose !== undefined && typeof options.onClose !== "function")
+                    throw new Error("Invalid plugin dialog close callback.");
+                const titleNode = extensionUiDialogTextNode(options.title);
+                const descriptionNode = options.description === undefined
+                    ? null : extensionUiDialogTextNode(options.description);
+                const cancelLabel = extensionUiDialogTextNode(options.cancelLabel ?? "Cancel");
+                const contentNodes = extensionUiDialogContent(options.content);
+                const initialFocus = options.initialFocus;
+                if (initialFocus !== undefined && (!initialFocus || typeof initialFocus.focus !== "function" ||
+                    initialFocus.ownerDocument !== document || !contentNodes.some((node) => node === initialFocus ||
+                    (node.nodeType === 1 && node.contains(initialFocus)))))
+                    throw new Error("Dialog initial focus must be inside its content.");
+                const instanceId = ++nextExtensionUiDialogId;
+                const titleId = `amaterasu-plugin-dialog-title-${instanceId}`;
+                const descriptionId = `amaterasu-plugin-dialog-description-${instanceId}`;
+                const element = document.createElement("dialog");
+                element.className = "plugin-dialog";
+                element.setAttribute("aria-modal", "true");
+                element.setAttribute("aria-labelledby", titleId);
+                const title = document.createElement("h2");
+                title.id = titleId;
+                title.append(titleNode);
+                element.append(title);
+                if (descriptionNode !== null) {
+                    const description = document.createElement("p");
+                    description.className = "plugin-dialog-description";
+                    description.id = descriptionId;
+                    description.append(descriptionNode);
+                    element.setAttribute("aria-describedby", descriptionId);
+                    element.append(description);
+                }
+                const body = document.createElement("div");
+                body.className = "plugin-dialog-content";
+                body.append(...contentNodes);
+                element.append(body);
+                const actions = document.createElement("div");
+                actions.className = "actions plugin-dialog-actions";
+                const cancelButton = document.createElement("button");
+                cancelButton.type = "button";
+                cancelButton.className = "button secondary";
+                cancelButton.append(cancelLabel);
+                actions.append(cancelButton);
+                element.append(actions);
+                const controller = new AbortController();
+                let disposed = false;
+                let opener = null;
+                let pendingCloseReason = null;
+                let closeEventPending = false;
+                const restoreFocus = () => {
+                    const target = opener;
+                    opener = null;
+                    if (!signal.aborted && target?.isConnected)
+                        target.focus();
+                };
+                const closeDialog = (reason) => {
+                    if (disposed || signal.aborted || !element.open)
+                        return;
+                    pendingCloseReason = reason;
+                    closeEventPending = true;
+                    element.close(reason);
+                };
+                const onCancel = (event) => {
+                    event.preventDefault();
+                    closeDialog("cancel");
+                };
+                const onKeyDown = (event) => {
+                    if (event.key !== "Tab" || disposed || signal.aborted)
+                        return;
+                    const focusable = Array.from(element.querySelectorAll("a[href],area[href],button:not(:disabled),input:not(:disabled):not([type=hidden]),select:not(:disabled),textarea:not(:disabled),iframe,[tabindex]:not([tabindex='-1']),[contenteditable='true']")).filter((control) => !control.hidden && control.getAttribute("aria-hidden") !== "true" && control.tabIndex >= 0 && control.getClientRects().length > 0);
+                    const first = focusable[0];
+                    const last = focusable.at(-1);
+                    const active = document.activeElement;
+                    if (!first || !last) {
+                        event.preventDefault();
+                        cancelButton.focus();
+                    }
+                    else if (event.shiftKey && (active === first || !element.contains(active))) {
+                        event.preventDefault();
+                        last.focus();
+                    }
+                    else if (!event.shiftKey && (active === last || !element.contains(active))) {
+                        event.preventDefault();
+                        first.focus();
+                    }
+                };
+                const onClose = () => {
+                    const reason = pendingCloseReason ?? (element.returnValue === "cancel" ? "cancel" : "close");
+                    pendingCloseReason = null;
+                    closeEventPending = false;
+                    if (disposed || signal.aborted)
+                        return;
+                    restoreFocus();
+                    options.onClose?.(reason);
+                };
+                const onHostAbort = () => {
+                    if (disposed)
+                        return;
+                    disposed = true;
+                    if (element.open)
+                        element.close("dispose");
+                    opener = null;
+                    controller.abort();
+                    element.remove();
+                };
+                cancelButton.addEventListener("click", () => closeDialog("cancel"), { signal: controller.signal });
+                element.addEventListener("cancel", onCancel, { signal: controller.signal });
+                element.addEventListener("keydown", onKeyDown, { signal: controller.signal });
+                element.addEventListener("close", onClose, { signal: controller.signal });
+                signal.addEventListener("abort", onHostAbort, { once: true });
+                const handle = {
+                    element,
+                    open() {
+                        if (disposed || signal.aborted || element.open || closeEventPending)
+                            return;
+                        if (!element.isConnected)
+                            throw new Error("Append the dialog element before opening it.");
+                        const active = document.activeElement;
+                        opener = active && typeof active.focus === "function" ? active : null;
+                        try {
+                            element.showModal();
+                        }
+                        catch (error) {
+                            opener = null;
+                            throw error;
+                        }
+                        (initialFocus ?? cancelButton).focus();
+                    },
+                    close() { closeDialog("close"); },
+                    dispose() {
+                        if (disposed)
+                            return;
+                        const wasOpen = element.open;
+                        const pendingReason = closeEventPending ? pendingCloseReason : null;
+                        disposed = true;
+                        if (wasOpen)
+                            element.close("dispose");
+                        if (!signal.aborted && (wasOpen || closeEventPending)) {
+                            restoreFocus();
+                            options.onClose?.(wasOpen ? "dispose" : pendingReason ?? "dispose");
+                        }
+                        pendingCloseReason = null;
+                        closeEventPending = false;
+                        opener = null;
+                        controller.abort();
+                        signal.removeEventListener("abort", onHostAbort);
+                        element.remove();
+                    },
+                };
+                return Object.freeze(handle);
+            },
+        };
+        return Object.freeze(dialogs);
+    }
+    Amaterasu.createExtensionUiDialogsV1 = createExtensionUiDialogsV1;
+    function createExtensionUiWithDialogsV1(signal) {
+        const ui = Amaterasu.createExtensionUiWithFeedbackV1(signal);
+        const dialogs = createExtensionUiDialogsV1(signal);
+        return Object.freeze({ ...ui, ...dialogs, version: 1 });
+    }
+    Amaterasu.createExtensionUiWithDialogsV1 = createExtensionUiWithDialogsV1;
+})(Amaterasu || (Amaterasu = {}));
+var Amaterasu;
+(function (Amaterasu) {
     const registrations = new Map();
     const loads = new Map();
     const pendingScripts = new WeakMap();
@@ -21125,8 +21327,8 @@ var Amaterasu;
             const sdk = Object.freeze({
                 version: 1,
                 signal: controller.signal,
-                features: Object.freeze(["ui.controls/1", "ui.forms/1", "ui.forms/2", "ui.controls/2", "ui.feedback/1"]),
-                ui: Amaterasu.createExtensionUiWithFeedbackV1(controller.signal),
+                features: Object.freeze(["ui.controls/1", "ui.forms/1", "ui.forms/2", "ui.controls/2", "ui.feedback/1", "ui.dialog/1"]),
+                ui: Amaterasu.createExtensionUiWithDialogsV1(controller.signal),
                 call: (method, payload = {}) => {
                     if (controller.signal.aborted || !aliases.has(method))
                         return Promise.reject(new Error("Extension method is unavailable."));
