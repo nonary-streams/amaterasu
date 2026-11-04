@@ -4305,6 +4305,15 @@ var Amaterasu;
             "Refresh failed. Check provider status before retrying.": "Aktualisierung fehlgeschlagen. Prüfe den Providerstatus, bevor du es erneut versuchst.",
             "Provider status reports an issue.": "Der Providerstatus meldet ein Problem.",
             "This account cannot read this provider's status.": "Dieses Konto kann den Status dieses Providers nicht lesen.",
+            "Provider status read completed; no provider refresh was requested.": "Statusabfrage abgeschlossen; es wurde keine Aktualisierung des Providers angefordert.",
+            "Provider status check failed.": "Statusabfrage fehlgeschlagen.",
+            "Refresh accepted, but status readback failed. Check status before retrying.": "Aktualisierung angenommen, Status konnte jedoch nicht abgerufen werden. Prüfe den Status vor einem erneuten Versuch.",
+            "Refresh outcome is uncertain. Check status before retrying.": "Ergebnis der Aktualisierung ungewiss. Prüfe den Status vor einem erneuten Versuch.",
+            "Request a {provider} refresh": "Aktualisierung für {provider} anfordern",
+            "Discovered games: {count}. Scan warnings: {warnings}.": "Entdeckte Spiele: {count}. Scan-Warnungen: {warnings}.",
+            "Discovered games: {count}.": "Entdeckte Spiele: {count}.",
+            "Games in the last snapshot: {count}.": "Spiele im letzten Snapshot: {count}.",
+            "Refresh accepted; provider status reports an issue.": "Aktualisierung angenommen; der Providerstatus meldet ein Problem.",
         },
         es: {
             Integrations: "Integraciones",
@@ -4323,6 +4332,15 @@ var Amaterasu;
             "Refresh failed. Check provider status before retrying.": "No se pudo actualizar. Comprueba el estado antes de volver a intentarlo.",
             "Provider status reports an issue.": "El estado del proveedor informa de un problema.",
             "This account cannot read this provider's status.": "Esta cuenta no puede leer el estado de este proveedor.",
+            "Provider status read completed; no provider refresh was requested.": "Consulta de estado completada; no se solicitó actualizar el proveedor.",
+            "Provider status check failed.": "No se pudo consultar el estado del proveedor.",
+            "Refresh accepted, but status readback failed. Check status before retrying.": "Se aceptó la actualización, pero no se pudo leer el estado. Compruébalo antes de volver a intentarlo.",
+            "Refresh outcome is uncertain. Check status before retrying.": "El resultado de la actualización es incierto. Comprueba el estado antes de volver a intentarlo.",
+            "Request a {provider} refresh": "Solicitar actualización de {provider}",
+            "Discovered games: {count}. Scan warnings: {warnings}.": "Juegos detectados: {count}. Advertencias del análisis: {warnings}.",
+            "Discovered games: {count}.": "Juegos detectados: {count}.",
+            "Games in the last snapshot: {count}.": "Juegos en la última instantánea: {count}.",
+            "Refresh accepted; provider status reports an issue.": "Se aceptó la actualización; el estado del proveedor informa de un problema.",
         },
         fr: {
             Integrations: "Intégrations",
@@ -4341,6 +4359,15 @@ var Amaterasu;
             "Refresh failed. Check provider status before retrying.": "Échec de l’actualisation. Vérifiez l’état du fournisseur avant de réessayer.",
             "Provider status reports an issue.": "L’état du fournisseur signale un problème.",
             "This account cannot read this provider's status.": "Ce compte ne peut pas lire l’état de ce fournisseur.",
+            "Provider status read completed; no provider refresh was requested.": "État du fournisseur consulté ; aucune actualisation n’a été demandée.",
+            "Provider status check failed.": "Échec de la vérification de l’état du fournisseur.",
+            "Refresh accepted, but status readback failed. Check status before retrying.": "Actualisation acceptée, mais état non récupéré. Vérifiez l’état avant de réessayer.",
+            "Refresh outcome is uncertain. Check status before retrying.": "Le résultat de l’actualisation est incertain. Vérifiez l’état avant de réessayer.",
+            "Request a {provider} refresh": "Demander l’actualisation de {provider}",
+            "Discovered games: {count}. Scan warnings: {warnings}.": "Jeux détectés : {count}. Avertissements d’analyse : {warnings}.",
+            "Discovered games: {count}.": "Jeux détectés : {count}.",
+            "Games in the last snapshot: {count}.": "Jeux dans le dernier instantané : {count}.",
+            "Refresh accepted; provider status reports an issue.": "Actualisation acceptée ; l’état du fournisseur signale un problème.",
         },
         ja: {
             Integrations: "連携",
@@ -4359,6 +4386,15 @@ var Amaterasu;
             "Refresh failed. Check provider status before retrying.": "更新に失敗しました。再試行する前に状態を確認してください。",
             "Provider status reports an issue.": "プロバイダーの状態に問題があります。",
             "This account cannot read this provider's status.": "このアカウントにはプロバイダーの状態を読み取る権限がありません。",
+            "Provider status read completed; no provider refresh was requested.": "状態の確認が完了しました。プロバイダーの更新要求は行っていません。",
+            "Provider status check failed.": "プロバイダーの状態を確認できませんでした。",
+            "Refresh accepted, but status readback failed. Check status before retrying.": "更新要求は受け付けられましたが、状態を取得できませんでした。再試行前に状態を確認してください。",
+            "Refresh outcome is uncertain. Check status before retrying.": "更新結果を確認できません。再試行前に状態を確認してください。",
+            "Request a {provider} refresh": "{provider} の更新をリクエスト",
+            "Discovered games: {count}. Scan warnings: {warnings}.": "検出したゲーム: {count}。スキャンの警告: {warnings}。",
+            "Discovered games: {count}.": "検出したゲーム: {count}。",
+            "Games in the last snapshot: {count}.": "最新のスナップショット内のゲーム: {count}。",
+            "Refresh accepted; provider status reports an issue.": "更新要求を受け付けましたが、プロバイダーの状態に問題があります。",
         },
         zh: {
             Integrations: "集成",
@@ -4377,6 +4413,15 @@ var Amaterasu;
             "Refresh failed. Check provider status before retrying.": "刷新失败。重试前请检查提供程序状态。",
             "Provider status reports an issue.": "提供程序状态报告了问题。",
             "This account cannot read this provider's status.": "此帐户无权读取该提供程序的状态。",
+            "Provider status read completed; no provider refresh was requested.": "已完成状态读取；未请求刷新提供程序。",
+            "Provider status check failed.": "无法检查提供程序状态。",
+            "Refresh accepted, but status readback failed. Check status before retrying.": "已接受刷新，但无法读取状态。重试前请检查状态。",
+            "Refresh outcome is uncertain. Check status before retrying.": "刷新结果不确定。重试前请检查状态。",
+            "Request a {provider} refresh": "请求刷新 {provider}",
+            "Discovered games: {count}. Scan warnings: {warnings}.": "发现的游戏：{count}。扫描警告：{warnings}。",
+            "Discovered games: {count}.": "发现的游戏：{count}。",
+            "Games in the last snapshot: {count}.": "上次快照中的游戏：{count}。",
+            "Refresh accepted; provider status reports an issue.": "已接受刷新请求；提供程序状态报告了问题。",
         },
         zh_TW: {
             Integrations: "整合",
@@ -4395,6 +4440,15 @@ var Amaterasu;
             "Refresh failed. Check provider status before retrying.": "重新整理失敗。重試前請檢查提供者狀態。",
             "Provider status reports an issue.": "提供者狀態回報問題。",
             "This account cannot read this provider's status.": "此帳戶無法讀取此提供者的狀態。",
+            "Provider status read completed; no provider refresh was requested.": "已完成狀態讀取；未要求重新整理提供者。",
+            "Provider status check failed.": "無法檢查提供者狀態。",
+            "Refresh accepted, but status readback failed. Check status before retrying.": "已接受重新整理，但無法讀取狀態。重試前請檢查狀態。",
+            "Refresh outcome is uncertain. Check status before retrying.": "重新整理結果不確定。重試前請檢查狀態。",
+            "Request a {provider} refresh": "要求重新整理 {provider}",
+            "Discovered games: {count}. Scan warnings: {warnings}.": "探索到的遊戲：{count}。掃描警告：{warnings}。",
+            "Discovered games: {count}.": "探索到的遊戲：{count}。",
+            "Games in the last snapshot: {count}.": "上次快照中的遊戲：{count}。",
+            "Refresh accepted; provider status reports an issue.": "已接受重新整理要求；提供者狀態回報問題。",
         },
         bg: {
             Integrations: "Интеграции",
@@ -4413,6 +4467,15 @@ var Amaterasu;
             "Refresh failed. Check provider status before retrying.": "Обновяването не бе успешно. Проверете състоянието на доставчика, преди да опитате отново.",
             "Provider status reports an issue.": "Състоянието на доставчика съобщава за проблем.",
             "This account cannot read this provider's status.": "Този акаунт няма достъп за четене на състоянието на този доставчик.",
+            "Provider status read completed; no provider refresh was requested.": "Проверката на състоянието приключи; заявка за обновяване не е изпращана.",
+            "Provider status check failed.": "Проверката на състоянието не бе успешна.",
+            "Refresh accepted, but status readback failed. Check status before retrying.": "Обновяването е прието, но състоянието не може да бъде прочетено. Проверете го, преди да опитате отново.",
+            "Refresh outcome is uncertain. Check status before retrying.": "Резултатът от обновяването е неизвестен. Проверете състоянието, преди да опитате отново.",
+            "Request a {provider} refresh": "Заявка за обновяване на {provider}",
+            "Discovered games: {count}. Scan warnings: {warnings}.": "Открити игри: {count}. Предупреждения от сканирането: {warnings}.",
+            "Discovered games: {count}.": "Открити игри: {count}.",
+            "Games in the last snapshot: {count}.": "Игри в последната снимка: {count}.",
+            "Refresh accepted; provider status reports an issue.": "Заявката за обновяване е приета; състоянието на доставчика показва проблем.",
         },
         cs: {
             Integrations: "Integrace",
@@ -4431,6 +4494,15 @@ var Amaterasu;
             "Refresh failed. Check provider status before retrying.": "Aktualizace se nezdařila. Před dalším pokusem ověřte stav poskytovatele.",
             "Provider status reports an issue.": "Stav poskytovatele hlásí problém.",
             "This account cannot read this provider's status.": "Tento účet nemůže číst stav tohoto poskytovatele.",
+            "Provider status read completed; no provider refresh was requested.": "Kontrola stavu byla dokončena; poskytovatel nebyl obnoven.",
+            "Provider status check failed.": "Kontrola stavu se nezdařila.",
+            "Refresh accepted, but status readback failed. Check status before retrying.": "Poskytovatel přijal požadavek, ale stav se nepodařilo načíst. Před dalším pokusem stav ověřte.",
+            "Refresh outcome is uncertain. Check status before retrying.": "Výsledek aktualizace není jistý. Před dalším pokusem ověřte stav.",
+            "Request a {provider} refresh": "Požádat o aktualizaci poskytovatele {provider}",
+            "Discovered games: {count}. Scan warnings: {warnings}.": "Nalezené hry: {count}. Upozornění skenování: {warnings}.",
+            "Discovered games: {count}.": "Nalezené hry: {count}.",
+            "Games in the last snapshot: {count}.": "Hry v posledním snímku: {count}.",
+            "Refresh accepted; provider status reports an issue.": "Požadavek na aktualizaci byl přijat; stav poskytovatele hlásí problém.",
         },
         hu: {
             Integrations: "Integrációk",
@@ -4449,6 +4521,15 @@ var Amaterasu;
             "Refresh failed. Check provider status before retrying.": "A frissítés nem sikerült. Újrapróbálás előtt ellenőrizze a szolgáltató állapotát.",
             "Provider status reports an issue.": "A szolgáltató állapota problémát jelez.",
             "This account cannot read this provider's status.": "Ez a fiók nem olvashatja a szolgáltató állapotát.",
+            "Provider status read completed; no provider refresh was requested.": "Az állapot lekérdezése befejeződött; szolgáltatói frissítést nem kértünk.",
+            "Provider status check failed.": "Nem sikerült lekérni a szolgáltató állapotát.",
+            "Refresh accepted, but status readback failed. Check status before retrying.": "A frissítést elfogadták, de az állapot nem olvasható. Újrapróbálás előtt ellenőrizze az állapotot.",
+            "Refresh outcome is uncertain. Check status before retrying.": "A frissítés eredménye bizonytalan. Újrapróbálás előtt ellenőrizze az állapotot.",
+            "Request a {provider} refresh": "{provider} frissítésének kérése",
+            "Discovered games: {count}. Scan warnings: {warnings}.": "Felfedezett játékok: {count}. Vizsgálati figyelmeztetések: {warnings}.",
+            "Discovered games: {count}.": "Felfedezett játékok: {count}.",
+            "Games in the last snapshot: {count}.": "Játékok az utolsó pillanatképben: {count}.",
+            "Refresh accepted; provider status reports an issue.": "A frissítési kérést elfogadták; a szolgáltató állapota problémát jelez.",
         },
         it: {
             Integrations: "Integrazioni",
@@ -4467,6 +4548,15 @@ var Amaterasu;
             "Refresh failed. Check provider status before retrying.": "Aggiornamento non riuscito. Controlla lo stato del provider prima di riprovare.",
             "Provider status reports an issue.": "Lo stato del provider segnala un problema.",
             "This account cannot read this provider's status.": "Questo account non può leggere lo stato di questo provider.",
+            "Provider status read completed; no provider refresh was requested.": "Controllo dello stato completato; non è stato richiesto alcun aggiornamento del provider.",
+            "Provider status check failed.": "Controllo dello stato del provider non riuscito.",
+            "Refresh accepted, but status readback failed. Check status before retrying.": "Aggiornamento accettato, ma impossibile leggere lo stato. Verificalo prima di riprovare.",
+            "Refresh outcome is uncertain. Check status before retrying.": "Esito dell’aggiornamento incerto. Verifica lo stato prima di riprovare.",
+            "Request a {provider} refresh": "Richiedi aggiornamento di {provider}",
+            "Discovered games: {count}. Scan warnings: {warnings}.": "Giochi rilevati: {count}. Avvisi della scansione: {warnings}.",
+            "Discovered games: {count}.": "Giochi rilevati: {count}.",
+            "Games in the last snapshot: {count}.": "Giochi nell’ultima istantanea: {count}.",
+            "Refresh accepted; provider status reports an issue.": "Aggiornamento accettato; lo stato del provider segnala un problema.",
         },
         ko: {
             Integrations: "통합",
@@ -4485,6 +4575,15 @@ var Amaterasu;
             "Refresh failed. Check provider status before retrying.": "새로 고침에 실패했습니다. 다시 시도하기 전에 공급자 상태를 확인하세요.",
             "Provider status reports an issue.": "공급자 상태에서 문제가 보고되었습니다.",
             "This account cannot read this provider's status.": "이 계정은 해당 공급자 상태를 읽을 수 없습니다.",
+            "Provider status read completed; no provider refresh was requested.": "상태 확인이 완료되었습니다. 공급자 새로 고침은 요청하지 않았습니다.",
+            "Provider status check failed.": "공급자 상태 확인에 실패했습니다.",
+            "Refresh accepted, but status readback failed. Check status before retrying.": "새로 고침은 수락되었지만 상태를 읽지 못했습니다. 다시 시도하기 전에 상태를 확인하세요.",
+            "Refresh outcome is uncertain. Check status before retrying.": "새로 고침 결과를 확인할 수 없습니다. 다시 시도하기 전에 상태를 확인하세요.",
+            "Request a {provider} refresh": "{provider} 새로 고침 요청",
+            "Discovered games: {count}. Scan warnings: {warnings}.": "검색된 게임: {count}. 검색 경고: {warnings}.",
+            "Discovered games: {count}.": "검색된 게임: {count}.",
+            "Games in the last snapshot: {count}.": "마지막 스냅샷의 게임: {count}.",
+            "Refresh accepted; provider status reports an issue.": "새로 고침 요청을 수락했지만 공급자 상태에서 문제가 보고되었습니다.",
         },
         pl: {
             Integrations: "Integracje",
@@ -4503,6 +4602,15 @@ var Amaterasu;
             "Refresh failed. Check provider status before retrying.": "Odświeżanie nie powiodło się. Sprawdź stan dostawcy przed ponowną próbą.",
             "Provider status reports an issue.": "Stan dostawcy zgłasza problem.",
             "This account cannot read this provider's status.": "To konto nie może odczytać stanu tego dostawcy.",
+            "Provider status read completed; no provider refresh was requested.": "Odczyt stanu zakończony; nie zażądano odświeżenia dostawcy.",
+            "Provider status check failed.": "Nie udało się odczytać stanu dostawcy.",
+            "Refresh accepted, but status readback failed. Check status before retrying.": "Przyjęto odświeżenie, ale nie udało się odczytać stanu. Sprawdź go przed ponowną próbą.",
+            "Refresh outcome is uncertain. Check status before retrying.": "Wynik odświeżania jest niepewny. Sprawdź stan przed ponowną próbą.",
+            "Request a {provider} refresh": "Poproś o odświeżenie {provider}",
+            "Discovered games: {count}. Scan warnings: {warnings}.": "Wykryte gry: {count}. Ostrzeżenia skanowania: {warnings}.",
+            "Discovered games: {count}.": "Wykryte gry: {count}.",
+            "Games in the last snapshot: {count}.": "Gry w ostatnim zrzucie: {count}.",
+            "Refresh accepted; provider status reports an issue.": "Przyjęto odświeżenie; stan dostawcy zgłasza problem.",
         },
         pt: {
             Integrations: "Integrações",
@@ -4521,6 +4629,15 @@ var Amaterasu;
             "Refresh failed. Check provider status before retrying.": "A atualização falhou. Verifique o estado do fornecedor antes de tentar novamente.",
             "Provider status reports an issue.": "O estado do fornecedor indica um problema.",
             "This account cannot read this provider's status.": "Esta conta não pode ler o estado deste fornecedor.",
+            "Provider status read completed; no provider refresh was requested.": "Consulta do estado concluída; não foi pedida uma atualização do fornecedor.",
+            "Provider status check failed.": "Falha ao consultar o estado do fornecedor.",
+            "Refresh accepted, but status readback failed. Check status before retrying.": "Atualização aceite, mas não foi possível ler o estado. Verifique-o antes de tentar novamente.",
+            "Refresh outcome is uncertain. Check status before retrying.": "O resultado da atualização é incerto. Verifique o estado antes de tentar novamente.",
+            "Request a {provider} refresh": "Pedir atualização de {provider}",
+            "Discovered games: {count}. Scan warnings: {warnings}.": "Jogos detetados: {count}. Avisos da análise: {warnings}.",
+            "Discovered games: {count}.": "Jogos detetados: {count}.",
+            "Games in the last snapshot: {count}.": "Jogos no último instantâneo: {count}.",
+            "Refresh accepted; provider status reports an issue.": "Atualização aceite; o estado do fornecedor indica um problema.",
         },
         pt_BR: {
             Integrations: "Integrações",
@@ -4539,6 +4656,15 @@ var Amaterasu;
             "Refresh failed. Check provider status before retrying.": "Falha ao atualizar. Verifique o status do provedor antes de tentar novamente.",
             "Provider status reports an issue.": "O status do provedor informa um problema.",
             "This account cannot read this provider's status.": "Esta conta não pode ler o status deste provedor.",
+            "Provider status read completed; no provider refresh was requested.": "Consulta de status concluída; nenhuma atualização do provedor foi solicitada.",
+            "Provider status check failed.": "Falha ao consultar o status do provedor.",
+            "Refresh accepted, but status readback failed. Check status before retrying.": "Atualização aceita, mas não foi possível ler o status. Confira antes de tentar novamente.",
+            "Refresh outcome is uncertain. Check status before retrying.": "O resultado da atualização é incerto. Confira o status antes de tentar novamente.",
+            "Request a {provider} refresh": "Solicitar atualização de {provider}",
+            "Discovered games: {count}. Scan warnings: {warnings}.": "Jogos descobertos: {count}. Avisos da verificação: {warnings}.",
+            "Discovered games: {count}.": "Jogos descobertos: {count}.",
+            "Games in the last snapshot: {count}.": "Jogos no último instantâneo: {count}.",
+            "Refresh accepted; provider status reports an issue.": "Atualização aceita; o status do provedor informa um problema.",
         },
         ru: {
             Integrations: "Интеграции",
@@ -4557,6 +4683,15 @@ var Amaterasu;
             "Refresh failed. Check provider status before retrying.": "Не удалось обновить. Проверьте статус провайдера перед повторной попыткой.",
             "Provider status reports an issue.": "Статус провайдера сообщает о проблеме.",
             "This account cannot read this provider's status.": "Эта учетная запись не может читать статус провайдера.",
+            "Provider status read completed; no provider refresh was requested.": "Проверка состояния завершена; обновление провайдера не запрашивалось.",
+            "Provider status check failed.": "Не удалось проверить состояние провайдера.",
+            "Refresh accepted, but status readback failed. Check status before retrying.": "Запрос принят, но состояние не удалось прочитать. Проверьте его перед повторной попыткой.",
+            "Refresh outcome is uncertain. Check status before retrying.": "Результат обновления неизвестен. Проверьте состояние перед повторной попыткой.",
+            "Request a {provider} refresh": "Запросить обновление {provider}",
+            "Discovered games: {count}. Scan warnings: {warnings}.": "Найдено игр: {count}. Предупреждения сканирования: {warnings}.",
+            "Discovered games: {count}.": "Найдено игр: {count}.",
+            "Games in the last snapshot: {count}.": "Игр в последнем снимке: {count}.",
+            "Refresh accepted; provider status reports an issue.": "Запрос на обновление принят; состояние провайдера сообщает о проблеме.",
         },
         sv: {
             Integrations: "Integrationer",
@@ -4575,6 +4710,15 @@ var Amaterasu;
             "Refresh failed. Check provider status before retrying.": "Det gick inte att uppdatera. Kontrollera leverantörens status innan du försöker igen.",
             "Provider status reports an issue.": "Leverantörsstatusen rapporterar ett problem.",
             "This account cannot read this provider's status.": "Det här kontot kan inte läsa leverantörens status.",
+            "Provider status read completed; no provider refresh was requested.": "Statuskontrollen är klar; ingen uppdatering av leverantören begärdes.",
+            "Provider status check failed.": "Det gick inte att läsa leverantörens status.",
+            "Refresh accepted, but status readback failed. Check status before retrying.": "Uppdateringen godkändes, men status kunde inte läsas. Kontrollera status innan du försöker igen.",
+            "Refresh outcome is uncertain. Check status before retrying.": "Resultatet av uppdateringen är osäkert. Kontrollera status innan du försöker igen.",
+            "Request a {provider} refresh": "Begär uppdatering av {provider}",
+            "Discovered games: {count}. Scan warnings: {warnings}.": "Upptäckta spel: {count}. Sökningsvarningar: {warnings}.",
+            "Discovered games: {count}.": "Upptäckta spel: {count}.",
+            "Games in the last snapshot: {count}.": "Spel i den senaste ögonblicksbilden: {count}.",
+            "Refresh accepted; provider status reports an issue.": "Uppdateringen godkändes; leverantörens status rapporterar ett problem.",
         },
         tr: {
             Integrations: "Entegrasyonlar",
@@ -4593,6 +4737,15 @@ var Amaterasu;
             "Refresh failed. Check provider status before retrying.": "Yenileme başarısız oldu. Yeniden denemeden önce sağlayıcı durumunu kontrol edin.",
             "Provider status reports an issue.": "Sağlayıcı durumu bir sorun bildiriyor.",
             "This account cannot read this provider's status.": "Bu hesap sağlayıcının durumunu okuyamaz.",
+            "Provider status read completed; no provider refresh was requested.": "Durum denetimi tamamlandı; sağlayıcı yenilemesi istenmedi.",
+            "Provider status check failed.": "Sağlayıcı durumu denetlenemedi.",
+            "Refresh accepted, but status readback failed. Check status before retrying.": "Yenileme kabul edildi ancak durum okunamadı. Yeniden denemeden önce durumu kontrol edin.",
+            "Refresh outcome is uncertain. Check status before retrying.": "Yenileme sonucu belirsiz. Yeniden denemeden önce durumu kontrol edin.",
+            "Request a {provider} refresh": "{provider} yenilemesi iste",
+            "Discovered games: {count}. Scan warnings: {warnings}.": "Bulunan oyunlar: {count}. Tarama uyarıları: {warnings}.",
+            "Discovered games: {count}.": "Bulunan oyunlar: {count}.",
+            "Games in the last snapshot: {count}.": "Son anlık görüntüdeki oyunlar: {count}.",
+            "Refresh accepted; provider status reports an issue.": "Yenileme kabul edildi; sağlayıcı durumu bir sorun bildiriyor.",
         },
         uk: {
             Integrations: "Інтеграції",
@@ -4611,6 +4764,15 @@ var Amaterasu;
             "Refresh failed. Check provider status before retrying.": "Не вдалося оновити. Перевірте стан провайдера перед повторною спробою.",
             "Provider status reports an issue.": "Стан провайдера повідомляє про проблему.",
             "This account cannot read this provider's status.": "Цей обліковий запис не може читати стан провайдера.",
+            "Provider status read completed; no provider refresh was requested.": "Перевірку стану завершено; оновлення провайдера не запитували.",
+            "Provider status check failed.": "Не вдалося перевірити стан провайдера.",
+            "Refresh accepted, but status readback failed. Check status before retrying.": "Запит прийнято, але стан не вдалося прочитати. Перевірте його перед повторною спробою.",
+            "Refresh outcome is uncertain. Check status before retrying.": "Результат оновлення невідомий. Перевірте стан перед повторною спробою.",
+            "Request a {provider} refresh": "Запросити оновлення {provider}",
+            "Discovered games: {count}. Scan warnings: {warnings}.": "Знайдено ігор: {count}. Попередження сканування: {warnings}.",
+            "Discovered games: {count}.": "Знайдено ігор: {count}.",
+            "Games in the last snapshot: {count}.": "Ігор в останньому знімку: {count}.",
+            "Refresh accepted; provider status reports an issue.": "Запит на оновлення прийнято; стан провайдера повідомляє про проблему.",
         },
         vi: {
             Integrations: "Tích hợp",
@@ -4629,6 +4791,15 @@ var Amaterasu;
             "Refresh failed. Check provider status before retrying.": "Làm mới thất bại. Hãy kiểm tra trạng thái trước khi thử lại.",
             "Provider status reports an issue.": "Trạng thái nhà cung cấp báo có sự cố.",
             "This account cannot read this provider's status.": "Tài khoản này không thể đọc trạng thái của nhà cung cấp.",
+            "Provider status read completed; no provider refresh was requested.": "Đã đọc xong trạng thái; không yêu cầu làm mới nhà cung cấp.",
+            "Provider status check failed.": "Không thể kiểm tra trạng thái nhà cung cấp.",
+            "Refresh accepted, but status readback failed. Check status before retrying.": "Đã chấp nhận làm mới nhưng không đọc được trạng thái. Hãy kiểm tra trước khi thử lại.",
+            "Refresh outcome is uncertain. Check status before retrying.": "Kết quả làm mới chưa xác định. Hãy kiểm tra trạng thái trước khi thử lại.",
+            "Request a {provider} refresh": "Yêu cầu làm mới {provider}",
+            "Discovered games: {count}. Scan warnings: {warnings}.": "Trò chơi được phát hiện: {count}. Cảnh báo quét: {warnings}.",
+            "Discovered games: {count}.": "Trò chơi được phát hiện: {count}.",
+            "Games in the last snapshot: {count}.": "Trò chơi trong ảnh chụp gần nhất: {count}.",
+            "Refresh accepted; provider status reports an issue.": "Đã chấp nhận làm mới; trạng thái nhà cung cấp báo có sự cố.",
         },
     };
     const PAGE_COPY_KEYS = [
@@ -5874,12 +6045,17 @@ var Amaterasu;
 (function (Amaterasu) {
     async function refreshLutrisProvider(api, accepted) {
         const status = await api.post("lutris/refresh");
+        if (!status || status.ok !== true)
+            throw new Error("Lutris refresh was not accepted.");
         accepted?.();
         return status;
     }
     Amaterasu.refreshLutrisProvider = refreshLutrisProvider;
     async function refreshPlayniteProvider(api, accepted) {
-        await api.post("playnite/refresh");
+        const response = await api.post("playnite/refresh");
+        if (!response || typeof response !== "object" || Array.isArray(response) ||
+            response.ok !== true)
+            throw new Error("Playnite refresh was not accepted.");
         accepted?.();
         return api.post("playnite/status");
     }
@@ -14014,6 +14190,8 @@ var Amaterasu;
                 state: scanning ? "Scanning" : complete ? "Scan complete" : "Awaiting scan",
                 tone: "",
                 detail: `${count} discovered games · ${warnings} scan warnings.`,
+                detailTemplate: "Discovered games: {count}. Scan warnings: {warnings}.",
+                detailValues: { count, warnings },
             };
         }
         if (name === "lutris") {
@@ -14031,8 +14209,12 @@ var Amaterasu;
             const lastError = record.last_error;
             if (lastError !== null && typeof lastError !== "string")
                 throw new Error("Provider status is invalid.");
-            return { state: lastError ? "Scan issue" : pending ? "Scanning" : "Available", tone: lastError ? "bad" : "",
-                detail: lastError ? `Last scan issue: ${lastError}` : `${count} discovered games.` };
+            return {
+                state: lastError ? "Scan issue" : pending ? "Scanning" : "Available",
+                tone: lastError ? "bad" : "",
+                detail: lastError ? `Last scan issue: ${lastError}` : `${count} discovered games.`,
+                ...(!lastError ? { detailTemplate: "Discovered games: {count}.", detailValues: { count } } : {}),
+            };
         }
         const running = providerBoolean(record, "playnite_running");
         const count = providerCount(record, "snapshot_game_count");
@@ -14044,6 +14226,7 @@ var Amaterasu;
             state: lastError ? "Sync issue" : pending ? "Syncing" : running ? "Running" : "Not detected",
             tone: lastError ? "bad" : "",
             detail: lastError ? `Last sync issue: ${lastError}` : `${count} games in the last snapshot.`,
+            ...(!lastError ? { detailTemplate: "Games in the last snapshot: {count}.", detailValues: { count } } : {}),
         };
     }
     Amaterasu.summarizeProvider = summarizeProvider;
@@ -14081,6 +14264,8 @@ var Amaterasu;
                 }
                 else if (provider.name !== "steam") {
                     refreshButton = Amaterasu.button(Amaterasu.localizedMessage("Refresh now"), () => refreshProvider(provider.name));
+                    if (typeof Amaterasu.setLocalizedAttributeTemplate === "function")
+                        Amaterasu.setLocalizedAttributeTemplate(refreshButton, "aria-label", "Request a {provider} refresh", { provider: Amaterasu.literalText(provider.label) });
                     refreshButton.disabled = true;
                     refreshButton.hidden = !context.api.allows("configuration.write");
                     actions.append(refreshButton);
@@ -14114,11 +14299,14 @@ var Amaterasu;
                         showProviderStatus(status, summary);
                         setProviderStatus(value);
                         if (announceReadback && !activeRefreshes.has(provider.name))
-                            cards.find((item) => item.provider.name === provider.name)?.feedback.replaceChildren(Amaterasu.el("span", "", Amaterasu.localizedMessage("Refresh accepted; current provider status was read back.")));
+                            cards.find((item) => item.provider.name === provider.name)?.feedback.replaceChildren(Amaterasu.el("span", "", Amaterasu.localizedMessage("Provider status read completed; no provider refresh was requested.")));
                     }
                     catch (error) {
-                        if (context.content.isConnected && request === generation)
+                        if (context.content.isConnected && request === generation) {
                             status.replaceChildren(Amaterasu.errorPanel(error));
+                            if (announceReadback)
+                                cards.find((item) => item.provider.name === provider.name)?.feedback.replaceChildren(Amaterasu.el("span", "", Amaterasu.localizedMessage("Provider status check failed.")), Amaterasu.el("span", "", Amaterasu.literalText(error instanceof Error ? error.message : String(error))));
+                        }
                     }
                 }));
             }
@@ -14129,11 +14317,27 @@ var Amaterasu;
         }
         function showProviderStatus(target, summary) {
             const observedAt = new Date();
-            const detail = summary.tone === "bad" ? Amaterasu.literalText(summary.detail) : Amaterasu.localizedMessage(summary.detail);
+            const detail = summary.tone === "bad"
+                ? Amaterasu.literalText(summary.detail)
+                : summary.detailTemplate
+                    ? providerCountTemplate(summary.detailTemplate, summary.detailValues ?? {})
+                    : Amaterasu.localizedMessage(summary.detail);
             const timestamp = Amaterasu.el("time", "", Amaterasu.literalText(observedAt.toISOString()));
             timestamp.dateTime = observedAt.toISOString();
             const observed = Amaterasu.el("p", "muted", Amaterasu.localizedMessage("Status observed"), " ", timestamp);
             target.replaceChildren(Amaterasu.badge(Amaterasu.localizedMessage(summary.state), summary.tone), Amaterasu.el("p", "muted", detail), observed);
+        }
+        function providerCountTemplate(template, values) {
+            const format = (locale) => {
+                let message = typeof Amaterasu.translateText === "function"
+                    ? Amaterasu.translateText(template) : template;
+                for (const [key, value] of Object.entries(values))
+                    message = message.replaceAll(`{${key}}`, new Intl.NumberFormat(locale).format(value));
+                return message;
+            };
+            return typeof Amaterasu.localeFormattedTextNode === "function"
+                ? Amaterasu.localeFormattedTextNode(format)
+                : format("en");
         }
         function currentCard(item) {
             return context.content.isConnected && item.card.parentElement === area;
@@ -14160,7 +14364,9 @@ var Amaterasu;
             try {
                 await Amaterasu.runAction(target, item.feedback, async () => {
                     item.feedback.replaceChildren(Amaterasu.el("span", "", Amaterasu.localizedMessage("Refreshing provider...")));
+                    let requestAccepted = false;
                     const accepted = () => {
+                        requestAccepted = true;
                         if (currentCard(item))
                             item.feedback.replaceChildren(Amaterasu.el("span", "", Amaterasu.localizedMessage("Refresh request accepted. Checking provider status.")));
                     };
@@ -14173,14 +14379,16 @@ var Amaterasu;
                         const summary = summarizeProvider(name, updated);
                         showProviderStatus(item.status, summary);
                         item.feedback.replaceChildren(summary.tone === "bad"
-                            ? Amaterasu.el("span", "", Amaterasu.localizedMessage("Provider status reports an issue."), " ", Amaterasu.literalText(summary.detail))
+                            ? Amaterasu.el("span", "", Amaterasu.localizedMessage("Refresh accepted; provider status reports an issue."), " ", Amaterasu.literalText(summary.detail))
                             : Amaterasu.el("span", "", Amaterasu.localizedMessage("Refresh accepted; current provider status was read back.")));
                         item.setProviderStatus(updated);
                     }
                     catch (error) {
                         item.setProviderStatus(null);
                         if (currentCard(item))
-                            item.feedback.replaceChildren(Amaterasu.el("span", "", Amaterasu.localizedMessage("Refresh failed. Check provider status before retrying.")), Amaterasu.el("span", "", Amaterasu.literalText(error instanceof Error ? error.message : String(error))));
+                            item.feedback.replaceChildren(Amaterasu.el("span", "", Amaterasu.localizedMessage(requestAccepted
+                                ? "Refresh accepted, but status readback failed. Check status before retrying."
+                                : "Refresh outcome is uncertain. Check status before retrying.")), Amaterasu.el("span", "", Amaterasu.literalText(error instanceof Error ? error.message : String(error))));
                     }
                 });
             }

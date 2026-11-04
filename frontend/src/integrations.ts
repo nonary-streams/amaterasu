@@ -4,6 +4,8 @@ namespace Amaterasu {
     state: string;
     tone: "" | "good" | "bad";
     detail: string;
+    detailTemplate?: string;
+    detailValues?: Record<string, number>;
   }
 
   function providerRecord(value: unknown): Record<string, unknown> {
@@ -43,6 +45,8 @@ namespace Amaterasu {
         state: scanning ? "Scanning" : complete ? "Scan complete" : "Awaiting scan",
         tone: "",
         detail: `${count} discovered games · ${warnings} scan warnings.`,
+        detailTemplate: "Discovered games: {count}. Scan warnings: {warnings}.",
+        detailValues: { count, warnings },
       };
     }
     if (name === "lutris") {
@@ -59,8 +63,12 @@ namespace Amaterasu {
       const pending = providerBoolean(record, "refresh_pending");
       const lastError = record.last_error;
       if (lastError !== null && typeof lastError !== "string") throw new Error("Provider status is invalid.");
-      return { state: lastError ? "Scan issue" : pending ? "Scanning" : "Available", tone: lastError ? "bad" : "",
-        detail: lastError ? `Last scan issue: ${lastError}` : `${count} discovered games.` };
+      return {
+        state: lastError ? "Scan issue" : pending ? "Scanning" : "Available",
+        tone: lastError ? "bad" : "",
+        detail: lastError ? `Last scan issue: ${lastError}` : `${count} discovered games.`,
+        ...(!lastError ? { detailTemplate: "Discovered games: {count}.", detailValues: { count } } : {}),
+      };
     }
     const running = providerBoolean(record, "playnite_running");
     const count = providerCount(record, "snapshot_game_count");
@@ -71,6 +79,7 @@ namespace Amaterasu {
       state: lastError ? "Sync issue" : pending ? "Syncing" : running ? "Running" : "Not detected",
       tone: lastError ? "bad" : "",
       detail: lastError ? `Last sync issue: ${lastError}` : `${count} games in the last snapshot.`,
+      ...(!lastError ? { detailTemplate: "Games in the last snapshot: {count}.", detailValues: { count } } : {}),
     };
   }
 
@@ -116,6 +125,13 @@ namespace Amaterasu {
           actions.append(button(localizedMessage("Manage Steam library"), () => context.navigate("steam")));
         } else if (provider.name !== "steam") {
           refreshButton = button(localizedMessage("Refresh now"), () => refreshProvider(provider.name as "lutris" | "playnite"));
+          if (typeof Amaterasu.setLocalizedAttributeTemplate === "function")
+            Amaterasu.setLocalizedAttributeTemplate(
+              refreshButton,
+              "aria-label",
+              "Request a {provider} refresh",
+              { provider: literalText(provider.label) },
+            );
           refreshButton.disabled = true;
           refreshButton.hidden = !context.api.allows("configuration.write");
           actions.append(refreshButton);
@@ -150,10 +166,17 @@ namespace Amaterasu {
             setProviderStatus(value);
             if (announceReadback && !activeRefreshes.has(provider.name))
               cards.find((item) => item.provider.name === provider.name)?.feedback.replaceChildren(
-                el("span", "", localizedMessage("Refresh accepted; current provider status was read back.")),
+                el("span", "", localizedMessage("Provider status read completed; no provider refresh was requested.")),
               );
           } catch (error) {
-            if (context.content.isConnected && request === generation) status.replaceChildren(errorPanel(error));
+            if (context.content.isConnected && request === generation) {
+              status.replaceChildren(errorPanel(error));
+              if (announceReadback)
+                cards.find((item) => item.provider.name === provider.name)?.feedback.replaceChildren(
+                  el("span", "", localizedMessage("Provider status check failed.")),
+                  el("span", "", literalText(error instanceof Error ? error.message : String(error))),
+                );
+            }
           }
         }));
       } finally {
@@ -162,11 +185,28 @@ namespace Amaterasu {
     }
     function showProviderStatus(target: HTMLElement, summary: ProviderSummary): void {
       const observedAt = new Date();
-      const detail = summary.tone === "bad" ? literalText(summary.detail) : localizedMessage(summary.detail);
+      const detail = summary.tone === "bad"
+        ? literalText(summary.detail)
+        : summary.detailTemplate
+          ? providerCountTemplate(summary.detailTemplate, summary.detailValues ?? {})
+          : localizedMessage(summary.detail);
       const timestamp = el("time", "", literalText(observedAt.toISOString()));
       timestamp.dateTime = observedAt.toISOString();
       const observed = el("p", "muted", localizedMessage("Status observed"), " ", timestamp);
       target.replaceChildren(badge(localizedMessage(summary.state), summary.tone), el("p", "muted", detail), observed);
+    }
+
+    function providerCountTemplate(template: string, values: Record<string, number>): Node | string {
+      const format = (locale: string): string => {
+        let message = typeof Amaterasu.translateText === "function"
+          ? Amaterasu.translateText(template) : template;
+        for (const [key, value] of Object.entries(values))
+          message = message.replaceAll(`{${key}}`, new Intl.NumberFormat(locale).format(value));
+        return message;
+      };
+      return typeof Amaterasu.localeFormattedTextNode === "function"
+        ? Amaterasu.localeFormattedTextNode(format)
+        : format("en");
     }
 
     function currentCard(item: Card): boolean {
@@ -191,7 +231,9 @@ namespace Amaterasu {
       try {
         await runAction(target, item.feedback, async () => {
           item.feedback.replaceChildren(el("span", "", localizedMessage("Refreshing provider...")));
+          let requestAccepted = false;
           const accepted = (): void => {
+            requestAccepted = true;
             if (currentCard(item))
               item.feedback.replaceChildren(el("span", "", localizedMessage("Refresh request accepted. Checking provider status.")));
           };
@@ -204,14 +246,16 @@ namespace Amaterasu {
             showProviderStatus(item.status, summary);
             item.feedback.replaceChildren(
               summary.tone === "bad"
-                ? el("span", "", localizedMessage("Provider status reports an issue."), " ", literalText(summary.detail))
+                ? el("span", "", localizedMessage("Refresh accepted; provider status reports an issue."), " ", literalText(summary.detail))
                 : el("span", "", localizedMessage("Refresh accepted; current provider status was read back.")),
             );
             item.setProviderStatus(updated);
           } catch (error) {
             item.setProviderStatus(null);
             if (currentCard(item)) item.feedback.replaceChildren(
-              el("span", "", localizedMessage("Refresh failed. Check provider status before retrying.")),
+              el("span", "", localizedMessage(requestAccepted
+                ? "Refresh accepted, but status readback failed. Check status before retrying."
+                : "Refresh outcome is uncertain. Check status before retrying.")),
               el("span", "", literalText(error instanceof Error ? error.message : String(error))),
             );
           }
