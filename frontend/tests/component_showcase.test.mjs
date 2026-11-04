@@ -11,6 +11,7 @@ class Element {
     this.hidden = false; this.disabled = false; this.open = false; this.validity = { valid: true };
   }
   append(...children) { this.children.push(...children); }
+  replaceChildren(...children) { this.children = children; }
   setAttribute(name, value) { this.attributes[name] = String(value); }
   getAttribute(name) { return this.attributes[name] ?? null; }
   addEventListener(type, callback, options = {}) {
