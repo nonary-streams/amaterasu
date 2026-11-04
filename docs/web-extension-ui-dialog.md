@@ -47,8 +47,13 @@ focus returns to the connected element that was active before `open()`.
 The cancel button and Escape both close with reason `cancel`; `close()` reports
 `close`; manually disposing an open dialog reports `dispose`. Native
 `element.close()` and `form method="dialog"` close events are handled too.
-`onClose` receives one of those reasons. `open()` waits until a queued native
-close event has been processed before reopening the same instance. A host
+`onClose` receives one of those reasons. Forms using `method="dialog"` retain
+native submit behavior and submitter return values; plugin submit listeners run
+normally and can cancel submission. A submit button's `formmethod` override is
+respected, and nested dialogs handle only their own forms. Closing a parent
+closes any open nested dialogs without returning focus into the closing parent.
+`open()` waits until a queued native close event has been processed before
+reopening the same instance. A host
 lifecycle abort closes and removes the dialog without running `onClose` or
 restoring focus into a page that is being torn down. `dispose()` is idempotent
 and removes the dialog and its listeners even if `onClose` throws; the callback

@@ -284,9 +284,76 @@ test("Chromium correlates native and method=dialog closes before allowing immedi
   assert.equal(await cdp.evaluate("window.__formDialog.element.open"), false);
   await tick();
   assert.deepEqual(await cdp.evaluate("window.__reasons"), ["native:close", "native:close", "form:close"]);
+  assert.equal(await cdp.evaluate("window.__formDialog.element.returnValue"), "accept");
   await cdp.evaluate("window.__formDialog.open(); true");
   assert.equal(await cdp.evaluate("window.__formDialog.element.open"), true);
   await cdp.evaluate("window.__formDialog.dispose(); true");
+});
+
+
+
+test("Chromium preserves submit handlers, cancellation, and submitter formmethod overrides", async t => {
+  if (!browser) return t.skip("Chromium browser setup unavailable.");
+  const {cdp} = browser;
+  await cdp.evaluate(`window.__reset(); window.__reasons=[]; window.__submits=0;
+    window.__opener=document.createElement("button"); window.__mount.append(window.__opener);
+    window.__form=document.createElement("form"); window.__form.method="dialog";
+    window.__submit=document.createElement("button"); window.__submit.type="submit"; window.__submit.value="keep-open";
+    window.__form.append(window.__submit);
+    window.__cancelHandler=event=>{ window.__submits++; event.preventDefault(); };
+    window.__form.addEventListener("submit", window.__cancelHandler);
+    window.__dialog=window.__ui.dialog({title:"Canceled submit",content:window.__form,onClose:reason=>window.__reasons.push(reason)});
+    window.__mount.append(window.__dialog.element); window.__opener.focus(); window.__dialog.open();
+    window.__form.requestSubmit(window.__submit); true`);
+  await tick();
+  assert.equal(await cdp.evaluate("window.__submits"), 1);
+  assert.equal(await cdp.evaluate("window.__dialog.element.open"), true);
+  assert.equal(await cdp.evaluate("window.__reasons.length"), 0);
+
+  await cdp.evaluate(`window.__form.onsubmit=null;
+    window.__form.addEventListener("submit", event=>event.preventDefault(), {once:true});
+    window.__submit.setAttribute("formmethod","get"); window.__form.requestSubmit(window.__submit); true`);
+  await tick();
+  assert.equal(await cdp.evaluate("window.__dialog.element.open"), true);
+  assert.equal(await cdp.evaluate("window.__reasons.length"), 0);
+
+  await cdp.evaluate(`window.__form.removeEventListener("submit", window.__cancelHandler);
+    window.__form.method="get"; window.__submit.setAttribute("formmethod","dialog");
+    window.__submit.value="override-return"; window.__form.requestSubmit(window.__submit); true`);
+  assert.equal(await cdp.evaluate("window.__dialog.element.open"), false);
+  await tick();
+  assert.equal(await cdp.evaluate("window.__dialog.element.returnValue"), "override-return");
+  assert.deepEqual(await cdp.evaluate("window.__reasons"), ["close"]);
+  await cdp.evaluate("window.__dialog.dispose(); true");
+});
+
+test("Chromium scopes method=dialog to the owning nested dialog and closes children with parents", async t => {
+  if (!browser) return t.skip("Chromium browser setup unavailable.");
+  const {cdp} = browser;
+  await cdp.evaluate(`window.__reset(); window.__reasons=[];
+    window.__outerOpener=document.createElement("button"); window.__mount.append(window.__outerOpener);
+    window.__outerContent=document.createElement("div");
+    window.__outer=window.__ui.dialog({title:"Outer dialog",content:window.__outerContent,onClose:reason=>window.__reasons.push("outer:"+reason)});
+    window.__innerForm=document.createElement("form"); window.__innerForm.method="dialog";
+    window.__innerSubmit=document.createElement("button"); window.__innerSubmit.type="submit"; window.__innerSubmit.value="inner-value";
+    window.__innerForm.append(window.__innerSubmit);
+    window.__inner=window.__ui.dialog({title:"Inner dialog",content:window.__innerForm,onClose:reason=>window.__reasons.push("inner:"+reason)});
+    window.__outerContent.append(window.__inner.element); window.__mount.append(window.__outer.element);
+    window.__outerOpener.focus(); window.__outer.open(); window.__inner.open();
+    window.__innerForm.requestSubmit(window.__innerSubmit); true`);
+  assert.equal(await cdp.evaluate("window.__outer.element.open"), true);
+  assert.equal(await cdp.evaluate("window.__inner.element.open"), false);
+  await tick();
+  assert.equal(await cdp.evaluate("window.__inner.element.returnValue"), "inner-value");
+  assert.deepEqual(await cdp.evaluate("window.__reasons"), ["inner:close"]);
+
+  await cdp.evaluate("window.__inner.open(); window.__outer.close(); true");
+  assert.equal(await cdp.evaluate("window.__outer.element.open"), false);
+  assert.equal(await cdp.evaluate("window.__inner.element.open"), false);
+  await tick();
+  assert.equal(await cdp.evaluate("document.activeElement === window.__outerOpener"), true);
+  assert.deepEqual(await cdp.evaluate("window.__reasons"), ["inner:close", "inner:close", "outer:close"]);
+  await cdp.evaluate("window.__inner.dispose(); window.__outer.dispose(); true");
 });
 
 test("Chromium always completes disposal when an onClose callback throws", async t => {

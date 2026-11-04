@@ -21011,6 +21011,7 @@ var Amaterasu;
 var Amaterasu;
 (function (Amaterasu) {
     let nextExtensionUiDialogId = 0;
+    const extensionUiDialogCloseFromParent = new WeakMap();
     function extensionUiDialogTextNode(value) {
         if (typeof value === "string") {
             if (!value.trim())
@@ -21098,18 +21099,33 @@ var Amaterasu;
                 let opener = null;
                 let pendingCloseReason = null;
                 let closeEventPending = false;
+                let suppressFocusReturn = false;
                 const restoreFocus = () => {
                     const target = opener;
                     opener = null;
                     if (!signal.aborted && target?.isConnected)
                         target.focus();
                 };
-                const closeDialog = (reason) => {
+                const closeNestedDialogs = () => {
+                    const nestedDialogs = Array.from(element.querySelectorAll("dialog")).reverse();
+                    for (const nested of nestedDialogs) {
+                        const closeOwned = extensionUiDialogCloseFromParent.get(nested);
+                        if (closeOwned)
+                            closeOwned();
+                        else if (nested.open)
+                            nested.close();
+                    }
+                };
+                const closeDialog = (reason, returnValue) => {
                     if (disposed || signal.aborted || !element.open)
                         return;
                     pendingCloseReason = reason;
                     closeEventPending = true;
-                    element.close(reason);
+                    element.close(returnValue ?? reason);
+                };
+                const closeFromParent = () => {
+                    suppressFocusReturn = true;
+                    closeDialog("close");
                 };
                 const onCancel = (event) => {
                     event.preventDefault();
@@ -21139,19 +21155,35 @@ var Amaterasu;
                     const reason = pendingCloseReason ?? (element.returnValue === "cancel" ? "cancel" : "close");
                     pendingCloseReason = null;
                     closeEventPending = false;
+                    const shouldRestoreFocus = !suppressFocusReturn;
+                    suppressFocusReturn = false;
                     if (disposed || signal.aborted)
                         return;
-                    restoreFocus();
+                    if (shouldRestoreFocus)
+                        restoreFocus();
+                    else
+                        opener = null;
                     options.onClose?.(reason);
                 };
                 const onDialogFormSubmit = (event) => {
                     const form = event.target;
-                    if (form?.tagName !== "FORM" || form.method.toLowerCase() !== "dialog")
+                    if (form?.tagName !== "FORM" || form.closest("dialog") !== element)
                         return;
-                    event.preventDefault();
-                    event.stopImmediatePropagation();
                     const submitter = event.submitter;
-                    closeDialog(submitter?.value === "cancel" ? "cancel" : "close");
+                    const method = submitter?.hasAttribute("formmethod")
+                        ? submitter.formMethod.toLowerCase() : form.method.toLowerCase();
+                    if (method !== "dialog")
+                        return;
+                    pendingCloseReason = "close";
+                    closeEventPending = true;
+                    queueMicrotask(() => {
+                        if (disposed || signal.aborted)
+                            return;
+                        if (event.defaultPrevented || element.open) {
+                            pendingCloseReason = null;
+                            closeEventPending = false;
+                        }
+                    });
                 };
                 const onHostAbort = () => {
                     if (disposed)
@@ -21168,6 +21200,8 @@ var Amaterasu;
                     }
                 };
                 element.close = ((returnValue) => {
+                    if (element.open)
+                        closeNestedDialogs();
                     if (element.open && !disposed && !signal.aborted) {
                         closeEventPending = true;
                         if (pendingCloseReason === null)
@@ -21175,6 +21209,7 @@ var Amaterasu;
                     }
                     nativeClose(returnValue);
                 });
+                extensionUiDialogCloseFromParent.set(element, closeFromParent);
                 cancelButton.addEventListener("click", () => closeDialog("cancel"), { signal: controller.signal });
                 element.addEventListener("cancel", onCancel, { signal: controller.signal });
                 element.addEventListener("keydown", onKeyDown, { signal: controller.signal });
@@ -21220,6 +21255,7 @@ var Amaterasu;
                             opener = null;
                             controller.abort();
                             signal.removeEventListener("abort", onHostAbort);
+                            extensionUiDialogCloseFromParent.delete(element);
                             element.remove();
                         }
                     },

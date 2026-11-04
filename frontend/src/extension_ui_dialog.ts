@@ -24,6 +24,7 @@ namespace Amaterasu {
   export type ExtensionUiWithDialogsV1 = ExtensionUiWithFeedbackV1 & ExtensionUiDialogsV1;
 
   let nextExtensionUiDialogId = 0;
+  const extensionUiDialogCloseFromParent = new WeakMap<HTMLDialogElement, () => void>();
 
   function extensionUiDialogTextNode(value: ExtensionUiText): Text | string {
     if (typeof value === "string") {
@@ -113,16 +114,29 @@ namespace Amaterasu {
         let opener: HTMLElement | null = null;
         let pendingCloseReason: ExtensionUiDialogCloseReason | null = null;
         let closeEventPending = false;
+        let suppressFocusReturn = false;
         const restoreFocus = (): void => {
           const target = opener;
           opener = null;
           if (!signal.aborted && target?.isConnected) target.focus();
         };
-        const closeDialog = (reason: ExtensionUiDialogCloseReason): void => {
+        const closeNestedDialogs = (): void => {
+          const nestedDialogs = Array.from(element.querySelectorAll<HTMLDialogElement>("dialog")).reverse();
+          for (const nested of nestedDialogs) {
+            const closeOwned = extensionUiDialogCloseFromParent.get(nested);
+            if (closeOwned) closeOwned();
+            else if (nested.open) nested.close();
+          }
+        };
+        const closeDialog = (reason: ExtensionUiDialogCloseReason, returnValue?: string): void => {
           if (disposed || signal.aborted || !element.open) return;
           pendingCloseReason = reason;
           closeEventPending = true;
-          element.close(reason);
+          element.close(returnValue ?? reason);
+        };
+        const closeFromParent = (): void => {
+          suppressFocusReturn = true;
+          closeDialog("close");
         };
         const onCancel = (event: Event): void => {
           event.preventDefault();
@@ -151,17 +165,29 @@ namespace Amaterasu {
           const reason = pendingCloseReason ?? (element.returnValue === "cancel" ? "cancel" : "close");
           pendingCloseReason = null;
           closeEventPending = false;
+          const shouldRestoreFocus = !suppressFocusReturn;
+          suppressFocusReturn = false;
           if (disposed || signal.aborted) return;
-          restoreFocus();
+          if (shouldRestoreFocus) restoreFocus();
+          else opener = null;
           options.onClose?.(reason);
         };
         const onDialogFormSubmit = (event: SubmitEvent): void => {
           const form = event.target as HTMLFormElement | null;
-          if (form?.tagName !== "FORM" || form.method.toLowerCase() !== "dialog") return;
-          event.preventDefault();
-          event.stopImmediatePropagation();
-          const submitter = event.submitter as HTMLButtonElement | null;
-          closeDialog(submitter?.value === "cancel" ? "cancel" : "close");
+          if (form?.tagName !== "FORM" || form.closest("dialog") !== element) return;
+          const submitter = event.submitter as HTMLButtonElement | HTMLInputElement | null;
+          const method = submitter?.hasAttribute("formmethod")
+            ? submitter.formMethod.toLowerCase() : form.method.toLowerCase();
+          if (method !== "dialog") return;
+          pendingCloseReason = "close";
+          closeEventPending = true;
+          queueMicrotask(() => {
+            if (disposed || signal.aborted) return;
+            if (event.defaultPrevented || element.open) {
+              pendingCloseReason = null;
+              closeEventPending = false;
+            }
+          });
         };
         const onHostAbort = (): void => {
           if (disposed) return;
@@ -175,6 +201,7 @@ namespace Amaterasu {
           }
         };
         element.close = ((returnValue?: string): void => {
+          if (element.open) closeNestedDialogs();
           if (element.open && !disposed && !signal.aborted) {
             closeEventPending = true;
             if (pendingCloseReason === null)
@@ -182,6 +209,7 @@ namespace Amaterasu {
           }
           nativeClose(returnValue);
         }) as typeof element.close;
+        extensionUiDialogCloseFromParent.set(element, closeFromParent);
         cancelButton.addEventListener("click", () => closeDialog("cancel"), { signal: controller.signal });
         element.addEventListener("cancel", onCancel, { signal: controller.signal });
         element.addEventListener("keydown", onKeyDown, { signal: controller.signal });
@@ -222,6 +250,7 @@ namespace Amaterasu {
               opener = null;
               controller.abort();
               signal.removeEventListener("abort", onHostAbort);
+              extensionUiDialogCloseFromParent.delete(element);
               element.remove();
             }
           },
