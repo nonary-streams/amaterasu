@@ -1,4 +1,24 @@
 namespace Amaterasu {
+  function steamChooserMessage(value: string): TextValue {
+    return typeof Amaterasu.localizedMessage === "function"
+      ? Amaterasu.localizedMessage(value)
+      : value;
+  }
+
+  function steamChooserSetText(target: Element, value: string): void {
+    if (typeof Amaterasu.setLocalizedTextContent === "function")
+      Amaterasu.setLocalizedTextContent(target, value);
+    else
+      target.textContent = value;
+  }
+
+  function steamChooserSetAttribute(target: Element, attribute: "aria-label", value: string): void {
+    if (typeof Amaterasu.setLocalizedAttribute === "function")
+      Amaterasu.setLocalizedAttribute(target, attribute, value);
+    else
+      target.setAttribute(attribute, value);
+  }
+
   export interface SteamChooserGame { app_id: number; name: string; install_directory?: string; }
   export interface SteamChooserReply {
     revision: number; games: SteamChooserGame[]; next_after: number | null; scanning: boolean; complete: boolean;
@@ -42,16 +62,16 @@ namespace Amaterasu {
   export function chooseSteamGame(api: SteamChooserApi): Promise<SteamChooserGame | null> {
     return new Promise((resolve) => {
       const dialog = el("dialog", "steam-game-chooser-dialog");
-      dialog.setAttribute("aria-label", "Choose a Steam game");
+      steamChooserSetAttribute(dialog, "aria-label", "Choose a Steam game");
       const status = el("p", "steam-game-chooser-status");
       status.setAttribute("role", "status");
       const list = el("ul", "steam-game-chooser-list");
-      const previous = button("← Previous", () => void showPage(pageIndex - 1));
-      const next = button("Next →", () => void showPage(pageIndex + 1), "primary");
-      const cancel = button("Cancel", () => finish(null));
+      const previous = button(steamChooserMessage("← Previous"), () => void showPage(pageIndex - 1));
+      const next = button(steamChooserMessage("Next →"), () => void showPage(pageIndex + 1), "primary");
+      const cancel = button(steamChooserMessage("Cancel"), () => finish(null));
       const pagination = el("div", "actions steam-game-chooser-pagination", previous, next);
-      dialog.append(el("h2", "", "Choose a Steam game"),
-        el("p", "muted", "Select a discovered game to use its Steam app ID and optional install directory."),
+      dialog.append(el("h2", "", steamChooserMessage("Choose a Steam game")),
+        el("p", "muted", steamChooserMessage("Select a discovered game to use its Steam app ID and optional install directory.")),
         status, list, pagination, el("div", "actions", cancel));
 
       let settled = false;
@@ -74,7 +94,7 @@ namespace Amaterasu {
       async function showPage(requestedPage: number): Promise<void> {
         if (settled || loading || requestedPage < 0 || requestedPage > pageIndex + 1) return;
         if (!api.allows("steam.read")) {
-          status.textContent = "Steam discovery requires steam.read permission. You can enter a Steam app ID manually.";
+          steamChooserSetText(status, "Steam discovery requires steam.read permission. You can enter a Steam app ID manually.");
           list.replaceChildren();
           updatePager(false);
           return;
@@ -83,7 +103,7 @@ namespace Amaterasu {
         pageIndex = requestedPage;
         const cursor = cursors[pageIndex] ?? null;
         list.replaceChildren();
-        status.textContent = "Loading discovered Steam games…";
+        steamChooserSetText(status, "Loading discovered Steam games…");
         updatePager(false);
         try {
           const raw = await api.post<SteamChooserReply>("steam/list", {
@@ -101,26 +121,31 @@ namespace Amaterasu {
           if (reply.next_after !== null) cursors[pageIndex + 1] = reply.next_after;
           else cursors.length = pageIndex + 1;
           for (const game of reply.games) {
-            const select = button("Select", () => finish(game));
-            select.setAttribute("aria-label", `Select ${game.name}`);
-            const directory = game.install_directory || "Install directory unavailable";
+            const select = button(steamChooserMessage("Select"), () => finish(game));
+            steamChooserSetAttribute(select, "aria-label", `Select ${game.name}`);
+            const directory = game.install_directory || "";
             list.append(el("li", "steam-game-chooser-item",
-              el("div", "steam-game-chooser-copy", el("strong", "", game.name),
-                el("span", "steam-game-chooser-details", `App ID ${game.app_id} · ${directory}`)),
+              el("div", "steam-game-chooser-copy",
+                el("strong", "", typeof Amaterasu.literalText === "function" ? Amaterasu.literalText(game.name) : game.name),
+                el("span", "steam-game-chooser-details",
+                  steamChooserMessage("App ID "), String(game.app_id),
+                  " · ",
+                  steamChooserMessage(directory ? "Install directory" : "Install directory unavailable"),
+                  ...(directory ? [" ", typeof Amaterasu.literalText === "function" ? Amaterasu.literalText(directory) : directory] : []))),
               select));
           }
-          status.textContent = reply.games.length
-            ? `Page ${pageIndex + 1} · ${reply.games.length} games`
+          steamChooserSetText(status, reply.games.length
+            ? "Choose a game to continue."
             : reply.complete ? "No Steam games were discovered."
               : reply.scanning ? "Steam is still scanning. Refresh the chooser later to see discovered games."
-                : "No Steam games are available yet.";
+                : "No Steam games are available yet.");
           updatePager(reply.next_after !== null);
         } catch (error) {
           if (settled) return;
           const code = error instanceof ApiError ? error.code : "";
-          status.textContent = code === "forbidden" || code === "permission_denied"
+          steamChooserSetText(status, code === "forbidden" || code === "permission_denied"
             ? "Steam discovery requires steam.read permission. You can enter a Steam app ID manually."
-            : `Steam games are unavailable: ${error instanceof Error ? error.message : String(error)}`;
+            : "Steam games are unavailable. You can enter a Steam app ID manually.");
           list.replaceChildren();
           updatePager(false);
         } finally {
@@ -134,7 +159,7 @@ namespace Amaterasu {
       cancel.focus();
       if (api.allows("steam.read")) void showPage(0);
       else {
-        status.textContent = "Steam discovery requires steam.read permission. You can enter a Steam app ID manually.";
+        steamChooserSetText(status, "Steam discovery requires steam.read permission. You can enter a Steam app ID manually.");
         updatePager(false);
       }
     });

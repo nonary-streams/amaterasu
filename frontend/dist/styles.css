@@ -1834,3 +1834,34 @@ input, textarea, select {
 .plugin-control-error { color: var(--danger); }
 .plugin-control input[aria-invalid="true"], .plugin-control select[aria-invalid="true"] { border-color: var(--danger); }
 .radio-options { display: grid; gap: 8px; }
+.steam-game-chooser-dialog {
+  max-width: 720px;
+  max-height: min(760px, calc(100vh - 32px));
+  overflow-y: auto;
+  color: var(--fg, #e9edf5);
+  background: var(--panel, #171f2b);
+  border-color: var(--line, #3d495d);
+}
+.steam-game-chooser-dialog > h2 { margin-bottom: 8px; }
+.steam-game-chooser-dialog > p { margin: 0 0 14px; }
+.steam-game-chooser-status { min-height: 24px; }
+.steam-game-chooser-list {
+  display: grid; gap: 8px; max-height: min(48vh, 440px); overflow: auto;
+  padding: 0; margin: 12px 0; list-style: none;
+}
+.steam-game-chooser-item {
+  display: flex; align-items: center; justify-content: space-between; gap: 16px;
+  padding: 12px 14px; border: 1px solid var(--line, #3d495d); border-radius: 10px;
+  background: color-mix(in srgb, var(--panel, #171f2b) 88%, var(--accent, #e3bc73));
+}
+.steam-game-chooser-copy { display: grid; gap: 4px; min-width: 0; }
+.steam-game-chooser-copy strong, .steam-game-chooser-details { overflow-wrap: anywhere; }
+.steam-game-chooser-details { color: var(--muted, #98a6ba); font-size: 12px; }
+.steam-game-chooser-pagination { justify-content: space-between; }
+@media (max-width: 560px) { .steam-game-chooser-item { align-items: flex-start; } }
+.catalog-steam-chooser {
+  display: grid;
+  justify-items: start;
+  gap: 6px;
+}
+.catalog-steam-chooser > p { margin: 0; }

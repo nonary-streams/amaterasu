@@ -1760,7 +1760,7 @@ namespace Amaterasu {
       capabilities: CatalogConfigOverrideCapabilities,
     ): void {
       const editRevision = revision;
-      const form = entryForm(row?.entry, runtimeStatus, capabilities);
+      const form = entryForm(row?.entry, runtimeStatus, capabilities, api);
       form.hidden = !api.allows("catalog.write");
       const feedback = el("div");
       const save = el(
@@ -1950,6 +1950,7 @@ namespace Amaterasu {
     entry: Entry | undefined,
     runtimeStatus: InputRuntimeStatus,
     capabilities: CatalogConfigOverrideCapabilities,
+    api: Api,
   ): HTMLFormElement {
     const form = el("form", "editor-form");
     const name = input("name", entry?.name ?? "");
@@ -2172,6 +2173,41 @@ namespace Amaterasu {
     const pathField = field("Absolute application path", path);
     const steamIdField = field("Steam app ID", steamId, "Optional canonical Steam app ID for provider-aware process tracking.");
     const steamInstallDirField = field("Steam install directory", steamInstallDir, "Optional absolute game directory; Linux tracks only newly launched processes inside it.");
+    const steamChooserStatus = el("p", "muted");
+    steamChooserStatus.setAttribute("role", "status");
+    steamChooserStatus.hidden = true;
+    const chooseSteamGameButton = button(catalogTextMessage("Choose a Steam game"), async () => {
+      if (!api.allows("catalog.write")) return;
+      const selected = await chooseSteamGame(api);
+      if (!selected) return;
+      if (!api.allows("catalog.write")) {
+        steamChooserStatus.hidden = false;
+        if (typeof Amaterasu.setLocalizedTextContent === "function")
+          Amaterasu.setLocalizedTextContent(steamChooserStatus, "Catalog write permission changed; the selection was not applied.");
+        else
+          steamChooserStatus.textContent = "Catalog write permission changed; the selection was not applied.";
+        return;
+      }
+      steamId.value = String(selected.app_id);
+      steamId.dispatchEvent(new Event("input", { bubbles: true }));
+      steamId.dispatchEvent(new Event("change", { bubbles: true }));
+      if (selected.install_directory !== undefined) {
+        steamInstallDir.value = selected.install_directory;
+        steamInstallDir.dispatchEvent(new Event("input", { bubbles: true }));
+        steamInstallDir.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+      steamChooserStatus.hidden = false;
+      const status = selected.install_directory === undefined
+        ? "Steam game selected. Its install directory is unavailable; the existing directory was kept."
+        : "Steam game selected. Other application edits were kept.";
+      if (typeof Amaterasu.setLocalizedTextContent === "function")
+        Amaterasu.setLocalizedTextContent(steamChooserStatus, status);
+      else
+        steamChooserStatus.textContent = status;
+    });
+    catalogLocalizedAttribute(chooseSteamGameButton, "aria-label", "Choose a Steam game");
+    const steamGameChooser = el("div", "catalog-steam-chooser",
+      chooseSteamGameButton, steamChooserStatus);
     const fullscreen = field("Exit timeout (seconds)", fullscreenTimeout, "Graceful session close window, from 0 to 300 seconds.");
     const showKind = () => {
       executable.hidden = kind.value !== "executable";
@@ -2184,6 +2220,7 @@ namespace Amaterasu {
       path.required = !processless;
       steamIdField.hidden = processless;
       steamInstallDirField.hidden = processless;
+      steamGameChooser.hidden = processless;
       sharedLaunchOptions.hidden = kind.value === "application";
       directory.disabled = kind.value === "application";
       path.placeholder =
@@ -2197,7 +2234,8 @@ namespace Amaterasu {
         field("Name", name), field("Description", description),
         field("Tags", tags, "Separate tags with commas.")),
       catalogEditorDisclosure("Launch", "Choose how the host starts and tracks the application.",
-        field("Launch type", kind), pathField, steamIdField, steamInstallDirField, fullscreen, sharedLaunchOptions, executable,
+        field("Launch type", kind), pathField, steamIdField, steamInstallDirField,
+        steamGameChooser, fullscreen, sharedLaunchOptions, executable,
         field("Command output", outputMode, "Use default discards command output without saving an output value."),
         outputFile, rawPreparation,
         field("Skip global preparation commands", excludeGlobalPreparation,

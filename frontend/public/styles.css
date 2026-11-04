@@ -1859,3 +1859,9 @@ input, textarea, select {
 .steam-game-chooser-details { color: var(--muted, #98a6ba); font-size: 12px; }
 .steam-game-chooser-pagination { justify-content: space-between; }
 @media (max-width: 560px) { .steam-game-chooser-item { align-items: flex-start; } }
+.catalog-steam-chooser {
+  display: grid;
+  justify-items: start;
+  gap: 6px;
+}
+.catalog-steam-chooser > p { margin: 0; }

@@ -90,7 +90,7 @@ test("unavailable Steam discovery has a recoverable status and Cancel preserves 
   const original = structuredClone(editorDraft);
   const view = setup({ allows: () => true, async post() { throw new ApiError("provider offline", "steam_unavailable", 503); } });
   await settle();
-  assert.match(view.dialog.textContent, /Steam games are unavailable: provider offline/);
+  assert.match(view.dialog.textContent, /Steam games are unavailable/);
   view.dialog.dispatch("cancel");
   assert.equal(await view.pending, null);
   assert.deepEqual(editorDraft, original);

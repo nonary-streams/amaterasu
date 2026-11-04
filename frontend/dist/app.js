@@ -4509,6 +4509,160 @@ var Amaterasu;
 })(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
 (function (Amaterasu) {
+    function steamChooserMessage(value) {
+        return typeof Amaterasu.localizedMessage === "function"
+            ? Amaterasu.localizedMessage(value)
+            : value;
+    }
+    function steamChooserSetText(target, value) {
+        if (typeof Amaterasu.setLocalizedTextContent === "function")
+            Amaterasu.setLocalizedTextContent(target, value);
+        else
+            target.textContent = value;
+    }
+    function steamChooserSetAttribute(target, attribute, value) {
+        if (typeof Amaterasu.setLocalizedAttribute === "function")
+            Amaterasu.setLocalizedAttribute(target, attribute, value);
+        else
+            target.setAttribute(attribute, value);
+    }
+    const steamChooserPageSize = 16;
+    function validateSteamChooserReply(value) {
+        if (!value || typeof value !== "object" || Array.isArray(value))
+            throw new Error("Steam game discovery returned an invalid response.");
+        const reply = value;
+        if (!Number.isSafeInteger(reply.revision) || !Array.isArray(reply.games) ||
+            (reply.next_after !== null && !Number.isSafeInteger(reply.next_after)) ||
+            typeof reply.scanning !== "boolean" || typeof reply.complete !== "boolean")
+            throw new Error("Steam game discovery returned an invalid response.");
+        const seen = new Set();
+        const games = reply.games.map((value) => {
+            if (!value || typeof value !== "object" || Array.isArray(value))
+                throw new Error("Steam game discovery returned an invalid game.");
+            const game = value;
+            if (!Number.isSafeInteger(game.app_id) || game.app_id <= 0 ||
+                typeof game.name !== "string" || !game.name.trim() ||
+                seen.has(game.app_id) ||
+                (game.install_directory !== undefined && typeof game.install_directory !== "string"))
+                throw new Error("Steam game discovery returned an invalid game.");
+            seen.add(game.app_id);
+            return { app_id: game.app_id, name: game.name,
+                ...(typeof game.install_directory === "string" ? { install_directory: game.install_directory } : {}) };
+        });
+        const nextAfter = reply.next_after;
+        if (nextAfter !== null && nextAfter < 0)
+            throw new Error("Steam game discovery returned an invalid cursor.");
+        return { revision: reply.revision, games, next_after: nextAfter,
+            scanning: reply.scanning, complete: reply.complete };
+    }
+    function chooseSteamGame(api) {
+        return new Promise((resolve) => {
+            const dialog = Amaterasu.el("dialog", "steam-game-chooser-dialog");
+            steamChooserSetAttribute(dialog, "aria-label", "Choose a Steam game");
+            const status = Amaterasu.el("p", "steam-game-chooser-status");
+            status.setAttribute("role", "status");
+            const list = Amaterasu.el("ul", "steam-game-chooser-list");
+            const previous = Amaterasu.button(steamChooserMessage("← Previous"), () => void showPage(pageIndex - 1));
+            const next = Amaterasu.button(steamChooserMessage("Next →"), () => void showPage(pageIndex + 1), "primary");
+            const cancel = Amaterasu.button(steamChooserMessage("Cancel"), () => finish(null));
+            const pagination = Amaterasu.el("div", "actions steam-game-chooser-pagination", previous, next);
+            dialog.append(Amaterasu.el("h2", "", steamChooserMessage("Choose a Steam game")), Amaterasu.el("p", "muted", steamChooserMessage("Select a discovered game to use its Steam app ID and optional install directory.")), status, list, pagination, Amaterasu.el("div", "actions", cancel));
+            let settled = false;
+            let loading = false;
+            let revision;
+            let pageIndex = 0;
+            const cursors = [null];
+            const finish = (selection) => {
+                if (settled)
+                    return;
+                settled = true;
+                dialog.close();
+                dialog.remove();
+                resolve(selection);
+            };
+            const updatePager = (hasNext) => {
+                previous.disabled = loading || pageIndex === 0;
+                next.disabled = loading || !hasNext;
+                pagination.hidden = pageIndex === 0 && !hasNext;
+            };
+            async function showPage(requestedPage) {
+                if (settled || loading || requestedPage < 0 || requestedPage > pageIndex + 1)
+                    return;
+                if (!api.allows("steam.read")) {
+                    steamChooserSetText(status, "Steam discovery requires steam.read permission. You can enter a Steam app ID manually.");
+                    list.replaceChildren();
+                    updatePager(false);
+                    return;
+                }
+                loading = true;
+                pageIndex = requestedPage;
+                const cursor = cursors[pageIndex] ?? null;
+                list.replaceChildren();
+                steamChooserSetText(status, "Loading discovered Steam games…");
+                updatePager(false);
+                try {
+                    const raw = await api.post("steam/list", {
+                        ...(revision !== undefined ? { revision } : {}),
+                        ...(cursor !== null ? { after: cursor } : {}),
+                        limit: steamChooserPageSize,
+                    });
+                    if (settled)
+                        return;
+                    const reply = validateSteamChooserReply(raw);
+                    if (revision !== undefined && reply.revision !== revision)
+                        throw new Error("Steam discovery changed while browsing. Close the chooser and try again.");
+                    revision = reply.revision;
+                    if (reply.next_after !== null && cursor !== null && reply.next_after <= cursor)
+                        throw new Error("Steam game discovery returned an invalid cursor.");
+                    if (reply.next_after !== null)
+                        cursors[pageIndex + 1] = reply.next_after;
+                    else
+                        cursors.length = pageIndex + 1;
+                    for (const game of reply.games) {
+                        const select = Amaterasu.button(steamChooserMessage("Select"), () => finish(game));
+                        steamChooserSetAttribute(select, "aria-label", `Select ${game.name}`);
+                        const directory = game.install_directory || "";
+                        list.append(Amaterasu.el("li", "steam-game-chooser-item", Amaterasu.el("div", "steam-game-chooser-copy", Amaterasu.el("strong", "", typeof Amaterasu.literalText === "function" ? Amaterasu.literalText(game.name) : game.name), Amaterasu.el("span", "steam-game-chooser-details", steamChooserMessage("App ID "), String(game.app_id), " · ", steamChooserMessage(directory ? "Install directory" : "Install directory unavailable"), ...(directory ? [" ", typeof Amaterasu.literalText === "function" ? Amaterasu.literalText(directory) : directory] : []))), select));
+                    }
+                    steamChooserSetText(status, reply.games.length
+                        ? "Choose a game to continue."
+                        : reply.complete ? "No Steam games were discovered."
+                            : reply.scanning ? "Steam is still scanning. Refresh the chooser later to see discovered games."
+                                : "No Steam games are available yet.");
+                    updatePager(reply.next_after !== null);
+                }
+                catch (error) {
+                    if (settled)
+                        return;
+                    const code = error instanceof Amaterasu.ApiError ? error.code : "";
+                    steamChooserSetText(status, code === "forbidden" || code === "permission_denied"
+                        ? "Steam discovery requires steam.read permission. You can enter a Steam app ID manually."
+                        : "Steam games are unavailable. You can enter a Steam app ID manually.");
+                    list.replaceChildren();
+                    updatePager(false);
+                }
+                finally {
+                    loading = false;
+                    if (!settled)
+                        updatePager(cursors[pageIndex + 1] !== undefined);
+                }
+            }
+            dialog.addEventListener("cancel", (event) => { event.preventDefault(); finish(null); });
+            document.body.append(dialog);
+            dialog.showModal();
+            cancel.focus();
+            if (api.allows("steam.read"))
+                void showPage(0);
+            else {
+                steamChooserSetText(status, "Steam discovery requires steam.read permission. You can enter a Steam app ID manually.");
+                updatePager(false);
+            }
+        });
+    }
+    Amaterasu.chooseSteamGame = chooseSteamGame;
+})(Amaterasu || (Amaterasu = {}));
+var Amaterasu;
+(function (Amaterasu) {
     function catalogTextLiteral(value) {
         return typeof Amaterasu.literalText === "function" ? Amaterasu.literalText(value) : value;
     }
@@ -5881,7 +6035,7 @@ var Amaterasu;
         }
         function renderEditor(row, runtimeStatus, capabilities) {
             const editRevision = revision;
-            const form = entryForm(row?.entry, runtimeStatus, capabilities);
+            const form = entryForm(row?.entry, runtimeStatus, capabilities, api);
             form.hidden = !api.allows("catalog.write");
             const feedback = Amaterasu.el("div");
             const save = Amaterasu.el("button", "button primary", row ? "Save changes" : "Add application");
@@ -6035,7 +6189,7 @@ var Amaterasu;
         }, true);
     }
     const catalogRemovedOverrides = new WeakMap();
-    function entryForm(entry, runtimeStatus, capabilities) {
+    function entryForm(entry, runtimeStatus, capabilities, api) {
         const form = Amaterasu.el("form", "editor-form");
         const name = Amaterasu.input("name", entry?.name ?? "");
         name.required = true;
@@ -6199,6 +6353,42 @@ var Amaterasu;
         const pathField = Amaterasu.field("Absolute application path", path);
         const steamIdField = Amaterasu.field("Steam app ID", steamId, "Optional canonical Steam app ID for provider-aware process tracking.");
         const steamInstallDirField = Amaterasu.field("Steam install directory", steamInstallDir, "Optional absolute game directory; Linux tracks only newly launched processes inside it.");
+        const steamChooserStatus = Amaterasu.el("p", "muted");
+        steamChooserStatus.setAttribute("role", "status");
+        steamChooserStatus.hidden = true;
+        const chooseSteamGameButton = Amaterasu.button(catalogTextMessage("Choose a Steam game"), async () => {
+            if (!api.allows("catalog.write"))
+                return;
+            const selected = await Amaterasu.chooseSteamGame(api);
+            if (!selected)
+                return;
+            if (!api.allows("catalog.write")) {
+                steamChooserStatus.hidden = false;
+                if (typeof Amaterasu.setLocalizedTextContent === "function")
+                    Amaterasu.setLocalizedTextContent(steamChooserStatus, "Catalog write permission changed; the selection was not applied.");
+                else
+                    steamChooserStatus.textContent = "Catalog write permission changed; the selection was not applied.";
+                return;
+            }
+            steamId.value = String(selected.app_id);
+            steamId.dispatchEvent(new Event("input", { bubbles: true }));
+            steamId.dispatchEvent(new Event("change", { bubbles: true }));
+            if (selected.install_directory !== undefined) {
+                steamInstallDir.value = selected.install_directory;
+                steamInstallDir.dispatchEvent(new Event("input", { bubbles: true }));
+                steamInstallDir.dispatchEvent(new Event("change", { bubbles: true }));
+            }
+            steamChooserStatus.hidden = false;
+            const status = selected.install_directory === undefined
+                ? "Steam game selected. Its install directory is unavailable; the existing directory was kept."
+                : "Steam game selected. Other application edits were kept.";
+            if (typeof Amaterasu.setLocalizedTextContent === "function")
+                Amaterasu.setLocalizedTextContent(steamChooserStatus, status);
+            else
+                steamChooserStatus.textContent = status;
+        });
+        catalogLocalizedAttribute(chooseSteamGameButton, "aria-label", "Choose a Steam game");
+        const steamGameChooser = Amaterasu.el("div", "catalog-steam-chooser", chooseSteamGameButton, steamChooserStatus);
         const fullscreen = Amaterasu.field("Exit timeout (seconds)", fullscreenTimeout, "Graceful session close window, from 0 to 300 seconds.");
         const showKind = () => {
             executable.hidden = kind.value !== "executable";
@@ -6211,6 +6401,7 @@ var Amaterasu;
             path.required = !processless;
             steamIdField.hidden = processless;
             steamInstallDirField.hidden = processless;
+            steamGameChooser.hidden = processless;
             sharedLaunchOptions.hidden = kind.value === "application";
             directory.disabled = kind.value === "application";
             path.placeholder =
@@ -6219,7 +6410,7 @@ var Amaterasu;
                     : "/Applications/Example.app";
         };
         kind.addEventListener("change", showKind);
-        form.append(catalogEditorSection("Identity", "Name and describe this application in your library.", Amaterasu.field("Name", name), Amaterasu.field("Description", description), Amaterasu.field("Tags", tags, "Separate tags with commas.")), catalogEditorDisclosure("Launch", "Choose how the host starts and tracks the application.", Amaterasu.field("Launch type", kind), pathField, steamIdField, steamInstallDirField, fullscreen, sharedLaunchOptions, executable, Amaterasu.field("Command output", outputMode, "Use default discards command output without saving an output value."), outputFile, rawPreparation, Amaterasu.field("Skip global preparation commands", excludeGlobalPreparation, "Do not run the host-wide preparation commands for this application.")), catalogEditorDisclosure("Display", "Choose display and virtual-screen overrides.", Amaterasu.field("Display output override", displayOutput, "Leave empty to inherit the next display selection. This is separate from the command output file."), Amaterasu.field("Virtual screen request", virtualScreen, "Inherit the host setting or explicitly request or avoid a virtual screen."), Amaterasu.field("Virtual display mode", virtualDisplayMode, "Inherit the host mode or explicitly disable, use per-client, or share a virtual display."), Amaterasu.field("Virtual display layout", virtualDisplayLayout, "Inherit the host layout or select how virtual displays are arranged."), ...refreshRateOptionFields, Amaterasu.field("Display and adapter policy (JSON)", displayPolicy, "Sparse application overrides. Use null or empty values to inherit; global-only keys are rejected."), Amaterasu.field("10-bit SDR preference", prefer10BitSdr, "Inherit the next setting scope, or set an explicit preference for this application.")), catalogEditorDisclosure("Streaming and audio", "Override streaming, frame limiting, and audio for this application.", Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global streaming setting; supported values are 1–255."), ...sessionPolicyFields, Amaterasu.field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this application streams audio."), audioSink.controls, virtualSink.controls, Amaterasu.field("Capture audio without changing default outputs", captureOnly, "Inherit the host setting, enable capture only, or allow Windows default-output routing.")), catalogEditorDisclosure("Input", "Set per-application controller, keyboard, and mouse preferences.", Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "Leave blank to inherit. Use -1 to disable the timeout; other signed 32-bit values set the duration."), Amaterasu.field("Controller input", controller, "Inherit the next scope, or enable/disable gamepad input for this application."), Amaterasu.field("Gamepad profile", gamepad, "Inherit the next scope. Recognized profiles unavailable on this backend stay selectable and are labeled unavailable."), Amaterasu.field("Keyboard input", keyboard, "Inherit the next scope, or enable/disable keyboard input for this application."), Amaterasu.field("Mouse input", mouse, "Inherit the next scope, or enable/disable mouse input for this application."), ...inputCompatibilityFields, ...advancedInput.fields), catalogEditorDisclosure("Encoder", "Override software and NVENC encoder settings.", ...softwareEncoder.fields, ...nvencSettingsFields));
+        form.append(catalogEditorSection("Identity", "Name and describe this application in your library.", Amaterasu.field("Name", name), Amaterasu.field("Description", description), Amaterasu.field("Tags", tags, "Separate tags with commas.")), catalogEditorDisclosure("Launch", "Choose how the host starts and tracks the application.", Amaterasu.field("Launch type", kind), pathField, steamIdField, steamInstallDirField, steamGameChooser, fullscreen, sharedLaunchOptions, executable, Amaterasu.field("Command output", outputMode, "Use default discards command output without saving an output value."), outputFile, rawPreparation, Amaterasu.field("Skip global preparation commands", excludeGlobalPreparation, "Do not run the host-wide preparation commands for this application.")), catalogEditorDisclosure("Display", "Choose display and virtual-screen overrides.", Amaterasu.field("Display output override", displayOutput, "Leave empty to inherit the next display selection. This is separate from the command output file."), Amaterasu.field("Virtual screen request", virtualScreen, "Inherit the host setting or explicitly request or avoid a virtual screen."), Amaterasu.field("Virtual display mode", virtualDisplayMode, "Inherit the host mode or explicitly disable, use per-client, or share a virtual display."), Amaterasu.field("Virtual display layout", virtualDisplayLayout, "Inherit the host layout or select how virtual displays are arranged."), ...refreshRateOptionFields, Amaterasu.field("Display and adapter policy (JSON)", displayPolicy, "Sparse application overrides. Use null or empty values to inherit; global-only keys are rejected."), Amaterasu.field("10-bit SDR preference", prefer10BitSdr, "Inherit the next setting scope, or set an explicit preference for this application.")), catalogEditorDisclosure("Streaming and audio", "Override streaming, frame limiting, and audio for this application.", Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global streaming setting; supported values are 1–255."), ...sessionPolicyFields, Amaterasu.field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this application streams audio."), audioSink.controls, virtualSink.controls, Amaterasu.field("Capture audio without changing default outputs", captureOnly, "Inherit the host setting, enable capture only, or allow Windows default-output routing.")), catalogEditorDisclosure("Input", "Set per-application controller, keyboard, and mouse preferences.", Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "Leave blank to inherit. Use -1 to disable the timeout; other signed 32-bit values set the duration."), Amaterasu.field("Controller input", controller, "Inherit the next scope, or enable/disable gamepad input for this application."), Amaterasu.field("Gamepad profile", gamepad, "Inherit the next scope. Recognized profiles unavailable on this backend stay selectable and are labeled unavailable."), Amaterasu.field("Keyboard input", keyboard, "Inherit the next scope, or enable/disable keyboard input for this application."), Amaterasu.field("Mouse input", mouse, "Inherit the next scope, or enable/disable mouse input for this application."), ...inputCompatibilityFields, ...advancedInput.fields), catalogEditorDisclosure("Encoder", "Override software and NVENC encoder settings.", ...softwareEncoder.fields, ...nvencSettingsFields));
         form.children[1].open = !entry;
         const sections = Array.from(form.children).slice(2);
         const overrides = catalogOverrideEditor(catalogOverrideSections(sections), { ...entry, ...entry?.config_overrides });
