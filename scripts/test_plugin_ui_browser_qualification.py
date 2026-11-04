@@ -11,6 +11,7 @@ import argparse
 import base64
 import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -67,9 +68,13 @@ def configure_signed_extension(harness: PlatformHarness) -> str:
         }],
     }
     policy = bootstrap["policy"]
+    authentication = policy["settings"]["amaterasu.authentication"]
+    if "account.self" not in authentication["allowed_scopes"]:
+        authentication["allowed_scopes"].append("account.self")
+        authentication["authorization_policy_generation"] += 1
     policy["principals"]["example.extension-provider"] = {"provide": ["example.extension/1"]}
     policy["principals"]["amaterasu.management"].setdefault("call", []).append("example.extension/1")
-    policy["api_methods"] = [{
+    policy.setdefault("api_methods", []).append({
         "provider": "example.extension-provider",
         "callers": ["amaterasu.management"],
         "method": {
@@ -81,7 +86,13 @@ def configure_signed_extension(harness: PlatformHarness) -> str:
             "response": {"required": {"message": "string"}, "optional": {}, "allow_extra": False},
             "privilege": "user",
         },
-    }]
+    })
+    assert any(
+        approval["provider"] == "amaterasu.frame-limiter"
+        and approval["method"]["service"] == "nonary.frame-limiter/1"
+        and approval["method"]["method"] == "settings_validate"
+        for approval in policy["api_methods"]
+    ), "signed extension setup must preserve the default frame-limiter API approval"
     bootstrap_path.write_text(json.dumps(bootstrap))
     return hashlib.sha256(FIXTURE.read_bytes()).hexdigest()
 
@@ -119,7 +130,7 @@ def spki_pin(certificate_path: Path) -> str:
     return base64.b64encode(hashlib.sha256(public).digest()).decode("ascii")
 
 
-def run_browser(harness: PlatformHarness, api, chromium: str, asset_digest: str) -> None:
+def run_browser(harness: PlatformHarness, api, chromium: str, asset_digest: str, certificate) -> None:
     browser = OwnedBrowser(harness.directory / "plugin-ui-browser", chromium, spki_pin(certificate))
     try:
         debugger_url = browser.start()
@@ -185,6 +196,12 @@ def main() -> None:
 
     with tempfile.TemporaryDirectory(prefix="amaterasu-plugin-ui-browser-") as temporary:
         harness = PlatformHarness(Path(temporary))
+        xdg_data = harness.directory / "xdg-data"
+        xdg_data.mkdir(mode=0o700)
+        os.environ["XDG_DATA_HOME"] = str(xdg_data)
+        xdg_runtime = harness.directory / "xdg-runtime"
+        xdg_runtime.mkdir(mode=0o700)
+        os.environ["XDG_RUNTIME_DIR"] = str(xdg_runtime)
         private.SERVER_ADDRESS = "127.0.0.1"
         certificate = private.configure_host(harness)
         asset_digest = configure_signed_extension(harness)
@@ -195,14 +212,25 @@ def main() -> None:
         package = harness.directory / "plugin-ui-platform"
         run(harness.publisher, "pack-extension-example", harness.root, harness.artifacts, package, "1")
         harness.stage(package)
+        web_package = harness.directory / "plugin-ui-platform-web"
+        run(harness.publisher, "pack-web", harness.root, WORKSPACE / "frontend/dist",
+            web_package, "1")
+        run(harness.publisher, "stage-web", harness.root, web_package)
 
         code = enrollment_code(harness)
         console = private.start_ready_console(harness)
         try:
             private.ready(console)
             api = private.PeerTlsApi(console, certificate, private.SERVER_ADDRESS)
-            test_enrollment_and_tls(api, code)
-            run_browser(harness, api, chromium, asset_digest)
+            administrator = test_enrollment_and_tls(api, code)
+            status, listing = api.request("POST", "/v1/extensions/list", {},
+                                          token=administrator["bearer"])
+            assert status == 200 and any(
+                entry.get("id") == EXTENSION_ID for entry in listing.get("extensions", [])
+            ), ("signed test extension is not discoverable through the authenticated host API "
+                f"(HTTP {status}, response keys {sorted(listing) if isinstance(listing, dict) else type(listing).__name__}, "
+                f"extension IDs {[entry.get('id') for entry in listing.get('extensions', [])] if isinstance(listing, dict) else []})")
+            run_browser(harness, api, chromium, asset_digest, certificate)
         finally:
             stop_console(console)
 

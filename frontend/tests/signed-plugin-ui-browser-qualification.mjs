@@ -117,7 +117,10 @@ try {
       }
       await delay(40);
     }
-    throw new Error(`browser timed out waiting for ${description}`);
+    const pageState = await evaluate(`JSON.stringify({href: location.href, title: document.title,
+      readyState: document.readyState, body: document.body?.innerText.slice(0, 1200),
+      markup: document.body?.innerHTML.slice(0, 240)})`).catch(() => "page state unavailable");
+    throw new Error(`browser timed out waiting for ${description}; page state: ${pageState}`);
   };
   const key = async (name, code, virtualKey) => {
     for (const type of ["keyDown", "keyUp"]) {

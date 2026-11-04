@@ -7,6 +7,7 @@ configuration, installed service, firewall rule, or non-loopback socket changes.
 from __future__ import annotations
 
 import json
+import os
 import argparse
 import base64
 import hashlib
@@ -67,7 +68,7 @@ def configure_extension(harness):
         auth["authorization_policy_generation"] += 1
     policy["principals"]["example.extension-provider"] = {"provide": ["example.extension/1"]}
     policy["principals"]["amaterasu.management"].setdefault("call", []).append("example.extension/1")
-    policy["api_methods"] = [{
+    policy.setdefault("api_methods", []).append({
         "provider": "example.extension-provider", "callers": ["amaterasu.management"],
         "method": {
             "service": "example.extension/1", "method": "greet", "interface_major": 1,
@@ -75,7 +76,13 @@ def configure_extension(harness):
             "response": {"required": {"message": "string"}, "optional": {}, "allow_extra": False},
             "privilege": "user",
         },
-    }]
+    })
+    assert any(
+        approval["provider"] == "amaterasu.frame-limiter"
+        and approval["method"]["service"] == "nonary.frame-limiter/1"
+        and approval["method"]["method"] == "settings_validate"
+        for approval in policy["api_methods"]
+    ), "signed extension setup must preserve the default frame-limiter API approval"
     bootstrap_path.write_text(json.dumps(bootstrap))
 
 
@@ -283,6 +290,12 @@ def main():
         run(CARGO, "build", "--workspace", "--offline")
     with tempfile.TemporaryDirectory(prefix="amaterasu-network-accounts-") as temporary:
         harness = PlatformHarness(Path(temporary))
+        xdg_data = harness.directory / "xdg-data"
+        xdg_data.mkdir(mode=0o700)
+        os.environ["XDG_DATA_HOME"] = str(xdg_data)
+        xdg_runtime = harness.directory / "xdg-runtime"
+        xdg_runtime.mkdir(mode=0o700)
+        os.environ["XDG_RUNTIME_DIR"] = str(xdg_runtime)
         # Reuse the private-peer fixture with a loopback-only server and client.
         private.SERVER_ADDRESS = "127.0.0.1"
         certificate = private.configure_host(harness)
