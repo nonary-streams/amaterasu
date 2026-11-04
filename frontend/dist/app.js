@@ -915,12 +915,14 @@ var Amaterasu;
             return (this.role === "administrator" || this.role === "operator" || this.role === "token") &&
                 (this.scopes === null || this.scopes.includes(scope));
         }
-        async post(route, payload = {}, protectedRoute = true) {
+        async post(route, payload = {}, protectedRoute = true, signal) {
+            if (signal?.aborted)
+                throw new Error("The request was cancelled.");
             if (this.loggingOut) {
                 throw new ApiError("Sign out is already in progress.", "unauthorized", 401);
             }
             if (protectedRoute && this.cookieSession)
-                return this.postWithCookies(route, payload);
+                return this.postWithCookies(route, payload, signal);
             if (protectedRoute && !this.bearer)
                 throw new ApiError("Sign in to continue.", "unauthorized", 401);
             if (protectedRoute &&
@@ -928,19 +930,25 @@ var Amaterasu;
                 this.accessExpiresAt - Date.now() / 1000 <= 60) {
                 await this.refreshOrClear();
             }
+            if (signal?.aborted)
+                throw new Error("The request was cancelled.");
             if (protectedRoute && !this.bearer)
                 throw new ApiError("Sign in to continue.", "unauthorized", 401);
             const bearerUsed = this.bearer;
             const authGeneration = this.authGeneration;
             const tokenGeneration = this.tokenGeneration;
             try {
-                const response = await this.send(route, payload, protectedRoute, bearerUsed);
+                const response = await this.send(route, payload, protectedRoute, bearerUsed, false, signal);
+                if (signal?.aborted)
+                    throw new Error("The request was cancelled.");
                 if (this.loggingOut) {
                     throw new ApiError("Sign out is already in progress.", "unauthorized", 401);
                 }
                 return response;
             }
             catch (error) {
+                if (signal?.aborted)
+                    throw new Error("The request was cancelled.");
                 if (!protectedRoute ||
                     !(error instanceof ApiError) ||
                     error.code !== "unauthorized" ||
@@ -953,7 +961,11 @@ var Amaterasu;
                     await this.refreshOrClear();
                 if (authGeneration !== this.authGeneration || !this.bearer)
                     throw error;
-                const response = await this.send(route, payload, true, this.bearer);
+                if (signal?.aborted)
+                    throw new Error("The request was cancelled.");
+                const response = await this.send(route, payload, true, this.bearer, false, signal);
+                if (signal?.aborted)
+                    throw new Error("The request was cancelled.");
                 if (this.loggingOut) {
                     throw new ApiError("Sign out is already in progress.", "unauthorized", 401);
                 }
@@ -1065,22 +1077,28 @@ var Amaterasu;
                     this.cookieRefreshInFlight = null;
             }
         }
-        async postWithCookies(route, payload) {
+        async postWithCookies(route, payload, signal) {
             if (this.pendingCookieLogout())
                 throw new ApiError("Sign-out is still pending. Retry when the host is reachable.", "logout_unconfirmed", 503);
             if (this.accessExpiresAt - Date.now() / 1000 <= 60)
                 await this.refreshCookieSession();
+            if (signal?.aborted)
+                throw new Error("The request was cancelled.");
             if (!this.cookieSession || this.loggingOut)
                 throw new ApiError("Sign in to continue.", "unauthorized", 401);
             const generation = this.authGeneration;
             const tokenGeneration = this.tokenGeneration;
             try {
-                const reply = await this.send(route, payload, true, "", true);
+                const reply = await this.send(route, payload, true, "", true, signal);
+                if (signal?.aborted)
+                    throw new Error("The request was cancelled.");
                 if (generation !== this.authGeneration || this.loggingOut)
                     throw new ApiError("Sign in to continue.", "unauthorized", 401);
                 return reply;
             }
             catch (error) {
+                if (signal?.aborted)
+                    throw new Error("The request was cancelled.");
                 if (!(error instanceof ApiError) || error.status !== 401 ||
                     generation !== this.authGeneration || this.loggingOut)
                     throw error;
@@ -1088,13 +1106,19 @@ var Amaterasu;
                     await this.refreshCookieSession();
                 if (!this.cookieSession || generation !== this.authGeneration)
                     throw error;
+                if (signal?.aborted)
+                    throw new Error("The request was cancelled.");
                 try {
-                    const reply = await this.send(route, payload, true, "", true);
+                    const reply = await this.send(route, payload, true, "", true, signal);
+                    if (signal?.aborted)
+                        throw new Error("The request was cancelled.");
                     if (generation !== this.authGeneration || this.loggingOut)
                         throw new ApiError("Sign in to continue.", "unauthorized", 401);
                     return reply;
                 }
                 catch (retryError) {
+                    if (signal?.aborted)
+                        throw new Error("The request was cancelled.");
                     if (retryError instanceof ApiError &&
                         retryError.status === 401 &&
                         generation === this.authGeneration) {
@@ -1765,8 +1789,12 @@ var Amaterasu;
                 }
             }
         }
-        async send(route, payload, protectedRoute, bearer, cookieAuth = false) {
+        async send(route, payload, protectedRoute, bearer, cookieAuth = false, signal) {
+            if (signal?.aborted)
+                throw new Error("The request was cancelled.");
             const controller = new AbortController();
+            const abortRequest = () => controller.abort();
+            signal?.addEventListener("abort", abortRequest, { once: true });
             const timer = window.setTimeout(() => controller.abort(), 12_000);
             this.requests.add(controller);
             if (route === "auth/refresh" || route === "auth/browser/refresh")
@@ -1801,6 +1829,7 @@ var Amaterasu;
                 throw new Error("Could not reach the host. Check its address, connection, and allowed browser origin.");
             }
             finally {
+                signal?.removeEventListener("abort", abortRequest);
                 clearTimeout(timer);
                 this.requests.delete(controller);
                 this.refreshRequests.delete(controller);
@@ -1858,6 +1887,47 @@ var Amaterasu;
         "Delete",
         "Try again",
         "Unable to complete request",
+        "Choose a Steam game",
+        "Select",
+        "Search discovered games",
+        "Search by game name or app ID",
+        "Restart",
+        "Clear search",
+        "Keep current directory",
+        "Clear current directory",
+        "Review fields",
+        "Steam games",
+        "App ID",
+        "Install directory",
+        "Install directory unavailable",
+        "Select {name}",
+        "Search found matches in the first 512 games. Browse later pages or refine your search.",
+        "Search stopped after the first 512 games. Browse later pages or refine your search.",
+        "Review Steam directory",
+        "The selected game has no install directory. Your current directory may belong to another game.",
+        "Choose whether to keep or clear the current directory, or review fields without applying.",
+        "Steam read permission is required. You can enter the app ID manually.",
+        "Loading Steam games…",
+        "Choose a discovered game.",
+        "No Steam games are available.",
+        "Steam is scanning. Refresh later to see discovered games.",
+        "Steam games changed. Restart to load the current list.",
+        "Steam pagination failed. Restart to continue.",
+        "Steam games are unavailable. Retry or enter the app ID manually.",
+        "Searching Steam games…",
+        "Steam games changed. Restart to search the current list.",
+        "Search complete. Choose a discovered game.",
+        "No Steam games matched.",
+        "Enter a game name or app ID.",
+        "Found matches within {count} checked games. Browse later pages or refine your search.",
+        "Checked {count} games across 32 pages. Browse later pages or refine your search.",
+        "Selection was not applied. Review the Steam fields and choose again.",
+        "A required permission changed; the selection was not applied.",
+        "Steam game selected. Other application edits were kept.",
+        "Steam game selected. Kept the existing directory by choice.",
+        "Steam game selected. Cleared the existing directory by choice.",
+        "Steam game selected. Its install directory is unavailable; the existing directory was kept.",
+        "Select a discovered game to use its Steam app ID and optional install directory.",
     ];
     const SHELL_MESSAGE_KEYS = [
         "WORKSPACE",
@@ -1876,7 +1946,47 @@ var Amaterasu;
             ],
             ui: [
                 "← Предишна", "Следваща →", "Обновяване", "Запазване", "Отказ", "Затвори", "Търсене",
-                "Редактиране", "Изтриване", "Опитай отново", "Заявката не можа да бъде изпълнена",
+                "Редактиране", "Изтриване", "Опитай отново", "Заявката не можа да бъде изпълнена", "Избор на Steam игра",
+                "Избор",
+                "Търсене на открити игри",
+                "Търсене по име на игра или ID на приложение",
+                "Рестартиране",
+                "Изчистване на търсенето",
+                "Запазване на текущата папка",
+                "Изчистване на текущата папка",
+                "Преглед на полетата",
+                "Steam игри",
+                "ID на приложението",
+                "Папка за инсталиране",
+                "Папката за инсталиране не е налична",
+                "Избор на {name}",
+                "Намерени са съвпадения сред първите 512 игри. Прегледайте следващите страници или прецизирайте търсенето.",
+                "Търсенето спря след първите 512 игри. Прегледайте следващите страници или прецизирайте търсенето.",
+                "Преглед на Steam папката",
+                "Избраната игра няма инсталационна папка. Текущата папка може да е за друга игра.",
+                "Изберете дали да запазите или изчистите текущата папка, или прегледайте полетата без прилагане.",
+                "Необходимо е разрешение за Steam. Можете да въведете ID на приложението ръчно.",
+                "Зареждане на Steam игри…",
+                "Изберете открита игра.",
+                "Няма налични Steam игри.",
+                "Steam сканира. Обновете по-късно.",
+                "Списъкът със Steam игри се промени. Рестартирайте, за да заредите текущия списък.",
+                "Страниците на Steam не се заредиха. Рестартирайте.",
+                "Steam игрите не са налични. Опитайте отново или въведете ID ръчно.",
+                "Търсене на Steam игри…",
+                "Списъкът се промени. Рестартирайте търсенето.",
+                "Търсенето завърши. Изберете открита игра.",
+                "Няма съвпадащи Steam игри.",
+                "Въведете име на игра или ID на приложение.",
+                "Намерени са съвпадения сред {count} проверени игри. Прегледайте следващите страници или прецизирайте търсенето.",
+                "Проверени са {count} игри в 32 страници. Прегледайте следващите страници или прецизирайте търсенето.",
+                "Изборът не е приложен. Прегледайте Steam полетата и изберете отново.",
+                "Необходимо разрешение се промени; изборът не е приложен.",
+                "Steam играта е избрана. Другите промени са запазени.",
+                "Steam играта е избрана. Текущата папка е запазена по ваш избор.",
+                "Steam играта е избрана. Текущата папка е изчистена по ваш избор.",
+                "Steam играта е избрана. Папката ѝ липсва; текущата папка е запазена.",
+                "Изберете открита игра, за да използвате нейния Steam ID на приложението и незадължителната инсталационна папка.",
             ],
         },
         cs: {
@@ -1888,7 +1998,47 @@ var Amaterasu;
             ],
             ui: [
                 "← Předchozí", "Další →", "Obnovit", "Uložit", "Zrušit", "Zavřít", "Hledat", "Upravit",
-                "Odstranit", "Zkusit znovu", "Požadavek se nepodařilo dokončit",
+                "Odstranit", "Zkusit znovu", "Požadavek se nepodařilo dokončit", "Vybrat hru na Steamu",
+                "Vybrat",
+                "Hledat nalezené hry",
+                "Hledat podle názvu hry nebo ID aplikace",
+                "Restartovat",
+                "Vymazat hledání",
+                "Ponechat aktuální složku",
+                "Vymazat aktuální složku",
+                "Zkontrolovat pole",
+                "Hry na Steamu",
+                "ID aplikace",
+                "Instalační složka",
+                "Instalační složka není dostupná",
+                "Vybrat {name}",
+                "Shody nalezeny mezi prvními 512 hrami. Projděte další stránky nebo upřesněte hledání.",
+                "Hledání se zastavilo po prvních 512 hrách. Projděte další stránky nebo upřesněte hledání.",
+                "Kontrola složky Steam",
+                "Vybraná hra nemá instalační složku. Aktuální složka může patřit jiné hře.",
+                "Rozhodněte, zda aktuální složku ponechat či vymazat, nebo zkontrolujte pole bez použití výběru.",
+                "Je vyžadováno oprávnění ke službě Steam. ID aplikace lze zadat ručně.",
+                "Načítání her ve službě Steam…",
+                "Vyberte nalezenou hru.",
+                "Nejsou dostupné žádné hry ve službě Steam.",
+                "Steam právě prohledává. Obnovte později.",
+                "Seznam her ve službě Steam se změnil. Restartujte načtení aktuálního seznamu.",
+                "Stránkování služby Steam selhalo. Restartujte.",
+                "Hry ve službě Steam nejsou dostupné. Zkuste to znovu nebo zadejte ID ručně.",
+                "Hledání her ve službě Steam…",
+                "Seznam se změnil. Restartujte hledání.",
+                "Hledání dokončeno. Vyberte nalezenou hru.",
+                "Nebyly nalezeny žádné hry ve službě Steam.",
+                "Zadejte název hry nebo ID aplikace.",
+                "Shody nalezeny mezi {count} zkontrolovanými hrami. Projděte další stránky nebo upřesněte hledání.",
+                "Na 32 stránkách bylo zkontrolováno {count} her. Projděte další stránky nebo upřesněte hledání.",
+                "Výběr nebyl použit. Zkontrolujte pole služby Steam a vyberte znovu.",
+                "Změnilo se požadované oprávnění; výběr nebyl použit.",
+                "Hra ve službě Steam vybrána. Ostatní úpravy zůstaly zachovány.",
+                "Hra ve službě Steam vybrána. Aktuální složka zůstala zachována podle vaší volby.",
+                "Hra ve službě Steam vybrána. Aktuální složka byla vymazána podle vaší volby.",
+                "Hra ve službě Steam vybrána. Její složka není dostupná; aktuální složka zůstala zachována.",
+                "Vyberte nalezenou hru a použijte její ID aplikace Steam a volitelnou instalační složku.",
             ],
         },
         de: {
@@ -1900,7 +2050,47 @@ var Amaterasu;
             ],
             ui: [
                 "← Zurück", "Weiter →", "Aktualisieren", "Speichern", "Abbrechen", "Schließen", "Suchen",
-                "Bearbeiten", "Löschen", "Erneut versuchen", "Anfrage konnte nicht ausgeführt werden",
+                "Bearbeiten", "Löschen", "Erneut versuchen", "Anfrage konnte nicht ausgeführt werden", "Steam-Spiel auswählen",
+                "Auswählen",
+                "Entdeckte Spiele durchsuchen",
+                "Nach Spielname oder App-ID suchen",
+                "Neu starten",
+                "Suche löschen",
+                "Aktuelles Verzeichnis behalten",
+                "Aktuelles Verzeichnis löschen",
+                "Felder prüfen",
+                "Steam-Spiele",
+                "App-ID",
+                "Installationsverzeichnis",
+                "Installationsverzeichnis nicht verfügbar",
+                "{name} auswählen",
+                "Treffer in den ersten 512 Spielen gefunden. Durchsuche spätere Seiten oder grenze die Suche ein.",
+                "Suche nach den ersten 512 Spielen beendet. Durchsuche spätere Seiten oder grenze die Suche ein.",
+                "Steam-Verzeichnis prüfen",
+                "Das ausgewählte Spiel hat kein Installationsverzeichnis. Das aktuelle Verzeichnis gehört möglicherweise zu einem anderen Spiel.",
+                "Wähle, ob du das aktuelle Verzeichnis behalten oder löschen möchtest, oder prüfe die Felder ohne Übernahme.",
+                "Steam-Leseberechtigung erforderlich. Du kannst die App-ID manuell eingeben.",
+                "Steam-Spiele werden geladen…",
+                "Wähle ein gefundenes Spiel.",
+                "Keine Steam-Spiele verfügbar.",
+                "Steam sucht noch. Aktualisiere später erneut.",
+                "Die Steam-Spieleliste hat sich geändert. Starte neu, um die aktuelle Liste zu laden.",
+                "Steam-Seiten konnten nicht geladen werden. Starte neu.",
+                "Steam-Spiele sind nicht verfügbar. Versuche es erneut oder gib die App-ID ein.",
+                "Steam-Spiele werden gesucht…",
+                "Die Liste hat sich geändert. Starte die Suche neu.",
+                "Suche abgeschlossen. Wähle ein gefundenes Spiel.",
+                "Keine Steam-Spiele gefunden.",
+                "Gib einen Spielnamen oder eine App-ID ein.",
+                "Treffer unter {count} geprüften Spielen. Durchsuche weitere Seiten oder grenze die Suche ein.",
+                "{count} Spiele auf 32 Seiten geprüft. Durchsuche weitere Seiten oder grenze die Suche ein.",
+                "Auswahl nicht übernommen. Prüfe die Steam-Felder und wähle erneut.",
+                "Eine erforderliche Berechtigung hat sich geändert; die Auswahl wurde nicht übernommen.",
+                "Steam-Spiel ausgewählt. Andere Änderungen wurden beibehalten.",
+                "Steam-Spiel ausgewählt. Aktuelles Verzeichnis wie gewünscht beibehalten.",
+                "Steam-Spiel ausgewählt. Aktuelles Verzeichnis wie gewünscht gelöscht.",
+                "Steam-Spiel ausgewählt. Verzeichnis nicht verfügbar; aktuelles Verzeichnis beibehalten.",
+                "Wähle ein gefundenes Spiel, um seine Steam-App-ID und ein optionales Installationsverzeichnis zu verwenden.",
             ],
         },
         es: {
@@ -1912,7 +2102,47 @@ var Amaterasu;
             ],
             ui: [
                 "← Anterior", "Siguiente →", "Actualizar", "Guardar", "Cancelar", "Cerrar", "Buscar", "Editar",
-                "Eliminar", "Intentar de nuevo", "No se pudo completar la solicitud",
+                "Eliminar", "Intentar de nuevo", "No se pudo completar la solicitud", "Elegir un juego de Steam",
+                "Seleccionar",
+                "Buscar juegos detectados",
+                "Buscar por nombre del juego o ID de aplicación",
+                "Reiniciar",
+                "Borrar búsqueda",
+                "Mantener el directorio actual",
+                "Borrar el directorio actual",
+                "Revisar campos",
+                "Juegos de Steam",
+                "ID de aplicación",
+                "Directorio de instalación",
+                "Directorio de instalación no disponible",
+                "Seleccionar {name}",
+                "Se encontraron coincidencias entre los primeros 512 juegos. Explora páginas posteriores o afina la búsqueda.",
+                "La búsqueda se detuvo tras los primeros 512 juegos. Explora páginas posteriores o afina la búsqueda.",
+                "Revisar directorio de Steam",
+                "El juego elegido no tiene directorio de instalación. El directorio actual podría pertenecer a otro juego.",
+                "Elige si quieres conservar o borrar el directorio actual, o revisa los campos sin aplicar la selección.",
+                "Se requiere permiso de lectura de Steam. Puedes introducir el ID manualmente.",
+                "Cargando juegos de Steam…",
+                "Elige un juego detectado.",
+                "No hay juegos de Steam disponibles.",
+                "Steam está buscando. Actualiza más tarde.",
+                "La lista de Steam cambió. Reinicia para cargar la lista actual.",
+                "Falló la paginación de Steam. Reinicia.",
+                "Los juegos de Steam no están disponibles. Reintenta o introduce el ID.",
+                "Buscando juegos de Steam…",
+                "La lista cambió. Reinicia la búsqueda.",
+                "Búsqueda completada. Elige un juego detectado.",
+                "No se encontraron juegos de Steam.",
+                "Introduce un nombre de juego o ID de aplicación.",
+                "Hay coincidencias entre {count} juegos revisados. Explora páginas posteriores o afina la búsqueda.",
+                "Se revisaron {count} juegos en 32 páginas. Explora páginas posteriores o afina la búsqueda.",
+                "No se aplicó la selección. Revisa los campos de Steam y vuelve a elegir.",
+                "Cambió un permiso necesario; no se aplicó la selección.",
+                "Juego de Steam seleccionado. Se conservaron los demás cambios.",
+                "Juego de Steam seleccionado. Se conservó el directorio actual por elección.",
+                "Juego de Steam seleccionado. Se borró el directorio actual por elección.",
+                "Juego de Steam seleccionado. No hay directorio; se conservó el actual.",
+                "Elige un juego detectado para usar su ID de aplicación de Steam y su directorio de instalación opcional.",
             ],
         },
         fr: {
@@ -1924,7 +2154,47 @@ var Amaterasu;
             ],
             ui: [
                 "← Précédent", "Suivant →", "Actualiser", "Enregistrer", "Annuler", "Fermer", "Rechercher",
-                "Modifier", "Supprimer", "Réessayer", "Impossible de terminer la requête",
+                "Modifier", "Supprimer", "Réessayer", "Impossible de terminer la requête", "Choisir un jeu Steam",
+                "Choisir",
+                "Rechercher les jeux détectés",
+                "Rechercher par nom de jeu ou ID d’application",
+                "Redémarrer",
+                "Effacer la recherche",
+                "Conserver le répertoire actuel",
+                "Effacer le répertoire actuel",
+                "Vérifier les champs",
+                "Jeux Steam",
+                "ID d’application",
+                "Répertoire d’installation",
+                "Répertoire d’installation indisponible",
+                "Choisir le jeu {name}",
+                "Des résultats ont été trouvés parmi les 512 premiers jeux. Parcourez les pages suivantes ou affinez la recherche.",
+                "La recherche s’est arrêtée après les 512 premiers jeux. Parcourez les pages suivantes ou affinez la recherche.",
+                "Vérifier le dossier Steam",
+                "Le jeu choisi n’a pas de dossier d’installation. Le dossier actuel peut appartenir à un autre jeu.",
+                "Choisissez de conserver ou d’effacer le dossier actuel, ou vérifiez les champs sans appliquer la sélection.",
+                "L’autorisation de lecture Steam est requise. Vous pouvez saisir l’ID manuellement.",
+                "Chargement des jeux Steam…",
+                "Choisissez un jeu détecté.",
+                "Aucun jeu Steam n’est disponible.",
+                "Steam effectue une recherche. Actualisez plus tard.",
+                "La liste Steam a changé. Redémarrez pour charger la liste actuelle.",
+                "La pagination Steam a échoué. Redémarrez.",
+                "Les jeux Steam sont indisponibles. Réessayez ou saisissez l’ID.",
+                "Recherche des jeux Steam…",
+                "La liste a changé. Redémarrez la recherche.",
+                "Recherche terminée. Choisissez un jeu détecté.",
+                "Aucun jeu Steam ne correspond.",
+                "Saisissez un nom de jeu ou un ID d’application.",
+                "Des résultats figurent parmi les {count} jeux vérifiés. Parcourez les pages suivantes ou affinez la recherche.",
+                "{count} jeux vérifiés sur 32 pages. Parcourez les pages suivantes ou affinez la recherche.",
+                "Sélection non appliquée. Vérifiez les champs Steam et choisissez à nouveau.",
+                "Une autorisation requise a changé ; la sélection n’a pas été appliquée.",
+                "Jeu Steam sélectionné. Les autres modifications sont conservées.",
+                "Jeu Steam sélectionné. Le dossier actuel est conservé selon votre choix.",
+                "Jeu Steam sélectionné. Le dossier actuel est effacé selon votre choix.",
+                "Jeu Steam sélectionné. Dossier indisponible ; dossier actuel conservé.",
+                "Choisissez un jeu détecté pour utiliser son ID d’application Steam et son dossier d’installation facultatif.",
             ],
         },
         hu: {
@@ -1936,7 +2206,47 @@ var Amaterasu;
             ],
             ui: [
                 "← Előző", "Következő →", "Frissítés", "Mentés", "Mégse", "Bezárás", "Keresés", "Szerkesztés",
-                "Törlés", "Próbálja újra", "A kérést nem sikerült végrehajtani",
+                "Törlés", "Próbálja újra", "A kérést nem sikerült végrehajtani", "Steam-játék kiválasztása",
+                "Kiválasztás",
+                "Felfedezett játékok keresése",
+                "Keresés játék neve vagy alkalmazásazonosító alapján",
+                "Újraindítás",
+                "Keresés törlése",
+                "Jelenlegi könyvtár megtartása",
+                "Jelenlegi könyvtár törlése",
+                "Mezők áttekintése",
+                "Steam-játékok",
+                "Alkalmazásazonosító",
+                "Telepítési könyvtár",
+                "A telepítési könyvtár nem érhető el",
+                "{name} kiválasztása",
+                "Találatok az első 512 játék között. Böngésszen tovább vagy pontosítsa a keresést.",
+                "A keresés az első 512 játék után leállt. Böngésszen tovább vagy pontosítsa a keresést.",
+                "Steam-könyvtár áttekintése",
+                "A kiválasztott játéknak nincs telepítési könyvtára. A jelenlegi könyvtár másik játékhoz tartozhat.",
+                "Válaszd ki, hogy megtartod vagy törlöd a jelenlegi könyvtárat, vagy nézd át a mezőket alkalmazás nélkül.",
+                "Steam-olvasási engedély szükséges. Az alkalmazásazonosító kézzel is megadható.",
+                "Steam-játékok betöltése…",
+                "Válassz egy felismert játékot.",
+                "Nem érhetők el Steam-játékok.",
+                "A Steam keres. Frissíts később.",
+                "A Steam-játéklista megváltozott. Indítsd újra a betöltést.",
+                "A Steam-lapozás nem sikerült. Indítsd újra.",
+                "A Steam-játékok nem érhetők el. Próbáld újra, vagy add meg az azonosítót.",
+                "Steam-játékok keresése…",
+                "A lista megváltozott. Indítsd újra a keresést.",
+                "Keresés kész. Válassz egy felismert játékot.",
+                "Nincs egyező Steam-játék.",
+                "Adj meg játéknevet vagy alkalmazásazonosítót.",
+                "Egyezés található az ellenőrzött {count} játék között. Lapozz tovább vagy pontosítsd a keresést.",
+                "{count} játék ellenőrizve 32 oldalon. Lapozz tovább vagy pontosítsd a keresést.",
+                "A kijelölés nem lett alkalmazva. Tekintsd át a Steam-mezőket, és válassz újra.",
+                "Egy szükséges engedély megváltozott; a kijelölés nem lett alkalmazva.",
+                "Steam-játék kiválasztva. A többi módosítás megmaradt.",
+                "Steam-játék kiválasztva. A jelenlegi könyvtárat megtartottuk a kérésedre.",
+                "Steam-játék kiválasztva. A jelenlegi könyvtárat töröltük a kérésedre.",
+                "Steam-játék kiválasztva. Nincs telepítési könyvtár; a jelenlegi megmaradt.",
+                "Válassz egy felismert játékot a Steam-alkalmazásazonosító és az opcionális telepítési könyvtár használatához.",
             ],
         },
         it: {
@@ -1948,7 +2258,47 @@ var Amaterasu;
             ],
             ui: [
                 "← Precedente", "Successivo →", "Aggiorna", "Salva", "Annulla", "Chiudi", "Cerca", "Modifica",
-                "Elimina", "Riprova", "Impossibile completare la richiesta",
+                "Elimina", "Riprova", "Impossibile completare la richiesta", "Scegli un gioco Steam",
+                "Seleziona",
+                "Cerca giochi rilevati",
+                "Cerca per nome del gioco o ID app",
+                "Riavvia",
+                "Cancella ricerca",
+                "Mantieni la cartella attuale",
+                "Cancella la cartella attuale",
+                "Rivedi i campi",
+                "Giochi Steam",
+                "ID app",
+                "Cartella di installazione",
+                "Cartella di installazione non disponibile",
+                "Seleziona {name}",
+                "Trovate corrispondenze tra i primi 512 giochi. Sfoglia le pagine successive o affina la ricerca.",
+                "Ricerca interrotta dopo i primi 512 giochi. Sfoglia le pagine successive o affina la ricerca.",
+                "Controlla la cartella Steam",
+                "Il gioco scelto non ha una cartella di installazione. La cartella attuale potrebbe appartenere a un altro gioco.",
+                "Scegli se mantenere o cancellare la cartella attuale, oppure rivedi i campi senza applicare la selezione.",
+                "È necessario il permesso di lettura Steam. Puoi inserire manualmente l’ID.",
+                "Caricamento giochi Steam…",
+                "Scegli un gioco rilevato.",
+                "Nessun gioco Steam disponibile.",
+                "Steam sta cercando. Aggiorna più tardi.",
+                "L’elenco Steam è cambiato. Riavvia per caricare l’elenco aggiornato.",
+                "Impaginazione Steam non riuscita. Riavvia.",
+                "Giochi Steam non disponibili. Riprova o inserisci l’ID.",
+                "Ricerca giochi Steam…",
+                "L’elenco è cambiato. Riavvia la ricerca.",
+                "Ricerca completata. Scegli un gioco rilevato.",
+                "Nessun gioco Steam corrispondente.",
+                "Inserisci il nome del gioco o l’ID app.",
+                "Trovate corrispondenze tra i {count} giochi controllati. Sfoglia le pagine successive o affina la ricerca.",
+                "Controllati {count} giochi su 32 pagine. Sfoglia le pagine successive o affina la ricerca.",
+                "Selezione non applicata. Rivedi i campi Steam e scegli di nuovo.",
+                "Un permesso necessario è cambiato; la selezione non è stata applicata.",
+                "Gioco Steam selezionato. Le altre modifiche sono state mantenute.",
+                "Gioco Steam selezionato. Cartella attuale mantenuta come richiesto.",
+                "Gioco Steam selezionato. Cartella attuale cancellata come richiesto.",
+                "Gioco Steam selezionato. Cartella non disponibile; mantenuta quella attuale.",
+                "Scegli un gioco rilevato per usare il suo ID app Steam e la cartella di installazione facoltativa.",
             ],
         },
         ja: {
@@ -1959,7 +2309,47 @@ var Amaterasu;
             ],
             ui: [
                 "← 前へ", "次へ →", "更新", "保存", "キャンセル", "閉じる", "検索", "編集", "削除", "再試行",
-                "リクエストを完了できませんでした",
+                "リクエストを完了できませんでした", "Steam ゲームを選択",
+                "選択",
+                "検出済みゲームを検索",
+                "ゲーム名またはアプリ ID で検索",
+                "再起動",
+                "検索をクリア",
+                "現在のディレクトリを保持",
+                "現在のディレクトリをクリア",
+                "項目を確認",
+                "Steam ゲーム",
+                "アプリ ID",
+                "インストール先",
+                "インストール先はありません",
+                "{name} を選択",
+                "最初の 512 件に一致するゲームがあります。後のページを表示するか、検索を絞り込んでください。",
+                "最初の 512 件で検索を終了しました。後のページを表示するか、検索を絞り込んでください。",
+                "Steam ディレクトリを確認",
+                "選択したゲームにはインストール先がありません。現在のディレクトリは別のゲーム用かもしれません。",
+                "現在のディレクトリを保持または消去するか、選択を適用せず項目を確認してください。",
+                "Steam の読み取り権限が必要です。アプリ ID は手動入力できます。",
+                "Steam ゲームを読み込み中…",
+                "検出されたゲームを選択してください。",
+                "Steam ゲームはありません。",
+                "Steam を検索中です。後でもう一度更新してください。",
+                "Steam の一覧が変わりました。再起動して最新の一覧を読み込みます。",
+                "Steam のページ取得に失敗しました。再起動してください。",
+                "Steam ゲームを利用できません。再試行するかアプリ ID を入力してください。",
+                "Steam ゲームを検索中…",
+                "一覧が変わりました。検索を再起動してください。",
+                "検索完了。検出されたゲームを選択してください。",
+                "一致する Steam ゲームはありません。",
+                "ゲーム名またはアプリ ID を入力してください。",
+                "確認した {count} 件のゲーム内に一致があります。後のページを表示するか検索を絞り込んでください。",
+                "32 ページで {count} 件を確認しました。後のページを表示するか検索を絞り込んでください。",
+                "選択は適用されませんでした。Steam の項目を確認して選び直してください。",
+                "必要な権限が変更されたため、選択を適用しませんでした。",
+                "Steam ゲームを選択しました。他の編集内容は保持しました。",
+                "選択に従って現在のディレクトリを保持しました。",
+                "選択に従って現在のディレクトリを消去しました。",
+                "Steam ゲームを選択しました。インストール先がないため現在のディレクトリを保持しました。",
+                "検出されたゲームを選択すると、Steam アプリ ID と任意のインストール先を使用できます。",
             ],
         },
         ko: {
@@ -1970,7 +2360,47 @@ var Amaterasu;
             ],
             ui: [
                 "← 이전", "다음 →", "새로 고침", "저장", "취소", "닫기", "검색", "편집", "삭제", "다시 시도",
-                "요청을 완료할 수 없습니다",
+                "요청을 완료할 수 없습니다", "Steam 게임 선택",
+                "선택",
+                "검색된 게임 찾기",
+                "게임 이름 또는 앱 ID로 검색",
+                "다시 시작",
+                "검색 지우기",
+                "현재 디렉터리 유지",
+                "현재 디렉터리 지우기",
+                "필드 검토",
+                "Steam 게임",
+                "앱 ID",
+                "설치 디렉터리",
+                "설치 디렉터리 없음",
+                "{name} 선택",
+                "처음 512개 게임에서 일치 항목을 찾았습니다. 이후 페이지를 둘러보거나 검색을 구체화하세요.",
+                "처음 512개 게임 뒤에 검색을 멈췄습니다. 이후 페이지를 둘러보거나 검색을 구체화하세요.",
+                "Steam 디렉터리 검토",
+                "선택한 게임에 설치 디렉터리가 없습니다. 현재 디렉터리가 다른 게임에 속할 수 있습니다.",
+                "현재 디렉터리를 유지하거나 지우고, 선택을 적용하지 않은 채 필드를 검토하세요.",
+                "Steam 읽기 권한이 필요합니다. 앱 ID를 직접 입력할 수 있습니다.",
+                "Steam 게임 불러오는 중…",
+                "발견된 게임을 선택하세요.",
+                "사용 가능한 Steam 게임이 없습니다.",
+                "Steam 검색 중입니다. 나중에 새로 고치세요.",
+                "Steam 목록이 변경되었습니다. 다시 시작해 현재 목록을 불러오세요.",
+                "Steam 페이지를 불러오지 못했습니다. 다시 시작하세요.",
+                "Steam 게임을 사용할 수 없습니다. 다시 시도하거나 앱 ID를 입력하세요.",
+                "Steam 게임 검색 중…",
+                "목록이 변경되었습니다. 검색을 다시 시작하세요.",
+                "검색 완료. 발견된 게임을 선택하세요.",
+                "일치하는 Steam 게임이 없습니다.",
+                "게임 이름 또는 앱 ID를 입력하세요.",
+                "확인한 {count}개 게임에서 일치 항목을 찾았습니다. 이후 페이지를 둘러보거나 검색을 구체화하세요.",
+                "32페이지에서 {count}개 게임을 확인했습니다. 이후 페이지를 둘러보거나 검색을 구체화하세요.",
+                "선택을 적용하지 않았습니다. Steam 필드를 검토하고 다시 선택하세요.",
+                "필수 권한이 변경되어 선택을 적용하지 않았습니다.",
+                "Steam 게임을 선택했습니다. 다른 편집 내용은 유지했습니다.",
+                "요청에 따라 현재 디렉터리를 유지했습니다.",
+                "요청에 따라 현재 디렉터리를 지웠습니다.",
+                "Steam 게임을 선택했습니다. 설치 디렉터리가 없어 현재 디렉터리를 유지했습니다.",
+                "발견된 게임을 선택하면 Steam 앱 ID와 선택적 설치 디렉터리를 사용할 수 있습니다.",
             ],
         },
         pl: {
@@ -1982,7 +2412,47 @@ var Amaterasu;
             ],
             ui: [
                 "← Poprzednia", "Następna →", "Odśwież", "Zapisz", "Anuluj", "Zamknij", "Szukaj", "Edytuj", "Usuń",
-                "Spróbuj ponownie", "Nie można wykonać żądania",
+                "Spróbuj ponownie", "Nie można wykonać żądania", "Wybierz grę Steam",
+                "Wybierz",
+                "Szukaj wykrytych gier",
+                "Szukaj według nazwy gry lub ID aplikacji",
+                "Uruchom ponownie",
+                "Wyczyść wyszukiwanie",
+                "Zachowaj bieżący katalog",
+                "Wyczyść bieżący katalog",
+                "Sprawdź pola",
+                "Gry Steam",
+                "ID aplikacji",
+                "Katalog instalacji",
+                "Katalog instalacji jest niedostępny",
+                "Wybierz {name}",
+                "Znaleziono wyniki wśród pierwszych 512 gier. Przejrzyj dalsze strony lub zawęź wyszukiwanie.",
+                "Wyszukiwanie zatrzymało się po pierwszych 512 grach. Przejrzyj dalsze strony lub zawęź wyszukiwanie.",
+                "Sprawdź katalog Steam",
+                "Wybrana gra nie ma katalogu instalacji. Bieżący katalog może należeć do innej gry.",
+                "Zdecyduj, czy zachować lub wyczyścić bieżący katalog, albo sprawdź pola bez stosowania wyboru.",
+                "Wymagane jest uprawnienie odczytu Steam. Możesz ręcznie wpisać ID aplikacji.",
+                "Wczytywanie gier Steam…",
+                "Wybierz wykrytą grę.",
+                "Brak dostępnych gier Steam.",
+                "Steam skanuje. Odśwież później.",
+                "Lista Steam uległa zmianie. Uruchom ponownie, aby wczytać aktualną listę.",
+                "Stronicowanie Steam nie powiodło się. Uruchom ponownie.",
+                "Gry Steam są niedostępne. Spróbuj ponownie lub wpisz ID aplikacji.",
+                "Wyszukiwanie gier Steam…",
+                "Lista uległa zmianie. Uruchom wyszukiwanie ponownie.",
+                "Wyszukiwanie zakończone. Wybierz wykrytą grę.",
+                "Nie znaleziono pasujących gier Steam.",
+                "Wpisz nazwę gry lub ID aplikacji.",
+                "Znaleziono wyniki wśród {count} sprawdzonych gier. Przejrzyj dalsze strony lub zawęź wyszukiwanie.",
+                "Sprawdzono {count} gier na 32 stronach. Przejrzyj dalsze strony lub zawęź wyszukiwanie.",
+                "Wybór nie został zastosowany. Sprawdź pola Steam i wybierz ponownie.",
+                "Zmieniono wymagane uprawnienie; wybór nie został zastosowany.",
+                "Wybrano grę Steam. Pozostałe zmiany zachowano.",
+                "Zgodnie z wyborem zachowano bieżący katalog.",
+                "Zgodnie z wyborem wyczyszczono bieżący katalog.",
+                "Wybrano grę Steam. Brak katalogu instalacji; zachowano bieżący katalog.",
+                "Wybierz wykrytą grę, aby użyć jej identyfikatora aplikacji Steam i opcjonalnego katalogu instalacji.",
             ],
         },
         pt: {
@@ -1994,7 +2464,47 @@ var Amaterasu;
             ],
             ui: [
                 "← Anterior", "Próxima →", "Atualizar", "Salvar", "Cancelar", "Fechar", "Pesquisar", "Editar",
-                "Excluir", "Tentar novamente", "Não foi possível concluir a solicitação",
+                "Excluir", "Tentar novamente", "Não foi possível concluir a solicitação", "Escolher jogo Steam",
+                "Selecionar",
+                "Pesquisar jogos detetados",
+                "Pesquisar por nome do jogo ou ID da aplicação",
+                "Reiniciar",
+                "Limpar pesquisa",
+                "Manter diretório atual",
+                "Limpar diretório atual",
+                "Rever campos",
+                "Jogos Steam",
+                "ID da aplicação",
+                "Diretório de instalação",
+                "Diretório de instalação indisponível",
+                "Selecionar {name}",
+                "Foram encontrados resultados nos primeiros 512 jogos. Explore páginas seguintes ou refine a pesquisa.",
+                "A pesquisa parou após os primeiros 512 jogos. Explore páginas seguintes ou refine a pesquisa.",
+                "Rever diretório do Steam",
+                "O jogo escolhido não tem diretório de instalação. O diretório atual pode pertencer a outro jogo.",
+                "Escolha manter ou limpar o diretório atual, ou reveja os campos sem aplicar a seleção.",
+                "É necessária permissão de leitura do Steam. Pode introduzir o ID manualmente.",
+                "A carregar jogos Steam…",
+                "Escolha um jogo detetado.",
+                "Não há jogos Steam disponíveis.",
+                "O Steam está a pesquisar. Atualize mais tarde.",
+                "A lista Steam mudou. Reinicie para carregar a lista atual.",
+                "A paginação do Steam falhou. Reinicie.",
+                "Os jogos Steam estão indisponíveis. Tente novamente ou introduza o ID.",
+                "A pesquisar jogos Steam…",
+                "A lista mudou. Reinicie a pesquisa.",
+                "Pesquisa concluída. Escolha um jogo detetado.",
+                "Não foram encontrados jogos Steam.",
+                "Introduza o nome do jogo ou o ID da aplicação.",
+                "Foram encontradas correspondências entre {count} jogos verificados. Explore páginas seguintes ou refine a pesquisa.",
+                "Foram verificados {count} jogos em 32 páginas. Explore páginas seguintes ou refine a pesquisa.",
+                "A seleção não foi aplicada. Reveja os campos Steam e escolha novamente.",
+                "Uma permissão necessária mudou; a seleção não foi aplicada.",
+                "Jogo Steam selecionado. As restantes alterações foram mantidas.",
+                "Diretório atual mantido conforme escolhido.",
+                "Diretório atual limpo conforme escolhido.",
+                "Jogo Steam selecionado. Sem diretório de instalação; o atual foi mantido.",
+                "Escolha um jogo detetado para usar o respetivo ID de aplicação Steam e o diretório de instalação opcional.",
             ],
         },
         pt_BR: {
@@ -2007,6 +2517,35 @@ var Amaterasu;
             ui: [
                 "← Anterior", "Próxima →", "Atualizar", "Salvar", "Cancelar", "Fechar", "Pesquisar", "Editar",
                 "Excluir", "Tentar novamente", "Não foi possível concluir a solicitação",
+                "Escolher jogo do Steam", "Selecionar", "Pesquisar jogos descobertos", "Pesquisar por nome do jogo ou ID do aplicativo",
+                "Reiniciar", "Limpar pesquisa", "Manter diretório atual", "Limpar diretório atual", "Revisar campos", "Jogos do Steam",
+                "ID do aplicativo", "Diretório de instalação", "Diretório de instalação indisponível", "Selecionar {name}",
+                "Foram encontrados resultados nos primeiros 512 jogos. Navegue pelas páginas seguintes ou refine a pesquisa.",
+                "A pesquisa parou após os primeiros 512 jogos. Navegue pelas páginas seguintes ou refine a pesquisa.", "Revisar diretório do Steam",
+                "O jogo escolhido não tem diretório de instalação. O diretório atual pode pertencer a outro jogo.",
+                "Escolha manter ou limpar o diretório atual, ou revise os campos sem aplicar a seleção.",
+                "É necessária permissão de leitura do Steam. Você pode informar o ID manualmente.",
+                "Carregando jogos do Steam…",
+                "Escolha um jogo encontrado.",
+                "Não há jogos do Steam disponíveis.",
+                "O Steam está pesquisando. Atualize mais tarde.",
+                "A lista do Steam mudou. Reinicie para carregar a lista atual.",
+                "A paginação do Steam falhou. Reinicie.",
+                "Os jogos do Steam estão indisponíveis. Tente novamente ou informe o ID.",
+                "Pesquisando jogos do Steam…",
+                "A lista mudou. Reinicie a pesquisa.",
+                "Pesquisa concluída. Escolha um jogo encontrado.",
+                "Nenhum jogo do Steam corresponde.",
+                "Informe o nome do jogo ou o ID do aplicativo.",
+                "Foram encontradas correspondências entre {count} jogos verificados. Navegue pelas próximas páginas ou refine a pesquisa.",
+                "{count} jogos verificados em 32 páginas. Navegue pelas próximas páginas ou refine a pesquisa.",
+                "A seleção não foi aplicada. Revise os campos do Steam e escolha novamente.",
+                "Uma permissão necessária mudou; a seleção não foi aplicada.",
+                "Jogo do Steam selecionado. As outras alterações foram mantidas.",
+                "Diretório atual mantido conforme sua escolha.",
+                "Diretório atual limpo conforme sua escolha.",
+                "Jogo do Steam selecionado. Sem diretório de instalação; o atual foi mantido.",
+                "Escolha um jogo encontrado para usar o ID do aplicativo Steam e o diretório de instalação opcional.",
             ],
         },
         ru: {
@@ -2017,7 +2556,47 @@ var Amaterasu;
             ],
             ui: [
                 "← Назад", "Далее →", "Обновить", "Сохранить", "Отмена", "Закрыть", "Поиск", "Изменить", "Удалить",
-                "Повторить попытку", "Не удалось выполнить запрос",
+                "Повторить попытку", "Не удалось выполнить запрос", "Выбрать игру Steam",
+                "Выбрать",
+                "Поиск обнаруженных игр",
+                "Поиск по названию игры или ID приложения",
+                "Перезапустить",
+                "Очистить поиск",
+                "Оставить текущую папку",
+                "Очистить текущую папку",
+                "Проверить поля",
+                "Игры Steam",
+                "ID приложения",
+                "Папка установки",
+                "Папка установки недоступна",
+                "Выбрать {name}",
+                "Совпадения найдены среди первых 512 игр. Просмотрите следующие страницы или уточните запрос.",
+                "Поиск остановлен после первых 512 игр. Просмотрите следующие страницы или уточните запрос.",
+                "Проверить папку Steam",
+                "У выбранной игры нет папки установки. Текущая папка может принадлежать другой игре.",
+                "Оставьте или очистите текущую папку либо проверьте поля без применения выбора.",
+                "Требуется разрешение на чтение Steam. ID приложения можно ввести вручную.",
+                "Загрузка игр Steam…",
+                "Выберите найденную игру.",
+                "Игры Steam недоступны.",
+                "Steam выполняет поиск. Обновите позже.",
+                "Список Steam изменился. Перезапустите загрузку актуального списка.",
+                "Не удалось загрузить страницы Steam. Перезапустите.",
+                "Игры Steam недоступны. Повторите попытку или введите ID приложения.",
+                "Поиск игр Steam…",
+                "Список изменился. Перезапустите поиск.",
+                "Поиск завершен. Выберите найденную игру.",
+                "Совпадений с играми Steam нет.",
+                "Введите название игры или ID приложения.",
+                "Совпадения найдены среди {count} проверенных игр. Просмотрите следующие страницы или уточните запрос.",
+                "Проверено {count} игр на 32 страницах. Просмотрите следующие страницы или уточните запрос.",
+                "Выбор не применен. Проверьте поля Steam и выберите снова.",
+                "Необходимое разрешение изменилось; выбор не применен.",
+                "Игра Steam выбрана. Остальные изменения сохранены.",
+                "Текущая папка оставлена по вашему выбору.",
+                "Текущая папка очищена по вашему выбору.",
+                "У игры Steam нет папки установки; текущая папка оставлена.",
+                "Выберите найденную игру, чтобы использовать ее ID приложения Steam и необязательную папку установки.",
             ],
         },
         sv: {
@@ -2028,7 +2607,47 @@ var Amaterasu;
             ],
             ui: [
                 "← Föregående", "Nästa →", "Uppdatera", "Spara", "Avbryt", "Stäng", "Sök", "Redigera", "Ta bort",
-                "Försök igen", "Det gick inte att slutföra begäran",
+                "Försök igen", "Det gick inte att slutföra begäran", "Välj ett Steam-spel",
+                "Välj",
+                "Sök bland upptäckta spel",
+                "Sök efter spelnamn eller app-ID",
+                "Starta om",
+                "Rensa sökning",
+                "Behåll aktuell katalog",
+                "Rensa aktuell katalog",
+                "Granska fält",
+                "Steam-spel",
+                "App-ID",
+                "Installationskatalog",
+                "Installationskatalog saknas",
+                "Välj {name}",
+                "Träffar hittades bland de första 512 spelen. Bläddra på senare sidor eller förfina sökningen.",
+                "Sökningen stoppades efter de första 512 spelen. Bläddra på senare sidor eller förfina sökningen.",
+                "Granska Steam-katalog",
+                "Det valda spelet saknar installationskatalog. Den aktuella katalogen kan tillhöra ett annat spel.",
+                "Välj om den aktuella katalogen ska behållas eller rensas, eller granska fälten utan att tillämpa valet.",
+                "Läsbehörighet till Steam krävs. Du kan ange app-ID:t manuellt.",
+                "Läser in Steam-spel…",
+                "Välj ett upptäckt spel.",
+                "Inga Steam-spel är tillgängliga.",
+                "Steam söker. Uppdatera senare.",
+                "Steam-listan ändrades. Starta om för att läsa in den aktuella listan.",
+                "Steam-sidindelningen misslyckades. Starta om.",
+                "Steam-spel är otillgängliga. Försök igen eller ange app-ID:t.",
+                "Söker efter Steam-spel…",
+                "Listan ändrades. Starta om sökningen.",
+                "Sökningen är klar. Välj ett upptäckt spel.",
+                "Inga Steam-spel matchade.",
+                "Ange ett spelnamn eller app-ID.",
+                "Träffar hittades bland {count} kontrollerade spel. Bläddra på senare sidor eller förfina sökningen.",
+                "{count} spel kontrollerades på 32 sidor. Bläddra på senare sidor eller förfina sökningen.",
+                "Valet tillämpades inte. Granska Steam-fälten och välj igen.",
+                "En nödvändig behörighet ändrades; valet tillämpades inte.",
+                "Steam-spel valt. Övriga ändringar behölls.",
+                "Den aktuella katalogen behölls enligt ditt val.",
+                "Den aktuella katalogen rensades enligt ditt val.",
+                "Steam-spel valt. Installationskatalog saknas; den aktuella behölls.",
+                "Välj ett upptäckt spel för att använda dess Steam-app-ID och valfria installationskatalog.",
             ],
         },
         tr: {
@@ -2039,7 +2658,47 @@ var Amaterasu;
             ],
             ui: [
                 "← Önceki", "Sonraki →", "Yenile", "Kaydet", "İptal", "Kapat", "Ara", "Düzenle", "Sil", "Tekrar dene",
-                "İstek tamamlanamadı",
+                "İstek tamamlanamadı", "Steam oyunu seç",
+                "Seç",
+                "Bulunan oyunlarda ara",
+                "Oyun adına veya uygulama kimliğine göre ara",
+                "Yeniden başlat",
+                "Aramayı temizle",
+                "Geçerli dizini koru",
+                "Geçerli dizini temizle",
+                "Alanları gözden geçir",
+                "Steam oyunları",
+                "Uygulama kimliği",
+                "Yükleme dizini",
+                "Yükleme dizini kullanılamıyor",
+                "{name} oyununu seç",
+                "İlk 512 oyunda eşleşmeler bulundu. Sonraki sayfalara göz atın veya aramayı daraltın.",
+                "Arama ilk 512 oyundan sonra durdu. Sonraki sayfalara göz atın veya aramayı daraltın.",
+                "Steam dizinini gözden geçir",
+                "Seçilen oyunun yükleme dizini yok. Geçerli dizin başka bir oyuna ait olabilir.",
+                "Geçerli dizini tutmayı veya temizlemeyi seçin ya da seçimi uygulamadan alanları gözden geçirin.",
+                "Steam okuma izni gerekiyor. Uygulama kimliğini elle girebilirsiniz.",
+                "Steam oyunları yükleniyor…",
+                "Bulunan bir oyunu seçin.",
+                "Kullanılabilir Steam oyunu yok.",
+                "Steam tarıyor. Daha sonra yenileyin.",
+                "Steam listesi değişti. Güncel listeyi yüklemek için yeniden başlatın.",
+                "Steam sayfaları yüklenemedi. Yeniden başlatın.",
+                "Steam oyunları kullanılamıyor. Yeniden deneyin veya kimliği girin.",
+                "Steam oyunları aranıyor…",
+                "Liste değişti. Aramayı yeniden başlatın.",
+                "Arama tamamlandı. Bulunan bir oyunu seçin.",
+                "Eşleşen Steam oyunu yok.",
+                "Oyun adını veya uygulama kimliğini girin.",
+                "Kontrol edilen {count} oyunda eşleşmeler bulundu. Sonraki sayfalara göz atın veya aramayı daraltın.",
+                "32 sayfada {count} oyun kontrol edildi. Sonraki sayfalara göz atın veya aramayı daraltın.",
+                "Seçim uygulanmadı. Steam alanlarını gözden geçirip yeniden seçin.",
+                "Gerekli bir izin değişti; seçim uygulanmadı.",
+                "Steam oyunu seçildi. Diğer düzenlemeler korundu.",
+                "Geçerli dizin seçiminize göre korundu.",
+                "Geçerli dizin seçiminize göre temizlendi.",
+                "Steam oyunu seçildi. Yükleme dizini yok; geçerli dizin korundu.",
+                "Steam uygulama kimliğini ve isteğe bağlı yükleme dizinini kullanmak için bulunan bir oyunu seçin.",
             ],
         },
         uk: {
@@ -2051,7 +2710,47 @@ var Amaterasu;
             ],
             ui: [
                 "← Назад", "Далі →", "Оновити", "Зберегти", "Скасувати", "Закрити", "Пошук", "Редагувати", "Видалити",
-                "Спробувати знову", "Не вдалося виконати запит",
+                "Спробувати знову", "Не вдалося виконати запит", "Вибрати гру Steam",
+                "Вибрати",
+                "Пошук знайдених ігор",
+                "Пошук за назвою гри або ID програми",
+                "Перезапустити",
+                "Очистити пошук",
+                "Залишити поточний каталог",
+                "Очистити поточний каталог",
+                "Переглянути поля",
+                "Ігри Steam",
+                "ID програми",
+                "Каталог встановлення",
+                "Каталог встановлення недоступний",
+                "Вибрати {name}",
+                "Збіги знайдено серед перших 512 ігор. Перегляньте наступні сторінки або уточніть пошук.",
+                "Пошук зупинено після перших 512 ігор. Перегляньте наступні сторінки або уточніть пошук.",
+                "Переглянути каталог Steam",
+                "У вибраної гри немає каталогу встановлення. Поточний каталог може належати іншій грі.",
+                "Залиште або очистьте поточний каталог чи перегляньте поля без застосування вибору.",
+                "Потрібен дозвіл на читання Steam. ID програми можна ввести вручну.",
+                "Завантаження ігор Steam…",
+                "Виберіть знайдену гру.",
+                "Ігри Steam недоступні.",
+                "Steam виконує пошук. Оновіть пізніше.",
+                "Список Steam змінився. Перезапустіть, щоб завантажити актуальний список.",
+                "Не вдалося завантажити сторінки Steam. Перезапустіть.",
+                "Ігри Steam недоступні. Спробуйте ще раз або введіть ID програми.",
+                "Пошук ігор Steam…",
+                "Список змінився. Перезапустіть пошук.",
+                "Пошук завершено. Виберіть знайдену гру.",
+                "Збігів з іграми Steam немає.",
+                "Введіть назву гри або ID програми.",
+                "Збіги знайдено серед {count} перевірених ігор. Перегляньте наступні сторінки або уточніть пошук.",
+                "Перевірено {count} ігор на 32 сторінках. Перегляньте наступні сторінки або уточніть пошук.",
+                "Вибір не застосовано. Перевірте поля Steam і виберіть знову.",
+                "Необхідний дозвіл змінився; вибір не застосовано.",
+                "Гру Steam вибрано. Інші зміни збережено.",
+                "Поточний каталог залишено за вашим вибором.",
+                "Поточний каталог очищено за вашим вибором.",
+                "У гри Steam немає каталогу встановлення; поточний каталог залишено.",
+                "Виберіть знайдену гру, щоб використати її ID програми Steam і необов’язковий каталог встановлення.",
             ],
         },
         vi: {
@@ -2063,7 +2762,47 @@ var Amaterasu;
             ],
             ui: [
                 "← Trước", "Tiếp →", "Làm mới", "Lưu", "Hủy", "Đóng", "Tìm kiếm", "Chỉnh sửa", "Xóa", "Thử lại",
-                "Không thể hoàn tất yêu cầu",
+                "Không thể hoàn tất yêu cầu", "Chọn trò chơi Steam",
+                "Chọn",
+                "Tìm trò chơi đã phát hiện",
+                "Tìm theo tên trò chơi hoặc ID ứng dụng",
+                "Khởi động lại",
+                "Xóa tìm kiếm",
+                "Giữ thư mục hiện tại",
+                "Xóa thư mục hiện tại",
+                "Xem lại các trường",
+                "Trò chơi Steam",
+                "ID ứng dụng",
+                "Thư mục cài đặt",
+                "Không có thư mục cài đặt",
+                "Chọn {name}",
+                "Đã tìm thấy kết quả trong 512 trò chơi đầu tiên. Hãy duyệt các trang sau hoặc thu hẹp tìm kiếm.",
+                "Đã dừng tìm kiếm sau 512 trò chơi đầu tiên. Hãy duyệt các trang sau hoặc thu hẹp tìm kiếm.",
+                "Xem lại thư mục Steam",
+                "Trò chơi đã chọn không có thư mục cài đặt. Thư mục hiện tại có thể thuộc trò chơi khác.",
+                "Chọn giữ hoặc xóa thư mục hiện tại, hoặc xem lại các trường mà không áp dụng lựa chọn.",
+                "Cần quyền đọc Steam. Bạn có thể nhập ID ứng dụng thủ công.",
+                "Đang tải trò chơi Steam…",
+                "Chọn trò chơi đã tìm thấy.",
+                "Không có trò chơi Steam khả dụng.",
+                "Steam đang quét. Hãy làm mới sau.",
+                "Danh sách Steam đã thay đổi. Khởi động lại để tải danh sách hiện tại.",
+                "Không thể tải trang Steam. Hãy khởi động lại.",
+                "Trò chơi Steam không khả dụng. Thử lại hoặc nhập ID ứng dụng.",
+                "Đang tìm trò chơi Steam…",
+                "Danh sách đã thay đổi. Khởi động lại tìm kiếm.",
+                "Đã tìm kiếm xong. Chọn trò chơi đã tìm thấy.",
+                "Không có trò chơi Steam phù hợp.",
+                "Nhập tên trò chơi hoặc ID ứng dụng.",
+                "Tìm thấy kết quả trong {count} trò chơi đã kiểm tra. Hãy duyệt các trang sau hoặc thu hẹp tìm kiếm.",
+                "Đã kiểm tra {count} trò chơi trong 32 trang. Hãy duyệt các trang sau hoặc thu hẹp tìm kiếm.",
+                "Chưa áp dụng lựa chọn. Xem lại các trường Steam và chọn lại.",
+                "Quyền bắt buộc đã thay đổi; lựa chọn chưa được áp dụng.",
+                "Đã chọn trò chơi Steam. Các chỉnh sửa khác được giữ nguyên.",
+                "Đã giữ thư mục hiện tại theo lựa chọn của bạn.",
+                "Đã xóa thư mục hiện tại theo lựa chọn của bạn.",
+                "Trò chơi Steam không có thư mục cài đặt; đã giữ thư mục hiện tại.",
+                "Chọn trò chơi đã tìm thấy để dùng ID ứng dụng Steam và thư mục cài đặt tùy chọn của trò chơi.",
             ],
         },
         zh: {
@@ -2073,7 +2812,47 @@ var Amaterasu;
                 "此语言会翻译导航菜单和部分标签；其他文本将以英语显示。",
             ],
             ui: [
-                "← 上一页", "下一页 →", "刷新", "保存", "取消", "关闭", "搜索", "编辑", "删除", "重试", "无法完成请求",
+                "← 上一页", "下一页 →", "刷新", "保存", "取消", "关闭", "搜索", "编辑", "删除", "重试", "无法完成请求", "选择 Steam 游戏",
+                "选择",
+                "搜索已发现的游戏",
+                "按游戏名称或应用 ID 搜索",
+                "重新开始",
+                "清除搜索",
+                "保留当前目录",
+                "清除当前目录",
+                "检查字段",
+                "Steam 游戏",
+                "应用 ID",
+                "安装目录",
+                "安装目录不可用",
+                "选择 {name}",
+                "前 512 个游戏中找到匹配项。请浏览后续页面或缩小搜索范围。",
+                "搜索已在前 512 个游戏后停止。请浏览后续页面或缩小搜索范围。",
+                "检查 Steam 目录",
+                "所选游戏没有安装目录。当前目录可能属于其他游戏。",
+                "选择保留或清除当前目录，也可以查看字段而不应用选择。",
+                "需要 Steam 读取权限。你可以手动输入应用 ID。",
+                "正在加载 Steam 游戏…",
+                "选择已发现的游戏。",
+                "没有可用的 Steam 游戏。",
+                "Steam 正在扫描。稍后刷新。",
+                "Steam 游戏列表已更改。重新开始以加载当前列表。",
+                "Steam 分页失败。请重新开始。",
+                "Steam 游戏不可用。请重试或输入应用 ID。",
+                "正在搜索 Steam 游戏…",
+                "列表已更改。重新开始搜索。",
+                "搜索完成。选择已发现的游戏。",
+                "没有匹配的 Steam 游戏。",
+                "输入游戏名称或应用 ID。",
+                "在已检查的 {count} 个游戏中找到匹配项。请浏览后续页面或缩小搜索范围。",
+                "已在 32 页中检查 {count} 个游戏。请浏览后续页面或缩小搜索范围。",
+                "未应用所选内容。请检查 Steam 字段并重新选择。",
+                "所需权限已更改；未应用所选内容。",
+                "已选择 Steam 游戏。保留了其他编辑内容。",
+                "按你的选择保留当前目录。",
+                "按你的选择清除了当前目录。",
+                "已选择 Steam 游戏。没有安装目录；保留了当前目录。",
+                "选择已发现的游戏，以使用其 Steam 应用 ID 和可选安装目录。",
             ],
         },
         zh_TW: {
@@ -2084,6 +2863,34 @@ var Amaterasu;
             ],
             ui: [
                 "← 上一頁", "下一頁 →", "重新整理", "儲存", "取消", "關閉", "搜尋", "編輯", "刪除", "重試", "無法完成要求",
+                "選擇 Steam 遊戲", "選擇", "搜尋已發現的遊戲", "依遊戲名稱或應用程式 ID 搜尋", "重新開始", "清除搜尋",
+                "保留目前目錄", "清除目前目錄", "檢查欄位", "Steam 遊戲", "應用程式 ID", "安裝目錄", "無法使用安裝目錄",
+                "選擇 {name}", "在前 512 個遊戲中找到相符項目。請瀏覽後續頁面或縮小搜尋範圍。",
+                "搜尋已在前 512 個遊戲後停止。請瀏覽後續頁面或縮小搜尋範圍。", "檢查 Steam 目錄",
+                "所選遊戲沒有安裝目錄。目前的目錄可能屬於其他遊戲。",
+                "選擇保留或清除目前目錄，也可以檢查欄位而不套用選擇。",
+                "需要 Steam 讀取權限。您可以手動輸入應用程式 ID。",
+                "正在載入 Steam 遊戲…",
+                "選擇已找到的遊戲。",
+                "沒有可用的 Steam 遊戲。",
+                "Steam 正在掃描。請稍後重新整理。",
+                "Steam 遊戲清單已變更。重新開始以載入目前清單。",
+                "Steam 分頁失敗。請重新開始。",
+                "Steam 遊戲無法使用。請重試或輸入應用程式 ID。",
+                "正在搜尋 Steam 遊戲…",
+                "清單已變更。重新開始搜尋。",
+                "搜尋完成。選擇已找到的遊戲。",
+                "沒有相符的 Steam 遊戲。",
+                "輸入遊戲名稱或應用程式 ID。",
+                "在已檢查的 {count} 個遊戲中找到相符項目。請瀏覽後續頁面或縮小搜尋範圍。",
+                "已在 32 頁中檢查 {count} 個遊戲。請瀏覽後續頁面或縮小搜尋範圍。",
+                "未套用所選項目。請檢查 Steam 欄位並重新選擇。",
+                "必要權限已變更；未套用所選項目。",
+                "已選擇 Steam 遊戲。保留其他編輯內容。",
+                "依照您的選擇保留目前目錄。",
+                "依照您的選擇清除目前目錄。",
+                "已選擇 Steam 遊戲。沒有安裝目錄；保留目前目錄。",
+                "選擇已找到的遊戲，以使用其 Steam 應用程式 ID 和選用安裝目錄。",
             ],
         },
     };
@@ -4664,6 +5471,497 @@ var Amaterasu;
 })(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
 (function (Amaterasu) {
+    function steamChooserMessage(value) {
+        return typeof Amaterasu.localizedMessage === "function"
+            ? Amaterasu.localizedMessage(value)
+            : value;
+    }
+    function steamChooserSetText(target, value) {
+        if (typeof Amaterasu.setLocalizedTextContent === "function")
+            Amaterasu.setLocalizedTextContent(target, value);
+        else
+            target.textContent = value;
+    }
+    function steamChooserSetFormattedText(target, source, values) {
+        if (typeof Amaterasu.localeFormattedTextNode === "function" &&
+            typeof Amaterasu.translateText === "function") {
+            const node = Amaterasu.localeFormattedTextNode(() => {
+                let rendered = Amaterasu.translateText(source);
+                for (const [name, value] of Object.entries(values))
+                    rendered = rendered.replaceAll(`{${name}}`, () => value);
+                return rendered;
+            });
+            target.replaceChildren(node);
+        }
+        else {
+            let rendered = source;
+            for (const [name, value] of Object.entries(values))
+                rendered = rendered.replaceAll(`{${name}}`, () => value);
+            target.textContent = rendered;
+        }
+    }
+    function steamChooserSetAttribute(target, attribute, value) {
+        if (typeof Amaterasu.setLocalizedAttribute === "function")
+            Amaterasu.setLocalizedAttribute(target, attribute, value);
+        else
+            target.setAttribute(attribute, value);
+    }
+    function steamChooserSetAttributeTemplate(target, attribute, source, values) {
+        if (typeof Amaterasu.setLocalizedAttributeTemplate === "function")
+            Amaterasu.setLocalizedAttributeTemplate(target, attribute, source, values);
+        else {
+            let rendered = source;
+            for (const [name, value] of Object.entries(values)) {
+                const literal = typeof value === "string" ? value : value.value;
+                rendered = rendered.replaceAll(`{${name}}`, () => literal);
+            }
+            target.setAttribute(attribute, rendered);
+        }
+    }
+    const steamChooserPageSize = 16;
+    const steamChooserSearchMaxPages = 32;
+    function validateSteamChooserReply(value) {
+        if (!value || typeof value !== "object" || Array.isArray(value))
+            throw new Error("Steam game discovery returned an invalid response.");
+        const reply = value;
+        if (!Number.isSafeInteger(reply.revision) || reply.revision < 0 ||
+            !Array.isArray(reply.games) || reply.games.length > steamChooserPageSize ||
+            (reply.next_after !== null && !Number.isSafeInteger(reply.next_after)) ||
+            typeof reply.scanning !== "boolean" || typeof reply.complete !== "boolean")
+            throw new Error("Steam game discovery returned an invalid response.");
+        const seen = new Set();
+        const games = reply.games.map((value) => {
+            if (!value || typeof value !== "object" || Array.isArray(value))
+                throw new Error("Steam game discovery returned an invalid game.");
+            const game = value;
+            const directory = typeof game.install_directory === "string" &&
+                game.install_directory.trim() !== "" ? game.install_directory : undefined;
+            if (!Number.isSafeInteger(game.app_id) || game.app_id <= 0 ||
+                typeof game.name !== "string" || !game.name.trim() ||
+                seen.has(game.app_id) ||
+                (game.install_directory !== undefined && typeof game.install_directory !== "string"))
+                throw new Error("Steam game discovery returned an invalid game.");
+            seen.add(game.app_id);
+            return {
+                app_id: game.app_id,
+                name: game.name,
+                ...(directory === undefined ? {} : { install_directory: directory }),
+            };
+        });
+        const nextAfter = reply.next_after;
+        if (nextAfter !== null && nextAfter < 0)
+            throw new Error("Steam game discovery returned an invalid cursor.");
+        return {
+            revision: reply.revision,
+            games,
+            next_after: nextAfter,
+            scanning: reply.scanning,
+            complete: reply.complete,
+        };
+    }
+    function steamChooserSetFocus(target) {
+        if (target.isConnected)
+            target.focus();
+    }
+    function chooseSteamGame(api, signal) {
+        return new Promise((resolve) => {
+            if (signal?.aborted) {
+                resolve(null);
+                return;
+            }
+            const opener = document.activeElement;
+            const dialog = Amaterasu.el("dialog", "steam-game-chooser-dialog");
+            steamChooserSetAttribute(dialog, "aria-label", "Choose a Steam game");
+            const status = Amaterasu.el("p", "steam-game-chooser-status");
+            status.setAttribute("role", "status");
+            status.setAttribute("aria-live", "polite");
+            const list = Amaterasu.el("ul", "steam-game-chooser-list");
+            steamChooserSetAttribute(list, "aria-label", "Steam games");
+            const searchInput = Amaterasu.input("steam_game_search");
+            searchInput.type = "search";
+            searchInput.maxLength = 128;
+            steamChooserSetAttribute(searchInput, "aria-label", "Search discovered games");
+            if (typeof Amaterasu.setLocalizedAttribute === "function")
+                Amaterasu.setLocalizedAttribute(searchInput, "placeholder", "Search by game name or app ID");
+            else
+                searchInput.placeholder = "Search by game name or app ID";
+            const searchButton = Amaterasu.button(steamChooserMessage("Search"), () => void searchGames());
+            const searchForm = Amaterasu.el("form", "steam-game-chooser-search", Amaterasu.field(steamChooserMessage("Search discovered games"), searchInput), searchButton);
+            const previous = Amaterasu.button(steamChooserMessage("← Previous"), () => void showPage(pageIndex - 1));
+            const next = Amaterasu.button(steamChooserMessage("Next →"), () => void showPage(pageIndex + 1), "primary");
+            const restart = Amaterasu.button(steamChooserMessage("Restart"), () => void restartDiscovery());
+            restart.hidden = true;
+            const clearSearch = Amaterasu.button(steamChooserMessage("Clear search"), () => {
+                searchInput.value = "";
+                activeSearchTerm = "";
+                activeRequestController?.abort();
+                activeRequestController = null;
+                operationToken += 1;
+                loading = false;
+                searching = false;
+                pageIndex = 0;
+                cursors.length = 1;
+                list.replaceChildren();
+                restart.hidden = true;
+                void showPage(0);
+            });
+            clearSearch.hidden = true;
+            const cancel = Amaterasu.button(steamChooserMessage("Cancel"), () => finish(null));
+            steamChooserSetAttribute(cancel, "aria-label", "Cancel");
+            const pagination = Amaterasu.el("div", "actions steam-game-chooser-pagination", previous, next);
+            const recovery = Amaterasu.el("div", "actions steam-game-chooser-recovery", restart, clearSearch);
+            const heading = Amaterasu.el("h2", "", steamChooserMessage("Choose a Steam game"));
+            heading.id = "steam-game-chooser-title";
+            dialog.setAttribute("aria-labelledby", heading.id);
+            dialog.append(heading, Amaterasu.el("p", "muted", steamChooserMessage("Select a discovered game to use its Steam app ID and optional install directory.")), searchForm, status, list, pagination, recovery, Amaterasu.el("div", "actions", cancel));
+            let settled = false;
+            let loading = false;
+            let searching = false;
+            let revision;
+            let pageIndex = 0;
+            let activeSearchTerm = "";
+            let cursors = [null];
+            let operationToken = 0;
+            let activeRequestController = null;
+            const beginOperation = () => {
+                activeRequestController?.abort();
+                const controller = new AbortController();
+                activeRequestController = controller;
+                const token = ++operationToken;
+                const abortWithEditor = () => controller.abort();
+                signal?.addEventListener("abort", abortWithEditor, { once: true });
+                return {
+                    token,
+                    requestSignal: controller.signal,
+                    cleanup: () => signal?.removeEventListener("abort", abortWithEditor),
+                };
+            };
+            const finish = (selection) => {
+                if (settled)
+                    return;
+                settled = true;
+                activeRequestController?.abort();
+                activeRequestController = null;
+                operationToken += 1;
+                signal?.removeEventListener("abort", onAbort);
+                dialog.close();
+                dialog.remove();
+                if (opener)
+                    steamChooserSetFocus(opener);
+                resolve(selection);
+            };
+            const onAbort = () => finish(null);
+            const updatePager = (hasNext) => {
+                previous.disabled = loading || searching || pageIndex === 0;
+                next.disabled = loading || searching || !hasNext;
+                pagination.hidden = searching || (pageIndex === 0 && !hasNext);
+                searchInput.disabled = loading || !api.allows("steam.read");
+                searchButton.disabled = loading || !api.allows("steam.read");
+                restart.disabled = loading;
+                clearSearch.hidden = !activeSearchTerm;
+            };
+            const showRestart = (message) => {
+                list.replaceChildren();
+                steamChooserSetText(status, message);
+                restart.hidden = false;
+                updatePager(false);
+            };
+            const permissionLost = () => {
+                list.replaceChildren();
+                steamChooserSetText(status, "Steam read permission is required. You can enter the app ID manually.");
+                restart.hidden = true;
+                updatePager(false);
+            };
+            const renderGames = (games) => {
+                list.replaceChildren();
+                for (const game of games) {
+                    const select = Amaterasu.button(steamChooserMessage("Select"), () => finish(game));
+                    steamChooserSetAttributeTemplate(select, "aria-label", "Select {name}", {
+                        name: typeof Amaterasu.literalText === "function"
+                            ? Amaterasu.literalText(game.name)
+                            : game.name,
+                    });
+                    const directory = game.install_directory;
+                    list.append(Amaterasu.el("li", "steam-game-chooser-item", Amaterasu.el("div", "steam-game-chooser-copy", Amaterasu.el("strong", "", typeof Amaterasu.literalText === "function"
+                        ? Amaterasu.literalText(game.name)
+                        : game.name), Amaterasu.el("span", "steam-game-chooser-details", steamChooserMessage("App ID"), " ", String(game.app_id), " · ", steamChooserMessage(directory ? "Install directory" : "Install directory unavailable"), ...(directory ? [" ", typeof Amaterasu.literalText === "function"
+                            ? Amaterasu.literalText(directory)
+                            : directory] : []))), select));
+                }
+            };
+            const showPage = async (requestedPage) => {
+                if (settled || loading || searching || requestedPage < 0 ||
+                    requestedPage > pageIndex + 1)
+                    return;
+                if (!api.allows("steam.read")) {
+                    permissionLost();
+                    return;
+                }
+                loading = true;
+                searching = false;
+                const operation = beginOperation();
+                pageIndex = requestedPage;
+                const cursor = cursors[pageIndex] ?? null;
+                cursors.length = pageIndex + 1;
+                list.replaceChildren();
+                restart.hidden = true;
+                steamChooserSetText(status, "Loading Steam games…");
+                updatePager(false);
+                try {
+                    const raw = await api.post("steam/list", {
+                        ...(revision !== undefined ? { revision } : {}),
+                        ...(cursor !== null ? { after: cursor } : {}),
+                        limit: steamChooserPageSize,
+                    }, true, operation.requestSignal);
+                    if (settled || signal?.aborted || operation.token !== operationToken)
+                        return;
+                    if (!api.allows("steam.read")) {
+                        permissionLost();
+                        return;
+                    }
+                    const reply = validateSteamChooserReply(raw);
+                    if (revision !== undefined && reply.revision !== revision) {
+                        showRestart("Steam games changed. Restart to load the current list.");
+                        return;
+                    }
+                    revision = reply.revision;
+                    if (reply.next_after !== null &&
+                        ((cursor !== null && reply.next_after <= cursor) ||
+                            cursors.slice(0, pageIndex + 1).includes(reply.next_after))) {
+                        showRestart("Steam pagination failed. Restart to continue.");
+                        return;
+                    }
+                    if (reply.next_after !== null)
+                        cursors[pageIndex + 1] = reply.next_after;
+                    else
+                        cursors.length = pageIndex + 1;
+                    renderGames(reply.games);
+                    steamChooserSetText(status, reply.games.length
+                        ? "Choose a discovered game."
+                        : reply.complete ? "No Steam games are available."
+                            : reply.scanning ? "Steam is scanning. Refresh later to see discovered games."
+                                : "No Steam games are available.");
+                    updatePager(reply.next_after !== null);
+                }
+                catch (error) {
+                    if (settled || signal?.aborted || operation.token !== operationToken)
+                        return;
+                    if (!api.allows("steam.read")) {
+                        permissionLost();
+                        return;
+                    }
+                    if (error instanceof Amaterasu.ApiError && error.code === "revision_conflict") {
+                        showRestart("Steam games changed. Restart to load the current list.");
+                        return;
+                    }
+                    showRestart("Steam games are unavailable. Retry or enter the app ID manually.");
+                }
+                finally {
+                    operation.cleanup();
+                    if (operation.token === operationToken) {
+                        loading = false;
+                        activeRequestController = null;
+                        if (!settled && !signal?.aborted)
+                            updatePager(cursors[pageIndex + 1] !== undefined);
+                    }
+                }
+            };
+            const searchGames = async () => {
+                if (settled || loading || !searchInput.value.trim()) {
+                    if (!settled && !searchInput.value.trim())
+                        steamChooserSetText(status, "Enter a game name or app ID.");
+                    return;
+                }
+                if (!api.allows("steam.read")) {
+                    permissionLost();
+                    return;
+                }
+                const query = searchInput.value.trim().toLocaleLowerCase();
+                activeSearchTerm = query;
+                loading = true;
+                searching = true;
+                const operation = beginOperation();
+                list.replaceChildren();
+                restart.hidden = true;
+                clearSearch.hidden = false;
+                steamChooserSetText(status, "Searching Steam games…");
+                updatePager(false);
+                const matches = [];
+                const seenCursors = new Set();
+                let cursor = null;
+                let pagesRead = 0;
+                let entriesChecked = 0;
+                let complete = false;
+                try {
+                    while (pagesRead < steamChooserSearchMaxPages) {
+                        if (settled || signal?.aborted || operation.token !== operationToken)
+                            return;
+                        if (!api.allows("steam.read")) {
+                            permissionLost();
+                            return;
+                        }
+                        const reply = validateSteamChooserReply(await api.post("steam/list", {
+                            ...(revision !== undefined ? { revision } : {}),
+                            ...(cursor !== null ? { after: cursor } : {}),
+                            limit: steamChooserPageSize,
+                        }, true, operation.requestSignal));
+                        if (settled || signal?.aborted || operation.token !== operationToken)
+                            return;
+                        if (!api.allows("steam.read")) {
+                            permissionLost();
+                            return;
+                        }
+                        if (revision !== undefined && reply.revision !== revision) {
+                            showRestart("Steam games changed. Restart to search the current list.");
+                            return;
+                        }
+                        revision = reply.revision;
+                        pagesRead += 1;
+                        entriesChecked += reply.games.length;
+                        matches.push(...reply.games.filter((game) => game.name.toLocaleLowerCase().includes(query) ||
+                            String(game.app_id).includes(query)));
+                        if (reply.next_after === null) {
+                            complete = true;
+                            break;
+                        }
+                        if ((cursor !== null && reply.next_after <= cursor) ||
+                            seenCursors.has(reply.next_after)) {
+                            showRestart("Steam pagination failed. Restart to continue.");
+                            return;
+                        }
+                        seenCursors.add(reply.next_after);
+                        cursor = reply.next_after;
+                    }
+                    renderGames(matches);
+                    if (matches.length) {
+                        if (complete)
+                            steamChooserSetText(status, "Search complete. Choose a discovered game.");
+                        else
+                            steamChooserSetFormattedText(status, "Found matches within {count} checked games. Browse later pages or refine your search.", { count: String(entriesChecked) });
+                    }
+                    else {
+                        if (complete)
+                            steamChooserSetText(status, "No Steam games matched.");
+                        else
+                            steamChooserSetFormattedText(status, "Checked {count} games across 32 pages. Browse later pages or refine your search.", { count: String(entriesChecked) });
+                    }
+                    restart.hidden = true;
+                    updatePager(false);
+                }
+                catch (error) {
+                    if (settled || signal?.aborted || operation.token !== operationToken)
+                        return;
+                    if (!api.allows("steam.read")) {
+                        permissionLost();
+                        return;
+                    }
+                    if (error instanceof Amaterasu.ApiError && error.code === "revision_conflict") {
+                        showRestart("Steam games changed. Restart to search the current list.");
+                        return;
+                    }
+                    showRestart("Steam games are unavailable. Retry or enter the app ID manually.");
+                }
+                finally {
+                    operation.cleanup();
+                    if (operation.token === operationToken) {
+                        loading = false;
+                        activeRequestController = null;
+                        if (!settled && !signal?.aborted)
+                            updatePager(false);
+                    }
+                }
+            };
+            const restartDiscovery = async () => {
+                if (settled || loading)
+                    return;
+                revision = undefined;
+                pageIndex = 0;
+                cursors = [null];
+                const query = activeSearchTerm;
+                activeSearchTerm = "";
+                restart.hidden = true;
+                if (query) {
+                    searchInput.value = query;
+                    await searchGames();
+                }
+                else {
+                    await showPage(0);
+                }
+            };
+            searchForm.addEventListener("submit", (event) => {
+                event.preventDefault();
+                void searchGames();
+            });
+            dialog.addEventListener("cancel", (event) => {
+                event.preventDefault();
+                finish(null);
+            });
+            signal?.addEventListener("abort", onAbort, { once: true });
+            if (signal?.aborted) {
+                finish(null);
+                return;
+            }
+            document.body.append(dialog);
+            dialog.showModal();
+            cancel.focus();
+            if (api.allows("steam.read"))
+                void showPage(0);
+            else
+                permissionLost();
+        });
+    }
+    Amaterasu.chooseSteamGame = chooseSteamGame;
+    function chooseSteamDirectoryChange(signal) {
+        return new Promise((resolve) => {
+            if (signal?.aborted) {
+                resolve(null);
+                return;
+            }
+            const opener = document.activeElement;
+            const dialog = Amaterasu.el("dialog", "steam-game-chooser-dialog");
+            steamChooserSetAttribute(dialog, "aria-label", "Review Steam directory");
+            const heading = Amaterasu.el("h2", "", steamChooserMessage("Review Steam directory"));
+            heading.id = "steam-directory-review-title";
+            dialog.setAttribute("aria-labelledby", heading.id);
+            const status = Amaterasu.el("p", "muted", steamChooserMessage("The selected game has no install directory. Your current directory may belong to another game."));
+            status.setAttribute("role", "status");
+            status.setAttribute("aria-live", "polite");
+            const keep = Amaterasu.button(steamChooserMessage("Keep current directory"), () => finish("keep"));
+            const clear = Amaterasu.button(steamChooserMessage("Clear current directory"), () => finish("clear"), "danger");
+            const review = Amaterasu.button(steamChooserMessage("Review fields"), () => finish("review"));
+            steamChooserSetAttribute(review, "aria-label", "Review fields");
+            dialog.append(heading, status, Amaterasu.el("p", "muted", steamChooserMessage("Choose whether to keep or clear the current directory, or review fields without applying.")), Amaterasu.el("div", "actions", review, keep, clear));
+            let settled = false;
+            const finish = (choice) => {
+                if (settled)
+                    return;
+                settled = true;
+                signal?.removeEventListener("abort", onAbort);
+                dialog.close();
+                dialog.remove();
+                if (opener)
+                    steamChooserSetFocus(opener);
+                resolve(choice);
+            };
+            const onAbort = () => finish(null);
+            dialog.addEventListener("cancel", (event) => {
+                event.preventDefault();
+                finish("review");
+            });
+            signal?.addEventListener("abort", onAbort, { once: true });
+            if (signal?.aborted) {
+                finish(null);
+                return;
+            }
+            document.body.append(dialog);
+            dialog.showModal();
+            review.focus();
+        });
+    }
+    Amaterasu.chooseSteamDirectoryChange = chooseSteamDirectoryChange;
+})(Amaterasu || (Amaterasu = {}));
+var Amaterasu;
+(function (Amaterasu) {
     function catalogTextLiteral(value) {
         return typeof Amaterasu.literalText === "function" ? Amaterasu.literalText(value) : value;
     }
@@ -5421,6 +6719,7 @@ var Amaterasu;
         const editor = Amaterasu.el("div");
         const editorDrafts = context.registerDraftGuard ? Amaterasu.trackDrafts(editor) : null;
         let editorSaving = false;
+        let editorLifecycle = null;
         const catalogDraftDirty = () => {
             const form = editor.querySelector(".editor-form");
             return !!form && !!editorDrafts?.isDirty(form);
@@ -5428,7 +6727,11 @@ var Amaterasu;
         let pluginArea = null;
         const pluginDirty = () => !!pluginArea && typeof Amaterasu.applicationPluginOverridesDirty === "function" && Amaterasu.applicationPluginOverridesDirty(pluginArea);
         if (editorDrafts)
-            context.registerDraftGuard?.(() => editorSaving || catalogDraftDirty() || pluginDirty(), editorDrafts.dispose);
+            context.registerDraftGuard?.(() => editorSaving || catalogDraftDirty() || pluginDirty(), () => {
+                editorLifecycle?.abort();
+                editorLifecycle = null;
+                editorDrafts.dispose();
+            });
         let editorGeneration = 0;
         const status = Amaterasu.el("div");
         const selectionCount = Amaterasu.el("span", "muted");
@@ -5870,6 +7173,8 @@ var Amaterasu;
             }
             if ((catalogDraftDirty() || pluginDirty()) && !window.confirm("Discard your unsaved application and plugin changes?"))
                 return false;
+            editorLifecycle?.abort();
+            editorLifecycle = null;
             pluginArea = null;
             editorGeneration += 1;
             editor.replaceChildren();
@@ -6036,7 +7341,9 @@ var Amaterasu;
         }
         function renderEditor(row, runtimeStatus, capabilities) {
             const editRevision = revision;
-            const form = entryForm(row?.entry, runtimeStatus, capabilities);
+            const lifecycle = new AbortController();
+            editorLifecycle = lifecycle;
+            const form = entryForm(row?.entry, runtimeStatus, capabilities, api, lifecycle.signal);
             form.hidden = !api.allows("catalog.write");
             const feedback = Amaterasu.el("div");
             const save = Amaterasu.el("button", "button primary", row ? "Save changes" : "Add application");
@@ -6066,6 +7373,9 @@ var Amaterasu;
                             entry,
                             expected_revision: editRevision,
                         });
+                        lifecycle.abort();
+                        if (editorLifecycle === lifecycle)
+                            editorLifecycle = null;
                         editor.replaceChildren();
                         notify(catalogTextMessage(row ? "Application updated." : "Application added."));
                         reset();
@@ -6190,7 +7500,7 @@ var Amaterasu;
         }, true);
     }
     const catalogRemovedOverrides = new WeakMap();
-    function entryForm(entry, runtimeStatus, capabilities) {
+    function entryForm(entry, runtimeStatus, capabilities, api, lifecycle) {
         const form = Amaterasu.el("form", "editor-form");
         const name = Amaterasu.input("name", entry?.name ?? "");
         name.required = true;
@@ -6354,6 +7664,71 @@ var Amaterasu;
         const pathField = Amaterasu.field("Absolute application path", path);
         const steamIdField = Amaterasu.field("Steam app ID", steamId, "Optional canonical Steam app ID for provider-aware process tracking.");
         const steamInstallDirField = Amaterasu.field("Steam install directory", steamInstallDir, "Optional absolute game directory; Linux tracks only newly launched processes inside it.");
+        const steamChooserStatus = Amaterasu.el("p", "muted");
+        steamChooserStatus.setAttribute("role", "status");
+        steamChooserStatus.hidden = true;
+        const setSteamChooserStatus = (message) => {
+            steamChooserStatus.hidden = false;
+            if (typeof Amaterasu.setLocalizedTextContent === "function")
+                Amaterasu.setLocalizedTextContent(steamChooserStatus, message);
+            else
+                steamChooserStatus.textContent = message;
+        };
+        const chooseSteamGameButton = Amaterasu.button(catalogTextMessage("Choose a Steam game"), async () => {
+            if (!api.allows("catalog.write") || lifecycle.aborted || !form.isConnected)
+                return;
+            const selected = await Amaterasu.chooseSteamGame(api, lifecycle);
+            if (!selected || lifecycle.aborted || !form.isConnected)
+                return;
+            if (!api.allows("catalog.write") || !api.allows("steam.read")) {
+                setSteamChooserStatus("A required permission changed; the selection was not applied.");
+                return;
+            }
+            const selectedId = String(selected.app_id);
+            const directoryAvailable = selected.install_directory !== undefined &&
+                selected.install_directory.trim() !== "";
+            const changingGame = steamId.value !== selectedId;
+            let keepDirectory = false;
+            let clearDirectory = false;
+            if (!directoryAvailable && changingGame && steamInstallDir.value.trim() !== "") {
+                const choice = await Amaterasu.chooseSteamDirectoryChange(lifecycle);
+                if (!choice || lifecycle.aborted || !form.isConnected)
+                    return;
+                if (choice === "review") {
+                    setSteamChooserStatus("Selection was not applied. Review the Steam fields and choose again.");
+                    return;
+                }
+                if (!api.allows("catalog.write") || !api.allows("steam.read")) {
+                    setSteamChooserStatus("A required permission changed; the selection was not applied.");
+                    return;
+                }
+                keepDirectory = choice === "keep";
+                clearDirectory = choice === "clear";
+            }
+            steamId.value = selectedId;
+            steamId.dispatchEvent(new Event("input", { bubbles: true }));
+            steamId.dispatchEvent(new Event("change", { bubbles: true }));
+            if (directoryAvailable) {
+                steamInstallDir.value = selected.install_directory;
+                steamInstallDir.dispatchEvent(new Event("input", { bubbles: true }));
+                steamInstallDir.dispatchEvent(new Event("change", { bubbles: true }));
+            }
+            else if (clearDirectory) {
+                steamInstallDir.value = "";
+                steamInstallDir.dispatchEvent(new Event("input", { bubbles: true }));
+                steamInstallDir.dispatchEvent(new Event("change", { bubbles: true }));
+            }
+            const status = directoryAvailable
+                ? "Steam game selected. Other application edits were kept."
+                : keepDirectory
+                    ? "Steam game selected. Kept the existing directory by choice."
+                    : clearDirectory
+                        ? "Steam game selected. Cleared the existing directory by choice."
+                        : "Steam game selected. Its install directory is unavailable; the existing directory was kept.";
+            setSteamChooserStatus(status);
+        });
+        catalogLocalizedAttribute(chooseSteamGameButton, "aria-label", "Choose a Steam game");
+        const steamGameChooser = Amaterasu.el("div", "catalog-steam-chooser", chooseSteamGameButton, steamChooserStatus);
         const fullscreen = Amaterasu.field("Exit timeout (seconds)", fullscreenTimeout, "Graceful session close window, from 0 to 300 seconds.");
         const showKind = () => {
             executable.hidden = kind.value !== "executable";
@@ -6366,6 +7741,7 @@ var Amaterasu;
             path.required = !processless;
             steamIdField.hidden = processless;
             steamInstallDirField.hidden = processless;
+            steamGameChooser.hidden = processless;
             sharedLaunchOptions.hidden = kind.value === "application";
             directory.disabled = kind.value === "application";
             path.placeholder =
@@ -6374,7 +7750,7 @@ var Amaterasu;
                     : "/Applications/Example.app";
         };
         kind.addEventListener("change", showKind);
-        form.append(catalogEditorSection("Identity", "Name and describe this application in your library.", Amaterasu.field("Name", name), Amaterasu.field("Description", description), Amaterasu.field("Tags", tags, "Separate tags with commas.")), catalogEditorDisclosure("Launch", "Choose how the host starts and tracks the application.", Amaterasu.field("Launch type", kind), pathField, steamIdField, steamInstallDirField, fullscreen, sharedLaunchOptions, executable, Amaterasu.field("Command output", outputMode, "Use default discards command output without saving an output value."), outputFile, rawPreparation, Amaterasu.field("Skip global preparation commands", excludeGlobalPreparation, "Do not run the host-wide preparation commands for this application.")), catalogEditorDisclosure("Display", "Choose display and virtual-screen overrides.", Amaterasu.field("Display output override", displayOutput, "Leave empty to inherit the next display selection. This is separate from the command output file."), Amaterasu.field("Virtual screen request", virtualScreen, "Inherit the host setting or explicitly request or avoid a virtual screen."), Amaterasu.field("Virtual display mode", virtualDisplayMode, "Inherit the host mode or explicitly disable, use per-client, or share a virtual display."), Amaterasu.field("Virtual display layout", virtualDisplayLayout, "Inherit the host layout or select how virtual displays are arranged."), ...refreshRateOptionFields, Amaterasu.field("Display and adapter policy (JSON)", displayPolicy, "Sparse application overrides. Use null or empty values to inherit; global-only keys are rejected."), Amaterasu.field("10-bit SDR preference", prefer10BitSdr, "Inherit the next setting scope, or set an explicit preference for this application.")), catalogEditorDisclosure("Streaming and audio", "Override streaming, frame limiting, and audio for this application.", Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global streaming setting; supported values are 1–255."), ...sessionPolicyFields, Amaterasu.field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this application streams audio."), audioSink.controls, virtualSink.controls, Amaterasu.field("Capture audio without changing default outputs", captureOnly, "Inherit the host setting, enable capture only, or allow Windows default-output routing.")), catalogEditorDisclosure("Input", "Set per-application controller, keyboard, and mouse preferences.", Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "Leave blank to inherit. Use -1 to disable the timeout; other signed 32-bit values set the duration."), Amaterasu.field("Controller input", controller, "Inherit the next scope, or enable/disable gamepad input for this application."), Amaterasu.field("Gamepad profile", gamepad, "Inherit the next scope. Recognized profiles unavailable on this backend stay selectable and are labeled unavailable."), Amaterasu.field("Keyboard input", keyboard, "Inherit the next scope, or enable/disable keyboard input for this application."), Amaterasu.field("Mouse input", mouse, "Inherit the next scope, or enable/disable mouse input for this application."), ...inputCompatibilityFields, ...advancedInput.fields), catalogEditorDisclosure("Encoder", "Override software and NVENC encoder settings.", ...softwareEncoder.fields, ...nvencSettingsFields));
+        form.append(catalogEditorSection("Identity", "Name and describe this application in your library.", Amaterasu.field("Name", name), Amaterasu.field("Description", description), Amaterasu.field("Tags", tags, "Separate tags with commas.")), catalogEditorDisclosure("Launch", "Choose how the host starts and tracks the application.", Amaterasu.field("Launch type", kind), pathField, steamIdField, steamInstallDirField, steamGameChooser, fullscreen, sharedLaunchOptions, executable, Amaterasu.field("Command output", outputMode, "Use default discards command output without saving an output value."), outputFile, rawPreparation, Amaterasu.field("Skip global preparation commands", excludeGlobalPreparation, "Do not run the host-wide preparation commands for this application.")), catalogEditorDisclosure("Display", "Choose display and virtual-screen overrides.", Amaterasu.field("Display output override", displayOutput, "Leave empty to inherit the next display selection. This is separate from the command output file."), Amaterasu.field("Virtual screen request", virtualScreen, "Inherit the host setting or explicitly request or avoid a virtual screen."), Amaterasu.field("Virtual display mode", virtualDisplayMode, "Inherit the host mode or explicitly disable, use per-client, or share a virtual display."), Amaterasu.field("Virtual display layout", virtualDisplayLayout, "Inherit the host layout or select how virtual displays are arranged."), ...refreshRateOptionFields, Amaterasu.field("Display and adapter policy (JSON)", displayPolicy, "Sparse application overrides. Use null or empty values to inherit; global-only keys are rejected."), Amaterasu.field("10-bit SDR preference", prefer10BitSdr, "Inherit the next setting scope, or set an explicit preference for this application.")), catalogEditorDisclosure("Streaming and audio", "Override streaming, frame limiting, and audio for this application.", Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global streaming setting; supported values are 1–255."), ...sessionPolicyFields, Amaterasu.field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this application streams audio."), audioSink.controls, virtualSink.controls, Amaterasu.field("Capture audio without changing default outputs", captureOnly, "Inherit the host setting, enable capture only, or allow Windows default-output routing.")), catalogEditorDisclosure("Input", "Set per-application controller, keyboard, and mouse preferences.", Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "Leave blank to inherit. Use -1 to disable the timeout; other signed 32-bit values set the duration."), Amaterasu.field("Controller input", controller, "Inherit the next scope, or enable/disable gamepad input for this application."), Amaterasu.field("Gamepad profile", gamepad, "Inherit the next scope. Recognized profiles unavailable on this backend stay selectable and are labeled unavailable."), Amaterasu.field("Keyboard input", keyboard, "Inherit the next scope, or enable/disable keyboard input for this application."), Amaterasu.field("Mouse input", mouse, "Inherit the next scope, or enable/disable mouse input for this application."), ...inputCompatibilityFields, ...advancedInput.fields), catalogEditorDisclosure("Encoder", "Override software and NVENC encoder settings.", ...softwareEncoder.fields, ...nvencSettingsFields));
         form.children[1].open = !entry;
         const sections = Array.from(form.children).slice(2);
         const overrides = catalogOverrideEditor(catalogOverrideSections(sections), { ...entry, ...entry?.config_overrides });

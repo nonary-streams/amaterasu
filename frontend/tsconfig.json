@@ -18,6 +18,7 @@
     "src/locale-catalogs.ts",
     "src/ui.ts",
     "src/theme.ts",
+    "src/steam_game_chooser.ts",
     "src/catalog.ts",
     "src/management-policy.ts",
     "src/csrf-policy.ts",

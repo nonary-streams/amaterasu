@@ -1019,13 +1019,21 @@ namespace Amaterasu {
     const editor = el("div");
     const editorDrafts = context.registerDraftGuard ? trackDrafts(editor) : null;
     let editorSaving = false;
+    let editorLifecycle: AbortController | null = null;
     const catalogDraftDirty = () => {
       const form = editor.querySelector<HTMLElement>(".editor-form");
       return !!form && !!editorDrafts?.isDirty(form);
     };
     let pluginArea: HTMLElement | null = null;
     const pluginDirty = () => !!pluginArea && typeof applicationPluginOverridesDirty === "function" && applicationPluginOverridesDirty(pluginArea);
-    if (editorDrafts) context.registerDraftGuard?.(() => editorSaving || catalogDraftDirty() || pluginDirty(), editorDrafts.dispose);
+    if (editorDrafts) context.registerDraftGuard?.(
+      () => editorSaving || catalogDraftDirty() || pluginDirty(),
+      () => {
+        editorLifecycle?.abort();
+        editorLifecycle = null;
+        editorDrafts.dispose();
+      },
+    );
     let editorGeneration = 0;
     const status = el("div");
     const selectionCount = el("span", "muted");
@@ -1481,6 +1489,8 @@ namespace Amaterasu {
         return false;
       }
       if ((catalogDraftDirty() || pluginDirty()) && !window.confirm("Discard your unsaved application and plugin changes?")) return false;
+      editorLifecycle?.abort();
+      editorLifecycle = null;
       pluginArea = null;
       editorGeneration += 1;
       editor.replaceChildren();
@@ -1760,7 +1770,9 @@ namespace Amaterasu {
       capabilities: CatalogConfigOverrideCapabilities,
     ): void {
       const editRevision = revision;
-      const form = entryForm(row?.entry, runtimeStatus, capabilities);
+      const lifecycle = new AbortController();
+      editorLifecycle = lifecycle;
+      const form = entryForm(row?.entry, runtimeStatus, capabilities, api, lifecycle.signal);
       form.hidden = !api.allows("catalog.write");
       const feedback = el("div");
       const save = el(
@@ -1803,6 +1815,8 @@ namespace Amaterasu {
               entry,
               expected_revision: editRevision,
             });
+            lifecycle.abort();
+            if (editorLifecycle === lifecycle) editorLifecycle = null;
             editor.replaceChildren();
             notify(catalogTextMessage(row ? "Application updated." : "Application added."));
             reset();
@@ -1950,6 +1964,8 @@ namespace Amaterasu {
     entry: Entry | undefined,
     runtimeStatus: InputRuntimeStatus,
     capabilities: CatalogConfigOverrideCapabilities,
+    api: Api,
+    lifecycle: AbortSignal,
   ): HTMLFormElement {
     const form = el("form", "editor-form");
     const name = input("name", entry?.name ?? "");
@@ -2172,6 +2188,71 @@ namespace Amaterasu {
     const pathField = field("Absolute application path", path);
     const steamIdField = field("Steam app ID", steamId, "Optional canonical Steam app ID for provider-aware process tracking.");
     const steamInstallDirField = field("Steam install directory", steamInstallDir, "Optional absolute game directory; Linux tracks only newly launched processes inside it.");
+    const steamChooserStatus = el("p", "muted");
+    steamChooserStatus.setAttribute("role", "status");
+    steamChooserStatus.hidden = true;
+    const setSteamChooserStatus = (message: string): void => {
+      steamChooserStatus.hidden = false;
+      if (typeof Amaterasu.setLocalizedTextContent === "function")
+        Amaterasu.setLocalizedTextContent(steamChooserStatus, message);
+      else
+        steamChooserStatus.textContent = message;
+    };
+    const chooseSteamGameButton = button(catalogTextMessage("Choose a Steam game"), async () => {
+      if (!api.allows("catalog.write") || lifecycle.aborted || !form.isConnected) return;
+      const selected = await chooseSteamGame(api, lifecycle);
+      if (!selected || lifecycle.aborted || !form.isConnected) return;
+      if (!api.allows("catalog.write") || !api.allows("steam.read")) {
+        setSteamChooserStatus("A required permission changed; the selection was not applied.");
+        return;
+      }
+
+      const selectedId = String(selected.app_id);
+      const directoryAvailable = selected.install_directory !== undefined &&
+        selected.install_directory.trim() !== "";
+      const changingGame = steamId.value !== selectedId;
+      let keepDirectory = false;
+      let clearDirectory = false;
+      if (!directoryAvailable && changingGame && steamInstallDir.value.trim() !== "") {
+        const choice = await chooseSteamDirectoryChange(lifecycle);
+        if (!choice || lifecycle.aborted || !form.isConnected) return;
+        if (choice === "review") {
+          setSteamChooserStatus("Selection was not applied. Review the Steam fields and choose again.");
+          return;
+        }
+        if (!api.allows("catalog.write") || !api.allows("steam.read")) {
+          setSteamChooserStatus("A required permission changed; the selection was not applied.");
+          return;
+        }
+        keepDirectory = choice === "keep";
+        clearDirectory = choice === "clear";
+      }
+
+      steamId.value = selectedId;
+      steamId.dispatchEvent(new Event("input", { bubbles: true }));
+      steamId.dispatchEvent(new Event("change", { bubbles: true }));
+      if (directoryAvailable) {
+        steamInstallDir.value = selected.install_directory!;
+        steamInstallDir.dispatchEvent(new Event("input", { bubbles: true }));
+        steamInstallDir.dispatchEvent(new Event("change", { bubbles: true }));
+      } else if (clearDirectory) {
+        steamInstallDir.value = "";
+        steamInstallDir.dispatchEvent(new Event("input", { bubbles: true }));
+        steamInstallDir.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+
+      const status = directoryAvailable
+        ? "Steam game selected. Other application edits were kept."
+        : keepDirectory
+          ? "Steam game selected. Kept the existing directory by choice."
+          : clearDirectory
+            ? "Steam game selected. Cleared the existing directory by choice."
+            : "Steam game selected. Its install directory is unavailable; the existing directory was kept.";
+      setSteamChooserStatus(status);
+    });
+    catalogLocalizedAttribute(chooseSteamGameButton, "aria-label", "Choose a Steam game");
+    const steamGameChooser = el("div", "catalog-steam-chooser",
+      chooseSteamGameButton, steamChooserStatus);
     const fullscreen = field("Exit timeout (seconds)", fullscreenTimeout, "Graceful session close window, from 0 to 300 seconds.");
     const showKind = () => {
       executable.hidden = kind.value !== "executable";
@@ -2184,6 +2265,7 @@ namespace Amaterasu {
       path.required = !processless;
       steamIdField.hidden = processless;
       steamInstallDirField.hidden = processless;
+      steamGameChooser.hidden = processless;
       sharedLaunchOptions.hidden = kind.value === "application";
       directory.disabled = kind.value === "application";
       path.placeholder =
@@ -2197,7 +2279,8 @@ namespace Amaterasu {
         field("Name", name), field("Description", description),
         field("Tags", tags, "Separate tags with commas.")),
       catalogEditorDisclosure("Launch", "Choose how the host starts and tracks the application.",
-        field("Launch type", kind), pathField, steamIdField, steamInstallDirField, fullscreen, sharedLaunchOptions, executable,
+        field("Launch type", kind), pathField, steamIdField, steamInstallDirField,
+        steamGameChooser, fullscreen, sharedLaunchOptions, executable,
         field("Command output", outputMode, "Use default discards command output without saving an output value."),
         outputFile, rawPreparation,
         field("Skip global preparation commands", excludeGlobalPreparation,

@@ -96,7 +96,7 @@ const settle = () => new Promise(setImmediate);
 
 test("application DOM saves output and keybindings while preserving raw preparation and sparse controls", async () => {
   const context = vm.createContext({
-    FormData: EditorFormData, TextEncoder, URL, Error,
+    FormData: EditorFormData, TextEncoder, URL, Error, AbortController,
     HTMLElement: Element, HTMLSelectElement: SelectElement, Event,
     document: { createElement: (tagName) => tagName === "select" ? new SelectElement(tagName) : new Element(tagName) },
   });
@@ -198,7 +198,7 @@ test("application DOM saves output and keybindings while preserving raw preparat
 });
 
 test("desktop editor saves its process-less target, preparation and display settings", async () => {
-  const context = vm.createContext({ FormData:EditorFormData, TextEncoder, URL, Error,
+  const context = vm.createContext({ FormData:EditorFormData, TextEncoder, URL, Error, AbortController,
     HTMLElement:Element, HTMLSelectElement:SelectElement, Event,
     document:{createElement:(tag)=>tag === "select" ? new SelectElement(tag) : new Element(tag)} });
   for (const source of ["src/model.ts","src/ui.ts","src/pages.ts","src/settings.ts","src/catalog.ts"]) {
@@ -233,7 +233,7 @@ test("desktop editor saves its process-less target, preparation and display sett
 });
 
 test("configuration-only users can open application plugin overrides", async () => {
-  const context = vm.createContext({ FormData: EditorFormData, TextEncoder, URL, Error,
+  const context = vm.createContext({ FormData: EditorFormData, TextEncoder, URL, Error, AbortController,
     HTMLElement: Element, HTMLSelectElement: SelectElement, Event,
     document: { createElement: tag => tag === "select" ? new SelectElement(tag) : new Element(tag) } });
   for (const source of ["src/model.ts", "src/ui.ts", "src/pages.ts", "src/settings.ts", "src/catalog.ts"]) {
