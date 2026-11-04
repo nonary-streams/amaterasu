@@ -128,8 +128,8 @@ test("Steam chooser paginates with a stable revision and returns only the explic
 test("permission denial explains manual entry and never calls Steam discovery", async () => {
   let calls = 0;
   const view = setup({ allows: () => false, async post() { calls++; throw new Error("must not request"); } });
-  assert.match(view.dialog.textContent, /steam.read permission/);
-  assert.match(view.dialog.textContent, /enter a Steam app ID manually/);
+  assert.match(view.dialog.textContent, /Steam read permission/);
+  assert.match(view.dialog.textContent, /enter the app ID manually/);
   assert.equal(calls, 0);
   button(view.dialog, "Cancel").click();
   assert.equal(await view.pending, null);
@@ -200,21 +200,30 @@ test("search walks bounded pages of the actual steam/list API and filters by nam
   assert.deepEqual(JSON.parse(JSON.stringify(await view.pending)), { app_id: 42, name: "Target game", install_directory: "/target" });
 });
 
-test("search stops at its page bound instead of scanning without limit", async () => {
+test("search bound reports actual entries checked across short continued pages", async () => {
   let calls = 0;
   const api = { allows: () => true, async post(_route, payload) {
     calls++;
-    const pageNumber = Math.floor(calls === 1 ? 0 : (calls - 2) % 100) + 1;
-    return page([{ app_id: pageNumber, name: "No match" }], pageNumber * 16);
+    if (calls === 1) return page([{ app_id: 1, name: "Browse first" }], 5);
+    if (calls <= 33) {
+      const after = payload.after ?? 0;
+      const games = Array.from({ length: 5 }, (_, index) => ({ app_id: after + index + 2, name: "No match" }));
+      return page(games, after + 5);
+    }
+    if (calls === 34) return page([{ app_id: 1001, name: "Browse after clear" }], 5);
+    return page([{ app_id: 1002, name: "Later page choice" }]);
   } };
-  const view = setup(api);
+  const view = setup(api, { liveLocale: true });
   await settle();
   const search = all(view.dialog).find((node) => node.name === "steam_game_search");
   search.value = "absent";
   button(view.dialog, "Search").click();
   await settle();
   assert.equal(calls, 33, "one browse request plus exactly 32 bounded search pages");
-  assert.match(view.dialog.textContent, /Search stopped after the first 512 games/);
+  assert.match(view.dialog.textContent, /160 games across 32 pages/);
+  view.context.Amaterasu.applyLocale("fr");
+  assert.match(view.dialog.textContent, /160 jeux vérifiés sur 32 pages/);
+  view.context.Amaterasu.applyLocale("en");
   button(view.dialog, "Clear search").click();
   await settle();
   assert.equal(calls, 34, "clearing search returns to browse mode");
@@ -222,10 +231,41 @@ test("search stops at its page bound instead of scanning without limit", async (
   button(view.dialog, "Next →").click();
   await settle();
   assert.equal(calls, 35, "later browse pages remain reachable beyond the search bound");
-  const chosen = all(view.dialog).find((node) => node.tagName === "BUTTON" && node.getAttribute("aria-label") === "Select No match");
+  const chosen = all(view.dialog).find((node) => node.tagName === "BUTTON" && node.getAttribute("aria-label") === "Select Later page choice");
   assert.ok(chosen);
   chosen.click();
-  assert.deepEqual(JSON.parse(JSON.stringify(await view.pending)), { app_id: 34, name: "No match" });
+  assert.deepEqual(JSON.parse(JSON.stringify(await view.pending)), { app_id: 1002, name: "Later page choice" });
+});
+
+test("clearing search aborts and invalidates a delayed response before browsing", async () => {
+  const calls = [];
+  let resolveSearch;
+  let delayedSignal;
+  const api = { allows: () => true, post(_route, payload, _protectedRoute, signal) {
+    calls.push(payload);
+    if (calls.length === 1) return Promise.resolve(page([{ app_id: 1, name: "Initial" }], 10));
+    if (calls.length === 2) {
+      delayedSignal = signal;
+      return new Promise(resolve => { resolveSearch = resolve; });
+    }
+    return Promise.resolve(page([{ app_id: 2, name: "Fresh browse" }], 20));
+  } };
+  const view = setup(api);
+  await settle();
+  const search = all(view.dialog).find((node) => node.name === "steam_game_search");
+  search.value = "old query";
+  button(view.dialog, "Search").click();
+  await settle();
+  button(view.dialog, "Clear search").click();
+  await settle();
+  assert.equal(delayedSignal.aborted, true);
+  assert.match(view.dialog.textContent, /Fresh browse/);
+  resolveSearch(page([{ app_id: 99, name: "Stale search result" }]));
+  await settle();
+  assert.match(view.dialog.textContent, /Fresh browse/);
+  assert.doesNotMatch(view.dialog.textContent, /Stale search result/);
+  button(view.dialog, "Cancel").click();
+  await view.pending;
 });
 
 test("stale pagination offers a clean restart using a new Steam revision", async () => {
@@ -240,7 +280,7 @@ test("stale pagination offers a clean restart using a new Steam revision", async
   await settle();
   button(view.dialog, "Next →").click();
   await settle();
-  assert.match(view.dialog.textContent, /changed while browsing/);
+  assert.match(view.dialog.textContent, /Steam games changed/);
   button(view.dialog, "Restart").click();
   await settle();
   assert.equal(view.dialog.textContent.includes("Fresh page"), true);
@@ -259,7 +299,7 @@ test("rejected revision_conflict offers restart and clears the stale revision", 
   await settle();
   button(view.dialog, "Next →").click();
   await settle();
-  assert.match(view.dialog.textContent, /changed while browsing/);
+  assert.match(view.dialog.textContent, /Steam games changed/);
   button(view.dialog, "Restart").click();
   await settle();
   assert.deepEqual(JSON.parse(JSON.stringify(calls[2].payload)), { limit: 16 });
@@ -298,7 +338,7 @@ test("permission loss during a pending request suppresses its late response", as
   allowed = false;
   resolvePage(page([{ app_id: 42, name: "Late secret" }]));
   await settle();
-  assert.match(view.dialog.textContent, /steam.read permission/);
+  assert.match(view.dialog.textContent, /Steam read permission/);
   assert.doesNotMatch(view.dialog.textContent, /Late secret/);
   button(view.dialog, "Cancel").click();
   assert.equal(await view.pending, null);
@@ -314,8 +354,9 @@ test("editor signal abort closes the modal and ignores a delayed API response", 
     post(_route, _payload, _protectedRoute, signal) { receivedSignal = signal; return pendingPage; },
   }, { signal: lifecycle.signal });
   await settle();
-  assert.equal(receivedSignal, lifecycle.signal);
+  assert.notEqual(receivedSignal, lifecycle.signal);
   lifecycle.abort();
+  assert.equal(receivedSignal.aborted, true);
   assert.equal(await view.pending, null);
   assert.equal(view.dialog.removed, true);
   resolvePage(page([{ app_id: 42, name: "Late response" }]));
@@ -350,4 +391,24 @@ test("dynamic select aria label translates while keeping the game name literal",
   assert.equal(select.getAttribute("aria-label"), "Select L'été Ω");
   button(view.dialog, "Cancel").click();
   await view.pending;
+});
+
+
+test("chooser loading and directory-review decision copy update with live locale", async () => {
+  const view = setup({ allows: () => true, async post() { return page([]); } }, { liveLocale: true });
+  await settle();
+  view.context.Amaterasu.applyLocale("fr");
+  assert.match(view.dialog.textContent, /Aucun jeu Steam n’est disponible/);
+  button(view.dialog, "Annuler").click();
+  await view.pending;
+
+  const review = view.context.Amaterasu.chooseSteamDirectoryChange();
+  const reviewDialog = view.document.body.children.find((node) => node.tagName === "DIALOG");
+  view.context.Amaterasu.applyLocale("en");
+  assert.match(reviewDialog.textContent, /current directory may belong to another game/i);
+  view.context.Amaterasu.applyLocale("fr");
+  assert.match(reviewDialog.textContent, /Le jeu choisi n’a pas de dossier d’installation/);
+  assert.match(reviewDialog.textContent, /Choisissez de conserver ou d’effacer/);
+  all(reviewDialog).find((node) => node.tagName === "BUTTON" && node.textContent === "Vérifier les champs").click();
+  assert.equal(await review, "review");
 });

@@ -260,7 +260,7 @@ test("application editor reports missing steam.read without issuing discovery re
   chooseButton(form).fire("click");
   await settle();
   const dialog = page.document.body.children[0];
-  assert.match(dialog.textContent, /steam.read permission/);
+  assert.match(dialog.textContent, /Steam read permission/);
   assert.equal(page.calls.filter(call => call.route === "steam/list").length, 0);
   find(dialog, node => node.tagName === "button" && node.textContent === "Cancel").fire("click");
   await settle();
@@ -307,7 +307,7 @@ test("permission loss during a pending list request discards its late games", as
   page.setSteamRead(false);
   resolveGames({ revision: 3, games: [{ app_id: 42, name: "Late game" }], next_after: null, scanning: false, complete: true });
   await settle();
-  assert.match(dialog.textContent, /steam.read permission/);
+  assert.match(dialog.textContent, /Steam read permission/);
   assert.doesNotMatch(dialog.textContent, /Late game/);
   find(dialog, node => node.tagName === "button" && node.textContent === "Cancel").fire("click");
   await settle();

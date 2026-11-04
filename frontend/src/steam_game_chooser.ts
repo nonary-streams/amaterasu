@@ -12,6 +12,28 @@ namespace Amaterasu {
       target.textContent = value;
   }
 
+  function steamChooserSetFormattedText(
+    target: Element,
+    source: string,
+    values: Readonly<Record<string, string>>,
+  ): void {
+    if (typeof Amaterasu.localeFormattedTextNode === "function" &&
+        typeof Amaterasu.translateText === "function") {
+      const node = Amaterasu.localeFormattedTextNode(() => {
+        let rendered = Amaterasu.translateText(source);
+        for (const [name, value] of Object.entries(values))
+          rendered = rendered.replaceAll(`{${name}}`, () => value);
+        return rendered;
+      });
+      target.replaceChildren(node);
+    } else {
+      let rendered = source;
+      for (const [name, value] of Object.entries(values))
+        rendered = rendered.replaceAll(`{${name}}`, () => value);
+      target.textContent = rendered;
+    }
+  }
+
   function steamChooserSetAttribute(target: Element, attribute: "aria-label", value: string): void {
     if (typeof Amaterasu.setLocalizedAttribute === "function")
       Amaterasu.setLocalizedAttribute(target, attribute, value);
@@ -142,6 +164,10 @@ namespace Amaterasu {
       const clearSearch = button(steamChooserMessage("Clear search"), () => {
         searchInput.value = "";
         activeSearchTerm = "";
+        activeRequestController?.abort();
+        activeRequestController = null;
+        operationToken += 1;
+        loading = false;
         searching = false;
         pageIndex = 0;
         cursors.length = 1;
@@ -175,9 +201,27 @@ namespace Amaterasu {
       let pageIndex = 0;
       let activeSearchTerm = "";
       let cursors: (number | null)[] = [null];
+      let operationToken = 0;
+      let activeRequestController: AbortController | null = null;
+      const beginOperation = () => {
+        activeRequestController?.abort();
+        const controller = new AbortController();
+        activeRequestController = controller;
+        const token = ++operationToken;
+        const abortWithEditor = (): void => controller.abort();
+        signal?.addEventListener("abort", abortWithEditor, { once: true });
+        return {
+          token,
+          requestSignal: controller.signal,
+          cleanup: () => signal?.removeEventListener("abort", abortWithEditor),
+        };
+      };
       const finish = (selection: SteamChooserGame | null): void => {
         if (settled) return;
         settled = true;
+        activeRequestController?.abort();
+        activeRequestController = null;
+        operationToken += 1;
         signal?.removeEventListener("abort", onAbort);
         dialog.close();
         dialog.remove();
@@ -202,7 +246,7 @@ namespace Amaterasu {
       };
       const permissionLost = (): void => {
         list.replaceChildren();
-        steamChooserSetText(status, "Steam discovery requires steam.read permission. You can enter a Steam app ID manually.");
+        steamChooserSetText(status, "Steam read permission is required. You can enter the app ID manually.");
         restart.hidden = true;
         updatePager(false);
       };
@@ -240,67 +284,72 @@ namespace Amaterasu {
         }
         loading = true;
         searching = false;
+        const operation = beginOperation();
         pageIndex = requestedPage;
         const cursor = cursors[pageIndex] ?? null;
         // A failed reload must not leave a previously discovered next cursor usable.
         cursors.length = pageIndex + 1;
         list.replaceChildren();
         restart.hidden = true;
-        steamChooserSetText(status, "Loading discovered Steam games…");
+        steamChooserSetText(status, "Loading Steam games…");
         updatePager(false);
         try {
           const raw = await api.post<SteamChooserReply>("steam/list", {
             ...(revision !== undefined ? { revision } : {}),
             ...(cursor !== null ? { after: cursor } : {}),
             limit: steamChooserPageSize,
-          }, true, signal);
-          if (settled || signal?.aborted) return;
+          }, true, operation.requestSignal);
+          if (settled || signal?.aborted || operation.token !== operationToken) return;
           if (!api.allows("steam.read")) {
             permissionLost();
             return;
           }
           const reply = validateSteamChooserReply(raw);
           if (revision !== undefined && reply.revision !== revision) {
-            showRestart("Steam games changed while browsing. Restart to load the current list.");
+            showRestart("Steam games changed. Restart to load the current list.");
             return;
           }
           revision = reply.revision;
           if (reply.next_after !== null &&
               ((cursor !== null && reply.next_after <= cursor) ||
                 cursors.slice(0, pageIndex + 1).includes(reply.next_after))) {
-            showRestart("Steam pagination could not continue. Restart to load the current list.");
+            showRestart("Steam pagination failed. Restart to continue.");
             return;
           }
           if (reply.next_after !== null) cursors[pageIndex + 1] = reply.next_after;
           else cursors.length = pageIndex + 1;
           renderGames(reply.games);
           steamChooserSetText(status, reply.games.length
-            ? "Choose a game to continue."
-            : reply.complete ? "No Steam games were discovered."
-              : reply.scanning ? "Steam is still scanning. Refresh the chooser later to see discovered games."
-                : "No Steam games are available yet.");
+            ? "Choose a discovered game."
+            : reply.complete ? "No Steam games are available."
+              : reply.scanning ? "Steam is scanning. Refresh later to see discovered games."
+                : "No Steam games are available.");
           updatePager(reply.next_after !== null);
         } catch (error) {
-          if (settled || signal?.aborted) return;
+          if (settled || signal?.aborted || operation.token !== operationToken) return;
           if (!api.allows("steam.read")) {
             permissionLost();
             return;
           }
           if (error instanceof ApiError && error.code === "revision_conflict") {
-            showRestart("Steam games changed while browsing. Restart to load the current list.");
+            showRestart("Steam games changed. Restart to load the current list.");
             return;
           }
-          showRestart("Steam games are unavailable. Retry or enter a Steam app ID manually.");
+          showRestart("Steam games are unavailable. Retry or enter the app ID manually.");
         } finally {
-          loading = false;
-          if (!settled && !signal?.aborted)
-            updatePager(cursors[pageIndex + 1] !== undefined);
+          operation.cleanup();
+          if (operation.token === operationToken) {
+            loading = false;
+            activeRequestController = null;
+            if (!settled && !signal?.aborted)
+              updatePager(cursors[pageIndex + 1] !== undefined);
+          }
         }
       };
       const searchGames = async (): Promise<void> => {
         if (settled || loading || !searchInput.value.trim()) {
           if (!settled && !searchInput.value.trim())
-            steamChooserSetText(status, "Enter a game name or app ID to search.");
+            steamChooserSetText(status, "Enter a game name or app ID.");
           return;
         }
         if (!api.allows("steam.read")) {
@@ -311,19 +360,21 @@ namespace Amaterasu {
         activeSearchTerm = query;
         loading = true;
         searching = true;
+        const operation = beginOperation();
         list.replaceChildren();
         restart.hidden = true;
         clearSearch.hidden = false;
-        steamChooserSetText(status, "Searching discovered Steam games…");
+        steamChooserSetText(status, "Searching Steam games…");
         updatePager(false);
         const matches: SteamChooserGame[] = [];
         const seenCursors = new Set<number>();
         let cursor: number | null = null;
         let pagesRead = 0;
+        let entriesChecked = 0;
         let complete = false;
         try {
           while (pagesRead < steamChooserSearchMaxPages) {
-            if (settled || signal?.aborted) return;
+            if (settled || signal?.aborted || operation.token !== operationToken) return;
             if (!api.allows("steam.read")) {
               permissionLost();
               return;
@@ -332,18 +383,19 @@ namespace Amaterasu {
               ...(revision !== undefined ? { revision } : {}),
               ...(cursor !== null ? { after: cursor } : {}),
               limit: steamChooserPageSize,
-            }, true, signal));
-            if (settled || signal?.aborted) return;
+            }, true, operation.requestSignal));
+            if (settled || signal?.aborted || operation.token !== operationToken) return;
             if (!api.allows("steam.read")) {
               permissionLost();
               return;
             }
             if (revision !== undefined && reply.revision !== revision) {
-              showRestart("Steam games changed during search. Restart to search the current list.");
+              showRestart("Steam games changed. Restart to search the current list.");
               return;
             }
             revision = reply.revision;
             pagesRead += 1;
+            entriesChecked += reply.games.length;
             matches.push(...reply.games.filter((game) =>
               game.name.toLocaleLowerCase().includes(query) ||
               String(game.app_id).includes(query)));
@@ -353,7 +405,7 @@ namespace Amaterasu {
             }
             if ((cursor !== null && reply.next_after <= cursor) ||
                 seenCursors.has(reply.next_after)) {
-              showRestart("Steam pagination could not continue. Restart to search the current list.");
+              showRestart("Steam pagination failed. Restart to continue.");
               return;
             }
             seenCursors.add(reply.next_after);
@@ -361,30 +413,36 @@ namespace Amaterasu {
           }
           renderGames(matches);
           if (matches.length) {
-            steamChooserSetText(status, complete
-              ? "Search complete. Choose a game to continue."
-              : "Search found matches in the first 512 games. Browse later pages or refine your search.");
+            if (complete) steamChooserSetText(status, "Search complete. Choose a discovered game.");
+            else steamChooserSetFormattedText(status,
+              "Found matches within {count} checked games. Browse later pages or refine your search.",
+              { count: String(entriesChecked) });
           } else {
-            steamChooserSetText(status, complete
-              ? "No Steam games matched. Try another search."
-              : "Search stopped after the first 512 games. Browse later pages or refine your search.");
+            if (complete) steamChooserSetText(status, "No Steam games matched.");
+            else steamChooserSetFormattedText(status,
+              "Checked {count} games across 32 pages. Browse later pages or refine your search.",
+              { count: String(entriesChecked) });
           }
           restart.hidden = true;
           updatePager(false);
         } catch (error) {
-          if (settled || signal?.aborted) return;
+          if (settled || signal?.aborted || operation.token !== operationToken) return;
           if (!api.allows("steam.read")) {
             permissionLost();
             return;
           }
           if (error instanceof ApiError && error.code === "revision_conflict") {
-            showRestart("Steam games changed during search. Restart to search the current list.");
+            showRestart("Steam games changed. Restart to search the current list.");
             return;
           }
-          showRestart("Steam games are unavailable. Retry or enter a Steam app ID manually.");
+          showRestart("Steam games are unavailable. Retry or enter the app ID manually.");
         } finally {
-          loading = false;
-          if (!settled && !signal?.aborted) updatePager(false);
+          operation.cleanup();
+          if (operation.token === operationToken) {
+            loading = false;
+            activeRequestController = null;
+            if (!settled && !signal?.aborted) updatePager(false);
+          }
         }
       };
       const restartDiscovery = async (): Promise<void> => {
@@ -433,8 +491,8 @@ namespace Amaterasu {
       }
       const opener = document.activeElement as HTMLElement | null;
       const dialog = el("dialog", "steam-game-chooser-dialog");
-      steamChooserSetAttribute(dialog, "aria-label", "Review Steam install directory");
-      const heading = el("h2", "", steamChooserMessage("Review Steam install directory"));
+      steamChooserSetAttribute(dialog, "aria-label", "Review Steam directory");
+      const heading = el("h2", "", steamChooserMessage("Review Steam directory"));
       heading.id = "steam-directory-review-title";
       dialog.setAttribute("aria-labelledby", heading.id);
       const status = el("p", "muted",
@@ -446,7 +504,7 @@ namespace Amaterasu {
       const review = button(steamChooserMessage("Review fields"), () => finish("review"));
       steamChooserSetAttribute(review, "aria-label", "Review fields");
       dialog.append(heading, status, el("p", "muted",
-        steamChooserMessage("Choose how to handle the current directory, or review the Steam fields without applying this selection.")),
+        steamChooserMessage("Choose whether to keep or clear the current directory, or review fields without applying.")),
         el("div", "actions", review, keep, clear));
       let settled = false;
       const finish = (choice: SteamDirectoryChangeChoice | null): void => {
