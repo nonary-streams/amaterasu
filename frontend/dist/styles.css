@@ -2002,3 +2002,110 @@ input, textarea, select {
 @media (max-width: 560px) {
   .steam-game-chooser-search { align-items: stretch; flex-direction: column; }
 }
+
+/* Application editor: a quiet brush-and-paper section rail with clear inheritance cues. */
+.catalog-editor-nav {
+  position: sticky;
+  top: 8px;
+  z-index: 4;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  margin: 0 0 20px;
+  padding: 7px 10px;
+  overflow-x: auto;
+  border: 1px solid color-mix(in srgb, var(--accent) 28%, var(--line));
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--panel) 94%, transparent);
+  box-shadow: 0 8px 24px rgb(0 0 0 / .16);
+  backdrop-filter: blur(12px);
+  scrollbar-width: thin;
+}
+.catalog-editor-nav::after {
+  content: "";
+  flex: 0 0 22px;
+  align-self: stretch;
+  margin-left: auto;
+  opacity: .34;
+  background: var(--accent);
+  -webkit-mask: url("./okami-botanical.svg") center / contain no-repeat;
+  mask: url("./okami-botanical.svg") center / contain no-repeat;
+  pointer-events: none;
+}
+.catalog-editor-nav-label {
+  flex: 0 0 auto;
+  padding: 0 8px 0 2px;
+  color: var(--accent);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 1.3px;
+}
+.button.catalog-editor-nav-item {
+  flex: 0 0 auto;
+  min-height: 34px;
+  padding: 6px 11px;
+  border-color: transparent;
+  border-radius: 999px;
+  color: var(--secondary);
+  font-size: 11px;
+}
+.button.catalog-editor-nav-item:hover {
+  border-color: color-mix(in srgb, var(--accent) 28%, var(--line));
+  background: color-mix(in srgb, var(--accent) 10%, var(--panel));
+  color: var(--fg);
+}
+.catalog-editor-section {
+  margin: 14px 0;
+  padding: 18px;
+  border: 1px solid var(--line);
+  border-left: 2px solid color-mix(in srgb, var(--accent) 42%, var(--line));
+  border-radius: 14px 16px 13px 15px;
+  background: linear-gradient(120deg, color-mix(in srgb, var(--panel) 96%, var(--paper)), var(--panel));
+  scroll-margin-top: 88px;
+}
+.catalog-editor-disclosure { padding: 0; overflow: clip; }
+.catalog-editor-disclosure > summary {
+  min-height: 64px;
+  padding: 13px 48px 13px 18px;
+}
+.catalog-editor-disclosure[open] > summary {
+  border-bottom: 1px solid color-mix(in srgb, var(--accent) 20%, var(--line));
+}
+.catalog-editor-disclosure-content { padding: 18px; }
+.catalog-editor-disclosure > summary strong {
+  font-family: var(--font-display);
+  font-size: 17px;
+  font-weight: 600;
+}
+.catalog-overrides > .catalog-editor-heading { margin-bottom: 12px; }
+.catalog-overrides > .catalog-editor-heading p { max-width: 650px; }
+.catalog-override-empty {
+  padding: 13px 15px;
+  border: 1px dashed color-mix(in srgb, var(--accent) 35%, var(--line));
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--accent) 6%, var(--panel));
+}
+.catalog-override-chooser > summary {
+  display: inline-flex;
+  align-items: center;
+  min-height: 40px;
+  padding: 8px 13px;
+  border: 1px solid color-mix(in srgb, var(--accent) 32%, var(--line));
+  border-radius: 999px;
+  color: var(--selected-accent);
+  background: color-mix(in srgb, var(--accent) 8%, var(--panel));
+}
+.catalog-override-chooser[open] > summary { margin-bottom: 8px; }
+.catalog-override-group { padding: 10px 0; border-top: 1px solid var(--line); }
+.catalog-override-group h4 { color: var(--selected-accent); font-family: var(--font-display); }
+.catalog-override-choice { border-radius: 999px; }
+
+@media (max-width: 600px) {
+  .editor-form > .catalog-editor-nav { top: 4px; margin: 0 -4px 16px; padding: 6px; border-radius: 10px; }
+  .editor-form > .catalog-editor-nav::after { display: none; }
+  .editor-form > .catalog-editor-section { padding: 14px; border-radius: 11px; }
+  .editor-form > .catalog-editor-disclosure { padding: 0; }
+  .editor-form > .catalog-editor-disclosure > summary { padding-left: 14px; }
+  .editor-form > .catalog-editor-disclosure .catalog-editor-disclosure-content { padding: 14px; }
+}
