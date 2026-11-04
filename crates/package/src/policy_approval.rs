@@ -168,7 +168,9 @@ pub fn candidate_from_allowlist(
     let mut candidate: Value = serde_json::from_slice(current_bytes).map_err(|e| e.to_string())?;
     for (path, change) in &allowlist.changes {
         let (parent_path, encoded_key) = path.rsplit_once('/').ok_or("invalid policy path")?;
-        if !parent_path.starts_with("/policy/") || encoded_key.is_empty() {
+        if (parent_path != "/policy" && !parent_path.starts_with("/policy/"))
+            || encoded_key.is_empty()
+        {
             return Err("invalid policy allowlist path".into());
         }
         let mut key = String::new();
@@ -324,6 +326,18 @@ fn collect_changes(
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn reconstructs_an_exact_top_level_api_method_approval() {
+        let (source, _, observed) = inputs();
+        let mut after: Value = serde_json::from_slice(&source).unwrap();
+        after["policy"]["api_methods"] = json!([{"provider":"video","callers":["video"],"method":{"service":"example.processor/1","method":"status","interface_major":1,"interface_minor":0,"request":{"required":{}},"response":{"required":{}},"privilege":"user"}}]);
+        let bytes = serde_json::to_vec(&after).unwrap();
+        let approval = propose_policy_approval(&source, &bytes, &context(&observed)).unwrap();
+        assert!(approval.changes.contains_key("/policy/api_methods"));
+        let (candidate, _) =
+            candidate_from_allowlist(&allowlist(&approval), &context(&approval), &source).unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&candidate).unwrap(), after);
+    }
     fn inputs() -> (Vec<u8>, Vec<u8>, PolicyApproval) {
         let before = json!({"development":false,"allow_unsigned":false,"trusted_keys":{"publisher":"key"},"policy":{"principals":{"video":{"native_use":[],"native_provide":[],"provide":[],"call":[],"publish":[],"subscribe":[],"hook":[]}},"settings":{"video":{"enabled":true}},"hooks":{}}});
         let mut after = before.clone();

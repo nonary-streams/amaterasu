@@ -25,6 +25,8 @@ pub struct Change {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Transition {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_policy: Option<Change>,
     pub bootstrap: Change,
     pub selection: Change,
     pub unit: Change,
@@ -39,18 +41,23 @@ struct Journal {
 }
 
 pub struct Paths<'a> {
+    pub input_policy: &'a Path,
     pub journal: &'a Path,
     pub bootstrap: &'a Path,
     pub selection: &'a Path,
     pub unit: &'a Path,
 }
 
-fn changes<'a>(paths: &'a Paths<'a>, transition: &'a Transition) -> [(&'a Path, &'a Change); 3] {
-    [
+fn changes<'a>(paths: &'a Paths<'a>, transition: &'a Transition) -> Vec<(&'a Path, &'a Change)> {
+    let mut items = vec![
         (paths.bootstrap, &transition.bootstrap),
         (paths.selection, &transition.selection),
         (paths.unit, &transition.unit),
-    ]
+    ];
+    if let Some(change) = &transition.input_policy {
+        items.push((paths.input_policy, change));
+    }
+    items
 }
 
 fn check_size(transition: &Transition) -> PackageResult<()> {
@@ -58,7 +65,10 @@ fn check_size(transition: &Transition) -> PackageResult<()> {
         &transition.bootstrap,
         &transition.selection,
         &transition.unit,
-    ] {
+    ]
+    .into_iter()
+    .chain(transition.input_policy.iter())
+    {
         if change.before.len() > MAX_DOCUMENT
             || change.after.len() > MAX_DOCUMENT
             || change.before == change.after
@@ -334,13 +344,16 @@ mod tests {
         let selection = root.join("selection");
         let unit = root.join("unit");
         let journal = root.join("journal");
+        let input_policy = root.join("input-companion-policy.json");
         let paths = Paths {
+            input_policy: &input_policy,
             journal: &journal,
             bootstrap: &bootstrap,
             selection: &selection,
             unit: &unit,
         };
         let transition = Transition {
+            input_policy: Some(change("old-input", "new-input")),
             bootstrap: Change {
                 before: vec![b'a'; 200_000],
                 after: vec![b'b'; 200_000],
@@ -370,13 +383,16 @@ mod tests {
         let selection = root.join("selection");
         let unit = root.join("unit");
         let journal = root.join("journal");
+        let input_policy = root.join("input-companion-policy.json");
         let paths = Paths {
+            input_policy: &input_policy,
             journal: &journal,
             bootstrap: &bootstrap,
             selection: &selection,
             unit: &unit,
         };
         let transition = Transition {
+            input_policy: Some(change("old-input", "new-input")),
             bootstrap: change("old-policy", "new-policy"),
             selection: change("old-set", "new-set"),
             unit: change("old-pin", "new-pin"),
