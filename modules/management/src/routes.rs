@@ -560,7 +560,7 @@ mod tests {
     }
 
     #[test]
-    fn session_extension_settings_only_accept_host_scope_and_server_action() {
+    fn session_extension_settings_accept_host_and_canonical_application_scopes() {
         let list = resolve("/v1/session-extensions/list").unwrap();
         let next = br#"{"after":"example","limit":32,"revision":7}"#;
         assert_eq!(payload(list, next).unwrap()["revision"], 7);
@@ -572,8 +572,27 @@ mod tests {
             payload(update, valid).unwrap()["operation"],
             "settings_update"
         );
+        let get = resolve("/v1/session-extensions/settings_get").unwrap();
+        assert_eq!(get.scope, Some("configuration.read"));
+        let application =
+            br#"{"provider":"example","scope":{"kind":"application","id":"app-0000000000000001"}}"#;
+        assert_eq!(
+            payload(get, application).unwrap()["scope"]["id"],
+            "app-0000000000000001"
+        );
+        let update_application = br#"{"provider":"example","scope":{"kind":"application","id":"app-0000000000000001"},"expected_revision":3,"values":{"enabled":false}}"#;
+        assert_eq!(
+            payload(update, update_application).unwrap()["operation"],
+            "settings_update"
+        );
         for invalid in [
             br#"{"provider":"example","scope":{"kind":"session","id":"s"},"expected_revision":3,"values":{}}"#.as_slice(),
+            br#"{"provider":"example","scope":{"kind":"paired_client","id":"c"},"expected_revision":3,"values":{}}"#,
+            br#"{"provider":"example","scope":{"kind":"application","id":"app-0000000000000000"},"expected_revision":3,"values":{}}"#,
+            br#"{"provider":"example","scope":{"kind":"application","id":"app-1"},"expected_revision":3,"values":{}}"#,
+            br#"{"provider":"example","scope":{"kind":"application","id":"app-000000000000000A"},"expected_revision":3,"values":{}}"#,
+            br#"{"provider":"example","scope":{"kind":"application","id":"app-0000000000000001","admin":true},"expected_revision":3,"values":{}}"#,
+            br#"{"provider":"example","scope":{"kind":"host","id":"app-0000000000000001"},"expected_revision":3,"values":{}}"#,
             br#"{"provider":"example","scope":{"kind":"host"},"expected_revision":3,"values":{},"operation":"list"}"#,
             br#"{"provider":"example","scope":{"kind":"host"},"values":{}}"#,
         ] {

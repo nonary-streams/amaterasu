@@ -503,10 +503,7 @@ fn session_extensions(action: &str, object: &Object) -> Result<(), &'static str>
                 )?;
             }
             text(object, "provider")?;
-            // HTTP has not authenticated ownership of session/client targets.
-            if object.get("scope") != Some(&serde_json::json!({"kind":"host"})) {
-                return Err(INVALID);
-            }
+            validate_extension_settings_scope(object.get("scope"))?;
             if action == "settings_update"
                 && (object
                     .get("expected_revision")
@@ -520,6 +517,27 @@ fn session_extensions(action: &str, object: &Object) -> Result<(), &'static str>
         _ => return Err(INVALID),
     }
     Ok(())
+}
+
+fn validate_extension_settings_scope(scope: Option<&Value>) -> Result<(), &'static str> {
+    let scope = scope.and_then(Value::as_object).ok_or(INVALID)?;
+    match scope.get("kind").and_then(Value::as_str) {
+        Some("host") => fields(scope, &["kind"], &[]),
+        Some("application") => {
+            fields(scope, &["kind", "id"], &[])?;
+            let id = text(scope, "id")?;
+            let number = id
+                .strip_prefix("app-")
+                .and_then(|value| u64::from_str_radix(value, 16).ok())
+                .ok_or(INVALID)?;
+            if number == 0 || id != format!("app-{number:016x}") {
+                return Err(INVALID);
+            }
+            Ok(())
+        }
+        // HTTP has not authenticated ownership of session/client targets.
+        _ => Err(INVALID),
+    }
 }
 
 fn host_configuration(action: &str, object: &Object) -> Result<(), &'static str> {
