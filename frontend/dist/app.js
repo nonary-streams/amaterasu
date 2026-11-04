@@ -4474,6 +4474,30 @@ var Amaterasu;
         }
     }
     Amaterasu.readCatalogArtwork = readCatalogArtwork;
+    const catalogArtworkQueue = [];
+    const catalogArtworkConcurrency = 4;
+    let catalogArtworkRunning = 0;
+    let catalogArtworkScheduled = false;
+    function scheduleCatalogArtwork(read) {
+        catalogArtworkQueue.push(read);
+        if (catalogArtworkScheduled)
+            return;
+        catalogArtworkScheduled = true;
+        queueMicrotask(drainCatalogArtworkQueue);
+    }
+    function drainCatalogArtworkQueue() {
+        catalogArtworkScheduled = false;
+        while (catalogArtworkRunning < catalogArtworkConcurrency && catalogArtworkQueue.length) {
+            const read = catalogArtworkQueue.shift();
+            if (!read)
+                break;
+            catalogArtworkRunning++;
+            void read().finally(() => {
+                catalogArtworkRunning--;
+                drainCatalogArtworkQueue();
+            });
+        }
+    }
     function showCatalogArtwork(api, reference, art, content, onLoad, catalogId) {
         if (!reference)
             return;
@@ -4486,36 +4510,41 @@ var Amaterasu;
         if (!catalogId && reference.provider === "external")
             return;
         const active = () => content.isConnected && art.isConnected;
-        const imageRead = catalogId
-            ? readCatalogArtwork(api, catalogId, reference.provider === "external" ? reference.reference.revision : reference.revision, active)
-            : reference.provider === "steam" ? readSteamArtwork(api, reference, active)
-                : reference.provider === "lutris" ? readLutrisArtwork(api, reference, active)
-                    : Promise.reject(new Error("Catalog artwork identity is required."));
-        void imageRead.then((blob) => {
-            if (!content.isConnected || !art.isConnected)
+        scheduleCatalogArtwork(async () => {
+            if (!active())
                 return;
-            const url = URL.createObjectURL(blob);
-            const image = Amaterasu.el("img");
-            image.alt = "";
-            let released = false;
-            const observer = new MutationObserver(() => {
-                if (!content.isConnected || !art.isConnected)
-                    release();
-            });
-            const release = () => {
-                if (released)
+            try {
+                const blob = await (catalogId
+                    ? readCatalogArtwork(api, catalogId, reference.provider === "external" ? reference.reference.revision : reference.revision, active)
+                    : reference.provider === "steam" ? readSteamArtwork(api, reference, active)
+                        : reference.provider === "lutris" ? readLutrisArtwork(api, reference, active)
+                            : Promise.reject(new Error("Catalog artwork identity is required.")));
+                if (!active())
                     return;
-                released = true;
-                observer.disconnect();
-                URL.revokeObjectURL(url);
-            };
-            image.addEventListener("load", () => { release(); if (active())
-                onLoad?.(); }, { once: true });
-            image.addEventListener("error", () => { image.remove(); release(); }, { once: true });
-            observer.observe(document, { childList: true, subtree: true });
-            image.src = url;
-            art.prepend(image);
-        }).catch(() => {
+                const url = URL.createObjectURL(blob);
+                const image = Amaterasu.el("img");
+                image.alt = "";
+                let released = false;
+                const observer = new MutationObserver(() => {
+                    if (!active())
+                        release();
+                });
+                const release = () => {
+                    if (released)
+                        return;
+                    released = true;
+                    observer.disconnect();
+                    URL.revokeObjectURL(url);
+                };
+                image.addEventListener("load", () => { release(); if (active())
+                    onLoad?.(); }, { once: true });
+                image.addEventListener("error", () => { image.remove(); release(); }, { once: true });
+                observer.observe(document, { childList: true, subtree: true });
+                image.src = url;
+                art.prepend(image);
+            }
+            catch {
+            }
         });
     }
     Amaterasu.showCatalogArtwork = showCatalogArtwork;
@@ -4586,7 +4615,7 @@ var Amaterasu;
             Amaterasu.field("VAAPI strict rate-control buffer", vaapiStrictRcBuffer, "Inherit the next scope or set strict rate-control buffer behavior."),
         ];
     }
-    function parseCatalogNvencSettingsOverrides(data) {
+    function parseCatalogNvencSettingsOverrides(data, current) {
         const text = (name) => String(data.get(name) ?? "").trim();
         const integer = (name, minimum, maximum) => {
             const value = text(name);
@@ -4613,7 +4642,7 @@ var Amaterasu;
             const value = text(name);
             if (value === "")
                 return null;
-            if (choices.includes(value))
+            if (choices.includes(value) || value === current?.[name])
                 return value;
             throw new Error(`${name} has an unsupported value.`);
         };
@@ -4727,7 +4756,7 @@ var Amaterasu;
             return null;
         if (currentValue != null &&
             !allowedValues.includes(currentValue) &&
-            value === catalogSavedUnsupportedEnumValueToken(allowedValues))
+            (value === currentValue || value === catalogSavedUnsupportedEnumValueToken(allowedValues)))
             return currentValue;
         if (!allowedValues.includes(value))
             throw new Error(`${label} must be one of the supported values.`);
@@ -4966,8 +4995,14 @@ var Amaterasu;
         const editor = Amaterasu.el("div");
         const editorDrafts = context.registerDraftGuard ? Amaterasu.trackDrafts(editor) : null;
         let editorSaving = false;
+        const catalogDraftDirty = () => {
+            const form = editor.querySelector(".editor-form");
+            return !!form && !!editorDrafts?.isDirty(form);
+        };
+        let pluginArea = null;
+        const pluginDirty = () => !!pluginArea && typeof Amaterasu.applicationPluginOverridesDirty === "function" && Amaterasu.applicationPluginOverridesDirty(pluginArea);
         if (editorDrafts)
-            context.registerDraftGuard?.(() => editorSaving || editorDrafts.isDirty(), editorDrafts.dispose);
+            context.registerDraftGuard?.(() => editorSaving || catalogDraftDirty() || pluginDirty(), editorDrafts.dispose);
         let editorGeneration = 0;
         const status = Amaterasu.el("div");
         const selectionCount = Amaterasu.el("span", "muted");
@@ -5303,8 +5338,8 @@ var Amaterasu;
                 row.entry.launch.kind === "playnite_fullscreen" ? "Playnite Fullscreen" :
                     row.entry.steam_id ? "Steam-linked" : row.entry.launch.kind === "executable" ? "Executable" :
                         providerLaunch ? "Playnite" : "Application";
-            const edit = Amaterasu.button("Edit", () => showEditor(row, capabilities));
-            edit.disabled = !api.allows("catalog.write") || providerLaunch;
+            const edit = Amaterasu.button(api.allows("catalog.write") ? "Edit" : "Settings", () => showEditor(row, capabilities));
+            edit.disabled = (!api.allows("catalog.write") && !api.allows("configuration.read")) || providerLaunch;
             if (providerLaunch)
                 catalogLocalizedAttribute(edit, "title", "Playnite launch targets are managed by the provider.");
             const launch = Amaterasu.button("Launch", () => void Amaterasu.runAction(launch, status, async () => {
@@ -5315,12 +5350,9 @@ var Amaterasu;
             }), "primary");
             launch.disabled = typeof api.allowsLaunchAction !== "function" || !api.allowsLaunchAction("start");
             const actions = [launch, edit];
-            const pluginSettings = Amaterasu.button("Plugin settings", () => Amaterasu.showSessionExtensionSettings(context, { kind: "application", id: row.id }, `${row.entry.name} plugin settings`));
-            pluginSettings.disabled = !api.allows("configuration.read");
-            actions.push(pluginSettings);
             if (providerLaunch) {
                 const configure = Amaterasu.button("Streaming settings", () => showProviderOverrideEditor(row, capabilities), "secondary");
-                configure.disabled = !api.allows("catalog.write");
+                configure.disabled = !api.allows("catalog.write") && !api.allows("configuration.read");
                 actions.unshift(configure);
             }
             const remove = Amaterasu.button("Delete", async () => {
@@ -5406,8 +5438,13 @@ var Amaterasu;
                 notify("Wait for the application save to finish.");
                 return false;
             }
-            if (editorDrafts?.isDirty() && !window.confirm("Discard your unsaved application changes?"))
+            if (pluginArea && typeof Amaterasu.applicationPluginOverridesSaving === "function" && Amaterasu.applicationPluginOverridesSaving(pluginArea)) {
+                notify("Wait for the plugin override save to finish.");
                 return false;
+            }
+            if ((catalogDraftDirty() || pluginDirty()) && !window.confirm("Discard your unsaved application and plugin changes?"))
+                return false;
+            pluginArea = null;
             editorGeneration += 1;
             editor.replaceChildren();
             return true;
@@ -5490,6 +5527,9 @@ var Amaterasu;
             displayPolicy.spellcheck = false;
             displayPolicy.value = JSON.stringify(row.entry.config_overrides?.display_policy ?? {}, null, 2);
             const form = Amaterasu.el("form", "editor-form", catalogEditorSection("Streaming and audio", "Override streaming and audio for this provider-managed application.", Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global setting. Supported values are 1–255."), ...sessionPolicyFields, Amaterasu.field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this game streams audio."), audioSink.controls, virtualSink.controls, Amaterasu.field("Capture audio without changing default outputs", captureOnly, "Inherit the host setting, enable capture only, or allow Windows default-output routing.")), catalogEditorDisclosure("Display", "Choose display and adapter overrides.", ...refreshRateOptionFields, Amaterasu.field("Display and adapter policy (JSON)", displayPolicy, "Sparse application overrides. Use null or empty values to inherit; global-only keys are rejected.")), catalogEditorDisclosure("Input", "Set per-application controller, keyboard, and mouse preferences.", Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "Leave blank to inherit. Use -1 to disable the timeout; other signed 32-bit values set the duration."), Amaterasu.field("Controller input", controller, "Inherit the next scope, or enable/disable gamepad input for this application."), Amaterasu.field("Gamepad profile", gamepad, "Inherit the next scope. Recognized unavailable profiles remain selectable."), Amaterasu.field("Keyboard input", keyboard, "Inherit the next scope, or enable/disable keyboard input for this application."), Amaterasu.field("Mouse input", mouse, "Inherit the next scope, or enable/disable mouse input for this application."), ...inputCompatibilityFields, ...advancedInput.fields), catalogEditorDisclosure("Encoder", "Override software and NVENC encoder settings.", ...softwareEncoder.fields, ...nvencSettingsFields));
+            const overrides = catalogOverrideEditor(catalogOverrideSections(Array.from(form.children)), { ...row.entry.config_overrides });
+            form.replaceChildren(overrides.node);
+            form.hidden = !api.allows("catalog.write");
             revealInvalidEditorControls(form);
             const feedback = Amaterasu.el("div");
             const save = Amaterasu.el("button", "button primary", "Save streaming settings");
@@ -5500,12 +5540,19 @@ var Amaterasu;
                 event.preventDefault();
                 if (!form.reportValidity())
                     return;
+                if (pluginDirty()) {
+                    feedback.replaceChildren(Amaterasu.el("p", "notice error", "Save plugin overrides before saving this application, or cancel to discard them."));
+                    return;
+                }
                 void Amaterasu.runAction(save, feedback, async () => {
-                    const config_overrides = mergeCatalogConfigOverrides(row.entry.config_overrides, new FormData(form).keys(), advancedInput.read(), softwareEncoder.read(), Amaterasu.providerConfigOverrides(fec.value, streamAudio.value, audioSink.mode.value, audioSink.id.value, captureOnly.value, backButtonTimeout.value, virtualSink.mode.value, virtualSink.selector.value, controller.value, gamepad.value, keyboard.value, mouse.value, runtimeStatus.recognized_profiles), parseCatalogSessionPolicyOverrides(new FormData(form), capabilities, row.entry.config_overrides), parseCatalogNvencSettingsOverrides(new FormData(form)), parseCatalogInputCompatibilityOverrides(new FormData(form)), {
+                    const config_overrides = mergeCatalogConfigOverrides(row.entry.config_overrides, new FormData(form).keys(), advancedInput.read(), softwareEncoder.read(), Amaterasu.providerConfigOverrides(fec.value, streamAudio.value, audioSink.mode.value, audioSink.id.value, captureOnly.value, backButtonTimeout.value, virtualSink.mode.value, virtualSink.selector.value, controller.value, gamepad.value, keyboard.value, mouse.value, runtimeStatus.recognized_profiles), parseCatalogSessionPolicyOverrides(new FormData(form), capabilities, row.entry.config_overrides), parseCatalogNvencSettingsOverrides(new FormData(form), row.entry.config_overrides), parseCatalogInputCompatibilityOverrides(new FormData(form)), {
                         dd_refresh_rate_option: parseCatalogRefreshRateOptionOverride(new FormData(form)),
                         display_policy: Amaterasu.parseDisplayPolicyOverrideMap(displayPolicy.value, "application"),
                     });
+                    for (const key of overrides.removed)
+                        delete config_overrides[key];
                     editorSaving = true;
+                    editor.inert = true;
                     const unlock = lockEditorControls(form);
                     try {
                         const reply = await api.post("catalog/update_provider_overrides", {
@@ -5536,12 +5583,17 @@ var Amaterasu;
                     }
                     finally {
                         editorSaving = false;
+                        editor.inert = false;
                         unlock();
                     }
                 });
             });
             const cover = catalogEditorCover(row);
-            editor.replaceChildren(Amaterasu.panel("Playnite streaming settings", Amaterasu.el("p", "muted", catalogTextLiteral(`${row.entry.name} · Playnite game ${row.entry.launch.kind === "playnite" ? row.entry.launch.game_id : ""}`)), Amaterasu.el("p", "muted", "The Playnite game identity and provider-managed launch metadata stay unchanged."), Amaterasu.el("div", "catalog-editor-layout", cover.figure, form)));
+            editor.replaceChildren(Amaterasu.panel("Playnite streaming settings", Amaterasu.el("p", "muted", catalogTextLiteral(`${row.entry.name} · Playnite game ${row.entry.launch.kind === "playnite" ? row.entry.launch.game_id : ""}`)), Amaterasu.el("p", "muted", "The Playnite game identity and provider-managed launch metadata stay unchanged."), Amaterasu.el("div", "catalog-editor-layout", cover.figure, form), Amaterasu.el("section", "catalog-editor-section", Amaterasu.el("h3", "", "Plugin overrides"), pluginArea = Amaterasu.el("div")), ...(!api.allows("catalog.write") ? [Amaterasu.button("Close", () => { closeEditor(); })] : [])));
+            if (api.allows("configuration.read") && typeof Amaterasu.renderApplicationPluginOverrides === "function")
+                Amaterasu.renderApplicationPluginOverrides(context, pluginArea, row.id);
+            else
+                pluginArea.textContent = "Plugin settings require configuration read access.";
             showCatalogArtwork(api, row.entry.artwork, cover.art, content, () => { cover.fallback.hidden = true; }, row.id);
             editor.scrollIntoView({ behavior: "smooth", block: "start" });
             fec.focus();
@@ -5559,6 +5611,7 @@ var Amaterasu;
         function renderEditor(row, runtimeStatus, capabilities) {
             const editRevision = revision;
             const form = entryForm(row?.entry, runtimeStatus, capabilities);
+            form.hidden = !api.allows("catalog.write");
             const feedback = Amaterasu.el("div");
             const save = Amaterasu.el("button", "button primary", row ? "Save changes" : "Add application");
             save.type = "submit";
@@ -5568,11 +5621,18 @@ var Amaterasu;
                 event.preventDefault();
                 if (!form.reportValidity())
                     return;
+                if (pluginDirty()) {
+                    feedback.replaceChildren(Amaterasu.el("p", "notice error", "Save plugin overrides before saving this application, or cancel to discard them."));
+                    return;
+                }
                 void Amaterasu.runAction(save, feedback, async () => {
                     const entry = Amaterasu.entryFromForm(new FormData(form), runtimeStatus.recognized_profiles);
                     Object.assign(entry, parseCatalogApplicationDisplaySettings(new FormData(form)));
-                    entry.config_overrides = mergeCatalogConfigOverrides(row?.entry.config_overrides, new FormData(form).keys(), entry.config_overrides, parseCatalogSessionPolicyOverrides(new FormData(form), capabilities, row?.entry.config_overrides), parseCatalogNvencSettingsOverrides(new FormData(form)), parseCatalogInputCompatibilityOverrides(new FormData(form)));
+                    entry.config_overrides = mergeCatalogConfigOverrides(row?.entry.config_overrides, new FormData(form).keys(), entry.config_overrides, parseCatalogSessionPolicyOverrides(new FormData(form), capabilities, row?.entry.config_overrides), parseCatalogNvencSettingsOverrides(new FormData(form), row?.entry.config_overrides), parseCatalogInputCompatibilityOverrides(new FormData(form)));
+                    for (const key of catalogRemovedOverrides.get(form) ?? [])
+                        delete entry.config_overrides[key];
                     editorSaving = true;
+                    editor.inert = true;
                     const unlock = lockEditorControls(form);
                     try {
                         await api.post(row ? "catalog/update" : "catalog/create", {
@@ -5586,12 +5646,17 @@ var Amaterasu;
                     }
                     finally {
                         editorSaving = false;
+                        editor.inert = false;
                         unlock();
                     }
                 });
             });
             const cover = row ? catalogEditorCover(row) : null;
-            editor.replaceChildren(Amaterasu.panel(row ? "Edit application" : "Add application", Amaterasu.el("p", "muted", "Save launch metadata for this host. Adding an entry does not launch it."), cover ? Amaterasu.el("div", "catalog-editor-layout", cover.figure, form) : form));
+            editor.replaceChildren(Amaterasu.panel(row ? "Edit application" : "Add application", Amaterasu.el("p", "muted", "Save launch metadata for this host. Adding an entry does not launch it."), cover ? Amaterasu.el("div", "catalog-editor-layout", cover.figure, form) : form, Amaterasu.el("section", "catalog-editor-section", Amaterasu.el("h3", "", "Plugin overrides"), pluginArea = Amaterasu.el("div", "", ...(row ? [] : [Amaterasu.el("p", "muted", "Plugin overrides are available after creating this application.")]))), ...(!api.allows("catalog.write") ? [Amaterasu.button("Close", () => { closeEditor(); })] : [])));
+            if (row && api.allows("configuration.read") && typeof Amaterasu.renderApplicationPluginOverrides === "function")
+                Amaterasu.renderApplicationPluginOverrides(context, pluginArea, row.id);
+            else if (row && !api.allows("configuration.read"))
+                pluginArea.textContent = "Plugin settings require configuration read access.";
             if (cover && row)
                 showCatalogArtwork(api, row.entry.artwork, cover.art, content, () => { cover.fallback.hidden = true; }, row.id);
             editor.scrollIntoView({ behavior: "smooth", block: "start" });
@@ -5615,6 +5680,80 @@ var Amaterasu;
     function catalogEditorDisclosure(title, description, ...children) {
         return Amaterasu.el("details", "catalog-editor-section catalog-editor-disclosure", Amaterasu.el("summary", "", Amaterasu.el("strong", "", title), Amaterasu.el("small", "muted", description)), Amaterasu.el("div", "catalog-editor-disclosure-content", ...children));
     }
+    function catalogOverrideEditor(sections, saved) {
+        const removed = new Set();
+        const active = Amaterasu.el("div", "catalog-override-active");
+        const empty = Amaterasu.el("p", "muted", "No settings overridden. This application inherits its settings.");
+        const search = Amaterasu.input("", "", "search");
+        search.placeholder = "Search settings";
+        search.setAttribute("data-draft-ignore", "");
+        search.setAttribute("aria-label", "Search available overrides");
+        const list = Amaterasu.el("div", "catalog-override-catalog");
+        const marker = Amaterasu.input("", "", "text");
+        marker.className = "catalog-override-draft-marker";
+        marker.tabIndex = -1;
+        marker.setAttribute("aria-hidden", "true");
+        const rows = [];
+        const mapping = { encoder_backend: "encoder", audio_sink_mode: "audio_sink", virtual_sink_mode: "virtual_sink", sw_preset_mode: "sw_preset", sw_tune_mode: "sw_tune", display_output: "display-output", virtual_screen: "virtual-screen", virtual_display_mode: "virtual-display-mode", virtual_display_layout: "virtual-display-layout" };
+        for (const section of sections) {
+            const group = Amaterasu.el("div", "catalog-override-group", Amaterasu.el("h4", "", section.area));
+            list.append(group);
+            for (let index = 0; index < section.fields.length; index++) {
+                const fieldNode = section.fields[index];
+                const first = fieldNode.querySelector("input,select,textarea");
+                if (!first)
+                    continue;
+                const key = mapping[first.name] ?? first.name;
+                const parts = [fieldNode];
+                if ((key === "sw_preset" || key === "sw_tune") && section.fields[index + 1])
+                    parts.push(section.fields[++index]);
+                const controls = parts.flatMap(part => Array.from(part.querySelectorAll("input,select,textarea")));
+                const label = fieldNode.querySelector(".field-label")?.textContent?.trim() || key;
+                const row = Amaterasu.el("div", "catalog-override-row");
+                const choice = Amaterasu.button(label, () => { item.selected = true; removed.delete(key); marker.value += "+"; update(); first.focus(); });
+                choice.className = "button secondary catalog-override-choice";
+                const remove = Amaterasu.button("Remove", () => {
+                    item.selected = false;
+                    removed.add(key);
+                    for (const control of controls) {
+                        if (control instanceof HTMLSelectElement)
+                            control.value = Array.from(control.options).some(option => option.value === "inherit") ? "inherit" : "";
+                        else
+                            control.value = control.name === "display_policy" ? "{}" : "";
+                        control.dispatchEvent(new Event("change", { bubbles: true }));
+                    }
+                    marker.value += "-";
+                    update();
+                }, "secondary");
+                remove.setAttribute("aria-label", `Remove ${label} override`);
+                row.append(Amaterasu.el("div", "catalog-override-row-content", ...parts), remove);
+                const item = { area: section.area, label, row, choice, selected: Object.hasOwn(saved, key) && saved[key] != null };
+                rows.push(item);
+                active.append(row);
+                group.append(choice);
+            }
+        }
+        function update() {
+            const query = search.value.trim().toLocaleLowerCase();
+            for (const item of rows) {
+                item.row.hidden = !item.selected;
+                item.choice.hidden = item.selected || !`${item.area} ${item.label}`.toLocaleLowerCase().includes(query);
+            }
+            for (const group of Array.from(list.children))
+                group.hidden = !group.querySelector("button:not([hidden])");
+            empty.hidden = rows.some(item => item.selected);
+        }
+        search.addEventListener("input", update);
+        const node = Amaterasu.el("section", "catalog-editor-section catalog-overrides", Amaterasu.el("div", "catalog-editor-heading", Amaterasu.el("h3", "", "Settings overrides"), Amaterasu.el("p", "muted", "Only selected settings override the host defaults. Remove an override to inherit.")), marker, empty, active, Amaterasu.el("details", "catalog-override-chooser", Amaterasu.el("summary", "", "Add override"), search, list));
+        update();
+        return { node, removed };
+    }
+    function catalogOverrideSections(sections) {
+        return sections.map(section => ({
+            area: section.querySelector("h3, summary strong")?.textContent?.trim() ?? "Settings",
+            fields: Array.from((section.querySelector(".catalog-editor-disclosure-content") ?? section).children).filter((child) => child instanceof HTMLElement && !child.classList.contains("catalog-editor-heading")),
+        }));
+    }
     function revealInvalidEditorControls(form) {
         form.addEventListener("invalid", (event) => {
             let details = event.target?.closest("details");
@@ -5624,6 +5763,7 @@ var Amaterasu;
             }
         }, true);
     }
+    const catalogRemovedOverrides = new WeakMap();
     function entryForm(entry, runtimeStatus, capabilities) {
         const form = Amaterasu.el("form", "editor-form");
         const name = Amaterasu.input("name", entry?.name ?? "");
@@ -5808,7 +5948,14 @@ var Amaterasu;
                     : "/Applications/Example.app";
         };
         kind.addEventListener("change", showKind);
-        form.append(catalogEditorSection("Identity", "Name and describe this application in your library.", Amaterasu.field("Name", name), Amaterasu.field("Description", description), Amaterasu.field("Tags", tags, "Separate tags with commas.")), catalogEditorSection("Launch", "Choose how the host starts and tracks the application.", Amaterasu.field("Launch type", kind), pathField, steamIdField, steamInstallDirField, fullscreen, sharedLaunchOptions, executable, Amaterasu.field("Command output", outputMode, "Use default discards command output without saving an output value."), outputFile, rawPreparation, Amaterasu.field("Skip global preparation commands", excludeGlobalPreparation, "Do not run the host-wide preparation commands for this application.")), catalogEditorDisclosure("Display", "Choose display and virtual-screen overrides.", Amaterasu.field("Display output override", displayOutput, "Leave empty to inherit the next display selection. This is separate from the command output file."), Amaterasu.field("Virtual screen request", virtualScreen, "Inherit the host setting or explicitly request or avoid a virtual screen."), Amaterasu.field("Virtual display mode", virtualDisplayMode, "Inherit the host mode or explicitly disable, use per-client, or share a virtual display."), Amaterasu.field("Virtual display layout", virtualDisplayLayout, "Inherit the host layout or select how virtual displays are arranged."), ...refreshRateOptionFields, Amaterasu.field("Display and adapter policy (JSON)", displayPolicy, "Sparse application overrides. Use null or empty values to inherit; global-only keys are rejected."), Amaterasu.field("10-bit SDR preference", prefer10BitSdr, "Inherit the next setting scope, or set an explicit preference for this application.")), catalogEditorDisclosure("Streaming and audio", "Override streaming, frame limiting, and audio for this application.", Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global streaming setting; supported values are 1–255."), ...sessionPolicyFields, Amaterasu.field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this application streams audio."), audioSink.controls, virtualSink.controls, Amaterasu.field("Capture audio without changing default outputs", captureOnly, "Inherit the host setting, enable capture only, or allow Windows default-output routing.")), catalogEditorDisclosure("Input", "Set per-application controller, keyboard, and mouse preferences.", Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "Leave blank to inherit. Use -1 to disable the timeout; other signed 32-bit values set the duration."), Amaterasu.field("Controller input", controller, "Inherit the next scope, or enable/disable gamepad input for this application."), Amaterasu.field("Gamepad profile", gamepad, "Inherit the next scope. Recognized profiles unavailable on this backend stay selectable and are labeled unavailable."), Amaterasu.field("Keyboard input", keyboard, "Inherit the next scope, or enable/disable keyboard input for this application."), Amaterasu.field("Mouse input", mouse, "Inherit the next scope, or enable/disable mouse input for this application."), ...inputCompatibilityFields, ...advancedInput.fields), catalogEditorDisclosure("Encoder", "Override software and NVENC encoder settings.", ...softwareEncoder.fields, ...nvencSettingsFields));
+        form.append(catalogEditorSection("Identity", "Name and describe this application in your library.", Amaterasu.field("Name", name), Amaterasu.field("Description", description), Amaterasu.field("Tags", tags, "Separate tags with commas.")), catalogEditorDisclosure("Launch", "Choose how the host starts and tracks the application.", Amaterasu.field("Launch type", kind), pathField, steamIdField, steamInstallDirField, fullscreen, sharedLaunchOptions, executable, Amaterasu.field("Command output", outputMode, "Use default discards command output without saving an output value."), outputFile, rawPreparation, Amaterasu.field("Skip global preparation commands", excludeGlobalPreparation, "Do not run the host-wide preparation commands for this application.")), catalogEditorDisclosure("Display", "Choose display and virtual-screen overrides.", Amaterasu.field("Display output override", displayOutput, "Leave empty to inherit the next display selection. This is separate from the command output file."), Amaterasu.field("Virtual screen request", virtualScreen, "Inherit the host setting or explicitly request or avoid a virtual screen."), Amaterasu.field("Virtual display mode", virtualDisplayMode, "Inherit the host mode or explicitly disable, use per-client, or share a virtual display."), Amaterasu.field("Virtual display layout", virtualDisplayLayout, "Inherit the host layout or select how virtual displays are arranged."), ...refreshRateOptionFields, Amaterasu.field("Display and adapter policy (JSON)", displayPolicy, "Sparse application overrides. Use null or empty values to inherit; global-only keys are rejected."), Amaterasu.field("10-bit SDR preference", prefer10BitSdr, "Inherit the next setting scope, or set an explicit preference for this application.")), catalogEditorDisclosure("Streaming and audio", "Override streaming, frame limiting, and audio for this application.", Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global streaming setting; supported values are 1–255."), ...sessionPolicyFields, Amaterasu.field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this application streams audio."), audioSink.controls, virtualSink.controls, Amaterasu.field("Capture audio without changing default outputs", captureOnly, "Inherit the host setting, enable capture only, or allow Windows default-output routing.")), catalogEditorDisclosure("Input", "Set per-application controller, keyboard, and mouse preferences.", Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "Leave blank to inherit. Use -1 to disable the timeout; other signed 32-bit values set the duration."), Amaterasu.field("Controller input", controller, "Inherit the next scope, or enable/disable gamepad input for this application."), Amaterasu.field("Gamepad profile", gamepad, "Inherit the next scope. Recognized profiles unavailable on this backend stay selectable and are labeled unavailable."), Amaterasu.field("Keyboard input", keyboard, "Inherit the next scope, or enable/disable keyboard input for this application."), Amaterasu.field("Mouse input", mouse, "Inherit the next scope, or enable/disable mouse input for this application."), ...inputCompatibilityFields, ...advancedInput.fields), catalogEditorDisclosure("Encoder", "Override software and NVENC encoder settings.", ...softwareEncoder.fields, ...nvencSettingsFields));
+        form.children[1].open = !entry;
+        const sections = Array.from(form.children).slice(2);
+        const overrides = catalogOverrideEditor(catalogOverrideSections(sections), { ...entry, ...entry?.config_overrides });
+        for (const section of sections)
+            section.remove();
+        form.append(overrides.node);
+        catalogRemovedOverrides.set(form, overrides.removed);
         revealInvalidEditorControls(form);
         showKind();
         return form;
@@ -16579,6 +16726,215 @@ var Amaterasu;
         void load();
     }
     Amaterasu.renderSessionExtensionSettings = renderSessionExtensionSettings;
+    const applicationOverrideGuards = new WeakMap();
+    const applicationOverrideSaves = new WeakMap();
+    function applicationPluginOverridesSaving(area) {
+        return applicationOverrideSaves.get(area)?.() ?? false;
+    }
+    Amaterasu.applicationPluginOverridesSaving = applicationPluginOverridesSaving;
+    function applicationPluginOverridesDirty(area) {
+        return applicationOverrideGuards.get(area)?.() ?? false;
+    }
+    Amaterasu.applicationPluginOverridesDirty = applicationPluginOverridesDirty;
+    function renderApplicationPluginOverrides(context, area, applicationId) {
+        const scope = { kind: "application", id: applicationId };
+        let busy = false;
+        const dirtyChecks = [];
+        const isDirty = () => busy || dirtyChecks.some((check) => check());
+        applicationOverrideGuards.set(area, isDirty);
+        applicationOverrideSaves.set(area, () => busy);
+        context.registerDraftGuard?.(() => area.isConnected && isDirty(), () => {
+            applicationOverrideGuards.delete(area);
+            applicationOverrideSaves.delete(area);
+        });
+        async function load() {
+            try {
+                const descriptors = [];
+                let after = null;
+                let revision = null;
+                const seen = new Set();
+                do {
+                    const page = await context.api.post("session-extensions/list", { after, limit: 32, revision });
+                    if (!Array.isArray(page.items) || (page.next !== null && typeof page.next !== "string") ||
+                        !Number.isSafeInteger(page.revision) || page.revision < 0 || (revision !== null && revision !== page.revision))
+                        throw new Error("Invalid or changed extension discovery response.");
+                    revision = page.revision;
+                    descriptors.push(...page.items);
+                    after = page.next;
+                    if (after && seen.has(after))
+                        throw new Error("Extension discovery cursor repeated.");
+                    if (after)
+                        seen.add(after);
+                    if (descriptors.length > 1024)
+                        throw new Error("Too many extensions.");
+                } while (after);
+                const providers = descriptors.filter((descriptor) => Array.isArray(descriptor.options) &&
+                    descriptor.options.some((option) => Array.isArray(option.allowed_scopes) && option.allowed_scopes.includes("application")));
+                const documents = [];
+                for (let offset = 0; offset < providers.length; offset += 4) {
+                    const batch = providers.slice(offset, offset + 4);
+                    documents.push(...await Promise.all(batch.map((descriptor) => context.api.post("session-extensions/settings_get", { provider: descriptor.provider, scope }))));
+                    if (!context.content.isConnected || !area.isConnected)
+                        return;
+                }
+                if (!context.content.isConnected || !area.isConnected)
+                    return;
+                const panels = providers.map((descriptor, index) => {
+                    const document = documents[index];
+                    if (!document || !document.values || !document.effective || !Number.isSafeInteger(document.revision))
+                        throw new Error("Invalid extension settings response.");
+                    let savedRevision = document.revision;
+                    let effectiveAvailable = true;
+                    let baseline = JSON.stringify(document.values);
+                    const options = descriptor.options.filter((option) => Array.isArray(option.allowed_scopes) && option.allowed_scopes.includes("application"));
+                    const entries = new Map();
+                    const form = Amaterasu.el("form", "settings-form catalog-plugin-overrides-form");
+                    const fields = Amaterasu.el("fieldset", "catalog-plugin-overrides-fields");
+                    fields.disabled = !context.api.allows("configuration.write");
+                    const rows = Amaterasu.el("div", "catalog-plugin-overrides-rows");
+                    const search = Amaterasu.input("", "", "search");
+                    search.placeholder = "Search settings";
+                    search.setAttribute("aria-label", "Search plugin settings");
+                    search.setAttribute("data-draft-ignore", "");
+                    const choices = Amaterasu.el("select");
+                    choices.setAttribute("aria-label", "Setting to override");
+                    choices.setAttribute("data-draft-ignore", "");
+                    const inherited = Amaterasu.el("p", "muted catalog-plugin-overrides-inherited");
+                    const describeInherited = () => {
+                        if (!effectiveAvailable) {
+                            inherited.textContent = "Reload the application editor to refresh inherited values.";
+                            return;
+                        }
+                        const effective = document.effective[choices.value];
+                        if (!effective) {
+                            inherited.textContent = "";
+                            return;
+                        }
+                        const source = effective.source;
+                        if (source?.kind === "application") {
+                            inherited.textContent = "Inherited value is available after reloading settings.";
+                            return;
+                        }
+                        inherited.textContent = `Current inherited value: ${JSON.stringify(effective.value)} (${source?.kind === "host" ? "host" : source === null ? "plugin default" : "other scope"})`;
+                    };
+                    const refreshChoices = () => {
+                        const query = search.value.trim().toLocaleLowerCase();
+                        const available = options.filter((option) => !entries.has(option.id) &&
+                            `${option.label} ${option.id} ${option.help}`.toLocaleLowerCase().includes(query));
+                        choices.replaceChildren(...available.map((option) => {
+                            const item = Amaterasu.el("option", "", Amaterasu.literalText(option.label));
+                            item.value = option.id;
+                            return item;
+                        }));
+                        add.disabled = !effectiveAvailable || !available.length;
+                        describeInherited();
+                    };
+                    const addOption = (option, value) => {
+                        if (option.presentation != null && option.presentation !== "keybinding")
+                            throw new Error("Unsupported extension setting presentation.");
+                        const editor = option.presentation === "keybinding"
+                            ? Amaterasu.extensionKeybindingSettingEditor(option.definition, value)
+                            : Amaterasu.extensionFieldEditor(option.definition, value, option.choice_labels);
+                        const controls = editor.node.matches("input,select,textarea") ? [editor.node] : Array.from(editor.node.querySelectorAll("input,select,textarea"));
+                        if (controls.length === 1)
+                            controls[0].setAttribute("aria-label", option.label);
+                        const row = Amaterasu.el("fieldset", "session-extension-option catalog-plugin-override-row", Amaterasu.el("legend", "field-label", Amaterasu.literalText(option.label)), editor.node);
+                        if (option.help)
+                            row.append(Amaterasu.el("small", "muted", Amaterasu.literalText(option.help)));
+                        row.append(Amaterasu.button("Remove override", () => { entries.delete(option.id); row.remove(); refreshChoices(); }));
+                        entries.set(option.id, { editor });
+                        rows.append(row);
+                    };
+                    const add = Amaterasu.button("Add override", () => {
+                        const option = options.find((candidate) => candidate.id === choices.value);
+                        const effective = option && document.effective[option.id];
+                        if (!effectiveAvailable || !option || !effective)
+                            return;
+                        addOption(option, structuredClone(effective.value));
+                        refreshChoices();
+                    });
+                    search.addEventListener("input", refreshChoices);
+                    choices.addEventListener("change", describeInherited);
+                    for (const option of options)
+                        if (Object.hasOwn(document.values, option.id))
+                            addOption(option, document.values[option.id]);
+                    refreshChoices();
+                    const values = () => {
+                        const result = { ...document.values };
+                        for (const option of options) {
+                            const entry = entries.get(option.id);
+                            if (entry)
+                                result[option.id] = entry.editor.value();
+                            else
+                                delete result[option.id];
+                        }
+                        return result;
+                    };
+                    dirtyChecks.push(() => { try {
+                        return JSON.stringify(values()) !== baseline;
+                    }
+                    catch {
+                        return true;
+                    } });
+                    const status = Amaterasu.el("div");
+                    const save = Amaterasu.el("button", "button primary", "Save plugin overrides");
+                    save.type = "submit";
+                    const chooser = Amaterasu.el("details", "catalog-override-chooser catalog-plugin-override-chooser", Amaterasu.el("summary", "", "Add override"), Amaterasu.el("div", "catalog-plugin-override-chooser-content", search, choices, inherited, add));
+                    const actions = Amaterasu.el("div", "catalog-plugin-overrides-actions", save);
+                    fields.append(rows, chooser, actions);
+                    form.append(fields, status);
+                    form.addEventListener("submit", (event) => {
+                        event.preventDefault();
+                        if (busy || !context.api.allows("configuration.write"))
+                            return;
+                        void Amaterasu.runAction(save, status, async () => {
+                            const submitted = values();
+                            if (JSON.stringify(submitted) === baseline)
+                                return;
+                            busy = true;
+                            fields.disabled = true;
+                            try {
+                                const reply = await context.api.post("session-extensions/settings_update", {
+                                    provider: descriptor.provider, scope, expected_revision: savedRevision, values: submitted,
+                                });
+                                if (!Number.isSafeInteger(reply.revision) || reply.revision <= savedRevision)
+                                    throw new Error("Plugin save could not be confirmed. Reopen the editor before retrying.");
+                                savedRevision = reply.revision;
+                                baseline = JSON.stringify(submitted);
+                                document.values = submitted;
+                                effectiveAvailable = false;
+                                refreshChoices();
+                                try {
+                                    const refreshed = await context.api.post("session-extensions/settings_get", { provider: descriptor.provider, scope });
+                                    if (!refreshed || refreshed.revision !== savedRevision || !refreshed.effective)
+                                        throw new Error("Settings changed during refresh.");
+                                    document.effective = refreshed.effective;
+                                    effectiveAvailable = true;
+                                    refreshChoices();
+                                }
+                                catch {
+                                    throw new Error("Plugin overrides were saved, but inherited values could not be refreshed. Reopen the application editor before adding an override.");
+                                }
+                                context.notify("Plugin overrides saved independently of application changes.");
+                            }
+                            finally {
+                                busy = false;
+                                fields.disabled = !context.api.allows("configuration.write");
+                            }
+                        });
+                    });
+                    return Amaterasu.panel(Amaterasu.literalText(descriptor.display_name || descriptor.provider), form);
+                });
+                area.replaceChildren(Amaterasu.el("p", "muted", "Plugin overrides are saved separately from application changes."), ...(panels.length ? panels : [Amaterasu.el("p", "muted", "No plugin settings are available for this application.")]));
+            }
+            catch (error) {
+                if (context.content.isConnected && area.isConnected)
+                    area.replaceChildren(Amaterasu.errorPanel(error, load));
+            }
+        }
+        void load();
+    }
+    Amaterasu.renderApplicationPluginOverrides = renderApplicationPluginOverrides;
 })(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
 (function (Amaterasu) {

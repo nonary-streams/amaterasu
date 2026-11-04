@@ -1540,3 +1540,27 @@ polyline.host-metric-chart-line { fill: none; }
 .button.catalog-select { position: absolute; z-index: 2; top: 8px; left: 8px; width: 32px; height: 32px; min-height: 32px; padding: 0; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); color: var(--fg); font-size: 18px; line-height: 1; }
 .button.catalog-select[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
 .app-card.is-selected .button.catalog-open { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent); }
+
+.catalog-override-active { display: grid; gap: .75rem; }
+.catalog-override-row { display: flex; align-items: start; gap: 1rem; padding: .9rem; border: 1px solid var(--line); border-radius: .5rem; }
+.catalog-override-row[hidden] { display: none; }
+.catalog-override-row-content { flex: 1; min-width: 0; display: grid; gap: .5rem; }
+.catalog-override-chooser { margin-top: 1rem; }
+.catalog-override-chooser summary { cursor: pointer; font-weight: 600; }
+.catalog-override-chooser input[type="search"] { margin: .75rem 0; width: 100%; }
+.catalog-override-catalog { display: grid; gap: .75rem; }
+.catalog-override-group { display: flex; flex-wrap: wrap; gap: .5rem; }
+.catalog-override-group[hidden], .catalog-override-choice[hidden] { display: none; }
+.catalog-override-group h4 { flex-basis: 100%; margin: 0; }
+.catalog-override-draft-marker { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+
+.catalog-plugin-overrides-fields { min-width: 0; margin: 0; padding: 0; border: 0; }
+.catalog-plugin-overrides-rows { display: grid; gap: .75rem; }
+.catalog-plugin-override-row { min-width: 0; margin: 0; padding: .9rem; border: 1px solid var(--line); border-radius: .5rem; display: grid; justify-items: start; gap: .75rem; }
+.catalog-plugin-override-row > legend { padding: 0 .3rem; }
+.catalog-plugin-override-row > input:not([type="checkbox"]), .catalog-plugin-override-row > select, .catalog-plugin-override-row > textarea, .catalog-plugin-override-row > .extension-object { width: 100%; }
+.catalog-plugin-override-chooser-content { display: grid; gap: .75rem; margin-top: .75rem; }
+.catalog-plugin-override-chooser-content input[type="search"] { margin: 0; }
+.catalog-plugin-overrides-inherited { margin: 0; font-size: 12px; overflow-wrap: anywhere; }
+.catalog-plugin-overrides-actions { display: flex; flex-wrap: wrap; gap: .75rem; margin-top: 1rem; }
+.catalog-plugin-overrides-fields:disabled { opacity: .7; }
