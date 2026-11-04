@@ -645,8 +645,22 @@ impl Coordinator {
         let Some(snapshots) = snapshots else {
             return Ok(false);
         };
+        let admitted_live_options = self.settings_jobs.get(&job_key).unwrap().all_live_options();
         let mut next = self.shared.borrow().value.clone();
         *frozen_settings_mut(&mut next, &work.target)? = snapshots;
+        let scopes = super::settings_snapshot::SnapshotScopes::from_work(&next, work)?;
+        let (_, session_id, stream_id, _) = super::operations::target_parts(&work.target)?;
+        if let Some(stream_id) = stream_id {
+            let stream = next
+                .sessions
+                .get_mut(session_id)
+                .ok_or("unknown_session")?
+                .streams
+                .get_mut(stream_id)
+                .ok_or("unknown_stream")?;
+            stream.snapshot_scopes = Some(scopes);
+            stream.admitted_live_options = Some(admitted_live_options);
+        }
         save(&self.shared, next)?;
         self.settings_jobs.remove(&job_key);
         Ok(true)

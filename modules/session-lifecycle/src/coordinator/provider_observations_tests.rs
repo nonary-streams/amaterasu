@@ -735,6 +735,8 @@ fn retired_stream_without_proof_keeps_its_admission() {
             retirements: BTreeSet::new(),
             binding_owner: "provider-a".into(),
             preparation_transition: "prepare".into(),
+            snapshot_scopes: None,
+            admitted_live_options: None,
             provider_settings: BTreeMap::new(),
         },
     );
@@ -773,6 +775,8 @@ fn forged_stream_proof_cannot_close_admissions() {
                 retirements: BTreeSet::new(),
                 binding_owner: "provider-a".into(),
                 preparation_transition: "prepare".into(),
+                snapshot_scopes: None,
+                admitted_live_options: None,
                 provider_settings: BTreeMap::new(),
             },
         );

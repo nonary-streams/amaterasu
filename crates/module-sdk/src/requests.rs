@@ -81,6 +81,25 @@ impl RuntimeClient {
         )
     }
 
+    /// Request a provider's live-adjustable settings for an exact stream.
+    /// Pending responses can be retried with a new request; successful reads
+    /// do not establish that the consumer applied the returned settings.
+    pub fn request_live_provider_settings(
+        &self,
+        options: RequestOptions<'_>,
+        target: crate::extension_api::LifecycleTarget,
+        provider: &str,
+    ) -> ModuleResult<u64> {
+        self.request_serialized(
+            options,
+            &crate::extension_api::LiveProviderSettingsRequest {
+                operation: "read_live_provider_settings".into(),
+                target,
+                provider: provider.into(),
+            },
+        )
+    }
+
     /// Queue a read of the generic context for a dispatched lifecycle
     /// operation while its transition remains pending. The caller needs a broker grant, and the
     /// coordinator still authenticates the exact provider request.

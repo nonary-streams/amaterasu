@@ -423,6 +423,8 @@ impl Coordinator {
                             retirements: BTreeSet::new(),
                             binding_owner: String::new(),
                             preparation_transition: current.transition_id.clone(),
+                            snapshot_scopes: None,
+                            admitted_live_options: None,
                             provider_settings: Default::default(),
                         },
                     );

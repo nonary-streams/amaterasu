@@ -116,6 +116,18 @@ validate the result and pass opaque settings to the owning provider. A session
 and a stream have independently frozen snapshots; consumers must not assume
 they match. These reads grant no resource mutation authority.
 
+An authorized stream consumer can also poll `request_live_provider_settings`
+for an exact ready or active stream and selected provider. The response may be
+pending while the coordinator resolves the stream's admitted scopes through the
+settings registry. A successful response is a bounded complete settings object:
+only options declared `live_action` both at admission and at the current read
+can differ from the frozen stream snapshot. Its opaque revision identifies the
+registry observation, not successful application by a consumer or provider.
+The consumer must check the returned target and provider and handle a rejected
+read when the stream ends or its generation changes. The lifecycle operation
+and caller/provider pair both require explicit grants. Saving settings alone
+does not establish that any running stream applied them.
+
 Built-in launch, RTSP and stream-session messages do not accept legacy
 frame-limiter policy payloads or invoke the limiter's apply/status/restore RPCs.
 The standard package no longer grants those calls to streaming consumers. A

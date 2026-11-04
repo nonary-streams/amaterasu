@@ -387,6 +387,8 @@ mod tests {
                     retirements: BTreeSet::new(),
                     binding_owner: String::new(),
                     preparation_transition: "transition".into(),
+                    snapshot_scopes: None,
+                    admitted_live_options: None,
                     provider_settings: Default::default(),
                 },
             )]

@@ -9,7 +9,7 @@ const MAX_PROVIDERS: usize = 32;
 const MAX_SETTINGS_BYTES: usize = 8192;
 const MAX_REGISTRY_RESPONSE_BYTES: usize = 12_000;
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub(super) struct SnapshotScopes {
     application: Option<String>,
     paired_client: Option<String>,
@@ -63,6 +63,10 @@ impl SnapshotScopes {
         })
     }
 
+    pub(super) fn valid_for_session(&self, session: &str) -> bool {
+        self.valid() && self.session.as_deref() == Some(session)
+    }
+
     fn valid(&self) -> bool {
         [&self.application, &self.paired_client, &self.session]
             .into_iter()
@@ -90,6 +94,8 @@ enum Stage {
     Release {
         request: u64,
         snapshot: FrozenSettings,
+        live_options: Vec<String>,
+        descriptor_revision: Option<u64>,
     },
     ReleaseFailure {
         request: u64,
@@ -107,6 +113,8 @@ pub struct SettingsSnapshotJob {
     snapshots: BTreeMap<String, FrozenSettings>,
     stage: Stage,
     scopes: SnapshotScopes,
+    live_options: BTreeMap<String, Vec<String>>,
+    descriptor_revisions: BTreeMap<String, u64>,
 }
 
 impl SettingsSnapshotJob {
@@ -158,7 +166,31 @@ impl SettingsSnapshotJob {
             snapshots,
             stage: Stage::Submit,
             scopes,
+            live_options: BTreeMap::new(),
+            descriptor_revisions: BTreeMap::new(),
         })
+    }
+
+    pub(super) fn all_live_options(&self) -> BTreeMap<String, Vec<String>> {
+        self.live_options.clone()
+    }
+
+    pub(super) fn descriptor_revision(&self, provider: &str) -> Option<u64> {
+        self.descriptor_revisions.get(provider).copied()
+    }
+
+    pub(super) fn live_options(&self, provider: &str) -> Option<&[String]> {
+        self.live_options.get(provider).map(Vec::as_slice)
+    }
+
+    pub(super) fn cancel(&self, send: &mut dyn FnMut(Command) -> ModuleResult<Response>) {
+        if let Stage::Poll { request }
+        | Stage::Release { request, .. }
+        | Stage::ReleaseFailure { request, .. } = self.stage
+        {
+            let _ = send(Command::Cancel { request });
+            let _ = send(Command::ReleaseResult { request });
+        }
     }
 
     /// One broker command at most per tick. Any ambiguous/failed read or release
@@ -177,6 +209,13 @@ impl SettingsSnapshotJob {
             Ok(()) if self.index == self.participants.len() => Ok(Some(self.snapshots.clone())),
             Ok(()) => Ok(None),
             Err(error) => {
+                if let Stage::Poll { request }
+                | Stage::Release { request, .. }
+                | Stage::ReleaseFailure { request, .. } = self.stage
+                {
+                    let _ = send(Command::Cancel { request });
+                    let _ = send(Command::ReleaseResult { request });
+                }
                 self.stage = Stage::Failed;
                 Err(error)
             }
@@ -207,9 +246,11 @@ impl SettingsSnapshotJob {
                 Response::Pending => {}
                 Response::Result { payload } => {
                     self.stage = match parse_registry_response(payload) {
-                        Ok(snapshot) => Stage::Release {
+                        Ok((snapshot, live_options, descriptor_revision)) => Stage::Release {
                             request: *request,
                             snapshot,
+                            live_options,
+                            descriptor_revision,
                         },
                         Err(error) => Stage::ReleaseFailure {
                             request: *request,
@@ -227,11 +268,24 @@ impl SettingsSnapshotJob {
                 }
                 _ => return Err("settings registry result unavailable".into()),
             },
-            Stage::Release { request, snapshot } => {
+            Stage::Release {
+                request,
+                snapshot,
+                live_options,
+                descriptor_revision,
+            } => {
                 match send(Command::ReleaseResult { request: *request })? {
                     Response::Ok => {}
                     _ => return Err("settings registry result release failed".into()),
                 }
+                if let Some(revision) = descriptor_revision {
+                    self.descriptor_revisions
+                        .insert(self.participants[self.index].provider.clone(), *revision);
+                }
+                self.live_options.insert(
+                    self.participants[self.index].provider.clone(),
+                    live_options.clone(),
+                );
                 self.snapshots.insert(
                     self.participants[self.index].provider.clone(),
                     snapshot.clone(),
@@ -241,7 +295,11 @@ impl SettingsSnapshotJob {
             }
             Stage::ReleaseFailure { request, error } => {
                 match send(Command::ReleaseResult { request: *request })? {
-                    Response::Ok => return Err(error.clone()),
+                    Response::Ok => {
+                        let error = error.clone();
+                        self.stage = Stage::Failed;
+                        return Err(error);
+                    }
                     _ => return Err("settings registry result release failed".into()),
                 }
             }
@@ -259,7 +317,9 @@ fn valid_snapshot(settings: &Value, revision: &str) -> bool {
         && serde_json::to_vec(settings).is_ok_and(|bytes| bytes.len() <= MAX_SETTINGS_BYTES)
 }
 
-fn parse_registry_response(payload: Value) -> ModuleResult<FrozenSettings> {
+fn parse_registry_response(
+    payload: Value,
+) -> ModuleResult<(FrozenSettings, Vec<String>, Option<u64>)> {
     if serde_json::to_vec(&payload)
         .map_err(|error| error.to_string())?
         .len()
@@ -298,7 +358,21 @@ fn parse_registry_response(payload: Value) -> ModuleResult<FrozenSettings> {
     if !valid_snapshot(&snapshot.settings, &snapshot.revision) {
         return Err("invalid effective settings".into());
     }
-    Ok(snapshot)
+    let live_options = match payload.get("live_options") {
+        None => Vec::new(),
+        Some(value) => serde_json::from_value::<Vec<String>>(value.clone())
+            .map_err(|_| "invalid live options")?,
+    };
+    let mut seen = BTreeSet::new();
+    if live_options.len() > 128
+        || live_options
+            .iter()
+            .any(|name| !effective.contains_key(name) || !seen.insert(name))
+    {
+        return Err("invalid live options".into());
+    }
+    let descriptor_revision = payload.get("descriptor_revision").and_then(Value::as_u64);
+    Ok((snapshot, live_options, descriptor_revision))
 }
 
 #[cfg(test)]
@@ -461,7 +535,7 @@ mod tests {
             )
             .unwrap();
             let mut replies = VecDeque::from([Response::Accepted { id: 1 }, result, Response::Ok]);
-            let mut send = |_: Command| Ok(replies.pop_front().unwrap());
+            let mut send = |_: Command| Ok(replies.pop_front().unwrap_or(Response::Ok));
             assert!(job.advance(&mut send).unwrap().is_none());
             assert!(job.advance(&mut send).unwrap().is_none());
             assert!(job.advance(&mut send).is_err());
@@ -481,7 +555,7 @@ mod tests {
             registry_result(json!(3), 1),
             Response::error("permission_denied", "failed"),
         ]);
-        let mut send = |_: Command| Ok(replies.pop_front().unwrap());
+        let mut send = |_: Command| Ok(replies.pop_front().unwrap_or(Response::Ok));
         assert!(job.advance(&mut send).unwrap().is_none());
         assert!(job.advance(&mut send).unwrap().is_none());
         assert!(job.advance(&mut send).is_err());

@@ -1231,6 +1231,8 @@ mod tests {
             retirements: BTreeSet::new(),
             binding_owner: String::new(),
             preparation_transition: String::new(),
+            snapshot_scopes: None,
+            admitted_live_options: None,
             provider_settings: BTreeMap::new(),
         };
         let mut session: SessionRecord = serde_json::from_value(json!({"host_epoch":"epoch","id":"session","generation":1,"phase":"ready","owner":{"caller":"c","initiator":"i"},"delegates":[],"application_ref":{},"settings_revision":"one","application_retired":false,"streams":{}})).unwrap();

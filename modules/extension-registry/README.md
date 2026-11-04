@@ -14,6 +14,11 @@ visible if the selected provider and complete method schema also match the
 operator policy. Both caller and initiator need exact scope grants. The registry
 does not derive authority from a payload selector.
 
+`settings_get` returns `live_options`, an array of option IDs whose installed
+descriptor declares `live_action`; each ID also appears in `effective`. The
+caller cannot supply or override apply policy. `descriptor_revision` identifies the
+installed descriptor revision separately from the persisted document `revision`.
+
 Settings use complete scope replacement and required document revisions.
 Every represented application/client/session combination, including absent
 scopes, is validated by the provider before the state-service CAS. Validation is

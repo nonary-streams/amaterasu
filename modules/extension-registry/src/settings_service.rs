@@ -6,7 +6,7 @@ use crate::{
     settings::{self, Document, Scope},
 };
 use amaterasu_configuration_schema::{Fields, Values};
-use amaterasu_extension_api::{LifecycleTarget, MethodRef, SettingScope};
+use amaterasu_extension_api::{ApplyPolicy, LifecycleTarget, MethodRef, SettingScope};
 use amaterasu_module_sdk::{Command, ModuleResult, Response, RuntimeClient};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -56,6 +56,7 @@ struct Pending {
     operation: SettingsOperation,
     deadline: Instant,
     fields: Fields,
+    live_options: Vec<String>,
     allowed: BTreeMap<String, BTreeSet<String>>,
     validation: MethodRef,
     schema_revision: u64,
@@ -271,6 +272,13 @@ impl SettingsService {
             .iter()
             .map(|option| (option.id.clone(), option.definition.clone()))
             .collect();
+        let live_options = item
+            .descriptor
+            .options
+            .iter()
+            .filter(|option| option.apply_policy == ApplyPolicy::LiveAction)
+            .map(|option| option.id.clone())
+            .collect();
         let allowed = item
             .descriptor
             .options
@@ -332,6 +340,7 @@ impl SettingsService {
                 operation,
                 deadline,
                 fields,
+                live_options,
                 allowed,
                 validation: item.descriptor.settings_validate.clone(),
                 schema_revision: item.descriptor.revision,
@@ -481,7 +490,12 @@ impl SettingsService {
                                 continue;
                             }
                         };
-                        if !settings::responses_fit(&pending.fields, &updated, MAX_RESPONSE_BYTES) {
+                        if !settings::responses_fit(
+                            &pending.fields,
+                            &pending.live_options,
+                            &updated,
+                            MAX_RESPONSE_BYTES,
+                        ) {
                             completed.push((
                                 id,
                                 discovery::failure(
@@ -552,7 +566,26 @@ impl SettingsService {
                                 .find(|layer| layer.scope == pending.scope)
                                 .map(|layer| layer.values.clone())
                                 .unwrap_or_default();
-                            match effective { Ok(effective) => completed.push((id, json!({"ok":true,"status":"ok","revision":document.revision,"values":values,"effective":effective}))), Err(error) => completed.push((id, discovery::failure("invalid_state", &error))) }
+                            match effective {
+                                Ok(effective) => {
+                                    let response = json!({"ok":true,"status":"ok","revision":document.revision,"descriptor_revision":pending.schema_revision,"values":values,"effective":effective,"live_options":pending.live_options});
+                                    if serde_json::to_vec(&response)
+                                        .is_ok_and(|bytes| bytes.len() <= MAX_RESPONSE_BYTES)
+                                    {
+                                        completed.push((id, response));
+                                    } else {
+                                        completed.push((
+                                            id,
+                                            discovery::failure(
+                                                "resource_exhausted",
+                                                "settings response exceeds size limit",
+                                            ),
+                                        ));
+                                    }
+                                }
+                                Err(error) => completed
+                                    .push((id, discovery::failure("invalid_state", &error))),
+                            }
                             continue;
                         }
                         SettingsOperation::Migrate { .. } => unreachable!(),
@@ -573,6 +606,7 @@ impl SettingsService {
                                 Ok(updated)
                                     if !settings::responses_fit(
                                         &pending.fields,
+                                        &pending.live_options,
                                         &updated,
                                         MAX_RESPONSE_BYTES,
                                     ) =>

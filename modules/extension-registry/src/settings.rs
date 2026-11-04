@@ -157,7 +157,12 @@ pub fn resolve(
 /// A conservative response bound, covering any authorized selection of layers.
 /// Each value and provenance uses the longest candidate independently, so the
 /// constructed response is at least as large as every actual response.
-pub fn responses_fit(fields: &Fields, document: &Document, limit: usize) -> bool {
+pub fn responses_fit(
+    fields: &Fields,
+    live_options: &[String],
+    document: &Document,
+    limit: usize,
+) -> bool {
     let Ok(defaults) = defaults(fields) else {
         return false;
     };
@@ -190,7 +195,7 @@ pub fn responses_fit(fields: &Fields, document: &Document, limit: usize) -> bool
         .iter()
         .map(|layer| &layer.values)
         .max_by_key(|values| serde_json::to_vec(values).map_or(usize::MAX, |v| v.len()));
-    let response = serde_json::json!({"ok":true,"status":"ok","revision":u64::MAX,"values":values.cloned().unwrap_or_default(),"effective":effective});
+    let response = serde_json::json!({"ok":true,"status":"ok","revision":u64::MAX,"descriptor_revision":u64::MAX,"values":values.cloned().unwrap_or_default(),"effective":effective,"live_options":live_options});
     serde_json::to_vec(&response).is_ok_and(|bytes| bytes.len() <= limit)
 }
 
@@ -451,7 +456,19 @@ mod tests {
         )
         .unwrap();
         assert!(serde_json::to_vec(&updated).unwrap().len() < 12_000);
-        assert!(!responses_fit(&fields, &updated, 12_000));
+        assert!(!responses_fit(&fields, &[], &updated, 12_000));
+    }
+
+    #[test]
+    fn response_bound_includes_live_option_metadata() {
+        let (fields, _, document) = fixture();
+        assert!(responses_fit(&fields, &[], &document, 1_000));
+        assert!(!responses_fit(
+            &fields,
+            &["x".repeat(1_000)],
+            &document,
+            1_000
+        ));
     }
 
     #[test]

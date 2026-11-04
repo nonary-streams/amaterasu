@@ -43,6 +43,7 @@ mod finalize_result_verify;
 #[allow(dead_code)] // Finalization selection remains gated until composition sequencing is wired.
 mod finalize_selection;
 mod frozen_settings_read;
+mod live_settings_read;
 mod observation_scheduler;
 mod operations;
 #[allow(dead_code)]
@@ -401,6 +402,10 @@ struct StreamRecord {
     preparation_transition: String,
     #[serde(default)]
     provider_settings: BTreeMap<String, settings_snapshot::FrozenSettings>,
+    #[serde(default)]
+    snapshot_scopes: Option<settings_snapshot::SnapshotScopes>,
+    #[serde(default)]
+    admitted_live_options: Option<BTreeMap<String, Vec<String>>>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -1118,6 +1123,7 @@ pub struct Coordinator {
     work_cursor: usize,
     settings_jobs: BTreeMap<String, settings_snapshot::SettingsSnapshotJob>,
     processing_jobs: BTreeMap<String, processing_preflight::ProcessingPreflightJob>,
+    live_settings_jobs: BTreeMap<String, live_settings_read::LiveSettingsJob>,
 }
 
 impl Coordinator {
@@ -1201,6 +1207,7 @@ impl Coordinator {
             work_cursor: 0,
             settings_jobs: BTreeMap::new(),
             processing_jobs: BTreeMap::new(),
+            live_settings_jobs: BTreeMap::new(),
         })
     }
 
@@ -1253,6 +1260,9 @@ impl Coordinator {
         }
         if operation == "read_frozen_provider_settings" {
             return self.read_frozen_provider_settings(caller, payload);
+        }
+        if operation == "read_live_provider_settings" {
+            return self.read_live_provider_settings(caller, payload);
         }
         if operation == "read_provider_context" {
             return self.read_provider_context(caller, payload);
@@ -1400,6 +1410,7 @@ impl Coordinator {
             return Ok(());
         }
         self.refresh_approvals(send)?;
+        self.advance_live_settings(send);
         self.advance_applications(send)?;
         self.advance_work(send)?;
         self.retire_ended_sessions_if_idle()?;

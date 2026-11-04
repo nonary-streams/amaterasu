@@ -373,6 +373,31 @@ pub struct FrozenProviderSettingsResponse {
     pub settings: Value,
 }
 
+/// Read the current live-adjustable values for a selected provider on an exact
+/// stream. Scope identities come from the admitted stream, never the caller.
+/// A pending result may be retried; the coordinator rechecks authority and
+/// stream lifetime on each request.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LiveProviderSettingsRequest {
+    pub operation: String,
+    pub target: LifecycleTarget,
+    pub provider: String,
+}
+
+/// A bounded complete provider settings object. Only fields declared live may
+/// differ from the stream's frozen settings. The opaque revision identifies
+/// the registry observation; it does not confirm that an effect was applied.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LiveProviderSettingsResponse {
+    pub status: String,
+    pub target: LifecycleTarget,
+    pub provider: String,
+    pub revision: String,
+    pub settings: Value,
+}
+
 /// Read-only context for an exact lifecycle operation dispatched to
 /// a selected participant. Supplying a request is not authority by itself;
 /// the coordinator checks it against its durable dispatch and broker caller.

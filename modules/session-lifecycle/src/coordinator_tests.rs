@@ -477,6 +477,8 @@ fn frozen_action_lineage_survives_restart_and_rejects_tampering() {
         retirements: Default::default(),
         binding_owner: "display".into(),
         preparation_transition: String::new(),
+        snapshot_scopes: None,
+        admitted_live_options: None,
         provider_settings: [(
             "display".into(),
             settings_snapshot::FrozenSettings {

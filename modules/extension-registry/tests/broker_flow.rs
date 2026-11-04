@@ -78,7 +78,7 @@ impl Harness {
             DIRECTORY_SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir(&root).unwrap();
-        let descriptor = json!({"provider":"example.demo","revision":if migrating {2} else {1},"options":[{"id":"enabled","label":"Enabled","help":"","definition":{"type":"boolean","default":true},"allowed_scopes":["host","application","session"],"apply_policy":"next_session","required_capabilities":[]}],"actions":[],"capabilities":[],"settings_validate":{"service":"example.demo/1","method":"settings_validate","interface_major":1,"interface_minor":0,"schema_revision":1}});
+        let descriptor = json!({"provider":"example.demo","revision":if migrating {2} else {1},"options":[{"id":"enabled","label":"Enabled","help":"","definition":{"type":"boolean","default":true},"allowed_scopes":["host","application","session"],"apply_policy":"next_session","required_capabilities":[]},{"id":"live","label":"Live","help":"","definition":{"type":"boolean","default":false},"allowed_scopes":["host"],"apply_policy":"live_action","required_capabilities":[]},{"id":"stream","label":"Stream","help":"","definition":{"type":"boolean","default":false},"allowed_scopes":["host"],"apply_policy":"next_stream","required_capabilities":[]}],"actions":[],"capabilities":[],"settings_validate":{"service":"example.demo/1","method":"settings_validate","interface_major":1,"interface_minor":0,"schema_revision":1}});
         use sha2::{Digest, Sha256};
         let typed: amaterasu_extension_api::ExtensionDescriptor =
             serde_json::from_value(descriptor.clone()).unwrap();
@@ -370,6 +370,9 @@ fn discovery_uses_actual_broker_approval_and_initiator() {
 #[test]
 fn settings_provider_rejection_and_compare_and_swap_use_actual_broker() {
     let mut harness = Harness::new();
+    let initial = harness.call("management", json!({"operation":"settings_get","provider":"example.demo","scope":{"kind":"host"},"application":null,"paired_client":null,"session":null}));
+    assert_eq!(initial["revision"], 0);
+    assert_eq!(initial["descriptor_revision"], 1);
     let request = |revision| json!({"operation":"settings_update","provider":"example.demo","scope":{"kind":"host"},"expected_revision":revision,"values":{}});
     harness.provider_accepts = false;
     let rejected = harness.call("management", request(0));
@@ -383,6 +386,9 @@ fn settings_provider_rejection_and_compare_and_swap_use_actual_broker() {
     assert_eq!(stale["error"]["code"], "revision_conflict");
     let get = harness.call("management",json!({"operation":"settings_get","provider":"example.demo","scope":{"kind":"host"},"application":null,"paired_client":null,"session":null}));
     assert_eq!(get["revision"], 1);
+    assert_eq!(get["descriptor_revision"], 1);
+    assert_eq!(get["live_options"], json!(["live"]));
+    assert_eq!(get["effective"]["live"]["value"], false);
 }
 
 #[test]
@@ -509,6 +515,8 @@ fn explicit_class_grants_resolve_and_reset_scoped_settings_without_provider_spec
     let query = json!({"operation":"settings_get","provider":"example.demo",
         "scope":{"kind":"host"},"application":"game","paired_client":"client","session":"session"});
     let result = harness.call("management", query.clone());
+    assert_eq!(result["descriptor_revision"], 1);
+    assert_eq!(result["live_options"], json!(["live"]));
     assert_eq!(result["effective"]["enabled"]["value"], true);
     assert_eq!(
         result["effective"]["enabled"]["source"],

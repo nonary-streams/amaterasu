@@ -4,16 +4,25 @@ use amaterasu_extension_api::{FrozenProviderSettingsRequest, FrozenProviderSetti
 
 impl Coordinator {
     pub(super) fn read_frozen_provider_settings(&self, caller: &str, payload: Value) -> Value {
+        self.read_settings_for_operation(caller, payload, "read_frozen_provider_settings")
+    }
+
+    pub(super) fn read_settings_for_operation(
+        &self,
+        caller: &str,
+        payload: Value,
+        operation: &str,
+    ) -> Value {
         let Ok(request) = serde_json::from_value::<FrozenProviderSettingsRequest>(payload) else {
             return rejection("invalid_request");
         };
-        if request.operation != "read_frozen_provider_settings"
+        if request.operation != operation
             || !self.settings.trusted_callers.contains(caller)
             || !self
                 .settings
                 .operation_grants
                 .get(caller)
-                .is_some_and(|operations| operations.contains("read_frozen_provider_settings"))
+                .is_some_and(|operations| operations.contains(operation))
             || !self
                 .settings
                 .provider_settings_readers
