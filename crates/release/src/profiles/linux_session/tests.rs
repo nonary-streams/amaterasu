@@ -948,6 +948,26 @@ fn rtx_hdr_composition_is_explicit_and_authorizes_the_processor() {
         .find(|component| component.id == VIDEO_COMPONENT_ID)
         .unwrap();
     assert!(provider.native_provides.contains(&"amaterasu.rtx-hdr/1"));
+    let foreground = RTX_HDR_COMPONENTS
+        .iter()
+        .find(|component| component.id == "amaterasu.foreground-context")
+        .unwrap();
+    assert!(provider.calls.contains(&"amaterasu.foreground-context/1"));
+    assert!(provider.dependencies.contains(&foreground.id));
+    assert!(
+        enabled.principals[provider.id]
+            .call
+            .contains("amaterasu.foreground-context/1")
+    );
+    assert_eq!(
+        enabled.settings[provider.id]["foreground_context_service"],
+        "amaterasu.foreground-context/1"
+    );
+    assert_eq!(
+        enabled.settings[foreground.id]["allowed_principals"],
+        json!([provider.id])
+    );
+    assert!(!default.principals.contains_key(foreground.id));
     assert!(video.native_uses.contains(&"amaterasu.rtx-hdr/1"));
     assert!(video.dependencies.contains(&provider.id));
     assert!(video.calls.contains(&"amaterasu.session-lifecycle/1"));
@@ -1074,7 +1094,7 @@ fn rtx_hdr_composition_is_explicit_and_authorizes_the_processor() {
             .any(|approval| approval.provider == "amaterasu.rtx-hdr"
                 && approval.method.method == "processing_intent")
     );
-    assert_eq!(RTX_HDR_COMPONENTS.len(), COMPONENTS.len() + 1);
+    assert_eq!(RTX_HDR_COMPONENTS.len(), COMPONENTS.len() + 2);
     for component in COMPONENTS {
         assert!(
             RTX_HDR_COMPONENTS
@@ -1108,5 +1128,20 @@ fn rtx_hdr_policy_rejects_missing_capture_helper_without_mutation() {
     let before = serde_json::to_value(&policy).unwrap();
     let error = enable_rtx_hdr(&mut policy, &root.path().join("runtime")).unwrap_err();
     assert!(error.contains("frame helper"));
+    assert_eq!(serde_json::to_value(&policy).unwrap(), before);
+}
+
+#[test]
+fn rtx_hdr_policy_rejects_conflicting_foreground_provider_without_mutation() {
+    let root = TemporaryRoot::new("rtx-hdr-foreground-conflict");
+    let mut policy = linux_session_policy(root.path(), &LinuxSessionOptions::default()).unwrap();
+    policy.settings.get_mut("amaterasu.capture-vkms").unwrap()["frame_helper"] =
+        json!("/opt/amaterasu/amaterasu-vkms-frame-helper");
+    policy.settings.insert(
+        "amaterasu.foreground-context".into(),
+        json!({"allowed_principals": ["other"]}),
+    );
+    let before = serde_json::to_value(&policy).unwrap();
+    assert!(enable_rtx_hdr(&mut policy, &root.path().join("runtime")).is_err());
     assert_eq!(serde_json::to_value(&policy).unwrap(), before);
 }

@@ -156,6 +156,11 @@ fn check_composition(manifest: &ReleaseManifest) -> PackageResult<&str> {
         .iter()
         .find(|c| c.id == "amaterasu.session-lifecycle")
         .ok_or("session lifecycle component is absent")?;
+    let foreground = manifest
+        .components
+        .iter()
+        .find(|c| c.id == "amaterasu.foreground-context")
+        .ok_or("foreground context component is absent")?;
     if !plugin.requested.provide.contains(SERVICE)
         || !plugin.requested.native_provide.contains(SERVICE)
         || !video.requested.native_use.contains(SERVICE)
@@ -165,6 +170,15 @@ fn check_composition(manifest: &ReleaseManifest) -> PackageResult<&str> {
             .call
             .contains("amaterasu.session-lifecycle/1")
         || video.requires.get(&lifecycle.id) != Some(&lifecycle.version)
+        || !foreground
+            .requested
+            .provide
+            .contains("amaterasu.foreground-context/1")
+        || !plugin
+            .requested
+            .call
+            .contains("amaterasu.foreground-context/1")
+        || plugin.requires.get(&foreground.id) != Some(&foreground.version)
     {
         return Err("RTX HDR signed grants or video dependency are missing".into());
     }

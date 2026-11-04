@@ -149,10 +149,24 @@ pub const RTX_HDR_COMPONENT: ComponentDefinition = ComponentDefinition {
     id: "amaterasu.rtx-hdr",
     library: "amaterasu_rtx_hdr",
     provides: &["amaterasu.rtx-hdr/1", "nonary.rtx-hdr/1"],
-    calls: &["amaterasu.session-lifecycle/1"],
+    calls: &[
+        "amaterasu.session-lifecycle/1",
+        "amaterasu.foreground-context/1",
+    ],
+    publishes: &[],
+    dependencies: &[RUNTIME_ID, "amaterasu.foreground-context"],
+    native_provides: &["amaterasu.rtx-hdr/1"],
+    native_uses: &[],
+};
+
+const FOREGROUND_CONTEXT: ComponentDefinition = ComponentDefinition {
+    id: "amaterasu.foreground-context",
+    library: "amaterasu_foreground_context",
+    provides: &["amaterasu.foreground-context/1"],
+    calls: &[],
     publishes: &[],
     dependencies: &[RUNTIME_ID],
-    native_provides: &["amaterasu.rtx-hdr/1"],
+    native_provides: &[],
     native_uses: &[],
 };
 
@@ -501,6 +515,7 @@ pub const RTX_HDR_COMPONENTS: &[ComponentDefinition] = &[
     AUDIO,
     AUDIO_ENCODE,
     ENCODE,
+    FOREGROUND_CONTEXT,
     RTX_HDR_COMPONENT,
     RTX_HDR_VIDEO,
     MEDIA_TRANSPORT,
@@ -710,6 +725,42 @@ pub fn enable_rtx_hdr(policy: &mut RuntimeConfig, runtime_directory: &Path) -> P
             RTX_HDR_COMPONENT.id.into(),
             json!({"runtime_directory": runtime_directory, "require_verified_runtime": true}),
         );
+    }
+    let provider_settings = candidate
+        .settings
+        .get_mut(RTX_HDR_COMPONENT.id)
+        .and_then(Value::as_object_mut)
+        .ok_or("RTX HDR settings must be an object")?;
+    let foreground_service = json!("amaterasu.foreground-context/1");
+    if provider_settings
+        .get("foreground_context_service")
+        .is_some_and(|selected| *selected != foreground_service)
+    {
+        return Err("RTX HDR foreground provider conflicts with existing settings".into());
+    }
+    provider_settings.insert("foreground_context_service".into(), foreground_service);
+    let foreground_settings = json!({"allowed_principals": [RTX_HDR_COMPONENT.id]});
+    if candidate
+        .settings
+        .get(FOREGROUND_CONTEXT.id)
+        .is_some_and(|existing| *existing != foreground_settings)
+    {
+        return Err("foreground provider settings conflict with existing settings".into());
+    }
+    candidate
+        .settings
+        .insert(FOREGROUND_CONTEXT.id.into(), foreground_settings);
+    let foreground_grants = FOREGROUND_CONTEXT.grants();
+    if let Some(existing) = candidate.principals.get(FOREGROUND_CONTEXT.id) {
+        if serde_json::to_value(existing).map_err(|error| error.to_string())?
+            != serde_json::to_value(&foreground_grants).map_err(|error| error.to_string())?
+        {
+            return Err("foreground provider principal conflicts with approved composition".into());
+        }
+    } else {
+        candidate
+            .principals
+            .insert(FOREGROUND_CONTEXT.id.into(), foreground_grants);
     }
     for principal in [
         "amaterasu.session-lifecycle",
