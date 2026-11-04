@@ -262,7 +262,7 @@ test("cancelling a pending support export closes its eventual handle without dow
   assert.equal(closed.filter((value)=>value===id).length,2);
 });
 
-test("copy copies only the bounded visible or filtered view and leaves follow state alone", async () => {
+test("copy copies every rendered preview line and search context without changing follow state", async () => {
   const text = `${Array.from({length:399}, (_, index) => `line ${index}`).join("\n")}\nneedle tail`;
   const bytes = Buffer.from(text);
   const api = { async post(route, payload = {}) {
@@ -278,7 +278,7 @@ test("copy copies only the bounded visible or filtered view and leaves follow st
   renderHostLogs({api}, target);
   await wait(() => target.textContent.includes("Snapshot loaded"));
   const output = find(target, (element) => element.className === "host-log-output");
-  const copy = find(target, (element) => element.tagName === "button" && element.textContent === "Copy visible log view");
+  const copy = find(target, (element) => element.tagName === "button" && element.textContent === "Copy rendered log preview");
   const copyStatus = find(target, (element) => element.attributes["aria-live"] === "polite" && element.tagName === "p");
   const pause = find(target, (element) => element.tagName === "button" && element.textContent === "Pause");
   assert.equal(copyStatus.attributes.role, "status");
@@ -312,10 +312,10 @@ test("copy reports clipboard failures through an accessible status message", asy
   const target = new Element("div"); target.setConnected(true);
   renderHostLogs({api}, target);
   await wait(() => target.textContent.includes("Snapshot loaded"));
-  const copy = find(target, (element) => element.tagName === "button" && element.textContent === "Copy visible log view");
+  const copy = find(target, (element) => element.tagName === "button" && element.textContent === "Copy rendered log preview");
   const status = find(target, (element) => element.tagName === "p" && element.attributes.role === "status");
   copy.click();
-  await wait(() => status.textContent.includes("Could not copy the visible log view"));
+  await wait(() => status.textContent.includes("Could not copy the rendered log preview"));
   assert.equal(status.attributes["aria-live"], "polite");
   assert.equal(copy.disabled, false);
 });

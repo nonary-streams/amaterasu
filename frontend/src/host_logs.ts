@@ -92,10 +92,10 @@ namespace Amaterasu {
       link.click();
       window.setTimeout(() => URL.revokeObjectURL(url), 0);
     });
-    const copyStatus = el("p", "muted");
+    const copyStatus = el("p", "muted host-log-copy-status");
     copyStatus.setAttribute("role", "status");
     copyStatus.setAttribute("aria-live", "polite");
-    const copyVisible = button(hostLogText("Copy visible log view"), () => void copyVisibleLog());
+    const copyVisible = button(hostLogText("Copy rendered log preview"), () => void copyVisibleLog());
     const refresh = button("Refresh host log", () => load());
     const controls = el(
       "div", "diagnostics-toolbar", field("Search host log", search), field("Level", level),
@@ -108,7 +108,7 @@ namespace Amaterasu {
       "Host log",
       el("p", "muted", "Current host session only; older rotated segments may have been discarded."),
       controls,
-      el("p", "muted", hostLogText("Copies only the log lines currently visible in this bounded view.")),
+      el("p", "muted", hostLogText("Copies every rendered line, including search context. Log content is raw and may contain identifying details.")),
       copyStatus, following, showLatest, progress, matchControls, output,
       el("div", "support-log-export", exportButton, cancelExport, exportStatus,
         el("p", "muted", "The support bundle includes retained sessions from the current log location. Common identifying details are redacted; review it before sharing.")));
@@ -155,10 +155,10 @@ namespace Amaterasu {
       try {
         if (!navigator.clipboard?.writeText) throw new Error("Clipboard access is unavailable.");
         await navigator.clipboard.writeText(visibleText);
-        if (!disposed && target.isConnected) hostLogSetLocalizedText(copyStatus, "Visible log view copied to the clipboard.");
+        if (!disposed && target.isConnected) hostLogSetLocalizedText(copyStatus, "Rendered log preview copied to the clipboard.");
       } catch {
         if (!disposed && target.isConnected)
-          hostLogSetLocalizedText(copyStatus, "Could not copy the visible log view. Allow clipboard access and try again.");
+          hostLogSetLocalizedText(copyStatus, "Could not copy the rendered log preview. Clipboard access may be unavailable in this browser context.");
       } finally {
         copyBusy = false;
         if (!disposed && target.isConnected) copyVisible.disabled = !output.textContent;

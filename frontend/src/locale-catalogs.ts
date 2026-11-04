@@ -72,10 +72,10 @@ namespace Amaterasu {
     "Steam game selected. Its install directory is unavailable; the existing directory was kept.",
     "Select a discovered game to use its Steam app ID and optional install directory.",
 
-    "Copy visible log view",
-    "Copies only the log lines currently visible in this bounded view.",
-    "Visible log view copied to the clipboard.",
-    "Could not copy the visible log view. Allow clipboard access and try again.",
+    "Copy rendered log preview",
+    "Copies every rendered line, including search context. Log content is raw and may contain identifying details.",
+    "Rendered log preview copied to the clipboard.",
+    "Could not copy the rendered log preview. Clipboard access may be unavailable in this browser context.",
   ] as const;
 
   const SHELL_MESSAGE_KEYS = [
@@ -146,10 +146,10 @@ namespace Amaterasu {
 
         "Изберете открита игра, за да използвате нейния Steam ID на приложението и незадължителната инсталационна папка.",
 
-        "Копирай видимия изглед на дневника",
-        "Копира само редовете от дневника, които се виждат в този ограничен изглед.",
-        "Видимият изглед на дневника е копиран в клипборда.",
-        "Неуспешно копиране на видимия изглед на дневника. Разрешете достъп до клипборда и опитайте отново.",
+        "Копирай изобразения преглед на дневника",
+        "Копира всички показани редове, включително контекста на търсенето. Суровото съдържание на дневника може да съдържа идентифицираща информация.",
+        "Изобразеният преглед на дневника е копиран в клипборда.",
+        "Неуспешно копиране на изобразения преглед на дневника. Достъпът до клипборда може да не е наличен в този контекст на браузъра.",
       ],
     },
     cs: {
@@ -204,10 +204,10 @@ namespace Amaterasu {
 
         "Vyberte nalezenou hru a použijte její ID aplikace Steam a volitelnou instalační složku.",
 
-        "Kopírovat viditelný výpis",
-        "Zkopírují se pouze řádky výpisu právě viditelné v tomto omezeném zobrazení.",
-        "Viditelný výpis byl zkopírován do schránky.",
-        "Viditelný výpis se nepodařilo zkopírovat. Povolte přístup ke schránce a zkuste to znovu.",
+        "Kopírovat vykreslený náhled výpisu",
+        "Zkopírují se všechny vykreslené řádky včetně kontextu hledání. Surový obsah výpisu může obsahovat identifikační údaje.",
+        "Vykreslený náhled výpisu byl zkopírován do schránky.",
+        "Vykreslený náhled výpisu se nepodařilo zkopírovat. Přístup ke schránce nemusí být v tomto kontextu prohlížeče dostupný.",
       ],
     },
     de: {
@@ -262,10 +262,10 @@ namespace Amaterasu {
 
         "Wähle ein gefundenes Spiel, um seine Steam-App-ID und ein optionales Installationsverzeichnis zu verwenden.",
 
-        "Sichtbare Protokollansicht kopieren",
-        "Es werden nur die Protokollzeilen kopiert, die in dieser begrenzten Ansicht sichtbar sind.",
-        "Die sichtbare Protokollansicht wurde in die Zwischenablage kopiert.",
-        "Die sichtbare Protokollansicht konnte nicht kopiert werden. Erlaube den Zugriff auf die Zwischenablage und versuche es erneut.",
+        "Gerenderte Protokollvorschau kopieren",
+        "Es werden alle gerenderten Zeilen einschließlich des Suchkontexts kopiert. Das Rohprotokoll kann identifizierende Angaben enthalten.",
+        "Die gerenderte Protokollvorschau wurde in die Zwischenablage kopiert.",
+        "Die gerenderte Protokollvorschau konnte nicht kopiert werden. Der Zugriff auf die Zwischenablage ist in diesem Browserkontext möglicherweise nicht verfügbar.",
       ],
     },
     es: {
@@ -320,10 +320,10 @@ namespace Amaterasu {
 
         "Elige un juego detectado para usar su ID de aplicación de Steam y su directorio de instalación opcional.",
 
-        "Copiar vista visible del registro",
-        "Solo se copian las líneas del registro visibles en esta vista limitada.",
-        "La vista visible del registro se copió en el portapapeles.",
-        "No se pudo copiar la vista visible del registro. Permite el acceso al portapapeles y vuelve a intentarlo.",
+        "Copiar vista previa renderizada del registro",
+        "Se copian todas las líneas renderizadas, incluido el contexto de búsqueda. El contenido sin procesar del registro puede incluir datos identificativos.",
+        "La vista previa renderizada del registro se copió en el portapapeles.",
+        "No se pudo copiar la vista previa renderizada del registro. Es posible que el acceso al portapapeles no esté disponible en este contexto del navegador.",
       ],
     },
     fr: {
@@ -378,10 +378,10 @@ namespace Amaterasu {
 
         "Choisissez un jeu détecté pour utiliser son ID d’application Steam et son dossier d’installation facultatif.",
 
-        "Copier la vue visible du journal",
-        "Seules les lignes visibles dans cette vue limitée sont copiées.",
-        "La vue visible du journal a été copiée dans le presse-papiers.",
-        "Impossible de copier la vue visible du journal. Autorisez l’accès au presse-papiers, puis réessayez.",
+        "Copier l’aperçu rendu du journal",
+        "Toutes les lignes affichées sont copiées, y compris le contexte de recherche. Le journal brut peut contenir des informations identifiantes.",
+        "L’aperçu rendu du journal a été copié dans le presse-papiers.",
+        "Impossible de copier l’aperçu rendu du journal. L’accès au presse-papiers n’est peut-être pas disponible dans ce contexte du navigateur.",
       ],
     },
     hu: {
@@ -436,10 +436,10 @@ namespace Amaterasu {
 
         "Válassz egy felismert játékot a Steam-alkalmazásazonosító és az opcionális telepítési könyvtár használatához.",
 
-        "Látható naplónézet másolása",
-        "Csak az ebben a korlátozott nézetben látható naplósorok másolódnak.",
-        "A látható naplónézet a vágólapra került.",
-        "A látható naplónézet nem másolható. Engedélyezze a vágólap elérését, majd próbálja újra.",
+        "Megjelenített naplóelőnézet másolása",
+        "Minden megjelenített sor másolódik, a keresési környezettel együtt. A nyers naplótartalom azonosító adatokat tartalmazhat.",
+        "A megjelenített naplóelőnézet a vágólapra került.",
+        "A megjelenített naplóelőnézet nem másolható. Lehet, hogy ebben a böngészőkörnyezetben nem érhető el a vágólap.",
       ],
     },
     it: {
@@ -494,10 +494,10 @@ namespace Amaterasu {
 
         "Scegli un gioco rilevato per usare il suo ID app Steam e la cartella di installazione facoltativa.",
 
-        "Copia vista visibile del registro",
-        "Vengono copiate solo le righe del registro visibili in questa vista limitata.",
-        "La vista visibile del registro è stata copiata negli appunti.",
-        "Impossibile copiare la vista visibile del registro. Consenti l’accesso agli appunti e riprova.",
+        "Copia anteprima renderizzata del registro",
+        "Vengono copiate tutte le righe visualizzate, incluso il contesto della ricerca. Il registro non elaborato può contenere dati identificativi.",
+        "L’anteprima renderizzata del registro è stata copiata negli appunti.",
+        "Impossibile copiare l’anteprima renderizzata del registro. L’accesso agli appunti potrebbe non essere disponibile in questo contesto del browser.",
       ],
     },
     ja: {
@@ -551,10 +551,10 @@ namespace Amaterasu {
 
         "検出されたゲームを選択すると、Steam アプリ ID と任意のインストール先を使用できます。",
 
-        "表示中のログをコピー",
-        "この制限付きビューに現在表示されているログ行のみをコピーします。",
-        "表示中のログをクリップボードにコピーしました。",
-        "表示中のログをコピーできませんでした。クリップボードへのアクセスを許可して、もう一度お試しください。",
+        "表示中のログプレビューをコピー",
+        "検索コンテキストを含む、描画済みのすべての行をコピーします。ログの生データには個人を特定できる情報が含まれる場合があります。",
+        "表示中のログプレビューをクリップボードにコピーしました。",
+        "表示中のログプレビューをコピーできませんでした。このブラウザー環境ではクリップボードを利用できない可能性があります。",
       ],
     },
     ko: {
@@ -608,10 +608,10 @@ namespace Amaterasu {
 
         "발견된 게임을 선택하면 Steam 앱 ID와 선택적 설치 디렉터리를 사용할 수 있습니다.",
 
-        "표시된 로그 보기 복사",
-        "이 제한된 보기에 현재 표시된 로그 줄만 복사합니다.",
-        "표시된 로그 보기를 클립보드에 복사했습니다.",
-        "표시된 로그 보기를 복사할 수 없습니다. 클립보드 액세스를 허용하고 다시 시도하세요.",
+        "렌더링된 로그 미리보기 복사",
+        "검색 문맥을 포함해 렌더링된 모든 줄을 복사합니다. 원시 로그 내용에 식별 정보가 포함될 수 있습니다.",
+        "렌더링된 로그 미리보기를 클립보드에 복사했습니다.",
+        "렌더링된 로그 미리보기를 복사할 수 없습니다. 이 브라우저 환경에서는 클립보드를 사용하지 못할 수 있습니다.",
       ],
     },
     pl: {
@@ -666,10 +666,10 @@ namespace Amaterasu {
 
         "Wybierz wykrytą grę, aby użyć jej identyfikatora aplikacji Steam i opcjonalnego katalogu instalacji.",
 
-        "Kopiuj widoczny widok dziennika",
-        "Kopiowane są tylko wiersze dziennika widoczne w tym ograniczonym widoku.",
-        "Widoczny widok dziennika skopiowano do schowka.",
-        "Nie udało się skopiować widocznego widoku dziennika. Zezwól na dostęp do schowka i spróbuj ponownie.",
+        "Kopiuj wyrenderowany podgląd dziennika",
+        "Kopiowane są wszystkie wyrenderowane wiersze, łącznie z kontekstem wyszukiwania. Surowy dziennik może zawierać dane identyfikujące.",
+        "Wyrenderowany podgląd dziennika skopiowano do schowka.",
+        "Nie udało się skopiować wyrenderowanego podglądu dziennika. Dostęp do schowka może być niedostępny w tym kontekście przeglądarki.",
       ],
     },
     pt: {
@@ -724,10 +724,10 @@ namespace Amaterasu {
 
         "Escolha um jogo detetado para usar o respetivo ID de aplicação Steam e o diretório de instalação opcional.",
 
-        "Copiar vista visível do registo",
-        "Só são copiadas as linhas do registo visíveis nesta vista limitada.",
-        "A vista visível do registo foi copiada para a área de transferência.",
-        "Não foi possível copiar a vista visível do registo. Permita o acesso à área de transferência e tente novamente.",
+        "Copiar pré-visualização apresentada do registo",
+        "São copiadas todas as linhas apresentadas, incluindo o contexto da pesquisa. O conteúdo bruto do registo pode conter dados identificativos.",
+        "A pré-visualização apresentada do registo foi copiada para a área de transferência.",
+        "Não foi possível copiar a pré-visualização apresentada do registo. O acesso à área de transferência poderá não estar disponível neste contexto do navegador.",
       ],
     },
     pt_BR: {
@@ -771,10 +771,10 @@ namespace Amaterasu {
 
         "Escolha um jogo encontrado para usar o ID do aplicativo Steam e o diretório de instalação opcional.",
 
-        "Copiar visualização visível do log",
-        "Somente as linhas de log visíveis nesta visualização limitada serão copiadas.",
-        "A visualização visível do log foi copiada para a área de transferência.",
-        "Não foi possível copiar a visualização visível do log. Permita o acesso à área de transferência e tente novamente.",
+        "Copiar prévia renderizada do log",
+        "Todas as linhas renderizadas são copiadas, inclusive o contexto da busca. O conteúdo bruto do log pode conter dados de identificação.",
+        "A prévia renderizada do log foi copiada para a área de transferência.",
+        "Não foi possível copiar a prévia renderizada do log. O acesso à área de transferência pode não estar disponível neste contexto do navegador.",
       ],
     },
     ru: {
@@ -828,10 +828,10 @@ namespace Amaterasu {
 
         "Выберите найденную игру, чтобы использовать ее ID приложения Steam и необязательную папку установки.",
 
-        "Копировать вид журнала",
-        "Копируются только строки журнала, видимые в этом ограниченном представлении.",
-        "Видимые строки журнала скопированы в буфер обмена.",
-        "Не удалось скопировать видимые строки журнала. Разрешите доступ к буферу обмена и повторите попытку.",
+        "Копировать отображаемый фрагмент журнала",
+        "Копируются все отображаемые строки, включая контекст поиска. Исходный журнал может содержать идентифицирующие сведения.",
+        "Отображаемый фрагмент журнала скопирован в буфер обмена.",
+        "Не удалось скопировать отображаемый фрагмент журнала. В этом контексте браузера доступ к буферу обмена может быть недоступен.",
       ],
     },
     sv: {
@@ -885,10 +885,10 @@ namespace Amaterasu {
 
         "Välj ett upptäckt spel för att använda dess Steam-app-ID och valfria installationskatalog.",
 
-        "Kopiera synlig loggvy",
-        "Endast loggraderna som visas i den här begränsade vyn kopieras.",
-        "Den synliga loggvyn har kopierats till urklipp.",
-        "Det gick inte att kopiera den synliga loggvyn. Tillåt åtkomst till urklipp och försök igen.",
+        "Kopiera återgiven loggförhandsvisning",
+        "Alla återgivna rader kopieras, inklusive söksammanhanget. Rå loggtext kan innehålla identifierande uppgifter.",
+        "Den återgivna loggförhandsvisningen har kopierats till urklipp.",
+        "Det gick inte att kopiera den återgivna loggförhandsvisningen. Åtkomst till urklipp kanske inte är tillgänglig i den här webbläsarkontexten.",
       ],
     },
     tr: {
@@ -942,10 +942,10 @@ namespace Amaterasu {
 
         "Steam uygulama kimliğini ve isteğe bağlı yükleme dizinini kullanmak için bulunan bir oyunu seçin.",
 
-        "Görünür günlük görünümünü kopyala",
-        "Yalnızca bu sınırlı görünümde görünen günlük satırları kopyalanır.",
-        "Görünür günlük görünümü panoya kopyalandı.",
-        "Görünür günlük görünümü kopyalanamadı. Pano erişimine izin verip tekrar deneyin.",
+        "Oluşturulan günlük önizlemesini kopyala",
+        "Arama bağlamı dahil oluşturulan tüm satırlar kopyalanır. Ham günlük içeriği kimlik belirleyici bilgiler içerebilir.",
+        "Oluşturulan günlük önizlemesi panoya kopyalandı.",
+        "Oluşturulan günlük önizlemesi kopyalanamadı. Bu tarayıcı bağlamında pano erişimi kullanılamıyor olabilir.",
       ],
     },
     uk: {
@@ -1000,10 +1000,10 @@ namespace Amaterasu {
 
         "Виберіть знайдену гру, щоб використати її ID програми Steam і необов’язковий каталог встановлення.",
 
-        "Копіювати видимий журнал",
-        "Копіюються лише рядки журналу, видимі в цьому обмеженому поданні.",
-        "Видимий журнал скопійовано до буфера обміну.",
-        "Не вдалося скопіювати видимий журнал. Дозвольте доступ до буфера обміну та спробуйте ще раз.",
+        "Копіювати відображений попередній перегляд журналу",
+        "Копіюються всі відображені рядки, зокрема контекст пошуку. Необроблений журнал може містити ідентифікаційні дані.",
+        "Відображений попередній перегляд журналу скопійовано до буфера обміну.",
+        "Не вдалося скопіювати відображений попередній перегляд журналу. У цьому контексті браузера доступ до буфера обміну може бути недоступний.",
       ],
     },
     vi: {
@@ -1058,10 +1058,10 @@ namespace Amaterasu {
 
         "Chọn trò chơi đã tìm thấy để dùng ID ứng dụng Steam và thư mục cài đặt tùy chọn của trò chơi.",
 
-        "Sao chép phần nhật ký đang hiển thị",
-        "Chỉ sao chép các dòng nhật ký hiện thấy trong khung giới hạn này.",
-        "Đã sao chép phần nhật ký đang hiển thị vào bảng tạm.",
-        "Không thể sao chép phần nhật ký đang hiển thị. Hãy cho phép truy cập bảng tạm rồi thử lại.",
+        "Sao chép bản xem trước nhật ký đã hiển thị",
+        "Sao chép mọi dòng đang hiển thị, bao gồm ngữ cảnh tìm kiếm. Nội dung nhật ký thô có thể chứa thông tin nhận dạng.",
+        "Đã sao chép bản xem trước nhật ký đã hiển thị vào bảng tạm.",
+        "Không thể sao chép bản xem trước nhật ký đã hiển thị. Có thể không truy cập được bảng tạm trong ngữ cảnh trình duyệt này.",
       ],
     },
     zh: {
@@ -1114,10 +1114,10 @@ namespace Amaterasu {
 
         "选择已发现的游戏，以使用其 Steam 应用 ID 和可选安装目录。",
 
-        "复制可见日志视图",
-        "仅复制此受限视图中当前可见的日志行。",
-        "已将可见日志视图复制到剪贴板。",
-        "无法复制可见日志视图。请允许访问剪贴板后重试。",
+        "复制已渲染的日志预览",
+        "复制所有已渲染的行，包括搜索上下文。原始日志内容可能包含身份识别信息。",
+        "已将已渲染的日志预览复制到剪贴板。",
+        "无法复制已渲染的日志预览。此浏览器上下文可能无法使用剪贴板。",
       ],
     },
     zh_TW: {
@@ -1158,10 +1158,10 @@ namespace Amaterasu {
 
         "選擇已找到的遊戲，以使用其 Steam 應用程式 ID 和選用安裝目錄。",
 
-        "複製可見記錄檢視",
-        "只會複製此限制檢視中目前可見的記錄行。",
-        "已將可見記錄檢視複製到剪貼簿。",
-        "無法複製可見記錄檢視。請允許存取剪貼簿後再試一次。",
+        "複製已呈現的記錄預覽",
+        "複製所有已呈現的行，包括搜尋內容。原始記錄可能含有可識別個人身分的資訊。",
+        "已將已呈現的記錄預覽複製到剪貼簿。",
+        "無法複製已呈現的記錄預覽。此瀏覽器環境可能無法使用剪貼簿。",
       ],
     },
   };
