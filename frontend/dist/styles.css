@@ -1693,6 +1693,18 @@ h1, h2, h3, .brand {
   font-size: clamp(30px, 3vw, 40px);
   letter-spacing: -.035em;
 }
+.page-heading h1::after {
+  content: "";
+  display: block;
+  width: clamp(46px, 6vw, 76px);
+  height: 4px;
+  margin-top: 9px;
+  border-radius: 2px 65% 18% 80%;
+  background: linear-gradient(96deg, var(--accent) 0 60%, var(--gold));
+  opacity: .86;
+  transform: rotate(-1.5deg);
+  transform-origin: left;
+}
 .panel, .overview-status, .overview-activity-panel, .metric {
   border-radius: 14px 16px 13px 15px;
   border-color: color-mix(in srgb, var(--line) 82%, var(--gold));
@@ -1723,6 +1735,33 @@ textarea:focus-visible, select:focus-visible, summary:focus-visible {
 .overview-status, .overview-activity-panel {
   background:
     linear-gradient(110deg, color-mix(in srgb, var(--panel) 94%, var(--paper)), var(--panel));
+}
+.overview-status {
+  position: relative;
+  isolation: isolate;
+  overflow: hidden;
+}
+.overview-status > * {
+  position: relative;
+  z-index: 1;
+}
+.overview-status::after {
+  content: "";
+  position: absolute;
+  z-index: 0;
+  right: 14px;
+  bottom: 8px;
+  width: clamp(104px, 17vw, 176px);
+  height: 88px;
+  background: var(--good);
+  opacity: .14;
+  -webkit-mask: url("./okami-botanical.svg") center / contain no-repeat;
+  mask: url("./okami-botanical.svg") center / contain no-repeat;
+  pointer-events: none;
+}
+@media (max-width: 640px) {
+  .overview-status::after { display: none; }
+  .page-heading h1::after { width: 48px; height: 3px; margin-top: 7px; }
 }
 .overview-status-icon {
   border-radius: 50%;

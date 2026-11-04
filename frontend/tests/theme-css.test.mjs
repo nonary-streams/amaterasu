@@ -44,10 +44,26 @@ for (const [name, pattern] of themes) {
     assert.ok(contrastRatio(tokens['selected-accent'], tokens['selected-bg']) >= 4.5, name + " selected navigation text contrast below 4.5:1");
   });
 }
-test("radio appearance targets the shared radio-group primitives", () => {
-  assert.match(css, /\.button\.nav-item\.selected\s*\{[^}]*color: var\(--selected-accent\);[^}]*background: var\(--selected-bg\)/s);
+test("selected navigation and radio appearance use shared semantic styles", () => {
+  const selectedNavigationStart = css.lastIndexOf(".button.nav-item.selected {");
+  assert.notEqual(selectedNavigationStart, -1);
+  const selectedNavigationRule = css.slice(selectedNavigationStart, css.indexOf("}", selectedNavigationStart));
+  assert.match(selectedNavigationRule, /color: var\(--selected-accent\)/);
+  assert.match(selectedNavigationRule, /background: var\(--selected-bg\)/);
   assert.match(css, /\.radio-group-label\s*\{/);
   assert.match(css, /\.radio-option:has\(input\[type="radio"\]:checked\)/);
   assert.match(css, /\.radio-option:focus-within/);
   assert.doesNotMatch(css, /\.plugin-radio-(?:group|option)/);
+});
+
+
+test("brush and botanical decorations remain decorative and responsive", () => {
+  const botanical = readFileSync(new URL("../public/okami-botanical.svg", import.meta.url), "utf8");
+  const build = readFileSync(new URL("../scripts/build.mjs", import.meta.url), "utf8");
+  assert.match(css, /\.page-heading h1::after/);
+  assert.match(css, /\.overview-status::after/);
+  assert.match(css, /mask: url\("\.\/okami-botanical\.svg"\)/);
+  assert.match(css, /@media \(max-width: 640px\) \{\s*\.overview-status::after \{ display: none; \}/);
+  assert.ok(botanical.startsWith("<svg "));
+  assert.match(build, /okami-botanical\.svg/);
 });
