@@ -9,6 +9,7 @@ const delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, mil
 const sha256 = (value) => createHash("sha256").update(value).digest("hex");
 const assetBytes = readFileSync(options.assetPath);
 check(sha256(assetBytes) === options.assetSha256, "fixture digest mismatch before browser run");
+for (const asset of options.themeAssets) check(sha256(readFileSync(asset.path)) === asset.sha256, `theme fixture digest mismatch: ${asset.name}`);
 
 class Debugger {
   sequence = 0;
@@ -70,6 +71,10 @@ const debuggerClient = new Debugger();
 let target;
 const networkRequests = new Map();
 const assetResponses = [];
+const themeRequests = new Map();
+const themeResponses = new Map();
+const failedThemeAssets = [];
+let documentCsp = "";
 try {
   await debuggerClient.connect(options.debuggerUrl);
   const browser = await debuggerClient.command("Browser.getBrowserCommandLine");
@@ -90,9 +95,22 @@ try {
       if (/^\/v1\/extensions\/[^/]+\/[a-f0-9]{64}\/assets\/example\.js$/.test(url.pathname)) {
         networkRequests.set(event.params.requestId, url.pathname);
       }
+      const match = url.pathname.match(/^\/web\/([a-f0-9]{64})\/(okami-botanical|okami-mountains)\.svg$/);
+      if (match) themeRequests.set(event.params.requestId, { digest: match[1], name: `${match[2]}.svg`, path: url.pathname });
     } else if (event.method === "Network.responseReceived") {
       const path = networkRequests.get(event.params.requestId);
       if (path) assetResponses.push({ requestId: event.params.requestId, path, status: event.params.response.status });
+      const themeRequest = themeRequests.get(event.params.requestId);
+      const headers = event.params.response.headers;
+      const header = (name) => Object.entries(headers).find(([key]) => key.toLowerCase() === name)?.[1] ?? "";
+      if (event.params.type === "Document") documentCsp = header("content-security-policy");
+      if (themeRequest) themeResponses.set(themeRequest.name, {
+        ...themeRequest, requestId: event.params.requestId, status: event.params.response.status,
+        contentType: header("content-type"), csp: header("content-security-policy"),
+      });
+    } else if (event.method === "Network.loadingFailed") {
+      const themeRequest = themeRequests.get(event.params.requestId);
+      if (themeRequest) failedThemeAssets.push(themeRequest.name);
     }
   });
   await debuggerClient.command("Page.enable", {}, sessionId);
@@ -148,6 +166,13 @@ try {
     "mounted signed extension");
   await wait("window.__pluginUiQualificationMounts === 1 && !!document.querySelector('#global-locale:not(:disabled)')",
     "extension and locale preference controls");
+  const baseHref = await evaluate("document.querySelector('base')?.getAttribute('href') ?? ''");
+  const selectedDigest = baseHref.match(/^\/web\/([a-f0-9]{64})\/$/)?.[1];
+  check(selectedDigest, "signed page did not expose its selected web bundle digest");
+  check(documentCsp.includes("default-src 'self'") && documentCsp.includes("img-src 'self' blob:") &&
+    documentCsp.includes("script-src 'self'") && documentCsp.includes("style-src 'self'") &&
+    documentCsp.includes("object-src 'none'"),
+    "signed document CSP did not retain its restrictive policy");
 
   const asset = assetResponses.find((entry) => entry.status === 200);
   check(asset, "browser did not receive the signed extension asset with HTTP 200");
@@ -231,6 +256,38 @@ try {
   await evaluate("location.hash = 'overview'");
   await wait("location.hash === '#overview' && window.__pluginUiQualificationCleanups === 1",
     "navigation disposal hook");
+  await wait("!!document.querySelector('.overview-status')", "overview theme panel");
+  await wait(`(() => {
+    const botanical = getComputedStyle(document.querySelector('.overview-status'), '::after');
+    const mountains = getComputedStyle(document.querySelector('.sidebar-bottom'), '::after');
+    return botanical.content !== 'none' && botanical.opacity !== '0' &&
+      botanical.maskImage.includes('okami-botanical.svg') &&
+      mountains.content !== 'none' && mountains.opacity !== '0' &&
+      mountains.backgroundImage.includes('okami-mountains.svg');
+  })()`,
+    "both SVGs rendered by the signed stylesheet");
+  const themeDeadline = Date.now() + 10000;
+  while (Date.now() < themeDeadline &&
+    !["okami-botanical.svg", "okami-mountains.svg"].every((name) => themeResponses.has(name))) {
+    await delay(40);
+  }
+  check(["okami-botanical.svg", "okami-mountains.svg"].every((name) => themeResponses.has(name)),
+    "both signed SVG asset responses");
+  check(failedThemeAssets.length === 0, `signed SVG asset requests failed: ${failedThemeAssets.join(', ')}`);
+  for (const asset of options.themeAssets) {
+    const response = themeResponses.get(asset.name);
+    check(response && response.status === 200, `signed ${asset.name} response was not HTTP 200`);
+    check(response.digest === selectedDigest && response.path === `/web/${selectedDigest}/${asset.name}`,
+      `${asset.name} did not use the selected signed web bundle digest route`);
+    check(response.contentType.toLowerCase().startsWith("image/svg+xml"),
+      `${asset.name} returned unexpected content type: ${response.contentType}`);
+    check(response.csp.includes("img-src 'self' blob:") && response.csp.includes("style-src 'self'"),
+      `${asset.name} response did not retain the actual signed asset CSP`);
+    const served = await debuggerClient.command("Network.getResponseBody", { requestId: response.requestId }, sessionId);
+    const bytes = served.base64Encoded ? Buffer.from(served.body, "base64") : Buffer.from(served.body);
+    check(sha256(bytes) === asset.sha256, `served signed ${asset.name} bytes differ from packaged bytes`);
+    check(bytes.toString("utf8").includes("<svg"), `served signed ${asset.name} is not SVG markup`);
+  }
   check(await evaluate(`!document.querySelector('[data-plugin-ui-qualification]') &&
     !document.querySelector('#plugin-ui-generic-controls')`),
   "navigation left extension or generic-control DOM mounted");
@@ -245,6 +302,7 @@ try {
   await evaluate("location.hash = 'overview'");
   await wait("window.__pluginUiQualificationCleanups === 2", "second extension disposal");
 
+  console.log(`Verified selected signed web digest ${selectedDigest}: both theme SVGs returned matching packaged bytes as image/svg+xml and rendered under the signed CSP.`);
   console.log("PASS: signed web asset delivery, extension keyboard use and host call, generic control keyboard/save, locale update, navigation cleanup/remount");
 } finally {
   if (target) {

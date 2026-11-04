@@ -29,6 +29,7 @@ from test_platform_modules import PlatformHarness
 from test_signed_browser_session import OwnedBrowser
 
 EXTENSION_ID = "plugin-ui-qualification"
+THEME_ASSETS = ("okami-botanical.svg", "okami-mountains.svg")
 METHODS = WORKSPACE / "examples/web-extension/methods.json"
 FIXTURE = WORKSPACE / "frontend/tests/fixtures/plugin-ui-browser/example.js"
 BROWSER_DRIVER = WORKSPACE / "frontend/tests/signed-plugin-ui-browser-qualification.mjs"
@@ -143,6 +144,16 @@ def run_browser(harness: PlatformHarness, api, chromium: str, asset_digest: str,
             "password": PASSWORD,
             "assetPath": str(FIXTURE),
             "assetSha256": asset_digest,
+            "themeAssets": [
+                {
+                    "name": name,
+                    "path": str(WORKSPACE / "frontend/dist" / name),
+                    "sha256": hashlib.sha256(
+                        (WORKSPACE / "frontend/dist" / name).read_bytes()
+                    ).hexdigest(),
+                }
+                for name in THEME_ASSETS
+            ],
         }
         result = subprocess.run(
             ["node", str(BROWSER_DRIVER)],
