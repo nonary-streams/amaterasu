@@ -45,10 +45,11 @@ test("radio presentation exposes a labelled native radio group and keeps enum wi
   const { extensionRadioGroupEditor } = editorEnvironment();
   const editor = extensionRadioGroupEditor({ type: "enum", default: "steady", options: ["steady", "responsive"] },
     "steady", "Pacing", { steady: "Smooth pacing", responsive: "Lower latency" });
-  const [, steady, responsive] = editor.node.children;
+  const [label, choices] = editor.node.children;
+  const [steady, responsive] = choices.children;
   assert.equal(editor.node.attributes.role, "radiogroup");
   assert.ok(editor.node.attributes["aria-labelledby"]);
-  assert.equal(editor.node.children[0].children[0], "Pacing");
+  assert.equal(label.children[0], "Pacing");
   assert.equal(steady.children[0].type, "radio");
   assert.equal(steady.children[0].checked, true);
   assert.equal(steady.children[1].children[0], "Smooth pacing");

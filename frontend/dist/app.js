@@ -3889,17 +3889,28 @@ var Amaterasu;
     }
     Amaterasu.input = input;
     let nextRadioGroupId = 0;
-    function radioGroup(label, options, selected, onChange = () => { }, signal) {
-        if (!options.length || new Set(options.map((option) => option.value)).size !== options.length ||
-            !options.some((option) => option.value === selected) || typeof onChange !== "function")
-            throw new Error("Invalid radio group options or selection.");
+    function radioGroup(label, options, selected, onChange = () => { }, signal, behavior = {}) {
+        const validate = (choices, value) => {
+            if (!choices.length || new Set(choices.map((option) => option.value)).size !== choices.length ||
+                !choices.some((option) => option.value === value) ||
+                choices.some((option) => typeof option.value !== "string" || !option.value || typeof option.label === "undefined"))
+                throw new Error("Invalid radio group options or selection.");
+        };
+        if (typeof onChange !== "function")
+            throw new Error("Invalid radio group callback.");
+        validate(options, selected);
         const controller = new AbortController();
         let disposed = false;
+        let currentValue = selected;
+        let currentOptions = options;
+        let controls = [];
+        let choiceController = new AbortController();
         const dispose = () => {
             if (disposed)
                 return;
             disposed = true;
             controller.abort();
+            choiceController.abort();
             signal?.removeEventListener("abort", dispose);
         };
         if (signal?.aborted)
@@ -3911,30 +3922,75 @@ var Amaterasu;
         group.setAttribute("role", "radiogroup");
         const labelNode = el("span", "radio-group-label", label);
         labelNode.id = `amaterasu-radio-label-${nextRadioGroupId}`;
+        const optionsNode = el("div", "radio-options");
         group.setAttribute("aria-labelledby", labelNode.id);
-        group.append(labelNode);
-        const controls = [];
-        for (const option of options) {
-            const control = input(name, option.value, "radio");
-            control.checked = option.value === selected;
-            control.addEventListener("change", () => {
-                if (!control.checked)
-                    return;
-                for (const peer of controls)
-                    peer.checked = peer === control;
-                onChange(control.value);
-            }, { signal: controller.signal });
-            group.append(el("label", "radio-option", control, el("span", "", option.label)));
-            controls.push(control);
-        }
+        if (behavior.disabled)
+            group.setAttribute("aria-disabled", "true");
+        if (behavior.readOnly)
+            group.setAttribute("aria-readonly", "true");
+        if (behavior.required)
+            group.setAttribute("aria-required", "true");
+        group.append(labelNode, optionsNode);
+        const render = () => {
+            choiceController.abort();
+            choiceController = new AbortController();
+            controls = currentOptions.map((option) => {
+                const control = input(name, option.value, "radio");
+                control.checked = option.value === currentValue;
+                control.disabled = behavior.disabled === true;
+                control.required = behavior.required === true;
+                if (behavior.readOnly)
+                    control.setAttribute("aria-readonly", "true");
+                control.addEventListener("click", (event) => {
+                    if (behavior.readOnly) {
+                        event.preventDefault();
+                        event.stopImmediatePropagation();
+                    }
+                }, { capture: true, signal: choiceController.signal });
+                control.addEventListener("keydown", (event) => {
+                    if (behavior.readOnly && event.key !== "Tab") {
+                        event.preventDefault();
+                        event.stopImmediatePropagation();
+                    }
+                }, { capture: true, signal: choiceController.signal });
+                control.addEventListener("change", (event) => {
+                    if (behavior.disabled || behavior.readOnly) {
+                        for (const peer of controls)
+                            peer.checked = peer.value === currentValue;
+                        event.preventDefault();
+                        event.stopImmediatePropagation();
+                        return;
+                    }
+                    if (!control.checked)
+                        return;
+                    currentValue = control.value;
+                    for (const peer of controls)
+                        peer.checked = peer === control;
+                    onChange(control.value);
+                }, { capture: true, signal: choiceController.signal });
+                return control;
+            });
+            optionsNode.replaceChildren(...currentOptions.map((option, index) => el("label", "radio-option", controls[index], el("span", "", option.label))));
+        };
+        render();
         return {
             node: group,
-            value: () => controls.find((control) => control.checked)?.value ?? "",
+            get controls() { return controls; },
+            value: () => currentValue,
             setValue: (value) => {
-                if (!options.some((option) => option.value === value))
+                if (!currentOptions.some((option) => option.value === value))
                     throw new Error("Unsupported radio group value.");
+                currentValue = value;
                 for (const control of controls)
                     control.checked = control.value === value;
+            },
+            setChoices: (nextOptions, nextValue = currentValue) => {
+                if (disposed)
+                    return;
+                validate(nextOptions, nextValue);
+                currentOptions = [...nextOptions];
+                currentValue = nextValue;
+                render();
             },
             dispose,
         };
@@ -3955,7 +4011,13 @@ var Amaterasu;
             control.min = String(minimum);
             control.max = String(maximum);
             control.step = String(step);
+            control.disabled = options.disabled === true;
+            control.required = options.required === true;
+            if (options.readOnly)
+                control.setAttribute("aria-readonly", "true");
         }
+        if (options.readOnly)
+            number.readOnly = true;
         if (options.accessibleLabel) {
             if (!options.accessibleLabel.id)
                 options.accessibleLabel.id = `amaterasu-slider-label-${++nextBoundedSliderId}`;
@@ -3969,6 +4031,7 @@ var Amaterasu;
         range.value = String(value);
         const controller = new AbortController();
         let disposed = false;
+        let currentValue = value;
         const dispose = () => {
             if (disposed)
                 return;
@@ -3987,6 +4050,37 @@ var Amaterasu;
                 throw new Error(`Enter a valid number from ${minimum} to ${maximum} on step ${step}.`);
             return parsed;
         };
+        const restoreCurrentValue = () => {
+            number.value = String(currentValue);
+            range.value = String(currentValue);
+        };
+        range.addEventListener("click", (event) => {
+            if (options.readOnly) {
+                event.preventDefault();
+                event.stopImmediatePropagation();
+            }
+        }, { capture: true, signal: controller.signal });
+        range.addEventListener("pointerdown", (event) => {
+            if (options.readOnly) {
+                event.preventDefault();
+                event.stopImmediatePropagation();
+            }
+        }, { capture: true, signal: controller.signal });
+        for (const control of [range, number]) {
+            control.addEventListener("keydown", (event) => {
+                if (options.readOnly && event.key !== "Tab") {
+                    event.preventDefault();
+                    event.stopImmediatePropagation();
+                }
+            }, { capture: true, signal: controller.signal });
+            control.addEventListener("input", (event) => {
+                if (options.disabled || options.readOnly) {
+                    restoreCurrentValue();
+                    event.preventDefault();
+                    event.stopImmediatePropagation();
+                }
+            }, { capture: true, signal: controller.signal });
+        }
         range.addEventListener("input", () => {
             let nextValue;
             try {
@@ -3996,6 +4090,7 @@ var Amaterasu;
                 return;
             }
             number.value = String(nextValue);
+            currentValue = nextValue;
             options.onChange?.(nextValue);
         }, { signal: controller.signal });
         number.addEventListener("input", () => {
@@ -4009,6 +4104,7 @@ var Amaterasu;
             range.value = String(nextValue);
             if (Number(range.value) !== nextValue)
                 return;
+            currentValue = nextValue;
             options.onChange?.(nextValue);
         }, { signal: controller.signal });
         const node = el("div", className, range, number);
@@ -4029,6 +4125,7 @@ var Amaterasu;
                     range.value = previousRange;
                     throw new Error("Slider value cannot be represented by the range control.");
                 }
+                currentValue = nextValue;
             },
             dispose,
         };
@@ -16357,6 +16454,7 @@ var Amaterasu;
 })(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
 (function (Amaterasu) {
+    let nextExtensionUiDescriptionId = 0;
     function extensionUiTextNode(value) {
         if (typeof value === "string")
             return Amaterasu.localizedTextNode(value);
@@ -16371,13 +16469,22 @@ var Amaterasu;
         return Amaterasu.el("span", "field-label", extensionUiTextNode(text));
     }
     function extensionUiChoices(choices, selected) {
-        if (!Array.isArray(choices) || choices.length < 2 || choices.length > 64 ||
+        if (!Array.isArray(choices) || choices.length < 1 || choices.length > 64 ||
             choices.some((choice) => !choice || typeof choice.value !== "string" || !choice.value || choice.value.length > 128) ||
             new Set(choices.map((choice) => choice.value)).size !== choices.length ||
             !choices.some((choice) => choice.value === selected))
             throw new Error("Invalid plugin UI choices or value.");
     }
-    function extensionUiControl(element, read, write, controller, parentSignal, release = () => { }) {
+    function validateExtensionUiFieldOptions(options) {
+        for (const name of ["disabled", "readOnly", "required"]) {
+            const value = options[name];
+            if (value !== undefined && typeof value !== "boolean")
+                throw new Error(`Invalid plugin UI ${name} state.`);
+        }
+        if (options.onChange !== undefined && typeof options.onChange !== "function")
+            throw new Error("Invalid plugin UI change callback.");
+    }
+    function extensionUiControl(element, read, write, controller, parentSignal, release = () => { }, updateChoices) {
         let disposed = false;
         const dispose = () => {
             if (disposed)
@@ -16391,13 +16498,52 @@ var Amaterasu;
             dispose();
         else
             parentSignal.addEventListener("abort", dispose, { once: true });
-        return Object.freeze({
+        const control = {
             element,
             value: read,
             setValue: (value) => { if (!disposed)
                 write(value); },
             dispose,
-        });
+        };
+        if (updateChoices) {
+            control.setChoices = (choices, value) => { if (!disposed)
+                updateChoices(choices, value); };
+        }
+        return Object.freeze(control);
+    }
+    function extensionUiFieldDescriptions(element, controls, options) {
+        const descriptionIds = [];
+        if (options.help !== undefined) {
+            const help = Amaterasu.el("small", "plugin-control-help", extensionUiTextNode(options.help));
+            help.id = `amaterasu-plugin-ui-description-${++nextExtensionUiDescriptionId}`;
+            descriptionIds.push(help.id);
+            element.append(help);
+        }
+        if (options.error !== undefined) {
+            const error = Amaterasu.el("small", "plugin-control-error", extensionUiTextNode(options.error));
+            error.id = `amaterasu-plugin-ui-description-${++nextExtensionUiDescriptionId}`;
+            error.setAttribute("role", "alert");
+            descriptionIds.push(error.id);
+            element.append(error);
+        }
+        const apply = (updatedControls) => {
+            for (const control of updatedControls) {
+                if (descriptionIds.length)
+                    control.setAttribute("aria-describedby", descriptionIds.join(" "));
+                if (options.error !== undefined)
+                    control.setAttribute("aria-invalid", "true");
+                if (options.required)
+                    control.setAttribute("aria-required", "true");
+            }
+            if (element.getAttribute("role") === "radiogroup") {
+                if (options.error !== undefined)
+                    element.setAttribute("aria-invalid", "true");
+                if (options.required)
+                    element.setAttribute("aria-required", "true");
+            }
+        };
+        apply(controls);
+        return apply;
     }
     function createExtensionUiV1(signal) {
         if (!signal || typeof signal.addEventListener !== "function")
@@ -16412,52 +16558,134 @@ var Amaterasu;
             toggle(options) {
                 if (!options || typeof options.label !== "string" && typeof options.label !== "object" || typeof options.value !== "boolean")
                     throw new Error("Invalid plugin toggle.");
+                validateExtensionUiFieldOptions(options);
                 const controller = makeController();
                 const checkbox = Amaterasu.input("", "", "checkbox");
                 checkbox.checked = options.value;
+                checkbox.disabled = options.disabled === true;
+                checkbox.required = options.required === true;
+                if (options.readOnly)
+                    checkbox.setAttribute("aria-readonly", "true");
+                let currentValue = options.value;
+                checkbox.addEventListener("click", (event) => {
+                    if (options.readOnly) {
+                        event.preventDefault();
+                        event.stopImmediatePropagation();
+                    }
+                }, { capture: true, signal: controller.signal });
+                checkbox.addEventListener("change", (event) => {
+                    if (options.disabled || options.readOnly) {
+                        checkbox.checked = currentValue;
+                        event.preventDefault();
+                        event.stopImmediatePropagation();
+                        return;
+                    }
+                    currentValue = checkbox.checked;
+                    options.onChange?.(currentValue);
+                }, { signal: controller.signal });
                 const element = Amaterasu.el("label", "field plugin-control plugin-toggle", extensionUiLabel(options.label), checkbox);
-                checkbox.addEventListener("change", () => options.onChange?.(checkbox.checked), { signal: controller.signal });
+                extensionUiFieldDescriptions(element, [checkbox], options);
                 return extensionUiControl(element, () => checkbox.checked, (value) => {
                     if (typeof value !== "boolean")
                         throw new Error("Toggle value must be boolean.");
+                    currentValue = value;
                     checkbox.checked = value;
                 }, controller, signal);
             },
             select(options) {
                 if (!options || typeof options.label !== "string" && typeof options.label !== "object")
                     throw new Error("Invalid plugin select.");
+                validateExtensionUiFieldOptions(options);
                 extensionUiChoices(options.choices, options.value);
                 const controller = makeController();
                 const select = Amaterasu.el("select", "");
-                for (const choice of options.choices) {
-                    const option = Amaterasu.el("option", "", extensionUiTextNode(choice.label));
-                    option.value = choice.value;
-                    select.append(option);
-                }
-                select.value = options.value;
+                let choices = [...options.choices];
+                let currentValue = options.value;
+                const renderChoices = () => {
+                    select.replaceChildren(...choices.map((choice) => {
+                        const option = Amaterasu.el("option", "", extensionUiTextNode(choice.label));
+                        option.value = choice.value;
+                        return option;
+                    }));
+                    select.value = currentValue;
+                };
+                renderChoices();
+                select.disabled = options.disabled === true;
+                select.required = options.required === true;
+                if (options.readOnly)
+                    select.setAttribute("aria-readonly", "true");
+                select.addEventListener("click", (event) => {
+                    if (options.readOnly) {
+                        event.preventDefault();
+                        event.stopImmediatePropagation();
+                    }
+                }, { capture: true, signal: controller.signal });
+                select.addEventListener("keydown", (event) => {
+                    if (options.readOnly && event.key !== "Tab") {
+                        event.preventDefault();
+                        event.stopImmediatePropagation();
+                    }
+                }, { capture: true, signal: controller.signal });
+                select.addEventListener("change", (event) => {
+                    if (options.disabled || options.readOnly) {
+                        select.value = currentValue;
+                        event.preventDefault();
+                        event.stopImmediatePropagation();
+                        return;
+                    }
+                    currentValue = select.value;
+                    options.onChange?.(currentValue);
+                }, { signal: controller.signal });
                 const element = Amaterasu.el("label", "field plugin-control", extensionUiLabel(options.label), select);
-                select.addEventListener("change", () => options.onChange?.(select.value), { signal: controller.signal });
+                extensionUiFieldDescriptions(element, [select], options);
+                const setChoices = (nextChoices, value) => {
+                    const nextValue = value ?? currentValue;
+                    extensionUiChoices(nextChoices, nextValue);
+                    choices = [...nextChoices];
+                    currentValue = nextValue;
+                    renderChoices();
+                };
                 return extensionUiControl(element, () => select.value, (value) => {
-                    if (!options.choices.some((choice) => choice.value === value))
+                    if (!choices.some((choice) => choice.value === value))
                         throw new Error("Unsupported select value.");
+                    currentValue = value;
                     select.value = value;
-                }, controller, signal);
+                }, controller, signal, () => { }, setChoices);
             },
             radioGroup(options) {
                 if (!options || typeof options.label !== "string" && typeof options.label !== "object")
                     throw new Error("Invalid plugin radio group.");
+                validateExtensionUiFieldOptions(options);
                 extensionUiChoices(options.choices, options.value);
                 const controller = makeController();
-                const group = Amaterasu.radioGroup(extensionUiTextNode(options.label), options.choices.map((choice) => ({ value: choice.value, label: extensionUiTextNode(choice.label) })), options.value, options.onChange, controller.signal);
-                return extensionUiControl(group.node, group.value, group.setValue, controller, signal, group.dispose);
+                const group = Amaterasu.radioGroup(extensionUiTextNode(options.label), options.choices.map((choice) => ({ value: choice.value, label: extensionUiTextNode(choice.label) })), options.value, (value) => options.onChange?.(value), controller.signal, { disabled: options.disabled, readOnly: options.readOnly, required: options.required });
+                const applyDescriptions = extensionUiFieldDescriptions(group.node, [...group.controls, group.node], options);
+                const setChoices = (nextChoices, value) => {
+                    const selected = value ?? group.value();
+                    extensionUiChoices(nextChoices, selected);
+                    const localized = nextChoices.map((choice) => ({ value: choice.value, label: extensionUiTextNode(choice.label) }));
+                    group.setChoices(localized, selected);
+                    applyDescriptions([...group.controls, group.node]);
+                };
+                return extensionUiControl(group.node, group.value, group.setValue, controller, signal, group.dispose, setChoices);
             },
             slider(options) {
                 if (!options || typeof options.label !== "string" && typeof options.label !== "object")
                     throw new Error("Invalid plugin slider.");
+                validateExtensionUiFieldOptions(options);
                 const controller = makeController();
                 const label = extensionUiLabel(options.label);
-                const slider = Amaterasu.boundedSlider(options.minimum, options.maximum, options.value, typeof options.label === "string" ? options.label : options.label.source, false, "plugin-slider-inputs", { step: options.step ?? "any", onChange: options.onChange, signal: controller.signal, accessibleLabel: label });
+                const slider = Amaterasu.boundedSlider(options.minimum, options.maximum, options.value, typeof options.label === "string" ? options.label : options.label.source, false, "plugin-slider-inputs", {
+                    step: options.step ?? "any",
+                    onChange: options.onChange,
+                    signal: controller.signal,
+                    accessibleLabel: label,
+                    disabled: options.disabled,
+                    readOnly: options.readOnly,
+                    required: options.required,
+                });
                 const element = Amaterasu.el("div", "field plugin-control plugin-slider", label, slider.node);
+                extensionUiFieldDescriptions(element, [slider.range, slider.number], options);
                 return extensionUiControl(element, slider.value, slider.setValue, controller, signal, slider.dispose);
             },
         };
@@ -16582,7 +16810,7 @@ var Amaterasu;
             const sdk = Object.freeze({
                 version: 1,
                 signal: controller.signal,
-                features: Object.freeze(["ui.controls/1"]),
+                features: Object.freeze(["ui.controls/1", "ui.forms/1"]),
                 ui: Amaterasu.createExtensionUiV1(controller.signal),
                 call: (method, payload = {}) => {
                     if (controller.signal.aborted || !aliases.has(method))

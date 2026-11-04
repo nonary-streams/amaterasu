@@ -1791,3 +1791,7 @@ input, textarea, select {
     padding: 24px 18px;
   }
 }
+.plugin-control-help { color: var(--secondary); }
+.plugin-control-error { color: var(--danger); }
+.plugin-control input[aria-invalid="true"], .plugin-control select[aria-invalid="true"] { border-color: var(--danger); }
+.radio-options { display: grid; gap: 8px; }

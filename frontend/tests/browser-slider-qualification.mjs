@@ -102,6 +102,21 @@ try {
   assert.match(await evaluate(`window.callbackFailure`), /plugin callback failure is visible/);
   await evaluate(`window.extensionController.abort(); window.extensionSlider.dispose(); window.callbackFailure = null; document.querySelector('input[type=number]').value = '0.9'; document.querySelector('input[type=number]').dispatchEvent(new Event('input', { bubbles: true }));`);
   assert.equal(await evaluate(`window.callbackFailure`), null);
+  await evaluate(`
+    window.fieldUi = Amaterasu.createExtensionUiV1(new AbortController().signal);
+    window.fieldChanges = 0;
+    window.fieldToggle = window.fieldUi.toggle({ label: "Locked toggle", value: true, readOnly: true, help: "Toggle help.", required: true, onChange() { window.fieldChanges++; } });
+    window.fieldSelect = window.fieldUi.select({ label: "Dynamic mode", choices: [{value:"a",label:"Alpha"},{value:"b",label:"Beta"}], value: "a", readOnly: true, error: "Mode error." });
+    window.fieldRadio = window.fieldUi.radioGroup({ label: "Preset", choices: [{value:"a",label:"Alpha"},{value:"b",label:"Beta"}], value: "a", readOnly: true, required: true, help: "Preset help.", error: "Preset error." });
+    window.fieldSlider = window.fieldUi.slider({ label: "Locked scale", minimum: 0, maximum: 10, step: 1, value: 5, readOnly: true, required: true });
+    document.body.replaceChildren(window.fieldToggle.element, window.fieldSelect.element, window.fieldRadio.element, window.fieldSlider.element);
+    window.fieldToggle.element.querySelector('input').click();
+    const selectInput = window.fieldSelect.element.querySelector('select'); selectInput.value = 'b'; selectInput.dispatchEvent(new Event('change', {bubbles:true}));
+    window.fieldRadio.setChoices([{value:'a',label:'Alpha'},{value:'b',label:'Beta'},{value:'c',label:'Gamma'}]);
+    const radioInput = window.fieldRadio.element.querySelectorAll('input[type=radio]')[1]; radioInput.checked = true; radioInput.dispatchEvent(new Event('change', {bubbles:true}));
+  `);
+  assert.deepEqual(await evaluate(`({ toggle: window.fieldToggle.value(), select: window.fieldSelect.value(), radio: window.fieldRadio.value(), disabled: window.fieldToggle.element.querySelector('input').disabled, required: window.fieldToggle.element.querySelector('input').required, readonly: window.fieldSelect.element.querySelector('select').getAttribute('aria-readonly'), radioCount: window.fieldRadio.element.querySelectorAll('input[type=radio]').length, radioDescription: !!window.fieldRadio.element.querySelectorAll('input[type=radio]')[1].getAttribute('aria-describedby'), descriptionTargets: [...window.fieldRadio.element.querySelectorAll('input[type=radio]')[1].getAttribute('aria-describedby').split(' ')].every(id => !!document.getElementById(id)), fieldChanges: window.fieldChanges })`), { toggle: true, select: "a", radio: "a", disabled: false, required: true, readonly: "true", radioCount: 3, radioDescription: true, descriptionTargets: true, fieldChanges: 0 });
+  console.log("PASS: plugin forms retain accessible states and descriptions across dynamic choices");
   console.log("PASS: shared and plugin sliders synchronize, enforce steps, expose callback errors, and dispose listeners");
 } finally {
   socket?.close();

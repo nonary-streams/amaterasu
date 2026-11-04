@@ -5,26 +5,37 @@ provides reusable, accessible controls; it does not sandbox a publisher or grant
 additional API methods. The signed extension manifest and host authorization
 remain the only authority for `sdk.call`.
 
-Hosts that implement the control contract advertise the `ui.controls/1` feature
-in the additive `sdk.features` list and supply `sdk.ui` with
-`sdk.ui.version === 1`. These fields are optional in the SDK v1 type so a page
-can detect older hosts before using the controls:
+Hosts that implement the base controls advertise `ui.controls/1` in the
+additive `sdk.features` list and supply `sdk.ui` with `sdk.ui.version === 1`.
+The form field options and dynamic choices are an additive `ui.forms/1` feature.
+Both feature checks are optional in SDK v1 so pages can detect older hosts:
 
 ```js
-if (!sdk.features?.includes("ui.controls/1") || sdk.ui?.version !== 1) {
+if (!sdk.features?.includes("ui.controls/1") ||
+    !sdk.features.includes("ui.forms/1") || sdk.ui?.version !== 1) {
   // Render a compatible fallback or a clear unsupported-host message.
 }
 ```
 
-Existing SDK v1 pages continue to run on older hosts. The UI contract currently provides `toggle`, `select`, `radioGroup`, and `slider`.
+Existing SDK v1 pages continue to run on older hosts. New pages that need only base controls can check `ui.controls/1`; pages that use form metadata or `setChoices()` must also check `ui.forms/1`. The UI contract provides `toggle`, `select`, `radioGroup`, and `slider`.
+Each factory accepts common `disabled`, `readOnly`, `required`, `help`, and
+`error` options. `help` and `error` use the same localized text format as labels;
+the SDK connects them with `aria-describedby`, sets `aria-invalid` for errors,
+and exposes errors as alerts. Native controls enforce disabled and required
+states. Read-only controls remain focusable and expose `aria-readonly` while
+preventing user changes. `setValue()` remains available for programmatic updates.
 Each factory returns a control with `element`, `value()`, `setValue(value)`, and
-`dispose()`. Append `element` to the page container. Values are local UI state;
+`dispose()`. Choice controls also provide `setChoices(choices, value?)`. The current
+selection is retained unless a new value is supplied; if the current value is not
+in the new list, the update fails without changing the control. Programmatic choice
+updates do not call `onChange`. Append `element` to the page container. Values are local UI state;
 the extension remains responsible for validation, persistence, and any approved
 service calls.
 
 Labels and choice labels accept plain source text or `{ source, translations }`.
 Translations are keyed by locale (for example `fr` or `fr-CA`); exact locale and
-language fallback are tried before the host's translation catalog. Labels are
+language fallback are tried before the host's translation catalog. Choice lists
+contain between one and 64 unique, nonempty wire values. Labels are
 inserted as text, never interpreted as markup. Native form controls provide
 keyboard and assistive technology behavior. The host lifecycle signal disposes
 all SDK control listeners on navigation or signout. Call `dispose()` sooner when

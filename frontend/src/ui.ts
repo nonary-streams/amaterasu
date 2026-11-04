@@ -76,10 +76,18 @@ namespace Amaterasu {
     label: TextValue | Node;
   }
 
+  export interface RadioGroupBehavior {
+    disabled?: boolean;
+    readOnly?: boolean;
+    required?: boolean;
+  }
+
   export interface RadioGroupControl {
     node: HTMLElement;
+    controls: readonly HTMLInputElement[];
     value(): string;
     setValue(value: string): void;
+    setChoices(options: readonly RadioGroupOption[], value?: string): void;
     dispose(): void;
   }
 
@@ -93,16 +101,27 @@ namespace Amaterasu {
     selected: string,
     onChange: (value: string) => void = () => {},
     signal?: AbortSignal,
+    behavior: RadioGroupBehavior = {},
   ): RadioGroupControl {
-    if (!options.length || new Set(options.map((option) => option.value)).size !== options.length ||
-        !options.some((option) => option.value === selected) || typeof onChange !== "function")
-      throw new Error("Invalid radio group options or selection.");
+    const validate = (choices: readonly RadioGroupOption[], value: string): void => {
+      if (!choices.length || new Set(choices.map((option) => option.value)).size !== choices.length ||
+          !choices.some((option) => option.value === value) ||
+          choices.some((option) => typeof option.value !== "string" || !option.value || typeof option.label === "undefined"))
+        throw new Error("Invalid radio group options or selection.");
+    };
+    if (typeof onChange !== "function") throw new Error("Invalid radio group callback.");
+    validate(options, selected);
     const controller = new AbortController();
     let disposed = false;
+    let currentValue = selected;
+    let currentOptions = options;
+    let controls: HTMLInputElement[] = [];
+    let choiceController = new AbortController();
     const dispose = (): void => {
       if (disposed) return;
       disposed = true;
       controller.abort();
+      choiceController.abort();
       signal?.removeEventListener("abort", dispose);
     };
     if (signal?.aborted) dispose();
@@ -112,26 +131,67 @@ namespace Amaterasu {
     group.setAttribute("role", "radiogroup");
     const labelNode = el("span", "radio-group-label", label);
     labelNode.id = `amaterasu-radio-label-${nextRadioGroupId}`;
+    const optionsNode = el("div", "radio-options");
     group.setAttribute("aria-labelledby", labelNode.id);
-    group.append(labelNode);
-    const controls: HTMLInputElement[] = [];
-    for (const option of options) {
-      const control = input(name, option.value, "radio");
-      control.checked = option.value === selected;
-      control.addEventListener("change", () => {
-        if (!control.checked) return;
-        for (const peer of controls) peer.checked = peer === control;
-        onChange(control.value);
-      }, { signal: controller.signal });
-      group.append(el("label", "radio-option", control, el("span", "", option.label)));
-      controls.push(control);
-    }
+    if (behavior.disabled) group.setAttribute("aria-disabled", "true");
+    if (behavior.readOnly) group.setAttribute("aria-readonly", "true");
+    if (behavior.required) group.setAttribute("aria-required", "true");
+
+    group.append(labelNode, optionsNode);
+    const render = (): void => {
+      choiceController.abort();
+      choiceController = new AbortController();
+      controls = currentOptions.map((option) => {
+        const control = input(name, option.value, "radio");
+        control.checked = option.value === currentValue;
+        control.disabled = behavior.disabled === true;
+        control.required = behavior.required === true;
+        if (behavior.readOnly) control.setAttribute("aria-readonly", "true");
+        control.addEventListener("click", (event) => {
+          if (behavior.readOnly) {
+            event.preventDefault();
+            event.stopImmediatePropagation();
+          }
+        }, { capture: true, signal: choiceController.signal });
+        control.addEventListener("keydown", (event) => {
+          if (behavior.readOnly && event.key !== "Tab") {
+            event.preventDefault();
+            event.stopImmediatePropagation();
+          }
+        }, { capture: true, signal: choiceController.signal });
+        control.addEventListener("change", (event) => {
+          if (behavior.disabled || behavior.readOnly) {
+            for (const peer of controls) peer.checked = peer.value === currentValue;
+            event.preventDefault();
+            event.stopImmediatePropagation();
+            return;
+          }
+          if (!control.checked) return;
+          currentValue = control.value;
+          for (const peer of controls) peer.checked = peer === control;
+          onChange(control.value);
+        }, { capture: true, signal: choiceController.signal });
+        return control;
+      });
+      optionsNode.replaceChildren(...currentOptions.map((option, index) =>
+        el("label", "radio-option", controls[index], el("span", "", option.label))));
+    };
+    render();
     return {
       node: group,
-      value: () => controls.find((control) => control.checked)?.value ?? "",
+      get controls() { return controls; },
+      value: () => currentValue,
       setValue: (value) => {
-        if (!options.some((option) => option.value === value)) throw new Error("Unsupported radio group value.");
+        if (!currentOptions.some((option) => option.value === value)) throw new Error("Unsupported radio group value.");
+        currentValue = value;
         for (const control of controls) control.checked = control.value === value;
+      },
+      setChoices: (nextOptions, nextValue = currentValue) => {
+        if (disposed) return;
+        validate(nextOptions, nextValue);
+        currentOptions = [...nextOptions];
+        currentValue = nextValue;
+        render();
       },
       dispose,
     };
@@ -151,6 +211,9 @@ namespace Amaterasu {
     onChange?: (value: number) => void;
     signal?: AbortSignal;
     accessibleLabel?: Node;
+    disabled?: boolean;
+    readOnly?: boolean;
+    required?: boolean;
   }
 
   let nextBoundedSliderId = 0;
@@ -178,7 +241,11 @@ namespace Amaterasu {
       control.min = String(minimum);
       control.max = String(maximum);
       control.step = String(step);
+      control.disabled = options.disabled === true;
+      control.required = options.required === true;
+      if (options.readOnly) control.setAttribute("aria-readonly", "true");
     }
+    if (options.readOnly) number.readOnly = true;
     if (options.accessibleLabel) {
       if (!(options.accessibleLabel as HTMLElement).id)
         (options.accessibleLabel as HTMLElement).id = `amaterasu-slider-label-${++nextBoundedSliderId}`;
@@ -191,6 +258,7 @@ namespace Amaterasu {
     range.value = String(value);
     const controller = new AbortController();
     let disposed = false;
+    let currentValue = value;
     const dispose = (): void => {
       if (disposed) return;
       disposed = true;
@@ -207,10 +275,33 @@ namespace Amaterasu {
         throw new Error(`Enter a valid number from ${minimum} to ${maximum} on step ${step}.`);
       return parsed;
     };
+    const restoreCurrentValue = (): void => {
+      number.value = String(currentValue);
+      range.value = String(currentValue);
+    };
+    range.addEventListener("click", (event) => {
+      if (options.readOnly) { event.preventDefault(); event.stopImmediatePropagation(); }
+    }, { capture: true, signal: controller.signal });
+    range.addEventListener("pointerdown", (event) => {
+      if (options.readOnly) { event.preventDefault(); event.stopImmediatePropagation(); }
+    }, { capture: true, signal: controller.signal });
+    for (const control of [range, number]) {
+      control.addEventListener("keydown", (event) => {
+        if (options.readOnly && event.key !== "Tab") { event.preventDefault(); event.stopImmediatePropagation(); }
+      }, { capture: true, signal: controller.signal });
+      control.addEventListener("input", (event) => {
+        if (options.disabled || options.readOnly) {
+          restoreCurrentValue();
+          event.preventDefault();
+          event.stopImmediatePropagation();
+        }
+      }, { capture: true, signal: controller.signal });
+    }
     range.addEventListener("input", () => {
       let nextValue: number;
       try { nextValue = readValue(range); } catch { return; }
       number.value = String(nextValue);
+      currentValue = nextValue;
       options.onChange?.(nextValue);
     }, { signal: controller.signal });
     number.addEventListener("input", () => {
@@ -218,6 +309,7 @@ namespace Amaterasu {
       try { nextValue = readValue(number); } catch { return; }
       range.value = String(nextValue);
       if (Number(range.value) !== nextValue) return;
+      currentValue = nextValue;
       options.onChange?.(nextValue);
     }, { signal: controller.signal });
     const node = el("div", className, range, number);
@@ -238,6 +330,7 @@ namespace Amaterasu {
           range.value = previousRange;
           throw new Error("Slider value cannot be represented by the range control.");
         }
+        currentValue = nextValue;
       },
       dispose,
     };
