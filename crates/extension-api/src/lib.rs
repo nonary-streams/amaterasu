@@ -341,6 +341,9 @@ pub struct ProviderRequest {
     /// Coordinator-selected capture mode; the client output mode remains `requested_video`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_video_mode: Option<VideoMode>,
+    /// Derived from a live source in the same session by the coordinator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub join_context: Option<Box<StreamJoinContext>>,
     pub consumer_requirements: ConsumerRequirements,
     pub remaining_ms: u64,
     pub plan_revision: Option<u64>,
@@ -497,7 +500,39 @@ pub enum LifecyclePhase {
 pub enum StreamIntent {
     Initial,
     Resume,
+    /// Admit another consumer of an existing source without reconfiguring it.
+    Join,
     Reconfigure,
+}
+
+/// Explicit support for the authenticated shared-source Join contract. Trusted
+/// startup composition must grant this capability to every participating provider.
+pub const STREAM_JOIN_CAPABILITY: &str = "amaterasu.stream/join";
+
+mod stream_preparation;
+pub use stream_preparation::*;
+mod stream_retirement;
+pub use stream_retirement::{
+    StreamRetirementProof, stream_retirement_proof, validate_stream_retirement_proof,
+};
+mod stream_join;
+pub use stream_join::{
+    stream_join_callback, stream_join_plan, stream_join_plan_context, validate_stream_join_binding,
+    validate_stream_join_context,
+};
+
+/// Coordinator-frozen provenance for a joined stream. Providers must validate the
+/// original source and retain its ownership until all joined consumers retire.
+/// Client requests cannot select or forge this context.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StreamJoinContext {
+    pub source: LifecycleTarget,
+    pub source_transition: String,
+    #[serde(default)]
+    pub capture_binding_mode: CaptureBindingMode,
+    pub binding_owner: Option<String>,
+    pub binding: Option<CaptureBinding>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -711,14 +746,35 @@ pub fn validate_provider_request(request: &ProviderRequest) -> Result<(), String
     {
         return Err("invalid provider request".into());
     }
+    match (&request.intent, &request.join_context) {
+        (Some(StreamIntent::Join), Some(context)) => {
+            validate_stream_join_context(context, &request.target)?;
+            if (context.capture_binding_mode.is_managed() && request.version != COMPOSITION_VERSION)
+                || !matches!(
+                    request.phase,
+                    LifecyclePhase::StreamPrepare | LifecyclePhase::StreamRelease
+                )
+                || (request.phase == LifecyclePhase::StreamPrepare
+                    && request.source_video_mode.as_ref()
+                        != context.binding.as_ref().map(|binding| &binding.mode))
+            {
+                return Err("invalid stream join context".into());
+            }
+        }
+        (Some(StreamIntent::Join), None) | (_, Some(_)) => {
+            return Err("stream join requires authenticated context".into());
+        }
+        _ => {}
+    }
     if let Some(source) = &request.source_video_mode {
         let output = request
             .requested_video
             .as_ref()
             .ok_or("source mode requires requested video")?;
-        if source.width != output.width
-            || source.height != output.height
-            || source.refresh_millihz != output.refresh_millihz
+        if request.intent != Some(StreamIntent::Join)
+            && (source.width != output.width
+                || source.height != output.height
+                || source.refresh_millihz != output.refresh_millihz)
         {
             return Err("source mode geometry differs from output".into());
         }
@@ -797,6 +853,7 @@ pub fn validate_provider_request(request: &ProviderRequest) -> Result<(), String
 /// Validate structural plan bounds and dependency identities. The coordinator
 /// must separately compare observed revisions, borrowers and installed grants.
 pub fn validate_resource_plan(plan: &ResourcePlan) -> Result<(), String> {
+    let shared_source = stream_join_plan_context(plan)?;
     use std::collections::BTreeSet;
     if !valid_opaque_id(&plan.plan_id)
         || plan.revision == 0
@@ -902,15 +959,17 @@ pub fn validate_resource_plan(plan: &ResourcePlan) -> Result<(), String> {
                 .incarnation
                 .as_ref()
                 .is_some_and(|id| !valid_opaque_id(id))
-            || !plan.resources.iter().any(|resource| {
-                resource.provider == binding.resource_provider
-                    && resource.resource_id == binding.resource_id
-                    && resource.execution_domain == binding.execution_domain
-                    && resource
-                        .incarnation
-                        .as_ref()
-                        .is_none_or(|incarnation| binding.incarnation.as_ref() == Some(incarnation))
-            }))
+            || !(shared_source
+                .as_ref()
+                .is_some_and(|context| stream_join::constraint_matches(context, binding))
+                || plan.resources.iter().any(|resource| {
+                    resource.provider == binding.resource_provider
+                        && resource.resource_id == binding.resource_id
+                        && resource.execution_domain == binding.execution_domain
+                        && resource.incarnation.as_ref().is_none_or(|incarnation| {
+                            binding.incarnation.as_ref() == Some(incarnation)
+                        })
+                })))
     {
         return Err("invalid binding constraint".into());
     }
@@ -959,6 +1018,10 @@ pub fn validate_resource_plan(plan: &ResourcePlan) -> Result<(), String> {
 }
 
 fn validate_composition_plan(request: &ProviderRequest, plan: &ResourcePlan) -> Result<(), String> {
+    let shared = stream_join_plan_context(plan)?;
+    if shared.as_ref() != request.join_context.as_deref() {
+        return Err("shared source plan is outside authenticated join context".into());
+    }
     if request.version == CONTRACT_VERSION && !plan.control_proposals.is_empty() {
         return Err("v1 control proposals unavailable".into());
     }
@@ -1123,7 +1186,9 @@ pub fn validate_provider_response(
                 .ok_or("missing admitted plan")?;
             if outputs.len() > 32
                 || (request.version == CONTRACT_VERSION && !outputs.is_empty())
-                || (request.version == COMPOSITION_VERSION && candidate.is_some())
+                || (request.version == COMPOSITION_VERSION
+                    && candidate.is_some()
+                    && request.intent != Some(StreamIntent::Join))
             {
                 return Err("invalid prepared outputs".into());
             }
@@ -1171,6 +1236,9 @@ pub fn validate_provider_response(
                 return Err("unadmitted obligation".into());
             }
             if let Some(candidate) = candidate {
+                if let Some(context) = &request.join_context {
+                    validate_stream_join_binding(context, &request.target, candidate)?;
+                }
                 validate_capture_binding(candidate)?;
                 let constraint = plan
                     .candidate_constraint
@@ -1954,6 +2022,7 @@ mod tests {
             settings_revision: "settings".into(),
             settings: Default::default(),
             intent: None,
+            join_context: None,
             reason: None,
             requested_video: None,
             source_video_mode: None,

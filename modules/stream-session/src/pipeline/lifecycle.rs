@@ -109,6 +109,7 @@ impl Pipeline {
                             | Step::PauseLifecycle
                             | Step::RetireLifecycle
                             | Step::RecoverLifecycle
+                            | Step::ResolveLifecyclePreparation
                             | Step::ObserveActiveBinding
                             | Step::ValidateActiveBinding
                             | Step::NotifyCaptureInvalidated
@@ -183,6 +184,7 @@ impl Pipeline {
                                 | Step::ReleaseInput
                                 | Step::FindOwnedVirtualDisplay
                                 | Step::RemoveOwnedVirtualDisplay
+                                | Step::ResolveLifecyclePreparation
                                 | Step::FindDisplay
                                 | Step::RestoreDisplay
                                 | Step::RecoverDisplay
@@ -234,6 +236,7 @@ impl Pipeline {
             if record.uncertain.is_some() {
                 return self.finish_cleanup(record, job, send);
             }
+            super::shared_capture::detach_if_borrowed(record, &self.records);
             transferred_display_restore = self.transfer_shared_display_restore(record);
             let Some(step) = job.next_cleanup(record) else {
                 return self.finish_cleanup(record, job, send);
@@ -301,10 +304,20 @@ impl Pipeline {
             job.step = Step::ReadFrozenProcessingSettings;
         }
         if job.step == Step::AcquireOutput
+            && let Err(code) = super::shared_capture::initialize_source(record)
+        {
+            job.fail(record, code, now);
+            return true;
+        }
+        if job.step == Step::AcquireOutput
             && super::virtual_display::requested(record)
             && record.virtual_display_output.is_none()
         {
-            job.step = Step::CreateOwnedVirtualDisplay;
+            job.step = if record.config.shared_source_operation_id.is_some() {
+                Step::FindOwnedVirtualDisplay
+            } else {
+                Step::CreateOwnedVirtualDisplay
+            };
         }
         if job.step == Step::CreateOwnedVirtualDisplay {
             record.virtual_display_attempted = true;

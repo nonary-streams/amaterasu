@@ -36,6 +36,9 @@ pub(super) struct Record {
     pub session_token: String,
     pub udp_discovery: Option<UdpDiscovery>,
     pub local: SocketAddr,
+    /// Requested UDP endpoints remain reserved until downstream cleanup is
+    /// confirmed. Port zero marks a provider-selected endpoint on this address.
+    pub media_binds: Option<crate::model::MediaBinds>,
     pub expires: u64,
     pub next_status: u64,
     pub failure: Option<&'static str>,
@@ -48,6 +51,12 @@ pub(super) struct Record {
     pub stream_state: Option<String>,
     pub lifecycle_target: Option<Value>,
     pub lifecycle_candidate: Option<Value>,
+    /// Original producer identity frozen by the coordinator's successful
+    /// admission. A subscriber may not substitute another generation on release.
+    pub lifecycle_source_target: Option<amaterasu_extension_api::LifecycleTarget>,
+    /// Present only after an exact shared-retained terminal receipt. This is
+    /// consumer retirement, not evidence that the producer resources released.
+    pub lifecycle_retained_source: Option<amaterasu_extension_api::LifecycleTarget>,
     pub lifecycle_prepare_outstanding: bool,
     pub lifecycle_input_required: Option<bool>,
     pub authenticated_disconnect_reason: Option<&'static str>,
@@ -157,6 +166,8 @@ impl Record {
                 "prepare_unresolved"
             } else if self.lifecycle_target.is_none() {
                 "not_admitted"
+            } else if self.cleanup_confirmed && self.lifecycle_retained_source.is_some() {
+                "shared_retained"
             } else if self.cleanup_confirmed {
                 "retired"
             } else {
@@ -170,7 +181,11 @@ impl Record {
             "lifecycle_settings_revision":self.config.lifecycle_settings_revision,
             "lifecycle_intent":self.config.lifecycle_intent,
             "lifecycle_target":self.lifecycle_target,
-            "lifecycle_retired":self.lifecycle_target.is_some() && self.cleanup_confirmed,
+            "lifecycle_retired":self.lifecycle_target.is_some() && self.cleanup_confirmed && self.lifecycle_retained_source.is_none(),
+            "lifecycle_consumer_retired":self.lifecycle_target.is_some() && self.cleanup_confirmed,
+            "lifecycle_resources_released":self.lifecycle_target.is_some() && self.cleanup_confirmed && self.lifecycle_retained_source.is_none(),
+            "lifecycle_shared_retained":self.cleanup_confirmed && self.lifecycle_retained_source.is_some(),
+            "lifecycle_shared_source":self.lifecycle_retained_source,
             "lifecycle_cleanup_state":lifecycle_cleanup_state,
             "authenticated_disconnect_reason":self.authenticated_disconnect_reason,
             "encoder":self.config.capture.encoder,"sw_preset":self.config.sw_preset,"sw_tune":self.config.sw_tune,"min_threads":self.config.min_threads,"qp":self.config.qp,

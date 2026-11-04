@@ -1,0 +1,297 @@
+/// Separately owned RTSP tickets and coordinator receipts exercised through the
+/// unchanged NVHTTP controller. No listeners or native input devices are opened.
+#[derive(Default)]
+struct SharedSessionBroker {
+    broker: Broker,
+    transports: BTreeMap<u64, Value>,
+    operations: BTreeMap<String, u64>,
+}
+
+impl SharedSessionBroker {
+    fn session_target() -> Value {
+        json!({"kind":"session","host_epoch":"epoch","session_id":"application","generation":1})
+    }
+
+    fn stream_target(ticket: u64) -> Value {
+        json!({"kind":"stream","host_epoch":"epoch","session_id":"application","stream_id":format!("client-{ticket}"),"generation":1})
+    }
+
+    fn terminal_transport(&self, ticket: u64) -> Value {
+        let mut reply = self.transports[&ticket].clone();
+        if reply["state"] == "closed" {
+            let shared = self.transports.iter().any(|(other, transport)| *other != ticket && transport["state"] != "closed");
+            reply["lifecycle_retired"] = json!(!shared);
+            reply["lifecycle_consumer_retired"] = json!(true);
+            reply["lifecycle_resources_released"] = json!(!shared);
+            reply["lifecycle_shared_retained"] = json!(shared);
+            reply["lifecycle_shared_source"] = if shared { Self::stream_target(71) } else { Value::Null };
+            reply["lifecycle_cleanup_state"] = json!(if shared { "shared_retained" } else { "retired" });
+        }
+        reply
+    }
+
+    fn send(&mut self, command: Command) -> Transport {
+        let response = self.broker.send(command.clone())?;
+        let (Command::Request { service, payload, .. }, Response::Accepted { id }) = (&command, &response) else { return Ok(response); };
+        if service == "amaterasu.session-lifecycle/1" {
+            let mut result = match payload["operation"].as_str().unwrap_or_default() {
+                "prepare" => json!({"status":"succeeded","target":Self::session_target(),"capture_binding_mode":"managed"}),
+                "snapshot" => {
+                    let live = self.transports.values().any(|transport| transport["state"] != "closed");
+                    json!({"status":"ok","host_epoch":"epoch","sessions":[{"session_id":"application","generation":1,"phase":if live {"ready"} else {"paused"}}]})
+                }
+                "bind_application" => json!({"status":"succeeded","target":payload["target"],"launch_id":payload["launch_id"],"application_operation_id":payload["application_operation_id"]}),
+                "end_session" | "application_retired" | "lookup" => json!({"status":"succeeded","target":Self::session_target()}),
+                operation => panic!("unexpected lifecycle operation {operation}"),
+            };
+            result["operation_id"] = payload["operation_id"].clone();
+            self.broker.results.insert(*id, result);
+        } else if service == "amaterasu.rtsp/1" {
+            let action = payload["action"].as_str().unwrap_or_default();
+            if action == "open" {
+                let ticket = 71 + self.transports.len() as u64;
+                let mut result = self.broker.results[id].clone();
+                result["ticket"] = json!(ticket);
+                result["session"] = json!(ticket + 100);
+                result["rtsp_url"] = json!(format!("rtspenc://127.0.0.1:48010/launch-{ticket}"));
+                result["lifecycle_target"] = Self::stream_target(ticket);
+                result["lifecycle_cleanup_state"] = json!("retirement_pending");
+                result["lifecycle_retired"] = json!(false);
+                self.operations.insert(payload["operation_id"].as_str().unwrap().to_owned(), ticket);
+                self.transports.insert(ticket, result.clone());
+                self.broker.results.insert(*id, result);
+            } else {
+                let ticket = payload["ticket"].as_u64().or_else(|| self.operations.get(payload["operation_id"].as_str().unwrap_or_default()).copied()).expect("owned ticket");
+                if action == "close" {
+                    self.transports.get_mut(&ticket).unwrap()["state"] = json!("closed");
+                }
+                self.broker.results.insert(*id, self.terminal_transport(ticket));
+            }
+        }
+        Ok(response)
+    }
+
+    fn reply(&mut self, controller: &mut Controller, now: Instant) -> (u64, Reply) {
+        for tick in 0..100 {
+            if let Some(reply) = controller.poll(now + Duration::from_millis(tick * 10), &mut |command| self.send(command)).into_iter().next() { return reply; }
+        }
+        panic!("shared application did not produce a bounded reply");
+    }
+}
+
+fn one_client_application() -> (Controller, SharedSessionBroker, Instant) {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    controller.set_global_display_policy(7, json!({}));
+    controller.set_session_lifecycle_required(true);
+    let mut broker = SharedSessionBroker::default();
+    assert!(controller.launch(10, request(1), peer(1), now).is_none());
+    let (_, first) = broker.reply(&mut controller, now);
+    assert_eq!(first.status, 200, "{}", String::from_utf8_lossy(&first.body));
+    controller.reply_delivered(10, now);
+    (controller, broker, now)
+}
+
+fn two_client_application() -> (Controller, SharedSessionBroker, Instant) {
+    let (mut controller, mut broker, now) = one_client_application();
+    assert!(controller.resume(11, request(2), &peer(2), now).is_none());
+    let (_, second) = broker.reply(&mut controller, now);
+    assert_eq!(second.status, 200, "{}", String::from_utf8_lossy(&second.body));
+    controller.reply_delivered(11, now);
+    (controller, broker, now)
+}
+
+#[test]
+fn two_clients_have_distinct_transports_and_one_running_application() {
+    let (mut controller, broker, now) = two_client_application();
+    assert_eq!(controller.records.len(), 2);
+    let clients: Vec<_> = controller.records.values().collect();
+    assert!(clients.iter().all(|record| record.state == State::Ready));
+    assert_ne!(clients[0].rtsp_ticket, clients[1].rtsp_ticket);
+    assert_ne!(clients[0].rtsp_operation, clients[1].rtsp_operation);
+    assert_ne!(clients[0].request.remote_input_key, clients[1].request.remote_input_key);
+    assert_ne!(clients[0].connect_data, clients[1].connect_data);
+    assert_eq!(clients[1].application_session, Some(clients[0].id));
+    assert_eq!(clients[0].application_launch, clients[1].application_launch);
+    assert!(clients[0].application_requested);
+    assert!(!clients[1].application_requested);
+    assert_eq!(broker.broker.actions().iter().filter(|action| **action == ("amaterasu.launch/1", "launch_export")).count(), 1);
+    assert_eq!(broker.broker.actions().iter().filter(|action| **action == ("amaterasu.launch/1", "stop")).count(), 0);
+    assert_eq!(broker.transports[&71]["lifecycle_intent"], "initial");
+    assert_eq!(broker.transports[&72]["lifecycle_intent"], "join");
+    let retry = controller.resume(12, request(2), &peer(2), now).unwrap();
+    assert_eq!(retry.status, 200);
+    assert!(String::from_utf8_lossy(&retry.body).contains("launch-72"));
+    assert_eq!(controller.records.len(), 2);
+}
+
+#[test]
+fn disconnecting_either_client_preserves_the_other_and_the_application() {
+    for departing in [71, 72] {
+        let (mut controller, mut broker, now) = two_client_application();
+        broker.transports.get_mut(&departing).unwrap()["state"] = json!("closed");
+        for tick in 1..=50 {
+            controller.poll(now + Duration::from_millis(tick * 250), &mut |command| broker.send(command));
+        }
+        let remaining = controller.records.values().find(|record| record.rtsp_ticket == Some(if departing == 71 { 72 } else { 71 })).unwrap();
+        assert_eq!(remaining.state, State::Ready);
+        assert_eq!(controller.management_status(None)["launch"]["state"], "ready");
+        assert!(!broker.broker.application_stopped);
+        assert!(!broker.broker.commands.iter().any(|command| matches!(command, Command::Request {service,payload,..} if service=="amaterasu.session-lifecycle/1" && payload["operation"]=="end_session")));
+        assert_eq!(controller.current_game(&peer(3)), 1);
+    }
+}
+
+#[test]
+fn management_stop_requires_the_observed_application_membership() {
+    let (mut controller, mut broker, now) = one_client_application();
+    let observed = controller.management_status(None);
+    let reference = observed["launch"]["reference"].as_str().unwrap();
+    let stale = observed["launch"]["revision"].as_str().unwrap();
+    assert!(controller.resume(11, request(2), &peer(2), now).is_none());
+    assert_eq!(broker.reply(&mut controller, now).1.status, 200);
+    controller.reply_delivered(11, now);
+    assert_eq!(controller.management_stop(reference, stale, now)["code"], "launch_changed");
+    assert!(controller.records.values().all(|record| record.state==State::Ready));
+    let current = controller.management_status(None);
+    assert_eq!(controller.management_stop(reference, current["launch"]["revision"].as_str().unwrap(), now)["accepted"], true);
+    for tick in 1..=100 {
+        controller.poll(now + Duration::from_millis(tick*50), &mut |command| broker.send(command));
+        if controller.records.values().all(|record| record.state.terminal()) { break; }
+    }
+    assert!(controller.records.values().all(|record| record.state.terminal()));
+    assert!(broker.broker.application_stopped);
+}
+
+#[test]
+fn explicit_quit_from_a_joined_client_ends_the_whole_application_after_transports() {
+    let (mut controller, mut broker, now) = two_client_application();
+    assert!(controller.cancel(12, &peer(2), now).is_none());
+    let (connection, reply) = broker.reply(&mut controller, now);
+    assert_eq!(connection, 12);
+    assert_eq!(reply.status, 200);
+    assert!(controller.records.values().all(|record| record.state.terminal()));
+    assert!(broker.broker.application_stopped);
+    assert_eq!(controller.current_game(&peer(1)), 0);
+    let requests: Vec<_> = broker.broker.commands.iter().filter_map(|command| match command {
+        Command::Request {service,payload,..} => Some((service.as_str(), payload)), _=>None,
+    }).collect();
+    let stop_application = requests.iter().position(|(service,payload)| *service=="amaterasu.launch/1" && payload["action"]=="stop").unwrap();
+    assert_eq!(requests[..stop_application].iter().filter(|(service,payload)| *service=="amaterasu.rtsp/1" && payload["action"]=="close").count(), 2);
+}
+
+#[test]
+fn revoking_a_client_retires_only_its_transport() {
+    for marker in [1, 2] {
+        let (mut controller, mut broker, now) = two_client_application();
+        controller.revoke_untrusted(now, |certificate| certificate != vec![marker; 32]);
+        for tick in 1..=50 {
+            controller.poll(now + Duration::from_millis(tick * 250), &mut |command| broker.send(command));
+        }
+        let remaining = controller.records.values().find(|record| record.peer.certificate == vec![3-marker;32]).unwrap();
+        assert_eq!(remaining.state, State::Ready);
+        assert!(!broker.broker.application_stopped);
+    }
+}
+
+#[test]
+fn client_monitoring_and_history_failures_do_not_end_the_shared_application() {
+    for failure in ["status_rejected", "status_timeout", "history_rejected"] {
+        let (mut controller, mut broker, now) = two_client_application();
+        let mut injected = false;
+        let mut held = None;
+        if failure == "history_rejected" {
+            broker.transports.get_mut(&71).unwrap()["state"] = json!("closed");
+            broker.broker.history_release_unavailable = true;
+        }
+        for tick in 1..=100 {
+            controller.poll(now + Duration::from_millis(tick * 250), &mut |command| {
+                if !injected && failure != "history_rejected"
+                    && matches!(&command, Command::Request { service, payload, .. }
+                        if service=="amaterasu.rtsp/1" && payload["action"]=="status" && payload["ticket"]==71) {
+                    injected = true;
+                    if failure == "status_rejected" { return Ok(Response::error("unavailable", "fixture")); }
+                    let response = broker.send(command)?;
+                    if let Response::Accepted { id } = response { held = Some(id); }
+                    return Ok(response);
+                }
+                if matches!(&command, Command::TakeResult {request} if Some(*request)==held) {
+                    return Ok(Response::Pending);
+                }
+                if matches!(&command, Command::Cancel {request} if Some(*request)==held) { held = None; }
+                broker.send(command)
+            });
+        }
+        let sibling = controller.records.values().find(|record| record.peer.certificate == vec![2;32]).unwrap();
+        assert_eq!(sibling.state, State::Ready, "{failure}");
+        assert!(!broker.broker.application_stopped, "{failure}");
+        assert!(!broker.broker.commands.iter().any(|command| matches!(command, Command::Request {service,payload,..}
+            if service=="amaterasu.session-lifecycle/1" && payload["operation"]=="end_session")), "{failure}");
+    }
+}
+
+#[test]
+fn joined_client_reconnects_retire_metadata_without_forgetting_used_keys() {
+    let (mut controller, mut broker, now) = two_client_application();
+    let mut elapsed = 0;
+    for marker in 3..=70 {
+        let ticket = controller.records.values().find(|record| record.application_session.is_some() && record.state==State::Ready).unwrap().rtsp_ticket.unwrap();
+        broker.transports.get_mut(&ticket).unwrap()["state"] = json!("closed");
+        for _ in 0..64 {
+            elapsed += 50;
+            controller.poll(now + Duration::from_millis(elapsed), &mut |command| broker.send(command));
+            if controller.records.values().all(|record| record.application_session.is_none() || record.state.terminal()) { break; }
+        }
+        assert!(controller.records.values().all(|record| record.application_session.is_none() || record.state.terminal()),
+            "marker={marker} states={:?}", controller.records.values().map(|record| (record.id,record.state,record.stage,record.cleanup_error)).collect::<Vec<_>>());
+        assert!(controller.resume(100 + marker as u64, request(marker), &peer(2), now + Duration::from_millis(elapsed)).is_none());
+        let (connection, reply) = broker.reply(&mut controller, now + Duration::from_millis(elapsed));
+        assert_eq!(reply.status, 200, "marker={marker} {}", String::from_utf8_lossy(&reply.body));
+        controller.reply_delivered(connection, now + Duration::from_millis(elapsed));
+        assert!(controller.records.len() <= MAX_RECORDS);
+    }
+    assert!(!controller.retired_stream_keys.is_empty());
+    let replay = controller.resume(200, request(2), &peer(2), now + Duration::from_millis(elapsed)).unwrap();
+    assert_eq!(replay.status, 409);
+    assert!(!broker.broker.application_stopped);
+}
+
+#[test]
+fn root_resume_keeps_its_previous_transport_key_fenced() {
+    let (mut controller, mut broker, now) = two_client_application();
+    for transport in broker.transports.values_mut() { transport["state"] = json!("closed"); }
+    for tick in 1..=50 {
+        controller.poll(now + Duration::from_millis(tick * 50), &mut |command| broker.send(command));
+    }
+    assert_eq!(controller.records[&1].state, State::Paused);
+    let resumed_at = now + Duration::from_secs(3);
+    assert!(controller.resume(12, request(3), &peer(1), resumed_at).is_none());
+    assert_eq!(broker.reply(&mut controller, resumed_at).1.status, 200);
+    controller.reply_delivered(12, resumed_at);
+    let replay = controller.resume(13, request(1), &peer(2), resumed_at).unwrap();
+    assert_eq!(replay.status, 409);
+    assert_eq!(controller.records[&1].request.remote_input_key, request(3).remote_input_key);
+    assert!(!broker.broker.application_stopped);
+}
+
+#[test]
+fn a_joined_client_can_confirm_application_exit_after_the_source_monitor_is_fenced() {
+    let (mut controller, mut broker, now) = two_client_application();
+    broker.transports.get_mut(&71).unwrap()["state"] = json!("closed");
+    broker.broker.history_release_unavailable = true;
+    for tick in 1..=50 {
+        controller.poll(now + Duration::from_millis(tick * 250), &mut |command| broker.send(command));
+    }
+    assert_eq!(controller.records[&1].state, State::CleanupFailed);
+    assert_eq!(controller.records[&2].state, State::Ready);
+    broker.broker.history_release_unavailable = false;
+    broker.broker.application_state = "stopped";
+    for tick in 51..=150 {
+        controller.poll(now + Duration::from_millis(tick * 250), &mut |command| broker.send(command));
+        if controller.records.values().all(|record| record.state.terminal()) { break; }
+    }
+    assert!(controller.records.values().all(|record| record.state.terminal()));
+    assert_eq!(controller.current_game(&peer(2)), 0);
+    assert!(broker.broker.commands.iter().any(|command| matches!(command, Command::Request {service,payload,..}
+        if service=="amaterasu.session-lifecycle/1" && payload["operation"]=="end_session")));
+}

@@ -53,6 +53,7 @@ struct Harness {
     dependent_refresh: Option<(u64, u64, Value)>,
     cleanup_deferred: bool,
     registry_settings: Option<(u64, Value)>,
+    external: bool,
 }
 
 impl Harness {
@@ -68,6 +69,15 @@ impl Harness {
         provider: bool,
         registry_settings: Option<(u64, Value)>,
         processing: bool,
+    ) -> Self {
+        Self::with_processing_mode(provider, registry_settings, processing, false)
+    }
+
+    fn with_processing_mode(
+        provider: bool,
+        registry_settings: Option<(u64, Value)>,
+        processing: bool,
+        external: bool,
     ) -> Self {
         let root = std::env::temp_dir().join(format!(
             "amaterasu-lifecycle-broker-{}-{}",
@@ -180,7 +190,59 @@ impl Harness {
                 configuration["settings"][COORDINATOR]["processing_policy"] = json!({"provider":"settings","service":"example.processing/1","processor_service":"example.processor/1","source_mode_providers":["display"]});
                 methods.push(json!({"service":"example.processing/1","method":"processing_intent","interface_major":1,"interface_minor":0,"request":{"required":{},"optional":{},"allow_extra":true},"response":{"required":{},"optional":{},"allow_extra":true},"privilege":"user"}));
             }
-            configuration["api_methods"]=json!(methods.iter().map(|method|json!({"provider":if method["service"] == "example.display/2" {"display"} else {"settings"},"callers":[COORDINATOR],"method":method})).collect::<Vec<_>>());
+            if external {
+                configuration["settings"][COORDINATOR]["capture_binding_mode"] = json!("external");
+                configuration["settings"][COORDINATOR]["consumer_requirements"] =
+                    json!({"execution_domain":"seat","capture_providers":[],"selector_schemas":[]});
+                configuration["settings"][COORDINATOR]["control_policies"] = json!([]);
+                configuration["settings"][COORDINATOR]["finalize_policies"] = json!([]);
+                for participant in configuration["settings"][COORDINATOR]["participants"]
+                    .as_array_mut()
+                    .unwrap()
+                {
+                    participant["contract_version"] = json!(1);
+                    participant["binding_validate_method"] = Value::Null;
+                    participant["capabilities"] =
+                        json!([amaterasu_module_sdk::extension_api::STREAM_JOIN_CAPABILITY]);
+                    for method in ["plan_method", "callback_method", "status_method"] {
+                        participant[method]["interface_major"] = json!(1);
+                        participant[method]["service"] = json!(
+                            participant[method]["service"]
+                                .as_str()
+                                .unwrap()
+                                .replace("/2", "/1")
+                        );
+                    }
+                    for method in participant["cleanup_methods"].as_array_mut().unwrap() {
+                        method["interface_major"] = json!(1);
+                        method["service"] =
+                            json!(method["service"].as_str().unwrap().replace("/2", "/1"));
+                    }
+                }
+                for method in &mut methods {
+                    method["interface_major"] = json!(1);
+                    method["service"] =
+                        json!(method["service"].as_str().unwrap().replace("/2", "/1"));
+                }
+                for principal in [COORDINATOR, "display", "settings"] {
+                    for grant in ["provide", "call"] {
+                        if let Some(services) =
+                            configuration["principals"][principal][grant].as_array_mut()
+                        {
+                            for service in services {
+                                if let Some(value) = service.as_str() {
+                                    *service = json!(
+                                        value
+                                            .replace("example.display/2", "example.display/1")
+                                            .replace("example.settings/2", "example.settings/1")
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            configuration["api_methods"]=json!(methods.iter().map(|method|json!({"provider":if method["service"].as_str().is_some_and(|service| service.starts_with("example.display/")) {"display"} else {"settings"},"callers":[COORDINATOR],"method":method})).collect::<Vec<_>>());
         }
         if registry_settings.is_some() {
             configuration["principals"][COORDINATOR]["call"]
@@ -194,11 +256,19 @@ impl Harness {
         }
         let settings: LifecycleSettings =
             serde_json::from_value(configuration["settings"][COORDINATOR].clone()).unwrap();
+        if external {
+            settings
+                .validate()
+                .expect("external fixture must use production-valid startup policy");
+        }
         let configuration = serde_json::from_value(configuration).unwrap();
         let broker = Rc::new(RefCell::new(Broker::new(configuration).unwrap()));
         for method in methods {
             let response = broker.borrow_mut().dispatch(
-                if method["service"] == "example.display/2" {
+                if method["service"]
+                    .as_str()
+                    .is_some_and(|service| service.starts_with("example.display/"))
+                {
                     "display"
                 } else {
                     "settings"
@@ -265,6 +335,7 @@ impl Harness {
             dependent_refresh: None,
             cleanup_deferred: false,
             registry_settings,
+            external,
         };
         harness.start();
         harness
@@ -345,7 +416,61 @@ impl Harness {
                 self.provider_calls.push(payload.clone());
                 self.events.push(("display".into(), payload.clone()));
                 let args = &payload["arguments"];
-                if payload["method"] == "resource_plan" {
+                if args["intent"] == "join" {
+                    let request = serde_json::from_value(args.clone()).unwrap();
+                    let response = if self.provider_invalid && payload["method"] == "resource_plan"
+                    {
+                        amaterasu_module_sdk::extension_api::ProviderResponse::Rejected {
+                            reason: "join unavailable".into(),
+                        }
+                    } else if payload["method"] == "resource_plan" {
+                        amaterasu_module_sdk::extension_api::ProviderResponse::Planned {
+                            plan: amaterasu_module_sdk::extension_api::stream_join_plan(
+                                &request, "display",
+                            )
+                            .unwrap(),
+                        }
+                    } else {
+                        amaterasu_module_sdk::extension_api::stream_join_callback(
+                            &request, "display",
+                        )
+                        .unwrap()
+                    };
+                    assert!(matches!(
+                        self.broker.borrow_mut().dispatch(
+                            "display",
+                            Command::Complete {
+                                request: id,
+                                payload: serde_json::to_value(response).unwrap()
+                            }
+                        ),
+                        Response::Ok
+                    ));
+                } else if self.external {
+                    let response =
+                        external_policy_response(&payload, "display", self.cleanup_deferred);
+                    if payload["method"] == "lifecycle_callback"
+                        && args["phase"] == "stream.prepare"
+                    {
+                        self.native_live = true;
+                    }
+                    if payload["method"] == "lifecycle_callback"
+                        && args["phase"] == "stream.release"
+                        && !self.cleanup_deferred
+                    {
+                        self.native_live = false;
+                    }
+                    assert!(matches!(
+                        self.broker.borrow_mut().dispatch(
+                            "display",
+                            Command::Complete {
+                                request: id,
+                                payload: response
+                            }
+                        ),
+                        Response::Ok
+                    ));
+                } else if payload["method"] == "resource_plan" {
                     let stream = args["phase"] == "stream.prepare"
                         || args["phase"] == "stream.release"
                         || args["phase"] == "session.release";
@@ -567,7 +692,23 @@ impl Harness {
             self.dependent_calls.push(payload.clone());
             self.events.push(("settings".into(), payload.clone()));
             let args = &payload["arguments"];
-            let response = if payload["method"] == "processing_intent" {
+            let response = if args["intent"] == "join" {
+                let request = serde_json::from_value(args.clone()).unwrap();
+                let response = if payload["method"] == "resource_plan" {
+                    amaterasu_module_sdk::extension_api::ProviderResponse::Planned {
+                        plan: amaterasu_module_sdk::extension_api::stream_join_plan(
+                            &request, "settings",
+                        )
+                        .unwrap(),
+                    }
+                } else {
+                    amaterasu_module_sdk::extension_api::stream_join_callback(&request, "settings")
+                        .unwrap()
+                };
+                serde_json::to_value(response).unwrap()
+            } else if self.external {
+                external_policy_response(&payload, "settings", false)
+            } else if payload["method"] == "processing_intent" {
                 assert!(self.processing);
                 let enabled = args["target"]["kind"] != "stream" || self.stream_processing_enabled;
                 json!({"status":"succeeded","target":args["target"],"revision":args["revision"],"enabled":enabled,
@@ -1427,4 +1568,721 @@ fn processing_preflight_rejects_stream_policy_incompatible_with_session_source()
         "stream effect occurred: {:?}",
         &harness.provider_calls[calls_before..]
     );
+}
+
+fn external_policy_response(payload: &Value, provider: &str, deferred: bool) -> Value {
+    let args = &payload["arguments"];
+    if deferred
+        && provider == "display"
+        && matches!(
+            args["phase"].as_str(),
+            Some("stream.prepare" | "stream.release")
+        )
+    {
+        let obligation = json!({"obligation_id":"external-policy-restore","provider":provider,
+            "resource_id":"host-policy","mutation_domain":"host-policy","depends_on":[],
+            "cleanup_method":{"service":"example.display/1","method":"lifecycle_callback","interface_major":1,"interface_minor":0,"schema_revision":1},"payload":{}});
+        if payload["method"] == "resource_plan" {
+            return json!({"status":"planned","plan":{"plan_id":"external-deferred-policy","revision":1,
+                "resources":[{"provider":provider,"resource_id":"host-policy","incarnation":null,"expected_revision":null,
+                    "execution_domain":"seat","mutation_domains":["host-policy"],"access":"exclusive"}],
+                "mutation_domains":[{"domain":"host-policy","expected_revision":1,"borrowers":{},"access":"exclusive"}],"required_capabilities":[],"constraints":{},"obligations":[obligation],
+                "affected_consumers":[],"consumer_change":"live","candidate_constraint":null,"allowed_degradation":[]}});
+        }
+        if args["phase"] == "stream.prepare" {
+            return json!({"status":"prepared","candidate":null,"obligations":[obligation]});
+        }
+        return json!({"status":"cleanup","outcomes":[{"obligation_id":"external-policy-restore","state":"deferred_restoration","reason":null}]});
+    }
+    if payload["method"] == "resource_plan" {
+        json!({"status":"planned","plan":{"plan_id":"external-policy","revision":1,"resources":[],"mutation_domains":[],"required_capabilities":[],"constraints":{},"obligations":[],"affected_consumers":[],"consumer_change":"live","candidate_constraint":null,"allowed_degradation":[]}})
+    } else if matches!(
+        args["phase"].as_str(),
+        Some("session.prepare" | "stream.prepare")
+    ) {
+        json!({"status":"prepared","candidate":null,"obligations":[]})
+    } else {
+        json!({"status":"cleanup","outcomes":[]})
+    }
+}
+
+fn shared_source_harness() -> (Harness, Value, Value) {
+    prepare_shared_source(Harness::with_provider(true))
+}
+
+fn prepare_shared_source(mut harness: Harness) -> (Harness, Value, Value) {
+    if !harness.external {
+        harness.simulate_stage_refresh = true;
+        harness.verify_finalize = true;
+    }
+    for participant in &mut harness.settings.participants {
+        participant
+            .capabilities
+            .insert(amaterasu_module_sdk::extension_api::STREAM_JOIN_CAPABILITY.into());
+    }
+    harness
+        .coordinator
+        .as_mut()
+        .unwrap()
+        .configure_for_test(harness.settings.clone());
+    let started=harness.call("transport",json!({"operation":"prepare","operation_id":"shared.session","application_ref":{"kind":"application","app_id":"app"}}));
+    assert_eq!(started["status"], "pending");
+    let session = wait_shared_operation(&mut harness, "shared.session")["target"].clone();
+    assert_eq!(harness.call("transport",json!({"operation":"bind_application","operation_id":"shared.app","target":session,"launch_id":42,"application_operation_id":"launch-42"}))["status"],"succeeded");
+    let started=harness.call("transport",json!({"operation":"prepare_stream","operation_id":"shared.source","target":session,"intent":"initial","requested_video":{"width":1920,"height":1080,"refresh_millihz":60000,"hdr":false},"consumer_requirements":["capture"]}));
+    assert_eq!(started["status"], "pending");
+    let source = wait_shared_operation(&mut harness, "shared.source");
+    assert_eq!(source["status"], "succeeded", "{source}");
+    (harness, session, source)
+}
+fn wait_shared_operation(harness: &mut Harness, operation: &str) -> Value {
+    let mut response = Value::Null;
+    for _ in 0..400 {
+        response = harness.call(
+            "transport",
+            json!({"operation":"lookup","operation_id":operation}),
+        );
+        if response["status"] != "pending" {
+            return response;
+        }
+    }
+    panic!("shared operation did not complete: {response}");
+}
+fn retire_shared_client(harness: &mut Harness, target: &Value, operation: &str) -> Value {
+    let pause = harness.call(
+        "transport",
+        json!({"operation":"pause_stream","operation_id":operation,"target":target}),
+    );
+    assert_eq!(pause["status"], "pending", "{pause}");
+    let retirement=harness.call("capture",json!({"operation":"retire_stream","operation_id":format!("retire-{operation}"),"target":target,"consumer":"capture","retirement_receipt":{"response":{"status":"not_found"}}}));
+    assert!(
+        matches!(retirement["status"].as_str(), Some("pending" | "succeeded")),
+        "{retirement}"
+    );
+    wait_shared_operation(harness, operation)
+}
+fn end_shared_application(harness: &mut Harness, session: &Value, prefix: &str) {
+    let operation = format!("{prefix}-end");
+    let end = harness.call(
+        "transport",
+        json!({"operation":"end_session","operation_id":operation,"target":session}),
+    );
+    assert_eq!(end["status"], "pending", "{end}");
+    let app=harness.call("transport",json!({"operation":"application_retired","operation_id":format!("{prefix}-app-retired"),"target":session}));
+    assert!(
+        matches!(app["status"].as_str(), Some("pending" | "succeeded")),
+        "{app}"
+    );
+    let ended = wait_shared_operation(harness, &operation);
+    assert_eq!(ended["status"], "succeeded", "{ended}");
+    assert!(!harness.native_live);
+}
+
+#[test]
+fn shared_source_join_keeps_geometry_and_releases_once_in_both_disconnect_orders() {
+    for source_first in [false, true] {
+        let (mut harness, session, source) = shared_source_harness();
+        let initial_effects = harness
+            .events
+            .iter()
+            .filter(|(_, payload)| payload["method"] == "control")
+            .count();
+        let started=harness.call("transport",json!({"operation":"prepare_stream","operation_id":"shared.join","target":session,"intent":"join","requested_video":{"width":1280,"height":720,"refresh_millihz":30000,"hdr":false},"consumer_requirements":["capture"],"client_context":{"client_ref":"second-client","properties":{}}}));
+        assert_eq!(started["status"], "pending", "{started}");
+        let joined = wait_shared_operation(&mut harness, "shared.join");
+        assert_eq!(joined["status"], "succeeded", "{joined}");
+        assert_eq!(joined["shared_source"], source["target"]);
+        assert_eq!(
+            joined["candidate"]["resource"],
+            source["candidate"]["resource"]
+        );
+        assert_eq!(
+            joined["candidate"]["geometry_revision"],
+            source["candidate"]["geometry_revision"]
+        );
+        assert_eq!(joined["candidate"]["mode"], source["candidate"]["mode"]);
+        let journal: Value =
+            serde_json::from_slice(&std::fs::read(harness.root.join("journal.json")).unwrap())
+                .unwrap();
+        let session_id = session["session_id"].as_str().unwrap();
+        let source_id = source["target"]["stream_id"].as_str().unwrap();
+        let subscriber_id = joined["target"]["stream_id"].as_str().unwrap();
+        let source_record = &journal["sessions"][session_id]["streams"][source_id];
+        let subscriber_record = &journal["sessions"][session_id]["streams"][subscriber_id];
+        assert_eq!(
+            subscriber_record["provider_settings"],
+            source_record["provider_settings"]
+        );
+        assert_eq!(
+            subscriber_record["snapshot_scopes"]["paired_client"],
+            "second-client"
+        );
+        assert_eq!(
+            source_record["snapshot_scopes"]["paired_client"],
+            Value::Null
+        );
+        assert_eq!(
+            harness
+                .events
+                .iter()
+                .filter(|(_, payload)| payload["method"] == "control")
+                .count(),
+            initial_effects
+        );
+        let (first, last) = if source_first {
+            (&source["target"], &joined["target"])
+        } else {
+            (&joined["target"], &source["target"])
+        };
+        let retired = retire_shared_client(&mut harness, first, "shared.first-close");
+        assert_eq!(retired["status"], "succeeded", "{retired}");
+        assert_eq!(retired["consumer_retired"], true);
+        assert_eq!(retired["shared_retained"], true);
+        assert_eq!(retired["resources_released"], false);
+        assert_eq!(retired["shared_source"], source["target"]);
+        assert!(harness.native_live, "sibling keeps original producer lease");
+        let retired = retire_shared_client(&mut harness, last, "shared.last-close");
+        assert_eq!(retired["status"], "succeeded", "{retired}");
+        for _ in 0..200 {
+            harness.tick();
+        }
+        let snapshot = harness.call(
+            "transport",
+            json!({"operation":"snapshot","target":session}),
+        );
+        assert_eq!(snapshot["sessions"][0]["phase"], "paused", "{snapshot}");
+        assert!(
+            snapshot["sessions"][0]["streams"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|stream| stream["phase"] == "retired")
+        );
+        assert!(
+            harness.native_live,
+            "application session retains producer for resume"
+        );
+        let restore_count = harness
+            .events
+            .iter()
+            .filter(|(_, payload)| {
+                payload["method"] == "control"
+                    && payload["arguments"]["proposal"]["arguments"]["operation"] == "restore"
+            })
+            .count();
+        assert_eq!(restore_count, 1);
+        end_shared_application(&mut harness, &session, "complete-shared");
+    }
+}
+
+#[test]
+fn join_capability_and_source_context_are_checked_before_provider_effects() {
+    let (mut harness, session, source) = shared_source_harness();
+    let forged=harness.call("transport",json!({"operation":"prepare_stream","operation_id":"forged.join","target":session,"intent":"join","join_context":{"source":"forged"},"requested_video":{"width":1280,"height":720,"refresh_millihz":30000,"hdr":false},"consumer_requirements":["capture"]}));
+    assert_eq!(forged["reason"], "join_context_is_coordinator_owned");
+    harness.settings.participants[0].capabilities.clear();
+    harness
+        .coordinator
+        .as_mut()
+        .unwrap()
+        .configure_for_test(harness.settings.clone());
+    let calls = harness.provider_calls.len();
+    let rejected=harness.call("transport",json!({"operation":"prepare_stream","operation_id":"unsupported.join","target":session,"intent":"join","requested_video":{"width":1280,"height":720,"refresh_millihz":30000,"hdr":false},"consumer_requirements":["capture"]}));
+    assert_eq!(rejected["reason"], "provider_join_unsupported");
+    assert_eq!(harness.provider_calls.len(), calls);
+    let snapshot = harness.call(
+        "transport",
+        json!({"operation":"snapshot","target":session}),
+    );
+    assert_eq!(
+        snapshot["sessions"][0]["streams"].as_array().unwrap().len(),
+        1
+    );
+    assert_eq!(
+        snapshot["sessions"][0]["streams"][0]["stream_id"],
+        source["target"]["stream_id"]
+    );
+}
+
+#[test]
+fn rejected_join_preserves_the_source_and_does_not_pin_a_phantom_subscriber() {
+    let (mut harness, session, source) = shared_source_harness();
+    harness.provider_invalid = true;
+    assert_eq!(harness.call("transport",json!({"operation":"prepare_stream","operation_id":"failed.join","target":session,"intent":"join","requested_video":{"width":1280,"height":720,"refresh_millihz":30000,"hdr":false},"consumer_requirements":["capture"]}))["status"],"pending");
+    let rejected = wait_shared_operation(&mut harness, "failed.join");
+    assert_eq!(rejected["status"], "failed", "{rejected}");
+    assert!(harness.native_live);
+    harness.provider_invalid = false;
+    let retired = retire_shared_client(&mut harness, &source["target"], "source.after-failed-join");
+    assert_eq!(retired["status"], "succeeded", "{retired}");
+    assert_eq!(
+        retired["resources_released"], true,
+        "failed join must not retain source lease"
+    );
+    let snapshot = harness.call(
+        "transport",
+        json!({"operation":"snapshot","target":session}),
+    );
+    assert_eq!(snapshot["sessions"][0]["phase"], "paused");
+    end_shared_application(&mut harness, &session, "failed-join-shared");
+}
+
+#[test]
+fn external_join_retains_host_policy_and_confirms_final_cleanup_in_both_orders() {
+    for source_first in [false, true] {
+        let harness = Harness::with_processing_mode(true, None, false, true);
+        let (mut harness, session, source) = prepare_shared_source(harness);
+        assert_eq!(source["capture_binding_mode"], "external");
+        assert_eq!(source["candidate"], Value::Null);
+        harness
+            .settings
+            .operation_grants
+            .get_mut("capture")
+            .unwrap()
+            .insert("ack_stream".into());
+        harness
+            .coordinator
+            .as_mut()
+            .unwrap()
+            .configure_for_test(harness.settings.clone());
+        assert_eq!(harness.call("capture",json!({"operation":"ack_stream","operation_id":"external-source-ack","target":source["target"],"consumer":"capture"}))["status"],"succeeded");
+        assert_eq!(harness.call("transport",json!({"operation":"start_stream","operation_id":"external-source-start","target":source["target"]}))["status"],"succeeded");
+        assert_eq!(harness.call("transport",json!({"operation":"prepare_stream","operation_id":"external.join","target":session,"intent":"join","requested_video":{"width":1280,"height":720,"refresh_millihz":30000,"hdr":false},"consumer_requirements":["capture"],"client_context":{"client_ref":"second-client","properties":{}}}))["status"],"pending");
+        let joined = wait_shared_operation(&mut harness, "external.join");
+        assert_eq!(joined["status"], "succeeded", "{joined}");
+        assert_eq!(joined["candidate"], Value::Null);
+        assert_eq!(joined["join_context"]["capture_binding_mode"], "external");
+        assert_eq!(joined["join_context"]["binding"], Value::Null);
+        assert_eq!(joined["join_context"]["binding_owner"], Value::Null);
+        assert_eq!(joined["shared_source"], source["target"]);
+        assert_eq!(harness.call("capture",json!({"operation":"ack_stream","operation_id":"external-join-ack","target":joined["target"],"consumer":"capture"}))["status"],"succeeded");
+        assert_eq!(harness.call("transport",json!({"operation":"start_stream","operation_id":"external-join-start","target":joined["target"]}))["status"],"succeeded");
+        let (first, last) = if source_first {
+            (&source["target"], &joined["target"])
+        } else {
+            (&joined["target"], &source["target"])
+        };
+        let retired = retire_shared_client(&mut harness, first, "external.first-close");
+        assert_eq!(retired["status"], "succeeded", "{retired}");
+        assert_eq!(retired["consumer_retired"], true);
+        assert_eq!(retired["resources_released"], false);
+        assert_eq!(retired["shared_retained"], true);
+        assert!(
+            harness.native_live,
+            "first retirement keeps shared host policy"
+        );
+        let retired = retire_shared_client(&mut harness, last, "external.last-close");
+        assert_eq!(retired["status"], "succeeded", "{retired}");
+        assert_eq!(retired["consumer_retired"], true);
+        assert_eq!(
+            retired["resources_released"], true,
+            "final receipt must wait for original source callbacks"
+        );
+        assert_eq!(retired["shared_retained"], false);
+        assert!(
+            !harness.native_live,
+            "final policy callback completed before proof"
+        );
+        for provider in ["display", "settings"] {
+            assert_eq!(
+                harness
+                    .events
+                    .iter()
+                    .filter(|(principal, payload)| principal == provider
+                        && payload["method"] == "lifecycle_callback"
+                        && payload["arguments"]["phase"] == "stream.release"
+                        && payload["arguments"]["intent"] != "join")
+                    .count(),
+                1
+            );
+        }
+    }
+}
+
+fn activate_external_consumer(harness: &mut Harness, target: &Value, prefix: &str) {
+    assert_eq!(harness.call("capture",json!({"operation":"ack_stream","operation_id":format!("{prefix}-ack"),"target":target,"consumer":"capture"}))["status"],"succeeded");
+    assert_eq!(harness.call("transport",json!({"operation":"start_stream","operation_id":format!("{prefix}-start"),"target":target}))["status"],"succeeded");
+}
+fn join_external_consumer(
+    harness: &mut Harness,
+    session: &Value,
+    operation: &str,
+    client: &str,
+) -> Value {
+    let admitted=harness.call("transport",json!({"operation":"prepare_stream","operation_id":operation,"target":session,"intent":"join","requested_video":{"width":1280,"height":720,"refresh_millihz":30000,"hdr":false},"consumer_requirements":["capture"],"client_context":{"client_ref":client,"properties":{}}}));
+    assert_eq!(admitted["status"], "pending", "{admitted}");
+    let joined = wait_shared_operation(harness, operation);
+    assert_eq!(joined["status"], "succeeded", "{joined}");
+    activate_external_consumer(harness, &joined["target"], operation);
+    joined
+}
+#[test]
+fn replacement_external_client_joins_retained_source_after_original_transport_retires() {
+    let harness = Harness::with_processing_mode(true, None, false, true);
+    let (mut harness, session, source) = prepare_shared_source(harness);
+    harness
+        .settings
+        .operation_grants
+        .get_mut("capture")
+        .unwrap()
+        .insert("ack_stream".into());
+    harness
+        .coordinator
+        .as_mut()
+        .unwrap()
+        .configure_for_test(harness.settings.clone());
+    activate_external_consumer(&mut harness, &source["target"], "replacement-source");
+    let joined = join_external_consumer(&mut harness, &session, "replacement.first", "client-two");
+    let retired =
+        retire_shared_client(&mut harness, &source["target"], "replacement.source-retire");
+    assert_eq!(retired["shared_retained"], true);
+    // Source transport is gone, but its source policy remains borrowed. A
+    // single active child must not reopen mutation rights on that source.
+    harness.settings.action_service = "transport".into();
+    harness
+        .settings
+        .operation_grants
+        .get_mut("transport")
+        .unwrap()
+        .extend([
+            "authorize_action".into(),
+            "capture_invalidated".into(),
+            "resource_invalidated".into(),
+        ]);
+    harness
+        .coordinator
+        .as_mut()
+        .unwrap()
+        .configure_for_test(harness.settings.clone());
+    let rejected = harness.call(
+        "transport",
+        json!({"operation":"prepare_stream",
+        "operation_id":"replacement.reconfigure", "target":session,"intent":"reconfigure",
+        "requested_video":{"width":640,"height":480,"refresh_millihz":30000,"hdr":false},
+        "consumer_requirements":["capture"]}),
+    );
+    assert_eq!(rejected["reason"], "shared_source_in_use", "{rejected}");
+    for operation in ["capture_invalidated", "resource_invalidated"] {
+        let rejected = harness.call(
+            "transport",
+            json!({"operation":operation,
+            "operation_id":format!("replacement.{operation}"),"target":source["target"]}),
+        );
+        assert_eq!(rejected["reason"], "shared_source_in_use", "{rejected}");
+    }
+    let snapshot = harness.call(
+        "transport",
+        json!({"operation":"snapshot","target":session}),
+    );
+    assert_eq!(snapshot["sessions"][0]["phase"], "ready");
+    let owner = json!({"caller":"transport", "initiator":"transport"});
+    let target = json!({"kind":"session","host_epoch":session["host_epoch"],
+        "session_id":session["session_id"],"expected_generation":session["generation"]});
+    let plan = json!({"plan_id":"shared-mutation","revision":1,"resources":[],
+        "mutation_domains":[],"required_capabilities":[],"constraints":{},"obligations":[],
+        "affected_consumers":["capture"],"consumer_change":"live",
+        "candidate_constraint":null,"allowed_degradation":[]});
+    let rejected = harness.call("transport", json!({"operation":"authorize_action",
+        "operation_id":"replacement.action","action_id":"display/change","target":target,
+        "source":owner,"plan_digest":format!("{:x}",Sha256::digest(serde_json::to_vec(&plan).unwrap())),
+        "plan":plan}));
+    assert_eq!(rejected["reason"], "shared_source_in_use", "{rejected}");
+    assert!(harness.native_live);
+    let replacement =
+        join_external_consumer(&mut harness, &session, "replacement.second", "client-three");
+    assert_eq!(replacement["shared_source"], source["target"]);
+    assert_eq!(
+        replacement["join_context"]["source_transition"],
+        joined["join_context"]["source_transition"]
+    );
+    assert_ne!(replacement["target"], joined["target"]);
+    let retired = retire_shared_client(&mut harness, &joined["target"], "replacement.first-retire");
+    assert_eq!(retired["shared_retained"], true);
+    assert!(harness.native_live);
+    let retired = retire_shared_client(
+        &mut harness,
+        &replacement["target"],
+        "replacement.last-retire",
+    );
+    assert_eq!(retired["resources_released"], true, "{retired}");
+    assert!(!harness.native_live);
+    assert_eq!(
+        harness
+            .provider_calls
+            .iter()
+            .filter(|payload| payload["method"] == "lifecycle_callback"
+                && payload["arguments"]["phase"] == "stream.prepare"
+                && payload["arguments"]["intent"] != "join")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn restarted_external_shared_source_retires_consumers_before_original_policy() {
+    for (source_first, source_retired_before_restart) in
+        [(false, false), (true, false), (true, true)]
+    {
+        let harness = Harness::with_processing_mode(true, None, false, true);
+        let (mut harness, session, source) = prepare_shared_source(harness);
+        harness
+            .settings
+            .operation_grants
+            .get_mut("capture")
+            .unwrap()
+            .insert("ack_stream".into());
+        harness
+            .coordinator
+            .as_mut()
+            .unwrap()
+            .configure_for_test(harness.settings.clone());
+        activate_external_consumer(&mut harness, &source["target"], "restart-source");
+        let joined = join_external_consumer(&mut harness, &session, "restart-join", "client-two");
+        if source_retired_before_restart {
+            let retired =
+                retire_shared_client(&mut harness, &source["target"], "restart-early-source");
+            assert_eq!(retired["shared_retained"], true);
+        }
+        harness
+            .settings
+            .operation_grants
+            .get_mut("capture")
+            .unwrap()
+            .insert("resolve_stream_preparation".into());
+        harness
+            .coordinator
+            .as_mut()
+            .unwrap()
+            .configure_for_test(harness.settings.clone());
+        let lookup = json!({"operation":"resolve_stream_preparation","session":session,
+            "preparation_operation_id":"restart-join","preparation_caller":"transport"});
+        let selected = harness.call("capture", lookup.clone());
+        let typed_request: amaterasu_module_sdk::extension_api::StreamPreparationLookup =
+            serde_json::from_value(lookup.clone()).unwrap();
+        let typed_response: amaterasu_module_sdk::extension_api::StreamPreparationResolution =
+            serde_json::from_value(selected.clone()).unwrap();
+        amaterasu_module_sdk::extension_api::validate_stream_preparation_resolution(
+            &typed_request,
+            &typed_response,
+        )
+        .unwrap();
+        assert_eq!(selected["target"], joined["target"]);
+        let mut missing = lookup.clone();
+        missing["preparation_operation_id"] = json!("never-admitted");
+        assert_eq!(
+            harness.call("capture", missing.clone())["status"],
+            "pending"
+        );
+        let mut foreign = lookup.clone();
+        foreign["preparation_caller"] = json!("foreign");
+        assert_eq!(harness.call("capture", foreign)["status"], "rejected");
+        harness.coordinator.take();
+        harness.start();
+        assert_eq!(harness.call("capture", lookup)["target"], joined["target"]);
+        let missing = harness.call("capture", missing);
+        assert_eq!(missing["status"], "missing");
+        assert_eq!(missing["target"], Value::Null);
+        let (first, last) = if source_first {
+            (&source["target"], &joined["target"])
+        } else {
+            (&joined["target"], &source["target"])
+        };
+        let retire = |harness: &mut Harness, target: &Value, operation: &str| {
+            let result = harness.call("capture",json!({"operation":"retire_stream",
+                "operation_id":operation,"restart_recovery":true,"target":target,
+                "retirement_receipt":{"service":"video/1","operation_id":format!("native-{operation}"),
+                    "response":{"code":"not_found"}}}));
+            assert_eq!(result["status"], "pending", "{result}");
+            let mut result = result;
+            for _ in 0..400 {
+                result = harness.call(
+                    "capture",
+                    json!({"operation":"lookup","operation_id":operation}),
+                );
+                if result["status"] != "pending" {
+                    break;
+                }
+            }
+            assert_eq!(result["status"], "succeeded", "{result}");
+            assert_eq!(result["target"], *target);
+            result
+        };
+        if !source_retired_before_restart {
+            let result = retire(&mut harness, first, "restart-first");
+            assert_eq!(result["consumer_retired"], true);
+            assert_eq!(result["resources_released"], false);
+            assert_eq!(result["shared_retained"], true);
+            assert!(harness.native_live);
+        }
+        let result = retire(&mut harness, last, "restart-last");
+        assert_eq!(result["resources_released"], true, "{result}");
+        assert_eq!(result["shared_retained"], false);
+        assert!(!harness.native_live);
+        for provider in ["display", "settings"] {
+            assert_eq!(
+                harness
+                    .events
+                    .iter()
+                    .filter(|(p, call)| p == provider
+                        && call["method"] == "lifecycle_callback"
+                        && call["arguments"]["phase"] == "stream.release"
+                        && call["arguments"]["intent"] != "join")
+                    .count(),
+                1
+            );
+        }
+    }
+}
+
+#[test]
+fn failed_last_join_keeps_failure_after_deferred_source_cleanup() {
+    let harness = Harness::with_processing_mode(true, None, false, true);
+    let (mut harness, session, source) = prepare_shared_source(harness);
+    let admitted=harness.call("transport",json!({"operation":"prepare_stream","operation_id":"failed-last-join",
+        "target":session,"intent":"join","requested_video":{"width":1280,"height":720,"refresh_millihz":30000,"hdr":false},
+        "consumer_requirements":["capture"]}));
+    assert_eq!(admitted["status"], "pending");
+    harness.provider_invalid = true;
+    let retired = retire_shared_client(&mut harness, &source["target"], "failed-last-source");
+    assert_eq!(retired["status"], "succeeded", "{retired}");
+    assert_eq!(
+        retired["shared_retained"], true,
+        "source must defer while final Join is pending"
+    );
+    let joined = wait_shared_operation(&mut harness, "failed-last-join");
+    assert_eq!(joined["status"], "failed", "{joined}");
+    assert_ne!(joined["reason"], Value::Null);
+    assert_eq!(
+        joined["resources_released"], true,
+        "failure waits final source cleanup"
+    );
+    assert!(
+        !harness.native_live,
+        "failed pending Join cannot pin the source"
+    );
+}
+
+#[test]
+fn joined_client_churn_compacts_only_closed_history_and_reopens_safely() {
+    let harness = Harness::with_processing_mode(true, None, false, true);
+    let (mut harness, session, source) = prepare_shared_source(harness);
+    harness
+        .settings
+        .operation_grants
+        .get_mut("capture")
+        .unwrap()
+        .insert("ack_stream".into());
+    harness
+        .coordinator
+        .as_mut()
+        .unwrap()
+        .configure_for_test(harness.settings.clone());
+    activate_external_consumer(&mut harness, &source["target"], "churn-source");
+    let mut first_join = Value::Null;
+    for i in 0..68 {
+        let join = join_external_consumer(
+            &mut harness,
+            &session,
+            &format!("churn-join-{i}"),
+            "same-client",
+        );
+        if i == 0 {
+            first_join = join.clone();
+        }
+        let retired =
+            retire_shared_client(&mut harness, &join["target"], &format!("churn-close-{i}"));
+        assert_eq!(retired["shared_retained"], true, "{retired}");
+        assert!(harness.native_live);
+    }
+    let old = harness.call(
+        "transport",
+        json!({"operation":"lookup","operation_id":"churn-join-0"}),
+    );
+    assert!(
+        old["status"] == "succeeded" || old["reason"] == "receipt_expired",
+        "{old}"
+    );
+    let stale=harness.call("transport",json!({"operation":"pause_stream","operation_id":"churn-stale","target":first_join["target"]}));
+    assert_eq!(stale["status"], "rejected", "{stale}");
+    harness.coordinator.take();
+    harness.start();
+    assert!(harness.native_live, "reopening only fences old consumers");
+    let retired = harness.call(
+        "capture",
+        json!({"operation":"retire_stream","operation_id":"churn-source-recovery",
+        "restart_recovery":true,"target":source["target"],"retirement_receipt":{"service":"video/1",
+        "operation_id":"source-video","response":{"code":"not_found"}}}),
+    );
+    assert_eq!(retired["status"], "pending", "{retired}");
+    let mut retired = retired;
+    for _ in 0..400 {
+        retired = harness.call(
+            "capture",
+            json!({"operation":"lookup","operation_id":"churn-source-recovery"}),
+        );
+        if retired["status"] != "pending" {
+            break;
+        }
+    }
+    assert_eq!(retired["resources_released"], true, "{retired}");
+    assert!(!harness.native_live);
+}
+
+#[test]
+fn shared_external_deferred_restoration_never_certifies_resource_release() {
+    for source_first in [false, true] {
+        let mut harness = Harness::with_processing_mode(true, None, false, true);
+        harness.cleanup_deferred = true;
+        let (mut harness, session, source) = prepare_shared_source(harness);
+        let joined=harness.call("transport",json!({"operation":"prepare_stream","operation_id":"deferred-join",
+        "target":session,"intent":"join","requested_video":{"width":1280,"height":720,"refresh_millihz":30000,"hdr":false},"consumer_requirements":["capture"]}));
+        assert_eq!(joined["status"], "pending");
+        let joined = wait_shared_operation(&mut harness, "deferred-join");
+        assert_eq!(joined["status"], "succeeded", "{joined}");
+        let (first_target, last_target) = if source_first {
+            (&source["target"], &joined["target"])
+        } else {
+            (&joined["target"], &source["target"])
+        };
+        let first = retire_shared_client(&mut harness, first_target, "deferred-source");
+        assert_eq!(first["shared_retained"], true);
+        assert_eq!(harness.call("transport",json!({"operation":"pause_stream","operation_id":"deferred-last","target":last_target}))["status"],"pending");
+        let retired=harness.call("capture",json!({"operation":"retire_stream","operation_id":"deferred-last-capture",
+        "target":last_target,"consumer":"capture","retirement_receipt":{"response":{"status":"not_found"}}}));
+        assert!(
+            matches!(retired["status"].as_str(), Some("pending" | "succeeded")),
+            "{retired}"
+        );
+        for _ in 0..100 {
+            harness.tick();
+        }
+        let last = harness.call(
+            "transport",
+            json!({"operation":"lookup","operation_id":"deferred-last"}),
+        );
+        assert_eq!(
+            last["status"],
+            if source_first {
+                "pending"
+            } else {
+                "recovery_required"
+            },
+            "{last}"
+        );
+        assert_ne!(last["resources_released"], true);
+        assert!(harness.native_live);
+        let journal: Value =
+            serde_json::from_slice(&std::fs::read(harness.root.join("journal.json")).unwrap())
+                .unwrap();
+        assert!(journal["receipts"].as_object().unwrap().values().any(
+            |receipt| receipt["response"]["reason"] == "shared_source_restoration_deferred"
+                && !receipt["work"].is_null()
+        ));
+        harness.coordinator.take();
+        harness.start();
+        assert!(
+            harness.native_live,
+            "restart must preserve unconfirmed source restoration"
+        );
+    }
 }

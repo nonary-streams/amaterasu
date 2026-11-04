@@ -8,6 +8,35 @@ pub(super) struct ResumeSnapshot {
 }
 
 impl ResumeSnapshot {
+    pub(super) fn stream_key(&self) -> [u8; 16] {
+        self.stream.request.remote_input_key
+    }
+    pub(super) fn into_join(
+        mut self,
+        application: &Record,
+        id: u64,
+        operation: String,
+        connection: u64,
+        now: std::time::Instant,
+    ) -> Record {
+        let stream = &mut self.stream;
+        stream.id = id;
+        stream.application_session = Some(application.id);
+        stream.application_launch = application.application_launch;
+        stream.application_properties = application.application_properties.clone();
+        stream.application_cleanup_budget_ms = application.application_cleanup_budget_ms;
+        stream.lifecycle_required = true;
+        stream.lifecycle_prepare_dispatched = true;
+        stream.lifecycle_session_target = application.lifecycle_session_target.clone();
+        stream.lifecycle_application_bound = application.lifecycle_application_bound;
+        stream.lifecycle_launch_epoch_ready = true;
+        stream.rtsp_operation = operation;
+        stream.launch_connection = Some(connection);
+        stream.stage = super::Stage::VerifyResumeSession;
+        stream.deadline = now + super::INITIAL_DEADLINE;
+        self.stream
+    }
+
     pub(super) fn legacy_display_conflict(&self) -> bool {
         if self.stream.lifecycle_capture_mode.is_external() {
             return false;

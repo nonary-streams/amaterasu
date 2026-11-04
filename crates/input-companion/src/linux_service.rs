@@ -150,7 +150,7 @@ impl LinuxInputService {
         validate_uinput_access(uinput_path)?;
         let socket_lock = SocketPathLock::acquire(socket_path)?;
         let host = inspect_process(std::process::id())?;
-        let registry = GrantRegistry::session_only();
+        let registry = GrantRegistry::independent_devices();
         let ledger = Arc::new(Mutex::new(PermitLedger::new(registry)));
         let stop = Arc::new(AtomicBool::new(false));
         remove_stale_socket(socket_path, &socket_lock)?;
@@ -649,6 +649,8 @@ fn serve_worker(
         .lock()
         .map_err(|_| InputError::Closed)?
         .claim(&process, Instant::now())?;
+    let generation = lease.generation;
+    let token = lease.token.clone();
     let keyboard = lease.grant.keyboard_enabled();
     let mouse = lease.grant.mouse_enabled();
     let gamepad = lease.grant.gamepad_enabled();
@@ -658,7 +660,7 @@ fn serve_worker(
             ledger
                 .lock()
                 .map_err(|_| InputError::Closed)?
-                .release(&process);
+                .release_lease(&process, generation, &token);
             write_reply_to(reader.get_ref(), &Reply::Denied)?;
             return Err(error);
         }
@@ -669,7 +671,7 @@ fn serve_worker(
             ledger
                 .lock()
                 .map_err(|_| InputError::Closed)?
-                .release(&process);
+                .release_lease(&process, generation, &token);
             return Err(error);
         }
     };
@@ -689,12 +691,20 @@ fn serve_worker(
             ledger
                 .lock()
                 .map_err(|_| InputError::Closed)?
-                .release(&process);
+                .release_lease(&process, generation, &token);
         }
         cleanup?;
         return Err(error);
     }
-    let result = run_worker(&mut reader, &process, &ledger, &mut session, &stop);
+    let result = run_worker(
+        &mut reader,
+        &process,
+        generation,
+        &token,
+        &ledger,
+        &mut session,
+        &stop,
+    );
     let cleanup = session.revoke();
     if session.cleanup_required() {
         cleanup_failed.store(true, Ordering::Release);
@@ -703,7 +713,7 @@ fn serve_worker(
         ledger
             .lock()
             .map_err(|_| InputError::Closed)?
-            .release(&process);
+            .release_lease(&process, generation, &token);
     }
     cleanup?;
     result
@@ -712,6 +722,8 @@ fn serve_worker(
 fn run_worker<S: DeviceSink>(
     reader: &mut BufReader<UnixStream>,
     process: &ProcessIdentity,
+    worker_generation: u64,
+    worker_token: &str,
     ledger: &Arc<Mutex<PermitLedger>>,
     session: &mut InputSession<S>,
     stop: &AtomicBool,
@@ -725,7 +737,7 @@ fn run_worker<S: DeviceSink>(
             || !ledger
                 .lock()
                 .map_err(|_| InputError::Closed)?
-                .is_current(process, Instant::now())
+                .is_current_lease(process, worker_generation, worker_token, Instant::now())
         {
             write_reply_to(reader.get_ref(), &Reply::Denied)?;
             break;
@@ -749,7 +761,12 @@ fn run_worker<S: DeviceSink>(
                 // Serialize device writes with host revocation. Once
                 // revoke_worker returns, no later packet can pass this lock.
                 let permit = ledger.lock().map_err(|_| InputError::Closed)?;
-                if !permit.is_current(process, Instant::now()) {
+                if !permit.is_current_lease(
+                    process,
+                    worker_generation,
+                    worker_token,
+                    Instant::now(),
+                ) {
                     drop(permit);
                     write_reply_to(reader.get_ref(), &Reply::Denied)?;
                     break;
@@ -771,7 +788,12 @@ fn run_worker<S: DeviceSink>(
             }
             Ok(Request::FeedbackPoll { generation, token }) => {
                 let permit = ledger.lock().map_err(|_| InputError::Closed)?;
-                if !permit.is_current(process, Instant::now()) {
+                if !permit.is_current_lease(
+                    process,
+                    worker_generation,
+                    worker_token,
+                    Instant::now(),
+                ) {
                     drop(permit);
                     write_reply_to(reader.get_ref(), &Reply::Denied)?;
                     break;

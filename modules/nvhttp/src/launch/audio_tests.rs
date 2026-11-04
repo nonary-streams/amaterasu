@@ -41,7 +41,7 @@ fn owner_launch_and_retry_preserve_512000_audio_bitrate_on_rtsp_open() {
     assert_eq!(opened_rtsp_payload(&broker)["profile"]["packet_ms"], 5);
     controller.reply_delivered(connection, now);
 
-    assert_eq!(controller.current_game(&peer(32)), 0);
+    assert_eq!(controller.current_game(&peer(32)), 1);
     assert_eq!(controller.cancel(12, &peer(32), now).unwrap().status, 403);
     let retry = controller
         .launch(11, request(31), peer(31), now)

@@ -235,7 +235,7 @@ fn native_limiter_prepares_through_unchanged_coordinator_and_broker() {
         "consumer_requirements":{"execution_domain":"seat","capture_providers":[],"selector_schemas":[]},
         "participants":[{"provider":PROVIDER,"plan_method":reference("resource_plan"),
             "callback_method":reference("lifecycle_callback"),"status_method":reference("lifecycle_status"),
-            "settings_revision":"initial","capabilities":["amaterasu.launch-environment"],"cleanup_methods":[reference("lifecycle_callback")],
+            "settings_revision":"initial","capabilities":["amaterasu.launch-environment",amaterasu_module_sdk::extension_api::STREAM_JOIN_CAPABILITY],"cleanup_methods":[reference("lifecycle_callback")],
             "settings":{"frame_limiter_enable":!automatic,"frame_limiter_provider":provider,"frame_limiter_fps_limit":0,
                 "frame_limiter_disable_vsync":false,"frame_limiter_auto_virtual_framegen":"disabled",
                 "mangohud_preset":"custom","mangohud_always_show_graph":false,"mangohud_limiter_method":"late"}}]
@@ -479,6 +479,116 @@ fn native_limiter_prepares_through_unchanged_coordinator_and_broker() {
         )
         .unwrap();
         assert_eq!(policy["policies"][0]["limit_millihz"], refresh);
+        if let Some(order) = std::env::var_os("AMATERASU_LIMITER_TEST_JOIN") {
+            let source_first = order == "source-first";
+            id += 1;
+            let joined = call(
+                json!({"operation":"prepare_stream","operation_id":"shared-native-join","target":admitted["target"],"intent":"join","consumer_requirements":["capture"],"client_context":{"client_ref":"second-client","properties":{}},"requested_video":{"width":1280,"height":720,"refresh_millihz":30000,"hdr":false}}),
+                id,
+                &mut coordinator,
+                &mut module,
+            );
+            assert_eq!(joined["status"], "pending", "{joined}");
+            let joined = loop {
+                id += 1;
+                let response = call(
+                    json!({"operation":"lookup","operation_id":"shared-native-join"}),
+                    id,
+                    &mut coordinator,
+                    &mut module,
+                );
+                if response["status"] != "pending" {
+                    break response;
+                }
+            };
+            assert_eq!(joined["status"], "succeeded", "{joined}");
+            assert_eq!(joined["shared_source"], target);
+            assert_eq!(joined["candidate"], Value::Null);
+            assert_eq!(
+                serde_json::from_slice::<Value>(
+                    &std::fs::read(root.join("amaterasu/frame-limiter/active.json")).unwrap()
+                )
+                .unwrap(),
+                policy,
+                "joining must inherit active host policy"
+            );
+            id += 1;
+            assert_eq!(
+                call(
+                    json!({"operation":"ack_stream","operation_id":"shared-ack","target":joined["target"],"consumer":"capture"}),
+                    id,
+                    &mut coordinator,
+                    &mut module
+                )["status"],
+                "succeeded"
+            );
+            id += 1;
+            assert_eq!(
+                call(
+                    json!({"operation":"start_stream","operation_id":"shared-start","target":joined["target"]}),
+                    id,
+                    &mut coordinator,
+                    &mut module
+                )["status"],
+                "succeeded"
+            );
+            let departing = if source_first {
+                [target.clone(), joined["target"].clone()]
+            } else {
+                [joined["target"].clone(), target.clone()]
+            };
+            for (index, target) in departing.into_iter().enumerate() {
+                let operation = format!("shared-native-pause-{index}");
+                id += 1;
+                assert_eq!(
+                    call(
+                        json!({"operation":"pause_stream","operation_id":operation,"target":target}),
+                        id,
+                        &mut coordinator,
+                        &mut module
+                    )["status"],
+                    "pending"
+                );
+                id += 1;
+                let retired = call(
+                    json!({"operation":"retire_stream","operation_id":format!("shared-native-retire-{index}"),"target":target,"retirement_receipt":{"response":{"state":"not_found"}}}),
+                    id,
+                    &mut coordinator,
+                    &mut module,
+                );
+                assert!(
+                    matches!(retired["status"].as_str(), Some("pending" | "succeeded")),
+                    "{retired}"
+                );
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let retired = loop {
+                    id += 1;
+                    let response = call(
+                        json!({"operation":"lookup","operation_id":operation}),
+                        id,
+                        &mut coordinator,
+                        &mut module,
+                    );
+                    if response["status"] != "pending" {
+                        break response;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "native shared cleanup stalled: {response}"
+                    );
+                };
+                assert_eq!(retired["status"], "succeeded", "{retired}");
+                assert_eq!(retired["consumer_retired"], true);
+                assert_eq!(retired["shared_retained"], index == 0);
+                assert_eq!(retired["resources_released"], index == 1);
+                assert_eq!(
+                    root.join("amaterasu/frame-limiter/active.json").exists(),
+                    index == 0,
+                    "first consumer must keep policy; last restores it"
+                );
+            }
+            break;
+        }
         if cycle == 0 {
             module.restart();
             let deadline = Instant::now() + Duration::from_secs(5);
@@ -617,4 +727,49 @@ fn native_limiter_reconciles_old_stream_context_after_coordinator_restart() {
         .status()
         .unwrap();
     assert!(status.success());
+}
+
+#[test]
+#[ignore = "requires rebuilt frame-limiter cdylib; only disposable Proton fixtures are modified"]
+fn native_limiter_shared_external_clients_preserve_policy_until_last_retirement() {
+    use std::os::unix::fs::DirBuilderExt;
+    let library = std::env::var_os("AMATERASU_FRAME_LIMITER_LIBRARY")
+        .expect("supply rebuilt frame-limiter library");
+    let root =
+        std::env::temp_dir().join(format!("amaterasu-limiter-shared-{}", std::process::id()));
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&root)
+        .unwrap();
+    let mut passed = true;
+    for order in ["source-first", "subscriber-first"] {
+        let directory = root.join(order);
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&directory)
+            .unwrap();
+        passed &= std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "native_limiter_prepares_through_unchanged_coordinator_and_broker",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("AMATERASU_FRAME_LIMITER_LIBRARY", &library)
+            .env("AMATERASU_LIMITER_TEST_CHILD", &directory)
+            .env("XDG_DATA_HOME", &directory)
+            .env("AMATERASU_LIMITER_TEST_AUTOMATIC", "0")
+            .env("AMATERASU_LIMITER_TEST_OVERLAY", "0")
+            .env("AMATERASU_LIMITER_TEST_JOIN", order)
+            .env("AMATERASU_LIMITER_TEST_PROVIDER", "proton")
+            .env_remove("AMATERASU_LIMITER_TEST_RESTART")
+            .status()
+            .unwrap()
+            .success();
+    }
+    std::fs::remove_dir_all(root).unwrap();
+    assert!(
+        passed,
+        "native shared-source lifecycle qualification failed"
+    );
 }

@@ -36,6 +36,7 @@ pub(super) enum Step {
     PauseLifecycle,
     RetireLifecycle,
     RecoverLifecycle,
+    ResolveLifecyclePreparation,
     ObserveActiveBinding,
     ValidateActiveBinding,
     NotifyCaptureInvalidated,
@@ -150,6 +151,9 @@ impl Job {
     }
 
     pub fn next_cleanup(&mut self, record: &Record) -> Option<Step> {
+        if record.restart_lifecycle_preparation.is_some() {
+            return (!self.lifecycle_retire_tried).then_some(Step::ResolveLifecyclePreparation);
+        }
         if record.control_authenticated
             && !record.control_disconnect_checked
             && matches!(
@@ -291,6 +295,25 @@ impl Job {
     pub fn command(&self, record: &Record) -> (String, Value) {
         let session = || record.resources[&Resource::Session];
         match self.step {
+            Step::ResolveLifecyclePreparation => {
+                let preparation = record
+                    .restart_lifecycle_preparation
+                    .as_ref()
+                    .expect("preparation recovery");
+                (
+                    "amaterasu.session-lifecycle/1".into(),
+                    serde_json::to_value(
+                        preparation.lookup(
+                            record
+                                .config
+                                .lifecycle_session_target
+                                .as_ref()
+                                .expect("recovery session"),
+                        ),
+                    )
+                    .expect("typed preparation lookup"),
+                )
+            }
             Step::RecoverLifecycle => {
                 let operation_id = record
                     .restart_lifecycle_operation

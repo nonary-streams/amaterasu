@@ -388,6 +388,10 @@ pub struct PrepareConfig {
     pub history_activity_id: Option<String>,
     #[serde(default)]
     pub rtsp_operation_id: Option<String>,
+    /// Version-1 owner-bound logical reference to an existing external source.
+    /// This is the original NVHTTP operation, never a native display handle.
+    #[serde(default)]
+    pub shared_source_operation_id: Option<String>,
     /// Complete, frozen display Apply request from the authenticated launch.
     #[serde(default)]
     pub display_request: Option<Box<DisplayRequest>>,
@@ -454,8 +458,23 @@ impl PrepareConfig {
         }
         match (&self.history_activity_id, &self.rtsp_operation_id) {
             (None, None) => {}
+            (None, Some(operation))
+                if self.lifecycle_capture_mode.is_external() && valid_name(operation) => {}
             (Some(activity), Some(operation)) if valid_name(activity) && activity == operation => {}
             _ => return Err("invalid_history_activity"),
+        }
+        if let Some(source) = &self.shared_source_operation_id
+            && (!self.lifecycle_capture_mode.is_external()
+                || self.lifecycle_session_target.is_none()
+                || !valid_name(source)
+                || self
+                    .rtsp_operation_id
+                    .as_ref()
+                    .is_none_or(|operation| operation == source)
+                || self.display_request.is_some()
+                || self.virtual_display_intent.is_some())
+        {
+            return Err("invalid_shared_source_reference");
         }
         if let Some(request) = &self.display_request {
             request.validate()?;
@@ -787,6 +806,9 @@ pub struct StartConfigData {
     pub lifecycle_capture_mode: amaterasu_extension_api::CaptureBindingMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lifecycle_target: Option<amaterasu_extension_api::LifecycleTarget>,
+    /// Coordinator-attested source configuration borrowed by a joined stream.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle_shared_source: Option<amaterasu_extension_api::LifecycleTarget>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lifecycle_candidate: Option<amaterasu_extension_api::CaptureBinding>,
     #[serde(default)]
@@ -948,6 +970,23 @@ impl StartConfig {
     }
 
     pub fn validate(&self, stream_audio: bool) -> Result<(), &'static str> {
+        if let Some(source) = &self.lifecycle_shared_source {
+            use amaterasu_extension_api::{
+                LifecycleTarget, StreamRetirementProof, validate_stream_retirement_proof,
+            };
+            let Some(target @ LifecycleTarget::Stream { .. }) = &self.lifecycle_target else {
+                return Err("invalid_lifecycle_identity");
+            };
+            let proof = StreamRetirementProof {
+                target: target.clone(),
+                consumer_retired: true,
+                resources_released: false,
+                shared_retained: true,
+                shared_source: Some(source.clone()),
+            };
+            validate_stream_retirement_proof(&proof, target, Some(source))
+                .map_err(|_| "invalid_lifecycle_identity")?;
+        }
         if self.lifecycle_capture_mode.is_external()
             && (self.lifecycle_target.is_none() || self.lifecycle_candidate.is_some())
         {

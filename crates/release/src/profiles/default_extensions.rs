@@ -107,6 +107,7 @@ fn configure(
                 "start_stream",
                 "pause_stream",
                 "retire_stream",
+                "resolve_stream_preparation",
                 "lookup",
                 "snapshot",
             ],

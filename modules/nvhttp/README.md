@@ -438,9 +438,11 @@ BMP noncharacters U+FFFE/U+FFFF and controls.
   rejected. moonlight-qt calls only the plaintext form, to clean up failed pairings
   (`nvpairingmanager.cpp:248-366`); a pairing transcript that the client abandoned
   therefore expires on its own. The PIN approval window is up to 120 seconds; after the server proof is sent, the client has at most 10 seconds to finish its proof, allowing a prompt retry after an incorrect PIN.
-- `/resume` requires trusted paired TLS and complete launch metadata. It resumes
-  an enabled Desktop session owned by that certificate by retiring its RTSP session
-  and opening a fresh encrypted ticket. Catalog application resume remains unsupported.
+- `/resume` requires trusted paired TLS, launch permission and complete launch
+  metadata. With the lifecycle coordinator selected it joins a running application
+  or resumes a retained application, including catalog games, with a fresh
+  encrypted transport. Another authorized client sees the same `currentgame`.
+  The legacy Desktop path retains its single-client replacement behavior.
 
 Without streaming configuration, server info advertises `appversion=7.1.0.0` and
 `StreamingSupported=0`. Configured Linux streaming advertises
@@ -513,7 +515,7 @@ by `NvComputer::NvComputer` (`app/backend/nvcomputer.cpp:131-221`) unless noted.
 | `ExternalPort` | `nvcomputer.cpp:193-196` | active HTTP port | Sunshine extension. |
 | `ExternalIP` | `nvcomputer.cpp:198-204` | omitted | Optional. |
 | `state` | `nvcomputer.cpp:209`, `nvhttp.cpp:122` | `AMATERASU_SERVER_FREE` / `_BUSY` | The client needs the `_SERVER_BUSY` suffix and must not see `MJOLNIR`. |
-| `currentgame` | `nvhttp.cpp:117-131` | app id for the owner only | Zero unless `state` is busy; this is what selects resume. |
+| `currentgame` | `nvhttp.cpp:117-131` | running or retained app id for trusted clients with launch permission | Selects resume/join; plaintext and clients without launch permission see zero. |
 | `PairStatus` | `nvcomputer.cpp:211` | `1` only on live-trusted TLS | Plaintext always `0`. |
 | `appversion` | `nvcomputer.cpp:214`, `session.cpp:1793`, `Connection.c:237` | `7.1.431.0` (`7.1.0.0` when unconfigured) | Selects SHA-256 pairing, encrypted control and RTSP (`RtspConnection.c:953-955`, `InputStream.c:105`). A non-Sunshine version quad. |
 | `GfeVersion` | `nvcomputer.cpp:215,220`, `session.cpp:1333,1802` | `0.0.0.0` | `compatfetcher.cpp:53-120` accepts it; only an empty or `2.x` value limits 4K. No client dependency found, so unchanged. |
@@ -546,9 +548,12 @@ to zero as soon as cleanup starts.
 `/resume` (`session.cpp:1775`): moonlight-qt sends `resume` instead of `launch`
 whenever `/serverinfo` reports a nonzero `currentgame` for its certificate, which is
 the normal state after closing a stream without choosing "quit app" (the default
-preference). Amaterasu supports this transition for the enabled Desktop application,
-with fresh certificate authorization before opening the replacement RTSP ticket.
-Catalog application resume remains an unimplemented parity requirement.
+preference). The lifecycle path uses a retained application owner and separate
+per-client transports. A second authorized client joins without relaunching the
+application; disconnect and revocation retire only that client's transport.
+Quit App from a member ends the group after transport cleanup. See
+[multi-client streaming](../../docs/multi-client-streaming.md) for contracts,
+limits and qualification requirements.
 
 Error mapping (`nvhttp.cpp:550-575`, `:153-165`): any non-2xx HTTP status becomes a
 network error and the host shows offline. Only an XML `status_code` inside a 2xx
@@ -760,7 +765,7 @@ Behavioral references were the pinned sibling's Gen7 server-info/pairing behavio
 and the primary Moonlight Qt client in `app/backend/nvpairingmanager.cpp`,
 `nvhttp.cpp`, and `nvcomputer.cpp`. The implementation does not copy or translate
 sibling source. Gen6/SHA-1, discovery,
-catalog application resume and HDR remain unimplemented here. Surround capture,
+HDR requires separate end-to-end qualification. Surround capture,
 display optimization, and controller forwarding depend on the selected providers;
 mock protocol tests do not establish real-client or hardware acceptance.
 

@@ -19,6 +19,8 @@ pub(super) struct TouchPort {
     height: f32,
     client_offset_x: f32,
     client_offset_y: f32,
+    content_width: f32,
+    content_height: f32,
     logical_width: f32,
     logical_height: f32,
 }
@@ -26,7 +28,7 @@ pub(super) struct TouchPort {
 impl TouchPort {
     fn from_video_response(response: &Value) -> Option<Self> {
         let value = response.get("touch_port")?.as_object()?;
-        if value.len() != 6 {
+        if !matches!(value.len(), 6 | 8) {
             return None;
         }
         let dimension = |name: &str| -> Option<f32> {
@@ -40,15 +42,33 @@ impl TouchPort {
             let number = value.get(name)?.as_f64()?;
             (number.is_finite() && (0.0..=1_000_000.0).contains(&number)).then_some(number as f32)
         };
+        let width = dimension("width")?;
+        let height = dimension("height")?;
+        let client_offset_x = offset("client_offset_x")?;
+        let client_offset_y = offset("client_offset_y")?;
         let port = Self {
-            width: dimension("width")?,
-            height: dimension("height")?,
-            client_offset_x: offset("client_offset_x")?,
-            client_offset_y: offset("client_offset_y")?,
+            width,
+            height,
+            client_offset_x,
+            client_offset_y,
+            content_width: if value.len() == 8 {
+                dimension("content_width")?
+            } else {
+                width - 2.0 * client_offset_x
+            },
+            content_height: if value.len() == 8 {
+                dimension("content_height")?
+            } else {
+                height - 2.0 * client_offset_y
+            },
             logical_width: dimension("logical_width")?,
             logical_height: dimension("logical_height")?,
         };
-        if port.client_offset_x * 2.0 >= port.width || port.client_offset_y * 2.0 >= port.height {
+        if port.content_width <= 0.0
+            || port.content_height <= 0.0
+            || port.client_offset_x + port.content_width > port.width
+            || port.client_offset_y + port.content_height > port.height
+        {
             return None;
         }
         Some(port)
@@ -177,7 +197,12 @@ pub(super) fn configure_absolute_input(
         .normalized_output()
         .map_err(|_| "invalid_capture_geometry")?;
     record.touch_port = TouchPort::from_video_response(video_response);
-    record.capture_geometry = Some(geometry);
+    record.capture_geometry =
+        if video_response.get("touch_port").is_some() && record.touch_port.is_none() {
+            None
+        } else {
+            Some(geometry)
+        };
     record.input_absolute_pointer = false;
     record.input_translator = InputTranslator::default();
     Ok(())
@@ -816,10 +841,14 @@ fn pen_touch_payload(
         .map_err(|_| "invalid_capture_geometry")?;
     let x = f32::from_bits(packet.x).clamp(0.0, 1.0);
     let y = f32::from_bits(packet.y).clamp(0.0, 1.0);
-    let local_x = (x * port.width).clamp(port.client_offset_x, port.width - port.client_offset_x)
-        - port.client_offset_x;
-    let local_y = (y * port.height).clamp(port.client_offset_y, port.height - port.client_offset_y)
-        - port.client_offset_y;
+    let local_x = (x * port.width).clamp(
+        port.client_offset_x,
+        port.client_offset_x + port.content_width,
+    ) - port.client_offset_x;
+    let local_y = (y * port.height).clamp(
+        port.client_offset_y,
+        port.client_offset_y + port.content_height,
+    ) - port.client_offset_y;
     let map = |value: f32, extent: f32, first: u16, last: u16| -> u16 {
         (f32::from(first) + value / extent * f32::from(last - first))
             .round()
@@ -839,8 +868,8 @@ fn pen_touch_payload(
         "kind":"pen_touch", "pointer_id":packet.pointer_id,
         "device":match packet.device { PointerDevice::Pen => "pen", PointerDevice::Touch => "touch" },
         "phase":match packet.event { PointerEvent::Down => "down", PointerEvent::Move => "move", PointerEvent::Up => "up", PointerEvent::Cancel => "cancel" },
-        "x":map(local_x, port.width - 2.0 * port.client_offset_x, normalized.left, normalized.right),
-        "y":map(local_y, port.height - 2.0 * port.client_offset_y, normalized.top, normalized.bottom),
+        "x":map(local_x, port.content_width, normalized.left, normalized.right),
+        "y":map(local_y, port.content_height, normalized.top, normalized.bottom),
         "pressure":f32::from_bits(packet.pressure).clamp(0.0, 1.0),
         "contact_area_major":scale(major, angle),
         "contact_area_minor":scale(minor, angle + std::f32::consts::FRAC_PI_2),
@@ -874,13 +903,35 @@ pub(super) fn configure_translator(
     let normalized = geometry
         .normalized_output()
         .map_err(|_| "invalid_capture_geometry")?;
-    let viewport = AbsoluteViewport::new(
+    let mut viewport = AbsoluteViewport::new(
         normalized.left,
         normalized.top,
         normalized.right,
         normalized.bottom,
     )
     .map_err(|_| "invalid_capture_geometry")?;
+    if let Some(port) = record.touch_port {
+        if port.width < 2.0
+            || port.height < 2.0
+            || port.content_width < 2.0
+            || port.content_height < 2.0
+        {
+            record.input_absolute_pointer = false;
+            record.input_translator = InputTranslator::default();
+            return Ok(());
+        }
+        let horizontal = f64::from(port.width) - 1.0;
+        let vertical = f64::from(port.height) - 1.0;
+        viewport = viewport
+            .with_client_content(
+                f64::from(port.client_offset_x) / horizontal,
+                f64::from(port.client_offset_y) / vertical,
+                (f64::from(port.client_offset_x) + f64::from(port.content_width) - 1.0)
+                    / horizontal,
+                (f64::from(port.client_offset_y) + f64::from(port.content_height) - 1.0) / vertical,
+            )
+            .map_err(|_| "invalid_capture_geometry")?;
+    }
     record.input_translator = InputTranslator::new(Some(viewport));
     Ok(())
 }

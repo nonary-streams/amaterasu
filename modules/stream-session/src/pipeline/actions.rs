@@ -152,6 +152,10 @@ impl Pipeline {
             rpc::complete(send, request, error("permission_denied"));
             return;
         }
+        if config.rtsp_operation_id.is_some() && owner != "amaterasu.rtsp" {
+            rpc::complete(send, request, error("permission_denied"));
+            return;
+        }
         if let Some(record) = self.records.values().find(|record| {
             record.owner == owner && record.config.operation_id == config.operation_id
         }) {
@@ -205,7 +209,18 @@ impl Pipeline {
             .lifecycle_session_target
             .as_ref()
             .map(|_| self.settings.enable_input);
+        let shared_capture =
+            match super::shared_capture::borrow_source(&self.records, &owner, &config) {
+                Ok(source) => source,
+                Err(code) => {
+                    rpc::complete(send, request, error(code));
+                    return;
+                }
+            };
         let mut record = Record::new(id, owner, config, self.settings.input_lease_ttl_ms);
+        record.shared_capture_attached = shared_capture.is_some();
+        record.virtual_display_attempted = shared_capture.is_some();
+        record.shared_capture = shared_capture;
         record.providers = self.settings.providers.clone();
         record.processing_plan_provider = self.settings.processing_plan.clone();
         record.lifecycle_input_required = lifecycle_input_required;
@@ -326,6 +341,10 @@ impl Pipeline {
             return;
         }
         if let Err(code) = configuration.validate(record.config.stream_audio) {
+            rpc::complete(send, request, error(code));
+            return;
+        }
+        if let Err(code) = super::shared_capture::validate_start(record, &configuration) {
             rpc::complete(send, request, error(code));
             return;
         }

@@ -615,6 +615,9 @@ pub struct Open {
     pub lifecycle_settings_revision: Option<String>,
     #[serde(default)]
     pub lifecycle_intent: Option<String>,
+    /// Version-1 owner-bound original NVHTTP operation for an external source.
+    #[serde(default)]
+    pub shared_source_operation_id: Option<String>,
     /// Facts supplied by the trusted session owner for this stream only.
     #[serde(default)]
     pub lifecycle_client_context: Option<amaterasu_extension_api::ClientContext>,
@@ -830,6 +833,15 @@ impl Open {
             return Err("continuous_audio_requires_stream_audio");
         }
         self.validate_operation_id()?;
+        if let Some(source) = &self.shared_source_operation_id
+            && (!self.lifecycle_capture_mode.is_external()
+                || self.lifecycle_intent.as_deref() != Some("join")
+                || self.lifecycle_session_target.is_none()
+                || !valid_name(source)
+                || source == &self.operation_id)
+        {
+            return Err("invalid_shared_source_reference");
+        }
         if self.lifecycle_capture_mode.is_external() && self.lifecycle_session_target.is_none() {
             return Err("invalid_lifecycle_identity");
         }
@@ -859,7 +871,7 @@ impl Open {
                 && valid_lifecycle_id(session_id)
                 && *generation > 0
                 && valid_lifecycle_id(revision)
-                && matches!(intent.as_str(), "initial" | "resume")
+                && matches!(intent.as_str(), "initial" | "resume" | "join")
                 && (self.lifecycle_capture_mode.is_external()
                     || (self.display_request.is_none()
                         && self.virtual_display_intent.is_none())) => {}
@@ -1144,6 +1156,12 @@ impl Open {
         if let Some(activity_id) = &self.history_activity_id {
             payload["history_activity_id"] = serde_json::json!(activity_id);
             payload["rtsp_operation_id"] = serde_json::json!(self.operation_id);
+        }
+        if self.lifecycle_capture_mode.is_external() {
+            payload["rtsp_operation_id"] = serde_json::json!(self.operation_id);
+        }
+        if let Some(source) = &self.shared_source_operation_id {
+            payload["shared_source_operation_id"] = serde_json::json!(source);
         }
         if let Some(session) = &self.lifecycle_session_target {
             payload["lifecycle_session_target"] = serde_json::json!(session);
@@ -1626,7 +1644,7 @@ pub enum Operation {
 pub fn valid_name(value: &str) -> bool {
     valid_label(value, 128)
 }
-fn valid_lifecycle_id(value: &str) -> bool {
+pub(crate) fn valid_lifecycle_id(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 128
         && value
@@ -1697,6 +1715,64 @@ mod tests {
 
     fn open() -> Open {
         serde_json::from_value(open_json()).unwrap()
+    }
+
+    #[test]
+    fn join_requires_a_complete_exact_lifecycle_session_identity() {
+        let mut input = open_json();
+        input["lifecycle_session_target"] =
+            json!({"kind":"session", "host_epoch":"epoch", "session_id":"session", "generation":1});
+        input["lifecycle_settings_revision"] = json!("7");
+        input["lifecycle_intent"] = json!("join");
+        let accepted: Open = serde_json::from_value(input.clone()).unwrap();
+        accepted.validate(false).unwrap();
+
+        for omitted in ["lifecycle_session_target", "lifecycle_settings_revision"] {
+            let mut missing = input.clone();
+            missing.as_object_mut().unwrap().remove(omitted);
+            let rejected: Open = serde_json::from_value(missing).unwrap();
+            assert_eq!(rejected.validate(false), Err("invalid_lifecycle_identity"));
+        }
+        for target in [
+            json!({"kind":"session", "host_epoch":"epoch", "session_id":"session", "generation":0}),
+            json!({"kind":"stream", "host_epoch":"epoch", "session_id":"session", "stream_id":"stream", "generation":1}),
+        ] {
+            input["lifecycle_session_target"] = target;
+            let rejected: Open = serde_json::from_value(input.clone()).unwrap();
+            assert_eq!(rejected.validate(false), Err("invalid_lifecycle_identity"));
+        }
+    }
+
+    #[test]
+    fn external_join_forwards_only_a_valid_distinct_source_operation() {
+        let mut input = open_json();
+        input["lifecycle_session_target"] =
+            json!({"kind":"session", "host_epoch":"epoch", "session_id":"session", "generation":1});
+        input["lifecycle_settings_revision"] = json!("7");
+        input["lifecycle_intent"] = json!("join");
+        input["lifecycle_capture_mode"] = json!("external");
+        input["shared_source_operation_id"] = json!("original-source");
+        let accepted: Open = serde_json::from_value(input.clone()).unwrap();
+        accepted.validate(false).unwrap();
+        let prepared = accepted.prepare("local-preparation", None);
+        assert_eq!(prepared["shared_source_operation_id"], "original-source");
+        assert_eq!(prepared["rtsp_operation_id"], "launch-one");
+        assert!(prepared.get("history_activity_id").is_none());
+
+        for (field, value) in [
+            ("lifecycle_intent", json!("initial")),
+            ("lifecycle_capture_mode", json!("managed")),
+            ("shared_source_operation_id", json!("launch-one")),
+            ("shared_source_operation_id", json!("")),
+        ] {
+            let mut invalid = input.clone();
+            invalid[field] = value;
+            let rejected: Open = serde_json::from_value(invalid).unwrap();
+            assert_eq!(
+                rejected.validate(false),
+                Err("invalid_shared_source_reference")
+            );
+        }
     }
 
     #[test]

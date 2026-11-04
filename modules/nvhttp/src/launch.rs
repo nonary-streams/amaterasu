@@ -9,6 +9,7 @@ use amaterasu_module_sdk::{
 mod call;
 mod record;
 mod resume_snapshot;
+mod shared_session;
 mod workflow;
 
 #[cfg(test)]
@@ -17,6 +18,7 @@ mod tests {
     include!("launch/audio_tests.rs");
     include!("launch/display_mutation_tests.rs");
     include!("launch/lifecycle_tests.rs");
+    include!("launch/shared_session_tests.rs");
 }
 
 use crate::encoder_snapshot::{
@@ -30,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     net::{IpAddr, Ipv4Addr},
     time::{Duration, Instant},
 };
@@ -708,6 +710,7 @@ pub struct Controller {
     nvenc_spatial_aq: bool,
     device_name: String,
     records: BTreeMap<u64, Record>,
+    retired_stream_keys: BTreeSet<[u8; 32]>,
     pending_resume: Option<PendingResume>,
     management_replies: Vec<(u64, Reply)>,
     job: Option<Job>,
@@ -754,6 +757,7 @@ impl Controller {
             nvenc_spatial_aq: false,
             device_name: "Amaterasu".into(),
             records: BTreeMap::new(),
+            retired_stream_keys: BTreeSet::new(),
             pending_resume: None,
             management_replies: Vec::new(),
             job: None,
@@ -943,8 +947,9 @@ impl Controller {
             Some(record) => json!({"ok":true,"launch":{
                 "reference":management_reference(record),
                 "revision":self.management_revision(record),
-                "state":management_state(record.state),
-                "pending_resume":self.pending_resume.as_ref().is_some_and(|pending| pending.record == record.id),
+                "state":management_state(self.application_status(record)),
+                "pending_resume":self.pending_resume.as_ref().is_some_and(|pending| self.records.get(&pending.record)
+                    .is_some_and(|pending_record| pending_record.application_root() == record.application_root())),
             }}),
             None if reference.is_none() => json!({"ok":true,"launch":null}),
             None => json!({"ok":false,"code":"launch_not_found"}),
@@ -952,14 +957,25 @@ impl Controller {
     }
 
     fn management_revision(&self, record: &Record) -> String {
-        let pending = self
-            .pending_resume
-            .as_ref()
-            .filter(|pending| pending.record == record.id);
+        let pending = self.pending_resume.as_ref().filter(|pending| {
+            self.records
+                .get(&pending.record)
+                .is_some_and(|pending_record| {
+                    pending_record.application_root() == record.application_root()
+                })
+        });
         let mut digest = Sha256::new();
-        digest.update(b"amaterasu-management-launch-revision-v1\0");
+        digest.update(b"amaterasu-management-launch-revision-v2\0");
         digest.update(record.rtsp_operation.as_bytes());
         digest.update([record.state as u8]);
+        for member in self.records.values().filter(|member| {
+            member.application_root() == record.application_root() && !member.state.terminal()
+        }) {
+            digest.update(member.id.to_be_bytes());
+            digest.update((member.rtsp_operation.len() as u64).to_be_bytes());
+            digest.update(member.rtsp_operation.as_bytes());
+            digest.update([member.state as u8]);
+        }
         match pending {
             Some(pending) => {
                 digest.update([1]);
@@ -988,6 +1004,27 @@ impl Controller {
         {
             return json!({"ok":false,"code":"launch_changed"});
         }
+        let application = self.records[&id].application_root();
+        if self.records.values().any(|record| {
+            record.application_session == Some(application) && !record.state.terminal()
+        }) {
+            if self.pending_resume.as_ref().is_some_and(|pending| {
+                self.records
+                    .get(&pending.record)
+                    .is_some_and(|record| record.application_root() == application)
+            }) && let Some(pending) = self.pending_resume.take()
+            {
+                if let Some(record) = self.records.get_mut(&pending.record) {
+                    record.launch_connection = None;
+                }
+                self.management_replies.push((
+                    pending.connection,
+                    private_error(409, "resume cancelled by host"),
+                ));
+            }
+            self.end_application_group(id, now);
+            return json!({"ok":true,"accepted":true,"reference":reference});
+        }
         if self
             .pending_resume
             .as_ref()
@@ -1005,6 +1042,9 @@ impl Controller {
             .expect("selected launch remains present");
         if record.lifecycle_prepare_dispatched && record.lifecycle_session_target.is_none() {
             return json!({"ok":false,"code":"lifecycle_retirement_unavailable"});
+        }
+        if record.application_session.is_none() {
+            record.transport_only_cleanup = false;
         }
         let already_stopping = record.state == State::Stopping;
         if record.state == State::CleanupFailed {
@@ -1032,6 +1072,12 @@ impl Controller {
         peer: PeerIdentity,
         now: Instant,
     ) -> Option<Reply> {
+        if peer.paired() {
+            self.prune_finished_transports();
+            if self.retired_stream_key(&request) {
+                return Some(private_error(409, "launch key was already used"));
+            }
+        }
         if self.package_activation_pending {
             return Some(private_error(503, "plugin activation is pending"));
         }
@@ -1122,10 +1168,14 @@ impl Controller {
                 "launch key conflicts with an existing request",
             ));
         }
-        if self.records.len() >= MAX_RECORDS
-            || self.records.values().any(|record| !record.state.terminal())
-        {
+        if self.records.len() >= MAX_RECORDS {
             return Some(private_error(503, "another stream is active"));
+        }
+        if self.shared_application(request.app_id).is_some() {
+            return self.join_or_resume(connection, request, peer, now);
+        }
+        if self.records.values().any(|record| !record.state.terminal()) {
+            return Some(private_error(503, "another application is active"));
         }
         let video_codec_offer = match self.codec_offer(config, &request) {
             Ok(offer) => offer,
@@ -1201,6 +1251,9 @@ impl Controller {
     }
 
     pub fn cancel(&mut self, connection: u64, peer: &PeerIdentity, now: Instant) -> Option<Reply> {
+        if let Some(member) = self.shared_cancel_member(peer) {
+            return self.cancel_application_group(member, connection, now);
+        }
         if self
             .pending_resume
             .as_ref()
@@ -1241,6 +1294,9 @@ impl Controller {
             record.state, record.stage
         );
         record.cancel_connection = Some(connection);
+        if record.application_session.is_none() {
+            record.transport_only_cleanup = false;
+        }
         let retry = if record.state == State::CleanupFailed {
             record.retry_cleanup(now)
         } else {
@@ -1268,26 +1324,38 @@ impl Controller {
         peer: &PeerIdentity,
         now: Instant,
     ) -> Option<Reply> {
+        if peer.paired() {
+            self.prune_finished_transports();
+            if self.retired_stream_key(&request) {
+                return Some(private_error(409, "launch key was already used"));
+            }
+        }
+        if self
+            .shared_application(request.app_id)
+            .is_some_and(|root| self.application_has_live_stream(root))
+        {
+            return self.join_stream(connection, request, peer.clone(), now);
+        }
         if self.package_activation_pending {
             return Some(private_error(503, "plugin activation is pending"));
         }
         let Some(config) = &self.config else {
             return Some(private_error(503, "streaming is disabled"));
         };
+        if !peer.paired() {
+            return Some(private_error(401, "authenticated paired TLS is required"));
+        }
         let retained = self.records.values().any(|record| {
             record.lifecycle_required
                 && record.state == State::Paused
                 && record.request.app_id == request.app_id
-                && record.peer.certificate == peer.certificate
+                && record.application_session.is_none()
         });
         if !retained && (!config.desktop.enabled || request.app_id != DESKTOP_APP_ID) {
             return Some(private_error(404, "Desktop session is unavailable"));
         }
         if !self.output_settings_ready {
             return Some(private_error(503, "stream settings are loading"));
-        }
-        if !peer.paired() {
-            return Some(private_error(401, "authenticated paired TLS is required"));
         }
         if !config.profile.accepts(&request)
             || !matches!(request.audio_channels, 2 | 6 | 8)
@@ -1312,6 +1380,7 @@ impl Controller {
                 && (record.peer != *peer || record.request != request)
                 && !(record.lifecycle_required
                     && record.state == State::Paused
+                    && record.request.app_id == request.app_id
                     && record.peer.certificate == peer.certificate
                     && record.peer.client_id == peer.client_id)
         }) {
@@ -1333,16 +1402,12 @@ impl Controller {
                     record.lifecycle_required
                         && record.state == State::Paused
                         && record.request.app_id == request.app_id
-                        && record.peer.certificate == peer.certificate
+                        && record.application_session.is_none()
                 })
                 .expect("retained session remains available");
-            if record.revoked
-                || record.peer.certificate != peer.certificate
-                || record.peer.client_id != peer.client_id
-            {
-                return Some(private_error(401, "paired client is no longer trusted"));
-            }
             record.rtsp_operation = operation;
+            record.revoked = false;
+            record.failure = None;
             record.resumed = true;
             record.adopted = false;
             record.resume_abandoned = false;
@@ -1378,11 +1443,14 @@ impl Controller {
         None
     }
 
-    pub fn current_game(&self, peer: &PeerIdentity) -> u32 {
+    /// The wire router supplies a peer only after trusted TLS and launch
+    /// permission checks. A retained application belongs to the host session;
+    /// another authorized client may resume it after the stream retires.
+    pub fn current_game(&self, _peer: &PeerIdentity) -> u32 {
         self.records
             .values()
             .find(|record| {
-                record.peer.certificate == peer.certificate
+                (!record.revoked || record.state == State::Paused)
                     && matches!(record.state, State::Ready | State::Paused)
             })
             .map_or(0, |record| record.request.app_id)
@@ -1400,6 +1468,7 @@ impl Controller {
         mut trusted: impl FnMut(&[u8]) -> bool,
     ) -> Vec<(u64, Reply)> {
         let mut replies = std::mem::take(&mut self.management_replies);
+        self.synchronize_application_cleanup(now);
         if let Some(mut job) = self.job.take() {
             self.advance(&mut job, now, send, &mut replies);
         }
@@ -1512,7 +1581,14 @@ impl Controller {
                     {
                         record.resume_abandoned = true;
                     } else {
-                        record.request_cleanup(Some("launch_response_unavailable"), now);
+                        if record.resumed && record.lifecycle_session_target.is_some() {
+                            record.request_transport_cleanup(
+                                Some("launch_response_unavailable"),
+                                now,
+                            );
+                        } else {
+                            record.request_cleanup(Some("launch_response_unavailable"), now);
+                        }
                     }
                     affected = Some(record.id);
                 }
@@ -1551,7 +1627,14 @@ impl Controller {
                 close.extend(record.launch_connection.take());
                 close.extend(record.cancel_connection.take());
                 if !matches!(record.state, State::Stopping | State::CleanupFailed) {
-                    record.request_cleanup(Some("client_revoked"), now);
+                    if record.lifecycle_session_target.is_some()
+                        && (record.application_session.is_some()
+                            || matches!(record.state, State::Ready | State::Paused))
+                    {
+                        record.request_transport_cleanup(Some("client_revoked"), now);
+                    } else {
+                        record.request_cleanup(Some("client_revoked"), now);
+                    }
                     affected.push(record.id);
                 }
             }
@@ -1572,6 +1655,9 @@ impl Controller {
             if !record.state.terminal()
                 && !matches!(record.state, State::Stopping | State::CleanupFailed)
             {
+                if record.application_session.is_none() {
+                    record.transport_only_cleanup = false;
+                }
                 record.request_cleanup(Some("host_stopping"), now);
             }
         }

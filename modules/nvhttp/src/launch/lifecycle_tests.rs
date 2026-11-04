@@ -362,6 +362,79 @@ fn retained_resume_uses_fresh_rtsp_operation_and_rechecks_paused_session() {
 }
 
 #[test]
+fn retained_application_resumes_on_another_paired_client_without_relaunch() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    controller.set_global_display_policy(7, json!({}));
+    let mut broker = Broker::default();
+    assert!(controller.launch(10, request(1), peer(1), now).is_none());
+    assert_eq!(poll_until_reply(&mut controller, &mut broker, now).1.status, 200);
+    controller.reply_delivered(10, now);
+    let target = json!({"kind":"session","host_epoch":"epoch","session_id":"session","generation":1});
+    let record = controller.records.values_mut().next().unwrap();
+    record.lifecycle_required = true;
+    record.lifecycle_prepare_dispatched = true;
+    record.lifecycle_application_bound = true;
+    record.lifecycle_launch_epoch_ready = true;
+    record.lifecycle_session_target = serde_json::from_value(target).ok();
+    record.application_display_overrides = Some(json!({}));
+    record.state = State::Paused;
+    record.stage = Stage::Live;
+    record.rtsp_requested = false;
+    record.rtsp_ticket = None;
+    record.rtsp_url = None;
+    record.history_release_required = false;
+    let application_operation = record.application_operation.clone();
+    let application_launch = record.application_launch;
+    let old_rtsp_operation = record.rtsp_operation.clone();
+    broker.commands.clear();
+    broker.lifecycle_replies.push_back(json!({"status":"ok","host_epoch":"epoch","sessions":[{"session_id":"session","generation":1,"phase":"paused"}]}));
+
+    assert_eq!(controller.current_game(&peer(2)), 1);
+    assert!(controller.resume(11, request(2), &peer(2), now).is_none());
+    let (connection, reply) = poll_until_reply(&mut controller, &mut broker, now);
+    assert_eq!(connection, 11);
+    assert_eq!(reply.status, 200, "{} failure={:?} cleanup={:?} commands={:?}", String::from_utf8_lossy(&reply.body),
+        controller.records.values().next().unwrap().failure,
+        controller.records.values().next().unwrap().cleanup_error, broker.actions());
+    assert!(String::from_utf8_lossy(&reply.body).contains("<resume>1</resume>"));
+    controller.reply_delivered(11, now);
+    let record = controller.records.values().next().unwrap();
+    assert_eq!(record.state, State::Ready);
+    assert_eq!(record.peer.client_id.as_deref(), Some("client-2"));
+    assert_eq!(record.request.remote_input_key, request(2).remote_input_key);
+    assert_eq!(record.application_operation, application_operation);
+    assert_eq!(record.application_launch, application_launch);
+    assert_ne!(record.rtsp_operation, old_rtsp_operation);
+    assert!(!broker.actions().contains(&("amaterasu.launch/1", "launch_export")));
+    assert!(!broker.actions().contains(&("amaterasu.launch/1", "stop")));
+    let open = broker.commands.iter().find_map(|command| match command {
+        Command::Request { service, payload, .. } if service == "amaterasu.rtsp/1" && payload["action"] == "open" => Some(payload),
+        _ => None,
+    }).unwrap();
+    assert_eq!(open["lifecycle_client_context"]["client_ref"], "client-2");
+    assert_eq!(open["lifecycle_intent"], "resume");
+}
+
+#[test]
+fn unauthenticated_client_cannot_resume_a_retained_application() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    assert!(controller.launch(10, request(1), peer(1), now).is_none());
+    let record = controller.records.values_mut().next().unwrap();
+    record.lifecycle_required = true;
+    record.state = State::Paused;
+    record.stage = Stage::Live;
+    let original_operation = record.rtsp_operation.clone();
+    let unpaired = PeerIdentity::new("127.0.0.1".parse().unwrap(), vec![2; 32]).unwrap();
+    assert_eq!(controller.resume(11, request(2), &unpaired, now).unwrap().status, 401);
+    let record = controller.records.values().next().unwrap();
+    assert_eq!(record.state, State::Paused);
+    assert_eq!(record.rtsp_operation, original_operation);
+    assert!(controller.pending_resume.is_none());
+}
+
+#[test]
 fn lifecycle_application_cleanup_failure_remains_fenced() {
     let now = Instant::now();
     let mut controller = Controller::new(Some(config())).unwrap();

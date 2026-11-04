@@ -175,7 +175,19 @@ impl Controller {
         )
         .ok();
         let valid_candidate = if record.config.lifecycle_capture_mode.is_external() {
-            payload["candidate"].is_null() && payload["required_consumers"] == json!(["capture"])
+            payload["candidate"].is_null()
+                && payload["required_consumers"] == json!(["capture"])
+                && (record.config.lifecycle_intent.as_deref() != Some("join")
+                    || target.as_ref().is_some_and(|target| {
+                        super::lifecycle_binding::valid_external_join(target, payload)
+                    }))
+        } else if record.config.lifecycle_intent.as_deref() == Some("join") {
+            candidate
+                .as_ref()
+                .zip(target.as_ref())
+                .is_some_and(|(binding, target)| {
+                    super::lifecycle_binding::valid_join_binding(binding, target, payload)
+                })
         } else {
             candidate
             .as_ref()
@@ -205,6 +217,19 @@ impl Controller {
             );
             return;
         }
+        let source =
+            match preparation_source(record, &payload["target"], payload.get("shared_source")) {
+                Some(source) => source,
+                None => {
+                    self.fail_network_action(
+                        record,
+                        connection,
+                        action_ticket,
+                        "lifecycle_prepare_rejected",
+                    );
+                    return;
+                }
+            };
         let Some(mut start) = record
             .session
             .and_then(|session| record.authenticated_start_payload(session))
@@ -214,9 +239,13 @@ impl Controller {
         };
         record.lifecycle_target = Some(payload["target"].clone());
         record.lifecycle_candidate = Some(payload["candidate"].clone());
+        record.lifecycle_source_target = Some(source.clone());
         record.lifecycle_prepare_outstanding = false;
         start["configuration"]["lifecycle_target"] = payload["target"].clone();
         start["configuration"]["lifecycle_candidate"] = payload["candidate"].clone();
+        if record.config.lifecycle_intent.as_deref() == Some("join") {
+            start["configuration"]["lifecycle_shared_source"] = json!(source);
+        }
         start["configuration"]["lifecycle_capture_mode"] =
             json!(record.config.lifecycle_capture_mode);
         self.schedule_actual_arm(record, start, connection, action_ticket, job.deadline);
@@ -271,7 +300,11 @@ impl Controller {
                         && payload["rtsp_operation_id"].as_str()
                             == Some(record.config.operation_id.as_str()) => {}
                 None if payload["history_activity_id"].is_null()
-                    && payload["rtsp_operation_id"].is_null() => {}
+                    && if record.config.lifecycle_capture_mode.is_external() {
+                        payload["rtsp_operation_id"] == record.config.operation_id
+                    } else {
+                        payload["rtsp_operation_id"].is_null()
+                    } => {}
                 _ => return Err("history_activity_unverified"),
             }
             if payload["lifecycle_session_target"] != json!(record.config.lifecycle_session_target)
@@ -441,11 +474,10 @@ impl Controller {
         payload: &Value,
         runtime: &RuntimeClient,
     ) {
-        if clean_terminal(record, payload) {
+        if confirm_terminal(record, payload) {
             record.authenticated_disconnect_reason =
                 authenticated_disconnect_reason(record, payload);
             record.stream_state = stream_state(payload).map(str::to_owned);
-            record.cleanup_confirmed = true;
             record.cleanup_error = None;
             self.finish_cleanup_reply(record, job, runtime);
         } else if response_session(payload) == record.session {
@@ -478,13 +510,12 @@ impl Controller {
             return;
         }
         record.stream_state = state.map(str::to_owned);
-        if clean_terminal(record, payload) {
+        if confirm_terminal(record, payload) {
             record.authenticated_disconnect_reason =
                 authenticated_disconnect_reason(record, payload);
             if record.state != State::Closing {
                 record.close(Some("stream_failed"));
             }
-            record.cleanup_confirmed = true;
             self.finish_cleanup_reply(record, job, runtime);
         } else if matches!(state, Some("cleanup_failed" | "failed" | "cancelled"))
             || !payload["cleanup_error"].is_null()

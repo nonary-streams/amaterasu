@@ -64,6 +64,10 @@ pub enum Stage {
 
 pub struct Record {
     pub id: u64,
+    /// Joining transports borrow the application/session retained by this root.
+    /// Only the root may terminate the application or end the lifecycle session.
+    pub application_session: Option<u64>,
+    pub transport_only_cleanup: bool,
     pub desktop: bool,
     pub resumed: bool,
     pub peer: PeerIdentity,
@@ -256,6 +260,8 @@ impl Record {
         });
         Self {
             id,
+            application_session: None,
+            transport_only_cleanup: false,
             encoder_snapshot: None,
             video_codec_offer: CodecOffer {
                 codecs: vec![amaterasu_media::VideoCodec::H264],
@@ -412,6 +418,15 @@ impl Record {
             self.deadline = self.cleanup_deadline(now);
         }
         self.cleanup_error = None;
+        if self.application_session.is_some() {
+            self.transport_only_cleanup = true;
+            self.application_launch = None;
+        }
+    }
+
+    pub fn request_transport_cleanup(&mut self, failure: Option<&'static str>, now: Instant) {
+        self.request_cleanup(failure, now);
+        self.transport_only_cleanup = true;
     }
 
     pub fn cleanup_deadline(&self, now: Instant) -> Instant {

@@ -43,6 +43,8 @@ pub struct Broker {
     pub lifecycle_observation_override: Option<Value>,
     pub lifecycle_input_target: Option<Value>,
     pub lifecycle_pending_once: bool,
+    pub lifecycle_retirement_override: Option<Value>,
+    pub lifecycle_preparation_resolution: Option<Value>,
     pub lifecycle_receipts: BTreeMap<String, Value>,
     incoming: VecDeque<Response>,
     requests: BTreeMap<u64, Request>,
@@ -224,6 +226,11 @@ impl Broker {
                 request: json!({}),
             },
         );
+    }
+
+    pub fn inherit_components(&mut self, previous: &Self) {
+        self.allocations = previous.allocations.clone();
+        self.next = self.next.max(previous.next);
     }
 
     pub fn session_is_stopped_without_leases(&self, key: &str) -> bool {
@@ -419,6 +426,21 @@ impl Broker {
                 return json!({"status":"rejected"});
             }
             let operation = call.payload["operation"].as_str().unwrap();
+            if operation == "resolve_stream_preparation" {
+                let mut result = self
+                    .lifecycle_preparation_resolution
+                    .clone()
+                    .unwrap_or_else(|| json!({"status":"missing","target":null}));
+                if result["status"] == "succeeded" && result.get("preparation_status").is_none() {
+                    result["preparation_status"] = json!("succeeded");
+                }
+                for field in ["session", "preparation_operation_id", "preparation_caller"] {
+                    if result.get(field).is_none() {
+                        result[field] = call.payload[field].clone();
+                    }
+                }
+                return result;
+            }
             if operation == "read_frozen_provider_settings" {
                 return json!({"status":"succeeded","target":call.payload["target"],
                     "provider":call.payload["provider"],"revision":"r1",
@@ -438,7 +460,13 @@ impl Broker {
             if operation == "issue_input_binding" {
                 self.lifecycle_input_target = Some(call.payload["target"].clone());
             }
-            let result = json!({"status":"succeeded", "target":call.payload["target"], "plan_revision":call.payload["plan_revision"], "fenced":true, "all_consumers_acknowledged":!self.lifecycle_omit_consumer_confirmation, "binding":call.payload["binding"], "observation":call.payload["observation"],"token":"binding-token","geometry_revision":1});
+            let result = if operation == "retire_stream"
+                && self.lifecycle_retirement_override.is_some()
+            {
+                self.lifecycle_retirement_override.clone().unwrap()
+            } else {
+                json!({"status":"succeeded", "target":call.payload["target"], "plan_revision":call.payload["plan_revision"], "fenced":true, "all_consumers_acknowledged":!self.lifecycle_omit_consumer_confirmation, "binding":call.payload["binding"], "observation":call.payload["observation"],"token":"binding-token","geometry_revision":1})
+            };
             self.lifecycle_receipts.insert(id.into(), result.clone());
             if self.lifecycle_pending_once && operation == "validate_candidate" {
                 self.lifecycle_pending_once = false;
@@ -959,7 +987,8 @@ impl Broker {
                             self.virtual_display_pending_statuses -= 1;
                         }
                         vec![json!({"specification":specification,"state":state,
-                            "ready":{"device_path":"\\\\.\\DISPLAYVDD"},"error":null})]
+                            "capture_output":"kwin:Virtual-2",
+                            "ready":{"device_path":"\\\\.\\DISPLAYVDD","active":true},"error":null})]
                     },
                 );
                 let parked = self
@@ -972,6 +1001,18 @@ impl Broker {
                 json!({"ok":true,"monitors":monitors,"reference_owned":reference_owned,"parked":parked,"parked_outputs":parked_outputs})
             }
             "remove" => {
+                if payload["reference_id"]
+                    .as_str()
+                    .is_some_and(|reference| reference.starts_with("shared-source-"))
+                {
+                    assert!(
+                        !self.allocations.iter().any(|((service, _), allocation)| {
+                            service == "amaterasu.video/1"
+                                && allocation.request["output"] == "kwin:Virtual-2"
+                        }),
+                        "shared native output removed while a source consumer still owns capture"
+                    );
+                }
                 if self.virtual_display_remove_failure {
                     return error("cleanup_pending");
                 }

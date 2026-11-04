@@ -11,6 +11,7 @@ mod record;
 mod responses;
 mod rpc;
 mod session_effects;
+mod shared_capture;
 #[cfg(test)]
 mod tests;
 mod virtual_display;

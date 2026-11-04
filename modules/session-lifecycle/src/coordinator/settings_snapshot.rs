@@ -17,6 +17,23 @@ pub(super) struct SnapshotScopes {
 }
 
 impl SnapshotScopes {
+    /// Shared resource policy may come from the source snapshot, while identity
+    /// scopes must continue to identify this newly authenticated client.
+    pub(super) fn for_joined_client(&self, value: Option<&Value>) -> ModuleResult<Self> {
+        let mut scopes = self.clone();
+        scopes.paired_client = match value.filter(|value| !value.is_null()) {
+            None => None,
+            Some(value) => {
+                let client: amaterasu_extension_api::ClientContext =
+                    serde_json::from_value(value.clone()).map_err(|_| "invalid_client_context")?;
+                if !client.validate() {
+                    return Err("invalid_client_context".into());
+                }
+                client.client_ref
+            }
+        };
+        Ok(scopes)
+    }
     /// Select from the admitted transition, never from provider-supplied data.
     pub(super) fn from_work(journal: &super::Journal, work: &super::Work) -> ModuleResult<Self> {
         let (_, session_id, _, _) = super::operations::target_parts(&work.target)?;

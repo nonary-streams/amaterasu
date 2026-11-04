@@ -41,6 +41,8 @@ pub(super) struct Entry {
     pub virtual_display_attempted: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub virtual_display: Option<VirtualDisplayRecovery>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_capture: Option<super::shared_capture::Source>,
     pub display_attempted: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_operation_id: Option<String>,
@@ -66,6 +68,30 @@ pub(super) struct LifecycleRecovery {
     session_target: amaterasu_extension_api::LifecycleTarget,
     stream_target: Option<amaterasu_extension_api::LifecycleTarget>,
     plan_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    preparation: Option<PreparationRecovery>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(super) struct PreparationRecovery {
+    pub operation_id: String,
+    pub caller: String,
+}
+
+impl PreparationRecovery {
+    pub fn lookup(
+        &self,
+        session: &amaterasu_extension_api::LifecycleTarget,
+    ) -> amaterasu_extension_api::StreamPreparationLookup {
+        amaterasu_extension_api::StreamPreparationLookup {
+            operation:
+                amaterasu_extension_api::StreamPreparationOperation::ResolveStreamPreparation,
+            session: session.clone(),
+            preparation_operation_id: self.operation_id.clone(),
+            preparation_caller: self.caller.clone(),
+        }
+    }
 }
 
 /// Only the provider's bounded cleanup identity and specification survive restart.
@@ -141,12 +167,24 @@ impl Entry {
                     stream_target: record
                         .start
                         .as_ref()
-                        .and_then(|start| start.lifecycle_target.clone()),
+                        .and_then(|start| start.lifecycle_target.clone())
+                        .or_else(|| record.restart_lifecycle_target.clone()),
                     plan_revision: record.start.as_ref().and_then(|start| {
                         start
                             .lifecycle_candidate
                             .as_ref()
                             .map(|candidate| candidate.plan_revision)
+                    }),
+                    preparation: record.restart_lifecycle_preparation.clone().or_else(|| {
+                        (record.owner == "amaterasu.rtsp"
+                            && record.config.lifecycle_capture_mode.is_external())
+                        .then(|| PreparationRecovery {
+                            operation_id: format!(
+                                "{}-lifecycle-prepare",
+                                record.config.operation_id
+                            ),
+                            caller: record.owner.clone(),
+                        })
                     }),
                 },
             ),
@@ -167,6 +205,10 @@ impl Entry {
                         .map(VirtualDisplayRecovery::from_intent)
                 })
                 .flatten(),
+            shared_capture: record
+                .shared_capture_attached
+                .then(|| record.shared_capture.clone())
+                .flatten(),
             display_attempted: record.display_attempted,
             display_operation_id: record.display_attempted.then(|| record.display_operation()),
             legacy_effect_pending: false,
@@ -183,6 +225,10 @@ impl Entry {
             && self.virtual_display.as_ref().is_none_or(|display| {
                 self.virtual_display_attempted && display.recovery_intent().validate().is_ok()
             })
+            && self
+                .shared_capture
+                .as_ref()
+                .is_none_or(|source| self.virtual_display_attempted && source.valid())
             && self.display_operation_id.as_ref().is_none_or(|operation| {
                 self.display_attempted
                     && !operation.is_empty()
@@ -221,11 +267,25 @@ impl Entry {
         if let Some(recovery) = &self.lifecycle_recovery {
             if recovery.version != 1
                 || recovery.plan_revision.is_some()
-                || recovery.stream_target.is_none()
+                || (recovery.stream_target.is_none()
+                    && recovery.preparation.as_ref().is_none_or(|preparation| {
+                        preparation.caller != "amaterasu.rtsp"
+                            || preparation.caller != self.owner
+                            || amaterasu_extension_api::validate_stream_preparation_lookup(
+                                &preparation.lookup(&recovery.session_target),
+                            )
+                            .is_err()
+                    }))
             {
                 return Err("lifecycle_reconciliation_required");
             }
             record.restart_lifecycle_target = recovery.stream_target.clone();
+            record.config.lifecycle_session_target = Some(recovery.session_target.clone());
+            record.restart_lifecycle_preparation = recovery
+                .stream_target
+                .is_none()
+                .then(|| recovery.preparation.clone())
+                .flatten();
             let mut nonce = [0u8; 16];
             getrandom::fill(&mut nonce).map_err(|_| "entropy_unavailable")?;
             record.restart_lifecycle_operation = Some(format!(
@@ -246,6 +306,8 @@ impl Entry {
         record.input_attempted = self.input_attempted;
         record.input_lookup_required = self.input_attempted;
         record.virtual_display_attempted = self.virtual_display_attempted;
+        record.shared_capture = self.shared_capture.clone();
+        record.shared_capture_attached = self.shared_capture.is_some();
         record.config.virtual_display_intent = self
             .virtual_display
             .as_ref()

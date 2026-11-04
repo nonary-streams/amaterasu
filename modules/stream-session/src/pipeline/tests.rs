@@ -5,6 +5,7 @@ mod history;
 mod input;
 mod providers;
 mod restart;
+mod shared_capture;
 mod virtual_display;
 use super::*;
 use harness::*;

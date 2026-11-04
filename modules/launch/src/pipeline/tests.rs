@@ -2901,7 +2901,7 @@ fn persisted_steam_identity_and_install_directory_reach_application_launch() {
         })
         .map(|(_, payload, _)| payload)
         .expect("launch workflow sends an application launch request");
-    assert_eq!(started["launch"]["stop_on_stream_end"], true);
+    assert_eq!(started["launch"]["stop_on_stream_end"], false);
     assert_eq!(application_launch["steam_id"], "42");
     assert_eq!(application_launch["steam_install_dir"], "/games/space game");
     let stopped = harness.request(
@@ -2910,13 +2910,13 @@ fn persisted_steam_identity_and_install_directory_reach_application_launch() {
         json!({"action":"stop","launch_id":started["launch"]["launch_id"]}),
     );
     assert_eq!(stopped["launch"]["state"], "stopped", "{stopped}");
-    assert_eq!(stopped["launch"]["stop_on_stream_end"], true);
+    assert_eq!(stopped["launch"]["stop_on_stream_end"], false);
     let status = harness.request(
         &mut pipeline,
         "alice",
         json!({"action":"status","launch_id":started["launch"]["launch_id"]}),
     );
-    assert_eq!(status["launch"]["stop_on_stream_end"], true);
+    assert_eq!(status["launch"]["stop_on_stream_end"], false);
 }
 
 #[test]

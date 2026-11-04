@@ -84,6 +84,7 @@ pub(crate) fn registrations() -> Vec<Command> {
                     &[
                         ("resource_generation", Kind::Integer),
                         ("source_video_mode", Kind::Object),
+                        ("join_context", Kind::Object),
                         ("dependency_inputs", Kind::Array),
                         ("control_results", Kind::Array),
                     ],
@@ -453,6 +454,23 @@ impl Bridge {
             || context.context.requested_video != request.requested_video
         {
             return json!({"status":"rejected","reason":"context_mismatch"});
+        }
+        if request.intent == Some(extension_api::StreamIntent::Join) {
+            let response = match request.operation {
+                ProviderOperation::ResourcePlan => {
+                    extension_api::stream_join_plan(request, crate::settings_descriptor::PROVIDER)
+                        .map(|plan| extension_api::ProviderResponse::Planned { plan })
+                }
+                ProviderOperation::LifecycleCallback => extension_api::stream_join_callback(
+                    request,
+                    crate::settings_descriptor::PROVIDER,
+                ),
+                _ => Err("unsupported join operation".into()),
+            };
+            return match response {
+                Ok(response) => serde_json::to_value(response).expect("serializable join response"),
+                Err(_) => json!({"status":"rejected","reason":"invalid_join_context"}),
+            };
         }
         let releasing = matches!(
             request.phase,

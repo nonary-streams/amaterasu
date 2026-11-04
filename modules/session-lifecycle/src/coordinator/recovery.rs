@@ -2,6 +2,116 @@
 use super::*;
 
 impl Coordinator {
+    /// Resolve an exact retained admission for a native-retired consumer. This
+    /// read-only query cannot retire resources, adopt capture or revive an epoch.
+    pub(super) fn resolve_stream_preparation(
+        &self,
+        caller: &str,
+        initiator: &str,
+        payload: Value,
+    ) -> Value {
+        use amaterasu_extension_api::{
+            StreamPreparationLookup, StreamPreparationResolution,
+            StreamPreparationResolutionStatus, validate_stream_preparation_lookup,
+        };
+        let Ok(request) = serde_json::from_value::<StreamPreparationLookup>(payload) else {
+            return rejection("invalid_preparation_lookup");
+        };
+        if caller != initiator
+            || !self.settings.consumers.capture.contains(caller)
+            || !self
+                .settings
+                .operation_grants
+                .get(caller)
+                .is_some_and(|grants| grants.contains("resolve_stream_preparation"))
+        {
+            return rejection("permission_denied");
+        }
+        if validate_stream_preparation_lookup(&request).is_err() {
+            return rejection("invalid_preparation_lookup");
+        }
+        let Ok((epoch, id, None, generation)) = operations::target_parts(&request.session) else {
+            return rejection("invalid_target");
+        };
+        let journal = &self.shared.borrow().value;
+        let Some(session) = journal.sessions.get(id) else {
+            return rejection("unknown_session");
+        };
+        if session.host_epoch != epoch
+            || session.generation != generation
+            || !session.delegates.contains(caller)
+            || !(session.delegates.contains(&request.preparation_caller)
+                || session.owner.caller == request.preparation_caller)
+        {
+            return rejection("permission_denied");
+        }
+        let mut receipts = journal.receipts.values().filter(|receipt| {
+            receipt.caller == request.preparation_caller
+                && receipt.initiator == request.preparation_caller
+                && receipt.request["operation_id"] == request.preparation_operation_id
+                && matches!(
+                    receipt.request["operation"].as_str(),
+                    Some("prepare_stream" | "resume_stream")
+                )
+                && receipt.request["target"] == json!(request.session)
+        });
+        let receipt = receipts.next();
+        if receipts.next().is_some() {
+            return rejection("preparation_identity_ambiguous");
+        }
+        let (status, target, preparation_status) = if let Some(receipt) = receipt {
+            let Ok(target) =
+                serde_json::from_value::<LifecycleTarget>(receipt.response["target"].clone())
+            else {
+                return rejection("preparation_target_unavailable");
+            };
+            let Ok((target_epoch, target_session, Some(stream_id), stream_generation)) =
+                operations::target_parts(&target)
+            else {
+                return rejection("preparation_target_unavailable");
+            };
+            if target_epoch != epoch
+                || target_session != id
+                || session
+                    .streams
+                    .get(stream_id)
+                    .is_none_or(|stream| stream.generation != stream_generation)
+            {
+                return rejection("preparation_target_unavailable");
+            }
+            (
+                StreamPreparationResolutionStatus::Succeeded,
+                Some(target),
+                receipt.response["status"].as_str().map(str::to_owned),
+            )
+        } else {
+            (
+                if epoch == journal.host_epoch {
+                    StreamPreparationResolutionStatus::Pending
+                } else {
+                    StreamPreparationResolutionStatus::Missing
+                },
+                None,
+                None,
+            )
+        };
+        let response = StreamPreparationResolution {
+            status,
+            session: request.session.clone(),
+            preparation_operation_id: request.preparation_operation_id.clone(),
+            preparation_caller: request.preparation_caller.clone(),
+            target,
+            preparation_status,
+        };
+        if amaterasu_extension_api::validate_stream_preparation_resolution(&request, &response)
+            .is_err()
+        {
+            return rejection("preparation_resolution_unverified");
+        }
+        serde_json::to_value(response)
+            .unwrap_or_else(|_| rejection("invalid_preparation_resolution"))
+    }
+
     /// A selected capture consumer reconciles its own durable stream marker only
     /// after retiring native resources. Old epochs cannot authorize new effects;
     /// this path runs the frozen providers' release graph, never their prepare.
@@ -89,6 +199,16 @@ impl Coordinator {
         work.recovery_authorized_epoch = Some(next.host_epoch.clone());
         if !resumed_existing_work {
             work.use_release_graph(stream.provider_graph.clone());
+            work.waiting_retirement = true;
+            work.join_context = stream.join_context.clone();
+            if work.join_context.is_some() {
+                work.intent = Some(StreamIntent::Join);
+            }
+        }
+        if work.join_context != stream.join_context
+            || (work.join_context.is_some() && work.intent != Some(StreamIntent::Join))
+        {
+            return Err("shared_source_recovery_context_changed".into());
         }
         work.reason = Some(ReleaseReason::Pause);
         let stream = next
@@ -335,6 +455,7 @@ mod tests {
             phase: LifecyclePhase::StreamPrepare,
             target: old_target.clone(),
             intent: Some(StreamIntent::Initial),
+            join_context: None,
             reason: None,
             video: None,
             transition_id: "transition".into(),
@@ -378,6 +499,7 @@ mod tests {
             streams: [(
                 "stream".into(),
                 StreamRecord {
+                    join_context: None,
                     provider_graph: None,
                     generation: 1,
                     phase: StreamPhase::RecoveryRequired,

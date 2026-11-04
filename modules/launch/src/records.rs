@@ -148,9 +148,9 @@ impl Record {
         response
     }
     fn stop_on_stream_end(&self) -> bool {
-        self.terminal_stop_on_stream_end.unwrap_or_else(|| {
-            matches!(&self.target, Some(crate::protocol::LaunchTarget::Executable(executable)) if executable.steam_id.is_some())
-        })
+        // A transport disconnect suspends streaming, including for Steam games.
+        // Explicit stop and application exit still retire the owned process.
+        self.terminal_stop_on_stream_end.unwrap_or(false)
     }
     pub fn retire_target(&mut self) {
         self.terminal_stop_on_stream_end = Some(self.stop_on_stream_end());

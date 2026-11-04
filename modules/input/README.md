@@ -21,6 +21,29 @@ only when an enabled acquire reaches its active-request check. No devices are
 created merely by loading the module. Windows ignores `uinput_path`. macOS and
 other platforms report unsupported native injection instead of simulated success.
 
+## Concurrent Linux streams
+
+Lifecycle-bound Linux acquisitions retain separate input controllers, native
+device sets, held keys, scroll/repeat state, scoped policy and controller feedback.
+Up to eight input contexts may be live. Completing or revoking one binding only
+retires its exact lease; it does not cancel another stream owned by the same
+broker caller. Retired contexts remain available for bounded operation lookup
+for five minutes, with at most 128 retained contexts. Unconfirmed native cleanup
+remains owned and cannot be reclaimed as an idle context.
+
+Every context uses the same trusted startup backend selection. The Linux
+companion allocates independent uinput devices per connection and checks each
+worker's exact generation/token under the original host process, package digest,
+capabilities and heartbeat authority. A failed companion acquisition never
+switches to native injection. Windows retains one live input context; its VHF
+companion remains exclusive. These source rules do not establish native
+multi-client hardware qualification.
+
+Global settings updates apply across the contexts and report outstanding cleanup
+from any context. Explicit client overrides remain scoped to their own lease.
+Unbound legacy acquisitions remain exclusive across the provider.
+The versioned Input SDK request/response contract is unchanged.
+
 ## Durable input policy
 
 The input module loads the caller-scoped product document `product/amaterasu.input`

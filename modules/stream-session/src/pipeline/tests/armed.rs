@@ -28,6 +28,65 @@ fn arm(id: u64) -> Value {
     value
 }
 
+#[test]
+fn shared_source_retirement_confirms_consumers_without_claiming_resource_release() {
+    for subscriber in [false, true] {
+        for valid in [false, true] {
+            let mut host = Harness::new();
+            host.pipeline
+                .settings
+                .allowed_principals
+                .push("amaterasu.rtsp".into());
+            host.broker.lifecycle_success = true;
+            let source = json!({"kind":"stream","host_epoch":"epoch","session_id":"session","stream_id":"source","generation":1});
+            let target = if subscriber {
+                json!({"kind":"stream","host_epoch":"epoch","session_id":"session","stream_id":"subscriber","generation":1})
+            } else {
+                source.clone()
+            };
+            let mut request = prepare();
+            request["lifecycle_capture_mode"] = json!("external");
+            request["lifecycle_session_target"] = json!({"kind":"session","host_epoch":"epoch","session_id":"session","generation":1});
+            let id = host.response_from(1, "amaterasu.rtsp", request)["session"]
+                .as_u64()
+                .unwrap();
+            let mut configuration = arm(id);
+            configuration["configuration"]["lifecycle_capture_mode"] = json!("external");
+            configuration["configuration"]["lifecycle_target"] = target.clone();
+            if subscriber {
+                configuration["configuration"]["lifecycle_shared_source"] = source.clone();
+            }
+            assert_eq!(
+                host.response_from(2, "amaterasu.rtsp", configuration)["state"],
+                "armed"
+            );
+            host.idle();
+            assert_eq!(host.pipeline.records[&id].state, State::Active);
+            let mut proof = json!({"status":"succeeded","target":target,"plan_revision":null,
+                "consumer_retired":true,"resources_released":false,"shared_retained":true,"shared_source":source});
+            if !valid {
+                proof["shared_source"]["generation"] = json!(2);
+            }
+            host.broker.lifecycle_retirement_override = Some(proof);
+            let stopped =
+                host.response_from(3, "amaterasu.rtsp", json!({"action":"stop","session":id}));
+            assert_eq!(stopped["lifecycle_retired"], false);
+            assert_eq!(stopped["lifecycle_resources_released"], false);
+            if valid {
+                assert_eq!(stopped["state"], "stopped", "{stopped}");
+                assert_eq!(stopped["lifecycle_consumer_retired"], true);
+                assert_eq!(stopped["lifecycle_shared_retained"], true);
+                assert!(host.pipeline.records[&id].resources.is_empty());
+                assert!(host.pipeline.records[&id].input_lease.is_none());
+            } else {
+                assert_eq!(stopped["state"], "cleanup_failed", "{stopped}");
+                assert_eq!(stopped["lifecycle_consumer_retired"], false);
+                assert_eq!(stopped["lifecycle_shared_retained"], false);
+            }
+        }
+    }
+}
+
 fn arm_lifecycle(host: &mut Harness) -> (u64, Value) {
     let session_target =
         json!({"kind":"session","host_epoch":"epoch","session_id":"session","generation":1});

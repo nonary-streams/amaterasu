@@ -789,3 +789,111 @@ fn alternating_resumes_and_second_session() {
 fn end_after_pause_with_real_state() {
     run_composition(true);
 }
+
+/// The consumer is unchanged across independently loaded owner/settings
+/// libraries; its shared lease must never create a second native borrow.
+#[test]
+#[ignore = "requires matching independently built Join providers and approved policy"]
+fn simultaneous_join_clients_keep_exact_source_and_release_in_both_orders() {
+    for source_first in [false, true] {
+        let mut fixture = Fixture::new();
+        let video = json!({"width":1920,"height":1080,"refresh_millihz":60000,"hdr":false});
+        let prepared = fixture.call(json!({"operation":"prepare","operation_id":"join-session",
+            "requested_video":video,"application_ref":{"kind":"desktop"}}));
+        assert_eq!(prepared["status"], "pending", "{prepared}");
+        let session = fixture.settled("join-session");
+        assert_eq!(session["status"], "succeeded", "{session}");
+        let prepare=fixture.call(json!({"operation":"prepare_stream","operation_id":"join-source",
+            "target":session["target"],"intent":"initial","requested_video":video,"consumer_requirements":["capture"]}));
+        assert_eq!(prepare["status"], "pending", "{prepare}");
+        let source = fixture.settled("join-source");
+        assert_eq!(source["status"], "succeeded", "{source}");
+        let source_target = start_capture(&mut fixture, &source, &video, "join-source");
+        let references = fixture.references.clone();
+        let borrows = fixture.borrows.clone();
+        let initial_effects = fixture
+            .native_calls
+            .iter()
+            .filter(|call| {
+                matches!(
+                    call["action"].as_str(),
+                    Some(
+                        "create" | "borrow" | "reconfigure_mode_only" | "remove" | "release_borrow"
+                    )
+                )
+            })
+            .count();
+        let join=fixture.call(json!({"operation":"prepare_stream","operation_id":"join-client",
+            "target":session["target"],"intent":"join","requested_video":{"width":1280,"height":720,"refresh_millihz":30000,"hdr":false},
+            "consumer_requirements":["capture"],"client_context":{"client_ref":"second-client","properties":{}}}));
+        assert_eq!(join["status"], "pending", "{join}");
+        let joined = fixture.settled("join-client");
+        assert_eq!(joined["status"], "succeeded", "{joined}");
+        assert_eq!(joined["shared_source"], source_target);
+        assert_eq!(joined["candidate"]["mode"], source["candidate"]["mode"]);
+        assert_eq!(
+            joined["candidate"]["resource"],
+            source["candidate"]["resource"]
+        );
+        let joined_target = start_capture(&mut fixture, &joined, &video, "join-client");
+        assert_eq!(fixture.references, references);
+        assert_eq!(fixture.borrows, borrows);
+        assert_eq!(
+            fixture
+                .native_calls
+                .iter()
+                .filter(|call| matches!(
+                    call["action"].as_str(),
+                    Some(
+                        "create" | "borrow" | "reconfigure_mode_only" | "remove" | "release_borrow"
+                    )
+                ))
+                .count(),
+            initial_effects
+        );
+        let (first, last) = if source_first {
+            (&source_target, &joined_target)
+        } else {
+            (&joined_target, &source_target)
+        };
+        for (target, operation, last_client) in [
+            (first, "join-first-retire", false),
+            (last, "join-last-retire", true),
+        ] {
+            assert_eq!(
+                fixture.call(
+                    json!({"operation":"pause_stream","operation_id":operation,"target":target})
+                )["status"],
+                "pending"
+            );
+            let retired=fixture.call_as("capture",json!({"operation":"retire_stream","operation_id":format!("{operation}-capture"),
+                "target":target,"consumer":"capture","retirement_receipt":{"response":{"status":"not_found"}}}));
+            assert!(
+                matches!(retired["status"].as_str(), Some("pending" | "succeeded")),
+                "{retired}"
+            );
+            let result = fixture.settled(operation);
+            assert_eq!(result["status"], "succeeded", "{result}");
+            assert_eq!(result["consumer_retired"], true);
+            assert_eq!(result["resources_released"], last_client);
+            if !last_client {
+                assert_eq!(fixture.references, references);
+                assert_eq!(fixture.borrows, borrows);
+            }
+        }
+        assert_eq!(
+            fixture.borrows.len(),
+            1,
+            "application retains only its original session borrow"
+        );
+        let end = fixture.call(
+            json!({"operation":"end_session","operation_id":"join-end","target":session["target"]}),
+        );
+        assert_eq!(end["status"], "pending", "{end}");
+        assert_eq!(fixture.call(json!({"operation":"application_retired","operation_id":"join-app-retired","target":session["target"]}))["status"],"succeeded");
+        let ended = fixture.settled("join-end");
+        assert_eq!(ended["status"], "succeeded", "{ended}");
+        assert!(fixture.references.is_empty());
+        assert!(fixture.borrows.is_empty());
+    }
+}

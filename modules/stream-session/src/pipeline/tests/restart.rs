@@ -12,6 +12,7 @@ fn journal_with_owned_session(record_id: u64) -> Value {
         input_attempted: false,
         virtual_display_attempted: false,
         virtual_display: None,
+        shared_capture: None,
         display_attempted: false,
         display_operation_id: None,
         legacy_effect_pending: false,

@@ -143,7 +143,9 @@ impl Controller {
         let Some(id) = self
             .records
             .values()
-            .find(|record| needs_work(record, now))
+            .find(|record| {
+                needs_work(record, now) && !self.application_cleanup_waits_for_clients(record)
+            })
             .map(|record| record.id)
         else {
             return;
@@ -317,6 +319,9 @@ impl Controller {
                     Phase::VerifyApplicationStopped => {
                         record.application_cleanup_blocked = true;
                     }
+                }
+                if job.phase == Phase::MonitorRtsp && record.lifecycle_session_target.is_some() {
+                    record.transport_only_cleanup = true;
                 }
                 record.state = State::Stopping;
                 record.stage = Stage::Cleanup;
@@ -695,7 +700,17 @@ impl Controller {
                     .expect("lifecycle revision")
                     .to_string()
             );
-            payload["lifecycle_intent"] = json!(if record.resumed { "resume" } else { "initial" });
+            payload["lifecycle_intent"] = json!(record.lifecycle_intent());
+            if record.lifecycle_capture_mode.is_external()
+                && let Some(application) = record.application_session
+            {
+                payload["shared_source_operation_id"] = json!(
+                    self.records
+                        .get(&application)
+                        .expect("joined transport retains its application anchor")
+                        .rtsp_operation
+                );
+            }
             payload["lifecycle_client_context"] = json!(record.peer.client_id.as_ref().map(|id| json!({"client_ref":id,"properties":record.peer.client_properties,
                 "display_mode":record.peer.client_display_mode.map(|mode| json!({"width":mode.width,"height":mode.height,"refresh_millihz":mode.refresh_millihz}))})));
         }
@@ -783,8 +798,14 @@ impl Controller {
                 if let Some(candidate) =
                     candidate.filter(|candidate| !candidate.legacy_display_conflict())
                 {
-                    candidate.apply(&mut record);
-                    record.stage = Stage::ReserveHistory;
+                    if candidate.stream_key() == record.request.remote_input_key
+                        || self.retire_stream_key(record.request.remote_input_key)
+                    {
+                        candidate.apply(&mut record);
+                        record.stage = Stage::ReserveHistory;
+                    } else {
+                        reject_resume(&mut record, replies);
+                    }
                 } else {
                     reject_resume(&mut record, replies);
                 }
@@ -793,6 +814,22 @@ impl Controller {
             self.finish_or_retain(job.record, now, replies);
             return;
         }
+        if job.phase == Phase::MonitorApplication
+            && application_response(&self.records[&job.record], &payload)
+                .is_ok_and(|(_, state, healthy)| state != "active" || !healthy)
+        {
+            self.end_application_group(job.record, now);
+            return;
+        }
+        let application = self.records[&job.record].application_root();
+        let other_live_stream = self.records.values().any(|record| {
+            record.id != job.record
+                && record.application_root() == application
+                && matches!(
+                    record.state,
+                    State::Starting | State::AwaitingDelivery | State::Ready
+                )
+        });
         let record = self.records.get_mut(&job.record).expect("workflow record");
         if record.resume_abandoned && record.state != State::Stopping {
             reject_resume(record, replies);
@@ -909,17 +946,33 @@ impl Controller {
                 }
             }
             Phase::VerifyPaused | Phase::VerifyResumeSession => {
-                if lifecycle_session_is_paused(record, &payload) {
+                let available = if record.application_session.is_some() || other_live_stream {
+                    lifecycle_session_is_available(record, &payload)
+                } else {
+                    lifecycle_session_is_paused(record, &payload)
+                };
+                if available {
                     if job.phase == Phase::VerifyPaused {
                         record.state = State::Paused;
                         record.stage = Stage::Live;
+                        record.transport_only_cleanup = false;
                     } else if record.desktop {
                         record.stage = Stage::RefreshResumePolicy;
                     } else {
                         record.stage = Stage::VerifyResumeApplication;
                     }
                 } else {
-                    record.request_cleanup(Some("lifecycle_pause_unconfirmed"), now);
+                    if job.phase == Phase::VerifyResumeSession {
+                        self.pending_resume = None;
+                        reject_resume(record, replies);
+                    } else if now < record.deadline
+                        && lifecycle_session_is_available(record, &payload)
+                    {
+                        record.next_monitor = now + CLEANUP_POLL_INTERVAL;
+                    } else {
+                        record.fail_cleanup("lifecycle_pause_unconfirmed");
+                        reply_failure(record, replies);
+                    }
                 }
             }
             Phase::VerifyResumeApplication => {
@@ -1240,7 +1293,7 @@ impl Controller {
                 Ok((_, _, "closed" | "failed", true))
                     if record.lifecycle_required
                         && !record.stop_on_stream_end
-                        && payload["lifecycle_retired"] == true =>
+                        && rtsp_stream_consumers_retired(record, &payload) =>
                 {
                     if payload["state"] == "failed" {
                         log_monitor_problem(logger.as_ref(), job.phase, "stream_failed");
@@ -1251,20 +1304,33 @@ impl Controller {
                     record.rtsp_requested = false;
                     record.rtsp_ticket = None;
                     record.rtsp_url = None;
-                    record.stage = if record.history_release_required {
-                        Stage::ReleasePausedHistory
+                    record.transport_only_cleanup = true;
+                    if record.application_session.is_some() {
+                        record.request_transport_cleanup(None, now);
                     } else {
-                        Stage::VerifyPaused
-                    };
+                        record.stage = if record.history_release_required {
+                            Stage::ReleasePausedHistory
+                        } else {
+                            Stage::VerifyPaused
+                        };
+                    }
                     record.deadline = now + INITIAL_DEADLINE;
                 }
                 Ok(_) => {
                     log_monitor_problem(logger.as_ref(), job.phase, "unhealthy");
-                    record.request_cleanup(Some("stream_ended"), now)
+                    if record.lifecycle_session_target.is_some() {
+                        record.request_transport_cleanup(Some("stream_ended"), now);
+                    } else {
+                        record.request_cleanup(Some("stream_ended"), now);
+                    }
                 }
                 Err(code) => {
                     log_monitor_problem(logger.as_ref(), job.phase, "invalid_response");
-                    fail_record(record, code, now)
+                    if record.lifecycle_session_target.is_some() {
+                        record.request_transport_cleanup(Some(code), now);
+                    } else {
+                        fail_record(record, code, now);
+                    }
                 }
             },
             Phase::StopRtsp | Phase::VerifyRtspStopped => {
@@ -1437,6 +1503,9 @@ impl Controller {
                 record.application_cleanup_blocked = true;
                 record.stage = Stage::Cleanup;
             }
+            Phase::MonitorRtsp if record.lifecycle_session_target.is_some() => {
+                record.request_transport_cleanup(Some("lifecycle_status_unavailable"), now);
+            }
             Phase::MonitorApplication | Phase::MonitorRtsp => {
                 fail_record(record, "lifecycle_status_unavailable", now)
             }
@@ -1566,6 +1635,9 @@ impl Controller {
                 record.rtsp_cleanup_blocked = false;
                 record.rtsp_reconcile = Some(job.phase);
             }
+            Phase::MonitorRtsp if record.lifecycle_session_target.is_some() => {
+                record.request_transport_cleanup(Some("lifecycle_status_unavailable"), now);
+            }
             Phase::MonitorApplication | Phase::MonitorRtsp => {
                 record.request_cleanup(Some("lifecycle_status_unavailable"), now);
             }
@@ -1587,7 +1659,10 @@ impl Controller {
     ) {
         let record = self.records.get_mut(&record_id).expect("workflow record");
         if record.state == State::Stopping {
-            if record.lifecycle_session_target.is_some() && !record.lifecycle_end_complete {
+            if record.lifecycle_session_target.is_some()
+                && record.owns_application_cleanup()
+                && !record.lifecycle_end_complete
+            {
                 if record.rtsp_requested && record.rtsp_cleanup_blocked {
                     record.fail_cleanup("rtsp_cleanup_unconfirmed");
                     reply_failure(record, replies);
@@ -1600,11 +1675,14 @@ impl Controller {
                 }
                 return;
             }
-            if now >= record.deadline && (record.rtsp_requested || record.application_requested) {
+            if now >= record.deadline
+                && (record.rtsp_requested
+                    || (record.application_requested && record.owns_application_cleanup()))
+            {
                 record.fail_cleanup("cleanup_deadline_exceeded");
                 reply_failure(record, replies);
             } else if !record.rtsp_requested
-                && !record.application_requested
+                && (!record.application_requested || !record.owns_application_cleanup())
                 && record.uncertain.is_empty()
                 && record.rtsp_reconcile.is_none()
                 && record.application_reconcile.is_none()
@@ -1618,6 +1696,14 @@ impl Controller {
                     record.stage = Stage::ReleaseHistory;
                     return;
                 }
+                if record.application_session.is_none() && record.transport_only_cleanup {
+                    record.transport_only_cleanup = false;
+                    record.state = State::Ready;
+                    record.stage = Stage::VerifyPaused;
+                    record.deadline = now + INITIAL_DEADLINE;
+                    record.next_monitor = now;
+                    return;
+                }
                 record.finish_cleanup();
                 if let Some(connection) = record.cancel_connection {
                     replies.push((connection, super::cancel_reply()));
@@ -1626,7 +1712,9 @@ impl Controller {
                 reply_failure(record, replies);
             } else if !record.retrying_uncertainty
                 && (!record.rtsp_requested || record.rtsp_cleanup_blocked)
-                && (!record.application_requested || record.application_cleanup_blocked)
+                && (!record.application_requested
+                    || !record.owns_application_cleanup()
+                    || record.application_cleanup_blocked)
             {
                 record.state = State::CleanupFailed;
                 reply_failure(record, replies);
@@ -1636,6 +1724,14 @@ impl Controller {
 }
 
 pub(super) fn lifecycle_session_is_paused(record: &Record, payload: &Value) -> bool {
+    lifecycle_session_has_phase(record, payload, &["paused"])
+}
+
+fn lifecycle_session_is_available(record: &Record, payload: &Value) -> bool {
+    lifecycle_session_has_phase(record, payload, &["paused", "ready"])
+}
+
+fn lifecycle_session_has_phase(record: &Record, payload: &Value, phases: &[&str]) -> bool {
     use amaterasu_module_sdk::extension_api::LifecycleTarget;
     let Some(LifecycleTarget::Session {
         host_epoch,
@@ -1656,7 +1752,9 @@ pub(super) fn lifecycle_session_is_paused(record: &Record, payload: &Value) -> b
         .filter(|session| {
             session["session_id"] == *session_id
                 && session["generation"] == *generation
-                && session["phase"] == "paused"
+                && session["phase"]
+                    .as_str()
+                    .is_some_and(|phase| phases.contains(&phase))
         })
         .count()
         == 1
@@ -1744,6 +1842,9 @@ fn negotiation_mode_limit(config: &StreamingConfig, offer: &CodecOffer) -> (u32,
 
 fn needs_work(record: &Record, now: Instant) -> bool {
     if record.state == State::CleanupFailed {
+        return false;
+    }
+    if record.stage == Stage::VerifyPaused && now < record.next_monitor {
         return false;
     }
     if record.retrying_uncertainty {
@@ -1842,7 +1943,10 @@ pub(super) fn next_phase(record: &Record) -> Phase {
             Phase::BindApplication
         };
     }
-    if record.stage == Stage::Cleanup && record.lifecycle_session_target.is_some() {
+    if record.stage == Stage::Cleanup
+        && record.lifecycle_session_target.is_some()
+        && record.owns_application_cleanup()
+    {
         if !record.lifecycle_end_fenced {
             return Phase::EndLifecycle;
         }
@@ -1890,20 +1994,23 @@ pub(super) fn next_phase(record: &Record) -> Phase {
             Phase::StopRtsp
         }
         Stage::Cleanup
-            if record.application_requested
+            if record.owns_application_cleanup()
+                && record.application_requested
                 && !record.application_cleanup_blocked
                 && record.application_launch.is_none() =>
         {
             Phase::LookupApplication
         }
         Stage::Cleanup
-            if !record.application_cleanup_blocked && record.application_launch.is_some() =>
+            if record.owns_application_cleanup()
+                && !record.application_cleanup_blocked
+                && record.application_launch.is_some() =>
         {
             Phase::StopApplication
         }
         Stage::Cleanup
             if !record.rtsp_requested
-                && !record.application_requested
+                && (!record.application_requested || !record.owns_application_cleanup())
                 && record.uncertain.is_empty()
                 && record.history_release_required =>
         {
@@ -2639,6 +2746,14 @@ pub(super) fn reject_resume(record: &mut Record, replies: &mut Vec<(u64, Reply)>
             connection,
             private_error(409, "resume settings are unavailable"),
         ));
+    }
+    if record.application_session.is_some() {
+        record.state = State::Stopping;
+        record.stage = Stage::Cleanup;
+        record.transport_only_cleanup = true;
+        record.application_launch = None;
+        record.failure = Some("join_rejected");
+        return;
     }
     record.state = if record.history_release_required {
         State::Starting
@@ -3924,8 +4039,7 @@ fn rtsp_response<'a>(
                             .global_display_revision
                             .map(|revision| revision.to_string())
                     )
-                || payload["lifecycle_intent"]
-                    != json!(if record.resumed { "resume" } else { "initial" })
+                || payload["lifecycle_intent"] != json!(record.lifecycle_intent())
                 || serde_json::from_value::<amaterasu_module_sdk::extension_api::CaptureBindingMode>(
                     payload.get("lifecycle_capture_mode").cloned().unwrap_or(json!("managed"))
                 ).ok() != Some(record.lifecycle_capture_mode)))
@@ -3997,8 +4111,58 @@ fn clean_rtsp_terminal(record: &Record, payload: &Value) -> bool {
         && payload["cleanup_error"].is_null()
         && (!record.lifecycle_required
             || payload["lifecycle_cleanup_state"] == "not_admitted"
-            || (payload["lifecycle_cleanup_state"] == "retired"
-                && payload["lifecycle_retired"] == true))
+            || ((payload["lifecycle_cleanup_state"] == "retired"
+                || payload["lifecycle_cleanup_state"] == "shared_retained")
+                && rtsp_stream_consumers_retired(record, payload)))
+}
+
+fn rtsp_stream_consumers_retired(record: &Record, payload: &Value) -> bool {
+    if payload["lifecycle_retired"] == true {
+        return payload.get("lifecycle_cleanup_state").is_none()
+            || payload["lifecycle_cleanup_state"] == "retired";
+    }
+    use amaterasu_module_sdk::extension_api::{
+        LifecycleTarget, StreamRetirementProof, validate_stream_retirement_proof,
+    };
+    if payload["lifecycle_cleanup_state"] != "shared_retained"
+        || payload["lifecycle_resources_released"] != false
+        || payload["lifecycle_consumer_retired"] != true
+        || payload["lifecycle_shared_retained"] != true
+    {
+        return false;
+    }
+    let Ok(target @ LifecycleTarget::Stream { .. }) =
+        serde_json::from_value::<LifecycleTarget>(payload["lifecycle_target"].clone())
+    else {
+        return false;
+    };
+    let Some(LifecycleTarget::Session {
+        host_epoch,
+        session_id,
+        ..
+    }) = &record.lifecycle_session_target
+    else {
+        return false;
+    };
+    if !matches!(&target, LifecycleTarget::Stream {host_epoch: epoch, session_id: session, ..} if host_epoch == epoch && session_id == session)
+    {
+        return false;
+    }
+    let Ok(source) =
+        serde_json::from_value::<LifecycleTarget>(payload["lifecycle_shared_source"].clone())
+    else {
+        return false;
+    };
+    let proof = StreamRetirementProof {
+        target: target.clone(),
+        consumer_retired: true,
+        resources_released: false,
+        shared_retained: true,
+        shared_source: Some(source.clone()),
+    };
+    // RTSP attests this exact encrypted ticket's coordinator-frozen source.
+    let expected_source = record.application_session.is_some().then_some(&source);
+    validate_stream_retirement_proof(&proof, &target, expected_source).is_ok()
 }
 
 fn clean_application_terminal(record: &Record, payload: &Value) -> bool {

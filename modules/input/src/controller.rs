@@ -768,6 +768,10 @@ impl<B: Backend> Controller<B> {
         Ok(())
     }
 
+    pub(crate) fn has_live_state(&self) -> bool {
+        self.lease.is_some() || self.cleanup_required()
+    }
+
     pub fn cleanup_required(&self) -> bool {
         self.startup_cleanup_pending
             || self.controller_cleanup_pending

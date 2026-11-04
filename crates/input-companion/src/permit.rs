@@ -2,6 +2,7 @@
 //! Native code inside that worker remains trusted user code; this protects the
 //! privileged companion from other processes and stale component sets.
 use crate::{GrantRegistry, InputError, InputGrant, InputResult, PeerIdentity};
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 const HOST_HEARTBEAT: Duration = Duration::from_secs(2);
@@ -66,14 +67,19 @@ pub struct PermitLedger {
     registry: GrantRegistry,
     authorized: Option<HostPermit>,
     active: Option<ProcessIdentity>,
+    independent_devices: bool,
+    active_leases: BTreeMap<u64, (ProcessIdentity, String)>,
 }
 
 impl PermitLedger {
     pub fn new(registry: GrantRegistry) -> Self {
+        let independent_devices = registry.permits_independent_devices();
         Self {
             registry,
             authorized: None,
             active: None,
+            independent_devices,
+            active_leases: BTreeMap::new(),
         }
     }
 
@@ -128,7 +134,7 @@ impl PermitLedger {
     }
 
     pub fn claim(&mut self, process: &ProcessIdentity, now: Instant) -> InputResult<WorkerLease> {
-        if self.active.is_some() {
+        if self.active.is_some() || self.active_leases.len() >= 8 {
             return Err(InputError::ResourceExhausted);
         }
         let permit = self
@@ -152,13 +158,44 @@ impl PermitLedger {
             permit.mouse,
             permit.gamepad,
         )?;
-        self.active = Some(process.clone());
+        self.active_leases
+            .insert(generation, (process.clone(), token.clone()));
+        if !self.independent_devices {
+            self.active = Some(process.clone());
+        }
         Ok(WorkerLease {
             generation,
             token,
             peer,
             grant,
         })
+    }
+
+    /// Select one connection even when several connections share an OS process.
+    pub fn is_current_lease(
+        &self,
+        process: &ProcessIdentity,
+        generation: u64,
+        token: &str,
+        now: Instant,
+    ) -> bool {
+        self.active_leases
+            .get(&generation)
+            .is_some_and(|(owner, expected)| owner == process && expected == token)
+            && self.may_open(process, now)
+    }
+
+    pub fn release_lease(&mut self, process: &ProcessIdentity, generation: u64, token: &str) {
+        if self
+            .active_leases
+            .get(&generation)
+            .is_some_and(|(owner, expected)| owner == process && expected == token)
+        {
+            self.active_leases.remove(&generation);
+            if !self.independent_devices && self.active.as_ref() == Some(process) {
+                self.active = None;
+            }
+        }
     }
 
     pub fn is_current(&self, process: &ProcessIdentity, now: Instant) -> bool {
@@ -179,6 +216,7 @@ impl PermitLedger {
         if self.active.as_ref() == Some(process) {
             self.active = None;
         }
+        self.active_leases.retain(|_, (owner, _)| owner != process);
     }
 
     /// Immediately invalidates a host permit and its active worker lease.
@@ -193,6 +231,7 @@ impl PermitLedger {
         if self.active.as_ref() == Some(process) {
             self.active = None;
         }
+        self.active_leases.retain(|_, (owner, _)| owner != process);
     }
 
     /// Revokes by the OS process identity captured when it was authorized.
@@ -206,6 +245,12 @@ impl PermitLedger {
             .map(|permit| &permit.process)
             .filter(|process| matches(process))
             .or_else(|| self.active.as_ref().filter(|process| matches(process)))
+            .or_else(|| {
+                self.active_leases
+                    .values()
+                    .map(|(process, _)| process)
+                    .find(|process| matches(process))
+            })
             .cloned();
         if let Some(process) = process {
             self.revoke(&process);
@@ -219,6 +264,40 @@ mod tests {
 
     fn process(id: u32) -> ProcessIdentity {
         ProcessIdentity::new("S-1-5-21-test".into(), 3, id, 12345 + u64::from(id)).unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn independent_connections_from_one_process_close_by_exact_lease() {
+        let now = Instant::now();
+        let process = process(11);
+        let mut ledger = PermitLedger::new(GrantRegistry::independent_devices());
+        ledger
+            .refresh_from_host_with_gamepad(process.clone(), "a".repeat(64), true, true, true, now)
+            .unwrap();
+        let first = ledger.claim(&process, now).unwrap();
+        let second = ledger.claim(&process, now).unwrap();
+        assert!(ledger.is_current_lease(&process, first.generation, &first.token, now));
+        assert!(ledger.is_current_lease(&process, second.generation, &second.token, now));
+        ledger.release_lease(&process, first.generation, &second.token);
+        assert!(ledger.is_current_lease(&process, first.generation, &first.token, now));
+        ledger.release_lease(&process, first.generation, &first.token);
+        assert!(!ledger.is_current_lease(&process, first.generation, &first.token, now));
+        assert!(ledger.is_current_lease(&process, second.generation, &second.token, now));
+        ledger.release_lease(&process, first.generation, &first.token);
+        assert!(ledger.is_current_lease(&process, second.generation, &second.token, now));
+        assert!(!ledger.is_current_lease(
+            &process,
+            second.generation,
+            &second.token,
+            now + HOST_HEARTBEAT
+        ));
+        ledger
+            .refresh_from_host_with_gamepad(process.clone(), "a".repeat(64), true, true, true, now)
+            .unwrap();
+        ledger.revoke(&process);
+        assert!(!ledger.is_current_lease(&process, second.generation, &second.token, now));
+        assert!(ledger.claim(&process, now).is_err());
     }
 
     #[test]

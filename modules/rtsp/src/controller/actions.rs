@@ -231,6 +231,7 @@ impl Controller {
         };
         let url = format!("rtspenc://{local}/launch-{ticket:016x}");
         let expires = deadline;
+        let media_binds = self.media_binds_for_open(local.ip());
         let mut record = Record {
             id: ticket,
             owner: caller,
@@ -248,6 +249,7 @@ impl Controller {
             session_token,
             udp_discovery,
             local,
+            media_binds,
             expires,
             next_status: expires,
             failure: None,
@@ -260,6 +262,8 @@ impl Controller {
             stream_state: None,
             lifecycle_target: None,
             lifecycle_candidate: None,
+            lifecycle_source_target: None,
+            lifecycle_retained_source: None,
             lifecycle_prepare_outstanding: false,
             lifecycle_input_required: None,
             authenticated_disconnect_reason: None,
@@ -270,7 +274,6 @@ impl Controller {
             revoke_after: None,
             cleanup_confirmed: false,
         };
-        let media_binds = self.media_binds_for_open(local.ip());
         let mut payload = record.config.prepare_with_media_binds(
             &record.operation(),
             record.udp_discovery.as_ref(),

@@ -189,6 +189,36 @@ pub(super) fn fence_exact_receipts(
     Ok(())
 }
 
+/// No-native Join history can retire once its exact terminal callback evidence
+/// and all consumer receipts have been verified. Keep an irreversible scope
+/// fence in the same bounded book as operation replay fences.
+pub(super) fn fence_join_scope(
+    journal: &mut Journal,
+    target: &LifecycleTarget,
+) -> ModuleResult<()> {
+    let (_, _, Some(_), _) = operations::target_parts(target)? else {
+        return Err("stream_target_required".into());
+    };
+    let scope = format!(
+        "\0join:{}",
+        serde_json::to_string(target).map_err(|_| "invalid_target")?
+    );
+    let fence = digest(&scope);
+    if !journal.retention.tombstones.contains(&fence) && at_capacity(journal) {
+        return Err("retention_capacity_exhausted".into());
+    }
+    journal.retention.tombstones.insert(fence);
+    Ok(())
+}
+pub(super) fn join_scope_fenced(journal: &Journal, target: &LifecycleTarget) -> bool {
+    serde_json::to_string(target).is_ok_and(|target| {
+        journal
+            .retention
+            .tombstones
+            .contains(&digest(&format!("\0join:{target}")))
+    })
+}
+
 pub(super) fn at_capacity(journal: &Journal) -> bool {
     journal.retention.tombstones.len() >= MAX_TOMBSTONES
 }
@@ -496,6 +526,10 @@ pub(super) fn compact(journal: &mut Journal) {
             .filter(|key| !known.contains(*key))
             .cloned(),
     );
+    // Closed stream removal also releases its historical shared-source
+    // callbacks. Remove those records before estimating receipt pressure, so
+    // just-completed final retirement proofs survive their first readback.
+    super::join::compact(journal);
     let mut remaining = journal.retention.order.len().saturating_sub(KEEP_RECEIPTS);
     let mut estimated_bytes = serde_json::to_vec(journal).map_or(usize::MAX, |bytes| bytes.len());
     let mut kept = VecDeque::new();

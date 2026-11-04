@@ -87,6 +87,17 @@ pub struct AbsoluteViewport {
     top: u16,
     right: u16,
     bottom: u16,
+    client_content: Option<ClientContent>,
+}
+
+// Keep the public viewport's exact equality and copy behavior while accepting
+// finite normalized content bounds. Values are canonicalized by the builder.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ClientContent {
+    left: u64,
+    top: u64,
+    right: u64,
+    bottom: u64,
 }
 
 impl AbsoluteViewport {
@@ -99,7 +110,40 @@ impl AbsoluteViewport {
             top,
             right,
             bottom,
+            client_content: None,
         })
+    }
+
+    /// Remove encoder letterboxing before mapping to the authoritative host
+    /// rectangle. Bounds identify the first and last content pixel centers as
+    /// fractions of the client's first-to-last pixel span, in `0..=1`.
+    /// This supplies no host geometry or input authority of its own.
+    pub fn with_client_content(
+        mut self,
+        left: f64,
+        top: f64,
+        right: f64,
+        bottom: f64,
+    ) -> Result<Self, TranslationError> {
+        if ![left, top, right, bottom]
+            .into_iter()
+            .all(|bound| bound.is_finite() && (0.0..=1.0).contains(&bound))
+            || left >= right
+            || top >= bottom
+        {
+            return Err(TranslationError::InvalidPointer);
+        }
+        self.client_content = if left == 0.0 && top == 0.0 && right == 1.0 && bottom == 1.0 {
+            None
+        } else {
+            Some(ClientContent {
+                left: left.max(0.0).to_bits(),
+                top: top.max(0.0).to_bits(),
+                right: right.to_bits(),
+                bottom: bottom.to_bits(),
+            })
+        };
+        Ok(self)
     }
 }
 
@@ -309,10 +353,31 @@ impl InputTranslator {
         {
             return Err(TranslationError::InvalidPointer);
         }
-        Ok(InputEvent::Absolute {
-            x: scale_coordinate(x, reference_width, viewport.left, viewport.right),
-            y: scale_coordinate(y, reference_height, viewport.top, viewport.bottom),
-        })
+        let (x, y) = match viewport.client_content {
+            Some(content) => (
+                scale_content_coordinate(
+                    x,
+                    reference_width,
+                    viewport.left,
+                    viewport.right,
+                    content.left,
+                    content.right,
+                ),
+                scale_content_coordinate(
+                    y,
+                    reference_height,
+                    viewport.top,
+                    viewport.bottom,
+                    content.top,
+                    content.bottom,
+                ),
+            ),
+            None => (
+                scale_coordinate(x, reference_width, viewport.left, viewport.right),
+                scale_coordinate(y, reference_height, viewport.top, viewport.bottom),
+            ),
+        };
+        Ok(InputEvent::Absolute { x, y })
     }
 
     fn scroll(&mut self, axis: ScrollAxis, amount: i16) -> Vec<InputEvent> {
@@ -334,6 +399,21 @@ fn scale_coordinate(value: u16, reference_size: u32, start: u16, end: u16) -> u1
     let span = u64::from(end - start);
     let scaled = (u64::from(value) * span + denominator / 2) / denominator;
     start + scaled as u16
+}
+
+fn scale_content_coordinate(
+    value: u16,
+    reference_size: u32,
+    start: u16,
+    end: u16,
+    first: u64,
+    last: u64,
+) -> u16 {
+    let first = f64::from_bits(first);
+    let last = f64::from_bits(last);
+    let client_position = f64::from(value) / f64::from(reference_size - 1);
+    let content_position = ((client_position - first) / (last - first)).clamp(0.0, 1.0);
+    (f64::from(start) + content_position * f64::from(end - start)).round() as u16
 }
 
 fn is_modifier(key: u8) -> bool {
@@ -695,6 +775,97 @@ mod tests {
             }),
             Err(TranslationError::InvalidPointer)
         );
+    }
+
+    #[test]
+    fn absolute_content_mapping_removes_letterboxes_and_clamps_exact_odd_edges() {
+        for (width, height, left, top, content_width, content_height) in [
+            (1920_u32, 1200_u32, 0_u32, 60_u32, 1920_u32, 1080_u32),
+            (1920, 1080, 656, 0, 607, 1080),
+            (1080, 1920, 0, 656, 1080, 607),
+        ] {
+            let viewport = AbsoluteViewport::new(1000, 2000, 5000, 6000)
+                .unwrap()
+                .with_client_content(
+                    f64::from(left) / f64::from(width - 1),
+                    f64::from(top) / f64::from(height - 1),
+                    f64::from(left + content_width - 1) / f64::from(width - 1),
+                    f64::from(top + content_height - 1) / f64::from(height - 1),
+                )
+                .unwrap();
+            let mut translator = InputTranslator::new(Some(viewport));
+            for (x, y, expected_x, expected_y) in [
+                (left, top, 1000, 2000),
+                (
+                    left + content_width - 1,
+                    top + content_height - 1,
+                    5000,
+                    6000,
+                ),
+                (0, 0, 1000, 2000),
+                (width - 1, height - 1, 5000, 6000),
+            ] {
+                assert_eq!(
+                    translator
+                        .translate(Input::AbsoluteMouse {
+                            x: x as u16,
+                            y: y as u16,
+                            reference_width: width,
+                            reference_height: height
+                        })
+                        .unwrap()
+                        .events(),
+                    &[InputEvent::Absolute {
+                        x: expected_x,
+                        y: expected_y
+                    }]
+                );
+            }
+            assert_eq!(
+                translator.translate(Input::AbsoluteMouse {
+                    x: width as u16,
+                    y: 0,
+                    reference_width: width,
+                    reference_height: height
+                }),
+                Err(TranslationError::InvalidPointer)
+            );
+        }
+    }
+
+    #[test]
+    fn absolute_content_builder_preserves_full_image_mapping_and_rejects_ambiguous_bounds() {
+        let full = AbsoluteViewport::new(0, 0, u16::MAX, u16::MAX).unwrap();
+        assert_eq!(full.with_client_content(0.0, 0.0, 1.0, 1.0).unwrap(), full);
+        for bounds in [
+            (f64::NAN, 0.0, 1.0, 1.0),
+            (0.0, 0.0, f64::INFINITY, 1.0),
+            (-0.1, 0.0, 1.0, 1.0),
+            (0.0, 0.0, 1.1, 1.0),
+            (0.5, 0.0, 0.5, 1.0),
+            (0.6, 0.0, 0.5, 1.0),
+        ] {
+            assert_eq!(
+                full.with_client_content(bounds.0, bounds.1, bounds.2, bounds.3),
+                Err(TranslationError::InvalidPointer)
+            );
+        }
+        // Full-image behavior remains the original exact rational calculation,
+        // including half-pixel ties and every supported reference extent.
+        let mut original = InputTranslator::new(Some(full));
+        let mut explicit =
+            InputTranslator::new(Some(full.with_client_content(0.0, 0.0, 1.0, 1.0).unwrap()));
+        for reference_width in [2, 3, 7, 1920, 65536] {
+            for x in [0, 1, (reference_width - 1) / 2, reference_width - 1] {
+                let input = || Input::AbsoluteMouse {
+                    x: x as u16,
+                    y: 1,
+                    reference_width,
+                    reference_height: 3,
+                };
+                assert_eq!(original.translate(input()), explicit.translate(input()));
+            }
+        }
     }
 
     #[test]

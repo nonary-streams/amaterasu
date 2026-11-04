@@ -112,7 +112,9 @@ def provider_entries(selected: list[dict], enable_action: bool = False) -> dict:
                        "callback_method": method_ref(provider, "lifecycle_callback"),
                        "status_method": method_ref(provider, "lifecycle_status"),
                        "settings_revision": "bootstrap-v1", "settings": defaults,
-                       "capabilities": [], "cleanup_methods": [method_ref(provider, "lifecycle_callback")]}
+                       "capabilities": [capability for capability in descriptor.get("capabilities", [])
+                                        if capability == "amaterasu.stream/join"],
+                       "cleanup_methods": [method_ref(provider, "lifecycle_callback")]}
         if provider == check.OWNER:
             participant["binding_validate_method"] = method_ref(provider, "binding_validate")
         participants.append(participant)

@@ -1362,6 +1362,7 @@ struct Broker {
     rtsp_nvenc_settings: Value,
     rtsp_nvenc_spatial_aq: Value,
     rtsp_display_request: Option<Value>,
+    rtsp_lifecycle_fields: BTreeMap<String, Value>,
     wrong_rtsp_display_policy_snapshot: bool,
     reject_rtsp_display_apply: bool,
     missing_rtsp_display_readback: bool,
@@ -1449,6 +1450,7 @@ impl Default for Broker {
             rtsp_nvenc_settings: Value::Null,
             rtsp_nvenc_spatial_aq: Value::Null,
             rtsp_display_request: None,
+            rtsp_lifecycle_fields: BTreeMap::new(),
             wrong_rtsp_display_policy_snapshot: false,
             reject_rtsp_display_apply: false,
             missing_rtsp_display_readback: false,
@@ -1683,6 +1685,8 @@ impl Broker {
             self.rtsp_nvenc_settings = payload["nvenc_settings"].clone();
             self.rtsp_nvenc_spatial_aq = payload["nvenc_spatial_aq"].clone();
             self.rtsp_display_policy_snapshot = payload.get("display_policy_snapshot").cloned();
+            self.rtsp_lifecycle_fields = ["lifecycle_session_target", "lifecycle_settings_revision", "lifecycle_intent", "lifecycle_capture_mode"]
+                .into_iter().filter_map(|field| payload.get(field).map(|value| (field.to_owned(), value.clone()))).collect();
             self.rtsp_display_request = payload.get("display_request").cloned();
         }
         if service == "amaterasu.rtsp/1"
@@ -1894,7 +1898,7 @@ impl Broker {
         self.wrong_rtsp_display_policy_snapshot = false;
         let missing_rtsp_display_readback = self.missing_rtsp_display_readback;
         self.missing_rtsp_display_readback = false;
-        json!({
+        let mut response = json!({
             "ok": true,
             "ticket": 71,
             "state": state,
@@ -1921,7 +1925,9 @@ impl Broker {
             } else {
                 Value::Null
             },
-        })
+        });
+        response.as_object_mut().unwrap().extend(self.rtsp_lifecycle_fields.clone());
+        response
     }
 
     fn actions(&self) -> Vec<(&str, &str)> {

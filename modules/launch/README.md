@@ -8,10 +8,11 @@ it does not imply capture, encoding, media transport, input delivery, or streami
 readiness. An optional [independent-library handoff](#optional-independent-library-handoff)
 also supports libraries that own their data outside Catalog.
 
-Steam executable launches advertise `stop_on_stream_end: true` in preflight and
-launch status. NVHTTP freezes that policy before launch and stops the owned game
-on an authenticated stream disconnect. Other applications retain their existing
-pause/resume policy. Provider readback must preserve the frozen lifetime policy.
+Executable launches, including Steam games, advertise `stop_on_stream_end: false`
+in preflight and launch status. Disconnecting a transport retains the application
+for another client or a later resume. Explicit Quit App and actual application
+exit still retire the owned process and its session. Provider readback preserves
+the frozen lifetime policy through terminal cleanup.
 
 Requests are strict JSON:
 

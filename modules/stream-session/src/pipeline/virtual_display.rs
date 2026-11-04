@@ -563,6 +563,9 @@ mod owned {
             .is_some_and(|start| start.output == REQUESTED_OUTPUT)
     }
     pub(in super::super) fn identity(record: &Record) -> String {
+        if let Some(source) = &record.shared_capture {
+            return source.identity.clone();
+        }
         let mut bytes = Sha256::digest(format!("amaterasu-stream-display-{:016x}", record.id));
         bytes[6] = (bytes[6] & 0x0f) | 0x40;
         bytes[8] = (bytes[8] & 0x3f) | 0x80;
@@ -580,6 +583,9 @@ mod owned {
         )
     }
     pub(in super::super) fn owned_create(record: &Record) -> Value {
+        if let Some(source) = &record.shared_capture {
+            return source.create();
+        }
         let configuration = &record
             .start
             .as_ref()
@@ -590,9 +596,15 @@ mod owned {
         "hdr_enabled":configuration.video_stream_format.dynamic_range == amaterasu_module_sdk::DynamicRange::Hdr})
     }
     pub(in super::super) fn owned_status(record: &Record) -> Value {
+        if let Some(source) = &record.shared_capture {
+            return source.status();
+        }
         json!({"action":"status","identity":identity(record)})
     }
     pub(in super::super) fn owned_remove(record: &Record) -> Value {
+        if let Some(source) = &record.shared_capture {
+            return source.remove();
+        }
         json!({"action":"remove","identity":identity(record)})
     }
     pub(in super::super) fn accept_ready(
@@ -624,12 +636,35 @@ mod owned {
                     .as_ref()
                     .ok_or("virtual_display_start_missing")?
                     .configuration;
-                if monitor["specification"]["width"] != configuration.width
-                    || monitor["specification"]["height"] != configuration.height
-                    || monitor["specification"]["refresh_millihz"] != configuration.fps * 1000
+                let (width, height, refresh_millihz) = record
+                    .shared_capture
+                    .as_ref()
+                    .map(|source| (source.width, source.height, source.refresh_millihz))
+                    .unwrap_or((
+                        configuration.width,
+                        configuration.height,
+                        configuration.fps * 1000,
+                    ));
+                if monitor["specification"]["width"] != width
+                    || monitor["specification"]["height"] != height
+                    || monitor["specification"]["refresh_millihz"] != refresh_millihz
                     || monitor["ready"]["active"] != true
                 {
                     return Err("virtual_display_configuration_mismatch");
+                }
+                if let Some(source) = &mut record.shared_capture {
+                    if payload["reference_owned"] != true
+                        || source
+                            .output
+                            .as_deref()
+                            .is_some_and(|expected| expected != output)
+                        || monitor["specification"]
+                            .get("hdr_enabled")
+                            .is_some_and(|hdr| *hdr != source.hdr_enabled)
+                    {
+                        return Err("shared_capture_source_changed");
+                    }
+                    source.output = Some(output.into());
                 }
                 record.virtual_display_output = Some(output.into());
                 Ok(true)
@@ -639,7 +674,7 @@ mod owned {
     }
     /// KWin names virtual outputs `Virtual-N`. Connector numbers keep counting
     /// across driver reloads, so any canonical positive 32-bit signed index is accepted.
-    fn is_kwin_virtual_output(output: &str) -> bool {
+    pub(in super::super) fn is_kwin_virtual_output(output: &str) -> bool {
         output
             .strip_prefix("kwin:Virtual-")
             .filter(|index| {
@@ -657,6 +692,12 @@ mod owned {
                     .is_some_and(|monitors| monitors.is_empty()))
     }
     pub(in super::super) fn owned_shutdown(record: &Record, send: &mut rpc::Send<'_>) -> bool {
+        // Shared output removal needs confirmed retirement of every local video
+        // consumer. Module unload cannot drive those asynchronous closes; retain
+        // the durable group reference for ordered restart recovery instead.
+        if record.shared_capture_attached {
+            return false;
+        }
         if !record.virtual_display_attempted {
             return true;
         }
@@ -712,8 +753,9 @@ mod owned {
     }
 }
 pub(super) use owned::{
-    absent, accept_ready, owned_create, owned_remove, owned_shutdown, owned_status, requested,
+    absent, accept_ready, identity, is_kwin_virtual_output, owned_create, owned_remove,
+    owned_shutdown, owned_status, requested,
 };
 
 #[cfg(test)]
-pub(super) use owned::{REQUESTED_OUTPUT, identity};
+pub(super) use owned::REQUESTED_OUTPUT;

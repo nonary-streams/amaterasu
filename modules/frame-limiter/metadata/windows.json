@@ -1,18 +1,13 @@
 {
   "descriptor": {
-    "provider": "amaterasu.frame-limiter",
+    "actions": [],
+    "capabilities": [
+      "nonary.frame-limiter.windows",
+      "amaterasu.stream/join"
+    ],
     "display_name": "Frame limiting",
-    "revision": 1,
     "options": [
       {
-        "id": "frame_limiter_enable",
-        "label": "Enable frame limiting",
-        "help": "Limit games launched during a streaming session. Start a new application session after saving.",
-        "definition": {
-          "type": "boolean",
-          "default": false
-        },
-        "presentation": null,
         "allowed_scopes": [
           "host",
           "application",
@@ -20,29 +15,47 @@
           "session"
         ],
         "apply_policy": "next_stream",
+        "definition": {
+          "default": false,
+          "type": "boolean"
+        },
+        "help": "Limit games launched during a streaming session. Start a new application session after saving.",
+        "id": "frame_limiter_enable",
+        "label": "Enable frame limiting",
+        "presentation": null,
         "required_capabilities": []
       },
       {
-        "id": "frame_limiter_provider",
-        "label": "Limiter",
-        "help": "Automatic uses Proton for limiting and MangoHUD for the overlay when available.",
-        "definition": {
-          "type": "enum",
-          "default": "auto",
-          "options": [
-            "auto",
-            "rtss",
-            "nvidia-control-panel",
-            "none"
-          ]
-        },
+        "allowed_scopes": [
+          "host",
+          "application",
+          "paired_client",
+          "session"
+        ],
+        "apply_policy": "next_stream",
         "choice_labels": {
           "auto": "Automatic",
           "none": "Disabled",
           "nvidia-control-panel": "NVIDIA driver",
           "rtss": "RTSS"
         },
+        "definition": {
+          "default": "auto",
+          "options": [
+            "auto",
+            "rtss",
+            "nvidia-control-panel",
+            "none"
+          ],
+          "type": "enum"
+        },
+        "help": "Automatic uses Proton for limiting and MangoHUD for the overlay when available.",
+        "id": "frame_limiter_provider",
+        "label": "Limiter",
         "presentation": null,
+        "required_capabilities": []
+      },
+      {
         "allowed_scopes": [
           "host",
           "application",
@@ -50,19 +63,19 @@
           "session"
         ],
         "apply_policy": "next_stream",
-        "required_capabilities": []
-      },
-      {
+        "definition": {
+          "default": 0.0,
+          "maximum": 1000.0,
+          "minimum": 0.0,
+          "type": "decimal"
+        },
+        "help": "Use 0 to follow the client display or stream rate. For example: 60 or 59.94.",
         "id": "frame_limiter_fps_limit",
         "label": "Frame rate limit (FPS)",
-        "help": "Use 0 to follow the client display or stream rate. For example: 60 or 59.94.",
-        "definition": {
-          "type": "decimal",
-          "default": 0.0,
-          "minimum": 0.0,
-          "maximum": 1000.0
-        },
         "presentation": null,
+        "required_capabilities": []
+      },
+      {
         "allowed_scopes": [
           "host",
           "application",
@@ -70,23 +83,55 @@
           "session"
         ],
         "apply_policy": "next_stream",
-        "required_capabilities": []
-      },
-      {
-        "id": "rtss_frame_limit_type",
-        "label": "RTSS timing",
-        "help": "Choose how RTSS paces frames.",
         "definition": {
-          "type": "enum",
           "default": "async",
           "options": [
             "async",
             "front edge sync",
             "back edge sync",
             "nvidia reflex"
-          ]
+          ],
+          "type": "enum"
         },
+        "help": "Choose how RTSS paces frames.",
+        "id": "rtss_frame_limit_type",
+        "label": "RTSS timing",
         "presentation": null,
+        "required_capabilities": []
+      },
+      {
+        "allowed_scopes": [
+          "host"
+        ],
+        "apply_policy": "next_stream",
+        "definition": {
+          "default": "",
+          "max_length": 1024,
+          "min_length": 0,
+          "type": "string"
+        },
+        "help": "Leave blank to find the installed RTSS copy automatically.",
+        "id": "rtss_install_path",
+        "label": "RTSS installation folder",
+        "presentation": null,
+        "required_capabilities": []
+      },
+      {
+        "allowed_scopes": [
+          "host"
+        ],
+        "apply_policy": "next_stream",
+        "definition": {
+          "default": false,
+          "type": "boolean"
+        },
+        "help": "Allow automatic timing selection for virtual displays.",
+        "id": "rtss_allow_virtual_display_override",
+        "label": "Override RTSS timing for virtual displays",
+        "presentation": null,
+        "required_capabilities": []
+      },
+      {
         "allowed_scopes": [
           "host",
           "application",
@@ -94,79 +139,29 @@
           "session"
         ],
         "apply_policy": "next_stream",
-        "required_capabilities": []
-      },
-      {
-        "id": "rtss_install_path",
-        "label": "RTSS installation folder",
-        "help": "Leave blank to find the installed RTSS copy automatically.",
-        "definition": {
-          "type": "string",
-          "default": "",
-          "min_length": 0,
-          "max_length": 1024
-        },
-        "presentation": null,
-        "allowed_scopes": [
-          "host"
-        ],
-        "apply_policy": "next_stream",
-        "required_capabilities": []
-      },
-      {
-        "id": "rtss_allow_virtual_display_override",
-        "label": "Override RTSS timing for virtual displays",
-        "help": "Allow automatic timing selection for virtual displays.",
-        "definition": {
-          "type": "boolean",
-          "default": false
-        },
-        "presentation": null,
-        "allowed_scopes": [
-          "host"
-        ],
-        "apply_policy": "next_stream",
-        "required_capabilities": []
-      },
-      {
-        "id": "frame_limiter_auto_virtual_framegen",
-        "label": "Automatic frame-generation limiting",
-        "help": "Apply frame limiting automatically when supported frame generation is configured.",
-        "definition": {
-          "type": "enum",
-          "default": "enabled",
-          "options": [
-            "enabled",
-            "vrr",
-            "legacy",
-            "disabled"
-          ]
-        },
         "choice_labels": {
           "disabled": "Disabled",
           "enabled": "Enabled",
           "legacy": "Legacy mode",
           "vrr": "Variable refresh rate"
         },
+        "definition": {
+          "default": "enabled",
+          "options": [
+            "enabled",
+            "vrr",
+            "legacy",
+            "disabled"
+          ],
+          "type": "enum"
+        },
+        "help": "Apply frame limiting automatically when supported frame generation is configured.",
+        "id": "frame_limiter_auto_virtual_framegen",
+        "label": "Automatic frame-generation limiting",
         "presentation": null,
-        "allowed_scopes": [
-          "host",
-          "application",
-          "paired_client",
-          "session"
-        ],
-        "apply_policy": "next_stream",
         "required_capabilities": []
       },
       {
-        "id": "frame_limiter_disable_vsync",
-        "label": "Disable VSync",
-        "help": "Turn off driver VSync while streaming, then restore it afterward.",
-        "definition": {
-          "type": "boolean",
-          "default": false
-        },
-        "presentation": null,
         "allowed_scopes": [
           "host",
           "application",
@@ -174,19 +169,25 @@
           "session"
         ],
         "apply_policy": "next_stream",
+        "definition": {
+          "default": false,
+          "type": "boolean"
+        },
+        "help": "Turn off driver VSync while streaming, then restore it afterward.",
+        "id": "frame_limiter_disable_vsync",
+        "label": "Disable VSync",
+        "presentation": null,
         "required_capabilities": []
       }
     ],
-    "actions": [],
-    "capabilities": [
-      "nonary.frame-limiter.windows"
-    ],
+    "provider": "amaterasu.frame-limiter",
+    "revision": 1,
     "settings_validate": {
-      "service": "nonary.frame-limiter/1",
-      "method": "settings_validate",
       "interface_major": 1,
       "interface_minor": 0,
-      "schema_revision": 1
+      "method": "settings_validate",
+      "schema_revision": 1,
+      "service": "nonary.frame-limiter/1"
     }
   },
   "methods": [
@@ -224,6 +225,7 @@
         "optional": {
           "control_results": "array",
           "dependency_inputs": "array",
+          "join_context": "object",
           "resource_generation": "integer",
           "source_video_mode": "object"
         },
@@ -274,6 +276,7 @@
         "optional": {
           "control_results": "array",
           "dependency_inputs": "array",
+          "join_context": "object",
           "resource_generation": "integer",
           "source_video_mode": "object"
         },

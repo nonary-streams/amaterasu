@@ -259,6 +259,7 @@ mod tests {
                 .insert(
                     "stream".into(),
                     StreamRecord {
+                        join_context: None,
                         provider_graph: None,
                         generation: 4,
                         phase: StreamPhase::Active,

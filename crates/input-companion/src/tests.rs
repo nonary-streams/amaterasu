@@ -916,3 +916,185 @@ fn gamepad_protocol_round_trips_the_normalized_snapshot_fields() {
         event
     );
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn independent_device_grants_keep_keys_controllers_and_feedback_separate() {
+    let now = Instant::now();
+    let mut registry = GrantRegistry::independent_devices();
+    let first_grant = registry
+        .issue_with_capabilities(
+            peer(),
+            "a".repeat(32),
+            7,
+            now + Duration::from_secs(5),
+            true,
+            true,
+            true,
+        )
+        .unwrap();
+    let second_grant = registry
+        .issue_with_capabilities(
+            peer(),
+            "b".repeat(32),
+            8,
+            now + Duration::from_secs(5),
+            true,
+            true,
+            true,
+        )
+        .unwrap();
+    let feedback = |motor| GamepadFeedback {
+        slot: 0,
+        strong_motor: motor,
+        weak_motor: 0,
+        duration_ms: 1,
+    };
+    // A pending grant remains valid after another independent grant is issued.
+    let mut first = InputSession::connect(
+        &peer(),
+        first_grant,
+        FakeDevice {
+            feedback: VecDeque::from([feedback(1)]),
+            ..Default::default()
+        },
+        now,
+    )
+    .unwrap();
+    let mut second = InputSession::connect(
+        &peer(),
+        second_grant,
+        FakeDevice {
+            feedback: VecDeque::from([feedback(2)]),
+            ..Default::default()
+        },
+        now,
+    )
+    .unwrap();
+    first.submit(&packet(1, key(true)), now).unwrap();
+    let mut second_packet = packet(1, key(true));
+    second_packet.generation = 8;
+    second_packet.lease_token = "b".repeat(32);
+    second.submit(&second_packet, now).unwrap();
+    first.submit(&packet(2, gamepad_event()), now).unwrap();
+    second_packet.sequence = 2;
+    second_packet.event = gamepad_event();
+    second.submit(&second_packet, now).unwrap();
+    assert_eq!(
+        first.poll_gamepad_feedback(7, &"a".repeat(32)),
+        Ok(Some(feedback(1)))
+    );
+    assert_eq!(
+        second.poll_gamepad_feedback(8, &"b".repeat(32)),
+        Ok(Some(feedback(2)))
+    );
+    assert_eq!(
+        second.poll_gamepad_feedback(7, &"a".repeat(32)),
+        Err(InputError::PermissionDenied)
+    );
+    first.revoke().unwrap();
+    assert_eq!(second.sink.sent, vec![key(true), gamepad_event()]);
+    second_packet.sequence = 3;
+    second_packet.event = key(false);
+    second.submit(&second_packet, now).unwrap();
+    assert_eq!(second.sink.releases, 0);
+    second.revoke().unwrap();
+    assert_eq!(second.sink.releases, 1);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn independent_grants_bound_pending_storage_and_preserve_failed_cleanup_fences() {
+    let now = Instant::now();
+    let mut registry = GrantRegistry::independent_devices();
+    let mut grants = (1..=8)
+        .map(|generation| {
+            registry
+                .issue(
+                    peer(),
+                    "a".repeat(32),
+                    generation,
+                    now + Duration::from_secs(5),
+                    true,
+                    true,
+                )
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        registry
+            .issue(
+                peer(),
+                "b".repeat(32),
+                9,
+                now + Duration::from_secs(5),
+                true,
+                true
+            )
+            .err(),
+        Some(InputError::ResourceExhausted)
+    );
+    drop(grants.pop());
+    let replacement = registry
+        .issue(
+            peer(),
+            "b".repeat(32),
+            9,
+            now + Duration::from_secs(5),
+            true,
+            true,
+        )
+        .unwrap();
+    let mut session = InputSession::connect(
+        &peer(),
+        replacement,
+        FakeDevice {
+            fail_release: true,
+            ..Default::default()
+        },
+        now,
+    )
+    .unwrap();
+    assert!(session.revoke().is_err());
+    drop(session);
+    // Dropping an uncertain active owner does not turn its device into free capacity.
+    assert_eq!(
+        registry
+            .issue(
+                peer(),
+                "c".repeat(32),
+                10,
+                now + Duration::from_secs(5),
+                true,
+                true
+            )
+            .err(),
+        Some(InputError::ResourceExhausted)
+    );
+    drop(grants.pop());
+    assert!(
+        registry
+            .issue(
+                peer(),
+                "d".repeat(32),
+                10,
+                now + Duration::from_secs(5),
+                true,
+                true
+            )
+            .is_ok()
+    );
+    assert_eq!(
+        registry
+            .issue(
+                peer(),
+                "e".repeat(32),
+                9,
+                now + Duration::from_secs(5),
+                true,
+                true
+            )
+            .err(),
+        Some(InputError::InvalidSequence)
+    );
+}

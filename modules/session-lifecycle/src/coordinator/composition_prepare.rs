@@ -298,6 +298,7 @@ impl Coordinator {
             settings: serde_json::from_value(participant.settings.clone())
                 .map_err(|_| "invalid_participant_settings")?,
             intent: work.intent.clone(),
+            join_context: None,
             reason: work.reason.clone(),
             requested_video: work.video.clone(),
             source_video_mode: work

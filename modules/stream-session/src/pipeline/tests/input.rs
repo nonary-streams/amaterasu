@@ -1429,6 +1429,75 @@ fn authoritative_capture_geometry_enables_absolute_output_mapping() {
 }
 
 #[test]
+fn fitted_client_viewports_map_mouse_and_touch_edges_without_the_letterbox() {
+    let mut host = Harness::new();
+    enable_input(&mut host);
+    host.broker.desktop_geometry = Some(desktop_geometry());
+    host.broker.input_absolute_pointer = Some(json!(true));
+    host.broker.input_pen_touch_supported = Some(json!(true));
+    host.broker.input_native_pen_touch = Some(json!(true));
+    host.broker.touch_port = Some(json!({"width":1000,"height":800,
+        "client_offset_x":0,"client_offset_y":118,"content_width":1000,"content_height":563,
+        "logical_width":1920,"logical_height":1080}));
+    let id = host.response(1, prepare())["session"].as_u64().unwrap();
+    let mut request = start(id);
+    request["configuration"]["configuration"]["width"] = json!(1000);
+    request["configuration"]["configuration"]["height"] = json!(800);
+    assert_eq!(host.response(2, request)["absolute_input"], true);
+    host.plane.borrow_mut().controls.extend([
+        absolute(1, 0, 118, 1000, 800),
+        absolute(2, 999, 680, 1000, 800),
+        absolute(3, 0, 0, 1000, 800),
+        absolute(4, 999, 799, 1000, 800),
+    ]);
+    host.idle();
+    let bounds = serde_json::from_value::<amaterasu_media::CaptureGeometry>(desktop_geometry())
+        .unwrap()
+        .normalized_output()
+        .unwrap();
+    assert_eq!(
+        host.broker.input_events,
+        vec![
+            json!({"kind":"absolute","x":bounds.left,"y":bounds.top}),
+            json!({"kind":"absolute","x":bounds.right,"y":bounds.bottom}),
+            json!({"kind":"absolute","x":bounds.left,"y":bounds.top}),
+            json!({"kind":"absolute","x":bounds.right,"y":bounds.bottom}),
+        ]
+    );
+    let mut touch = touch_packet(0x55000002, 1, 22);
+    touch.payload[16..20].copy_from_slice(&1.0f32.to_bits().to_le_bytes());
+    touch.payload[20..24].copy_from_slice(&1.0f32.to_bits().to_le_bytes());
+    host.plane.borrow_mut().controls.push(touch);
+    host.idle();
+    assert_eq!(host.broker.input_events.last().unwrap()["x"], bounds.right);
+    assert_eq!(host.broker.input_events.last().unwrap()["y"], bounds.bottom);
+}
+
+#[test]
+fn malformed_fitted_client_metadata_does_not_enable_absolute_input() {
+    for malformed in [
+        json!({"width":1000,"height":800,"client_offset_x":0,"client_offset_y":118,
+            "logical_width":1920,"logical_height":1080,"content_width":1000}),
+        json!({"width":1000,"height":800,"client_offset_x":0,"client_offset_y":118,
+            "logical_width":1920,"logical_height":1080,"content_width":1000,"content_height":700}),
+    ] {
+        let mut host = Harness::new();
+        enable_input(&mut host);
+        host.broker.desktop_geometry = Some(desktop_geometry());
+        host.broker.input_absolute_pointer = Some(json!(true));
+        host.broker.touch_port = Some(malformed);
+        let id = host.response(1, prepare())["session"].as_u64().unwrap();
+        assert_eq!(host.response(2, start(id))["absolute_input"], false);
+        host.plane
+            .borrow_mut()
+            .controls
+            .push(absolute(1, 0, 0, 1000, 800));
+        host.idle();
+        assert!(host.broker.input_events.is_empty());
+    }
+}
+
+#[test]
 fn absent_geometry_is_unsupported_and_malformed_geometry_fails_startup() {
     let mut absent = Harness::new();
     enable_input(&mut absent);

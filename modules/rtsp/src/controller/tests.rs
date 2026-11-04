@@ -13,7 +13,7 @@ use std::{
     },
 };
 
-static NETWORK_TEST_LOCK: Mutex<()> = Mutex::new(());
+pub(super) static NETWORK_TEST_LOCK: Mutex<()> = Mutex::new(());
 static NEXT_TEST_BASE_PORT: AtomicU16 = AtomicU16::new(0);
 const TEST_BASE_PORT: u16 = 47_989;
 
@@ -381,7 +381,7 @@ fn startup_reconciliation_timeout_after_partial_stop_keeps_launch_fail_closed() 
         Command::Request { payload, .. } if payload["action"] == "prepare")));
 }
 
-fn record(state: State) -> Record {
+pub(super) fn record(state: State) -> Record {
     Record {
         id: 5,
         owner: "caller".into(),
@@ -399,6 +399,7 @@ fn record(state: State) -> Record {
         session_token: "00112233445566778899aabbccddeeff".into(),
         udp_discovery: None,
         local: "127.0.0.1:48010".parse().expect("literal"),
+        media_binds: None,
         expires: 5_000,
         next_status: 5_000,
         failure: None,
@@ -411,6 +412,8 @@ fn record(state: State) -> Record {
         stream_state: Some("stopping".into()),
         lifecycle_target: None,
         lifecycle_candidate: None,
+        lifecycle_source_target: None,
+        lifecycle_retained_source: None,
         lifecycle_prepare_outstanding: false,
         lifecycle_input_required: None,
         authenticated_disconnect_reason: None,
@@ -1017,6 +1020,7 @@ fn cancelled_parent_reaches_cleanup_failed_when_settlement_stays_unavailable() {
         session_token: "00112233445566778899aabbccddeeff".into(),
         udp_discovery: None,
         local: "127.0.0.1:48010".parse().expect("literal"),
+        media_binds: None,
         expires: 5_000,
         next_status: 5_000,
         failure: None,
@@ -1029,6 +1033,8 @@ fn cancelled_parent_reaches_cleanup_failed_when_settlement_stays_unavailable() {
         stream_state: None,
         lifecycle_target: None,
         lifecycle_candidate: None,
+        lifecycle_source_target: None,
+        lifecycle_retained_source: None,
         lifecycle_prepare_outstanding: false,
         lifecycle_input_required: None,
         authenticated_disconnect_reason: None,
@@ -1248,7 +1254,7 @@ fn status_reports_all_bound_families_and_keeps_legacy_local_field() {
     assert_eq!(response["locals"].as_array().unwrap().len(), 2);
 }
 
-fn free_base_port() -> u16 {
+pub(super) fn free_base_port() -> u16 {
     // On Windows, an ephemeral TCP port can sit in an excluded UDP range.
     // Probe the actual RTSP and media ports before returning a base port.
     let start = u32::from(NEXT_TEST_BASE_PORT.fetch_add(37, Ordering::Relaxed))
@@ -2185,8 +2191,167 @@ fn unknown_lifecycle_prepare_cannot_be_reported_clean() {
 }
 
 #[test]
+fn joined_transport_preserves_its_intent_and_exact_lifecycle_session_target() {
+    let (mut record, announce) = announced_profile_record();
+    assert!(record.accept_announce(&announce));
+    let target =
+        json!({"kind":"session","host_epoch":"epoch","session_id":"session","generation":1});
+    record.config.lifecycle_session_target = serde_json::from_value(target.clone()).ok();
+    record.config.lifecycle_settings_revision = Some("7".into());
+    record.config.lifecycle_intent = Some("join".into());
+    record.lifecycle_input_required = Some(false);
+    assert_eq!(record.response()["lifecycle_intent"], "join");
+    let mut controller = Controller::new(Settings::default()).unwrap();
+    let start = record.authenticated_start_payload(23).unwrap();
+    controller.schedule_arm(&mut record, start, 8, 9, 0);
+    controller.records.insert(record.id, record);
+    let mut endpoint = Endpoint::default();
+    let runtime = client(&mut endpoint);
+    controller.advance_job(&runtime, 1);
+    assert!(endpoint.commands.iter().any(|command| matches!(command,
+        Command::Request { service, payload, .. }
+            if service == "amaterasu.session-lifecycle/1"
+            && payload["operation"] == "prepare_stream"
+            && payload["intent"] == "join"
+            && payload["target"] == target
+    )));
+}
+
+#[test]
+fn joined_transport_freezes_and_forwards_the_coordinator_source_before_start() {
+    for source in [
+        Some(
+            json!({"kind":"stream","host_epoch":"epoch","session_id":"session","stream_id":"source","generation":3}),
+        ),
+        None,
+    ] {
+        let (mut record, announce) = announced_profile_record();
+        assert!(record.accept_announce(&announce));
+        record.config.lifecycle_session_target = serde_json::from_value(
+            json!({"kind":"session","host_epoch":"epoch","session_id":"session","generation":1}),
+        )
+        .ok();
+        record.config.lifecycle_settings_revision = Some("7".into());
+        record.config.lifecycle_intent = Some("join".into());
+        record.lifecycle_input_required = Some(false);
+        let mut controller = Controller::new(Settings::default()).unwrap();
+        let start = record.authenticated_start_payload(23).unwrap();
+        controller.schedule_arm(&mut record, start, 8, 9, 0);
+        controller.records.insert(record.id, record);
+        let mut reply = json!({"status":"succeeded","operation_id":"rtsp-0000000000000005-lifecycle-prepare",
+            "target":{"kind":"stream","host_epoch":"epoch","session_id":"session","stream_id":"subscriber","generation":1},
+            "candidate":{"capture_provider":"amaterasu.capture-pipewire/1","selector_schema":"amaterasu.kwin-wl-output/1","selector":{"output":"kwin:Virtual-12"},
+                "resource":{"provider":"test.provider","resource_id":"output","incarnation":"one","revision":1,"execution_domain":"desktop","mutation_domain":null,"mutation_domains":["desktop"]},
+                "mode":{"width":announce.video.width * 2,"height":announce.video.height * 2,"refresh_millihz":announce.video.fps * 2000,"hdr":false},
+                "plan_revision":1,"geometry_revision":1,"generation":1,"fallback":"forbidden"}});
+        if let Some(source) = &source {
+            reply["shared_source"] = source.clone();
+            let mut source_binding = reply["candidate"].clone();
+            source_binding["generation"] = source["generation"].clone();
+            reply["join_context"] = json!({"source":source,"source_transition":"source-prepare",
+                "binding_owner":"test.provider","binding":source_binding});
+        }
+        let mut endpoint = Endpoint {
+            verifier_reply: Some(reply),
+            ..Endpoint::default()
+        };
+        let runtime = client(&mut endpoint);
+        for tick in 1..=3 {
+            controller.advance_job(&runtime, tick);
+        }
+        let start = endpoint.commands.iter().find_map(|command| match command {
+            Command::Request {
+                service, payload, ..
+            } if service == "amaterasu.stream-session/1"
+                && payload["action"] == "start_when_authenticated" =>
+            {
+                Some(payload)
+            }
+            _ => None,
+        });
+        if let Some(source) = source {
+            let start = start.unwrap();
+            assert_eq!(start["configuration"]["lifecycle_shared_source"], source);
+            assert_eq!(
+                start["configuration"]["configuration"]["width"],
+                announce.video.width
+            );
+            assert_eq!(
+                start["configuration"]["configuration"]["height"],
+                announce.video.height
+            );
+            assert_eq!(
+                start["configuration"]["configuration"]["fps"],
+                announce.video.fps
+            );
+            assert_eq!(
+                start["configuration"]["lifecycle_candidate"]["mode"]["width"],
+                announce.video.width * 2
+            );
+            assert_eq!(
+                json!(controller.records[&5].lifecycle_source_target),
+                source
+            );
+            assert_eq!(controller.records[&5].state, State::Arming);
+        } else {
+            assert!(start.is_none());
+            assert!(controller.records[&5].lifecycle_source_target.is_none());
+            assert!(controller.records[&5].lifecycle_prepare_outstanding);
+        }
+    }
+}
+
+#[test]
+fn shared_retention_completes_departing_transport_without_releasing_source_status() {
+    let mut record = record(State::Closing);
+    let source = json!({"kind":"stream","host_epoch":"epoch","session_id":"session","stream_id":"source","generation":3});
+    record.config.lifecycle_session_target = serde_json::from_value(
+        json!({"kind":"session","host_epoch":"epoch","session_id":"session","generation":1}),
+    )
+    .ok();
+    record.lifecycle_target = Some(
+        json!({"kind":"stream","host_epoch":"epoch","session_id":"session","stream_id":"subscriber","generation":1}),
+    );
+    record.lifecycle_source_target = serde_json::from_value(source.clone()).ok();
+    let receipt = json!({"ok":true,"session":23,"state":"stopped","cleanup_error":null,
+        "lifecycle_target":record.lifecycle_target,"lifecycle_retired":false,
+        "lifecycle_consumer_retired":true,"lifecycle_resources_released":false,
+        "lifecycle_shared_retained":true,"lifecycle_shared_source":source});
+    let mut controller = Controller::new(Settings::default()).unwrap();
+    let job = Job {
+        ticket: record.id,
+        phase: Phase::Stop,
+        call: Call::new(json!({"action":"stop","session":23}), "stop".into(), None),
+        caller: None,
+        network: None,
+        deadline: 5_000,
+    };
+    let mut endpoint = Endpoint::default();
+    let runtime = client(&mut endpoint);
+    controller.stopped(&mut record, job, &receipt, &runtime);
+    assert_eq!(record.state, State::Closed);
+    assert!(record.cleanup_confirmed);
+    assert_eq!(
+        record.response()["lifecycle_cleanup_state"],
+        "shared_retained"
+    );
+    assert_eq!(record.response()["lifecycle_retired"], false);
+    assert_eq!(record.response()["lifecycle_resources_released"], false);
+    assert_eq!(record.response()["lifecycle_shared_source"], source);
+}
+
+#[test]
 fn lifecycle_gate_rejects_foreign_stream_or_stale_binding_before_capture_start() {
-    for mismatch in ["epoch", "generation", "geometry", "plan"] {
+    for mismatch in [
+        "epoch",
+        "generation",
+        "geometry",
+        "plan",
+        "width",
+        "height",
+        "rate",
+        "hdr",
+    ] {
         let (mut record, announce) = announced_profile_record();
         assert!(record.accept_announce(&announce));
         record.config.lifecycle_session_target = Some(
@@ -2220,6 +2385,12 @@ fn lifecycle_gate_rejects_foreign_stream_or_stale_binding_before_capture_start()
             "generation" => reply["candidate"]["generation"] = json!(2),
             "geometry" => reply["candidate"]["geometry_revision"] = json!(0),
             "plan" => reply["candidate"]["plan_revision"] = json!(0),
+            "width" => reply["candidate"]["mode"]["width"] = json!(announce.video.width + 1),
+            "height" => reply["candidate"]["mode"]["height"] = json!(announce.video.height + 1),
+            "rate" => {
+                reply["candidate"]["mode"]["refresh_millihz"] = json!(announce.video.fps * 1000 + 1)
+            }
+            "hdr" => reply["candidate"]["mode"]["hdr"] = json!(true),
             _ => {}
         }
         let runtime = client(&mut endpoint);

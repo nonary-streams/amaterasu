@@ -1,8 +1,12 @@
 mod actions;
+#[cfg(test)]
+mod concurrent_ports_tests;
+mod lifecycle_binding;
 mod network;
 #[cfg(test)]
 mod ownership_tests;
 mod record;
+mod retirement;
 #[cfg(test)]
 mod tests;
 mod workflow;
@@ -21,6 +25,7 @@ use amaterasu_gamestream::rtsp::{
 };
 use amaterasu_module_sdk::{Command, ModuleResult, Response, RuntimeClient, network::Network};
 use record::{Job, Phase, Record, State};
+use retirement::{clean_terminal, confirm_terminal, preparation_source};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
@@ -336,9 +341,8 @@ impl Controller {
             deadline,
         );
         match stop {
-            Ok(payload) if clean_terminal(record, &payload) => {
+            Ok(payload) if confirm_terminal(record, &payload) => {
                 record.stream_state = stream_state(&payload).map(str::to_owned);
-                record.cleanup_confirmed = true;
                 record.cleanup_error = None;
                 finish_record(record);
             }
@@ -539,9 +543,27 @@ impl Controller {
         &self,
         local_address: IpAddr,
     ) -> Option<crate::model::MediaBinds> {
-        self.active_network_base_port
+        let mut binds = self
+            .active_network_base_port
             .or(self.listener_base_port)
-            .and_then(|port| self.settings.media_binds_on(port, local_address).ok())
+            .and_then(|port| self.settings.media_binds_on(port, local_address).ok())?;
+        // The configured ports belong to the first transport on this address.
+        // Each later transport asks the selected network provider for its own
+        // endpoints, which RTSP advertises from the provider's Prepare readback.
+        // Keep the address occupied through pending opens and uncertain cleanup;
+        // a terminal label alone does not prove that its sockets have retired.
+        let occupied = self.records.values().any(|record| {
+            record
+                .media_binds
+                .is_some_and(|reserved| reserved.video.ip() == binds.video.ip())
+                && (!record.state.terminal() || !record.cleanup_confirmed)
+        });
+        if occupied {
+            binds.video.set_port(0);
+            binds.control.set_port(0);
+            binds.audio.set_port(0);
+        }
+        Some(binds)
     }
 
     pub(super) fn advertised_local_for_peer(
@@ -805,20 +827,6 @@ fn local_port(payload: &Value, field: &str) -> Result<u16, &'static str> {
     (port != 0)
         .then_some(port)
         .ok_or("invalid_prepare_response")
-}
-
-fn clean_terminal(record: &Record, payload: &Value) -> bool {
-    !record.lifecycle_prepare_outstanding
-        && record.lifecycle_target.as_ref().is_none_or(|target| {
-            payload["lifecycle_retired"] == true && payload["lifecycle_target"] == *target
-        })
-        && payload["ok"] == true
-        && response_session(payload) == record.session
-        && matches!(
-            stream_state(payload),
-            Some("stopped" | "failed" | "cancelled")
-        )
-        && payload["cleanup_error"].is_null()
 }
 
 fn authenticated_disconnect_reason(record: &Record, payload: &Value) -> Option<&'static str> {

@@ -343,6 +343,14 @@ pub fn validate_candidate(
 ) -> Result<(), String> {
     api::validate_resource_plan(plan)?;
     api::validate_capture_binding(candidate)?;
+    if let Some(context) = api::stream_join_plan_context(plan)? {
+        let mut expected = context.binding.ok_or("managed join binding missing")?;
+        expected.generation = expected_generation;
+        if candidate != &expected || candidate.geometry_revision != expected_geometry_revision {
+            return Err("joined binding differs from shared source".into());
+        }
+        return Ok(());
+    }
     let constraint = plan
         .candidate_constraint
         .as_ref()

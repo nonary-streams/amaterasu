@@ -12,6 +12,49 @@ impl Pipeline {
         send: &mut Send<'_>,
     ) -> bool {
         match job.step {
+            Step::ResolveLifecyclePreparation => {
+                let preparation = record
+                    .restart_lifecycle_preparation
+                    .as_ref()
+                    .expect("preparation recovery");
+                let lookup = preparation.lookup(
+                    record
+                        .config
+                        .lifecycle_session_target
+                        .as_ref()
+                        .expect("recovery session"),
+                );
+                let resolution = serde_json::from_value::<
+                    amaterasu_extension_api::StreamPreparationResolution,
+                >(payload)
+                .ok()
+                .filter(|response| {
+                    amaterasu_extension_api::validate_stream_preparation_resolution(
+                        &lookup, response,
+                    )
+                    .is_ok()
+                });
+                match resolution {
+                    Some(response) => match response.status {
+                        amaterasu_extension_api::StreamPreparationResolutionStatus::Succeeded => {
+                            record.restart_lifecycle_target = response.target;
+                            record.restart_lifecycle_preparation = None;
+                        }
+                        amaterasu_extension_api::StreamPreparationResolutionStatus::Missing => {
+                            // Only the authenticated coordinator can prove this
+                            // old preparation cannot commit after restart.
+                            record.restart_lifecycle_preparation = None;
+                            record.config.lifecycle_session_target = None;
+                            record.lifecycle_fenced = false;
+                        }
+                        amaterasu_extension_api::StreamPreparationResolutionStatus::Pending => {}
+                    },
+                    None => {
+                        record.cleanup_error = Some("lifecycle_preparation_unconfirmed");
+                        job.lifecycle_retire_tried = true;
+                    }
+                }
+            }
             Step::ConfirmControlDisconnect => {
                 record.control_disconnect_checked = true;
                 if payload["ok"] == true
@@ -67,11 +110,27 @@ impl Pipeline {
                 } else {
                     job.lifecycle_retire_tried = true;
                     job.lifecycle_lookup = false;
+                    let proof = target.and_then(|target| {
+                        amaterasu_extension_api::stream_retirement_proof(
+                            &payload,
+                            target,
+                            record
+                                .start
+                                .as_ref()
+                                .and_then(|start| start.lifecycle_shared_source.as_ref())
+                                .or_else(|| {
+                                    record.shared_capture.as_ref().map(|source| &source.stream)
+                                }),
+                        )
+                        .ok()
+                    });
                     if payload["status"] == "succeeded"
                         && payload["target"] == json!(target)
                         && payload["plan_revision"] == json!(plan_revision)
+                        && let Some(proof) = proof
                     {
-                        record.lifecycle_retired = true;
+                        record.lifecycle_retired = proof.resources_released;
+                        record.lifecycle_retirement_proof = Some(proof);
                     } else {
                         record.cleanup_error = Some("lifecycle_retirement_unconfirmed");
                     }
@@ -82,8 +141,12 @@ impl Pipeline {
                     return true;
                 }
                 if super::virtual_display::absent(record, &payload) {
+                    record.shared_capture_attached = false;
                     record.virtual_display_attempted = false;
                     record.virtual_display_output = None;
+                    if record.cleanup_error == Some("virtual_display_remove_unconfirmed") {
+                        record.cleanup_error = None;
+                    }
                     job.virtual_display_tried = true;
                 } else if payload["ok"] == true {
                     if payload["monitors"].as_array().is_some_and(|monitors| {
@@ -306,9 +369,22 @@ impl Pipeline {
     ) -> bool {
         record.cleanup_error = Some("component_cleanup_failed");
         match job.step {
-            Step::FindOwnedVirtualDisplay | Step::RemoveOwnedVirtualDisplay => {
+            Step::RemoveOwnedVirtualDisplay => {
+                // The provider may have committed the removal before its reply
+                // was lost. Observe the same stable reference without sending
+                // another native mutation.
+                record.cleanup_error = Some("virtual_display_remove_unconfirmed");
+                job.virtual_display_removing = true;
+                true
+            }
+            Step::FindOwnedVirtualDisplay => {
                 record.cleanup_error = Some("virtual_display_cleanup_unavailable");
                 job.virtual_display_tried = true;
+                true
+            }
+            Step::ResolveLifecyclePreparation => {
+                record.cleanup_error = Some("lifecycle_preparation_unconfirmed");
+                job.lifecycle_retire_tried = true;
                 true
             }
             Step::FindDisplay | Step::RestoreDisplay | Step::RecoverDisplay => {
@@ -359,6 +435,8 @@ impl Pipeline {
         send: &mut Send<'_>,
     ) -> bool {
         let clean = record.attempted.is_empty()
+            && record.restart_lifecycle_preparation.is_none()
+            && !record.shared_capture_attached
             && record.uncertain.is_none()
             && !record.input_attempted
             && record.input_lease.is_none()
@@ -366,12 +444,12 @@ impl Pipeline {
             && !record.display_attempted
             && record.display_lease.is_none()
             && !record.virtual_display_reference_owned
-            && (record.restart_lifecycle_target.is_none() || record.lifecycle_retired)
+            && (record.restart_lifecycle_target.is_none() || record.lifecycle_consumers_retired())
             && (record
                 .start
                 .as_ref()
                 .is_none_or(|start| start.lifecycle_target.is_none())
-                || record.lifecycle_retired);
+                || record.lifecycle_consumers_retired());
         if clean && self.journal.document.entries.contains_key(&record.id) {
             let document = self.journal.without_record(record.id);
             job.journal_resume = Some(Step::WaitDrain);

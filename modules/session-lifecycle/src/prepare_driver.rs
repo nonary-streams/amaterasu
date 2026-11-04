@@ -632,7 +632,7 @@ impl PrepareDriver {
             }
             _ => return Err("provider response not valid for prepare".into()),
         }
-        if terminal_response {
+        if terminal_response || next.phase == PreparePhase::Rejected {
             next.terminal_dispatch = self.state.dispatch.as_ref().filter(|record| {
                 matches!(&record.state, DispatchState::Completed { payload: stored } if stored == &payload)
             }).cloned();

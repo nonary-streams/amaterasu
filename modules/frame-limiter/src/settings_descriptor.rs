@@ -201,10 +201,18 @@ pub fn descriptor(platform: Platform) -> ExtensionDescriptor {
         actions: vec![],
         capabilities: match platform {
             Platform::Linux => {
-                vec![amaterasu_module_sdk::extension_api::LAUNCH_ENVIRONMENT_CAPABILITY.into()]
+                vec![
+                    amaterasu_module_sdk::extension_api::LAUNCH_ENVIRONMENT_CAPABILITY.into(),
+                    amaterasu_module_sdk::extension_api::STREAM_JOIN_CAPABILITY.into(),
+                ]
             }
-            Platform::Windows => vec![WINDOWS_CAPABILITY.into()],
-            Platform::Macos => vec![],
+            Platform::Windows => vec![
+                WINDOWS_CAPABILITY.into(),
+                amaterasu_module_sdk::extension_api::STREAM_JOIN_CAPABILITY.into(),
+            ],
+            Platform::Macos => {
+                vec![amaterasu_module_sdk::extension_api::STREAM_JOIN_CAPABILITY.into()]
+            }
         },
         settings_validate: MethodRef {
             service: SERVICE.into(),

@@ -1199,6 +1199,61 @@ fn resume_requires_complete_launch_metadata_and_paired_tls() {
 }
 
 #[test]
+fn serverinfo_advertises_the_running_game_to_other_authorized_clients() {
+    let mut router = streaming_router();
+    let mut broker = Broker::default();
+    let now = Instant::now();
+    assert!(
+        router
+            .dispatch_with(
+                19,
+                request(LAUNCH_TARGET),
+                trusted_tls(&[1, 2, 3]),
+                now,
+                &mut |command| broker.send(command)
+            )
+            .is_none()
+    );
+    assert_eq!(
+        poll_until_reply(&mut router, &mut broker, now).1.status,
+        200
+    );
+    router.reply_delivered(19);
+
+    for (connection, context, expected_game) in [
+        (20, trusted_tls(&[4, 5, 6]), 7),
+        (21, peer("127.0.0.1", false, None, false), 0),
+        (
+            22,
+            RequestContext {
+                launch_allowed: false,
+                ..trusted_tls(&[4, 5, 6])
+            },
+            0,
+        ),
+    ] {
+        assert!(
+            router
+                .dispatch_with(
+                    connection,
+                    request("/serverinfo"),
+                    context,
+                    now,
+                    &mut |command| broker.send(command)
+                )
+                .is_none()
+        );
+        let (id, reply) = poll_until_reply(&mut router, &mut broker, now);
+        assert_eq!(id, connection);
+        let body = String::from_utf8(reply.body).unwrap();
+        assert!(
+            body.contains(&format!("<currentgame>{expected_game}</currentgame>")),
+            "{body}"
+        );
+    }
+}
+
+#[test]
 fn unpairing_a_client_cancels_its_active_launch_through_the_revoke_path() {
     let mut router = streaming_router();
     let mut broker = Broker::default();

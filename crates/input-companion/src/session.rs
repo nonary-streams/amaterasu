@@ -7,6 +7,7 @@ use amaterasu_storage::{
     write_json_atomically,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -48,6 +49,28 @@ struct RegistryState {
     highest_generation: u64,
     // One source device is owned by at most one worker lease at a time.
     active: Option<(PeerIdentity, u64)>,
+    independent_devices: bool,
+    independent_grants: BTreeMap<u64, IndependentGrant>,
+}
+
+struct IndependentGrant {
+    peer: PeerIdentity,
+    token: String,
+    active: bool,
+}
+
+impl RegistryState {
+    fn active_for(&self, grant: &InputGrant) -> bool {
+        if self.independent_devices {
+            self.independent_grants
+                .get(&grant.generation)
+                .is_some_and(|entry| {
+                    entry.active && entry.peer == grant.peer && entry.token == grant.lease_token
+                })
+        } else {
+            self.active.as_ref() == Some(&(grant.peer.clone(), grant.generation))
+        }
+    }
 }
 
 /// Generation floors are in memory for synthetic tests and persisted in a
@@ -86,6 +109,25 @@ impl GrantRegistry {
         }
     }
 
+    /// Only for transports that allocate and destroy an independent native
+    /// device set for every connection. Never use for a shared VHF device.
+    #[cfg(target_os = "linux")]
+    pub fn independent_devices() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(RegistryState {
+                independent_devices: true,
+                ..Default::default()
+            })),
+            generation_file: None,
+        }
+    }
+
+    pub(crate) fn permits_independent_devices(&self) -> bool {
+        self.state
+            .lock()
+            .is_ok_and(|state| state.independent_devices)
+    }
+
     /// The installed service must supply an installer-owned machine root and
     /// run as LocalSystem. Generation floors survive a companion restart;
     /// live grants deliberately do not, so a restart invalidates all tickets.
@@ -110,6 +152,7 @@ impl GrantRegistry {
             state: Arc::new(Mutex::new(RegistryState {
                 highest_generation,
                 active: None,
+                ..Default::default()
             })),
             generation_file: Some(generation_file),
         })
@@ -194,7 +237,9 @@ impl GrantRegistry {
             return Err(InputError::InvalidGrant);
         }
         let mut registry = self.state.lock().map_err(|_| InputError::InvalidGrant)?;
-        if registry.active.is_some() {
+        if registry.active.is_some()
+            || (registry.independent_devices && registry.independent_grants.len() >= 8)
+        {
             return Err(InputError::ResourceExhausted);
         }
         if generation <= registry.highest_generation {
@@ -209,6 +254,16 @@ impl GrantRegistry {
             protect_machine_private_file(path).map_err(|_| InputError::Storage)?;
         }
         registry.highest_generation = generation;
+        if registry.independent_devices {
+            registry.independent_grants.insert(
+                generation,
+                IndependentGrant {
+                    peer: peer.clone(),
+                    token: lease_token.clone(),
+                    active: false,
+                },
+            );
+        }
         Ok(InputGrant {
             peer,
             lease_token,
@@ -254,7 +309,7 @@ impl<S: DeviceSink> InputSession<S> {
             .registry
             .lock()
             .map_err(|_| InputError::InvalidGrant)?;
-        if registry.active.as_ref() != Some(&(self.grant.peer.clone(), self.grant.generation)) {
+        if !registry.active_for(&self.grant) {
             return Err(InputError::PermissionDenied);
         }
         self.sink.poll_gamepad_feedback()
@@ -322,8 +377,8 @@ impl<S: DeviceSink> InputSession<S> {
         self.validate_transition(&packet.event, transition)?;
         self.check_rate(now, transition)?;
 
-        // Keep issuance of a newer generation serialized with device I/O.
-        // Once `issue` returns, the old session cannot submit another event.
+        // Keep grant checks serialized with device I/O. Exclusive devices
+        // retain one current owner; independent devices retain separate grants.
         let registry_handle = Arc::clone(&self.grant.registry);
         let registry = match registry_handle.lock() {
             Ok(registry) => registry,
@@ -332,7 +387,7 @@ impl<S: DeviceSink> InputSession<S> {
                 return Err(InputError::InvalidGrant);
             }
         };
-        if registry.active.as_ref() != Some(&(self.grant.peer.clone(), self.grant.generation)) {
+        if !registry.active_for(&self.grant) {
             drop(registry);
             let _ = self.revoke();
             return Err(InputError::PermissionDenied);
@@ -474,25 +529,41 @@ impl InputGrant {
 
     fn activate(&self) -> InputResult<()> {
         let mut registry = self.registry.lock().map_err(|_| InputError::InvalidGrant)?;
-        if registry.highest_generation != self.generation {
-            return Err(InputError::InvalidSequence);
+        if registry.independent_devices {
+            let entry = registry
+                .independent_grants
+                .get_mut(&self.generation)
+                .filter(|entry| entry.peer == self.peer && entry.token == self.lease_token)
+                .ok_or(InputError::InvalidSequence)?;
+            if entry.active {
+                return Err(InputError::ResourceExhausted);
+            }
+            entry.active = true;
+        } else {
+            if registry.highest_generation != self.generation {
+                return Err(InputError::InvalidSequence);
+            }
+            if registry.active.is_some() {
+                return Err(InputError::ResourceExhausted);
+            }
+            registry.active = Some((self.peer.clone(), self.generation));
         }
-        if registry.active.is_some() {
-            return Err(InputError::ResourceExhausted);
-        }
-        registry.active = Some((self.peer.clone(), self.generation));
         Ok(())
     }
 
     fn is_active(&self) -> InputResult<bool> {
         let registry = self.registry.lock().map_err(|_| InputError::InvalidGrant)?;
-        Ok(registry.active.as_ref() == Some(&(self.peer.clone(), self.generation)))
+        Ok(registry.active_for(self))
     }
 
     fn deactivate(&self) -> InputResult<()> {
         let mut registry = self.registry.lock().map_err(|_| InputError::InvalidGrant)?;
-        if registry.active.as_ref() == Some(&(self.peer.clone(), self.generation)) {
-            registry.active = None;
+        if registry.active_for(self) {
+            if registry.independent_devices {
+                registry.independent_grants.remove(&self.generation);
+            } else {
+                registry.active = None;
+            }
         }
         Ok(())
     }
@@ -502,6 +573,24 @@ impl<S: DeviceSink> Drop for InputSession<S> {
     fn drop(&mut self) {
         if !self.closed || self.cleanup_required {
             let _ = self.revoke();
+        }
+    }
+}
+
+// A grant abandoned before activation owns no native device. Active grants
+// remain fenced until confirmed native cleanup, even if cleanup loses its owner.
+impl Drop for InputGrant {
+    fn drop(&mut self) {
+        if let Ok(mut registry) = self.registry.lock()
+            && registry.independent_devices
+            && registry
+                .independent_grants
+                .get(&self.generation)
+                .is_some_and(|entry| {
+                    !entry.active && entry.peer == self.peer && entry.token == self.lease_token
+                })
+        {
+            registry.independent_grants.remove(&self.generation);
         }
     }
 }

@@ -88,10 +88,13 @@ pub(super) struct Record {
     pub owner: String,
     pub config: PrepareConfig,
     pub start: Option<StartConfig>,
+    pub shared_capture: Option<super::shared_capture::Source>,
+    pub shared_capture_attached: bool,
     pub lifecycle_observation: Option<Value>,
     pub lifecycle_retirement_receipt: Option<Value>,
     pub restart_lifecycle_operation: Option<String>,
     pub restart_lifecycle_target: Option<amaterasu_extension_api::LifecycleTarget>,
+    pub restart_lifecycle_preparation: Option<super::journal::PreparationRecovery>,
     pub lifecycle_candidate_validated: bool,
     pub processing_plan_provider: Option<crate::model::ProcessingPlanProvider>,
     pub processing_frozen: Option<(String, Value)>,
@@ -99,6 +102,7 @@ pub(super) struct Record {
     pub gpu_processing: Option<Value>,
     pub lifecycle_fenced: bool,
     pub lifecycle_retired: bool,
+    pub lifecycle_retirement_proof: Option<amaterasu_extension_api::StreamRetirementProof>,
     pub lifecycle_delivery_permit: bool,
     pub lifecycle_control_permit: bool,
     pub lifecycle_validation_sequence: u64,
@@ -228,9 +232,12 @@ impl Record {
             owner,
             config,
             start: None,
+            shared_capture: None,
+            shared_capture_attached: false,
             lifecycle_observation: None,
             lifecycle_retirement_receipt: None,
             restart_lifecycle_target: None,
+            restart_lifecycle_preparation: None,
             restart_lifecycle_operation: None,
             lifecycle_candidate_validated: false,
             processing_plan_provider: None,
@@ -239,6 +246,7 @@ impl Record {
             gpu_processing: None,
             lifecycle_fenced: false,
             lifecycle_retired: false,
+            lifecycle_retirement_proof: None,
             lifecycle_delivery_permit: false,
             lifecycle_control_permit: false,
             lifecycle_validation_sequence: 0,
@@ -403,6 +411,14 @@ impl Record {
         })
     }
 
+    pub fn lifecycle_consumers_retired(&self) -> bool {
+        self.lifecycle_retired
+            || self
+                .lifecycle_retirement_proof
+                .as_ref()
+                .is_some_and(|proof| proof.consumer_retired)
+    }
+
     pub fn response(&self) -> Value {
         json!({
             "ok": true,
@@ -412,6 +428,10 @@ impl Record {
             "lifecycle_input_required": self.lifecycle_input_required,
             "lifecycle_target": self.start.as_ref().and_then(|start| start.lifecycle_target.as_ref()),
             "lifecycle_retired": self.lifecycle_retired,
+            "lifecycle_consumer_retired": self.lifecycle_consumers_retired(),
+            "lifecycle_resources_released": self.lifecycle_retired,
+            "lifecycle_shared_retained": self.lifecycle_retirement_proof.as_ref().is_some_and(|proof| proof.shared_retained),
+            "lifecycle_shared_source": self.lifecycle_retirement_proof.as_ref().and_then(|proof| proof.shared_source.as_ref()),
             "authenticated_disconnect_reason": self.authenticated_disconnect_reason,
             "history_activity_id": self.config.history_activity_id,
             "rtsp_operation_id": self.config.rtsp_operation_id,

@@ -337,7 +337,7 @@ impl Router {
                     connection.into(),
                     Purpose::Identity {
                         paired: trusted,
-                        peer: peer.identity().ok(),
+                        peer: peer.launch_allowed.then(|| peer.identity().ok()).flatten(),
                     },
                     json!({"action":"identity"}),
                     now + SERVICE_TIMEOUT,

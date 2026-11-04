@@ -63,6 +63,35 @@ does not prove that behavior.
 
 ## Lifecycle
 
+The external capture profile accepts an optional `shared_source_operation_id` on
+`prepare`. This version-1 logical reference names the original NVHTTP operation.
+Only the authenticated RTSP owner can resolve it, within the exact lifecycle
+session, to an active consumer of an existing owned output. An unready source
+returns `shared_capture_source_not_ready` without allocating another display.
+
+Each client keeps independent media, control, capture and encoding resources. The
+group keeps one source-owned VirtualDisplay SDK reference, the original physical
+mode and a journaled logical lease for each consumer. Joining verifies the exact
+source output through SDK status and never changes its geometry. The original
+transport may close first; replacement clients can resolve the same original
+operation through a surviving consumer. The final consumer removes the native
+reference only after all group video consumers have retired. Restart recovery
+reconstructs those claims from every consumer's stable source descriptor before
+removal; module unload leaves unresolved ownership in the journal.
+
+A prepared consumer can crash before its admitted stream target reaches the
+journal. External RTSP preparations retain the exact coordinator preparation
+operation and caller alongside the session. Recovery uses the versioned
+`resolve_stream_preparation` query to recover that target, or authenticated proof
+that an old preparation cannot commit. Pending or mismatched resolution keeps
+the source lease and journal intact; it never invents a stream target.
+
+`lifecycle_consumer_retired` with `lifecycle_shared_retained` confirms local
+consumer cleanup while source resources remain retained. Full
+`lifecycle_resources_released` additionally requires coordinator policy cleanup.
+The selected capture and encoder providers still determine which independent
+output sizes and formats they can deliver from that source.
+
 1. `prepare` allocates a session record, a stereo Opus encoder, media UDP sockets
    and an authenticated control endpoint. It returns the bound ports and actual
    encoded audio packet size before opening capture hardware.

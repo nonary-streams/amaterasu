@@ -150,6 +150,9 @@ impl Coordinator {
         target: LifecycleTarget,
         payload: &Value,
     ) -> ModuleResult<Work> {
+        if payload.get("join_context").is_some() {
+            return Err("join_context_is_coordinator_owned".into());
+        }
         if let Some(value) = payload
             .get("client_context")
             .filter(|value| !value.is_null())
@@ -179,6 +182,7 @@ impl Coordinator {
             providers.reverse();
         }
         Ok(Work {
+            join_context: None,
             composition_progress: None,
             compacted_release: false,
             owner_observations: Default::default(),
@@ -328,6 +332,9 @@ impl Coordinator {
                     self.prepare_stream_history(candidate, &target)
                 })?;
             }
+            if matches!(operation, "prepare_stream" | "resume_stream") {
+                super::join::compact_retired_subscribers(&mut next, &target);
+            }
             let (session, stream_id) = checked_target(&next, &target, caller, initiator)?;
             let session_id = session.id.clone();
             response = json!({"status":"succeeded","target":target,"plan_revision":payload.get("plan_revision")});
@@ -356,6 +363,22 @@ impl Coordinator {
                     }
                     let mut current =
                         self.new_work(LifecyclePhase::StreamPrepare, target.clone(), &payload)?;
+                    if current.intent == Some(StreamIntent::Join) {
+                        if reprepare.is_some() {
+                            return Err("join_source_unavailable".into());
+                        }
+                        current.join_context =
+                            Some(super::join::freeze_source(&self.settings, &next, session)?);
+                    } else if super::join::session_has_shared_lease(&next, &session_id) {
+                        return Err("shared_source_in_use".into());
+                    } else if session.streams.values().any(|stream| {
+                        matches!(
+                            stream.phase,
+                            StreamPhase::Preparing | StreamPhase::Ready | StreamPhase::Active
+                        )
+                    }) {
+                        return Err("join_intent_required".into());
+                    }
                     if reprepare.is_some()
                         && serde_json::to_value(&current.provider_graph).ok()
                             != serde_json::to_value(&session.provider_graph).ok()
@@ -374,7 +397,9 @@ impl Coordinator {
                         stream_id: stream_id.clone(),
                         generation: 1,
                     };
-                    if next.closed_streams.scope_fenced(&current.target) {
+                    if next.closed_streams.scope_fenced(&current.target)
+                        || retention::join_scope_fenced(&next, &current.target)
+                    {
                         return Err("stream_identifier_retired".into());
                     }
                     let required: BTreeSet<String> = payload
@@ -411,9 +436,23 @@ impl Coordinator {
                         .get_mut(&session_id)
                         .unwrap()
                         .required_consumers = Some(required.clone());
+                    if let Some(context) = &current.join_context {
+                        super::join::subscribe(&mut next, context, &current.target)?;
+                    }
+                    let source_snapshot = current.join_context.as_ref().map(|context| {
+                        let (_, _, source, _) =
+                            target_parts(&context.source).expect("validated source target");
+                        next.sessions[&session_id].streams[source.expect("source stream")].clone()
+                    });
+                    let joined_scopes = source_snapshot
+                        .as_ref()
+                        .and_then(|source| source.snapshot_scopes.as_ref())
+                        .map(|scopes| scopes.for_joined_client(payload.get("client_context")))
+                        .transpose()?;
                     next.sessions.get_mut(&session_id).unwrap().streams.insert(
                         stream_id,
                         StreamRecord {
+                            join_context: current.join_context.clone(),
                             provider_graph: current.provider_graph.clone(),
                             generation: 1,
                             phase: StreamPhase::Preparing,
@@ -423,9 +462,13 @@ impl Coordinator {
                             retirements: BTreeSet::new(),
                             binding_owner: String::new(),
                             preparation_transition: current.transition_id.clone(),
-                            snapshot_scopes: None,
-                            admitted_live_options: None,
-                            provider_settings: Default::default(),
+                            snapshot_scopes: joined_scopes,
+                            admitted_live_options: source_snapshot
+                                .as_ref()
+                                .and_then(|source| source.admitted_live_options.clone()),
+                            provider_settings: source_snapshot
+                                .map(|source| source.provider_settings)
+                                .unwrap_or_default(),
                         },
                     );
                     response = json!({"status":"pending","target":current.target,"transition_id":current.transition_id});
@@ -522,6 +565,11 @@ impl Coordinator {
                     response["all_consumers_acknowledged"] = json!(true);
                 }
                 "pause_stream" | "capture_invalidated" | "resource_invalidated" => {
+                    if operation != "pause_stream"
+                        && super::join::session_has_shared_lease(&next, &session_id)
+                    {
+                        return Err("shared_source_in_use".into());
+                    }
                     let stream_id = stream_id.ok_or("stream_target_required")?;
                     let stream = next
                         .sessions
@@ -552,6 +600,10 @@ impl Coordinator {
                         stream.phase = StreamPhase::Quiescing;
                         let mut current =
                             self.new_work(LifecyclePhase::StreamRelease, target.clone(), &payload)?;
+                        current.join_context = stream.join_context.clone();
+                        if current.join_context.is_some() {
+                            current.intent = Some(StreamIntent::Join);
+                        }
                         current.use_release_graph(stream.provider_graph.clone());
                         current.reason = Some(ReleaseReason::Pause);
                         current.waiting_retirement = true;
@@ -627,6 +679,9 @@ impl Coordinator {
                             generation,
                         };
                         self.fence_stream(&mut next, &stream_target)?;
+                        if super::join::source_release_deferred(&next, &stream_target) {
+                            continue;
+                        }
                         if !next.receipts.values().any(|r| {
                             r.work.as_ref().is_some_and(|w| {
                                 w.target == stream_target
@@ -638,6 +693,12 @@ impl Coordinator {
                                 stream_target.clone(),
                                 &json!({}),
                             )?;
+                            release.join_context = next.sessions[&session_id].streams[&stream_id]
+                                .join_context
+                                .clone();
+                            if release.join_context.is_some() {
+                                release.intent = Some(StreamIntent::Join);
+                            }
                             let graph = next.sessions[&session_id].streams[&stream_id]
                                 .provider_graph
                                 .clone();

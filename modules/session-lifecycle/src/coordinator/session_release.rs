@@ -286,8 +286,10 @@ fn session_lineage_closed(journal: &Journal, target: &LifecycleTarget, provider:
     {
         return false;
     }
-    let stream_closed =
-        |target: &LifecycleTarget| journal.verified_released_output(target).is_some();
+    let stream_closed = |target: &LifecycleTarget| {
+        journal.verified_released_output(target).is_some()
+            || super::join::subscriber_resources_released(journal, target)
+    };
     if session.streams.iter().any(|(id, stream)| {
         let target = LifecycleTarget::Stream {
             host_epoch: epoch.into(),

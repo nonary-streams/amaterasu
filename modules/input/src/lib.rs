@@ -2,7 +2,10 @@
 #[cfg_attr(feature = "qualification-fake-backend", allow(dead_code))]
 mod backend;
 pub mod companion_client;
+#[cfg(all(test, target_os = "linux", feature = "qualification-fake-backend"))]
+mod concurrent_module_tests;
 mod controller;
+mod controllers;
 mod feedback;
 #[cfg(any(target_os = "linux", windows, test))]
 mod gamepad;
@@ -24,7 +27,7 @@ mod session_binding;
 use amaterasu_input_policy::KeyBindings;
 use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};
 use backend::NativeBackend;
-use controller::Controller;
+use controllers::Controllers;
 use model::{InputError, MAX_QUEUED_REQUESTS, Operation};
 use product_settings::{InputPolicyUpdate, ProductSettings};
 use serde::Deserialize;
@@ -36,7 +39,7 @@ use std::{
 
 const SERVICE: &str = amaterasu_module_sdk::input::INPUT_SERVICE;
 const CONFIGURATION_SERVICE: &str = "amaterasu.configuration/1";
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Settings {
     #[serde(default)]
@@ -68,7 +71,7 @@ fn default_linux_companion_socket_path() -> String {
 }
 struct InputModule {
     runtime: RuntimeClient,
-    controller: Controller<NativeBackend>,
+    controller: Controllers<NativeBackend>,
     product_settings: ProductSettings,
     queued: VecDeque<QueuedRequest>,
     shortcut_job: Option<(String, shortcut_job::ShortcutJob)>,
@@ -77,7 +80,6 @@ struct InputModule {
     activation_job: Option<(QueuedRequest, session_binding::BatchActivationJob)>,
     input_boot_epoch: String,
     shortcut_cache: shortcut_cache::ShortcutCache,
-    has_consumed_held: bool,
     pending_revoke: Option<(QueuedRequest, session_binding::RevokeRequest)>,
 }
 
@@ -158,6 +160,44 @@ where
     KeyBindings::deserialize(deserializer).map(Some)
 }
 
+impl Settings {
+    fn backend(&self) -> ModuleResult<NativeBackend> {
+        #[cfg(feature = "qualification-fake-backend")]
+        let backend = {
+            // Keep settings parsing and path checks intact in the qualification
+            // artifact while never constructing a native backend.
+            let _ = (&self.uinput_path, &self.windows_backend);
+            NativeBackend::new()
+        };
+        #[cfg(all(windows, not(feature = "qualification-fake-backend")))]
+        let backend = match self.windows_backend.as_deref() {
+            None | Some("native") => NativeBackend::new(self.uinput_path.clone()),
+            Some("vhf_companion") => NativeBackend::new_with_companion(true),
+            Some(_) => return Err("unknown Windows input backend".into()),
+        };
+        #[cfg(all(not(windows), not(feature = "qualification-fake-backend")))]
+        let backend = {
+            if self.windows_backend.is_some() {
+                return Err(
+                    "Windows input backend selection is unavailable on this platform".into(),
+                );
+            }
+            #[cfg(target_os = "linux")]
+            {
+                NativeBackend::new(
+                    self.linux_companion_socket_path.clone(),
+                    self.uinput_path.clone(),
+                )
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                NativeBackend::new(self.uinput_path.clone())
+            }
+        };
+        Ok(backend)
+    }
+}
+
 impl ManagedModule for InputModule {
     fn start(runtime: RuntimeClient) -> ModuleResult<Self> {
         let Response::Result { payload } = runtime.send(Command::GetSettings {})? else {
@@ -169,35 +209,7 @@ impl ManagedModule for InputModule {
         if !std::path::Path::new(&settings.linux_companion_socket_path).is_absolute() {
             return Err("linux_companion_socket_path must be absolute".into());
         }
-        #[cfg(feature = "qualification-fake-backend")]
-        let backend = {
-            // Keep settings parsing and path checks intact in the qualification
-            // artifact while never constructing a native backend.
-            let _ = (&settings.uinput_path, &settings.windows_backend);
-            NativeBackend::new()
-        };
-        #[cfg(all(windows, not(feature = "qualification-fake-backend")))]
-        let backend = match settings.windows_backend.as_deref() {
-            None | Some("native") => NativeBackend::new(settings.uinput_path),
-            Some("vhf_companion") => NativeBackend::new_with_companion(true),
-            Some(_) => return Err("unknown Windows input backend".into()),
-        };
-        #[cfg(all(not(windows), not(feature = "qualification-fake-backend")))]
-        let backend = {
-            if settings.windows_backend.is_some() {
-                return Err(
-                    "Windows input backend selection is unavailable on this platform".into(),
-                );
-            }
-            #[cfg(target_os = "linux")]
-            {
-                NativeBackend::new(settings.linux_companion_socket_path, settings.uinput_path)
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                NativeBackend::new(settings.uinput_path)
-            }
-        };
+        let backend = settings.backend()?;
         runtime.require_success(Command::Register {
             service: SERVICE.into(),
         })?;
@@ -210,9 +222,10 @@ impl ManagedModule for InputModule {
         Ok(Self {
             input_boot_epoch,
             shortcut_cache: shortcut_cache::ShortcutCache::default(),
-            has_consumed_held: true,
             runtime,
-            controller: Controller::new(backend, settings.allow_injection),
+            controller: Controllers::new(backend, settings.allow_injection, move || {
+                settings.backend()
+            }),
             product_settings: ProductSettings::new(),
             queued: VecDeque::new(),
             shortcut_job: None,
@@ -226,7 +239,8 @@ impl ManagedModule for InputModule {
         let _priority = amaterasu_module_sdk::threading::ScopedThreadPriority::best_effort(
             amaterasu_module_sdk::threading::ThreadPriority::Critical,
         );
-        self.controller.expire(Instant::now());
+        self.controller.expire_all(Instant::now());
+        self.controller.select_default();
         let runtime = &self.runtime;
         self.product_settings
             .advance(&mut |command| runtime.send(command), &mut self.controller)?;
@@ -349,7 +363,8 @@ impl InputModule {
                 );
             }
             self.shortcut_cache.invalidate(&revoke.token);
-            self.has_consumed_held = true;
+            self.controller.select_binding(&revoke.token);
+            self.controller.set_consumed_held(true);
             if transferred {
                 self.shortcut_job
                     .as_mut()
@@ -421,6 +436,8 @@ impl InputModule {
     }
 
     fn dispatch(&mut self, request: QueuedRequest) -> ModuleResult<()> {
+        self.controller
+            .select_request(&request.caller, &request.payload);
         if request.service != SERVICE {
             return self.complete(
                 request.id,
@@ -744,7 +761,7 @@ impl InputModule {
             }
             // A cached nonmatching chord has no shortcut effects. Reconstruct
             // forwarded held keys from the controller before testing it.
-            if !self.has_consumed_held
+            if !self.controller.consumed_held()
                 && !non_keyboard_batch(&batch.events)
                 && let Some(snapshot) =
                     self.shortcut_cache
@@ -818,7 +835,7 @@ impl InputModule {
                 &batch.input_binding,
                 &target,
                 Instant::now(),
-                self.has_consumed_held,
+                self.controller.consumed_held(),
             );
             if non_keyboard_batch(&batch.events) || bypass_keyboard {
                 let runtime = &self.runtime;
@@ -870,6 +887,19 @@ impl InputModule {
                     false,
                 ),
             };
+        }
+        if request.payload["action"] == "acquire" && !self.controller.legacy_acquisition_available()
+        {
+            return self.complete(
+                request.id,
+                InputError::new(
+                    "input_busy",
+                    "unbound input acquisitions require exclusive device ownership",
+                )
+                .payload(),
+                &request.caller,
+                false,
+            );
         }
         let operation: Result<Operation, _> = serde_json::from_value(request.payload);
         match operation {
@@ -961,6 +991,15 @@ impl InputModule {
                         );
                     }
                 };
+                if let Err(error) = self.controller.prepare_binding(
+                    &job.token,
+                    &job.owner,
+                    &job.payload,
+                    Instant::now(),
+                ) {
+                    self.bindings.abandon_acquire(&job.token);
+                    return self.complete(job.parent, error.payload(), &job.owner, false);
+                }
                 let runtime = &self.runtime;
                 let mut guard = || match runtime.send(Command::CheckRequest {
                     request: job.parent,
@@ -972,6 +1011,7 @@ impl InputModule {
                     self.controller
                         .handle(&job.owner, operation, Instant::now(), &mut guard);
                 if reply.get("ok").and_then(Value::as_bool) == Some(true) {
+                    self.controller.note_lease(&reply);
                     let lease = reply
                         .get("lease")
                         .and_then(Value::as_str)
@@ -992,7 +1032,7 @@ impl InputModule {
                         );
                     }
                     self.shortcut_cache.invalidate(&job.token);
-                    self.has_consumed_held = true;
+                    self.controller.set_consumed_held(true);
                     reply["input_binding"] = job.token.clone().into();
                     reply["target"] =
                         serde_json::to_value(authority.target).map_err(|e| e.to_string())?;
@@ -1009,6 +1049,9 @@ impl InputModule {
     }
 
     fn advance_revoke(&mut self) -> ModuleResult<()> {
+        if let Some((_, revoke)) = &self.pending_revoke {
+            self.controller.select_binding(&revoke.token);
+        }
         if self.controller.cleanup_required() {
             return Ok(());
         }
@@ -1075,6 +1118,7 @@ impl InputModule {
         let (lease, binding) = job.binding_identity();
         let lease = lease.to_owned();
         let binding = binding.to_owned();
+        self.controller.select_binding(&binding);
         if self
             .bindings
             .authorize_batch(&caller, &lease, Some(&binding))
@@ -1110,7 +1154,7 @@ impl InputModule {
             }
             Ok(Some(payload)) => {
                 if payload["ok"] == true {
-                    self.has_consumed_held = job.has_consumed_held();
+                    self.controller.set_consumed_held(job.has_consumed_held());
                     if let Some(snapshot) = job.take_cache_snapshot()
                         && let Ok(target) = self.bindings.batch_target(&caller, &lease, &binding)
                     {

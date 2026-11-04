@@ -43,6 +43,7 @@ mod finalize_result_verify;
 #[allow(dead_code)] // Finalization selection remains gated until composition sequencing is wired.
 mod finalize_selection;
 mod frozen_settings_read;
+mod join;
 mod live_settings_read;
 mod observation_scheduler;
 mod operations;
@@ -131,6 +132,8 @@ struct Work {
     phase: LifecyclePhase,
     target: LifecycleTarget,
     intent: Option<StreamIntent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    join_context: Option<amaterasu_extension_api::StreamJoinContext>,
     reason: Option<ReleaseReason>,
     video: Option<VideoMode>,
     #[serde(default)]
@@ -393,6 +396,8 @@ struct StreamRecord {
     generation: u64,
     phase: StreamPhase,
     candidate: Option<CaptureBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    join_context: Option<amaterasu_extension_api::StreamJoinContext>,
     required: BTreeSet<String>,
     acknowledgements: BTreeSet<String>,
     retirements: BTreeSet<String>,
@@ -468,6 +473,8 @@ struct Journal {
     receipts: BTreeMap<String, Receipt>,
     #[serde(default)]
     sessions: BTreeMap<String, SessionRecord>,
+    #[serde(default)]
+    shared_sources: BTreeMap<String, join::SharedSourceLease>,
     #[serde(default)]
     authority: AuthorityState,
     #[serde(default)]
@@ -594,6 +601,7 @@ fn valid_id(value: &str) -> bool {
 fn save(shared: &Shared, mut next: Journal) -> ModuleResult<()> {
     action_closed_history::compact_released_actions(&mut next);
     retention::compact(&mut next);
+    join::compact(&mut next);
     action_root_retirement::compact_replaced_roots(&mut next);
     let mut shared = shared.borrow_mut();
     shared
@@ -605,6 +613,12 @@ fn save(shared: &Shared, mut next: Journal) -> ModuleResult<()> {
     Ok(())
 }
 fn validate_journal(journal: &Journal) -> io::Result<()> {
+    if !join::validate(journal) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid shared source lease journal",
+        ));
+    }
     if !matches!(journal.version, 2 | 3)
         || !valid_id(&journal.host_epoch)
         || journal.receipts.len() > MAX_RECEIPTS
@@ -1135,6 +1149,7 @@ impl Coordinator {
             host_epoch: epoch.clone(),
             receipts: BTreeMap::new(),
             sessions: BTreeMap::new(),
+            shared_sources: BTreeMap::new(),
             authority: AuthorityState::default(),
             inputs: Default::default(),
             actions: Default::default(),
@@ -1234,6 +1249,9 @@ impl Coordinator {
         let Some(operation) = payload.get("operation").and_then(Value::as_str) else {
             return rejection("invalid_request");
         };
+        if operation == "resolve_stream_preparation" {
+            return self.resolve_stream_preparation(caller, initiator, payload);
+        }
         if operation == "snapshot" {
             return self.snapshot(caller, initiator);
         }

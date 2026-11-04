@@ -46,6 +46,11 @@ fn binding_resource_generation(
     binding: &CaptureBinding,
     provider: &str,
 ) -> ModuleResult<u64> {
+    let (source, source_binding, _) =
+        super::join::validation_source(journal, target, binding, provider)?;
+    if &source != target {
+        return binding_resource_generation(journal, &source, &source_binding, provider);
+    }
     let (epoch, session_id, stream_id, generation) = operations::target_parts(target)?;
     let session = journal
         .sessions
@@ -693,12 +698,17 @@ impl Coordinator {
                     self.finish_validation(&job, None)?;
                     continue;
                 };
-                let (_, session, stream, _) = super::operations::target_parts(&job.target)?;
-                let transition = self.shared.borrow().value.sessions[session].streams
-                    [stream.unwrap()]
-                .preparation_transition
-                .clone();
-                let mut payload = json!({"operation_id":job.operation_id,"transition_id":transition,"target":job.target,"plan_revision":job.binding.plan_revision,"binding":job.binding,"observation":job.observation});
+                let source = super::join::validation_source(
+                    &self.shared.borrow().value,
+                    &job.target,
+                    &job.binding,
+                    &job.provider,
+                );
+                let Ok((provider_target, provider_binding, transition)) = source else {
+                    self.finish_validation(&job, None)?;
+                    continue;
+                };
+                let mut payload = json!({"operation_id":job.operation_id,"transition_id":transition,"target":provider_target,"plan_revision":provider_binding.plan_revision,"binding":provider_binding,"observation":job.observation});
                 if selection.participant.contract_version
                     == amaterasu_extension_api::COMPOSITION_VERSION
                 {
@@ -747,6 +757,8 @@ impl Coordinator {
             binding_resource_generation(&next, &job.target, &job.binding, &job.provider)
                 == Ok(expected)
         });
+        let provider_source =
+            super::join::validation_source(&next, &job.target, &job.binding, &job.provider).ok();
         let (_, session_id, stream_id, generation) = super::operations::target_parts(&job.target)?;
         let stream = next
             .sessions
@@ -763,8 +775,11 @@ impl Coordinator {
                     && r["lease"].as_str().is_some_and(|s| !s.is_empty())
             } else {
                 r["status"] == "succeeded"
-                    && r["target"] == json!(job.target)
-                    && r["binding"] == json!(job.binding)
+                    && provider_source
+                        .as_ref()
+                        .is_some_and(|(target, binding, _)| {
+                            r["target"] == json!(target) && r["binding"] == json!(binding)
+                        })
                     && r["observation"] == job.observation
                     && r["plan_revision"] == job.binding.plan_revision
             }

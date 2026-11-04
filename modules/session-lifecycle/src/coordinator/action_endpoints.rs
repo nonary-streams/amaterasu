@@ -335,6 +335,9 @@ impl Coordinator {
                 let mut selection = None;
                 let mut method = None;
                 if mutating {
+                    if shared_action_target(&journal, &canonical_target) {
+                        return rejection("shared_source_in_use");
+                    }
                     let Some(provider) = payload["provider"].as_str() else {
                         return rejection("provider_required");
                     };
@@ -563,6 +566,9 @@ impl Coordinator {
                 let Some(session) = journal.sessions.get(&session_id) else {
                     return rejection("unknown_session");
                 };
+                if super::join::session_has_shared_lease(&journal, &session_id) {
+                    return rejection("shared_source_in_use");
+                }
                 let stream_id = match &binding.target {
                     ActionTarget::Stream { stream_id, .. } => stream_id.clone(),
                     ActionTarget::Session { .. } => {
@@ -649,6 +655,7 @@ impl Coordinator {
                     phase: amaterasu_extension_api::LifecyclePhase::StreamRelease,
                     target,
                     intent: None,
+                    join_context: None,
                     reason: Some(amaterasu_extension_api::ReleaseReason::Reconfigure),
                     video: None,
                     transition_id,
@@ -1842,12 +1849,27 @@ fn active_provider_revision<'a>(
     Some(revision)
 }
 
+fn shared_action_target(journal: &super::Journal, target: &ActionTarget) -> bool {
+    match target {
+        ActionTarget::Session { session_id, .. } | ActionTarget::Stream { session_id, .. } => {
+            super::join::session_has_shared_lease(journal, session_id)
+        }
+        ActionTarget::Host { .. } => journal
+            .sessions
+            .keys()
+            .any(|session| super::join::session_has_shared_lease(journal, session)),
+    }
+}
+
 pub(super) fn effect_rights_current(
     journal: &super::Journal,
     service: &str,
     token: &str,
     binding: &ActionBinding,
 ) -> bool {
+    if shared_action_target(journal, &binding.target) {
+        return false;
+    }
     let key = super::receipt_key(service, "action-transition", &binding.operation_id);
     let Some(receipt) = journal.receipts.get(&key) else {
         return false;
@@ -2398,6 +2420,7 @@ mod tests {
                 acknowledgements: ["capture".into()].into(),
                 retirements: Default::default(),
                 binding_owner: "display".into(),
+                join_context: None,
                 preparation_transition: String::new(),
                 snapshot_scopes: None,
                 admitted_live_options: None,
@@ -2732,6 +2755,7 @@ mod tests {
                 acknowledgements: Default::default(),
                 retirements: Default::default(),
                 binding_owner: "display".into(),
+                join_context: None,
                 preparation_transition: String::new(),
                 snapshot_scopes: None,
                 admitted_live_options: None,

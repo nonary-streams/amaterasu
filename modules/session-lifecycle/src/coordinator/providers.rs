@@ -88,6 +88,56 @@ struct WorkFinishWriter {
     settings: LifecycleSettings,
     selections: BTreeMap<String, ProviderSelection>,
 }
+/// A Join acknowledgement retains the original source's ownership. Its admitted
+/// plan permits no native effects; every participating provider still responds
+/// through its approved lifecycle method and the common SDK contract.
+struct JoinFinishWriter {
+    shared: Shared,
+    key: String,
+    provider: String,
+    state: PrepareState,
+}
+impl AuthorityJournal for JoinFinishWriter {
+    fn persist(&mut self, authority: &AuthorityState) -> ModuleResult<()> {
+        let mut next = self.shared.borrow().value.clone();
+        let work = next
+            .receipts
+            .get(&self.key)
+            .and_then(|receipt| receipt.work.as_ref())
+            .ok_or("unknown_transition")?;
+        let context = work.join_context.as_ref().ok_or("join_context_missing")?;
+        let output = super::join::cleanup_source_output(&next, work)?;
+        if self.state.request.join_context.as_deref() != Some(context)
+            || self.state.request.dependency_inputs != output.into_iter().collect::<Vec<_>>()
+        {
+            return Err("join_source_changed".into());
+        }
+        let expected =
+            amaterasu_extension_api::stream_join_callback(&self.state.request, &self.provider)?;
+        if self.state.response.as_ref() != Some(&expected) {
+            return Err("join_acknowledgement_mismatch".into());
+        }
+        let admission = self
+            .state
+            .admission_id
+            .as_deref()
+            .ok_or("admission_missing")?;
+        if !authority.settled.contains_key(admission) {
+            return Err("join_admission_not_retained".into());
+        }
+        next.authority = authority.clone();
+        super::join::record_callback(&mut next, &self.state)?;
+        apply_participant(
+            &mut next,
+            &self.key,
+            &self.provider,
+            &self.state,
+            self.state.request.version == amaterasu_extension_api::COMPOSITION_VERSION,
+        )?;
+        validate_journal(&next).map_err(|_| "invalid_join_journal")?;
+        save(&self.shared, next)
+    }
+}
 impl AuthorityJournal for WorkFinishWriter {
     fn persist(&mut self, authority: &AuthorityState) -> ModuleResult<()> {
         let mut next = self.shared.borrow().value.clone();
@@ -281,6 +331,7 @@ fn apply_participant(
                     || (outputs.len() != 1
                         && !(outputs.is_empty()
                             && (work.phase == LifecyclePhase::SessionPrepare
+                                || work.join_context.is_some()
                                 || work
                                     .provider_graph
                                     .as_ref()
@@ -883,6 +934,9 @@ impl Coordinator {
                 }
             }
             if work.phase == LifecyclePhase::StreamRelease
+                && work.join_context.is_none()
+                && selected.participant.contract_version
+                    == amaterasu_extension_api::COMPOSITION_VERSION
                 && work.providers.get(work.index) == Some(provider)
                 && work
                     .provider_graph
@@ -1081,7 +1135,8 @@ impl Coordinator {
             .collect();
         for (target, transition) in candidates {
             let mut receipts = next.receipts.iter().filter(|(_, receipt)| {
-                receipt.response["status"] == "succeeded"
+                amaterasu_extension_api::stream_retirement_proof(&receipt.response, &target, None)
+                    .is_ok_and(|proof| proof.resources_released)
                     && receipt.work.is_none()
                     && receipt.response["transition_id"].as_str() == Some(transition.as_str())
                     && serde_json::from_value::<LifecycleTarget>(receipt.response["target"].clone())
@@ -1285,6 +1340,9 @@ impl Coordinator {
             };
             if work.waiting_retirement {
                 if !self.retirement_ready(&work)? {
+                    continue;
+                }
+                if self.retain_shared_source(&key, &work)? {
                     continue;
                 }
                 work.waiting_retirement = false;
@@ -1525,6 +1583,8 @@ impl Coordinator {
                     .filter(|policy| policy.owner_provider == participant.provider)
                     .count()
                     == 1;
+            let join_contract =
+                work.join_context.is_some() && work.intent == Some(StreamIntent::Join);
             // Qualification startup remains fenced for dependent graphs until
             // composition, cleanup and recovery pass end-to-end tests.
             let composed_v2 = participant.contract_version
@@ -1559,7 +1619,7 @@ impl Coordinator {
                     continue;
                 }
             }
-            if standalone_v2 && work.phase == LifecyclePhase::StreamRelease {
+            if standalone_v2 && !join_contract && work.phase == LifecyclePhase::StreamRelease {
                 let preflight = {
                     let shared = self.shared.borrow();
                     super::stream_release::validate_release_preflight(
@@ -1574,6 +1634,7 @@ impl Coordinator {
                 }
             }
             if composed_v2
+                && !join_contract
                 && work.phase == LifecyclePhase::StreamRelease
                 && !work.states.contains_key(provider)
             {
@@ -1587,6 +1648,7 @@ impl Coordinator {
                 }
             }
             if composed_v2
+                && !join_contract
                 && work.phase == LifecyclePhase::StreamPrepare
                 && !work.states.contains_key(provider)
                 && work
@@ -1622,9 +1684,11 @@ impl Coordinator {
                     .as_ref()
                     .and_then(|graph| graph.dependencies.get(provider))
                     .is_some_and(|dependencies| !dependencies.is_empty());
-                let dependency_inputs = if composed_v2
-                    && work.phase == LifecyclePhase::StreamRelease
-                {
+                let dependency_inputs = if work.join_context.is_some() {
+                    super::join::cleanup_source_output(&self.shared.borrow().value, &work)?
+                        .into_iter()
+                        .collect()
+                } else if composed_v2 && work.phase == LifecyclePhase::StreamRelease {
                     if has_dependencies {
                         match self.freeze_release_inputs(&key, &work, provider) {
                             Ok(inputs) => inputs,
@@ -1754,15 +1818,23 @@ impl Coordinator {
                     settings: serde_json::from_value(participant.settings.clone())
                         .map_err(|_| "invalid_participant_settings")?,
                     intent: work.intent.clone(),
+                    join_context: work.join_context.clone().map(Box::new),
                     reason: work.reason.clone(),
                     requested_video: work.video.clone(),
-                    source_video_mode: self
-                        .settings
-                        .processing_policy
-                        .as_ref()
-                        .filter(|policy| policy.source_mode_providers.contains(provider))
-                        .and(work.processing_decision.as_ref())
-                        .and_then(|decision| decision.source_video_mode.clone()),
+                    source_video_mode: if let Some(context) = &work.join_context {
+                        context
+                            .binding
+                            .as_ref()
+                            .filter(|_| work.phase == LifecyclePhase::StreamPrepare)
+                            .map(|binding| binding.mode.clone())
+                    } else {
+                        self.settings
+                            .processing_policy
+                            .as_ref()
+                            .filter(|policy| policy.source_mode_providers.contains(provider))
+                            .and(work.processing_decision.as_ref())
+                            .and_then(|decision| decision.source_video_mode.clone())
+                    },
                     consumer_requirements: self.settings.consumer_requirements.clone(),
                     remaining_ms: 30_000,
                     plan_revision: None,
@@ -1834,7 +1906,11 @@ impl Coordinator {
                         .as_ref()
                         .and_then(|graph| graph.order.first())
                         == Some(provider);
-                let driver = if composed_v2 && !session_release_owner {
+                let driver = if join_contract
+                    && participant.contract_version == amaterasu_extension_api::CONTRACT_VERSION
+                {
+                    PrepareDriver::new(work.states[provider].clone(), &effective_settings)?
+                } else if join_contract || (composed_v2 && !session_release_owner) {
                     PrepareDriver::new_composed(work.states[provider].clone(), &effective_settings)?
                 } else if (composed_v2 && session_release_owner)
                     || (standalone_v2
@@ -1891,6 +1967,25 @@ impl Coordinator {
                 state.phase,
                 PreparePhase::Prepared | PreparePhase::CleanupSettled
             ) {
+                if join_contract {
+                    let admission = state.admission_id.as_deref().ok_or("admission_missing")?;
+                    let writer = JoinFinishWriter {
+                        shared: self.shared.clone(),
+                        key: key.clone(),
+                        provider: provider.clone(),
+                        state: state.clone(),
+                    };
+                    let mut finish = CoordinatorPrepareAuthority::new(
+                        self.shared.borrow().value.authority.clone(),
+                        self.work_selections(&work)?,
+                        writer,
+                    )?;
+                    if let Err(reason) = finish.finish_admission_retained(provider, admission) {
+                        self.fail_work(&key, &reason)?;
+                    }
+                    self.drivers.remove(&runtime_key);
+                    continue;
+                }
                 if let Some(ProviderResponse::Prepared { outputs, .. }) = &state.response
                     && !outputs.is_empty()
                 {
@@ -2434,8 +2529,11 @@ impl Coordinator {
                 .get(session)
                 .and_then(|session| session.streams.get(stream?))
                 .is_some_and(|stream| stream.phase == StreamPhase::Retired)
+                && !super::join::awaiting_shared_release(journal, target)
             {
-                keys.push(key.clone());
+                keys.push((key.clone(), super::join::retirement_proof(journal, target)));
+            } else if let Some(proof) = super::join::retirement_proof(journal, target) {
+                keys.push((key.clone(), Some(proof)));
             }
         }
         if keys.is_empty() {
@@ -2443,10 +2541,22 @@ impl Coordinator {
         }
         let mut next = journal.clone();
         drop(shared);
-        for key in keys {
+        for (key, proof) in keys {
             let receipt = next.receipts.get_mut(&key).unwrap();
             receipt.wait_target = None;
-            receipt.response["status"] = json!("succeeded");
+            let status = receipt
+                .response
+                .as_object_mut()
+                .and_then(|response| response.remove("terminal_status_after_cleanup"))
+                .filter(|status| matches!(status.as_str(), Some("failed" | "cancelled")))
+                .unwrap_or_else(|| json!("succeeded"));
+            receipt.response["status"] = status;
+            if let Some(proof) = proof {
+                receipt.response["consumer_retired"] = json!(proof.consumer_retired);
+                receipt.response["resources_released"] = json!(proof.resources_released);
+                receipt.response["shared_retained"] = json!(proof.shared_retained);
+                receipt.response["shared_source"] = json!(proof.shared_source);
+            }
         }
         save(&self.shared, next)
     }
@@ -2549,6 +2659,7 @@ impl Coordinator {
             return save(&self.shared, next);
         }
         let composed_release = work.phase == LifecyclePhase::StreamRelease
+            && work.join_context.is_none()
             && work
                 .provider_graph
                 .as_ref()
@@ -2583,6 +2694,7 @@ impl Coordinator {
                         )
                 })
             });
+        let shared_source_cleanup = super::join::source_resources_retained(&next, &work.target);
         let session = next.sessions.get_mut(id).ok_or("unknown_session")?;
         let mut response = json!({"status":"succeeded","target":work.target,"transition_id":work.transition_id,"host_epoch":session.host_epoch,"session_id":session.id,"generation":session.generation});
         if let Some(stream) = stream_id.and_then(|id| session.streams.get(id)) {
@@ -2622,6 +2734,10 @@ impl Coordinator {
                     response["candidate"] = Value::Null;
                     response["capture_binding_mode"] = json!(session.capture_binding_mode);
                     response["required_consumers"] = json!(stream.required);
+                    if let Some(context) = &work.join_context {
+                        response["shared_source"] = json!(context.source);
+                        response["join_context"] = json!(context);
+                    }
                 } else {
                     let candidate = work.candidate.clone().ok_or("capture_candidate_missing")?;
                     let stream = session
@@ -2630,10 +2746,17 @@ impl Coordinator {
                         .ok_or("unknown_stream")?;
                     if candidate.generation != stream.generation
                         || work
-                            .processing_decision
+                            .join_context
                             .as_ref()
-                            .and_then(|decision| decision.source_video_mode.as_ref())
-                            .or(work.video.as_ref())
+                            .and_then(|context| {
+                                context.binding.as_ref().map(|binding| &binding.mode)
+                            })
+                            .or_else(|| {
+                                work.processing_decision
+                                    .as_ref()
+                                    .and_then(|decision| decision.source_video_mode.as_ref())
+                                    .or(work.video.as_ref())
+                            })
                             != Some(&candidate.mode)
                     {
                         return Err("capture_candidate_mismatch".into());
@@ -2663,6 +2786,10 @@ impl Coordinator {
                         serde_json::to_value(candidate).map_err(|e| e.to_string())?;
                     response["required_consumers"] = json!(stream.required);
                     response["capture_binding_mode"] = json!(session.capture_binding_mode);
+                    if let Some(context) = &work.join_context {
+                        response["shared_source"] = json!(context.source);
+                        response["join_context"] = json!(context);
+                    }
                 }
             }
             LifecyclePhase::StreamRelease => {
@@ -2718,6 +2845,18 @@ impl Coordinator {
         }
         if deferred {
             response["status"] = json!("deferred_restoration");
+            if shared_source_cleanup {
+                response["status"] = json!("recovery_required");
+                response["reason"] = json!("shared_source_restoration_deferred");
+                session.phase = SessionPhase::RecoveryRequired;
+                if let Some(stream) = stream_id {
+                    session
+                        .streams
+                        .get_mut(stream)
+                        .ok_or("unknown_stream")?
+                        .phase = StreamPhase::RecoveryRequired;
+                }
+            }
         }
         if let Some(failed) = &work.failed_preparation {
             response["status"] = json!(if failed.uncertain {
@@ -2736,14 +2875,27 @@ impl Coordinator {
                 }
             }
         }
+        if work.phase == LifecyclePhase::StreamRelease
+            && work.cleanup_blockers.is_empty()
+            && !deferred
+        {
+            self.release_join_subscription(&mut next, work, &mut response)?;
+        }
         let receipt = next.receipts.get_mut(key).ok_or("unknown_transition")?;
+        if response["shared_source_cleanup_pending"] == true {
+            receipt.wait_target = Some(
+                serde_json::from_value(response["shared_source"].clone())
+                    .map_err(|_| "invalid_shared_source")?,
+            );
+        }
         response["operation_id"] = receipt.request["operation_id"].clone();
         receipt.response = response;
-        receipt.work = work
-            .failed_preparation
-            .as_ref()
-            .is_some_and(|failed| failed.uncertain)
-            .then(|| work.clone());
+        receipt.work = ((deferred && shared_source_cleanup)
+            || work
+                .failed_preparation
+                .as_ref()
+                .is_some_and(|failed| failed.uncertain))
+        .then(|| work.clone());
         if composed_release {
             validate_journal(&next).map_err(|_| "invalid_composed_release_journal")?;
         }
@@ -2891,7 +3043,8 @@ impl Coordinator {
                     reprepare: None,
                     phase,
                     target: work.target.clone(),
-                    intent: None,
+                    intent: work.join_context.as_ref().map(|_| StreamIntent::Join),
+                    join_context: work.join_context.clone(),
                     reason: Some(ReleaseReason::FailedStart),
                     video: work.video.clone(),
                     transition_id: identifier()?,
@@ -3111,6 +3264,7 @@ mod admission_target_tests {
     #[test]
     fn admission_target_survives_roundtrip_and_rejects_rebinding() {
         let mut journal = Journal {
+            shared_sources: Default::default(),
             version: 3,
             host_epoch: "epoch".into(),
             receipts: Default::default(),
@@ -3295,6 +3449,7 @@ mod dependency_cleanup_tests {
                 generation: 1,
             },
             intent: None,
+            join_context: None,
             reason: Some(ReleaseReason::End),
             video: None,
             transition_id: "transition".into(),

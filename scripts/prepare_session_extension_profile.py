@@ -35,7 +35,7 @@ OPERATIONS = {
     LAUNCH: ["read_prepared_plans"],
     NVHTTP: ["prepare", "bind_application", "application_retired", "end_session", "lookup", "snapshot", "recover_session"],
     RTSP: ["prepare_stream", "resume_stream", "lookup", "snapshot"],
-    STREAM: ["validate_candidate", "ack_binding", "start_stream", "pause_stream", "retire_stream", "binding_validate", "capture_invalidated", "resource_invalidated", "issue_input_binding", "lookup"],
+    STREAM: ["validate_candidate", "ack_binding", "start_stream", "pause_stream", "retire_stream", "resolve_stream_preparation", "binding_validate", "capture_invalidated", "resource_invalidated", "issue_input_binding", "lookup"],
     INPUT: ["validate_input_binding", "reserve_input_action", "finish_input_action", "lookup_input_action"],
     ACTIONS: ["authorize_action", "consume_action_permit", "begin_action_transition", "complete_action", "consume_input_reservation", "cancel_input_reservation", "lookup"],
     REGISTRY: ["resolve_settings_scope"],
@@ -162,7 +162,8 @@ def prepare(bootstrap: dict, root: Path, descriptor: dict, descriptor_digest: st
         "participants": [{"provider": PROVIDER, "plan_method": method_ref("resource_plan"),
             "callback_method": method_ref("lifecycle_callback"), "status_method": method_ref("lifecycle_status"),
             "binding_validate_method": method_ref("binding_validate"), "settings_revision": "bootstrap-v1",
-            "settings": defaults, "capabilities": [], "cleanup_methods": []}],
+            "settings": defaults, "capabilities": [capability for capability in descriptor.get("capabilities", [])
+                                                   if capability == "amaterasu.stream/join"], "cleanup_methods": []}],
     }
     action_grants = [{"principal": identity, "action_ids": [action_id],
                       "target_kinds": ["session", "stream"], "execution_classes": ["session_mutation"]}

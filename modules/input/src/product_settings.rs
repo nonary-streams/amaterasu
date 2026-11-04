@@ -8,6 +8,19 @@ use amaterasu_module_sdk::{Command, ModuleResult, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+pub(crate) trait PolicyTarget {
+    fn apply_input_policy(&mut self, policy: &InputPolicy) -> bool;
+    fn input_policy_state(&self, policy: &InputPolicy) -> (bool, bool);
+}
+impl<B: Backend> PolicyTarget for Controller<B> {
+    fn apply_input_policy(&mut self, policy: &InputPolicy) -> bool {
+        policy.apply_to_controller(self)
+    }
+    fn input_policy_state(&self, policy: &InputPolicy) -> (bool, bool) {
+        policy.controller_state(self)
+    }
+}
+
 pub const PRODUCT_SETTINGS_VERSION: u32 = 14;
 const CONFIGURATION_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_KEY_REPEAT_DELAY_MS: u32 = 500;
@@ -79,6 +92,50 @@ const fn default_enabled() -> bool {
 }
 
 impl InputPolicy {
+    fn controller_state<B: Backend>(&self, controller: &Controller<B>) -> (bool, bool) {
+        let cleanup_required = controller.cleanup_required();
+        let applied = controller.device_policy() == self.device_policy()
+            && controller.controller_enabled() == self.controller
+            && controller.high_resolution_scrolling() == self.high_resolution_scrolling
+            && controller.always_send_scancodes() == self.always_send_scancodes
+            && controller.key_rightalt_to_key_win() == self.key_rightalt_to_key_win
+            && controller.keybindings() == &self.keybindings
+            && controller.key_repeat_policy() == (self.key_repeat_delay, self.key_repeat_frequency)
+            && controller.back_button_timeout_ms() == self.back_button_timeout
+            && controller.gamepad_profile() == self.gamepad
+            && controller.ds4_back_as_touchpad_click() == self.ds4_back_as_touchpad_click
+            && controller.motion_as_ds4() == self.motion_as_ds4
+            && controller.touchpad_as_ds4() == self.touchpad_as_ds4
+            && controller.ds5_inputtino_randomize_mac() == self.ds5_inputtino_randomize_mac
+            && controller.native_pen_touch() == self.native_pen_touch
+            && !cleanup_required;
+        (applied, cleanup_required)
+    }
+
+    /// Apply global defaults to one controller. Its explicit per-lease overrides
+    /// remain selected by the controller's existing effective-policy rules.
+    pub(crate) fn apply_to_controller<B: Backend>(&self, controller: &mut Controller<B>) -> bool {
+        controller.set_high_resolution_scrolling(self.high_resolution_scrolling);
+        controller.set_always_send_scancodes(self.always_send_scancodes);
+        controller.set_key_rightalt_to_key_win(self.key_rightalt_to_key_win);
+        controller.set_keybindings(&self.keybindings);
+        controller.set_key_repeat_policy(self.key_repeat_delay, self.key_repeat_frequency);
+        controller.set_back_button_timeout_ms(self.back_button_timeout);
+        controller.set_gamepad_profile(self.gamepad);
+        controller.set_ds4_back_as_touchpad_click(self.ds4_back_as_touchpad_click);
+        controller.set_motion_as_ds4(self.motion_as_ds4);
+        controller.set_touchpad_as_ds4(self.touchpad_as_ds4);
+        controller.set_ds5_inputtino_randomize_mac(self.ds5_inputtino_randomize_mac);
+        controller.set_native_pen_touch(self.native_pen_touch);
+        let now = std::time::Instant::now();
+        let controller_cleanup = controller
+            .set_controller_enabled(self.controller, now)
+            .is_err();
+        let device_cleanup = controller
+            .set_device_policy(self.device_policy(), now)
+            .is_err();
+        controller_cleanup || device_cleanup
+    }
     fn device_policy(&self) -> DevicePolicy {
         DevicePolicy {
             keyboard: self.keyboard,
@@ -283,7 +340,7 @@ impl ProductSettings {
         }
     }
 
-    pub fn get_response<B: Backend>(&self, controller: &Controller<B>) -> Value {
+    pub fn get_response<C: PolicyTarget>(&self, controller: &C) -> Value {
         if !self.ready {
             return error("settings_unavailable");
         }
@@ -332,10 +389,10 @@ impl ProductSettings {
         Ok(())
     }
 
-    pub fn advance<B: Backend>(
+    pub fn advance<C: PolicyTarget>(
         &mut self,
         send: Sender<'_>,
-        controller: &mut Controller<B>,
+        controller: &mut C,
     ) -> ModuleResult<()> {
         let Some(pending) = self.pending.take() else {
             return Ok(());
@@ -515,10 +572,10 @@ impl ProductSettings {
         Ok(())
     }
 
-    fn on_terminal<B: Backend>(
+    fn on_terminal<C: PolicyTarget>(
         &mut self,
         send: Sender<'_>,
-        controller: &mut Controller<B>,
+        controller: &mut C,
         work: Work,
         outcome: ChildOutcome,
     ) -> ModuleResult<()> {
@@ -529,27 +586,7 @@ impl ProductSettings {
                         self.policy = policy.clone();
                         self.revision = revision;
                         self.ready = true;
-                        controller.set_high_resolution_scrolling(policy.high_resolution_scrolling);
-                        controller.set_always_send_scancodes(policy.always_send_scancodes);
-                        controller.set_key_rightalt_to_key_win(policy.key_rightalt_to_key_win);
-                        controller.set_keybindings(&policy.keybindings);
-                        controller.set_key_repeat_policy(
-                            policy.key_repeat_delay,
-                            policy.key_repeat_frequency,
-                        );
-                        controller.set_back_button_timeout_ms(policy.back_button_timeout);
-                        controller.set_gamepad_profile(policy.gamepad);
-                        controller
-                            .set_ds4_back_as_touchpad_click(policy.ds4_back_as_touchpad_click);
-                        controller.set_motion_as_ds4(policy.motion_as_ds4);
-                        controller.set_touchpad_as_ds4(policy.touchpad_as_ds4);
-                        controller
-                            .set_ds5_inputtino_randomize_mac(policy.ds5_inputtino_randomize_mac);
-                        controller.set_native_pen_touch(policy.native_pen_touch);
-                        let _ = controller
-                            .set_controller_enabled(policy.controller, std::time::Instant::now());
-                        let _ = controller
-                            .set_device_policy(policy.device_policy(), std::time::Instant::now());
+                        controller.apply_input_policy(&policy);
                     }
                     Err(_) => self.retry_startup_load(30),
                 },
@@ -611,31 +648,7 @@ impl ProductSettings {
                         self.policy = actual.clone();
                         self.revision = revision;
                         self.ready = true;
-                        controller.set_high_resolution_scrolling(actual.high_resolution_scrolling);
-                        controller.set_always_send_scancodes(actual.always_send_scancodes);
-                        controller.set_key_rightalt_to_key_win(actual.key_rightalt_to_key_win);
-                        controller.set_keybindings(&actual.keybindings);
-                        controller.set_key_repeat_policy(
-                            actual.key_repeat_delay,
-                            actual.key_repeat_frequency,
-                        );
-                        controller.set_back_button_timeout_ms(actual.back_button_timeout);
-                        controller.set_gamepad_profile(actual.gamepad);
-                        controller
-                            .set_ds4_back_as_touchpad_click(actual.ds4_back_as_touchpad_click);
-                        controller.set_motion_as_ds4(actual.motion_as_ds4);
-                        controller.set_touchpad_as_ds4(actual.touchpad_as_ds4);
-                        controller
-                            .set_ds5_inputtino_randomize_mac(actual.ds5_inputtino_randomize_mac);
-                        controller.set_native_pen_touch(actual.native_pen_touch);
-                        let now = std::time::Instant::now();
-                        let controller_cleanup = controller
-                            .set_controller_enabled(actual.controller, now)
-                            .is_err();
-                        let device_cleanup = controller
-                            .set_device_policy(actual.device_policy(), std::time::Instant::now())
-                            .is_err();
-                        let cleanup = controller_cleanup || device_cleanup;
+                        let cleanup = controller.apply_input_policy(&actual);
                         complete(
                             send,
                             management_request,
@@ -657,10 +670,10 @@ impl ProductSettings {
         Ok(())
     }
 
-    fn apply_update<B: Backend>(
+    fn apply_update<C: PolicyTarget>(
         &mut self,
         send: Sender<'_>,
-        controller: &mut Controller<B>,
+        controller: &mut C,
         request: u64,
         policy: InputPolicy,
         revision: u64,
@@ -668,26 +681,7 @@ impl ProductSettings {
         self.policy = policy.clone();
         self.revision = revision;
         self.ready = true;
-        controller.set_high_resolution_scrolling(policy.high_resolution_scrolling);
-        controller.set_always_send_scancodes(policy.always_send_scancodes);
-        controller.set_key_rightalt_to_key_win(policy.key_rightalt_to_key_win);
-        controller.set_keybindings(&policy.keybindings);
-        controller.set_key_repeat_policy(policy.key_repeat_delay, policy.key_repeat_frequency);
-        controller.set_back_button_timeout_ms(policy.back_button_timeout);
-        controller.set_gamepad_profile(policy.gamepad);
-        controller.set_ds4_back_as_touchpad_click(policy.ds4_back_as_touchpad_click);
-        controller.set_motion_as_ds4(policy.motion_as_ds4);
-        controller.set_touchpad_as_ds4(policy.touchpad_as_ds4);
-        controller.set_ds5_inputtino_randomize_mac(policy.ds5_inputtino_randomize_mac);
-        controller.set_native_pen_touch(policy.native_pen_touch);
-        let now = std::time::Instant::now();
-        let controller_cleanup = controller
-            .set_controller_enabled(policy.controller, now)
-            .is_err();
-        let device_cleanup = controller
-            .set_device_policy(policy.device_policy(), now)
-            .is_err();
-        let cleanup = controller_cleanup || device_cleanup;
+        let cleanup = controller.apply_input_policy(&policy);
         let response = if cleanup {
             json!({
                 "ok":false,
@@ -704,27 +698,8 @@ impl ProductSettings {
         complete(send, request, response)
     }
 
-    fn response<B: Backend>(&self, controller: &Controller<B>, persisted: bool) -> Value {
-        let cleanup_required = controller.cleanup_required();
-        let applied = controller.device_policy() == self.policy.device_policy()
-            && controller.controller_enabled() == self.policy.controller
-            && controller.high_resolution_scrolling() == self.policy.high_resolution_scrolling
-            && controller.always_send_scancodes() == self.policy.always_send_scancodes
-            && controller.key_rightalt_to_key_win() == self.policy.key_rightalt_to_key_win
-            && controller.keybindings() == &self.policy.keybindings
-            && controller.key_repeat_policy()
-                == (
-                    self.policy.key_repeat_delay,
-                    self.policy.key_repeat_frequency,
-                )
-            && controller.back_button_timeout_ms() == self.policy.back_button_timeout
-            && controller.gamepad_profile() == self.policy.gamepad
-            && controller.ds4_back_as_touchpad_click() == self.policy.ds4_back_as_touchpad_click
-            && controller.motion_as_ds4() == self.policy.motion_as_ds4
-            && controller.touchpad_as_ds4() == self.policy.touchpad_as_ds4
-            && controller.ds5_inputtino_randomize_mac() == self.policy.ds5_inputtino_randomize_mac
-            && controller.native_pen_touch() == self.policy.native_pen_touch
-            && !cleanup_required;
+    fn response<C: PolicyTarget>(&self, controller: &C, persisted: bool) -> Value {
+        let (applied, cleanup_required) = controller.input_policy_state(&self.policy);
         settings_response_with_state(
             self.policy.clone(),
             self.revision,
