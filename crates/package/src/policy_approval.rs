@@ -194,6 +194,11 @@ pub fn candidate_from_allowlist(
             .get(&key)
             .cloned()
             .map_or(PolicyValue::Absent, PolicyValue::Present);
+        // An optional composition may already be installed. Keep its exact
+        // approved destination unchanged when updating the signed package.
+        if before == change.after {
+            continue;
+        }
         if before != change.before {
             return Err("host policy changed since authorization".into());
         }
@@ -326,6 +331,28 @@ fn collect_changes(
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn installed_policy_can_be_reused_but_drift_is_rejected() {
+        let (_, installed, approval) = inputs();
+        let (candidate, repeated) =
+            candidate_from_allowlist(&allowlist(&approval), &context(&approval), &installed)
+                .unwrap();
+        assert!(repeated.changes.is_empty());
+        assert_eq!(
+            serde_json::from_slice::<Value>(&candidate).unwrap(),
+            serde_json::from_slice::<Value>(&installed).unwrap()
+        );
+        let mut drift: Value = serde_json::from_slice(&installed).unwrap();
+        drift["policy"]["settings"]["video"]["processor"] = json!("other/1");
+        assert!(
+            candidate_from_allowlist(
+                &allowlist(&approval),
+                &context(&approval),
+                &serde_json::to_vec(&drift).unwrap()
+            )
+            .is_err()
+        );
+    }
     #[test]
     fn reconstructs_an_exact_top_level_api_method_approval() {
         let (source, _, observed) = inputs();

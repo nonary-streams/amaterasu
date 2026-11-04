@@ -93,6 +93,20 @@ pub fn prepare_trial<T>(
 /// Run a disposable trial against a stopped Linux user service. A successful
 /// probe does not change the active selection or install a service unit.
 pub fn probe(root: &Path, request: &HostPackageActivation) -> PackageResult<()> {
+    probe_with_recovery(root, request, std::time::Duration::ZERO)
+}
+
+/// Run only the verified candidate's existing recovery machinery while the
+/// service is stopped. This does not change the active package or fake receipts.
+pub fn reconcile(root: &Path, request: &HostPackageActivation) -> PackageResult<()> {
+    probe_with_recovery(root, request, std::time::Duration::from_secs(10))
+}
+
+fn probe_with_recovery(
+    root: &Path,
+    request: &HostPackageActivation,
+    recovery_budget: std::time::Duration,
+) -> PackageResult<()> {
     let root = crate::service::validate_user_service_root(root)?;
     let _lock = amaterasu_package::RootLock::acquire(&root)?;
     let state_root = crate::service::validate_user_state_root(&root.join("data/state"))?;
@@ -126,6 +140,13 @@ pub fn probe(root: &Path, request: &HostPackageActivation) -> PackageResult<()> 
         )?;
         loaded.tick()?;
         loaded.health()?;
+        let deadline = std::time::Instant::now() + recovery_budget;
+        while std::time::Instant::now() < deadline {
+            let observed = loaded.observe_work()?;
+            loaded.tick()?;
+            loaded.health()?;
+            loaded.wait_for_work(observed, std::time::Duration::from_millis(5))?;
+        }
         loaded.quiesce(std::time::Duration::from_secs(20))?;
         drop(loaded);
         Ok(())

@@ -883,6 +883,8 @@ impl Coordinator {
                 }
             }
             if work.phase == LifecyclePhase::StreamRelease
+                && selected.participant.contract_version
+                    == amaterasu_extension_api::COMPOSITION_VERSION
                 && work.providers.get(work.index) == Some(provider)
                 && work
                     .provider_graph
