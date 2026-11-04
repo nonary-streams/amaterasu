@@ -1,39 +1,20 @@
 // A consuming UI showcase using the host's versioned extension control SDK.
+const showcaseStylesheetUrl = (() => {
+  const sourceUrl = document.currentScript?.src;
+  if (!sourceUrl) return "";
+  try {
+    const stylesheetUrl = new URL("showcase.css", sourceUrl);
+    return stylesheetUrl.origin === location.origin ? stylesheetUrl.href : "";
+  } catch {
+    return "";
+  }
+})();
+
 window.AmaterasuExtensions.v1.register("showcase", {
   title: "UI elements",
   mount(container, sdk) {
-    const style = document.createElement("style");
-    style.textContent = ".okami-showcase{display:grid;gap:20px;color:var(--fg)}" +
-      ".okami-showcase *{box-sizing:border-box}" +
-      ".showcase-intro{padding:clamp(18px,3vw,30px);border:1px solid var(--line);border-radius:16px;background:var(--panel)}" +
-      ".showcase-intro h2,.showcase-theme>h3{margin:0;font:500 clamp(24px,3vw,34px)/1.15 var(--font-display)}" +
-      ".showcase-intro p{max-width:64ch;color:var(--secondary)}" +
-      ".showcase-brush{width:min(190px,48vw);height:4px;margin-top:16px;border-radius:99px;background:linear-gradient(90deg,var(--accent),var(--gold),transparent);transform:rotate(-1deg);transform-origin:left}" +
-      ".showcase-theme-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;align-items:start}" +
-      ".showcase-theme{min-width:0;display:grid;gap:12px;padding:clamp(12px,2vw,20px);border:1px solid var(--line);border-radius:16px;color:var(--fg);background:var(--bg)}" +
-      ".showcase-theme>h3{font-size:20px}" +
-      ".showcase-panel{min-width:0;margin:0;padding:16px}" +
-      ".showcase-panel h4{margin:0 0 12px;font:500 16px/1.3 var(--font-display)}" +
-      ".showcase-actions{display:flex;flex-wrap:wrap;gap:8px;align-items:center}" +
-      ".showcase-field{display:grid;gap:6px;margin:10px 0}" +
-      ".showcase-field>span:first-child{color:var(--fg);font-weight:600}" +
-      ".showcase-field input{width:100%;min-height:40px;padding:8px 10px;border:1px solid var(--line);border-radius:9px;color:var(--fg);background:var(--bg);font:inherit}" +
-      ".showcase-field input[aria-invalid=true]{border-color:var(--danger)}" +
-      ".showcase-field small{color:var(--muted)}" +
-      ".showcase-tabs{display:flex;gap:6px;overflow-x:auto;border-bottom:1px solid var(--line)}" +
-      ".showcase-tab[aria-selected=true]{color:var(--accent);border-color:var(--accent);background:var(--selected-bg)}" +
-      ".showcase-tab-panel{min-height:74px;padding:12px 4px;color:var(--secondary)}" +
-      ".showcase-alert{margin:8px 0 0;padding:12px;border:1px solid var(--warning-border);border-radius:10px;color:var(--warning-text);background:var(--warning-bg)}" +
-      ".showcase-alert[data-kind=error]{color:var(--error-text);border-color:var(--error-border);background:var(--error-bg)}" +
-      ".showcase-table-wrap{overflow-x:auto}.showcase-table{width:100%;border-collapse:collapse}" +
-      ".showcase-table th,.showcase-table td{padding:9px 10px;border-bottom:1px solid var(--line);text-align:left;white-space:nowrap}" +
-      ".showcase-table th{color:var(--secondary);font-size:12px}" +
-      ".showcase-modal{width:min(calc(100% - 32px),480px);max-width:480px;border:1px solid var(--line);border-radius:16px;color:var(--fg);background:var(--panel)}" +
-      ".showcase-modal::backdrop{background:color-mix(in srgb,var(--ink) 68%,transparent)}" +
-      ".showcase-modal h4{font:500 21px/1.2 var(--font-display)}" +
-      "@media(max-width:720px){.showcase-theme-grid{grid-template-columns:minmax(0,1fr)}.showcase-theme{padding:12px}.showcase-panel{padding:14px}.showcase-actions .button{flex:1 1 auto}}" +
-      "@media(prefers-reduced-motion:reduce){.okami-showcase *,.okami-showcase *::before,.okami-showcase *::after{scroll-behavior:auto;transition:none}}";
     const root = element("main", "okami-showcase");
+    const removeStylesheet = attachShowcaseStylesheet(root);
     root.setAttribute("aria-label", "Component showcase");
     const intro = element("header", "showcase-intro");
     intro.append(element("h2", "", "Ink, paper, and living controls"),
@@ -44,15 +25,44 @@ window.AmaterasuExtensions.v1.register("showcase", {
     const dialogs = [];
     grid.append(buildTheme("light", sdk, controls, dialogs), buildTheme("dark", sdk, controls, dialogs));
     root.append(intro, grid);
-    container.append(style, root);
+    container.append(root);
     return () => {
       controls.forEach((control) => control.dispose());
       dialogs.forEach((dialog) => dialog.close());
-      style.remove();
+      removeStylesheet();
       root.remove();
     };
   },
 });
+
+function attachShowcaseStylesheet(root) {
+  const stylesheet = document.createElement("link");
+  stylesheet.rel = "stylesheet";
+  stylesheet.href = showcaseStylesheetUrl;
+  const status = element("p", "showcase-style-status",
+    "Showcase styles could not be loaded; host styles remain available.");
+  status.setAttribute("role", "status");
+  status.setAttribute("aria-live", "polite");
+  const supportsStylesheetLoading = Boolean(showcaseStylesheetUrl) &&
+    typeof stylesheet.addEventListener === "function" &&
+    typeof document.head?.append === "function";
+  if (supportsStylesheetLoading) {
+    status.textContent = "Loading showcase styles.";
+    stylesheet.addEventListener("load", () => {
+      root.dataset.stylesheetState = "loaded";
+      status.remove();
+    });
+    stylesheet.addEventListener("error", () => {
+      root.dataset.stylesheetState = "fallback";
+      status.textContent = "Showcase styles could not be loaded; host styles remain available.";
+    });
+    document.head.append(stylesheet);
+  } else {
+    root.dataset.stylesheetState = "fallback";
+  }
+  root.append(status);
+  return () => stylesheet.remove();
+}
 
 function element(tag, className, text) {
   const node = document.createElement(tag);

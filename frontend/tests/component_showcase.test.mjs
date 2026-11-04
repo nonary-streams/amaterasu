@@ -8,6 +8,7 @@ class Element {
   constructor(tag = "div", document = null) {
     this.tagName = tag.toUpperCase(); this.document = document; this.children = [];
     this.attributes = {}; this.listeners = {}; this.value = ""; this.checked = false;
+    this.dataset = {};
     this.hidden = false; this.disabled = false; this.open = false; this.validity = { valid: true };
   }
   append(...children) { this.children.push(...children); }
@@ -30,12 +31,19 @@ class Element {
   get textContent() { return this.children.map((child) => typeof child === "string" ? child : child.textContent ?? "").join(""); }
   set textContent(value) { this.children = [String(value)]; }
 }
-function setupShowcase() {
+function setupShowcase({ scriptUrl = "https://host.test/v1/extensions/showcase/" +
+  "a".repeat(64) + "/assets/showcase.js" } = {}) {
   let registered;
-  const document = { activeElement: null, createElement(tag) { return new Element(tag, this); } };
+  const document = {
+    activeElement: null,
+    currentScript: { src: scriptUrl },
+    head: new Element("head"),
+    createElement(tag) { return new Element(tag, this); },
+  };
   const context = vm.createContext({
     document, window: { AmaterasuExtensions: { v1: { register(_id, page) { registered = page; } } } },
-    AbortController, Error, Number, String, Object, Array,
+    AbortController, Error, Number, String, Object, Array, URL,
+    location: { origin: "https://host.test" },
   });
   context.localizedTextNode = (text) => text;
   context.localeFormattedTextNode = (format) => format("en");
@@ -49,7 +57,7 @@ function setupShowcase() {
   vm.runInContext(readFileSync(new URL("../../examples/web-extension/showcase.js", import.meta.url), "utf8"), context);
   const container = new Element("main", document);
   const cleanup = registered.mount(container, sdk);
-  return { container, cleanup, lifecycle, document };
+  return { container, cleanup, lifecycle, document, stylesheet: document.head.children[0] };
 }
 function all(node) {
   return [node, ...(node.children ?? []).flatMap((child) => child instanceof Element ? all(child) : [])];
@@ -72,10 +80,16 @@ test("Okami showcase consumes host SDK controls and displays both themes and com
   assert.ok(invalidEmail);
   assert.ok(nodes.some((node) => node.id === invalidEmail.getAttribute("aria-describedby")));
   assert.equal(nodes.filter((node) => node.tagName === "TH" && node.getAttribute("scope") === "col").length, 6);
-  const styles = nodes.find((node) => node.tagName === "STYLE").textContent;
-  assert.ok(styles.includes("@media(max-width:720px)"));
+  assert.equal(page.stylesheet.rel, "stylesheet");
+  assert.equal(page.stylesheet.href,
+    "https://host.test/v1/extensions/showcase/" + "a".repeat(64) + "/assets/showcase.css");
+  page.stylesheet.dispatch("load");
+  assert.equal(nodes.find((node) => node.getAttribute("role") === "status").removed, true);
+  const styles = readFileSync(new URL("../../examples/web-extension/showcase.css", import.meta.url), "utf8");
+  assert.ok(styles.includes("@media (max-width: 720px)"));
   assert.ok(styles.includes("prefers-reduced-motion"));
   assert.ok(styles.includes("var(--accent)"));
+  assert.ok(!nodes.some((node) => node.tagName === "STYLE"));
   const hostStyles = readFileSync(new URL("../public/styles.css", import.meta.url), "utf8");
   assert.ok(hostStyles.includes("[data-theme=\"light\"]"));
   assert.ok(hostStyles.includes(":focus-visible"));
@@ -88,6 +102,20 @@ test("Okami showcase consumes host SDK controls and displays both themes and com
     .every((entry) => !entry.signal || entry.signal.aborted)));
 });
 
+test("showcase reports a useful fallback when its signed stylesheet cannot load", () => {
+  const page = setupShowcase();
+  page.stylesheet.dispatch("error");
+  const status = all(page.container).find((node) => node.getAttribute("role") === "status");
+  assert.ok(status.textContent.includes("host styles remain available"));
+  const featureFallback = setupShowcase({ scriptUrl: "" });
+  assert.equal(featureFallback.stylesheet, undefined);
+  assert.ok(all(featureFallback.container).some((node) =>
+    node.getAttribute("role") === "status" &&
+    node.textContent.includes("host styles remain available")));
+  page.cleanup();
+  featureFallback.cleanup();
+  assert.equal(page.stylesheet.removed, true);
+});
 test("keyboard tabs support arrows, Home, End, and dialogs return focus to the opener", () => {
   const page = setupShowcase();
   const nodes = all(page.container);

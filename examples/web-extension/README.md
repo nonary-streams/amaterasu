@@ -124,9 +124,12 @@ generation when changing scopes or administrator principals.
 The `showcase.js` page consumes the versioned `sdk.ui` controls and displays
 light and dark semantic theme samples, button and field states, keyboard tabs,
 status and alert panels, a native dialog, and a responsive table. Page styles
-use host semantic theme tokens. The showcase is an extension consumer and does
-not replace or modify shared controls. To package it, copy only `showcase.js` into
-a clean source directory and use the `amaterasu-web-extension pack` workflow
+use host semantic theme tokens. Its stylesheet is a separate signed same-origin
+asset to satisfy the host's `style-src 'self'` policy. If the asset cannot load,
+the page reports the issue and keeps the controls usable with host styles. The
+showcase is an extension consumer and does not replace or modify shared
+controls. To package it, copy `showcase.js` and `showcase.css` into a clean
+source directory and use the `amaterasu-web-extension pack` workflow
 above with ID `showcase`, title `UI Elements`, entrypoint `showcase.js`, and no
 method declarations. Stage and approve the signed extension through the normal
 host workflow before opening it.
