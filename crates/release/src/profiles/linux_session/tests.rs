@@ -950,6 +950,13 @@ fn rtx_hdr_composition_is_explicit_and_authorizes_the_processor() {
     assert!(provider.native_provides.contains(&"amaterasu.rtx-hdr/1"));
     assert!(video.native_uses.contains(&"amaterasu.rtx-hdr/1"));
     assert!(video.dependencies.contains(&provider.id));
+    assert!(video.calls.contains(&"amaterasu.session-lifecycle/1"));
+    assert!(video.dependencies.contains(&"amaterasu.session-lifecycle"));
+    assert!(
+        enabled.principals[VIDEO_COMPONENT_ID]
+            .call
+            .contains("amaterasu.session-lifecycle/1")
+    );
     assert!(
         enabled.principals[VIDEO_COMPONENT_ID]
             .native_use
@@ -998,6 +1005,30 @@ fn rtx_hdr_composition_is_explicit_and_authorizes_the_processor() {
         "amaterasu.rtx-hdr/1"
     );
     assert!(enabled.settings["amaterasu.session-lifecycle"]["provider_settings_readers"]["amaterasu.stream-session"].as_array().unwrap().contains(&json!("amaterasu.rtx-hdr")));
+    let lifecycle = &enabled.settings["amaterasu.session-lifecycle"];
+    assert!(
+        lifecycle["trusted_callers"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(VIDEO_COMPONENT_ID))
+    );
+    assert!(
+        lifecycle["operation_grants"][VIDEO_COMPONENT_ID]
+            .as_array()
+            .unwrap()
+            .contains(&json!("read_live_provider_settings"))
+    );
+    assert!(
+        lifecycle["provider_settings_readers"][VIDEO_COMPONENT_ID]
+            .as_array()
+            .unwrap()
+            .contains(&json!("amaterasu.rtx-hdr"))
+    );
+    assert!(
+        default.settings["amaterasu.session-lifecycle"]["provider_settings_readers"]
+            .get(VIDEO_COMPONENT_ID)
+            .is_none()
+    );
     assert!(
         enabled.settings["amaterasu.session-lifecycle"]["participants"]
             .as_array()

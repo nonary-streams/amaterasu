@@ -157,6 +157,13 @@ pub const RTX_HDR_COMPONENT: ComponentDefinition = ComponentDefinition {
 };
 
 const RTX_HDR_VIDEO: ComponentDefinition = ComponentDefinition {
+    calls: &[
+        "amaterasu.capture-kms/1",
+        "amaterasu.capture-pipewire/1",
+        "amaterasu.capture-vkms/1",
+        "amaterasu.encode/1",
+        "amaterasu.session-lifecycle/1",
+    ],
     native_uses: &[
         "amaterasu.capture-kms/1",
         "amaterasu.capture-pipewire/1",
@@ -171,6 +178,7 @@ const RTX_HDR_VIDEO: ComponentDefinition = ComponentDefinition {
         "amaterasu.capture-vkms",
         "amaterasu.encode",
         "amaterasu.rtx-hdr",
+        "amaterasu.session-lifecycle",
     ],
     ..LINUX_SESSION_VIDEO
 };
@@ -674,6 +682,9 @@ pub fn enable_rtx_hdr(policy: &mut RuntimeConfig, runtime_directory: &Path) -> P
         .get_mut(VIDEO_COMPONENT_ID)
         .ok_or("Linux session video principal missing")?;
     video_grants.native_use.insert("amaterasu.rtx-hdr/1".into());
+    video_grants
+        .call
+        .insert("amaterasu.session-lifecycle/1".into());
     let desired_grants = RTX_HDR_COMPONENT.grants();
     if let Some(existing) = candidate.principals.get(RTX_HDR_COMPONENT.id) {
         if serde_json::to_value(existing).map_err(|error| error.to_string())?
@@ -750,6 +761,25 @@ pub fn enable_rtx_hdr(policy: &mut RuntimeConfig, runtime_directory: &Path) -> P
     if !operations.contains(&json!("read_frozen_provider_settings")) {
         operations.push(json!("read_frozen_provider_settings"));
     }
+    let grants = lifecycle
+        .get_mut("operation_grants")
+        .and_then(Value::as_object_mut)
+        .ok_or("stream lifecycle operation grants missing")?;
+    let video_operations = grants
+        .entry(VIDEO_COMPONENT_ID)
+        .or_insert_with(|| json!([]))
+        .as_array_mut()
+        .ok_or("invalid video lifecycle operation grants")?;
+    if !video_operations.contains(&json!("read_live_provider_settings")) {
+        video_operations.push(json!("read_live_provider_settings"));
+    }
+    let trusted_callers = lifecycle
+        .get_mut("trusted_callers")
+        .and_then(Value::as_array_mut)
+        .ok_or("stream lifecycle trusted callers missing")?;
+    if !trusted_callers.contains(&json!(VIDEO_COMPONENT_ID)) {
+        trusted_callers.push(json!(VIDEO_COMPONENT_ID));
+    }
     let readers = lifecycle
         .entry("provider_settings_readers")
         .or_insert_with(|| json!({}))
@@ -762,6 +792,17 @@ pub fn enable_rtx_hdr(policy: &mut RuntimeConfig, runtime_directory: &Path) -> P
         .ok_or("invalid stream settings readers")?;
     if !readers.contains(&json!("amaterasu.rtx-hdr")) {
         readers.push(json!("amaterasu.rtx-hdr"));
+    }
+    let video_readers = lifecycle
+        .get_mut("provider_settings_readers")
+        .and_then(Value::as_object_mut)
+        .ok_or("invalid provider settings readers")?
+        .entry(VIDEO_COMPONENT_ID)
+        .or_insert_with(|| json!([]))
+        .as_array_mut()
+        .ok_or("invalid video settings readers")?;
+    if !video_readers.contains(&json!("amaterasu.rtx-hdr")) {
+        video_readers.push(json!("amaterasu.rtx-hdr"));
     }
     super::default_extensions::add_extension(
         &mut candidate,

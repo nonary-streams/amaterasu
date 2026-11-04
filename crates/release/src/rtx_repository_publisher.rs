@@ -151,10 +151,20 @@ fn check_composition(manifest: &ReleaseManifest) -> PackageResult<&str> {
         .iter()
         .find(|c| c.id == VIDEO_COMPONENT_ID)
         .ok_or("Linux video component is absent")?;
+    let lifecycle = manifest
+        .components
+        .iter()
+        .find(|c| c.id == "amaterasu.session-lifecycle")
+        .ok_or("session lifecycle component is absent")?;
     if !plugin.requested.provide.contains(SERVICE)
         || !plugin.requested.native_provide.contains(SERVICE)
         || !video.requested.native_use.contains(SERVICE)
         || video.requires.get(SLOT) != Some(&plugin.version)
+        || !video
+            .requested
+            .call
+            .contains("amaterasu.session-lifecycle/1")
+        || video.requires.get(&lifecycle.id) != Some(&lifecycle.version)
     {
         return Err("RTX HDR signed grants or video dependency are missing".into());
     }
@@ -329,6 +339,31 @@ mod tests {
         let output = fixture.root.join("output");
         assert!(fixture.run(&output).is_err());
         assert!(!output.exists());
+    }
+
+    #[test]
+    fn publisher_requires_signed_live_settings_authority() {
+        let fixture = Fixture::new();
+        let manifest: ReleaseManifest = read_json(&fixture.source.join("manifest.json")).unwrap();
+        assert!(check_composition(&manifest).is_ok());
+
+        let mut missing_grant = manifest.clone();
+        let video = missing_grant
+            .components
+            .iter_mut()
+            .find(|c| c.id == VIDEO_COMPONENT_ID)
+            .unwrap();
+        video.requested.call.remove("amaterasu.session-lifecycle/1");
+        assert!(check_composition(&missing_grant).is_err());
+
+        let mut missing_dependency = manifest;
+        let video = missing_dependency
+            .components
+            .iter_mut()
+            .find(|c| c.id == VIDEO_COMPONENT_ID)
+            .unwrap();
+        video.requires.remove("amaterasu.session-lifecycle");
+        assert!(check_composition(&missing_dependency).is_err());
     }
 
     #[test]
