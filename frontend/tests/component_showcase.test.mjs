@@ -170,6 +170,26 @@ test("older hosts get a native fallback before styles or SDK controls are mounte
   }
 });
 
+test("fallback is disposed by the SDK signal without an explicit cleanup call", () => {
+  const page = setupShowcase({ sdkOverrides: { features: [] } });
+  const root = page.container.children[0];
+  assert.ok(root);
+  page.lifecycle.abort();
+  assert.equal(root.removed, true);
+  assert.equal(page.stylesheet, undefined);
+});
+
+test("already-aborted old host mounts neither fallback DOM nor stylesheet", () => {
+  const page = setupShowcase({
+    sdkOverrides: { features: [] },
+    autoMount: false,
+  });
+  page.lifecycle.abort();
+  const mounted = page.mountPage(page.registration);
+  assert.equal(mounted.container.children.length, 0);
+  assert.equal(page.stylesheet, undefined);
+});
+
 test("sequential signed digest versions register independently in one page context", () => {
   const first = setupShowcase();
   const secondRegistration = first.loadShowcase(

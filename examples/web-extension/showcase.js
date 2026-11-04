@@ -14,8 +14,10 @@
   window.AmaterasuExtensions.v1.register("showcase", {
     title: "UI elements",
     mount(container, sdk) {
-      if (!supportsShowcaseControls(sdk)) return mountCompatibilityFallback(container);
-      if (sdk.signal?.aborted) return () => {};
+      if (sdk?.signal?.aborted) return () => {};
+      if (!supportsShowcaseControls(sdk)) {
+        return mountCompatibilityFallback(container, sdk?.signal);
+      }
 
       const root = element("main", "okami-showcase");
       root.setAttribute("aria-label", "Component showcase");
@@ -65,7 +67,7 @@
       sdk.features.includes("ui.controls/1");
   }
 
-  function mountCompatibilityFallback(container) {
+  function mountCompatibilityFallback(container, signal) {
     const root = element("main", "okami-showcase");
     root.setAttribute("aria-label", "Component showcase fallback");
     const heading = element("h2", "", "Basic component showcase");
@@ -81,10 +83,25 @@
     button.type = "button";
     const status = element("p", "", "Fallback controls are ready.");
     status.setAttribute("role", "status");
-    button.addEventListener("click", () => { status.textContent = "Fallback button works."; });
-    root.append(heading, explanation, label, button, status);
-    container.append(root);
-    return () => root.remove();
+    const onButtonClick = () => { status.textContent = "Fallback button works."; };
+    button.addEventListener("click", onButtonClick);
+    let disposed = false;
+    const cleanup = () => {
+      if (disposed) return;
+      disposed = true;
+      signal?.removeEventListener("abort", cleanup);
+      button.removeEventListener("click", onButtonClick);
+      root.remove();
+    };
+    try {
+      signal?.addEventListener("abort", cleanup, { once: true });
+      root.append(heading, explanation, label, button, status);
+      container.append(root);
+      return cleanup;
+    } catch (error) {
+      cleanup();
+      throw error;
+    }
   }
 
   function attachShowcaseStylesheet(root) {
