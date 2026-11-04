@@ -11,11 +11,13 @@ function editorEnvironment() {
     checked = false;
     validity = { valid: true };
     listeners = {};
-    setAttribute() {}
+    attributes = {};
+    setAttribute(name, value) { this.attributes[name] = value; }
     replaceChildren(...children) { this.children = []; this.append(...children); }
     get lastElementChild() { return this.children.filter((child) => child instanceof Element).at(-1); }
     append(...children) { this.children.push(...children); for (const child of children) if (child instanceof Element) child.parent = this; }
     addEventListener(type, callback) { this.listeners[type] = callback; }
+    dispatch(type) { this.listeners[type]?.({ type, target: this }); }
     remove() { this.parent.children = this.parent.children.filter((child) => child !== this); }
     click() { this.listeners.click(); }
   }
@@ -61,6 +63,39 @@ test("invalid numbers and unsupported schemas fail closed", () => {
   editor.node.value = "1.5";
   assert.throws(() => editor.value());
   assert.throws(() => create({ type: "unknown", default: null }, null));
+});
+
+test("bounded slider and number controls synchronize input and reject invalid edits", () => {
+  const { extensionSliderEditor, extensionFieldEditor } = editorEnvironment();
+  const definition = { type: "integer", default: 10, minimum: 0, maximum: 100 };
+  const editor = extensionSliderEditor(definition, 10, "Strength");
+  const [slider, number] = editor.node.children;
+  assert.equal(slider.type, "range");
+  assert.equal(slider.attributes["aria-label"], "Strength slider");
+  assert.equal(number.attributes["aria-label"], "Strength value");
+  assert.equal(slider.min, "0");
+  assert.equal(slider.max, "100");
+  assert.equal(slider.step, "1");
+  slider.value = "35"; slider.dispatch("input");
+  assert.equal(number.value, "35");
+  assert.equal(editor.value(), 35);
+  number.value = "42"; number.dispatch("input");
+  assert.equal(slider.value, "42");
+  assert.equal(editor.value(), 42);
+  number.value = "101"; number.dispatch("input");
+  assert.equal(slider.value, "42");
+  assert.throws(() => editor.value(), /valid number/);
+  number.value = "1.5"; number.dispatch("input");
+  assert.throws(() => editor.value(), /valid number/);
+  const ordinary = extensionFieldEditor(definition, 10);
+  assert.equal(ordinary.node.type, "number");
+  assert.equal(ordinary.value(), 10);
+  assert.throws(() => extensionSliderEditor({ ...definition, maximum: null }, 10, "Bad"), /Invalid slider/);
+  assert.throws(() => extensionSliderEditor({ ...definition, type: "string" }, 10, "Bad"), /Invalid slider/);
+  const fractional = extensionSliderEditor({ type: "decimal", minimum: -2, maximum: -1 }, -1.5, "Fraction");
+  assert.equal(fractional.node.children[0].step, "any");
+  assert.equal(fractional.node.children[0].value, "-1.5");
+  assert.equal(fractional.value(), -1.5);
 });
 
 

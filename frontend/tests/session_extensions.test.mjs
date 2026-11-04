@@ -27,7 +27,7 @@ function fixture(scope, write = true, values = { enabled: false }, provider) {
     nodes.push(node);
     return node;
   };
-  const calls = [], editors = [], pending = [], errors = [];
+  const calls = [], editors = [], pending = [], errors = [], notifications = [];
   const descriptor = { provider: "example.pacing", display_name: "Pacing controls", actions: [], options: [
     { id: "enabled", label: "Enabled", help: "", definition: { type: "boolean", default: true }, allowed_scopes: ["host", "application", "paired_client"], apply_policy: "next_stream" },
     { id: "installation", label: "Installation", help: "", definition: { type: "string", default: "" }, allowed_scopes: ["host"], apply_policy: "next_session" },
@@ -53,7 +53,7 @@ function fixture(scope, write = true, values = { enabled: false }, provider) {
   vm.runInContext(ts.transpile(readFileSync(new URL("../src/session_extensions.ts", import.meta.url), "utf8"),
     { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None }), runtime);
   const area = element("area");
-  const context = { content: { isConnected: true }, notify() {}, api: {
+  const context = { content: { isConnected: true }, notify(message) { notifications.push(message); }, api: {
     allows: () => write,
     async post(route, payload) {
       calls.push([route, plain(payload)]);
@@ -65,7 +65,7 @@ function fixture(scope, write = true, values = { enabled: false }, provider) {
     },
   } };
   runtime.Amaterasu.renderSessionExtensionSettings(context, area, scope, provider);
-  return { area, calls, nodes, editors, pending, errors };
+  return { area, calls, nodes, editors, pending, errors, notifications, descriptor };
 }
 
 for (const scope of [{ kind: "application", id: "game" }, { kind: "paired_client", id: "client" }]) {
@@ -134,4 +134,27 @@ test("provider filter shows only the selected plugin settings", async () => {
   await settle();
   assert.equal(other.editors.length, 0);
   assert.equal(other.calls.some(([route]) => route.endsWith("/settings_get")), false);
+});
+
+
+test("setting policy guidance and save feedback distinguish persistence from application", async () => {
+  const env = fixture({ kind: "host" });
+  await settle();
+  const guidance = env.nodes.filter(node => node.tag === "small").map(node => node.children[0]);
+  assert.ok(guidance.includes("Used when the next stream is prepared."));
+  assert.ok(guidance.includes("Used when the next session is prepared."));
+  env.nodes.find(node => node.tag === "form").listeners.submit({ preventDefault() {} });
+  await Promise.all(env.pending);
+  assert.deepEqual(env.notifications, ["Plugin settings saved. Application to an active session or stream is not confirmed."]);
+});
+
+test("live and unknown policy guidance does not claim runtime application", async () => {
+  const live = fixture({ kind: "application", id: "game" });
+  live.descriptor.options[0].apply_policy = "live_action";
+  await settle();
+  assert.ok(live.nodes.some(node => node.tag === "small" && node.children[0] === "May apply during an active session or stream; saving does not confirm application."));
+  const unknown = fixture({ kind: "application", id: "game" });
+  unknown.descriptor.options[0].apply_policy = "future_policy";
+  await settle();
+  assert.ok(unknown.nodes.some(node => node.tag === "small" && node.children[0] === "Application timing is not available."));
 });

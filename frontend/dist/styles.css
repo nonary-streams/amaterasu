@@ -827,6 +827,9 @@ dialog::backdrop {
 .session-extension-option > select,
 .session-extension-option > input:not([type="checkbox"]) { width: min(100%, 420px); }
 .session-extension-option > small { line-height: 1.45; max-width: 680px; }
+.extension-slider { display: flex; align-items: center; gap: 12px; width: min(100%, 420px); }
+.extension-slider input[type="range"] { flex: 1; min-width: 0; }
+.extension-slider input[type="number"] { width: 7rem; }
 .session-extension-inherit { display: flex; align-items: center; gap: 6px; font-size: 13px; }
 dialog p {
   font-size: 12px;

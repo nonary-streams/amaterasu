@@ -23,6 +23,15 @@ namespace Amaterasu {
     effective: Record<string, { value: unknown; source: unknown }>;
   }
 
+  function sessionExtensionApplyPolicyHelp(policy: string): string {
+    switch (policy) {
+      case "next_session": return "Used when the next session is prepared.";
+      case "next_stream": return "Used when the next stream is prepared.";
+      case "live_action": return "May apply during an active session or stream; saving does not confirm application.";
+      default: return "Application timing is not available.";
+    }
+  }
+
   export function showSessionExtensionSettings(context: PageContext, scope: SessionExtensionScope, title: string, provider?: string): void {
     if (!context.content.isConnected) return;
     const area = el("div");
@@ -80,10 +89,12 @@ namespace Amaterasu {
             if (!effective) throw new Error("Missing effective extension setting.");
             const isOverride = Object.hasOwn(document.values, option.id);
             const editorValue = isOverride ? document.values[option.id] : effective.value;
-            if (option.presentation != null && option.presentation !== "keybinding")
+            const isSlider = option.presentation === "slider";
+            if (option.presentation != null && option.presentation !== "keybinding" && !isSlider)
               throw new Error("Unsupported extension setting presentation.");
             const editor = option.presentation === "keybinding"
               ? extensionKeybindingSettingEditor(option.definition, editorValue)
+              : isSlider ? extensionSliderEditor(option.definition, editorValue, option.label)
               : extensionFieldEditor(option.definition, editorValue, option.choice_labels);
             // Host settings are ordinary editable values. Scoped values may
             // inherit, but editing a control must always save that edit.
@@ -101,6 +112,7 @@ namespace Amaterasu {
               el("legend", "field-label", literalText(option.label)), editor.node);
             if (inherit) group.append(el("label", "session-extension-inherit", inherit, " Use inherited value"));
             if (option.help) group.append(el("small", "muted", literalText(option.help)));
+            group.append(el("small", "muted", sessionExtensionApplyPolicyHelp(option.apply_policy)));
             form.append(group);
             editors.set(option.id, { inherit, editor });
           }
@@ -118,7 +130,7 @@ namespace Amaterasu {
                 else values[id] = entry.editor.value();
               }
               await context.api.post("session-extensions/settings_update", { provider: descriptor.provider, scope, expected_revision: document.revision, values });
-              context.notify("Plugin settings saved.");
+              context.notify("Plugin settings saved. Application to an active session or stream is not confirmed.");
               await load();
             });
           });

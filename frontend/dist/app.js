@@ -16058,6 +16058,42 @@ var Amaterasu;
 })(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
 (function (Amaterasu) {
+    function extensionSliderEditor(definition, value, label) {
+        const min = definition.minimum;
+        const max = definition.maximum;
+        if ((definition.type !== "integer" && definition.type !== "decimal") ||
+            typeof min !== "number" || !Number.isFinite(min) ||
+            typeof max !== "number" || !Number.isFinite(max) || min >= max ||
+            (definition.type === "integer" && (!Number.isSafeInteger(min) || !Number.isSafeInteger(max))))
+            throw new Error("Invalid slider setting.");
+        const number = Amaterasu.input("", String(value), "number");
+        const slider = Amaterasu.input("", "", "range");
+        for (const control of [number, slider]) {
+            control.min = String(min);
+            control.max = String(max);
+            control.step = definition.type === "integer" ? "1" : "any";
+        }
+        slider.value = String(value);
+        slider.setAttribute("aria-label", `${label} slider`);
+        number.setAttribute("aria-label", `${label} value`);
+        const validNumber = () => {
+            const parsed = Number(number.value);
+            return number.value !== "" && number.validity.valid && Number.isFinite(parsed) &&
+                parsed >= min && parsed <= max && (definition.type !== "integer" || Number.isSafeInteger(parsed));
+        };
+        slider.addEventListener("input", () => { number.value = slider.value; });
+        number.addEventListener("input", () => { if (validNumber())
+            slider.value = number.value; });
+        return {
+            node: Amaterasu.el("div", "extension-slider", slider, number),
+            value: () => {
+                if (!validNumber())
+                    throw new Error(`Enter a valid number from ${min} to ${max}.`);
+                return Number(number.value);
+            },
+        };
+    }
+    Amaterasu.extensionSliderEditor = extensionSliderEditor;
     function extensionFieldEditor(definition, value, choiceLabels = {}) {
         switch (definition.type) {
             case "nullable": {
@@ -16444,6 +16480,14 @@ var Amaterasu;
 })(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
 (function (Amaterasu) {
+    function sessionExtensionApplyPolicyHelp(policy) {
+        switch (policy) {
+            case "next_session": return "Used when the next session is prepared.";
+            case "next_stream": return "Used when the next stream is prepared.";
+            case "live_action": return "May apply during an active session or stream; saving does not confirm application.";
+            default: return "Application timing is not available.";
+        }
+    }
     function showSessionExtensionSettings(context, scope, title, provider) {
         if (!context.content.isConnected)
             return;
@@ -16514,11 +16558,13 @@ var Amaterasu;
                             throw new Error("Missing effective extension setting.");
                         const isOverride = Object.hasOwn(document.values, option.id);
                         const editorValue = isOverride ? document.values[option.id] : effective.value;
-                        if (option.presentation != null && option.presentation !== "keybinding")
+                        const isSlider = option.presentation === "slider";
+                        if (option.presentation != null && option.presentation !== "keybinding" && !isSlider)
                             throw new Error("Unsupported extension setting presentation.");
                         const editor = option.presentation === "keybinding"
                             ? Amaterasu.extensionKeybindingSettingEditor(option.definition, editorValue)
-                            : Amaterasu.extensionFieldEditor(option.definition, editorValue, option.choice_labels);
+                            : isSlider ? Amaterasu.extensionSliderEditor(option.definition, editorValue, option.label)
+                                : Amaterasu.extensionFieldEditor(option.definition, editorValue, option.choice_labels);
                         const inherit = scope.kind === "host" ? null : Amaterasu.input("", "", "checkbox");
                         if (inherit) {
                             inherit.checked = !isOverride;
@@ -16535,6 +16581,7 @@ var Amaterasu;
                             group.append(Amaterasu.el("label", "session-extension-inherit", inherit, " Use inherited value"));
                         if (option.help)
                             group.append(Amaterasu.el("small", "muted", Amaterasu.literalText(option.help)));
+                        group.append(Amaterasu.el("small", "muted", sessionExtensionApplyPolicyHelp(option.apply_policy)));
                         form.append(group);
                         editors.set(option.id, { inherit, editor });
                     }
@@ -16554,7 +16601,7 @@ var Amaterasu;
                                     values[id] = entry.editor.value();
                             }
                             await context.api.post("session-extensions/settings_update", { provider: descriptor.provider, scope, expected_revision: document.revision, values });
-                            context.notify("Plugin settings saved.");
+                            context.notify("Plugin settings saved. Application to an active session or stream is not confirmed.");
                             await load();
                         });
                     });
