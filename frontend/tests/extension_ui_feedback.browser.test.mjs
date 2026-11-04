@@ -13,6 +13,7 @@ const tick = () => new Promise(resolve => setTimeout(resolve, 30));
 const transpile = source => ts.transpile(source, { target: ts.ScriptTarget.ES2022 });
 const transpiledUi = transpile(await readFile("src/ui.ts", "utf8"));
 const transpiledExtensionUi = transpile(await readFile("src/extension_ui.ts", "utf8"));
+const transpiledLayout = transpile(await readFile("src/extension_ui_layout.ts", "utf8"));
 const transpiledFeedback = transpile(await readFile("src/extension_ui_feedback.ts", "utf8"));
 
 function html() {
@@ -25,6 +26,8 @@ window.Amaterasu = {
   literalText: value => ({kind:"literal", value}),
   textValueNode: value => document.createTextNode(typeof value === "string" ? value : value.value),
   translateText: value => value,
+  setLocalizedAttribute: (element, attribute, value) => element.setAttribute(attribute, value),
+  setLocalizedAttributeFormatter: (element, attribute, format) => element.setAttribute(attribute, format(navigator.language)),
 };
 Object.assign(window, {
   el: (...args) => window.Amaterasu.el(...args),
@@ -33,10 +36,12 @@ Object.assign(window, {
   localizedTextNode: source => window.Amaterasu.localizedTextNode(source),
   localeFormattedTextNode: format => window.Amaterasu.localeFormattedTextNode(format),
   translateText: source => window.Amaterasu.translateText(source),
+  activeIntlLocale: () => navigator.language,
 });
 </script>
 <script>${transpiledUi}</script>
 <script>${transpiledExtensionUi}</script>
+<script>${transpiledLayout}</script>
 <script>${transpiledFeedback}</script>
 <script>
 window.__mount = document.querySelector("#mount");
@@ -259,4 +264,42 @@ test("Chromium allocates stable unique progress description IDs in creation orde
   await cdp.evaluate(`window.__ui.progress({label:"Third task",value:0,message:"Third description"}); window.__firstProgress.setMessage("Updated first description"); true`);
   assert.equal(await cdp.evaluate("window.__firstProgress.element.querySelector('progress').getAttribute('aria-describedby')"), before);
   assert.equal(await cdp.evaluate(`document.getElementById("${ids.firstId}").textContent`), "Updated first description");
+});
+
+
+test("Chromium renders semantic plugin cards and responsive tables as localized safe DOM", async t => {
+  if (!browser) return t.skip("Chromium browser setup unavailable.");
+  const {cdp} = browser;
+  await cdp.evaluate(`window.__reset();
+    window.__card = window.__ui.card({label:{source:"Project summary",translations:{fr:"Résumé du projet",en:"Résumé du projet"}}});
+    const paragraph = document.createElement("p"); paragraph.textContent = "<img src=x onerror=window.__xss=true>";
+    window.__card.append(paragraph);
+    window.__table = window.__ui.table({caption:{source:"Build status",translations:{fr:"État de compilation",en:"État de compilation"}},
+      columns:[{header:{source:"Component",translations:{fr:"Composant",en:"Composant"}}},{header:"State"}],
+      rows:[["<script>unsafe()</script>","Ready"]]});
+    window.__mount.append(window.__card.element,window.__table.element); true`);
+  assert.deepEqual(await cdp.evaluate(`(()=>{
+    const card=window.__card.element;
+    const region=window.__table.element;
+    const table=region.querySelector("table");
+    return {tableFound:!!table,section:card.tagName,cardName:card.querySelector("h2").textContent,
+      labelled:card.getAttribute("aria-labelledby")===card.querySelector("h2").id,
+      cardText:card.textContent,images:card.querySelectorAll("img").length,
+      regionRole:region.getAttribute("role"),regionTabIndex:region.tabIndex,
+      regionClass:region.classList.contains("table-scroll"),regionName:region.getAttribute("aria-label"),
+      caption:table.querySelector("caption").textContent,
+      headers:[...table.querySelectorAll("th")].map(header=>[header.textContent,header.getAttribute("scope")]),
+      cellText:table.querySelector("tbody td").textContent,cellImages:table.querySelectorAll("tbody img").length};
+  })()`), {
+    tableFound:true, section:"SECTION", cardName:"Résumé du projet", labelled:true,
+    cardText:"Résumé du projet<img src=x onerror=window.__xss=true>", images:0,
+    regionRole:"region", regionTabIndex:0, regionClass:true, regionName:"État de compilation",
+    caption:"État de compilation", headers:[["Composant","col"],["State","col"]],
+    cellText:"<script>unsafe()</script>", cellImages:0,
+  });
+  await cdp.evaluate(`window.__controller.abort();
+    window.__card.append(document.createElement("span"));
+    window.__table.setRows([["late","update"]]); true`);
+  assert.equal(await cdp.evaluate("window.__card.element.isConnected || window.__table.element.isConnected"), false);
+  assert.equal(await cdp.evaluate("window.__table.element.querySelector('table').children.length"), 0);
 });

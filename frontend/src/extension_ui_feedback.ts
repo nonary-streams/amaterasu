@@ -44,7 +44,7 @@ namespace Amaterasu {
     progress(options: ExtensionUiFeedbackProgressOptions): ExtensionUiFeedbackProgress;
   }
 
-  export type ExtensionUiWithFeedbackV1 = ExtensionUiV1 & ExtensionUiFeedbackV1;
+  export type ExtensionUiWithFeedbackV1 = ExtensionUiV1 & ExtensionUiFeedbackV1 & ExtensionUiLayoutV1;
 
   let nextExtensionUiFeedbackId = 0;
 
@@ -229,6 +229,7 @@ namespace Amaterasu {
   export function createExtensionUiWithFeedbackV1(signal: AbortSignal): ExtensionUiWithFeedbackV1 {
     const ui = createExtensionUiV1(signal);
     const feedback = createExtensionUiFeedbackV1(signal);
-    return Object.freeze({ ...ui, ...feedback, version: 1 as const });
+    const layout = Amaterasu.createExtensionUiLayoutV1(signal);
+    return Object.freeze({ ...ui, ...feedback, ...layout, version: 1 as const });
   }
 }
