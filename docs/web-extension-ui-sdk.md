@@ -8,6 +8,8 @@ remain the only authority for `sdk.call`.
 The additive status, alert, and progress components are documented in the
 [feedback UI SDK guide](web-extension-ui-feedback.md); they use the separate
 `ui.feedback/1` capability while keeping `sdk.ui.version` at 1.
+The semantic card and table components use the separate additive
+`ui.layout/1` capability. It does not change `sdk.version` or `sdk.ui.version`.
 
 Hosts that implement the base controls advertise `ui.controls/1` in the
 additive `sdk.features` list and supply `sdk.ui` with `sdk.ui.version === 1`.
@@ -139,3 +141,38 @@ return () => quality.dispose();
 The controls use host semantic classes and theme variables. Plugins can add
 page-specific markup and styles around them; no product-specific provider,
 Vibeshine feature, or fixed palette is part of this API.
+
+## Semantic cards and tables (`ui.layout/1`)
+
+`ui.layout/1` is independent of the form, control, and feedback capabilities.
+Check the feature before using its factories; a host without it keeps the same
+version 1 SDK and existing controls:
+
+```js
+if (sdk.version !== 1 || sdk.ui?.version !== 1 ||
+    !sdk.features?.includes("ui.layout/1")) {
+  // Render a compatible fallback.
+  return;
+}
+```
+
+`card({ label })` returns a labelled native section with an `h2` and a content
+slot. Append plugin-created DOM nodes through `card.append(node)` or the
+`content` element; strings are rejected, and HTML strings are never parsed.
+Build children with `document.createElement()` and set text through
+`textContent`. The card label accepts the same localized text values as other
+controls.
+
+`table({ caption, columns, rows? })` returns a keyboard-focusable, horizontally
+scrollable region containing a native table. The table has a localized caption,
+column header cells with `scope="col"`, and text-only data cells. `setRows()`
+replaces the rows without rebuilding the table headers. Each row must have one
+cell per column. Tables allow up to 32 columns and 1,000 rows; sorting,
+selection, pagination, and virtualization remain the page's responsibility.
+Caption, header, and cell strings use the same locale resolution as controls.
+No table cell value is interpreted as markup.
+
+Both components expose `element` and idempotent `dispose()`. The host lifecycle
+signal disposes them on navigation or signout; disposal removes the component
+from the DOM and prevents later updates. Call `dispose()` sooner when removing a
+component before its page ends.

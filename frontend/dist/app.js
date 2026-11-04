@@ -20805,6 +20805,174 @@ var Amaterasu;
 })(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
 (function (Amaterasu) {
+    let nextExtensionUiLayoutId = 0;
+    const EXTENSION_UI_TABLE_MAX_COLUMNS = 32;
+    const EXTENSION_UI_TABLE_MAX_ROWS = 1000;
+    function extensionUiLayoutLifecycle(signal) {
+        if (!signal || typeof signal.addEventListener !== "function" || typeof signal.removeEventListener !== "function")
+            throw new Error("Plugin UI requires a lifecycle signal.");
+        if (signal.aborted)
+            throw new Error("Plugin page is no longer active.");
+    }
+    function extensionUiLayoutText(value, locale) {
+        if (typeof value === "string")
+            return Amaterasu.translateText(value);
+        if (!value || typeof value !== "object" || Array.isArray(value) || typeof value.source !== "string" || !value.source.trim())
+            throw new Error("Invalid plugin UI text.");
+        const translations = value.translations ?? {};
+        if (!translations || typeof translations !== "object" || Array.isArray(translations) ||
+            Object.values(translations).some((translation) => typeof translation !== "string" || !translation.trim()))
+            throw new Error("Invalid plugin UI translations.");
+        return translations[locale] ?? translations[locale.split("-")[0] ?? locale] ?? Amaterasu.translateText(value.source);
+    }
+    function extensionUiLayoutTextNode(value) {
+        if (typeof value === "string")
+            return Amaterasu.localizedTextNode(value);
+        extensionUiLayoutText(value, Amaterasu.activeIntlLocale());
+        return Amaterasu.localeFormattedTextNode((locale) => extensionUiLayoutText(value, locale));
+    }
+    function extensionUiLayoutRequiredText(value, description) {
+        if (typeof value === "string") {
+            if (!value.trim())
+                throw new Error(`Invalid plugin UI ${description}.`);
+            return;
+        }
+        extensionUiLayoutText(value, Amaterasu.activeIntlLocale());
+    }
+    function extensionUiLayoutNode(value) {
+        if (!value || typeof value !== "object" || typeof value.nodeType !== "number")
+            return false;
+        const supportedNodeTypes = [Node.ELEMENT_NODE, Node.TEXT_NODE, Node.COMMENT_NODE, Node.DOCUMENT_FRAGMENT_NODE];
+        return supportedNodeTypes.includes(value.nodeType);
+    }
+    function extensionUiLayoutSetLabelAttribute(element, label) {
+        if (typeof label === "string")
+            Amaterasu.setLocalizedAttribute(element, "aria-label", label);
+        else
+            Amaterasu.setLocalizedAttributeFormatter(element, "aria-label", (locale) => extensionUiLayoutText(label, locale));
+    }
+    function createExtensionUiCard(signal, options) {
+        extensionUiLayoutLifecycle(signal);
+        if (!options || typeof options !== "object" || Array.isArray(options))
+            throw new Error("Invalid plugin UI card.");
+        extensionUiLayoutRequiredText(options.label, "card label");
+        const id = `amaterasu-plugin-card-${++nextExtensionUiLayoutId}`;
+        const heading = Amaterasu.el("h2", "", extensionUiLayoutTextNode(options.label));
+        heading.id = `${id}-heading`;
+        const content = Amaterasu.el("div", "plugin-ui-card-content");
+        const element = Amaterasu.el("section", "panel plugin-ui-card", heading, content);
+        element.setAttribute("aria-labelledby", heading.id);
+        let disposed = false;
+        const dispose = () => {
+            if (disposed)
+                return;
+            disposed = true;
+            content.replaceChildren();
+            element.remove();
+            signal.removeEventListener("abort", dispose);
+        };
+        const card = Object.freeze({
+            element,
+            content,
+            append: (child) => {
+                if (disposed || signal.aborted)
+                    return;
+                if (!extensionUiLayoutNode(child))
+                    throw new Error("Plugin UI card children must be DOM nodes.");
+                content.append(child);
+            },
+            dispose,
+        });
+        signal.addEventListener("abort", dispose, { once: true });
+        return card;
+    }
+    function validateExtensionUiTableRows(rows, columnCount) {
+        if (!Array.isArray(rows) || rows.length > EXTENSION_UI_TABLE_MAX_ROWS ||
+            rows.some((row) => !Array.isArray(row) || row.length !== columnCount))
+            throw new Error("Invalid plugin UI table rows.");
+        for (const row of rows) {
+            for (const value of row) {
+                if (typeof value !== "string")
+                    extensionUiLayoutText(value, Amaterasu.activeIntlLocale());
+            }
+        }
+    }
+    function createExtensionUiTable(signal, options) {
+        extensionUiLayoutLifecycle(signal);
+        if (!options || typeof options !== "object" || Array.isArray(options))
+            throw new Error("Invalid plugin UI table.");
+        extensionUiLayoutRequiredText(options.caption, "table caption");
+        if (!Array.isArray(options.columns) || options.columns.length < 1 || options.columns.length > EXTENSION_UI_TABLE_MAX_COLUMNS)
+            throw new Error("Invalid plugin UI table columns.");
+        for (const column of options.columns) {
+            if (!column || typeof column !== "object" || Array.isArray(column))
+                throw new Error("Invalid plugin UI table column.");
+            extensionUiLayoutRequiredText(column.header, "table header");
+        }
+        const columnCount = options.columns.length;
+        const initialRows = options.rows === undefined ? [] : options.rows;
+        validateExtensionUiTableRows(initialRows, columnCount);
+        const region = Amaterasu.el("div", "table-scroll plugin-ui-table-scroll");
+        region.setAttribute("role", "region");
+        region.tabIndex = 0;
+        extensionUiLayoutSetLabelAttribute(region, options.caption);
+        const table = Amaterasu.el("table", "plugin-ui-table");
+        table.append(Amaterasu.el("caption", "", extensionUiLayoutTextNode(options.caption)));
+        const head = Amaterasu.el("thead", "");
+        const headerRow = Amaterasu.el("tr", "");
+        for (const column of options.columns) {
+            const header = Amaterasu.el("th", "", extensionUiLayoutTextNode(column.header));
+            header.setAttribute("scope", "col");
+            headerRow.append(header);
+        }
+        head.append(headerRow);
+        const body = Amaterasu.el("tbody", "");
+        table.append(head, body);
+        region.append(table);
+        let disposed = false;
+        const renderRows = (rows) => {
+            const preparedRows = rows.map((row) => {
+                const tr = Amaterasu.el("tr", "");
+                for (const value of row)
+                    tr.append(Amaterasu.el("td", "", extensionUiLayoutTextNode(value)));
+                return tr;
+            });
+            body.replaceChildren(...preparedRows);
+        };
+        renderRows(initialRows);
+        const dispose = () => {
+            if (disposed)
+                return;
+            disposed = true;
+            table.replaceChildren();
+            region.remove();
+            signal.removeEventListener("abort", dispose);
+        };
+        const component = Object.freeze({
+            element: region,
+            setRows: (rows) => {
+                if (disposed || signal.aborted)
+                    return;
+                validateExtensionUiTableRows(rows, columnCount);
+                renderRows(rows);
+            },
+            dispose,
+        });
+        signal.addEventListener("abort", dispose, { once: true });
+        return component;
+    }
+    function createExtensionUiLayoutV1(signal) {
+        extensionUiLayoutLifecycle(signal);
+        return Object.freeze({
+            version: 1,
+            card: (options) => createExtensionUiCard(signal, options),
+            table: (options) => createExtensionUiTable(signal, options),
+        });
+    }
+    Amaterasu.createExtensionUiLayoutV1 = createExtensionUiLayoutV1;
+})(Amaterasu || (Amaterasu = {}));
+var Amaterasu;
+(function (Amaterasu) {
     let nextExtensionUiFeedbackId = 0;
     function feedbackTextNode(value) {
         if (typeof value === "string")
@@ -21004,7 +21172,8 @@ var Amaterasu;
     function createExtensionUiWithFeedbackV1(signal) {
         const ui = Amaterasu.createExtensionUiV1(signal);
         const feedback = createExtensionUiFeedbackV1(signal);
-        return Object.freeze({ ...ui, ...feedback, version: 1 });
+        const layout = Amaterasu.createExtensionUiLayoutV1(signal);
+        return Object.freeze({ ...ui, ...feedback, ...layout, version: 1 });
     }
     Amaterasu.createExtensionUiWithFeedbackV1 = createExtensionUiWithFeedbackV1;
 })(Amaterasu || (Amaterasu = {}));
@@ -21125,7 +21294,7 @@ var Amaterasu;
             const sdk = Object.freeze({
                 version: 1,
                 signal: controller.signal,
-                features: Object.freeze(["ui.controls/1", "ui.forms/1", "ui.forms/2", "ui.controls/2", "ui.feedback/1"]),
+                features: Object.freeze(["ui.controls/1", "ui.forms/1", "ui.forms/2", "ui.controls/2", "ui.feedback/1", "ui.layout/1"]),
                 ui: Amaterasu.createExtensionUiWithFeedbackV1(controller.signal),
                 call: (method, payload = {}) => {
                     if (controller.signal.aborted || !aliases.has(method))

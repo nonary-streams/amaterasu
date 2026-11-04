@@ -30,7 +30,7 @@ function setup(entries) {
   };
   const context = vm.createContext({ window: {}, document, HTMLScriptElement: Script, AbortController, console });
   context.createExtensionUiV1 = (signal) => Object.freeze({ version: 1, signal });
-  context.createExtensionUiWithFeedbackV1 = (signal) => Object.freeze({ version: 1, signal, feedback: true });
+  context.createExtensionUiWithFeedbackV1 = (signal) => Object.freeze({ version: 1, signal, feedback: true, card() {}, table() {} });
   const source = readFileSync(new URL("../src/extensions.ts", import.meta.url), "utf8");
   vm.runInContext(ts.transpile(source, { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None }), context);
   const api = { async post(route, payload) { calls.push({ route, payload }); return route === "extensions/list" ? { extensions: entries } : { ok: true, result: { answer: 42 } }; } };
@@ -44,11 +44,13 @@ test("extension registration is bound to a loaded signed script and calls use de
   assert.equal((await env.pages.discover()).length, 1);
   await env.pages.mount("hello", {});
   assert.equal(env.mounts(), 1);
-  assert.deepEqual(Array.from(env.sdk().features), ["ui.controls/1", "ui.forms/1", "ui.forms/2", "ui.controls/2", "ui.feedback/1"]);
+  assert.deepEqual(Array.from(env.sdk().features), ["ui.controls/1", "ui.forms/1", "ui.forms/2", "ui.controls/2", "ui.feedback/1", "ui.layout/1"]);
   assert.equal(Object.isFrozen(env.sdk().features), true);
   assert.equal(env.sdk().ui.version, 1);
   assert.equal(env.sdk().ui.signal, env.sdk().signal);
   assert.equal(env.sdk().ui.feedback, true);
+  assert.equal(typeof env.sdk().ui.card, "function");
+  assert.equal(typeof env.sdk().ui.table, "function");
   assert.equal((await env.sdk().call("status", { value: 1 })).answer, 42);
   assert.deepEqual(JSON.parse(JSON.stringify(env.calls.at(-1))), { route: "extensions/call", payload: { id: "hello", digest: valid.digest, method: "status", payload: { value: 1 } } });
   await assert.rejects(env.sdk().call("other"));

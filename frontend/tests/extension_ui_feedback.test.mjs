@@ -44,10 +44,13 @@ function setup() {
   context.localizedTextNode = (text) => text;
   context.localeFormattedTextNode = (format) => format("fr-CA");
   context.translateText = (text) => `translated:${text}`;
-  const source = ["ui.ts", "extension_ui.ts", "extension_ui_feedback.ts"]
+  const source = ["ui.ts", "extension_ui.ts", "extension_ui_layout.ts", "extension_ui_feedback.ts"]
     .map((file) => readFileSync(new URL(`../src/${file}`, import.meta.url), "utf8"))
     .join("\n");
   vm.runInContext(ts.transpile(source, { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None }), context);
+  context.activeIntlLocale = () => "en";
+  context.Amaterasu.setLocalizedAttribute = (element, attribute, value) => element.setAttribute(attribute, value);
+  context.Amaterasu.setLocalizedAttributeFormatter = (element, attribute, format) => element.setAttribute(attribute, format("en"));
   const controller = new AbortController();
   const feedback = context.Amaterasu.createExtensionUiFeedbackV1(controller.signal);
   return { controller, feedback, context };
@@ -178,4 +181,6 @@ test("combined UI factory preserves version 1 and exposes existing controls with
   assert.equal(typeof combined.status, "function");
   assert.equal(typeof combined.alert, "function");
   assert.equal(typeof combined.progress, "function");
+  assert.equal(typeof combined.card, "function");
+  assert.equal(typeof combined.table, "function");
 });
