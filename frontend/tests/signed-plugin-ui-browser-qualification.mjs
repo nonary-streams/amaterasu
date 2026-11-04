@@ -77,6 +77,9 @@ const failedThemeAssets = [];
 const showcaseRequests = new Map();
 const showcaseResponses = new Map();
 const failedShowcaseAssets = [];
+const primitivesRequests = new Map();
+const primitivesResponses = new Map();
+const failedPrimitivesAssets = [];
 let documentCsp = "";
 try {
   await debuggerClient.connect(options.debuggerUrl);
@@ -98,6 +101,10 @@ try {
       if (/^\/v1\/extensions\/[^/]+\/[a-f0-9]{64}\/assets\/example\.js$/.test(url.pathname)) {
         networkRequests.set(event.params.requestId, url.pathname);
       }
+      const primitivesMatch = url.pathname.match(/^\/v1\/extensions\/signed-ui-primitives\/([a-f0-9]{64})\/assets\/primitives\.js$/);
+      if (primitivesMatch) primitivesRequests.set(event.params.requestId, {
+        digest: primitivesMatch[1], name: "primitives.js", path: url.pathname, origin: url.origin,
+      });
       const showcaseMatch = url.pathname.match(/^\/v1\/extensions\/showcase\/([a-f0-9]{64})\/assets\/(showcase\.js|showcase\.css)$/);
       if (showcaseMatch) showcaseRequests.set(event.params.requestId, {
         digest: showcaseMatch[1], name: showcaseMatch[2], path: url.pathname, origin: url.origin,
@@ -109,6 +116,7 @@ try {
       if (path) assetResponses.push({ requestId: event.params.requestId, path, status: event.params.response.status });
       const themeRequest = themeRequests.get(event.params.requestId);
       const showcaseRequest = showcaseRequests.get(event.params.requestId);
+      const primitivesRequest = primitivesRequests.get(event.params.requestId);
       const headers = event.params.response.headers;
       const header = (name) => Object.entries(headers).find(([key]) => key.toLowerCase() === name)?.[1] ?? "";
       if (event.params.type === "Document") documentCsp = header("content-security-policy");
@@ -120,11 +128,17 @@ try {
         ...showcaseRequest, requestId: event.params.requestId, status: event.params.response.status,
         contentType: header("content-type"), csp: header("content-security-policy"),
       });
+      if (primitivesRequest) primitivesResponses.set(primitivesRequest.name, {
+        ...primitivesRequest, requestId: event.params.requestId, status: event.params.response.status,
+        contentType: header("content-type"), csp: header("content-security-policy"),
+      });
     } else if (event.method === "Network.loadingFailed") {
       const themeRequest = themeRequests.get(event.params.requestId);
       if (themeRequest) failedThemeAssets.push(themeRequest.name);
       const showcaseRequest = showcaseRequests.get(event.params.requestId);
       if (showcaseRequest) failedShowcaseAssets.push(showcaseRequest.name);
+      const primitivesRequest = primitivesRequests.get(event.params.requestId);
+      if (primitivesRequest) failedPrimitivesAssets.push(primitivesRequest.name);
     }
   });
   await debuggerClient.command("Page.enable", {}, sessionId);
@@ -347,9 +361,165 @@ try {
       `signed showcase ${asset.name} differs from the packaged bytes`);
   }
 
+  await evaluate("location.hash = 'extension/signed-ui-primitives'");
+  await wait("!!document.querySelector('[data-signed-ui-primitives]')",
+    "signed UI primitives consumer mount");
+  const primitives = primitivesResponses.get("primitives.js");
+  check(primitives && primitives.status === 200, "signed UI primitives JavaScript was not delivered");
+  check(primitives.path === `/v1/extensions/signed-ui-primitives/${primitives.digest}/assets/primitives.js` &&
+    primitives.origin === options.origin, "UI primitives asset did not use its same-origin signed digest route");
+  check(primitives.contentType.toLowerCase().includes("javascript") &&
+    primitives.csp.includes("default-src 'self'") && primitives.csp.includes("script-src 'self'") &&
+    primitives.csp.includes("object-src 'none'"),
+    "signed UI primitives response did not retain JavaScript type and restrictive host CSP");
+  check(failedPrimitivesAssets.length === 0,
+    `signed UI primitives assets failed to load: ${failedPrimitivesAssets.join(", ")}`);
+  const servedPrimitives = await debuggerClient.command("Network.getResponseBody",
+    { requestId: primitives.requestId }, sessionId);
+  const primitivesBytes = servedPrimitives.base64Encoded
+    ? Buffer.from(servedPrimitives.body, "base64") : Buffer.from(servedPrimitives.body);
+  check(sha256(primitivesBytes) === options.primitivesSha256 &&
+    primitivesBytes.equals(readFileSync(options.primitivesPath)),
+    "served UI primitives asset differs from the signed packaged fixture bytes");
+
+  const featureQualification = await evaluate(`(() => {
+    const section = document.querySelector('[data-signed-ui-primitives]');
+    const expected = ['ui.dialog/1', 'ui.tabs/1', 'ui.layout/1', 'ui.feedback/1'];
+    const fallbackRoot = document.createElement('div');
+    const fallbackCleanup = window.__signedUiPrimitiveQualification.mount(fallbackRoot,
+      {version: 1, ui: {version: 1}, features: ['ui.dialog/1']});
+    const fallbackWorked = !!fallbackRoot.querySelector('[data-ui-primitive-fallback]') &&
+      !fallbackRoot.querySelector('[data-signed-ui-primitives]');
+    fallbackCleanup();
+    return section.dataset.detectedFeatures === expected.join(',') && fallbackWorked;
+  })()`);
+  check(featureQualification, "feature detection or missing-feature fallback did not work");
+  const semanticState = await evaluate(`(() => {
+    const section = document.querySelector('[data-signed-ui-primitives]');
+    const table = section.querySelector('table');
+    const cells = [...table.querySelectorAll('tbody td')];
+    return {
+      dialogLabel: section.querySelector('dialog[aria-modal="true"]')?.getAttribute('aria-labelledby'),
+      dialogDescription: section.querySelector('dialog')?.getAttribute('aria-describedby'),
+      tablistLabel: section.querySelector('[role=tablist]')?.getAttribute('aria-labelledby'),
+      tablistLabelText: section.querySelector('#' + CSS.escape(section.querySelector('[role=tablist]')?.getAttribute('aria-labelledby') ?? ''))?.textContent,
+      selectedPanel: section.querySelector('[role=tabpanel]:not([hidden])')?.textContent,
+      cardTitle: section.querySelector('section[aria-labelledby] h2')?.textContent,
+      caption: table.caption.textContent,
+      header: table.querySelector('th[scope=col]')?.textContent,
+      cells: cells.map((cell) => cell.textContent),
+      unsafeMarkup: !!table.querySelector('img'),
+      status: section.querySelector('[role=status][aria-live=polite]')?.textContent,
+      alert: section.querySelector('[role=alert][data-severity=warning]')?.textContent,
+      progressDescription: section.querySelector('progress')?.getAttribute('aria-describedby'),
+    };
+  })()`);
+  check(semanticState.dialogLabel && semanticState.dialogDescription && semanticState.tablistLabel &&
+    semanticState.tablistLabelText === 'Qualification sections' &&
+    semanticState.selectedPanel?.includes('Summary panel content') && semanticState.cardTitle === 'Metrics card' &&
+    semanticState.caption === 'Qualification results' && semanticState.header === 'Name' &&
+    semanticState.cells.length === 2 && semanticState.cells[1] === '<img src=x onerror=alert(1)>' &&
+    !semanticState.unsafeMarkup && semanticState.status === 'Ready' &&
+    semanticState.alert === 'Qualification warning' && semanticState.progressDescription,
+    `semantic dialog, tabs, layout, feedback, or text-only table rendering failed: ${JSON.stringify(semanticState)}`);
+
+  await evaluate(`document.querySelector('[data-signed-ui-primitives] button').focus()`);
+  await key("Enter", "Enter", 13);
+  await wait(`document.querySelector('[data-signed-ui-primitives] dialog')?.open === true &&
+    document.activeElement?.getAttribute('aria-label') === 'Qualification value'`,
+    "keyboard-opened modal dialog and initial focus");
+  check(await evaluate(`(() => {
+    const dialog = document.querySelector('[data-signed-ui-primitives] dialog');
+    return dialog.querySelector('#' + CSS.escape(dialog.getAttribute('aria-labelledby')))?.textContent === 'Qualification dialog' &&
+      dialog.querySelector('#' + CSS.escape(dialog.getAttribute('aria-describedby')))?.textContent.includes('Dialog description');
+  })()`), "dialog accessible title or description association failed");
+  await key("Escape", "Escape", 27);
+  await wait(`!document.querySelector('[data-signed-ui-primitives] dialog')?.open &&
+    window.__signedUiDialogCloseReason === 'cancel' && document.activeElement?.textContent === 'Open qualification dialog'`,
+    "Escape close and focus restoration");
+  await key("Enter", "Enter", 13);
+  await wait("document.querySelector('[data-signed-ui-primitives] dialog')?.open === true",
+    "reopened modal dialog");
+  await key("Tab", "Tab", 9);
+  check(await evaluate("document.querySelector('[data-signed-ui-primitives] dialog')?.contains(document.activeElement)"),
+    "modal dialog did not keep keyboard focus within its content");
+  await key("Escape", "Escape", 27);
+  await wait("!document.querySelector('[data-signed-ui-primitives] dialog')?.open", "second dialog close");
+
+  await evaluate(`document.querySelector('[data-signed-ui-primitives] [role=tab][data-tab-id=summary]').focus()`);
+  await key("ArrowRight", "ArrowRight", 39);
+  const tabState = await evaluate(`(() => {
+    const section = document.querySelector('[data-signed-ui-primitives]');
+    return {
+      focused: document.activeElement?.dataset.tabId,
+      selected: section.querySelector('[role=tab][aria-selected=true]')?.dataset.tabId,
+      direction: getComputedStyle(section.querySelector('[role=tablist]')).direction,
+      panels: [...section.querySelectorAll('[role=tabpanel]')].map((panel) => ({hidden: panel.hidden, text: panel.textContent})),
+    };
+  })()`);
+  check(tabState.focused === 'details' && tabState.selected === 'details' &&
+    tabState.panels.some((panel) => panel.hidden && panel.text.includes('Summary panel content')) &&
+    tabState.panels.some((panel) => !panel.hidden && panel.text.includes('Details panel content')),
+    `arrow-key tab activation or linked panel state failed: ${JSON.stringify(tabState)}`);
+  await key("Home", "Home", 36);
+  check(await evaluate("document.activeElement?.dataset.tabId === 'summary'"), "Home did not focus the first enabled tab");
+  await key("End", "End", 35);
+  check(await evaluate("document.activeElement?.dataset.tabId === 'details'"), "End did not focus the last enabled tab");
+  await evaluate(`(() => {
+    const h = window.__signedUiPrimitiveHandles;
+    h.table.setRows([["updated", "still text"]]);
+    h.status.setBusy(true);
+    h.status.setMessage("Updating");
+    h.alert.setSeverity("error");
+    h.progress.setValue(2);
+  })()`);
+  check(await evaluate(`(() => {
+    const section = document.querySelector('[data-signed-ui-primitives]');
+    return section.querySelector('tbody td')?.textContent === 'updated' &&
+      section.querySelector('[role=status]')?.getAttribute('aria-busy') === 'true' &&
+      section.querySelector('[role=status]')?.textContent === 'Updating' &&
+      section.querySelector('[role=alert]')?.dataset.severity === 'error' &&
+      section.querySelector('progress')?.value === 2;
+  })()`), "feedback state updates or table row updates failed");
+
+  await evaluate(`(() => {
+    window.__signedUiPrimitiveHandles.status.setMessage({
+      source: "Ready after update", translations: { fr: "Prêt après mise à jour" },
+    });
+    const locale = document.querySelector('#global-locale');
+    locale.value = 'fr';
+    locale.dispatchEvent(new Event('change', {bubbles: true}));
+  })()`);
+  await wait(`document.querySelector('#global-locale')?.value === 'fr' &&
+    document.querySelector('[data-signed-ui-primitives] [role=tablist] [data-tab-id=summary]')?.textContent === 'Résumé' &&
+    document.querySelector('[data-signed-ui-primitives] .plugin-ui-card h2')?.textContent === 'Carte des mesures' &&
+    document.querySelector('[data-signed-ui-primitives] table caption')?.textContent === 'Résultats de qualification' &&
+    document.querySelector('[data-signed-ui-primitives] table th')?.textContent === 'Nom' &&
+    document.querySelector('[data-signed-ui-primitives] dialog h2')?.textContent === 'Dialogue de qualification' &&
+    document.querySelector('[data-signed-ui-primitives] [role=status]')?.textContent === 'Prêt après mise à jour'`,
+    "locale refresh for tabs, layout, and feedback");
+  await evaluate("location.hash = 'overview'");
+  await wait(`window.__signedUiPrimitiveLifecycle?.aborted === true &&
+    !document.querySelector('[data-signed-ui-primitives]') &&
+    !document.querySelector('dialog[aria-modal=true]')`,
+    "page abort cleanup of dialog, tabs, layout, and feedback");
+  check(await evaluate(`(() => {
+    const h = window.__signedUiPrimitiveHandles;
+    h.table.setRows([["after abort", "must stay removed"]]);
+    h.status.setMessage("after abort");
+    h.progress.setValue(99);
+    h.card.append(document.createElement('p'));
+    return !document.querySelector('[data-signed-ui-primitives]') &&
+      !h.table.element.isConnected && !h.card.element.isConnected && !h.status.element.isConnected &&
+      !h.alert.element.isConnected && !h.progress.element.isConnected && !h.dialog.element.isConnected &&
+      !h.tabs.element.isConnected;
+  })()`), "aborted page controls accepted a late update or remained connected");
+
+  console.log(`Verified signed UI primitives asset at ${primitives.path}: same-origin digest route, matching signed bytes, JavaScript content type, and restrictive host CSP.`);
+  console.log("Verified dialog keyboard focus/escape, tabs keyboard navigation, semantic layout, live feedback, locale updates, feature fallback, and page-abort cleanup.");
   console.log(`Verified signed showcase CSS at ${showcaseCss.path}: same-origin, matching bytes, text/css, rendered under the host CSP.`);
   console.log(`Verified selected signed web digest ${selectedDigest}: both theme SVGs returned matching packaged bytes as image/svg+xml and rendered under the signed CSP.`);
-  console.log("PASS: signed web asset delivery, extension keyboard use and host call, generic control keyboard/save, locale update, navigation cleanup/remount");
+  console.log("PASS: signed web asset delivery, packaged UI primitives under CSP, extension keyboard use and host call, generic control keyboard/save, locale update, and navigation cleanup/remount");
 } finally {
   if (target) {
     try { await debuggerClient.command("Target.closeTarget", { targetId: target.targetId }); } catch {}

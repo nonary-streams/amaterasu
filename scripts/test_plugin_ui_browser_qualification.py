@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Opt-in real Chromium qualification for signed and reusable plugin UI controls.
 
-Runs a private loopback host, packages a signed test extension and the showcase,
-and drives an owned Chromium over its loopback-only CDP endpoint. It changes no
+Runs a private loopback host, packages signed test extensions, the showcase,
+and a zero-method UI primitives consumer, then drives owned Chromium over its
+loopback-only CDP endpoint. UI primitive calls need no mocked service. The
+existing generic settings-controls check uses an in-page API stub. It changes no
 installed host, shared repository, firewall rule, or non-loopback listener.
 """
 from __future__ import annotations
@@ -30,15 +32,17 @@ from test_signed_browser_session import OwnedBrowser
 
 EXTENSION_ID = "plugin-ui-qualification"
 SHOWCASE_ID = "showcase"
+PRIMITIVES_ID = "signed-ui-primitives"
 SHOWCASE_SOURCE = WORKSPACE / "examples/web-extension"
 SHOWCASE_ASSETS = ("showcase.js", "showcase.css")
 THEME_ASSETS = ("okami-botanical.svg", "okami-mountains.svg")
 METHODS = WORKSPACE / "examples/web-extension/methods.json"
 FIXTURE = WORKSPACE / "frontend/tests/fixtures/plugin-ui-browser/example.js"
+PRIMITIVES_FIXTURE = WORKSPACE / "frontend/tests/fixtures/plugin-ui-browser/primitives.js"
 BROWSER_DRIVER = WORKSPACE / "frontend/tests/signed-plugin-ui-browser-qualification.mjs"
 
 
-def configure_signed_extension(harness: PlatformHarness) -> tuple[str, dict[str, str]]:
+def configure_signed_extension(harness: PlatformHarness) -> tuple[str, dict[str, str], str]:
     source = harness.directory / "plugin-ui-extension-source"
     source.mkdir()
     shutil.copy2(FIXTURE, source / "example.js")
@@ -71,6 +75,16 @@ def configure_signed_extension(harness: PlatformHarness) -> tuple[str, dict[str,
     showcase_root = harness.directory / SHOWCASE_ID
     run(binary, "stage", showcase_bundle, showcase_root, fingerprint, public_key)
 
+    primitives_source = harness.directory / "signed-ui-primitives-source"
+    primitives_source.mkdir()
+    shutil.copy2(PRIMITIVES_FIXTURE, primitives_source / "primitives.js")
+    primitives_bundle = harness.directory / "signed-ui-primitives-bundle"
+    run(binary, "pack", primitives_source, primitives_bundle, PRIMITIVES_ID,
+        "Signed UI Primitives Qualification", "primitives.js", "1",
+        str(int(time.time()) + 3600), secret)
+    primitives_root = harness.directory / PRIMITIVES_ID
+    run(binary, "stage", primitives_bundle, primitives_root, fingerprint, public_key)
+
     bootstrap_path = harness.root / "bootstrap.json"
     bootstrap = json.loads(bootstrap_path.read_text())
     bootstrap["policy"]["settings"]["amaterasu.management"]["extensions"] = {
@@ -84,6 +98,12 @@ def configure_signed_extension(harness: PlatformHarness) -> tuple[str, dict[str,
             {
                 "id": SHOWCASE_ID,
                 "root": str(showcase_root),
+                "trusted_keys": {fingerprint: public_key},
+                "methods": [],
+            },
+            {
+                "id": PRIMITIVES_ID,
+                "root": str(primitives_root),
                 "trusted_keys": {fingerprint: public_key},
                 "methods": [],
             },
@@ -122,6 +142,7 @@ def configure_signed_extension(harness: PlatformHarness) -> tuple[str, dict[str,
             name: hashlib.sha256((SHOWCASE_SOURCE / name).read_bytes()).hexdigest()
             for name in SHOWCASE_ASSETS
         },
+        hashlib.sha256(PRIMITIVES_FIXTURE.read_bytes()).hexdigest(),
     )
 
 
@@ -164,6 +185,7 @@ def run_browser(
     chromium: str,
     asset_digest: str,
     showcase_digests: dict[str, str],
+    primitives_digest: str,
     certificate,
 ) -> None:
     browser = OwnedBrowser(harness.directory / "plugin-ui-browser", chromium, spki_pin(certificate))
@@ -178,6 +200,8 @@ def run_browser(
             "password": PASSWORD,
             "assetPath": str(FIXTURE),
             "assetSha256": asset_digest,
+            "primitivesPath": str(PRIMITIVES_FIXTURE),
+            "primitivesSha256": primitives_digest,
             "showcaseAssets": [
                 {
                     "name": name,
@@ -257,9 +281,9 @@ def main() -> None:
         os.environ["XDG_RUNTIME_DIR"] = str(xdg_runtime)
         private.SERVER_ADDRESS = "127.0.0.1"
         certificate = private.configure_host(harness)
-        asset_digest, showcase_digests = configure_signed_extension(harness)
+        asset_digest, showcase_digests, primitives_digest = configure_signed_extension(harness)
         if args.stage_only:
-            print("PASS: signed test extension and showcase assets staged; browser delivery was not run")
+            print("PASS: signed test extension, showcase assets, and zero-method UI primitives consumer staged; browser delivery was not run")
             return
 
         package = harness.directory / "plugin-ui-platform"
@@ -286,7 +310,11 @@ def main() -> None:
             assert any(
                 entry.get("id") == SHOWCASE_ID for entry in listing.get("extensions", [])
             ), "signed showcase is not discoverable through the authenticated host API"
-            run_browser(harness, api, chromium, asset_digest, showcase_digests, certificate)
+            assert any(
+                entry.get("id") == PRIMITIVES_ID for entry in listing.get("extensions", [])
+            ), "signed UI primitives fixture is not discoverable through the authenticated host API"
+            run_browser(harness, api, chromium, asset_digest, showcase_digests,
+                        primitives_digest, certificate)
         finally:
             stop_console(console)
 
