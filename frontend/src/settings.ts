@@ -3962,7 +3962,7 @@ namespace Amaterasu {
         const refresh = button(
           "Refresh now",
           () => runAction(refresh, refreshStatus, async () => {
-            const updated = await context.api.post<LutrisStatus>("lutris/refresh");
+            const updated = await refreshLutrisProvider(context.api);
             if (!runtimeStatus.isConnected || !lutrisLoads.isCurrent(loaded.generation)) return;
             runtimeStatus.className = updated.last_error ? "error" : "muted";
             settingsSetLocalizedTextContent(runtimeStatus, lutrisStatusDescription(updated));
@@ -4251,8 +4251,7 @@ namespace Amaterasu {
         const refresh = button(
           "Refresh now",
           () => runAction(refresh, refreshStatus, async () => {
-            await context.api.post("playnite/refresh");
-            const updated = await context.api.post<PlayniteStatus>("playnite/status");
+            const updated = await refreshPlayniteProvider(context.api);
             if (!runtimeStatus.isConnected) return;
             currentRuntime = updated;
             runtimeStatus.className = updated.last_error ? "error" : "muted";

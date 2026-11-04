@@ -4487,6 +4487,521 @@ var Amaterasu;
             "Maximum retained samples": "最多保留的樣本數", "Pause after the dashboard is hidden": "隱藏儀表板後暫停", "Show host statistics": "顯示主機統計資料",
         },
     };
+    const INTEGRATION_COPY_TRANSLATIONS = {
+        de: {
+            Integrations: "Integrationen",
+            "Connect and manage integrations on this host.": "Integrationen auf diesem Host verbinden und verwalten.",
+            "Refresh provider statuses": "Providerstatus aktualisieren",
+            "Refresh now": "Jetzt aktualisieren",
+            "Manage Steam library": "Steam-Bibliothek verwalten",
+            "Discover games from local Steam libraries.": "Spiele aus lokalen Steam-Bibliotheken erkennen.",
+            "Discover games from the current user's Lutris library.": "Spiele aus der Lutris-Bibliothek des aktuellen Benutzers erkennen.",
+            "Sync a Playnite library and provider-managed applications.": "Eine Playnite-Bibliothek und vom Provider verwaltete Anwendungen synchronisieren.",
+            "Loading provider status...": "Providerstatus wird geladen...",
+            "Status observed": "Status erfasst",
+            "Refreshing provider...": "Provider wird aktualisiert...",
+            "Refresh request accepted. Checking provider status.": "Aktualisierungsanfrage angenommen. Providerstatus wird geprüft.",
+            "Refresh accepted; current provider status was read back.": "Aktualisierung angenommen; der aktuelle Providerstatus wurde erneut abgefragt.",
+            "Refresh failed. Check provider status before retrying.": "Aktualisierung fehlgeschlagen. Prüfe den Providerstatus, bevor du es erneut versuchst.",
+            "Provider status reports an issue.": "Der Providerstatus meldet ein Problem.",
+            "This account cannot read this provider's status.": "Dieses Konto kann den Status dieses Providers nicht lesen.",
+            "Provider status read completed; no provider refresh was requested.": "Statusabfrage abgeschlossen; es wurde keine Aktualisierung des Providers angefordert.",
+            "Provider status check failed.": "Statusabfrage fehlgeschlagen.",
+            "Refresh accepted, but status readback failed. Check status before retrying.": "Aktualisierung angenommen, Status konnte jedoch nicht abgerufen werden. Prüfe den Status vor einem erneuten Versuch.",
+            "Refresh outcome is uncertain. Check status before retrying.": "Ergebnis der Aktualisierung ungewiss. Prüfe den Status vor einem erneuten Versuch.",
+            "Request a {provider} refresh": "Aktualisierung für {provider} anfordern",
+            "Discovered games: {count}. Scan warnings: {warnings}.": "Entdeckte Spiele: {count}. Scan-Warnungen: {warnings}.",
+            "Discovered games: {count}.": "Entdeckte Spiele: {count}.",
+            "Games in the last snapshot: {count}.": "Spiele im letzten Snapshot: {count}.",
+            "Refresh accepted; provider status reports an issue.": "Aktualisierung angenommen; der Providerstatus meldet ein Problem.",
+        },
+        es: {
+            Integrations: "Integraciones",
+            "Connect and manage integrations on this host.": "Conecta y administra las integraciones de este host.",
+            "Refresh provider statuses": "Actualizar estados de proveedores",
+            "Refresh now": "Actualizar ahora",
+            "Manage Steam library": "Administrar biblioteca de Steam",
+            "Discover games from local Steam libraries.": "Detecta juegos en las bibliotecas locales de Steam.",
+            "Discover games from the current user's Lutris library.": "Detecta juegos en la biblioteca de Lutris del usuario actual.",
+            "Sync a Playnite library and provider-managed applications.": "Sincroniza una biblioteca de Playnite y las aplicaciones administradas por el proveedor.",
+            "Loading provider status...": "Cargando estado del proveedor...",
+            "Status observed": "Estado observado",
+            "Refreshing provider...": "Actualizando proveedor...",
+            "Refresh request accepted. Checking provider status.": "Solicitud aceptada. Comprobando el estado del proveedor.",
+            "Refresh accepted; current provider status was read back.": "Solicitud aceptada; se volvió a consultar el estado actual del proveedor.",
+            "Refresh failed. Check provider status before retrying.": "No se pudo actualizar. Comprueba el estado antes de volver a intentarlo.",
+            "Provider status reports an issue.": "El estado del proveedor informa de un problema.",
+            "This account cannot read this provider's status.": "Esta cuenta no puede leer el estado de este proveedor.",
+            "Provider status read completed; no provider refresh was requested.": "Consulta de estado completada; no se solicitó actualizar el proveedor.",
+            "Provider status check failed.": "No se pudo consultar el estado del proveedor.",
+            "Refresh accepted, but status readback failed. Check status before retrying.": "Se aceptó la actualización, pero no se pudo leer el estado. Compruébalo antes de volver a intentarlo.",
+            "Refresh outcome is uncertain. Check status before retrying.": "El resultado de la actualización es incierto. Comprueba el estado antes de volver a intentarlo.",
+            "Request a {provider} refresh": "Solicitar actualización de {provider}",
+            "Discovered games: {count}. Scan warnings: {warnings}.": "Juegos detectados: {count}. Advertencias del análisis: {warnings}.",
+            "Discovered games: {count}.": "Juegos detectados: {count}.",
+            "Games in the last snapshot: {count}.": "Juegos en la última instantánea: {count}.",
+            "Refresh accepted; provider status reports an issue.": "Se aceptó la actualización; el estado del proveedor informa de un problema.",
+        },
+        fr: {
+            Integrations: "Intégrations",
+            "Connect and manage integrations on this host.": "Connectez et gérez les intégrations sur cet hôte.",
+            "Refresh provider statuses": "Actualiser les états des fournisseurs",
+            "Refresh now": "Actualiser",
+            "Manage Steam library": "Gérer la bibliothèque Steam",
+            "Discover games from local Steam libraries.": "Détecter les jeux des bibliothèques Steam locales.",
+            "Discover games from the current user's Lutris library.": "Détecter les jeux de la bibliothèque Lutris de l’utilisateur actuel.",
+            "Sync a Playnite library and provider-managed applications.": "Synchroniser une bibliothèque Playnite et les applications gérées par le fournisseur.",
+            "Loading provider status...": "Chargement de l’état du fournisseur...",
+            "Status observed": "État observé",
+            "Refreshing provider...": "Actualisation du fournisseur...",
+            "Refresh request accepted. Checking provider status.": "Demande acceptée. Vérification de l’état du fournisseur.",
+            "Refresh accepted; current provider status was read back.": "Demande acceptée ; l’état actuel du fournisseur a été relu.",
+            "Refresh failed. Check provider status before retrying.": "Échec de l’actualisation. Vérifiez l’état du fournisseur avant de réessayer.",
+            "Provider status reports an issue.": "L’état du fournisseur signale un problème.",
+            "This account cannot read this provider's status.": "Ce compte ne peut pas lire l’état de ce fournisseur.",
+            "Provider status read completed; no provider refresh was requested.": "État du fournisseur consulté ; aucune actualisation n’a été demandée.",
+            "Provider status check failed.": "Échec de la vérification de l’état du fournisseur.",
+            "Refresh accepted, but status readback failed. Check status before retrying.": "Actualisation acceptée, mais état non récupéré. Vérifiez l’état avant de réessayer.",
+            "Refresh outcome is uncertain. Check status before retrying.": "Le résultat de l’actualisation est incertain. Vérifiez l’état avant de réessayer.",
+            "Request a {provider} refresh": "Demander l’actualisation de {provider}",
+            "Discovered games: {count}. Scan warnings: {warnings}.": "Jeux détectés : {count}. Avertissements d’analyse : {warnings}.",
+            "Discovered games: {count}.": "Jeux détectés : {count}.",
+            "Games in the last snapshot: {count}.": "Jeux dans le dernier instantané : {count}.",
+            "Refresh accepted; provider status reports an issue.": "Actualisation acceptée ; l’état du fournisseur signale un problème.",
+        },
+        ja: {
+            Integrations: "連携",
+            "Connect and manage integrations on this host.": "このホストの連携を接続および管理します。",
+            "Refresh provider statuses": "プロバイダーの状態を更新",
+            "Refresh now": "今すぐ更新",
+            "Manage Steam library": "Steam ライブラリを管理",
+            "Discover games from local Steam libraries.": "ローカルの Steam ライブラリからゲームを検出します。",
+            "Discover games from the current user's Lutris library.": "現在のユーザーの Lutris ライブラリからゲームを検出します。",
+            "Sync a Playnite library and provider-managed applications.": "Playnite ライブラリとプロバイダー管理アプリを同期します。",
+            "Loading provider status...": "プロバイダーの状態を読み込み中...",
+            "Status observed": "状態の確認時刻",
+            "Refreshing provider...": "プロバイダーを更新中...",
+            "Refresh request accepted. Checking provider status.": "更新要求を受け付けました。状態を確認しています。",
+            "Refresh accepted; current provider status was read back.": "更新要求を受け付け、現在のプロバイダー状態を再取得しました。",
+            "Refresh failed. Check provider status before retrying.": "更新に失敗しました。再試行する前に状態を確認してください。",
+            "Provider status reports an issue.": "プロバイダーの状態に問題があります。",
+            "This account cannot read this provider's status.": "このアカウントにはプロバイダーの状態を読み取る権限がありません。",
+            "Provider status read completed; no provider refresh was requested.": "状態の確認が完了しました。プロバイダーの更新要求は行っていません。",
+            "Provider status check failed.": "プロバイダーの状態を確認できませんでした。",
+            "Refresh accepted, but status readback failed. Check status before retrying.": "更新要求は受け付けられましたが、状態を取得できませんでした。再試行前に状態を確認してください。",
+            "Refresh outcome is uncertain. Check status before retrying.": "更新結果を確認できません。再試行前に状態を確認してください。",
+            "Request a {provider} refresh": "{provider} の更新をリクエスト",
+            "Discovered games: {count}. Scan warnings: {warnings}.": "検出したゲーム: {count}。スキャンの警告: {warnings}。",
+            "Discovered games: {count}.": "検出したゲーム: {count}。",
+            "Games in the last snapshot: {count}.": "最新のスナップショット内のゲーム: {count}。",
+            "Refresh accepted; provider status reports an issue.": "更新要求を受け付けましたが、プロバイダーの状態に問題があります。",
+        },
+        zh: {
+            Integrations: "集成",
+            "Connect and manage integrations on this host.": "连接并管理此主机上的集成。",
+            "Refresh provider statuses": "刷新提供程序状态",
+            "Refresh now": "立即刷新",
+            "Manage Steam library": "管理 Steam 库",
+            "Discover games from local Steam libraries.": "从本地 Steam 库发现游戏。",
+            "Discover games from the current user's Lutris library.": "从当前用户的 Lutris 库发现游戏。",
+            "Sync a Playnite library and provider-managed applications.": "同步 Playnite 库和由提供程序管理的应用。",
+            "Loading provider status...": "正在加载提供程序状态...",
+            "Status observed": "状态观测时间",
+            "Refreshing provider...": "正在刷新提供程序...",
+            "Refresh request accepted. Checking provider status.": "已接受刷新请求。正在检查提供程序状态。",
+            "Refresh accepted; current provider status was read back.": "已接受刷新请求，并重新读取当前提供程序状态。",
+            "Refresh failed. Check provider status before retrying.": "刷新失败。重试前请检查提供程序状态。",
+            "Provider status reports an issue.": "提供程序状态报告了问题。",
+            "This account cannot read this provider's status.": "此帐户无权读取该提供程序的状态。",
+            "Provider status read completed; no provider refresh was requested.": "已完成状态读取；未请求刷新提供程序。",
+            "Provider status check failed.": "无法检查提供程序状态。",
+            "Refresh accepted, but status readback failed. Check status before retrying.": "已接受刷新，但无法读取状态。重试前请检查状态。",
+            "Refresh outcome is uncertain. Check status before retrying.": "刷新结果不确定。重试前请检查状态。",
+            "Request a {provider} refresh": "请求刷新 {provider}",
+            "Discovered games: {count}. Scan warnings: {warnings}.": "发现的游戏：{count}。扫描警告：{warnings}。",
+            "Discovered games: {count}.": "发现的游戏：{count}。",
+            "Games in the last snapshot: {count}.": "上次快照中的游戏：{count}。",
+            "Refresh accepted; provider status reports an issue.": "已接受刷新请求；提供程序状态报告了问题。",
+        },
+        zh_TW: {
+            Integrations: "整合",
+            "Connect and manage integrations on this host.": "連線並管理此主機上的整合。",
+            "Refresh provider statuses": "重新整理提供者狀態",
+            "Refresh now": "立即重新整理",
+            "Manage Steam library": "管理 Steam 程式庫",
+            "Discover games from local Steam libraries.": "從本機 Steam 程式庫探索遊戲。",
+            "Discover games from the current user's Lutris library.": "從目前使用者的 Lutris 程式庫探索遊戲。",
+            "Sync a Playnite library and provider-managed applications.": "同步 Playnite 程式庫和由提供者管理的應用程式。",
+            "Loading provider status...": "正在載入提供者狀態...",
+            "Status observed": "狀態觀測時間",
+            "Refreshing provider...": "正在重新整理提供者...",
+            "Refresh request accepted. Checking provider status.": "已接受重新整理要求。正在檢查提供者狀態。",
+            "Refresh accepted; current provider status was read back.": "已接受重新整理要求，並重新讀取目前的提供者狀態。",
+            "Refresh failed. Check provider status before retrying.": "重新整理失敗。重試前請檢查提供者狀態。",
+            "Provider status reports an issue.": "提供者狀態回報問題。",
+            "This account cannot read this provider's status.": "此帳戶無法讀取此提供者的狀態。",
+            "Provider status read completed; no provider refresh was requested.": "已完成狀態讀取；未要求重新整理提供者。",
+            "Provider status check failed.": "無法檢查提供者狀態。",
+            "Refresh accepted, but status readback failed. Check status before retrying.": "已接受重新整理，但無法讀取狀態。重試前請檢查狀態。",
+            "Refresh outcome is uncertain. Check status before retrying.": "重新整理結果不確定。重試前請檢查狀態。",
+            "Request a {provider} refresh": "要求重新整理 {provider}",
+            "Discovered games: {count}. Scan warnings: {warnings}.": "探索到的遊戲：{count}。掃描警告：{warnings}。",
+            "Discovered games: {count}.": "探索到的遊戲：{count}。",
+            "Games in the last snapshot: {count}.": "上次快照中的遊戲：{count}。",
+            "Refresh accepted; provider status reports an issue.": "已接受重新整理要求；提供者狀態回報問題。",
+        },
+        bg: {
+            Integrations: "Интеграции",
+            "Connect and manage integrations on this host.": "Свързвайте и управлявайте интеграциите на този хост.",
+            "Refresh provider statuses": "Обновяване на състоянията",
+            "Refresh now": "Обнови сега",
+            "Manage Steam library": "Управление на Steam библиотеката",
+            "Discover games from local Steam libraries.": "Открива игри от локалните Steam библиотеки.",
+            "Discover games from the current user's Lutris library.": "Открива игри от Lutris библиотеката на текущия потребител.",
+            "Sync a Playnite library and provider-managed applications.": "Синхронизира Playnite библиотека и управлявани от доставчика приложения.",
+            "Status observed": "Състоянието е проверено",
+            "Loading provider status...": "Зареждане на състоянието на доставчика...",
+            "Refreshing provider...": "Обновяване на доставчика...",
+            "Refresh request accepted. Checking provider status.": "Заявката за обновяване е приета. Проверява се състоянието на доставчика.",
+            "Refresh accepted; current provider status was read back.": "Обновяването е прието; текущото състояние на доставчика е прочетено повторно.",
+            "Refresh failed. Check provider status before retrying.": "Обновяването не бе успешно. Проверете състоянието на доставчика, преди да опитате отново.",
+            "Provider status reports an issue.": "Състоянието на доставчика съобщава за проблем.",
+            "This account cannot read this provider's status.": "Този акаунт няма достъп за четене на състоянието на този доставчик.",
+            "Provider status read completed; no provider refresh was requested.": "Проверката на състоянието приключи; заявка за обновяване не е изпращана.",
+            "Provider status check failed.": "Проверката на състоянието не бе успешна.",
+            "Refresh accepted, but status readback failed. Check status before retrying.": "Обновяването е прието, но състоянието не може да бъде прочетено. Проверете го, преди да опитате отново.",
+            "Refresh outcome is uncertain. Check status before retrying.": "Резултатът от обновяването е неизвестен. Проверете състоянието, преди да опитате отново.",
+            "Request a {provider} refresh": "Заявка за обновяване на {provider}",
+            "Discovered games: {count}. Scan warnings: {warnings}.": "Открити игри: {count}. Предупреждения от сканирането: {warnings}.",
+            "Discovered games: {count}.": "Открити игри: {count}.",
+            "Games in the last snapshot: {count}.": "Игри в последната снимка: {count}.",
+            "Refresh accepted; provider status reports an issue.": "Заявката за обновяване е приета; състоянието на доставчика показва проблем.",
+        },
+        cs: {
+            Integrations: "Integrace",
+            "Connect and manage integrations on this host.": "Připojujte a spravujte integrace na tomto hostiteli.",
+            "Refresh provider statuses": "Obnovit stavy poskytovatelů",
+            "Refresh now": "Obnovit",
+            "Manage Steam library": "Spravovat knihovnu služby Steam",
+            "Discover games from local Steam libraries.": "Vyhledá hry v místních knihovnách služby Steam.",
+            "Discover games from the current user's Lutris library.": "Vyhledá hry v knihovně Lutris aktuálního uživatele.",
+            "Sync a Playnite library and provider-managed applications.": "Synchronizuje knihovnu Playnite a aplikace spravované poskytovatelem.",
+            "Status observed": "Stav zjištěn",
+            "Loading provider status...": "Načítání stavu poskytovatele...",
+            "Refreshing provider...": "Aktualizace poskytovatele...",
+            "Refresh request accepted. Checking provider status.": "Požadavek na aktualizaci byl přijat. Ověřuje se stav poskytovatele.",
+            "Refresh accepted; current provider status was read back.": "Aktualizace byla přijata; aktuální stav poskytovatele byl znovu načten.",
+            "Refresh failed. Check provider status before retrying.": "Aktualizace se nezdařila. Před dalším pokusem ověřte stav poskytovatele.",
+            "Provider status reports an issue.": "Stav poskytovatele hlásí problém.",
+            "This account cannot read this provider's status.": "Tento účet nemůže číst stav tohoto poskytovatele.",
+            "Provider status read completed; no provider refresh was requested.": "Kontrola stavu byla dokončena; poskytovatel nebyl obnoven.",
+            "Provider status check failed.": "Kontrola stavu se nezdařila.",
+            "Refresh accepted, but status readback failed. Check status before retrying.": "Poskytovatel přijal požadavek, ale stav se nepodařilo načíst. Před dalším pokusem stav ověřte.",
+            "Refresh outcome is uncertain. Check status before retrying.": "Výsledek aktualizace není jistý. Před dalším pokusem ověřte stav.",
+            "Request a {provider} refresh": "Požádat o aktualizaci poskytovatele {provider}",
+            "Discovered games: {count}. Scan warnings: {warnings}.": "Nalezené hry: {count}. Upozornění skenování: {warnings}.",
+            "Discovered games: {count}.": "Nalezené hry: {count}.",
+            "Games in the last snapshot: {count}.": "Hry v posledním snímku: {count}.",
+            "Refresh accepted; provider status reports an issue.": "Požadavek na aktualizaci byl přijat; stav poskytovatele hlásí problém.",
+        },
+        hu: {
+            Integrations: "Integrációk",
+            "Connect and manage integrations on this host.": "Integrációk csatlakoztatása és kezelése ezen a gazdagépen.",
+            "Refresh provider statuses": "Szolgáltatói állapotok frissítése",
+            "Refresh now": "Frissítés most",
+            "Manage Steam library": "Steam-könyvtár kezelése",
+            "Discover games from local Steam libraries.": "Játékok keresése a helyi Steam-könyvtárakban.",
+            "Discover games from the current user's Lutris library.": "Játékok keresése az aktuális felhasználó Lutris-könyvtárában.",
+            "Sync a Playnite library and provider-managed applications.": "Playnite-könyvtár és szolgáltató által kezelt alkalmazások szinkronizálása.",
+            "Status observed": "Állapot időpontja",
+            "Loading provider status...": "Szolgáltatói állapot betöltése...",
+            "Refreshing provider...": "Szolgáltató frissítése...",
+            "Refresh request accepted. Checking provider status.": "A frissítési kérés elfogadva. A szolgáltatói állapot ellenőrzése folyamatban.",
+            "Refresh accepted; current provider status was read back.": "A frissítés elfogadva; a szolgáltató aktuális állapotát újra lekértük.",
+            "Refresh failed. Check provider status before retrying.": "A frissítés nem sikerült. Újrapróbálás előtt ellenőrizze a szolgáltató állapotát.",
+            "Provider status reports an issue.": "A szolgáltató állapota problémát jelez.",
+            "This account cannot read this provider's status.": "Ez a fiók nem olvashatja a szolgáltató állapotát.",
+            "Provider status read completed; no provider refresh was requested.": "Az állapot lekérdezése befejeződött; szolgáltatói frissítést nem kértünk.",
+            "Provider status check failed.": "Nem sikerült lekérni a szolgáltató állapotát.",
+            "Refresh accepted, but status readback failed. Check status before retrying.": "A frissítést elfogadták, de az állapot nem olvasható. Újrapróbálás előtt ellenőrizze az állapotot.",
+            "Refresh outcome is uncertain. Check status before retrying.": "A frissítés eredménye bizonytalan. Újrapróbálás előtt ellenőrizze az állapotot.",
+            "Request a {provider} refresh": "{provider} frissítésének kérése",
+            "Discovered games: {count}. Scan warnings: {warnings}.": "Felfedezett játékok: {count}. Vizsgálati figyelmeztetések: {warnings}.",
+            "Discovered games: {count}.": "Felfedezett játékok: {count}.",
+            "Games in the last snapshot: {count}.": "Játékok az utolsó pillanatképben: {count}.",
+            "Refresh accepted; provider status reports an issue.": "A frissítési kérést elfogadták; a szolgáltató állapota problémát jelez.",
+        },
+        it: {
+            Integrations: "Integrazioni",
+            "Connect and manage integrations on this host.": "Collega e gestisci le integrazioni su questo host.",
+            "Refresh provider statuses": "Aggiorna gli stati dei provider",
+            "Refresh now": "Aggiorna ora",
+            "Manage Steam library": "Gestisci la libreria Steam",
+            "Discover games from local Steam libraries.": "Rileva i giochi dalle librerie Steam locali.",
+            "Discover games from the current user's Lutris library.": "Rileva i giochi dalla libreria Lutris dell'utente corrente.",
+            "Sync a Playnite library and provider-managed applications.": "Sincronizza una libreria Playnite e le applicazioni gestite dal provider.",
+            "Status observed": "Stato rilevato",
+            "Loading provider status...": "Caricamento dello stato del provider...",
+            "Refreshing provider...": "Aggiornamento del provider...",
+            "Refresh request accepted. Checking provider status.": "Richiesta di aggiornamento accettata. Verifica dello stato del provider.",
+            "Refresh accepted; current provider status was read back.": "Aggiornamento accettato; lo stato attuale del provider è stato riletto.",
+            "Refresh failed. Check provider status before retrying.": "Aggiornamento non riuscito. Controlla lo stato del provider prima di riprovare.",
+            "Provider status reports an issue.": "Lo stato del provider segnala un problema.",
+            "This account cannot read this provider's status.": "Questo account non può leggere lo stato di questo provider.",
+            "Provider status read completed; no provider refresh was requested.": "Controllo dello stato completato; non è stato richiesto alcun aggiornamento del provider.",
+            "Provider status check failed.": "Controllo dello stato del provider non riuscito.",
+            "Refresh accepted, but status readback failed. Check status before retrying.": "Aggiornamento accettato, ma impossibile leggere lo stato. Verificalo prima di riprovare.",
+            "Refresh outcome is uncertain. Check status before retrying.": "Esito dell’aggiornamento incerto. Verifica lo stato prima di riprovare.",
+            "Request a {provider} refresh": "Richiedi aggiornamento di {provider}",
+            "Discovered games: {count}. Scan warnings: {warnings}.": "Giochi rilevati: {count}. Avvisi della scansione: {warnings}.",
+            "Discovered games: {count}.": "Giochi rilevati: {count}.",
+            "Games in the last snapshot: {count}.": "Giochi nell’ultima istantanea: {count}.",
+            "Refresh accepted; provider status reports an issue.": "Aggiornamento accettato; lo stato del provider segnala un problema.",
+        },
+        ko: {
+            Integrations: "통합",
+            "Connect and manage integrations on this host.": "이 호스트의 통합을 연결하고 관리합니다.",
+            "Refresh provider statuses": "공급자 상태 새로 고침",
+            "Refresh now": "지금 새로 고침",
+            "Manage Steam library": "Steam 라이브러리 관리",
+            "Discover games from local Steam libraries.": "로컬 Steam 라이브러리에서 게임을 검색합니다.",
+            "Discover games from the current user's Lutris library.": "현재 사용자의 Lutris 라이브러리에서 게임을 검색합니다.",
+            "Sync a Playnite library and provider-managed applications.": "Playnite 라이브러리와 공급자 관리 앱을 동기화합니다.",
+            "Status observed": "상태 확인 시각",
+            "Loading provider status...": "공급자 상태 로드 중...",
+            "Refreshing provider...": "공급자 새로 고침 중...",
+            "Refresh request accepted. Checking provider status.": "새로 고침 요청을 수락했습니다. 공급자 상태를 확인하고 있습니다.",
+            "Refresh accepted; current provider status was read back.": "새로 고침을 수락하고 현재 공급자 상태를 다시 읽었습니다.",
+            "Refresh failed. Check provider status before retrying.": "새로 고침에 실패했습니다. 다시 시도하기 전에 공급자 상태를 확인하세요.",
+            "Provider status reports an issue.": "공급자 상태에서 문제가 보고되었습니다.",
+            "This account cannot read this provider's status.": "이 계정은 해당 공급자 상태를 읽을 수 없습니다.",
+            "Provider status read completed; no provider refresh was requested.": "상태 확인이 완료되었습니다. 공급자 새로 고침은 요청하지 않았습니다.",
+            "Provider status check failed.": "공급자 상태 확인에 실패했습니다.",
+            "Refresh accepted, but status readback failed. Check status before retrying.": "새로 고침은 수락되었지만 상태를 읽지 못했습니다. 다시 시도하기 전에 상태를 확인하세요.",
+            "Refresh outcome is uncertain. Check status before retrying.": "새로 고침 결과를 확인할 수 없습니다. 다시 시도하기 전에 상태를 확인하세요.",
+            "Request a {provider} refresh": "{provider} 새로 고침 요청",
+            "Discovered games: {count}. Scan warnings: {warnings}.": "검색된 게임: {count}. 검색 경고: {warnings}.",
+            "Discovered games: {count}.": "검색된 게임: {count}.",
+            "Games in the last snapshot: {count}.": "마지막 스냅샷의 게임: {count}.",
+            "Refresh accepted; provider status reports an issue.": "새로 고침 요청을 수락했지만 공급자 상태에서 문제가 보고되었습니다.",
+        },
+        pl: {
+            Integrations: "Integracje",
+            "Connect and manage integrations on this host.": "Połącz integracje i zarządzaj nimi na tym hoście.",
+            "Refresh provider statuses": "Odśwież stany dostawców",
+            "Refresh now": "Odśwież teraz",
+            "Manage Steam library": "Zarządzaj biblioteką Steam",
+            "Discover games from local Steam libraries.": "Wykrywaj gry w lokalnych bibliotekach Steam.",
+            "Discover games from the current user's Lutris library.": "Wykrywaj gry w bibliotece Lutris bieżącego użytkownika.",
+            "Sync a Playnite library and provider-managed applications.": "Synchronizuj bibliotekę Playnite i aplikacje zarządzane przez dostawcę.",
+            "Status observed": "Czas odczytu stanu",
+            "Loading provider status...": "Ładowanie stanu dostawcy...",
+            "Refreshing provider...": "Odświeżanie dostawcy...",
+            "Refresh request accepted. Checking provider status.": "Przyjęto żądanie odświeżenia. Sprawdzanie stanu dostawcy.",
+            "Refresh accepted; current provider status was read back.": "Przyjęto odświeżenie; ponownie odczytano bieżący stan dostawcy.",
+            "Refresh failed. Check provider status before retrying.": "Odświeżanie nie powiodło się. Sprawdź stan dostawcy przed ponowną próbą.",
+            "Provider status reports an issue.": "Stan dostawcy zgłasza problem.",
+            "This account cannot read this provider's status.": "To konto nie może odczytać stanu tego dostawcy.",
+            "Provider status read completed; no provider refresh was requested.": "Odczyt stanu zakończony; nie zażądano odświeżenia dostawcy.",
+            "Provider status check failed.": "Nie udało się odczytać stanu dostawcy.",
+            "Refresh accepted, but status readback failed. Check status before retrying.": "Przyjęto odświeżenie, ale nie udało się odczytać stanu. Sprawdź go przed ponowną próbą.",
+            "Refresh outcome is uncertain. Check status before retrying.": "Wynik odświeżania jest niepewny. Sprawdź stan przed ponowną próbą.",
+            "Request a {provider} refresh": "Poproś o odświeżenie {provider}",
+            "Discovered games: {count}. Scan warnings: {warnings}.": "Wykryte gry: {count}. Ostrzeżenia skanowania: {warnings}.",
+            "Discovered games: {count}.": "Wykryte gry: {count}.",
+            "Games in the last snapshot: {count}.": "Gry w ostatnim zrzucie: {count}.",
+            "Refresh accepted; provider status reports an issue.": "Przyjęto odświeżenie; stan dostawcy zgłasza problem.",
+        },
+        pt: {
+            Integrations: "Integrações",
+            "Connect and manage integrations on this host.": "Ligue e gere as integrações neste anfitrião.",
+            "Refresh provider statuses": "Atualizar estados dos fornecedores",
+            "Refresh now": "Atualizar agora",
+            "Manage Steam library": "Gerir biblioteca Steam",
+            "Discover games from local Steam libraries.": "Detetar jogos nas bibliotecas Steam locais.",
+            "Discover games from the current user's Lutris library.": "Detetar jogos na biblioteca Lutris do utilizador atual.",
+            "Sync a Playnite library and provider-managed applications.": "Sincronizar uma biblioteca Playnite e aplicações geridas pelo fornecedor.",
+            "Status observed": "Estado observado",
+            "Loading provider status...": "A carregar o estado do fornecedor...",
+            "Refreshing provider...": "A atualizar o fornecedor...",
+            "Refresh request accepted. Checking provider status.": "Pedido de atualização aceite. A verificar o estado do fornecedor.",
+            "Refresh accepted; current provider status was read back.": "Atualização aceite; o estado atual do fornecedor foi consultado novamente.",
+            "Refresh failed. Check provider status before retrying.": "A atualização falhou. Verifique o estado do fornecedor antes de tentar novamente.",
+            "Provider status reports an issue.": "O estado do fornecedor indica um problema.",
+            "This account cannot read this provider's status.": "Esta conta não pode ler o estado deste fornecedor.",
+            "Provider status read completed; no provider refresh was requested.": "Consulta do estado concluída; não foi pedida uma atualização do fornecedor.",
+            "Provider status check failed.": "Falha ao consultar o estado do fornecedor.",
+            "Refresh accepted, but status readback failed. Check status before retrying.": "Atualização aceite, mas não foi possível ler o estado. Verifique-o antes de tentar novamente.",
+            "Refresh outcome is uncertain. Check status before retrying.": "O resultado da atualização é incerto. Verifique o estado antes de tentar novamente.",
+            "Request a {provider} refresh": "Pedir atualização de {provider}",
+            "Discovered games: {count}. Scan warnings: {warnings}.": "Jogos detetados: {count}. Avisos da análise: {warnings}.",
+            "Discovered games: {count}.": "Jogos detetados: {count}.",
+            "Games in the last snapshot: {count}.": "Jogos no último instantâneo: {count}.",
+            "Refresh accepted; provider status reports an issue.": "Atualização aceite; o estado do fornecedor indica um problema.",
+        },
+        pt_BR: {
+            Integrations: "Integrações",
+            "Connect and manage integrations on this host.": "Conecte e gerencie as integrações neste host.",
+            "Refresh provider statuses": "Atualizar status dos provedores",
+            "Refresh now": "Atualizar agora",
+            "Manage Steam library": "Gerenciar biblioteca Steam",
+            "Discover games from local Steam libraries.": "Descubra jogos nas bibliotecas locais do Steam.",
+            "Discover games from the current user's Lutris library.": "Descubra jogos na biblioteca Lutris do usuário atual.",
+            "Sync a Playnite library and provider-managed applications.": "Sincronize uma biblioteca Playnite e aplicativos gerenciados pelo provedor.",
+            "Status observed": "Status observado",
+            "Loading provider status...": "Carregando status do provedor...",
+            "Refreshing provider...": "Atualizando provedor...",
+            "Refresh request accepted. Checking provider status.": "Solicitação de atualização aceita. Verificando o status do provedor.",
+            "Refresh accepted; current provider status was read back.": "Atualização aceita; o status atual do provedor foi consultado novamente.",
+            "Refresh failed. Check provider status before retrying.": "Falha ao atualizar. Verifique o status do provedor antes de tentar novamente.",
+            "Provider status reports an issue.": "O status do provedor informa um problema.",
+            "This account cannot read this provider's status.": "Esta conta não pode ler o status deste provedor.",
+            "Provider status read completed; no provider refresh was requested.": "Consulta de status concluída; nenhuma atualização do provedor foi solicitada.",
+            "Provider status check failed.": "Falha ao consultar o status do provedor.",
+            "Refresh accepted, but status readback failed. Check status before retrying.": "Atualização aceita, mas não foi possível ler o status. Confira antes de tentar novamente.",
+            "Refresh outcome is uncertain. Check status before retrying.": "O resultado da atualização é incerto. Confira o status antes de tentar novamente.",
+            "Request a {provider} refresh": "Solicitar atualização de {provider}",
+            "Discovered games: {count}. Scan warnings: {warnings}.": "Jogos descobertos: {count}. Avisos da verificação: {warnings}.",
+            "Discovered games: {count}.": "Jogos descobertos: {count}.",
+            "Games in the last snapshot: {count}.": "Jogos no último instantâneo: {count}.",
+            "Refresh accepted; provider status reports an issue.": "Atualização aceita; o status do provedor informa um problema.",
+        },
+        ru: {
+            Integrations: "Интеграции",
+            "Connect and manage integrations on this host.": "Подключайте интеграции и управляйте ими на этом хосте.",
+            "Refresh provider statuses": "Обновить статусы провайдеров",
+            "Refresh now": "Обновить",
+            "Manage Steam library": "Управление библиотекой Steam",
+            "Discover games from local Steam libraries.": "Находит игры в локальных библиотеках Steam.",
+            "Discover games from the current user's Lutris library.": "Находит игры в библиотеке Lutris текущего пользователя.",
+            "Sync a Playnite library and provider-managed applications.": "Синхронизирует библиотеку Playnite и приложения под управлением провайдера.",
+            "Status observed": "Время проверки состояния",
+            "Loading provider status...": "Загрузка статуса провайдера...",
+            "Refreshing provider...": "Обновление провайдера...",
+            "Refresh request accepted. Checking provider status.": "Запрос на обновление принят. Проверяется статус провайдера.",
+            "Refresh accepted; current provider status was read back.": "Обновление принято; текущий статус провайдера повторно получен.",
+            "Refresh failed. Check provider status before retrying.": "Не удалось обновить. Проверьте статус провайдера перед повторной попыткой.",
+            "Provider status reports an issue.": "Статус провайдера сообщает о проблеме.",
+            "This account cannot read this provider's status.": "Эта учетная запись не может читать статус провайдера.",
+            "Provider status read completed; no provider refresh was requested.": "Проверка состояния завершена; обновление провайдера не запрашивалось.",
+            "Provider status check failed.": "Не удалось проверить состояние провайдера.",
+            "Refresh accepted, but status readback failed. Check status before retrying.": "Запрос принят, но состояние не удалось прочитать. Проверьте его перед повторной попыткой.",
+            "Refresh outcome is uncertain. Check status before retrying.": "Результат обновления неизвестен. Проверьте состояние перед повторной попыткой.",
+            "Request a {provider} refresh": "Запросить обновление {provider}",
+            "Discovered games: {count}. Scan warnings: {warnings}.": "Найдено игр: {count}. Предупреждения сканирования: {warnings}.",
+            "Discovered games: {count}.": "Найдено игр: {count}.",
+            "Games in the last snapshot: {count}.": "Игр в последнем снимке: {count}.",
+            "Refresh accepted; provider status reports an issue.": "Запрос на обновление принят; состояние провайдера сообщает о проблеме.",
+        },
+        sv: {
+            Integrations: "Integrationer",
+            "Connect and manage integrations on this host.": "Anslut och hantera integrationer på den här värden.",
+            "Refresh provider statuses": "Uppdatera leverantörsstatus",
+            "Refresh now": "Uppdatera nu",
+            "Manage Steam library": "Hantera Steam-bibliotek",
+            "Discover games from local Steam libraries.": "Identifiera spel från lokala Steam-bibliotek.",
+            "Discover games from the current user's Lutris library.": "Identifiera spel från den aktuella användarens Lutris-bibliotek.",
+            "Sync a Playnite library and provider-managed applications.": "Synkronisera ett Playnite-bibliotek och program som hanteras av leverantören.",
+            "Status observed": "Status avläst",
+            "Loading provider status...": "Läser in leverantörsstatus...",
+            "Refreshing provider...": "Uppdaterar leverantören...",
+            "Refresh request accepted. Checking provider status.": "Uppdateringsbegäran har godkänts. Kontrollerar leverantörens status.",
+            "Refresh accepted; current provider status was read back.": "Uppdateringen godkändes; aktuell leverantörsstatus lästes in igen.",
+            "Refresh failed. Check provider status before retrying.": "Det gick inte att uppdatera. Kontrollera leverantörens status innan du försöker igen.",
+            "Provider status reports an issue.": "Leverantörsstatusen rapporterar ett problem.",
+            "This account cannot read this provider's status.": "Det här kontot kan inte läsa leverantörens status.",
+            "Provider status read completed; no provider refresh was requested.": "Statuskontrollen är klar; ingen uppdatering av leverantören begärdes.",
+            "Provider status check failed.": "Det gick inte att läsa leverantörens status.",
+            "Refresh accepted, but status readback failed. Check status before retrying.": "Uppdateringen godkändes, men status kunde inte läsas. Kontrollera status innan du försöker igen.",
+            "Refresh outcome is uncertain. Check status before retrying.": "Resultatet av uppdateringen är osäkert. Kontrollera status innan du försöker igen.",
+            "Request a {provider} refresh": "Begär uppdatering av {provider}",
+            "Discovered games: {count}. Scan warnings: {warnings}.": "Upptäckta spel: {count}. Sökningsvarningar: {warnings}.",
+            "Discovered games: {count}.": "Upptäckta spel: {count}.",
+            "Games in the last snapshot: {count}.": "Spel i den senaste ögonblicksbilden: {count}.",
+            "Refresh accepted; provider status reports an issue.": "Uppdateringen godkändes; leverantörens status rapporterar ett problem.",
+        },
+        tr: {
+            Integrations: "Entegrasyonlar",
+            "Connect and manage integrations on this host.": "Bu ana bilgisayardaki entegrasyonları bağlayın ve yönetin.",
+            "Refresh provider statuses": "Sağlayıcı durumlarını yenile",
+            "Refresh now": "Şimdi yenile",
+            "Manage Steam library": "Steam kitaplığını yönet",
+            "Discover games from local Steam libraries.": "Yerel Steam kitaplıklarındaki oyunları keşfeder.",
+            "Discover games from the current user's Lutris library.": "Geçerli kullanıcının Lutris kitaplığındaki oyunları keşfeder.",
+            "Sync a Playnite library and provider-managed applications.": "Playnite kitaplığını ve sağlayıcı tarafından yönetilen uygulamaları eşitler.",
+            "Status observed": "Durumun gözlemlendiği zaman",
+            "Loading provider status...": "Sağlayıcı durumu yükleniyor...",
+            "Refreshing provider...": "Sağlayıcı yenileniyor...",
+            "Refresh request accepted. Checking provider status.": "Yenileme isteği kabul edildi. Sağlayıcı durumu kontrol ediliyor.",
+            "Refresh accepted; current provider status was read back.": "Yenileme kabul edildi; güncel sağlayıcı durumu yeniden okundu.",
+            "Refresh failed. Check provider status before retrying.": "Yenileme başarısız oldu. Yeniden denemeden önce sağlayıcı durumunu kontrol edin.",
+            "Provider status reports an issue.": "Sağlayıcı durumu bir sorun bildiriyor.",
+            "This account cannot read this provider's status.": "Bu hesap sağlayıcının durumunu okuyamaz.",
+            "Provider status read completed; no provider refresh was requested.": "Durum denetimi tamamlandı; sağlayıcı yenilemesi istenmedi.",
+            "Provider status check failed.": "Sağlayıcı durumu denetlenemedi.",
+            "Refresh accepted, but status readback failed. Check status before retrying.": "Yenileme kabul edildi ancak durum okunamadı. Yeniden denemeden önce durumu kontrol edin.",
+            "Refresh outcome is uncertain. Check status before retrying.": "Yenileme sonucu belirsiz. Yeniden denemeden önce durumu kontrol edin.",
+            "Request a {provider} refresh": "{provider} yenilemesi iste",
+            "Discovered games: {count}. Scan warnings: {warnings}.": "Bulunan oyunlar: {count}. Tarama uyarıları: {warnings}.",
+            "Discovered games: {count}.": "Bulunan oyunlar: {count}.",
+            "Games in the last snapshot: {count}.": "Son anlık görüntüdeki oyunlar: {count}.",
+            "Refresh accepted; provider status reports an issue.": "Yenileme kabul edildi; sağlayıcı durumu bir sorun bildiriyor.",
+        },
+        uk: {
+            Integrations: "Інтеграції",
+            "Connect and manage integrations on this host.": "Підключайте інтеграції та керуйте ними на цьому хості.",
+            "Refresh provider statuses": "Оновити стани провайдерів",
+            "Refresh now": "Оновити зараз",
+            "Manage Steam library": "Керувати бібліотекою Steam",
+            "Discover games from local Steam libraries.": "Знаходить ігри в локальних бібліотеках Steam.",
+            "Discover games from the current user's Lutris library.": "Знаходить ігри в бібліотеці Lutris поточного користувача.",
+            "Sync a Playnite library and provider-managed applications.": "Синхронізує бібліотеку Playnite та програми під керуванням провайдера.",
+            "Status observed": "Час перевірки стану",
+            "Loading provider status...": "Завантаження стану провайдера...",
+            "Refreshing provider...": "Оновлення провайдера...",
+            "Refresh request accepted. Checking provider status.": "Запит на оновлення прийнято. Перевіряється стан провайдера.",
+            "Refresh accepted; current provider status was read back.": "Оновлення прийнято; поточний стан провайдера повторно зчитано.",
+            "Refresh failed. Check provider status before retrying.": "Не вдалося оновити. Перевірте стан провайдера перед повторною спробою.",
+            "Provider status reports an issue.": "Стан провайдера повідомляє про проблему.",
+            "This account cannot read this provider's status.": "Цей обліковий запис не може читати стан провайдера.",
+            "Provider status read completed; no provider refresh was requested.": "Перевірку стану завершено; оновлення провайдера не запитували.",
+            "Provider status check failed.": "Не вдалося перевірити стан провайдера.",
+            "Refresh accepted, but status readback failed. Check status before retrying.": "Запит прийнято, але стан не вдалося прочитати. Перевірте його перед повторною спробою.",
+            "Refresh outcome is uncertain. Check status before retrying.": "Результат оновлення невідомий. Перевірте стан перед повторною спробою.",
+            "Request a {provider} refresh": "Запросити оновлення {provider}",
+            "Discovered games: {count}. Scan warnings: {warnings}.": "Знайдено ігор: {count}. Попередження сканування: {warnings}.",
+            "Discovered games: {count}.": "Знайдено ігор: {count}.",
+            "Games in the last snapshot: {count}.": "Ігор в останньому знімку: {count}.",
+            "Refresh accepted; provider status reports an issue.": "Запит на оновлення прийнято; стан провайдера повідомляє про проблему.",
+        },
+        vi: {
+            Integrations: "Tích hợp",
+            "Connect and manage integrations on this host.": "Kết nối và quản lý các tích hợp trên máy chủ này.",
+            "Refresh provider statuses": "Làm mới trạng thái nhà cung cấp",
+            "Refresh now": "Làm mới ngay",
+            "Manage Steam library": "Quản lý thư viện Steam",
+            "Discover games from local Steam libraries.": "Tìm trò chơi trong thư viện Steam cục bộ.",
+            "Discover games from the current user's Lutris library.": "Tìm trò chơi trong thư viện Lutris của người dùng hiện tại.",
+            "Sync a Playnite library and provider-managed applications.": "Đồng bộ thư viện Playnite và ứng dụng do nhà cung cấp quản lý.",
+            "Status observed": "Thời điểm ghi nhận trạng thái",
+            "Loading provider status...": "Đang tải trạng thái nhà cung cấp...",
+            "Refreshing provider...": "Đang làm mới nhà cung cấp...",
+            "Refresh request accepted. Checking provider status.": "Đã chấp nhận yêu cầu làm mới. Đang kiểm tra trạng thái nhà cung cấp.",
+            "Refresh accepted; current provider status was read back.": "Đã chấp nhận làm mới; trạng thái nhà cung cấp hiện tại đã được đọc lại.",
+            "Refresh failed. Check provider status before retrying.": "Làm mới thất bại. Hãy kiểm tra trạng thái trước khi thử lại.",
+            "Provider status reports an issue.": "Trạng thái nhà cung cấp báo có sự cố.",
+            "This account cannot read this provider's status.": "Tài khoản này không thể đọc trạng thái của nhà cung cấp.",
+            "Provider status read completed; no provider refresh was requested.": "Đã đọc xong trạng thái; không yêu cầu làm mới nhà cung cấp.",
+            "Provider status check failed.": "Không thể kiểm tra trạng thái nhà cung cấp.",
+            "Refresh accepted, but status readback failed. Check status before retrying.": "Đã chấp nhận làm mới nhưng không đọc được trạng thái. Hãy kiểm tra trước khi thử lại.",
+            "Refresh outcome is uncertain. Check status before retrying.": "Kết quả làm mới chưa xác định. Hãy kiểm tra trạng thái trước khi thử lại.",
+            "Request a {provider} refresh": "Yêu cầu làm mới {provider}",
+            "Discovered games: {count}. Scan warnings: {warnings}.": "Trò chơi được phát hiện: {count}. Cảnh báo quét: {warnings}.",
+            "Discovered games: {count}.": "Trò chơi được phát hiện: {count}.",
+            "Games in the last snapshot: {count}.": "Trò chơi trong ảnh chụp gần nhất: {count}.",
+            "Refresh accepted; provider status reports an issue.": "Đã chấp nhận làm mới; trạng thái nhà cung cấp báo có sự cố.",
+        },
+    };
     const PAGE_COPY_KEYS = [
         "A durable catalog of the applications on your host.",
         "Discover local Steam games and optionally sync a complete scan into the catalog.",
@@ -5067,7 +5582,7 @@ var Amaterasu;
         const localeAttributeTemplates = catalogFromTranslations(ATTRIBUTE_TEMPLATE_KEYS, attributeTemplateTranslations[locale]);
         const localeInputOverrideLabels = catalogFromTranslations(INPUT_OVERRIDE_LABEL_KEYS, inputOverrideLabelTranslations[locale]);
         const localeMetricLabels = catalogFromTranslations(METRIC_LABEL_KEYS, metricLabelTranslations[locale]);
-        return mergeLocaleMessages(mergeLocaleMessages(mergeLocaleMessages(mergeLocaleMessages(mergeLocaleMessages(englishBase, englishUi), englishShell), localeBase), mergeLocaleMessages(localeUi, localeShell)), mergeLocaleMessages(mergeLocaleMessages(englishProduct, mergeLocaleMessages(productTranslations[locale] ?? {}, pairedClientTranslations[locale] ?? {})), mergeLocaleMessages(specializedTranslations[locale] ?? {}, mergeLocaleMessages(mergeLocaleMessages(localePageCopy, localeAttributeTemplates), mergeLocaleMessages(localeInputOverrideLabels, localeMetricLabels)))));
+        return mergeLocaleMessages(mergeLocaleMessages(mergeLocaleMessages(mergeLocaleMessages(mergeLocaleMessages(englishBase, englishUi), englishShell), localeBase), mergeLocaleMessages(localeUi, localeShell)), mergeLocaleMessages(mergeLocaleMessages(englishProduct, mergeLocaleMessages(productTranslations[locale] ?? {}, pairedClientTranslations[locale] ?? {})), mergeLocaleMessages(mergeLocaleMessages(specializedTranslations[locale] ?? {}, INTEGRATION_COPY_TRANSLATIONS[locale] ?? {}), mergeLocaleMessages(mergeLocaleMessages(localePageCopy, localeAttributeTemplates), mergeLocaleMessages(localeInputOverrideLabels, localeMetricLabels)))));
     }
     Amaterasu.localeMessagesFor = localeMessagesFor;
     function translateLocaleMessage(source, messages) {
@@ -5725,6 +6240,26 @@ var Amaterasu;
         });
     }
     Amaterasu.confirmAction = confirmAction;
+})(Amaterasu || (Amaterasu = {}));
+var Amaterasu;
+(function (Amaterasu) {
+    async function refreshLutrisProvider(api, accepted) {
+        const status = await api.post("lutris/refresh");
+        if (!status || status.ok !== true)
+            throw new Error("Lutris refresh was not accepted.");
+        accepted?.();
+        return status;
+    }
+    Amaterasu.refreshLutrisProvider = refreshLutrisProvider;
+    async function refreshPlayniteProvider(api, accepted) {
+        const response = await api.post("playnite/refresh");
+        if (!response || typeof response !== "object" || Array.isArray(response) ||
+            response.ok !== true)
+            throw new Error("Playnite refresh was not accepted.");
+        accepted?.();
+        return api.post("playnite/status");
+    }
+    Amaterasu.refreshPlayniteProvider = refreshPlayniteProvider;
 })(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
 (function (Amaterasu) {
@@ -12658,7 +13193,7 @@ var Amaterasu;
                     }
                 }, "secondary");
                 const refresh = Amaterasu.button("Refresh now", () => Amaterasu.runAction(refresh, refreshStatus, async () => {
-                    const updated = await context.api.post("lutris/refresh");
+                    const updated = await Amaterasu.refreshLutrisProvider(context.api);
                     if (!runtimeStatus.isConnected || !lutrisLoads.isCurrent(loaded.generation))
                         return;
                     runtimeStatus.className = updated.last_error ? "error" : "muted";
@@ -12872,8 +13407,7 @@ var Amaterasu;
                     }
                 }, "secondary");
                 const refresh = Amaterasu.button("Refresh now", () => Amaterasu.runAction(refresh, refreshStatus, async () => {
-                    await context.api.post("playnite/refresh");
-                    const updated = await context.api.post("playnite/status");
+                    const updated = await Amaterasu.refreshPlayniteProvider(context.api);
                     if (!runtimeStatus.isConnected)
                         return;
                     currentRuntime = updated;
@@ -13898,6 +14432,8 @@ var Amaterasu;
                 state: scanning ? "Scanning" : complete ? "Scan complete" : "Awaiting scan",
                 tone: "",
                 detail: `${count} discovered games · ${warnings} scan warnings.`,
+                detailTemplate: "Discovered games: {count}. Scan warnings: {warnings}.",
+                detailValues: { count, warnings },
             };
         }
         if (name === "lutris") {
@@ -13915,8 +14451,12 @@ var Amaterasu;
             const lastError = record.last_error;
             if (lastError !== null && typeof lastError !== "string")
                 throw new Error("Provider status is invalid.");
-            return { state: lastError ? "Scan issue" : pending ? "Scanning" : "Available", tone: lastError ? "bad" : "",
-                detail: lastError ? `Last scan issue: ${lastError}` : `${count} discovered games.` };
+            return {
+                state: lastError ? "Scan issue" : pending ? "Scanning" : "Available",
+                tone: lastError ? "bad" : "",
+                detail: lastError ? `Last scan issue: ${lastError}` : `${count} discovered games.`,
+                ...(!lastError ? { detailTemplate: "Discovered games: {count}.", detailValues: { count } } : {}),
+            };
         }
         const running = providerBoolean(record, "playnite_running");
         const count = providerCount(record, "snapshot_game_count");
@@ -13928,6 +14468,7 @@ var Amaterasu;
             state: lastError ? "Sync issue" : pending ? "Syncing" : running ? "Running" : "Not detected",
             tone: lastError ? "bad" : "",
             detail: lastError ? `Last sync issue: ${lastError}` : `${count} games in the last snapshot.`,
+            ...(!lastError ? { detailTemplate: "Games in the last snapshot: {count}.", detailValues: { count } } : {}),
         };
     }
     Amaterasu.summarizeProvider = summarizeProvider;
@@ -13939,38 +14480,168 @@ var Amaterasu;
             { name: "playnite", label: "Playnite", description: "Sync a Playnite library and provider-managed applications.", scope: "configuration.read" },
         ];
         let generation = 0;
+        const activeRefreshes = new Set();
+        let currentCards = [];
         const rtxHdrArea = Amaterasu.el("div");
-        context.content.append(Amaterasu.sectionHeading("Integrations", "Connect and manage integrations on this host.", Amaterasu.button("Refresh", load)), rtxHdrArea, area);
-        async function load() {
+        const refreshStatuses = Amaterasu.button(Amaterasu.localizedMessage("Refresh provider statuses"), () => load(true));
+        if (typeof Amaterasu.setLocalizedAttribute === "function")
+            Amaterasu.setLocalizedAttribute(refreshStatuses, "aria-label", "Refresh provider statuses");
+        context.content.append(Amaterasu.sectionHeading("Integrations", "Connect and manage integrations on this host.", refreshStatuses), rtxHdrArea, area);
+        async function load(announceReadback = false) {
             const request = ++generation;
+            refreshStatuses.disabled = true;
             Amaterasu.renderRtxHdrIntegration(context, rtxHdrArea);
             const cards = providers.map((provider) => {
-                const status = Amaterasu.el("div", "integration-status", Amaterasu.el("p", "muted", "Loading provider status…"));
-                const settings = Amaterasu.button("Configure", () => context.navigate("settings/integrations"));
+                const status = Amaterasu.el("div", "integration-status", Amaterasu.el("p", "muted", Amaterasu.localizedMessage("Loading provider status...")));
+                const feedback = Amaterasu.el("div", "integration-action-status");
+                feedback.setAttribute("role", "status");
+                feedback.setAttribute("aria-live", "polite");
+                feedback.setAttribute("aria-atomic", "true");
+                const settings = Amaterasu.button(Amaterasu.localizedMessage("Configure"), () => context.navigate("settings/integrations"));
                 settings.disabled = !context.api.allows("configuration.read");
                 const actions = Amaterasu.el("div", "actions", settings);
-                if (provider.name === "steam" && context.api.allows("steam.read"))
-                    actions.append(Amaterasu.button("Browse games", () => context.navigate("steam")));
-                const card = Amaterasu.el("section", "panel integration-card", Amaterasu.el("h2", "", provider.label), Amaterasu.el("p", "muted", provider.description), status, actions);
-                return { provider, status, card };
+                let refreshButton = null;
+                if (provider.name === "steam" && context.api.allows("steam.read")) {
+                    actions.append(Amaterasu.button(Amaterasu.localizedMessage("Manage Steam library"), () => context.navigate("steam")));
+                }
+                else if (provider.name !== "steam") {
+                    refreshButton = Amaterasu.button(Amaterasu.localizedMessage("Refresh now"), () => refreshProvider(provider.name));
+                    if (typeof Amaterasu.setLocalizedAttributeTemplate === "function")
+                        Amaterasu.setLocalizedAttributeTemplate(refreshButton, "aria-label", "Request a {provider} refresh", { provider: Amaterasu.literalText(provider.label) });
+                    refreshButton.disabled = true;
+                    refreshButton.hidden = !context.api.allows("configuration.write");
+                    actions.append(refreshButton);
+                }
+                const card = Amaterasu.el("section", "panel integration-card", Amaterasu.el("h2", "", provider.label), Amaterasu.el("p", "muted", Amaterasu.localizedMessage(provider.description)), status, actions, feedback);
+                const item = {
+                    provider, status, feedback, card, refreshButton, providerStatus: null,
+                    setProviderStatus(value) {
+                        item.providerStatus = value && typeof value === "object" && !Array.isArray(value)
+                            ? value : null;
+                        if (refreshButton)
+                            refreshButton.disabled = !canRefresh(provider.name, item.providerStatus) ||
+                                !context.api.allows("configuration.write");
+                    },
+                };
+                return item;
             });
+            currentCards = cards;
             area.replaceChildren(...cards.map((item) => item.card));
-            await Promise.all(cards.map(async ({ provider, status }) => {
-                if (!context.api.allows(provider.scope)) {
-                    status.replaceChildren(Amaterasu.badge("Unavailable"), Amaterasu.el("p", "muted", "This account cannot read this provider's status."));
-                    return;
-                }
-                try {
-                    const summary = summarizeProvider(provider.name, await context.api.post(`${provider.name}/status`));
-                    if (!context.content.isConnected || request !== generation)
+            try {
+                await Promise.all(cards.map(async ({ provider, status, setProviderStatus }) => {
+                    if (!context.api.allows(provider.scope)) {
+                        status.replaceChildren(Amaterasu.badge("Unavailable"), Amaterasu.el("p", "muted", Amaterasu.localizedMessage("This account cannot read this provider's status.")));
                         return;
-                    status.replaceChildren(Amaterasu.badge(summary.state, summary.tone), Amaterasu.el("p", "muted", Amaterasu.literalText(summary.detail)));
-                }
-                catch (error) {
-                    if (context.content.isConnected && request === generation)
-                        status.replaceChildren(Amaterasu.errorPanel(error));
-                }
-            }));
+                    }
+                    try {
+                        const value = await context.api.post(`${provider.name}/status`);
+                        if (!context.content.isConnected || request !== generation)
+                            return;
+                        const summary = summarizeProvider(provider.name, value);
+                        showProviderStatus(status, summary);
+                        setProviderStatus(value);
+                        if (announceReadback && !activeRefreshes.has(provider.name))
+                            cards.find((item) => item.provider.name === provider.name)?.feedback.replaceChildren(Amaterasu.el("span", "", Amaterasu.localizedMessage("Provider status read completed; no provider refresh was requested.")));
+                    }
+                    catch (error) {
+                        if (context.content.isConnected && request === generation) {
+                            status.replaceChildren(Amaterasu.errorPanel(error));
+                            if (announceReadback)
+                                cards.find((item) => item.provider.name === provider.name)?.feedback.replaceChildren(Amaterasu.el("span", "", Amaterasu.localizedMessage("Provider status check failed.")), Amaterasu.el("span", "", Amaterasu.literalText(error instanceof Error ? error.message : String(error))));
+                        }
+                    }
+                }));
+            }
+            finally {
+                if (context.content.isConnected && request === generation)
+                    refreshStatuses.disabled = false;
+            }
+        }
+        function showProviderStatus(target, summary) {
+            const observedAt = new Date();
+            const detail = summary.tone === "bad"
+                ? Amaterasu.literalText(summary.detail)
+                : summary.detailTemplate
+                    ? providerCountTemplate(summary.detailTemplate, summary.detailValues ?? {})
+                    : Amaterasu.localizedMessage(summary.detail);
+            const timestamp = Amaterasu.el("time", "", Amaterasu.literalText(observedAt.toISOString()));
+            timestamp.dateTime = observedAt.toISOString();
+            const observed = Amaterasu.el("p", "muted", Amaterasu.localizedMessage("Status observed"), " ", timestamp);
+            target.replaceChildren(Amaterasu.badge(Amaterasu.localizedMessage(summary.state), summary.tone), Amaterasu.el("p", "muted", detail), observed);
+        }
+        function providerCountTemplate(template, values) {
+            const format = (locale) => {
+                let message = typeof Amaterasu.translateText === "function"
+                    ? Amaterasu.translateText(template) : template;
+                for (const [key, value] of Object.entries(values))
+                    message = message.replaceAll(`{${key}}`, new Intl.NumberFormat(locale).format(value));
+                return message;
+            };
+            return typeof Amaterasu.localeFormattedTextNode === "function"
+                ? Amaterasu.localeFormattedTextNode(format)
+                : format("en");
+        }
+        function currentCard(item) {
+            return context.content.isConnected && item.card.parentElement === area;
+        }
+        function canRefresh(name, status) {
+            if (activeRefreshes.has(name))
+                return false;
+            if (!status || status.ok !== true || status.settings_ready !== true || status.enabled !== true)
+                return false;
+            if (name === "lutris")
+                return status.platform_supported === true && status.available === true && status.refresh_pending !== true;
+            if (name === "playnite")
+                return status.playnite_running === true && status.snapshot_pending !== true;
+            return false;
+        }
+        async function refreshProvider(name) {
+            const item = currentCards.find((candidate) => candidate.provider.name === name);
+            if (!item?.refreshButton || item.refreshButton.disabled)
+                return;
+            const target = item.refreshButton;
+            if (activeRefreshes.has(name))
+                return;
+            activeRefreshes.add(name);
+            try {
+                await Amaterasu.runAction(target, item.feedback, async () => {
+                    item.feedback.replaceChildren(Amaterasu.el("span", "", Amaterasu.localizedMessage("Refreshing provider...")));
+                    let requestAccepted = false;
+                    const accepted = () => {
+                        requestAccepted = true;
+                        if (currentCard(item))
+                            item.feedback.replaceChildren(Amaterasu.el("span", "", Amaterasu.localizedMessage("Refresh request accepted. Checking provider status.")));
+                    };
+                    try {
+                        const updated = name === "lutris"
+                            ? await Amaterasu.refreshLutrisProvider(context.api, accepted)
+                            : await Amaterasu.refreshPlayniteProvider(context.api, accepted);
+                        if (!currentCard(item))
+                            return;
+                        const summary = summarizeProvider(name, updated);
+                        showProviderStatus(item.status, summary);
+                        item.feedback.replaceChildren(summary.tone === "bad"
+                            ? Amaterasu.el("span", "", Amaterasu.localizedMessage("Refresh accepted; provider status reports an issue."), " ", Amaterasu.literalText(summary.detail))
+                            : Amaterasu.el("span", "", Amaterasu.localizedMessage("Refresh accepted; current provider status was read back.")));
+                        item.setProviderStatus(updated);
+                    }
+                    catch (error) {
+                        item.setProviderStatus(null);
+                        if (currentCard(item))
+                            item.feedback.replaceChildren(Amaterasu.el("span", "", Amaterasu.localizedMessage(requestAccepted
+                                ? "Refresh accepted, but status readback failed. Check status before retrying."
+                                : "Refresh outcome is uncertain. Check status before retrying.")), Amaterasu.el("span", "", Amaterasu.literalText(error instanceof Error ? error.message : String(error))));
+                    }
+                });
+            }
+            finally {
+                activeRefreshes.delete(name);
+                if (currentCard(item))
+                    target.disabled = !context.api.allows("configuration.write") ||
+                        !canRefresh(name, item.providerStatus);
+                else if (context.content.isConnected)
+                    void load();
+            }
         }
         void load();
     }
