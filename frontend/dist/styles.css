@@ -937,6 +937,14 @@ dialog::backdrop {
   max-height: calc(100vh - 32px);
   overflow-y: auto;
 }
+.plugin-dialog {
+  max-width: min(720px, calc(100vw - 32px));
+  max-height: calc(100vh - 32px);
+  overflow: auto;
+}
+.plugin-dialog-content { display: grid; gap: 12px; }
+.plugin-dialog-description { color: var(--secondary); }
+.plugin-dialog-actions { display: flex; justify-content: flex-end; margin-top: 20px; }
 
 .session-extension-option {
   display: flex;

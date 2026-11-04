@@ -16,7 +16,7 @@ namespace Amaterasu {
     readonly version: 1;
     readonly signal: AbortSignal;
     readonly features?: readonly string[];
-    readonly ui?: ExtensionUiWithFeedbackV1 & ExtensionUiTabsV1;
+    readonly ui?: ExtensionUiWithDialogsV1 & ExtensionUiTabsV1;
     call(method: string, payload?: Payload): Promise<unknown>;
   }
   interface ExtensionRegistry {
@@ -126,9 +126,9 @@ namespace Amaterasu {
       const sdk: ExtensionPageSdk = Object.freeze({
         version: 1 as const,
         signal: controller.signal,
-        features: Object.freeze(["ui.controls/1", "ui.forms/1", "ui.forms/2", "ui.controls/2", "ui.feedback/1", "ui.layout/1", "ui.tabs/1"]),
+        features: Object.freeze(["ui.controls/1", "ui.forms/1", "ui.forms/2", "ui.controls/2", "ui.feedback/1", "ui.layout/1", "ui.tabs/1", "ui.dialog/1"]),
         ui: Object.freeze({
-          ...createExtensionUiWithFeedbackV1(controller.signal),
+          ...createExtensionUiWithDialogsV1(controller.signal),
           ...createExtensionUiTabsV1(controller.signal),
         }),
         call: (method: string, payload: Payload = {}) => {
