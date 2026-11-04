@@ -1934,6 +1934,10 @@ var Amaterasu;
         "Launch",
         "Settings overrides",
         "Inheritance is field-specific. Use the field's Inherit option or placeholder; Automatic audio selection and exact empty encoder strings are explicit choices.",
+        "Copy rendered log preview",
+        "Copies every rendered line, including search context. Log content is raw and may contain identifying details.",
+        "Rendered log preview copied to the clipboard.",
+        "Could not copy the rendered log preview. Clipboard access may be unavailable in this browser context.",
     ];
     const SHELL_MESSAGE_KEYS = [
         "WORKSPACE",
@@ -1999,6 +2003,10 @@ var Amaterasu;
                 "Стартиране",
                 "Замени на настройките",
                 "Наследяването зависи от полето. Използвайте опцията или подсказката „Inherit“; автоматичният аудио избор и точните празни низове за кодиране са изрични стойности.",
+                "Копирай изобразения преглед на дневника",
+                "Копира всички показани редове, включително контекста на търсенето. Суровото съдържание на дневника може да съдържа идентифицираща информация.",
+                "Изобразеният преглед на дневника е копиран в клипборда.",
+                "Неуспешно копиране на изобразения преглед на дневника. Достъпът до клипборда може да не е наличен в този контекст на браузъра.",
             ],
         },
         cs: {
@@ -2057,6 +2065,10 @@ var Amaterasu;
                 "Spuštění",
                 "Přepsání nastavení",
                 "Dědění závisí na poli. Použijte volbu nebo nápovědu Inherit; automatický výběr zvuku a přesné prázdné řetězce kodéru jsou výslovné hodnoty.",
+                "Kopírovat vykreslený náhled výpisu",
+                "Zkopírují se všechny vykreslené řádky včetně kontextu hledání. Surový obsah výpisu může obsahovat identifikační údaje.",
+                "Vykreslený náhled výpisu byl zkopírován do schránky.",
+                "Vykreslený náhled výpisu se nepodařilo zkopírovat. Přístup ke schránce nemusí být v tomto kontextu prohlížeče dostupný.",
             ],
         },
         de: {
@@ -2115,6 +2127,10 @@ var Amaterasu;
                 "Start",
                 "Einstellungsüberschreibungen",
                 "Die Vererbung hängt vom Feld ab. Nutze die Option oder den Hinweis „Inherit“; automatische Audioauswahl und exakt leere Encoder-Zeichenfolgen sind ausdrückliche Werte.",
+                "Gerenderte Protokollvorschau kopieren",
+                "Es werden alle gerenderten Zeilen einschließlich des Suchkontexts kopiert. Das Rohprotokoll kann identifizierende Angaben enthalten.",
+                "Die gerenderte Protokollvorschau wurde in die Zwischenablage kopiert.",
+                "Die gerenderte Protokollvorschau konnte nicht kopiert werden. Der Zugriff auf die Zwischenablage ist in diesem Browserkontext möglicherweise nicht verfügbar.",
             ],
         },
         es: {
@@ -2173,6 +2189,10 @@ var Amaterasu;
                 "Inicio",
                 "Anulaciones de ajustes",
                 "La herencia depende del campo. Usa la opción o la indicación Inherit; la selección de audio automática y las cadenas de codificador exactamente vacías son valores explícitos.",
+                "Copiar vista previa renderizada del registro",
+                "Se copian todas las líneas renderizadas, incluido el contexto de búsqueda. El contenido sin procesar del registro puede incluir datos identificativos.",
+                "La vista previa renderizada del registro se copió en el portapapeles.",
+                "No se pudo copiar la vista previa renderizada del registro. Es posible que el acceso al portapapeles no esté disponible en este contexto del navegador.",
             ],
         },
         fr: {
@@ -2231,6 +2251,10 @@ var Amaterasu;
                 "Lancement",
                 "Remplacements des paramètres",
                 "L’héritage dépend de chaque champ. Utilisez son option ou son indication « Inherit » ; la sélection audio automatique et les chaînes d’encodeur exactement vides sont des choix explicites.",
+                "Copier l’aperçu rendu du journal",
+                "Toutes les lignes affichées sont copiées, y compris le contexte de recherche. Le journal brut peut contenir des informations identifiantes.",
+                "L’aperçu rendu du journal a été copié dans le presse-papiers.",
+                "Impossible de copier l’aperçu rendu du journal. L’accès au presse-papiers n’est peut-être pas disponible dans ce contexte du navigateur.",
             ],
         },
         hu: {
@@ -2289,6 +2313,10 @@ var Amaterasu;
                 "Indítás",
                 "Beállítás-felülbírálások",
                 "Az öröklés mezőnként eltér. Használd az Inherit lehetőséget vagy súgót; az automatikus hangválasztás és a pontosan üres kódolósztring kifejezett érték.",
+                "Megjelenített naplóelőnézet másolása",
+                "Minden megjelenített sor másolódik, a keresési környezettel együtt. A nyers naplótartalom azonosító adatokat tartalmazhat.",
+                "A megjelenített naplóelőnézet a vágólapra került.",
+                "A megjelenített naplóelőnézet nem másolható. Lehet, hogy ebben a böngészőkörnyezetben nem érhető el a vágólap.",
             ],
         },
         it: {
@@ -2347,6 +2375,10 @@ var Amaterasu;
                 "Avvio",
                 "Override impostazioni",
                 "L’ereditarietà dipende dal campo. Usa l’opzione o il suggerimento Inherit; la selezione audio automatica e le stringhe encoder esattamente vuote sono valori espliciti.",
+                "Copia anteprima renderizzata del registro",
+                "Vengono copiate tutte le righe visualizzate, incluso il contesto della ricerca. Il registro non elaborato può contenere dati identificativi.",
+                "L’anteprima renderizzata del registro è stata copiata negli appunti.",
+                "Impossibile copiare l’anteprima renderizzata del registro. L’accesso agli appunti potrebbe non essere disponibile in questo contesto del browser.",
             ],
         },
         ja: {
@@ -2404,6 +2436,10 @@ var Amaterasu;
                 "起動",
                 "設定の上書き",
                 "継承の扱いは項目ごとに異なります。項目の Inherit 選択肢またはヒントを確認してください。音声の自動選択と空文字列のエンコーダー値は明示的な設定です。",
+                "表示中のログプレビューをコピー",
+                "検索コンテキストを含む、描画済みのすべての行をコピーします。ログの生データには個人を特定できる情報が含まれる場合があります。",
+                "表示中のログプレビューをクリップボードにコピーしました。",
+                "表示中のログプレビューをコピーできませんでした。このブラウザー環境ではクリップボードを利用できない可能性があります。",
             ],
         },
         ko: {
@@ -2461,6 +2497,10 @@ var Amaterasu;
                 "실행",
                 "설정 재정의",
                 "상속 방식은 필드마다 다릅니다. 필드의 Inherit 옵션이나 안내를 사용하세요. 자동 오디오 선택과 정확히 빈 인코더 문자열은 명시적 값입니다.",
+                "렌더링된 로그 미리보기 복사",
+                "검색 문맥을 포함해 렌더링된 모든 줄을 복사합니다. 원시 로그 내용에 식별 정보가 포함될 수 있습니다.",
+                "렌더링된 로그 미리보기를 클립보드에 복사했습니다.",
+                "렌더링된 로그 미리보기를 복사할 수 없습니다. 이 브라우저 환경에서는 클립보드를 사용하지 못할 수 있습니다.",
             ],
         },
         pl: {
@@ -2519,6 +2559,10 @@ var Amaterasu;
                 "Uruchamianie",
                 "Nadpisania ustawień",
                 "Dziedziczenie zależy od pola. Użyj opcji lub podpowiedzi Inherit; automatyczny wybór dźwięku i dokładnie puste ciągi kodera są wartościami jawnymi.",
+                "Kopiuj wyrenderowany podgląd dziennika",
+                "Kopiowane są wszystkie wyrenderowane wiersze, łącznie z kontekstem wyszukiwania. Surowy dziennik może zawierać dane identyfikujące.",
+                "Wyrenderowany podgląd dziennika skopiowano do schowka.",
+                "Nie udało się skopiować wyrenderowanego podglądu dziennika. Dostęp do schowka może być niedostępny w tym kontekście przeglądarki.",
             ],
         },
         pt: {
@@ -2577,6 +2621,10 @@ var Amaterasu;
                 "Arranque",
                 "Substituições de definições",
                 "A herança depende do campo. Use a opção ou a indicação Inherit; a seleção automática de áudio e as cadeias de codificação exatamente vazias são escolhas explícitas.",
+                "Copiar pré-visualização apresentada do registo",
+                "São copiadas todas as linhas apresentadas, incluindo o contexto da pesquisa. O conteúdo bruto do registo pode conter dados identificativos.",
+                "A pré-visualização apresentada do registo foi copiada para a área de transferência.",
+                "Não foi possível copiar a pré-visualização apresentada do registo. O acesso à área de transferência poderá não estar disponível neste contexto do navegador.",
             ],
         },
         pt_BR: {
@@ -2624,6 +2672,10 @@ var Amaterasu;
                 "Inicialização",
                 "Substituições de configurações",
                 "A herança depende do campo. Use a opção ou a indicação Inherit; a seleção automática de áudio e as strings de codificador exatamente vazias são escolhas explícitas.",
+                "Copiar prévia renderizada do log",
+                "Todas as linhas renderizadas são copiadas, inclusive o contexto da busca. O conteúdo bruto do log pode conter dados de identificação.",
+                "A prévia renderizada do log foi copiada para a área de transferência.",
+                "Não foi possível copiar a prévia renderizada do log. O acesso à área de transferência pode não estar disponível neste contexto do navegador.",
             ],
         },
         ru: {
@@ -2681,6 +2733,10 @@ var Amaterasu;
                 "Запуск",
                 "Переопределения настроек",
                 "Наследование зависит от поля. Используйте вариант или подсказку Inherit; автоматический выбор аудио и точно пустые строки кодировщика являются явными значениями.",
+                "Копировать отображаемый фрагмент журнала",
+                "Копируются все отображаемые строки, включая контекст поиска. Исходный журнал может содержать идентифицирующие сведения.",
+                "Отображаемый фрагмент журнала скопирован в буфер обмена.",
+                "Не удалось скопировать отображаемый фрагмент журнала. В этом контексте браузера доступ к буферу обмена может быть недоступен.",
             ],
         },
         sv: {
@@ -2738,6 +2794,10 @@ var Amaterasu;
                 "Start",
                 "Inställningsöverskridningar",
                 "Arvet beror på fältet. Använd fältets Inherit-val eller platshållare; automatiskt ljudval och exakt tomma kodarsträngar är uttryckliga värden.",
+                "Kopiera återgiven loggförhandsvisning",
+                "Alla återgivna rader kopieras, inklusive söksammanhanget. Rå loggtext kan innehålla identifierande uppgifter.",
+                "Den återgivna loggförhandsvisningen har kopierats till urklipp.",
+                "Det gick inte att kopiera den återgivna loggförhandsvisningen. Åtkomst till urklipp kanske inte är tillgänglig i den här webbläsarkontexten.",
             ],
         },
         tr: {
@@ -2795,6 +2855,10 @@ var Amaterasu;
                 "Başlatma",
                 "Ayar geçersiz kılmaları",
                 "Devralma alan bazında değişir. Alanın Inherit seçeneğini veya ipucunu kullanın; otomatik ses seçimi ve tamamen boş kodlayıcı dizeleri açık değerlerdir.",
+                "Oluşturulan günlük önizlemesini kopyala",
+                "Arama bağlamı dahil oluşturulan tüm satırlar kopyalanır. Ham günlük içeriği kimlik belirleyici bilgiler içerebilir.",
+                "Oluşturulan günlük önizlemesi panoya kopyalandı.",
+                "Oluşturulan günlük önizlemesi kopyalanamadı. Bu tarayıcı bağlamında pano erişimi kullanılamıyor olabilir.",
             ],
         },
         uk: {
@@ -2853,6 +2917,10 @@ var Amaterasu;
                 "Запуск",
                 "Перевизначення налаштувань",
                 "Успадкування залежить від поля. Використовуйте варіант або підказку Inherit; автоматичний вибір аудіо й точно порожні рядки кодера є явними значеннями.",
+                "Копіювати відображений попередній перегляд журналу",
+                "Копіюються всі відображені рядки, зокрема контекст пошуку. Необроблений журнал може містити ідентифікаційні дані.",
+                "Відображений попередній перегляд журналу скопійовано до буфера обміну.",
+                "Не вдалося скопіювати відображений попередній перегляд журналу. У цьому контексті браузера доступ до буфера обміну може бути недоступний.",
             ],
         },
         vi: {
@@ -2911,6 +2979,10 @@ var Amaterasu;
                 "Khởi chạy",
                 "Ghi đè cài đặt",
                 "Cách kế thừa tùy theo trường. Hãy dùng tùy chọn hoặc gợi ý Inherit của trường; lựa chọn âm thanh tự động và chuỗi bộ mã hóa rỗng chính xác là giá trị tường minh.",
+                "Sao chép bản xem trước nhật ký đã hiển thị",
+                "Sao chép mọi dòng đang hiển thị, bao gồm ngữ cảnh tìm kiếm. Nội dung nhật ký thô có thể chứa thông tin nhận dạng.",
+                "Đã sao chép bản xem trước nhật ký đã hiển thị vào bảng tạm.",
+                "Không thể sao chép bản xem trước nhật ký đã hiển thị. Có thể không truy cập được bảng tạm trong ngữ cảnh trình duyệt này.",
             ],
         },
         zh: {
@@ -2967,6 +3039,10 @@ var Amaterasu;
                 "启动",
                 "设置覆盖",
                 "继承方式因字段而异。请使用字段的 Inherit 选项或提示；自动音频选择和精确的空编码器字符串都是明确值。",
+                "复制已渲染的日志预览",
+                "复制所有已渲染的行，包括搜索上下文。原始日志内容可能包含身份识别信息。",
+                "已将已渲染的日志预览复制到剪贴板。",
+                "无法复制已渲染的日志预览。此浏览器上下文可能无法使用剪贴板。",
             ],
         },
         zh_TW: {
@@ -3011,6 +3087,10 @@ var Amaterasu;
                 "啟動",
                 "設定覆寫",
                 "繼承方式依欄位而異。請使用欄位的 Inherit 選項或提示；自動音訊選擇與完全空白的編碼器字串都是明確值。",
+                "複製已呈現的記錄預覽",
+                "複製所有已呈現的行，包括搜尋內容。原始記錄可能含有可識別個人身分的資訊。",
+                "已將已呈現的記錄預覽複製到剪貼簿。",
+                "無法複製已呈現的記錄預覽。此瀏覽器環境可能無法使用剪貼簿。",
             ],
         },
     };
@@ -15903,6 +15983,17 @@ var Amaterasu;
     const HOST_LOG_REFRESH_MS = 5000;
     const SUPPORT_BUNDLE_MAX_BYTES = 96 * 1024 * 1024;
     const SUPPORT_BUNDLE_CHUNK_BYTES = 8192;
+    function hostLogText(source) {
+        return typeof Amaterasu.localizedMessage === "function"
+            ? Amaterasu.localizedMessage(source)
+            : source;
+    }
+    function hostLogSetLocalizedText(target, source) {
+        if (typeof Amaterasu.setLocalizedTextContent === "function")
+            Amaterasu.setLocalizedTextContent(target, source);
+        else
+            target.textContent = source;
+    }
     function hostLogReply(value) {
         if (!value || typeof value !== "object" || Array.isArray(value))
             throw new Error("The host returned an invalid log response.");
@@ -15936,6 +16027,7 @@ var Amaterasu;
         let observer;
         let exportGeneration = 0;
         let exportBusy = false;
+        let copyBusy = false;
         const following = Amaterasu.el("span", "muted", "Following");
         following.setAttribute("role", "status");
         following.setAttribute("aria-live", "polite");
@@ -15980,12 +16072,16 @@ var Amaterasu;
             link.click();
             window.setTimeout(() => URL.revokeObjectURL(url), 0);
         });
+        const copyStatus = Amaterasu.el("p", "muted host-log-copy-status");
+        copyStatus.setAttribute("role", "status");
+        copyStatus.setAttribute("aria-live", "polite");
+        const copyVisible = Amaterasu.button(hostLogText("Copy rendered log preview"), () => void copyVisibleLog());
         const refresh = Amaterasu.button("Refresh host log", () => load());
-        const controls = Amaterasu.el("div", "diagnostics-toolbar", Amaterasu.field("Search host log", search), Amaterasu.field("Level", level), followLabel, pause, refresh, download);
+        const controls = Amaterasu.el("div", "diagnostics-toolbar", Amaterasu.field("Search host log", search), Amaterasu.field("Level", level), followLabel, pause, refresh, copyVisible, download);
         const matchControls = Amaterasu.el("div", "diagnostics-match-navigation", previous, next, status);
         matchControls.setAttribute("role", "group");
         matchControls.setAttribute("aria-label", "Host log search navigation");
-        const box = Amaterasu.panel("Host log", Amaterasu.el("p", "muted", "Current host session only; older rotated segments may have been discarded."), controls, following, showLatest, progress, matchControls, output, Amaterasu.el("div", "support-log-export", exportButton, cancelExport, exportStatus, Amaterasu.el("p", "muted", "The support bundle includes retained sessions from the current log location. Common identifying details are redacted; review it before sharing.")));
+        const box = Amaterasu.panel("Host log", Amaterasu.el("p", "muted", "Current host session only; older rotated segments may have been discarded."), controls, Amaterasu.el("p", "muted", hostLogText("Copies every rendered line, including search context. Log content is raw and may contain identifying details.")), copyStatus, following, showLatest, progress, matchControls, output, Amaterasu.el("div", "support-log-export", exportButton, cancelExport, exportStatus, Amaterasu.el("p", "muted", "The support bundle includes retained sessions from the current log location. Common identifying details are redacted; review it before sharing.")));
         target.append(box);
         function render() {
             const query = search.value.trim().toLocaleLowerCase();
@@ -16021,6 +16117,32 @@ var Amaterasu;
                     ? `Showing the last ${HOST_LOG_PREVIEW_LINES} of ${filtered.length} matching lines. Search covers the full snapshot.`
                     : `${filtered.length} matching lines in this snapshot.`;
                 output.textContent = filtered.slice(-HOST_LOG_PREVIEW_LINES).map((index) => lines[index] ?? "").join("\n");
+            }
+            copyVisible.disabled = copyBusy || !output.textContent;
+        }
+        async function copyVisibleLog() {
+            if (copyBusy || disposed || !target.isConnected)
+                return;
+            const visibleText = output.textContent ?? "";
+            if (!visibleText)
+                return;
+            copyBusy = true;
+            copyVisible.disabled = true;
+            try {
+                if (!navigator.clipboard?.writeText)
+                    throw new Error("Clipboard access is unavailable.");
+                await navigator.clipboard.writeText(visibleText);
+                if (!disposed && target.isConnected)
+                    hostLogSetLocalizedText(copyStatus, "Rendered log preview copied to the clipboard.");
+            }
+            catch {
+                if (!disposed && target.isConnected)
+                    hostLogSetLocalizedText(copyStatus, "Could not copy the rendered log preview. Clipboard access may be unavailable in this browser context.");
+            }
+            finally {
+                copyBusy = false;
+                if (!disposed && target.isConnected)
+                    copyVisible.disabled = !output.textContent;
             }
         }
         function nearBottom() {
