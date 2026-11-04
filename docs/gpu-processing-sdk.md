@@ -60,6 +60,24 @@ output. Older v1.0 processors remain bindable and have unspecified output
 metadata. C providers use `AmaterasuGpuProcessorApiV1_1` and its matching size
 constant from `sdk/include/amaterasu_media.h`.
 
+## Stream settings and live updates
+
+The v1.2 `configure_stream` operation supplies bounded JSON before processing.
+The optional v1.3 `update_stream` operation replaces the full configuration
+for an already configured stream. The provider owns the format and must copy
+any data it needs after the call. SDK consumers use `update_gpu_stream` on a live,
+typed GPU processor binding; the interface identity must be verified separately
+from the table version and size. Older processors and providers that do not
+implement updates return `MEDIA_UNSUPPORTED`.
+
+Updates must be serialized with frame processing and stream retirement. A
+rejected update leaves the previous configuration usable and does not cancel the
+stream. Successful updates must preserve the negotiated output format and HDR
+metadata; changes that cannot preserve them must be rejected. A settings save
+or a newly observed revision only establishes that configuration was stored or
+read. It does not establish that the processor accepted an update or that the
+result reached a client display.
+
 The [RTX HDR module](../modules/rtx-hdr/README.md) implements this interface using
 NVIDIA TrueHDR. The SDK's replacement test runs an unchanged consumer with two
 independent effect types, including sink rejection, retained output and teardown.

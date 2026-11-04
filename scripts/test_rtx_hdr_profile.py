@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Exercise signed RTX HDR startup and settings in an isolated Linux host.
 
-Requires coherent debug artifacts, a VKMS frame helper, and a trusted NVIDIA
-runtime directory. Opens loopback listeners only and does not start capture,
+Requires coherent debug artifacts, a VKMS frame helper, and a verified NVIDIA
+runtime installed in a private service-owned parent directory. Opens loopback
+listeners only and does not start capture,
 display effects, a stream, or install a service. The capture helper is configured
 but never invoked. This is not a GPU or Moonlight playback qualification.
 """
@@ -20,6 +21,14 @@ from test_session_extension_profile import available_base_port
 WORKSPACE = Path(__file__).resolve().parents[1]
 PROVIDER = "amaterasu.rtx-hdr"
 REGISTRY = "amaterasu.extension-registry/1"
+TUNING = {
+    "rtx_hdr_enable": True,
+    "rtx_hdr_peak_brightness": 1200,
+    "rtx_hdr_middle_gray": 65,
+    "rtx_hdr_contrast": -25,
+    "rtx_hdr_saturation": 35,
+    "rtx_hdr_debanding": False,
+}
 
 
 def run(*arguments: object, environment: dict[str, str]) -> str:
@@ -67,11 +76,12 @@ def main() -> None:
             {"operation": "list", "after": None, "limit": 32, "revision": None},
             settings_get(),
             {"operation": "settings_update", "provider": PROVIDER, "scope": {"kind": "host"},
-             "expected_revision": 0, "values": {"rtx_hdr_enable": True, "rtx_hdr_peak_brightness": 1200}},
+             "expected_revision": 0, "values": TUNING},
             {"operation": "settings_update", "provider": PROVIDER, "scope": {"kind": "host"},
              "expected_revision": 0, "values": {"rtx_hdr_enable": False}},
+            # Include a valid change with an invalid one to verify atomic rejection.
             {"operation": "settings_update", "provider": PROVIDER, "scope": {"kind": "host"},
-             "expected_revision": 1, "values": {"rtx_hdr_peak_brightness": 2001}},
+             "expected_revision": 1, "values": {"rtx_hdr_peak_brightness": 2001, "rtx_hdr_contrast": 0}},
             settings_get(),
         ]
         responses = json.loads(run(host, "probe", root, json.dumps([envelope(command, index) for index, command in enumerate(commands)]),
@@ -84,15 +94,15 @@ def main() -> None:
         assert not stale["ok"] and stale["error"]["code"] == "revision_conflict", stale
         assert not invalid["ok"], invalid
         assert reloaded["ok"] and reloaded["revision"] == 1, reloaded
-        assert reloaded["effective"]["rtx_hdr_enable"]["value"] is True, reloaded
-        assert reloaded["effective"]["rtx_hdr_peak_brightness"]["value"] == 1200, reloaded
+        for option, value in TUNING.items():
+            assert reloaded["effective"][option]["value"] == value, (option, reloaded)
         # A new worker must read the persisted values rather than process-local state.
         response = json.loads(run(host, "probe", root, json.dumps(envelope(settings_get())), environment=environment))
         assert response["kind"] == "result", response
         persisted = response["payload"]
         assert persisted["ok"] and persisted["revision"] == 1, persisted
-        assert persisted["effective"]["rtx_hdr_enable"]["value"] is True, persisted
-        assert persisted["effective"]["rtx_hdr_peak_brightness"]["value"] == 1200, persisted
+        for option, value in TUNING.items():
+            assert persisted["effective"][option]["value"] == value, (option, persisted)
     print("Passed isolated signed RTX HDR startup, registry discovery, validation, CAS and persisted settings.")
     print("No capture, display effect, GPU conversion, stream or client playback was exercised.")
 
