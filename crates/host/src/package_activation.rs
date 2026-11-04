@@ -12,6 +12,9 @@ use amaterasu_package::{
 };
 use std::{fs, os::unix::fs::MetadataExt, path::Path};
 
+mod offline;
+pub use offline::activate_stopped;
+
 fn read_allowlist(root: &Path) -> PackageResult<PolicyAllowlist> {
     let policy_path = root.join("package-activation-policy.json");
     let metadata = fs::symlink_metadata(&policy_path).map_err(|e| e.to_string())?;
@@ -325,7 +328,17 @@ pub fn validate_transition(
 /// The user manager identifies the actual unit; browser input never supplies a
 /// filesystem path. A different running process or an unexpected response is
 /// not an authorized service unit.
+#[derive(Clone, Copy)]
+enum UnitOwner {
+    RunningHost,
+    Stopped,
+}
+
 fn managed_unit() -> PackageResult<std::path::PathBuf> {
+    managed_unit_for(UnitOwner::RunningHost)
+}
+
+fn managed_unit_for(owner: UnitOwner) -> PackageResult<std::path::PathBuf> {
     use std::{
         io::Read,
         process::{Command, Stdio},
@@ -338,6 +351,9 @@ fn managed_unit() -> PackageResult<std::path::PathBuf> {
             "amaterasu-linux-session.service",
             "--property=FragmentPath",
             "--property=MainPID",
+            "--property=ActiveState",
+            "--property=DropInPaths",
+            "--property=NeedDaemonReload",
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -370,8 +386,27 @@ fn managed_unit() -> PackageResult<std::path::PathBuf> {
         return Err("systemd unit response is too large".into());
     }
     let output = std::str::from_utf8(&bytes).map_err(|e| e.to_string())?;
+    let path = parse_managed_unit(output, owner)?;
+    let mut current = std::path::PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        if fs::symlink_metadata(&current)
+            .map_err(|e| e.to_string())?
+            .file_type()
+            .is_symlink()
+        {
+            return Err("systemd unit path contains a symlink".into());
+        }
+    }
+    Ok(path)
+}
+
+fn parse_managed_unit(output: &str, owner: UnitOwner) -> PackageResult<std::path::PathBuf> {
     let mut fragment = None;
     let mut pid = None;
+    let mut active = None;
+    let mut drop_ins = None;
+    let mut needs_reload = None;
     for line in output.lines() {
         if let Some(value) = line.strip_prefix("FragmentPath=") {
             if fragment.replace(value).is_some() {
@@ -381,12 +416,36 @@ fn managed_unit() -> PackageResult<std::path::PathBuf> {
             if pid.replace(value).is_some() {
                 return Err("duplicate systemd process".into());
             }
+        } else if let Some(value) = line.strip_prefix("ActiveState=") {
+            if active.replace(value).is_some() {
+                return Err("duplicate systemd active state".into());
+            }
+        } else if let Some(value) = line.strip_prefix("DropInPaths=") {
+            if drop_ins.replace(value).is_some() {
+                return Err("duplicate systemd drop-ins".into());
+            }
+        } else if let Some(value) = line.strip_prefix("NeedDaemonReload=") {
+            if needs_reload.replace(value).is_some() {
+                return Err("duplicate systemd reload state".into());
+            }
         } else {
             return Err("unexpected systemd unit response".into());
         }
     }
-    if pid != Some(std::process::id().to_string().as_str()) {
-        return Err("systemd unit does not own this host process".into());
+    match owner {
+        UnitOwner::RunningHost => {
+            if pid != Some(std::process::id().to_string().as_str()) {
+                return Err("systemd unit does not own this host process".into());
+            }
+        }
+        UnitOwner::Stopped => {
+            if pid != Some("0") || !matches!(active, Some("inactive" | "failed")) {
+                return Err("offline activation requires a stopped service".into());
+            }
+            if drop_ins != Some("") || needs_reload != Some("no") {
+                return Err("offline activation requires a loaded unit without overrides".into());
+            }
+        }
     }
     let path = std::path::PathBuf::from(fragment.ok_or("systemd fragment missing")?);
     if !path.is_absolute()
@@ -398,17 +457,6 @@ fn managed_unit() -> PackageResult<std::path::PathBuf> {
         })
     {
         return Err("invalid systemd unit path".into());
-    }
-    let mut current = std::path::PathBuf::new();
-    for component in path.components() {
-        current.push(component.as_os_str());
-        if fs::symlink_metadata(&current)
-            .map_err(|e| e.to_string())?
-            .file_type()
-            .is_symlink()
-        {
-            return Err("systemd unit path contains a symlink".into());
-        }
     }
     Ok(path)
 }
@@ -582,6 +630,17 @@ pub fn activate(
     state_root: &Path,
     request: &HostPackageActivation,
 ) -> PackageResult<()> {
+    let unit = managed_unit()?;
+    activate_with_unit(root, running_pin, state_root, request, &unit)
+}
+
+fn activate_with_unit(
+    root: &Path,
+    running_pin: &str,
+    state_root: &Path,
+    request: &HostPackageActivation,
+    unit: &Path,
+) -> PackageResult<()> {
     if request.expected_active != running_pin {
         return Err("activation request does not match the running service".into());
     }
@@ -592,8 +651,7 @@ pub fn activate(
     let old_selection = read_bounded(&selection_path, 1024 * 1024)?;
     let selection: ActivationState =
         serde_json::from_slice(&old_selection).map_err(|e| e.to_string())?;
-    let unit = managed_unit()?;
-    let old_unit = read_bounded(&unit, 1024 * 1024)?;
+    let old_unit = read_bounded(unit, 1024 * 1024)?;
     let (executable, host_hash) = host_executable()?;
     let ((sequence, signer), proposed) =
         prepare_trial(root, request, |path, verified, bootstrap| {
@@ -667,7 +725,7 @@ pub fn activate(
         journal: &journal,
         bootstrap: &bootstrap_path,
         selection: &selection_path,
-        unit: &unit,
+        unit,
     };
     // Keep publisher approval and catalog identity locked through the complete
     // transaction, including the unit reload and possible rollback.

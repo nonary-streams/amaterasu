@@ -89,7 +89,8 @@ fn run() -> PackageResult<()> {
         #[cfg(target_os = "linux")]
         [command, root, repository, catalog, digest, active, revision]
             if command == "probe-package-activation"
-                || command == "reconcile-package-activation" =>
+                || command == "reconcile-package-activation"
+                || command == "activate-package-offline" =>
         {
             let request = amaterasu_contracts::HostPackageActivation {
                 repository_id: repository.clone(),
@@ -98,7 +99,12 @@ fn run() -> PackageResult<()> {
                 expected_active: active.clone(),
                 expected_revision: revision.clone(),
             };
-            if command == "reconcile-package-activation" {
+            if command == "activate-package-offline" {
+                package_activation::activate_stopped(Path::new(root), &request)?;
+                println!(
+                    "Verified activation prepared; start the managed service to complete its trial."
+                );
+            } else if command == "reconcile-package-activation" {
                 package_activation::reconcile(Path::new(root), &request)?;
                 println!(
                     "Verified candidate recovery ran; inspect cleanup state before activation."
@@ -125,7 +131,7 @@ fn run() -> PackageResult<()> {
         }
         _ => {
             return Err(
-                "usage: amaterasu probe ROOT [CONTROL_MESSAGE_JSON] | reconcile-package-activation ROOT REPOSITORY CATALOG_DIGEST MANIFEST_DIGEST ACTIVE_DIGEST SELECTION_REVISION | service-ready ROOT | operational-ready ROOT | web-recovery-status ROOT | web-recover ROOT DIGEST | native-recover ROOT [DIGEST] | serve ROOT | service ROOT | service-user ROOT ACTIVE_DIGEST (Linux user service)"
+                "usage: amaterasu probe ROOT [CONTROL_MESSAGE_JSON] | reconcile-package-activation ROOT REPOSITORY CATALOG_DIGEST MANIFEST_DIGEST ACTIVE_DIGEST SELECTION_REVISION | activate-package-offline ROOT REPOSITORY CATALOG_DIGEST MANIFEST_DIGEST ACTIVE_DIGEST SELECTION_REVISION | service-ready ROOT | operational-ready ROOT | web-recovery-status ROOT | web-recover ROOT DIGEST | native-recover ROOT [DIGEST] | serve ROOT | service ROOT | service-user ROOT ACTIVE_DIGEST (Linux user service)"
                     .into(),
             );
         }

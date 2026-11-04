@@ -125,6 +125,18 @@ imported again with the console `import_identity` call, or created by `initializ
 
 ## Options
 
+For a stopped installed production service whose old package cannot read journals
+already upgraded by authenticated recovery, the service owner can complete the
+reviewed transition with `amaterasu activate-package-offline ROOT REPOSITORY
+CATALOG_DIGEST MANIFEST_DIGEST ACTIVE_DIGEST SELECTION_REVISION`. Use the exact
+locked selection and the approved signed catalog. The current executable must
+match the canonical service unit's path and hash, root, and old package pin; the
+unit must be stopped, loaded without overrides, and owned by the service user.
+This uses the ordinary protected policy, signed trial and durable activation
+transaction. It does not make old journals readable or change cleanup evidence.
+Start the managed service afterward to complete its trial, then verify the loaded
+digest, cleanup and readiness separately from client playback.
+
 | Option | Effect |
 | --- | --- |
 | `--lan ADDRESS:PORT` | Base port and a concrete bind address for NVHTTP, RTSP, media and control. See [LAN option](#lan-option). |
