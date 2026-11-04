@@ -1731,7 +1731,17 @@ polyline.host-metric-chart-line { fill: none; }
 .catalog-plugin-overrides-actions { display: flex; flex-wrap: wrap; gap: .75rem; margin-top: 1rem; }
 .catalog-plugin-overrides-fields:disabled { opacity: .7; }
 
-/* Reusable web-extension controls inherit the active host semantic theme. */
+/* Reusable web-extension controls and feedback inherit the active host semantic theme. */
+.plugin-feedback { color: var(--fg); }
+.plugin-feedback-status { color: var(--secondary); }
+.plugin-feedback-alert { padding: .75rem 1rem; border: 1px solid var(--line); border-left: 3px solid var(--accent); border-radius: .5rem; background: var(--panel); }
+.plugin-feedback-alert[data-severity="success"] { border-left-color: var(--good); }
+.plugin-feedback-alert[data-severity="warning"] { border-left-color: var(--accent); }
+.plugin-feedback-alert[data-severity="error"] { border-left-color: var(--danger); }
+.plugin-feedback-progress { display: grid; gap: .4rem; width: min(100%, 520px); }
+.plugin-feedback-label { font-weight: 600; }
+.plugin-feedback-progressbar { width: 100%; accent-color: var(--accent); }
+.plugin-feedback-message { color: var(--secondary); }
 .plugin-control { width: min(100%, 520px); }
 .plugin-control > select { min-height: 40px; width: 100%; }
 .plugin-toggle { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
