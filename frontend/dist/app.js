@@ -1927,6 +1927,7 @@ var Amaterasu;
         "Steam game selected. Kept the existing directory by choice.",
         "Steam game selected. Cleared the existing directory by choice.",
         "Steam game selected. Its install directory is unavailable; the existing directory was kept.",
+        "Select a discovered game to use its Steam app ID and optional install directory.",
     ];
     const SHELL_MESSAGE_KEYS = [
         "WORKSPACE",
@@ -1985,6 +1986,7 @@ var Amaterasu;
                 "Steam играта е избрана. Текущата папка е запазена по ваш избор.",
                 "Steam играта е избрана. Текущата папка е изчистена по ваш избор.",
                 "Steam играта е избрана. Папката ѝ липсва; текущата папка е запазена.",
+                "Изберете открита игра, за да използвате нейния Steam ID на приложението и незадължителната инсталационна папка.",
             ],
         },
         cs: {
@@ -2036,6 +2038,7 @@ var Amaterasu;
                 "Hra ve službě Steam vybrána. Aktuální složka zůstala zachována podle vaší volby.",
                 "Hra ve službě Steam vybrána. Aktuální složka byla vymazána podle vaší volby.",
                 "Hra ve službě Steam vybrána. Její složka není dostupná; aktuální složka zůstala zachována.",
+                "Vyberte nalezenou hru a použijte její ID aplikace Steam a volitelnou instalační složku.",
             ],
         },
         de: {
@@ -2087,6 +2090,7 @@ var Amaterasu;
                 "Steam-Spiel ausgewählt. Aktuelles Verzeichnis wie gewünscht beibehalten.",
                 "Steam-Spiel ausgewählt. Aktuelles Verzeichnis wie gewünscht gelöscht.",
                 "Steam-Spiel ausgewählt. Verzeichnis nicht verfügbar; aktuelles Verzeichnis beibehalten.",
+                "Wähle ein gefundenes Spiel, um seine Steam-App-ID und ein optionales Installationsverzeichnis zu verwenden.",
             ],
         },
         es: {
@@ -2138,6 +2142,7 @@ var Amaterasu;
                 "Juego de Steam seleccionado. Se conservó el directorio actual por elección.",
                 "Juego de Steam seleccionado. Se borró el directorio actual por elección.",
                 "Juego de Steam seleccionado. No hay directorio; se conservó el actual.",
+                "Elige un juego detectado para usar su ID de aplicación de Steam y su directorio de instalación opcional.",
             ],
         },
         fr: {
@@ -2189,6 +2194,7 @@ var Amaterasu;
                 "Jeu Steam sélectionné. Le dossier actuel est conservé selon votre choix.",
                 "Jeu Steam sélectionné. Le dossier actuel est effacé selon votre choix.",
                 "Jeu Steam sélectionné. Dossier indisponible ; dossier actuel conservé.",
+                "Choisissez un jeu détecté pour utiliser son ID d’application Steam et son dossier d’installation facultatif.",
             ],
         },
         hu: {
@@ -2240,6 +2246,7 @@ var Amaterasu;
                 "Steam-játék kiválasztva. A jelenlegi könyvtárat megtartottuk a kérésedre.",
                 "Steam-játék kiválasztva. A jelenlegi könyvtárat töröltük a kérésedre.",
                 "Steam-játék kiválasztva. Nincs telepítési könyvtár; a jelenlegi megmaradt.",
+                "Válassz egy felismert játékot a Steam-alkalmazásazonosító és az opcionális telepítési könyvtár használatához.",
             ],
         },
         it: {
@@ -2291,6 +2298,7 @@ var Amaterasu;
                 "Gioco Steam selezionato. Cartella attuale mantenuta come richiesto.",
                 "Gioco Steam selezionato. Cartella attuale cancellata come richiesto.",
                 "Gioco Steam selezionato. Cartella non disponibile; mantenuta quella attuale.",
+                "Scegli un gioco rilevato per usare il suo ID app Steam e la cartella di installazione facoltativa.",
             ],
         },
         ja: {
@@ -2341,6 +2349,7 @@ var Amaterasu;
                 "選択に従って現在のディレクトリを保持しました。",
                 "選択に従って現在のディレクトリを消去しました。",
                 "Steam ゲームを選択しました。インストール先がないため現在のディレクトリを保持しました。",
+                "検出されたゲームを選択すると、Steam アプリ ID と任意のインストール先を使用できます。",
             ],
         },
         ko: {
@@ -2391,6 +2400,7 @@ var Amaterasu;
                 "요청에 따라 현재 디렉터리를 유지했습니다.",
                 "요청에 따라 현재 디렉터리를 지웠습니다.",
                 "Steam 게임을 선택했습니다. 설치 디렉터리가 없어 현재 디렉터리를 유지했습니다.",
+                "발견된 게임을 선택하면 Steam 앱 ID와 선택적 설치 디렉터리를 사용할 수 있습니다.",
             ],
         },
         pl: {
@@ -2442,6 +2452,7 @@ var Amaterasu;
                 "Zgodnie z wyborem zachowano bieżący katalog.",
                 "Zgodnie z wyborem wyczyszczono bieżący katalog.",
                 "Wybrano grę Steam. Brak katalogu instalacji; zachowano bieżący katalog.",
+                "Wybierz wykrytą grę, aby użyć jej identyfikatora aplikacji Steam i opcjonalnego katalogu instalacji.",
             ],
         },
         pt: {
@@ -2493,6 +2504,7 @@ var Amaterasu;
                 "Diretório atual mantido conforme escolhido.",
                 "Diretório atual limpo conforme escolhido.",
                 "Jogo Steam selecionado. Sem diretório de instalação; o atual foi mantido.",
+                "Escolha um jogo detetado para usar o respetivo ID de aplicação Steam e o diretório de instalação opcional.",
             ],
         },
         pt_BR: {
@@ -2533,6 +2545,7 @@ var Amaterasu;
                 "Diretório atual mantido conforme sua escolha.",
                 "Diretório atual limpo conforme sua escolha.",
                 "Jogo do Steam selecionado. Sem diretório de instalação; o atual foi mantido.",
+                "Escolha um jogo encontrado para usar o ID do aplicativo Steam e o diretório de instalação opcional.",
             ],
         },
         ru: {
@@ -2583,6 +2596,7 @@ var Amaterasu;
                 "Текущая папка оставлена по вашему выбору.",
                 "Текущая папка очищена по вашему выбору.",
                 "У игры Steam нет папки установки; текущая папка оставлена.",
+                "Выберите найденную игру, чтобы использовать ее ID приложения Steam и необязательную папку установки.",
             ],
         },
         sv: {
@@ -2633,6 +2647,7 @@ var Amaterasu;
                 "Den aktuella katalogen behölls enligt ditt val.",
                 "Den aktuella katalogen rensades enligt ditt val.",
                 "Steam-spel valt. Installationskatalog saknas; den aktuella behölls.",
+                "Välj ett upptäckt spel för att använda dess Steam-app-ID och valfria installationskatalog.",
             ],
         },
         tr: {
@@ -2683,6 +2698,7 @@ var Amaterasu;
                 "Geçerli dizin seçiminize göre korundu.",
                 "Geçerli dizin seçiminize göre temizlendi.",
                 "Steam oyunu seçildi. Yükleme dizini yok; geçerli dizin korundu.",
+                "Steam uygulama kimliğini ve isteğe bağlı yükleme dizinini kullanmak için bulunan bir oyunu seçin.",
             ],
         },
         uk: {
@@ -2734,6 +2750,7 @@ var Amaterasu;
                 "Поточний каталог залишено за вашим вибором.",
                 "Поточний каталог очищено за вашим вибором.",
                 "У гри Steam немає каталогу встановлення; поточний каталог залишено.",
+                "Виберіть знайдену гру, щоб використати її ID програми Steam і необов’язковий каталог встановлення.",
             ],
         },
         vi: {
@@ -2785,6 +2802,7 @@ var Amaterasu;
                 "Đã giữ thư mục hiện tại theo lựa chọn của bạn.",
                 "Đã xóa thư mục hiện tại theo lựa chọn của bạn.",
                 "Trò chơi Steam không có thư mục cài đặt; đã giữ thư mục hiện tại.",
+                "Chọn trò chơi đã tìm thấy để dùng ID ứng dụng Steam và thư mục cài đặt tùy chọn của trò chơi.",
             ],
         },
         zh: {
@@ -2834,6 +2852,7 @@ var Amaterasu;
                 "按你的选择保留当前目录。",
                 "按你的选择清除了当前目录。",
                 "已选择 Steam 游戏。没有安装目录；保留了当前目录。",
+                "选择已发现的游戏，以使用其 Steam 应用 ID 和可选安装目录。",
             ],
         },
         zh_TW: {
@@ -2871,6 +2890,7 @@ var Amaterasu;
                 "依照您的選擇保留目前目錄。",
                 "依照您的選擇清除目前目錄。",
                 "已選擇 Steam 遊戲。沒有安裝目錄；保留目前目錄。",
+                "選擇已找到的遊戲，以使用其 Steam 應用程式 ID 和選用安裝目錄。",
             ],
         },
     };
@@ -5509,7 +5529,7 @@ var Amaterasu;
                     const directory = game.install_directory;
                     list.append(Amaterasu.el("li", "steam-game-chooser-item", Amaterasu.el("div", "steam-game-chooser-copy", Amaterasu.el("strong", "", typeof Amaterasu.literalText === "function"
                         ? Amaterasu.literalText(game.name)
-                        : game.name), Amaterasu.el("span", "steam-game-chooser-details", steamChooserMessage("App ID"), String(game.app_id), " · ", steamChooserMessage(directory ? "Install directory" : "Install directory unavailable"), ...(directory ? [" ", typeof Amaterasu.literalText === "function"
+                        : game.name), Amaterasu.el("span", "steam-game-chooser-details", steamChooserMessage("App ID"), " ", String(game.app_id), " · ", steamChooserMessage(directory ? "Install directory" : "Install directory unavailable"), ...(directory ? [" ", typeof Amaterasu.literalText === "function"
                             ? Amaterasu.literalText(directory)
                             : directory] : []))), select));
                 }

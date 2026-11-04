@@ -112,6 +112,7 @@ test("Steam chooser paginates with a stable revision and returns only the explic
   const view = setup(api);
   await settle();
   assert.equal(view.dialog.textContent.includes("First"), true);
+  assert.match(view.dialog.textContent, /App ID 10/);
   button(view.dialog, "Next →").click();
   await settle();
   assert.deepEqual(JSON.parse(JSON.stringify(calls)), [
@@ -398,6 +399,7 @@ test("chooser loading and directory-review decision copy update with live locale
   const view = setup({ allows: () => true, async post() { return page([]); } }, { liveLocale: true });
   await settle();
   view.context.Amaterasu.applyLocale("fr");
+  assert.match(view.dialog.textContent, /Choisissez un jeu détecté pour utiliser son ID d’application Steam et son dossier d’installation facultatif/);
   assert.match(view.dialog.textContent, /Aucun jeu Steam n’est disponible/);
   button(view.dialog, "Annuler").click();
   await view.pending;

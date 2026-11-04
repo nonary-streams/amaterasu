@@ -266,7 +266,7 @@ namespace Amaterasu {
                 ? Amaterasu.literalText(game.name)
                 : game.name),
               el("span", "steam-game-chooser-details",
-                steamChooserMessage("App ID"), String(game.app_id),
+                steamChooserMessage("App ID"), " ", String(game.app_id),
                 " · ",
                 steamChooserMessage(directory ? "Install directory" : "Install directory unavailable"),
                 ...(directory ? [" ", typeof Amaterasu.literalText === "function"
