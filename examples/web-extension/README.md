@@ -9,6 +9,9 @@ The host calls `mount(container, api)` with `api.version`, an `AbortSignal` in
 `api.signal`, and `api.call(alias, payload)`. Calls are limited to aliases
 declared in the signed manifest and approved by the host. `mount` may return a
 cleanup function, which the host invokes on navigation or signout.
+The additive `api.ui` v1 contract supplies reusable accessible controls; see
+[the UI SDK contract](../../docs/web-extension-ui-sdk.md) and the standalone
+[controls consumer](controls.js).
 
 ```sh
 mkdir -p /tmp/hello-source

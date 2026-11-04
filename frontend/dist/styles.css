@@ -1597,3 +1597,17 @@ polyline.host-metric-chart-line { fill: none; }
 .catalog-plugin-overrides-inherited { margin: 0; font-size: 12px; overflow-wrap: anywhere; }
 .catalog-plugin-overrides-actions { display: flex; flex-wrap: wrap; gap: .75rem; margin-top: 1rem; }
 .catalog-plugin-overrides-fields:disabled { opacity: .7; }
+
+/* Reusable web-extension controls inherit the active host semantic theme. */
+.plugin-control { width: min(100%, 520px); }
+.plugin-control > select { min-height: 40px; width: 100%; }
+.plugin-toggle { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.plugin-toggle input[type="checkbox"] { width: 20px; height: 20px; accent-color: var(--accent); }
+.plugin-radio-group { min-width: 0; margin: 0; padding: 0; border: 0; }
+.plugin-radio-group legend { margin-bottom: 8px; }
+.plugin-radio-option { display: flex; align-items: center; gap: 10px; min-height: 38px; padding: 4px 8px; border-radius: 8px; }
+.plugin-radio-option:has(input:checked) { background: var(--selected-bg); color: var(--fg); }
+.plugin-radio-option input { accent-color: var(--accent); }
+.plugin-slider-inputs { display: flex; align-items: center; gap: 12px; width: min(100%, 420px); }
+.plugin-slider-inputs input[type="range"] { flex: 1; min-width: 0; accent-color: var(--accent); }
+.plugin-slider-inputs input[type="number"] { width: 7rem; }

@@ -41,6 +41,7 @@
     "src/accounts.ts",
     "src/tokens.ts",
     "src/maintenance.ts",
+    "src/extension_ui.ts",
     "src/extensions.ts",
     "src/extension_fields.ts",
     "src/session_extension_actions.ts",
