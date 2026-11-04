@@ -20805,6 +20805,260 @@ var Amaterasu;
 })(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
 (function (Amaterasu) {
+    let nextExtensionUiTabsId = 0;
+    function validateExtensionUiTabText(value) {
+        if (typeof value === "string")
+            return;
+        if (!value || typeof value !== "object" || typeof value.source !== "string" || !value.source.trim())
+            throw new Error("Invalid plugin tab label.");
+        const translations = value.translations ?? {};
+        if (!translations || typeof translations !== "object" || Array.isArray(translations) ||
+            Object.values(translations).some((translation) => typeof translation !== "string" || !translation.trim()))
+            throw new Error("Invalid plugin tab translations.");
+    }
+    function extensionUiTabsText(value) {
+        validateExtensionUiTabText(value);
+        if (typeof value === "string")
+            return Amaterasu.localizedTextNode(value);
+        const translations = value.translations ?? {};
+        return Amaterasu.localeFormattedTextNode((locale) => translations[locale] ?? translations[locale.split("-")[0] ?? locale] ?? Amaterasu.translateText(value.source));
+    }
+    function validateExtensionUiTabs(tabs) {
+        if (!Array.isArray(tabs) || tabs.length < 1 || tabs.length > 64)
+            throw new Error("Plugin tabs must contain between one and 64 items.");
+        const ids = new Set();
+        const contents = new Set();
+        for (const tab of tabs) {
+            if (!tab || typeof tab !== "object" || typeof tab.id !== "string" ||
+                !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(tab.id) || ids.has(tab.id) ||
+                typeof tab.disabled !== "undefined" && typeof tab.disabled !== "boolean" ||
+                !tab.content || typeof tab.content !== "object" || tab.content.nodeType !== 1 ||
+                typeof tab.content.nodeName !== "string" || contents.has(tab.content))
+                throw new Error("Invalid plugin tab item.");
+            validateExtensionUiTabText(tab.label);
+            ids.add(tab.id);
+            contents.add(tab.content);
+        }
+    }
+    function createExtensionUiTabsV1(signal) {
+        if (!signal || typeof signal.addEventListener !== "function" || typeof signal.removeEventListener !== "function")
+            throw new Error("Plugin tabs require a lifecycle signal.");
+        if (signal.aborted)
+            throw new Error("Plugin page is no longer active.");
+        const makeController = () => {
+            if (signal.aborted)
+                throw new Error("Plugin page is no longer active.");
+            return new AbortController();
+        };
+        const tabs = {
+            tabs(options) {
+                if (!options || typeof options !== "object" || Array.isArray(options))
+                    throw new Error("Invalid plugin tabs options.");
+                if (typeof options.onChange !== "undefined" && typeof options.onChange !== "function")
+                    throw new Error("Invalid plugin tab change callback.");
+                validateExtensionUiTabText(options.label);
+                validateExtensionUiTabs(options.tabs);
+                const controller = makeController();
+                const prefix = `amaterasu-plugin-tabs-${++nextExtensionUiTabsId}`;
+                const labelId = `${prefix}-label`;
+                const label = Amaterasu.el("span", "field-label plugin-tabs-label", extensionUiTabsText(options.label));
+                label.id = labelId;
+                const tablist = Amaterasu.el("div", "plugin-tablist");
+                tablist.setAttribute("role", "tablist");
+                tablist.setAttribute("aria-labelledby", labelId);
+                const panels = Amaterasu.el("div", "plugin-tab-panels");
+                const element = Amaterasu.el("div", "field plugin-tabs", label, tablist, panels);
+                let entries = [];
+                let activeId = null;
+                let disposed = false;
+                const enabledEntry = (id) => id === null ? undefined : entries.find((entry) => entry.id === id && !entry.disabled);
+                const firstEnabled = () => entries.find((entry) => !entry.disabled);
+                const updateSelection = () => {
+                    for (const entry of entries) {
+                        const selected = entry.id === activeId;
+                        entry.button.disabled = entry.disabled;
+                        entry.button.setAttribute("aria-selected", String(selected));
+                        entry.button.tabIndex = selected ? 0 : -1;
+                        entry.panel.hidden = !selected;
+                    }
+                };
+                const makeEntry = (tab) => {
+                    const encodedId = encodeURIComponent(tab.id);
+                    const button = Amaterasu.el("button", "plugin-tab", extensionUiTabsText(tab.label));
+                    button.type = "button";
+                    button.id = `${prefix}-tab-${encodedId}`;
+                    button.setAttribute("role", "tab");
+                    button.setAttribute("data-tab-id", tab.id);
+                    button.setAttribute("aria-controls", `${prefix}-panel-${encodedId}`);
+                    const panel = Amaterasu.el("div", "plugin-tabpanel", tab.content);
+                    panel.id = `${prefix}-panel-${encodedId}`;
+                    panel.setAttribute("role", "tabpanel");
+                    panel.setAttribute("aria-labelledby", button.id);
+                    panel.tabIndex = 0;
+                    return { id: tab.id, disabled: tab.disabled === true, button, panel };
+                };
+                const chooseNextActive = (requested, nextTabs) => {
+                    if (requested !== undefined) {
+                        const tab = nextTabs.find((candidate) => candidate.id === requested);
+                        if (!tab || tab.disabled === true)
+                            throw new Error("Plugin tab selection must name an enabled tab.");
+                        return tab.id;
+                    }
+                    const retained = nextTabs.find((tab) => tab.id === activeId && tab.disabled !== true);
+                    return retained?.id ?? nextTabs.find((tab) => tab.disabled !== true)?.id ?? null;
+                };
+                const commitTabs = (nextTabs, requested) => {
+                    validateExtensionUiTabs(nextTabs);
+                    const focusedId = entries.find((entry) => entry.button === document.activeElement)?.id ?? null;
+                    const nextActiveId = chooseNextActive(requested, nextTabs);
+                    const currentById = new Map(entries.map((entry) => [entry.id, entry]));
+                    const nextEntries = nextTabs.map((tab) => {
+                        const existing = currentById.get(tab.id);
+                        if (!existing)
+                            return makeEntry(tab);
+                        return { ...existing, disabled: tab.disabled === true };
+                    });
+                    const nextIds = new Set(nextEntries.map((entry) => entry.id));
+                    for (const entry of entries) {
+                        if (!nextIds.has(entry.id)) {
+                            entry.button.remove();
+                            entry.panel.remove();
+                        }
+                    }
+                    for (let index = 0; index < nextEntries.length; index++) {
+                        const entry = nextEntries[index];
+                        const tab = nextTabs[index];
+                        entry.button.replaceChildren(extensionUiTabsText(tab.label));
+                        entry.button.disabled = entry.disabled;
+                        entry.panel.replaceChildren(tab.content);
+                        tablist.append(entry.button);
+                        panels.append(entry.panel);
+                    }
+                    entries = nextEntries;
+                    activeId = nextActiveId;
+                    updateSelection();
+                    if (focusedId !== null && document.activeElement === document.body) {
+                        const focusTarget = entries.find((entry) => entry.id === focusedId && !entry.disabled) ?? enabledEntry(activeId);
+                        focusTarget?.button.focus();
+                    }
+                };
+                const activate = (id, focus, notify) => {
+                    const entry = entries.find((candidate) => candidate.id === id);
+                    if (!entry)
+                        throw new Error("Unknown plugin tab.");
+                    if (entry.disabled)
+                        throw new Error("Cannot select a disabled plugin tab.");
+                    const changed = activeId !== id;
+                    activeId = id;
+                    updateSelection();
+                    if (focus)
+                        entry.button.focus();
+                    if (changed && notify)
+                        options.onChange?.(id);
+                };
+                const moveFocus = (id) => {
+                    const entry = entries.find((candidate) => candidate.id === id);
+                    if (!entry || entry.disabled)
+                        return;
+                    activate(id, true, true);
+                };
+                const onClick = (event) => {
+                    const target = event.target instanceof Element ? event.target.closest('[role="tab"]') : null;
+                    if (!target || !tablist.contains(target))
+                        return;
+                    const id = target.getAttribute("data-tab-id");
+                    if (id !== null) {
+                        const entry = entries.find((candidate) => candidate.id === id);
+                        if (entry && !entry.disabled)
+                            activate(id, false, true);
+                    }
+                };
+                const onKeyDown = (event) => {
+                    const target = event.target instanceof Element ? event.target.closest('[role="tab"]') : null;
+                    if (!target || !tablist.contains(target))
+                        return;
+                    const id = target.getAttribute("data-tab-id");
+                    if (id === null)
+                        return;
+                    const enabled = entries.filter((entry) => !entry.disabled);
+                    if (enabled.length < 1)
+                        return;
+                    const index = enabled.findIndex((entry) => entry.id === id);
+                    if (index < 0)
+                        return;
+                    let next;
+                    const rtl = getComputedStyle(tablist).direction === "rtl";
+                    if (event.key === "Home")
+                        next = enabled[0];
+                    else if (event.key === "End")
+                        next = enabled.at(-1);
+                    else if (event.key === "ArrowRight")
+                        next = enabled[(index + (rtl ? -1 : 1) + enabled.length) % enabled.length];
+                    else if (event.key === "ArrowLeft")
+                        next = enabled[(index + (rtl ? 1 : -1) + enabled.length) % enabled.length];
+                    else
+                        return;
+                    event.preventDefault();
+                    if (next)
+                        moveFocus(next.id);
+                };
+                tablist.addEventListener("click", onClick, { signal: controller.signal });
+                tablist.addEventListener("keydown", onKeyDown, { signal: controller.signal });
+                const setTabs = (nextTabs, requested) => {
+                    if (!disposed)
+                        commitTabs(nextTabs, requested);
+                };
+                const setDisabled = (id, disabled) => {
+                    if (disposed)
+                        return;
+                    if (typeof disabled !== "boolean")
+                        throw new Error("Plugin tab disabled state must be boolean.");
+                    const entry = entries.find((candidate) => candidate.id === id);
+                    if (!entry)
+                        throw new Error("Unknown plugin tab.");
+                    if (entry.disabled === disabled)
+                        return;
+                    const focused = document.activeElement === entry.button;
+                    entry.disabled = disabled;
+                    entry.button.disabled = disabled;
+                    if (disabled && activeId === id)
+                        activeId = firstEnabled()?.id ?? null;
+                    updateSelection();
+                    if (focused)
+                        enabledEntry(activeId)?.button.focus();
+                };
+                const select = (id) => {
+                    if (!disposed)
+                        activate(id, false, false);
+                };
+                const dispose = () => {
+                    if (disposed)
+                        return;
+                    disposed = true;
+                    controller.abort();
+                    signal.removeEventListener("abort", dispose);
+                };
+                if (signal.aborted)
+                    dispose();
+                else
+                    signal.addEventListener("abort", dispose, { once: true });
+                commitTabs(options.tabs, options.activeId);
+                return Object.freeze({
+                    element,
+                    active: () => activeId,
+                    select,
+                    setTabs,
+                    setDisabled,
+                    dispose,
+                });
+            },
+        };
+        return Object.freeze(tabs);
+    }
+    Amaterasu.createExtensionUiTabsV1 = createExtensionUiTabsV1;
+})(Amaterasu || (Amaterasu = {}));
+var Amaterasu;
+(function (Amaterasu) {
     let nextExtensionUiFeedbackId = 0;
     function feedbackTextNode(value) {
         if (typeof value === "string")
@@ -21125,8 +21379,11 @@ var Amaterasu;
             const sdk = Object.freeze({
                 version: 1,
                 signal: controller.signal,
-                features: Object.freeze(["ui.controls/1", "ui.forms/1", "ui.forms/2", "ui.controls/2", "ui.feedback/1"]),
-                ui: Amaterasu.createExtensionUiWithFeedbackV1(controller.signal),
+                features: Object.freeze(["ui.controls/1", "ui.forms/1", "ui.forms/2", "ui.controls/2", "ui.feedback/1", "ui.tabs/1"]),
+                ui: Object.freeze({
+                    ...Amaterasu.createExtensionUiWithFeedbackV1(controller.signal),
+                    ...Amaterasu.createExtensionUiTabsV1(controller.signal),
+                }),
                 call: (method, payload = {}) => {
                     if (controller.signal.aborted || !aliases.has(method))
                         return Promise.reject(new Error("Extension method is unavailable."));
