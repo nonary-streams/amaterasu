@@ -139,6 +139,12 @@ namespace Amaterasu {
   }
   const applicationOverrideGuards = new WeakMap<HTMLElement, () => boolean>();
 
+  const applicationOverrideSaves = new WeakMap<HTMLElement, () => boolean>();
+
+  export function applicationPluginOverridesSaving(area: HTMLElement): boolean {
+    return applicationOverrideSaves.get(area)?.() ?? false;
+  }
+
   export function applicationPluginOverridesDirty(area: HTMLElement): boolean {
     return applicationOverrideGuards.get(area)?.() ?? false;
   }
@@ -149,7 +155,11 @@ namespace Amaterasu {
     const dirtyChecks: Array<() => boolean> = [];
     const isDirty = () => busy || dirtyChecks.some((check) => check());
     applicationOverrideGuards.set(area, isDirty);
-    context.registerDraftGuard?.(() => area.isConnected && isDirty(), () => applicationOverrideGuards.delete(area));
+    applicationOverrideSaves.set(area, () => busy);
+    context.registerDraftGuard?.(() => area.isConnected && isDirty(), () => {
+      applicationOverrideGuards.delete(area);
+      applicationOverrideSaves.delete(area);
+    });
 
     async function load(): Promise<void> {
       try {
@@ -179,6 +189,7 @@ namespace Amaterasu {
           if (!document || !document.values || !document.effective || !Number.isSafeInteger(document.revision))
             throw new Error("Invalid extension settings response.");
           let savedRevision = document.revision;
+          let effectiveAvailable = true;
           let baseline = JSON.stringify(document.values);
           const options = descriptor.options.filter((option) => Array.isArray(option.allowed_scopes) && option.allowed_scopes.includes("application"));
           const entries = new Map<string, { editor: ExtensionFieldEditor }>();
@@ -195,6 +206,7 @@ namespace Amaterasu {
           choices.setAttribute("data-draft-ignore", "");
           const inherited = el("small", "muted");
           const describeInherited = () => {
+            if (!effectiveAvailable) { inherited.textContent = "Reload the application editor to refresh inherited values."; return; }
             const effective = document.effective[choices.value];
             if (!effective) { inherited.textContent = ""; return; }
             const source = effective.source as { kind?: string } | null;
@@ -213,7 +225,7 @@ namespace Amaterasu {
               item.value = option.id;
               return item;
             }));
-            add.disabled = !available.length;
+            add.disabled = !effectiveAvailable || !available.length;
             describeInherited();
           };
           const addOption = (option: SessionExtensionOption, value: unknown) => {
@@ -232,7 +244,7 @@ namespace Amaterasu {
           const add = button("Add override", () => {
             const option = options.find((candidate) => candidate.id === choices.value);
             const effective = option && document.effective[option.id];
-            if (!option || !effective) return;
+            if (!effectiveAvailable || !option || !effective) return;
             addOption(option, structuredClone(effective.value));
             refreshChoices();
           });
@@ -260,6 +272,7 @@ namespace Amaterasu {
             if (busy || !context.api.allows("configuration.write")) return;
             void runAction(save, status, async () => {
               const submitted = values();
+              if (JSON.stringify(submitted) === baseline) return;
               busy = true;
               fields.disabled = true;
               try {
@@ -270,6 +283,18 @@ namespace Amaterasu {
                 savedRevision = reply.revision;
                 baseline = JSON.stringify(submitted);
                 document.values = submitted;
+                effectiveAvailable = false;
+                refreshChoices();
+                try {
+                  const refreshed = await context.api.post<SessionExtensionSettings>("session-extensions/settings_get", { provider: descriptor.provider, scope });
+                  if (!refreshed || refreshed.revision !== savedRevision || !refreshed.effective)
+                    throw new Error("Settings changed during refresh.");
+                  document.effective = refreshed.effective;
+                  effectiveAvailable = true;
+                  refreshChoices();
+                } catch {
+                  throw new Error("Plugin overrides were saved, but inherited values could not be refreshed. Reopen the application editor before adding an override.");
+                }
                 context.notify("Plugin overrides saved independently of application changes.");
               } finally {
                 busy = false;

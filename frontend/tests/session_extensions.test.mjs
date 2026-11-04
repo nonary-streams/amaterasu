@@ -146,7 +146,7 @@ test("application overrides preserve unrelated values, guard structural edits, a
     setAttribute() {} matches() { return false; } querySelectorAll() { return []; }
     remove() { this.removed = true; }
   }
-  const nodes = [], calls = [], pending = [];
+  const nodes = [], calls = [], pending = [], initialValues = [];
   const element = (tag, _class, ...children) => { const n = new Element(tag, children); nodes.push(n); return n; };
   const descriptor = { provider: "example", display_name: "Example", options: [
     { id: "enabled", label: "Enabled", help: "", definition: { type: "boolean", default: true }, allowed_scopes: ["application"] },
@@ -157,7 +157,7 @@ test("application overrides preserve unrelated values, guard structural edits, a
     input: () => element("input"),
     button: (label, click) => { const n = element("button", "", label); n.listeners.click = click; return n; },
     panel: (title, ...children) => element("panel", "", title, ...children),
-    extensionFieldEditor: (_definition, initial) => ({ node: element("editor"), value: () => initial }),
+    extensionFieldEditor: (_definition, initial) => { initialValues.push(initial); return { node: element("editor"), value: () => initial }; },
     runAction: (_button, _status, action) => { const p = action(); pending.push(p); return p; },
     errorPanel: error => { throw error; },
   } });
@@ -171,9 +171,11 @@ test("application overrides preserve unrelated values, guard structural edits, a
     async post(route, payload) {
       calls.push([route, plain(payload)]);
       if (route.endsWith("/list")) return { items: [descriptor], next: null, revision: 1 };
-      if (route.endsWith("/settings_get")) return { revision: 7, values: { enabled: false, unknown: 42 }, effective: {
-        enabled: { value: false, source: { kind: "application", id: "game" } },
-      } };
+      if (route.endsWith("/settings_get")) return calls.some(([name]) => name.endsWith("/settings_update"))
+        ? { revision: 8, values: { unknown: 42 }, effective: { enabled: { value: true, source: { kind: "host" } } } }
+        : { revision: 7, values: { enabled: false, unknown: 42 }, effective: {
+          enabled: { value: false, source: { kind: "application", id: "game" } },
+        } };
       return { revision: 8 };
     },
   } };
@@ -192,4 +194,5 @@ test("application overrides preserve unrelated values, guard structural edits, a
   assert.equal(guard(), false);
   nodes.find(n => n.tag === "button" && n.children[0] === "Add override").listeners.click();
   assert.equal(guard(), true, "adding an override must guard navigation");
+  assert.deepEqual(initialValues, [false, true], "re-added override starts from refreshed inherited value");
 });
