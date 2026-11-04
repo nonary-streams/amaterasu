@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Real Chromium against signed native HTTPS management and production assets.
 
-All sockets are ephemeral loopback. TLS identities, host state, browser HOME and
-profile are temporary; no installed CA, browser preference or service is changed.
+All sockets are ephemeral loopback. TLS identities, host and browser HOME, XDG
+state and browser profiles are temporary; no installed CA, browser preference or service is changed.
 Chromium's certificate exception is restricted to one newly generated SPKI key.
 """
 from __future__ import annotations
@@ -411,6 +411,17 @@ def worker_ready(console):
 
 def exercise(directory, executable):
     harness = PlatformHarness(directory)
+    private_directories = {
+        "HOME": directory / "host-home",
+        "XDG_CONFIG_HOME": directory / "xdg-config",
+        "XDG_CACHE_HOME": directory / "xdg-cache",
+        "XDG_DATA_HOME": directory / "xdg-data",
+        "XDG_RUNTIME_DIR": directory / "xdg-runtime",
+    }
+    for private_directory in private_directories.values():
+        private_directory.mkdir(mode=0o700)
+    host_environment = os.environ.copy()
+    host_environment.update({name: str(path) for name, path in private_directories.items()})
     certificate, spki, origin = configure_host(harness)
     harness.stage(harness.package(1))
     web = directory / "signed-web"
@@ -421,7 +432,7 @@ def exercise(directory, executable):
     browser = None
     driver = None
     try:
-        console = Console(harness)
+        console = Console(harness, environment=host_environment)
         worker_ready(console)
         console.send({"op": "log", "level": 2, "target": "browser-test", "message": "prior support marker username=fixturealice source=192.0.2.13:1234 password=fixture-private-secret user_name=\"fixture private name\""})
         assert console.receive().get("kind") == "ok", "prior support record was rejected"
@@ -457,7 +468,7 @@ def exercise(directory, executable):
                  for session_id, start in [("signed-group-old", 860), ("signed-group-new", 1010)]
                  for index in range(2)],
             )
-        console = Console(harness)
+        console = Console(harness, environment=host_environment)
         worker_ready(console)
         console.send({"op": "log", "level": 2, "target": "browser-test", "message": "signed browser host log marker"})
         assert console.receive().get("kind") == "ok", "fixture log record was rejected"
@@ -537,7 +548,7 @@ def exercise(directory, executable):
         assert len(rotated) == 1 and rotated[0]["session_id"] != previous[0]["session_id"], "native session did not rotate"
         assert rotated[0]["refresh_expires_at"] == previous[0]["refresh_expires_at"], "refresh extended the remembered session deadline"
         stop_console(console)
-        console = Console(harness)
+        console = Console(harness, environment=host_environment)
         worker_ready(console)
         restored = ready(console)
         assert restored["revision"] == saved["revision"] and restored["values"]["origin_web_ui_allowed"] == saved["selection"], "native restart lost the browser policy save"
