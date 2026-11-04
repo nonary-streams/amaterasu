@@ -181,8 +181,14 @@ namespace Amaterasu {
         } while (after);
         const providers = descriptors.filter((descriptor) => Array.isArray(descriptor.options) &&
           descriptor.options.some((option) => Array.isArray(option.allowed_scopes) && option.allowed_scopes.includes("application")));
-        const documents = await Promise.all(providers.map((descriptor) => context.api.post<SessionExtensionSettings>(
-          "session-extensions/settings_get", { provider: descriptor.provider, scope })));
+        const documents: SessionExtensionSettings[] = [];
+        // Keep discovery from exhausting the registry's bounded pending requests.
+        for (let offset = 0; offset < providers.length; offset += 4) {
+          const batch = providers.slice(offset, offset + 4);
+          documents.push(...await Promise.all(batch.map((descriptor) => context.api.post<SessionExtensionSettings>(
+            "session-extensions/settings_get", { provider: descriptor.provider, scope }))));
+          if (!context.content.isConnected || !area.isConnected) return;
+        }
         if (!context.content.isConnected || !area.isConnected) return;
         const panels = providers.map((descriptor, index) => {
           const document = documents[index];
