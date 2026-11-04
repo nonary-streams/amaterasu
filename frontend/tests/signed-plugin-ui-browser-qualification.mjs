@@ -124,9 +124,14 @@ try {
   };
   const key = async (name, code, virtualKey) => {
     for (const type of ["keyDown", "keyUp"]) {
-      await debuggerClient.command("Input.dispatchKeyEvent", {
+      const event = {
         type, key: name, code, windowsVirtualKeyCode: virtualKey, nativeVirtualKeyCode: virtualKey,
-      }, sessionId);
+      };
+      if (type === "keyDown" && name === "Enter") {
+        event.text = "\r";
+        event.unmodifiedText = "\r";
+      }
+      await debuggerClient.command("Input.dispatchKeyEvent", event, sessionId);
     }
   };
 
@@ -202,7 +207,8 @@ try {
     const area = document.querySelector('#plugin-ui-generic-controls');
     return area.querySelector('input[type=range]').value === '11' &&
       area.querySelector('input[type=number]').value === '11' &&
-      area.querySelector('input[type=range]').getAttribute('aria-label') === 'Strength';
+      area.querySelector('input[type=range]').getAttribute('aria-label') === 'Strength slider' &&
+      area.querySelector('input[type=number]').getAttribute('aria-label') === 'Strength value';
   })()`), "reusable control keyboard editing or accessible labeling failed");
 
   await evaluate(`(() => {
