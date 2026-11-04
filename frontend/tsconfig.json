@@ -47,6 +47,7 @@
     "src/maintenance.ts",
     "src/extension_ui.ts",
     "src/extension_ui_layout.ts",
+    "src/extension_ui_tabs.ts",
     "src/extension_ui_feedback.ts",
     "src/extensions.ts",
     "src/extension_fields.ts",

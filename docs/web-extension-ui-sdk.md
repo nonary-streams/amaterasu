@@ -26,6 +26,10 @@ if (!sdk.features?.includes("ui.controls/1") ||
 }
 ```
 
+Plugin tabs are a separate additive `ui.tabs/1` capability. Check for it before
+calling `sdk.ui.tabs()`; older SDK v1 hosts continue to provide the controls and
+feedback features they advertised.
+
 Existing SDK v1 pages continue to run on older hosts. New pages that need only base controls can check `ui.controls/1`; pages that use form metadata or `setChoices()` must also check `ui.forms/1`; pages that call `setState()` must check `ui.forms/2`; pages that use `textField()`, `numberField()`, or `button()` must check `ui.controls/2`. Hosts without the newer features continue to provide the original controls and their creation-time options. The control contract provides `toggle`, `select`, `radioGroup`, `slider`, `textField`, `numberField`, and `button`.
 
 Field controls accept disabled, busy, read-only, required, help, and error; action
@@ -108,6 +112,52 @@ container.append(search.element, maxItems.element, refresh.element);
 
 Append each control's `element` to the page container. Values are local UI state;
 the extension remains responsible for validation, persistence, and approved service calls.
+
+## Plugin tabs
+
+sdk.ui.tabs() is available with ui.tabs/1. Each tab has a stable unique ID, a
+localized label, an HTMLElement content node, and optional disabled state. IDs
+are unique, 1-128 ASCII letters, digits, dots, underscores, colons, or hyphens,
+starting with a letter or digit; at most 64 tabs are allowed. Content is inserted
+as a DOM node; the SDK never parses plugin HTML strings. The tablist and panels
+receive linked ARIA roles and IDs. Selected panels are shown; other panels are
+hidden. Labels refresh when the host locale changes.
+
+```js
+if (!sdk.features?.includes("ui.tabs/1")) {
+  throw new Error("This host does not support reusable plugin tabs.");
+}
+
+const overview = document.createElement("section");
+overview.textContent = "Overview content";
+const advanced = document.createElement("section");
+advanced.textContent = "Advanced content";
+
+const tabs = sdk.ui.tabs({
+  label: { source: "Settings sections", translations: { fr: "Settings sections (FR)" } },
+  tabs: [
+    { id: "overview", label: "Overview", content: overview },
+    { id: "advanced", label: "Advanced", content: advanced, disabled: true },
+  ],
+  onChange(id) { console.log("Selected tab:", id); },
+});
+container.append(tabs.element);
+```
+
+Arrow keys move focus and activate the next or previous enabled tab, wrapping at
+the ends; Home and End move to the first and last enabled tabs. Clicks and keyboard
+activation call onChange when the selection changes. Programmatic select(id),
+setTabs(), and setDisabled() do not call onChange. Selecting an unknown or disabled
+tab throws. If the active tab becomes disabled or is removed, the first enabled
+tab becomes active; all-disabled sets have no active panel, and re-enabling a tab
+selects it when none is active. Updating tabs reuses
+surviving tab and panel nodes and preserves tab focus when possible. dispose()
+removes event listeners, and the page lifecycle signal disposes the control on
+navigation.
+
+The control exposes element, active(), select(id), setTabs(tabs, activeId?),
+setDisabled(id, disabled), and dispose(). active() returns the selected tab ID or
+null when all tabs are disabled.
 
 Labels and choice labels accept plain source text or `{ source, translations }`.
 Translations are keyed by locale (for example `fr` or `fr-CA`); exact locale and
