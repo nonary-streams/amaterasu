@@ -20557,6 +20557,211 @@ var Amaterasu;
 })(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
 (function (Amaterasu) {
+    let nextExtensionUiFeedbackId = 0;
+    function feedbackTextNode(value) {
+        if (typeof value === "string")
+            return Amaterasu.localizedTextNode(value);
+        if (!value || typeof value.source !== "string" || !value.source.trim())
+            throw new Error("Invalid plugin UI text.");
+        const translations = value.translations ?? {};
+        if (!translations || typeof translations !== "object" || Array.isArray(translations) ||
+            Object.values(translations).some((translation) => typeof translation !== "string" || !translation.trim()))
+            throw new Error("Invalid plugin UI translations.");
+        return Amaterasu.localeFormattedTextNode((locale) => translations[locale] ?? translations[locale.split("-")[0] ?? locale] ?? Amaterasu.translateText(value.source));
+    }
+    function validateFeedbackMessage(message) {
+        if (typeof message === "string")
+            return;
+        if (!message || typeof message !== "object" || typeof message.source !== "string" || !message.source.trim())
+            throw new Error("Invalid plugin UI text.");
+        const translations = message.translations ?? {};
+        if (!translations || typeof translations !== "object" || Array.isArray(translations) ||
+            Object.values(translations).some((translation) => typeof translation !== "string" || !translation.trim()))
+            throw new Error("Invalid plugin UI translations.");
+    }
+    function feedbackHandle(element, signal, methods) {
+        let disposed = false;
+        const dispose = () => {
+            if (disposed)
+                return;
+            disposed = true;
+            signal.removeEventListener("abort", dispose);
+        };
+        if (signal.aborted)
+            dispose();
+        else
+            signal.addEventListener("abort", dispose, { once: true });
+        return Object.freeze({ element, ...methods, dispose });
+    }
+    function feedbackLifecycle(signal) {
+        if (!signal || typeof signal.addEventListener !== "function" || typeof signal.removeEventListener !== "function")
+            throw new Error("Plugin UI requires a lifecycle signal.");
+        if (signal.aborted)
+            throw new Error("Plugin page is no longer active.");
+    }
+    function feedbackSetMessage(element, message) {
+        validateFeedbackMessage(message);
+        element.replaceChildren(feedbackTextNode(message));
+    }
+    function createExtensionUiFeedbackV1(signal) {
+        feedbackLifecycle(signal);
+        const makeElement = (className) => Amaterasu.el("div", `plugin-feedback ${className}`);
+        const feedback = {
+            version: 1,
+            status(options) {
+                feedbackLifecycle(signal);
+                if (!options || typeof options !== "object" || Array.isArray(options))
+                    throw new Error("Invalid plugin status feedback.");
+                validateFeedbackMessage(options.message);
+                if (options.busy !== undefined && typeof options.busy !== "boolean")
+                    throw new Error("Invalid plugin status busy state.");
+                const element = makeElement("plugin-feedback-status");
+                element.setAttribute("role", "status");
+                element.setAttribute("aria-live", "polite");
+                element.setAttribute("aria-atomic", "true");
+                element.setAttribute("aria-busy", String(options.busy === true));
+                feedbackSetMessage(element, options.message);
+                let disposed = false;
+                const handle = feedbackHandle(element, signal, {
+                    setMessage(message) {
+                        if (disposed || signal.aborted)
+                            return;
+                        feedbackSetMessage(element, message);
+                    },
+                    setBusy(busy) {
+                        if (disposed || signal.aborted)
+                            return;
+                        if (typeof busy !== "boolean")
+                            throw new Error("Invalid plugin status busy state.");
+                        element.setAttribute("aria-busy", String(busy));
+                    },
+                });
+                const originalDispose = handle.dispose;
+                return Object.freeze({ ...handle, dispose() { disposed = true; originalDispose(); } });
+            },
+            alert(options) {
+                feedbackLifecycle(signal);
+                if (!options || typeof options !== "object" || Array.isArray(options))
+                    throw new Error("Invalid plugin alert feedback.");
+                validateFeedbackMessage(options.message);
+                const severity = options.severity === undefined ? "info" : options.severity;
+                if (!["info", "success", "warning", "error"].includes(severity))
+                    throw new Error("Invalid plugin alert severity.");
+                const element = makeElement("plugin-feedback-alert");
+                element.setAttribute("role", "alert");
+                element.setAttribute("aria-live", "assertive");
+                element.setAttribute("aria-atomic", "true");
+                element.setAttribute("data-severity", severity);
+                feedbackSetMessage(element, options.message);
+                let disposed = false;
+                const handle = feedbackHandle(element, signal, {
+                    setMessage(message) {
+                        if (disposed || signal.aborted)
+                            return;
+                        feedbackSetMessage(element, message);
+                    },
+                    setSeverity(nextSeverity) {
+                        if (disposed || signal.aborted)
+                            return;
+                        if (!["info", "success", "warning", "error"].includes(nextSeverity))
+                            throw new Error("Invalid plugin alert severity.");
+                        element.setAttribute("data-severity", nextSeverity);
+                    },
+                });
+                const originalDispose = handle.dispose;
+                return Object.freeze({ ...handle, dispose() { disposed = true; originalDispose(); } });
+            },
+            progress(options) {
+                feedbackLifecycle(signal);
+                if (!options || typeof options !== "object" || Array.isArray(options))
+                    throw new Error("Invalid plugin progress feedback.");
+                validateFeedbackMessage(options.label);
+                if (options.message !== undefined)
+                    validateFeedbackMessage(options.message);
+                const maximum = options.maximum === undefined ? 100 : options.maximum;
+                if (typeof maximum !== "number" || !Number.isFinite(maximum) || maximum <= 0)
+                    throw new Error("Invalid plugin progress maximum.");
+                const initialValue = options.value === undefined ? null : options.value;
+                if (initialValue !== null && (typeof initialValue !== "number" || !Number.isFinite(initialValue)))
+                    throw new Error("Invalid plugin progress value.");
+                const clampedValue = initialValue === null ? null : Math.min(maximum, Math.max(0, initialValue));
+                const element = makeElement("plugin-feedback-progress");
+                const label = Amaterasu.el("label", "plugin-feedback-label", feedbackTextNode(options.label));
+                const progress = Amaterasu.el("progress", "plugin-feedback-progressbar");
+                const instanceId = ++nextExtensionUiFeedbackId;
+                const progressId = `amaterasu-plugin-feedback-progress-${instanceId}`;
+                const descriptionId = `amaterasu-plugin-feedback-description-${instanceId}`;
+                progress.id = progressId;
+                label.htmlFor = progressId;
+                progress.max = maximum;
+                progress.setAttribute("max", String(maximum));
+                const syncValue = (value) => {
+                    if (value === null) {
+                        progress.removeAttribute("value");
+                    }
+                    else {
+                        progress.value = value;
+                        progress.setAttribute("value", String(value));
+                    }
+                };
+                syncValue(clampedValue);
+                const content = [label, progress];
+                let messageNode = options.message === undefined ? null : Amaterasu.el("small", "plugin-feedback-message", feedbackTextNode(options.message));
+                if (messageNode) {
+                    messageNode.id = descriptionId;
+                    progress.setAttribute("aria-describedby", messageNode.id);
+                    content.push(messageNode);
+                }
+                element.replaceChildren(...content);
+                let currentValue = clampedValue;
+                let disposed = false;
+                const handle = feedbackHandle(element, signal, {
+                    value: () => currentValue,
+                    setValue(value) {
+                        if (disposed || signal.aborted)
+                            return;
+                        if (value !== null && (typeof value !== "number" || !Number.isFinite(value)))
+                            throw new Error("Invalid plugin progress value.");
+                        currentValue = value === null ? null : Math.min(maximum, Math.max(0, value));
+                        syncValue(currentValue);
+                    },
+                    setMessage(message) {
+                        if (disposed || signal.aborted)
+                            return;
+                        if (message !== null)
+                            validateFeedbackMessage(message);
+                        if (message === null) {
+                            messageNode?.remove();
+                            messageNode = null;
+                            progress.removeAttribute("aria-describedby");
+                        }
+                        else if (messageNode) {
+                            messageNode.replaceChildren(feedbackTextNode(message));
+                        }
+                        else {
+                            messageNode = Amaterasu.el("small", "plugin-feedback-message", feedbackTextNode(message));
+                            messageNode.id = descriptionId;
+                            progress.setAttribute("aria-describedby", messageNode.id);
+                            element.append(messageNode);
+                        }
+                    },
+                });
+                const originalDispose = handle.dispose;
+                return Object.freeze({ ...handle, dispose() { disposed = true; originalDispose(); } });
+            },
+        };
+        return Object.freeze(feedback);
+    }
+    Amaterasu.createExtensionUiFeedbackV1 = createExtensionUiFeedbackV1;
+    function createExtensionUiWithFeedbackV1(signal) {
+        const ui = Amaterasu.createExtensionUiV1(signal);
+        const feedback = createExtensionUiFeedbackV1(signal);
+        return Object.freeze({ ...ui, ...feedback, version: 1 });
+    }
+    Amaterasu.createExtensionUiWithFeedbackV1 = createExtensionUiWithFeedbackV1;
+})(Amaterasu || (Amaterasu = {}));
+var Amaterasu;
+(function (Amaterasu) {
     const registrations = new Map();
     const loads = new Map();
     const pendingScripts = new WeakMap();
@@ -20672,8 +20877,8 @@ var Amaterasu;
             const sdk = Object.freeze({
                 version: 1,
                 signal: controller.signal,
-                features: Object.freeze(["ui.controls/1", "ui.forms/1", "ui.forms/2"]),
-                ui: Amaterasu.createExtensionUiV1(controller.signal),
+                features: Object.freeze(["ui.controls/1", "ui.forms/1", "ui.forms/2", "ui.feedback/1"]),
+                ui: Amaterasu.createExtensionUiWithFeedbackV1(controller.signal),
                 call: (method, payload = {}) => {
                     if (controller.signal.aborted || !aliases.has(method))
                         return Promise.reject(new Error("Extension method is unavailable."));
