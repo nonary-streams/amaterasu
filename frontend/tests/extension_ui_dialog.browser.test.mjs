@@ -228,3 +228,79 @@ test("Chromium rejects initial focus outside content and nodes from another docu
   assert.match(result.focusError, /inside its content/);
   assert.match(result.documentError, /owned by this document/);
 });
+
+test("Chromium supports fragment initial focus and concurrent dialog focus restoration", async t => {
+  if (!browser) return t.skip("Chromium browser setup unavailable.");
+  const {cdp} = browser;
+  await cdp.evaluate(`window.__reset(); window.__reasons=[];
+    window.__outerOpener=document.createElement("button"); window.__outerOpener.textContent="Open first"; window.__mount.append(window.__outerOpener);
+    window.__fragment=document.createDocumentFragment();
+    window.__openSecond=document.createElement("button"); window.__openSecond.textContent="Open second"; window.__fragment.append(window.__openSecond);
+    window.__first=window.__ui.dialog({title:"First modal",description:"First description",content:window.__fragment,initialFocus:window.__openSecond,onClose:reason=>window.__reasons.push("first:"+reason)});
+    window.__secondInput=document.createElement("input"); window.__secondInput.setAttribute("aria-label","Second dialog input");
+    window.__second=window.__ui.dialog({title:"Second modal",description:"Second description",content:window.__secondInput,initialFocus:window.__secondInput,onClose:reason=>window.__reasons.push("second:"+reason)});
+    window.__mount.append(window.__first.element,window.__second.element);
+    window.__openSecond.addEventListener("click",()=>window.__second.open());
+    window.__outerOpener.focus(); window.__first.open(); true`);
+  assert.equal(await cdp.evaluate("document.activeElement === window.__openSecond"), true);
+  assert.equal(await cdp.evaluate("window.__first.element.contains(window.__openSecond)"), true);
+  await cdp.evaluate("window.__openSecond.click(); true");
+  assert.equal(await cdp.evaluate("window.__second.element.open"), true);
+  assert.equal(await cdp.evaluate("document.activeElement === window.__secondInput"), true);
+  const ids = await cdp.evaluate(`({first:window.__first.element.getAttribute('aria-labelledby'),second:window.__second.element.getAttribute('aria-labelledby')})`);
+  assert.notEqual(ids.first, ids.second);
+  await cdp.evaluate("window.__second.close(); true");
+  await tick();
+  assert.equal(await cdp.evaluate("document.activeElement === window.__openSecond"), true);
+  assert.deepEqual(await cdp.evaluate("window.__reasons"), ["second:close"]);
+  await cdp.evaluate("window.__first.close(); true");
+  await tick();
+  assert.equal(await cdp.evaluate("document.activeElement === window.__outerOpener"), true);
+  assert.deepEqual(await cdp.evaluate("window.__reasons"), ["second:close", "first:close"]);
+});
+
+test("Chromium correlates native and method=dialog closes before allowing immediate reopen", async t => {
+  if (!browser) return t.skip("Chromium browser setup unavailable.");
+  const {cdp} = browser;
+  await cdp.evaluate(`window.__reset(); window.__reasons=[];
+    window.__opener=document.createElement("button"); window.__mount.append(window.__opener);
+    window.__native=window.__ui.dialog({title:"Native close",content:"Text",onClose:reason=>window.__reasons.push("native:"+reason)});
+    window.__mount.append(window.__native.element); window.__opener.focus(); window.__native.open();
+    window.__native.element.close("native-return"); window.__native.open(); true`);
+  assert.equal(await cdp.evaluate("window.__native.element.open"), false);
+  await tick();
+  assert.deepEqual(await cdp.evaluate("window.__reasons"), ["native:close"]);
+  await cdp.evaluate("window.__native.open(); true");
+  assert.equal(await cdp.evaluate("window.__native.element.open"), true);
+  await cdp.evaluate("window.__native.close(); true");
+  await tick();
+  assert.deepEqual(await cdp.evaluate("window.__reasons"), ["native:close", "native:close"]);
+
+  await cdp.evaluate(`window.__form=document.createElement("form"); window.__form.method="dialog";
+    window.__submit=document.createElement("button"); window.__submit.type="submit"; window.__submit.value="accept"; window.__form.append(window.__submit);
+    window.__formDialog=window.__ui.dialog({title:"Form close",content:window.__form,onClose:reason=>window.__reasons.push("form:"+reason)});
+    window.__mount.append(window.__formDialog.element); window.__opener.focus(); window.__formDialog.open();
+    window.__form.requestSubmit(window.__submit); window.__formDialog.open(); true`);
+  assert.equal(await cdp.evaluate("window.__formDialog.element.open"), false);
+  await tick();
+  assert.deepEqual(await cdp.evaluate("window.__reasons"), ["native:close", "native:close", "form:close"]);
+  await cdp.evaluate("window.__formDialog.open(); true");
+  assert.equal(await cdp.evaluate("window.__formDialog.element.open"), true);
+  await cdp.evaluate("window.__formDialog.dispose(); true");
+});
+
+test("Chromium always completes disposal when an onClose callback throws", async t => {
+  if (!browser) return t.skip("Chromium browser setup unavailable.");
+  const {cdp} = browser;
+  await cdp.evaluate(`window.__reset();
+    window.__opener=document.createElement("button"); window.__mount.append(window.__opener);
+    window.__throwing=window.__ui.dialog({title:"Throw on close",content:"Text",onClose(){throw new Error("close callback failed")}});
+    window.__mount.append(window.__throwing.element); window.__opener.focus(); window.__throwing.open();
+    window.__disposeError=""; try { window.__throwing.dispose(); } catch(error) { window.__disposeError=error.message; } true`);
+  assert.equal(await cdp.evaluate("window.__disposeError"), "close callback failed");
+  assert.equal(await cdp.evaluate("window.__throwing.element.isConnected"), false);
+  assert.equal(await cdp.evaluate("window.__throwing.element.open"), false);
+  assert.equal(await cdp.evaluate("document.activeElement === window.__opener"), true);
+  await cdp.evaluate("window.__throwing.open(); window.__throwing.close(); true");
+  assert.equal(await cdp.evaluate("window.__throwing.element.open"), false);
+});

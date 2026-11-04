@@ -72,7 +72,7 @@ namespace Amaterasu {
         const initialFocus = options.initialFocus;
         if (initialFocus !== undefined && (!initialFocus || typeof initialFocus.focus !== "function" ||
             initialFocus.ownerDocument !== document || !contentNodes.some((node) => node === initialFocus ||
-              (node.nodeType === 1 && (node as HTMLElement).contains(initialFocus)))))
+              ((node.nodeType === 1 || node.nodeType === 11) && node.contains(initialFocus)))))
           throw new Error("Dialog initial focus must be inside its content.");
 
         const instanceId = ++nextExtensionUiDialogId;
@@ -108,6 +108,7 @@ namespace Amaterasu {
         element.append(actions);
 
         const controller = new AbortController();
+        const nativeClose = element.close.bind(element);
         let disposed = false;
         let opener: HTMLElement | null = null;
         let pendingCloseReason: ExtensionUiDialogCloseReason | null = null;
@@ -154,17 +155,37 @@ namespace Amaterasu {
           restoreFocus();
           options.onClose?.(reason);
         };
+        const onDialogFormSubmit = (event: SubmitEvent): void => {
+          const form = event.target as HTMLFormElement | null;
+          if (form?.tagName !== "FORM" || form.method.toLowerCase() !== "dialog") return;
+          event.preventDefault();
+          event.stopImmediatePropagation();
+          const submitter = event.submitter as HTMLButtonElement | null;
+          closeDialog(submitter?.value === "cancel" ? "cancel" : "close");
+        };
         const onHostAbort = (): void => {
           if (disposed) return;
           disposed = true;
-          if (element.open) element.close("dispose");
-          opener = null;
-          controller.abort();
-          element.remove();
+          try {
+            if (element.open) element.close("dispose");
+          } finally {
+            opener = null;
+            controller.abort();
+            element.remove();
+          }
         };
+        element.close = ((returnValue?: string): void => {
+          if (element.open && !disposed && !signal.aborted) {
+            closeEventPending = true;
+            if (pendingCloseReason === null)
+              pendingCloseReason = returnValue === "cancel" ? "cancel" : "close";
+          }
+          nativeClose(returnValue);
+        }) as typeof element.close;
         cancelButton.addEventListener("click", () => closeDialog("cancel"), { signal: controller.signal });
         element.addEventListener("cancel", onCancel, { signal: controller.signal });
         element.addEventListener("keydown", onKeyDown, { signal: controller.signal });
+        element.addEventListener("submit", onDialogFormSubmit, { capture: true, signal: controller.signal });
         element.addEventListener("close", onClose, { signal: controller.signal });
         signal.addEventListener("abort", onHostAbort, { once: true });
 
@@ -189,17 +210,20 @@ namespace Amaterasu {
             const wasOpen = element.open;
             const pendingReason = closeEventPending ? pendingCloseReason : null;
             disposed = true;
-            if (wasOpen) element.close("dispose");
-            if (!signal.aborted && (wasOpen || closeEventPending)) {
-              restoreFocus();
-              options.onClose?.(wasOpen ? "dispose" : pendingReason ?? "dispose");
+            try {
+              if (wasOpen) element.close("dispose");
+              if (!signal.aborted && (wasOpen || closeEventPending)) {
+                restoreFocus();
+                options.onClose?.(wasOpen ? "dispose" : pendingReason ?? "dispose");
+              }
+            } finally {
+              pendingCloseReason = null;
+              closeEventPending = false;
+              opener = null;
+              controller.abort();
+              signal.removeEventListener("abort", onHostAbort);
+              element.remove();
             }
-            pendingCloseReason = null;
-            closeEventPending = false;
-            opener = null;
-            controller.abort();
-            signal.removeEventListener("abort", onHostAbort);
-            element.remove();
           },
         };
         return Object.freeze(handle);

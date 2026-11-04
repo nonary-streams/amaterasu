@@ -21059,7 +21059,7 @@ var Amaterasu;
                 const initialFocus = options.initialFocus;
                 if (initialFocus !== undefined && (!initialFocus || typeof initialFocus.focus !== "function" ||
                     initialFocus.ownerDocument !== document || !contentNodes.some((node) => node === initialFocus ||
-                    (node.nodeType === 1 && node.contains(initialFocus)))))
+                    ((node.nodeType === 1 || node.nodeType === 11) && node.contains(initialFocus)))))
                     throw new Error("Dialog initial focus must be inside its content.");
                 const instanceId = ++nextExtensionUiDialogId;
                 const titleId = `amaterasu-plugin-dialog-title-${instanceId}`;
@@ -21093,6 +21093,7 @@ var Amaterasu;
                 actions.append(cancelButton);
                 element.append(actions);
                 const controller = new AbortController();
+                const nativeClose = element.close.bind(element);
                 let disposed = false;
                 let opener = null;
                 let pendingCloseReason = null;
@@ -21143,19 +21144,41 @@ var Amaterasu;
                     restoreFocus();
                     options.onClose?.(reason);
                 };
+                const onDialogFormSubmit = (event) => {
+                    const form = event.target;
+                    if (form?.tagName !== "FORM" || form.method.toLowerCase() !== "dialog")
+                        return;
+                    event.preventDefault();
+                    event.stopImmediatePropagation();
+                    const submitter = event.submitter;
+                    closeDialog(submitter?.value === "cancel" ? "cancel" : "close");
+                };
                 const onHostAbort = () => {
                     if (disposed)
                         return;
                     disposed = true;
-                    if (element.open)
-                        element.close("dispose");
-                    opener = null;
-                    controller.abort();
-                    element.remove();
+                    try {
+                        if (element.open)
+                            element.close("dispose");
+                    }
+                    finally {
+                        opener = null;
+                        controller.abort();
+                        element.remove();
+                    }
                 };
+                element.close = ((returnValue) => {
+                    if (element.open && !disposed && !signal.aborted) {
+                        closeEventPending = true;
+                        if (pendingCloseReason === null)
+                            pendingCloseReason = returnValue === "cancel" ? "cancel" : "close";
+                    }
+                    nativeClose(returnValue);
+                });
                 cancelButton.addEventListener("click", () => closeDialog("cancel"), { signal: controller.signal });
                 element.addEventListener("cancel", onCancel, { signal: controller.signal });
                 element.addEventListener("keydown", onKeyDown, { signal: controller.signal });
+                element.addEventListener("submit", onDialogFormSubmit, { capture: true, signal: controller.signal });
                 element.addEventListener("close", onClose, { signal: controller.signal });
                 signal.addEventListener("abort", onHostAbort, { once: true });
                 const handle = {
@@ -21183,18 +21206,22 @@ var Amaterasu;
                         const wasOpen = element.open;
                         const pendingReason = closeEventPending ? pendingCloseReason : null;
                         disposed = true;
-                        if (wasOpen)
-                            element.close("dispose");
-                        if (!signal.aborted && (wasOpen || closeEventPending)) {
-                            restoreFocus();
-                            options.onClose?.(wasOpen ? "dispose" : pendingReason ?? "dispose");
+                        try {
+                            if (wasOpen)
+                                element.close("dispose");
+                            if (!signal.aborted && (wasOpen || closeEventPending)) {
+                                restoreFocus();
+                                options.onClose?.(wasOpen ? "dispose" : pendingReason ?? "dispose");
+                            }
                         }
-                        pendingCloseReason = null;
-                        closeEventPending = false;
-                        opener = null;
-                        controller.abort();
-                        signal.removeEventListener("abort", onHostAbort);
-                        element.remove();
+                        finally {
+                            pendingCloseReason = null;
+                            closeEventPending = false;
+                            opener = null;
+                            controller.abort();
+                            signal.removeEventListener("abort", onHostAbort);
+                            element.remove();
+                        }
                     },
                 };
                 return Object.freeze(handle);

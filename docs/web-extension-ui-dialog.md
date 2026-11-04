@@ -45,17 +45,23 @@ plugin-owned element inside `content` instead. After a normal close or cancel,
 focus returns to the connected element that was active before `open()`.
 
 The cancel button and Escape both close with reason `cancel`; `close()` reports
-`close`; manually disposing an open dialog reports `dispose`. `onClose` receives
-one of those reasons. A host lifecycle abort closes and removes the dialog
-without running `onClose` or restoring focus into a page that is being torn
-down. `dispose()` is idempotent and removes the dialog and its listeners.
+`close`; manually disposing an open dialog reports `dispose`. Native
+`element.close()` and `form method="dialog"` close events are handled too.
+`onClose` receives one of those reasons. `open()` waits until a queued native
+close event has been processed before reopening the same instance. A host
+lifecycle abort closes and removes the dialog without running `onClose` or
+restoring focus into a page that is being torn down. `dispose()` is idempotent
+and removes the dialog and its listeners even if `onClose` throws; the callback
+exception may propagate to the caller.
 
 ## Safe content and lifecycle
 
 String content is inserted as text, never parsed as HTML. For richer content,
-pass DOM nodes created by the plugin in the current document. The SDK rejects
-nodes owned by a different document. Use `textContent` for dynamic values and
-avoid `innerHTML`.
+pass DOM nodes created by the plugin in the current document; a
+`DocumentFragment` and its descendants are supported. The SDK rejects nodes
+owned by a different document. `initialFocus` may point to a focusable element
+inside a passed node or fragment. Use `textContent` for dynamic values and avoid
+`innerHTML`.
 
 Dialogs are bound to the extension's lifecycle `AbortSignal`. They close and
 remove themselves on navigation or signout. Dispose sooner when removing a
