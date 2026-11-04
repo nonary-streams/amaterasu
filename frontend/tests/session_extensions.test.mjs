@@ -173,3 +173,68 @@ test("a future presentation hint falls back to its typed editor and saves edits"
   assert.equal(env.calls.find(([route]) => route.endsWith("/settings_update"))[1].values.enabled, true);
   assert.deepEqual(env.errors, []);
 });
+
+test("application overrides preserve unrelated values, guard structural edits, and save with the provider revision", async () => {
+  class Element {
+    children = []; listeners = {}; isConnected = true; value = ""; disabled = false;
+    constructor(tag, children = []) { this.tag = tag; this.children = children; }
+    append(...children) { this.children.push(...children); }
+    replaceChildren(...children) { this.children = children; if (this.tag === "select") this.value = children[0]?.value ?? ""; }
+    addEventListener(name, callback) { this.listeners[name] = callback; }
+    setAttribute() {} matches() { return false; } querySelectorAll() { return []; }
+    remove() { this.removed = true; }
+  }
+  const nodes = [], calls = [], pending = [], initialValues = [];
+  const element = (tag, _class, ...children) => { const n = new Element(tag, children); nodes.push(n); return n; };
+  const descriptor = { provider: "example", display_name: "Example", options: [
+    { id: "enabled", label: "Enabled", help: "", presentation: "future_control", definition: { type: "boolean", default: true }, allowed_scopes: ["application"] },
+    { id: "global", label: "Global", help: "", definition: { type: "boolean", default: true }, allowed_scopes: ["host"] },
+  ] };
+  const runtime = vm.createContext({ structuredClone, Amaterasu: {
+    el: element, literalText: value => value,
+    input: () => element("input"),
+    button: (label, click) => { const n = element("button", "", label); n.listeners.click = click; return n; },
+    panel: (title, ...children) => element("panel", "", title, ...children),
+    extensionFieldEditor: (_definition, initial) => { initialValues.push(initial); return { node: element("editor"), value: () => initial }; },
+    runAction: (_button, _status, action) => { const p = action(); pending.push(p); return p; },
+    errorPanel: error => { throw error; },
+  } });
+  Object.assign(runtime, runtime.Amaterasu);
+  vm.runInContext(ts.transpile(readFileSync(new URL("../src/session_extensions.ts", import.meta.url), "utf8"),
+    { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None }), runtime);
+  const area = element("area");
+  let guard;
+  const context = { content: { isConnected: true }, notify() {}, registerDraftGuard(check) { guard = check; }, api: {
+    allows: () => true,
+    async post(route, payload) {
+      calls.push([route, plain(payload)]);
+      if (route.endsWith("/list")) return { items: [descriptor], next: null, revision: 1 };
+      if (route.endsWith("/settings_get")) return calls.some(([name]) => name.endsWith("/settings_update"))
+        ? { revision: 8, values: { unknown: 42 }, effective: { enabled: { value: true, source: { kind: "host" } } } }
+        : { revision: 7, values: { enabled: false, unknown: 42 }, effective: {
+          enabled: { value: false, source: { kind: "application", id: "game" } },
+        } };
+      return { revision: 8 };
+    },
+  } };
+  runtime.Amaterasu.renderApplicationPluginOverrides(context, area, "game");
+  await settle();
+  assert.equal(guard(), false);
+  assert.equal(nodes.filter(n => n.tag === "editor").length, 1);
+  const chooser = nodes.find(n => n.tag === "details");
+  assert.equal(chooser.children[0].tag, "summary");
+  assert.equal(chooser.children[0].children[0], "Add override");
+  assert.equal(chooser.children[1].children.some(n => n.tag === "p"), true, "inherited hint has its own block");
+  nodes.find(n => n.tag === "button" && n.children[0] === "Remove override").listeners.click();
+  assert.equal(guard(), true);
+  assert.equal(runtime.Amaterasu.applicationPluginOverridesDirty(area), true);
+  nodes.find(n => n.tag === "form").listeners.submit({ preventDefault() {} });
+  await Promise.all(pending);
+  assert.deepEqual(calls.find(([route]) => route.endsWith("/settings_update"))[1], {
+    provider: "example", scope: { kind: "application", id: "game" }, expected_revision: 7, values: { unknown: 42 },
+  });
+  assert.equal(guard(), false);
+  nodes.find(n => n.tag === "button" && n.children[0] === "Add override").listeners.click();
+  assert.equal(guard(), true, "adding an override must guard navigation");
+  assert.deepEqual(initialValues, [false, true], "re-added override starts from refreshed inherited value");
+});

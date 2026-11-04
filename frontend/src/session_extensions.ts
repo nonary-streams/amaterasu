@@ -147,4 +147,191 @@ namespace Amaterasu {
     }
     void load();
   }
+  const applicationOverrideGuards = new WeakMap<HTMLElement, () => boolean>();
+
+  const applicationOverrideSaves = new WeakMap<HTMLElement, () => boolean>();
+
+  export function applicationPluginOverridesSaving(area: HTMLElement): boolean {
+    return applicationOverrideSaves.get(area)?.() ?? false;
+  }
+
+  export function applicationPluginOverridesDirty(area: HTMLElement): boolean {
+    return applicationOverrideGuards.get(area)?.() ?? false;
+  }
+
+  export function renderApplicationPluginOverrides(context: PageContext, area: HTMLElement, applicationId: string): void {
+    const scope: SessionExtensionScope = { kind: "application", id: applicationId };
+    let busy = false;
+    const dirtyChecks: Array<() => boolean> = [];
+    const isDirty = () => busy || dirtyChecks.some((check) => check());
+    applicationOverrideGuards.set(area, isDirty);
+    applicationOverrideSaves.set(area, () => busy);
+    context.registerDraftGuard?.(() => area.isConnected && isDirty(), () => {
+      applicationOverrideGuards.delete(area);
+      applicationOverrideSaves.delete(area);
+    });
+
+    async function load(): Promise<void> {
+      try {
+        const descriptors: SessionExtensionDescriptor[] = [];
+        let after: string | null = null;
+        let revision: number | null = null;
+        const seen = new Set<string>();
+        do {
+          const page: { items: SessionExtensionDescriptor[]; next: string | null; revision: number } = await context.api.post("session-extensions/list", { after, limit: 32, revision });
+          if (!Array.isArray(page.items) || (page.next !== null && typeof page.next !== "string") ||
+              !Number.isSafeInteger(page.revision) || page.revision < 0 || (revision !== null && revision !== page.revision))
+            throw new Error("Invalid or changed extension discovery response.");
+          revision = page.revision;
+          descriptors.push(...page.items);
+          after = page.next;
+          if (after && seen.has(after)) throw new Error("Extension discovery cursor repeated.");
+          if (after) seen.add(after);
+          if (descriptors.length > 1024) throw new Error("Too many extensions.");
+        } while (after);
+        const providers = descriptors.filter((descriptor) => Array.isArray(descriptor.options) &&
+          descriptor.options.some((option) => Array.isArray(option.allowed_scopes) && option.allowed_scopes.includes("application")));
+        const documents: SessionExtensionSettings[] = [];
+        // Keep discovery from exhausting the registry's bounded pending requests.
+        for (let offset = 0; offset < providers.length; offset += 4) {
+          const batch = providers.slice(offset, offset + 4);
+          documents.push(...await Promise.all(batch.map((descriptor) => context.api.post<SessionExtensionSettings>(
+            "session-extensions/settings_get", { provider: descriptor.provider, scope }))));
+          if (!context.content.isConnected || !area.isConnected) return;
+        }
+        if (!context.content.isConnected || !area.isConnected) return;
+        const panels = providers.map((descriptor, index) => {
+          const document = documents[index];
+          if (!document || !document.values || !document.effective || !Number.isSafeInteger(document.revision))
+            throw new Error("Invalid extension settings response.");
+          let savedRevision = document.revision;
+          let effectiveAvailable = true;
+          let baseline = JSON.stringify(document.values);
+          const options = descriptor.options.filter((option) => Array.isArray(option.allowed_scopes) && option.allowed_scopes.includes("application"));
+          const entries = new Map<string, { editor: ExtensionFieldEditor }>();
+          const form = el("form", "settings-form catalog-plugin-overrides-form");
+          const fields = el("fieldset", "catalog-plugin-overrides-fields");
+          fields.disabled = !context.api.allows("configuration.write");
+          const rows = el("div", "catalog-plugin-overrides-rows");
+          const search = input("", "", "search");
+          search.placeholder = "Search settings";
+          search.setAttribute("aria-label", "Search plugin settings");
+          search.setAttribute("data-draft-ignore", "");
+          const choices = el("select");
+          choices.setAttribute("aria-label", "Setting to override");
+          choices.setAttribute("data-draft-ignore", "");
+          const inherited = el("p", "muted catalog-plugin-overrides-inherited");
+          const describeInherited = () => {
+            if (!effectiveAvailable) { inherited.textContent = "Reload the application editor to refresh inherited values."; return; }
+            const effective = document.effective[choices.value];
+            if (!effective) { inherited.textContent = ""; return; }
+            const source = effective.source as { kind?: string } | null;
+            if (source?.kind === "application") {
+              inherited.textContent = "Inherited value is available after reloading settings.";
+              return;
+            }
+            inherited.textContent = `Current inherited value: ${JSON.stringify(effective.value)} (${source?.kind === "host" ? "host" : source === null ? "plugin default" : "other scope"})`;
+          };
+          const refreshChoices = () => {
+            const query = search.value.trim().toLocaleLowerCase();
+            const available = options.filter((option) => !entries.has(option.id) &&
+              `${option.label} ${option.id} ${option.help}`.toLocaleLowerCase().includes(query));
+            choices.replaceChildren(...available.map((option) => {
+              const item = el("option", "", literalText(option.label));
+              item.value = option.id;
+              return item;
+            }));
+            add.disabled = !effectiveAvailable || !available.length;
+            describeInherited();
+          };
+          const addOption = (option: SessionExtensionOption, value: unknown) => {
+            const editor = option.presentation === "keybinding"
+              ? extensionKeybindingSettingEditor(option.definition, value)
+              : option.presentation === "slider" ? extensionSliderEditor(option.definition, value, option.label)
+              : extensionFieldEditor(option.definition, value, option.choice_labels);
+            const controls = editor.node.matches("input,select,textarea") ? [editor.node] : Array.from(editor.node.querySelectorAll("input,select,textarea"));
+            if (controls.length === 1) controls[0]!.setAttribute("aria-label", option.label);
+            const row = el("fieldset", "session-extension-option catalog-plugin-override-row", el("legend", "field-label", literalText(option.label)), editor.node);
+            if (option.help) row.append(el("small", "muted", literalText(option.help)));
+            row.append(el("small", "muted", sessionExtensionApplyPolicyHelp(option.apply_policy)));
+            row.append(button("Remove override", () => { entries.delete(option.id); row.remove(); refreshChoices(); }));
+            entries.set(option.id, { editor });
+            rows.append(row);
+          };
+          const add = button("Add override", () => {
+            const option = options.find((candidate) => candidate.id === choices.value);
+            const effective = option && document.effective[option.id];
+            if (!effectiveAvailable || !option || !effective) return;
+            addOption(option, structuredClone(effective.value));
+            refreshChoices();
+          });
+          search.addEventListener("input", refreshChoices);
+          choices.addEventListener("change", describeInherited);
+          for (const option of options) if (Object.hasOwn(document.values, option.id)) addOption(option, document.values[option.id]);
+          refreshChoices();
+          const values = (): Payload => {
+            const result: Payload = { ...document.values };
+            for (const option of options) {
+              const entry = entries.get(option.id);
+              if (entry) result[option.id] = entry.editor.value();
+              else delete result[option.id];
+            }
+            return result;
+          };
+          dirtyChecks.push(() => { try { return JSON.stringify(values()) !== baseline; } catch { return true; } });
+          const status = el("div");
+          const save = el("button", "button primary", "Save plugin overrides");
+          save.type = "submit";
+          const chooser = el("details", "catalog-override-chooser catalog-plugin-override-chooser",
+            el("summary", "", "Add override"),
+            el("div", "catalog-plugin-override-chooser-content", search, choices, inherited, add));
+          const actions = el("div", "catalog-plugin-overrides-actions", save);
+          fields.append(rows, chooser, actions);
+          form.append(fields, status);
+          form.addEventListener("submit", (event) => {
+            event.preventDefault();
+            if (busy || !context.api.allows("configuration.write")) return;
+            void runAction(save, status, async () => {
+              const submitted = values();
+              if (JSON.stringify(submitted) === baseline) return;
+              busy = true;
+              fields.disabled = true;
+              try {
+                const reply = await context.api.post<{ revision: number }>("session-extensions/settings_update", {
+                  provider: descriptor.provider, scope, expected_revision: savedRevision, values: submitted,
+                });
+                if (!Number.isSafeInteger(reply.revision) || reply.revision <= savedRevision) throw new Error("Plugin save could not be confirmed. Reopen the editor before retrying.");
+                savedRevision = reply.revision;
+                baseline = JSON.stringify(submitted);
+                document.values = submitted;
+                effectiveAvailable = false;
+                refreshChoices();
+                try {
+                  const refreshed = await context.api.post<SessionExtensionSettings>("session-extensions/settings_get", { provider: descriptor.provider, scope });
+                  if (!refreshed || refreshed.revision !== savedRevision || !refreshed.effective)
+                    throw new Error("Settings changed during refresh.");
+                  document.effective = refreshed.effective;
+                  effectiveAvailable = true;
+                  refreshChoices();
+                } catch {
+                  throw new Error("Plugin overrides were saved, but inherited values could not be refreshed. Reopen the application editor before adding an override.");
+                }
+                context.notify("Plugin overrides saved independently of application changes. Application to an active session or stream is not confirmed.");
+              } finally {
+                busy = false;
+                fields.disabled = !context.api.allows("configuration.write");
+              }
+            });
+          });
+          return panel(literalText(descriptor.display_name || descriptor.provider), form);
+        });
+        area.replaceChildren(el("p", "muted", "Plugin overrides are saved separately from application changes."),
+          ...(panels.length ? panels : [el("p", "muted", "No plugin settings are available for this application.")]));
+      } catch (error) {
+        if (context.content.isConnected && area.isConnected) area.replaceChildren(errorPanel(error, load));
+      }
+    }
+    void load();
+  }
+
 }

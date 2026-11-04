@@ -63,7 +63,27 @@ try {
   assert.deepEqual(await evaluate(`({ slider: document.querySelector('input[type=range]').value, number: document.querySelector('input[type=number]').value, inherit: document.querySelector('input[type=checkbox]').checked })`), { slider: "11", number: "11", inherit: false });
   await evaluate(`document.querySelector('form').requestSubmit()`);
   assert.deepEqual(await evaluate(`window.saved`), { strength: 11 });
-  console.log("PASS: native slider keyboard input synchronizes value and saves scoped override");
+  await evaluate(`
+    window.saved = null;
+    const inlineArea = document.querySelector('main'); inlineArea.replaceChildren();
+    const inlineContext = { content: inlineArea, notify() {}, api: { allows: () => true, post: async (route, payload) => {
+      if (route.endsWith('/list')) return { items: [descriptor], next: null, revision: 1 };
+      if (route.endsWith('/settings_get')) return { revision: window.saved ? 2 : 1, values: window.saved ?? { strength: 10 }, effective: { strength: { value: window.saved?.strength ?? 10, source: {kind:'application', id:'game'} } } };
+      window.saved = payload.values; return { revision: 2 };
+    } } };
+    Amaterasu.renderApplicationPluginOverrides(inlineContext, inlineArea, 'game');
+  `);
+  for (let attempt = 0; attempt < 100 && !await evaluate(`!!document.querySelector("input[type=range]")`); attempt++)
+    await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal(await evaluate(`window.failure ?? null`), null);
+  await evaluate(`document.querySelector('input[type=range]').focus()`);
+  for (const type of ["keyDown", "keyUp"]) await command("Input.dispatchKeyEvent", { type, key: "ArrowRight", code: "ArrowRight", windowsVirtualKeyCode: 39, nativeVirtualKeyCode: 39 }, sessionId);
+  assert.deepEqual(await evaluate(`({ slider: document.querySelector('input[type=range]').value, number: document.querySelector('input[type=number]').value })`), { slider: "11", number: "11" });
+  await evaluate(`document.querySelector('form').requestSubmit()`);
+  for (let attempt = 0; attempt < 100 && !await evaluate(`window.saved !== null`); attempt++) await new Promise(resolve => setTimeout(resolve, 20));
+  assert.deepEqual(await evaluate(`window.saved`), { strength: 11 });
+  assert.equal(await evaluate(`window.failure ?? null`), null);
+  console.log("PASS: native slider keyboard input synchronizes and saves both scoped editors");
 } finally {
   socket?.close();
   browser.kill();
