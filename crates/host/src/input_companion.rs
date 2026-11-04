@@ -1,12 +1,12 @@
 //! Host-owned opt-in for a separately authorized input companion. A signed
 //! component set does not gain input solely by selecting a backend.
 use amaterasu_package::{PackageResult, read_json};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 const POLICY_FILE: &str = "input-companion-policy.json";
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CompanionPolicy {
     schema: u32,
@@ -61,9 +61,39 @@ impl CompanionPolicy {
     }
 }
 
+/// Preserve the independently granted capabilities while advancing an authorized set.
+#[cfg(target_os = "linux")]
+pub(crate) fn retarget_policy(bytes: &[u8], old: &str, new: &str) -> PackageResult<Vec<u8>> {
+    let mut policy: CompanionPolicy = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+    if policy.schema != 1
+        || policy.component_set_digest != old
+        || !amaterasu_package::linux_user_unit::valid_digest(old)
+        || !amaterasu_package::linux_user_unit::valid_digest(new)
+        || !(policy.keyboard || policy.mouse || policy.gamepad)
+    {
+        return Err("input companion policy does not authorize the prior selection".into());
+    }
+    policy.component_set_digest = new.into();
+    serde_json::to_vec_pretty(&policy).map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn authorized_retarget_preserves_exact_input_capabilities() {
+        let old = "a".repeat(64);
+        let new = "b".repeat(64);
+        let bytes = serde_json::to_vec(&serde_json::json!({"schema":1,"component_set_digest":old,"keyboard":true,"mouse":false,"gamepad":true})).unwrap();
+        let changed = retarget_policy(&bytes, &old, &new).unwrap();
+        let policy: CompanionPolicy = serde_json::from_slice(&changed).unwrap();
+        assert_eq!(policy.component_set_digest, new);
+        assert_eq!(policy.capabilities(), (true, false, true));
+        assert!(retarget_policy(&bytes, &new, &old).is_err());
+        assert!(retarget_policy(&bytes, &old, "bad").is_err());
+    }
 
     #[test]
     fn policy_only_authorizes_the_selected_component_set() {

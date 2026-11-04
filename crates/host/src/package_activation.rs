@@ -199,6 +199,15 @@ pub fn validate_transition(
         .active
         .as_deref()
         .ok_or("new package identity missing")?;
+    if let Some(change) = &transition.input_policy {
+        let expected =
+            crate::input_companion::retarget_policy(&change.before, old_digest, new_digest)?;
+        if expected != change.after {
+            return Err("input companion capabilities changed during activation".into());
+        }
+    } else if root.join("input-companion-policy.json").exists() {
+        return Err("input companion authorization is missing from activation transaction".into());
+    }
     if running_pin != old_digest && running_pin != new_digest {
         return Err("service pin is unrelated to transition".into());
     }
@@ -436,7 +445,9 @@ pub fn recover(root: &Path, running_pin: &str) -> PackageResult<bool> {
     let bootstrap = root.join("bootstrap.json");
     let selection = root.join("selection.json");
     let (executable, hash) = host_executable()?;
+    let input_policy = root.join("input-companion-policy.json");
     let paths = crate::activation_transaction::Paths {
+        input_policy: &input_policy,
         journal: &journal,
         bootstrap: &bootstrap,
         selection: &selection,
@@ -471,7 +482,9 @@ pub fn startup_transition(root: &Path, running_pin: &str) -> PackageResult<Start
     let bootstrap = root.join("bootstrap.json");
     let selection = root.join("selection.json");
     let (executable, hash) = host_executable()?;
+    let input_policy = root.join("input-companion-policy.json");
     let paths = crate::activation_transaction::Paths {
+        input_policy: &input_policy,
         journal: &journal,
         bootstrap: &bootstrap,
         selection: &selection,
@@ -520,7 +533,9 @@ pub fn finalize(root: &Path, running_pin: &str) -> PackageResult<()> {
     let bootstrap = root.join("bootstrap.json");
     let selection = root.join("selection.json");
     let (executable, hash) = host_executable()?;
+    let input_policy = root.join("input-companion-policy.json");
     let paths = crate::activation_transaction::Paths {
+        input_policy: &input_policy,
         journal: &journal,
         bootstrap: &bootstrap,
         selection: &selection,
@@ -607,6 +622,11 @@ pub fn activate(
         &host_hash,
     )?;
     let transition = crate::activation_transaction::Transition {
+        input_policy: prepare_input_transition(
+            root,
+            &request.expected_active,
+            &request.manifest_digest,
+        )?,
         bootstrap: crate::activation_transaction::Change {
             before: old_bootstrap,
             after: proposed,
@@ -620,7 +640,9 @@ pub fn activate(
             after: new_unit.into_bytes(),
         },
     };
+    let input_policy = root.join("input-companion-policy.json");
     let paths = crate::activation_transaction::Paths {
+        input_policy: &input_policy,
         journal: &journal,
         bootstrap: &bootstrap_path,
         selection: &selection_path,
@@ -711,6 +733,23 @@ pub fn write_status(state_root: &Path, digest: &str, status: &str) -> PackageRes
         &path,
         &serde_json::json!({"schema":1,"digest":digest,"status":status}),
     )
+}
+
+fn prepare_input_transition(
+    root: &Path,
+    old: &str,
+    new: &str,
+) -> PackageResult<Option<crate::activation_transaction::Change>> {
+    let path = root.join("input-companion-policy.json");
+    if !path.try_exists().map_err(|e| e.to_string())? {
+        return Ok(None);
+    }
+    let before = read_bounded(&path, 1024 * 1024)?;
+    let after = crate::input_companion::retarget_policy(&before, old, new)?;
+    Ok(Some(crate::activation_transaction::Change {
+        before,
+        after,
+    }))
 }
 
 #[cfg(test)]
@@ -916,6 +955,7 @@ mod tests {
         )
         .unwrap();
         let transition = crate::activation_transaction::Transition {
+            input_policy: None,
             bootstrap: crate::activation_transaction::Change {
                 before: before_bootstrap,
                 after: after_bootstrap,
@@ -933,6 +973,23 @@ mod tests {
             },
         };
         validate_transition(&root, &transition, executable, &host_hash, &old_digest).unwrap();
+        let mut with_input = transition.clone();
+        let input_before = serde_json::to_vec(&serde_json::json!({"schema":1,"component_set_digest":old_digest,"keyboard":true,"mouse":false,"gamepad":false})).unwrap();
+        let input_after =
+            crate::input_companion::retarget_policy(&input_before, &old_digest, &new_digest)
+                .unwrap();
+        with_input.input_policy = Some(crate::activation_transaction::Change {
+            before: input_before,
+            after: input_after,
+        });
+        validate_transition(&root, &with_input, executable, &host_hash, &old_digest).unwrap();
+        let change = with_input.input_policy.as_mut().unwrap();
+        let mut widened: serde_json::Value = serde_json::from_slice(&change.after).unwrap();
+        widened["mouse"] = serde_json::json!(true);
+        change.after = serde_json::to_vec_pretty(&widened).unwrap();
+        assert!(
+            validate_transition(&root, &with_input, executable, &host_hash, &old_digest).is_err()
+        );
         let mut forged = transition.clone();
         forged.unit.after.extend_from_slice(b"changed");
         assert!(validate_transition(&root, &forged, executable, &host_hash, &old_digest).is_err());
@@ -943,7 +1000,9 @@ mod tests {
         let s = root.join("selection.json");
         let u = root.join("unit");
         let j = root.join("journal");
+        let input_policy = root.join("input-companion-policy.json");
         let paths = crate::activation_transaction::Paths {
+            input_policy: &input_policy,
             journal: &j,
             bootstrap: &b,
             selection: &s,
