@@ -1836,11 +1836,11 @@ test("Playnite settings and runtime load discards stale success and failure", as
 test("recent-games UI preserves the provider's 10000 Playnite range", () => {
   const settingsSource = readFileSync("src/settings.ts", "utf8");
   const steamSettingsUi = settingsSource.slice(
-    settingsSource.indexOf("async function loadSteam(): Promise<void>"),
+    settingsSource.indexOf("async function loadSteam("),
     settingsSource.indexOf("async function loadLutris(): Promise<void>"),
   );
   const playniteSettingsUi = settingsSource.slice(
-    settingsSource.indexOf("async function loadPlaynite(): Promise<void>"),
+    settingsSource.indexOf("async function loadPlaynite("),
     settingsSource.indexOf(
       "async function loadHistorySettings(): Promise<void>",
     ),
@@ -3337,7 +3337,9 @@ test("Steam form reloads normalized Linux settings and explains the enabled poli
       this.append(...children);
     }
     addEventListener(name, callback) { this.listeners.set(name, callback); }
+    dispatchEvent(event) { this.listeners.get(event.type)?.(event); return true; }
     setAttribute() {}
+    removeAttribute() {}
     reportValidity() { return true; }
     setCustomValidity() {}
     get options() { return this.children.filter((child) => child?.tagName === "option"); }
@@ -3358,10 +3360,11 @@ test("Steam form reloads normalized Linux settings and explains the enabled poli
     return null;
   };
   const dom = vm.createContext({
-    TextEncoder, URL, Error,
+    TextEncoder, URL, Error, AbortController,
+    Event: class Event { constructor(type, init = {}) { this.type = type; this.bubbles = init.bubbles ?? false; } },
     document: { createElement: (name) => new Element(name) },
   });
-  for (const source of ["src/model.ts", "src/ui.ts", "src/pages.ts", "src/management-policy.ts", "src/csrf-policy.ts", "src/client_directory.ts", "src/settings.ts", "src/updater.ts"]) {
+  for (const source of ["src/model.ts", "src/ui.ts", "src/pages.ts", "src/management-policy.ts", "src/csrf-policy.ts", "src/client_directory.ts", "src/list_editor.ts", "src/steam_exclusion_picker.ts", "src/settings.ts", "src/updater.ts"]) {
     vm.runInContext(ts.transpile(readFileSync(source, "utf8"), {
       target: ts.ScriptTarget.ES2022,
     }), dom);

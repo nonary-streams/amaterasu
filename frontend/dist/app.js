@@ -3248,6 +3248,63 @@ var Amaterasu;
             "Core console labels and selected notices are translated; some descriptions remain English.": "Las etiquetas principales y algunos avisos están traducidos; algunas descripciones siguen en inglés.",
         },
         fr: {
+            "Choose excluded Steam games": "Choisir les jeux Steam à exclure",
+            "Search discoveries and select games to exclude. Existing name-only or unavailable exclusions are preserved.": "Recherchez les jeux détectés et sélectionnez ceux à exclure. Les exclusions existantes sans nom ou indisponibles sont conservées.",
+            "Search Steam games": "Rechercher des jeux Steam",
+            "Search games": "Rechercher des jeux",
+            "Steam discovery is unavailable without steam.read permission. Saved exclusions can still be edited.": "La découverte Steam est indisponible sans l’autorisation steam.read. Les exclusions enregistrées restent modifiables.",
+            "Loading Steam games…": "Chargement des jeux Steam…",
+            "Steam game list has not been loaded.": "La liste des jeux Steam n’a pas été chargée.",
+            "Steam games could not be loaded. Your current draft is preserved.": "Impossible de charger les jeux Steam. Votre brouillon actuel est conservé.",
+            "Current exclusions": "Exclusions actuelles",
+            "Current Steam exclusions": "Exclusions Steam actuelles",
+            "Load more games": "Charger plus de jeux",
+            "Retry loading games": "Réessayer de charger les jeux",
+            "Steam app {appId}": "Application Steam {appId}",
+            "Name-only exclusion": "Exclusion par nom uniquement",
+            "Edit excluded Steam app ID": "Modifier l’identifiant d’application Steam exclu",
+            "Optional Steam app ID": "Identifiant d’application Steam facultatif",
+            "Edit excluded Steam game name": "Modifier le nom du jeu Steam exclu",
+            "Edit name-only Steam exclusion": "Modifier l’exclusion Steam par nom uniquement",
+            "Remove exclusion": "Supprimer l’exclusion",
+            "Remove exclusion {index}": "Supprimer l’exclusion {index}",
+            "You can exclude up to 256 Steam games. Remove an exclusion before adding another.": "Vous pouvez exclure jusqu’à 256 jeux Steam. Supprimez une exclusion avant d’en ajouter une autre.",
+            "{matchingCount} matching loaded games · {exclusionCount} exclusions": "{matchingCount} jeux chargés correspondants · {exclusionCount} exclusions",
+            "{matchingCount} matching loaded games; {exclusionCount} exclusions": "{matchingCount} jeux chargés correspondants ; {exclusionCount} exclusions",
+            "No matching Steam games on loaded pages.": "Aucun jeu Steam correspondant dans les pages chargées.",
+            "No Steam discoveries are available.": "Aucun jeu Steam détecté n’est disponible.",
+            "The Steam list changed while paging; restarted at the latest revision.": "La liste Steam a changé pendant le chargement. La pagination a repris à la dernière révision.",
+            "Steam scan is still in progress.": "L’analyse Steam est toujours en cours.",
+            "Steam scan is incomplete; existing exclusions are preserved.": "L’analyse Steam est incomplète ; les exclusions existantes sont conservées.",
+            "Add item": "Ajouter un élément",
+            "Remove {label} item {index}": "Supprimer l’élément {label} {index}",
+            "This list can contain at most {maxItems} items.": "Cette liste peut contenir au maximum {maxItems} éléments.",
+            "Add, edit, or remove list values. Unknown values are kept in their current order.": "Ajoutez, modifiez ou supprimez des valeurs. Les valeurs inconnues conservent leur ordre actuel.",
+            "Enter a value for the new item.": "Saisissez une valeur pour le nouvel élément.",
+            "This value is invalid.": "Cette valeur n’est pas valide.",
+            "Resolve invalid list entries before reading their values.": "Corrigez les éléments non valides avant de lire les valeurs de la liste.",
+            "Settings changed elsewhere. Your draft is preserved; review it before saving again.": "Les paramètres ont été modifiés ailleurs. Votre brouillon est conservé ; vérifiez-le avant de réessayer.",
+            "Steam save could not be confirmed. Your submitted draft is preserved for review against the latest saved values.": "L’enregistrement Steam n’a pas pu être confirmé. Votre brouillon soumis est conservé pour comparaison avec les dernières valeurs enregistrées.",
+            "Lutris save could not be confirmed. Your submitted draft is preserved for review against the latest saved values.": "L’enregistrement Lutris n’a pas pu être confirmé. Votre brouillon soumis est conservé pour comparaison avec les dernières valeurs enregistrées.",
+            "Playnite save could not be confirmed. Your draft is preserved for review against the latest saved values.": "L’enregistrement Playnite n’a pas pu être confirmé. Votre brouillon est conservé pour comparaison avec les dernières valeurs enregistrées.",
+            "Steam app IDs must be canonical nonzero decimal strings.": "Les identifiants d’application Steam doivent être des nombres décimaux canoniques non nuls.",
+            "Each Lutris exclusion needs a positive ID or a name.": "Chaque exclusion Lutris doit contenir un identifiant positif ou un nom.",
+            "Excluded Lutris games": "Jeux Lutris exclus",
+            "Included categories": "Catégories incluses",
+            "Excluded categories": "Catégories exclues",
+            "Included plugin IDs": "Identifiants des extensions incluses",
+            "Excluded plugin IDs": "Identifiants des extensions exclues",
+            "Excluded game IDs": "Identifiants des jeux exclus",
+            "Steam settings saved and confirmed. Scan status is shown below.": "Paramètres Steam enregistrés et confirmés. L’état de l’analyse est affiché ci-dessous.",
+            "Steam settings saved and confirmed. Steam discovery remains enabled by Linux host policy; scan status is shown below.": "Paramètres Steam enregistrés et confirmés. La détection Steam reste activée par la politique de l’hôte Linux ; l’état de l’analyse est affiché ci-dessous.",
+            "Steam settings changed elsewhere. Your draft is preserved for review.": "Les paramètres Steam ont été modifiés ailleurs. Votre brouillon est conservé pour vérification.",
+            "Steam save could not be confirmed. Review your preserved draft against the latest saved values before saving again.": "L’enregistrement Steam n’a pas pu être confirmé. Comparez votre brouillon conservé aux dernières valeurs enregistrées avant de réessayer.",
+            "Lutris settings saved and confirmed. Scan status is shown below.": "Paramètres Lutris enregistrés et confirmés. L’état de l’analyse est affiché ci-dessous.",
+            "Lutris settings changed elsewhere. Your draft is preserved for review.": "Les paramètres Lutris ont été modifiés ailleurs. Votre brouillon est conservé pour vérification.",
+            "Lutris save could not be confirmed. Review your preserved draft against the latest saved values before saving again.": "L’enregistrement Lutris n’a pas pu être confirmé. Comparez votre brouillon conservé aux dernières valeurs enregistrées avant de réessayer.",
+            "Playnite settings saved and confirmed. Runtime status is shown below.": "Paramètres Playnite enregistrés et confirmés. L’état d’exécution est affiché ci-dessous.",
+            "Playnite settings changed elsewhere. Your draft is preserved for review.": "Les paramètres Playnite ont été modifiés ailleurs. Votre brouillon est conservé pour vérification.",
+            "Playnite save could not be confirmed. Review your preserved draft against the latest saved values before saving again.": "L’enregistrement Playnite n’a pas pu être confirmé. Comparez votre brouillon conservé aux dernières valeurs enregistrées avant de réessayer.",
             "Host overview": "Vue d’ensemble de l’hôte", "Your host, your library": "Votre hôte, votre bibliothèque",
             "A home for your applications.": "Un espace pour vos applications.",
             "Your applications, sessions, and local services in one place.": "Vos applications, sessions et services locaux réunis au même endroit.",
@@ -3368,6 +3425,63 @@ var Amaterasu;
             "Core console labels and selected notices are translated; some descriptions remain English.": "Le etichette principali e alcuni avvisi sono tradotti; alcune descrizioni restano in inglese.",
         },
         ja: {
+            "Choose excluded Steam games": "除外する Steam ゲームを選択",
+            "Search discoveries and select games to exclude. Existing name-only or unavailable exclusions are preserved.": "検出されたゲームを検索して除外対象を選択します。名前のみ、または利用できない既存の除外項目は保持されます。",
+            "Search Steam games": "Steam ゲームを検索",
+            "Search games": "ゲームを検索",
+            "Steam discovery is unavailable without steam.read permission. Saved exclusions can still be edited.": "steam.read 権限がないため Steam の検出一覧は利用できません。保存済みの除外項目は引き続き編集できます。",
+            "Loading Steam games…": "Steam ゲームを読み込み中…",
+            "Steam game list has not been loaded.": "Steam ゲーム一覧はまだ読み込まれていません。",
+            "Steam games could not be loaded. Your current draft is preserved.": "Steam ゲームを読み込めませんでした。現在の下書きは保持されています。",
+            "Current exclusions": "現在の除外項目",
+            "Current Steam exclusions": "現在の Steam 除外項目",
+            "Load more games": "さらにゲームを読み込む",
+            "Retry loading games": "ゲームの読み込みを再試行",
+            "Steam app {appId}": "Steam アプリ {appId}",
+            "Name-only exclusion": "名前のみの除外項目",
+            "Edit excluded Steam app ID": "除外する Steam アプリ ID を編集",
+            "Optional Steam app ID": "任意の Steam アプリ ID",
+            "Edit excluded Steam game name": "除外する Steam ゲーム名を編集",
+            "Edit name-only Steam exclusion": "名前のみの Steam 除外項目を編集",
+            "Remove exclusion": "除外項目を削除",
+            "Remove exclusion {index}": "除外項目 {index} を削除",
+            "You can exclude up to 256 Steam games. Remove an exclusion before adding another.": "Steam ゲームは最大 256 件まで除外できます。追加する前に既存の項目を削除してください。",
+            "{matchingCount} matching loaded games · {exclusionCount} exclusions": "一致した読み込み済みゲーム {matchingCount} 件 · 除外 {exclusionCount} 件",
+            "{matchingCount} matching loaded games; {exclusionCount} exclusions": "一致した読み込み済みゲーム {matchingCount} 件、除外 {exclusionCount} 件",
+            "No matching Steam games on loaded pages.": "読み込み済みページに一致する Steam ゲームはありません。",
+            "No Steam discoveries are available.": "利用可能な Steam 検出結果はありません。",
+            "The Steam list changed while paging; restarted at the latest revision.": "ページ読み込み中に Steam 一覧が変更されました。最新のリビジョンから再開しました。",
+            "Steam scan is still in progress.": "Steam のスキャンはまだ進行中です。",
+            "Steam scan is incomplete; existing exclusions are preserved.": "Steam のスキャンは未完了です。既存の除外項目は保持されます。",
+            "Add item": "項目を追加",
+            "Remove {label} item {index}": "{label} 項目 {index} を削除",
+            "This list can contain at most {maxItems} items.": "このリストには最大 {maxItems} 件の項目を登録できます。",
+            "Add, edit, or remove list values. Unknown values are kept in their current order.": "リストの値を追加、編集、削除できます。不明な値も現在の順序で保持されます。",
+            "Enter a value for the new item.": "新しい項目の値を入力してください。",
+            "This value is invalid.": "この値は無効です。",
+            "Resolve invalid list entries before reading their values.": "リストの値を読み取る前に、無効な項目を修正してください。",
+            "Settings changed elsewhere. Your draft is preserved; review it before saving again.": "設定が別の場所で変更されました。下書きを保持しています。確認してから再度保存してください。",
+            "Steam save could not be confirmed. Your submitted draft is preserved for review against the latest saved values.": "Steam の保存を確認できませんでした。送信した下書きを保持しています。最新の保存値と比較してください。",
+            "Lutris save could not be confirmed. Your submitted draft is preserved for review against the latest saved values.": "Lutris の保存を確認できませんでした。送信した下書きを保持しています。最新の保存値と比較してください。",
+            "Playnite save could not be confirmed. Your draft is preserved for review against the latest saved values.": "Playnite の保存を確認できませんでした。下書きを保持しています。最新の保存値と比較してください。",
+            "Steam app IDs must be canonical nonzero decimal strings.": "Steam アプリ ID は正規形式の 0 以外の 10 進文字列である必要があります。",
+            "Each Lutris exclusion needs a positive ID or a name.": "Lutris の除外項目には正の ID または名前が必要です。",
+            "Excluded Lutris games": "除外する Lutris ゲーム",
+            "Included categories": "含めるカテゴリ",
+            "Excluded categories": "除外するカテゴリ",
+            "Included plugin IDs": "含めるプラグイン ID",
+            "Excluded plugin IDs": "除外するプラグイン ID",
+            "Excluded game IDs": "除外するゲーム ID",
+            "Steam settings saved and confirmed. Scan status is shown below.": "Steam の設定を保存し、確認しました。スキャン状態を以下に表示します。",
+            "Steam settings saved and confirmed. Steam discovery remains enabled by Linux host policy; scan status is shown below.": "Steam の設定を保存し、確認しました。Linux ホストのポリシーにより Steam 検出は有効なままです。スキャン状態を以下に表示します。",
+            "Steam settings changed elsewhere. Your draft is preserved for review.": "Steam の設定が別の場所で変更されました。確認用に下書きを保持しています。",
+            "Steam save could not be confirmed. Review your preserved draft against the latest saved values before saving again.": "Steam の保存を確認できませんでした。再保存する前に、保持された下書きと最新の保存値を比較してください。",
+            "Lutris settings saved and confirmed. Scan status is shown below.": "Lutris の設定を保存し、確認しました。スキャン状態を以下に表示します。",
+            "Lutris settings changed elsewhere. Your draft is preserved for review.": "Lutris の設定が別の場所で変更されました。確認用に下書きを保持しています。",
+            "Lutris save could not be confirmed. Review your preserved draft against the latest saved values before saving again.": "Lutris の保存を確認できませんでした。再保存する前に、保持された下書きと最新の保存値を比較してください。",
+            "Playnite settings saved and confirmed. Runtime status is shown below.": "Playnite の設定を保存し、確認しました。実行状態を以下に表示します。",
+            "Playnite settings changed elsewhere. Your draft is preserved for review.": "Playnite の設定が別の場所で変更されました。確認用に下書きを保持しています。",
+            "Playnite save could not be confirmed. Review your preserved draft against the latest saved values before saving again.": "Playnite の保存を確認できませんでした。再保存する前に、保持された下書きと最新の保存値を比較してください。",
             "Host overview": "ホストの概要", "Your host, your library": "あなたのホスト、あなたのライブラリ",
             "A home for your applications.": "アプリケーションのホーム。",
             "Your applications, sessions, and local services in one place.": "アプリケーション、セッション、ローカルサービスをひとまとめにします。",
@@ -5411,6 +5525,236 @@ var Amaterasu;
         });
     }
     Amaterasu.confirmAction = confirmAction;
+})(Amaterasu || (Amaterasu = {}));
+var Amaterasu;
+(function (Amaterasu) {
+    let nextListEditorId = 0;
+    function listEditorSetText(target, source) {
+        if (typeof Amaterasu.setLocalizedTextContent === "function")
+            Amaterasu.setLocalizedTextContent(target, source);
+        else
+            target.textContent = source;
+    }
+    function listEditorSetAttribute(target, attribute, source) {
+        if (typeof Amaterasu.setLocalizedAttribute === "function")
+            Amaterasu.setLocalizedAttribute(target, attribute, source);
+        else
+            target.setAttribute(attribute, source);
+    }
+    function listEditorSetTextTemplate(target, source, values) {
+        const format = (locale) => {
+            let rendered = typeof Amaterasu.translateText === "function"
+                ? Amaterasu.translateText(source) : source;
+            const formatter = new Intl.NumberFormat(locale);
+            for (const [name, value] of Object.entries(values)) {
+                const raw = typeof value === "string" ? value : value.value;
+                const formatted = /^\d+$/.test(raw) ? formatter.format(Number(raw)) : raw;
+                rendered = rendered.replaceAll(`{${name}}`, () => formatted);
+            }
+            return rendered;
+        };
+        if (typeof Amaterasu.localeFormattedTextNode === "function")
+            target.replaceChildren(Amaterasu.localeFormattedTextNode(format));
+        else
+            target.textContent = format("en");
+    }
+    function listEditorSetTemplate(target, source, values) {
+        if (typeof Amaterasu.setLocalizedAttributeTemplate === "function")
+            Amaterasu.setLocalizedAttributeTemplate(target, "aria-label", source, values);
+        else {
+            let label = source;
+            for (const [name, value] of Object.entries(values)) {
+                const text = typeof value === "string" ? value : value.value;
+                label = label.replaceAll(`{${name}}`, () => text);
+            }
+            target.setAttribute("aria-label", label);
+        }
+    }
+    function accessibleListEditor(options) {
+        const maxItems = options.maxItems ?? 256;
+        if (typeof options.label !== "string" || !options.label.trim() ||
+            !Array.isArray(options.values) || typeof options.formatValue !== "function" ||
+            typeof options.parseValue !== "function" ||
+            (options.onChange !== undefined && typeof options.onChange !== "function") ||
+            !Number.isInteger(maxItems) || maxItems < 1 || options.values.length > maxItems) {
+            throw new Error("Invalid list editor options.");
+        }
+        const id = ++nextListEditorId;
+        const root = document.createElement("fieldset");
+        root.className = "list-editor";
+        const legend = document.createElement("legend");
+        listEditorSetText(legend, options.label);
+        const description = options.description ? document.createElement("small") : null;
+        if (description && options.description) {
+            description.id = `amaterasu-list-editor-description-${id}`;
+            description.className = "list-editor-description muted";
+            listEditorSetText(description, options.description);
+        }
+        const list = document.createElement("ol");
+        list.className = "list-editor-items";
+        listEditorSetAttribute(list, "aria-label", `${options.label} items`);
+        const status = document.createElement("p");
+        status.id = `amaterasu-list-editor-status-${id}`;
+        status.className = "list-editor-status muted";
+        status.setAttribute("aria-live", "polite");
+        status.setAttribute("aria-atomic", "true");
+        const add = document.createElement("button");
+        add.type = "button";
+        add.className = "button secondary";
+        listEditorSetText(add, "Add item");
+        const draftSignal = document.createElement("input");
+        draftSignal.type = "text";
+        draftSignal.hidden = true;
+        draftSignal.tabIndex = -1;
+        draftSignal.setAttribute("aria-hidden", "true");
+        draftSignal.name = "list_editor_draft";
+        const rootController = new AbortController();
+        let rowController = new AbortController();
+        let disposed = false;
+        let entries = options.values.map((value) => ({
+            text: options.formatValue(value),
+            value,
+            valid: true,
+        }));
+        root.append(legend);
+        if (description)
+            root.append(description);
+        root.append(list, status, add, draftSignal);
+        draftSignal.value = JSON.stringify(entries.map((entry) => entry.text));
+        function signalDraft() {
+            draftSignal.value = JSON.stringify(entries.map((entry) => entry.text));
+            draftSignal.dispatchEvent(new Event("input", { bubbles: true }));
+        }
+        function currentValues() {
+            if (entries.some((entry) => !entry.valid || entry.value === undefined))
+                throw new Error("Resolve invalid list entries before reading their values.");
+            return entries.map((entry) => entry.value);
+        }
+        function publish() {
+            if (entries.every((entry) => entry.valid && entry.value !== undefined))
+                options.onChange?.(currentValues());
+        }
+        function setStatus(message) {
+            listEditorSetText(status, message);
+        }
+        function renderRows(focusIndex) {
+            rowController.abort();
+            rowController = new AbortController();
+            list.replaceChildren();
+            entries.forEach((entry, index) => {
+                const item = document.createElement("li");
+                item.className = "list-editor-item";
+                const input = document.createElement("input");
+                input.type = "text";
+                input.className = "list-editor-input";
+                input.value = entry.text;
+                const errorElement = document.createElement("small");
+                errorElement.id = `amaterasu-list-editor-error-${id}-${index}`;
+                errorElement.className = "list-editor-error";
+                listEditorSetText(errorElement, entry.validationMessage ?? "");
+                if (!entry.valid)
+                    input.setAttribute("aria-invalid", "true");
+                listEditorSetTemplate(input, "{label}, item {index}", {
+                    label: typeof Amaterasu.localizedMessage === "function"
+                        ? Amaterasu.localizedMessage(options.label) : options.label,
+                    index: typeof Amaterasu.literalText === "function"
+                        ? Amaterasu.literalText(String(index + 1)) : String(index + 1),
+                });
+                input.setAttribute("aria-describedby", [description?.id, status.id, errorElement.id].filter(Boolean).join(" "));
+                input.addEventListener("input", () => {
+                    entry.text = input.value;
+                    signalDraft();
+                    let value;
+                    try {
+                        value = options.parseValue(input.value);
+                        if (value === undefined)
+                            throw new Error("The value is invalid.");
+                    }
+                    catch (error) {
+                        entry.value = undefined;
+                        entry.valid = false;
+                        const message = error && typeof error === "object" && "message" in error
+                            ? error.message
+                            : undefined;
+                        entry.validationMessage = typeof message === "string"
+                            ? message : "This value is invalid.";
+                        input.setAttribute("aria-invalid", "true");
+                        listEditorSetText(errorElement, entry.validationMessage);
+                        setStatus(entry.validationMessage);
+                        return;
+                    }
+                    entry.value = value;
+                    entry.valid = true;
+                    entry.validationMessage = undefined;
+                    input.removeAttribute("aria-invalid");
+                    listEditorSetText(errorElement, "");
+                    setStatus("");
+                    publish();
+                }, { signal: rowController.signal });
+                const remove = document.createElement("button");
+                remove.type = "button";
+                remove.className = "button secondary list-editor-remove";
+                listEditorSetText(remove, "Remove");
+                listEditorSetTemplate(remove, "Remove {label} item {index}", {
+                    label: typeof Amaterasu.localizedMessage === "function"
+                        ? Amaterasu.localizedMessage(options.label) : options.label,
+                    index: typeof Amaterasu.literalText === "function"
+                        ? Amaterasu.literalText(String(index + 1)) : String(index + 1),
+                });
+                remove.addEventListener("click", () => {
+                    entries.splice(index, 1);
+                    signalDraft();
+                    setStatus("");
+                    renderRows(Math.min(index, entries.length - 1));
+                    publish();
+                }, { signal: rowController.signal });
+                item.append(input, remove, errorElement);
+                list.append(item);
+            });
+            add.disabled = entries.length >= maxItems;
+            if (focusIndex !== undefined && focusIndex >= 0) {
+                const row = list.children.item(focusIndex);
+                row?.querySelector("input")?.focus();
+            }
+        }
+        add.addEventListener("click", () => {
+            if (entries.length >= maxItems) {
+                listEditorSetTextTemplate(status, "This list can contain at most {maxItems} items.", {
+                    maxItems: typeof Amaterasu.literalText === "function"
+                        ? Amaterasu.literalText(String(maxItems)) : String(maxItems),
+                });
+                return;
+            }
+            entries.push({ text: "", value: undefined, valid: false });
+            signalDraft();
+            setStatus("Enter a value for the new item.");
+            renderRows(entries.length - 1);
+        }, { signal: rootController.signal });
+        renderRows();
+        return {
+            element: root,
+            values: currentValues,
+            setValues(values) {
+                if (disposed)
+                    throw new Error("The list editor has been disposed.");
+                if (!Array.isArray(values) || values.length > maxItems)
+                    throw new Error(`The list can contain at most ${maxItems} items.`);
+                entries = values.map((value) => ({ text: options.formatValue(value), value, valid: true }));
+                signalDraft();
+                setStatus("");
+                renderRows();
+            },
+            dispose() {
+                if (disposed)
+                    return;
+                disposed = true;
+                rootController.abort();
+                rowController.abort();
+                root.replaceChildren();
+            },
+        };
+    }
+    Amaterasu.accessibleListEditor = accessibleListEditor;
 })(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
 (function (Amaterasu) {
@@ -7765,6 +8109,486 @@ var Amaterasu;
 })(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
 (function (Amaterasu) {
+    function steamPickerMessage(source) {
+        return typeof Amaterasu.localizedMessage === "function"
+            ? Amaterasu.localizedMessage(source) : source;
+    }
+    function steamPickerLiteral(source) {
+        return typeof Amaterasu.literalText === "function"
+            ? Amaterasu.literalText(source) : source;
+    }
+    function steamPickerSetText(target, source) {
+        if (typeof Amaterasu.setLocalizedTextContent === "function")
+            Amaterasu.setLocalizedTextContent(target, source);
+        else
+            target.textContent = source;
+    }
+    function steamPickerSetTextTemplate(target, source, values) {
+        const format = (locale) => {
+            let rendered = typeof Amaterasu.translateText === "function"
+                ? Amaterasu.translateText(source) : source;
+            const formatter = new Intl.NumberFormat(locale);
+            for (const [name, value] of Object.entries(values)) {
+                const raw = typeof value === "string" ? value : value.value;
+                const formatted = /^\d+$/.test(raw) ? formatter.format(Number(raw)) : raw;
+                rendered = rendered.replaceAll(`{${name}}`, () => formatted);
+            }
+            return rendered;
+        };
+        if (typeof Amaterasu.localeFormattedTextNode === "function") {
+            target.replaceChildren(Amaterasu.localeFormattedTextNode(format));
+        }
+        else {
+            steamPickerSetText(target, format("en"));
+        }
+    }
+    function steamPickerSetAttribute(target, attribute, source) {
+        if (typeof Amaterasu.setLocalizedAttribute === "function")
+            Amaterasu.setLocalizedAttribute(target, attribute, source);
+        else
+            target.setAttribute(attribute, source);
+    }
+    function steamPickerSetTemplate(target, attribute, source, values) {
+        if (typeof Amaterasu.setLocalizedAttributeTemplate === "function")
+            Amaterasu.setLocalizedAttributeTemplate(target, attribute, source, values);
+        else {
+            let rendered = source;
+            for (const [name, value] of Object.entries(values)) {
+                const text = typeof value === "string" ? value : value.value;
+                rendered = rendered.replaceAll(`{${name}}`, () => text);
+            }
+            target.setAttribute(attribute, rendered);
+        }
+    }
+    function steamExclusionPicker(api, initial, onChange = () => { }) {
+        const root = document.createElement("section");
+        root.className = "steam-exclusion-picker";
+        const heading = document.createElement("h3");
+        steamPickerSetText(heading, "Choose excluded Steam games");
+        const help = document.createElement("p");
+        steamPickerSetText(help, "Search discoveries and select games to exclude. Existing name-only or unavailable exclusions are preserved.");
+        const search = document.createElement("input");
+        search.type = "search";
+        search.autocomplete = "off";
+        steamPickerSetAttribute(search, "aria-label", "Search Steam games");
+        steamPickerSetAttribute(search, "placeholder", "Search games");
+        const status = document.createElement("p");
+        status.setAttribute("role", "status");
+        status.setAttribute("aria-live", "polite");
+        const savedLabel = document.createElement("h4");
+        steamPickerSetText(savedLabel, "Current exclusions");
+        const saved = document.createElement("div");
+        saved.className = "steam-exclusion-saved";
+        steamPickerSetAttribute(saved, "aria-label", "Current Steam exclusions");
+        const manualAdd = document.createElement("div");
+        manualAdd.className = "steam-exclusion-manual-add";
+        const manualId = document.createElement("input");
+        manualId.type = "text";
+        manualId.inputMode = "numeric";
+        steamPickerSetAttribute(manualId, "aria-label", "Steam app ID to exclude");
+        steamPickerSetAttribute(manualId, "placeholder", "Optional Steam app ID");
+        const manualName = document.createElement("input");
+        manualName.type = "text";
+        steamPickerSetAttribute(manualName, "aria-label", "Steam game name to exclude");
+        steamPickerSetAttribute(manualName, "placeholder", "Game name");
+        const manualAddButton = document.createElement("button");
+        manualAddButton.type = "button";
+        manualAddButton.className = "button secondary";
+        steamPickerSetText(manualAddButton, "Add exclusion");
+        const manualAddStatus = document.createElement("p");
+        manualAddStatus.setAttribute("role", "status");
+        manualAddStatus.setAttribute("aria-live", "polite");
+        manualAdd.append(manualId, manualName, manualAddButton, manualAddStatus);
+        const warning = document.createElement("p");
+        warning.className = "steam-exclusion-warning";
+        warning.setAttribute("role", "status");
+        warning.setAttribute("aria-live", "polite");
+        const results = document.createElement("div");
+        steamPickerSetAttribute(results, "aria-label", "Steam games");
+        const more = document.createElement("button");
+        more.type = "button";
+        more.className = "button secondary";
+        steamPickerSetText(more, "Load more games");
+        const draftSignal = document.createElement("input");
+        draftSignal.type = "text";
+        draftSignal.hidden = true;
+        draftSignal.tabIndex = -1;
+        draftSignal.name = "steam_exclusion_draft";
+        draftSignal.setAttribute("aria-hidden", "true");
+        const lifecycle = new AbortController();
+        let draft = initial.map((entry) => ({ ...entry }));
+        let revision = null;
+        let after = null;
+        let games = [];
+        let loading = false;
+        let scanWarning = "";
+        let loadError = "";
+        let revisionChanged = false;
+        let revisionRetries = 0;
+        let disabled = false;
+        let disposed = false;
+        const MAX_EXCLUSIONS = 256;
+        function signalDraft() {
+            draftSignal.value = JSON.stringify(draft);
+            draftSignal.dispatchEvent(new Event("input", { bubbles: true }));
+        }
+        signalDraft();
+        function renderStatus() {
+            status.removeAttribute("title");
+            status.removeAttribute("aria-label");
+            if (!api.allows("steam.read")) {
+                steamPickerSetText(status, "Steam discovery is unavailable without steam.read permission. Saved exclusions can still be edited.");
+                more.hidden = true;
+            }
+            else if (loading) {
+                steamPickerSetText(status, "Loading Steam games…");
+            }
+            else if (loadError) {
+                steamPickerSetText(status, "Steam games could not be loaded. Your current draft is preserved.");
+                steamPickerSetAttribute(status, "title", loadError);
+            }
+            else if (revision === null) {
+                steamPickerSetText(status, "Steam game list has not been loaded.");
+            }
+            else {
+                const matching = games.filter((game) => game.name.toLocaleLowerCase().includes(search.value.trim().toLocaleLowerCase())).length;
+                steamPickerSetTextTemplate(status, "{matchingCount} matching loaded games · {exclusionCount} exclusions", {
+                    matchingCount: steamPickerLiteral(String(matching)),
+                    exclusionCount: steamPickerLiteral(String(draft.length)),
+                });
+                steamPickerSetTemplate(status, "aria-label", "{matchingCount} matching loaded games; {exclusionCount} exclusions", {
+                    matchingCount: steamPickerLiteral(String(matching)),
+                    exclusionCount: steamPickerLiteral(String(draft.length)),
+                });
+            }
+            const warnings = [scanWarning, revisionChanged
+                    ? "The Steam list changed while paging; restarted at the latest revision."
+                    : ""].filter(Boolean);
+            warning.replaceChildren();
+            warnings.forEach((source, index) => {
+                if (index > 0)
+                    warning.append(document.createTextNode(" "));
+                const item = document.createElement("span");
+                steamPickerSetText(item, source);
+                warning.append(item);
+            });
+            warning.hidden = warnings.length === 0;
+            more.hidden = (!loadError && after === null) || disposed || !api.allows("steam.read");
+            more.disabled = disabled || loading || disposed;
+            steamPickerSetText(more, loadError ? "Retry loading games" : "Load more games");
+            root.setAttribute("aria-busy", String(loading));
+        }
+        function renderSaved() {
+            saved.replaceChildren();
+            draft.forEach((entry, index) => {
+                const row = document.createElement("div");
+                row.className = "steam-exclusion-saved-item";
+                const idInput = document.createElement("input");
+                idInput.type = "text";
+                idInput.inputMode = "numeric";
+                idInput.setAttribute("data-focus-key", "saved-" + index + "-id");
+                idInput.disabled = disabled;
+                idInput.value = entry.id ?? "";
+                steamPickerSetAttribute(idInput, "aria-label", "Edit excluded Steam app ID");
+                steamPickerSetAttribute(idInput, "placeholder", "Optional Steam app ID");
+                idInput.addEventListener("input", () => {
+                    if (disposed || disabled)
+                        return;
+                    const id = idInput.value.trim();
+                    if (id)
+                        draft[index] = { ...draft[index], id };
+                    else {
+                        const current = draft[index];
+                        if (!current)
+                            return;
+                        const { id: _oldId, ...withoutId } = current;
+                        draft[index] = withoutId;
+                    }
+                    signalDraft();
+                    onChange(draft.map((value) => ({ ...value })));
+                    renderStatus();
+                }, { signal: lifecycle.signal });
+                const name = document.createElement("input");
+                name.type = "text";
+                name.value = entry.name ?? "";
+                name.setAttribute("data-focus-key", "saved-" + index + "-name");
+                name.disabled = disabled;
+                steamPickerSetAttribute(name, "aria-label", entry.id
+                    ? "Edit excluded Steam game name"
+                    : "Edit name-only Steam exclusion");
+                name.addEventListener("input", () => {
+                    if (disposed || disabled)
+                        return;
+                    const current = draft[index];
+                    if (!current)
+                        return;
+                    const nextName = name.value.trim();
+                    if (nextName)
+                        draft[index] = { ...current, name: name.value };
+                    else {
+                        const { name: _oldName, ...withoutName } = current;
+                        draft[index] = withoutName;
+                    }
+                    signalDraft();
+                    onChange(draft.map((value) => ({ ...value })));
+                    renderStatus();
+                }, { signal: lifecycle.signal });
+                const remove = document.createElement("button");
+                remove.type = "button";
+                remove.setAttribute("data-focus-key", "saved-" + index + "-remove");
+                remove.disabled = disabled;
+                remove.className = "button secondary";
+                steamPickerSetText(remove, "Remove exclusion");
+                steamPickerSetTemplate(remove, "aria-label", "Remove exclusion {index}", {
+                    index: steamPickerLiteral(String(index + 1)),
+                });
+                remove.addEventListener("click", () => {
+                    if (disposed || disabled)
+                        return;
+                    draft = draft.filter((_, currentIndex) => currentIndex !== index);
+                    signalDraft();
+                    onChange(draft.map((value) => ({ ...value })));
+                    render(true);
+                    const nextFocusKey = draft[index]
+                        ? `saved-${index}-remove`
+                        : draft.length
+                            ? `saved-${draft.length - 1}-remove`
+                            : "manual-id";
+                    allElements(root).find((element) => element.getAttribute?.("data-focus-key") === nextFocusKey)?.focus();
+                }, { signal: lifecycle.signal });
+                row.append(idInput, name, remove);
+                saved.append(row);
+            });
+        }
+        function renderResults() {
+            const query = search.value.trim().toLocaleLowerCase();
+            const visible = games.filter((game) => game.name.toLocaleLowerCase().includes(query));
+            results.replaceChildren();
+            const selected = new Set(draft.flatMap((entry) => entry.id ? [entry.id] : []));
+            for (const game of visible) {
+                const label = document.createElement("label");
+                label.className = "steam-exclusion-option";
+                const checkbox = document.createElement("input");
+                checkbox.type = "checkbox";
+                checkbox.setAttribute("data-focus-key", "game-" + game.app_id);
+                checkbox.disabled = disabled;
+                checkbox.checked = selected.has(String(game.app_id));
+                checkbox.addEventListener("change", () => {
+                    if (disposed || disabled)
+                        return;
+                    const id = String(game.app_id);
+                    draft = draft.filter((entry) => entry.id !== id);
+                    if (checkbox.checked) {
+                        if (draft.length >= MAX_EXCLUSIONS) {
+                            checkbox.checked = false;
+                            steamPickerSetText(status, "You can exclude up to 256 Steam games. Remove an exclusion before adding another.");
+                            return;
+                        }
+                        draft.push({ id, name: game.name });
+                    }
+                    signalDraft();
+                    onChange(draft.map((entry) => ({ ...entry })));
+                    render(true);
+                }, { signal: lifecycle.signal });
+                const name = document.createElement("span");
+                name.textContent = game.name;
+                const id = document.createElement("small");
+                steamPickerSetTemplate(id, "aria-label", "Steam app {appId}", {
+                    appId: steamPickerLiteral(String(game.app_id)),
+                });
+                steamPickerSetTextTemplate(id, "Steam app {appId}", {
+                    appId: steamPickerLiteral(String(game.app_id)),
+                });
+                label.append(checkbox, name, id);
+                results.append(label);
+            }
+            if (revision !== null && visible.length === 0 && !loading) {
+                const emptyMessage = query
+                    ? "No matching Steam games on loaded pages."
+                    : "No Steam discoveries are available.";
+                results.append(typeof Amaterasu.textValueNode === "function"
+                    ? Amaterasu.textValueNode(steamPickerMessage(emptyMessage))
+                    : emptyMessage);
+            }
+        }
+        function render(preserveFocus = false) {
+            if (disposed)
+                return;
+            const active = preserveFocus ? document.activeElement : null;
+            const focusKey = active && root.contains(active) ? active.getAttribute("data-focus-key") : null;
+            const selectionStart = active?.selectionStart ?? null;
+            const selectionEnd = active?.selectionEnd ?? null;
+            search.disabled = disabled;
+            manualId.disabled = disabled;
+            manualName.disabled = disabled;
+            manualAddButton.disabled = disabled;
+            renderStatus();
+            renderSaved();
+            renderResults();
+            if (focusKey) {
+                const replacement = allElements(root).find((element) => element.getAttribute("data-focus-key") === focusKey);
+                replacement?.focus();
+                if (replacement && selectionStart !== null && selectionEnd !== null)
+                    replacement.setSelectionRange?.(selectionStart, selectionEnd);
+            }
+        }
+        function allElements(parent) {
+            return [parent, ...Array.from(parent.children ?? []).flatMap((child) => allElements(child))];
+        }
+        async function load() {
+            if (disposed || disabled || !api.allows("steam.read") || loading)
+                return;
+            loading = true;
+            loadError = "";
+            renderStatus();
+            try {
+                const reply = await api.post("steam/list", {
+                    ...(revision !== null ? { revision } : {}),
+                    ...(after !== null ? { after } : {}),
+                    limit: 32,
+                });
+                if (disposed)
+                    return;
+                if (!Number.isSafeInteger(reply.revision) || reply.revision < 0 ||
+                    !Array.isArray(reply.games) ||
+                    !(reply.next_after === null || Number.isSafeInteger(reply.next_after)) ||
+                    typeof reply.scanning !== "boolean" || typeof reply.complete !== "boolean") {
+                    throw new Error("Steam game list response is invalid.");
+                }
+                if (revision !== null && reply.revision !== revision) {
+                    if (revisionRetries >= 2) {
+                        throw new Error("Steam game list kept changing. Retry loading games to try again.");
+                    }
+                    revisionRetries += 1;
+                    revision = null;
+                    after = null;
+                    games = [];
+                    revisionChanged = true;
+                    loading = false;
+                    await load();
+                    return;
+                }
+                revisionRetries = 0;
+                revision = reply.revision;
+                const uniqueGames = new Map(games.map((game) => [game.app_id, game]));
+                for (const game of reply.games) {
+                    if (!Number.isSafeInteger(game.app_id) || game.app_id < 1 || typeof game.name !== "string")
+                        throw new Error("Steam game list contains an invalid entry.");
+                    uniqueGames.set(game.app_id, game);
+                }
+                games = [...uniqueGames.values()];
+                after = reply.next_after;
+                scanWarning = reply.scanning
+                    ? "Steam scan is still in progress."
+                    : !reply.complete
+                        ? "Steam scan is incomplete; existing exclusions are preserved."
+                        : "";
+            }
+            catch (error) {
+                if (disposed)
+                    return;
+                const revisionConflict = typeof error === "object" && error !== null &&
+                    "code" in error && error.code === "revision_conflict";
+                if (revisionConflict && revisionRetries < 2) {
+                    revisionRetries += 1;
+                    revision = null;
+                    after = null;
+                    games = [];
+                    revisionChanged = true;
+                    loading = false;
+                    await load();
+                    return;
+                }
+                loadError = revisionConflict
+                    ? "Steam game list kept changing. Retry loading games to try again."
+                    : error instanceof Error ? error.message : "Unable to load Steam games.";
+            }
+            finally {
+                loading = false;
+                if (!disposed)
+                    render(true);
+            }
+        }
+        search.setAttribute("data-focus-key", "search");
+        manualId.setAttribute("data-focus-key", "manual-id");
+        manualName.setAttribute("data-focus-key", "manual-name");
+        search.addEventListener("input", () => { if (!disabled)
+            render(true); }, { signal: lifecycle.signal });
+        const addManualExclusion = () => {
+            if (disposed || disabled)
+                return;
+            const id = manualId.value.trim();
+            const name = manualName.value.trim();
+            if (!id && !name) {
+                steamPickerSetText(manualAddStatus, "Enter a Steam app ID or game name.");
+                return;
+            }
+            if (draft.length >= MAX_EXCLUSIONS) {
+                steamPickerSetText(manualAddStatus, "You can exclude up to 256 Steam games. Remove an exclusion before adding another.");
+                return;
+            }
+            if (id && draft.some((entry) => entry.id === id)) {
+                steamPickerSetText(manualAddStatus, "That Steam app ID is already excluded.");
+                return;
+            }
+            draft.push({ ...(id ? { id } : {}), ...(name ? { name } : {}) });
+            manualId.value = "";
+            manualName.value = "";
+            steamPickerSetText(manualAddStatus, "Exclusion added.");
+            signalDraft();
+            onChange(draft.map((entry) => ({ ...entry })));
+            render(true);
+            manualName.focus();
+        };
+        manualAddButton.addEventListener("click", addManualExclusion, { signal: lifecycle.signal });
+        for (const field of [manualId, manualName])
+            field.addEventListener("keydown", (event) => {
+                if (event.key !== "Enter")
+                    return;
+                event.preventDefault();
+                addManualExclusion();
+            }, { signal: lifecycle.signal });
+        more.addEventListener("click", () => {
+            if (disposed || disabled)
+                return;
+            if (loadError)
+                revisionRetries = 0;
+            void load();
+        }, { signal: lifecycle.signal });
+        root.append(heading, help, savedLabel, saved, search, status, results, more, draftSignal, manualAdd, warning);
+        render();
+        void load();
+        return {
+            node: root,
+            value: () => draft.map((entry) => ({ ...entry })),
+            setValue(values) {
+                if (disposed)
+                    throw new Error("The Steam exclusion picker has been disposed.");
+                if (!Array.isArray(values))
+                    throw new Error("Steam exclusions must be a list.");
+                draft = values.map((entry) => ({ ...entry }));
+                signalDraft();
+                render(true);
+            },
+            setDisabled(value) {
+                if (disposed)
+                    return;
+                disabled = Boolean(value);
+                render();
+            },
+            dispose() {
+                if (disposed)
+                    return;
+                disposed = true;
+                lifecycle.abort();
+                root.replaceChildren();
+            },
+        };
+    }
+    Amaterasu.steamExclusionPicker = steamExclusionPicker;
+})(Amaterasu || (Amaterasu = {}));
+var Amaterasu;
+(function (Amaterasu) {
     function managementPolicyTextMessage(value) {
         return typeof Amaterasu.localizedMessage === "function" ? Amaterasu.localizedMessage(value) : value;
     }
@@ -8174,6 +8998,31 @@ var Amaterasu;
         else {
             target.textContent = source;
         }
+    }
+    function settingsComponentField(label, control, hint) {
+        return Amaterasu.el("div", "field", Amaterasu.el("span", "field-label", settingsTextMessage(label)), control, Amaterasu.el("small", "muted", settingsTextMessage(hint)));
+    }
+    function settingsDispatchDraftEvent(target, type) {
+        target.dispatchEvent(new Event(type, { bubbles: true }));
+    }
+    function settingsSetDraftCheckbox(control, value) {
+        control.checked = value;
+        settingsDispatchDraftEvent(control, "change");
+    }
+    function settingsSetDraftNumber(control, value) {
+        control.value = String(value);
+        settingsDispatchDraftEvent(control, "input");
+    }
+    function setSettingsFormDisabled(form, disabled) {
+        const visit = (node) => {
+            if (!node || typeof node.tagName !== "string")
+                return;
+            if (["INPUT", "BUTTON", "SELECT", "TEXTAREA"].includes(node.tagName))
+                node.disabled = disabled;
+            for (const child of Array.from(node.children))
+                visit(child);
+        };
+        visit(form);
     }
     function settingsLocalizedAttributeTemplate(target, source, values) {
         if (typeof Amaterasu.setLocalizedAttributeTemplate === "function") {
@@ -10824,6 +11673,23 @@ var Amaterasu;
         return !needle || parts.join(" ").toLocaleLowerCase().includes(needle);
     }
     Amaterasu.settingsSearchMatches = settingsSearchMatches;
+    function rebaseProviderDraft(pending, latest) {
+        const merged = { ...latest };
+        const overlaps = [];
+        for (const field of Object.keys(pending.submitted)) {
+            const baselineValue = pending.baseline[field];
+            const submittedValue = pending.submitted[field];
+            const latestValue = latest[field];
+            if (sameConfigurationValue(submittedValue, baselineValue))
+                continue;
+            if (!sameConfigurationValue(latestValue, baselineValue)) {
+                overlaps.push(field);
+                continue;
+            }
+            merged[field] = submittedValue;
+        }
+        return { merged, overlaps };
+    }
     function renderSettings(context) {
         const area = Amaterasu.el("div", "settings-area-registered");
         const sessionExtensionsArea = Amaterasu.el("div", "settings-area-session-extensions");
@@ -10837,10 +11703,13 @@ var Amaterasu;
         const pipewireArea = Amaterasu.el("div", "settings-area-pipewire");
         const steamArea = Amaterasu.el("div", "settings-area-steam");
         const steamLoads = new ImportSettingsLoadGate();
+        let activeSteamExclusionPicker = null;
         const lutrisArea = Amaterasu.el("div", "settings-area-lutris");
         const lutrisLoads = new ImportSettingsLoadGate();
+        let activeLutrisExclusionEditor = null;
         const playniteArea = Amaterasu.el("div", "settings-area-playnite");
         const playniteLoads = new PlayniteSettingsLoadGate();
+        let activePlayniteListEditors = [];
         const inputArea = Amaterasu.el("div", "settings-area-input");
         const inputLoads = new InputPolicyLoadGate();
         const historyArea = Amaterasu.el("div", "settings-area-history");
@@ -10850,12 +11719,38 @@ var Amaterasu;
         const historyLoads = new HistorySettingsLoadGate();
         const pairingArea = Amaterasu.el("div", "settings-area-pairing");
         let drafts = null;
+        const pendingProviderDrafts = new Map();
         let clientSaveBusy = false;
         const updateDraftStatus = () => {
-            const dirty = drafts?.isDirty() ?? false;
+            const dirty = (drafts?.isDirty() ?? false) || pendingProviderDrafts.size > 0;
             refreshSettings.disabled = dirty || clientSaveBusy;
             dirtyNotice.hidden = !dirty && !clientSaveBusy;
             settingsSetLocalizedTextContent(dirtyNotice, clientSaveBusy ? "Saving changes…" : "Unsaved changes");
+        };
+        const configureProviderConflictReview = (provider, status, save, applyValues) => {
+            const pending = pendingProviderDrafts.get(provider);
+            if (!pending || pending.overlaps.length === 0)
+                return;
+            save.disabled = true;
+            const message = Amaterasu.el("p", "error", `Overlapping fields: ${pending.overlaps.join(", ")}. Latest values are kept until you choose an action.`);
+            const review = Amaterasu.button("Review and keep latest values", () => {
+                pending.reviewed = true;
+                if (pending.latest)
+                    applyValues(pending.latest, pending.overlaps);
+                save.disabled = !context.api.allows("configuration.write");
+                message.textContent = `Reviewed overlapping fields: ${pending.overlaps.join(", ")}. Latest values will be saved.`;
+                review.disabled = true;
+                overwrite.disabled = true;
+            }, "secondary");
+            const overwrite = Amaterasu.button("Overwrite overlapping fields", () => {
+                pending.reviewed = true;
+                applyValues(pending.submitted, pending.overlaps);
+                save.disabled = !context.api.allows("configuration.write");
+                message.textContent = `Overwriting overlapping fields: ${pending.overlaps.join(", ")}. Review the draft before saving.`;
+                review.disabled = true;
+                overwrite.disabled = true;
+            }, "secondary");
+            status.append(message, review, overwrite);
         };
         const loadPairing = createPairedClientEditor(context, pairingArea, () => drafts, (busy) => {
             clientSaveBusy = busy;
@@ -11004,7 +11899,19 @@ var Amaterasu;
         context.content.append(Amaterasu.sectionHeading("Settings", "Configure your host, streaming, integrations, and access.", refreshSettings), Amaterasu.el("div", "settings-tools", search, dirtyNotice), Amaterasu.el("div", "settings-layout", settingsNavigation, categoryContent));
         if (context.registerDraftGuard) {
             drafts = Amaterasu.trackDrafts(categoryContent, updateDraftStatus);
-            context.registerDraftGuard(() => clientSaveBusy || (drafts?.isDirty() ?? false), drafts.dispose);
+            context.registerDraftGuard(() => clientSaveBusy || pendingProviderDrafts.size > 0 || (drafts?.isDirty() ?? false), () => {
+                steamLoads.invalidate();
+                lutrisLoads.invalidate();
+                playniteLoads.invalidate();
+                activeSteamExclusionPicker?.dispose();
+                activeSteamExclusionPicker = null;
+                activeLutrisExclusionEditor?.dispose();
+                activeLutrisExclusionEditor = null;
+                for (const editor of activePlayniteListEditors)
+                    editor.dispose();
+                activePlayniteListEditors = [];
+                drafts?.dispose();
+            });
         }
         Amaterasu.renderManagementPolicy(context, managementArea);
         Amaterasu.renderCsrfPolicy(context, csrfArea);
@@ -11267,7 +12174,9 @@ var Amaterasu;
                     hostLoggingArea.replaceChildren(Amaterasu.errorPanel(new Error("Host logging policy could not be loaded. Try again."), loadHostLogging));
             }
         }
-        async function loadSteam() {
+        async function loadSteam(draftValues, draftNotice) {
+            activeSteamExclusionPicker?.dispose();
+            activeSteamExclusionPicker = null;
             steamArea.replaceChildren(Amaterasu.el("p", "muted", "Loading Steam settings…"));
             try {
                 const loaded = await steamLoads.read(() => readSteamSettings(context.api));
@@ -11276,53 +12185,92 @@ var Amaterasu;
                 const { value: settings, generation } = loaded;
                 if (!context.content.isConnected)
                     return;
+                const pendingDraft = pendingProviderDrafts.get("steam");
+                if (pendingDraft) {
+                    const rebased = rebaseProviderDraft(pendingDraft, settings.values);
+                    pendingDraft.latest = settings.values;
+                    pendingDraft.merged = rebased.merged;
+                    pendingDraft.overlaps = rebased.overlaps;
+                    pendingDraft.reviewed = rebased.overlaps.length === 0;
+                    draftValues = rebased.merged;
+                    draftNotice = rebased.overlaps.length
+                        ? "Conflicting fields need review. Non-overlapping edits were rebased."
+                        : "Settings changed elsewhere. Non-overlapping edits were rebased; review before saving again.";
+                }
+                const valuesForForm = settings.values;
                 const form = Amaterasu.el("form", "settings-form");
                 const enabled = Amaterasu.input("steam_enabled", "", "checkbox");
-                enabled.checked = settings.values.enabled;
+                enabled.checked = valuesForForm.enabled;
                 const autoSync = Amaterasu.input("steam_auto_sync", "", "checkbox");
-                autoSync.checked = settings.values.auto_sync;
+                autoSync.checked = valuesForForm.auto_sync;
                 const includeTools = Amaterasu.input("steam_include_tools", "", "checkbox");
-                includeTools.checked = settings.values.include_tools;
+                includeTools.checked = valuesForForm.include_tools;
                 const syncAllInstalled = Amaterasu.input("steam_sync_all_installed", "", "checkbox");
-                syncAllInstalled.checked = settings.values.sync_all_installed;
+                syncAllInstalled.checked = valuesForForm.sync_all_installed;
                 const autosyncRemoveUninstalled = Amaterasu.input("steam_autosync_remove_uninstalled", "", "checkbox");
                 autosyncRemoveUninstalled.checked =
-                    settings.values.autosync_remove_uninstalled;
-                const recentGames = Amaterasu.input("steam_recent_games", String(settings.values.recent_games), "number");
+                    valuesForForm.autosync_remove_uninstalled;
+                const recentGames = Amaterasu.input("steam_recent_games", String(valuesForForm.recent_games), "number");
                 recentGames.required = true;
                 recentGames.min = "0";
                 recentGames.max = "10000";
                 recentGames.step = "1";
-                const recentMaxAgeDays = Amaterasu.input("steam_recent_max_age_days", String(settings.values.recent_max_age_days), "number");
+                const recentMaxAgeDays = Amaterasu.input("steam_recent_max_age_days", String(valuesForForm.recent_max_age_days), "number");
                 recentMaxAgeDays.required = true;
                 recentMaxAgeDays.min = "0";
                 recentMaxAgeDays.max = "36500";
                 recentMaxAgeDays.step = "1";
-                const exclusions = Amaterasu.el("textarea");
-                exclusions.name = "steam_exclude_games";
-                exclusions.rows = 10;
-                exclusions.spellcheck = false;
-                exclusions.value = JSON.stringify(settings.values.exclude_games, null, 2);
+                const exclusions = Amaterasu.steamExclusionPicker(context.api, valuesForForm.exclude_games);
+                activeSteamExclusionPicker = exclusions;
+                const exclusionsField = Amaterasu.el("div", "field", Amaterasu.el("span", "field-label", settingsTextMessage("Excluded games")), exclusions.node);
                 const status = Amaterasu.el("div");
+                if (draftNotice)
+                    settingsSetLocalizedTextContent(status, draftNotice);
                 const runtimeStatus = Amaterasu.el("p", "muted", "Loading current provider status…");
                 const save = Amaterasu.el("button", "button primary", "Save Steam settings");
                 save.type = "submit";
                 save.disabled = !context.api.allows("configuration.write");
-                form.append(Amaterasu.field("Enable Steam library discovery", enabled, "Controls whether the provider exposes discovered Steam games and accepts scans. On Linux the provider keeps discovery enabled."), Amaterasu.field("Automatic synchronization", autoSync, "Controls automatic scans of the configured Steam library roots."), Amaterasu.field("Include tools", includeTools, "Includes tools alongside games when importing the library."), Amaterasu.field("Synchronize all installed games", syncAllInstalled, "When off, import recently played games instead of every installed game."), Amaterasu.field("Remove uninstalled games during synchronization", autosyncRemoveUninstalled, "Applies when synchronizing all installed games. Recent-game mode always removes stale imported entries."), Amaterasu.field("Recent games to import", recentGames, "Maximum number of recently played games (0–10000); zero imports none in recent-only mode."), Amaterasu.field("Recent game age limit (days)", recentMaxAgeDays, "Ignore games older than this age (0–36500); zero disables the age cutoff."), Amaterasu.field("Excluded games (JSON)", exclusions, 'Use objects with "id" (canonical app ID), "name", or both. ID takes precedence; name-only entries match without case sensitivity.'), runtimeStatus, status, Amaterasu.el("div", "actions", save, Amaterasu.badge(settingsTextLiteral(`Revision ${settings.revision}`))));
+                let actionInProgress = false;
+                const cancel = Amaterasu.button(settingsTextMessage("Cancel"), () => {
+                    if (!actionInProgress) {
+                        pendingProviderDrafts.delete("steam");
+                        updateDraftStatus();
+                        void loadSteam();
+                    }
+                }, "secondary");
+                form.append(Amaterasu.field("Enable Steam library discovery", enabled, "Controls whether the provider exposes discovered Steam games and accepts scans. On Linux the provider keeps discovery enabled."), Amaterasu.field("Automatic synchronization", autoSync, "Controls automatic scans of the configured Steam library roots."), Amaterasu.field("Include tools", includeTools, "Includes tools alongside games when importing the library."), Amaterasu.field("Synchronize all installed games", syncAllInstalled, "When off, import recently played games instead of every installed game."), Amaterasu.field("Remove uninstalled games during synchronization", autosyncRemoveUninstalled, "Applies when synchronizing all installed games. Recent-game mode always removes stale imported entries."), Amaterasu.field("Recent games to import", recentGames, "Maximum number of recently played games (0–10000); zero imports none in recent-only mode."), Amaterasu.field("Recent game age limit (days)", recentMaxAgeDays, "Ignore games older than this age (0–36500); zero disables the age cutoff."), exclusionsField, runtimeStatus, status, Amaterasu.el("div", "actions", save, cancel, Amaterasu.badge(settingsTextLiteral(`Revision ${settings.revision}`))));
                 form.addEventListener("submit", (event) => {
                     event.preventDefault();
                     void Amaterasu.runAction(save, status, async () => {
+                        actionInProgress = true;
+                        cancel.disabled = true;
                         steamLoads.invalidate();
                         let saveStarted = false;
+                        let requestedValues = null;
                         try {
                             const values = {
                                 enabled: enabled.checked,
                                 auto_sync: autoSync.checked,
-                                exclude_games: parseSteamExclusions(exclusions.value),
+                                exclude_games: parseSteamExclusions(JSON.stringify(exclusions.value())),
                                 ...parseSteamImportSettings(includeTools.checked, syncAllInstalled.checked, autosyncRemoveUninstalled.checked, recentGames.valueAsNumber, recentMaxAgeDays.valueAsNumber),
                             };
+                            requestedValues = values;
+                            const existingPending = pendingProviderDrafts.get("steam");
+                            if (existingPending?.overlaps.length && !existingPending.reviewed)
+                                throw new Error("Review overlapping fields before saving again.");
+                            pendingProviderDrafts.set("steam", {
+                                baseline: settings.values,
+                                submitted: values,
+                                overlaps: [],
+                                reviewed: true,
+                            });
+                            updateDraftStatus();
+                            setSettingsFormDisabled(form, true);
+                            exclusions.setDisabled(true);
                             saveStarted = true;
                             const saved = await saveSteamSettings(context.api, settings, values);
+                            pendingProviderDrafts.delete("steam");
+                            updateDraftStatus();
                             await loadSteam();
                             context.notify(!values.enabled && saved.values.enabled
                                 ? settingsTextMessage("Steam settings saved and confirmed. Steam discovery remains enabled by Linux host policy; scan status is shown below.")
@@ -11330,25 +12278,71 @@ var Amaterasu;
                         }
                         catch (error) {
                             if (saveStarted) {
-                                await loadSteam();
-                                context.notify(error instanceof Amaterasu.ApiError && error.code === "revision_conflict"
-                                    ? settingsTextMessage("Steam settings changed elsewhere. Review the latest values before saving again.")
-                                    : settingsTextMessage("Steam save could not be confirmed. Review the latest values before saving again."));
+                                const conflict = error instanceof Amaterasu.ApiError && error.code === "revision_conflict";
+                                const nextDraft = requestedValues ?? undefined;
+                                const notice = conflict
+                                    ? "Settings changed elsewhere. Your draft is preserved; review it before saving again."
+                                    : "Steam save could not be confirmed. Your submitted draft is preserved for review against the latest saved values.";
+                                await loadSteam(nextDraft, notice);
+                                context.notify(settingsTextMessage(conflict
+                                    ? "Steam settings changed elsewhere. Your draft is preserved for review."
+                                    : "Steam save could not be confirmed. Review your preserved draft against the latest saved values before saving again."));
                                 return;
                             }
                             throw error;
                         }
+                        finally {
+                            actionInProgress = false;
+                            if (form.isConnected)
+                                setSettingsFormDisabled(form, false);
+                            exclusions.setDisabled(false);
+                            cancel.disabled = false;
+                        }
                     });
                 });
                 steamArea.replaceChildren(Amaterasu.panel("Steam", form));
+                if (draftValues) {
+                    const baseline = drafts?.capture(steamArea);
+                    if (baseline)
+                        drafts?.markSaved(baseline);
+                    settingsSetDraftCheckbox(enabled, draftValues.enabled);
+                    settingsSetDraftCheckbox(autoSync, draftValues.auto_sync);
+                    settingsSetDraftCheckbox(includeTools, draftValues.include_tools);
+                    settingsSetDraftCheckbox(syncAllInstalled, draftValues.sync_all_installed);
+                    settingsSetDraftCheckbox(autosyncRemoveUninstalled, draftValues.autosync_remove_uninstalled);
+                    settingsSetDraftNumber(recentGames, draftValues.recent_games);
+                    settingsSetDraftNumber(recentMaxAgeDays, draftValues.recent_max_age_days);
+                    exclusions.setValue(draftValues.exclude_games);
+                    configureProviderConflictReview("steam", status, save, (values, fields) => {
+                        const selected = new Set(fields);
+                        if (selected.has("enabled"))
+                            settingsSetDraftCheckbox(enabled, values.enabled);
+                        if (selected.has("auto_sync"))
+                            settingsSetDraftCheckbox(autoSync, values.auto_sync);
+                        if (selected.has("include_tools"))
+                            settingsSetDraftCheckbox(includeTools, values.include_tools);
+                        if (selected.has("sync_all_installed"))
+                            settingsSetDraftCheckbox(syncAllInstalled, values.sync_all_installed);
+                        if (selected.has("autosync_remove_uninstalled"))
+                            settingsSetDraftCheckbox(autosyncRemoveUninstalled, values.autosync_remove_uninstalled);
+                        if (selected.has("recent_games"))
+                            settingsSetDraftNumber(recentGames, values.recent_games);
+                        if (selected.has("recent_max_age_days"))
+                            settingsSetDraftNumber(recentMaxAgeDays, values.recent_max_age_days);
+                        if (selected.has("exclude_games"))
+                            exclusions.setValue(values.exclude_games);
+                    });
+                }
                 void loadSteamRuntimeStatus(runtimeStatus, context, settings, generation);
             }
             catch (error) {
                 if (context.content.isConnected)
-                    steamArea.replaceChildren(Amaterasu.errorPanel(error, loadSteam));
+                    steamArea.replaceChildren(Amaterasu.errorPanel(error, () => { void loadSteam(draftValues, draftNotice); }));
             }
         }
-        async function loadLutris() {
+        async function loadLutris(draftValues, draftNotice) {
+            activeLutrisExclusionEditor?.dispose();
+            activeLutrisExclusionEditor = null;
             lutrisArea.replaceChildren(Amaterasu.el("p", "muted", "Loading Lutris settings…"));
             try {
                 const loaded = await lutrisLoads.read(async () => {
@@ -11361,44 +12355,78 @@ var Amaterasu;
                 const { settings, runtime } = loaded.value;
                 if (!context.content.isConnected)
                     return;
+                const pendingDraft = pendingProviderDrafts.get("lutris");
+                if (pendingDraft) {
+                    const rebased = rebaseProviderDraft(pendingDraft, settings.values);
+                    pendingDraft.latest = settings.values;
+                    pendingDraft.merged = rebased.merged;
+                    pendingDraft.overlaps = rebased.overlaps;
+                    pendingDraft.reviewed = rebased.overlaps.length === 0;
+                    draftValues = rebased.merged;
+                    draftNotice = rebased.overlaps.length
+                        ? "Conflicting fields need review. Non-overlapping edits were rebased."
+                        : "Settings changed elsewhere. Non-overlapping edits were rebased; review before saving again.";
+                }
+                const valuesForForm = settings.values;
                 const form = Amaterasu.el("form", "settings-form");
                 const enabled = Amaterasu.input("lutris_enabled", "", "checkbox");
-                enabled.checked = settings.values.enabled;
+                enabled.checked = valuesForForm.enabled;
                 enabled.disabled = !runtime.platform_supported;
                 const autoSync = Amaterasu.input("lutris_auto_sync", "", "checkbox");
-                autoSync.checked = settings.values.auto_sync;
+                autoSync.checked = valuesForForm.auto_sync;
                 const removeUninstalled = Amaterasu.input("lutris_autosync_remove_uninstalled", "", "checkbox");
-                removeUninstalled.checked = settings.values.autosync_remove_uninstalled;
+                removeUninstalled.checked = valuesForForm.autosync_remove_uninstalled;
                 const includeSteam = Amaterasu.input("lutris_include_steam", "", "checkbox");
-                includeSteam.checked = settings.values.include_steam;
-                const exclusions = Amaterasu.el("textarea");
-                exclusions.name = "lutris_exclude_games";
-                exclusions.rows = 8;
-                exclusions.maxLength = 12_000;
-                exclusions.spellcheck = false;
-                exclusions.value = JSON.stringify(settings.values.exclude_games, null, 2);
+                includeSteam.checked = valuesForForm.include_steam;
+                const exclusions = Amaterasu.accessibleListEditor({
+                    label: "Excluded Lutris games",
+                    description: 'Enter a positive ID, or an object such as {"id":"123","name":"Game"}. Existing IDs missing from discovery remain in the list.',
+                    values: valuesForForm.exclude_games,
+                    formatValue: (value) => typeof value === "string" ? value : JSON.stringify(value),
+                    parseValue: (text) => {
+                        const source = text.trimStart().startsWith("{")
+                            ? `[${text}]`
+                            : JSON.stringify([text]);
+                        const parsed = parseLutrisExclusions(source);
+                        if (!parsed[0])
+                            throw new Error("Each Lutris exclusion needs a positive ID or a name.");
+                        return parsed[0];
+                    },
+                });
+                activeLutrisExclusionEditor = exclusions;
+                const exclusionsField = Amaterasu.el("div", "field", exclusions.element);
                 const runtimeStatus = Amaterasu.el("p", runtime.last_error ? "error" : "muted", runtime.settings_revision !== settings.revision ||
                     runtime.enabled !== settings.values.enabled ||
                     runtime.auto_sync !== settings.values.auto_sync
                     ? "Saved Lutris settings are not yet reflected in provider status. Refresh to check application."
                     : lutrisStatusDescription(runtime));
                 const saveStatus = Amaterasu.el("div");
+                if (draftNotice)
+                    settingsSetLocalizedTextContent(saveStatus, draftNotice);
                 const refreshStatus = Amaterasu.el("div");
                 const save = Amaterasu.el("button", "button primary", "Save Lutris settings");
                 save.type = "submit";
                 save.disabled = !context.api.allows("configuration.write");
+                let actionInProgress = false;
+                const cancel = Amaterasu.button(settingsTextMessage("Cancel"), () => {
+                    if (!actionInProgress) {
+                        pendingProviderDrafts.delete("lutris");
+                        updateDraftStatus();
+                        void loadLutris();
+                    }
+                }, "secondary");
                 const refresh = Amaterasu.button("Refresh now", () => Amaterasu.runAction(refresh, refreshStatus, async () => {
                     const updated = await context.api.post("lutris/refresh");
                     if (!runtimeStatus.isConnected || !lutrisLoads.isCurrent(loaded.generation))
                         return;
                     runtimeStatus.className = updated.last_error ? "error" : "muted";
-                    runtimeStatus.textContent = lutrisStatusDescription(updated);
+                    settingsSetLocalizedTextContent(runtimeStatus, lutrisStatusDescription(updated));
                     context.notify(settingsTextMessage("Lutris refresh requested."));
                 }));
                 refresh.disabled =
                     !context.api.allows("configuration.write") ||
                         !runtime.platform_supported ||
-                        !settings.values.enabled;
+                        !valuesForForm.enabled;
                 enabled.addEventListener("change", () => {
                     refresh.disabled =
                         !context.api.allows("configuration.write") ||
@@ -11407,46 +12435,100 @@ var Amaterasu;
                 });
                 form.append(Amaterasu.field("Enable Lutris discovery", enabled, runtime.platform_supported
                     ? "Controls discovery for the current Linux user."
-                    : "Lutris discovery is available only on Linux; this option cannot be enabled on this platform."), Amaterasu.field("Automatic synchronization", autoSync, "Scan the current user's installed Lutris games automatically."), Amaterasu.field("Remove uninstalled games", removeUninstalled, "After a successful complete scan, remove Lutris-owned games that are no longer installed."), Amaterasu.field("Include matching Steam games", includeSteam, "Read a complete Steam catalog before import; the direct Steam catalog record takes precedence for matching app IDs."), Amaterasu.field("Excluded games (JSON)", exclusions, 'Use a positive decimal ID string or an object with "id", "name", or both. ID takes precedence; name-only entries match without case sensitivity.'), runtimeStatus, saveStatus, Amaterasu.el("div", "actions", save, Amaterasu.badge(settingsTextLiteral(`Revision ${settings.revision}`))));
+                    : "Lutris discovery is available only on Linux; this option cannot be enabled on this platform."), Amaterasu.field("Automatic synchronization", autoSync, "Scan the current user's installed Lutris games automatically."), Amaterasu.field("Remove uninstalled games", removeUninstalled, "After a successful complete scan, remove Lutris-owned games that are no longer installed."), Amaterasu.field("Include matching Steam games", includeSteam, "Read a complete Steam catalog before import; the direct Steam catalog record takes precedence for matching app IDs."), exclusionsField, runtimeStatus, saveStatus, Amaterasu.el("div", "actions", save, cancel, Amaterasu.badge(settingsTextLiteral(`Revision ${settings.revision}`))));
                 form.addEventListener("submit", (event) => {
                     event.preventDefault();
                     void Amaterasu.runAction(save, saveStatus, async () => {
+                        actionInProgress = true;
+                        cancel.disabled = true;
                         lutrisLoads.invalidate();
                         let saveStarted = false;
+                        let requestedValues = null;
                         try {
                             const values = {
                                 enabled: enabled.checked,
                                 auto_sync: autoSync.checked,
                                 autosync_remove_uninstalled: removeUninstalled.checked,
                                 include_steam: includeSteam.checked,
-                                exclude_games: parseLutrisExclusions(exclusions.value),
+                                exclude_games: parseLutrisExclusions(JSON.stringify(exclusions.values())),
                             };
+                            requestedValues = values;
+                            const existingPending = pendingProviderDrafts.get("lutris");
+                            if (existingPending?.overlaps.length && !existingPending.reviewed)
+                                throw new Error("Review overlapping fields before saving again.");
+                            pendingProviderDrafts.set("lutris", {
+                                baseline: settings.values,
+                                submitted: values,
+                                overlaps: [],
+                                reviewed: true,
+                            });
+                            updateDraftStatus();
+                            setSettingsFormDisabled(form, true);
                             saveStarted = true;
                             await saveLutrisSettings(context.api, settings, values);
+                            pendingProviderDrafts.delete("lutris");
+                            updateDraftStatus();
                             await loadLutris();
                             context.notify(settingsTextMessage("Lutris settings saved and confirmed. Scan status is shown below."));
                         }
                         catch (error) {
                             if (saveStarted) {
-                                await loadLutris();
-                                context.notify(error instanceof Amaterasu.ApiError && error.code === "revision_conflict"
-                                    ? settingsTextMessage("Lutris settings changed elsewhere. Review the latest values before saving again.")
-                                    : settingsTextMessage("Lutris save could not be confirmed. Review the latest values before saving again."));
+                                const conflict = error instanceof Amaterasu.ApiError && error.code === "revision_conflict";
+                                const nextDraft = requestedValues ?? undefined;
+                                const notice = conflict
+                                    ? "Settings changed elsewhere. Your draft is preserved; review it before saving again."
+                                    : "Lutris save could not be confirmed. Your submitted draft is preserved for review against the latest saved values.";
+                                await loadLutris(nextDraft, notice);
+                                context.notify(settingsTextMessage(conflict
+                                    ? "Lutris settings changed elsewhere. Your draft is preserved for review."
+                                    : "Lutris save could not be confirmed. Review your preserved draft against the latest saved values before saving again."));
                                 return;
                             }
                             throw error;
+                        }
+                        finally {
+                            actionInProgress = false;
+                            if (form.isConnected)
+                                setSettingsFormDisabled(form, false);
+                            cancel.disabled = false;
                         }
                     });
                 });
                 refreshStatus.className = "muted";
                 lutrisArea.replaceChildren(Amaterasu.panel("Lutris", form, Amaterasu.el("div", "actions", refresh, refreshStatus)));
+                if (draftValues) {
+                    const baseline = drafts?.capture(lutrisArea);
+                    if (baseline)
+                        drafts?.markSaved(baseline);
+                    settingsSetDraftCheckbox(enabled, draftValues.enabled);
+                    settingsSetDraftCheckbox(autoSync, draftValues.auto_sync);
+                    settingsSetDraftCheckbox(removeUninstalled, draftValues.autosync_remove_uninstalled);
+                    settingsSetDraftCheckbox(includeSteam, draftValues.include_steam);
+                    exclusions.setValues(draftValues.exclude_games);
+                    configureProviderConflictReview("lutris", saveStatus, save, (values, fields) => {
+                        const selected = new Set(fields);
+                        if (selected.has("enabled"))
+                            settingsSetDraftCheckbox(enabled, values.enabled);
+                        if (selected.has("auto_sync"))
+                            settingsSetDraftCheckbox(autoSync, values.auto_sync);
+                        if (selected.has("autosync_remove_uninstalled"))
+                            settingsSetDraftCheckbox(removeUninstalled, values.autosync_remove_uninstalled);
+                        if (selected.has("include_steam"))
+                            settingsSetDraftCheckbox(includeSteam, values.include_steam);
+                        if (selected.has("exclude_games"))
+                            exclusions.setValues(values.exclude_games);
+                    });
+                }
             }
             catch (error) {
                 if (context.content.isConnected)
-                    lutrisArea.replaceChildren(Amaterasu.errorPanel(error, loadLutris));
+                    lutrisArea.replaceChildren(Amaterasu.errorPanel(error, () => { void loadLutris(draftValues, draftNotice); }));
             }
         }
-        async function loadPlaynite() {
+        async function loadPlaynite(draftValues, draftNotice) {
+            for (const editor of activePlayniteListEditors)
+                editor.dispose();
+            activePlayniteListEditors = [];
             playniteArea.replaceChildren(Amaterasu.el("p", "muted", "Loading Playnite settings…"));
             try {
                 const loaded = await playniteLoads.read(() => readPlayniteSettings(context.api), () => context.api.post("playnite/status"));
@@ -11455,89 +12537,130 @@ var Amaterasu;
                 const { settings, runtime } = loaded;
                 if (!context.content.isConnected)
                     return;
+                const pendingDraft = pendingProviderDrafts.get("playnite");
+                if (pendingDraft) {
+                    const rebased = rebaseProviderDraft(pendingDraft, settings.values);
+                    pendingDraft.latest = settings.values;
+                    pendingDraft.merged = rebased.merged;
+                    pendingDraft.overlaps = rebased.overlaps;
+                    pendingDraft.reviewed = rebased.overlaps.length === 0;
+                    draftValues = rebased.merged;
+                    draftNotice = rebased.overlaps.length
+                        ? "Conflicting fields need review. Non-overlapping edits were rebased."
+                        : "Settings changed elsewhere. Non-overlapping edits were rebased; review before saving again.";
+                }
+                const valuesForForm = settings.values;
                 const form = Amaterasu.el("form", "settings-form");
                 const enabled = Amaterasu.input("playnite_enabled", "", "checkbox");
-                enabled.checked = settings.values.enabled;
+                enabled.checked = valuesForForm.enabled;
                 const autoSync = Amaterasu.input("playnite_auto_sync", "", "checkbox");
-                autoSync.checked = settings.values.auto_sync;
+                autoSync.checked = valuesForForm.auto_sync;
                 const syncAllInstalled = Amaterasu.input("playnite_sync_all_installed", "", "checkbox");
-                syncAllInstalled.checked = settings.values.sync_all_installed;
+                syncAllInstalled.checked = valuesForForm.sync_all_installed;
                 const removeUninstalled = Amaterasu.input("playnite_autosync_remove_uninstalled", "", "checkbox");
-                removeUninstalled.checked = settings.values.autosync_remove_uninstalled;
-                const deleteAfterDays = Amaterasu.input("playnite_autosync_delete_after_days", String(settings.values.autosync_delete_after_days), "number");
+                removeUninstalled.checked = valuesForForm.autosync_remove_uninstalled;
+                const deleteAfterDays = Amaterasu.input("playnite_autosync_delete_after_days", String(valuesForForm.autosync_delete_after_days), "number");
                 deleteAfterDays.required = true;
                 deleteAfterDays.min = "0";
                 deleteAfterDays.max = "2147483647";
                 deleteAfterDays.step = "1";
                 const requireReplacement = Amaterasu.input("playnite_autosync_require_replacement", "", "checkbox");
-                requireReplacement.checked = settings.values.autosync_require_replacement;
-                const focusAttempts = Amaterasu.input("playnite_focus_attempts", String(settings.values.focus_attempts), "number");
+                requireReplacement.checked = valuesForForm.autosync_require_replacement;
+                const focusAttempts = Amaterasu.input("playnite_focus_attempts", String(valuesForForm.focus_attempts), "number");
                 focusAttempts.required = true;
                 focusAttempts.min = "0";
                 focusAttempts.max = "2147483647";
                 focusAttempts.step = "1";
-                const focusTimeoutSecs = Amaterasu.input("playnite_focus_timeout_secs", String(settings.values.focus_timeout_secs), "number");
+                const focusTimeoutSecs = Amaterasu.input("playnite_focus_timeout_secs", String(valuesForForm.focus_timeout_secs), "number");
                 focusTimeoutSecs.required = true;
                 focusTimeoutSecs.min = "0";
                 focusTimeoutSecs.max = "2147483647";
                 focusTimeoutSecs.step = "1";
                 const focusExitOnFirst = Amaterasu.input("playnite_focus_exit_on_first", "", "checkbox");
-                focusExitOnFirst.checked = settings.values.focus_exit_on_first;
+                focusExitOnFirst.checked = valuesForForm.focus_exit_on_first;
                 const fullscreenEntryEnabled = Amaterasu.input("playnite_fullscreen_entry_enabled", "", "checkbox");
-                fullscreenEntryEnabled.checked = settings.values.fullscreen_entry_enabled;
-                const recentGames = Amaterasu.input("playnite_recent_games", String(settings.values.recent_games), "number");
+                fullscreenEntryEnabled.checked = valuesForForm.fullscreen_entry_enabled;
+                const recentGames = Amaterasu.input("playnite_recent_games", String(valuesForForm.recent_games), "number");
                 recentGames.required = true;
                 recentGames.min = "0";
                 recentGames.max = "10000";
                 recentGames.step = "1";
-                const recentMaxAgeDays = Amaterasu.input("playnite_recent_max_age_days", String(settings.values.recent_max_age_days), "number");
+                const recentMaxAgeDays = Amaterasu.input("playnite_recent_max_age_days", String(valuesForForm.recent_max_age_days), "number");
                 recentMaxAgeDays.required = true;
                 recentMaxAgeDays.min = "0";
                 recentMaxAgeDays.max = "36500";
                 recentMaxAgeDays.step = "1";
-                const filterList = (name, values) => {
-                    const control = Amaterasu.el("textarea");
-                    control.name = name;
-                    control.rows = 5;
-                    control.maxLength = 12_000;
-                    control.spellcheck = false;
-                    control.value = JSON.stringify(values, null, 2);
+                const filterList = (name, label, values) => {
+                    const control = Amaterasu.accessibleListEditor({
+                        label,
+                        description: "Add, edit, or remove list values. Unknown values are kept in their current order.",
+                        values,
+                        maxItems: 256,
+                        formatValue: (value) => value,
+                        parseValue: (value) => parsePlayniteFilterList(JSON.stringify([value]), label)[0],
+                    });
+                    control.element.setAttribute("data-provider-field", name);
+                    activePlayniteListEditors.push(control);
                     return control;
                 };
-                const syncCategories = filterList("playnite_sync_categories", settings.values.sync_categories);
-                const excludeCategories = filterList("playnite_exclude_categories", settings.values.exclude_categories);
-                const syncPlugins = filterList("playnite_sync_plugins", settings.values.sync_plugins);
-                const excludePlugins = filterList("playnite_exclude_plugins", settings.values.exclude_plugins);
-                const excludeGames = filterList("playnite_exclude_games", settings.values.exclude_games);
+                const filterField = (editor) => editor.element;
+                const syncCategories = filterList("playnite_sync_categories", "Included categories", valuesForForm.sync_categories);
+                const excludeCategories = filterList("playnite_exclude_categories", "Excluded categories", valuesForForm.exclude_categories);
+                const syncPlugins = filterList("playnite_sync_plugins", "Included plugin IDs", valuesForForm.sync_plugins);
+                const excludePlugins = filterList("playnite_exclude_plugins", "Excluded plugin IDs", valuesForForm.exclude_plugins);
+                const excludeGames = filterList("playnite_exclude_games", "Excluded game IDs", valuesForForm.exclude_games);
+                let currentRuntime = runtime;
                 const runtimeStatus = Amaterasu.el("p", runtime.last_error ? "error" : "muted", runtime.revision !== settings.revision || runtime.enabled !== settings.values.enabled ||
                     runtime.auto_sync !== settings.values.auto_sync
                     ? "Saved Playnite settings are not yet reflected in runtime status. Refresh to check application."
                     : playniteStatusDescription(runtime));
                 const saveStatus = Amaterasu.el("div");
+                if (draftNotice)
+                    settingsSetLocalizedTextContent(saveStatus, draftNotice);
                 const refreshStatus = Amaterasu.el("div");
                 const save = Amaterasu.el("button", "button primary", "Save Playnite settings");
                 save.type = "submit";
                 save.disabled = !context.api.allows("configuration.write");
+                let actionInProgress = false;
+                const cancel = Amaterasu.button(settingsTextMessage("Cancel"), () => {
+                    if (!actionInProgress) {
+                        pendingProviderDrafts.delete("playnite");
+                        updateDraftStatus();
+                        void loadPlaynite();
+                    }
+                }, "secondary");
                 const refresh = Amaterasu.button("Refresh now", () => Amaterasu.runAction(refresh, refreshStatus, async () => {
                     await context.api.post("playnite/refresh");
+                    const updated = await context.api.post("playnite/status");
+                    if (!runtimeStatus.isConnected)
+                        return;
+                    currentRuntime = updated;
+                    runtimeStatus.className = updated.last_error ? "error" : "muted";
+                    settingsSetLocalizedTextContent(runtimeStatus, updated.revision !== settings.revision || updated.enabled !== settings.values.enabled ||
+                        updated.auto_sync !== settings.values.auto_sync
+                        ? "Saved Playnite settings are not yet reflected in provider status. Refresh to check application."
+                        : playniteStatusDescription(updated));
+                    updateRefreshAvailability();
                     context.notify(settingsTextMessage("Playnite refresh requested."));
-                    await loadPlaynite();
                 }));
                 const updateRefreshAvailability = () => {
                     refresh.disabled =
                         !context.api.allows("configuration.write") ||
                             !enabled.checked ||
-                            !runtime.playnite_running ||
-                            runtime.snapshot_pending;
+                            !currentRuntime.playnite_running ||
+                            currentRuntime.snapshot_pending;
                 };
                 updateRefreshAvailability();
                 enabled.addEventListener("change", updateRefreshAvailability);
-                form.append(Amaterasu.field("Enable Playnite synchronization", enabled, "Controls whether Playnite games are imported. The setting is preserved on hosts where Playnite process discovery is unavailable."), Amaterasu.field("Automatic synchronization", autoSync, "Periodically scan Playnite while its desktop or fullscreen client is running."), Amaterasu.field("Synchronize all installed games", syncAllInstalled, "When off, import recent games plus installed games selected by category or plugin filters."), Amaterasu.field("Remove uninstalled Playnite games", removeUninstalled, "Remove imported games explicitly reported as uninstalled by a complete Playnite snapshot."), Amaterasu.field("Delete expired Playnite games after (days)", deleteAfterDays, "Remove eligible Playnite imports after this age when they have not been played since import. Zero disables this cleanup."), Amaterasu.field("Require a replacement for recent-game cleanup", requireReplacement, "Limit removal of unselected recent imports to the count of newly selected games."), Amaterasu.field("Focus attempts after game start", focusAttempts, "Try to focus the confirmed Playnite game process this many times. Zero disables focus."), Amaterasu.field("Focus timeout (seconds)", focusTimeoutSecs, "Stop trying after this many seconds. Zero disables focus."), Amaterasu.field("Stop focus attempts after first success", focusExitOnFirst, "When enabled, stop retrying once the game is confirmed in the foreground."), Amaterasu.field("Show Playnite Fullscreen in the catalog", fullscreenEntryEnabled, "Add or remove the provider-managed Playnite Fullscreen launch entry. Manual Fullscreen entries remain available."), Amaterasu.field("Recent games to import", recentGames, "Maximum number of recent games (0–10000); zero disables recent-game selection."), Amaterasu.field("Recent game age limit (days)", recentMaxAgeDays, "Ignore recent games older than this age (0–36500); zero disables the age cutoff."), Amaterasu.field("Included categories (JSON)", syncCategories, "Additional installed games whose category matches any listed value; an empty list adds no category matches."), Amaterasu.field("Excluded categories (JSON)", excludeCategories, "Games in these categories are excluded even if another setting would include them."), Amaterasu.field("Included plugin IDs (JSON)", syncPlugins, "Additional installed games from any listed Playnite plugin; an empty list adds no plugin matches."), Amaterasu.field("Excluded plugin IDs (JSON)", excludePlugins, "Games from these plugin IDs are excluded even if another setting would include them."), Amaterasu.field("Excluded game IDs (JSON)", excludeGames, "Game IDs to omit from every import selection."), runtimeStatus, saveStatus, Amaterasu.el("div", "actions", save, Amaterasu.badge(settingsTextLiteral(`Revision ${settings.revision}`))));
+                form.append(Amaterasu.field("Enable Playnite synchronization", enabled, "Controls whether Playnite games are imported. The setting is preserved on hosts where Playnite process discovery is unavailable."), Amaterasu.field("Automatic synchronization", autoSync, "Periodically scan Playnite while its desktop or fullscreen client is running."), Amaterasu.field("Synchronize all installed games", syncAllInstalled, "When off, import recent games plus installed games selected by category or plugin filters."), Amaterasu.field("Remove uninstalled Playnite games", removeUninstalled, "Remove imported games explicitly reported as uninstalled by a complete Playnite snapshot."), Amaterasu.field("Delete expired Playnite games after (days)", deleteAfterDays, "Remove eligible Playnite imports after this age when they have not been played since import. Zero disables this cleanup."), Amaterasu.field("Require a replacement for recent-game cleanup", requireReplacement, "Limit removal of unselected recent imports to the count of newly selected games."), Amaterasu.field("Focus attempts after game start", focusAttempts, "Try to focus the confirmed Playnite game process this many times. Zero disables focus."), Amaterasu.field("Focus timeout (seconds)", focusTimeoutSecs, "Stop trying after this many seconds. Zero disables focus."), Amaterasu.field("Stop focus attempts after first success", focusExitOnFirst, "When enabled, stop retrying once the game is confirmed in the foreground."), Amaterasu.field("Show Playnite Fullscreen in the catalog", fullscreenEntryEnabled, "Add or remove the provider-managed Playnite Fullscreen launch entry. Manual Fullscreen entries remain available."), Amaterasu.field("Recent games to import", recentGames, "Maximum number of recent games (0–10000); zero disables recent-game selection."), Amaterasu.field("Recent game age limit (days)", recentMaxAgeDays, "Ignore recent games older than this age (0–36500); zero disables the age cutoff."), settingsComponentField("Included categories", filterField(syncCategories), "Additional installed games whose category matches any listed value; an empty list adds no category matches."), settingsComponentField("Excluded categories", filterField(excludeCategories), "Games in these categories are excluded even if another setting would include them."), settingsComponentField("Included plugin IDs", filterField(syncPlugins), "Additional installed games from any listed Playnite plugin; an empty list adds no plugin matches."), settingsComponentField("Excluded plugin IDs", filterField(excludePlugins), "Games from these plugin IDs are excluded even if another setting would include them."), settingsComponentField("Excluded game IDs", filterField(excludeGames), "Game IDs to omit from every import selection."), runtimeStatus, saveStatus, Amaterasu.el("div", "actions", save, cancel, Amaterasu.badge(settingsTextLiteral(`Revision ${settings.revision}`))));
                 form.addEventListener("submit", (event) => {
                     event.preventDefault();
                     void Amaterasu.runAction(save, saveStatus, async () => {
+                        actionInProgress = true;
+                        cancel.disabled = true;
                         playniteLoads.invalidate();
                         let saveStarted = false;
+                        let requestedValues = null;
                         try {
                             const values = parsePlayniteSettings({
                                 enabled: enabled.checked,
@@ -11552,38 +12675,117 @@ var Amaterasu;
                                 fullscreen_entry_enabled: fullscreenEntryEnabled.checked,
                                 recent_games: recentGames.valueAsNumber,
                                 recent_max_age_days: recentMaxAgeDays.valueAsNumber,
-                                sync_categories: parsePlayniteFilterList(syncCategories.value, "Sync categories"),
-                                exclude_categories: parsePlayniteFilterList(excludeCategories.value, "Excluded categories"),
-                                sync_plugins: parsePlayniteFilterList(syncPlugins.value, "Sync plugin IDs"),
-                                exclude_plugins: parsePlayniteFilterList(excludePlugins.value, "Excluded plugin IDs"),
-                                exclude_games: parsePlayniteFilterList(excludeGames.value, "Excluded game IDs"),
+                                sync_categories: parsePlayniteFilterList(JSON.stringify(syncCategories.values()), "Sync categories"),
+                                exclude_categories: parsePlayniteFilterList(JSON.stringify(excludeCategories.values()), "Excluded categories"),
+                                sync_plugins: parsePlayniteFilterList(JSON.stringify(syncPlugins.values()), "Sync plugin IDs"),
+                                exclude_plugins: parsePlayniteFilterList(JSON.stringify(excludePlugins.values()), "Excluded plugin IDs"),
+                                exclude_games: parsePlayniteFilterList(JSON.stringify(excludeGames.values()), "Excluded game IDs"),
                             });
+                            requestedValues = values;
+                            const existingPending = pendingProviderDrafts.get("playnite");
+                            if (existingPending?.overlaps.length && !existingPending.reviewed)
+                                throw new Error("Review overlapping fields before saving again.");
+                            pendingProviderDrafts.set("playnite", {
+                                baseline: settings.values,
+                                submitted: values,
+                                overlaps: [],
+                                reviewed: true,
+                            });
+                            updateDraftStatus();
+                            setSettingsFormDisabled(form, true);
                             saveStarted = true;
                             await savePlayniteSettings(context.api, settings, values);
+                            pendingProviderDrafts.delete("playnite");
+                            updateDraftStatus();
                             await loadPlaynite();
                             context.notify(settingsTextMessage("Playnite settings saved and confirmed. Runtime status is shown below."));
                         }
                         catch (error) {
                             if (error instanceof Amaterasu.ApiError && error.code === "revision_conflict") {
-                                context.notify(settingsTextMessage("Playnite settings changed elsewhere. The latest values have been reloaded."));
-                                await loadPlaynite();
+                                await loadPlaynite(requestedValues ?? undefined, "Settings changed elsewhere. Your draft is preserved; review it before saving again.");
+                                context.notify(settingsTextMessage("Playnite settings changed elsewhere. Your draft is preserved for review."));
                                 return;
                             }
                             if (saveStarted) {
-                                await loadPlaynite();
-                                context.notify(settingsTextMessage("Playnite save could not be confirmed. Review the latest values before saving again."));
+                                await loadPlaynite(requestedValues ?? undefined, "Playnite save could not be confirmed. Your draft is preserved for review against the latest saved values.");
+                                context.notify(settingsTextMessage("Playnite save could not be confirmed. Review your preserved draft against the latest saved values before saving again."));
                                 return;
                             }
                             throw error;
+                        }
+                        finally {
+                            actionInProgress = false;
+                            if (form.isConnected)
+                                setSettingsFormDisabled(form, false);
+                            cancel.disabled = false;
                         }
                     });
                 });
                 refreshStatus.className = "muted";
                 playniteArea.replaceChildren(Amaterasu.panel("Playnite", form, Amaterasu.el("div", "actions", refresh, refreshStatus)));
+                if (draftValues) {
+                    const baseline = drafts?.capture(playniteArea);
+                    if (baseline)
+                        drafts?.markSaved(baseline);
+                    settingsSetDraftCheckbox(enabled, draftValues.enabled);
+                    settingsSetDraftCheckbox(autoSync, draftValues.auto_sync);
+                    settingsSetDraftCheckbox(syncAllInstalled, draftValues.sync_all_installed);
+                    settingsSetDraftCheckbox(removeUninstalled, draftValues.autosync_remove_uninstalled);
+                    settingsSetDraftNumber(deleteAfterDays, draftValues.autosync_delete_after_days);
+                    settingsSetDraftCheckbox(requireReplacement, draftValues.autosync_require_replacement);
+                    settingsSetDraftNumber(focusAttempts, draftValues.focus_attempts);
+                    settingsSetDraftNumber(focusTimeoutSecs, draftValues.focus_timeout_secs);
+                    settingsSetDraftCheckbox(focusExitOnFirst, draftValues.focus_exit_on_first);
+                    settingsSetDraftCheckbox(fullscreenEntryEnabled, draftValues.fullscreen_entry_enabled);
+                    settingsSetDraftNumber(recentGames, draftValues.recent_games);
+                    settingsSetDraftNumber(recentMaxAgeDays, draftValues.recent_max_age_days);
+                    syncCategories.setValues(draftValues.sync_categories);
+                    excludeCategories.setValues(draftValues.exclude_categories);
+                    syncPlugins.setValues(draftValues.sync_plugins);
+                    excludePlugins.setValues(draftValues.exclude_plugins);
+                    excludeGames.setValues(draftValues.exclude_games);
+                    configureProviderConflictReview("playnite", saveStatus, save, (values, fields) => {
+                        const selected = new Set(fields);
+                        if (selected.has("enabled"))
+                            settingsSetDraftCheckbox(enabled, values.enabled);
+                        if (selected.has("auto_sync"))
+                            settingsSetDraftCheckbox(autoSync, values.auto_sync);
+                        if (selected.has("sync_all_installed"))
+                            settingsSetDraftCheckbox(syncAllInstalled, values.sync_all_installed);
+                        if (selected.has("autosync_remove_uninstalled"))
+                            settingsSetDraftCheckbox(removeUninstalled, values.autosync_remove_uninstalled);
+                        if (selected.has("autosync_delete_after_days"))
+                            settingsSetDraftNumber(deleteAfterDays, values.autosync_delete_after_days);
+                        if (selected.has("autosync_require_replacement"))
+                            settingsSetDraftCheckbox(requireReplacement, values.autosync_require_replacement);
+                        if (selected.has("focus_attempts"))
+                            settingsSetDraftNumber(focusAttempts, values.focus_attempts);
+                        if (selected.has("focus_timeout_secs"))
+                            settingsSetDraftNumber(focusTimeoutSecs, values.focus_timeout_secs);
+                        if (selected.has("focus_exit_on_first"))
+                            settingsSetDraftCheckbox(focusExitOnFirst, values.focus_exit_on_first);
+                        if (selected.has("fullscreen_entry_enabled"))
+                            settingsSetDraftCheckbox(fullscreenEntryEnabled, values.fullscreen_entry_enabled);
+                        if (selected.has("recent_games"))
+                            settingsSetDraftNumber(recentGames, values.recent_games);
+                        if (selected.has("recent_max_age_days"))
+                            settingsSetDraftNumber(recentMaxAgeDays, values.recent_max_age_days);
+                        if (selected.has("sync_categories"))
+                            syncCategories.setValues(values.sync_categories);
+                        if (selected.has("exclude_categories"))
+                            excludeCategories.setValues(values.exclude_categories);
+                        if (selected.has("sync_plugins"))
+                            syncPlugins.setValues(values.sync_plugins);
+                        if (selected.has("exclude_plugins"))
+                            excludePlugins.setValues(values.exclude_plugins);
+                        if (selected.has("exclude_games"))
+                            excludeGames.setValues(values.exclude_games);
+                    });
+                }
             }
             catch (error) {
                 if (context.content.isConnected)
-                    playniteArea.replaceChildren(Amaterasu.errorPanel(error, loadPlaynite));
+                    playniteArea.replaceChildren(Amaterasu.errorPanel(error, () => { void loadPlaynite(draftValues, draftNotice); }));
             }
         }
         async function loadHistorySettings() {
@@ -11741,17 +12943,16 @@ var Amaterasu;
                 const status = await context.api.post("steam/status");
                 if (!target.isConnected || !steamLoads.isCurrent(generation))
                     return;
-                target.textContent = status.settings_ready && status.enabled !== settings.values.enabled
+                settingsSetLocalizedTextContent(target, status.settings_ready && status.enabled !== settings.values.enabled
                     ? "Saved Steam discovery setting is not yet reflected in provider status. Refresh to check application."
-                    : steamStatusDescription(status);
+                    : steamStatusDescription(status));
             }
             catch (error) {
                 if (!target.isConnected || !steamLoads.isCurrent(generation))
                     return;
-                target.textContent =
-                    error instanceof Amaterasu.ApiError && error.code === "forbidden"
-                        ? "Runtime status requires steam.read; settings remain available with configuration access."
-                        : "Current provider status is unavailable; settings remain editable.";
+                settingsSetLocalizedTextContent(target, error instanceof Amaterasu.ApiError && error.code === "forbidden"
+                    ? "Runtime status requires steam.read; settings remain available with configuration access."
+                    : "Current provider status is unavailable; settings remain editable.");
             }
         }
         async function loadHost() {
