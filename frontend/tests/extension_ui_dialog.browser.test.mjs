@@ -356,6 +356,66 @@ test("Chromium scopes method=dialog to the owning nested dialog and closes child
   await cdp.evaluate("window.__inner.dispose(); window.__outer.dispose(); true");
 });
 
+
+
+test("Chromium keeps explicit closes pending when a canceled submit closes the dialog", async t => {
+  if (!browser) return t.skip("Chromium browser setup unavailable.");
+  const {cdp} = browser;
+  await cdp.evaluate(`window.__reset(); window.__reasons=[];
+    window.__opener=document.createElement("button"); window.__mount.append(window.__opener);
+    window.__form=document.createElement("form"); window.__form.method="dialog";
+    window.__submit=document.createElement("button"); window.__submit.type="submit"; window.__submit.value="submit-value";
+    window.__form.append(window.__submit);
+    window.__dialog=window.__ui.dialog({title:"Close during submit",content:window.__form,onClose:reason=>window.__reasons.push(reason)});
+    window.__mount.append(window.__dialog.element); window.__opener.focus(); window.__dialog.open();
+    window.__form.addEventListener("submit", event=>{event.preventDefault(); window.__dialog.element.close("plugin-value");});
+    window.__form.requestSubmit(window.__submit); window.__dialog.open(); true`);
+  assert.equal(await cdp.evaluate("window.__dialog.element.open"), false);
+  await tick();
+  assert.deepEqual(await cdp.evaluate("window.__reasons"), ["close"]);
+  assert.equal(await cdp.evaluate("window.__dialog.element.returnValue"), "plugin-value");
+  assert.equal(await cdp.evaluate("document.activeElement === window.__opener"), true);
+  await cdp.evaluate("window.__dialog.open(); true");
+  assert.equal(await cdp.evaluate("window.__dialog.element.open"), true);
+  await cdp.evaluate("window.__dialog.dispose(); true");
+});
+
+test("Chromium closes nested dialogs on native parent form close without stale focus suppression", async t => {
+  if (!browser) return t.skip("Chromium browser setup unavailable.");
+  const {cdp} = browser;
+  await cdp.evaluate(`window.__reset(); window.__reasons=[];
+    window.__outerOpener=document.createElement("button"); window.__mount.append(window.__outerOpener);
+    window.__form=document.createElement("form"); window.__form.method="dialog";
+    window.__submit=document.createElement("button"); window.__submit.type="submit"; window.__submit.value="parent-submit";
+    window.__trigger=document.createElement("button"); window.__trigger.type="button"; window.__trigger.textContent="Open child";
+    window.__form.append(window.__submit,window.__trigger);
+    window.__outer=window.__ui.dialog({title:"Form parent",content:window.__form,onClose:reason=>window.__reasons.push("outer:"+reason)});
+    window.__inner=window.__ui.dialog({title:"Child",content:"Child",onClose:reason=>window.__reasons.push("inner:"+reason)});
+    window.__form.append(window.__inner.element); window.__mount.append(window.__outer.element);
+    window.__trigger.addEventListener("click",()=>window.__inner.open());
+    window.__outerOpener.focus(); window.__outer.open(); window.__inner.open();
+    window.__form.requestSubmit(window.__submit); true`);
+  assert.equal(await cdp.evaluate("window.__outer.element.open"), false);
+  assert.equal(await cdp.evaluate("window.__inner.element.open"), false);
+  await tick();
+  assert.equal(await cdp.evaluate("window.__outer.element.returnValue"), "parent-submit");
+  assert.deepEqual(await cdp.evaluate("window.__reasons"), ["outer:close", "inner:close"]);
+  assert.equal(await cdp.evaluate("document.activeElement === window.__outerOpener"), true);
+
+  // A later parent close must not leave a suppression flag on an already closed child.
+  await cdp.evaluate("window.__outer.open(); window.__trigger.focus(); window.__inner.open(); window.__inner.close(); true");
+  await tick();
+  assert.equal(await cdp.evaluate("document.activeElement === window.__trigger"), true);
+  await cdp.evaluate("window.__outer.close(); true");
+  await tick();
+  assert.equal(await cdp.evaluate("document.activeElement === window.__outerOpener"), true);
+  await cdp.evaluate("window.__outer.open(); window.__trigger.focus(); window.__inner.open(); window.__inner.close(); true");
+  await tick();
+  assert.equal(await cdp.evaluate("document.activeElement === window.__trigger"), true);
+  assert.deepEqual(await cdp.evaluate("window.__reasons"), ["outer:close", "inner:close", "inner:close", "outer:close", "inner:close"]);
+  await cdp.evaluate("window.__inner.dispose(); window.__outer.dispose(); true");
+});
+
 test("Chromium always completes disposal when an onClose callback throws", async t => {
   if (!browser) return t.skip("Chromium browser setup unavailable.");
   const {cdp} = browser;

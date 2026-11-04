@@ -21124,8 +21124,15 @@ var Amaterasu;
                     element.close(returnValue ?? reason);
                 };
                 const closeFromParent = () => {
-                    suppressFocusReturn = true;
-                    closeDialog("close");
+                    if (disposed || signal.aborted)
+                        return;
+                    if (element.open) {
+                        suppressFocusReturn = true;
+                        closeDialog("close");
+                    }
+                    else if (closeEventPending) {
+                        suppressFocusReturn = true;
+                    }
                 };
                 const onCancel = (event) => {
                     event.preventDefault();
@@ -21179,9 +21186,12 @@ var Amaterasu;
                     queueMicrotask(() => {
                         if (disposed || signal.aborted)
                             return;
-                        if (event.defaultPrevented || element.open) {
+                        if (element.open) {
                             pendingCloseReason = null;
                             closeEventPending = false;
+                        }
+                        else {
+                            closeNestedDialogs();
                         }
                     });
                 };

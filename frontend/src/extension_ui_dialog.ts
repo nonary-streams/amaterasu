@@ -135,8 +135,13 @@ namespace Amaterasu {
           element.close(returnValue ?? reason);
         };
         const closeFromParent = (): void => {
-          suppressFocusReturn = true;
-          closeDialog("close");
+          if (disposed || signal.aborted) return;
+          if (element.open) {
+            suppressFocusReturn = true;
+            closeDialog("close");
+          } else if (closeEventPending) {
+            suppressFocusReturn = true;
+          }
         };
         const onCancel = (event: Event): void => {
           event.preventDefault();
@@ -183,9 +188,11 @@ namespace Amaterasu {
           closeEventPending = true;
           queueMicrotask(() => {
             if (disposed || signal.aborted) return;
-            if (event.defaultPrevented || element.open) {
+            if (element.open) {
               pendingCloseReason = null;
               closeEventPending = false;
+            } else {
+              closeNestedDialogs();
             }
           });
         };
