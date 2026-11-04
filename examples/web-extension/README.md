@@ -118,3 +118,15 @@ the host is stopped. When revoking an extension, remove its local entry and any
 no-longer-needed grants; close open browser tabs because already loaded trusted
 JavaScript cannot be recalled from them. Advance the authentication policy
 generation when changing scopes or administrator principals.
+
+## Component showcase
+
+The `showcase.js` page consumes the versioned `sdk.ui` controls and displays
+light and dark semantic theme samples, button and field states, keyboard tabs,
+status and alert panels, a native dialog, and a responsive table. Page styles
+use host semantic theme tokens. The showcase is an extension consumer and does
+not replace or modify shared controls. To package it, copy only `showcase.js` into
+a clean source directory and use the `amaterasu-web-extension pack` workflow
+above with ID `showcase`, title `UI Elements`, entrypoint `showcase.js`, and no
+method declarations. Stage and approve the signed extension through the normal
+host workflow before opening it.
