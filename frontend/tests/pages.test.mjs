@@ -9,6 +9,7 @@ class FakeElement {
     this.tagName = tagName.toLowerCase();
     this.children = [];
     this.listeners = new Map();
+    this.attributes = new Map();
     this.isConnected = false;
   }
 
@@ -39,7 +40,7 @@ class FakeElement {
     this.listeners.set(event, listener);
   }
 
-  setAttribute() {}
+  setAttribute(name, value) { this.attributes.set(name, value); }
 
   click() {
     this.listeners.get("click")?.();
@@ -148,9 +149,14 @@ test("overview reports partial service failures and only offers permitted action
   pages.renderOverview({ content, api, navigate: (page) => navigated.push(page), notify() {} });
   await new Promise((resolve) => setImmediate(resolve));
   assert.match(content.textContent, /Some information is unavailable/);
+  assert.match(content.textContent, /MANAGEMENT SERVICE ACCESS/);
+  assert.doesNotMatch(content.textContent, /Services responding/);
   assert.match(content.textContent, /Not available to this account/);
   const descendants = (node) => [node, ...node.children.flatMap((child) =>
     child instanceof FakeElement ? descendants(child) : [])];
+  const managementStatus = descendants(content).find((node) => node.className === "overview-status");
+  assert.equal(managementStatus.attributes.get("role"), "status");
+  assert.equal(managementStatus.attributes.get("aria-live"), "polite");
   const actions = descendants(content).filter((node) => node.className === "button quick-action");
   assert.equal(actions.length, 1);
   assert.match(actions[0].textContent, /Library/);
@@ -212,6 +218,11 @@ test("overview presents reported stream activity without treating it as client d
   assert.match(content.textContent, /Launch tracking is degraded/);
   assert.match(content.textContent, /Client media delivery is not verified/);
   assert.match(content.textContent, /Host measurements require configuration.read and diagnostics.read/);
+  const descendants = (node) => [node, ...node.children.flatMap((child) =>
+    child instanceof FakeElement ? descendants(child) : [])];
+  const activitySummary = descendants(content).find((node) => node.className === "overview-activity-summary")?.children[0];
+  assert.equal(activitySummary.attributes.get("role"), "status");
+  assert.equal(activitySummary.attributes.get("aria-live"), "polite");
   findButton(content, "View sessions").click();
   assert.deepEqual(navigated, ["sessions"]);
 });

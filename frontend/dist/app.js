@@ -13822,9 +13822,9 @@ var Amaterasu;
                 ? "Scanning local libraries"
                 : "Latest provider scan");
             const available = snapshots.filter((snapshot) => snapshot.status === "fulfilled").length;
-            const status = Amaterasu.el("section", "overview-status", Amaterasu.el("div", "overview-status-icon", available === snapshots.length ? "✓" : "!"), Amaterasu.el("div", "overview-status-copy", Amaterasu.el("p", "overview-status-label", "SERVICE ACCESS"), Amaterasu.el("h2", "", available === snapshots.length ? "Services responding" : "Some information is unavailable"), Amaterasu.el("p", "muted", available === snapshots.length
-                ? "Catalog, session coordination, applications, and Steam responded to the latest refresh."
-                : "Some service requests could not be completed. Check service access below for details.")));
+            const status = Amaterasu.el("section", "overview-status", Amaterasu.el("div", "overview-status-icon", available === snapshots.length ? "✓" : "!"), Amaterasu.el("div", "overview-status-copy", Amaterasu.el("p", "overview-status-label", "MANAGEMENT SERVICE ACCESS"), Amaterasu.el("h2", "", available === snapshots.length ? "Management services responding" : "Some information is unavailable"), Amaterasu.el("p", "muted", available === snapshots.length
+                ? "Catalog, session coordination, applications, and Steam responded to the latest refresh. This does not indicate stream readiness."
+                : "Some management requests could not be completed. Check service access below for details.")));
             const quickActions = Amaterasu.el("div", "quick-actions");
             for (const [page, label, detail, scope] of [
                 ["host", "Host & devices", "Review pairing and host services", "configuration.read"],
@@ -13847,6 +13847,9 @@ var Amaterasu;
                     ? Amaterasu.messageOf(snapshot.reason)
                     : pagesTextMessage("Responded to the latest refresh"),
             ]);
+            status.setAttribute("role", "status");
+            status.setAttribute("aria-live", "polite");
+            status.setAttribute("aria-atomic", "true");
             const details = Amaterasu.el("div", "overview-details", Amaterasu.panel("Service access", Amaterasu.table(["Service", "Status", "Details"], serviceRows)));
             if (quickActions.hasChildNodes())
                 details.append(Amaterasu.panel("Quick actions", quickActions));
@@ -13861,6 +13864,9 @@ var Amaterasu;
             return () => { };
         }
         const summary = Amaterasu.el("strong", "", "Loading host stream activity…");
+        summary.setAttribute("role", "status");
+        summary.setAttribute("aria-live", "polite");
+        summary.setAttribute("aria-atomic", "true");
         const launchStatus = Amaterasu.el("p", "muted");
         const observation = Amaterasu.el("p", "muted");
         const icon = Amaterasu.el("div", "overview-status-icon", "↗");
@@ -17444,6 +17450,9 @@ var Amaterasu;
             setupPassword.required = true;
             setupPassword.autocomplete = "new-password";
             const setupStatus = Amaterasu.el("div");
+            setupStatus.setAttribute("role", "status");
+            setupStatus.setAttribute("aria-live", "polite");
+            setupStatus.setAttribute("aria-atomic", "true");
             const setupSubmit = Amaterasu.el("button", "button primary", "Create administrator");
             setupSubmit.type = "submit";
             const setupForm = Amaterasu.el("form", "settings-form", Amaterasu.field("Code shown on the host", setupCode), Amaterasu.field("Username", setupUsername), Amaterasu.field("Password", setupPassword), setupSubmit, setupStatus);
