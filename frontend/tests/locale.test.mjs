@@ -264,6 +264,12 @@ test("product, catalog, settings, updater, and notice messages cover every trans
     "System tray",
     "No active streams",
     "No paired clients",
+    "Search paired clients",
+    "Sort by",
+    "Recently paired",
+    "No paired clients match this search.",
+    "Showing {visible} of {total} paired client",
+    "Showing {visible} of {total} paired clients",
     "No diagnostic records",
     "Search names, descriptions, tags",
     "Absolute application path",
@@ -333,6 +339,12 @@ test("locale changes translate existing UI text nodes and the browser title", ()
   });
   vm.runInContext(localeSource, runtimeContext);
   vm.runInContext(uiSource, runtimeContext);
+  vm.runInContext(
+    ts.transpile(readFileSync("src/client_directory.ts", "utf8"), {
+      target: ts.ScriptTarget.ES2022,
+    }),
+    runtimeContext,
+  );
   runtimeContext.Amaterasu.setLocalizedPageTitle("Overview");
   const heading = runtimeContext.Amaterasu.el("h1", "", "Overview");
   const literalHeading = runtimeContext.Amaterasu.el(
@@ -359,6 +371,11 @@ test("locale changes translate existing UI text nodes and the browser title", ()
       client: runtimeContext.Amaterasu.literalText("Overview"),
     },
   );
+  const clientDirectory = runtimeContext.Amaterasu.createClientDirectory([
+    { key: "a", name: "Living room", searchText: "Living room living-room", pairedAt: 10, card: new FakeElement("article") },
+    { key: "b", name: "Desk", searchText: "Desk desk", pairedAt: 20, card: new FakeElement("article") },
+  ]);
+  const clientDirectoryRoot = clientDirectory.element;
   const date = new Date(Date.UTC(2024, 0, 2, 15, 4));
   const localizedDate = runtimeContext.Amaterasu.localeFormattedTextNode(
     (locale) => date.toLocaleString(locale),
@@ -371,6 +388,7 @@ test("locale changes translate existing UI text nodes and the browser title", ()
   root.append(asyncStatus);
   root.append(menu);
   root.append(clientOverride);
+  root.append(clientDirectoryRoot);
   root.append(dateLabel);
   const textNode = heading.children[0];
   const literalTextNode = literalHeading.children[0];
@@ -384,6 +402,19 @@ test("locale changes translate existing UI text nodes and the browser title", ()
   assert.equal(menu.getAttribute("aria-label"), "Toggle navigation");
   assert.equal(clientOverride.getAttribute("aria-label"), "FEC percentage override for Overview");
   assert.equal(dateTextNode.nodeValue, date.toLocaleString("en"));
+  const directoryText = (node) => (node.children ?? [])
+    .map((child) => child.nodeValue ?? directoryText(child))
+    .join("");
+  const searchLabel = clientDirectoryRoot.findByClass("field-label");
+  const directoryCount = clientDirectoryRoot.children[0].children[2];
+  const directoryEmpty = clientDirectoryRoot.children[1];
+  const sortOption = clientDirectoryRoot.children[0].children[1].children[1].children[0];
+  assert.equal(directoryText(searchLabel), "Search paired clients");
+  assert.equal(directoryText(sortOption), "Recently paired");
+  assert.equal(directoryText(directoryCount), "Showing 2 of 2 paired clients");
+  clientDirectory.search.value = "missing";
+  clientDirectory.search.dispatch("input");
+  assert.equal(directoryText(directoryEmpty), "No paired clients match this search.");
   runtimeContext.Amaterasu.applyLocale("de");
   assert.equal(textNode.nodeValue, "Übersicht");
   assert.equal(literalTextNode.nodeValue, "Overview");
@@ -398,6 +429,11 @@ test("locale changes translate existing UI text nodes and the browser title", ()
     `${locale.translateLocaleMessage("FEC percentage", locale.localeMessagesFor("de"))} für Overview überschreiben`,
   );
   assert.equal(dateTextNode.nodeValue, date.toLocaleString("de"));
+  assert.equal(directoryText(searchLabel), "Gekoppelte Clients suchen");
+  assert.equal(directoryText(sortOption), "Zuletzt gekoppelt");
+  assert.equal(directoryCount.children[0].nodeValue, "0 von 2 gekoppelten Clients werden angezeigt");
+  assert.equal(directoryText(directoryEmpty), "Keine gekoppelten Clients entsprechen dieser Suche.");
+  assert.equal(clientDirectory.search.getAttribute("placeholder"), "Gekoppelte Clients suchen");
   assert.equal(document.documentElement.lang, "de");
   assert.equal(document.title, "Übersicht · Amaterasu");
 
@@ -409,6 +445,10 @@ test("locale changes translate existing UI text nodes and the browser title", ()
   assert.equal(menu.getAttribute("aria-label"), "Toggle navigation");
   assert.equal(clientOverride.getAttribute("aria-label"), "FEC percentage override for Overview");
   assert.equal(dateTextNode.nodeValue, date.toLocaleString("en"));
+  assert.equal(directoryText(searchLabel), "Search paired clients");
+  assert.equal(directoryCount.children[0].nodeValue, "Showing 0 of 2 paired clients");
+  assert.equal(directoryText(directoryEmpty), "No paired clients match this search.");
+  assert.equal(clientDirectory.search.getAttribute("placeholder"), "Search paired clients");
   assert.equal(document.title, "Overview · Amaterasu");
 });
 

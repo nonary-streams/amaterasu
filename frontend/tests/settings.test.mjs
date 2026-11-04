@@ -2441,7 +2441,7 @@ test("paired-client form preserves drafts on conflict and opaque fields after re
   assert.equal(find(pairingArea, (node) => node.name === `fec_${"b".repeat(64)}`), remainingDraft);
   assert.equal(remainingDraft.value, "42");
   assert.match(pairingArea.textContent, /Revision 10/);
-  assert.match(pairingArea.textContent, /1 of 1 paired clients/);
+  assert.match(pairingArea.textContent, /1 of 1 paired clients?/);
   const remainingRemove = find(pairingArea, (node) => node.tagName === "button" && node.textContent === "Remove device");
   remainingRemove.fire("click");
   await new Promise(setImmediate);

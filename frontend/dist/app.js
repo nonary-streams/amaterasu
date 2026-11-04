@@ -2163,6 +2163,122 @@ var Amaterasu;
             "工作區", "開發預覽版", "本地主機管理主控台", "串流功能仍在開發中。", "切換導覽選單",
         ],
     };
+    const pairedClientTranslations = {
+        bg: {
+            "Search paired clients": "Търсене на сдвоени клиенти", "Sort by": "Сортиране по",
+            "Recently paired": "Наскоро сдвоени", "No paired clients match this search.": "Няма сдвоени клиенти, отговарящи на търсенето.",
+            "Showing {visible} of {total} paired client": "Показване на {visible} от {total} сдвоен клиент",
+            "Showing {visible} of {total} paired clients": "Показване на {visible} от {total} сдвоени клиенти",
+        },
+        cs: {
+            "Search paired clients": "Hledat spárované klienty", "Sort by": "Řadit podle",
+            "Recently paired": "Nedávno spárovaní", "No paired clients match this search.": "Hledání neodpovídají žádní spárovaní klienti.",
+            "Showing {visible} of {total} paired client": "Zobrazen {visible} z {total} spárovaného klienta",
+            "Showing {visible} of {total} paired clients": "Zobrazeno {visible} z {total} spárovaných klientů",
+        },
+        de: {
+            "Search paired clients": "Gekoppelte Clients suchen", "Sort by": "Sortieren nach",
+            "Recently paired": "Zuletzt gekoppelt", "No paired clients match this search.": "Keine gekoppelten Clients entsprechen dieser Suche.",
+            "Showing {visible} of {total} paired client": "{visible} von {total} gekoppelten Clients werden angezeigt",
+            "Showing {visible} of {total} paired clients": "{visible} von {total} gekoppelten Clients werden angezeigt",
+        },
+        es: {
+            "Search paired clients": "Buscar clientes emparejados", "Sort by": "Ordenar por",
+            "Recently paired": "Emparejados recientemente", "No paired clients match this search.": "Ningún cliente emparejado coincide con esta búsqueda.",
+            "Showing {visible} of {total} paired client": "Se muestra {visible} de {total} cliente emparejado",
+            "Showing {visible} of {total} paired clients": "Se muestran {visible} de {total} clientes emparejados",
+        },
+        fr: {
+            "Search paired clients": "Rechercher des clients associés", "Sort by": "Trier par",
+            "Recently paired": "Associés récemment", "No paired clients match this search.": "Aucun client associé ne correspond à cette recherche.",
+            "Showing {visible} of {total} paired client": "Affichage de {visible} sur {total} client associé",
+            "Showing {visible} of {total} paired clients": "Affichage de {visible} sur {total} clients associés",
+        },
+        hu: {
+            "Search paired clients": "Párosított kliensek keresése", "Sort by": "Rendezés",
+            "Recently paired": "Legutóbb párosított", "No paired clients match this search.": "Nincs a keresésnek megfelelő párosított kliens.",
+            "Showing {visible} of {total} paired client": "{visible}/{total} párosított kliens megjelenítve",
+            "Showing {visible} of {total} paired clients": "{visible}/{total} párosított kliens megjelenítve",
+        },
+        it: {
+            "Search paired clients": "Cerca client associati", "Sort by": "Ordina per",
+            "Recently paired": "Associati di recente", "No paired clients match this search.": "Nessun client associato corrisponde alla ricerca.",
+            "Showing {visible} of {total} paired client": "Visualizzazione di {visible} client associato su {total}",
+            "Showing {visible} of {total} paired clients": "Visualizzazione di {visible} client associati su {total}",
+        },
+        ja: {
+            "Search paired clients": "ペアリング済みクライアントを検索", "Sort by": "並べ替え",
+            "Recently paired": "最近ペアリングした順", "No paired clients match this search.": "検索に一致するペアリング済みクライアントはありません。",
+            "Showing {visible} of {total} paired client": "{total} 台中 {visible} 台のペアリング済みクライアントを表示",
+            "Showing {visible} of {total} paired clients": "{total} 台中 {visible} 台のペアリング済みクライアントを表示",
+        },
+        ko: {
+            "Search paired clients": "페어링된 클라이언트 검색", "Sort by": "정렬 기준",
+            "Recently paired": "최근 페어링 순", "No paired clients match this search.": "검색과 일치하는 페어링된 클라이언트가 없습니다.",
+            "Showing {visible} of {total} paired client": "{total}개 중 {visible}개의 페어링된 클라이언트 표시",
+            "Showing {visible} of {total} paired clients": "{total}개 중 {visible}개의 페어링된 클라이언트 표시",
+        },
+        pl: {
+            "Search paired clients": "Szukaj sparowanych klientów", "Sort by": "Sortuj według",
+            "Recently paired": "Ostatnio sparowani", "No paired clients match this search.": "Brak sparowanych klientów pasujących do wyszukiwania.",
+            "Showing {visible} of {total} paired client": "Wyświetlanie {visible} z {total} sparowanego klienta",
+            "Showing {visible} of {total} paired clients": "Wyświetlanie {visible} z {total} sparowanych klientów",
+        },
+        pt: {
+            "Search paired clients": "Pesquisar clientes emparelhados", "Sort by": "Ordenar por",
+            "Recently paired": "Emparelhados recentemente", "No paired clients match this search.": "Nenhum cliente emparelhado corresponde a esta pesquisa.",
+            "Showing {visible} of {total} paired client": "A mostrar {visible} de {total} cliente emparelhado",
+            "Showing {visible} of {total} paired clients": "A mostrar {visible} de {total} clientes emparelhados",
+        },
+        pt_BR: {
+            "Search paired clients": "Buscar clientes pareados", "Sort by": "Ordenar por",
+            "Recently paired": "Pareados recentemente", "No paired clients match this search.": "Nenhum cliente pareado corresponde a esta busca.",
+            "Showing {visible} of {total} paired client": "Exibindo {visible} de {total} cliente pareado",
+            "Showing {visible} of {total} paired clients": "Exibindo {visible} de {total} clientes pareados",
+        },
+        ru: {
+            "Search paired clients": "Поиск сопряжённых клиентов", "Sort by": "Сортировать по",
+            "Recently paired": "Недавно сопряжённые", "No paired clients match this search.": "Нет сопряжённых клиентов, соответствующих запросу.",
+            "Showing {visible} of {total} paired client": "Показано {visible} из {total} сопряжённых клиентов",
+            "Showing {visible} of {total} paired clients": "Показано {visible} из {total} сопряжённых клиентов",
+        },
+        sv: {
+            "Search paired clients": "Sök parkopplade klienter", "Sort by": "Sortera efter",
+            "Recently paired": "Nyligen parkopplade", "No paired clients match this search.": "Inga parkopplade klienter matchar sökningen.",
+            "Showing {visible} of {total} paired client": "Visar {visible} av {total} parkopplad klient",
+            "Showing {visible} of {total} paired clients": "Visar {visible} av {total} parkopplade klienter",
+        },
+        tr: {
+            "Search paired clients": "Eşleştirilmiş istemcileri ara", "Sort by": "Sıralama ölçütü",
+            "Recently paired": "Son eşleştirilenler", "No paired clients match this search.": "Bu aramayla eşleşen eşleştirilmiş istemci yok.",
+            "Showing {visible} of {total} paired client": "{total} eşleştirilmiş istemciden {visible} tanesi gösteriliyor",
+            "Showing {visible} of {total} paired clients": "{total} eşleştirilmiş istemciden {visible} tanesi gösteriliyor",
+        },
+        uk: {
+            "Search paired clients": "Шукати сполучені клієнти", "Sort by": "Сортувати за",
+            "Recently paired": "Нещодавно сполучені", "No paired clients match this search.": "Немає сполучених клієнтів, що відповідають запиту.",
+            "Showing {visible} of {total} paired client": "Показано {visible} з {total} сполученого клієнта",
+            "Showing {visible} of {total} paired clients": "Показано {visible} з {total} сполучених клієнтів",
+        },
+        vi: {
+            "Search paired clients": "Tìm ứng dụng khách đã ghép nối", "Sort by": "Sắp xếp theo",
+            "Recently paired": "Được ghép nối gần đây", "No paired clients match this search.": "Không có ứng dụng khách đã ghép nối nào khớp với tìm kiếm.",
+            "Showing {visible} of {total} paired client": "Đang hiển thị {visible}/{total} ứng dụng khách đã ghép nối",
+            "Showing {visible} of {total} paired clients": "Đang hiển thị {visible}/{total} ứng dụng khách đã ghép nối",
+        },
+        zh: {
+            "Search paired clients": "搜索已配对客户端", "Sort by": "排序方式",
+            "Recently paired": "最近配对", "No paired clients match this search.": "没有符合此搜索条件的已配对客户端。",
+            "Showing {visible} of {total} paired client": "显示 {total} 个已配对客户端中的 {visible} 个",
+            "Showing {visible} of {total} paired clients": "显示 {total} 个已配对客户端中的 {visible} 个",
+        },
+        zh_TW: {
+            "Search paired clients": "搜尋已配對的用戶端", "Sort by": "排序依據",
+            "Recently paired": "最近配對", "No paired clients match this search.": "沒有符合此搜尋條件的已配對用戶端。",
+            "Showing {visible} of {total} paired client": "顯示 {total} 個已配對用戶端中的 {visible} 個",
+            "Showing {visible} of {total} paired clients": "顯示 {total} 個已配對用戶端中的 {visible} 個",
+        },
+    };
     const productTranslations = {
         bg: {
             "Host overview": "Общ преглед на хоста", "Your host, your library": "Вашият хост, вашата библиотека",
@@ -3814,6 +3930,7 @@ var Amaterasu;
         const englishProduct = englishCatalog([
             ...new Set([
                 ...Object.keys(productTranslations.bg ?? {}),
+                ...Object.keys(pairedClientTranslations.bg ?? {}),
                 ...Object.keys(specializedTranslations.bg ?? {}),
                 ...PAGE_COPY_KEYS,
                 ...ATTRIBUTE_TEMPLATE_KEYS,
@@ -3829,7 +3946,7 @@ var Amaterasu;
         const localeAttributeTemplates = catalogFromTranslations(ATTRIBUTE_TEMPLATE_KEYS, attributeTemplateTranslations[locale]);
         const localeInputOverrideLabels = catalogFromTranslations(INPUT_OVERRIDE_LABEL_KEYS, inputOverrideLabelTranslations[locale]);
         const localeMetricLabels = catalogFromTranslations(METRIC_LABEL_KEYS, metricLabelTranslations[locale]);
-        return mergeLocaleMessages(mergeLocaleMessages(mergeLocaleMessages(mergeLocaleMessages(mergeLocaleMessages(englishBase, englishUi), englishShell), localeBase), mergeLocaleMessages(localeUi, localeShell)), mergeLocaleMessages(mergeLocaleMessages(englishProduct, productTranslations[locale] ?? {}), mergeLocaleMessages(specializedTranslations[locale] ?? {}, mergeLocaleMessages(mergeLocaleMessages(localePageCopy, localeAttributeTemplates), mergeLocaleMessages(localeInputOverrideLabels, localeMetricLabels)))));
+        return mergeLocaleMessages(mergeLocaleMessages(mergeLocaleMessages(mergeLocaleMessages(mergeLocaleMessages(englishBase, englishUi), englishShell), localeBase), mergeLocaleMessages(localeUi, localeShell)), mergeLocaleMessages(mergeLocaleMessages(englishProduct, mergeLocaleMessages(productTranslations[locale] ?? {}, pairedClientTranslations[locale] ?? {})), mergeLocaleMessages(specializedTranslations[locale] ?? {}, mergeLocaleMessages(mergeLocaleMessages(localePageCopy, localeAttributeTemplates), mergeLocaleMessages(localeInputOverrideLabels, localeMetricLabels)))));
     }
     Amaterasu.localeMessagesFor = localeMessagesFor;
     function translateLocaleMessage(source, messages) {
@@ -6504,6 +6621,39 @@ var Amaterasu;
 })(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
 (function (Amaterasu) {
+    function clientDirectoryTextNode(source) {
+        return typeof Amaterasu.localizedTextNode === "function"
+            ? Amaterasu.localizedTextNode(source)
+            : source;
+    }
+    function clientDirectorySetText(target, source) {
+        if (typeof Amaterasu.setLocalizedTextContent === "function")
+            Amaterasu.setLocalizedTextContent(target, source);
+        else
+            target.textContent = source;
+    }
+    function clientDirectorySetPlaceholder(target, source) {
+        if (typeof Amaterasu.setLocalizedAttribute === "function")
+            Amaterasu.setLocalizedAttribute(target, "placeholder", source);
+        else
+            target.setAttribute("placeholder", source);
+    }
+    function clientDirectoryCountNode(visible, total) {
+        const format = (locale) => {
+            const source = total === 1
+                ? "Showing {visible} of {total} paired client"
+                : "Showing {visible} of {total} paired clients";
+            const message = typeof Amaterasu.translateText === "function"
+                ? Amaterasu.translateText(source)
+                : source;
+            return message
+                .replaceAll("{visible}", new Intl.NumberFormat(locale).format(visible))
+                .replaceAll("{total}", new Intl.NumberFormat(locale).format(total));
+        };
+        return typeof Amaterasu.localeFormattedTextNode === "function"
+            ? Amaterasu.localeFormattedTextNode(format)
+            : format("en");
+    }
     function sortClientDirectoryEntries(entries, query, sort, locale) {
         const needle = query.trim().toLocaleLowerCase(locale);
         const collator = new Intl.Collator(locale, { sensitivity: "base", numeric: true });
@@ -6526,19 +6676,19 @@ var Amaterasu;
         const search = document.createElement("input");
         search.type = "search";
         search.name = "client_search";
-        search.placeholder = "Search paired clients";
         search.value = initialQuery;
         search.setAttribute("data-draft-ignore", "");
+        clientDirectorySetPlaceholder(search, "Search paired clients");
         const sort = document.createElement("select");
         sort.name = "client_sort";
         sort.value = "recent";
         sort.setAttribute("data-draft-ignore", "");
         const recent = document.createElement("option");
         recent.value = "recent";
-        recent.textContent = "Recently paired";
+        recent.append(clientDirectoryTextNode("Recently paired"));
         const name = document.createElement("option");
         name.value = "name";
-        name.textContent = "Name";
+        name.append(clientDirectoryTextNode("Name"));
         sort.append(recent, name);
         const count = document.createElement("p");
         count.className = "muted client-search-summary";
@@ -6553,24 +6703,24 @@ var Amaterasu;
         searchLabel.className = "field";
         const searchText = document.createElement("span");
         searchText.className = "field-label";
-        searchText.textContent = "Search paired clients";
+        searchText.append(clientDirectoryTextNode("Search paired clients"));
         searchLabel.append(searchText, search);
         const sortLabel = document.createElement("label");
         sortLabel.className = "field";
         const sortText = document.createElement("span");
         sortText.className = "field-label";
-        sortText.textContent = "Sort by";
+        sortText.append(clientDirectoryTextNode("Sort by"));
         sortLabel.append(sortText, sort);
         const controls = document.createElement("div");
         controls.className = "client-search";
         controls.append(searchLabel, sortLabel, count);
         const update = () => {
             const visible = sortClientDirectoryEntries(directoryEntries, search.value, sort.value, locale);
-            count.textContent = visible.length + " of " + directoryEntries.length + " paired clients";
+            count.replaceChildren(clientDirectoryCountNode(visible.length, directoryEntries.length));
             empty.hidden = visible.length !== 0;
-            empty.textContent = directoryEntries.length === 0
-                ? "No paired clients remain."
-                : "No paired clients match this search.";
+            clientDirectorySetText(empty, directoryEntries.length === 0
+                ? "No paired clients"
+                : "No paired clients match this search.");
             for (const entry of directoryEntries)
                 entry.card.hidden = !visible.includes(entry);
             list.replaceChildren(...visible.map((entry) => entry.card));

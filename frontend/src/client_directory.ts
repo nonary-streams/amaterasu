@@ -15,6 +15,44 @@ namespace Amaterasu {
 
   export type ClientDirectorySort = "recent" | "name";
 
+  function clientDirectoryTextNode(source: string): Text | string {
+    return typeof Amaterasu.localizedTextNode === "function"
+      ? Amaterasu.localizedTextNode(source)
+      : source;
+  }
+
+  function clientDirectorySetText(target: Element, source: string): void {
+    if (typeof Amaterasu.setLocalizedTextContent === "function")
+      Amaterasu.setLocalizedTextContent(target, source);
+    else target.textContent = source;
+  }
+
+  function clientDirectorySetPlaceholder(target: Element, source: string): void {
+    if (typeof Amaterasu.setLocalizedAttribute === "function")
+      Amaterasu.setLocalizedAttribute(target, "placeholder", source);
+    else target.setAttribute("placeholder", source);
+  }
+
+  function clientDirectoryCountNode(
+    visible: number,
+    total: number,
+  ): Text | string {
+    const format = (locale: string): string => {
+      const source = total === 1
+        ? "Showing {visible} of {total} paired client"
+        : "Showing {visible} of {total} paired clients";
+      const message = typeof Amaterasu.translateText === "function"
+        ? Amaterasu.translateText(source)
+        : source;
+      return message
+        .replaceAll("{visible}", new Intl.NumberFormat(locale).format(visible))
+        .replaceAll("{total}", new Intl.NumberFormat(locale).format(total));
+    };
+    return typeof Amaterasu.localeFormattedTextNode === "function"
+      ? Amaterasu.localeFormattedTextNode(format)
+      : format("en");
+  }
+
   export function sortClientDirectoryEntries(
     entries: readonly ClientDirectoryEntry[],
     query: string,
@@ -45,9 +83,9 @@ namespace Amaterasu {
     const search = document.createElement("input");
     search.type = "search";
     search.name = "client_search";
-    search.placeholder = "Search paired clients";
     search.value = initialQuery;
     search.setAttribute("data-draft-ignore", "");
+    clientDirectorySetPlaceholder(search, "Search paired clients");
 
     const sort = document.createElement("select");
     sort.name = "client_sort";
@@ -56,10 +94,10 @@ namespace Amaterasu {
 
     const recent = document.createElement("option");
     recent.value = "recent";
-    recent.textContent = "Recently paired";
+    recent.append(clientDirectoryTextNode("Recently paired"));
     const name = document.createElement("option");
     name.value = "name";
-    name.textContent = "Name";
+    name.append(clientDirectoryTextNode("Name"));
     sort.append(recent, name);
 
     const count = document.createElement("p");
@@ -77,14 +115,14 @@ namespace Amaterasu {
     searchLabel.className = "field";
     const searchText = document.createElement("span");
     searchText.className = "field-label";
-    searchText.textContent = "Search paired clients";
+    searchText.append(clientDirectoryTextNode("Search paired clients"));
     searchLabel.append(searchText, search);
 
     const sortLabel = document.createElement("label");
     sortLabel.className = "field";
     const sortText = document.createElement("span");
     sortText.className = "field-label";
-    sortText.textContent = "Sort by";
+    sortText.append(clientDirectoryTextNode("Sort by"));
     sortLabel.append(sortText, sort);
 
     const controls = document.createElement("div");
@@ -98,11 +136,14 @@ namespace Amaterasu {
         sort.value as ClientDirectorySort,
         locale,
       );
-      count.textContent = visible.length + " of " + directoryEntries.length + " paired clients";
+      count.replaceChildren(clientDirectoryCountNode(visible.length, directoryEntries.length));
       empty.hidden = visible.length !== 0;
-      empty.textContent = directoryEntries.length === 0
-        ? "No paired clients remain."
-        : "No paired clients match this search.";
+      clientDirectorySetText(
+        empty,
+        directoryEntries.length === 0
+          ? "No paired clients"
+          : "No paired clients match this search.",
+      );
 
       for (const entry of directoryEntries) entry.card.hidden = !visible.includes(entry);
       list.replaceChildren(...visible.map((entry) => entry.card));
