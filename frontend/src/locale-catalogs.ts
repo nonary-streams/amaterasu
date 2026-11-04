@@ -71,6 +71,12 @@ namespace Amaterasu {
     "Steam game selected. Cleared the existing directory by choice.",
     "Steam game selected. Its install directory is unavailable; the existing directory was kept.",
     "Select a discovered game to use its Steam app ID and optional install directory.",
+    "Application editor sections",
+    "SECTIONS",
+    "Identity",
+    "Launch",
+    "Settings overrides",
+    "Blank values inherit host defaults. Select only the settings this application should override.",
   ] as const;
 
   const SHELL_MESSAGE_KEYS = [
@@ -140,6 +146,12 @@ namespace Amaterasu {
         "Steam играта е избрана. Папката ѝ липсва; текущата папка е запазена.",
 
         "Изберете открита игра, за да използвате нейния Steam ID на приложението и незадължителната инсталационна папка.",
+        "Раздели на редактора на приложения",
+        "РАЗДЕЛИ",
+        "Идентичност",
+        "Стартиране",
+        "Замени на настройките",
+        "Празните стойности наследяват настройките на хоста. Изберете само настройките, които това приложение трябва да замени.",
       ],
     },
     cs: {
@@ -193,6 +205,12 @@ namespace Amaterasu {
         "Hra ve službě Steam vybrána. Její složka není dostupná; aktuální složka zůstala zachována.",
 
         "Vyberte nalezenou hru a použijte její ID aplikace Steam a volitelnou instalační složku.",
+        "Sekce editoru aplikace",
+        "SEKCE",
+        "Identita",
+        "Spuštění",
+        "Přepsání nastavení",
+        "Prázdné hodnoty přebírají nastavení hostitele. Vyberte pouze nastavení, která má tato aplikace přepsat.",
       ],
     },
     de: {
@@ -246,6 +264,12 @@ namespace Amaterasu {
         "Steam-Spiel ausgewählt. Verzeichnis nicht verfügbar; aktuelles Verzeichnis beibehalten.",
 
         "Wähle ein gefundenes Spiel, um seine Steam-App-ID und ein optionales Installationsverzeichnis zu verwenden.",
+        "Abschnitte des Anwendungseditors",
+        "BEREICHE",
+        "Identität",
+        "Start",
+        "Einstellungsüberschreibungen",
+        "Leere Werte übernehmen die Host-Standardeinstellungen. Wähle nur Einstellungen aus, die diese Anwendung überschreiben soll.",
       ],
     },
     es: {
@@ -299,6 +323,12 @@ namespace Amaterasu {
         "Juego de Steam seleccionado. No hay directorio; se conservó el actual.",
 
         "Elige un juego detectado para usar su ID de aplicación de Steam y su directorio de instalación opcional.",
+        "Secciones del editor de aplicaciones",
+        "SECCIONES",
+        "Identidad",
+        "Inicio",
+        "Anulaciones de ajustes",
+        "Los valores vacíos heredan los valores predeterminados del host. Selecciona solo los ajustes que esta aplicación debe anular.",
       ],
     },
     fr: {
@@ -352,6 +382,12 @@ namespace Amaterasu {
         "Jeu Steam sélectionné. Dossier indisponible ; dossier actuel conservé.",
 
         "Choisissez un jeu détecté pour utiliser son ID d’application Steam et son dossier d’installation facultatif.",
+        "Sections de l’éditeur d’application",
+        "SECTIONS",
+        "Identité",
+        "Lancement",
+        "Remplacements des paramètres",
+        "Les valeurs vides héritent des valeurs par défaut de l’hôte. Sélectionnez uniquement les paramètres à remplacer pour cette application.",
       ],
     },
     hu: {
@@ -405,6 +441,12 @@ namespace Amaterasu {
         "Steam-játék kiválasztva. Nincs telepítési könyvtár; a jelenlegi megmaradt.",
 
         "Válassz egy felismert játékot a Steam-alkalmazásazonosító és az opcionális telepítési könyvtár használatához.",
+        "Alkalmazásszerkesztő szakaszai",
+        "SZAKASZOK",
+        "Identitás",
+        "Indítás",
+        "Beállítás-felülbírálások",
+        "Az üres értékek a gazdagép alapértékeit öröklik. Csak azokat a beállításokat válaszd ki, amelyeket az alkalmazás felülír.",
       ],
     },
     it: {
@@ -458,6 +500,12 @@ namespace Amaterasu {
         "Gioco Steam selezionato. Cartella non disponibile; mantenuta quella attuale.",
 
         "Scegli un gioco rilevato per usare il suo ID app Steam e la cartella di installazione facoltativa.",
+        "Sezioni dell’editor applicazione",
+        "SEZIONI",
+        "Identità",
+        "Avvio",
+        "Override impostazioni",
+        "I valori vuoti ereditano le impostazioni predefinite dell’host. Seleziona solo le impostazioni che questa applicazione deve sovrascrivere.",
       ],
     },
     ja: {
@@ -510,6 +558,12 @@ namespace Amaterasu {
         "Steam ゲームを選択しました。インストール先がないため現在のディレクトリを保持しました。",
 
         "検出されたゲームを選択すると、Steam アプリ ID と任意のインストール先を使用できます。",
+        "アプリケーションエディターのセクション",
+        "セクション",
+        "ID 情報",
+        "起動",
+        "設定の上書き",
+        "空の値はホストの既定値を継承します。このアプリで上書きする設定だけを選択してください。",
       ],
     },
     ko: {
@@ -562,6 +616,12 @@ namespace Amaterasu {
         "Steam 게임을 선택했습니다. 설치 디렉터리가 없어 현재 디렉터리를 유지했습니다.",
 
         "발견된 게임을 선택하면 Steam 앱 ID와 선택적 설치 디렉터리를 사용할 수 있습니다.",
+        "애플리케이션 편집기 섹션",
+        "섹션",
+        "ID 정보",
+        "실행",
+        "설정 재정의",
+        "빈 값은 호스트 기본값을 상속합니다. 이 애플리케이션에서 재정의할 설정만 선택하세요.",
       ],
     },
     pl: {
@@ -615,6 +675,12 @@ namespace Amaterasu {
         "Wybrano grę Steam. Brak katalogu instalacji; zachowano bieżący katalog.",
 
         "Wybierz wykrytą grę, aby użyć jej identyfikatora aplikacji Steam i opcjonalnego katalogu instalacji.",
+        "Sekcje edytora aplikacji",
+        "SEKCJE",
+        "Tożsamość",
+        "Uruchamianie",
+        "Nadpisania ustawień",
+        "Puste wartości dziedziczą ustawienia hosta. Wybierz tylko ustawienia, które ta aplikacja ma nadpisywać.",
       ],
     },
     pt: {
@@ -668,6 +734,12 @@ namespace Amaterasu {
         "Jogo Steam selecionado. Sem diretório de instalação; o atual foi mantido.",
 
         "Escolha um jogo detetado para usar o respetivo ID de aplicação Steam e o diretório de instalação opcional.",
+        "Secções do editor de aplicações",
+        "SECÇÕES",
+        "Identidade",
+        "Arranque",
+        "Substituições de definições",
+        "Os valores vazios herdam as predefinições do anfitrião. Selecione apenas as definições que esta aplicação deve substituir.",
       ],
     },
     pt_BR: {
@@ -710,6 +782,12 @@ namespace Amaterasu {
         "Jogo do Steam selecionado. Sem diretório de instalação; o atual foi mantido.",
 
         "Escolha um jogo encontrado para usar o ID do aplicativo Steam e o diretório de instalação opcional.",
+        "Seções do editor de aplicativos",
+        "SEÇÕES",
+        "Identidade",
+        "Inicialização",
+        "Substituições de configurações",
+        "Valores vazios herdam os padrões do host. Selecione apenas as configurações que este aplicativo deve substituir.",
       ],
     },
     ru: {
@@ -762,6 +840,12 @@ namespace Amaterasu {
         "У игры Steam нет папки установки; текущая папка оставлена.",
 
         "Выберите найденную игру, чтобы использовать ее ID приложения Steam и необязательную папку установки.",
+        "Разделы редактора приложения",
+        "РАЗДЕЛЫ",
+        "Идентификация",
+        "Запуск",
+        "Переопределения настроек",
+        "Пустые значения наследуют настройки хоста. Выберите только параметры, которые нужно переопределить для этого приложения.",
       ],
     },
     sv: {
@@ -814,6 +898,12 @@ namespace Amaterasu {
         "Steam-spel valt. Installationskatalog saknas; den aktuella behölls.",
 
         "Välj ett upptäckt spel för att använda dess Steam-app-ID och valfria installationskatalog.",
+        "Programredigerarens avsnitt",
+        "AVSNITT",
+        "Identitet",
+        "Start",
+        "Inställningsöverskridningar",
+        "Tomma värden ärver värdens standardinställningar. Välj bara de inställningar som appen ska åsidosätta.",
       ],
     },
     tr: {
@@ -866,6 +956,12 @@ namespace Amaterasu {
         "Steam oyunu seçildi. Yükleme dizini yok; geçerli dizin korundu.",
 
         "Steam uygulama kimliğini ve isteğe bağlı yükleme dizinini kullanmak için bulunan bir oyunu seçin.",
+        "Uygulama düzenleyici bölümleri",
+        "BÖLÜMLER",
+        "Kimlik",
+        "Başlatma",
+        "Ayar geçersiz kılmaları",
+        "Boş değerler ana makine varsayılanlarını devralır. Yalnızca bu uygulamanın geçersiz kılması gereken ayarları seçin.",
       ],
     },
     uk: {
@@ -919,6 +1015,12 @@ namespace Amaterasu {
         "У гри Steam немає каталогу встановлення; поточний каталог залишено.",
 
         "Виберіть знайдену гру, щоб використати її ID програми Steam і необов’язковий каталог встановлення.",
+        "Розділи редактора програми",
+        "РОЗДІЛИ",
+        "Ідентифікація",
+        "Запуск",
+        "Перевизначення налаштувань",
+        "Порожні значення успадковують налаштування хоста. Виберіть лише параметри, які потрібно перевизначити для цієї програми.",
       ],
     },
     vi: {
@@ -972,6 +1074,12 @@ namespace Amaterasu {
         "Trò chơi Steam không có thư mục cài đặt; đã giữ thư mục hiện tại.",
 
         "Chọn trò chơi đã tìm thấy để dùng ID ứng dụng Steam và thư mục cài đặt tùy chọn của trò chơi.",
+        "Các mục của trình chỉnh sửa ứng dụng",
+        "CÁC MỤC",
+        "Danh tính",
+        "Khởi chạy",
+        "Ghi đè cài đặt",
+        "Giá trị trống kế thừa mặc định của máy chủ. Chỉ chọn cài đặt mà ứng dụng này cần ghi đè.",
       ],
     },
     zh: {
@@ -1023,6 +1131,12 @@ namespace Amaterasu {
         "已选择 Steam 游戏。没有安装目录；保留了当前目录。",
 
         "选择已发现的游戏，以使用其 Steam 应用 ID 和可选安装目录。",
+        "应用编辑器分区",
+        "分区",
+        "身份",
+        "启动",
+        "设置覆盖",
+        "空值会继承主机默认值。仅选择此应用需要覆盖的设置。",
       ],
     },
     zh_TW: {
@@ -1062,6 +1176,12 @@ namespace Amaterasu {
         "已選擇 Steam 遊戲。沒有安裝目錄；保留目前目錄。",
 
         "選擇已找到的遊戲，以使用其 Steam 應用程式 ID 和選用安裝目錄。",
+        "應用程式編輯器區段",
+        "區段",
+        "識別資訊",
+        "啟動",
+        "設定覆寫",
+        "空白值會繼承主機預設值。只選擇此應用程式需要覆寫的設定。",
       ],
     },
   };

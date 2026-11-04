@@ -149,6 +149,29 @@ function named(form, name) { return find(form, node => node.name === name); }
 function chooseButton(form) { return find(form, node => node.tagName === "button" && node.textContent === "Choose a Steam game"); }
 function save(form) { form.fire("submit"); }
 
+test("application editor navigation reveals launch and inherited settings without changing drafts", async () => {
+  const page = setup(true);
+  const form = await openEditor(page);
+  const name = named(form, "name");
+  name.value = "Untouched editor draft";
+  const navigation = find(form, node => node.tagName === "nav" && node.getAttribute("aria-label") === "Application editor sections");
+  assert.ok(navigation);
+  assert.match(navigation.textContent, /Identity.*Launch.*Settings overrides/);
+  const launch = find(form, node => node.tagName === "details" && node.id === "catalog-editor-launch");
+  assert.equal(launch.open, false);
+  find(navigation, node => node.tagName === "button" && node.textContent === "Launch").fire("click");
+  assert.equal(launch.open, true);
+  assert.equal(page.document.activeElement, launch.querySelector("summary"));
+  const overrides = find(form, node => node.tagName === "details" && node.className.includes("catalog-override-chooser"));
+  find(navigation, node => node.tagName === "button" && node.textContent === "Settings overrides").fire("click");
+  assert.equal(overrides.open, true);
+  assert.equal(page.document.activeElement, overrides.querySelector("summary"));
+  assert.match(form.textContent, /Blank values inherit host defaults/);
+  assert.equal(name.value, "Untouched editor draft");
+  assert.equal(named(form, "steam_id").value, "77");
+  assert.equal(page.calls.some(call => call.route === "catalog/update"), false);
+});
+
 test("application editor applies only an explicitly selected Steam record and saves other drafts at the catalog revision", async () => {
   const page = setup(true);
   const form = await openEditor(page);

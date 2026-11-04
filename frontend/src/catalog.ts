@@ -1873,12 +1873,39 @@ namespace Amaterasu {
       el("div", "catalog-editor-disclosure-content", ...children));
   }
 
+  function catalogEditorNavigation(items: Array<{
+    label: string;
+    target: HTMLElement;
+    reveal?: HTMLDetailsElement | null;
+  }>): HTMLElement {
+    const navigation = el("nav", "catalog-editor-nav");
+    catalogLocalizedAttribute(navigation, "aria-label", "Application editor sections");
+    navigation.append(el("span", "catalog-editor-nav-label", catalogTextMessage("SECTIONS")));
+    for (const item of items) {
+      const control = button(catalogTextMessage(item.label), () => {
+        if (item.target.tagName.toLowerCase() === "details")
+          (item.target as HTMLDetailsElement).open = true;
+        if (item.reveal) item.reveal.open = true;
+        item.target.scrollIntoView({ behavior: "smooth", block: "start" });
+        const focusTarget = item.reveal?.querySelector("summary") ??
+          (item.target.tagName.toLowerCase() === "details"
+            ? item.target.querySelector("summary")
+            : item.target.querySelector("h3"));
+        if (focusTarget instanceof HTMLElement) focusTarget.focus();
+      }, "quiet");
+      control.className += " catalog-editor-nav-item";
+      control.setAttribute("aria-controls", item.target.id);
+      navigation.append(control);
+    }
+    return navigation;
+  }
+
   // Controls remain in the form so the established parsers and conditional
   // controls retain their behavior when their rows are hidden.
   function catalogOverrideEditor(sections: Array<{ area: string; fields: HTMLElement[] }>, saved: Record<string, unknown>): { node: HTMLElement; removed: Set<string> } {
     const removed = new Set<string>();
     const active = el("div", "catalog-override-active");
-    const empty = el("p", "muted", "No settings overridden. This application inherits its settings.");
+    const empty = el("p", "muted catalog-override-empty", "No settings overridden. This application inherits its settings.");
     const search = input("", "", "search");
     search.placeholder = "Search settings";
     search.setAttribute("data-draft-ignore", "");
@@ -1935,7 +1962,7 @@ namespace Amaterasu {
     }
     search.addEventListener("input", update);
     const node = el("section", "catalog-editor-section catalog-overrides",
-      el("div", "catalog-editor-heading", el("h3", "", "Settings overrides"), el("p", "muted", "Only selected settings override the host defaults. Remove an override to inherit.")),
+      el("div", "catalog-editor-heading", el("h3", "", catalogTextMessage("Settings overrides")), el("p", "muted", catalogTextMessage("Blank values inherit host defaults. Select only the settings this application should override."))),
       marker, empty, active, el("details", "catalog-override-chooser", el("summary", "", "Add override"), search, list));
     update();
     return { node, removed };
@@ -2317,11 +2344,29 @@ namespace Amaterasu {
       catalogEditorDisclosure("Encoder", "Override software and NVENC encoder settings.",
         ...softwareEncoder.fields, ...nvencSettingsFields),
     );
-    (form.children[1] as HTMLDetailsElement).open = !entry;
+    const identitySection = form.children[0] as HTMLElement;
+    const launchSection = form.children[1] as HTMLElement;
+    identitySection.id = "catalog-editor-identity";
+    launchSection.id = "catalog-editor-launch";
+    (launchSection as HTMLDetailsElement).open = !entry;
     const sections = Array.from(form.children).slice(2) as HTMLElement[];
     const overrides = catalogOverrideEditor(catalogOverrideSections(sections), { ...entry, ...entry?.config_overrides });
     for (const section of sections) section.remove();
-    form.append(overrides.node);
+    overrides.node.id = "catalog-editor-overrides";
+    form.replaceChildren(
+      catalogEditorNavigation([
+        { label: "Identity", target: identitySection },
+        { label: "Launch", target: launchSection },
+        {
+          label: "Settings overrides",
+          target: overrides.node,
+          reveal: overrides.node.querySelector<HTMLDetailsElement>("details"),
+        },
+      ]),
+      identitySection,
+      launchSection,
+      overrides.node,
+    );
     catalogRemovedOverrides.set(form, overrides.removed);
     revealInvalidEditorControls(form);
     showKind();

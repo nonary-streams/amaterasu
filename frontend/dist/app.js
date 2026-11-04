@@ -1928,6 +1928,12 @@ var Amaterasu;
         "Steam game selected. Cleared the existing directory by choice.",
         "Steam game selected. Its install directory is unavailable; the existing directory was kept.",
         "Select a discovered game to use its Steam app ID and optional install directory.",
+        "Application editor sections",
+        "SECTIONS",
+        "Identity",
+        "Launch",
+        "Settings overrides",
+        "Blank values inherit host defaults. Select only the settings this application should override.",
     ];
     const SHELL_MESSAGE_KEYS = [
         "WORKSPACE",
@@ -1987,6 +1993,12 @@ var Amaterasu;
                 "Steam играта е избрана. Текущата папка е изчистена по ваш избор.",
                 "Steam играта е избрана. Папката ѝ липсва; текущата папка е запазена.",
                 "Изберете открита игра, за да използвате нейния Steam ID на приложението и незадължителната инсталационна папка.",
+                "Раздели на редактора на приложения",
+                "РАЗДЕЛИ",
+                "Идентичност",
+                "Стартиране",
+                "Замени на настройките",
+                "Празните стойности наследяват настройките на хоста. Изберете само настройките, които това приложение трябва да замени.",
             ],
         },
         cs: {
@@ -2039,6 +2051,12 @@ var Amaterasu;
                 "Hra ve službě Steam vybrána. Aktuální složka byla vymazána podle vaší volby.",
                 "Hra ve službě Steam vybrána. Její složka není dostupná; aktuální složka zůstala zachována.",
                 "Vyberte nalezenou hru a použijte její ID aplikace Steam a volitelnou instalační složku.",
+                "Sekce editoru aplikace",
+                "SEKCE",
+                "Identita",
+                "Spuštění",
+                "Přepsání nastavení",
+                "Prázdné hodnoty přebírají nastavení hostitele. Vyberte pouze nastavení, která má tato aplikace přepsat.",
             ],
         },
         de: {
@@ -2091,6 +2109,12 @@ var Amaterasu;
                 "Steam-Spiel ausgewählt. Aktuelles Verzeichnis wie gewünscht gelöscht.",
                 "Steam-Spiel ausgewählt. Verzeichnis nicht verfügbar; aktuelles Verzeichnis beibehalten.",
                 "Wähle ein gefundenes Spiel, um seine Steam-App-ID und ein optionales Installationsverzeichnis zu verwenden.",
+                "Abschnitte des Anwendungseditors",
+                "BEREICHE",
+                "Identität",
+                "Start",
+                "Einstellungsüberschreibungen",
+                "Leere Werte übernehmen die Host-Standardeinstellungen. Wähle nur Einstellungen aus, die diese Anwendung überschreiben soll.",
             ],
         },
         es: {
@@ -2143,6 +2167,12 @@ var Amaterasu;
                 "Juego de Steam seleccionado. Se borró el directorio actual por elección.",
                 "Juego de Steam seleccionado. No hay directorio; se conservó el actual.",
                 "Elige un juego detectado para usar su ID de aplicación de Steam y su directorio de instalación opcional.",
+                "Secciones del editor de aplicaciones",
+                "SECCIONES",
+                "Identidad",
+                "Inicio",
+                "Anulaciones de ajustes",
+                "Los valores vacíos heredan los valores predeterminados del host. Selecciona solo los ajustes que esta aplicación debe anular.",
             ],
         },
         fr: {
@@ -2195,6 +2225,12 @@ var Amaterasu;
                 "Jeu Steam sélectionné. Le dossier actuel est effacé selon votre choix.",
                 "Jeu Steam sélectionné. Dossier indisponible ; dossier actuel conservé.",
                 "Choisissez un jeu détecté pour utiliser son ID d’application Steam et son dossier d’installation facultatif.",
+                "Sections de l’éditeur d’application",
+                "SECTIONS",
+                "Identité",
+                "Lancement",
+                "Remplacements des paramètres",
+                "Les valeurs vides héritent des valeurs par défaut de l’hôte. Sélectionnez uniquement les paramètres à remplacer pour cette application.",
             ],
         },
         hu: {
@@ -2247,6 +2283,12 @@ var Amaterasu;
                 "Steam-játék kiválasztva. A jelenlegi könyvtárat töröltük a kérésedre.",
                 "Steam-játék kiválasztva. Nincs telepítési könyvtár; a jelenlegi megmaradt.",
                 "Válassz egy felismert játékot a Steam-alkalmazásazonosító és az opcionális telepítési könyvtár használatához.",
+                "Alkalmazásszerkesztő szakaszai",
+                "SZAKASZOK",
+                "Identitás",
+                "Indítás",
+                "Beállítás-felülbírálások",
+                "Az üres értékek a gazdagép alapértékeit öröklik. Csak azokat a beállításokat válaszd ki, amelyeket az alkalmazás felülír.",
             ],
         },
         it: {
@@ -2299,6 +2341,12 @@ var Amaterasu;
                 "Gioco Steam selezionato. Cartella attuale cancellata come richiesto.",
                 "Gioco Steam selezionato. Cartella non disponibile; mantenuta quella attuale.",
                 "Scegli un gioco rilevato per usare il suo ID app Steam e la cartella di installazione facoltativa.",
+                "Sezioni dell’editor applicazione",
+                "SEZIONI",
+                "Identità",
+                "Avvio",
+                "Override impostazioni",
+                "I valori vuoti ereditano le impostazioni predefinite dell’host. Seleziona solo le impostazioni che questa applicazione deve sovrascrivere.",
             ],
         },
         ja: {
@@ -2350,6 +2398,12 @@ var Amaterasu;
                 "選択に従って現在のディレクトリを消去しました。",
                 "Steam ゲームを選択しました。インストール先がないため現在のディレクトリを保持しました。",
                 "検出されたゲームを選択すると、Steam アプリ ID と任意のインストール先を使用できます。",
+                "アプリケーションエディターのセクション",
+                "セクション",
+                "ID 情報",
+                "起動",
+                "設定の上書き",
+                "空の値はホストの既定値を継承します。このアプリで上書きする設定だけを選択してください。",
             ],
         },
         ko: {
@@ -2401,6 +2455,12 @@ var Amaterasu;
                 "요청에 따라 현재 디렉터리를 지웠습니다.",
                 "Steam 게임을 선택했습니다. 설치 디렉터리가 없어 현재 디렉터리를 유지했습니다.",
                 "발견된 게임을 선택하면 Steam 앱 ID와 선택적 설치 디렉터리를 사용할 수 있습니다.",
+                "애플리케이션 편집기 섹션",
+                "섹션",
+                "ID 정보",
+                "실행",
+                "설정 재정의",
+                "빈 값은 호스트 기본값을 상속합니다. 이 애플리케이션에서 재정의할 설정만 선택하세요.",
             ],
         },
         pl: {
@@ -2453,6 +2513,12 @@ var Amaterasu;
                 "Zgodnie z wyborem wyczyszczono bieżący katalog.",
                 "Wybrano grę Steam. Brak katalogu instalacji; zachowano bieżący katalog.",
                 "Wybierz wykrytą grę, aby użyć jej identyfikatora aplikacji Steam i opcjonalnego katalogu instalacji.",
+                "Sekcje edytora aplikacji",
+                "SEKCJE",
+                "Tożsamość",
+                "Uruchamianie",
+                "Nadpisania ustawień",
+                "Puste wartości dziedziczą ustawienia hosta. Wybierz tylko ustawienia, które ta aplikacja ma nadpisywać.",
             ],
         },
         pt: {
@@ -2505,6 +2571,12 @@ var Amaterasu;
                 "Diretório atual limpo conforme escolhido.",
                 "Jogo Steam selecionado. Sem diretório de instalação; o atual foi mantido.",
                 "Escolha um jogo detetado para usar o respetivo ID de aplicação Steam e o diretório de instalação opcional.",
+                "Secções do editor de aplicações",
+                "SECÇÕES",
+                "Identidade",
+                "Arranque",
+                "Substituições de definições",
+                "Os valores vazios herdam as predefinições do anfitrião. Selecione apenas as definições que esta aplicação deve substituir.",
             ],
         },
         pt_BR: {
@@ -2546,6 +2618,12 @@ var Amaterasu;
                 "Diretório atual limpo conforme sua escolha.",
                 "Jogo do Steam selecionado. Sem diretório de instalação; o atual foi mantido.",
                 "Escolha um jogo encontrado para usar o ID do aplicativo Steam e o diretório de instalação opcional.",
+                "Seções do editor de aplicativos",
+                "SEÇÕES",
+                "Identidade",
+                "Inicialização",
+                "Substituições de configurações",
+                "Valores vazios herdam os padrões do host. Selecione apenas as configurações que este aplicativo deve substituir.",
             ],
         },
         ru: {
@@ -2597,6 +2675,12 @@ var Amaterasu;
                 "Текущая папка очищена по вашему выбору.",
                 "У игры Steam нет папки установки; текущая папка оставлена.",
                 "Выберите найденную игру, чтобы использовать ее ID приложения Steam и необязательную папку установки.",
+                "Разделы редактора приложения",
+                "РАЗДЕЛЫ",
+                "Идентификация",
+                "Запуск",
+                "Переопределения настроек",
+                "Пустые значения наследуют настройки хоста. Выберите только параметры, которые нужно переопределить для этого приложения.",
             ],
         },
         sv: {
@@ -2648,6 +2732,12 @@ var Amaterasu;
                 "Den aktuella katalogen rensades enligt ditt val.",
                 "Steam-spel valt. Installationskatalog saknas; den aktuella behölls.",
                 "Välj ett upptäckt spel för att använda dess Steam-app-ID och valfria installationskatalog.",
+                "Programredigerarens avsnitt",
+                "AVSNITT",
+                "Identitet",
+                "Start",
+                "Inställningsöverskridningar",
+                "Tomma värden ärver värdens standardinställningar. Välj bara de inställningar som appen ska åsidosätta.",
             ],
         },
         tr: {
@@ -2699,6 +2789,12 @@ var Amaterasu;
                 "Geçerli dizin seçiminize göre temizlendi.",
                 "Steam oyunu seçildi. Yükleme dizini yok; geçerli dizin korundu.",
                 "Steam uygulama kimliğini ve isteğe bağlı yükleme dizinini kullanmak için bulunan bir oyunu seçin.",
+                "Uygulama düzenleyici bölümleri",
+                "BÖLÜMLER",
+                "Kimlik",
+                "Başlatma",
+                "Ayar geçersiz kılmaları",
+                "Boş değerler ana makine varsayılanlarını devralır. Yalnızca bu uygulamanın geçersiz kılması gereken ayarları seçin.",
             ],
         },
         uk: {
@@ -2751,6 +2847,12 @@ var Amaterasu;
                 "Поточний каталог очищено за вашим вибором.",
                 "У гри Steam немає каталогу встановлення; поточний каталог залишено.",
                 "Виберіть знайдену гру, щоб використати її ID програми Steam і необов’язковий каталог встановлення.",
+                "Розділи редактора програми",
+                "РОЗДІЛИ",
+                "Ідентифікація",
+                "Запуск",
+                "Перевизначення налаштувань",
+                "Порожні значення успадковують налаштування хоста. Виберіть лише параметри, які потрібно перевизначити для цієї програми.",
             ],
         },
         vi: {
@@ -2803,6 +2905,12 @@ var Amaterasu;
                 "Đã xóa thư mục hiện tại theo lựa chọn của bạn.",
                 "Trò chơi Steam không có thư mục cài đặt; đã giữ thư mục hiện tại.",
                 "Chọn trò chơi đã tìm thấy để dùng ID ứng dụng Steam và thư mục cài đặt tùy chọn của trò chơi.",
+                "Các mục của trình chỉnh sửa ứng dụng",
+                "CÁC MỤC",
+                "Danh tính",
+                "Khởi chạy",
+                "Ghi đè cài đặt",
+                "Giá trị trống kế thừa mặc định của máy chủ. Chỉ chọn cài đặt mà ứng dụng này cần ghi đè.",
             ],
         },
         zh: {
@@ -2853,6 +2961,12 @@ var Amaterasu;
                 "按你的选择清除了当前目录。",
                 "已选择 Steam 游戏。没有安装目录；保留了当前目录。",
                 "选择已发现的游戏，以使用其 Steam 应用 ID 和可选安装目录。",
+                "应用编辑器分区",
+                "分区",
+                "身份",
+                "启动",
+                "设置覆盖",
+                "空值会继承主机默认值。仅选择此应用需要覆盖的设置。",
             ],
         },
         zh_TW: {
@@ -2891,6 +3005,12 @@ var Amaterasu;
                 "依照您的選擇清除目前目錄。",
                 "已選擇 Steam 遊戲。沒有安裝目錄；保留目前目錄。",
                 "選擇已找到的遊戲，以使用其 Steam 應用程式 ID 和選用安裝目錄。",
+                "應用程式編輯器區段",
+                "區段",
+                "識別資訊",
+                "啟動",
+                "設定覆寫",
+                "空白值會繼承主機預設值。只選擇此應用程式需要覆寫的設定。",
             ],
         },
     };
@@ -7760,10 +7880,34 @@ var Amaterasu;
     function catalogEditorDisclosure(title, description, ...children) {
         return Amaterasu.el("details", "catalog-editor-section catalog-editor-disclosure", Amaterasu.el("summary", "", Amaterasu.el("strong", "", title), Amaterasu.el("small", "muted", description)), Amaterasu.el("div", "catalog-editor-disclosure-content", ...children));
     }
+    function catalogEditorNavigation(items) {
+        const navigation = Amaterasu.el("nav", "catalog-editor-nav");
+        catalogLocalizedAttribute(navigation, "aria-label", "Application editor sections");
+        navigation.append(Amaterasu.el("span", "catalog-editor-nav-label", catalogTextMessage("SECTIONS")));
+        for (const item of items) {
+            const control = Amaterasu.button(catalogTextMessage(item.label), () => {
+                if (item.target.tagName.toLowerCase() === "details")
+                    item.target.open = true;
+                if (item.reveal)
+                    item.reveal.open = true;
+                item.target.scrollIntoView({ behavior: "smooth", block: "start" });
+                const focusTarget = item.reveal?.querySelector("summary") ??
+                    (item.target.tagName.toLowerCase() === "details"
+                        ? item.target.querySelector("summary")
+                        : item.target.querySelector("h3"));
+                if (focusTarget instanceof HTMLElement)
+                    focusTarget.focus();
+            }, "quiet");
+            control.className += " catalog-editor-nav-item";
+            control.setAttribute("aria-controls", item.target.id);
+            navigation.append(control);
+        }
+        return navigation;
+    }
     function catalogOverrideEditor(sections, saved) {
         const removed = new Set();
         const active = Amaterasu.el("div", "catalog-override-active");
-        const empty = Amaterasu.el("p", "muted", "No settings overridden. This application inherits its settings.");
+        const empty = Amaterasu.el("p", "muted catalog-override-empty", "No settings overridden. This application inherits its settings.");
         const search = Amaterasu.input("", "", "search");
         search.placeholder = "Search settings";
         search.setAttribute("data-draft-ignore", "");
@@ -7824,7 +7968,7 @@ var Amaterasu;
             empty.hidden = rows.some(item => item.selected);
         }
         search.addEventListener("input", update);
-        const node = Amaterasu.el("section", "catalog-editor-section catalog-overrides", Amaterasu.el("div", "catalog-editor-heading", Amaterasu.el("h3", "", "Settings overrides"), Amaterasu.el("p", "muted", "Only selected settings override the host defaults. Remove an override to inherit.")), marker, empty, active, Amaterasu.el("details", "catalog-override-chooser", Amaterasu.el("summary", "", "Add override"), search, list));
+        const node = Amaterasu.el("section", "catalog-editor-section catalog-overrides", Amaterasu.el("div", "catalog-editor-heading", Amaterasu.el("h3", "", catalogTextMessage("Settings overrides")), Amaterasu.el("p", "muted", catalogTextMessage("Blank values inherit host defaults. Select only the settings this application should override."))), marker, empty, active, Amaterasu.el("details", "catalog-override-chooser", Amaterasu.el("summary", "", "Add override"), search, list));
         update();
         return { node, removed };
     }
@@ -8095,12 +8239,25 @@ var Amaterasu;
         };
         kind.addEventListener("change", showKind);
         form.append(catalogEditorSection("Identity", "Name and describe this application in your library.", Amaterasu.field("Name", name), Amaterasu.field("Description", description), Amaterasu.field("Tags", tags, "Separate tags with commas.")), catalogEditorDisclosure("Launch", "Choose how the host starts and tracks the application.", Amaterasu.field("Launch type", kind), pathField, steamIdField, steamInstallDirField, steamGameChooser, fullscreen, sharedLaunchOptions, executable, Amaterasu.field("Command output", outputMode, "Use default discards command output without saving an output value."), outputFile, rawPreparation, Amaterasu.field("Skip global preparation commands", excludeGlobalPreparation, "Do not run the host-wide preparation commands for this application.")), catalogEditorDisclosure("Display", "Choose display and virtual-screen overrides.", Amaterasu.field("Display output override", displayOutput, "Leave empty to inherit the next display selection. This is separate from the command output file."), Amaterasu.field("Virtual screen request", virtualScreen, "Inherit the host setting or explicitly request or avoid a virtual screen."), Amaterasu.field("Virtual display mode", virtualDisplayMode, "Inherit the host mode or explicitly disable, use per-client, or share a virtual display."), Amaterasu.field("Virtual display layout", virtualDisplayLayout, "Inherit the host layout or select how virtual displays are arranged."), ...refreshRateOptionFields, Amaterasu.field("Display and adapter policy (JSON)", displayPolicy, "Sparse application overrides. Use null or empty values to inherit; global-only keys are rejected."), Amaterasu.field("10-bit SDR preference", prefer10BitSdr, "Inherit the next setting scope, or set an explicit preference for this application.")), catalogEditorDisclosure("Streaming and audio", "Override streaming, frame limiting, and audio for this application.", Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global streaming setting; supported values are 1–255."), ...sessionPolicyFields, Amaterasu.field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this application streams audio."), audioSink.controls, virtualSink.controls, Amaterasu.field("Capture audio without changing default outputs", captureOnly, "Inherit the host setting, enable capture only, or allow Windows default-output routing.")), catalogEditorDisclosure("Input", "Set per-application controller, keyboard, and mouse preferences.", Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "Leave blank to inherit. Use -1 to disable the timeout; other signed 32-bit values set the duration."), Amaterasu.field("Controller input", controller, "Inherit the next scope, or enable/disable gamepad input for this application."), Amaterasu.field("Gamepad profile", gamepad, "Inherit the next scope. Recognized profiles unavailable on this backend stay selectable and are labeled unavailable."), Amaterasu.field("Keyboard input", keyboard, "Inherit the next scope, or enable/disable keyboard input for this application."), Amaterasu.field("Mouse input", mouse, "Inherit the next scope, or enable/disable mouse input for this application."), ...inputCompatibilityFields, ...advancedInput.fields), catalogEditorDisclosure("Encoder", "Override software and NVENC encoder settings.", ...softwareEncoder.fields, ...nvencSettingsFields));
-        form.children[1].open = !entry;
+        const identitySection = form.children[0];
+        const launchSection = form.children[1];
+        identitySection.id = "catalog-editor-identity";
+        launchSection.id = "catalog-editor-launch";
+        launchSection.open = !entry;
         const sections = Array.from(form.children).slice(2);
         const overrides = catalogOverrideEditor(catalogOverrideSections(sections), { ...entry, ...entry?.config_overrides });
         for (const section of sections)
             section.remove();
-        form.append(overrides.node);
+        overrides.node.id = "catalog-editor-overrides";
+        form.replaceChildren(catalogEditorNavigation([
+            { label: "Identity", target: identitySection },
+            { label: "Launch", target: launchSection },
+            {
+                label: "Settings overrides",
+                target: overrides.node,
+                reveal: overrides.node.querySelector("details"),
+            },
+        ]), identitySection, launchSection, overrides.node);
         catalogRemovedOverrides.set(form, overrides.removed);
         revealInvalidEditorControls(form);
         showKind();
