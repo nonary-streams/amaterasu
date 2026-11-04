@@ -106,6 +106,41 @@ try {
     disabled: true, escaped: true, activeContentNodePreserved: true,
   });
 
+  assert.deepEqual(await evaluate(`(() => {
+    const alpha = document.createElement('section');
+    const beta = document.createElement('section');
+    const betaInput = document.createElement('input');
+    beta.append(betaInput);
+    const fallback = window.tabsApi.tabs({ label: 'Focus recovery', tabs: [
+      { id: 'alpha', label: 'Alpha', content: alpha },
+      { id: 'beta', label: 'Beta', content: beta },
+    ] });
+    document.querySelector('main').append(fallback.element);
+    fallback.select('beta');
+    fallback.element.querySelector('[data-tab-id=beta]').focus();
+    fallback.setTabs([{ id: 'alpha', label: 'Alpha', content: alpha }]);
+    const removedTab = fallback.active() === 'alpha' &&
+      document.activeElement === fallback.element.querySelector('[data-tab-id=alpha]');
+    fallback.setTabs([
+      { id: 'alpha', label: 'Alpha', content: alpha },
+      { id: 'beta', label: 'Beta', content: beta },
+    ]);
+    fallback.select('beta');
+    betaInput.focus();
+    const replacement = document.createElement('section');
+    fallback.setTabs([
+      { id: 'alpha', label: 'Alpha', content: alpha },
+      { id: 'beta', label: 'Beta', content: replacement },
+    ]);
+    const replacedPanel = fallback.active() === 'beta' &&
+      document.activeElement === fallback.element.querySelector('[data-tab-id=beta]') &&
+      betaInput.isConnected === false;
+    fallback.dispose();
+    fallback.element.remove();
+    return { removedTab, replacedPanel };
+  })()`), { removedTab: true, replacedPanel: true });
+
+
   await evaluate(`document.querySelector('[data-tab-id="general"]').focus()`);
   await key("ArrowRight", "ArrowRight", 39);
   assert.deepEqual(await evaluate(`({active:window.tabsHandle.active(), focus:document.activeElement.getAttribute("data-tab-id"), changes:window.tabChanges})`),

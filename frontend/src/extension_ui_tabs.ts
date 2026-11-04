@@ -182,14 +182,15 @@ namespace Amaterasu {
           entries = nextEntries;
           activeId = nextActiveId;
           updateSelection();
-          if (focusedElement && focusedElement.isConnected && document.activeElement === document.body) {
-            const panelFocusStillVisible = focusedPanelId !== null && focusedPanelId === activeId &&
-              entries.some((entry) => entry.id === focusedPanelId && entry.panel.contains(focusedElement));
+          if (focusedElement && document.activeElement === document.body) {
+            const panelFocusStillVisible = focusedElement.isConnected && focusedPanelId !== null &&
+              focusedPanelId === activeId && entries.some((entry) => entry.id === focusedPanelId && entry.panel.contains(focusedElement));
             if (panelFocusStillVisible) focusedElement.focus();
             else {
-              const focusedTab = focusedTabId === null ? undefined : entries.find((entry) => entry.id === focusedTabId && !entry.disabled);
-              if (focusedTab) focusedTab.button.focus();
-              else if (focusedPanelId !== null || focusedTabId !== null) enabledEntry(activeId)?.button.focus();
+              const focusedTab = focusedElement.isConnected && focusedTabId !== null
+                ? entries.find((entry) => entry.id === focusedTabId && !entry.disabled)
+                : undefined;
+              (focusedTab ?? enabledEntry(activeId))?.button.focus();
             }
           }
         };
