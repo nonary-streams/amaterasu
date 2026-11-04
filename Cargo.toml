@@ -70,6 +70,7 @@ members = [
     "modules/stream-session",
     "modules/session-history",
     "modules/host-metrics",
+    "modules/foreground-context",
     "modules/updater",
     "modules/system-tray",
     "modules/rtsp",
