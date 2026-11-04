@@ -192,6 +192,16 @@ mod tests {
     }
 }
 
+pub fn reconcile() {
+    if std::env::var("XDG_SESSION_TYPE").as_deref() == Ok("wayland") {
+        let _ = run_helper(
+            "python3",
+            &["-c", include_str!("kwin.py"), "--reconcile"],
+            Duration::from_millis(210),
+        );
+    }
+}
+
 #[derive(serde::Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct KwinObservation {

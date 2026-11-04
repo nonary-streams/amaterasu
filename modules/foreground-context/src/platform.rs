@@ -19,3 +19,9 @@ pub fn observe() -> Option<Snapshot> {
         None
     }
 }
+
+/// Retry any persistent compositor cleanup obligation at module startup.
+pub fn reconcile() {
+    #[cfg(target_os = "linux")]
+    linux::reconcile();
+}

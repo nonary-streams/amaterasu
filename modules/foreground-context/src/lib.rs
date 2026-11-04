@@ -69,6 +69,7 @@ impl ManagedModule for ForegroundModule {
         let settings: Settings =
             serde_json::from_value(payload).map_err(|_| "invalid foreground settings")?;
         settings.validate()?;
+        platform::reconcile();
         runtime.require_success(Command::Register {
             service: SERVICE.into(),
         })?;
@@ -140,6 +141,41 @@ mod tests {
             json!({"ok":true,"snapshot":null})
         );
     }
+    #[test]
+    fn sdk_consumer_accepts_actual_dispatch_and_independent_replacement() {
+        use amaterasu_module_sdk::foreground_context::{Request, SnapshotResponse};
+
+        fn consume(provider: impl FnOnce(Value) -> Value) -> Option<Snapshot> {
+            let request = serde_json::to_value(Request::Snapshot).unwrap();
+            SnapshotResponse::parse(&provider(request))
+                .unwrap()
+                .snapshot
+        }
+        let settings = Settings {
+            allowed_principals: vec!["consumer".into()],
+        };
+        let first = consume(|request| {
+            handle(&settings, "consumer", request, || {
+                new_snapshot("/games/example".into(), Some(true))
+            })
+        });
+        // A separately implemented provider handles the same SDK request and
+        // serializes its own response; it does not use this module's dispatch.
+        let second = consume(|request| {
+            let _: Request = serde_json::from_value(request).unwrap();
+            serde_json::to_value(SnapshotResponse {
+                ok: true,
+                snapshot: Some(Snapshot {
+                    executable: "/games/example".into(),
+                    fullscreen: Some(true),
+                }),
+            })
+            .unwrap()
+        });
+        assert_eq!(first, second);
+        assert!(first.unwrap().fullscreen.unwrap());
+    }
+
     #[test]
     fn executable_identity_is_bounded() {
         assert!(new_snapshot("".into(), None).is_none());

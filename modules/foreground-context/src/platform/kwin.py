@@ -2,9 +2,8 @@
 import fcntl
 import json
 import os
-import re
 import stat
-import uuid
+import sys
 import dbus
 import dbus.service
 from dbus.mainloop.glib import DBusGMainLoop
@@ -14,37 +13,41 @@ runtime = os.environ['XDG_RUNTIME_DIR']
 info = os.stat(runtime, follow_symlinks=False)
 if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
     raise RuntimeError('unsafe runtime directory')
-lock_path = os.path.join(runtime, 'amaterasu-foreground.lock')
-lock = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+plugin = 'amaterasu-foreground-observer'
+lock_path = os.path.join(runtime, plugin + '.lock')
+marker = os.path.join(runtime, plugin + '.pending')
+path = os.path.join(runtime, plugin + '.js')
+
+def owned_file(path, flags):
+    fd = os.open(path, flags | os.O_NOFOLLOW, 0o600)
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        os.close(fd)
+        raise RuntimeError('unsafe observer file')
+    return fd
+
+lock = owned_file(lock_path, os.O_CREAT | os.O_RDWR)
 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+# This sentinel is permanent: a late load can arrive after a negative query.
+# Never delete it, even after successful cleanup.
+with os.fdopen(owned_file(marker, os.O_CREAT | os.O_RDWR), 'r+') as obligation:
+    obligation.write('cleanup required on every invocation\n')
+    obligation.flush()
+    os.fsync(obligation.fileno())
 DBusGMainLoop(set_as_default=True)
 bus = dbus.SessionBus()
 kwin_owner = bus.get_name_owner('org.kde.KWin')
 scripting = dbus.Interface(bus.get_object('org.kde.KWin', '/Scripting'), 'org.kde.kwin.Scripting')
-pattern = re.compile(r'amaterasu-foreground-[0-9a-f]{32}\.pending\Z')
 
 def reconcile():
-    for entry in os.scandir(runtime):
-        if not pattern.fullmatch(entry.name):
-            continue
-        entry_info = entry.stat(follow_symlinks=False)
-        if not stat.S_ISREG(entry_info.st_mode) or entry_info.st_uid != os.getuid() or entry_info.st_mode & 0o077:
-            raise RuntimeError('unsafe cleanup obligation')
-        name = entry.name[:-len('.pending')]
-        if scripting.isScriptLoaded(name, timeout=0.1):
-            scripting.unloadScript(name, timeout=0.1)
-        if scripting.isScriptLoaded(name, timeout=0.1):
-            raise RuntimeError('script cleanup pending')
-        try:
-            os.unlink(os.path.join(runtime, name + '.js'))
-        except FileNotFoundError:
-            pass
-        os.unlink(entry.path)
+    if scripting.isScriptLoaded(plugin, timeout=0.1):
+        scripting.unloadScript(plugin, timeout=0.1)
+    if scripting.isScriptLoaded(plugin, timeout=0.1):
+        raise RuntimeError('script cleanup pending')
 
 reconcile()
-plugin = 'amaterasu-foreground-' + uuid.uuid4().hex
-marker = os.path.join(runtime, plugin + '.pending')
-path = os.path.join(runtime, plugin + '.js')
+if len(sys.argv) == 2 and sys.argv[1] == '--reconcile':
+    sys.exit(0)
 loop = GLib.MainLoop()
 result = None
 
@@ -68,12 +71,11 @@ try {
 }
 ''' % (json.dumps(str(bus.get_unique_name())), json.dumps(plugin))
 try:
-    with os.fdopen(os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600), 'w') as obligation:
-        obligation.write('pending\n')
-        obligation.flush()
-        os.fsync(obligation.fileno())
-    with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600), 'w') as source:
+    with os.fdopen(owned_file(path, os.O_CREAT | os.O_RDWR), 'r+') as source:
+        source.seek(0)
+        source.truncate()
         source.write(script)
+        source.flush()
     script_id = bus.call_blocking('org.kde.KWin', '/Scripting', 'org.kde.kwin.Scripting', 'loadScript', 'ss', (path, plugin), timeout=0.1)
     if int(script_id) >= 0:
         instance = dbus.Interface(bus.get_object('org.kde.KWin', '/Scripting/Script' + str(script_id)), 'org.kde.kwin.Script')
