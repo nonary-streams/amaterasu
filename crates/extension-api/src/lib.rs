@@ -513,11 +513,13 @@ pub enum ProviderResponse {
     },
 }
 
-/// An explicit editor hint; consumers never infer keybindings from object shape.
+/// An explicit editor hint; consumers do not infer editors from value shape.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OptionPresentation {
     Keybinding,
+    /// A numeric slider paired with an editable numeric value.
+    Slider,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1320,6 +1322,27 @@ pub fn validate_descriptor(descriptor: &ExtensionDescriptor) -> Result<(), Strin
             .into_iter()
             .collect();
         amaterasu_configuration_schema::defaults(&fields)?;
+        if option.presentation == Some(OptionPresentation::Slider) {
+            use amaterasu_configuration_schema::Definition;
+            // JavaScript clients must be able to represent every integer bound exactly.
+            const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
+            let bounded = match &option.definition {
+                Definition::Integer {
+                    minimum: Some(min),
+                    maximum: Some(max),
+                    ..
+                } => *min >= -MAX_SAFE_INTEGER && *max <= MAX_SAFE_INTEGER && min < max,
+                Definition::Decimal {
+                    minimum: Some(min),
+                    maximum: Some(max),
+                    ..
+                } => min.is_finite() && max.is_finite() && min < max,
+                _ => false,
+            };
+            if !bounded {
+                return Err("slider requires distinct, bounded numeric limits".into());
+            }
+        }
         if !option.choice_labels.is_empty() {
             let amaterasu_configuration_schema::Definition::Enum { options, .. } =
                 &option.definition
@@ -1766,6 +1789,56 @@ mod tests {
             serde_json::from_value::<ActionStatus>(json!("reserved")).unwrap(),
             status
         );
+    }
+
+    #[test]
+    fn slider_presentation_requires_usable_numeric_bounds() {
+        let method = MethodRef {
+            service: "example.provider/1".into(),
+            method: "validate".into(),
+            interface_major: 1,
+            interface_minor: 0,
+            schema_revision: 1,
+        };
+        let option: OptionDescriptor = serde_json::from_value(json!({
+            "id":"strength", "label":"Strength", "help":"",
+            "definition":{"type":"integer","default":5,"minimum":0,"maximum":10},
+            "presentation":"slider", "allowed_scopes":["host"],
+            "apply_policy":"next_stream", "required_capabilities":[]
+        }))
+        .unwrap();
+        let mut descriptor = ExtensionDescriptor {
+            provider: "example.provider".into(),
+            display_name: None,
+            revision: 1,
+            options: vec![option],
+            actions: vec![],
+            capabilities: vec![],
+            settings_validate: method,
+        };
+        assert!(validate_descriptor(&descriptor).is_ok());
+        assert_eq!(
+            serde_json::to_value(&descriptor.options[0]).unwrap()["presentation"],
+            json!("slider")
+        );
+        for definition in [
+            json!({"type":"integer","default":5,"minimum":null,"maximum":10}),
+            json!({"type":"integer","default":5,"minimum":5,"maximum":5}),
+            json!({"type":"integer","default":5,"minimum":0,"maximum":9007199254740992_i64}),
+            json!({"type":"boolean","default":true}),
+        ] {
+            descriptor.options[0].definition = serde_json::from_value(definition).unwrap();
+            assert!(validate_descriptor(&descriptor).is_err());
+        }
+        descriptor.options[0].definition = serde_json::from_value(json!({
+            "type":"decimal","default":0.5,"minimum":0.0,"maximum":1.0
+        }))
+        .unwrap();
+        assert!(validate_descriptor(&descriptor).is_ok());
+        descriptor.options[0].presentation = None;
+        descriptor.options[0].definition =
+            serde_json::from_value(json!({"type":"boolean","default":true})).unwrap();
+        assert!(validate_descriptor(&descriptor).is_ok());
     }
 
     #[test]
