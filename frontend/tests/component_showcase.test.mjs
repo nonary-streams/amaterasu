@@ -57,7 +57,9 @@ test("Okami showcase consumes host SDK controls and displays both themes and com
   const page = setupShowcase();
   const nodes = all(page.container);
   assert.equal(nodes.filter((node) => ["light", "dark"].includes(node.getAttribute("data-theme"))).length, 2);
-  assert.equal(nodes.filter((node) => node.className?.includes("plugin-control")).length, 8);
+  const controlPanels = nodes.filter((node) => node.tagName === "SECTION" && node.children[0]?.textContent === "Reusable host controls");
+  assert.equal(controlPanels.length, 2);
+  assert.ok(controlPanels.every((node) => node.children.length === 5));
   assert.equal(nodes.filter((node) => node.getAttribute("role") === "tablist").length, 2);
   assert.equal(nodes.filter((node) => node.getAttribute("role") === "tabpanel").length, 6);
   assert.equal(nodes.filter((node) => node.tagName === "DIALOG").length, 2);
