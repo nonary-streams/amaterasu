@@ -94,15 +94,20 @@ namespace Amaterasu {
     };
     let currentCards: Card[] = [];
     const rtxHdrArea = el("div");
-    const refreshStatuses = button(localizedMessage("Refresh statuses"), load);
+    const refreshStatuses = button(localizedMessage("Refresh provider statuses"), () => load(true));
+    if (typeof Amaterasu.setLocalizedAttribute === "function")
+      Amaterasu.setLocalizedAttribute(refreshStatuses, "aria-label", "Refresh provider statuses");
     context.content.append(sectionHeading("Integrations", "Connect and manage integrations on this host.", refreshStatuses), rtxHdrArea, area);
-    async function load(): Promise<void> {
+    async function load(announceReadback = false): Promise<void> {
       const request = ++generation;
       refreshStatuses.disabled = true;
       renderRtxHdrIntegration(context, rtxHdrArea);
       const cards = providers.map((provider): Card => {
         const status = el("div", "integration-status", el("p", "muted", localizedMessage("Loading provider status...")));
         const feedback = el("div", "integration-action-status");
+        feedback.setAttribute("role", "status");
+        feedback.setAttribute("aria-live", "polite");
+        feedback.setAttribute("aria-atomic", "true");
         const settings = button(localizedMessage("Configure"), () => context.navigate("settings/integrations"));
         settings.disabled = !context.api.allows("configuration.read");
         const actions = el("div", "actions", settings);
@@ -116,7 +121,7 @@ namespace Amaterasu {
           actions.append(refreshButton);
         }
         const card = el("section", "panel integration-card", el("h2", "", provider.label),
-          el("p", "muted", literalText(provider.description)), status, actions, feedback);
+          el("p", "muted", localizedMessage(provider.description)), status, actions, feedback);
         const item: Card = {
           provider, status, feedback, card, refreshButton, providerStatus: null,
           setProviderStatus(value: unknown) {
@@ -141,9 +146,12 @@ namespace Amaterasu {
             const value = await context.api.post<unknown>(`${provider.name}/status`);
             if (!context.content.isConnected || request !== generation) return;
             const summary = summarizeProvider(provider.name, value);
-            status.replaceChildren(badge(localizedMessage(summary.state), summary.tone),
-              el("p", "muted", literalText(summary.detail)));
+            showProviderStatus(status, summary);
             setProviderStatus(value);
+            if (announceReadback && !activeRefreshes.has(provider.name))
+              cards.find((item) => item.provider.name === provider.name)?.feedback.replaceChildren(
+                el("span", "", localizedMessage("Refresh accepted; current provider status was read back.")),
+              );
           } catch (error) {
             if (context.content.isConnected && request === generation) status.replaceChildren(errorPanel(error));
           }
@@ -152,6 +160,19 @@ namespace Amaterasu {
         if (context.content.isConnected && request === generation) refreshStatuses.disabled = false;
       }
     }
+    function showProviderStatus(target: HTMLElement, summary: ProviderSummary): void {
+      const observedAt = new Date();
+      const detail = summary.tone === "bad" ? literalText(summary.detail) : localizedMessage(summary.detail);
+      const timestamp = el("time", "", literalText(observedAt.toISOString()));
+      timestamp.dateTime = observedAt.toISOString();
+      const observed = el("p", "muted", localizedMessage("Status observed"), " ", timestamp);
+      target.replaceChildren(badge(localizedMessage(summary.state), summary.tone), el("p", "muted", detail), observed);
+    }
+
+    function currentCard(item: Card): boolean {
+      return context.content.isConnected && item.card.parentElement === area;
+    }
+
     function canRefresh(name: ProviderName, status: Record<string, unknown> | null): boolean {
       if (activeRefreshes.has(name)) return false;
       if (!status || status.ok !== true || status.settings_ready !== true || status.enabled !== true) return false;
@@ -169,23 +190,35 @@ namespace Amaterasu {
       activeRefreshes.add(name);
       try {
         await runAction(target, item.feedback, async () => {
+          item.feedback.replaceChildren(el("span", "", localizedMessage("Refreshing provider...")));
+          const accepted = (): void => {
+            if (currentCard(item))
+              item.feedback.replaceChildren(el("span", "", localizedMessage("Refresh request accepted. Checking provider status.")));
+          };
           try {
             const updated = name === "lutris"
-              ? await refreshLutrisProvider(context.api)
-              : await refreshPlayniteProvider(context.api);
-            if (!context.content.isConnected || item.card.parentElement !== area) return;
+              ? await refreshLutrisProvider(context.api, accepted)
+              : await refreshPlayniteProvider(context.api, accepted);
+            if (!currentCard(item)) return;
             const summary = summarizeProvider(name, updated);
-            item.status.replaceChildren(badge(localizedMessage(summary.state), summary.tone),
-              el("p", "muted", literalText(summary.detail)));
+            showProviderStatus(item.status, summary);
+            item.feedback.replaceChildren(
+              summary.tone === "bad"
+                ? el("span", "", localizedMessage("Provider status reports an issue."), " ", literalText(summary.detail))
+                : el("span", "", localizedMessage("Refresh accepted; current provider status was read back.")),
+            );
             item.setProviderStatus(updated);
           } catch (error) {
             item.setProviderStatus(null);
-            throw error;
+            if (currentCard(item)) item.feedback.replaceChildren(
+              el("span", "", localizedMessage("Refresh failed. Check provider status before retrying.")),
+              el("span", "", literalText(error instanceof Error ? error.message : String(error))),
+            );
           }
         });
       } finally {
         activeRefreshes.delete(name);
-        if (context.content.isConnected && item.card.parentElement === area)
+        if (currentCard(item))
           target.disabled = !context.api.allows("configuration.write") ||
             !canRefresh(name, item.providerStatus);
         else if (context.content.isConnected) void load();
