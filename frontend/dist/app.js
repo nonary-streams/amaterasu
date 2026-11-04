@@ -3948,7 +3948,9 @@ var Amaterasu;
                     }
                 }, { capture: true, signal: choiceController.signal });
                 control.addEventListener("keydown", (event) => {
-                    if (behavior.readOnly && event.key !== "Tab") {
+                    const mutatingKey = !event.ctrlKey && !event.metaKey && !event.altKey &&
+                        (event.key.length === 1 || ["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Home", "End", "PageUp", "PageDown", "Enter", " ", "Spacebar", "Backspace", "Delete"].includes(event.key));
+                    if (behavior.readOnly && mutatingKey) {
                         event.preventDefault();
                         event.stopImmediatePropagation();
                     }
@@ -3988,9 +3990,14 @@ var Amaterasu;
                 if (disposed)
                     return;
                 validate(nextOptions, nextValue);
+                const focusedValue = controls.find((control) => control === document.activeElement)?.value;
                 currentOptions = [...nextOptions];
                 currentValue = nextValue;
                 render();
+                if (focusedValue !== undefined) {
+                    (controls.find((control) => control.value === focusedValue) ??
+                        controls.find((control) => control.value === currentValue))?.focus();
+                }
             },
             dispose,
         };
@@ -16455,6 +16462,7 @@ var Amaterasu;
 var Amaterasu;
 (function (Amaterasu) {
     let nextExtensionUiDescriptionId = 0;
+    let nextExtensionUiFieldId = 0;
     function extensionUiTextNode(value) {
         if (typeof value === "string")
             return Amaterasu.localizedTextNode(value);
@@ -16467,6 +16475,18 @@ var Amaterasu;
     }
     function extensionUiLabel(text) {
         return Amaterasu.el("span", "field-label", extensionUiTextNode(text));
+    }
+    function extensionUiControlLabel(text, control) {
+        const label = Amaterasu.el("label", "field-label", extensionUiTextNode(text));
+        const id = `amaterasu-plugin-ui-control-${++nextExtensionUiFieldId}`;
+        control.id = id;
+        label.htmlFor = id;
+        return label;
+    }
+    function extensionUiReadOnlyKeyMutation(event) {
+        if (event.ctrlKey || event.metaKey || event.altKey)
+            return false;
+        return event.key.length === 1 || ["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Home", "End", "PageUp", "PageDown", "Enter", " ", "Spacebar", "Backspace", "Delete"].includes(event.key);
     }
     function extensionUiChoices(choices, selected) {
         if (!Array.isArray(choices) || choices.length < 1 || choices.length > 64 ||
@@ -16583,7 +16603,7 @@ var Amaterasu;
                     currentValue = checkbox.checked;
                     options.onChange?.(currentValue);
                 }, { signal: controller.signal });
-                const element = Amaterasu.el("label", "field plugin-control plugin-toggle", extensionUiLabel(options.label), checkbox);
+                const element = Amaterasu.el("div", "field plugin-control plugin-toggle", extensionUiControlLabel(options.label, checkbox), checkbox);
                 extensionUiFieldDescriptions(element, [checkbox], options);
                 return extensionUiControl(element, () => checkbox.checked, (value) => {
                     if (typeof value !== "boolean")
@@ -16601,15 +16621,13 @@ var Amaterasu;
                 const select = Amaterasu.el("select", "");
                 let choices = [...options.choices];
                 let currentValue = options.value;
-                const renderChoices = () => {
-                    select.replaceChildren(...choices.map((choice) => {
-                        const option = Amaterasu.el("option", "", extensionUiTextNode(choice.label));
-                        option.value = choice.value;
-                        return option;
-                    }));
-                    select.value = currentValue;
-                };
-                renderChoices();
+                const makeChoiceOptions = (nextChoices) => nextChoices.map((choice) => {
+                    const option = Amaterasu.el("option", "", extensionUiTextNode(choice.label));
+                    option.value = choice.value;
+                    return option;
+                });
+                select.replaceChildren(...makeChoiceOptions(choices));
+                select.value = currentValue;
                 select.disabled = options.disabled === true;
                 select.required = options.required === true;
                 if (options.readOnly)
@@ -16621,7 +16639,7 @@ var Amaterasu;
                     }
                 }, { capture: true, signal: controller.signal });
                 select.addEventListener("keydown", (event) => {
-                    if (options.readOnly && event.key !== "Tab") {
+                    if (options.readOnly && extensionUiReadOnlyKeyMutation(event)) {
                         event.preventDefault();
                         event.stopImmediatePropagation();
                     }
@@ -16636,14 +16654,17 @@ var Amaterasu;
                     currentValue = select.value;
                     options.onChange?.(currentValue);
                 }, { signal: controller.signal });
-                const element = Amaterasu.el("label", "field plugin-control", extensionUiLabel(options.label), select);
+                const element = Amaterasu.el("div", "field plugin-control", extensionUiControlLabel(options.label, select), select);
                 extensionUiFieldDescriptions(element, [select], options);
                 const setChoices = (nextChoices, value) => {
                     const nextValue = value ?? currentValue;
                     extensionUiChoices(nextChoices, nextValue);
-                    choices = [...nextChoices];
+                    const preparedChoices = [...nextChoices];
+                    const preparedOptions = makeChoiceOptions(preparedChoices);
+                    select.replaceChildren(...preparedOptions);
+                    select.value = nextValue;
+                    choices = preparedChoices;
                     currentValue = nextValue;
-                    renderChoices();
                 };
                 return extensionUiControl(element, () => select.value, (value) => {
                     if (!choices.some((choice) => choice.value === value))

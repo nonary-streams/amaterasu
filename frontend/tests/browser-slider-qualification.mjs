@@ -116,6 +116,30 @@ try {
     const radioInput = window.fieldRadio.element.querySelectorAll('input[type=radio]')[1]; radioInput.checked = true; radioInput.dispatchEvent(new Event('change', {bubbles:true}));
   `);
   assert.deepEqual(await evaluate(`({ toggle: window.fieldToggle.value(), select: window.fieldSelect.value(), radio: window.fieldRadio.value(), disabled: window.fieldToggle.element.querySelector('input').disabled, required: window.fieldToggle.element.querySelector('input').required, readonly: window.fieldSelect.element.querySelector('select').getAttribute('aria-readonly'), radioCount: window.fieldRadio.element.querySelectorAll('input[type=radio]').length, radioDescription: !!window.fieldRadio.element.querySelectorAll('input[type=radio]')[1].getAttribute('aria-describedby'), descriptionTargets: [...window.fieldRadio.element.querySelectorAll('input[type=radio]')[1].getAttribute('aria-describedby').split(' ')].every(id => !!document.getElementById(id)), fieldChanges: window.fieldChanges })`), { toggle: true, select: "a", radio: "a", disabled: false, required: true, readonly: "true", radioCount: 3, radioDescription: true, descriptionTargets: true, fieldChanges: 0 });
+  await evaluate(`
+    window.formController = new AbortController();
+    window.formUi = Amaterasu.createExtensionUiV1(window.formController.signal);
+    window.readOnlySelect = window.formUi.select({ label: "Locked mode", choices: [{value:"a",label:"Alpha"},{value:"b",label:"Beta"}], value: "a", readOnly: true, help: "Mode help.", error: "Mode error." });
+    window.dynamicRadioChanges = 0;
+    window.dynamicRadio = window.formUi.radioGroup({ label: "Dynamic preset", choices: [{value:"a",label:"Alpha"},{value:"b",label:"Beta"},{value:"c",label:"Gamma"}], value: "a", onChange() { window.dynamicRadioChanges++; } });
+    document.body.replaceChildren(window.readOnlySelect.element, window.dynamicRadio.element);
+    window.readOnlyKeys = [];
+  `);
+  await evaluate(`
+    const select = document.querySelector('select'); select.focus();
+    const copy = new KeyboardEvent('keydown', { key: 'c', ctrlKey: true, bubbles: true, cancelable: true });
+    const arrow = new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true, cancelable: true });
+    window.readOnlyKeys = [[copy.key, !select.dispatchEvent(copy)], [arrow.key, !select.dispatchEvent(arrow)]];
+  `);
+  assert.deepEqual(await evaluate(`window.readOnlyKeys`), [["c", false], ["ArrowDown", true]]);
+  assert.deepEqual(await evaluate(`({ selected: document.querySelector('select').value, labelFor: document.querySelector('label[for]').htmlFor, controlId: document.querySelector('select').id, labels: document.querySelector('select').labels.length, descriptionsOutsideLabel: [...document.querySelectorAll('.plugin-control-help, .plugin-control-error')].every(node => !node.closest('label')), descriptionsResolve: [...document.querySelectorAll('select')].every(node => node.getAttribute('aria-describedby').split(' ').every(id => !!document.getElementById(id))) })`), { selected: "a", labelFor: "amaterasu-plugin-ui-control-3", controlId: "amaterasu-plugin-ui-control-3", labels: 1, descriptionsOutsideLabel: true, descriptionsResolve: true });
+  await evaluate(`document.querySelectorAll('input[type=radio]')[1].focus()`);
+  assert.equal(await evaluate(`document.activeElement.value`), "b");
+  await evaluate(`window.dynamicRadio.setChoices([{value:'c',label:'Gamma'},{value:'b',label:'Beta'},{value:'d',label:'Delta'}], 'c')`);
+  assert.deepEqual(await evaluate(`({ focus: document.activeElement.value, selected: window.dynamicRadio.value(), changes: window.dynamicRadioChanges })`), { focus: "b", selected: "c", changes: 0 });
+  await evaluate(`window.dynamicRadio.setChoices([{value:'a',label:'Alpha'},{value:'c',label:'Gamma'}], 'a')`);
+  assert.deepEqual(await evaluate(`({ focus: document.activeElement.value, selected: window.dynamicRadio.value(), changes: window.dynamicRadioChanges })`), { focus: "a", selected: "a", changes: 0 });
+  console.log("PASS: form labels/descriptions, readonly keyboard shortcuts, and radio focus survive real browser interactions");
   console.log("PASS: plugin forms retain accessible states and descriptions across dynamic choices");
   console.log("PASS: shared and plugin sliders synchronize, enforce steps, expose callback errors, and dispose listeners");
 } finally {

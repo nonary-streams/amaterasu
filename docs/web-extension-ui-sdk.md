@@ -23,14 +23,18 @@ Each factory accepts common `disabled`, `readOnly`, `required`, `help`, and
 the SDK connects them with `aria-describedby`, sets `aria-invalid` for errors,
 and exposes errors as alerts. Native controls enforce disabled and required
 states. Read-only controls remain focusable and expose `aria-readonly` while
-preventing user changes. `setValue()` remains available for programmatic updates.
+preventing user changes. Non-mutating keyboard shortcuts remain available.
+`help` and `error` text sit outside the clickable label and are associated with
+the control through `aria-describedby`. `setValue()` remains available for
+programmatic updates.
 Each factory returns a control with `element`, `value()`, `setValue(value)`, and
 `dispose()`. Choice controls also provide `setChoices(choices, value?)`. The current
 selection is retained unless a new value is supplied; if the current value is not
-in the new list, the update fails without changing the control. Programmatic choice
-updates do not call `onChange`. Append `element` to the page container. Values are local UI state;
-the extension remains responsible for validation, persistence, and any approved
-service calls.
+in the new list, the update fails without changing the control. A radio group's
+focused choice remains focused if it survives replacement; if it is removed, focus
+moves to the selected choice. Programmatic choice updates do not call `onChange`.
+Append `element` to the page container. Values are local UI state; the extension
+remains responsible for validation, persistence, and any approved service calls.
 
 Labels and choice labels accept plain source text or `{ source, translations }`.
 Translations are keyed by locale (for example `fr` or `fr-CA`); exact locale and

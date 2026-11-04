@@ -31,7 +31,7 @@ class Element {
 function setupConsumer({ features = ["ui.controls/1", "ui.forms/1"], withUi = true } = {}) {
   let registered;
   const context = vm.createContext({
-    document: { createElement: (tag) => new Element(tag) },
+    document: { activeElement: null, createElement: (tag) => new Element(tag) },
     window: { AmaterasuExtensions: { v1: { register(_id, page) { registered = page; } } } },
     AbortController,
   });
@@ -56,7 +56,9 @@ test("independent plugin consumer gets accessible native controls and lifecycle 
   const page = setupConsumer();
   assert.equal(page.container.children.length, 2);
   const [toggle, radios] = page.container.children;
-  assert.equal(toggle.tagName, "LABEL");
+  assert.equal(toggle.tagName, "DIV");
+  assert.equal(toggle.children[0].tagName, "LABEL");
+  assert.equal(toggle.children[0].htmlFor, toggle.children[1].id);
   assert.equal(toggle.children[1].type, "checkbox");
   assert.equal(radios.tagName, "DIV");
   assert.equal(radios.attributes.role, "radiogroup");
@@ -162,6 +164,11 @@ test("field metadata is localized and associated with native controls", () => {
   });
   const input = field.element.children[1];
   const [help, error] = field.element.children.slice(2);
+  assert.equal(field.element.tagName, "DIV");
+  assert.equal(field.element.children[0].tagName, "LABEL");
+  assert.equal(field.element.children[0].htmlFor, input.id);
+  assert.notEqual(help.tagName, "LABEL");
+  assert.notEqual(error.tagName, "LABEL");
   const descriptions = input.attributes["aria-describedby"].split(" ");
   assert.deepEqual(descriptions, [help.id, error.id]);
   assert.equal(help.children[0], "Activez cette option.");
@@ -193,6 +200,10 @@ test("disabled and read-only controls reject user changes but allow programmatic
   const selectInput = select.element.children[1];
   selectInput.value = "b";
   selectInput.dispatch("change");
+  const copied = selectInput.dispatch("keydown", { key: "c", ctrlKey: true });
+  const arrow = selectInput.dispatch("keydown", { key: "ArrowDown" });
+  assert.equal(copied.defaultPrevented, false);
+  assert.equal(arrow.defaultPrevented, true);
   assert.equal(select.value(), "a");
   assert.equal(selectChanges, 0);
 
@@ -213,6 +224,9 @@ test("choice controls update options transactionally without firing change callb
   assert.equal(select.value(), "c");
   assert.deepEqual(select.element.children[1].children.map((option) => option.value), ["b", "c"]);
   assert.throws(() => select.setChoices([{ value: "x", label: "X" }, { value: "x", label: "Duplicate" }], "x"), /choices/);
+  assert.throws(() => select.setChoices([{ value: "broken", label: { source: "Broken", translations: { "fr-CA": "" } } }], "broken"), /translations/);
+  assert.equal(select.value(), "c");
+  assert.deepEqual(select.element.children[1].children.map((option) => option.value), ["b", "c"]);
 
   const radio = page.sdk.ui.radioGroup({ label: "Quality", choices: [{ value: "low", label: "Low" }, { value: "high", label: "High" }], value: "low", required: true, error: "Choose a quality." });
   const oldRadioInput = radio.element.children[1].children[0].children[0];
@@ -241,6 +255,8 @@ test("read-only radio groups and sliders expose required/error semantics and rej
   assert.equal(radio.element.attributes["aria-required"], "true");
   assert.ok(radio.element.attributes["aria-describedby"]);
   assert.equal(option.required, true);
+  assert.equal(option.dispatch("keydown", { key: "c", ctrlKey: true }).defaultPrevented, false);
+  assert.equal(option.dispatch("keydown", { key: "ArrowDown" }).defaultPrevented, true);
 
   const slider = page.sdk.ui.slider({ label: "Power", minimum: 0, maximum: 10, step: 1, value: 5, readOnly: true, required: true, help: "Read only value." });
   const [range, number] = slider.element.children[1].children;

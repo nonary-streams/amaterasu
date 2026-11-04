@@ -154,7 +154,9 @@ namespace Amaterasu {
           }
         }, { capture: true, signal: choiceController.signal });
         control.addEventListener("keydown", (event) => {
-          if (behavior.readOnly && event.key !== "Tab") {
+          const mutatingKey = !event.ctrlKey && !event.metaKey && !event.altKey &&
+            (event.key.length === 1 || ["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Home", "End", "PageUp", "PageDown", "Enter", " ", "Spacebar", "Backspace", "Delete"].includes(event.key));
+          if (behavior.readOnly && mutatingKey) {
             event.preventDefault();
             event.stopImmediatePropagation();
           }
@@ -189,9 +191,14 @@ namespace Amaterasu {
       setChoices: (nextOptions, nextValue = currentValue) => {
         if (disposed) return;
         validate(nextOptions, nextValue);
+        const focusedValue = controls.find((control) => control === document.activeElement)?.value;
         currentOptions = [...nextOptions];
         currentValue = nextValue;
         render();
+        if (focusedValue !== undefined) {
+          (controls.find((control) => control.value === focusedValue) ??
+            controls.find((control) => control.value === currentValue))?.focus();
+        }
       },
       dispose,
     };

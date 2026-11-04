@@ -37,6 +37,7 @@ namespace Amaterasu {
   }
 
   let nextExtensionUiDescriptionId = 0;
+  let nextExtensionUiFieldId = 0;
 
   function extensionUiTextNode(value: ExtensionUiText): Text | string {
     if (typeof value === "string") return localizedTextNode(value);
@@ -49,6 +50,19 @@ namespace Amaterasu {
 
   function extensionUiLabel(text: ExtensionUiText): HTMLElement {
     return el("span", "field-label", extensionUiTextNode(text));
+  }
+
+  function extensionUiControlLabel(text: ExtensionUiText, control: HTMLElement): HTMLLabelElement {
+    const label = el("label", "field-label", extensionUiTextNode(text));
+    const id = `amaterasu-plugin-ui-control-${++nextExtensionUiFieldId}`;
+    control.id = id;
+    label.htmlFor = id;
+    return label;
+  }
+
+  function extensionUiReadOnlyKeyMutation(event: KeyboardEvent): boolean {
+    if (event.ctrlKey || event.metaKey || event.altKey) return false;
+    return event.key.length === 1 || ["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Home", "End", "PageUp", "PageDown", "Enter", " ", "Spacebar", "Backspace", "Delete"].includes(event.key);
   }
 
   function extensionUiChoices(choices: readonly ExtensionUiOption[], selected: string): void {
@@ -181,7 +195,7 @@ namespace Amaterasu {
           currentValue = checkbox.checked;
           options.onChange?.(currentValue);
         }, { signal: controller.signal });
-        const element = el("label", "field plugin-control plugin-toggle", extensionUiLabel(options.label), checkbox);
+        const element = el("div", "field plugin-control plugin-toggle", extensionUiControlLabel(options.label, checkbox), checkbox);
         extensionUiFieldDescriptions(element, [checkbox], options);
         return extensionUiControl(element, () => checkbox.checked, (value) => {
           if (typeof value !== "boolean") throw new Error("Toggle value must be boolean.");
@@ -197,15 +211,14 @@ namespace Amaterasu {
         const select = el("select", "");
         let choices = [...options.choices];
         let currentValue = options.value;
-        const renderChoices = (): void => {
-          select.replaceChildren(...choices.map((choice) => {
+        const makeChoiceOptions = (nextChoices: readonly ExtensionUiOption[]): HTMLOptionElement[] =>
+          nextChoices.map((choice) => {
             const option = el("option", "", extensionUiTextNode(choice.label));
             option.value = choice.value;
             return option;
-          }));
-          select.value = currentValue;
-        };
-        renderChoices();
+          });
+        select.replaceChildren(...makeChoiceOptions(choices));
+        select.value = currentValue;
         select.disabled = options.disabled === true;
         select.required = options.required === true;
         if (options.readOnly) select.setAttribute("aria-readonly", "true");
@@ -213,7 +226,7 @@ namespace Amaterasu {
           if (options.readOnly) { event.preventDefault(); event.stopImmediatePropagation(); }
         }, { capture: true, signal: controller.signal });
         select.addEventListener("keydown", (event) => {
-          if (options.readOnly && event.key !== "Tab") { event.preventDefault(); event.stopImmediatePropagation(); }
+          if (options.readOnly && extensionUiReadOnlyKeyMutation(event)) { event.preventDefault(); event.stopImmediatePropagation(); }
         }, { capture: true, signal: controller.signal });
         select.addEventListener("change", (event) => {
           if (options.disabled || options.readOnly) {
@@ -225,14 +238,17 @@ namespace Amaterasu {
           currentValue = select.value;
           options.onChange?.(currentValue);
         }, { signal: controller.signal });
-        const element = el("label", "field plugin-control", extensionUiLabel(options.label), select);
+        const element = el("div", "field plugin-control", extensionUiControlLabel(options.label, select), select);
         extensionUiFieldDescriptions(element, [select], options);
         const setChoices = (nextChoices: readonly ExtensionUiOption[], value?: string): void => {
           const nextValue = value ?? currentValue;
           extensionUiChoices(nextChoices, nextValue);
-          choices = [...nextChoices];
+          const preparedChoices = [...nextChoices];
+          const preparedOptions = makeChoiceOptions(preparedChoices);
+          select.replaceChildren(...preparedOptions);
+          select.value = nextValue;
+          choices = preparedChoices;
           currentValue = nextValue;
-          renderChoices();
         };
         return extensionUiControl(element, () => select.value, (value) => {
           if (!choices.some((choice) => choice.value === value)) throw new Error("Unsupported select value.");
