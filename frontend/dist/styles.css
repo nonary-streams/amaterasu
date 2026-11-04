@@ -1158,35 +1158,43 @@ dialog .actions {
 /* Console foundations, aligned with the Vibeshine v2 design language. */
 :root, [data-theme="dark"] {
   color-scheme: dark;
-  color: #eef1f8; background: #101218;
-  --bg: #101218; --panel: #181b24; --line: #303746;
-  --fg: #eef1f8; --secondary: #b8c0d0; --muted: #9aa5bb;
-  --subtle: #222632; --raised: #2b3040; --strong: #748099;
-  --accent: #a5b0ff; --accent-hover: #c2caff; --on-accent: #101218;
-  --good: #71d5ab; --danger: #f49aa7; --focus: #89dbea;
-  --selected-bg: #292d43; --selected-border: #393f5d; --selected-strong: #343a50;
-  --art-bg: #24283a; --art-text: #a5b0ffb3; --status-bg: #273047;
-  --danger-bg-strong: #552a34; --danger-border: #884451;
-  --accent-border: #4c5277; --accent-bg: #24283d;
-  --warning-border: #5c5037; --warning-bg: #2a261e; --warning-text: #dfd0b5; --warning-strong: #ebc17b;
-  --error-border: #71404b; --error-bg: #34232b; --error-text: #efc5ca;
-  --intro-glow: #303550;
+  color: #f2eadb; background: #171513;
+  --bg: #171513; --panel: #211e1b; --line: #40382f;
+  --fg: #f2eadb; --secondary: #c4b9a7; --muted: #a59887;
+  --subtle: #2a2521; --raised: #37302a; --strong: #796b5a;
+  --accent: #d04b36; --accent-hover: #e0634e; --on-accent: #fff8ee;
+  --good: #8db393; --danger: #ef9b8b; --focus: #e2b55d;
+  --selected-bg: #45251f; --selected-border: #824235; --selected-strong: #593127;
+  --art-bg: #30251f; --art-text: #e07156; --status-bg: #29352b;
+  --danger-bg-strong: #4c2925; --danger-border: #77423a;
+  --accent-border: #854739; --accent-bg: #35231e;
+  --warning-border: #675533; --warning-bg: #30291d; --warning-text: #e8d6b4; --warning-strong: #e5bd69;
+  --error-border: #76463c; --error-bg: #36231f; --error-text: #f0c9be;
+  --intro-glow: #443025;
+  --gold: #c9a65b; --ink: #1b1714; --paper: #f2eadb; --paper-edge: #bca77e;
+  --font-display: Georgia, "Times New Roman", serif;
 }
 [data-theme="light"] {
   color-scheme: light;
-  color: #252923; background: #f7f7f5;
-  --bg: #f7f7f5; --panel: #ffffff; --line: #dadfd7;
-  --fg: #252923; --secondary: #535d50; --muted: #677162;
-  --subtle: #f0f1ee; --raised: #e6e9e3; --strong: #828d7b;
-  --accent: #a64b14; --accent-hover: #883a0c; --on-accent: #ffffff;
-  --good: #197447; --danger: #bc3548; --focus: #6d28d9;
-  --selected-bg: #f5e8dd; --selected-border: #e8c7af; --selected-strong: #ead6c5;
-  --art-bg: #f2ebe4; --art-text: #9b5125; --status-bg: #f4e5d9;
-  --danger-bg-strong: #f8e5e7; --danger-border: #cb9da4;
-  --accent-border: #ddbaa1; --accent-bg: #f8eadf;
-  --warning-border: #dbc79f; --warning-bg: #fff7e7; --warning-text: #594c35; --warning-strong: #88591a;
-  --error-border: #d7a9b0; --error-bg: #fff0f1; --error-text: #68303b;
-  --intro-glow: #e9d4c2;
+  color: #251e19;
+  background:
+    radial-gradient(ellipse at 12% 6%, rgb(255 255 255 / .7), transparent 48%),
+    repeating-linear-gradient(0deg, rgb(105 79 43 / .018) 0 1px, transparent 1px 4px),
+    #f3ecd9;
+  --bg: #f3ecd9; --panel: #fbf5e6; --line: #d4c5a5;
+  --fg: #251e19; --secondary: #57483b; --muted: #716353;
+  --subtle: #eee4ce; --raised: #e5d7bb; --strong: #a5906b;
+  --accent: #b52f22; --accent-hover: #94251c; --on-accent: #fff9ed;
+  --good: #3f6a4b; --danger: #a52b2a; --focus: #8c281d;
+  --selected-bg: #f1ddd1; --selected-border: #d7a18d; --selected-strong: #e6c2ad;
+  --art-bg: #eee1ca; --art-text: #963a2a; --status-bg: #e4eadb;
+  --danger-bg-strong: #f5e3d9; --danger-border: #d4a396;
+  --accent-border: #d79c88; --accent-bg: #f3dfd3;
+  --warning-border: #d5bd86; --warning-bg: #f7edcf; --warning-text: #58462a; --warning-strong: #79531a;
+  --error-border: #d6a396; --error-bg: #f8e8df; --error-text: #642d27;
+  --intro-glow: #e7d5b6;
+  --gold: #98732f; --ink: #251e19; --paper: #fbf5e6; --paper-edge: #bda77b;
+  --font-display: Georgia, "Times New Roman", serif;
 }
 
 body { font-size: 15px; line-height: 1.47; }
@@ -1611,3 +1619,175 @@ polyline.host-metric-chart-line { fill: none; }
 .plugin-slider-inputs { display: flex; align-items: center; gap: 12px; width: min(100%, 420px); }
 .plugin-slider-inputs input[type="range"] { flex: 1; min-width: 0; accent-color: var(--accent); }
 .plugin-slider-inputs input[type="number"] { width: 7rem; }
+
+/* Amaterasu's Okami foundation: parchment, ink and restrained vermilion. */
+body {
+  color: var(--fg);
+  background:
+    repeating-linear-gradient(0deg, color-mix(in srgb, var(--ink) 1.4%, transparent) 0 1px, transparent 1px 5px),
+    radial-gradient(ellipse at 18% 0%, color-mix(in srgb, var(--gold) 8%, transparent), transparent 44%),
+    var(--bg);
+}
+h1, h2, h3, .brand {
+  font-family: var(--font-display);
+}
+.shell {
+  background: var(--bg);
+}
+.sidebar {
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--panel) 94%, var(--paper)), var(--panel));
+  border-right-color: var(--line);
+}
+.sidebar .brand {
+  min-height: 86px;
+  letter-spacing: .01em;
+}
+.brand-symbol {
+  border: 1px solid var(--gold);
+  background: radial-gradient(circle at 35% 35%, var(--accent) 0 25%, transparent 27%);
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--gold) 15%, transparent);
+}
+.brand-symbol > span {
+  width: 7px;
+  height: 7px;
+  background: var(--gold);
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 18%, transparent);
+}
+.brand-symbol:after {
+  width: 37px;
+  height: 2px;
+  background: var(--accent);
+}
+.nav-heading {
+  color: var(--muted);
+  font-family: var(--font-display);
+  letter-spacing: .12em;
+}
+.button.nav-item {
+  border-radius: 9px 13px 8px 11px;
+}
+.button.nav-item.selected {
+  color: var(--on-accent);
+  background:
+    linear-gradient(100deg, color-mix(in srgb, var(--accent) 92%, transparent), color-mix(in srgb, var(--accent) 78%, var(--gold)));
+  border-color: color-mix(in srgb, var(--accent) 76%, var(--gold));
+  box-shadow: inset 3px 0 0 var(--gold), 0 2px 8px color-mix(in srgb, var(--accent) 18%, transparent);
+}
+.button.nav-item.selected .nav-icon {
+  color: var(--on-accent);
+}
+.workspace {
+  background:
+    radial-gradient(ellipse at 100% 0%, color-mix(in srgb, var(--gold) 5%, transparent), transparent 45%),
+    var(--bg);
+}
+.topbar {
+  background: color-mix(in srgb, var(--bg) 90%, var(--panel));
+}
+.content {
+  max-width: 1440px;
+}
+.page-heading h1 {
+  font-family: var(--font-display);
+  font-size: clamp(30px, 3vw, 40px);
+  letter-spacing: -.035em;
+}
+.panel, .overview-status, .overview-activity-panel, .metric {
+  border-radius: 14px 16px 13px 15px;
+  border-color: color-mix(in srgb, var(--line) 82%, var(--gold));
+  box-shadow: 0 8px 24px color-mix(in srgb, var(--ink) 6%, transparent);
+}
+.panel {
+  background:
+    linear-gradient(145deg, color-mix(in srgb, var(--panel) 97%, var(--paper)), var(--panel));
+}
+.button {
+  border-radius: 9px 11px 9px 12px;
+}
+.button.primary {
+  background:
+    linear-gradient(100deg, var(--accent), color-mix(in srgb, var(--accent) 84%, var(--gold)));
+  border-color: var(--accent);
+  color: var(--on-accent);
+}
+.button.primary:hover:not(:disabled) {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+}
+.button.nav-item:focus-visible, .button:focus-visible, input:focus-visible,
+textarea:focus-visible, select:focus-visible, summary:focus-visible {
+  outline: 3px solid var(--focus);
+  outline-offset: 3px;
+}
+.overview-status, .overview-activity-panel {
+  background:
+    linear-gradient(110deg, color-mix(in srgb, var(--panel) 94%, var(--paper)), var(--panel));
+}
+.overview-status-icon {
+  border-radius: 50%;
+  border: 1px solid color-mix(in srgb, var(--good) 52%, var(--line));
+  color: var(--good);
+}
+.overview-status h2, .overview-activity-summary {
+  font-family: var(--font-display);
+}
+.sidebar-bottom {
+  position: relative;
+  min-height: 142px;
+  isolation: isolate;
+  overflow: hidden;
+}
+.sidebar-bottom::after {
+  content: "";
+  position: absolute;
+  z-index: -1;
+  inset: 12px 0 0;
+  opacity: .2;
+  background: url("./okami-mountains.svg") center bottom / contain no-repeat;
+  pointer-events: none;
+}
+.login-intro {
+  color: var(--fg);
+  background:
+    url("./okami-mountains.svg") right 5% bottom 6% / min(72%, 520px) auto no-repeat,
+    radial-gradient(circle at 76% 18%, color-mix(in srgb, var(--accent) 12%, transparent) 0 11%, transparent 11.2%),
+    radial-gradient(ellipse at 8% 15%, color-mix(in srgb, var(--gold) 15%, transparent), transparent 58%),
+    repeating-linear-gradient(0deg, color-mix(in srgb, var(--ink) 2%, transparent) 0 1px, transparent 1px 5px),
+    var(--panel);
+  border-color: var(--line);
+}
+.login-intro h1 {
+  font-family: var(--font-display);
+  font-weight: 500;
+}
+.login-card {
+  padding: clamp(22px, 4vw, 38px);
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: color-mix(in srgb, var(--panel) 94%, var(--paper));
+  box-shadow: 0 16px 42px color-mix(in srgb, var(--ink) 8%, transparent);
+}
+.login-card h2 {
+  font-family: var(--font-display);
+}
+input, textarea, select {
+  border-radius: 9px;
+  border-color: var(--line);
+  background: color-mix(in srgb, var(--bg) 84%, var(--panel));
+}
+.badge {
+  border-radius: 999px;
+}
+.button.quick-action {
+  border-radius: 11px 14px 10px 12px;
+}
+@media (max-width: 800px) {
+  .sidebar {
+    background: var(--panel);
+    box-shadow: 12px 12px 32px color-mix(in srgb, var(--ink) 18%, transparent);
+  }
+  .login-card {
+    padding: 24px 18px;
+  }
+}
