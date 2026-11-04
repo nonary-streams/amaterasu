@@ -136,6 +136,17 @@ test("table provides a caption, scoped headers, localized text cells, responsive
   assert.equal(tableElement.children.length, 0);
 });
 
+test("table row shape remains tied to the rendered columns after caller mutation", () => {
+  const { layout } = setup();
+  const columns = [{ header: "First" }, { header: "Second" }];
+  const table = layout.table({ caption: "Stable shape", columns });
+  columns.pop();
+  table.setRows([["one", "two"]]);
+  const body = table.element.children[0].children[2];
+  assert.equal(body.children[0].children.length, 2);
+  assert.throws(() => table.setRows([["one"]]), /table rows/);
+});
+
 test("table validates labels, row shapes, and bounded dimensions before rendering", () => {
   const { layout } = setup();
   assert.throws(() => layout.card({ label: "  " }), /card label/);

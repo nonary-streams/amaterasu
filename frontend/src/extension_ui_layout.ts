@@ -132,8 +132,9 @@ namespace Amaterasu {
       if (!column || typeof column !== "object" || Array.isArray(column)) throw new Error("Invalid plugin UI table column.");
       extensionUiLayoutRequiredText(column.header, "table header");
     }
+    const columnCount = options.columns.length;
     const initialRows = options.rows === undefined ? [] : options.rows;
-    validateExtensionUiTableRows(initialRows, options.columns.length);
+    validateExtensionUiTableRows(initialRows, columnCount);
 
     const region = el("div", "table-scroll plugin-ui-table-scroll");
     region.setAttribute("role", "region");
@@ -174,7 +175,7 @@ namespace Amaterasu {
       element: region,
       setRows: (rows: readonly (readonly ExtensionUiText[])[]): void => {
         if (disposed || signal.aborted) return;
-        validateExtensionUiTableRows(rows, options.columns.length);
+        validateExtensionUiTableRows(rows, columnCount);
         renderRows(rows);
       },
       dispose,

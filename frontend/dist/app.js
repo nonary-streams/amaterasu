@@ -20909,8 +20909,9 @@ var Amaterasu;
                 throw new Error("Invalid plugin UI table column.");
             extensionUiLayoutRequiredText(column.header, "table header");
         }
+        const columnCount = options.columns.length;
         const initialRows = options.rows === undefined ? [] : options.rows;
-        validateExtensionUiTableRows(initialRows, options.columns.length);
+        validateExtensionUiTableRows(initialRows, columnCount);
         const region = Amaterasu.el("div", "table-scroll plugin-ui-table-scroll");
         region.setAttribute("role", "region");
         region.tabIndex = 0;
@@ -20952,7 +20953,7 @@ var Amaterasu;
             setRows: (rows) => {
                 if (disposed || signal.aborted)
                     return;
-                validateExtensionUiTableRows(rows, options.columns.length);
+                validateExtensionUiTableRows(rows, columnCount);
                 renderRows(rows);
             },
             dispose,
