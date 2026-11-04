@@ -1,10 +1,10 @@
 //! Synchronous GPU processor consumer, shared by built-in and external plugins.
 use crate::abi::{STATUS_INVALID_ARGUMENT, STATUS_OK, Status};
 use amaterasu_media::{
-    DmaBufFrameLease, DmaBufLeaseSink, GPU_PROCESSOR_API_V1_2_SIZE,
+    DmaBufFrameLease, DmaBufLeaseSink, GPU_PROCESSOR_API_V1_2_SIZE, GPU_PROCESSOR_API_V1_3_SIZE,
     GPU_PROCESSOR_CONFIGURATION_INTERFACE_MINOR, GPU_PROCESSOR_INTERFACE_MAJOR,
-    GPU_PROCESSOR_MAX_CONFIGURATION_BYTES, GpuProcessorApi, GpuProcessorApiV1_2, MEDIA_BUSY,
-    MEDIA_UNSUPPORTED,
+    GPU_PROCESSOR_MAX_CONFIGURATION_BYTES, GPU_PROCESSOR_UPDATE_INTERFACE_MINOR, GpuProcessorApi,
+    GpuProcessorApiV1_2, GpuProcessorApiV1_3, MEDIA_BUSY, MEDIA_UNSUPPORTED,
 };
 use std::{
     ffi::c_void,
@@ -49,6 +49,43 @@ pub unsafe fn configure_gpu_stream(
         // SAFETY: a rejected configuration may have reserved provider state;
         // the live binding's cancellation callback synchronously retires it.
         unsafe { (api.cancel_dmabuf_leases)(api.base.context, stream) };
+        Err(status)
+    }
+}
+
+/// Atomically replace settings for a configured stream. A rejected update
+/// leaves the stream active with its prior settings; this helper never cancels.
+/// Calls must be serialized with frame processing and stream retirement.
+///
+/// # Safety
+/// `api` must be a live binding obtained with the GPU processor's typed
+/// contract identity, and its advertised v1.3 table must be complete. Table
+/// version and size alone cannot establish interface identity.
+pub unsafe fn update_gpu_stream(
+    api: &GpuProcessorApi,
+    stream: u64,
+    json: &[u8],
+) -> Result<(), Status> {
+    if json.is_empty()
+        || json.len() > GPU_PROCESSOR_MAX_CONFIGURATION_BYTES
+        || serde_json::from_slice::<serde_json::Value>(json).is_err()
+    {
+        return Err(STATUS_INVALID_ARGUMENT);
+    }
+    let header = api.base.header;
+    if header.major != GPU_PROCESSOR_INTERFACE_MAJOR
+        || header.minor < GPU_PROCESSOR_UPDATE_INTERFACE_MINOR
+        || header.size < GPU_PROCESSOR_API_V1_3_SIZE
+    {
+        return Err(MEDIA_UNSUPPORTED);
+    }
+    // SAFETY: caller guarantees the advertised complete table and live binding.
+    let table = unsafe { &*std::ptr::from_ref(api).cast::<GpuProcessorApiV1_3>() };
+    let status =
+        unsafe { (table.update_stream)(api.base.context, stream, json.as_ptr(), json.len()) };
+    if status == STATUS_OK {
+        Ok(())
+    } else {
         Err(status)
     }
 }

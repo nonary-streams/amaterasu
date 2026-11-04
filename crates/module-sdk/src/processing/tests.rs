@@ -271,6 +271,10 @@ fn factory_checks_version_and_uses_authenticated_principal() {
         assert_eq!(invoke(&factory, principal, &query, &mut result), STATUS_OK);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         (*result).release.unwrap()((*result).context);
+        query.min_minor = GPU_PROCESSOR_UPDATE_INTERFACE_MINOR;
+        query.min_size = GPU_PROCESSOR_API_V1_3_SIZE;
+        assert_eq!(invoke(&factory, principal, &query, &mut result), STATUS_OK);
+        (*result).release.unwrap()((*result).context);
         query.min_minor += 1;
         assert_eq!(
             invoke(&factory, principal, &query, &mut result),
@@ -278,6 +282,90 @@ fn factory_checks_version_and_uses_authenticated_principal() {
         );
         assert!(result.is_null());
     }
+}
+
+struct UpdatingEffect<const ALTERNATE: bool> {
+    settings: Rc<std::cell::RefCell<Vec<u8>>>,
+    cancellations: Rc<Cell<u32>>,
+}
+impl<const ALTERNATE: bool> GpuFrameProcessor for UpdatingEffect<ALTERNATE> {
+    fn update_stream(&mut self, _: u64, json: &[u8]) -> Result<(), Status> {
+        if json == b"{}" {
+            return Err(MEDIA_BACKEND_ERROR);
+        }
+        *self.settings.borrow_mut() = json.to_vec();
+        Ok(())
+    }
+    fn process(&mut self, _: u64, _: GpuFrame<'_>) -> Result<GpuOutputFrame, Status> {
+        Err(MEDIA_UNSUPPORTED)
+    }
+    fn cancel(&mut self, _: u64) {
+        self.cancellations.set(self.cancellations.get() + 1);
+    }
+    fn shutdown(&mut self) {}
+}
+
+#[test]
+fn unchanged_update_consumer_supports_replacement_and_preserves_rejected_stream() {
+    fn exercise(
+        api: &GpuProcessorApi,
+        settings: &std::cell::RefCell<Vec<u8>>,
+        cancellations: &Cell<u32>,
+    ) {
+        assert_eq!(
+            unsafe { update_gpu_stream(api, 7, br#"{"gain":2}"#) },
+            Ok(())
+        );
+        assert_eq!(settings.borrow().as_slice(), br#"{"gain":2}"#);
+        assert_eq!(
+            unsafe { update_gpu_stream(api, 7, b"{}") },
+            Err(MEDIA_BACKEND_ERROR)
+        );
+        assert_eq!(settings.borrow().as_slice(), br#"{"gain":2}"#);
+        assert_eq!(
+            unsafe { update_gpu_stream(api, 7, b"bad") },
+            Err(STATUS_INVALID_ARGUMENT)
+        );
+        assert_eq!(cancellations.get(), 0);
+    }
+    let settings = Rc::new(std::cell::RefCell::new(Vec::new()));
+    let cancellations = Rc::new(Cell::new(0));
+    for raw in [
+        into_gpu_binding(UpdatingEffect::<false> {
+            settings: settings.clone(),
+            cancellations: cancellations.clone(),
+        }),
+        into_gpu_binding(UpdatingEffect::<true> {
+            settings: settings.clone(),
+            cancellations: cancellations.clone(),
+        }),
+    ] {
+        let api = unsafe { &*raw };
+        exercise(api, &settings, &cancellations);
+        let table = unsafe { &*raw.cast::<GpuProcessorApiV1_3>() };
+        assert_eq!(
+            unsafe { (table.update_stream)(api.base.context, 7, std::ptr::null(), 1) },
+            STATUS_INVALID_ARGUMENT
+        );
+        unsafe { api.base.release.unwrap()(api.base.context) };
+    }
+    let old = GpuProcessorApi {
+        base: NativeInterface {
+            header: AbiHeader {
+                major: GPU_PROCESSOR_INTERFACE_MAJOR,
+                minor: 2,
+                size: GPU_PROCESSOR_API_V1_2_SIZE,
+            },
+            context: std::ptr::null_mut(),
+            release: None,
+        },
+        process: unreachable_process,
+        cancel_dmabuf_leases: unreachable_cancel,
+    };
+    assert_eq!(
+        unsafe { update_gpu_stream(&old, 7, b"{}") },
+        Err(MEDIA_UNSUPPORTED)
+    );
 }
 
 #[test]

@@ -622,6 +622,17 @@ typedef struct {
     AmaterasuStatus (*configure_stream)(void *, uint64_t, const uint8_t *, size_t);
 } AmaterasuGpuProcessorApiV1_2;
 #define AMATERASU_GPU_PROCESSOR_API_V1_2_SIZE ((uint32_t)sizeof(AmaterasuGpuProcessorApiV1_2))
+/* v1.3 atomically replaces settings of an active configured stream. JSON has
+ * the same size and borrowing rules as configure_stream. Failure leaves the
+ * previous settings active and does not cancel the stream. Calls are serialized
+ * with processing and retirement. Updates must preserve the negotiated output
+ * format and HDR metadata. */
+#define AMATERASU_GPU_PROCESSOR_UPDATE_INTERFACE_MINOR 3u
+typedef struct {
+    AmaterasuGpuProcessorApiV1_2 base;
+    AmaterasuStatus (*update_stream)(void *, uint64_t, const uint8_t *, size_t);
+} AmaterasuGpuProcessorApiV1_3;
+#define AMATERASU_GPU_PROCESSOR_API_V1_3_SIZE ((uint32_t)sizeof(AmaterasuGpuProcessorApiV1_3))
 typedef struct {
     AmaterasuCaptureApiV1_8 base;
     AmaterasuStatus (*hdr_metadata)(void *, uint64_t, AmaterasuHdrMetadata *);

@@ -139,3 +139,19 @@ pub struct GpuProcessorApiV1_2 {
 }
 
 pub const GPU_PROCESSOR_API_V1_2_SIZE: u32 = size_of::<GpuProcessorApiV1_2>() as u32;
+
+pub const GPU_PROCESSOR_UPDATE_INTERFACE_MINOR: u32 = 3;
+
+/// Atomic replacement of an active stream's configuration. The JSON has the
+/// same size and lifetime bounds as `configure_stream`. The call is serialized
+/// with processing and cancellation. A failed update leaves the previous
+/// configuration active and does not cancel the stream. Successful updates
+/// must preserve the negotiated output format and HDR metadata; changes that
+/// cannot satisfy those invariants must be rejected.
+#[repr(C)]
+pub struct GpuProcessorApiV1_3 {
+    pub base: GpuProcessorApiV1_2,
+    pub update_stream: unsafe extern "C" fn(*mut c_void, u64, *const u8, usize) -> Status,
+}
+
+pub const GPU_PROCESSOR_API_V1_3_SIZE: u32 = size_of::<GpuProcessorApiV1_3>() as u32;

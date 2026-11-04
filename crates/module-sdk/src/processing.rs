@@ -8,7 +8,9 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
 };
 mod consumer;
-pub use consumer::{ProcessingOutcome, ScopedGpuFrame, configure_gpu_stream, process_gpu};
+pub use consumer::{
+    ProcessingOutcome, ScopedGpuFrame, configure_gpu_stream, process_gpu, update_gpu_stream,
+};
 
 /// A synchronous borrow. Plane descriptors and pixels belong to the input
 /// provider and must not be closed, modified, or used after `process` returns.
@@ -69,6 +71,12 @@ pub trait GpuFrameProcessor: 'static {
     fn configure_stream(&mut self, _stream: u64, _json: &[u8]) -> Result<(), Status> {
         Err(MEDIA_UNSUPPORTED)
     }
+    /// Atomically replace the active settings of a configured stream. Rejection
+    /// must leave its prior settings usable. The negotiated output format and
+    /// HDR metadata must remain unchanged. Copy settings needed after return.
+    fn update_stream(&mut self, _stream: u64, _json: &[u8]) -> Result<(), Status> {
+        Err(MEDIA_UNSUPPORTED)
+    }
     fn process(&mut self, stream: u64, input: GpuFrame<'_>) -> Result<GpuOutputFrame, Status>;
     /// Retire this stream's GPU work and references synchronously. Downstream
     /// consumers must have retired their retained output references first.
@@ -83,7 +91,7 @@ pub trait GpuFrameProcessor: 'static {
 
 #[repr(C)]
 struct Binding<P> {
-    api: GpuProcessorApiV1_2,
+    api: GpuProcessorApiV1_3,
     processor: RefCell<P>,
 }
 
@@ -92,29 +100,64 @@ struct Binding<P> {
 /// providers as well as built-ins; no effect-specific runtime support is needed.
 pub fn into_gpu_binding<P: GpuFrameProcessor>(processor: P) -> *const GpuProcessorApi {
     let mut binding = Box::new(Binding {
-        api: GpuProcessorApiV1_2 {
-            base: GpuProcessorApiV1_1 {
-                base: GpuProcessorApi {
-                    base: NativeInterface {
-                        header: AbiHeader {
-                            major: GPU_PROCESSOR_INTERFACE_MAJOR,
-                            minor: GPU_PROCESSOR_CONFIGURATION_INTERFACE_MINOR,
-                            size: GPU_PROCESSOR_API_V1_2_SIZE,
+        api: GpuProcessorApiV1_3 {
+            base: GpuProcessorApiV1_2 {
+                base: GpuProcessorApiV1_1 {
+                    base: GpuProcessorApi {
+                        base: NativeInterface {
+                            header: AbiHeader {
+                                major: GPU_PROCESSOR_INTERFACE_MAJOR,
+                                minor: GPU_PROCESSOR_UPDATE_INTERFACE_MINOR,
+                                size: GPU_PROCESSOR_API_V1_3_SIZE,
+                            },
+                            context: std::ptr::null_mut(),
+                            release: Some(release::<P>),
                         },
-                        context: std::ptr::null_mut(),
-                        release: Some(release::<P>),
+                        process: process::<P>,
+                        cancel_dmabuf_leases: cancel::<P>,
                     },
-                    process: process::<P>,
-                    cancel_dmabuf_leases: cancel::<P>,
+                    hdr_metadata: metadata::<P>,
                 },
-                hdr_metadata: metadata::<P>,
+                configure_stream: configure::<P>,
             },
-            configure_stream: configure::<P>,
+            update_stream: update::<P>,
         },
         processor: RefCell::new(processor),
     });
-    binding.api.base.base.base.context = (&mut *binding as *mut Binding<P>).cast();
+    binding.api.base.base.base.base.context = (&mut *binding as *mut Binding<P>).cast();
     Box::into_raw(binding).cast()
+}
+
+unsafe extern "C" fn update<P: GpuFrameProcessor>(
+    context: *mut c_void,
+    stream: u64,
+    json: *const u8,
+    len: usize,
+) -> Status {
+    guard(|| {
+        if context.is_null()
+            || json.is_null()
+            || len == 0
+            || len > GPU_PROCESSOR_MAX_CONFIGURATION_BYTES
+        {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: the caller supplies readable borrowed bytes for this synchronous call.
+        let json = unsafe { std::slice::from_raw_parts(json, len) };
+        if serde_json::from_slice::<serde_json::Value>(json).is_err() {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: the binding is live and points to the SDK-owned context.
+        let binding = unsafe { &*context.cast::<Binding<P>>() };
+        let Ok(mut processor) = binding.processor.try_borrow_mut() else {
+            return MEDIA_BUSY;
+        };
+        match processor.update_stream(stream, json) {
+            Ok(()) => STATUS_OK,
+            Err(status) if status != STATUS_OK => status,
+            Err(_) => STATUS_INTERNAL_ERROR,
+        }
+    })
 }
 
 unsafe extern "C" fn configure<P: GpuFrameProcessor>(
@@ -301,8 +344,8 @@ where
         let query = unsafe { &*query };
         if !query.header.supports::<NativeInterfaceQuery>()
             || query.interface_major != GPU_PROCESSOR_INTERFACE_MAJOR
-            || query.min_minor > GPU_PROCESSOR_CONFIGURATION_INTERFACE_MINOR
-            || query.min_size > GPU_PROCESSOR_API_V1_2_SIZE
+            || query.min_minor > GPU_PROCESSOR_UPDATE_INTERFACE_MINOR
+            || query.min_size > GPU_PROCESSOR_API_V1_3_SIZE
         {
             return MEDIA_UNSUPPORTED;
         }
