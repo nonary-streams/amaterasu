@@ -3192,6 +3192,7 @@ namespace Amaterasu {
       const message = el("p", "error", `Overlapping fields: ${pending.overlaps.join(", ")}. Latest values are kept until you choose an action.`);
       const review = button("Review and keep latest values", () => {
         pending.reviewed = true;
+        if (pending.latest) applyValues(pending.latest, pending.overlaps);
         save.disabled = !context.api.allows("configuration.write");
         message.textContent = `Reviewed overlapping fields: ${pending.overlaps.join(", ")}. Latest values will be saved.`;
         review.disabled = true;
@@ -4473,24 +4474,25 @@ namespace Amaterasu {
           syncPlugins.setValues(draftValues.sync_plugins);
           excludePlugins.setValues(draftValues.exclude_plugins);
           excludeGames.setValues(draftValues.exclude_games);
-          configureProviderConflictReview("playnite", saveStatus, save, (values) => {
-            settingsSetDraftCheckbox(enabled, values.enabled as boolean);
-            settingsSetDraftCheckbox(autoSync, values.auto_sync as boolean);
-            settingsSetDraftCheckbox(syncAllInstalled, values.sync_all_installed as boolean);
-            settingsSetDraftCheckbox(removeUninstalled, values.autosync_remove_uninstalled as boolean);
-            settingsSetDraftNumber(deleteAfterDays, values.autosync_delete_after_days as number);
-            settingsSetDraftCheckbox(requireReplacement, values.autosync_require_replacement as boolean);
-            settingsSetDraftNumber(focusAttempts, values.focus_attempts as number);
-            settingsSetDraftNumber(focusTimeoutSecs, values.focus_timeout_secs as number);
-            settingsSetDraftCheckbox(focusExitOnFirst, values.focus_exit_on_first as boolean);
-            settingsSetDraftCheckbox(fullscreenEntryEnabled, values.fullscreen_entry_enabled as boolean);
-            settingsSetDraftNumber(recentGames, values.recent_games as number);
-            settingsSetDraftNumber(recentMaxAgeDays, values.recent_max_age_days as number);
-            syncCategories.setValues(values.sync_categories as string[]);
-            excludeCategories.setValues(values.exclude_categories as string[]);
-            syncPlugins.setValues(values.sync_plugins as string[]);
-            excludePlugins.setValues(values.exclude_plugins as string[]);
-            excludeGames.setValues(values.exclude_games as string[]);
+          configureProviderConflictReview("playnite", saveStatus, save, (values, fields) => {
+            const selected = new Set(fields);
+            if (selected.has("enabled")) settingsSetDraftCheckbox(enabled, values.enabled as boolean);
+            if (selected.has("auto_sync")) settingsSetDraftCheckbox(autoSync, values.auto_sync as boolean);
+            if (selected.has("sync_all_installed")) settingsSetDraftCheckbox(syncAllInstalled, values.sync_all_installed as boolean);
+            if (selected.has("autosync_remove_uninstalled")) settingsSetDraftCheckbox(removeUninstalled, values.autosync_remove_uninstalled as boolean);
+            if (selected.has("autosync_delete_after_days")) settingsSetDraftNumber(deleteAfterDays, values.autosync_delete_after_days as number);
+            if (selected.has("autosync_require_replacement")) settingsSetDraftCheckbox(requireReplacement, values.autosync_require_replacement as boolean);
+            if (selected.has("focus_attempts")) settingsSetDraftNumber(focusAttempts, values.focus_attempts as number);
+            if (selected.has("focus_timeout_secs")) settingsSetDraftNumber(focusTimeoutSecs, values.focus_timeout_secs as number);
+            if (selected.has("focus_exit_on_first")) settingsSetDraftCheckbox(focusExitOnFirst, values.focus_exit_on_first as boolean);
+            if (selected.has("fullscreen_entry_enabled")) settingsSetDraftCheckbox(fullscreenEntryEnabled, values.fullscreen_entry_enabled as boolean);
+            if (selected.has("recent_games")) settingsSetDraftNumber(recentGames, values.recent_games as number);
+            if (selected.has("recent_max_age_days")) settingsSetDraftNumber(recentMaxAgeDays, values.recent_max_age_days as number);
+            if (selected.has("sync_categories")) syncCategories.setValues(values.sync_categories as string[]);
+            if (selected.has("exclude_categories")) excludeCategories.setValues(values.exclude_categories as string[]);
+            if (selected.has("sync_plugins")) syncPlugins.setValues(values.sync_plugins as string[]);
+            if (selected.has("exclude_plugins")) excludePlugins.setValues(values.exclude_plugins as string[]);
+            if (selected.has("exclude_games")) excludeGames.setValues(values.exclude_games as string[]);
           });
         }
       } catch (error) {

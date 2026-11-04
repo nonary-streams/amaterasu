@@ -682,6 +682,8 @@ test("Steam keep-latest review preserves edits made while the conflict decision 
   await tick();
 
   form = formFor(f, "steam");
+  inputNamed(form, "steam_auto_sync").checked = true;
+  inputNamed(form, "steam_auto_sync").fire("change");
   inputNamed(form, "steam_include_tools").checked = true;
   inputNamed(form, "steam_include_tools").fire("change");
   buttonNamed(form, "Review and keep latest values").click();
@@ -695,4 +697,97 @@ test("Steam keep-latest review preserves edits made while the conflict decision 
   assert.equal(f.state.steam.values.include_tools, true);
   assert.equal(f.draftGuard.isDirty(), false);
   f.draftGuard.dispose();
+});
+
+
+test("Lutris conflict choices restore only overlapping fields and preserve later edits", async () => {
+  const overwrite = fixture();
+  await tick();
+  overwrite.conflictNext.add("lutris");
+  let form = formFor(overwrite, "lutris");
+  inputNamed(form, "lutris_auto_sync").checked = false;
+  inputNamed(form, "lutris_auto_sync").fire("change");
+  submit(form);
+  await tick();
+  form = formFor(overwrite, "lutris");
+  inputNamed(form, "lutris_include_steam").checked = true;
+  inputNamed(form, "lutris_include_steam").fire("change");
+  buttonNamed(form, "Overwrite overlapping fields").click();
+  assert.equal(inputNamed(form, "lutris_auto_sync").checked, false);
+  assert.equal(inputNamed(form, "lutris_include_steam").checked, true);
+  submit(form);
+  await tick();
+  assert.equal(overwrite.state.lutris.values.auto_sync, false);
+  assert.equal(overwrite.state.lutris.values.include_steam, true);
+  overwrite.draftGuard.dispose();
+
+  const keepLatest = fixture();
+  await tick();
+  keepLatest.conflictNext.add("lutris");
+  form = formFor(keepLatest, "lutris");
+  inputNamed(form, "lutris_auto_sync").checked = false;
+  inputNamed(form, "lutris_auto_sync").fire("change");
+  submit(form);
+  await tick();
+  form = formFor(keepLatest, "lutris");
+  inputNamed(form, "lutris_auto_sync").checked = true;
+  inputNamed(form, "lutris_auto_sync").fire("change");
+  inputNamed(form, "lutris_include_steam").checked = true;
+  inputNamed(form, "lutris_include_steam").fire("change");
+  buttonNamed(form, "Review and keep latest values").click();
+  assert.equal(inputNamed(form, "lutris_auto_sync").checked, false);
+  assert.equal(inputNamed(form, "lutris_include_steam").checked, true);
+  submit(form);
+  await tick();
+  assert.equal(keepLatest.state.lutris.values.auto_sync, false);
+  assert.equal(keepLatest.state.lutris.values.include_steam, true);
+  keepLatest.draftGuard.dispose();
+});
+
+test("Playnite conflict choices restore only overlapping fields and preserve later edits", async () => {
+  const keepLatest = fixture();
+  await tick();
+  keepLatest.conflictNext.add("playnite");
+  keepLatest.conflictOverrides.set("playnite", { recent_games: 60 });
+  let form = formFor(keepLatest, "playnite");
+  inputNamed(form, "playnite_recent_games").value = "45";
+  inputNamed(form, "playnite_recent_games").fire("input");
+  submit(form);
+  await tick();
+  form = formFor(keepLatest, "playnite");
+  inputNamed(form, "playnite_recent_games").value = "50";
+  inputNamed(form, "playnite_recent_games").fire("input");
+  inputNamed(form, "playnite_focus_attempts").value = "8";
+  inputNamed(form, "playnite_focus_attempts").fire("input");
+  buttonNamed(form, "Review and keep latest values").click();
+  assert.equal(inputNamed(form, "playnite_recent_games").value, "60");
+  assert.equal(inputNamed(form, "playnite_focus_attempts").value, "8");
+  submit(form);
+  await tick();
+  assert.equal(keepLatest.state.playnite.values.recent_games, 60);
+  assert.equal(keepLatest.state.playnite.values.focus_attempts, 8);
+  keepLatest.draftGuard.dispose();
+
+  const overwrite = fixture();
+  await tick();
+  overwrite.conflictNext.add("playnite");
+  overwrite.conflictOverrides.set("playnite", { recent_games: 60 });
+  form = formFor(overwrite, "playnite");
+  inputNamed(form, "playnite_recent_games").value = "45";
+  inputNamed(form, "playnite_recent_games").fire("input");
+  submit(form);
+  await tick();
+  form = formFor(overwrite, "playnite");
+  inputNamed(form, "playnite_recent_games").value = "50";
+  inputNamed(form, "playnite_recent_games").fire("input");
+  inputNamed(form, "playnite_focus_attempts").value = "8";
+  inputNamed(form, "playnite_focus_attempts").fire("input");
+  buttonNamed(form, "Overwrite overlapping fields").click();
+  assert.equal(inputNamed(form, "playnite_recent_games").value, "45");
+  assert.equal(inputNamed(form, "playnite_focus_attempts").value, "8");
+  submit(form);
+  await tick();
+  assert.equal(overwrite.state.playnite.values.recent_games, 45);
+  assert.equal(overwrite.state.playnite.values.focus_attempts, 8);
+  overwrite.draftGuard.dispose();
 });
