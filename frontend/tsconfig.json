@@ -21,6 +21,7 @@
     "src/catalog.ts",
     "src/management-policy.ts",
     "src/csrf-policy.ts",
+    "src/client_directory.ts",
     "src/settings.ts",
     "src/rtx_hdr.ts",
     "src/integrations.ts",

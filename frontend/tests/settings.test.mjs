@@ -15,6 +15,12 @@ context.Amaterasu.renderHostMetricsDashboard = () => {};
 context.Amaterasu.renderSystemTraySettings = () => {};
 vm.runInContext("Object.assign(globalThis, Amaterasu)", context);
 vm.runInContext(
+  ts.transpile(readFileSync("src/client_directory.ts", "utf8"), {
+    target: ts.ScriptTarget.ES2022,
+  }),
+  context,
+);
+vm.runInContext(
   ts.transpile(readFileSync("src/settings.ts", "utf8"), {
     target: ts.ScriptTarget.ES2022,
   }),
@@ -33,6 +39,21 @@ vm.runInContext(
 const parse = context.Amaterasu.parseSteamExclusions;
 const ordinary = (value) => JSON.parse(JSON.stringify(value));
 const diagnosticsResult = (status) => ({ status, error: null });
+
+test("paired client directory filters names and fingerprints and sorts by recency or name", () => {
+  const sort = context.Amaterasu.sortClientDirectoryEntries;
+  const entries = [
+    { key: "a", name: "Living room", searchText: "Living room client-a aaaa", pairedAt: 10, card: {} },
+    { key: "b", name: "Bedroom", searchText: "Bedroom client-b bbbb", pairedAt: 30, card: {} },
+    { key: "c", name: "Office", searchText: "Office client-c cccc", pairedAt: 20, card: {} },
+  ];
+  assert.deepEqual(sort(entries, "", "recent").map((entry) => entry.key), ["b", "c", "a"]);
+  assert.deepEqual(sort(entries, "", "name").map((entry) => entry.key), ["b", "a", "c"]);
+  assert.deepEqual(sort(entries, "CLIENT-C", "recent").map((entry) => entry.key), ["c"]);
+  assert.deepEqual(sort(entries, "cccc", "recent").map((entry) => entry.key), ["c"]);
+  assert.deepEqual(sort(entries, "no match", "recent"), []);
+  assert.deepEqual(sort(entries, "", "recent").map((entry) => entry.key), ["b", "c", "a"]);
+});
 
 test("settings search matches labels, descriptions, category and keys case insensitively", () => {
   const matches = context.Amaterasu.settingsSearchMatches;

@@ -2941,10 +2941,13 @@ namespace Amaterasu {
           }, "danger");
           remove.disabled = !context.api.allows("pairing.admin");
           clientSaveControls.push({ control: remove, allowed: !remove.disabled });
+          const pairedDate = client.paired_at > 0
+            ? "Paired " + new Date(client.paired_at * 1000).toLocaleDateString()
+            : "Pair date unavailable";
           const identity = el(
             "summary", "client-settings-summary",
             el("span", "client-settings-name", settingsTextLiteral(client.name)),
-            el("small", "muted", settingsTextLiteral(`${client.client_id} · certificate ${client.certificate_id.slice(0, 12)}…`)),
+            el("small", "muted", settingsTextLiteral(client.client_id + " · " + pairedDate + " · certificate " + client.certificate_id.slice(0, 12) + "…")),
           );
           const audioSettings = el("details", "client-settings-group",
             el("summary", "", "Audio"),
@@ -3042,34 +3045,19 @@ namespace Amaterasu {
             controls.forEach((control, index) => rebaseBaselines.set(control, pairingStateSignature(latestStates[index]!)));
           }
         }
-        const clientSearch = input("client_search", "", "search");
-        clientSearch.setAttribute("data-draft-ignore", "");
-        clientSearch.placeholder = "Search clients";
-        if (rebase) clientSearch.value = rebase.search.value;
-        const searchSummary = el("p", "muted client-search-summary");
-        searchSummary.setAttribute("role", "status");
-        const noMatches = el("p", "muted client-search-empty", "No paired clients match this search.");
-        function filterClients(): void {
-          const query = clientSearch.value.trim().toLocaleLowerCase();
-          let visible = 0;
-          for (const { client, card } of rows) {
-            const identity = `${client.name} ${client.client_id} ${client.certificate_id}`.toLocaleLowerCase();
-            card.hidden = !!query && !identity.includes(query);
-            if (!card.hidden) visible++;
-          }
-          searchSummary.textContent = `${visible} of ${rows.length} paired clients`;
-          noMatches.hidden = visible !== 0;
-          noMatches.textContent = rows.length === 0 ? "No paired clients remain." : "No paired clients match this search.";
-        }
-        clientSearch.addEventListener("input", filterClients);
-        filterClients();
+        const directory = createClientDirectory(rows.map(({ client, card }) => ({
+          key: client.certificate_id,
+          name: client.name,
+          searchText: client.name + " " + client.client_id + " " + client.certificate_id,
+          pairedAt: client.paired_at,
+          card,
+        })), rebase?.search.value ?? "");
+        const clientSearch = directory.search;
         pairingArea.replaceChildren(
           panel(
             "Paired client overrides",
             el("p", "muted", "Open a client to review its streaming overrides. Saves confirm the stored pairing revision; input preferences apply when the next stream acquires its input lease."),
-            el("div", "client-search", field("Search paired clients", clientSearch), searchSummary),
-            noMatches,
-            el("div", "client-settings-list", ...rows.map(({ card }) => card)),
+            directory.element,
             el("div", "actions", revisionBadge),
           ),
         );
