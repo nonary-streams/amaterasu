@@ -1332,6 +1332,7 @@ dialog .actions {
   --dialog-backdrop: rgb(60 42 28 / .56);
 }
 
+input[type="range"] { accent-color: var(--accent); }
 body { font-size: 15px; line-height: 1.47; }
 p { line-height: 1.5; }
 :focus-visible { outline-color: var(--focus); outline-offset: 2px; }

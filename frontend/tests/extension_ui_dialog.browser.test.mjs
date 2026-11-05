@@ -440,10 +440,12 @@ test("Chromium styles modal backdrops for both Okami themes and keeps tall dialo
   await cdp.command("Emulation.setDeviceMetricsOverride", {width:360,height:640,deviceScaleFactor:1,mobile:true});
   await cdp.evaluate(`window.__reset();
     const content=document.createElement("div");
+    window.__visualRange=document.createElement("input"); window.__visualRange.type="range"; content.append(window.__visualRange);
     for(let index=0;index<24;index++){const paragraph=document.createElement("p");paragraph.textContent="Scrollable plugin setting "+(index+1);content.append(paragraph);}
     window.__visualDialog=window.__ui.dialog({title:"Narrow plugin settings",description:"Long content should remain scrollable.",content});
     window.__mount.append(window.__visualDialog.element); window.__visualDialog.open(); true`);
   const darkBackdrop = await cdp.evaluate("getComputedStyle(window.__visualDialog.element, '::backdrop').backgroundColor");
+  const darkRangeAccent = await cdp.evaluate("getComputedStyle(window.__visualRange).accentColor");
   const narrow = await cdp.evaluate(`(() => {
     const dialog=window.__visualDialog.element;
     const rect=dialog.getBoundingClientRect();
@@ -456,6 +458,7 @@ test("Chromium styles modal backdrops for both Okami themes and keeps tall dialo
   assert.equal(narrow.scrollable, true);
   assert.equal(narrow.horizontalOverflow, false);
   assert.equal(darkBackdrop, "rgba(13, 10, 7, 0.76)");
+  assert.equal(darkRangeAccent, "rgb(177, 50, 35)");
   await cdp.evaluate("window.__visualDialog.element.tabIndex=-1; window.__visualDialog.element.scrollTop=0; window.__visualDialog.element.focus(); true");
   await press(cdp, "PageDown", "PageDown", 34);
   assert.equal(await cdp.evaluate("window.__visualDialog.element.scrollTop>0"), true);
@@ -467,8 +470,10 @@ test("Chromium styles modal backdrops for both Okami themes and keeps tall dialo
     return dialog.scrollTop>0 && actions.bottom<=rect.bottom && actions.bottom>rect.top;
   })()`);
   const lightBackdrop = await cdp.evaluate("getComputedStyle(window.__visualDialog.element, '::backdrop').backgroundColor");
+  const lightRangeAccent = await cdp.evaluate("getComputedStyle(window.__visualRange).accentColor");
   assert.equal(reachedActions, true);
   assert.equal(lightBackdrop, "rgba(60, 42, 28, 0.56)");
+  assert.equal(lightRangeAccent, "rgb(181, 47, 34)");
   await cdp.command("Emulation.clearDeviceMetricsOverride");
   await cdp.evaluate("window.__visualDialog.dispose(); document.documentElement.removeAttribute('data-theme'); true");
 });
