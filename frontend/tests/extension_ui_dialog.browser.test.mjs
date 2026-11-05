@@ -13,9 +13,10 @@ const tick = () => new Promise(resolve => setTimeout(resolve, 40));
 const sourceFiles = ["ui.ts", "extension_ui.ts", "extension_ui_layout.ts", "extension_ui_feedback.ts", "extension_ui_dialog.ts"];
 const sources = await Promise.all(sourceFiles.map(file => readFile(`src/${file}`, "utf8")));
 const transpiled = sources.map(source => ts.transpile(source, { target: ts.ScriptTarget.ES2022 })).join("\n");
+const stylesheet = await readFile("public/styles.css", "utf8");
 
 function html() {
-  return `<!doctype html><meta charset="utf-8"><main id="mount"></main>
+  return `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><style>${stylesheet}</style><main id="mount"></main>
 <script>window.onerror=(message,source,line,column,error)=>{window.__loadError=error?.stack ?? String(message)};</script>
 <script>
 window.Amaterasu = {
@@ -430,4 +431,44 @@ test("Chromium always completes disposal when an onClose callback throws", async
   assert.equal(await cdp.evaluate("document.activeElement === window.__opener"), true);
   await cdp.evaluate("window.__throwing.open(); window.__throwing.close(); true");
   assert.equal(await cdp.evaluate("window.__throwing.element.open"), false);
+});
+
+
+test("Chromium styles modal backdrops for both Okami themes and keeps tall dialog actions reachable on narrow screens", async t => {
+  if (!browser) return t.skip("Chromium browser setup unavailable.");
+  const {cdp} = browser;
+  await cdp.command("Emulation.setDeviceMetricsOverride", {width:360,height:640,deviceScaleFactor:1,mobile:true});
+  await cdp.evaluate(`window.__reset();
+    const content=document.createElement("div");
+    for(let index=0;index<24;index++){const paragraph=document.createElement("p");paragraph.textContent="Scrollable plugin setting "+(index+1);content.append(paragraph);}
+    window.__visualDialog=window.__ui.dialog({title:"Narrow plugin settings",description:"Long content should remain scrollable.",content});
+    window.__mount.append(window.__visualDialog.element); window.__visualDialog.open(); true`);
+  const darkBackdrop = await cdp.evaluate("getComputedStyle(window.__visualDialog.element, '::backdrop').backgroundColor");
+  const narrow = await cdp.evaluate(`(() => {
+    const dialog=window.__visualDialog.element;
+    const rect=dialog.getBoundingClientRect();
+    return {width:rect.width,viewport:innerWidth,maxHeight:getComputedStyle(dialog).maxHeight,
+      scrollable:dialog.scrollHeight>dialog.clientHeight,horizontalOverflow:dialog.scrollWidth>dialog.clientWidth};
+  })()`);
+  assert.equal(narrow.width <= narrow.viewport - 32, true);
+  assert.equal(narrow.width >= 280, true);
+  assert.equal(narrow.maxHeight, "608px");
+  assert.equal(narrow.scrollable, true);
+  assert.equal(narrow.horizontalOverflow, false);
+  assert.equal(darkBackdrop, "rgba(13, 10, 7, 0.76)");
+  await cdp.evaluate("window.__visualDialog.element.tabIndex=-1; window.__visualDialog.element.scrollTop=0; window.__visualDialog.element.focus(); true");
+  await press(cdp, "PageDown", "PageDown", 34);
+  assert.equal(await cdp.evaluate("window.__visualDialog.element.scrollTop>0"), true);
+  await cdp.evaluate("window.__visualDialog.element.scrollTop=window.__visualDialog.element.scrollHeight; document.documentElement.dataset.theme='light'; true");
+  const reachedActions = await cdp.evaluate(`(() => {
+    const dialog=window.__visualDialog.element;
+    const actions=dialog.querySelector(".plugin-dialog-actions").getBoundingClientRect();
+    const rect=dialog.getBoundingClientRect();
+    return dialog.scrollTop>0 && actions.bottom<=rect.bottom && actions.bottom>rect.top;
+  })()`);
+  const lightBackdrop = await cdp.evaluate("getComputedStyle(window.__visualDialog.element, '::backdrop').backgroundColor");
+  assert.equal(reachedActions, true);
+  assert.equal(lightBackdrop, "rgba(60, 42, 28, 0.56)");
+  await cdp.command("Emulation.clearDeviceMetricsOverride");
+  await cdp.evaluate("window.__visualDialog.dispose(); document.documentElement.removeAttribute('data-theme'); true");
 });

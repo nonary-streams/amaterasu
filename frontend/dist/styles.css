@@ -929,7 +929,7 @@ dialog {
   box-shadow: 0 20px 80px #0008;
 }
 dialog::backdrop {
-  background: #050911ba;
+  background: var(--dialog-backdrop);
   backdrop-filter: blur(3px);
 }
 .extension-settings-dialog {
@@ -1306,6 +1306,7 @@ dialog .actions {
   --intro-glow: #443025;
   --gold: #c9a65b; --ink: #1b1714; --paper: #f2eadb; --paper-edge: #bca77e;
   --font-display: Georgia, "Times New Roman", serif;
+  --dialog-backdrop: rgb(13 10 7 / .76);
 }
 [data-theme="light"] {
   color-scheme: light;
@@ -1328,6 +1329,7 @@ dialog .actions {
   --intro-glow: #e7d5b6;
   --gold: #98732f; --ink: #251e19; --paper: #fbf5e6; --paper-edge: #bda77b;
   --font-display: Georgia, "Times New Roman", serif;
+  --dialog-backdrop: rgb(60 42 28 / .56);
 }
 
 body { font-size: 15px; line-height: 1.47; }
