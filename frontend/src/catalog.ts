@@ -1734,7 +1734,7 @@ namespace Amaterasu {
           ...(!api.allows("catalog.write") ? [button("Close", () => { closeEditor(); })] : []),
         ),
       );
-      if (api.allows("configuration.read") && typeof renderApplicationPluginOverrides === "function") renderApplicationPluginOverrides(context, pluginArea, row.id);
+      if (api.allows("configuration.read") && typeof renderApplicationPluginOverrides === "function") renderApplicationPluginOverrides(context, pluginArea, row.id, form.hidden ? undefined : form.querySelector<HTMLElement>(".catalog-overrides") ?? undefined);
       else pluginArea.textContent = "Plugin settings require configuration read access.";
       showCatalogArtwork(api, row.entry.artwork, cover.art, content, () => { cover.fallback.hidden = true; }, row.id);
       editor.scrollIntoView({ behavior: "smooth", block: "start" });
@@ -1827,7 +1827,7 @@ namespace Amaterasu {
           ...(!api.allows("catalog.write") ? [button("Close", () => { closeEditor(); })] : []),
         ),
       );
-      if (row && api.allows("configuration.read") && typeof renderApplicationPluginOverrides === "function") renderApplicationPluginOverrides(context, pluginArea, row.id);
+      if (row && api.allows("configuration.read") && typeof renderApplicationPluginOverrides === "function") renderApplicationPluginOverrides(context, pluginArea, row.id, form.hidden ? undefined : form.querySelector<HTMLElement>(".catalog-overrides") ?? undefined);
       else if (row && !api.allows("configuration.read")) pluginArea.textContent = "Plugin settings require configuration read access.";
       if (cover && row) showCatalogArtwork(api, row.entry.artwork, cover.art, content, () => { cover.fallback.hidden = true; }, row.id);
       editor.scrollIntoView({ behavior: "smooth", block: "start" });
@@ -1864,7 +1864,7 @@ namespace Amaterasu {
   function catalogOverrideEditor(sections: Array<{ area: string; fields: HTMLElement[] }>, saved: Record<string, unknown>): { node: HTMLElement; removed: Set<string> } {
     const removed = new Set<string>();
     const active = el("div", "catalog-override-active");
-    const empty = el("p", "muted", "No settings overridden. This application inherits its settings.");
+    const empty = el("p", "catalog-override-empty muted", "Choose a setting to customize it for this application. All other settings inherit their defaults.");
     const search = input("", "", "search");
     search.placeholder = "Search settings";
     search.setAttribute("data-draft-ignore", "");
@@ -1874,10 +1874,12 @@ namespace Amaterasu {
     marker.className = "catalog-override-draft-marker";
     marker.tabIndex = -1;
     marker.setAttribute("aria-hidden", "true");
-    const rows: Array<{ area: string; label: string; row: HTMLElement; choice: HTMLButtonElement; selected: boolean }> = [];
+    const rows: Array<{ area: string; label: string; description: string; row: HTMLElement; choice: HTMLButtonElement; selected: boolean }> = [];
+    const groups: HTMLElement[] = [];
     const mapping: Record<string, string> = { encoder_backend: "encoder", audio_sink_mode: "audio_sink", virtual_sink_mode: "virtual_sink", sw_preset_mode: "sw_preset", sw_tune_mode: "sw_tune", display_output: "display-output", virtual_screen: "virtual-screen", virtual_display_mode: "virtual-display-mode", virtual_display_layout: "virtual-display-layout" };
     for (const section of sections) {
       const group = el("div", "catalog-override-group", el("h4", "", section.area));
+      groups.push(group);
       list.append(group);
       for (let index = 0; index < section.fields.length; index++) {
         const fieldNode = section.fields[index]!;
@@ -1888,8 +1890,12 @@ namespace Amaterasu {
         if ((key === "sw_preset" || key === "sw_tune") && section.fields[index + 1]) parts.push(section.fields[++index]!);
         const controls = parts.flatMap(part => Array.from(part.querySelectorAll<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>("input,select,textarea")));
         const label = fieldNode.querySelector(".field-label")?.textContent?.trim() || key;
+        const description = fieldNode.querySelector(".muted")?.textContent?.trim() ?? "";
         const row = el("div", "catalog-override-row");
-        const choice = button(label, () => { item.selected = true; removed.delete(key); marker.value += "+"; update(); first.focus(); });
+        const choice = button(label, () => {
+          if (!item.selected) { item.selected = true; removed.delete(key); marker.value += "+"; update(); }
+          first.focus();
+        });
         choice.className = "button secondary catalog-override-choice";
         const remove = button("Remove", () => {
           item.selected = false;
@@ -1904,7 +1910,7 @@ namespace Amaterasu {
         }, "secondary");
         remove.setAttribute("aria-label", `Remove ${label} override`);
         row.append(el("div", "catalog-override-row-content", ...parts), remove);
-        const item = { area: section.area, label, row, choice, selected: Object.hasOwn(saved, key) && saved[key] != null };
+        const item = { area: section.area, label, description, row, choice, selected: Object.hasOwn(saved, key) && saved[key] != null };
         rows.push(item);
         active.append(row);
         group.append(choice);
@@ -1914,15 +1920,19 @@ namespace Amaterasu {
       const query = search.value.trim().toLocaleLowerCase();
       for (const item of rows) {
         item.row.hidden = !item.selected;
-        item.choice.hidden = item.selected || !`${item.area} ${item.label}`.toLocaleLowerCase().includes(query);
+        item.choice.hidden = !`${item.area} ${item.label} ${item.description}`.toLocaleLowerCase().includes(query);
+        item.choice.setAttribute("data-selected", String(item.selected));
+        item.choice.setAttribute("aria-label", `${item.selected ? "Edit" : "Add"} ${item.label} override`);
       }
-      for (const group of Array.from(list.children) as HTMLElement[]) group.hidden = !group.querySelector("button:not([hidden])");
+      for (const group of groups) group.hidden = !group.querySelector("button:not([hidden])");
       empty.hidden = rows.some(item => item.selected);
     }
     search.addEventListener("input", update);
     const node = el("section", "catalog-editor-section catalog-overrides",
       el("div", "catalog-editor-heading", el("h3", "", "Settings overrides"), el("p", "muted", "Only selected settings override the host defaults. Remove an override to inherit.")),
-      marker, empty, active, el("details", "catalog-override-chooser", el("summary", "", "Add override"), search, list));
+      marker, el("div", "catalog-override-layout",
+        el("div", "catalog-override-browser", el("div", "catalog-override-pane-heading", el("h4", "", "Browse settings"), el("p", "muted", "Choose a setting to add or edit.")), search, list),
+        el("div", "catalog-override-editor", el("div", "catalog-override-pane-heading", el("h4", "", "Active overrides"), el("p", "muted", "Changes apply to this application.")), empty, active)));
     update();
     return { node, removed };
   }

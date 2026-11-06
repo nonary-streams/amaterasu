@@ -158,6 +158,9 @@ test("application DOM saves output and keybindings while preserving raw preparat
       const add = find(form, node => node.className === "button secondary catalog-override-choice" && node.textContent === "Controller input");
       add.fire("click");
       assert.equal(inherited.hidden, false);
+      assert.equal(add.hidden, false, "active settings remain in the browser");
+      add.fire("click");
+      assert.equal(inherited.hidden, false, "choosing an active setting keeps its override");
       find(inherited, node => node.tagName === "button" && node.textContent === "Remove").fire("click");
       assert.equal(inherited.hidden, true);
     }

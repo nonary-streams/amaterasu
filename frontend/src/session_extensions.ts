@@ -159,9 +159,17 @@ namespace Amaterasu {
     return applicationOverrideGuards.get(area)?.() ?? false;
   }
 
-  export function renderApplicationPluginOverrides(context: PageContext, area: HTMLElement, applicationId: string): void {
+  export function renderApplicationPluginOverrides(context: PageContext, area: HTMLElement, applicationId: string, overrideCatalog?: HTMLElement): void {
     const scope: SessionExtensionScope = { kind: "application", id: applicationId };
     let busy = false;
+    const catalogSearch = overrideCatalog?.querySelector<HTMLInputElement>('input[type="search"]');
+    const catalogChoices = overrideCatalog?.querySelector<HTMLElement>(".catalog-override-catalog");
+    const sharedChoices = catalogSearch && catalogChoices ? { search: catalogSearch, list: catalogChoices } : undefined;
+    const sharedGroups: HTMLElement[] = [];
+    const sharedRefreshers: Array<() => void> = [];
+    sharedChoices?.search.addEventListener("input", () => {
+      for (const refresh of sharedRefreshers) refresh();
+    });
     const dirtyChecks: Array<() => boolean> = [];
     const isDirty = () => busy || dirtyChecks.some((check) => check());
     applicationOverrideGuards.set(area, isDirty);
@@ -172,6 +180,8 @@ namespace Amaterasu {
     });
 
     async function load(): Promise<void> {
+      for (const group of sharedGroups.splice(0)) group.remove();
+      sharedRefreshers.length = 0;
       try {
         const descriptors: SessionExtensionDescriptor[] = [];
         let after: string | null = null;
@@ -220,6 +230,9 @@ namespace Amaterasu {
           const choices = el("select");
           choices.setAttribute("aria-label", "Setting to override");
           choices.setAttribute("data-draft-ignore", "");
+          const providerName = descriptor.display_name || descriptor.provider;
+          const sharedGroup = sharedChoices ? el("div", "catalog-override-group", el("h4", "", literalText(providerName))) : undefined;
+          const sharedButtons: Array<{ option: SessionExtensionOption; button: HTMLButtonElement }> = [];
           const inherited = el("p", "muted catalog-plugin-overrides-inherited");
           const describeInherited = () => {
             if (!effectiveAvailable) { inherited.textContent = "Reload the application editor to refresh inherited values."; return; }
@@ -242,6 +255,16 @@ namespace Amaterasu {
               return item;
             }));
             add.disabled = !effectiveAvailable || !available.length;
+            if (sharedChoices && sharedGroup) {
+              const sharedQuery = sharedChoices.search.value.trim().toLocaleLowerCase();
+              for (const entry of sharedButtons) {
+                entry.button.hidden = !`${providerName} ${entry.option.label} ${entry.option.id} ${entry.option.help}`.toLocaleLowerCase().includes(sharedQuery);
+                entry.button.setAttribute("data-selected", String(entries.has(entry.option.id)));
+                entry.button.setAttribute("aria-label", `${entries.has(entry.option.id) ? "Edit" : "Add"} ${entry.option.label} override`);
+                entry.button.disabled = busy || !effectiveAvailable || !context.api.allows("configuration.write");
+              }
+              sharedGroup.hidden = sharedButtons.every((entry) => entry.button.hidden);
+            }
             describeInherited();
           };
           const addOption = (option: SessionExtensionOption, value: unknown) => {
@@ -265,6 +288,27 @@ namespace Amaterasu {
             addOption(option, structuredClone(effective.value));
             refreshChoices();
           });
+          if (sharedChoices && sharedGroup) {
+            for (const option of options) {
+              const choice = button(option.label, () => {
+                const effective = document.effective[option.id];
+                if (busy || !context.api.allows("configuration.write")) return;
+                if (!entries.has(option.id)) {
+                  if (!effectiveAvailable || !effective) return;
+                  addOption(option, structuredClone(effective.value));
+                  refreshChoices();
+                }
+                const control = entries.get(option.id)?.editor.node;
+                control?.scrollIntoView?.({ behavior: "smooth", block: "nearest" });
+                (control?.matches("input,select,textarea") ? control : control?.querySelector<HTMLElement>("input,select,textarea"))?.focus();
+              }, "secondary");
+              choice.className = "button secondary catalog-override-choice";
+              sharedButtons.push({ option, button: choice });
+              sharedGroup.append(choice);
+            }
+            sharedGroups.push(sharedGroup);
+            sharedRefreshers.push(refreshChoices);
+          }
           search.addEventListener("input", refreshChoices);
           choices.addEventListener("change", describeInherited);
           for (const option of options) if (Object.hasOwn(document.values, option.id)) addOption(option, document.values[option.id]);
@@ -286,7 +330,7 @@ namespace Amaterasu {
             el("summary", "", "Add override"),
             el("div", "catalog-plugin-override-chooser-content", search, choices, inherited, add));
           const actions = el("div", "catalog-plugin-overrides-actions", save);
-          fields.append(rows, chooser, actions);
+          fields.append(rows, ...(sharedChoices ? [] : [chooser]), actions);
           form.append(fields, status);
           form.addEventListener("submit", (event) => {
             event.preventDefault();
@@ -296,6 +340,7 @@ namespace Amaterasu {
               if (JSON.stringify(submitted) === baseline) return;
               busy = true;
               fields.disabled = true;
+              refreshChoices();
               try {
                 const reply = await context.api.post<{ revision: number }>("session-extensions/settings_update", {
                   provider: descriptor.provider, scope, expected_revision: savedRevision, values: submitted,
@@ -320,11 +365,13 @@ namespace Amaterasu {
               } finally {
                 busy = false;
                 fields.disabled = !context.api.allows("configuration.write");
+                refreshChoices();
               }
             });
           });
           return panel(literalText(descriptor.display_name || descriptor.provider), form);
         });
+        if (sharedChoices) sharedChoices.list.append(...sharedGroups);
         area.replaceChildren(el("p", "muted", "Plugin overrides are saved separately from application changes."),
           ...(panels.length ? panels : [el("p", "muted", "No plugin settings are available for this application.")]));
       } catch (error) {

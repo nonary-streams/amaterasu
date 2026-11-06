@@ -174,14 +174,14 @@ test("a future presentation hint falls back to its typed editor and saves edits"
   assert.deepEqual(env.errors, []);
 });
 
-test("application overrides preserve unrelated values, guard structural edits, and save with the provider revision", async () => {
+for (const sharedCatalog of [false, true]) test(`application overrides ${sharedCatalog ? "in the shared RTX HDR chooser" : "in the standalone chooser"} preserve values and save with the provider revision`, async () => {
   class Element {
     children = []; listeners = {}; isConnected = true; value = ""; disabled = false;
     constructor(tag, children = []) { this.tag = tag; this.children = children; }
     append(...children) { this.children.push(...children); }
     replaceChildren(...children) { this.children = children; if (this.tag === "select") this.value = children[0]?.value ?? ""; }
     addEventListener(name, callback) { this.listeners[name] = callback; }
-    setAttribute() {} matches() { return false; } querySelectorAll() { return []; }
+    setAttribute() {} matches() { return false; } querySelectorAll() { return []; } querySelector() { return null; }
     remove() { this.removed = true; }
   }
   const nodes = [], calls = [], pending = [], initialValues = [];
@@ -203,6 +203,9 @@ test("application overrides preserve unrelated values, guard structural edits, a
   vm.runInContext(ts.transpile(readFileSync(new URL("../src/session_extensions.ts", import.meta.url), "utf8"),
     { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None }), runtime);
   const area = element("area");
+  const catalogSearch = element("input");
+  const catalogList = element("div");
+  const overrideCatalog = { querySelector: selector => selector === 'input[type="search"]' ? catalogSearch : catalogList };
   let guard;
   const context = { content: { isConnected: true }, notify() {}, registerDraftGuard(check) { guard = check; }, api: {
     allows: () => true,
@@ -217,10 +220,21 @@ test("application overrides preserve unrelated values, guard structural edits, a
       return { revision: 8 };
     },
   } };
-  runtime.Amaterasu.renderApplicationPluginOverrides(context, area, "game");
+  if (sharedCatalog) {
+    descriptor.display_name = "RTX HDR";
+    descriptor.options[0].label = "Enable RTX HDR";
+  }
+  runtime.Amaterasu.renderApplicationPluginOverrides(context, area, "game", sharedCatalog ? overrideCatalog : undefined);
   await settle();
   assert.equal(guard(), false);
   assert.equal(nodes.filter(n => n.tag === "editor").length, 1);
+  const sharedButton = catalogList.children[0]?.children.find(n => n.tag === "button");
+  if (sharedCatalog) {
+    assert.equal(catalogList.children.length, 1);
+    assert.equal(sharedButton.children[0], "Enable RTX HDR");
+    assert.equal(sharedButton.hidden, false, "existing override remains available for editing");
+    assert.equal(catalogList.children[0].children.filter(n => n.tag === "button").length, 1, "host-only options stay out of application choices");
+  }
   const chooser = nodes.find(n => n.tag === "details");
   assert.equal(chooser.children[0].tag, "summary");
   assert.equal(chooser.children[0].children[0], "Add override");
@@ -234,7 +248,18 @@ test("application overrides preserve unrelated values, guard structural edits, a
     provider: "example", scope: { kind: "application", id: "game" }, expected_revision: 7, values: { unknown: 42 },
   });
   assert.equal(guard(), false);
-  nodes.find(n => n.tag === "button" && n.children[0] === "Add override").listeners.click();
+  if (sharedCatalog) {
+    assert.equal(sharedButton.hidden, false);
+    catalogSearch.value = "unrelated";
+    catalogSearch.listeners.input();
+    assert.equal(sharedButton.hidden, true);
+    assert.equal(catalogList.children[0].hidden, true);
+    catalogSearch.value = "RTX HDR";
+    catalogSearch.listeners.input();
+    assert.equal(sharedButton.hidden, false);
+    sharedButton.listeners.click();
+    assert.equal(sharedButton.hidden, false);
+  } else nodes.find(n => n.tag === "button" && n.children[0] === "Add override").listeners.click();
   assert.equal(guard(), true, "adding an override must guard navigation");
   assert.deepEqual(initialValues, [false, true], "re-added override starts from refreshed inherited value");
 });
