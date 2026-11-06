@@ -1,6 +1,8 @@
 //! Capture-only publishing and notifications. No encoding or provider selection
 //! runs on a capture thread. Each channel represents one capture session.
 mod connection;
+mod cpu_source;
+pub mod high_depth;
 mod negotiation;
 mod preflight;
 mod provenance;
@@ -10,6 +12,10 @@ mod source_format;
 mod subscription;
 
 pub use connection::{ConnectionError, ResourceConnection};
+pub use cpu_source::{
+    CpuSourceDescription, CpuSourceFactory, CpuSourceFormat, CpuSourcePresentation,
+    CpuSourceProvider,
+};
 pub use negotiation::{
     Accessibility, DeliveryFormat, DeliveryRequirement, DeliverySelection,
     MAX_DELIVERY_CAPABILITY_BYTES, MAX_DELIVERY_OFFERS, MAX_DELIVERY_REQUIREMENTS,
