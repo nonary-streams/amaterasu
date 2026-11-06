@@ -210,7 +210,7 @@ fn replies_reject_malformed_state_and_unbounded_retry_or_artwork() {
 #[test]
 fn method_contracts_have_unique_exact_identity_and_no_raw_action_field() {
     let methods = methods();
-    assert_eq!(methods.len(), 14);
+    assert_eq!(methods.len(), 16);
     let names: std::collections::BTreeSet<_> = methods.iter().map(|m| m.method.as_str()).collect();
     assert_eq!(methods.len(), names.len());
     for method in methods {
@@ -220,6 +220,89 @@ fn method_contracts_have_unique_exact_identity_and_no_raw_action_field() {
         assert!(!method.request.required.contains_key("action"));
         assert_eq!(method.response.required["result"], ApiFieldKind::String);
     }
+}
+
+#[test]
+fn recovery_references_are_typed_bounded_and_never_arbitrary_calls() {
+    let item = RecoveryWorkItem {
+        id: "work".into(),
+        client_id: "client".into(),
+        session_id: "session".into(),
+        generation: 1,
+        reservation_id: "reservation".into(),
+        binding: RecoveryBinding::Transport {
+            operation_id: "transport".into(),
+            epoch: "epoch".into(),
+        },
+        budget_ms: 30_000,
+    };
+    assert!(item.validate().is_ok());
+    assert!(
+        Reply::RecoveryWork {
+            items: vec![item.clone()],
+            next_cursor: None
+        }
+        .validate()
+        .is_ok()
+    );
+    assert!(
+        Reply::RecoveryWork {
+            items: vec![item.clone(), item.clone()],
+            next_cursor: None
+        }
+        .validate()
+        .is_err()
+    );
+    let mut invalid = item;
+    invalid.budget_ms = 30_001;
+    assert!(invalid.validate().is_err());
+    assert!(
+        Request::RecoveryWork {
+            cursor: None,
+            limit: 0
+        }
+        .validate()
+        .is_err()
+    );
+    assert!(
+        Request::RecoveryWork {
+            cursor: None,
+            limit: MAX_RECOVERY_ITEMS + 1
+        }
+        .validate()
+        .is_err()
+    );
+    assert!(
+        Request::RecoveryWork {
+            cursor: Some("cursor".into()),
+            limit: MAX_RECOVERY_ITEMS
+        }
+        .validate()
+        .is_ok()
+    );
+    assert!(
+        Reply::RecoveryWork {
+            items: vec![],
+            next_cursor: Some("cursor".into())
+        }
+        .validate()
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<RecoveryBinding>(
+            json!({"kind":"transport","operation_id":"op","epoch":"epoch","service":"arbitrary/1"})
+        )
+        .is_err()
+    );
+    assert!(
+        RecoveryBinding::Application {
+            operation_id: "app-op".into(),
+            epoch: "epoch".into(),
+            application_generation: 0
+        }
+        .validate()
+        .is_err()
+    );
 }
 
 #[test]
@@ -243,6 +326,7 @@ fn game_source_is_optional_but_a_present_association_must_be_valid() {
         reservation_id: "original-game-source".into(),
         capture: CaptureSource::ExactOutput {
             output: "logical-selector".into(),
+            route_key: DEFAULT_CAPTURE_ROUTE.into(),
         },
         mode: Mode {
             width: 1920,
@@ -261,6 +345,50 @@ fn game_source_is_optional_but_a_present_association_must_be_valid() {
         .unwrap()
         .generation = 0;
     assert!(value.validate().is_err());
+}
+
+#[test]
+fn capture_routes_are_bounded_opaque_keys_with_legacy_default() {
+    let legacy = json!({"kind":"exact_output","output":"logical-selector"});
+    let source: CaptureSource = serde_json::from_value(legacy.clone()).unwrap();
+    assert_eq!(
+        source,
+        CaptureSource::ExactOutput {
+            output: "logical-selector".into(),
+            route_key: DEFAULT_CAPTURE_ROUTE.into()
+        }
+    );
+    assert_eq!(serde_json::to_value(source).unwrap(), legacy);
+    for route in [
+        "managed_output",
+        "desktop_output",
+        "third-party.capture-route/2",
+    ] {
+        assert!(
+            CaptureSource::ExactOutput {
+                output: "logical-selector".into(),
+                route_key: route.into()
+            }
+            .validate()
+            .is_ok()
+        );
+    }
+    assert!(
+        CaptureSource::ExactOutput {
+            output: "logical-selector".into(),
+            route_key: String::new()
+        }
+        .validate()
+        .is_err()
+    );
+    assert!(
+        CaptureSource::ExactOutput {
+            output: "logical-selector".into(),
+            route_key: "x".repeat(129)
+        }
+        .validate()
+        .is_err()
+    );
 }
 
 #[test]

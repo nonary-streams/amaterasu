@@ -106,6 +106,13 @@ exact output. It contains an opaque session, generation, admission reservation,
 mode and audio requirements. A normal application can borrow a retained output
 through `SharedCapture`, which freezes the same source and mode. Neither type
 contains native providers, OS handles or native allocation ownership.
+An exact source carries an opaque `route_key`. Missing keys decode as the legacy
+`default` route; other bounded keys are extensible. Trusted startup composition
+maps each accepted key to an approved capture alias and required capabilities.
+The consumer rejects an unknown key before effects. It does not derive routing
+from an operating-system name, output prefix or provider identity. The built-in
+resolver uses semantic `managed_output` and `desktop_output` routes. Source
+verification and immutable bindings include the exact route key.
 `Game.source`, when present, is the trusted coordinator's original application
 source association. The provider checks that original owner's source and game
 generation before issuing a secondary client a fresh independent reservation.
@@ -154,6 +161,17 @@ admission alone is not completion.
 Crash recovery verifies the recorded transport operation and epoch through the
 transport owner's authenticated retirement status. A restart alone, an empty
 current-session list, or an unreconciled new epoch does not prove old work retired.
+
+`RecoveryWork` lists at most eight durable retirement intents belonging to the
+requesting original broker consumer. Each item contains only a bounded source
+tuple and a typed transport or application operation/epoch binding, with a
+bounded per-attempt budget. A caller/revision-bound expiring cursor must not skip
+unfinished work or turn cancellation into completion. The consumer invokes only
+its fixed selected transport or execution retirement contract; a plugin cannot
+supply an arbitrary service, method or payload to execute. Then
+`ReconcileRecovery` asks the policy provider to independently recheck the exact
+authenticated retirement status before releasing its source hold. Pending work
+remains durable when an attempt times out or is cancelled.
 
 ## Replacement validation
 

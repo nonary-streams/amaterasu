@@ -15,6 +15,8 @@ use crate::{ApiFieldKind, ApiMethod, ApiSchema, Command, ModuleResult, operation
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+mod recovery;
+pub use recovery::{MAX_RECOVERY_BUDGET_MS, MAX_RECOVERY_ITEMS, RecoveryBinding, RecoveryWorkItem};
 
 pub const SERVICE: &str = "nonary.session-presentation/1";
 pub const MAX_PAGE_ENTRIES: usize = 32;
@@ -25,6 +27,7 @@ pub const MAX_PAYLOAD_BYTES: usize = 12_000;
 pub const MAX_ARTWORK_BYTES: usize = 4_096;
 /// Includes provider-owned ordering/role labels around a catalog title.
 pub const MAX_TITLE_BYTES: usize = 192;
+pub const DEFAULT_CAPTURE_ROUTE: &str = "default";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -114,7 +117,23 @@ pub enum CaptureSource {
     SyntheticBlack,
     /// A logical exact selector resolved and verified by the capture provider.
     /// This is not an OS handle, device path or permission to choose a provider.
-    ExactOutput { output: String },
+    ExactOutput {
+        output: String,
+        /// Opaque logical route selected through trusted startup composition.
+        /// This is not a provider identity and never comes from an OS prefix.
+        #[serde(
+            default = "default_capture_route",
+            skip_serializing_if = "is_default_capture_route"
+        )]
+        route_key: String,
+    },
+}
+
+fn default_capture_route() -> String {
+    DEFAULT_CAPTURE_ROUTE.into()
+}
+fn is_default_capture_route(value: &str) -> bool {
+    value == DEFAULT_CAPTURE_ROUTE
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -297,6 +316,17 @@ pub enum Request {
     RevokeClient {
         client_id: String,
     },
+    /// List only persisted retirement intents owned by this broker consumer.
+    /// Cursors are caller/revision-bound and expire; unfinished work survives.
+    RecoveryWork {
+        cursor: Option<String>,
+        limit: usize,
+    },
+    /// The provider independently verifies the selected owner's exact native
+    /// retirement status before dropping its source hold or acknowledging.
+    ReconcileRecovery {
+        work_id: String,
+    },
     VerifySource {
         client_id: String,
         source: SharedCapture,
@@ -384,6 +414,10 @@ pub enum Reply {
     Pending {
         retry_after_ms: u64,
     },
+    RecoveryWork {
+        items: Vec<RecoveryWorkItem>,
+        next_cursor: Option<String>,
+    },
     Acknowledged {},
     Artwork {
         artwork: Artwork,
@@ -442,6 +476,8 @@ pub fn methods() -> Vec<ApiMethod> {
             vec![("client_id", Text), ("operation_id", Text)],
         ),
         ("revoke_client", vec![("client_id", Text)]),
+        ("recovery_work", vec![("cursor", Any), ("limit", Integer)]),
+        ("reconcile_recovery", vec![("work_id", Text)]),
         (
             "bind_application",
             vec![
@@ -607,7 +643,11 @@ impl CaptureSource {
     pub fn validate(&self) -> Result<(), &'static str> {
         match self {
             Self::SyntheticBlack => Ok(()),
-            Self::ExactOutput { output } if bounded_text(output, 1024) => Ok(()),
+            Self::ExactOutput { output, route_key }
+                if bounded_text(output, 1024) && token(route_key) =>
+            {
+                Ok(())
+            }
             _ => Err("invalid_capture_source"),
         }
     }
@@ -731,6 +771,18 @@ impl Request {
             Self::RevokeClient { client_id } => {
                 if !token(client_id) {
                     return Err("invalid_revoked_client");
+                }
+            }
+            Self::RecoveryWork { cursor, limit } => {
+                if !(1..=MAX_RECOVERY_ITEMS).contains(limit)
+                    || cursor.as_ref().is_some_and(|cursor| !token(cursor))
+                {
+                    return Err("invalid_recovery_page");
+                }
+            }
+            Self::ReconcileRecovery { work_id } => {
+                if !token(work_id) {
+                    return Err("invalid_recovery_work_identity");
                 }
             }
             Self::BindApplication {
@@ -943,6 +995,21 @@ impl Reply {
             Self::Verified { source } => source.validate()?,
             Self::Pending { retry_after_ms } if !(1..=1000).contains(retry_after_ms) => {
                 return Err("invalid_session_retry");
+            }
+            Self::RecoveryWork { items, next_cursor } => {
+                if items.len() > MAX_RECOVERY_ITEMS
+                    || next_cursor.as_ref().is_some_and(|cursor| !token(cursor))
+                    || (items.is_empty() && next_cursor.is_some())
+                {
+                    return Err("invalid_recovery_page");
+                }
+                let mut ids = std::collections::BTreeSet::new();
+                for item in items {
+                    item.validate()?;
+                    if !ids.insert(&item.id) {
+                        return Err("duplicate_recovery_work");
+                    }
+                }
             }
             Self::Artwork { artwork } => match artwork {
                 Artwork::Application { application_id } if !token(application_id) => {
