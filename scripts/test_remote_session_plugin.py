@@ -178,6 +178,9 @@ def configure_fixture(policy, base_port):
         "enabled": True, "bind": f"127.0.0.1:{base_port + 21}",
         "allow_remote": False, "allowed_principals": ["amaterasu.nvhttp"],
         "retirement_status_principals": [PLUGIN, "amaterasu.console"],
+        "retirement_status_owners": {
+            PLUGIN: "amaterasu.nvhttp", "amaterasu.console": "amaterasu.nvhttp",
+        },
     })
     settings["amaterasu.stream-session"].update({
         "enabled": True, "enable_input": True,
@@ -195,6 +198,7 @@ def configure_fixture(policy, base_port):
         settings[name]["enabled"] = False
     settings["amaterasu.linux-session-video"] = {
         "enabled": True, "capture_providers": [],
+        "source_preflight_routes": {"synthetic_black": "black"},
         "external_capture_providers": {
             "black": {"service": "amaterasu.capture-black/1", "frame_transport": "generic_cpu"},
         },
@@ -216,7 +220,15 @@ def assert_device_isolation(policy):
     require(settings["amaterasu.linux-session-video"]["external_capture_providers"] == {
         "black": {"service": "amaterasu.capture-black/1", "frame_transport": "generic_cpu"}},
         "capture is not restricted to the explicit black source")
+    require(settings["amaterasu.linux-session-video"]["source_preflight_routes"] == {
+        "synthetic_black": "black"}, "preflight can select a managed or desktop source")
     require(settings["amaterasu.input"] == {"enabled": True}, "input fixture settings changed")
+    rtsp = settings["amaterasu.rtsp"]
+    require(rtsp["allowed_principals"] == ["amaterasu.nvhttp"],
+            "fixture observers gained RTSP open or close authority")
+    require(rtsp["retirement_status_owners"] == {
+        PLUGIN: "amaterasu.nvhttp", "amaterasu.console": "amaterasu.nvhttp"},
+        "retirement observations are not scoped to the NVHTTP transport owner")
     for name in ("amaterasu.nvhttp", "amaterasu.rtsp", "amaterasu.media-transport", "amaterasu.control-transport"):
         require(settings[name].get("allow_remote", False) is False, "remote listener enabled", name)
 
@@ -561,6 +573,24 @@ class HarnessSelfTests(unittest.TestCase):
     def test_isolation_guard_rejects_a_live_desktop_capture_provider(self):
         policy = {"settings": {"amaterasu.display": {"allow_mutation": True}}}
         with self.assertRaisesRegex(AssertionError, "physical display mutation"):
+            assert_device_isolation(policy)
+
+    def test_fixture_preflight_and_retirement_observers_keep_their_exact_scope(self):
+        policy = {
+            "principals": {"amaterasu.console": {"call": []}, "amaterasu.input": {"provide": []}},
+            "settings": {name: {} for name in (
+                PLUGIN, "amaterasu.pairing", "amaterasu.nvhttp", "amaterasu.rtsp",
+                "amaterasu.stream-session", "amaterasu.display", "amaterasu.virtual-display",
+                "amaterasu.capture-kms", "amaterasu.capture-pipewire", "amaterasu.capture-vkms")},
+        }
+        configure_fixture(policy, 47989)
+        video = policy["settings"]["amaterasu.linux-session-video"]
+        video["source_preflight_routes"]["managed_output"] = "black"
+        with self.assertRaisesRegex(AssertionError, "preflight can select"):
+            assert_device_isolation(policy)
+        del video["source_preflight_routes"]["managed_output"]
+        policy["settings"]["amaterasu.rtsp"]["allowed_principals"].append("amaterasu.console")
+        with self.assertRaisesRegex(AssertionError, "open or close authority"):
             assert_device_isolation(policy)
 
 
