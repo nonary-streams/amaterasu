@@ -16,6 +16,7 @@ use amaterasu_module_sdk::{Command, ModuleResult, Response};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+mod artwork_refresh;
 
 const MAX_QUEUED: usize = 32;
 const PAGE_BYTES: usize = 12_000;
@@ -55,6 +56,11 @@ struct Pending {
     stage: Stage,
 }
 enum Stage {
+    ArtworkMarker {
+        source_id: String,
+        artwork: ArtworkReference,
+    },
+    ArtworkEntry(Box<artwork_refresh::Refresh>),
     Loading(Operation),
     LaunchMarkerPage(LaunchMarkerScan),
     Legacy(Operation),
@@ -291,6 +297,7 @@ impl Pipeline {
         }
         match operation {
             operation @ (Operation::ProviderSnapshotBegin { .. }
+            | Operation::ProviderArtworkRefresh { .. }
             | Operation::ProviderSnapshotRevoke { .. }
             | Operation::ProviderSnapshotInventory { .. }
             | Operation::ProviderSnapshotBatch { .. }
@@ -418,6 +425,7 @@ impl Pipeline {
                 catalog_owner: incoming.catalog_owner,
                 importer: match &incoming.operation {
                     Operation::ProviderSnapshotBegin { .. }
+                    | Operation::ProviderArtworkRefresh { .. }
                     | Operation::ProviderSnapshotRevoke { .. }
                     | Operation::ProviderSnapshotInventory { .. }
                     | Operation::ProviderSnapshotBatch { .. }
@@ -434,7 +442,9 @@ impl Pipeline {
             // Snapshot authority comes from the Poll caller. Provider override
             // requests use a fixed importer only after management authorization;
             // neither path accepts an owner selector in request data.
-            if matches!(
+            if let Operation::ProviderArtworkRefresh { source_id, artwork } = incoming.operation {
+                self.start_artwork_refresh(context, source_id, artwork, &mut send)?;
+            } else if matches!(
                 incoming.operation,
                 Operation::ProviderSnapshotBegin { .. }
                     | Operation::ProviderSnapshotRevoke { .. }
@@ -2409,6 +2419,12 @@ impl Pipeline {
             }
             Stage::ProviderOverrideEntry(update) => {
                 self.finish_provider_override(context, state_revision, payload, *update, send)
+            }
+            Stage::ArtworkMarker { source_id, artwork } => {
+                self.read_artwork_entry(context, state_revision, payload, source_id, artwork, send)
+            }
+            Stage::ArtworkEntry(update) => {
+                self.finish_artwork_refresh(context, state_revision, payload, *update, send)
             }
             Stage::ProviderFullscreenEntryRow(update) => self.finish_playnite_fullscreen_entry(
                 context,

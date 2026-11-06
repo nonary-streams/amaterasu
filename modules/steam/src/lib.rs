@@ -1,5 +1,6 @@
 //! Read-only local Steam provider. Product policy and launching stay in other libraries.
 mod artwork;
+mod artwork_refresh;
 mod catalog_sync;
 mod configuration;
 mod discovery;
@@ -176,6 +177,17 @@ impl Provider {
 
     fn has_complete_snapshot(&self) -> bool {
         self.revision > 0 && self.snapshot_complete
+    }
+
+    fn has_artwork_snapshot(&self) -> bool {
+        self.has_complete_snapshot()
+            || (self.revision > 0
+                && self.warning_count > 0
+                && self.warning_count == self.warnings.len() as u64
+                && self
+                    .warnings
+                    .iter()
+                    .all(|warning| warning == "library_unavailable"))
     }
 
     fn scan_in_progress(&self) -> bool {
@@ -440,9 +452,11 @@ impl Provider {
         if app_id == 0 {
             return Err("invalid_request");
         }
-        // A refresh can invalidate membership before it publishes a new
-        // snapshot. Never use an in-flight or warned scan as artwork authority.
-        if !self.enabled || self.scan_in_progress() || !self.has_complete_snapshot() {
+        // Missing libraries prevent authoritative catalog removal, but do not
+        // invalidate images individually validated in the published snapshot.
+        // Other scan failures can truncate or corrupt discovery, so retain the
+        // complete-snapshot requirement for those failures and in-flight scans.
+        if !self.enabled || self.scan_in_progress() || !self.has_artwork_snapshot() {
             return Err("artwork_unavailable");
         }
         let Some(game) = self.games.get(&app_id) else {
@@ -809,6 +823,7 @@ struct SteamModule {
     provider: Provider,
     configuration: ProductConfiguration,
     catalog_sync: catalog_sync::CatalogSync,
+    artwork_refresh: artwork_refresh::Refresh,
     library_principal: String,
 }
 
@@ -850,6 +865,7 @@ impl ManagedModule for SteamModule {
             },
             configuration,
             catalog_sync: catalog_sync::CatalogSync::new(),
+            artwork_refresh: artwork_refresh::Refresh::default(),
             library_principal: settings.library_principal,
         })
     }
@@ -882,6 +898,7 @@ impl ManagedModule for SteamModule {
             &mut self.provider,
             self.configuration.settings(),
         )?;
+        self.artwork_refresh.tick(&self.runtime, &self.provider)?;
         match self.runtime.send(Command::Poll {})? {
             Response::Pending => Ok(()),
             Response::Request {

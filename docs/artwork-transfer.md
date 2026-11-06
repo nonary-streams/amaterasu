@@ -45,6 +45,15 @@ consumes its native record, and publishes an owner-bound record to its caller.
 External providers and built-ins use the same transfer adapter. A requested
 revision must match the resolved reference; each native record pins the bytes.
 
+The catalog's `provider_artwork_refresh` operation accepts `{source_id, artwork}`
+only from a configured importer. It updates an existing reference for the same
+provider and image identity with a collection-revision check, preserving the
+application's other fields and ownership marker. It cannot create an entry or
+substitute another application's image. Steam uses this operation independently
+of catalog auto-sync, so changing a cached cover does not require re-importing
+games or overwriting application settings. Missing library paths still prevent
+destructive reconciliation; individually validated current covers remain usable.
+
 ## Browser and Moonlight
 
 Authenticated `POST /v1/library/artwork` accepts `{id, revision?}` and responds

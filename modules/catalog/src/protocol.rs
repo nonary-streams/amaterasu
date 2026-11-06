@@ -1,10 +1,17 @@
-use crate::model::{ConfigOverrides, Document, Entry, Launch, MAX_ENTRIES, bounded_text, parse_id};
+use crate::model::{
+    ArtworkReference, ConfigOverrides, Document, Entry, Launch, MAX_ENTRIES, bounded_text, parse_id,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Operation {
+    /// Refresh only an existing importer's artwork, never application settings.
+    ProviderArtworkRefresh {
+        source_id: String,
+        artwork: ArtworkReference,
+    },
     Create {
         entry: Entry,
         expected_revision: u64,
@@ -201,6 +208,7 @@ pub fn apply(operation: Operation, existing: Option<Document>) -> Result<Change,
             return page(&document, &query.to_lowercase(), cursor, limit, false);
         }
         Operation::ProviderSnapshotBegin { .. }
+        | Operation::ProviderArtworkRefresh { .. }
         | Operation::ProviderSnapshotRevoke { .. }
         | Operation::ProviderSnapshotInventory { .. }
         | Operation::ProviderSnapshotBatch { .. }

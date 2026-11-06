@@ -684,6 +684,46 @@ fn artwork_read_uses_only_the_current_app_revision_and_never_returns_a_path() {
     assert_eq!(payload["next_offset"], Value::Null);
     assert!(payload["data"].as_str().unwrap().starts_with("iVBORw0KGgo"));
     assert!(payload.get("path").is_none());
+
+    // An unrelated offline library must not hide this freshly validated cover.
+    // Catalog reconciliation must still see the snapshot as incomplete.
+    provider.snapshot_complete = false;
+    provider.warning_count = 1;
+    provider.warnings = vec!["library_unavailable".into()];
+    assert!(!provider.has_complete_snapshot());
+    assert!(
+        provider
+            .read_artwork(12, 42, &revision, 0, 1_000)
+            .unwrap()
+            .is_none()
+    );
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        provider.process_local_artwork();
+        if let Some((id, image)) = provider.drain_local_artwork().pop() {
+            assert_eq!(id, 12);
+            assert_eq!(image["data"], payload["data"]);
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(
+        provider
+            .read_artwork(13, 99, &revision, 0, 1_000)
+            .unwrap_err(),
+        "artwork_unavailable"
+    );
+    provider.warnings.push("invalid_libraryfolders".into());
+    provider.warning_count += 1;
+    assert_eq!(
+        provider
+            .read_artwork(14, 42, &revision, 0, 1_000)
+            .unwrap_err(),
+        "artwork_unavailable"
+    );
+    provider.warnings.pop();
+    provider.warning_count -= 1;
     assert_eq!(
         provider.read_artwork(11, 42, "1", 0, 1_000).unwrap_err(),
         "artwork_changed"
@@ -855,6 +895,7 @@ struct FakeHost {
     released: Vec<u64>,
     configuration_actions: Vec<String>,
     catalog_requests: Vec<Value>,
+    artwork_refresh_requests: Vec<Value>,
     catalog_revision: u64,
     catalog_generation: u64,
     catalog_next_sequence: u64,
@@ -975,6 +1016,16 @@ impl FakeHost {
                         _ => Response::error("invalid_request", "unexpected configuration action"),
                     }
                 } else if service == "amaterasu.catalog/1" {
+                    if action == "provider_artwork_refresh" {
+                        self.artwork_refresh_requests.push(payload.clone());
+                        self.child_results.insert(
+                            request,
+                            Response::Result {
+                                payload: json!({"ok":true,"changed":false}),
+                            },
+                        );
+                        return Response::Accepted { id: request };
+                    }
                     self.catalog_requests.push(payload.clone());
                     if self.catalog_hold_next_request {
                         self.catalog_hold_next_request = false;
@@ -1478,7 +1529,7 @@ fn unusable_force_sync_snapshot_clears_the_request_without_catalog_writes() {
 }
 
 #[test]
-fn ordinary_refresh_remains_discovery_only_when_auto_sync_is_disabled() {
+fn ordinary_refresh_does_not_reimport_applications_when_auto_sync_is_disabled() {
     let mut host = Box::new(FakeHost::default());
     host.product_get_results
         .push_back(persisted_settings_with_sync_policy(true, false, 1));
@@ -1505,6 +1556,42 @@ fn ordinary_refresh_remains_discovery_only_when_auto_sync_is_disabled() {
         module.tick().unwrap();
     }
     assert!(host.catalog_requests.is_empty());
+}
+
+#[test]
+fn artwork_references_refresh_without_autosync_or_a_complete_library_inventory() {
+    let mut host = Box::new(FakeHost::default());
+    host.product_get_results
+        .push_back(persisted_settings_with_sync_policy(true, false, 1));
+    let mut module = start_test_module(&mut host);
+    module.tick().unwrap();
+    module.tick().unwrap();
+    set_complete_test_snapshot(&mut module.provider, 1, "Keep my application");
+    module.provider.snapshot_complete = false;
+    module.provider.warning_count = 1;
+    module.provider.warnings = vec!["library_unavailable".into()];
+    for _ in 0..5 {
+        module.tick().unwrap();
+    }
+    assert!(host.catalog_requests.is_empty());
+    assert_eq!(host.artwork_refresh_requests.len(), 1);
+    assert_eq!(host.artwork_refresh_requests[0]["source_id"], "steam:42");
+    module.provider.games.get_mut(&42).unwrap().artwork_revision = Some("999".into());
+    for _ in 0..5 {
+        module.tick().unwrap();
+    }
+    assert_eq!(host.artwork_refresh_requests.len(), 2);
+    assert_eq!(
+        host.artwork_refresh_requests[1]["artwork"]["revision"],
+        "999"
+    );
+    assert!(host.catalog_requests.is_empty());
+    module.provider.enabled = false;
+    module.provider.games.get_mut(&42).unwrap().artwork_revision = Some("1000".into());
+    for _ in 0..5 {
+        module.tick().unwrap();
+    }
+    assert_eq!(host.artwork_refresh_requests.len(), 2);
 }
 
 #[test]

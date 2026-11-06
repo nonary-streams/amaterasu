@@ -402,6 +402,87 @@ fn steam_artwork_importer() -> Pipeline {
     )
 }
 
+#[test]
+fn artwork_refresh_preserves_edits_and_requires_the_original_provider_identity() {
+    let mut backend = Backend::default();
+    let mut pipeline = steam_artwork_importer();
+    run_steam_artwork_snapshot(
+        &mut backend,
+        &mut pipeline,
+        "initial-artwork",
+        1,
+        Some("101"),
+    );
+    let id = "app-0000000000000001";
+    let mut edited = backend.entries[id].clone();
+    edited["name"] = json!("My custom title");
+    edited["config_overrides"] = json!({"bitrate":42000});
+    let before_revision = backend.metadata["revision"].as_u64().unwrap();
+    let mut request_entry = edited.clone();
+    request_entry.as_object_mut().unwrap().remove("artwork");
+    let reply = backend.run_for(&mut pipeline,
+        json!({"action":"update","id":id,"entry":request_entry,"expected_revision":before_revision}),
+        "amaterasu.management", "amaterasu.management", "amaterasu.management");
+    assert_eq!(reply["ok"], true, "{reply}");
+    let refresh = json!({"action":"provider_artwork_refresh","source_id":"steam:42",
+        "artwork":{"provider":"steam","app_id":42,"revision":"202"}});
+    let denied = backend.run_for(
+        &mut pipeline,
+        refresh.clone(),
+        "untrusted",
+        "amaterasu.steam",
+        "amaterasu.management",
+    );
+    assert_eq!(denied["error"]["code"], "permission_denied");
+    let refreshed = backend.run_for(
+        &mut pipeline,
+        refresh.clone(),
+        "amaterasu.steam",
+        "untrusted",
+        "amaterasu.management",
+    );
+    assert_eq!(refreshed["changed"], true, "{refreshed}");
+    edited["artwork"]["revision"] = json!("202");
+    assert_eq!(backend.entries[id], edited);
+    let revision = backend.revision;
+    let replay = backend.run_for(
+        &mut pipeline,
+        refresh.clone(),
+        "amaterasu.steam",
+        "amaterasu.steam",
+        "amaterasu.management",
+    );
+    assert_eq!(replay["changed"], false);
+    assert_eq!(backend.revision, revision);
+    let mut swapped = refresh;
+    swapped["artwork"]["app_id"] = json!(43);
+    let denied = backend.run_for(
+        &mut pipeline,
+        swapped,
+        "amaterasu.steam",
+        "amaterasu.steam",
+        "amaterasu.management",
+    );
+    assert_eq!(denied["error"]["code"], "provider_artwork_required");
+    assert_eq!(backend.entries[id], edited);
+}
+
+#[test]
+fn artwork_refresh_does_not_create_unimported_applications() {
+    let mut backend = Backend::default();
+    let mut pipeline = steam_artwork_importer();
+    let result = backend.run_for(
+        &mut pipeline,
+        json!({"action":"provider_artwork_refresh","source_id":"steam:42",
+            "artwork":{"provider":"steam","app_id":42,"revision":"202"}}),
+        "amaterasu.steam",
+        "amaterasu.steam",
+        "amaterasu.management",
+    );
+    assert_eq!(result["changed"], false, "{result}");
+    assert!(backend.entries.is_empty());
+}
+
 fn steam_artwork_entry(name: &str, revision: Option<&str>) -> Value {
     let mut result = entry(name);
     if let Some(revision) = revision {
