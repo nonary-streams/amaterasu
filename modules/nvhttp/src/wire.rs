@@ -470,7 +470,7 @@ impl Router {
                 if !peer.launch_allowed {
                     return Some(xml::error(403, "launch permission denied"));
                 }
-                let request = match streaming::launch_request(&query) {
+                let request = match streaming::resume_request(&query) {
                     Ok(request) => request,
                     Err(error) => return Some(xml::error(400, error)),
                 };

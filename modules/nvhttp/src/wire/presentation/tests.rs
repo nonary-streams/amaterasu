@@ -817,6 +817,7 @@ fn auxiliary_resume_uses_semantic_view_permission_even_from_an_applist_launch() 
             generation: 1,
             reservation_id: "resume-operation".into(),
             capture: session::CaptureSource::SyntheticBlack,
+            source_mode: None,
             mode: session::Mode {
                 width: 1920,
                 height: 1080,

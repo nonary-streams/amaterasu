@@ -7,7 +7,7 @@ mod applications;
 mod recovery;
 
 use super::{Permission, Purpose, Reply, RequestContext, Router, RouterConfig, xml};
-use crate::launch::{Controller, LaunchRequest, PeerIdentity};
+use crate::launch::{Controller, LaunchRequest, PeerIdentity, StreamResponse};
 use amaterasu_module_sdk::requests::RequestOptions;
 use amaterasu_module_sdk::session_presentation::{
     self as session, Artwork, Client, Context, ControlCompletion, Decision, DispatchIntent,
@@ -574,10 +574,13 @@ impl PresentationRouter {
                 context: work.context.clone(),
                 operation_id: operation_id.clone(),
                 intent: work.intent.expect("dispatch intent"),
-                selection: request.as_ref().map(|request| session::Selection {
-                    id: request.app_id.to_string(),
-                    uuid: None,
-                }),
+                selection: request
+                    .as_ref()
+                    .filter(|request| request.app_id != 0)
+                    .map(|request| session::Selection {
+                        id: request.app_id.to_string(),
+                        uuid: None,
+                    }),
                 mode: request.as_ref().map(|request| session::Mode {
                     width: request.width,
                     height: request.height,
@@ -853,6 +856,7 @@ impl PresentationRouter {
         now: Instant,
     ) -> Option<Reply> {
         let connection = work.connection?;
+        let response = stream_response(work.intent);
         let auxiliary_permission = if matches!(&decision, Decision::ResumeAuxiliary { .. }) {
             Permission::View
         } else {
@@ -878,9 +882,10 @@ impl PresentationRouter {
                     Err(reply) => return self.fail_with_release(work, reply),
                 };
                 let reply = match source {
-                    Some(source) => launches
-                        .launch_application_with_source(connection, request, peer, source, now),
-                    None => launches.launch(connection, request, peer, now),
+                    Some(source) => launches.launch_application_with_source_for_route(
+                        connection, request, peer, source, response, now,
+                    ),
+                    None => launches.launch_for_route(connection, request, peer, response, now),
                 };
                 self.handoff_reply(work, reply)
             }
@@ -902,10 +907,10 @@ impl PresentationRouter {
                     Err(reply) => return self.fail_with_release(work, reply),
                 };
                 let reply = match source {
-                    Some(source) => {
-                        launches.resume_with_source(connection, request, &peer, source, now)
-                    }
-                    None => launches.resume(connection, request, &peer, now),
+                    Some(source) => launches.resume_with_source_for_route(
+                        connection, request, &peer, source, response, now,
+                    ),
+                    None => launches.resume_for_route(connection, request, &peer, response, now),
                 };
                 launches.set_presentation_delivery_permission(connection, Permission::View);
                 self.handoff_reply(
@@ -934,7 +939,8 @@ impl PresentationRouter {
                     );
                 };
                 let permission = auxiliary_permission;
-                let reply = launches.launch_auxiliary(connection, request, peer, plan, now);
+                let reply = launches
+                    .launch_auxiliary_for_route(connection, request, peer, plan, response, now);
                 launches.set_presentation_delivery_permission(connection, permission);
                 self.handoff_reply(work, reply.map(|reply| private_reply(reply, permission)))
             }
@@ -1089,10 +1095,12 @@ impl PresentationRouter {
                     return self.fail_with_release(work, reply);
                 }
                 let connection = work.connection?;
+                let response = stream_response(work.intent);
                 let reply = match source {
-                    Some(source) => launches
-                        .launch_application_with_source(connection, request, *peer, source, now),
-                    None => launches.launch(connection, request, *peer, now),
+                    Some(source) => launches.launch_application_with_source_for_route(
+                        connection, request, *peer, source, response, now,
+                    ),
+                    None => launches.launch_for_route(connection, request, *peer, response, now),
                 };
                 self.handoff_reply(work, reply)
             }
@@ -1469,6 +1477,14 @@ fn valid_status(status: u16) -> u16 {
         502
     }
 }
+
+fn stream_response(intent: Option<DispatchIntent>) -> StreamResponse {
+    if intent == Some(DispatchIntent::Resume) {
+        StreamResponse::Resume
+    } else {
+        StreamResponse::Launch
+    }
+}
 fn bounded_message(message: &str) -> String {
     message.chars().take(512).collect()
 }
@@ -1549,7 +1565,12 @@ impl Router {
                     }
                     None
                 } else {
-                    match super::streaming::launch_request(query) {
+                    let parsed = if intent == DispatchIntent::Resume {
+                        super::streaming::resume_request(query)
+                    } else {
+                        super::streaming::launch_request(query)
+                    };
+                    match parsed {
                         Ok(request) => Some(request),
                         Err(error) => return Some(xml::error(400, error)),
                     }
@@ -1586,5 +1607,7 @@ impl Router {
     }
 }
 
+#[cfg(test)]
+mod protocol_tests;
 #[cfg(test)]
 mod tests;
