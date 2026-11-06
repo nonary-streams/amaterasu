@@ -3292,6 +3292,185 @@ fn export_pages_are_sanitized_revision_bound_and_read_only() {
 }
 
 #[test]
+fn identity_inventory_retains_hidden_alias_occupancy_without_exposing_launch_data() {
+    for legacy in [false, true] {
+        let entries:BTreeMap<String,Value>=(1..=25).map(|id| {
+            let mut entry=json!({"name":format!("Game {id}"),"uuid":format!("stable-{id}"),"hidden":id%2==0,"id_aliases":[format!("app-{:016x}",10_000+id)],"properties":{"presentation_hint":"retained"},"launch":{"kind":"executable","program":"/private/game","arguments":["secret"]}});
+            if id==2 {entry["remote_monitor_profile"]=true.into();entry["config_overrides"]=json!({"dd_virtual_display_scale":125});}
+            (format!("app-{id:016x}"),entry)
+        }).collect();
+        let mut backend = if legacy {
+            Backend {
+                legacy: Some(json!({"revision":7,"next_id":26,"entries":entries})),
+                ..Default::default()
+            }
+        } else {
+            Backend {
+                revision: 3,
+                metadata: json!({"revision":7,"next_id":26}),
+                entries,
+                ..Default::default()
+            }
+        };
+        let original_revision = backend.revision;
+        let mut pipeline = Pipeline::new_with_steam_id_export_principals(
+            BTreeSet::new(),
+            BTreeMap::from([("consumer".into(), "owner".into())]),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        );
+        let mut cursor = Value::Null;
+        let mut first_cursor = Value::Null;
+        let mut rows = Vec::new();
+        loop {
+            let reply = backend.run_for(
+                &mut pipeline,
+                json!({"action":"export_identity_inventory","cursor":cursor,"limit":7}),
+                "amaterasu.library",
+                "consumer",
+                "owner",
+            );
+            assert_eq!(reply["ok"], true, "{reply}");
+            assert_eq!(reply["revision"], 7);
+            assert!(serde_json::to_vec(&reply).unwrap().len() <= 12_288);
+            for row in reply["entries"].as_array().unwrap() {
+                assert_eq!(row.as_object().unwrap().len(), 7);
+                assert!(row.get("launch").is_none());
+                assert!(row.get("entry").is_none());
+                assert_eq!(row["aliases"].as_array().unwrap().len(), 1);
+                rows.push(row.clone());
+            }
+            cursor = reply["next_cursor"].clone();
+            if cursor.is_null() {
+                break;
+            }
+            if first_cursor.is_null() {
+                first_cursor = cursor.clone();
+            }
+            assert_eq!(cursor["after"], rows.last().unwrap()["id"]);
+            assert_eq!(cursor["query"], "");
+        }
+        assert_eq!(rows.len(), 25);
+        assert_eq!(rows[1]["visible"], false);
+        assert_eq!(rows[1]["monitor_profile"], true);
+        assert_eq!(
+            rows[1]["properties"]["config_overrides"]["dd_virtual_display_scale"],
+            125
+        );
+        assert_eq!(rows[1]["properties"]["presentation_hint"], "retained");
+        assert_eq!(
+            backend.revision, original_revision,
+            "inventory must not migrate or mutate storage"
+        );
+        let ordinary = backend.run_for(
+            &mut pipeline,
+            json!({"action":"export_list","limit":7}),
+            "amaterasu.library",
+            "consumer",
+            "owner",
+        );
+        assert!(ordinary["entries"].as_array().unwrap().iter().all(|row| {
+            u64::from_str_radix(
+                row["id"].as_str().unwrap().strip_prefix("app-").unwrap(),
+                16,
+            )
+            .unwrap()
+                % 2
+                == 1
+        }));
+        if legacy {
+            backend.legacy.as_mut().unwrap()["revision"] = 8.into();
+        } else {
+            backend.metadata["revision"] = 8.into();
+        }
+        let stale = backend.run_for(
+            &mut pipeline,
+            json!({"action":"export_identity_inventory","cursor":first_cursor}),
+            "amaterasu.library",
+            "consumer",
+            "owner",
+        );
+        assert_eq!(stale["error"]["code"], "revision_conflict");
+    }
+}
+
+#[test]
+fn identity_inventory_requires_the_selected_library_and_configured_initiator() {
+    let pipeline = Pipeline::new_with_steam_id_export_principals(
+        BTreeSet::new(),
+        BTreeMap::from([("consumer".into(), "owner".into())]),
+        BTreeMap::new(),
+        BTreeMap::new(),
+    )
+    .with_library_principal("external.library".into());
+    let request = || Operation::ExportIdentityInventory {
+        cursor: None,
+        limit: None,
+    };
+    assert_eq!(
+        pipeline
+            .select_catalog("external.library", "consumer", request())
+            .unwrap()
+            .0,
+        "principal/owner"
+    );
+    for (caller, initiator) in [
+        ("consumer", "consumer"),
+        ("amaterasu.library", "consumer"),
+        ("external.library", "foreign"),
+    ] {
+        let denied = pipeline
+            .select_catalog(caller, initiator, request())
+            .err()
+            .unwrap();
+        assert_eq!(denied["error"]["code"], "permission_denied");
+    }
+}
+
+#[test]
+fn identity_inventory_pages_bound_metadata_bytes_and_always_advance() {
+    let entries:BTreeMap<String,Value>=(1..=7).map(|id|(format!("app-{id:016x}"),json!({"name":format!("Game {id}"),"hidden":true,"properties":{"payload":"x".repeat(3900)},"launch":{"kind":"desktop"}}))).collect();
+    let mut backend = Backend {
+        revision: 1,
+        metadata: json!({"revision":1,"next_id":8}),
+        entries,
+        ..Default::default()
+    };
+    let mut pipeline = Pipeline::new_with_steam_id_export_principals(
+        BTreeSet::new(),
+        BTreeMap::from([("consumer".into(), "owner".into())]),
+        BTreeMap::new(),
+        BTreeMap::new(),
+    );
+    let mut cursor = Value::Null;
+    let mut total = 0;
+    let mut pages = 0;
+    loop {
+        let response = backend.run_for(
+            &mut pipeline,
+            json!({"action":"export_identity_inventory","limit":32,"cursor":cursor}),
+            "amaterasu.library",
+            "consumer",
+            "owner",
+        );
+        assert_eq!(response["ok"], true, "{response}");
+        let entries = response["entries"].as_array().unwrap();
+        assert!(!entries.is_empty());
+        assert!(entries.len() < 32);
+        assert!(serde_json::to_vec(&response).unwrap().len() <= 12_288);
+        total += entries.len();
+        pages += 1;
+        cursor = response["next_cursor"].clone();
+        if cursor.is_null() {
+            break;
+        }
+        assert!(pages < 10);
+    }
+    assert_eq!(total, 7);
+    assert!(pages > 1);
+}
+
+#[test]
 fn provider_snapshots_are_caller_bound_replay_safe_and_delete_only_after_complete_finish() {
     let mut backend = Backend::default();
     let mut pipeline = steam_importer();

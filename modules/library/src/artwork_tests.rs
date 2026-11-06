@@ -97,6 +97,98 @@ impl Drop for Runtime {
 }
 
 #[test]
+fn unchanged_library_inventory_consumer_accepts_two_independent_catalog_implementations() {
+    use amaterasu_module_sdk::application_library::{
+        LibraryIdentityEntry, LibraryIdentityInventoryResponse, LibraryRequest,
+    };
+    for replacement in [false, true] {
+        let host = Runtime::new("unused.covers/1");
+        let catalog = host.client("catalog");
+        let consumer = host.client("consumer");
+        catalog
+            .require_success(Command::Register {
+                service: CATALOG.into(),
+            })
+            .unwrap();
+        let mut library = Library::start(host.client("library")).unwrap();
+        let Response::Accepted { id: request } = consumer
+            .send(Command::Request {
+                service: SERVICE.into(),
+                payload: serde_json::to_value(LibraryRequest::IdentityInventory {
+                    cursor: None,
+                    limit: Some(32),
+                })
+                .unwrap(),
+                timeout_ms: 5_000,
+                operation_id: "read.identity.inventory".into(),
+                parent: None,
+            })
+            .unwrap()
+        else {
+            panic!("inventory request rejected");
+        };
+        let mut completed = None;
+        for _ in 0..20 {
+            library.tick().unwrap();
+            if let Response::Request {
+                id,
+                caller,
+                initiator,
+                payload,
+                ..
+            } = catalog.send(Command::Poll {}).unwrap()
+            {
+                assert_eq!(caller, "library");
+                assert_eq!(initiator, "consumer");
+                assert_eq!(payload["action"], "export_identity_inventory");
+                let response = if replacement {
+                    serde_json::to_value(LibraryIdentityInventoryResponse {
+                        ok: true,
+                        revision: 7,
+                        entries: vec![LibraryIdentityEntry {
+                            id: "app-0000000000000001".into(),
+                            uuid: "stable-game".into(),
+                            title: "Game".into(),
+                            aliases: vec!["app-000000000000002a".into()],
+                            visible: false,
+                            monitor_profile: true,
+                            properties: json!({"frozen":"profile"}),
+                        }],
+                        next_cursor: None,
+                    })
+                    .unwrap()
+                } else {
+                    json!({"ok":true,"revision":7,"entries":[{"id":"app-0000000000000001","uuid":"stable-game","title":"Game","aliases":["app-000000000000002a"],"visible":false,"monitor_profile":true,"properties":{"frozen":"profile"},"launch":{"program":"/private/game"}}],"next_cursor":null})
+                };
+                catalog
+                    .require_success(Command::Complete {
+                        request: id,
+                        payload: response,
+                    })
+                    .unwrap();
+            }
+            match consumer.send(Command::TakeResult { request }).unwrap() {
+                Response::Result { payload } => {
+                    completed = Some(payload);
+                    break;
+                }
+                Response::Pending => {}
+                other => panic!("unexpected inventory response {other:?}"),
+            }
+        }
+        let response: LibraryIdentityInventoryResponse =
+            serde_json::from_value(completed.expect("inventory never completed")).unwrap();
+        response.validate(32).unwrap();
+        assert!(!response.entries[0].visible);
+        assert_eq!(response.entries[0].aliases, ["app-000000000000002a"]);
+        assert_eq!(response.entries[0].properties, json!({"frozen":"profile"}));
+        consumer
+            .require_success(Command::ReleaseResult { request })
+            .unwrap();
+    }
+}
+
+#[test]
 fn interchangeable_native_providers_deliver_large_artwork_without_json_bytes() {
     for service in ["vendor.artwork/1", "replacement.covers/1"] {
         let host = Runtime::new(service);

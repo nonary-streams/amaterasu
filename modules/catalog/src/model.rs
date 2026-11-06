@@ -13,6 +13,20 @@ const MAX_LAUNCH_WORKING_DIRECTORY_BYTES: usize = 1_024;
 #[serde(deny_unknown_fields)]
 pub struct Entry {
     pub name: String,
+    /// Optional stable identity retained independently of allocated catalog IDs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uuid: Option<String>,
+    /// Earlier catalog IDs still reserved by this application.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub id_aliases: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub hidden: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub remote_monitor_profile: bool,
+    /// Provider-owned presentation metadata. It never includes launch settings
+    /// merely because those are stored in the same catalog row.
+    #[serde(default = "empty_properties", skip_serializing_if = "properties_empty")]
+    pub properties: serde_json::Value,
     #[serde(default)]
     pub description: String,
     #[serde(default)]
@@ -78,6 +92,14 @@ pub struct Entry {
 
 fn is_false(value: &bool) -> bool {
     !value
+}
+
+fn empty_properties() -> serde_json::Value {
+    serde_json::json!({})
+}
+
+fn properties_empty(value: &serde_json::Value) -> bool {
+    value.as_object().is_some_and(serde_json::Map::is_empty)
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1066,6 +1088,25 @@ fn default_command_timeout_ms() -> u64 {
 
 impl Entry {
     pub fn validate(&self) -> Result<(), &'static str> {
+        if self
+            .uuid
+            .as_deref()
+            .is_some_and(|uuid| uuid.is_empty() || !bounded_text(uuid, 128))
+        {
+            return Err("uuid must contain 1..128 printable bytes");
+        }
+        if self.id_aliases.len() > 32
+            || self.id_aliases.iter().any(|id| parse_id(id).is_none())
+            || self
+                .id_aliases
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                != self.id_aliases.len()
+        {
+            return Err("at most 32 unique canonical catalog aliases are allowed");
+        }
+        crate::identity::properties(self)?;
         if self.elevated && !matches!(&self.launch, Launch::Executable { .. }) {
             return Err("elevated is supported only for executable launch targets");
         }
@@ -1480,6 +1521,40 @@ pub fn parse_id(id: &str) -> Option<u64> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn presentation_identity_defaults_preserve_old_documents_and_validate_new_metadata() {
+        let legacy: Entry =
+            serde_json::from_value(json!({"name":"Game","launch":{"kind":"desktop"}})).unwrap();
+        legacy.validate().unwrap();
+        assert!(legacy.uuid.is_none());
+        assert!(!legacy.hidden);
+        assert!(legacy.id_aliases.is_empty());
+        for fields in [
+            json!({"uuid":""}),
+            json!({"id_aliases":["not-a-catalog-id"]}),
+            json!({"id_aliases":["app-0000000000000001","app-0000000000000001"]}),
+            json!({"properties":[]}),
+            json!({"properties":{"oversized":"x".repeat(4096)}}),
+        ] {
+            let mut value = serde_json::to_value(&legacy).unwrap();
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
+            let entry: Entry = serde_json::from_value(value).unwrap();
+            assert!(entry.validate().is_err());
+        }
+        let mut profile = legacy;
+        profile.remote_monitor_profile = true;
+        profile.properties = json!({"config_overrides":{"dd_virtual_display_scale":200}});
+        profile.config_overrides =
+            serde_json::from_value(json!({"dd_virtual_display_scale":125})).unwrap();
+        assert_eq!(
+            crate::identity::properties(&profile).unwrap()["config_overrides"]["dd_virtual_display_scale"],
+            125
+        );
+    }
 
     #[test]
     fn display_remapping_requires_resolver_usable_final_values_and_tokens() {

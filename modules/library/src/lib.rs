@@ -4,6 +4,7 @@
 //! ownership of launch operations and their retirement proofs.
 mod artwork;
 mod discovery;
+mod identity_inventory;
 
 use amaterasu_module_sdk::application_library::artwork::{ArtworkRoutes, supports_artwork};
 use amaterasu_module_sdk::artwork_transfer::{self, Offer, Source};
@@ -25,6 +26,10 @@ const DEFAULT_LIST_LIMIT: usize = 20;
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 enum Action {
     List {
+        cursor: Option<Cursor>,
+        limit: Option<usize>,
+    },
+    IdentityInventory {
         cursor: Option<Cursor>,
         limit: Option<usize>,
     },
@@ -54,6 +59,7 @@ struct Cursor {
 enum CatalogProjection {
     Resolve,
     List { limit: usize },
+    IdentityInventory { limit: usize },
 }
 
 impl Action {
@@ -71,6 +77,20 @@ impl Action {
                 Ok((
                     json!({"action":"export_list","cursor":cursor,"limit":limit}),
                     CatalogProjection::List { limit },
+                ))
+            }
+            Self::IdentityInventory { cursor, limit } => {
+                if limit.is_some_and(|limit| !(1..=32).contains(&limit))
+                    || cursor
+                        .as_ref()
+                        .is_some_and(|cursor| !valid_id(&cursor.after) || !cursor.query.is_empty())
+                {
+                    return Err("invalid pagination");
+                }
+                let limit = limit.unwrap_or(DEFAULT_LIST_LIMIT);
+                Ok((
+                    json!({"action":"export_identity_inventory","cursor":cursor,"limit":limit}),
+                    CatalogProjection::IdentityInventory { limit },
                 ))
             }
             Self::Resolve { id } if valid_id(&id) => Ok((
@@ -98,6 +118,9 @@ fn error(code: &str, message: &str) -> Value {
 
 /// Never forward launch details, paths, or unknown fields from the catalog.
 fn project(payload: Value, projection: CatalogProjection) -> Value {
+    if let CatalogProjection::IdentityInventory { limit } = projection {
+        return identity_inventory::project(payload, limit);
+    }
     if payload["ok"] == false {
         let code = payload
             .pointer("/error/code")
@@ -629,5 +652,37 @@ mod forwarding_tests {
                 assert_eq!(response["error"]["code"], "invalid_catalog_response");
             }
         }
+    }
+
+    #[test]
+    fn inventory_delegates_through_library_with_exact_parent_and_keeps_hidden_rows() {
+        let mut host = Box::new(Host {
+            requested: Some(json!({"action":"identity_inventory","limit":32})),
+            catalog_result: Some(
+                json!({"ok":true,"revision":9,"entries":[{"id":"app-0000000000000001","uuid":"stable","title":"Hidden profile","aliases":["app-000000000000002a"],"visible":false,"monitor_profile":true,"properties":{},"launch":"secret"}],"next_cursor":null}),
+            ),
+            ..Default::default()
+        });
+        let endpoint = HostApi {
+            header: AbiHeader::of::<HostApi>(),
+            context: (&mut *host as *mut Host).cast(),
+            invoke,
+        };
+        // SAFETY: the boxed host remains live through all synchronous callbacks.
+        let mut module = Library::start(unsafe { RuntimeClient::from_endpoint(endpoint) }).unwrap();
+        for _ in 0..3 {
+            module.tick().unwrap();
+        }
+        assert!(host.commands.iter().any(|command|matches!(command,Command::Request {service,payload,parent:Some(11),..}if service==CATALOG && payload["action"]=="export_identity_inventory" && payload["limit"]==32)));
+        let reply = host.completed.as_ref().unwrap();
+        assert_eq!(reply["ok"], true, "{reply}");
+        assert_eq!(reply["entries"][0]["visible"], false);
+        assert_eq!(reply["entries"][0]["aliases"][0], "app-000000000000002a");
+        assert!(reply["entries"][0].get("launch").is_none());
+        assert!(
+            host.commands
+                .iter()
+                .any(|command| matches!(command, Command::ReleaseResult { request: 12 }))
+        );
     }
 }

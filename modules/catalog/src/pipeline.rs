@@ -215,6 +215,7 @@ struct ProviderFinish {
 enum ScanProjection {
     List,
     ExportList,
+    IdentityInventory,
     SteamIds,
 }
 
@@ -319,6 +320,21 @@ impl Pipeline {
                     ));
                 }
                 Ok((format!("principal/{caller}"), None, operation))
+            }
+            operation @ Operation::ExportIdentityInventory { .. } => {
+                if caller != library_principal {
+                    return Err(error(
+                        "permission_denied",
+                        "caller is not the library facade",
+                    ));
+                }
+                let owner = self.export_principals.get(initiator).ok_or_else(|| {
+                    error(
+                        "permission_denied",
+                        "request initiator is not an authorized catalog consumer",
+                    )
+                })?;
+                Ok((format!("principal/{owner}"), None, operation))
             }
             operation @ Operation::ExportList { .. } => {
                 let consumer = if caller == library_principal {
@@ -2751,6 +2767,7 @@ impl Pipeline {
             if matches!(
                 operation,
                 Operation::ExportList { .. }
+                    | Operation::ExportIdentityInventory { .. }
                     | Operation::ExportSteamIds { .. }
                     | Operation::ResolveExported { .. }
                     | Operation::ResolveExportedArtwork { .. }
@@ -2771,6 +2788,7 @@ impl Pipeline {
         if matches!(
             operation,
             Operation::ExportList { .. }
+                | Operation::ExportIdentityInventory { .. }
                 | Operation::ExportSteamIds { .. }
                 | Operation::ResolveExported { .. }
                 | Operation::ResolveExportedArtwork { .. }
@@ -2811,6 +2829,13 @@ impl Pipeline {
                 cursor,
                 limit,
                 ScanProjection::ExportList,
+            ),
+            Operation::ExportIdentityInventory { cursor, limit } => (
+                String::new(),
+                String::new(),
+                cursor,
+                limit,
+                ScanProjection::IdentityInventory,
             ),
             Operation::ExportSteamIds { cursor, limit } => (
                 String::new(),
@@ -3126,9 +3151,17 @@ impl Pipeline {
                 ScanProjection::List if matches_query(&entry, &scan.query) => {
                     Some(project_entry(id, &entry, false))
                 }
-                ScanProjection::ExportList if matches_query(&entry, &scan.query) => {
+                ScanProjection::ExportList
+                    if !entry.hidden && matches_query(&entry, &scan.query) =>
+                {
                     Some(project_entry(id, &entry, true))
                 }
+                ScanProjection::IdentityInventory => match crate::identity::project(id, &entry) {
+                    Ok(projected) => Some(projected),
+                    Err(message) => {
+                        return complete(send, context.request_id, error("invalid_entry", message));
+                    }
+                },
                 ScanProjection::SteamIds => entry
                     .steam_id
                     .as_deref()
@@ -3180,7 +3213,7 @@ impl Scan {
                     crate::protocol::config_override_capabilities();
                 reply
             }
-            ScanProjection::ExportList => {
+            ScanProjection::ExportList | ScanProjection::IdentityInventory => {
                 json!({"ok":true,"revision":self.revision,"entries":self.entries,"next_cursor":cursor})
             }
         }
@@ -3722,6 +3755,11 @@ fn collection_commit(session: &ProviderSession, edits: Vec<Value>) -> Value {
 fn playnite_fullscreen_entry(config_overrides: ConfigOverrides) -> Entry {
     Entry {
         name: PLAYNITE_FULLSCREEN_NAME.into(),
+        uuid: None,
+        id_aliases: Vec::new(),
+        hidden: false,
+        remote_monitor_profile: false,
+        properties: json!({}),
         description: String::new(),
         tags: Vec::new(),
         artwork: None,

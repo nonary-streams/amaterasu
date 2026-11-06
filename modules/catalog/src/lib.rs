@@ -1,4 +1,5 @@
 //! Durable, caller-scoped manual application catalogs.
+mod identity;
 mod model;
 mod pipeline;
 mod product;

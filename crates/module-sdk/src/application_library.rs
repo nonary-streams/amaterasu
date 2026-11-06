@@ -38,6 +38,12 @@ pub enum LibraryRequest {
         cursor: Option<LibraryCursor>,
         limit: Option<usize>,
     },
+    /// Complete identity occupancy for an installed session-presentation
+    /// consumer. Unlike `List`, this includes hidden applications and aliases.
+    IdentityInventory {
+        cursor: Option<LibraryCursor>,
+        limit: Option<usize>,
+    },
     Resolve {
         id: String,
     },
@@ -57,6 +63,89 @@ pub struct LibraryListResponse {
     pub revision: u64,
     pub entries: Vec<LibraryEntry>,
     pub next_cursor: Option<LibraryCursor>,
+}
+
+/// Presentation identity without executable or preparation metadata. Properties
+/// are provider-owned and bounded; monitor profiles retain their approved
+/// display overrides here so editing a row cannot retarget an existing lease.
+#[derive(Clone, Debug, serde::Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LibraryIdentityEntry {
+    pub id: String,
+    pub uuid: String,
+    pub title: String,
+    pub aliases: Vec<String>,
+    pub visible: bool,
+    pub monitor_profile: bool,
+    pub properties: Value,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LibraryIdentityInventoryResponse {
+    pub ok: bool,
+    pub revision: u64,
+    pub entries: Vec<LibraryIdentityEntry>,
+    pub next_cursor: Option<LibraryCursor>,
+}
+
+impl LibraryIdentityEntry {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        let valid_id = |id: &str| {
+            id.len() == 20
+                && id.starts_with("app-")
+                && id[4..]
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+                && id[4..].bytes().any(|byte| byte != b'0')
+        };
+        let printable = |text: &str, max| {
+            !text.is_empty() && text.len() <= max && !text.chars().any(char::is_control)
+        };
+        if !valid_id(&self.id)
+            || !printable(&self.uuid, 128)
+            || !printable(&self.title, 160)
+            || self.title.trim().is_empty()
+            || self.aliases.len() > 32
+            || self.aliases.iter().any(|id| !valid_id(id))
+            || self.aliases.iter().collect::<BTreeSet<_>>().len() != self.aliases.len()
+            || !self.properties.is_object()
+            || !serde_json::to_vec(&self.properties).is_ok_and(|bytes| bytes.len() <= 4_096)
+        {
+            return Err("invalid library identity entry");
+        }
+        Ok(())
+    }
+}
+
+impl LibraryIdentityInventoryResponse {
+    /// Validate the complete page before exposing any occupancy to a consumer.
+    pub fn validate(&self, limit: usize) -> Result<(), &'static str> {
+        if !self.ok
+            || !(1..=32).contains(&limit)
+            || self.entries.len() > limit
+            || !serde_json::to_vec(self).is_ok_and(|bytes| bytes.len() <= 12_288)
+        {
+            return Err("invalid library identity inventory page");
+        }
+        for entry in &self.entries {
+            entry.validate()?;
+        }
+        if self.entries.windows(2).any(|pair| pair[0].id >= pair[1].id) {
+            return Err("unordered library identity inventory page");
+        }
+        if let Some(cursor) = &self.next_cursor
+            && (cursor.revision != self.revision
+                || !cursor.query.is_empty()
+                || self
+                    .entries
+                    .last()
+                    .is_none_or(|entry| entry.id != cursor.after))
+        {
+            return Err("invalid library identity inventory continuation");
+        }
+        Ok(())
+    }
 }
 
 /// Successful resolve response. Error envelopes have a different shape and
@@ -173,6 +262,26 @@ fn is_false(value: &bool) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn identity_inventory_sdk_keeps_exact_hidden_occupancy_and_revision_cursor() {
+        let request = LibraryRequest::IdentityInventory {
+            cursor: None,
+            limit: Some(32),
+        };
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            json!({"action":"identity_inventory","cursor":null,"limit":32})
+        );
+        let mut page:LibraryIdentityInventoryResponse=serde_json::from_value(json!({"ok":true,"revision":9,"entries":[{"id":"app-0000000000000001","uuid":"stable","title":"Hidden profile","aliases":["app-000000000000002a"],"visible":false,"monitor_profile":true,"properties":{}}],"next_cursor":{"revision":9,"after":"app-0000000000000001","query":""}})).unwrap();
+        page.validate(32).unwrap();
+        assert!(!page.entries[0].visible);
+        page.next_cursor.as_mut().unwrap().revision = 10;
+        assert!(page.validate(32).is_err());
+        page.next_cursor = None;
+        page.entries[0].aliases.push("app-000000000000002a".into());
+        assert!(page.validate(32).is_err());
+    }
 
     fn entry(id: &str) -> ProviderEntry {
         ProviderEntry {

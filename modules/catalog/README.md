@@ -34,6 +34,17 @@ Create a manual entry:
 {"action":"create","expected_revision":0,"entry":{"name":"Example Game","description":"Local game","tags":["arcade"],"launch":{"kind":"executable","program":"/opt/games/example","arguments":["--fullscreen"],"working_directory":"/opt/games"}}}
 ```
 
+Presentation metadata can add an optional printable `uuid`, at most 32 unique
+canonical `id_aliases`, `hidden` (default false), `remote_monitor_profile`
+(default false), and a `properties` object. The complete identity inventory
+reserves hidden current IDs and aliases while the ordinary client export omits
+hidden rows. A monitor profile's identity properties also freeze its
+authoritative `config_overrides` and explicit display settings; they do not
+include executable, preparation, or command-log data. Combined properties are
+limited to 4,096 encoded bytes. Existing entries omit these fields and keep
+their prior defaults without a storage migration. The selected presentation
+provider validates profile semantics and owns runtime effects.
+
 Entries may include sparse application `config_overrides`. The optional
 `amd_av1_latency_mode` string accepts exactly `auto`, `none`, `power_saving`,
 `realtime`, or `lowest` (case-sensitive). Omit it or set it to null to inherit;
