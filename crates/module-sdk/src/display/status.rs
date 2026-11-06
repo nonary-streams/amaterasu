@@ -9,6 +9,11 @@ use serde_json::Value;
 /// exact operation ID rather than constructing a replacement configuration.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScopedStatus {
+    /// Whether the exact caller, identity and reference still own a durable
+    /// reservation. A reservation may remain after a placement was not applied.
+    /// False also excludes earlier queued or pending placement admissions;
+    /// it is not inferred merely from an absent completed operation ID.
+    pub reference_owned: bool,
     pub operation_id: Option<String>,
     pub pending: bool,
 }
@@ -26,6 +31,7 @@ pub fn scoped_status_from_reply(
         ok: bool,
         identity: String,
         reference_id: String,
+        reference_owned: bool,
         operation_id: Option<String>,
         pending: bool,
     }
@@ -43,6 +49,7 @@ pub fn scoped_status_from_reply(
     if !reply.ok
         || reply.identity != identity
         || reply.reference_id != reference_id
+        || !reply.reference_owned && (reply.operation_id.is_some() || reply.pending)
         || reply
             .operation_id
             .as_deref()
@@ -52,6 +59,7 @@ pub fn scoped_status_from_reply(
         return Err("invalid_scoped_status_response".into());
     }
     Ok(ScopedStatus {
+        reference_owned: reply.reference_owned,
         operation_id: reply.operation_id,
         pending: reply.pending,
     })
@@ -68,13 +76,19 @@ mod tests {
 
     #[test]
     fn status_distinguishes_absent_completed_and_pending_exact_admission() {
-        for (operation_id, pending) in [(None, false), (Some("op"), false), (Some("op"), true)] {
+        for (reference_owned, operation_id, pending) in [
+            (false, None, false),
+            (true, None, false),
+            (true, Some("op"), false),
+            (true, Some("op"), true),
+        ] {
             let status = scoped_status_from_reply(
-                json!({"ok":true,"identity":"owner","reference_id":"reference","operation_id":operation_id,"pending":pending}),
+                json!({"ok":true,"identity":"owner","reference_id":"reference","reference_owned":reference_owned,"operation_id":operation_id,"pending":pending}),
                 "owner",
                 "reference",
             )
             .unwrap();
+            assert_eq!(status.reference_owned, reference_owned);
             assert_eq!(status.operation_id.as_deref(), operation_id);
             assert_eq!(status.pending, pending);
         }
@@ -82,11 +96,13 @@ mod tests {
 
     #[test]
     fn malformed_or_different_scope_is_not_absence_or_recovery_proof() {
-        let valid = json!({"ok":true,"identity":"owner","reference_id":"reference","operation_id":"op","pending":true});
+        let valid = json!({"ok":true,"identity":"owner","reference_id":"reference","reference_owned":true,"operation_id":"op","pending":true});
         for (field, value) in [
             ("ok", json!(false)),
             ("identity", json!("foreign")),
             ("reference_id", json!("different")),
+            ("reference_owned", json!(false)),
+            ("reference_owned", json!("false")),
             ("operation_id", Value::Null),
             ("operation_id", json!("x".repeat(129))),
             ("operation_id", json!("bad operation")),
@@ -96,7 +112,13 @@ mod tests {
             malformed[field] = value;
             assert!(scoped_status_from_reply(malformed, "owner", "reference").is_err());
         }
-        for field in ["identity", "reference_id", "operation_id", "pending"] {
+        for field in [
+            "identity",
+            "reference_id",
+            "reference_owned",
+            "operation_id",
+            "pending",
+        ] {
             let mut truncated = valid.clone();
             truncated.as_object_mut().unwrap().remove(field);
             assert!(scoped_status_from_reply(truncated, "owner", "reference").is_err());

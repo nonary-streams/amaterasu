@@ -53,7 +53,7 @@ impl<P: Platform> Pipeline<P> {
             send,
             context.request,
             json!({"ok":true,"identity":identity,"reference_id":reference_id,
-                "operation_id":operation_id,"pending":pending.is_some()}),
+                "reference_owned":target.is_some(),"operation_id":operation_id,"pending":pending.is_some()}),
         )
     }
 

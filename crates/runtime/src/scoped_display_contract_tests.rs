@@ -306,7 +306,7 @@ fn scoped_reply(
             reference_id,
         } => {
             let admission = journal.get(&Scope::new(caller, &identity, &reference_id));
-            json!({"ok":true,"identity":identity,"reference_id":reference_id,"operation_id":admission.as_ref().filter(|entry| entry.pending || entry.applied).map(|entry| &entry.operation),"pending":admission.is_some_and(|entry| entry.pending)})
+            json!({"ok":true,"identity":identity,"reference_id":reference_id,"reference_owned":admission.is_some(),"operation_id":admission.as_ref().filter(|entry| entry.pending || entry.applied).map(|entry| &entry.operation),"pending":admission.is_some_and(|entry| entry.pending)})
         }
         ScopedOperation::ScopedReconcile {
             operation_id,
@@ -650,6 +650,7 @@ fn scoped_workflow(fixture: &mut dyn DisplayFixture) -> Outcome {
     assert_eq!(
         consumer.status(),
         ScopedStatus {
+            reference_owned: false,
             operation_id: None,
             pending: false
         }
@@ -736,6 +737,7 @@ fn scoped_workflow(fixture: &mut dyn DisplayFixture) -> Outcome {
     assert_eq!(
         consumer.status(),
         ScopedStatus {
+            reference_owned: true,
             operation_id: Some(discovered.clone()),
             pending: false
         }
@@ -808,6 +810,7 @@ fn scoped_workflow(fixture: &mut dyn DisplayFixture) -> Outcome {
     assert_eq!(
         consumer.status(),
         ScopedStatus {
+            reference_owned: true,
             operation_id: None,
             pending: false
         }
@@ -849,6 +852,7 @@ fn scoped_workflow(fixture: &mut dyn DisplayFixture) -> Outcome {
         assert_eq!(
             consumer.status(),
             ScopedStatus {
+                reference_owned: false,
                 operation_id: None,
                 pending: false
             }

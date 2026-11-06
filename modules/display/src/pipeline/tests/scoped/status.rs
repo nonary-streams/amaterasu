@@ -26,10 +26,9 @@ fn status(state: &mut State, pipeline: &mut Pipeline<FakePlatform>, caller: &str
 fn status_is_read_only_and_does_not_reveal_foreign_or_unmatched_admission() {
     let mut state = State::default();
     let mut pipeline = pipeline();
-    assert_eq!(
-        status(&mut state, &mut pipeline, "remote").operation_id,
-        None
-    );
+    let absent = status(&mut state, &mut pipeline, "remote");
+    assert_eq!(absent.operation_id, None);
+    assert!(!absent.reference_owned);
     let request = add_request(&pipeline, "private-monitor-add");
     assert_eq!(state.run(&mut pipeline, "remote", request)["applied"], true);
     let journal = state.journal.clone();
@@ -41,6 +40,7 @@ fn status_is_read_only_and_does_not_reveal_foreign_or_unmatched_admission() {
     pipeline.platform.scoped_only = true;
     let own = status(&mut state, &mut pipeline, "remote");
     assert_eq!(own.operation_id.as_deref(), Some("private-monitor-add"));
+    assert!(own.reference_owned);
     assert!(!own.pending);
     for (caller, identity, reference) in [
         ("foreign", IDENTITY, REFERENCE),
@@ -50,12 +50,91 @@ fn status_is_read_only_and_does_not_reveal_foreign_or_unmatched_admission() {
         let response = state.run(&mut pipeline, caller, status_request(identity, reference));
         let absent = scoped_status_from_reply(response.clone(), identity, reference).unwrap();
         assert_eq!(absent.operation_id, None);
+        assert!(!absent.reference_owned);
         assert!(!absent.pending);
         assert!(!response.to_string().contains("private-monitor-add"));
     }
     assert_eq!(state.journal, journal);
     assert_eq!(state.revision, revision);
     assert_eq!(pipeline.platform.effects, effects);
+}
+
+#[test]
+fn absent_scope_status_needs_no_native_observation_or_mutation_permission() {
+    let mut state = State::default();
+    let mut pipeline = pipeline();
+    pipeline.allow_mutation = false;
+    pipeline.platform.capture_targets_unavailable = true;
+    let observed = status(&mut state, &mut pipeline, "remote");
+    assert!(!observed.reference_owned);
+    assert!(observed.operation_id.is_none());
+    assert!(!observed.pending);
+    assert!(state.journal.is_none());
+    assert_eq!(state.revision, 0);
+    assert!(pipeline.platform.effects.is_empty());
+    assert_eq!(pipeline.platform.kscreen_capture_count, 0);
+}
+
+#[test]
+fn status_waits_behind_queued_apply_before_proving_reference_ownership() {
+    let mut pipeline = pipeline();
+    let mut incoming = std::collections::VecDeque::from([
+        (7, add_request(&pipeline, "queued-placement")),
+        (8, status_request(IDENTITY, REFERENCE)),
+    ]);
+    let mut journal = None;
+    let mut revision = 0;
+    let mut response = None;
+    let mut completed = Vec::new();
+    for _ in 0..24 {
+        pipeline
+            .tick(|command| {
+                Ok(match command {
+                    Command::Poll {} => incoming.pop_front().map_or(Response::Pending, |(id, payload)| Response::Request {
+                        id, caller:"remote".into(), initiator:"remote".into(), service:SERVICE.into(), payload, remaining_ms:30_000,
+                    }),
+                    Command::Request { service, payload, .. } => {
+                        response = Some(if service == amaterasu_module_sdk::virtual_display::SERVICE {
+                            json!({"ok":true,"owned":true,"target_id":"monitor.remote","specification":{"identity":IDENTITY,"name":"Remote Monitor","hdr_enabled":false,"width":1280,"height":720,"refresh_millihz":60000},"active":true})
+                        } else {
+                            assert_eq!(service, STATE_SERVICE);
+                            match payload["action"].as_str().unwrap() {
+                                "get" => json!({"ok":true,"revision":revision,"found":journal.is_some(),"value":journal}),
+                                "set" => {
+                                    assert_eq!(payload["expected_revision"], revision);
+                                    journal = Some(payload["value"].clone());
+                                    revision += 1;
+                                    json!({"ok":true,"revision":revision})
+                                }
+                                action => panic!("unexpected state action {action}"),
+                            }
+                        });
+                        Response::Accepted { id:20 }
+                    }
+                    Command::TakeResult { .. } => Response::Result { payload:response.take().unwrap() },
+                    Command::CheckRequest { .. } => {
+                        assert!(journal.is_some());
+                        Response::Ok
+                    }
+                    Command::Complete { request, payload } => {
+                        completed.push((request, payload));
+                        Response::Ok
+                    }
+                    other => panic!("unexpected command {other:?}"),
+                })
+            })
+            .unwrap();
+        if completed.len() == 2 {
+            break;
+        }
+    }
+    assert_eq!(completed.len(), 2);
+    assert_eq!(completed[0].0, 7);
+    assert_eq!(completed[0].1["applied"], true);
+    assert_eq!(completed[1].0, 8);
+    let status = scoped_status_from_reply(completed.remove(1).1, IDENTITY, REFERENCE).unwrap();
+    assert!(status.reference_owned);
+    assert_eq!(status.operation_id.as_deref(), Some("queued-placement"));
 }
 
 #[test]
@@ -84,11 +163,13 @@ fn restarted_consumer_discovers_initial_pending_operation_before_or_after_native
             Some("original-placement")
         );
         assert!(recovered.pending);
+        assert!(recovered.reference_owned);
         assert_eq!(state.journal, original_journal);
         assert_eq!(state.revision, original_revision);
         assert_eq!(restarted.platform.effects, original_effects);
         let foreign = status(&mut state, &mut restarted, "foreign");
         assert_eq!(foreign.operation_id, None);
+        assert!(!foreign.reference_owned);
         assert!(!foreign.pending);
         let reconciled = state.run(
             &mut restarted,
@@ -154,6 +235,7 @@ fn second_restart_after_unapplied_settlement_allows_fresh_plan_and_normal_restor
         let mut restarted_again = Pipeline::new(restarted.platform, true);
         let recovered = status(&mut state, &mut restarted_again, "remote");
         assert_eq!(recovered.operation_id, None);
+        assert!(recovered.reference_owned);
         assert!(!recovered.pending);
         let stale = state.run(
             &mut restarted_again,
