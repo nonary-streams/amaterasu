@@ -28,13 +28,30 @@ const LAUNCH_FIELDS: &[&str] = &[
     "continuousAudio",
 ];
 
+#[derive(Clone, Copy)]
+enum RequestKind {
+    Launch,
+    Resume,
+}
+
 pub(super) fn launch_request(query: &Query) -> Result<LaunchRequest, &'static str> {
+    streaming_request(query, RequestKind::Launch)
+}
+
+/// A resume may omit its application selection. Zero remains unresolved here;
+/// the authenticated session owner must supply the actual target later.
+pub(super) fn resume_request(query: &Query) -> Result<LaunchRequest, &'static str> {
+    streaming_request(query, RequestKind::Resume)
+}
+
+fn streaming_request(query: &Query, kind: RequestKind) -> Result<LaunchRequest, &'static str> {
     query.require_only(LAUNCH_FIELDS)?;
     validate_metadata(query)?;
-    let app_id = decimal_u32(query.required("appid")?)?;
-    if app_id == 0 {
-        return Err("invalid application identifier");
-    }
+    let app_id = match (kind, query.get("appid")) {
+        (RequestKind::Resume, None) => 0,
+        (_, Some(value)) => application_id(value)?,
+        (RequestKind::Launch, None) => return Err("missing query field"),
+    };
     let (width, height, fps) = mode(query.required("mode")?)?;
     let key = hex_bytes(query.required("rikey")?, 16)?;
     let remote_input_key: [u8; 16] = key
@@ -62,6 +79,14 @@ pub(super) fn launch_request(query: &Query) -> Result<LaunchRequest, &'static st
         remote_input_key,
         key_id,
     })
+}
+
+fn application_id(value: &str) -> Result<u32, &'static str> {
+    let app_id = decimal_u32(value)?;
+    if app_id == 0 || app_id > i32::MAX as u32 {
+        return Err("invalid application identifier");
+    }
+    Ok(app_id)
 }
 
 fn validate_metadata(query: &Query) -> Result<(), &'static str> {
@@ -206,6 +231,118 @@ mod tests {
 
     fn parse(fields: &str) -> Result<LaunchRequest, &'static str> {
         launch_request(&Query::parse(&format!("/launch?{fields}")).unwrap())
+    }
+
+    fn parse_resume(fields: &str) -> Result<LaunchRequest, &'static str> {
+        resume_request(&Query::parse(&format!("/resume?{fields}")).unwrap())
+    }
+
+    #[test]
+    fn resume_without_application_id_preserves_streaming_and_client_metadata() {
+        let request = parse_resume(concat!(
+            "mode=1920x1080x60&rikey=00112233445566778899aabbccddeeff",
+            "&rikeyid=-2147483648&uniqueid=untrusted-metadata&uuid=request-ticket",
+            "&clientName=Living+Room&hdrMode=1&localAudioPlayMode=1",
+            "&continuousAudio=1&surroundAudioInfo=4128774",
+            "&additionalStates=1&sops=1&remoteControllersBitmap=1&gcmap=1",
+            "&gcpersist=1&corever=1"
+        ))
+        .unwrap();
+        assert_eq!(request.app_id, 0);
+        assert_eq!(
+            (request.width, request.height, request.fps),
+            (1920, 1080, 60)
+        );
+        assert_eq!(
+            request.remote_input_key,
+            hex_bytes("00112233445566778899aabbccddeeff", 16)
+                .unwrap()
+                .as_slice()
+        );
+        assert_eq!(request.key_id, 0x8000_0000);
+        assert_eq!(request.device_name.as_deref(), Some("Living Room"));
+        assert!(request.hdr);
+        assert!(request.host_audio_enabled);
+        assert!(request.continuous_audio);
+        assert_eq!(request.audio_channels, 6);
+    }
+
+    #[test]
+    fn resume_accepts_an_explicit_positive_application_id() {
+        let base = "mode=16x16x1&rikey=00000000000000000000000000000000&rikeyid=4294967295";
+        for app_id in [1, 7, i32::MAX as u32] {
+            let request = parse_resume(&format!("appid={app_id}&{base}")).unwrap();
+            assert_eq!(request.app_id, app_id);
+            assert_eq!(request.key_id, u32::MAX);
+        }
+    }
+
+    #[test]
+    fn explicit_application_ids_have_the_same_positive_range_for_launch_and_resume() {
+        let base = "mode=16x16x1&rikey=00000000000000000000000000000000&rikeyid=1";
+        for app_id in [
+            "",
+            "0",
+            "-1",
+            "+1",
+            " 1",
+            "1 ",
+            "1.0",
+            "app-1",
+            "2147483648",
+            "4294967295",
+            "4294967296",
+        ] {
+            let fields = format!("appid={app_id}&{base}");
+            assert!(parse(&fields).is_err(), "launch accepted {app_id:?}");
+            assert!(parse_resume(&fields).is_err(), "resume accepted {app_id:?}");
+        }
+        assert!(parse(base).is_err(), "launch accepted an omitted target");
+        assert_eq!(parse_resume(base).unwrap().app_id, 0);
+    }
+
+    #[test]
+    fn unresolved_resume_still_requires_valid_mode_and_encryption_inputs() {
+        for fields in [
+            "rikey=00000000000000000000000000000000&rikeyid=1",
+            "mode=16x16x1&rikeyid=1",
+            "mode=16x16x1&rikey=00000000000000000000000000000000",
+            "mode=&rikey=00000000000000000000000000000000&rikeyid=1",
+            "mode=17x16x1&rikey=00000000000000000000000000000000&rikeyid=1",
+            "mode=16x16x0&rikey=00000000000000000000000000000000&rikeyid=1",
+            "mode=16x16x1&rikey=&rikeyid=1",
+            "mode=16x16x1&rikey=000000000000000000000000000000&rikeyid=1",
+            "mode=16x16x1&rikey=0000000000000000000000000000000g&rikeyid=1",
+            "mode=16x16x1&rikey=00000000000000000000000000000000&rikeyid=",
+            "mode=16x16x1&rikey=00000000000000000000000000000000&rikeyid=-0",
+            "mode=16x16x1&rikey=00000000000000000000000000000000&rikeyid=-2147483649",
+            "mode=16x16x1&rikey=00000000000000000000000000000000&rikeyid=4294967296",
+        ] {
+            assert!(parse_resume(fields).is_err(), "accepted {fields:?}");
+        }
+    }
+
+    #[test]
+    fn unresolved_resume_retains_metadata_and_configuration_authority_checks() {
+        let base = "mode=16x16x1&rikey=00000000000000000000000000000000&rikeyid=1";
+        for field in [
+            "executable=attacker",
+            "environment=attacker",
+            "catalog_owner=attacker",
+            "uniqueid=invalid%20client",
+            "uuid=invalid%20request",
+            "localAudioPlayMode=2",
+            "continuousAudio=true",
+            "surroundAudioInfo=6",
+            "gcmap=65536",
+            "corever=2",
+        ] {
+            assert!(
+                parse_resume(&format!("{base}&{field}")).is_err(),
+                "accepted {field:?}"
+            );
+        }
+        assert!(parse_resume(&format!("{base}&clientName={}", "x".repeat(129))).is_err());
     }
 
     #[test]
