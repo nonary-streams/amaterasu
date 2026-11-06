@@ -166,6 +166,14 @@ impl CpuResourceProcessingSession {
     pub fn is_retired(&self) -> bool {
         self.retired
     }
+    /// Negotiated output color belongs to the processor, never the capture.
+    /// Static mastering metadata is unspecified by the v1.0 processor ABI.
+    pub fn output_format(&self) -> Option<CpuSourceFormat> {
+        self.selected.map(|selected| CpuSourceFormat {
+            pixel_format: selected.output.capabilities.base.format,
+            color: selected.output.capabilities.color,
+        })
+    }
     pub fn cancel(&mut self) {
         if self.active {
             // SAFETY: constructor pins this exact provider through cancellation.
@@ -393,6 +401,9 @@ unsafe extern "C" fn processed_frame(
     context: *mut c_void,
     frame: *const CaptureResourceFrame,
 ) -> Status {
+    if context.is_null() {
+        return STATUS_INVALID_ARGUMENT;
+    }
     let output = unsafe { &mut *context.cast::<Output<'_, '_>>() };
     output.calls += 1;
     if frame.is_null()

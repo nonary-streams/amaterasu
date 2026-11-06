@@ -84,6 +84,18 @@ pub(super) fn none(d: &FrameDescriptor) -> bool {
         && d.namespace == [0; 16]
         && d.data.is_null()
 }
+// Match the base resource contract: v0 is absent, v1 has a complete envelope
+// with reserved zero, and unknown versions remain opaque. No domain is used
+// for timing comparisons here, including UNKNOWN or future domain values.
+fn valid_clock(clock: FrameClockMetadata) -> bool {
+    match clock.version {
+        0 => {
+            clock.size == 0 && clock.domain == 0 && clock.reserved == 0 && clock.epoch_id == [0; 16]
+        }
+        1 => clock.size == size_of::<FrameClockMetadata>() as u32 && clock.reserved == 0,
+        _ => true,
+    }
+}
 pub(super) fn validate_description(description: &CpuProcessingDescription) -> Result<(), Status> {
     if description.generation == 0 {
         return Err(MEDIA_BACKEND_ERROR);
@@ -145,6 +157,8 @@ pub(super) unsafe fn input<'a>(
 ) -> Result<CpuResourceInput<'a>, Status> {
     let d = frame.resource;
     if frame.reserved != 0
+        || !valid_clock(frame.clock)
+        || !valid_clock(frame.pacing_clock)
         || frame.sequence == 0
         || !matches!(
             frame.freshness,

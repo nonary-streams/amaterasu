@@ -587,3 +587,103 @@ fn panicking_output_consumer_is_contained_and_retires_the_processor() {
     drop(session);
     assert_eq!(counts.cancels.load(Ordering::SeqCst), 1);
 }
+
+type ReadResource =
+    unsafe extern "C" fn(*mut std::ffi::c_void, u64, CaptureResourceFrameSink) -> Status;
+thread_local! {
+    static ORIGINAL_READ:std::cell::Cell<Option<ReadResource>>=const {std::cell::Cell::new(None)};
+    static SOURCE_CLOCK:std::cell::Cell<FrameClockMetadata>=const {std::cell::Cell::new(FrameClockMetadata {version:0,size:0,domain:0,reserved:0,epoch_id:[0;16]})};
+}
+unsafe extern "C" fn replace_clock(
+    context: *mut std::ffi::c_void,
+    frame: *const CaptureResourceFrame,
+) -> Status {
+    let sink = unsafe { &*context.cast::<CaptureResourceFrameSink>() };
+    let mut frame = unsafe { *frame };
+    frame.clock = SOURCE_CLOCK.get();
+    unsafe { (sink.write)(sink.context, &frame) }
+}
+unsafe extern "C" fn read_with_clock(
+    context: *mut std::ffi::c_void,
+    stream: u64,
+    mut sink: CaptureResourceFrameSink,
+) -> Status {
+    unsafe {
+        ORIGINAL_READ.get().unwrap()(
+            context,
+            stream,
+            CaptureResourceFrameSink {
+                context: std::ptr::from_mut(&mut sink).cast(),
+                write: replace_clock,
+            },
+        )
+    }
+}
+#[test]
+fn malformed_source_clock_envelopes_fail_before_processing_but_unknown_domain_is_valid() {
+    let valid = FrameClockMetadata {
+        version: 1,
+        size: size_of::<FrameClockMetadata>() as u32,
+        domain: FRAME_CLOCK_UNKNOWN,
+        reserved: 0,
+        epoch_id: [0; 16],
+    };
+    for (clock, accepted) in [
+        (FrameClockMetadata { size: 0, ..valid }, false),
+        (
+            FrameClockMetadata {
+                reserved: 1,
+                ..valid
+            },
+            false,
+        ),
+        (
+            FrameClockMetadata {
+                version: 0,
+                ..valid
+            },
+            false,
+        ),
+        (valid, true),
+    ] {
+        let counts = Arc::new(Counts::default());
+        let factory = CpuSourceFactory::new(Arc::new(Source(counts.clone())));
+        let capture = Native::capture(&factory.api);
+        // SAFETY: this borrowed table copy retains the original owner/context;
+        // it does not own or release that binding, and changes only the test
+        // read callback to supply an otherwise genuine CPU presentation.
+        let mut table = unsafe { std::ptr::read(capture.table::<CaptureApiV1_8>()) };
+        ORIGINAL_READ.set(Some(table.read_resource_frame));
+        SOURCE_CLOCK.set(clock);
+        table.read_resource_frame = read_with_clock;
+        let processor = Native(
+            into_resource_processor_binding(Planar {
+                counts: counts.clone(),
+                unsupported: false,
+                wrong_sequence: false,
+            })
+            .cast(),
+        );
+        let mut session = unsafe {
+            CpuResourceProcessingSession::new(
+                processor.table(),
+                1,
+                2,
+                SourceFormat {
+                    bit_depth: 10,
+                    dynamic_range: DynamicRange::Hdr,
+                },
+                target(),
+            )
+        }
+        .unwrap();
+        let result = unsafe { session.forward(&table, |_| STATUS_OK) };
+        assert_eq!(result.is_ok(), accepted);
+        assert_eq!(
+            counts.processes.load(Ordering::SeqCst),
+            usize::from(accepted)
+        );
+        drop(session);
+        assert_eq!(counts.cancels.load(Ordering::SeqCst), 1);
+    }
+}
