@@ -93,7 +93,7 @@ fn installer_selects_exact_contracts_and_keeps_hardware_disabled() {
         .iter()
         .filter(|entry| entry.method.service == "nonary.remote-session/1")
         .collect();
-    assert_eq!(public_methods.len(), 7);
+    assert_eq!(public_methods.len(), 8);
     for method in public_methods {
         assert_eq!(method.provider, COMPONENT.id);
         assert_eq!(
