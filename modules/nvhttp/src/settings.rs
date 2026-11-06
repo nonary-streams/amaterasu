@@ -1,5 +1,6 @@
 use crate::launch::StreamingConfig;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 const FALLBACK_HOSTNAME: &str = "Amaterasu";
@@ -29,6 +30,7 @@ pub struct Settings {
     pub session_presentation_provider: Option<String>,
     pub auxiliary_black_capture_provider: Option<crate::launch::CaptureProvider>,
     pub auxiliary_exact_capture_provider: Option<crate::launch::CaptureProvider>,
+    pub auxiliary_exact_capture_routes: BTreeMap<String, crate::launch::CaptureProvider>,
     pub http_bind: SocketAddr,
     pub https_bind: SocketAddr,
     pub address_family: Option<AddressFamily>,
@@ -49,6 +51,7 @@ impl Default for Settings {
             session_presentation_provider: None,
             auxiliary_black_capture_provider: None,
             auxiliary_exact_capture_provider: None,
+            auxiliary_exact_capture_routes: BTreeMap::new(),
             http_bind: SocketAddr::from(([127, 0, 0, 1], 47989)),
             https_bind: SocketAddr::from(([127, 0, 0, 1], 47984)),
             address_family: None,
@@ -79,6 +82,14 @@ impl Settings {
             .is_some_and(|provider| provider != amaterasu_module_sdk::session_presentation::SERVICE)
         {
             return Err("invalid_session_presentation_provider");
+        }
+        if self.auxiliary_exact_capture_routes.len() > 32
+            || self
+                .auxiliary_exact_capture_routes
+                .keys()
+                .any(|key| !amaterasu_contracts::valid_name(key))
+        {
+            return Err("invalid_auxiliary_capture_routes");
         }
         let http_binds = self.resolved_http_binds()?;
         let https_binds = self.resolved_https_binds()?;
@@ -349,13 +360,19 @@ mod tests {
         assert!(defaults.session_presentation_provider.is_none());
         assert!(defaults.auxiliary_black_capture_provider.is_none());
         assert!(defaults.auxiliary_exact_capture_provider.is_none());
+        assert!(defaults.auxiliary_exact_capture_routes.is_empty());
         let configured: Settings = serde_json::from_value(serde_json::json!({
             "session_presentation_provider":amaterasu_module_sdk::session_presentation::SERVICE,
             "auxiliary_black_capture_provider":"black",
-            "auxiliary_exact_capture_provider":"virtual_screen"
+            "auxiliary_exact_capture_provider":"virtual_screen",
+            "auxiliary_exact_capture_routes":{"managed_output":"virtual_screen","desktop_output":"kms"}
         }))
         .unwrap();
         configured.validate().unwrap();
+        assert_eq!(
+            configured.auxiliary_exact_capture_routes["desktop_output"].as_str(),
+            "kms"
+        );
         assert_eq!(
             configured
                 .auxiliary_black_capture_provider
@@ -383,6 +400,14 @@ mod tests {
                 "auxiliary_black_capture_provider":"../host-capture"
             }))
             .is_err()
+        );
+        let invalid_routes: Settings = serde_json::from_value(serde_json::json!({
+            "auxiliary_exact_capture_routes":{"":"kms"}
+        }))
+        .unwrap();
+        assert_eq!(
+            invalid_routes.validate(),
+            Err("invalid_auxiliary_capture_routes")
         );
     }
 
