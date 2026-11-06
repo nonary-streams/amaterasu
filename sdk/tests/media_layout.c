@@ -1,6 +1,8 @@
 #include "amaterasu_media.h"
 _Static_assert(AMATERASU_PIXEL_BGRA8 == 1 && AMATERASU_PIXEL_NV12 == 2, "existing CPU pixel identities");
 _Static_assert(AMATERASU_PIXEL_P010 == 3, "P010 CPU pixel identity");
+_Static_assert(offsetof(AmaterasuCaptureApiV1_11,source_preflight) == sizeof(AmaterasuCaptureApiV1_10), "capture v1.10 prefix preserved");
+_Static_assert(offsetof(AmaterasuCaptureApiV1_11,base) == 0, "capture v1.11 complete prefix");
 #if UINTPTR_MAX == UINT64_MAX
 _Static_assert(sizeof(AmaterasuNativeInterface) == 32, "native prefix layout");
 _Static_assert(sizeof(AmaterasuCaptureSwapRequest) == 56, "capture swap request layout");

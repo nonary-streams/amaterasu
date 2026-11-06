@@ -87,6 +87,70 @@ pub struct Controller {
 }
 
 impl Controller {
+    pub fn preflight(
+        &self,
+        request: &amaterasu_module_sdk::capture::SourcePreflightRequest,
+    ) -> amaterasu_module_sdk::capture::SourcePreflightResponse {
+        use amaterasu_module_sdk::capture::{
+            SourceClass, SourceModeCapabilities, SourcePreflightResponse,
+        };
+        if request.source_class != SourceClass::Synthetic {
+            return SourcePreflightResponse::unsupported(request, "source_class_unsupported");
+        }
+        if !self.enabled {
+            return SourcePreflightResponse::unavailable(request, "disabled");
+        }
+        if !request.mode.refresh_millihz.is_multiple_of(1_000) {
+            return SourcePreflightResponse::unsupported(request, "refresh_unsupported");
+        }
+        let mode = SourceMode {
+            width: request.mode.width,
+            height: request.mode.height,
+            fps: request.mode.refresh_millihz / 1_000,
+            format: if request.mode.hdr {
+                PIXEL_P010
+            } else {
+                PIXEL_NV12
+            },
+        };
+        let mode = match SourceMode::parse(&mode.output()) {
+            Ok(mode) => mode,
+            Err(_) => return SourcePreflightResponse::unsupported(request, "mode_unsupported"),
+        };
+        if let Some(route) = &request.route {
+            match SourceMode::parse(route) {
+                Ok(route)
+                    if route.width == mode.width
+                        && route.height == mode.height
+                        && route.fps == mode.fps => {}
+                _ => return SourcePreflightResponse::unsupported(request, "route_unsupported"),
+            }
+        }
+        if self.streams.len() >= MAX_STREAMS
+            || self.streams.len() + self.retired.len() >= MAX_LEDGER
+            || self
+                .bytes
+                .checked_add(mode.buffer_length().expect("validated mode"))
+                .is_none_or(|bytes| bytes > MAX_BUFFER_BYTES)
+        {
+            return SourcePreflightResponse::unavailable(request, "source_capacity");
+        }
+        SourcePreflightResponse::ready(
+            request,
+            vec![SourceModeCapabilities {
+                source_class: SourceClass::Synthetic,
+                min_width: 2,
+                max_width: 8192,
+                min_height: 2,
+                max_height: 8192,
+                min_refresh_millihz: 1_000,
+                max_refresh_millihz: 240_000,
+                sdr: true,
+                hdr: true,
+            }],
+        )
+    }
+
     pub fn new(enabled: bool) -> Self {
         Self {
             enabled,

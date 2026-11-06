@@ -23,6 +23,8 @@ mod capture_events;
 pub use capture_events::*;
 mod frame_resource;
 pub use frame_resource::*;
+mod source_preflight;
+pub use source_preflight::*;
 mod encoder_provider;
 pub use encoder_provider::*;
 mod encoder_input_pool;

@@ -678,6 +678,16 @@ typedef struct {
     AmaterasuStatus (*color_provenance)(void *, uint64_t, uint32_t *);
 } AmaterasuCaptureApiV1_10;
 #define AMATERASU_CAPTURE_API_V1_10_SIZE ((uint32_t)sizeof(AmaterasuCaptureApiV1_10))
+/* Optional nonmutating source preflight on the same typed Capture family.
+ * Input/output JSON is bounded to 8192 bytes. A query creates no source, native
+ * resource, display, permission or lease; one reply is synchronously copied.
+ * Ready is an observation, not a guarantee a later capture open will succeed. */
+#define AMATERASU_CAPTURE_SOURCE_PREFLIGHT_INTERFACE_MINOR 11
+typedef struct {
+    AmaterasuCaptureApiV1_10 base;
+    AmaterasuStatus (*source_preflight)(void *, AmaterasuBorrowedBytes, AmaterasuReplySink);
+} AmaterasuCaptureApiV1_11;
+#define AMATERASU_CAPTURE_API_V1_11_SIZE ((uint32_t)sizeof(AmaterasuCaptureApiV1_11))
 typedef struct {
     AmaterasuVideoApiV1_1 base;
     AmaterasuStatus (*hdr_metadata)(void *, uint64_t, AmaterasuHdrMetadata *);

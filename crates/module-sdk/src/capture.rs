@@ -2,6 +2,7 @@
 //! runs on a capture thread. Each channel represents one capture session.
 mod connection;
 mod negotiation;
+mod preflight;
 mod provenance;
 mod publisher;
 mod selector;
@@ -13,6 +14,12 @@ pub use negotiation::{
     MAX_DELIVERY_CAPABILITY_BYTES, MAX_DELIVERY_OFFERS, MAX_DELIVERY_REQUIREMENTS,
     NegotiationError, Ownership, ProviderOffer, Schema, select_delivery,
     select_delivery_with_compatibility,
+};
+pub use preflight::{
+    MAX_SOURCE_CAPABILITIES, MAX_SOURCE_PREFLIGHT_BYTES, SourceClass, SourceMode,
+    SourceModeCapabilities, SourcePreflightConnection, SourcePreflightFactory,
+    SourcePreflightProvider, SourcePreflightRequest, SourcePreflightResponse, SourceReadiness,
+    decode_video_source_preflight, source_preflight, source_preflight_payload,
 };
 pub use provenance::color_provenance;
 pub use publisher::{CaptureFrames, CapturePublisher, PublishError, capture_channel};

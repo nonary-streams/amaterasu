@@ -1,6 +1,53 @@
 use super::*;
 use crate::model::failure;
 
+#[test]
+fn source_preflight_is_read_only_and_rejects_unsupported_classes_and_modes() {
+    use amaterasu_module_sdk::capture::{
+        SourceClass, SourceMode as RequestedMode, SourcePreflightRequest, SourceReadiness,
+    };
+    let controller = Controller::new(true);
+    let mut request = SourcePreflightRequest {
+        source_class: SourceClass::Synthetic,
+        route: None,
+        mode: RequestedMode {
+            width: 1920,
+            height: 1080,
+            refresh_millihz: 60_000,
+            hdr: true,
+        },
+    };
+    let ready = controller.preflight(&request);
+    ready.validate(&request).unwrap();
+    assert!(ready.is_ready());
+    assert!(controller.streams.is_empty());
+    assert!(controller.retired.is_empty());
+    assert_eq!(controller.bytes, 0);
+    assert_eq!(controller.next_id, 0);
+    request.source_class = SourceClass::ManagedOutput;
+    assert_eq!(
+        controller.preflight(&request).state,
+        SourceReadiness::Unsupported
+    );
+    request.source_class = SourceClass::Synthetic;
+    request.mode.width = 1919;
+    assert_eq!(
+        controller.preflight(&request).state,
+        SourceReadiness::Unsupported
+    );
+    request.mode.width = 1920;
+    request.route = Some("unrelated:physical-monitor".into());
+    assert_eq!(
+        controller.preflight(&request).state,
+        SourceReadiness::Unsupported
+    );
+    request.route = None;
+    assert_eq!(
+        Controller::new(false).preflight(&request).state,
+        SourceReadiness::Unavailable
+    );
+}
+
 fn open(controller: &mut Controller, caller: &str, operation_id: &str, now: u64) -> u64 {
     controller
         .handle(
