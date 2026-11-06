@@ -1,4 +1,5 @@
-use crate::model::{CaptureError, CaptureResult, Frame, copy_bgra_rows, frame_layout};
+use crate::format::SourceEncoding;
+use crate::model::{CaptureError, CaptureResult, Frame, copy_source_rows, source_frame_layout};
 use crate::staging::{StagingKey, StagingLifecycle};
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -6,7 +7,9 @@ use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
 use windows::Win32::Graphics::Direct3D11::*;
-use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
+use windows::Win32::Graphics::Dxgi::Common::{
+    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT,
+};
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::System::WinRT::Direct3D11::CreateDirect3D11DeviceFromDXGIDevice;
 use windows::core::Interface;
@@ -16,6 +19,7 @@ pub struct Readback {
     context: ID3D11DeviceContext,
     staging: StagingLifecycle<ID3D11Texture2D, PendingTexture>,
     sequence: u64,
+    encoding: SourceEncoding,
 }
 
 struct PendingTexture {
@@ -28,7 +32,7 @@ struct PendingTexture {
 }
 
 impl Readback {
-    pub fn new() -> CaptureResult<(Self, IDirect3DDevice)> {
+    pub fn new(encoding: SourceEncoding) -> CaptureResult<(Self, IDirect3DDevice)> {
         let mut device = None;
         let mut context = None;
         // SAFETY: output slots are writable locals; official wrappers own the
@@ -70,6 +74,7 @@ impl Readback {
                 context,
                 staging: StagingLifecycle::default(),
                 sequence: 0,
+                encoding,
             },
             graphics_device,
         ))
@@ -113,7 +118,7 @@ impl Readback {
                 "WGC readback is still pending",
             ));
         }
-        if let Err(error) = frame_layout(width, height) {
+        if let Err(error) = source_frame_layout(width, height, self.encoding) {
             self.staging.invalidate();
             return Err(error);
         }
@@ -128,15 +133,19 @@ impl Readback {
                 "capture surface dimensions changed; reopen the output",
             ));
         }
-        if description.Format != DXGI_FORMAT_B8G8R8A8_UNORM
+        let expected_format = match self.encoding {
+            SourceEncoding::Bgra8 => DXGI_FORMAT_B8G8R8A8_UNORM,
+            SourceEncoding::Rgba16FloatScRgb => DXGI_FORMAT_R16G16B16A16_FLOAT,
+        };
+        if description.Format != expected_format
             || description.SampleDesc.Count != 1
             || description.ArraySize != 1
             || description.MipLevels != 1
         {
             self.staging.invalidate();
             return Err(CaptureError::new(
-                "unsupported_format",
-                "WGC surface must be single-plane BGRA8",
+                "access_lost",
+                "WGC surface must match the exact selected BGRA8 or FP16 frame-pool format",
             ));
         }
         description.Usage = D3D11_USAGE_STAGING;
@@ -206,7 +215,7 @@ impl Readback {
             context: &self.context,
             texture: &pending.texture,
         };
-        let (stride, _) = match frame_layout(pending.width, pending.height) {
+        let (stride, _) = match source_frame_layout(pending.width, pending.height, self.encoding) {
             Ok(layout) => layout,
             Err(error) => {
                 drop(mapping);
@@ -217,11 +226,12 @@ impl Readback {
         // SAFETY: each mapped row contains initialized pixel bytes through
         // Unmap. The helper reads only pixels, never uninitialized row padding.
         let bytes = unsafe {
-            copy_bgra_rows(
+            copy_source_rows(
                 pending.width,
                 pending.height,
                 mapped.RowPitch,
                 mapped.pData.cast::<u8>(),
+                self.encoding,
             )
         };
         drop(mapping);
@@ -234,6 +244,7 @@ impl Readback {
         };
         self.sequence = self.sequence.saturating_add(1);
         let result = Frame {
+            encoding: self.encoding,
             width: pending.width,
             height: pending.height,
             stride,

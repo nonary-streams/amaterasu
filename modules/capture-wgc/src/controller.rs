@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use std::time::Instant;
 
 struct Stream {
+    capture_format: crate::format::CaptureFormat,
     owner: String,
     output: String,
     session: Box<dyn CaptureSession>,
@@ -101,7 +102,14 @@ impl<B: Backend> Controller<B> {
                 output,
                 operation_id,
                 constant_rate,
-            } => self.open(caller, &output, operation_id, constant_rate, guard),
+                source_format,
+            } => {
+                let format = match crate::format::CaptureFormat::requested(source_format.as_ref()) {
+                    Ok(format) => format,
+                    Err(error) => return error.payload(),
+                };
+                self.open(caller, &output, operation_id, constant_rate, format, guard)
+            }
             Operation::Lookup { operation_id } => self.lookup(caller, &operation_id),
             Operation::Close { stream } => self.close(caller, stream).map(|()| json!({"ok":true})),
         };
@@ -114,6 +122,7 @@ impl<B: Backend> Controller<B> {
         output: &str,
         operation_id: Option<String>,
         constant_rate: bool,
+        capture_format: crate::format::CaptureFormat,
         guard: &mut impl FnMut() -> CaptureResult<()>,
     ) -> CaptureResult<Value> {
         if !self.enabled {
@@ -125,7 +134,10 @@ impl<B: Backend> Controller<B> {
         if let Some(operation_id) = &operation_id {
             validate_operation_id(operation_id)?;
             if let Some((stream_id, existing)) = self.find_operation(caller, operation_id) {
-                if existing.output != output || existing.constant_rate != constant_rate {
+                if existing.output != output
+                    || existing.constant_rate != constant_rate
+                    || existing.capture_format != capture_format
+                {
                     return Err(CaptureError::new(
                         "operation_conflict",
                         "operation ID already selected a different output or delivery mode",
@@ -148,14 +160,32 @@ impl<B: Backend> Controller<B> {
         }
         let id = self.next_stream_id()?;
         guard()?;
-        let mut session = self.backend.open(output)?;
+        let mut session = self.backend.open_with_format(output, capture_format)?;
         let geometry = initial_geometry(&mut *session)?;
+        if capture_format.color_proof {
+            session.validate_source()?;
+            let info = session.source_info()?.ok_or_else(|| {
+                CaptureError::new(
+                    "unsupported_format",
+                    "native source format proof unavailable",
+                )
+            })?;
+            if info.encoding != capture_format.encoding() || info.desktop_hdr != capture_format.hdr
+            {
+                return Err(CaptureError::new(
+                    "unsupported_format",
+                    "native source format does not match requested representation",
+                ));
+            }
+            capture_format.validate_dimensions(info.width, info.height)?;
+        }
         let touch_surface = initial_touch_surface(&mut *session, geometry)?;
         // Opening may block in a driver. Recheck before retaining resources.
         guard()?;
         self.streams.insert(
             id,
             Stream {
+                capture_format,
                 owner: caller.into(),
                 output: output.into(),
                 session,
@@ -244,6 +274,55 @@ impl<B: Backend> Controller<B> {
             })
     }
 
+    pub(crate) fn source_info(
+        &mut self,
+        caller: &str,
+        id: u64,
+    ) -> CaptureResult<(crate::format::CaptureFormat, crate::format::SourceInfo)> {
+        self.authorize(caller, id)?;
+        let result = (|| {
+            let stream = self.streams.get_mut(&id).expect("authorized stream");
+            stream.session.validate_source()?;
+            let info = stream
+                .session
+                .source_info()?
+                .or_else(|| {
+                    if stream.capture_format.color_proof {
+                        return None;
+                    }
+                    stream.geometry.map(|geometry| crate::format::SourceInfo {
+                        width: geometry.output.width,
+                        height: geometry.output.height,
+                        encoding: stream.capture_format.encoding(),
+                        desktop_hdr: false,
+                    })
+                })
+                .ok_or_else(|| {
+                    CaptureError::new(
+                        "source_pending",
+                        "capture source information is not yet available",
+                    )
+                })?;
+            if info.encoding != stream.capture_format.encoding()
+                || stream.capture_format.color_proof
+                    && stream.capture_format.hdr != info.desktop_hdr
+            {
+                return Err(CaptureError::new(
+                    "unsupported_format",
+                    "the selected native source cannot preserve the requested format",
+                ));
+            }
+            Ok((stream.capture_format, info))
+        })();
+        if result
+            .as_ref()
+            .is_err_and(|error: &CaptureError| matches!(error.code, "access_lost" | "device_lost"))
+        {
+            self.streams.remove(&id);
+        }
+        result
+    }
+
     pub fn close(&mut self, caller: &str, id: u64) -> CaptureResult<()> {
         self.authorize(caller, id)?;
         self.streams.remove(&id);
@@ -327,6 +406,16 @@ impl<B: Backend> Controller<B> {
                 }
             }
         };
+        if let Ok(Some(delivery)) = &result {
+            let stream = self.streams.get_mut(&id).expect("authorized stream");
+            let source = stream.session.validate_source();
+            if delivery.frame.encoding != stream.capture_format.encoding() || source.is_err() {
+                stream.last_frame = None;
+                result = Err(source.err().unwrap_or_else(|| {
+                    CaptureError::new("access_lost", "capture frame layout changed after open")
+                }));
+            }
+        }
         if result.as_ref().is_ok_and(Option::is_some)
             && self
                 .streams

@@ -41,6 +41,16 @@ pub(super) fn query<B: Backend>(
         if let Err(reason) = exact_output(backend, route, request) {
             return SourcePreflightResponse::unavailable(request, reason);
         }
+        let format = crate::format::CaptureFormat {
+            ten_bit: request.mode.bit_depth == Some(10) || request.mode.hdr,
+            hdr: request.mode.hdr,
+            color_proof: request.mode.bit_depth.is_some() || request.mode.hdr,
+        };
+        // The exact route must independently prove scan-out range before a
+        // high-depth source is admitted. This creates no device, pool or worker.
+        if let Err(error) = backend.verify_source_format(route, format) {
+            return SourcePreflightResponse::unavailable(request, error.code);
+        }
     }
     ready(request)
 }

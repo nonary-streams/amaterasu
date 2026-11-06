@@ -1,5 +1,6 @@
 use super::{Backend, CaptureSession, TouchSurface};
-use crate::model::{CaptureError, CaptureResult, Frame, Output, frame_layout};
+use crate::format::{CaptureFormat, SourceEncoding, SourceInfo};
+use crate::model::{CaptureError, CaptureResult, Frame, Output};
 use crate::worker::{FrameSource, Worker};
 use amaterasu_media::{CaptureGeometry, DesktopRect};
 use amaterasu_module_sdk::capture::{EXACT_TARGET_PREFIX, exact_target_key, exact_target_selector};
@@ -65,11 +66,29 @@ impl Backend for WindowsBackend {
     }
 
     fn open(&self, output: &str) -> CaptureResult<Box<dyn CaptureSession>> {
+        self.open_with_format(output, CaptureFormat::default())
+    }
+
+    fn verify_source_format(&self, output: &str, format: CaptureFormat) -> CaptureResult<()> {
+        let (_, monitor) = resolve_monitor(output, None)?;
+        format.validate_dimensions(monitor.metadata.width, monitor.metadata.height)?;
+        if format.color_proof {
+            monitors::desktop_color(&monitor)?.verify(format)?;
+        }
+        Ok(())
+    }
+
+    fn open_with_format(
+        &self,
+        output: &str,
+        format: CaptureFormat,
+    ) -> CaptureResult<Box<dyn CaptureSession>> {
         let target_id = match resolve_monitor(output, None) {
             Ok((selection, _)) => Some(selection.target_id),
             Err(error)
                 if error.code == "geometry_unavailable"
-                    && !output.starts_with(EXACT_TARGET_PREFIX) =>
+                    && !output.starts_with(EXACT_TARGET_PREFIX)
+                    && !format.color_proof =>
             {
                 None
             }
@@ -85,22 +104,26 @@ impl Backend for WindowsBackend {
         let worker_output = output_id.clone();
         let worker_target = target_id.clone();
         let capture_cursor = self.capture_cursor;
-        let (worker, (device_adapter, closed)) = Worker::start_with_metadata(move || {
-            let monitor = match worker_target {
-                Some(target) => resolve_monitor(&worker_output, Some(&target))?.1,
-                None => find_monitor(&worker_output)?,
-            };
-            let session = Session::open(monitor, capture_cursor)?;
-            let device_adapter = session.readback.device_adapter();
-            let closed = session.closed.clone();
-            Ok((session, (device_adapter, closed)))
-        })?;
+        let (worker, (device_adapter, closed, source_info)) =
+            Worker::start_with_metadata(move || {
+                let monitor = match worker_target {
+                    Some(target) => resolve_monitor(&worker_output, Some(&target))?.1,
+                    None => find_monitor(&worker_output)?,
+                };
+                let session = Session::open(monitor, capture_cursor, format)?;
+                let device_adapter = session.readback.device_adapter();
+                let closed = session.closed.clone();
+                let source_info = session.source_info;
+                Ok((session, (device_adapter, closed, source_info)))
+            })?;
         Ok(Box::new(WindowsSession {
             worker,
             output_id,
             target_id,
             device_adapter,
             closed,
+            format,
+            source_info,
         }))
     }
 }
@@ -111,9 +134,31 @@ struct WindowsSession {
     target_id: Option<String>,
     device_adapter: Value,
     closed: Arc<AtomicBool>,
+    format: CaptureFormat,
+    source_info: SourceInfo,
 }
 
 impl CaptureSession for WindowsSession {
+    fn source_info(&mut self) -> CaptureResult<Option<SourceInfo>> {
+        self.validate_source()?;
+        Ok(Some(self.source_info))
+    }
+    fn validate_source(&mut self) -> CaptureResult<()> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(CaptureError::new("access_lost", "capture monitor closed"));
+        }
+        if self.format.color_proof {
+            let target = self.target_id.as_deref().ok_or_else(|| {
+                CaptureError::new("access_lost", "high-depth source lost exact target binding")
+            })?;
+            let (_, monitor) = resolve_monitor(&self.output_id, Some(target))?;
+            monitors::desktop_color(&monitor)
+                .and_then(|color| color.verify(self.format))
+                .map_err(|error| CaptureError::new("access_lost", error.message))?;
+        }
+        Ok(())
+    }
+
     fn read(&mut self, wait_ms: u32) -> CaptureResult<Option<Frame>> {
         while_item_open(&self.closed, || self.worker.read(wait_ms))
     }
@@ -159,11 +204,18 @@ struct Session {
     size: SizeInt32,
     started: Instant,
     source_clock: SourceClock,
+    monitor: monitors::Monitor,
+    format: CaptureFormat,
+    source_info: SourceInfo,
     _apartment: Apartment,
 }
 
 impl Session {
-    fn open(monitor: monitors::Monitor, capture_cursor: Option<bool>) -> CaptureResult<Self> {
+    fn open(
+        monitor: monitors::Monitor,
+        capture_cursor: Option<bool>,
+        format: CaptureFormat,
+    ) -> CaptureResult<Self> {
         let apartment = Apartment::initialize()?;
         if !GraphicsCaptureSession::IsSupported().map_err(native_error)? {
             return Err(CaptureError::new(
@@ -179,7 +231,14 @@ impl Session {
         let item: GraphicsCaptureItem =
             unsafe { interop.CreateForMonitor(monitor.handle) }.map_err(native_error)?;
         let size = item.Size().map_err(native_error)?;
-        validate_size(size)?;
+        validate_size(size, format)?;
+        let desktop_hdr = if format.color_proof {
+            let color = monitors::desktop_color(&monitor)?;
+            color.verify(format)?;
+            color.hdr()?
+        } else {
+            false
+        };
         if u32::try_from(size.Width).ok() != Some(monitor.metadata.width)
             || u32::try_from(size.Height).ok() != Some(monitor.metadata.height)
         {
@@ -188,10 +247,13 @@ impl Session {
                 "WGC capture size differs from the selected physical monitor",
             ));
         }
-        let (readback, graphics_device) = Readback::new()?;
+        let (readback, graphics_device) = Readback::new(format.encoding())?;
         let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
             &graphics_device,
-            DirectXPixelFormat::B8G8R8A8UIntNormalized,
+            match format.encoding() {
+                SourceEncoding::Bgra8 => DirectXPixelFormat::B8G8R8A8UIntNormalized,
+                SourceEncoding::Rgba16FloatScRgb => DirectXPixelFormat::R16G16B16A16Float,
+            },
             2,
             size,
         )
@@ -220,6 +282,14 @@ impl Session {
             size,
             started,
             source_clock: SourceClock::start(),
+            source_info: SourceInfo {
+                width: size.Width as u32,
+                height: size.Height as u32,
+                encoding: format.encoding(),
+                desktop_hdr,
+            },
+            monitor,
+            format,
             _apartment: apartment,
         };
         result.configure(capture_cursor)?;
@@ -386,10 +456,21 @@ impl FrameSource for Session {
     fn poll(&mut self) -> CaptureResult<Option<Frame>> {
         let closed = self.closed.clone();
         let result = while_item_open(&closed, || {
+            if self.format.color_proof {
+                monitors::desktop_color(&self.monitor)
+                    .and_then(|color| color.verify(self.format))
+                    .map_err(|error| CaptureError::new("access_lost", error.message))?;
+            }
             if !self.readback.pending() && !self.acquire()? {
                 return Ok(None);
             }
-            self.readback.poll()
+            let frame = self.readback.poll()?;
+            if self.format.color_proof {
+                monitors::desktop_color(&self.monitor)
+                    .and_then(|color| color.verify(self.format))
+                    .map_err(|error| CaptureError::new("access_lost", error.message))?;
+            }
+            Ok(frame)
         });
         if result.is_err() {
             self.readback.invalidate();
@@ -430,10 +511,10 @@ impl Drop for Session {
     }
 }
 
-fn validate_size(size: SizeInt32) -> CaptureResult<()> {
+fn validate_size(size: SizeInt32, format: CaptureFormat) -> CaptureResult<()> {
     let width = u32::try_from(size.Width).unwrap_or(0);
     let height = u32::try_from(size.Height).unwrap_or(0);
-    frame_layout(width, height).map(|_| ())
+    format.validate_dimensions(width, height)
 }
 
 fn next_frame(pool: &Direct3D11CaptureFramePool) -> CaptureResult<Option<Direct3D11CaptureFrame>> {
@@ -494,6 +575,7 @@ mod lifecycle_tests {
         fn poll(&mut self) -> CaptureResult<Option<Frame>> {
             self.release.recv().unwrap();
             Ok(Some(Frame {
+                encoding: SourceEncoding::Bgra8,
                 width: 1,
                 height: 1,
                 stride: 4,
@@ -551,6 +633,13 @@ mod lifecycle_tests {
             target_id: None,
             device_adapter: Value::Null,
             closed: closed.clone(),
+            format: CaptureFormat::default(),
+            source_info: SourceInfo {
+                width: 1,
+                height: 1,
+                encoding: SourceEncoding::Bgra8,
+                desktop_hdr: false,
+            },
         };
 
         assert!(session.read(0).unwrap().is_none());

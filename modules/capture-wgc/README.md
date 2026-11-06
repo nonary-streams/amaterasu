@@ -44,9 +44,17 @@ these grants. Linux/macOS implement explicit `unsupported_platform` responses.
 - Open also accepts optional `constant_rate`; when `true`, it enables cached
   image repeats as described below. Omission and `false` retain event-driven
   delivery.
+- Open accepts optional `source_format:{"bit_depth":10,"dynamic_range":"sdr"}`
+  or `"hdr"`. This describes capture pixels independently of the encoder codec
+  and output range. Omission preserves eight-bit SDR BGRA delivery. Ten-bit SDR
+  and HDR both require an FP16 scRGB WGC frame pool; failure never retries BGRA8.
+  Even dimensions and bounded CPU storage are required for P010 delivery.
+  Explicit format requests require the exact native monitor's observed scan-out range
+  to match. A different encoder output range requires explicitly selected
+  processing; this provider does not tone map HDR into SDR.
 - Open accepts optional `operation_id` containing 1..128 UTF-8 bytes. Repeating
   the same caller/output/delivery mode/operation ID returns the existing live
-  stream. A different output or delivery mode with the same operation ID
+  stream. A different output, delivery mode, or source format with the same operation ID
   returns `operation_conflict`.
 - Open accepts optional `constant_rate`, defaulting to `false`. When enabled,
   reads repeat the last completed WGC image if no newer frame is ready. The
@@ -95,9 +103,31 @@ stream separately.
 
 ## Native frames and lifetimes
 
-The provider advertises capture API version 1.3 on `amaterasu.capture-wgc/1`.
-Versions 1.0 through 1.2 remain available as unchanged prefixes for older
-consumers. The 1.1 `geometry` callback returns the validated open-stream
+The provider publishes the public CPU capture resource API through version 1.10,
+wrapped by the read-only version 1.11 source-preflight contract on
+`amaterasu.capture-wgc/1`. The same SDK factory is available to external
+providers. Legacy prefixes remain usable for eight-bit SDR streams; their
+BGRA callbacks return `MEDIA_UNSUPPORTED` for a ten-bit stream.
+
+Ten-bit streams offer P010 in explicit limited and full ranges, with BT.709 SDR
+or PQ/BT.2020 HDR metadata. Conversion starts from the owned FP16 pixels for each
+selected range, without an intermediate eight-bit image. The provider matches
+GDI/CCD target identity and geometry to the exact DXGI Output6 color observation;
+unknown scan-out encoding, insufficient HDR precision, or a range change stops
+high-depth delivery. The native texture descriptor must match the selected
+frame-pool format on every readback. Source range and geometry are checked again
+before publishing fresh or cached frames and resource descriptions. HDR static
+mastering fields remain zero when the source does not supply them.
+
+WGC's FP16 path follows Microsoft's
+[screen capture guidance](https://learn.microsoft.com/en-us/windows/apps/develop/media-authoring-processing/screen-capture)
+and [scRGB color model](https://learn.microsoft.com/en-us/windows/win32/direct3darticles/high-dynamic-range).
+Pure tests cover both ranges, precision-preserving source layouts, caller
+isolation, resource negotiation and retirement. Native Windows compilation,
+actual Output6 observations, HDR playback and GPU performance still require
+qualification on a Windows host.
+
+ The 1.1 `geometry` callback returns the validated open-stream
 geometry, or `MEDIA_UNSUPPORTED` when open could not prove geometry. Once
 geometry was advertised, a changed rectangle, missing display, or changed
 physical target closes the stream. Fresh frames and constant-rate cached repeats
@@ -124,6 +154,12 @@ The broker supplies
 the authenticated immediate caller at bind time, and the provider copies it into
 the binding. Frame reads contain only the stream ID and sink, never a caller
 string. Unknown and foreign streams both return `MEDIA_CLOSED`.
+
+Raw FP16 CPU frames are bounded to 256 MiB; selected P010 or BGRA delivery
+storage is separately bounded to 128 MiB. Readback copies initialized pixels
+row by row, including FP16 rows, without reading native padding. Resource frames
+are borrowed synchronously; retention returns `MEDIA_UNSUPPORTED`, and a caller
+can copy pixels through the public SDK while the callback is active.
 
 Each stream has one joined worker thread. That worker initializes the WinRT MTA,
 creates the monitor capture item and a two-buffer `CreateFreeThreaded` frame pool,

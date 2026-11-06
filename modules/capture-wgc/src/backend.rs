@@ -18,6 +18,12 @@ impl TouchSurface {
 
 pub trait CaptureSession: Send {
     fn read(&mut self, wait_ms: u32) -> CaptureResult<Option<Frame>>;
+    fn source_info(&mut self) -> CaptureResult<Option<crate::format::SourceInfo>> {
+        Ok(None)
+    }
+    fn validate_source(&mut self) -> CaptureResult<()> {
+        Ok(())
+    }
     fn geometry(&mut self) -> CaptureResult<Option<CaptureGeometry>> {
         Ok(None)
     }
@@ -33,6 +39,35 @@ pub trait Backend: Send {
     fn supported(&self) -> bool;
     fn enumerate(&self) -> CaptureResult<Vec<Output>>;
     fn open(&self, output: &str) -> CaptureResult<Box<dyn CaptureSession>>;
+    /// Read-only source format proof; no frame pool or capture worker is opened.
+    #[cfg(any(windows, test))]
+    fn verify_source_format(
+        &self,
+        _output: &str,
+        format: crate::format::CaptureFormat,
+    ) -> CaptureResult<()> {
+        if format == crate::format::CaptureFormat::default() {
+            Ok(())
+        } else {
+            Err(crate::model::CaptureError::new(
+                "unsupported_format",
+                "high-depth source proof unavailable",
+            ))
+        }
+    }
+    fn open_with_format(
+        &self,
+        output: &str,
+        format: crate::format::CaptureFormat,
+    ) -> CaptureResult<Box<dyn CaptureSession>> {
+        if format != crate::format::CaptureFormat::default() {
+            return Err(crate::model::CaptureError::new(
+                "unsupported_format",
+                "this capture backend has no high-depth source implementation",
+            ));
+        }
+        self.open(output)
+    }
 }
 
 #[cfg(windows)]

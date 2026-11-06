@@ -156,6 +156,7 @@ mod tests {
                 .push(("poll".into(), thread::current().id()));
             self.gate.recv().unwrap();
             Ok(Some(Frame {
+                encoding: crate::format::SourceEncoding::Bgra8,
                 width: 1,
                 height: 1,
                 stride: 4,

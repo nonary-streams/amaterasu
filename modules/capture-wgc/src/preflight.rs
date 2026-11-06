@@ -1,6 +1,6 @@
 //! Read-only admission on the selected WGC provider, before capture effects.
 use crate::{backend::Backend, controller::Controller};
-use amaterasu_media::{MAX_FRAME_BYTES, MEDIA_BACKEND_ERROR, MEDIA_BUSY};
+use amaterasu_media::{MEDIA_BACKEND_ERROR, MEDIA_BUSY};
 use amaterasu_module_sdk::abi::{STATUS_INVALID_ARGUMENT, Status};
 #[cfg(any(windows, test))]
 use amaterasu_module_sdk::capture::SourceModeCapabilities;
@@ -82,25 +82,18 @@ fn unsupported_mode(request: &SourcePreflightRequest) -> Option<SourcePreflightR
             "source_class_unsupported",
         ));
     }
-    // This provider currently publishes BGRA8 CPU frames. Display HDR alone
-    // cannot establish an HDR capture format or color provenance.
-    if request.mode.hdr {
+    let format = crate::format::CaptureFormat {
+        ten_bit: request.mode.bit_depth == Some(10) || request.mode.hdr,
+        hdr: request.mode.hdr,
+        color_proof: request.mode.bit_depth.is_some() || request.mode.hdr,
+    };
+    if format
+        .validate_dimensions(request.mode.width, request.mode.height)
+        .is_err()
+    {
         return Some(SourcePreflightResponse::unsupported(
             request,
-            "hdr_capture_unavailable",
-        ));
-    }
-    if request.mode.bit_depth == Some(10) {
-        return Some(SourcePreflightResponse::unsupported(
-            request,
-            "capture_depth_unavailable",
-        ));
-    }
-    let frame_bytes = u64::from(request.mode.width) * u64::from(request.mode.height) * 4;
-    if frame_bytes > MAX_FRAME_BYTES as u64 {
-        return Some(SourcePreflightResponse::unsupported(
-            request,
-            "source_frame_too_large",
+            "source_frame_too_large_or_unaligned",
         ));
     }
     None
@@ -121,9 +114,9 @@ fn ready(request: &SourcePreflightRequest) -> SourcePreflightResponse {
             min_refresh_millihz: 1000,
             max_refresh_millihz: 1_000_000,
             sdr: true,
-            hdr: false,
-            bit_depths: vec![8],
-            format_open: false,
+            hdr: true,
+            bit_depths: vec![8, 10],
+            format_open: true,
         }],
     )
 }
@@ -209,27 +202,26 @@ mod tests {
         }
     }
     #[test]
-    fn current_cpu_format_never_claims_hdr_or_unbounded_frame_storage() {
+    fn high_depth_modes_require_bounded_aligned_storage_before_native_admission() {
         let mut request = request();
         assert!(unsupported_mode(&request).is_none());
         ready(&request).validate(&request).unwrap();
         request.mode.hdr = true;
-        assert_eq!(
-            unsupported_mode(&request).unwrap().state,
-            SourceReadiness::Unsupported
-        );
+        assert!(unsupported_mode(&request).is_none());
+        ready(&request).validate(&request).unwrap();
         request.mode.hdr = false;
         request.mode.bit_depth = Some(10);
-        assert_eq!(
-            unsupported_mode(&request).unwrap().reason.as_deref(),
-            Some("capture_depth_unavailable")
-        );
+        assert!(unsupported_mode(&request).is_none());
+        ready(&request).validate(&request).unwrap();
+        request.mode.width = 1921;
+        assert!(unsupported_mode(&request).is_some());
+        request.mode.width = 1920;
         request.mode.bit_depth = None;
         request.mode.width = 8192;
         request.mode.height = 8192;
         assert_eq!(
             unsupported_mode(&request).unwrap().reason.as_deref(),
-            Some("source_frame_too_large")
+            Some("source_frame_too_large_or_unaligned")
         );
         request.source_class = SourceClass::Synthetic;
         assert_eq!(
