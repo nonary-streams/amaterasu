@@ -21,6 +21,7 @@ fn context() -> Context {
         client: Client {
             id: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
             paired: true,
+            may_list: true,
             may_view: true,
             may_launch: true,
             may_terminate: false,

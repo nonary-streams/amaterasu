@@ -4,10 +4,27 @@ fn client() -> Client {
     Client {
         id: "certificate-sha256".into(),
         paired: true,
+        may_list: true,
         may_view: true,
         may_launch: true,
         may_terminate: false,
     }
+}
+
+#[test]
+fn list_and_view_authority_are_independent_and_missing_list_is_denied() {
+    let legacy = json!({"id":"paired-client","paired":true,"may_view":true,"may_launch":false,"may_terminate":false});
+    let viewer: Client = serde_json::from_value(legacy).unwrap();
+    assert!(!viewer.may_list);
+    assert!(viewer.may_view);
+    assert!(viewer.validate().is_ok());
+    let mut list_only = viewer;
+    list_only.may_list = true;
+    list_only.may_view = false;
+    assert!(list_only.validate().is_ok());
+    let encoded = serde_json::to_value(list_only).unwrap();
+    assert_eq!(encoded["may_list"], true);
+    assert_eq!(encoded["may_view"], false);
 }
 fn app() -> Application {
     Application {

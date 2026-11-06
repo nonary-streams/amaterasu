@@ -36,6 +36,9 @@ pub struct Client {
     /// Stable identity derived from authenticated transport, never a query ID.
     pub id: String,
     pub paired: bool,
+    /// Application-list authority is independent of watching/resuming a stream.
+    #[serde(default)]
+    pub may_list: bool,
     pub may_view: bool,
     pub may_launch: bool,
     pub may_terminate: bool,

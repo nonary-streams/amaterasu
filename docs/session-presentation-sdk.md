@@ -35,6 +35,12 @@ matches its current operation before taking effects.
 The runtime authenticates module principals. The adapter must separately derive
 `Client.id` from its authenticated transport and read current view, launch and
 terminate permissions. A query-string client identifier is not that authority.
+`may_list` is a separate application-list permission, not an alias for
+`may_view`. It defaults to false when an older context omits it. A client can
+watch or resume a retained stream without being allowed to list applications,
+or list applications without being allowed to view a stream. Providers enforce
+List on projected-list reads and artwork; trusted backend inventory collection
+may still support a separately authorized dispatch without exposing that list.
 Native plugins remain trusted code; these grants do not sandbox native code.
 
 Amaterasu's pairing authority grants permissions independently per certificate.
