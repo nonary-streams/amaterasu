@@ -108,20 +108,22 @@ impl Bridge {
     }
 
     fn trusted(&self, certificate: &[u8]) -> bool {
+        self.trust_status(certificate) == STATUS_OK
+    }
+
+    fn trust_status(&self, certificate: &[u8]) -> Status {
         if certificate.is_empty() || certificate.len() > amaterasu_identity::MAX_CERTIFICATE_BYTES {
-            return false;
+            return amaterasu_identity::IDENTITY_UNTRUSTED;
         }
         let Ok(active) = self.active.lock() else {
-            return false;
+            return amaterasu_identity::IDENTITY_UNAVAILABLE;
         };
         if !*active {
-            return false;
+            return amaterasu_identity::IDENTITY_UNAVAILABLE;
         }
         // SAFETY: exact committed membership is checked on the live provider;
         // proof of possession was separately checked during the TLS handshake.
-        unsafe {
-            (self.calls.verify)(self.calls.context, BorrowedBytes::new(certificate)) == STATUS_OK
-        }
+        unsafe { (self.calls.verify)(self.calls.context, BorrowedBytes::new(certificate)) }
     }
 }
 
@@ -177,19 +179,36 @@ impl Identity {
     }
 
     pub fn allowed(&self, certificate: &[u8], permission: crate::wire::Permission) -> bool {
+        if permission == crate::wire::Permission::Paired {
+            return self.trusted(certificate);
+        }
         let selector = match permission {
+            crate::wire::Permission::Paired => unreachable!("handled paired transport check"),
             crate::wire::Permission::List => amaterasu_identity::PERMISSION_LIST,
             crate::wire::Permission::Launch => amaterasu_identity::PERMISSION_LAUNCH,
+            crate::wire::Permission::View => amaterasu_identity::PERMISSION_VIEW,
+            crate::wire::Permission::Terminate => amaterasu_identity::PERMISSION_TERMINATE,
         };
         self.bridge.permission_status(certificate, selector) == STATUS_OK
     }
 
     /// A transiently unavailable authority blocks new work, but does not prove
     /// that an existing session was revoked. Retry until a committed denial.
-    pub fn launch_not_revoked(&self, certificate: &[u8]) -> bool {
-        let status = self
-            .bridge
-            .permission_status(certificate, amaterasu_identity::PERMISSION_LAUNCH);
+    pub fn permission_not_revoked(
+        &self,
+        certificate: &[u8],
+        permission: crate::wire::Permission,
+    ) -> bool {
+        let selector = match permission {
+            crate::wire::Permission::Paired => {
+                return !permission_revoked(self.bridge.trust_status(certificate));
+            }
+            crate::wire::Permission::List => amaterasu_identity::PERMISSION_LIST,
+            crate::wire::Permission::View => amaterasu_identity::PERMISSION_VIEW,
+            crate::wire::Permission::Launch => amaterasu_identity::PERMISSION_LAUNCH,
+            crate::wire::Permission::Terminate => amaterasu_identity::PERMISSION_TERMINATE,
+        };
+        let status = self.bridge.permission_status(certificate, selector);
         !permission_revoked(status)
     }
 

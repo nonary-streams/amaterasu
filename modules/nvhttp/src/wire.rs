@@ -4,6 +4,7 @@ mod artwork;
 mod capabilities;
 mod cleanup;
 mod pairing;
+mod presentation;
 mod query;
 mod streaming;
 pub(crate) mod xml;
@@ -35,6 +36,8 @@ pub struct RequestContext {
     pub peer_trusted: bool,
     pub list_allowed: bool,
     pub launch_allowed: bool,
+    pub view_allowed: bool,
+    pub terminate_allowed: bool,
 }
 
 impl RequestContext {
@@ -62,11 +65,14 @@ impl RequestContext {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Permission {
+    Paired,
     List,
     Launch,
+    View,
+    Terminate,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Reply {
     pub status: u16,
     pub content_type: &'static str,
@@ -100,6 +106,7 @@ pub struct Router {
     cancellations: BTreeMap<u64, Instant>,
     next_job: u64,
     next_call: u64,
+    presentation: Option<presentation::PresentationRouter>,
 }
 
 struct Job {
@@ -121,6 +128,8 @@ enum Purpose {
     Identity {
         paired: bool,
         peer: Option<PeerIdentity>,
+        presentation_client: Option<amaterasu_module_sdk::session_presentation::Client>,
+        certificate: Option<Vec<u8>>,
     },
     Begin {
         client: String,
@@ -137,8 +146,16 @@ enum Purpose {
         peer: PeerIdentity,
         resume: bool,
     },
+    PresentationIdentity {
+        request: Option<LaunchRequest>,
+        peer: PeerIdentity,
+        client: amaterasu_module_sdk::session_presentation::Client,
+        intent: amaterasu_module_sdk::session_presentation::DispatchIntent,
+    },
     /// Removes the certificate presented on this paired TLS connection.
-    Unpair,
+    Unpair {
+        certificate: Vec<u8>,
+    },
     Cleanup,
     Artwork {
         id: String,
@@ -168,12 +185,41 @@ impl Router {
             cancellations: BTreeMap::new(),
             next_job: 0,
             next_call: 0,
+            presentation: None,
         }
     }
 
     pub fn set_hostname(&mut self, hostname: String) {
         self.launches.set_device_name(&hostname);
         self.config.hostname = hostname;
+    }
+
+    pub(crate) fn select_session_presentation(
+        &mut self,
+        runtime: &RuntimeClient,
+        provider: Option<&str>,
+    ) -> ModuleResult<()> {
+        self.presentation = provider
+            .map(|provider| presentation::PresentationRouter::bind(runtime, provider))
+            .transpose()?;
+        self.launches
+            .set_borrowed_capture_verification(provider.is_some());
+        Ok(())
+    }
+
+    pub(crate) fn set_auxiliary_capture_routes(
+        &mut self,
+        black: Option<crate::launch::CaptureProvider>,
+        exact: Option<crate::launch::CaptureProvider>,
+    ) {
+        self.launches.set_auxiliary_capture_routes(black, exact);
+    }
+
+    pub(crate) fn set_auxiliary_exact_capture_routes(
+        &mut self,
+        routes: BTreeMap<String, crate::launch::CaptureProvider>,
+    ) {
+        self.launches.set_auxiliary_exact_capture_routes(routes);
     }
 
     pub fn set_encoder_snapshot(&mut self, snapshot: crate::encoder_snapshot::EncoderSnapshot) {
@@ -324,6 +370,14 @@ impl Router {
             Err(error) => return Some(xml::error(400, error)),
         };
         let trusted = peer.trusted();
+        if self.presentation.is_some()
+            && matches!(
+                query.path.as_str(),
+                "/applist" | "/appasset" | "/launch" | "/resume" | "/cancel"
+            )
+        {
+            return self.dispatch_presented(connection, &query, &peer, now);
+        }
         match query.path.as_str() {
             "/serverinfo" => {
                 if peer.secure && !trusted {
@@ -334,6 +388,14 @@ impl Router {
                     Purpose::Identity {
                         paired: trusted,
                         peer: peer.launch_allowed.then(|| peer.identity().ok()).flatten(),
+                        presentation_client: self
+                            .presentation
+                            .as_ref()
+                            .and_then(|_| presentation::PresentationRouter::client(&peer).ok()),
+                        certificate: self
+                            .presentation
+                            .as_ref()
+                            .and_then(|_| peer.peer_certificate.clone()),
                     },
                     json!({"action":"identity"}),
                     now + SERVICE_TIMEOUT,
@@ -462,9 +524,20 @@ impl Router {
             Some(certificate_pem) => certificate_pem,
             None => return Some(xml::error(401, "client certificate is unavailable")),
         };
+        if let Some(presentation) = &mut self.presentation
+            && let Err(reply) = presentation.remember_client(
+                peer.peer_certificate
+                    .as_deref()
+                    .expect("trusted certificate"),
+            )
+        {
+            return Some(reply);
+        }
         self.queue(
             Some(connection),
-            Purpose::Unpair,
+            Purpose::Unpair {
+                certificate: peer.peer_certificate.clone().expect("trusted certificate"),
+            },
             json!({"action":"unpair_presented_client","certificate_pem":certificate_pem}),
             now + SERVICE_TIMEOUT,
             now,
@@ -570,9 +643,19 @@ impl Router {
         receive: &mut impl FnMut(Value) -> ModuleResult<amaterasu_module_sdk::artwork_transfer::Image>,
     ) -> Vec<(u64, Reply)> {
         self.poll_cancellations(now, send);
-        let mut replies = self.launches.poll_with_trust(now, send, |certificate| {
-            allowed(certificate, Permission::Launch)
-        });
+        let mut replies = self
+            .launches
+            .poll_with_authorization(now, send, &mut allowed);
+        if let Some(presentation) = &mut self.presentation {
+            replies.extend(presentation.poll(
+                &mut self.launches,
+                &self.config,
+                now,
+                send,
+                &mut allowed,
+                receive,
+            ));
+        }
         let keys: Vec<_> = self.jobs.keys().copied().collect();
         for key in keys {
             let Some(mut job) = self.jobs.remove(&key) else {
@@ -585,6 +668,9 @@ impl Router {
                 }
                 Purpose::LaunchIdentity { peer, .. } => {
                     Some((peer.certificate(), Permission::Launch))
+                }
+                Purpose::PresentationIdentity { peer, .. } => {
+                    Some((peer.certificate(), Permission::Paired))
                 }
                 _ => None,
             };
@@ -726,6 +812,9 @@ impl Router {
             }
         }
         self.artwork_reservations.remove(&connection);
+        if let Some(presentation) = &mut self.presentation {
+            presentation.cancel(connection);
+        }
     }
 
     pub fn reply_delivered(&mut self, connection: u64) {
@@ -733,16 +822,37 @@ impl Router {
         self.launches.reply_delivered(connection, Instant::now());
     }
 
+    #[cfg(test)]
     pub fn revoke_untrusted(&mut self, trusted: impl FnMut(&[u8]) -> bool) -> Vec<u64> {
         self.launches.revoke_untrusted(Instant::now(), trusted)
     }
 
+    pub fn revoke_unauthorized(
+        &mut self,
+        mut allowed: impl FnMut(&[u8], Permission) -> bool,
+    ) -> Vec<u64> {
+        if let Some(presentation) = &mut self.presentation {
+            presentation.revoke_untrusted_clients(&mut allowed);
+        }
+        self.launches.revoke_unauthorized(Instant::now(), allowed)
+    }
+
     pub fn quiesce(&mut self) -> bool {
-        self.launches.quiesce(Instant::now())
+        let streams = self.launches.quiesce(Instant::now());
+        let presentation = self
+            .presentation
+            .as_mut()
+            .is_none_or(presentation::PresentationRouter::quiesce);
+        streams && presentation
     }
 
     pub fn package_activation_barrier(&mut self, pending: bool) -> bool {
-        self.launches.package_activation_barrier(pending)
+        let streams = self.launches.package_activation_barrier(pending);
+        let policy = self
+            .presentation
+            .as_mut()
+            .is_none_or(|presentation| presentation.package_activation_barrier(pending));
+        streams && policy
     }
 
     pub fn shutdown(&mut self, runtime: &RuntimeClient) {

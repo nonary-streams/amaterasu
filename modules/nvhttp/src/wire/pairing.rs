@@ -329,8 +329,10 @@ impl Router {
         if matches!(job.purpose, Purpose::Cleanup) {
             return None;
         }
-        if let Purpose::LaunchIdentity { .. } = &job.purpose
-            && let Ok(payload) = &result
+        if matches!(
+            &job.purpose,
+            Purpose::LaunchIdentity { .. } | Purpose::PresentationIdentity { .. }
+        ) && let Ok(payload) = &result
             && payload["ok"] != true
             && payload["code"] == "not_paired"
         {
@@ -359,7 +361,30 @@ impl Router {
             }
         };
         match job.purpose.clone() {
-            Purpose::Identity { paired, peer } => {
+            Purpose::Identity {
+                paired,
+                peer,
+                presentation_client,
+                certificate,
+            } => {
+                if let (Some(client), Some(certificate), Some(host_id)) = (
+                    presentation_client,
+                    certificate,
+                    payload
+                        .get("host_id")
+                        .and_then(Value::as_str)
+                        .filter(|id| !id.is_empty() && id.len() <= 64),
+                ) {
+                    let context = self.launches.session_presentation_context(client);
+                    if let (Some(connection), Some(presentation)) =
+                        (job.connection, &mut self.presentation)
+                        && let Some(reply) =
+                            presentation.info(connection, certificate, context, host_id.into(), now)
+                    {
+                        complete(&job, reply, replies);
+                    }
+                    return None;
+                }
                 let current_game = peer
                     .as_ref()
                     .map_or(0, |peer| self.launches.current_game(peer));
@@ -373,7 +398,7 @@ impl Router {
                         host_id,
                         paired,
                         current_game,
-                        self.launches.busy(),
+                        paired && self.launches.busy(),
                         self.launches.supported(),
                         self.launches.codec_advertisement(),
                     ),
@@ -382,7 +407,12 @@ impl Router {
                 complete(&job, reply, replies);
                 None
             }
-            Purpose::Unpair => {
+            Purpose::Unpair { certificate } => {
+                if payload.get("unpaired").and_then(Value::as_u64) == Some(1)
+                    && let Some(presentation) = &mut self.presentation
+                {
+                    presentation.revoke_client(super::presentation::fingerprint(&certificate));
+                }
                 let reply = match payload.get("unpaired").and_then(Value::as_u64) {
                     Some(removed @ (0 | 1)) => xml::unpaired(removed == 1),
                     _ => xml::error(503, "invalid unpair response"),
@@ -470,6 +500,39 @@ impl Router {
                 }
                 None
             }
+            Purpose::PresentationIdentity {
+                request,
+                peer,
+                client,
+                intent,
+            } => {
+                let peer = match decode_peer_identity(peer, &payload) {
+                    Ok(peer) => peer,
+                    Err(reply) => {
+                        complete(&job, reply, replies);
+                        return None;
+                    }
+                };
+                let context = self.launches.session_presentation_context(client);
+                if let (Some(connection), Some(presentation)) =
+                    (job.connection, &mut self.presentation)
+                    && let Some(reply) = presentation.dispatch(
+                        super::presentation::DispatchSubmission {
+                            connection,
+                            certificate: peer.certificate().to_vec(),
+                            context,
+                            peer,
+                            request,
+                            intent,
+                        },
+                        &self.launches,
+                        now,
+                    )
+                {
+                    complete(&job, reply, replies);
+                }
+                None
+            }
             Purpose::Cleanup | Purpose::Applications { .. } | Purpose::Artwork { .. } => None,
         }
     }
@@ -553,6 +616,30 @@ impl Router {
             }
         }
     }
+}
+
+fn decode_peer_identity(
+    peer: crate::launch::PeerIdentity,
+    payload: &Value,
+) -> Result<crate::launch::PeerIdentity, Reply> {
+    let invalid = || xml::error(503, "invalid paired client response");
+    if payload["paired"] != 1 {
+        return Err(invalid());
+    }
+    let client_id = payload
+        .get("client_id")
+        .and_then(Value::as_str)
+        .ok_or_else(invalid)?;
+    let certificate_id = payload
+        .get("certificate_id")
+        .and_then(Value::as_str)
+        .ok_or_else(invalid)?;
+    let overrides = match payload.get("config_overrides") {
+        None | Some(Value::Null) => ClientConfigOverrides::default(),
+        Some(value) => serde_json::from_value(value.clone()).map_err(|_| invalid())?,
+    };
+    peer.with_paired_identity(client_id.into(), certificate_id.into(), overrides)
+        .map_err(|_| invalid())
 }
 
 impl Phase {
