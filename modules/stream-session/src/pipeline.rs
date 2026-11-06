@@ -812,6 +812,7 @@ impl Pipeline {
             let result = plane.tick(media_active);
             match result {
                 Ok(progress) => {
+                    record.history.observe_encode_timing(progress.encode_timing);
                     if virtual_display::requested(record)
                         && record.capture_geometry != progress.desktop_geometry
                     {
@@ -868,6 +869,9 @@ impl Pipeline {
                     }
                 }
                 Err(failure) => {
+                    record
+                        .history
+                        .observe_encode_timing(failure.progress.encode_timing);
                     eprintln!("amaterasu session media failed code={}", failure.code);
                     record.history.observe_media(
                         failure.progress.accepted_video_access_units,

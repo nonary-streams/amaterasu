@@ -1333,6 +1333,7 @@ impl Drive for FakePlane {
         state.ticks += 1;
         state.media_ticks += usize::from(media_active);
         let progress = PlaneProgress {
+            encode_timing: None,
             controls: std::mem::take(&mut state.controls),
             desktop_geometry: state.desktop_geometry,
             accepted_video_access_units: std::mem::take(&mut state.accepted_video_access_units),
@@ -1340,7 +1341,10 @@ impl Drive for FakePlane {
             observed_video_sequence_gaps: std::mem::take(&mut state.observed_video_sequence_gaps),
         };
         if let Some(code) = state.failure {
-            return Err(PlaneFailure { code, progress });
+            return Err(PlaneFailure {
+                code,
+                progress: Box::new(progress),
+            });
         }
         Ok(progress)
     }

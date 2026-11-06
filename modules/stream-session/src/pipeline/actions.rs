@@ -610,6 +610,7 @@ impl Pipeline {
                     "frames_sent": frames.to_string(),
                     "bytes_sent": bytes.to_string(),
                     "sequence_gaps": gaps.to_string(),
+                    "encode_timing": record.history.live_encode_timing(),
                 }))
             })
             .collect();

@@ -219,6 +219,14 @@ typedef struct {
     void (*destroy_session)(void *, uint64_t);
 } AmaterasuEncoderProviderApi;
 #define AMATERASU_ENCODER_PROVIDER_API_V1_0_SIZE ((uint32_t)sizeof(AmaterasuEncoderProviderApi))
+#define AMATERASU_ENCODER_PROVIDER_TIMING_INTERFACE_MINOR 1u
+/* Optional v1.1 timing tail, preserving the entire v1.0 prefix. Read-only and
+ * caller-scoped; unsupported/pending/busy initialize no output. */
+typedef struct {
+    AmaterasuEncoderProviderApi base;
+    AmaterasuStatus (*encode_timing)(void *, uint64_t, AmaterasuEncodeTimingSnapshotV1 *);
+} AmaterasuEncoderProviderApiV1_1;
+#define AMATERASU_ENCODER_PROVIDER_API_V1_1_SIZE ((uint32_t)sizeof(AmaterasuEncoderProviderApiV1_1))
 #ifdef __cplusplus
 }
 #endif

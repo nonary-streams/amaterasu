@@ -342,3 +342,45 @@ not `Send` or `Sync`; dropping an unresolved lease poisons the pool and leaks it
 guard, which protects dependencies only if its construction contract is met.
 The existing host native binding alone does not meet that contract. Fake tests
 exercise the helper; they are not production or hardware proof.
+
+## Optional measured timing
+
+`EncodeTimingSnapshotV1` and the C `AmaterasuEncodeTimingSnapshotV1` define
+cumulative input-to-owned-coded-output-ready observations for one session epoch.
+Optional additive tails are encoder v1.3, encoder-provider v1.1, and video v1.4;
+all older prefixes and mandatory minimum versions are unchanged. The native
+family identities and signed service grants remain required. A query authorizes
+the same session owner as receive, initializes output only on success, consumes
+no media, and performs no work-retirement or worker-result side effects.
+
+Providers timestamp readiness when complete owned coded output is produced,
+before it enters a consumer queue. Pair that with the corresponding admitted
+input's monotonic start. This measures provider conversion, queueing and encoding
+through the output-readiness observation. An asynchronous codec may complete
+internally before that observation; the contract does not claim device-only
+execution time. Exclude later consumer polling and sink retries. Unmatched,
+failed, unsupported or unmeasured work adds no sample. Never use admission as
+completion or subtract timestamps from unrelated clocks.
+
+Counters are exact, bounded, and scoped by a nonzero epoch; change the epoch
+before resetting them. Stop adding samples before integer overflow. A zero
+sample count is unknown, whereas a measured zero duration is valid. Each duration
+is at most 60 seconds; a stalled frame outside that bound remains unmeasured.
+Consumers must use compatible interval deltas, reject backwards counters and
+avoid joining epochs. Video translates epochs when the selected provider or
+session changes. Native API reads never silently choose another encoder.
+
+Rust providers may implement `EncoderProvider::encode_timing`; the SDK adapter
+publishes the new tail and defaults to unavailable. Rust consumers use
+`media::encoder_timing`, `media::provider_encode_timing` or
+`media::video_encode_timing` on a live, authenticated typed binding. These helpers
+validate the optional version/size and snapshot bounds. Unsupported, pending or
+busy queries yield no sample. `EncodeTimingSnapshotV1::record` and
+`mean_ms_since` supply checked counter recording and interval conversion.
+
+The reference encoder's backend packets retain an internal readiness timestamp.
+Native sessions match it to the original input and count it once, including when
+the output sink rejects the same packet repeatedly. Stream-session forwards
+counters through the public stream snapshot and derives recorded interval means;
+the stats plugin renders the same live and historical meaning. This does not
+measure capture-to-display or client delivery.

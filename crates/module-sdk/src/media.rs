@@ -13,10 +13,12 @@ pub mod native_contracts {
 
 mod generic;
 mod lease;
+mod timing;
 use amaterasu_abi::{STATUS_INVALID_ARGUMENT, Status};
 use amaterasu_media::{CpuFrame, frame_size};
 pub use generic::{BorrowedResourceFrame, OwnedResourceCpuFrame, RetainedResourceFrame};
 pub use lease::RetainedDmaBufFrame;
+pub use timing::*;
 
 /// A validated CPU frame whose pixels remain borrowed for its lifetime.
 /// Native callbacks may read the descriptor only during the synchronous call;

@@ -72,6 +72,7 @@ pub struct RumbleCommand {
 
 #[derive(Debug, Default)]
 pub struct Progress {
+    pub encode_timing: Option<EncodeTimingSnapshotV1>,
     pub controls: Vec<ControlRecord>,
     pub desktop_geometry: Option<CaptureGeometry>,
     /// Complete non-EOS access units admitted to the local transport queue.
@@ -85,7 +86,9 @@ pub struct Progress {
 #[derive(Debug)]
 pub struct TickFailure {
     pub code: &'static str,
-    pub progress: Progress,
+    /// Allocate only on failure; the successful per-frame path keeps telemetry
+    /// inline without making the error variant as large as a full snapshot.
+    pub progress: Box<Progress>,
 }
 
 pub struct Plane {
@@ -145,6 +148,9 @@ impl Plane {
 }
 
 trait Backend {
+    fn encode_timing(&mut self) -> PlaneResult<Option<EncodeTimingSnapshotV1>> {
+        Ok(None)
+    }
     fn desktop_geometry(&mut self) -> PlaneResult<Option<CaptureGeometry>> {
         Ok(None)
     }
@@ -215,7 +221,7 @@ impl<B: Backend> Pump<B> {
         if let Some(code) = self.failure {
             return Err(TickFailure {
                 code,
-                progress: Progress::default(),
+                progress: Box::default(),
             });
         }
         let result = self.advance(media_active);
@@ -233,18 +239,23 @@ impl<B: Backend> Pump<B> {
         // Check the authenticated provider before any media effect. A failed or
         // closed control stream ends pumping; routing metadata grants no authority.
         let mut progress = Progress::default();
+        // Telemetry is optional; failure never interrupts media forwarding.
+        progress.encode_timing = self.backend.encode_timing().ok().flatten();
         progress.desktop_geometry =
             self.backend
                 .desktop_geometry()
                 .map_err(|code| TickFailure {
                     code,
-                    progress: Progress::default(),
+                    progress: Box::default(),
                 })?;
         for _ in 0..CONTROL_READ_BUDGET {
             let message = match self.backend.control() {
                 Ok(message) => message,
                 Err(code) => {
-                    return Err(TickFailure { code, progress });
+                    return Err(TickFailure {
+                        code,
+                        progress: Box::new(progress),
+                    });
                 }
             };
             let Some(message) = message else {
@@ -253,23 +264,37 @@ impl<B: Backend> Pump<B> {
             progress.controls.push(message);
         }
         if let Err(code) = self.pump_feedback() {
-            return Err(TickFailure { code, progress });
+            return Err(TickFailure {
+                code,
+                progress: Box::new(progress),
+            });
         }
         if !media_active {
             return Ok(progress);
         }
         if let Err(code) = self.pump_video(&mut progress) {
-            return Err(TickFailure { code, progress });
+            return Err(TickFailure {
+                code,
+                progress: Box::new(progress),
+            });
         }
         if !self.audio_recovery_needed
             && let Err(code) = self.pump_audio(&mut progress)
         {
-            return Err(TickFailure { code, progress });
+            return Err(TickFailure {
+                code,
+                progress: Box::new(progress),
+            });
         }
         if self.video_ended && self.audio_ended && !self.transport_draining {
             self.transport_draining = match self.backend.drain_transport() {
                 Ok(draining) => draining,
-                Err(code) => return Err(TickFailure { code, progress }),
+                Err(code) => {
+                    return Err(TickFailure {
+                        code,
+                        progress: Box::new(progress),
+                    });
+                }
             };
         }
         Ok(progress)

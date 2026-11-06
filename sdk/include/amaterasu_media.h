@@ -538,6 +538,29 @@ typedef struct {
     void (*cancel_dmabuf_leases)(void *, uint64_t);
 } AmaterasuEncoderApiV1_2;
 #define AMATERASU_ENCODER_API_V1_2_SIZE ((uint32_t)sizeof(AmaterasuEncoderApiV1_2))
+
+/* Exact cumulative provider input-to-complete-owned-output-ready measurements.
+ * Includes provider conversion, queues and codec work; excludes capture,
+ * consumer polling after readiness, sink retries, transport and presentation.
+ * Timestamp readiness when output is produced, not when later polled. Unmatched
+ * or unmeasured frames add nothing. Zero completed_frames means unavailable,
+ * not zero latency; a measured zero duration is valid. Counters never saturate
+ * or wrap; stop adding samples before overflow. Epoch is nonzero, stable for a
+ * session, and changes before resetting counters. version=1 and size gate the
+ * prefix. Every duration is <= MAX_ENCODE_LATENCY_US. */
+#define AMATERASU_MAX_ENCODE_LATENCY_US UINT64_C(60000000)
+typedef struct {
+    uint32_t version, size;
+    uint64_t epoch, completed_frames, total_us, min_us, max_us;
+} AmaterasuEncodeTimingSnapshotV1;
+#define AMATERASU_ENCODER_TIMING_INTERFACE_MINOR 3u
+/* Read-only optional tail: output initialized only on OK, otherwise unchanged.
+ * Authorize the binding's session owner; consume no media or pending work. */
+typedef struct {
+    AmaterasuEncoderApiV1_2 base;
+    AmaterasuStatus (*encode_timing)(void *, uint64_t, AmaterasuEncodeTimingSnapshotV1 *);
+} AmaterasuEncoderApiV1_3;
+#define AMATERASU_ENCODER_API_V1_3_SIZE ((uint32_t)sizeof(AmaterasuEncoderApiV1_3))
 #define AMATERASU_ENCODER_API_V1_0_SIZE ((uint32_t)sizeof(AmaterasuEncoderApi))
 #define AMATERASU_ENCODER_API_V1_1_SIZE ((uint32_t)sizeof(AmaterasuEncoderApiV1_1))
 typedef struct {
@@ -660,6 +683,13 @@ typedef struct {
     AmaterasuVideoApiV1_2 base;
     AmaterasuStatus (*receive_timed)(void *, uint64_t, AmaterasuTimedPacketSink);
 } AmaterasuVideoApiV1_3;
+#define AMATERASU_VIDEO_TIMING_INTERFACE_MINOR 4u
+/* Same caller-scoped, read-only timing contract. Video translates provider
+ * epochs when the selected encoder changes; it never substitutes a default. */
+typedef struct {
+    AmaterasuVideoApiV1_3 base;
+    AmaterasuStatus (*encode_timing)(void *, uint64_t, AmaterasuEncodeTimingSnapshotV1 *);
+} AmaterasuVideoApiV1_4;
 #ifdef __cplusplus
 }
 #endif

@@ -3,6 +3,10 @@
 #include <stdint.h>
 _Static_assert(offsetof(AmaterasuEncoderProviderApi, base) == 0, "base prefix");
 _Static_assert(offsetof(AmaterasuEncoderProviderApi, probe) == sizeof(AmaterasuNativeInterface), "table prefix");
+_Static_assert(sizeof(AmaterasuEncodeTimingSnapshotV1) == 48, "timing snapshot");
+_Static_assert(offsetof(AmaterasuEncoderApiV1_3, encode_timing) == sizeof(AmaterasuEncoderApiV1_2), "encoder timing tail");
+_Static_assert(offsetof(AmaterasuEncoderProviderApiV1_1, encode_timing) == sizeof(AmaterasuEncoderProviderApi), "provider timing tail");
+_Static_assert(offsetof(AmaterasuVideoApiV1_4, encode_timing) == sizeof(AmaterasuVideoApiV1_3), "video timing tail");
 _Static_assert(sizeof(AmaterasuEncoderFormatId) == 24, "format ID");
 _Static_assert(AMATERASU_ENCODER_PROVIDER_MAX_CONTROL_RECORDS == 1024u, "control records");
 _Static_assert(AMATERASU_ENCODER_PROVIDER_MAX_CONTROL_BYTES == 8u * 1024u * 1024u, "control bytes");

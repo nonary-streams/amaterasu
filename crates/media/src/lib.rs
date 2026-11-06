@@ -27,6 +27,8 @@ mod encoder_provider;
 pub use encoder_provider::*;
 mod encoder_input_pool;
 pub use encoder_input_pool::*;
+mod encode_timing;
+pub use encode_timing::*;
 mod codec;
 pub use codec::*;
 mod geometry;

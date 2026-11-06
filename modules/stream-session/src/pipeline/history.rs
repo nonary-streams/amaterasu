@@ -1,5 +1,6 @@
 use super::rpc;
 use crate::model::StartConfig;
+use amaterasu_media::EncodeTimingSnapshotV1;
 use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -29,6 +30,7 @@ struct QueuedUpdate {
 
 #[derive(Clone, Copy)]
 struct SamplePoint {
+    encode_timing: Option<EncodeTimingSnapshotV1>,
     at_ms: u64,
     frames_sent: u64,
     bytes_sent: u64,
@@ -52,6 +54,7 @@ enum Phase {
 }
 
 pub(super) struct SessionHistory {
+    encode_timing: Option<EncodeTimingSnapshotV1>,
     record_id: u64,
     session_id: String,
     phase: Phase,
@@ -70,6 +73,7 @@ pub(super) struct SessionHistory {
 impl SessionHistory {
     pub(super) fn new(record_id: u64, activity_id: Option<String>) -> Self {
         Self {
+            encode_timing: None,
             record_id,
             session_id: activity_id.unwrap_or_else(|| history_session_id(record_id)),
             phase: Phase::NotStarted,
@@ -98,7 +102,7 @@ impl SessionHistory {
             json!({
                 "counter_scope":"complete video access units and encoded audio/video payload bytes accepted by the media-transport local queue",
                 "dropped_frames_scope":"forward video sequence gaps between accepted access units; end-to-end frame loss is not observable",
-                "encode_latency_ms":"null means unmeasured; the video ABI exposes no encoder timing",
+                "encode_latency_ms":"mean of measured provider input-to-output-ready intervals; includes provider conversion and queueing, excludes consumer polling, capture, transport and client presentation; null means no compatible measured interval",
                 "zero_duration_rates":"actual_fps and actual_bitrate_kbps are numeric zero when no monotonic millisecond elapsed; unknown is not representable in the history schema",
                 "audio_payload_bytes_included":true,
                 "transport_acceptance_is_client_delivery":false
@@ -121,6 +125,23 @@ impl SessionHistory {
 
     pub(super) fn observed_counters(&self) -> (u64, u64, u64) {
         (self.frames_sent, self.bytes_sent, self.dropped_frames)
+    }
+
+    pub(super) fn observe_encode_timing(&mut self, timing: Option<EncodeTimingSnapshotV1>) {
+        self.encode_timing = timing.filter(|current| {
+            current.validate().is_ok()
+                && self.encode_timing.is_none_or(|previous| {
+                    amaterasu_module_sdk::media::timing_follows(*current, previous)
+                })
+        });
+    }
+
+    pub(super) fn live_encode_timing(&self) -> Value {
+        self.encode_timing.map(|timing| json!({
+            "version":1,"scope":"provider_input_to_output_ready",
+            "epoch":timing.epoch.to_string(),"completed_frames":timing.completed_frames.to_string(),
+            "total_us":timing.total_us.to_string(),"min_us":timing.min_us.to_string(),"max_us":timing.max_us.to_string()
+        })).unwrap_or(Value::Null)
     }
 
     pub(super) fn live_identity(&self) -> (&str, Option<i64>) {
@@ -497,6 +518,10 @@ impl SessionHistory {
         };
         let actual_fps = finite_or_zero(actual_fps);
         let actual_bitrate_kbps = finite_or_zero(actual_bitrate_kbps);
+        let encode_latency_ms = self
+            .encode_timing
+            .zip(range_start.encode_timing)
+            .and_then(|(current, previous)| current.mean_ms_since(previous));
         let point = self.sample_point(now);
         self.last_sample_scheduled = Some(point);
         let sequence = self.next_update_sequence();
@@ -513,7 +538,7 @@ impl SessionHistory {
                     "dropped_frames":sqlite_counter(self.dropped_frames),
                     "actual_fps":actual_fps,
                     "actual_bitrate_kbps":actual_bitrate_kbps,
-                    "encode_latency_ms":null
+                    "encode_latency_ms":encode_latency_ms
                 }
             }),
         };
@@ -552,6 +577,7 @@ impl SessionHistory {
 
     fn sample_point(&self, now: u64) -> SamplePoint {
         SamplePoint {
+            encode_timing: self.encode_timing,
             at_ms: now,
             frames_sent: self.frames_sent,
             bytes_sent: self.bytes_sent,
@@ -667,6 +693,52 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn history_uses_measured_interval_deltas_and_coalesces_without_recounting() {
+        use amaterasu_media::EncodeTimingSnapshotV1;
+        let mut history = SessionHistory::new(7, None);
+        let mut timing = EncodeTimingSnapshotV1::empty(1);
+        history.observe_encode_timing(Some(timing));
+        history.activated(0);
+        history.phase = Phase::Begun;
+        history.updates.clear();
+        timing.record(2000);
+        history.observe_encode_timing(Some(timing));
+        history.observe_media(1, 100, 0);
+        history.sample_if_due(1000);
+        assert_eq!(
+            history.updates.back().unwrap().request.payload["sample"]["encode_latency_ms"],
+            2.0
+        );
+        timing.record(6000);
+        history.observe_encode_timing(Some(timing));
+        history.observe_media(1, 100, 0);
+        history.sample_if_due(2000);
+        assert_eq!(history.updates.len(), 1);
+        assert_eq!(
+            history.updates.back().unwrap().request.payload["sample"]["encode_latency_ms"],
+            4.0
+        );
+        history.updates.clear();
+        history.observe_encode_timing(Some(timing));
+        history.sample_if_due(3000);
+        assert!(
+            history.updates.back().unwrap().request.payload["sample"]["encode_latency_ms"]
+                .is_null(),
+            "no measured new output is unknown, not a repeated old average"
+        );
+        history.updates.clear();
+        let mut replacement = EncodeTimingSnapshotV1::empty(2);
+        replacement.record(1000);
+        history.observe_encode_timing(Some(replacement));
+        history.sample_if_due(4000);
+        assert!(
+            history.updates.back().unwrap().request.payload["sample"]["encode_latency_ms"]
+                .is_null(),
+            "replacement epochs never join incompatible counters"
+        );
+    }
+
+    #[test]
     fn cumulative_counters_fit_the_history_sqlite_integer_range() {
         let maximum = i64::MAX as u64;
         assert_eq!(sqlite_counter(maximum - 1), maximum - 1);
@@ -680,6 +752,7 @@ mod tests {
         let mut history = SessionHistory::new(7, None);
         history.phase = Phase::Begun;
         history.last_sample_scheduled = Some(SamplePoint {
+            encode_timing: None,
             at_ms: 0,
             frames_sent: 0,
             bytes_sent: 0,

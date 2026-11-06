@@ -106,6 +106,14 @@ impl NativeBackend {
 }
 
 impl Backend for NativeBackend {
+    fn encode_timing(&mut self) -> PlaneResult<Option<EncodeTimingSnapshotV1>> {
+        // SAFETY: this is the selected typed video binding and this caller's
+        // stream. SDK checks the optional prefix before reading the new tail.
+        let api =
+            unsafe { self.video.table::<VideoApi>() }.map_err(|_| "native_layout_mismatch")?;
+        unsafe { amaterasu_module_sdk::media::video_encode_timing(api, self.handles.video) }
+            .map_err(|_| "video_timing_unavailable")
+    }
     fn desktop_geometry(&mut self) -> PlaneResult<Option<CaptureGeometry>> {
         self.update_hdr()?;
         // SAFETY: the retained binding was validated for the v1.0 prefix. Only

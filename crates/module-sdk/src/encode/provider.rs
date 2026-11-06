@@ -92,6 +92,11 @@ pub trait EncoderProvider: Send + Sync + 'static {
         self.output(session).map(Some)
     }
     fn control(&self, session: u64, request: ControlRequest) -> Result<ControlResponse, Status>;
+    /// Optional exact cumulative measurements for the authenticated session.
+    /// Default providers explicitly leave telemetry unavailable.
+    fn encode_timing(&self, _session: u64) -> Result<Option<EncodeTimingSnapshotV1>, Status> {
+        Ok(None)
+    }
     fn drain(&self, session: u64) -> Result<(), Status>;
     fn destroy(&self, session: u64);
     /// Retire all sessions, callbacks and workers synchronously. An error aborts
@@ -107,7 +112,7 @@ pub struct ProviderAdapter<P: EncoderProvider> {
 
 #[repr(C)]
 struct Binding<P: EncoderProvider> {
-    table: EncoderProviderApi,
+    table: EncoderProviderApiV1_1,
     provider: P,
 }
 
@@ -121,30 +126,60 @@ impl<P: EncoderProvider> ProviderAdapter<P> {
     /// panicking teardown aborts the process instead of returning.
     pub fn into_binding(self) -> *const EncoderProviderApi {
         let mut binding = Box::new(Binding {
-            table: EncoderProviderApi {
-                base: NativeInterface {
-                    header: AbiHeader {
-                        size: ENCODER_PROVIDER_API_V1_0_SIZE,
-                        major: ENCODER_PROVIDER_INTERFACE_MAJOR,
-                        minor: ENCODER_PROVIDER_INTERFACE_MINOR,
+            table: EncoderProviderApiV1_1 {
+                base: EncoderProviderApi {
+                    base: NativeInterface {
+                        header: AbiHeader {
+                            size: std::mem::size_of::<EncoderProviderApiV1_1>() as u32,
+                            major: ENCODER_PROVIDER_INTERFACE_MAJOR,
+                            minor: ENCODER_PROVIDER_TIMING_INTERFACE_MINOR,
+                        },
+                        context: std::ptr::null_mut(),
+                        release: Some(release::<P>),
                     },
-                    context: std::ptr::null_mut(),
-                    release: Some(release::<P>),
+                    probe: probe::<P>,
+                    configure_session: configure::<P>,
+                    receive: receive::<P>,
+                    control: control::<P>,
+                    subscribe: Some(subscribe::<P>),
+                    unsubscribe: Some(unsubscribe::<P>),
+                    drain: drain::<P>,
+                    destroy_session: destroy::<P>,
                 },
-                probe: probe::<P>,
-                configure_session: configure::<P>,
-                receive: receive::<P>,
-                control: control::<P>,
-                subscribe: Some(subscribe::<P>),
-                unsubscribe: Some(unsubscribe::<P>),
-                drain: drain::<P>,
-                destroy_session: destroy::<P>,
+                encode_timing: encode_timing::<P>,
             },
             provider: self.provider,
         });
-        binding.table.base.context = (&mut *binding as *mut Binding<P>).cast();
+        binding.table.base.base.context = (&mut *binding as *mut Binding<P>).cast();
         Box::into_raw(binding).cast::<EncoderProviderApi>()
     }
+}
+
+unsafe extern "C" fn encode_timing<P: EncoderProvider>(
+    context: *mut c_void,
+    session: u64,
+    output: *mut EncodeTimingSnapshotV1,
+) -> Status {
+    catch_unwind(AssertUnwindSafe(|| {
+        if context.is_null() || output.is_null() {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: runtime retains this adapter during the call; output is a
+        // caller-owned writable v1 structure. Provider authorizes the session.
+        let binding = unsafe { &*context.cast::<Binding<P>>() };
+        match binding.provider.encode_timing(session) {
+            Ok(Some(snapshot)) => match snapshot.validate() {
+                Ok(()) => {
+                    unsafe { output.write(snapshot) };
+                    STATUS_OK
+                }
+                Err(status) => status,
+            },
+            Ok(None) => MEDIA_UNSUPPORTED,
+            Err(status) => status,
+        }
+    }))
+    .unwrap_or(STATUS_INTERNAL_ERROR)
 }
 
 unsafe extern "C" fn release<P: EncoderProvider>(context: *mut c_void) {
