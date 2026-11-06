@@ -190,7 +190,7 @@ fn replies_reject_malformed_state_and_unbounded_retry_or_artwork() {
 #[test]
 fn method_contracts_have_unique_exact_identity_and_no_raw_action_field() {
     let methods = methods();
-    assert_eq!(methods.len(), 11);
+    assert_eq!(methods.len(), 12);
     let names: std::collections::BTreeSet<_> = methods.iter().map(|m| m.method.as_str()).collect();
     assert_eq!(methods.len(), names.len());
     for method in methods {
@@ -200,4 +200,42 @@ fn method_contracts_have_unique_exact_identity_and_no_raw_action_field() {
         assert!(!method.request.required.contains_key("action"));
         assert_eq!(method.response.required["result"], ApiFieldKind::String);
     }
+}
+
+#[test]
+fn transport_binding_requires_exact_owner_epoch_before_effects() {
+    let request = Request::BindTransport {
+        client_id: "client".into(),
+        session_id: "session".into(),
+        generation: 9,
+        reservation_id: "admission".into(),
+        transport_id: "stream-operation".into(),
+        transport_epoch: "server-epoch".into(),
+    };
+    assert!(request.validate().is_ok());
+    let mut invalid = request.clone();
+    if let Request::BindTransport {
+        transport_epoch, ..
+    } = &mut invalid
+    {
+        *transport_epoch = String::new();
+    }
+    assert!(invalid.validate().is_err());
+    let mut invalid = request;
+    if let Request::BindTransport { generation, .. } = &mut invalid {
+        *generation = 0;
+    }
+    assert!(invalid.validate().is_err());
+    let legacy = serde_json::json!({"action":"observe","client_id":"client","session_id":"session","generation":9,
+        "reservation_id":"admission","transport_id":"stream-operation","event":"failed_start"});
+    let decoded: Request = serde_json::from_value(legacy).unwrap();
+    assert!(decoded.validate().is_ok());
+    let method = methods()
+        .into_iter()
+        .find(|method| method.method == "observe")
+        .unwrap();
+    assert_eq!(
+        method.request.optional["transport_epoch"],
+        ApiFieldKind::Any
+    );
 }

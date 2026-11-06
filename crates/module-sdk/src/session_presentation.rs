@@ -200,8 +200,10 @@ pub enum SessionEvent {
     /// Send after this exact transport's native resources have retired.
     StreamEnded,
     ClientDisconnected,
-    /// Send after all transports borrowing the exact session have retired. The
-    /// provider acknowledges only after its retained resources are also gone.
+    /// Send after this auxiliary role's transports have retired. A normal
+    /// application may still borrow the same retained source through its own
+    /// reservation. The provider releases the role and keeps that source until
+    /// its final independently owned borrower retires.
     ExplicitDisconnect,
     Unpaired,
     Shutdown,
@@ -218,6 +220,10 @@ pub struct Observation {
     /// Distinct RTSP/transport operation identity; reconnects retain session_id
     /// and generation but receive a fresh transport identity.
     pub transport_id: String,
+    /// Runtime identity of the transport owner. A different reconciled epoch
+    /// proves retirement only through that owner's authenticated status API.
+    #[serde(default)]
+    pub transport_epoch: Option<String>,
     pub event: SessionEvent,
 }
 
@@ -278,12 +284,25 @@ pub enum Request {
         client_id: String,
         source: SharedCapture,
     },
+    /// Persist the source reservation's exact transport operation and owner
+    /// epoch before any transport/native effects. Retrying this exact binding
+    /// is idempotent; retargeting an existing binding must fail.
+    BindTransport {
+        client_id: String,
+        session_id: String,
+        generation: u64,
+        reservation_id: String,
+        transport_id: String,
+        transport_epoch: String,
+    },
     Observe {
         client_id: String,
         session_id: String,
         generation: u64,
         reservation_id: String,
         transport_id: String,
+        #[serde(default)]
+        transport_epoch: Option<String>,
         event: SessionEvent,
     },
     Artwork {
@@ -384,6 +403,17 @@ pub fn methods() -> Vec<ApiMethod> {
             vec![("client_id", Text), ("source", Object)],
         ),
         (
+            "bind_transport",
+            vec![
+                ("client_id", Text),
+                ("session_id", Text),
+                ("generation", Integer),
+                ("reservation_id", Text),
+                ("transport_id", Text),
+                ("transport_epoch", Text),
+            ],
+        ),
+        (
             "observe",
             vec![
                 ("client_id", Text),
@@ -398,7 +428,12 @@ pub fn methods() -> Vec<ApiMethod> {
     ]
     .into_iter()
     .map(|(name, required)| {
-        let mut method = operation_api::method(SERVICE, name, &required, &[]);
+        let optional = if name == "observe" {
+            vec![("transport_epoch", Any)]
+        } else {
+            vec![]
+        };
+        let mut method = operation_api::method(SERVICE, name, &required, &optional);
         method.response = ApiSchema {
             required: BTreeMap::from([("result".into(), Text)]),
             optional: BTreeMap::new(),
@@ -640,12 +675,31 @@ impl Request {
                 }
                 source.validate()?;
             }
+            Self::BindTransport {
+                client_id,
+                session_id,
+                generation,
+                reservation_id,
+                transport_id,
+                transport_epoch,
+            } => {
+                if !token(client_id)
+                    || !token(session_id)
+                    || *generation == 0
+                    || !token(reservation_id)
+                    || !token(transport_id)
+                    || !token(transport_epoch)
+                {
+                    return Err("invalid_transport_binding");
+                }
+            }
             Self::Observe {
                 client_id,
                 session_id,
                 generation,
                 reservation_id,
                 transport_id,
+                transport_epoch,
                 ..
             } => {
                 if !token(client_id)
@@ -653,6 +707,7 @@ impl Request {
                     || *generation == 0
                     || !token(reservation_id)
                     || !token(transport_id)
+                    || transport_epoch.as_ref().is_some_and(|epoch| !token(epoch))
                 {
                     return Err("invalid_session_observation");
                 }
