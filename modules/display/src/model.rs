@@ -57,6 +57,10 @@ pub enum Operation {
         identity: String,
         reference_id: String,
     },
+    ScopedStatus {
+        identity: String,
+        reference_id: String,
+    },
     ScopedRelease {
         operation_id: String,
         identity: String,

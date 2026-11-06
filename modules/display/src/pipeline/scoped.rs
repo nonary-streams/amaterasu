@@ -4,6 +4,59 @@ use crate::scoped::{self, ScopedPending, ScopedReservation};
 use amaterasu_module_sdk::virtual_display;
 
 impl<P: Platform> Pipeline<P> {
+    pub(super) fn scoped_status(
+        &self,
+        context: Context,
+        operation: Operation,
+        journal: Option<Journal>,
+        send: &mut impl FnMut(Command) -> Transport,
+    ) -> ModuleResult<()> {
+        let Operation::ScopedStatus {
+            identity,
+            reference_id,
+        } = operation
+        else {
+            unreachable!("scoped status only")
+        };
+        for value in [&identity, &reference_id] {
+            if let Err(error) = scoped::validate_identity(value) {
+                return complete(send, context.request, error.payload());
+            }
+        }
+        let target = journal.as_ref().and_then(|journal| {
+            journal.scoped_targets.iter().find(|target| {
+                !target.borrowed
+                    && target.owner == context.caller
+                    && target.identity == identity
+                    && target.reference_id == reference_id
+            })
+        });
+        let pending = target.and_then(|target| {
+            journal
+                .as_ref()
+                .and_then(|journal| journal.scoped_pending.as_ref())
+                .filter(|pending| {
+                    pending.owner == context.caller
+                        && pending.target_id == target.target_id
+                        && pending.request_identity["identity"] == identity
+                        && pending.request_identity["reference_id"] == reference_id
+                })
+        });
+        let operation_id = pending
+            .map(|pending| pending.operation_id.as_str())
+            .or_else(|| {
+                target
+                    .filter(|target| target.operation_applied)
+                    .map(|target| target.operation_id.as_str())
+            });
+        complete(
+            send,
+            context.request,
+            json!({"ok":true,"identity":identity,"reference_id":reference_id,
+                "operation_id":operation_id,"pending":pending.is_some()}),
+        )
+    }
+
     pub(super) fn validate_scoped_owner(
         &mut self,
         incoming: Incoming,
@@ -206,6 +259,16 @@ impl<P: Platform> Pipeline<P> {
                 ),
             );
         };
+        if journal.scoped_pending.is_none() && !target.operation_applied {
+            return complete(
+                send,
+                context.request,
+                failure(
+                    "scoped_operation_not_found",
+                    "the target has no completed placement admission",
+                ),
+            );
+        }
         let current = match self.capture_scoped_baseline() {
             Ok(current) => current,
             Err(error) => return complete(send, context.request, error.payload()),
@@ -268,6 +331,20 @@ impl<P: Platform> Pipeline<P> {
                 return self.persist_scoped(context,revision,journal,json!({"ok":true,"state":"succeeded","reconciled":true,"operation_id":operation_id,"mode_operation_id":mode_operation_id,"target_id":target.target_id}),send);
             }
             if scoped::same_configuration(&pending.before_configuration, &observed) {
+                if let Some(target) = journal.scoped_targets.iter_mut().find(|target| {
+                    !target.borrowed
+                        && target.owner == context.caller
+                        && target.identity == identity
+                        && target.reference_id == reference_id
+                        && target.operation_id == pending.operation_id
+                        && target.request_identity.as_ref() == Some(&pending.request_identity)
+                }) {
+                    // The initial reservation may come from a legacy journal
+                    // without an outcome bit. This native before-state proof
+                    // retires only its admission, retaining reference ownership.
+                    target.operation_applied = false;
+                    target.primary = false;
+                }
                 journal.scoped_pending = None;
                 if let Err(error) = check_request(send, &context) {
                     return complete(send, context.request, error.payload());
@@ -511,17 +588,19 @@ impl<P: Platform> Pipeline<P> {
                         "scoped operation identity already has different content",
                     ));
                 }
-                if requested.as_ref().is_some_and(|requested| {
-                    let mut effective = requested.clone();
-                    if primary {
-                        effective.x = 0;
-                        effective.y = 0;
-                    }
-                    current
-                        .displays
-                        .iter()
-                        .any(|observed| scoped::same_setting(&effective, observed))
-                }) {
+                if reserved.operation_applied
+                    && requested.as_ref().is_some_and(|requested| {
+                        let mut effective = requested.clone();
+                        if primary {
+                            effective.x = 0;
+                            effective.y = 0;
+                        }
+                        current
+                            .displays
+                            .iter()
+                            .any(|observed| scoped::same_setting(&effective, observed))
+                    })
+                {
                     let reply = json!({"ok":true,"applied":false,"reconciled":true,"target_id":reserved.target_id,"operation_id":operation_id});
                     return Ok((journal, before, current, Some(reply)));
                 }
@@ -631,8 +710,9 @@ impl<P: Platform> Pipeline<P> {
                 reference_id,
                 target_id: target_id.clone(),
                 operation_id: operation_id.clone(),
+                operation_applied: false,
                 request_identity: Some(request_identity.clone()),
-                primary,
+                primary: false,
                 borrowed: false,
                 borrow_binding: None,
             });
@@ -878,9 +958,14 @@ impl<P: Platform> Pipeline<P> {
                 }
             }
             if let Some(target) = journal.scoped_targets.iter_mut().find(|target| {
-                target.owner == pending.owner && target.target_id == pending.target_id
+                !target.borrowed
+                    && target.owner == pending.owner
+                    && target.target_id == pending.target_id
+                    && pending.request_identity["identity"] == target.identity
+                    && pending.request_identity["reference_id"] == target.reference_id
             }) {
                 target.operation_id = pending.operation_id;
+                target.operation_applied = true;
                 target.request_identity = Some(pending.request_identity);
                 target.primary = target_is_primary;
             }
@@ -964,6 +1049,9 @@ impl<P: Platform> Pipeline<P> {
                 .displays
                 .iter()
                 .find(|display| display.id.eq_ignore_ascii_case(&target.target_id));
+            if !target.operation_applied && observed.is_none() && requested.is_none() {
+                continue;
+            }
             if observed
                 .zip(requested)
                 .is_none_or(|(observed, requested)| !scoped::same_setting(observed, requested))
@@ -993,6 +1081,12 @@ impl<P: Platform> Pipeline<P> {
         scoped::translate_baseline(&mut journal.snapshot, origin)?;
         journal.scoped_origin_shift = (0, 0);
         for target in &journal.scoped_targets {
+            if !target.operation_applied && !baseline_contains(&current, &target.target_id) {
+                // A settled, never-applied admission does not establish that
+                // an active native target exists or belongs in a game restore.
+                scoped::forget_target(&mut journal.snapshot, &target.target_id)?;
+                continue;
+            }
             scoped::merge_current_target(&mut journal.snapshot, &current, &target.target_id)?;
         }
         if let Some(target) = journal.scoped_targets.iter().find(|target| target.primary) {

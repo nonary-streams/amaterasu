@@ -16,6 +16,11 @@ pub struct ScopedReservation {
     pub reference_id: String,
     pub target_id: String,
     pub operation_id: String,
+    /// New owned reservations are armed before native application. Only a
+    /// verified finalization establishes a completed operation; legacy records
+    /// already used their operation ID as the completed receipt.
+    #[serde(default = "legacy_operation_applied")]
+    pub operation_applied: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_identity: Option<Value>,
     #[serde(default)]
@@ -24,6 +29,10 @@ pub struct ScopedReservation {
     pub borrowed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub borrow_binding: Option<amaterasu_module_sdk::display::targets::Binding>,
+}
+
+fn legacy_operation_applied() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -114,30 +123,54 @@ pub fn validate_journal(journal: &Journal) -> DisplayResult<()> {
         pending
             .desired_configuration
             .validate_with_scales(pending.observed_scales.as_ref())?;
-        if !journal
-            .scoped_targets
-            .iter()
-            .any(|target| target.owner == pending.owner && target.target_id == pending.target_id)
-        {
-            return Err(DisplayError::new(
-                "invalid_journal",
-                "pending target has no protected owner",
-            ));
-        }
         let operation =
             serde_json::from_value::<crate::model::Operation>(pending.request_identity.clone())
                 .map_err(|_| DisplayError::new("invalid_journal", "invalid scoped operation"))?;
-        let consistent = match operation {
-            crate::model::Operation::ScopedApply { operation_id, .. }
-            | crate::model::Operation::ScopedReconfigure { operation_id, .. } => {
-                !pending.releasing && operation_id == pending.operation_id
+        let (operation_id, identity, reference_id, releasing, target_matches) = match operation {
+            crate::model::Operation::ScopedApply {
+                operation_id,
+                identity,
+                reference_id,
+                target,
+                ..
             }
-            crate::model::Operation::ScopedRelease { operation_id, .. } => {
-                pending.releasing && operation_id == pending.operation_id
+            | crate::model::Operation::ScopedReconfigure {
+                operation_id,
+                identity,
+                reference_id,
+                target,
+                ..
+            } => (
+                operation_id,
+                identity,
+                reference_id,
+                false,
+                target.id == pending.target_id,
+            ),
+            crate::model::Operation::ScopedRelease {
+                operation_id,
+                identity,
+                reference_id,
+                ..
+            } => (operation_id, identity, reference_id, true, true),
+            _ => {
+                return Err(DisplayError::new(
+                    "invalid_journal",
+                    "invalid scoped operation",
+                ));
             }
-            _ => false,
         };
-        if !consistent {
+        if operation_id != pending.operation_id
+            || releasing != pending.releasing
+            || !target_matches
+            || !journal.scoped_targets.iter().any(|target| {
+                !target.borrowed
+                    && target.owner == pending.owner
+                    && target.identity == identity
+                    && target.reference_id == reference_id
+                    && target.target_id == pending.target_id
+            })
+        {
             return Err(DisplayError::new(
                 "invalid_journal",
                 "scoped operation changed",

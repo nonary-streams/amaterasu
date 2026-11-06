@@ -457,6 +457,9 @@ impl<P: Platform> Pipeline<P> {
         ) {
             return self.loaded_targets(context, operation, revision, journal, send);
         }
+        if matches!(operation, Operation::ScopedStatus { .. }) {
+            return self.scoped_status(context, operation, journal, send);
+        }
         if matches!(operation, Operation::ScopedReconcile { .. }) {
             return self.reconcile_scoped(context, operation, revision, journal, send);
         }

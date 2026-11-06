@@ -1,5 +1,7 @@
 use super::*;
 
+mod status;
+
 fn pipeline() -> Pipeline<FakePlatform> {
     Pipeline::new(
         FakePlatform {

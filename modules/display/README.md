@@ -462,6 +462,16 @@ provider independently reads back the result before committing its effective
 mode revision.
 
 After a lost reply or consumer restart,
+`scoped_status { identity, reference_id }` discovers only the authenticated
+caller's exact owned scope. It returns the echoed identity/reference, nullable
+`operation_id`, and `pending` flag without observing or changing native displays
+or writing state. An absent or foreign scope, or a retained reference whose
+initial placement was verified as not applied, returns a null operation and
+`pending: false`. The SDK's `scoped_status_from_reply` binds that result to the
+requested scope. This lookup remains available when broad mutation is disabled;
+it establishes admission only, not placement or source readiness.
+
+With the discovered original operation ID,
 `scoped_reconcile { operation_id, identity, reference_id }` settles only an
 existing caller-owned admission. Observed requested state returns `succeeded`.
 Observed pre-mutation state retires the pending transition as `not_applied`,

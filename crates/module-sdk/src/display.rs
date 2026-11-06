@@ -5,7 +5,9 @@
 //! reference before it changes its exact target; all observed peers are retained.
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+mod status;
 pub mod targets;
+pub use status::{ScopedStatus, scoped_status_from_reply};
 
 pub const SERVICE: &str = "amaterasu.display/1";
 
@@ -71,6 +73,13 @@ pub enum ScopedOperation {
     /// This never admits a new configuration or replays an unknown mutation.
     ScopedReconcile {
         operation_id: String,
+        identity: String,
+        reference_id: String,
+    },
+    /// Look up this caller's exact durable composition admission. This is a
+    /// read-only recovery lookup; the returned operation still needs native
+    /// reconciliation before it establishes placement or source readiness.
+    ScopedStatus {
         identity: String,
         reference_id: String,
     },

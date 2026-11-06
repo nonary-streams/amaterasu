@@ -203,6 +203,7 @@ impl<P: Platform> Pipeline<P> {
             reference_id: reference_id.clone(),
             target_id: target.native_id,
             operation_id,
+            operation_applied: true,
             request_identity: Some(request_identity),
             primary: false,
             borrowed: true,
