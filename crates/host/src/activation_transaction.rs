@@ -69,12 +69,16 @@ fn check_size(transition: &Transition) -> PackageResult<()> {
     .into_iter()
     .chain(transition.input_policy.iter())
     {
-        if change.before.len() > MAX_DOCUMENT
-            || change.after.len() > MAX_DOCUMENT
-            || change.before == change.after
-        {
+        if change.before.len() > MAX_DOCUMENT || change.after.len() > MAX_DOCUMENT {
             return Err("invalid activation transition document".into());
         }
+    }
+    // Component-only updates retain the exact bootstrap policy. Selection and
+    // service pin still must advance; policy equality is not a failed update.
+    if transition.selection.before == transition.selection.after
+        || transition.unit.before == transition.unit.after
+    {
+        return Err("activation must change selection and service pin".into());
     }
     Ok(())
 }
@@ -332,6 +336,54 @@ mod tests {
             before: before.as_bytes().into(),
             after: after.as_bytes().into(),
         }
+    }
+    #[test]
+    fn component_only_update_commits_recovers_and_finishes_with_unchanged_policy() {
+        let root = std::env::temp_dir().join(random_identifier().unwrap());
+        fs::create_dir(&root).unwrap();
+        let bootstrap = root.join("bootstrap");
+        let selection = root.join("selection");
+        let unit = root.join("unit");
+        let journal = root.join("journal");
+        let input = root.join("input");
+        let paths = Paths {
+            input_policy: &input,
+            journal: &journal,
+            bootstrap: &bootstrap,
+            selection: &selection,
+            unit: &unit,
+        };
+        let transition = Transition {
+            input_policy: None,
+            bootstrap: change("same-policy", "same-policy"),
+            selection: change("old-set", "new-set"),
+            unit: change("old-pin", "new-pin"),
+        };
+        for (path, item) in changes(&paths, &transition) {
+            fs::write(path, &item.before).unwrap();
+        }
+        let mut authorize = |observed: &Transition| {
+            if observed == &transition {
+                Ok(())
+            } else {
+                Err("unexpected transition".into())
+            }
+        };
+        commit(&paths, &transition, &mut authorize, &mut || Ok(())).unwrap();
+        assert!(recover(&paths, &mut authorize, &mut || Ok(())).unwrap());
+        assert_eq!(fs::read(&selection).unwrap(), b"old-set");
+        commit(&paths, &transition, &mut authorize, &mut || Ok(())).unwrap();
+        claim_trial(&paths, &mut authorize).unwrap();
+        finalize_trial(&paths, &mut authorize).unwrap();
+        assert_eq!(fs::read(&bootstrap).unwrap(), b"same-policy");
+        assert_eq!(fs::read(&selection).unwrap(), b"new-set");
+        let mut invalid = transition.clone();
+        invalid.selection.after = invalid.selection.before.clone();
+        assert!(check_size(&invalid).is_err());
+        invalid = transition.clone();
+        invalid.unit.after = invalid.unit.before.clone();
+        assert!(check_size(&invalid).is_err());
+        fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn durable_trial_claim_handles_a_large_bounded_journal() {
