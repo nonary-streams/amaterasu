@@ -38,6 +38,13 @@ traffic without acquiring a host display. Remote Monitor supplies a logical
 exact output selector after the display provider verifies readiness; a missing
 target fails instead of selecting another client's display.
 
+Display cleanup reads caller-scoped journal ownership before requesting native
+desktop topology. The SDK requires an explicit `reference_owned` result: a
+reserved but unapplied reference remains owned even without an operation ID.
+Only a proven absent reference, with no capture holds and verified native
+reference retirement, permits cleanup without accessing a desktop. Unknown or
+pending placement work continues through reconciliation.
+
 Before borrowing a retained source, the selected NVHTTP transport obtains
 `VerifySource` and durably binds the exact reservation to its RTSP operation and
 runtime epoch through `BindTransport`. The lifecycle coordinator accepts only
@@ -211,10 +218,19 @@ previous runtime epoch. Such a source stays held until its owning executor can
 produce authenticated cleanup evidence. A service restart is not retirement
 proof; crash recovery of that case remains a specific qualification limit.
 
-The isolated signed native run reached worker `READY` but did not complete its
-shutdown-drain checks. This establishes loader readiness only. Full signed
-stream, cleanup and shutdown acceptance remains pending; source and replacement
-tests must not be reported as a complete native pass.
+The isolated signed native acceptance case passes loading and shutdown, paired
+client-specific catalog presentation, Remote Input transport, independent
+FFmpeg decoding of 23 black frames, held-input neutralization, input lease
+release and transport cleanup. It also passes unavailable-monitor cancellation
+and conclusive missing-provider rejection. Native input is supplied by an
+in-memory probe; these results do not establish OS input delivery, monitor
+creation or Moonlight presentation.
+
+Windows source compilation checks cover DXGI, WGC, Video, Audio, Encode,
+Display, Virtual Display and Remote Session using an isolated matching compiler
+and Windows standard library. These are compile checks, without Windows linking,
+driver execution or hardware qualification. The public SDK also exports the
+small Windows capture geometry helper used by the built-in capture providers.
 
 For isolated signed native acceptance, build the complete Linux session profile,
 the in-memory input probe, host and release utility, plus software x264 encoding
