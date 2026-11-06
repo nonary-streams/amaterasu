@@ -6,6 +6,8 @@ extern "C" {
 #endif
 #define AMATERASU_PIXEL_BGRA8 1
 #define AMATERASU_PIXEL_NV12 2
+/* P010: little-endian u16 samples, ten-bit codes in bits 15:6, bits 5:0 zero. */
+#define AMATERASU_PIXEL_P010 3
 #define AMATERASU_CODEC_H264 1
 #define AMATERASU_CODEC_HEVC 2
 #define AMATERASU_CODEC_AV1 3
@@ -86,7 +88,9 @@ typedef struct {
 } AmaterasuAudioEncoderApi;
 
 /* CPU bytes are borrowed only during submit or a synchronous frame callback.
- * NV12 is Y then UV, both with the same stride and even width/height. */
+ * NV12/P010 are contiguous Y then UV with equal byte stride and even dimensions.
+ * P010 stride is even and at least width*2; its low six sample bits are zero.
+ * The pixel format describes storage, not color primaries or transfer. */
 typedef struct {
     uint32_t width, height, format, stride;
     const uint8_t *data;

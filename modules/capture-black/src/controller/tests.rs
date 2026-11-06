@@ -37,13 +37,66 @@ fn generated_nv12_black_has_valid_geometry_levels_and_canonical_bounded_output()
         "black:8194x48@60:nv12",
         "black:064x48@60:nv12",
         "black:64x48@241:nv12",
-        "black:64x48@60:p010",
+        "black:64x48@60:yuv444",
         "black:64x48@+60:nv12",
         "black:64x48@60:nv12:extra",
         "black:64x48@60.0:nv12",
     ] {
         assert!(SourceMode::parse(bad).is_err(), "{bad}");
     }
+}
+
+#[test]
+fn generated_p010_black_has_neutral_ten_bit_codes_without_truncating_to_eight_bits() {
+    let mode = SourceMode::parse("black:1920x1080@60:p010").unwrap();
+    assert_eq!(mode.output(), "black:1920x1080@60:p010");
+    assert_eq!(mode.stride(), 3840);
+    let pixels = mode.pixels().unwrap();
+    assert_eq!(pixels.len(), 1920 * 1080 * 3);
+    let luma_bytes = 1920 * 1080 * 2;
+    assert!(
+        pixels[..luma_bytes]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .all(|sample| u16::from_le_bytes([sample[0], sample[1]]) == 64 << 6)
+    );
+    assert!(
+        pixels[luma_bytes..]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .all(|sample| u16::from_le_bytes([sample[0], sample[1]]) == 512 << 6)
+    );
+    assert!(
+        SourceMode::parse("black:8192x8192@60:p010").is_err(),
+        "per-frame SDK byte bound still applies"
+    );
+}
+
+#[test]
+fn nv12_preference_can_negotiate_p010_after_sdr_ten_bit_is_selected() {
+    let mut controller = Controller::new(true);
+    let id = open(&mut controller, "owner", "sdr-ten-bit", 1_000_000);
+    assert_eq!(controller.mode("owner", id).unwrap().format, PIXEL_NV12);
+    let old = controller.prepare("owner", id, 1_000_000, false).unwrap();
+    assert_eq!(
+        controller.select("owner", id, id, 2),
+        MEDIA_BUSY,
+        "selection cannot replace an in-flight delivery"
+    );
+    drop(old);
+    assert_eq!(controller.select("owner", id, id, 2), STATUS_OK);
+    let p010 = controller.prepare("owner", id, 1_000_000, true).unwrap();
+    assert_eq!(p010.mode.format, PIXEL_P010);
+    assert_eq!(p010.pixels.len(), 64 * 48 * 3);
+    p010.finish(STATUS_OK);
+    assert_eq!(controller.select("owner", id, id, 1), STATUS_OK);
+    let nv12 = controller.prepare("owner", id, 1_016_666, true).unwrap();
+    assert_eq!(nv12.mode.format, PIXEL_NV12);
+    nv12.finish(STATUS_OK);
+    controller.close("owner", id, 1_020_000).unwrap();
+    assert_eq!(controller.bytes, 0);
 }
 
 #[test]
@@ -56,7 +109,7 @@ fn admission_and_lookup_are_owner_scoped_and_retries_preserve_stream_identity() 
     assert!(controller.mode("other", id).is_err());
     assert_eq!(controller.close("other", id, 1_000_003), Err("not_found"));
     assert_eq!(controller.select("first", id, id + 1, 1), MEDIA_UNSUPPORTED);
-    assert_eq!(controller.select("first", id, id, 2), MEDIA_UNSUPPORTED);
+    assert_eq!(controller.select("first", id, id, 3), MEDIA_UNSUPPORTED);
     assert_eq!(controller.select("first", id, id, 1), STATUS_OK);
     let conflict = controller.handle(
         "first",

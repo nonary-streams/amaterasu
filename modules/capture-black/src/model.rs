@@ -1,4 +1,4 @@
-use amaterasu_media::{CaptureGeometry, DesktopRect, PIXEL_NV12, frame_size};
+use amaterasu_media::{CaptureGeometry, DesktopRect, PIXEL_NV12, PIXEL_P010, frame_size};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -70,22 +70,27 @@ pub struct SourceMode {
     pub width: u32,
     pub height: u32,
     pub fps: u32,
+    pub format: u32,
 }
 
 impl SourceMode {
     /// Output names are an explicit request for generated content. They never
     /// select an operating-system output or fall back to desktop capture.
     pub fn parse(output: &str) -> Result<Self, &'static str> {
-        let mode = output
-            .strip_prefix("black:")
-            .and_then(|value| value.strip_suffix(":nv12"))
-            .ok_or("invalid_output")?;
+        let output = output.strip_prefix("black:").ok_or("invalid_output")?;
+        let (mode, format) = output.rsplit_once(':').ok_or("invalid_output")?;
+        let format = match format {
+            "nv12" => PIXEL_NV12,
+            "p010" => PIXEL_P010,
+            _ => return Err("invalid_output"),
+        };
         let (dimensions, fps) = mode.split_once('@').ok_or("invalid_output")?;
         let (width, height) = dimensions.split_once('x').ok_or("invalid_output")?;
         let mode = Self {
             width: canonical_integer(width)?,
             height: canonical_integer(height)?,
             fps: canonical_integer(fps)?,
+            format,
         };
         if !(1..=240).contains(&mode.fps) {
             return Err("invalid_output");
@@ -95,11 +100,25 @@ impl SourceMode {
     }
 
     pub fn output(self) -> String {
-        format!("black:{}x{}@{}:nv12", self.width, self.height, self.fps)
+        let format = if self.format == PIXEL_P010 {
+            "p010"
+        } else {
+            "nv12"
+        };
+        format!("black:{}x{}@{}:{format}", self.width, self.height, self.fps)
     }
 
     pub fn buffer_length(self) -> Result<usize, &'static str> {
-        frame_size(self.width, self.height, PIXEL_NV12, self.width).map_err(|_| "invalid_output")
+        frame_size(self.width, self.height, self.format, self.stride())
+            .map_err(|_| "invalid_output")
+    }
+
+    pub fn stride(self) -> u32 {
+        if self.format == PIXEL_P010 {
+            self.width.saturating_mul(2)
+        } else {
+            self.width
+        }
     }
 
     pub fn pixels(self) -> Result<Box<[u8]>, &'static str> {
@@ -109,8 +128,16 @@ impl SourceMode {
         bytes
             .try_reserve_exact(length)
             .map_err(|_| "resource_exhausted")?;
-        bytes.resize(length, 128);
-        bytes[..luma_length].fill(16);
+        if self.format == PIXEL_P010 {
+            for (samples, code) in [(luma_length, 64u16), (luma_length / 2, 512u16)] {
+                for _ in 0..samples {
+                    bytes.extend_from_slice(&(code << 6).to_le_bytes());
+                }
+            }
+        } else {
+            bytes.resize(length, 128);
+            bytes[..luma_length].fill(16);
+        }
         Ok(bytes.into_boxed_slice())
     }
 

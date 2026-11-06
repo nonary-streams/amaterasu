@@ -2,7 +2,10 @@ use crate::model::{
     MAX_BUFFER_BYTES, MAX_LEDGER, MAX_STREAMS, Operation, ResourceCaptureClock, SourceMode,
     validate_operation_id,
 };
-use amaterasu_media::{MEDIA_BUSY, MEDIA_CLOSED, MEDIA_PENDING, MEDIA_UNSUPPORTED};
+use amaterasu_media::{
+    MEDIA_BACKEND_ERROR, MEDIA_BUSY, MEDIA_CLOSED, MEDIA_PENDING, MEDIA_UNSUPPORTED, PIXEL_NV12,
+    PIXEL_P010,
+};
 use amaterasu_module_sdk::abi::{STATUS_OK, Status};
 use serde_json::{Value, json};
 use std::{
@@ -61,6 +64,7 @@ struct Stream {
     owner: String,
     operation_id: Option<String>,
     mode: SourceMode,
+    pixel_mode: SourceMode,
     pixels: Arc<[u8]>,
     resource_clock: Option<ResourceCaptureClock>,
     selected: bool,
@@ -200,6 +204,7 @@ impl Controller {
             owner: caller.into(),
             operation_id,
             mode,
+            pixel_mode: mode,
             pixels,
             resource_clock,
             selected: false,
@@ -249,8 +254,49 @@ impl Controller {
         else {
             return MEDIA_CLOSED;
         };
-        if generation != id || offer != 1 {
+        let format = match offer {
+            1 => PIXEL_NV12,
+            2 => PIXEL_P010,
+            _ => return MEDIA_UNSUPPORTED,
+        };
+        if generation != id {
             return MEDIA_UNSUPPORTED;
+        }
+        let mode = SourceMode {
+            format,
+            ..stream.mode
+        };
+        let Ok(length) = mode.buffer_length() else {
+            return MEDIA_UNSUPPORTED;
+        };
+        let mut pacing = stream
+            .pacing
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if pacing.closed {
+            return MEDIA_CLOSED;
+        }
+        if pacing.reading {
+            return MEDIA_BUSY;
+        }
+        if stream.pixel_mode != mode {
+            // Both the previous and candidate allocation must fit while a
+            // selection transaction is prepared; no live frame is overwritten.
+            if self
+                .bytes
+                .checked_add(length)
+                .is_none_or(|bytes| bytes > MAX_BUFFER_BYTES)
+            {
+                return MEDIA_BUSY;
+            }
+            let pixels: Arc<[u8]> = match mode.pixels() {
+                Ok(pixels) => pixels.into(),
+                Err(_) => return MEDIA_BACKEND_ERROR,
+            };
+            self.bytes = self.bytes - stream.pixels.len() + pixels.len();
+            stream.pixels = pixels;
+            stream.pixel_mode = mode;
+            pacing.pending = None;
         }
         stream.selected = true;
         STATUS_OK
@@ -309,7 +355,7 @@ impl Controller {
         pacing.reading = true;
         drop(pacing);
         Ok(Delivery {
-            mode: stream.mode,
+            mode: stream.pixel_mode,
             pixels: stream.pixels.clone(),
             identity,
             clock_epoch: stream

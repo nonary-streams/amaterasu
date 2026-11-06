@@ -1,6 +1,6 @@
 use super::*;
 use crate::model::{Operation, ResourceCaptureClock};
-use amaterasu_media::{CaptureApi, MEDIA_CLOSED, MEDIA_PENDING};
+use amaterasu_media::{CaptureApi, MEDIA_CLOSED, MEDIA_PENDING, PIXEL_NV12};
 
 struct OwnedBinding(*const CaptureApiV1_8);
 
@@ -43,6 +43,10 @@ impl Drop for OwnedBinding {
 }
 
 fn setup() -> (SharedController, Box<Factory>, u64) {
+    setup_output("black:64x48@60:nv12")
+}
+
+fn setup_output(output: &str) -> (SharedController, Box<Factory>, u64) {
     let controller = Arc::new(Mutex::new(Controller::new(true)));
     let (reply, _) = controller
         .lock()
@@ -50,7 +54,7 @@ fn setup() -> (SharedController, Box<Factory>, u64) {
         .handle(
             "video",
             Operation::Open {
-                output: "black:64x48@60:nv12".into(),
+                output: output.into(),
                 operation_id: Some("native".into()),
                 resource_capture_clock: Some(ResourceCaptureClock {
                     domain: "host_monotonic".into(),
@@ -72,6 +76,7 @@ struct Captured {
     frames: Vec<(u64, u64, Vec<u8>)>,
     resource_calls: usize,
     controller: Option<SharedController>,
+    format: u32,
 }
 
 unsafe extern "C" fn copy_frame(context: *mut c_void, frame: *const CpuFrame) -> Status {
@@ -79,9 +84,19 @@ unsafe extern "C" fn copy_frame(context: *mut c_void, frame: *const CpuFrame) ->
     let sink = unsafe { &mut *context.cast::<Captured>() };
     let frame = unsafe { &*frame };
     assert_eq!(frame.validate(), Ok(()));
+    let expected_format = if sink.format == 0 {
+        PIXEL_NV12
+    } else {
+        sink.format
+    };
+    let expected_stride = if expected_format == amaterasu_media::PIXEL_P010 {
+        128
+    } else {
+        64
+    };
     assert_eq!(
         (frame.width, frame.height, frame.format, frame.stride),
-        (64, 48, PIXEL_NV12, 64)
+        (64, 48, expected_format, expected_stride)
     );
     if let Some(controller) = &sink.controller {
         assert!(
@@ -108,7 +123,14 @@ unsafe extern "C" fn inspect_resource(
     state.resource_calls += 1;
     assert_eq!(resource.clock.domain, FRAME_CLOCK_HOST_MONOTONIC);
     assert_eq!(resource.clock.epoch_id, [0x11; 16]);
-    assert_eq!(resource.offer_id, 1);
+    assert_eq!(
+        resource.offer_id,
+        if state.format == amaterasu_media::PIXEL_P010 {
+            2
+        } else {
+            1
+        }
+    );
     assert_eq!(resource.resource.kind, FRAME_RESOURCE_CPU);
     // SAFETY: this negotiated CPU schema points to a live CpuFrame.
     let frame = unsafe { &*resource.resource.data.cast::<CpuFrame>() };
@@ -148,8 +170,12 @@ unsafe extern "C" fn inspect_offer(
             caps.min_height,
             caps.max_height
         ),
-        (PIXEL_NV12, 64, 64, 48, 48)
+        (caps.format, 64, 64, 48, 48)
     );
+    assert!(matches!(
+        caps.format,
+        PIXEL_NV12 | amaterasu_media::PIXEL_P010
+    ));
     STATUS_OK
 }
 
@@ -234,7 +260,7 @@ fn generic_cpu_offer_requires_exact_stream_generation_then_preserves_clock_and_p
         STATUS_OK
     );
     assert_eq!(generation, id);
-    assert_eq!(offers.calls, 1);
+    assert_eq!(offers.calls, 2);
     assert_eq!(
         unsafe { (api.select_resource)(context, id, generation + 1, 1) },
         MEDIA_UNSUPPORTED
@@ -282,4 +308,44 @@ fn malformed_native_query_is_rejected_without_allocating_a_binding() {
         assert!(interface.is_null());
         assert_eq!(Arc::strong_count(&controller), count);
     }
+}
+
+#[test]
+fn p010_native_cpu_delivery_preserves_neutral_codes_and_true_pixel_format() {
+    let (_controller, factory, id) = setup_output("black:64x48@60:p010");
+    let owner = OwnedBinding::new(&factory, "video");
+    let api = owner.api();
+    let mut frames = Captured {
+        format: amaterasu_media::PIXEL_P010,
+        ..Default::default()
+    };
+    let sink = CaptureResourceFrameSink {
+        context: (&mut frames as *mut Captured).cast(),
+        write: inspect_resource,
+    };
+    // SAFETY: retained binding and synchronous resource callback remain live.
+    assert_eq!(
+        unsafe { (api.select_resource)(api.base.base.base.context, id, id, 2) },
+        STATUS_OK
+    );
+    assert_eq!(
+        unsafe { (api.read_resource_frame)(api.base.base.base.context, id, sink) },
+        STATUS_OK
+    );
+    let bytes = &frames.frames[0].2;
+    assert_eq!(bytes.len(), 64 * 48 * 3);
+    assert!(
+        bytes[..64 * 48 * 2]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .all(|sample| u16::from_le_bytes([sample[0], sample[1]]) == 64 << 6)
+    );
+    assert!(
+        bytes[64 * 48 * 2..]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .all(|sample| u16::from_le_bytes([sample[0], sample[1]]) == 512 << 6)
+    );
 }

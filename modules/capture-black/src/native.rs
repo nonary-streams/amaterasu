@@ -8,8 +8,8 @@ use amaterasu_media::{
     CpuResourceCapabilities, DmaBufFrameSink, DmaBufLeaseSink, FRAME_ACCESS_CPU,
     FRAME_CLOCK_HOST_MONOTONIC, FRAME_OWNERSHIP_BORROWED, FRAME_RESOURCE_CPU, FRAME_SYNC_NONE,
     FrameClockMetadata, FrameDescriptor, FrameSink, FreshFrameSinkV1_2, FreshFrameSinkV1_3,
-    INTERFACE_MAJOR, MEDIA_BACKEND_ERROR, MEDIA_BUSY, MEDIA_UNSUPPORTED, PIXEL_NV12,
-    PresentationStatus, host_monotonic_micros,
+    INTERFACE_MAJOR, MEDIA_BACKEND_ERROR, MEDIA_BUSY, MEDIA_UNSUPPORTED, PresentationStatus,
+    host_monotonic_micros,
 };
 use amaterasu_module_sdk::abi::{
     AbiHeader, BorrowedBytes, NativeInterface, NativeInterfaceQuery, NativeServiceFactory,
@@ -176,8 +176,8 @@ fn deliver(
     let frame = CpuFrame {
         width: delivery.mode.width,
         height: delivery.mode.height,
-        format: PIXEL_NV12,
-        stride: delivery.mode.width,
+        format: delivery.mode.format,
+        stride: delivery.mode.stride(),
         data: delivery.pixels.as_ptr(),
         len: delivery.pixels.len(),
         timestamp_us: delivery.identity.timestamp_us,
@@ -292,36 +292,48 @@ unsafe extern "C" fn enumerate_resources(
                 Err(status) => return status,
             }
         };
-        let capabilities = CpuResourceCapabilities {
-            format: PIXEL_NV12,
-            min_width: mode.width,
-            max_width: mode.width,
-            min_height: mode.height,
-            max_height: mode.height,
-        };
-        let offer = CaptureResourceOffer {
-            id: 1,
-            ownership: FRAME_OWNERSHIP_BORROWED,
-            accessibility: FRAME_ACCESS_CPU,
-            reserved: 0,
-            resource: FrameDescriptor {
-                kind: FRAME_RESOURCE_CPU,
-                version: 1,
-                size: size_of::<CpuResourceCapabilities>() as u32,
+        for (id, format) in [
+            (1, amaterasu_media::PIXEL_NV12),
+            (2, amaterasu_media::PIXEL_P010),
+        ] {
+            if (crate::model::SourceMode { format, ..mode })
+                .buffer_length()
+                .is_err()
+            {
+                continue;
+            }
+            let capabilities = CpuResourceCapabilities {
+                format,
+                min_width: mode.width,
+                max_width: mode.width,
+                min_height: mode.height,
+                max_height: mode.height,
+            };
+            let offer = CaptureResourceOffer {
+                id,
+                ownership: FRAME_OWNERSHIP_BORROWED,
+                accessibility: FRAME_ACCESS_CPU,
                 reserved: 0,
-                namespace: [0; 16],
-                data: (&capabilities as *const CpuResourceCapabilities).cast(),
-            },
-            acquire_sync: none_descriptor(),
-            completion_sync: none_descriptor(),
-        };
-        // SAFETY: capabilities and offer live until the synchronous sink returns.
-        let status = unsafe { (sink.write)(sink.context, &offer) };
-        if status == STATUS_OK {
-            // SAFETY: caller supplies an aligned writable generation output.
-            unsafe { generation.write(stream) };
+                resource: FrameDescriptor {
+                    kind: FRAME_RESOURCE_CPU,
+                    version: 1,
+                    size: size_of::<CpuResourceCapabilities>() as u32,
+                    reserved: 0,
+                    namespace: [0; 16],
+                    data: (&capabilities as *const CpuResourceCapabilities).cast(),
+                },
+                acquire_sync: none_descriptor(),
+                completion_sync: none_descriptor(),
+            };
+            // SAFETY: capabilities and offer live until the synchronous sink returns.
+            let status = unsafe { (sink.write)(sink.context, &offer) };
+            if status != STATUS_OK {
+                return status;
+            }
         }
-        status
+        // SAFETY: caller supplies an aligned writable generation output.
+        unsafe { generation.write(stream) };
+        STATUS_OK
     })
 }
 
@@ -364,7 +376,11 @@ unsafe extern "C" fn read_resource_frame(
                 });
             let offered = CaptureResourceFrame {
                 offer_generation: stream,
-                offer_id: 1,
+                offer_id: if frame.format == amaterasu_media::PIXEL_P010 {
+                    2
+                } else {
+                    1
+                },
                 timestamp_us: frame.timestamp_us,
                 capture_pacing_timestamp_us: frame.timestamp_us,
                 sequence: frame.sequence,
@@ -372,8 +388,8 @@ unsafe extern "C" fn read_resource_frame(
                 height: frame.height,
                 freshness: CAPTURE_FRAME_FRESH,
                 reserved: 0,
-                // The CPU bridge has no color-conversion contract. Black's NV12
-                // levels are limited-range; requested encoded color is negotiated upstream.
+                // The CPU bridge has no color-conversion contract. Generated
+                // neutral codes are limited-range; encoded color is negotiated upstream.
                 color: Default::default(),
                 clock,
                 pacing_clock: clock,

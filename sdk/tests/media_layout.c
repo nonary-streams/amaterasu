@@ -1,4 +1,6 @@
 #include "amaterasu_media.h"
+_Static_assert(AMATERASU_PIXEL_BGRA8 == 1 && AMATERASU_PIXEL_NV12 == 2, "existing CPU pixel identities");
+_Static_assert(AMATERASU_PIXEL_P010 == 3, "P010 CPU pixel identity");
 #if UINTPTR_MAX == UINT64_MAX
 _Static_assert(sizeof(AmaterasuNativeInterface) == 32, "native prefix layout");
 _Static_assert(sizeof(AmaterasuCaptureSwapRequest) == 56, "capture swap request layout");
