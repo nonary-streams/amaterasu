@@ -8,6 +8,7 @@ namespace Amaterasu {
     entrypoint: string;
     placements?: ("page" | "application" | "overview" | "settings")[];
     settings_provider?: string | null;
+    settings_owner?: string | null;
     methods: ExtensionMethod[];
   }
   interface ExtensionPage {
@@ -17,7 +18,7 @@ namespace Amaterasu {
     mountSettings?(container: HTMLElement, sdk: ExtensionPageSdk): void | (() => void);
     mountApplication?(container: HTMLElement, sdk: ExtensionPageSdk): void | (() => void);
   }
-  export interface ApplicationExtensionContext { readonly id: string; readonly name: string }
+  export interface ApplicationExtensionContext { readonly id: string; readonly name: string; readonly onDocumentChange?: () => void }
   export interface ApplicationSettingsDocument {
     revision: number;
     values: Record<string, unknown>;
@@ -27,8 +28,20 @@ namespace Amaterasu {
     readonly version: 1;
     readonly provider: string;
     readonly canWrite: boolean;
+    readonly scope?: ExtensionSettingsScope;
+    describe?(): Promise<ExtensionSettingsDescriptor>;
     read(): Promise<ApplicationSettingsDocument>;
     update(expectedRevision: number, values: Payload): Promise<{ revision: number }>;
+  }
+  export type ExtensionSettingsScope = { readonly kind: "host" } | { readonly kind: "application"; readonly id: string };
+  export interface ExtensionSettingsDescriptor {
+    provider: string;
+    display_name?: string | null;
+    options: {
+      id: string; label: string; help: string; definition: ExtensionFieldDefinition;
+      choice_labels?: Record<string,string>; presentation?: string | null;
+      allowed_scopes: string[]; apply_policy: string;
+    }[];
   }
   export interface ApplicationExtensionMount {
     readonly ready: Promise<void>;
@@ -43,7 +56,7 @@ namespace Amaterasu {
     readonly ui?: ExtensionUiWithDialogsV1 & ExtensionUiTabsV1 & ExtensionUiChartsV1;
     readonly assets?: { stylesheet(path: string): Promise<void> };
     canCall?(method: string): boolean;
-    readonly application?: ApplicationExtensionContext;
+    readonly application?: Pick<ApplicationExtensionContext, "id" | "name"> & { readonly notifyChanged?: () => void };
     readonly settings?: ApplicationSettingsApi;
     setDirty?(dirty: boolean): void;
     setBusy?(busy: boolean): void;
@@ -85,7 +98,9 @@ namespace Amaterasu {
       (record.placements === undefined || (Array.isArray(record.placements) && record.placements.length > 0 && record.placements.length <= 4 &&
         new Set(record.placements).size === record.placements.length && record.placements.every((place: unknown) => place === "page" || place === "application" || place === "overview" || place === "settings"))) &&
       (record.settings_provider == null || (typeof record.settings_provider === "string" && /^[a-z0-9._-]{1,128}$/.test(record.settings_provider) &&
-        Array.isArray(record.placements) && record.placements.includes("application"))) &&
+        Array.isArray(record.placements) && (record.placements.includes("application") || record.placements.includes("settings")))) &&
+      (record.settings_owner == null || (typeof record.settings_owner === "string" && /^[a-z0-9._-]{1,128}$/.test(record.settings_owner) &&
+        Array.isArray(record.placements) && (record.placements.includes("application") || record.placements.includes("settings")))) &&
       /^[a-zA-Z0-9._/-]+\.js$/.test(record.entrypoint) &&
       !record.entrypoint.split("/").some((part) => !part || part === "." || part === "..") &&
       Array.isArray(record.methods) && record.methods.length <= 64 &&
@@ -199,7 +214,7 @@ namespace Amaterasu {
       const sdk: ExtensionPageSdk = Object.freeze({
         version: 1 as const,
         signal: controller.signal,
-        features: Object.freeze(["ui.controls/1", "ui.forms/1", "ui.forms/2", "ui.controls/2", "ui.feedback/1", "ui.layout/1", "ui.tabs/1", "ui.dialog/1", "ui.charts/1", "ui.assets/1", ...(application ? ["ui.application-section/1", ...(descriptor.settings_provider ? ["ui.application-settings/1"] : [])] : [])]),
+        features: Object.freeze(["ui.controls/1", "ui.forms/1", "ui.forms/2", "ui.controls/2", "ui.feedback/1", "ui.layout/1", "ui.tabs/1", "ui.dialog/1", "ui.charts/1", "ui.assets/1", ...(descriptor.settings_provider && (application || slot === "settings") ? ["ui.settings/1"] : []), ...(application ? ["ui.application-section/1", ...(descriptor.settings_provider ? ["ui.application-settings/1"] : [])] : [])]),
         ui: Object.freeze({
           ...createExtensionUiWithDialogsV1(controller.signal),
           ...createExtensionUiTabsV1(controller.signal),
@@ -218,8 +233,11 @@ namespace Amaterasu {
         setDirty: (value: boolean) => { if (typeof value !== "boolean") throw new Error("Invalid plugin draft state."); if (!controller.signal.aborted) { this.dirty = value; state?.("dirty", value); } },
         setBusy: (value: boolean) => { if (typeof value !== "boolean") throw new Error("Invalid plugin busy state."); if (!controller.signal.aborted) { this.busy = value; state?.("busy", value); } },
         ...(application ? {
-          application: Object.freeze({ id: application.id, name: application.name }),
-          ...(descriptor.settings_provider ? { settings: this.applicationSettings(descriptor.settings_provider, application, controller.signal) } : {}),
+          application: Object.freeze({ id: application.id, name: application.name,
+            notifyChanged: () => {if (!controller.signal.aborted) application.onDocumentChange?.();} }),
+        } : {}),
+        ...(descriptor.settings_provider && (application || slot === "settings") ? {
+          settings: this.scopedSettings(descriptor.settings_provider, application ? {kind:"application",id:application.id} : {kind:"host"},controller.signal),
         } : {}),
       });
       const callback = slot === "overview" ? page.mountOverview : slot === "settings" ? page.mountSettings : application ? page.mountApplication : page.mount;
@@ -240,18 +258,36 @@ namespace Amaterasu {
       return this.mount(id, container, undefined, undefined, slot);
     }
 
-    private applicationSettings(provider: string, application: ApplicationExtensionContext, signal: AbortSignal): ApplicationSettingsApi {
-      const scope = Object.freeze({ kind: "application", id: application.id });
+    private scopedSettings(provider: string, selectedScope: ExtensionSettingsScope, signal: AbortSignal): ApplicationSettingsApi {
+      const scope = Object.freeze(selectedScope);
       const request = async <T>(route: string, payload: Payload): Promise<T> => {
-        if (signal.aborted) throw new Error("Application section is closed.");
+        if (signal.aborted) throw new Error("Plugin settings section is closed.");
         const response = await this.api.post<T>(route, { ...payload, provider, scope }, true, signal);
-        if (signal.aborted) throw new Error("Application section is closed.");
+        if (signal.aborted) throw new Error("Plugin settings section is closed.");
         return response;
       };
       return Object.freeze({
         version: 1 as const,
         provider,
+        scope,
         canWrite: this.api.allows("configuration.write"),
+        describe: async () => {
+          let after: string | null = null, revision: number | null = null;
+          const seen = new Set<string>();
+          for (let pageIndex = 0; pageIndex < 32; pageIndex++) {
+            if (signal.aborted) throw new Error("Plugin settings section is closed.");
+            const page: {items:ExtensionSettingsDescriptor[];next:string|null;revision:number} = await this.api.post("session-extensions/list",{after,limit:32,revision},true,signal);
+            if (signal.aborted) throw new Error("Plugin settings section is closed.");
+            if (!Array.isArray(page.items) || page.items.length > 32 || !Number.isSafeInteger(page.revision) || page.revision < 0 ||
+                (revision !== null && revision !== page.revision) || (page.next !== null && typeof page.next !== "string")) throw new Error("Invalid plugin settings discovery.");
+            const descriptor = page.items.find(item => item.provider === provider);
+            if (descriptor) return descriptor;
+            if (page.next === null) throw new Error("Plugin settings provider is unavailable.");
+            if (!page.next || seen.has(page.next)) throw new Error("Plugin settings discovery cursor repeated.");
+            seen.add(page.next); after = page.next; revision = page.revision;
+          }
+          throw new Error("Plugin settings discovery exceeded its bound.");
+        },
         read: () => request<ApplicationSettingsDocument>("session-extensions/settings_get", {}),
         update: (expectedRevision: number, values: Payload) => {
           if (!this.api.allows("configuration.write")) return Promise.reject(new Error("Plugin settings are read-only."));

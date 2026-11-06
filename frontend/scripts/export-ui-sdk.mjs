@@ -1,7 +1,7 @@
 // Export declarations only; consumers never import the shell's implementation.
 import ts from 'typescript';
 import {readFile,writeFile,mkdir} from 'node:fs/promises';
-const files=['extension_ui.ts','extension_ui_layout.ts','extension_ui_feedback.ts','extension_ui_dialog.ts','extension_ui_tabs.ts','extension_ui_charts.ts','extensions.ts'];
+const files=['extension_ui.ts','extension_ui_layout.ts','extension_ui_feedback.ts','extension_ui_dialog.ts','extension_ui_tabs.ts','extension_ui_charts.ts','extension_fields.ts','extensions.ts'];
 const declarations=[];
 for(const file of files){
  const text=await readFile(`src/${file}`,'utf8');

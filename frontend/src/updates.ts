@@ -31,7 +31,23 @@ namespace Amaterasu {
     pending: string | null;
     trial: string | null;
     highestSequence: string;
-    running: { available: boolean; digest: string | null };
+    running: { available: boolean; digest: string | null; modules?: RunningModuleIdentity[] };
+  }
+
+  export interface RunningModuleIdentity { id: string; version: string; sha256: string; runtime: boolean }
+
+  export function parseRunningModules(value: unknown): RunningModuleIdentity[] {
+    if (!Array.isArray(value) || value.length < 1 || value.length > 128) throw new Error("Loaded module inventory is invalid.");
+    const ids = new Set<string>();
+    return value.map((entry: unknown) => {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) throw new Error("Loaded module identity is invalid.");
+      const row = entry as Record<string,unknown>;
+      if (typeof row.id !== "string" || !/^[a-z0-9._-]{1,128}$/.test(row.id) || ids.has(row.id) ||
+          typeof row.version !== "string" || !row.version || new TextEncoder().encode(row.version).length > 128 || /[\u0000-\u001f\u007f-\u009f]/u.test(row.version) ||
+          typeof row.sha256 !== "string" || !/^[a-f0-9]{64}$/.test(row.sha256) || typeof row.runtime !== "boolean") throw new Error("Loaded module identity is invalid.");
+      ids.add(row.id);
+      return {id:row.id,version:row.version,sha256:row.sha256,runtime:row.runtime};
+    });
   }
 
   export function parsePackageSelectionStatus(value: unknown): PackageSelectionStatus {
@@ -74,6 +90,7 @@ namespace Amaterasu {
       running: {
         available: running.available as boolean,
         digest: running.available === true ? running.digest as string : null,
+        ...(running.available === true && Object.hasOwn(running,"modules") ? {modules:parseRunningModules(running.modules)} : {}),
       },
     };
   }
@@ -149,13 +166,15 @@ namespace Amaterasu {
 
   export function renderUpdates(context: PageContext): void {
     const area = el("div");
-    const statusArea = el("div");
+    const statusArea = el("div", "module-repository-status");
     const selectionArea = el("div");
+    const modulesArea = el("div");
     let loadRequest = 0;
     let selectionSnapshot: PackageSelectionStatus | null | undefined;
     let repositorySnapshot: ApprovedRepositoryView[] | null | undefined;
     context.content.append(
       sectionHeading("Modules & UI", "Choose verified implementations from approved publishers.", button("Refresh", load)),
+      panel("Loaded modules", modulesArea),
       el("div", "notice",
         el("strong", "", "Publisher authority is broad"),
         el("p", "", "Approving a publisher allows it to supply any native module slot, including management, and the UI. Native modules share their worker's user privileges, while a replacement UI runs in the signed-in browser session and can use its API authority. Approval does not grant elevation. A signature proves source, not safe behavior."),
@@ -178,6 +197,7 @@ namespace Amaterasu {
           "Package selection unavailable",
           "This session needs configuration.read to inspect persisted package selection metadata.",
         ));
+        modulesArea.replaceChildren(empty("Modules unavailable", "Sign in with permission to read configuration."));
         statusArea.replaceChildren(empty(
           "Repository status unavailable",
           "This session needs configuration.read to inspect approved publishers and their verified catalog choices.",
@@ -186,13 +206,15 @@ namespace Amaterasu {
         return;
       }
       selectionArea.replaceChildren(el("p", "muted", "Loading persisted package selection…"));
+      modulesArea.replaceChildren(el("p", "muted", "Loading modules from the running package…"));
       statusArea.replaceChildren(el("p", "muted", "Loading verified repository status…"));
       area.replaceChildren(el("p", "muted", "Loading verified repository choices…"));
       const selectionRequest = loadPackageSelection(request);
       void selectionRequest.then((selection) => {
         if (!selectionArea.isConnected || request !== loadRequest) return;
         selectionSnapshot = selection;
-        if (selection) renderSelection(selection, repositorySnapshot);
+        if (selection) {renderSelection(selection, repositorySnapshot);renderModules(selection);}
+        else modulesArea.replaceChildren(empty("Modules unavailable", "The running package could not be verified."));
       });
       try {
         const byId = new Map<string, ApprovedRepositoryView>();
@@ -280,6 +302,28 @@ namespace Amaterasu {
         el("p", "muted", "Catalog matches require exact signed native manifest digest equality. They do not establish which publisher supplied the staged package or whether a trial passed."),
         ...(!selection.active ? [el("p", "muted", "No active package digest is recorded in selection metadata.")] : []),
       );
+    }
+
+    function renderModules(selection: PackageSelectionStatus): void {
+      const modules = selection.running.modules;
+      if (!selection.running.available || !modules) {
+        modulesArea.replaceChildren(empty("Module inventory unavailable", "The verified manifest is unavailable, or this host does not support module inventory."));
+        return;
+      }
+      const find = input("module_search", "");
+      find.placeholder = "Find a module";
+      const cards = el("div", "module-card-grid");
+      const render = () => {
+        const search = find.value.trim().toLowerCase();
+        const selected = modules.filter(module => module.id.includes(search)).sort((a,b) => a.id.localeCompare(b.id));
+        cards.replaceChildren(...selected.map(module => panel(module.id.replace(/^amaterasu\./, "").replace(/[._-]+/g," "),
+          badge(module.runtime ? "Runtime" : "Native module"), el("p", "muted", module.id),
+          el("p", "", `Version ${module.version}`), el("small", "muted module-digest", `Verified library ${module.sha256}`))));
+        if (!selected.length) cards.replaceChildren(empty("No matching modules", "Try another module name."));
+      };
+      find.addEventListener("input",render);
+      modulesArea.replaceChildren(el("p", "muted", `${modules.length} modules in the verified running package. This list does not establish individual module health.`),field("Find a module",find),cards);
+      render();
     }
 
     function renderStatus(repositories: ApprovedRepositoryView[]): void {

@@ -9,6 +9,7 @@ class Element {
     this.tagName = tagName;
     this.children = [];
     this.listeners = new Map();
+    this.attributes = new Map();
     this.value = "";
     this.dataset = {};
     this.isConnected = false;
@@ -31,8 +32,9 @@ class Element {
     this.append(...children);
   }
   addEventListener(name, callback) { this.listeners.set(name, callback); }
-  setAttribute() {}
-  removeAttribute() {}
+  setAttribute(name, value) { this.attributes.set(name, String(value)); }
+  getAttribute(name) { return this.attributes.get(name) ?? null; }
+  removeAttribute(name) { this.attributes.delete(name); }
   scrollIntoView() {}
   focus() {}
   reportValidity() { return true; }

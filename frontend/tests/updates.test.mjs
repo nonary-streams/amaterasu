@@ -45,7 +45,7 @@ class FakeElement {
 }
 
 const context = vm.createContext({
-  Error,
+  Error, TextEncoder,
   document: { createElement: (tagName) => new FakeElement(tagName) },
 });
 for (const source of ["src/model.ts", "src/ui.ts", "src/updates.ts"]) {
@@ -281,4 +281,12 @@ test("repository inventory shows a scoped permission state without requesting da
   await waitFor(() => content.textContent.includes("needs configuration.read"), "configuration.read permission message");
   assert.match(content.textContent, /Package selection unavailable/);
   assert.equal(requests, 0);
+});
+
+
+test("loaded module inventory is bounded and separate from catalog availability",()=>{
+  const modules=[{id:"amaterasu.display",version:"0.1.0",sha256:"a".repeat(64),runtime:false},{id:"amaterasu.frame-limiter",version:"0.1.0",sha256:"b".repeat(64),runtime:false}];
+  const result=context.Amaterasu.parseRunningModules(modules);
+  assert.equal(result[0].id,"amaterasu.display");
+  for(const bad of [[],[...modules,modules[0]],Array(129).fill(modules[0]),[{...modules[0],sha256:"invalid"}],[{...modules[0],version:"bad\nversion"}],[{...modules[0],id:"../display"}]])assert.throws(()=>context.Amaterasu.parseRunningModules(bad));
 });

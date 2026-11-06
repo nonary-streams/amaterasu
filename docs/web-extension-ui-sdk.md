@@ -389,3 +389,38 @@ Public TypeScript declarations are published in
 from the SDK interfaces by `npm run export-sdk` in `frontend`; importing them
 does not import the shell. The independently built
 [Stats plugin](../modules/stats/README.md) is a full consumer example.
+
+## Module-owned settings surfaces
+
+`settings_provider` supports both `settings` and `application` placements. A
+mounted surface receives `ui.settings/1`, `sdk.settings.scope` and
+`sdk.settings.describe()`. The descriptor supplies the selected provider's option
+schemas, platform choices, labels, bounds, allowed scopes and application timing.
+Discovery is bounded and checks pagination revisions. Host mounts bind
+`{kind:"host"}`; app mounts bind that app's ID. Scripts cannot change this binding.
+The older `ui.application-settings/1` feature remains available on app mounts.
+
+A module that stores settings through its own approved operation API can declare
+`settings_owner` instead of `settings_provider`:
+
+```json
+{"placements":["settings","application"],"settings_owner":"amaterasu.display","methods":[]}
+```
+
+This associates legacy controls with the selected custom UI; it grants no API
+or registry access. Declare and approve actual methods separately. Without a
+selected custom surface, legacy controls and registry-generated forms remain
+available. Display uses revisioned `nonary.host-settings/1` and
+`nonary.catalog/1` methods to preserve existing storage. Frame limiting uses the
+selected native provider's registry descriptor through `ui.settings/1`.
+
+After a plugin independently updates an application document and confirms its
+readback, call `sdk.application.notifyChanged?.()`. This tells the open app editor
+to re-read before saving its own draft. The editor merges non-overlapping changes
+and rejects conflicting edits. The notification grants no authority and conveys
+no trusted document values or revision. Closing the surface retires notifications,
+queued UI work and the lifecycle signal.
+
+Saved Display and Frame limiting settings apply to a new application session.
+Their UI does not restart a stream or modify an existing display/limiter lease.
+The RTX live-action contract described above remains separate.

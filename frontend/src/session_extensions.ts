@@ -1,4 +1,12 @@
 namespace Amaterasu {
+  const settingsRenderers = new WeakMap<HTMLElement, object>();
+  export function claimModuleSettings(context: PageContext, owners: ReadonlySet<string>): void {
+    for (const node of context.content.querySelectorAll<HTMLElement>("[data-settings-owner]")) {
+      const claimed = owners.has(node.getAttribute("data-settings-owner") ?? "");
+      node.classList.toggle("module-settings-claimed", claimed);
+      node.inert = claimed;
+    }
+  }
   export type SessionExtensionScope = { kind: "host" } |
     { kind: "application" | "paired_client" | "session"; id: string };
   interface SessionExtensionOption {
@@ -53,7 +61,8 @@ namespace Amaterasu {
     renderSessionExtensionSettings(context, area, scope, provider);
   }
 
-  export function renderSessionExtensionSettings(context: PageContext, area: HTMLElement, scope: SessionExtensionScope = { kind: "host" }, provider?: string): void {
+  export function renderSessionExtensionSettings(context: PageContext, area: HTMLElement, scope: SessionExtensionScope = { kind: "host" }, provider?: string, excluded: ReadonlySet<string> = new Set()): void {
+    const renderer = {}; settingsRenderers.set(area, renderer);
     let generation = 0;
     async function load(): Promise<void> {
       const current = ++generation;
@@ -73,9 +82,9 @@ namespace Amaterasu {
           if (after) seen.add(after);
           if (descriptors.length > 1024) throw new Error("Too many extensions.");
         } while (after);
-        const scopedDescriptors = descriptors.filter((descriptor) => (!provider || descriptor.provider === provider) && Array.isArray(descriptor.options) && descriptor.options.some((option) => Array.isArray(option.allowed_scopes) && option.allowed_scopes.includes(scope.kind)));
+        const scopedDescriptors = descriptors.filter((descriptor) => !excluded.has(descriptor.provider) && (!provider || descriptor.provider === provider) && Array.isArray(descriptor.options) && descriptor.options.some((option) => Array.isArray(option.allowed_scopes) && option.allowed_scopes.includes(scope.kind)));
         const settings = await Promise.all(scopedDescriptors.map((descriptor) => context.api.post<SessionExtensionSettings>("session-extensions/settings_get", { provider: descriptor.provider, scope })));
-        if (current !== generation || !context.content.isConnected || !area.isConnected) return;
+        if (settingsRenderers.get(area) !== renderer || current !== generation || !context.content.isConnected || !area.isConnected) return;
         const panels: HTMLElement[] = [];
         scopedDescriptors.forEach((descriptor, index) => {
           const document = settings[index];
@@ -142,7 +151,7 @@ namespace Amaterasu {
         }
         area.replaceChildren(...(panels.length ? panels : [el("p", "muted", "No plugin settings are available for this scope.")]));
       } catch (error) {
-        if (current === generation && context.content.isConnected && area.isConnected) area.replaceChildren(errorPanel(error, load));
+        if (settingsRenderers.get(area) === renderer && current === generation && context.content.isConnected && area.isConnected) area.replaceChildren(errorPanel(error, load));
       }
     }
     void load();
@@ -199,6 +208,7 @@ namespace Amaterasu {
     void pages.discover().then((descriptors) => {
       if (disposed || !area.isConnected) return;
       const sections = descriptors.filter((entry) => entry.placements?.includes("application"));
+      claimModuleSettings(context, new Set(sections.flatMap(entry => entry.settings_owner ?? entry.settings_provider ? [entry.settings_owner ?? entry.settings_provider!] : [])));
       renderFallback(new Set(sections.flatMap((entry) => entry.settings_provider ? [entry.settings_provider] : [])));
       for (const descriptor of sections) {
         const container = el("div");

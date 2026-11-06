@@ -171,6 +171,16 @@ pub struct ApiMethodApproval {
     pub method: ApiMethod,
 }
 
+/// Bounded identity metadata for one component in the verified running package.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunningModuleIdentity {
+    pub id: String,
+    pub version: String,
+    pub sha256: String,
+    pub runtime: bool,
+}
+
 /// Facts supplied by the trusted host for one worker process.
 ///
 /// `state_root` is intentionally separate from module settings: a release

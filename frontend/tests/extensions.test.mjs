@@ -25,7 +25,7 @@ function setup(entries, { applicationOnly = false, deferLoad = false, write = tr
           return () => { cleanupCount++; };
       };
       context.window.AmaterasuExtensions.v1.register("hello", {
-        title: "Hello", ...(applicationOnly ? {} : { mount }), mountApplication: mount,
+        title: "Hello", ...(applicationOnly ? {} : { mount }), mountApplication: mount, mountSettings: mount,
       });
       currentScript = null;
       scripts.push(script);
@@ -43,6 +43,7 @@ function setup(entries, { applicationOnly = false, deferLoad = false, write = tr
   const api = { allows: () => write, async post(route, payload) {
     calls.push({ route, payload });
     if (route === "extensions/list") return { extensions: entries };
+    if (route === "session-extensions/list") return {items:[{provider:"amaterasu.frame-limiter",options:[]}],next:null,revision:1};
     if (route === "session-extensions/settings_get") return { revision: 7, values: {}, effective: {} };
     if (route === "session-extensions/settings_update") return { revision: 8 };
     return { ok: true, result: { answer: 42 } };
@@ -162,4 +163,21 @@ test("plugin settings helper binds the selected provider and application scope",
   await readonly.pages.mountApplication("hello", {}, { id: "app-0000000000000002", name: "Other" }).ready;
   assert.equal(readonly.sdk().settings.canWrite, false);
   await assert.rejects(readonly.sdk().settings.update(7, {}), /read-only/);
+});
+
+
+test("host plugin settings bind their provider and cannot forge a scope",async()=>{
+  const env=setup([{...valid,placements:["settings","application"],settings_provider:"amaterasu.frame-limiter"}]);
+  await env.pages.discover();await env.pages.mountSlot("hello",{},"settings");
+  assert.equal(env.sdk().settings.scope.kind,"host");
+  assert.equal((await env.sdk().settings.describe()).provider,"amaterasu.frame-limiter");
+  await env.sdk().settings.update(7,{frame_limiter_enable:true});
+  assert.deepEqual(JSON.parse(JSON.stringify(env.calls.at(-1).payload)),{expected_revision:7,values:{frame_limiter_enable:true},provider:"amaterasu.frame-limiter",scope:{kind:"host"}});
+});
+
+test("application notifications are scoped to a live mounted editor",async()=>{
+  const env=setup([{...valid,placements:["application"],settings_owner:"amaterasu.display"}]);let updates=0;
+  await env.pages.discover();const mount=env.pages.mountApplication("hello",{},{id:"app-0000000000000001",name:"Game",onDocumentChange(){updates++;}});await mount.ready;
+  assert.equal(env.sdk().settings,undefined,"custom settings ownership grants no registry adapter or extra API authority");
+  env.sdk().application.notifyChanged();assert.equal(updates,1);mount.dispose();env.sdk().application.notifyChanged();assert.equal(updates,1);
 });

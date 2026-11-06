@@ -1,7 +1,11 @@
 namespace Amaterasu {
+  const extensionSlotDisposers = new WeakMap<HTMLElement, () => void>();
   /** Generic signed-extension surfaces; the shell has no product renderer. */
-  export function renderExtensionSlot(context: PageContext, container: HTMLElement, slot: "overview" | "settings"): void {
+  export function renderExtensionSlot(context: PageContext, container: HTMLElement, slot: "overview" | "settings", onOwners?: (owners: ReadonlySet<string>) => void): void {
+    extensionSlotDisposers.get(container)?.();
+    container.replaceChildren();
     const children: ExtensionPages[] = [];
+    let owners: ReadonlySet<string> = new Set();
     let disposed = false;
     const dispose = () => {
       if (disposed) return;
@@ -10,11 +14,21 @@ namespace Amaterasu {
       for (const child of children) child.dispose();
       discovery.dispose();
     };
-    const observer = new MutationObserver(() => { if (!container.isConnected) dispose(); });
+    extensionSlotDisposers.set(container,dispose);
+    const observer = new MutationObserver(() => {
+      if (!container.isConnected) dispose();
+      else if (slot === "settings" && typeof Amaterasu.claimModuleSettings === "function") Amaterasu.claimModuleSettings(context,owners);
+    });
     observer.observe(document.body, { childList: true, subtree: true });
     context.registerDraftGuard?.(() => children.some(child => child.isDirty()), dispose);
     const discovery = new ExtensionPages(context.api);
     void discovery.discover().then(async (descriptors) => {
+      if (disposed || !container.isConnected) return;
+      owners = new Set(descriptors.filter(entry => entry.placements?.includes(slot)).flatMap(entry => {
+        const owner = entry.settings_owner ?? entry.settings_provider; return owner ? [owner] : [];
+      }));
+      onOwners?.(owners);
+      if (slot === "settings" && typeof Amaterasu.claimModuleSettings === "function") Amaterasu.claimModuleSettings(context,owners);
       for (const descriptor of descriptors) {
         if (disposed || !container.isConnected) return;
         if (!descriptor.placements?.includes(slot)) continue;

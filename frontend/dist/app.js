@@ -7078,6 +7078,37 @@ var Amaterasu;
 })(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
 (function (Amaterasu) {
+    function markCatalogSettingsOwner(owner, node) {
+        node.setAttribute("data-settings-owner", owner);
+        return node;
+    }
+    function mergeCatalogEditorDraft(baseline, draft, current) {
+        const absent = Symbol("absent");
+        const object = (value) => !!value && typeof value === "object" && !Array.isArray(value);
+        const normalize = (value) => Array.isArray(value) ? value.map(normalize) : object(value)
+            ? Object.fromEntries(Object.keys(value).sort().map(key => [key, normalize(value[key])])) : value;
+        const canonical = (value) => JSON.stringify(normalize(value));
+        const equal = (a, b) => a === absent || b === absent ? a === b : canonical(a) === canonical(b);
+        const merge = (before, edited, latest) => {
+            if (equal(before, edited))
+                return latest;
+            if (equal(before, latest) || equal(edited, latest))
+                return edited;
+            if (object(edited) && object(latest) && (object(before) || before === absent)) {
+                const original = object(before) ? before : {};
+                const result = {};
+                for (const key of new Set([...Object.keys(original), ...Object.keys(edited), ...Object.keys(latest)])) {
+                    const value = merge(Object.hasOwn(original, key) ? original[key] : absent, Object.hasOwn(edited, key) ? edited[key] : absent, Object.hasOwn(latest, key) ? latest[key] : absent);
+                    if (value !== absent)
+                        Object.defineProperty(result, key, { value, enumerable: true, writable: true, configurable: true });
+                }
+                return result;
+            }
+            throw new Error("This application setting changed elsewhere. Reload and review the conflicting changes.");
+        };
+        return JSON.parse(JSON.stringify(merge(baseline, draft, current)));
+    }
+    Amaterasu.mergeCatalogEditorDraft = mergeCatalogEditorDraft;
     function catalogTextLiteral(value) {
         return typeof Amaterasu.literalText === "function" ? Amaterasu.literalText(value) : value;
     }
@@ -8216,6 +8247,7 @@ var Amaterasu;
         }
         function renderProviderOverrideEditor(row, runtimeStatus, capabilities) {
             let editRevision = revision;
+            let pluginDocumentChanged = false;
             const currentFec = row.entry.config_overrides?.fec_percentage;
             const fec = Amaterasu.input("fec_percentage", currentFec === undefined ? "" : String(currentFec), "number");
             fec.min = "1";
@@ -8254,7 +8286,7 @@ var Amaterasu;
             displayPolicy.rows = 12;
             displayPolicy.spellcheck = false;
             displayPolicy.value = JSON.stringify(row.entry.config_overrides?.display_policy ?? {}, null, 2);
-            const form = Amaterasu.el("form", "editor-form", catalogEditorSection("Streaming and audio", "Override streaming and audio for this provider-managed application.", Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global setting. Supported values are 1–255."), ...sessionPolicyFields, Amaterasu.field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this game streams audio."), audioSink.controls, virtualSink.controls, Amaterasu.field("Capture audio without changing default outputs", captureOnly, "Inherit the host setting, enable capture only, or allow Windows default-output routing.")), catalogEditorDisclosure("Display", "Choose display and adapter overrides.", ...refreshRateOptionFields, Amaterasu.field("Display and adapter policy (JSON)", displayPolicy, "Sparse application overrides. Use null or empty values to inherit; global-only keys are rejected.")), catalogEditorDisclosure("Input", "Set per-application controller, keyboard, and mouse preferences.", Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "Leave blank to inherit. Use -1 to disable the timeout; other signed 32-bit values set the duration."), Amaterasu.field("Controller input", controller, "Inherit the next scope, or enable/disable gamepad input for this application."), Amaterasu.field("Gamepad profile", gamepad, "Inherit the next scope. Recognized unavailable profiles remain selectable."), Amaterasu.field("Keyboard input", keyboard, "Inherit the next scope, or enable/disable keyboard input for this application."), Amaterasu.field("Mouse input", mouse, "Inherit the next scope, or enable/disable mouse input for this application."), ...inputCompatibilityFields, ...advancedInput.fields), catalogEditorDisclosure("Encoder", "Override software and NVENC encoder settings.", ...softwareEncoder.fields, ...nvencSettingsFields));
+            const form = Amaterasu.el("form", "editor-form", catalogEditorSection("Streaming and audio", "Override streaming and audio for this provider-managed application.", Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global setting. Supported values are 1–255."), ...sessionPolicyFields, Amaterasu.field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this game streams audio."), audioSink.controls, virtualSink.controls, Amaterasu.field("Capture audio without changing default outputs", captureOnly, "Inherit the host setting, enable capture only, or allow Windows default-output routing.")), markCatalogSettingsOwner("amaterasu.display", catalogEditorDisclosure("Display", "Choose display and adapter overrides.", ...refreshRateOptionFields, Amaterasu.field("Display and adapter policy (JSON)", displayPolicy, "Sparse application overrides. Use null or empty values to inherit; global-only keys are rejected."))), catalogEditorDisclosure("Input", "Set per-application controller, keyboard, and mouse preferences.", Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "Leave blank to inherit. Use -1 to disable the timeout; other signed 32-bit values set the duration."), Amaterasu.field("Controller input", controller, "Inherit the next scope, or enable/disable gamepad input for this application."), Amaterasu.field("Gamepad profile", gamepad, "Inherit the next scope. Recognized unavailable profiles remain selectable."), Amaterasu.field("Keyboard input", keyboard, "Inherit the next scope, or enable/disable keyboard input for this application."), Amaterasu.field("Mouse input", mouse, "Inherit the next scope, or enable/disable mouse input for this application."), ...inputCompatibilityFields, ...advancedInput.fields), catalogEditorDisclosure("Encoder", "Override software and NVENC encoder settings.", ...softwareEncoder.fields, ...nvencSettingsFields));
             const overrides = catalogOverrideEditor(catalogOverrideSections(Array.from(form.children)), { ...row.entry.config_overrides });
             form.replaceChildren(overrides.node);
             form.hidden = !api.allows("catalog.write");
@@ -8264,6 +8296,16 @@ var Amaterasu;
             save.type = "submit";
             const cancel = Amaterasu.button("Cancel", () => { closeEditor(); });
             form.append(feedback, Amaterasu.el("div", "catalog-editor-save-bar", Amaterasu.el("span", "muted", "Save or cancel your changes."), Amaterasu.el("div", "actions", cancel, save)));
+            const collectOverrideDraft = () => {
+                const config_overrides = mergeCatalogConfigOverrides(row.entry.config_overrides, new FormData(form).keys(), advancedInput.read(), softwareEncoder.read(), Amaterasu.providerConfigOverrides(fec.value, streamAudio.value, audioSink.mode.value, audioSink.id.value, captureOnly.value, backButtonTimeout.value, virtualSink.mode.value, virtualSink.selector.value, controller.value, gamepad.value, keyboard.value, mouse.value, runtimeStatus.recognized_profiles), parseCatalogSessionPolicyOverrides(new FormData(form), capabilities, row.entry.config_overrides), parseCatalogNvencSettingsOverrides(new FormData(form), row.entry.config_overrides), parseCatalogInputCompatibilityOverrides(new FormData(form)), {
+                    dd_refresh_rate_option: parseCatalogRefreshRateOptionOverride(new FormData(form)),
+                    display_policy: Amaterasu.parseDisplayPolicyOverrideMap(displayPolicy.value, "application"),
+                });
+                for (const key of overrides.removed)
+                    delete config_overrides[key];
+                return config_overrides;
+            };
+            const baselineOverrides = collectOverrideDraft();
             form.addEventListener("submit", (event) => {
                 event.preventDefault();
                 if (!form.reportValidity())
@@ -8273,12 +8315,14 @@ var Amaterasu;
                     return;
                 }
                 void Amaterasu.runAction(save, feedback, async () => {
-                    const config_overrides = mergeCatalogConfigOverrides(row.entry.config_overrides, new FormData(form).keys(), advancedInput.read(), softwareEncoder.read(), Amaterasu.providerConfigOverrides(fec.value, streamAudio.value, audioSink.mode.value, audioSink.id.value, captureOnly.value, backButtonTimeout.value, virtualSink.mode.value, virtualSink.selector.value, controller.value, gamepad.value, keyboard.value, mouse.value, runtimeStatus.recognized_profiles), parseCatalogSessionPolicyOverrides(new FormData(form), capabilities, row.entry.config_overrides), parseCatalogNvencSettingsOverrides(new FormData(form), row.entry.config_overrides), parseCatalogInputCompatibilityOverrides(new FormData(form)), {
-                        dd_refresh_rate_option: parseCatalogRefreshRateOptionOverride(new FormData(form)),
-                        display_policy: Amaterasu.parseDisplayPolicyOverrideMap(displayPolicy.value, "application"),
-                    });
-                    for (const key of overrides.removed)
-                        delete config_overrides[key];
+                    let config_overrides = collectOverrideDraft();
+                    if (pluginDocumentChanged) {
+                        const current = await api.post("catalog/get", { id: row.id });
+                        if (current.id !== row.id || !Number.isSafeInteger(current.revision) || current.revision < 0 || !current.entry)
+                            throw new Error("The current application could not be verified.");
+                        config_overrides = mergeCatalogEditorDraft(baselineOverrides, config_overrides, current.entry.config_overrides ?? {});
+                        editRevision = current.revision;
+                    }
                     editorSaving = true;
                     editor.inert = true;
                     const unlock = lockEditorControls(form);
@@ -8319,7 +8363,7 @@ var Amaterasu;
             const cover = catalogEditorCover(row);
             editor.replaceChildren(Amaterasu.panel("Playnite streaming settings", Amaterasu.el("p", "muted", catalogTextLiteral(`${row.entry.name} · Playnite game ${row.entry.launch.kind === "playnite" ? row.entry.launch.game_id : ""}`)), Amaterasu.el("p", "muted", "The Playnite game identity and provider-managed launch metadata stay unchanged."), Amaterasu.el("div", "catalog-editor-layout", cover.figure, form), Amaterasu.el("section", "catalog-editor-section", Amaterasu.el("h3", "", "Plugin settings"), pluginArea = Amaterasu.el("div")), ...(!api.allows("catalog.write") ? [Amaterasu.button("Close", () => { closeEditor(); })] : [])));
             if (typeof Amaterasu.renderApplicationPluginSections === "function")
-                Amaterasu.renderApplicationPluginSections(context, pluginArea, { id: row.id, name: row.entry.name }, form.hidden ? undefined : form.querySelector(".catalog-overrides") ?? undefined);
+                Amaterasu.renderApplicationPluginSections(context, pluginArea, { id: row.id, name: row.entry.name, onDocumentChange: () => { pluginDocumentChanged = true; } }, form.hidden ? undefined : form.querySelector(".catalog-overrides") ?? undefined);
             showCatalogArtwork(api, row.entry.artwork, cover.art, content, () => { cover.fallback.hidden = true; }, row.id);
             editor.scrollIntoView({ behavior: "smooth", block: "start" });
             fec.focus();
@@ -8336,6 +8380,7 @@ var Amaterasu;
         }
         function renderEditor(row, runtimeStatus, capabilities) {
             const editRevision = revision;
+            let pluginDocumentChanged = false;
             const lifecycle = new AbortController();
             editorLifecycle = lifecycle;
             const form = entryForm(row?.entry, runtimeStatus, capabilities, api, lifecycle.signal);
@@ -8345,6 +8390,15 @@ var Amaterasu;
             save.type = "submit";
             const cancel = Amaterasu.button("Cancel", () => { closeEditor(); });
             form.append(feedback, Amaterasu.el("div", "catalog-editor-save-bar", Amaterasu.el("span", "muted", "Save or cancel your changes."), Amaterasu.el("div", "actions", cancel, save)));
+            const collectEntryDraft = () => {
+                const entry = Amaterasu.entryFromForm(new FormData(form), runtimeStatus.recognized_profiles);
+                Object.assign(entry, parseCatalogApplicationDisplaySettings(new FormData(form)));
+                entry.config_overrides = mergeCatalogConfigOverrides(row?.entry.config_overrides, new FormData(form).keys(), entry.config_overrides, parseCatalogSessionPolicyOverrides(new FormData(form), capabilities, row?.entry.config_overrides), parseCatalogNvencSettingsOverrides(new FormData(form), row?.entry.config_overrides), parseCatalogInputCompatibilityOverrides(new FormData(form)));
+                for (const key of catalogRemovedOverrides.get(form) ?? [])
+                    delete entry.config_overrides[key];
+                return entry;
+            };
+            const baselineDraft = row ? collectEntryDraft() : undefined;
             form.addEventListener("submit", (event) => {
                 event.preventDefault();
                 if (!form.reportValidity())
@@ -8354,11 +8408,15 @@ var Amaterasu;
                     return;
                 }
                 void Amaterasu.runAction(save, feedback, async () => {
-                    const entry = Amaterasu.entryFromForm(new FormData(form), runtimeStatus.recognized_profiles);
-                    Object.assign(entry, parseCatalogApplicationDisplaySettings(new FormData(form)));
-                    entry.config_overrides = mergeCatalogConfigOverrides(row?.entry.config_overrides, new FormData(form).keys(), entry.config_overrides, parseCatalogSessionPolicyOverrides(new FormData(form), capabilities, row?.entry.config_overrides), parseCatalogNvencSettingsOverrides(new FormData(form), row?.entry.config_overrides), parseCatalogInputCompatibilityOverrides(new FormData(form)));
-                    for (const key of catalogRemovedOverrides.get(form) ?? [])
-                        delete entry.config_overrides[key];
+                    let entry = collectEntryDraft();
+                    let expectedRevision = editRevision;
+                    if (row && baselineDraft && pluginDocumentChanged) {
+                        const current = await api.post("catalog/get", { id: row.id });
+                        if (current.id !== row.id || !Number.isSafeInteger(current.revision) || current.revision < 0 || !current.entry)
+                            throw new Error("The current application could not be verified.");
+                        entry = mergeCatalogEditorDraft(baselineDraft, entry, current.entry);
+                        expectedRevision = current.revision;
+                    }
                     editorSaving = true;
                     editor.inert = true;
                     const unlock = lockEditorControls(form);
@@ -8366,7 +8424,7 @@ var Amaterasu;
                         await api.post(row ? "catalog/update" : "catalog/create", {
                             ...(row ? { id: row.id } : {}),
                             entry,
-                            expected_revision: editRevision,
+                            expected_revision: expectedRevision,
                         });
                         lifecycle.abort();
                         if (editorLifecycle === lifecycle)
@@ -8385,7 +8443,7 @@ var Amaterasu;
             const cover = row ? catalogEditorCover(row) : null;
             editor.replaceChildren(Amaterasu.panel(row ? "Edit application" : "Add application", Amaterasu.el("p", "muted", "Save launch metadata for this host. Adding an entry does not launch it."), cover ? Amaterasu.el("div", "catalog-editor-layout", cover.figure, form) : form, Amaterasu.el("section", "catalog-editor-section", Amaterasu.el("h3", "", "Plugin settings"), pluginArea = Amaterasu.el("div", "", ...(row ? [] : [Amaterasu.el("p", "muted", "Plugin sections are available after creating this application.")]))), ...(!api.allows("catalog.write") ? [Amaterasu.button("Close", () => { closeEditor(); })] : [])));
             if (row && typeof Amaterasu.renderApplicationPluginSections === "function")
-                Amaterasu.renderApplicationPluginSections(context, pluginArea, { id: row.id, name: row.entry.name }, form.hidden ? undefined : form.querySelector(".catalog-overrides") ?? undefined);
+                Amaterasu.renderApplicationPluginSections(context, pluginArea, { id: row.id, name: row.entry.name, onDocumentChange: () => { pluginDocumentChanged = true; } }, form.hidden ? undefined : form.querySelector(".catalog-overrides") ?? undefined);
             if (cover && row)
                 showCatalogArtwork(api, row.entry.artwork, cover.art, content, () => { cover.fallback.hidden = true; }, row.id);
             editor.scrollIntoView({ behavior: "smooth", block: "start" });
@@ -8456,6 +8514,8 @@ var Amaterasu;
         const mapping = { encoder_backend: "encoder", audio_sink_mode: "audio_sink", virtual_sink_mode: "virtual_sink", sw_preset_mode: "sw_preset", sw_tune_mode: "sw_tune", display_output: "display-output", virtual_screen: "virtual-screen", virtual_display_mode: "virtual-display-mode", virtual_display_layout: "virtual-display-layout" };
         for (const section of sections) {
             const group = Amaterasu.el("div", "catalog-override-group", Amaterasu.el("h4", "", section.area));
+            if (section.owner)
+                group.setAttribute("data-settings-owner", section.owner);
             groups.push(group);
             list.append(group);
             for (let index = 0; index < section.fields.length; index++) {
@@ -8481,6 +8541,8 @@ var Amaterasu;
                     first.focus();
                 });
                 choice.className = "button secondary catalog-override-choice";
+                if (section.owner)
+                    row.setAttribute("data-settings-owner", section.owner);
                 const remove = Amaterasu.button("Remove", () => {
                     item.selected = false;
                     removed.add(key);
@@ -8524,6 +8586,7 @@ var Amaterasu;
     function catalogOverrideSections(sections) {
         return sections.map(section => ({
             area: section.querySelector("h3, summary strong")?.textContent?.trim() ?? "Settings",
+            owner: section.getAttribute("data-settings-owner") ?? undefined,
             fields: Array.from((section.querySelector(".catalog-editor-disclosure-content") ?? section).children).filter((child) => child instanceof HTMLElement && !child.classList.contains("catalog-editor-heading")),
         }));
     }
@@ -8787,7 +8850,7 @@ var Amaterasu;
                     : "/Applications/Example.app";
         };
         kind.addEventListener("change", showKind);
-        form.append(catalogEditorSection("Identity", "Name and describe this application in your library.", Amaterasu.field("Name", name), Amaterasu.field("Description", description), Amaterasu.field("Tags", tags, "Separate tags with commas.")), catalogEditorDisclosure("Launch", "Choose how the host starts and tracks the application.", Amaterasu.field("Launch type", kind), pathField, steamIdField, steamInstallDirField, steamGameChooser, fullscreen, sharedLaunchOptions, executable, Amaterasu.field("Command output", outputMode, "Use default discards command output without saving an output value."), outputFile, rawPreparation, Amaterasu.field("Skip global preparation commands", excludeGlobalPreparation, "Do not run the host-wide preparation commands for this application.")), catalogEditorDisclosure("Display", "Choose display and virtual-screen overrides.", Amaterasu.field("Display output override", displayOutput, "Leave empty to inherit the next display selection. This is separate from the command output file."), Amaterasu.field("Virtual screen request", virtualScreen, "Inherit the host setting or explicitly request or avoid a virtual screen."), Amaterasu.field("Virtual display mode", virtualDisplayMode, "Inherit the host mode or explicitly disable, use per-client, or share a virtual display."), Amaterasu.field("Virtual display layout", virtualDisplayLayout, "Inherit the host layout or select how virtual displays are arranged."), ...refreshRateOptionFields, Amaterasu.field("Display and adapter policy (JSON)", displayPolicy, "Sparse application overrides. Use null or empty values to inherit; global-only keys are rejected."), Amaterasu.field("10-bit SDR preference", prefer10BitSdr, "Inherit the next setting scope, or set an explicit preference for this application.")), catalogEditorDisclosure("Streaming and audio", "Override streaming, frame limiting, and audio for this application.", Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global streaming setting; supported values are 1–255."), ...sessionPolicyFields, Amaterasu.field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this application streams audio."), audioSink.controls, virtualSink.controls, Amaterasu.field("Capture audio without changing default outputs", captureOnly, "Inherit the host setting, enable capture only, or allow Windows default-output routing.")), catalogEditorDisclosure("Input", "Set per-application controller, keyboard, and mouse preferences.", Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "Leave blank to inherit. Use -1 to disable the timeout; other signed 32-bit values set the duration."), Amaterasu.field("Controller input", controller, "Inherit the next scope, or enable/disable gamepad input for this application."), Amaterasu.field("Gamepad profile", gamepad, "Inherit the next scope. Recognized profiles unavailable on this backend stay selectable and are labeled unavailable."), Amaterasu.field("Keyboard input", keyboard, "Inherit the next scope, or enable/disable keyboard input for this application."), Amaterasu.field("Mouse input", mouse, "Inherit the next scope, or enable/disable mouse input for this application."), ...inputCompatibilityFields, ...advancedInput.fields), catalogEditorDisclosure("Encoder", "Override software and NVENC encoder settings.", ...softwareEncoder.fields, ...nvencSettingsFields));
+        form.append(catalogEditorSection("Identity", "Name and describe this application in your library.", Amaterasu.field("Name", name), Amaterasu.field("Description", description), Amaterasu.field("Tags", tags, "Separate tags with commas.")), catalogEditorDisclosure("Launch", "Choose how the host starts and tracks the application.", Amaterasu.field("Launch type", kind), pathField, steamIdField, steamInstallDirField, steamGameChooser, fullscreen, sharedLaunchOptions, executable, Amaterasu.field("Command output", outputMode, "Use default discards command output without saving an output value."), outputFile, rawPreparation, Amaterasu.field("Skip global preparation commands", excludeGlobalPreparation, "Do not run the host-wide preparation commands for this application.")), markCatalogSettingsOwner("amaterasu.display", catalogEditorDisclosure("Display", "Choose display and virtual-screen overrides.", Amaterasu.field("Display output override", displayOutput, "Leave empty to inherit the next display selection. This is separate from the command output file."), Amaterasu.field("Virtual screen request", virtualScreen, "Inherit the host setting or explicitly request or avoid a virtual screen."), Amaterasu.field("Virtual display mode", virtualDisplayMode, "Inherit the host mode or explicitly disable, use per-client, or share a virtual display."), Amaterasu.field("Virtual display layout", virtualDisplayLayout, "Inherit the host layout or select how virtual displays are arranged."), ...refreshRateOptionFields, Amaterasu.field("Display and adapter policy (JSON)", displayPolicy, "Sparse application overrides. Use null or empty values to inherit; global-only keys are rejected."), Amaterasu.field("10-bit SDR preference", prefer10BitSdr, "Inherit the next setting scope, or set an explicit preference for this application."))), catalogEditorDisclosure("Streaming and audio", "Override streaming, frame limiting, and audio for this application.", Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global streaming setting; supported values are 1–255."), ...sessionPolicyFields, Amaterasu.field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this application streams audio."), audioSink.controls, virtualSink.controls, Amaterasu.field("Capture audio without changing default outputs", captureOnly, "Inherit the host setting, enable capture only, or allow Windows default-output routing.")), catalogEditorDisclosure("Input", "Set per-application controller, keyboard, and mouse preferences.", Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "Leave blank to inherit. Use -1 to disable the timeout; other signed 32-bit values set the duration."), Amaterasu.field("Controller input", controller, "Inherit the next scope, or enable/disable gamepad input for this application."), Amaterasu.field("Gamepad profile", gamepad, "Inherit the next scope. Recognized profiles unavailable on this backend stay selectable and are labeled unavailable."), Amaterasu.field("Keyboard input", keyboard, "Inherit the next scope, or enable/disable keyboard input for this application."), Amaterasu.field("Mouse input", mouse, "Inherit the next scope, or enable/disable mouse input for this application."), ...inputCompatibilityFields, ...advancedInput.fields), catalogEditorDisclosure("Encoder", "Override software and NVENC encoder settings.", ...softwareEncoder.fields, ...nvencSettingsFields));
         const identitySection = form.children[0];
         const launchSection = form.children[1];
         identitySection.id = "catalog-editor-identity";
@@ -9691,6 +9754,10 @@ var Amaterasu;
 })(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
 (function (Amaterasu) {
+    function markHostSettingsOwner(owner, node) {
+        node.setAttribute("data-settings-owner", owner);
+        return node;
+    }
     function settingsTextLiteral(value) {
         return typeof Amaterasu.literalText === "function" ? Amaterasu.literalText(value) : value;
     }
@@ -12462,7 +12529,10 @@ var Amaterasu;
             void loadLutris();
             void loadPlaynite();
             void loadInput();
-            Amaterasu.renderExtensionSlot(context, metricsArea, "settings");
+            Amaterasu.renderExtensionSlot(context, metricsArea, "settings", owners => {
+                if (typeof Amaterasu.renderSessionExtensionSettings === "function")
+                    Amaterasu.renderSessionExtensionSettings(context, sessionExtensionsArea, { kind: "host" }, undefined, owners);
+            });
             Amaterasu.renderUpdaterSettings(context, updaterArea);
             Amaterasu.renderSystemTraySettings(context, systemTrayArea);
             void loadPairing();
@@ -13810,7 +13880,7 @@ var Amaterasu;
                 const save = Amaterasu.el("button", "button primary", "Save host settings");
                 save.type = "submit";
                 save.disabled = !context.api.allows("configuration.write");
-                form.append(...softwareEncoder.fields, softwareAvailability, Amaterasu.el("p", "muted", settingsTextLiteral(`Effective software settings: preset ${JSON.stringify(settings.effective_sw_preset ?? "superfast")}, tune ${JSON.stringify(settings.effective_sw_tune ?? "zerolatency")}, minimum slice request ${settings.effective_min_threads ?? 2}; software requests max(client-negotiated slices, this value), subject to x264 frame-size and backend limits. Effective QP metadata: ${settings.effective_qp ?? 28}; current x264 ABR ignores it because Amaterasu has no VAAPI CQP consumer.`)), Amaterasu.field("Name shown to Moonlight", hostname, "Leave blank to use this PC's name."), Amaterasu.field("Moonlight HTTP port", port, "HTTPS uses the port five below this value."), Amaterasu.field("Global FEC percentage", fecPercentage, settingsTextLiteral(`Controls the repair percentage used for new streams unless an application or paired client overrides it. Leave blank to use the startup value (${settings.effective_fec_percentage}%). Valid values are 1–255.`)), Amaterasu.field("Automatic router port mapping (UPnP)", upnp, "Requests gateway mappings for active stream listeners. The management listener is mapped only when its peer policy allows WAN access. This setting has no effect when the gateway does not support UPnP."), Amaterasu.el("p", settings.upnp_status === "error" ? "error" : "muted", settingsTextLiteral(`UPnP status: ${settings.upnp_status.replaceAll("_", " ")}${settings.upnp_error ? ` · ${settings.upnp_error}` : ""}`)), Amaterasu.field("Address family", addressFamily, "Choose IPv4 only, both families, or retain the startup policy."), Amaterasu.field("Use startup bind address", useStartupBindAddress, settingsTextLiteral(`The effective bind address is ${settings.bind_address}. Turn this off to choose an explicit address; a blank value is distinct from startup policy.`)), Amaterasu.field("Bind address override", bindAddress, "Use a literal IPv4 or IPv6 address. An explicit blank uses the startup policy's wildcard/loopback behavior."), Amaterasu.field("Capture backend", capture, settingsTextLiteral(`Automatic uses the startup backend. The current backend is ${settings.capture_provider ?? "unavailable"}; explicit providers fail if unavailable. X11 requires the host process's authorized DISPLAY and reads output pixels through the X server. DRM/KMS reads only an active primary plane and omits cursor/overlay planes and the CRTC color pipeline; it does not capture managed virtual displays. Save and reopen settings to list outputs for a new backend.`)), Amaterasu.field("Display and adapter policy (JSON)", displayPolicy, "Use the listed setting names and typed JSON values. This editor saves a full policy snapshot: omitted keys reset to the product default. Per-application and paired-client values may override stream-scoped settings. Native support remains platform/provider-specific and unsupported changes fail closed."), Amaterasu.field("Capture output", outputName, "Choose a display for future Moonlight streams. Automatic retains the configured startup output."), Amaterasu.field("Stream audio", streamAudio, "Enable host audio capture for future streams. Applications and paired clients may override this setting."), Amaterasu.field("NVENC preset", nvencPreset, "Select NVENC preset P1 through P7 for future streams."), Amaterasu.field("NVENC H.264 CAVLC", nvencH264Cavlc, "Request CAVLC entropy coding for NVENC H.264."), Amaterasu.field("NVENC two-pass mode", nvencTwoPass, "Choose disabled, quarter-resolution, or full-resolution two-pass encoding."), Amaterasu.field("NVENC VBV increase (%)", nvencVbvIncrease, "Increase NVENC VBV buffer size by 0–400 percent."), Amaterasu.field("NVENC split encode", nvencSplitEncode, "Choose automatic driver selection or explicitly enable or disable split encoding."), Amaterasu.field("NVENC real-time HAGS", nvencRealtimeHags, "Configure the NVENC real-time scheduling hint for systems using hardware-accelerated GPU scheduling."), Amaterasu.field("NVENC OpenGL/Vulkan on DXGI", nvencOpenGlVulkanOnDxgi, "Configure NVENC handling for OpenGL and Vulkan capture through DXGI."), Amaterasu.field("NVENC latency over power", nvencLatencyOverPower, "Prefer encoding latency over power efficiency."), Amaterasu.field("VAAPI strict rate-control buffer", vaapiStrictRcBuffer, "Use strict rate-control buffer behavior for VAAPI."), Amaterasu.field("WGC pacing smoothing", wgcPacing, settingsTextLiteral(`Preserve the frame pacing grid after eligible Windows WGC capture misses. Current effective policy: ${settings.effective_wgc_pacing_smoothing ? "enabled" : "disabled"}. Constant-rate WGC currently lacks fresh-frame identity for this policy.`)), Amaterasu.field("Audio capture endpoint", audioSink, settingsTextLiteral(`Choose the output device used for loopback capture in future streams. Automatic uses the startup endpoint. Current effective endpoint: ${settings.effective_audio_sink}.`)), Amaterasu.field("Set a virtual audio sink", virtualSinkEnabled, "Keep the selector unset to use the regular capture endpoint. An explicitly empty selector is preserved as distinct from unset; Amaterasu currently cannot perform Sunshine's host-audio fallback selection for it."), Amaterasu.field("Virtual sink ID or name", virtualSink, "Match a Windows virtual output by ID, friendly name, device description, or adapter name. The selected virtual sink takes precedence over the regular endpoint for future streams."), Amaterasu.field("Global preparation commands (JSON)", globalPreparation, "Enter an ordered JSON array of up to 8 run commands with optional undo commands. Executables and working directories must be absolute native paths; blank input clears the list."), globalPreparationValidation, Amaterasu.field("Capture selected audio endpoint without changing default outputs", audioSinkCaptureOnly, "For an explicitly selected Windows endpoint, keep the host's Console, Multimedia, and Communications default outputs. The setting applies to future streams."), Amaterasu.field("Install Steam Streaming Speakers driver when missing", installSteamAudioDrivers, "Enabled by default on Windows. Amaterasu best-effort installs Steam's x64 INF from Common Files when the endpoint is missing. Installer failures do not block streaming. Default roles are restored only when they remain on Steam's endpoint. Disabling does not cancel a Windows installation already in progress; its endpoint check and route cleanup finish."), steamAudioDriverStatus, Amaterasu.field("External IP", externalIp, "Stored for configuration parity. This host does not currently advertise or detect an external IP from this setting; blank resets it."), Amaterasu.field("LAN video encryption", lanEncryptionMode, "Choose whether video-stream encryption is disabled, negotiated when supported, or required for LAN peers. Applies to new streams."), Amaterasu.field("WAN video encryption", wanEncryptionMode, "Choose whether video-stream encryption is disabled, negotiated when supported, or required for WAN peers. Applies to new streams."), Amaterasu.field("Video batch size (KiB)", videoBatchSize, settingsTextLiteral(`Use 16, 32, or 64 KiB; blank or 0 selects 64 KiB. Current effective size: ${settings.effective_video_max_batch_size_kb} KiB${settings.video_batch_size_fallback ? " (configured value fell back to 64 KiB)" : ""}.`)), Amaterasu.field("Maximum bitrate (kbps)", maxBitrate, settingsTextLiteral(`A positive value caps the host's initial stream bitrate. Blank resets to no host cap; zero or negative values also leave it uncapped. Caps below 100 kbps cannot launch with the current encoder. Current cap: ${settings.effective_max_bitrate_kbps === null ? "none" : `${settings.effective_max_bitrate_kbps} kbps`}.`)), Amaterasu.field("Minimum frame rate (FPS)", minimumFpsTarget, settingsTextLiteral(`On idle capture, repeat the last accepted frame to target this rate. Zero uses the negotiated stream FPS; blank resets to 20 FPS. Current effective target: ${settings.effective_minimum_fps_target} FPS.`)), Amaterasu.field("Stream ping timeout (ms)", pingTimeout, settingsTextLiteral(`Disconnect a stream after this much time without a ping. Zero expires immediately; blank resets to the default. Current effective timeout: ${settings.effective_ping_timeout_ms} ms.`)), ...(outputDiscoveryIssue ? [Amaterasu.el("p", "muted", outputDiscoveryIssue)] : []), ...(audioDiscoveryIssue ? [Amaterasu.el("p", "muted", audioDiscoveryIssue)] : []), Amaterasu.el("p", "muted", settingsTextLiteral(`Active HTTP addresses: ${settings.http_addresses?.join(", ") || "off"} · HTTPS: ${settings.https_addresses?.join(", ") || "off"} · RTSP: ${settings.rtsp_addresses?.join(", ") || "off"}`)), Amaterasu.el("p", "muted", settingsTextLiteral(`Active ports: HTTP ${settings.active_http_port ?? "off"}, HTTPS ${settings.active_https_port ?? "off"}, RTSP ${settings.active_rtsp_port ?? "off"}`)), ...(settings.listener_error ? [Amaterasu.el("p", "error", settings.listener_error)] : []), ...(settings.rtsp_listener_error ? [Amaterasu.el("p", "error", settings.rtsp_listener_error)] : []), status, Amaterasu.el("div", "actions", save, Amaterasu.badge(settingsTextLiteral(`Revision ${settings.revision}`))));
+                form.append(...softwareEncoder.fields, softwareAvailability, Amaterasu.el("p", "muted", settingsTextLiteral(`Effective software settings: preset ${JSON.stringify(settings.effective_sw_preset ?? "superfast")}, tune ${JSON.stringify(settings.effective_sw_tune ?? "zerolatency")}, minimum slice request ${settings.effective_min_threads ?? 2}; software requests max(client-negotiated slices, this value), subject to x264 frame-size and backend limits. Effective QP metadata: ${settings.effective_qp ?? 28}; current x264 ABR ignores it because Amaterasu has no VAAPI CQP consumer.`)), Amaterasu.field("Name shown to Moonlight", hostname, "Leave blank to use this PC's name."), Amaterasu.field("Moonlight HTTP port", port, "HTTPS uses the port five below this value."), Amaterasu.field("Global FEC percentage", fecPercentage, settingsTextLiteral(`Controls the repair percentage used for new streams unless an application or paired client overrides it. Leave blank to use the startup value (${settings.effective_fec_percentage}%). Valid values are 1–255.`)), Amaterasu.field("Automatic router port mapping (UPnP)", upnp, "Requests gateway mappings for active stream listeners. The management listener is mapped only when its peer policy allows WAN access. This setting has no effect when the gateway does not support UPnP."), Amaterasu.el("p", settings.upnp_status === "error" ? "error" : "muted", settingsTextLiteral(`UPnP status: ${settings.upnp_status.replaceAll("_", " ")}${settings.upnp_error ? ` · ${settings.upnp_error}` : ""}`)), Amaterasu.field("Address family", addressFamily, "Choose IPv4 only, both families, or retain the startup policy."), Amaterasu.field("Use startup bind address", useStartupBindAddress, settingsTextLiteral(`The effective bind address is ${settings.bind_address}. Turn this off to choose an explicit address; a blank value is distinct from startup policy.`)), Amaterasu.field("Bind address override", bindAddress, "Use a literal IPv4 or IPv6 address. An explicit blank uses the startup policy's wildcard/loopback behavior."), Amaterasu.field("Capture backend", capture, settingsTextLiteral(`Automatic uses the startup backend. The current backend is ${settings.capture_provider ?? "unavailable"}; explicit providers fail if unavailable. X11 requires the host process's authorized DISPLAY and reads output pixels through the X server. DRM/KMS reads only an active primary plane and omits cursor/overlay planes and the CRTC color pipeline; it does not capture managed virtual displays. Save and reopen settings to list outputs for a new backend.`)), markHostSettingsOwner("amaterasu.display", Amaterasu.field("Display and adapter policy (JSON)", displayPolicy, "Use the listed setting names and typed JSON values. This editor saves a full policy snapshot: omitted keys reset to the product default. Per-application and paired-client values may override stream-scoped settings. Native support remains platform/provider-specific and unsupported changes fail closed.")), markHostSettingsOwner("amaterasu.display", Amaterasu.field("Capture output", outputName, "Choose a display for future Moonlight streams. Automatic retains the configured startup output.")), Amaterasu.field("Stream audio", streamAudio, "Enable host audio capture for future streams. Applications and paired clients may override this setting."), Amaterasu.field("NVENC preset", nvencPreset, "Select NVENC preset P1 through P7 for future streams."), Amaterasu.field("NVENC H.264 CAVLC", nvencH264Cavlc, "Request CAVLC entropy coding for NVENC H.264."), Amaterasu.field("NVENC two-pass mode", nvencTwoPass, "Choose disabled, quarter-resolution, or full-resolution two-pass encoding."), Amaterasu.field("NVENC VBV increase (%)", nvencVbvIncrease, "Increase NVENC VBV buffer size by 0–400 percent."), Amaterasu.field("NVENC split encode", nvencSplitEncode, "Choose automatic driver selection or explicitly enable or disable split encoding."), Amaterasu.field("NVENC real-time HAGS", nvencRealtimeHags, "Configure the NVENC real-time scheduling hint for systems using hardware-accelerated GPU scheduling."), Amaterasu.field("NVENC OpenGL/Vulkan on DXGI", nvencOpenGlVulkanOnDxgi, "Configure NVENC handling for OpenGL and Vulkan capture through DXGI."), Amaterasu.field("NVENC latency over power", nvencLatencyOverPower, "Prefer encoding latency over power efficiency."), Amaterasu.field("VAAPI strict rate-control buffer", vaapiStrictRcBuffer, "Use strict rate-control buffer behavior for VAAPI."), Amaterasu.field("WGC pacing smoothing", wgcPacing, settingsTextLiteral(`Preserve the frame pacing grid after eligible Windows WGC capture misses. Current effective policy: ${settings.effective_wgc_pacing_smoothing ? "enabled" : "disabled"}. Constant-rate WGC currently lacks fresh-frame identity for this policy.`)), Amaterasu.field("Audio capture endpoint", audioSink, settingsTextLiteral(`Choose the output device used for loopback capture in future streams. Automatic uses the startup endpoint. Current effective endpoint: ${settings.effective_audio_sink}.`)), Amaterasu.field("Set a virtual audio sink", virtualSinkEnabled, "Keep the selector unset to use the regular capture endpoint. An explicitly empty selector is preserved as distinct from unset; Amaterasu currently cannot perform Sunshine's host-audio fallback selection for it."), Amaterasu.field("Virtual sink ID or name", virtualSink, "Match a Windows virtual output by ID, friendly name, device description, or adapter name. The selected virtual sink takes precedence over the regular endpoint for future streams."), Amaterasu.field("Global preparation commands (JSON)", globalPreparation, "Enter an ordered JSON array of up to 8 run commands with optional undo commands. Executables and working directories must be absolute native paths; blank input clears the list."), globalPreparationValidation, Amaterasu.field("Capture selected audio endpoint without changing default outputs", audioSinkCaptureOnly, "For an explicitly selected Windows endpoint, keep the host's Console, Multimedia, and Communications default outputs. The setting applies to future streams."), Amaterasu.field("Install Steam Streaming Speakers driver when missing", installSteamAudioDrivers, "Enabled by default on Windows. Amaterasu best-effort installs Steam's x64 INF from Common Files when the endpoint is missing. Installer failures do not block streaming. Default roles are restored only when they remain on Steam's endpoint. Disabling does not cancel a Windows installation already in progress; its endpoint check and route cleanup finish."), steamAudioDriverStatus, Amaterasu.field("External IP", externalIp, "Stored for configuration parity. This host does not currently advertise or detect an external IP from this setting; blank resets it."), Amaterasu.field("LAN video encryption", lanEncryptionMode, "Choose whether video-stream encryption is disabled, negotiated when supported, or required for LAN peers. Applies to new streams."), Amaterasu.field("WAN video encryption", wanEncryptionMode, "Choose whether video-stream encryption is disabled, negotiated when supported, or required for WAN peers. Applies to new streams."), Amaterasu.field("Video batch size (KiB)", videoBatchSize, settingsTextLiteral(`Use 16, 32, or 64 KiB; blank or 0 selects 64 KiB. Current effective size: ${settings.effective_video_max_batch_size_kb} KiB${settings.video_batch_size_fallback ? " (configured value fell back to 64 KiB)" : ""}.`)), Amaterasu.field("Maximum bitrate (kbps)", maxBitrate, settingsTextLiteral(`A positive value caps the host's initial stream bitrate. Blank resets to no host cap; zero or negative values also leave it uncapped. Caps below 100 kbps cannot launch with the current encoder. Current cap: ${settings.effective_max_bitrate_kbps === null ? "none" : `${settings.effective_max_bitrate_kbps} kbps`}.`)), Amaterasu.field("Minimum frame rate (FPS)", minimumFpsTarget, settingsTextLiteral(`On idle capture, repeat the last accepted frame to target this rate. Zero uses the negotiated stream FPS; blank resets to 20 FPS. Current effective target: ${settings.effective_minimum_fps_target} FPS.`)), Amaterasu.field("Stream ping timeout (ms)", pingTimeout, settingsTextLiteral(`Disconnect a stream after this much time without a ping. Zero expires immediately; blank resets to the default. Current effective timeout: ${settings.effective_ping_timeout_ms} ms.`)), ...(outputDiscoveryIssue ? [Amaterasu.el("p", "muted", outputDiscoveryIssue)] : []), ...(audioDiscoveryIssue ? [Amaterasu.el("p", "muted", audioDiscoveryIssue)] : []), Amaterasu.el("p", "muted", settingsTextLiteral(`Active HTTP addresses: ${settings.http_addresses?.join(", ") || "off"} · HTTPS: ${settings.https_addresses?.join(", ") || "off"} · RTSP: ${settings.rtsp_addresses?.join(", ") || "off"}`)), Amaterasu.el("p", "muted", settingsTextLiteral(`Active ports: HTTP ${settings.active_http_port ?? "off"}, HTTPS ${settings.active_https_port ?? "off"}, RTSP ${settings.active_rtsp_port ?? "off"}`)), ...(settings.listener_error ? [Amaterasu.el("p", "error", settings.listener_error)] : []), ...(settings.rtsp_listener_error ? [Amaterasu.el("p", "error", settings.rtsp_listener_error)] : []), status, Amaterasu.el("div", "actions", save, Amaterasu.badge(settingsTextLiteral(`Revision ${settings.revision}`))));
                 form.addEventListener("submit", (event) => {
                     event.preventDefault();
                     if (!form.reportValidity())
@@ -13986,7 +14056,10 @@ var Amaterasu;
         void loadLutris();
         void loadPlaynite();
         void loadInput();
-        Amaterasu.renderExtensionSlot(context, metricsArea, "settings");
+        Amaterasu.renderExtensionSlot(context, metricsArea, "settings", owners => {
+            if (typeof Amaterasu.renderSessionExtensionSettings === "function")
+                Amaterasu.renderSessionExtensionSettings(context, sessionExtensionsArea, { kind: "host" }, undefined, owners);
+        });
         Amaterasu.renderUpdaterSettings(context, updaterArea);
         Amaterasu.renderSystemTraySettings(context, systemTrayArea);
         void loadPairing();
@@ -14402,6 +14475,23 @@ var Amaterasu;
 })(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
 (function (Amaterasu) {
+    function parseRunningModules(value) {
+        if (!Array.isArray(value) || value.length < 1 || value.length > 128)
+            throw new Error("Loaded module inventory is invalid.");
+        const ids = new Set();
+        return value.map((entry) => {
+            if (!entry || typeof entry !== "object" || Array.isArray(entry))
+                throw new Error("Loaded module identity is invalid.");
+            const row = entry;
+            if (typeof row.id !== "string" || !/^[a-z0-9._-]{1,128}$/.test(row.id) || ids.has(row.id) ||
+                typeof row.version !== "string" || !row.version || new TextEncoder().encode(row.version).length > 128 || /[\u0000-\u001f\u007f-\u009f]/u.test(row.version) ||
+                typeof row.sha256 !== "string" || !/^[a-f0-9]{64}$/.test(row.sha256) || typeof row.runtime !== "boolean")
+                throw new Error("Loaded module identity is invalid.");
+            ids.add(row.id);
+            return { id: row.id, version: row.version, sha256: row.sha256, runtime: row.runtime };
+        });
+    }
+    Amaterasu.parseRunningModules = parseRunningModules;
     function parsePackageSelectionStatus(value) {
         if (!value || typeof value !== "object" || Array.isArray(value))
             throw new Error("Package selection response is invalid.");
@@ -14444,6 +14534,7 @@ var Amaterasu;
             running: {
                 available: running.available,
                 digest: running.available === true ? running.digest : null,
+                ...(running.available === true && Object.hasOwn(running, "modules") ? { modules: parseRunningModules(running.modules) } : {}),
             },
         };
     }
@@ -14514,12 +14605,13 @@ var Amaterasu;
     Amaterasu.parseRepositoryPage = parseRepositoryPage;
     function renderUpdates(context) {
         const area = Amaterasu.el("div");
-        const statusArea = Amaterasu.el("div");
+        const statusArea = Amaterasu.el("div", "module-repository-status");
         const selectionArea = Amaterasu.el("div");
+        const modulesArea = Amaterasu.el("div");
         let loadRequest = 0;
         let selectionSnapshot;
         let repositorySnapshot;
-        context.content.append(Amaterasu.sectionHeading("Modules & UI", "Choose verified implementations from approved publishers.", Amaterasu.button("Refresh", load)), Amaterasu.el("div", "notice", Amaterasu.el("strong", "", "Publisher authority is broad"), Amaterasu.el("p", "", "Approving a publisher allows it to supply any native module slot, including management, and the UI. Native modules share their worker's user privileges, while a replacement UI runs in the signed-in browser session and can use its API authority. Approval does not grant elevation. A signature proves source, not safe behavior.")), Amaterasu.panel("Persisted package selection", selectionArea, Amaterasu.el("p", "muted", "Persisted phases are not a live runtime snapshot; the host reports the loaded package digest separately.")), Amaterasu.panel("Read-only repository status", statusArea, Amaterasu.el("p", "muted", "The authenticated API exposes repository listing only and has no approve, revoke, refresh, download, stage, install, activate, or restore actions. This page will not run shell commands.")), area);
+        context.content.append(Amaterasu.sectionHeading("Modules & UI", "Choose verified implementations from approved publishers.", Amaterasu.button("Refresh", load)), Amaterasu.panel("Loaded modules", modulesArea), Amaterasu.el("div", "notice", Amaterasu.el("strong", "", "Publisher authority is broad"), Amaterasu.el("p", "", "Approving a publisher allows it to supply any native module slot, including management, and the UI. Native modules share their worker's user privileges, while a replacement UI runs in the signed-in browser session and can use its API authority. Approval does not grant elevation. A signature proves source, not safe behavior.")), Amaterasu.panel("Persisted package selection", selectionArea, Amaterasu.el("p", "muted", "Persisted phases are not a live runtime snapshot; the host reports the loaded package digest separately.")), Amaterasu.panel("Read-only repository status", statusArea, Amaterasu.el("p", "muted", "The authenticated API exposes repository listing only and has no approve, revoke, refresh, download, stage, install, activate, or restore actions. This page will not run shell commands.")), area);
         async function load() {
             const request = ++loadRequest;
             selectionSnapshot = undefined;
@@ -14528,11 +14620,13 @@ var Amaterasu;
                 selectionSnapshot = null;
                 repositorySnapshot = null;
                 selectionArea.replaceChildren(Amaterasu.empty("Package selection unavailable", "This session needs configuration.read to inspect persisted package selection metadata."));
+                modulesArea.replaceChildren(Amaterasu.empty("Modules unavailable", "Sign in with permission to read configuration."));
                 statusArea.replaceChildren(Amaterasu.empty("Repository status unavailable", "This session needs configuration.read to inspect approved publishers and their verified catalog choices."));
                 area.replaceChildren();
                 return;
             }
             selectionArea.replaceChildren(Amaterasu.el("p", "muted", "Loading persisted package selection…"));
+            modulesArea.replaceChildren(Amaterasu.el("p", "muted", "Loading modules from the running package…"));
             statusArea.replaceChildren(Amaterasu.el("p", "muted", "Loading verified repository status…"));
             area.replaceChildren(Amaterasu.el("p", "muted", "Loading verified repository choices…"));
             const selectionRequest = loadPackageSelection(request);
@@ -14540,8 +14634,12 @@ var Amaterasu;
                 if (!selectionArea.isConnected || request !== loadRequest)
                     return;
                 selectionSnapshot = selection;
-                if (selection)
+                if (selection) {
                     renderSelection(selection, repositorySnapshot);
+                    renderModules(selection);
+                }
+                else
+                    modulesArea.replaceChildren(Amaterasu.empty("Modules unavailable", "The running package could not be verified."));
             });
             try {
                 const byId = new Map();
@@ -14620,6 +14718,26 @@ var Amaterasu;
                 ["Trial selection", value(selection.trial), candidateMatch(selection.trial)],
                 ["Highest accepted sequence", selection.highestSequence, "—"],
             ]), Amaterasu.el("p", "muted", "Catalog matches require exact signed native manifest digest equality. They do not establish which publisher supplied the staged package or whether a trial passed."), ...(!selection.active ? [Amaterasu.el("p", "muted", "No active package digest is recorded in selection metadata.")] : []));
+        }
+        function renderModules(selection) {
+            const modules = selection.running.modules;
+            if (!selection.running.available || !modules) {
+                modulesArea.replaceChildren(Amaterasu.empty("Module inventory unavailable", "The verified manifest is unavailable, or this host does not support module inventory."));
+                return;
+            }
+            const find = Amaterasu.input("module_search", "");
+            find.placeholder = "Find a module";
+            const cards = Amaterasu.el("div", "module-card-grid");
+            const render = () => {
+                const search = find.value.trim().toLowerCase();
+                const selected = modules.filter(module => module.id.includes(search)).sort((a, b) => a.id.localeCompare(b.id));
+                cards.replaceChildren(...selected.map(module => Amaterasu.panel(module.id.replace(/^amaterasu\./, "").replace(/[._-]+/g, " "), Amaterasu.badge(module.runtime ? "Runtime" : "Native module"), Amaterasu.el("p", "muted", module.id), Amaterasu.el("p", "", `Version ${module.version}`), Amaterasu.el("small", "muted module-digest", `Verified library ${module.sha256}`))));
+                if (!selected.length)
+                    cards.replaceChildren(Amaterasu.empty("No matching modules", "Try another module name."));
+            };
+            find.addEventListener("input", render);
+            modulesArea.replaceChildren(Amaterasu.el("p", "muted", `${modules.length} modules in the verified running package. This list does not establish individual module health.`), Amaterasu.field("Find a module", find), cards);
+            render();
         }
         function renderStatus(repositories) {
             const summary = summarizeRepositoryState(repositories);
@@ -19893,8 +20011,12 @@ var Amaterasu;
 })(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
 (function (Amaterasu) {
-    function renderExtensionSlot(context, container, slot) {
+    const extensionSlotDisposers = new WeakMap();
+    function renderExtensionSlot(context, container, slot, onOwners) {
+        extensionSlotDisposers.get(container)?.();
+        container.replaceChildren();
         const children = [];
+        let owners = new Set();
         let disposed = false;
         const dispose = () => {
             if (disposed)
@@ -19905,12 +20027,26 @@ var Amaterasu;
                 child.dispose();
             discovery.dispose();
         };
-        const observer = new MutationObserver(() => { if (!container.isConnected)
-            dispose(); });
+        extensionSlotDisposers.set(container, dispose);
+        const observer = new MutationObserver(() => {
+            if (!container.isConnected)
+                dispose();
+            else if (slot === "settings" && typeof Amaterasu.claimModuleSettings === "function")
+                Amaterasu.claimModuleSettings(context, owners);
+        });
         observer.observe(document.body, { childList: true, subtree: true });
         context.registerDraftGuard?.(() => children.some(child => child.isDirty()), dispose);
         const discovery = new Amaterasu.ExtensionPages(context.api);
         void discovery.discover().then(async (descriptors) => {
+            if (disposed || !container.isConnected)
+                return;
+            owners = new Set(descriptors.filter(entry => entry.placements?.includes(slot)).flatMap(entry => {
+                const owner = entry.settings_owner ?? entry.settings_provider;
+                return owner ? [owner] : [];
+            }));
+            onOwners?.(owners);
+            if (slot === "settings" && typeof Amaterasu.claimModuleSettings === "function")
+                Amaterasu.claimModuleSettings(context, owners);
             for (const descriptor of descriptors) {
                 if (disposed || !container.isConnected)
                     return;
@@ -19988,7 +20124,9 @@ var Amaterasu;
             (record.placements === undefined || (Array.isArray(record.placements) && record.placements.length > 0 && record.placements.length <= 4 &&
                 new Set(record.placements).size === record.placements.length && record.placements.every((place) => place === "page" || place === "application" || place === "overview" || place === "settings"))) &&
             (record.settings_provider == null || (typeof record.settings_provider === "string" && /^[a-z0-9._-]{1,128}$/.test(record.settings_provider) &&
-                Array.isArray(record.placements) && record.placements.includes("application"))) &&
+                Array.isArray(record.placements) && (record.placements.includes("application") || record.placements.includes("settings")))) &&
+            (record.settings_owner == null || (typeof record.settings_owner === "string" && /^[a-z0-9._-]{1,128}$/.test(record.settings_owner) &&
+                Array.isArray(record.placements) && (record.placements.includes("application") || record.placements.includes("settings")))) &&
             /^[a-zA-Z0-9._/-]+\.js$/.test(record.entrypoint) &&
             !record.entrypoint.split("/").some((part) => !part || part === "." || part === "..") &&
             Array.isArray(record.methods) && record.methods.length <= 64 &&
@@ -20116,7 +20254,7 @@ var Amaterasu;
             const sdk = Object.freeze({
                 version: 1,
                 signal: controller.signal,
-                features: Object.freeze(["ui.controls/1", "ui.forms/1", "ui.forms/2", "ui.controls/2", "ui.feedback/1", "ui.layout/1", "ui.tabs/1", "ui.dialog/1", "ui.charts/1", "ui.assets/1", ...(application ? ["ui.application-section/1", ...(descriptor.settings_provider ? ["ui.application-settings/1"] : [])] : [])]),
+                features: Object.freeze(["ui.controls/1", "ui.forms/1", "ui.forms/2", "ui.controls/2", "ui.feedback/1", "ui.layout/1", "ui.tabs/1", "ui.dialog/1", "ui.charts/1", "ui.assets/1", ...(descriptor.settings_provider && (application || slot === "settings") ? ["ui.settings/1"] : []), ...(application ? ["ui.application-section/1", ...(descriptor.settings_provider ? ["ui.application-settings/1"] : [])] : [])]),
                 ui: Object.freeze({
                     ...Amaterasu.createExtensionUiWithDialogsV1(controller.signal),
                     ...Amaterasu.createExtensionUiTabsV1(controller.signal),
@@ -20145,8 +20283,12 @@ var Amaterasu;
                     state?.("busy", value);
                 } },
                 ...(application ? {
-                    application: Object.freeze({ id: application.id, name: application.name }),
-                    ...(descriptor.settings_provider ? { settings: this.applicationSettings(descriptor.settings_provider, application, controller.signal) } : {}),
+                    application: Object.freeze({ id: application.id, name: application.name,
+                        notifyChanged: () => { if (!controller.signal.aborted)
+                            application.onDocumentChange?.(); } }),
+                } : {}),
+                ...(descriptor.settings_provider && (application || slot === "settings") ? {
+                    settings: this.scopedSettings(descriptor.settings_provider, application ? { kind: "application", id: application.id } : { kind: "host" }, controller.signal),
                 } : {}),
             });
             const callback = slot === "overview" ? page.mountOverview : slot === "settings" ? page.mountSettings : application ? page.mountApplication : page.mount;
@@ -20169,20 +20311,46 @@ var Amaterasu;
         async mountSlot(id, container, slot) {
             return this.mount(id, container, undefined, undefined, slot);
         }
-        applicationSettings(provider, application, signal) {
-            const scope = Object.freeze({ kind: "application", id: application.id });
+        scopedSettings(provider, selectedScope, signal) {
+            const scope = Object.freeze(selectedScope);
             const request = async (route, payload) => {
                 if (signal.aborted)
-                    throw new Error("Application section is closed.");
+                    throw new Error("Plugin settings section is closed.");
                 const response = await this.api.post(route, { ...payload, provider, scope }, true, signal);
                 if (signal.aborted)
-                    throw new Error("Application section is closed.");
+                    throw new Error("Plugin settings section is closed.");
                 return response;
             };
             return Object.freeze({
                 version: 1,
                 provider,
+                scope,
                 canWrite: this.api.allows("configuration.write"),
+                describe: async () => {
+                    let after = null, revision = null;
+                    const seen = new Set();
+                    for (let pageIndex = 0; pageIndex < 32; pageIndex++) {
+                        if (signal.aborted)
+                            throw new Error("Plugin settings section is closed.");
+                        const page = await this.api.post("session-extensions/list", { after, limit: 32, revision }, true, signal);
+                        if (signal.aborted)
+                            throw new Error("Plugin settings section is closed.");
+                        if (!Array.isArray(page.items) || page.items.length > 32 || !Number.isSafeInteger(page.revision) || page.revision < 0 ||
+                            (revision !== null && revision !== page.revision) || (page.next !== null && typeof page.next !== "string"))
+                            throw new Error("Invalid plugin settings discovery.");
+                        const descriptor = page.items.find(item => item.provider === provider);
+                        if (descriptor)
+                            return descriptor;
+                        if (page.next === null)
+                            throw new Error("Plugin settings provider is unavailable.");
+                        if (!page.next || seen.has(page.next))
+                            throw new Error("Plugin settings discovery cursor repeated.");
+                        seen.add(page.next);
+                        after = page.next;
+                        revision = page.revision;
+                    }
+                    throw new Error("Plugin settings discovery exceeded its bound.");
+                },
                 read: () => request("session-extensions/settings_get", {}),
                 update: (expectedRevision, values) => {
                     if (!this.api.allows("configuration.write"))
@@ -20609,6 +20777,15 @@ var Amaterasu;
 })(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
 (function (Amaterasu) {
+    const settingsRenderers = new WeakMap();
+    function claimModuleSettings(context, owners) {
+        for (const node of context.content.querySelectorAll("[data-settings-owner]")) {
+            const claimed = owners.has(node.getAttribute("data-settings-owner") ?? "");
+            node.classList.toggle("module-settings-claimed", claimed);
+            node.inert = claimed;
+        }
+    }
+    Amaterasu.claimModuleSettings = claimModuleSettings;
     function sessionExtensionApplyPolicyHelp(policy) {
         switch (policy) {
             case "next_session": return "Requires a new application session.";
@@ -20642,7 +20819,9 @@ var Amaterasu;
         renderSessionExtensionSettings(context, area, scope, provider);
     }
     Amaterasu.showSessionExtensionSettings = showSessionExtensionSettings;
-    function renderSessionExtensionSettings(context, area, scope = { kind: "host" }, provider) {
+    function renderSessionExtensionSettings(context, area, scope = { kind: "host" }, provider, excluded = new Set()) {
+        const renderer = {};
+        settingsRenderers.set(area, renderer);
         let generation = 0;
         async function load() {
             const current = ++generation;
@@ -20667,9 +20846,9 @@ var Amaterasu;
                     if (descriptors.length > 1024)
                         throw new Error("Too many extensions.");
                 } while (after);
-                const scopedDescriptors = descriptors.filter((descriptor) => (!provider || descriptor.provider === provider) && Array.isArray(descriptor.options) && descriptor.options.some((option) => Array.isArray(option.allowed_scopes) && option.allowed_scopes.includes(scope.kind)));
+                const scopedDescriptors = descriptors.filter((descriptor) => !excluded.has(descriptor.provider) && (!provider || descriptor.provider === provider) && Array.isArray(descriptor.options) && descriptor.options.some((option) => Array.isArray(option.allowed_scopes) && option.allowed_scopes.includes(scope.kind)));
                 const settings = await Promise.all(scopedDescriptors.map((descriptor) => context.api.post("session-extensions/settings_get", { provider: descriptor.provider, scope })));
-                if (current !== generation || !context.content.isConnected || !area.isConnected)
+                if (settingsRenderers.get(area) !== renderer || current !== generation || !context.content.isConnected || !area.isConnected)
                     return;
                 const panels = [];
                 scopedDescriptors.forEach((descriptor, index) => {
@@ -20746,7 +20925,7 @@ var Amaterasu;
                 area.replaceChildren(...(panels.length ? panels : [Amaterasu.el("p", "muted", "No plugin settings are available for this scope.")]));
             }
             catch (error) {
-                if (current === generation && context.content.isConnected && area.isConnected)
+                if (settingsRenderers.get(area) === renderer && current === generation && context.content.isConnected && area.isConnected)
                     area.replaceChildren(Amaterasu.errorPanel(error, load));
             }
         }
@@ -20807,6 +20986,7 @@ var Amaterasu;
             if (disposed || !area.isConnected)
                 return;
             const sections = descriptors.filter((entry) => entry.placements?.includes("application"));
+            claimModuleSettings(context, new Set(sections.flatMap(entry => entry.settings_owner ?? entry.settings_provider ? [entry.settings_owner ?? entry.settings_provider] : [])));
             renderFallback(new Set(sections.flatMap((entry) => entry.settings_provider ? [entry.settings_provider] : [])));
             for (const descriptor of sections) {
                 const container = Amaterasu.el("div");

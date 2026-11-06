@@ -1,4 +1,7 @@
 namespace Amaterasu {
+  function markHostSettingsOwner(owner: string, node: HTMLElement): HTMLElement {
+    node.setAttribute("data-settings-owner",owner); return node;
+  }
   function settingsTextLiteral(value: string): TextValue {
     return typeof Amaterasu.literalText === "function" ? Amaterasu.literalText(value) : value;
   }
@@ -3179,7 +3182,10 @@ namespace Amaterasu {
       void loadLutris();
       void loadPlaynite();
       void loadInput();
-      renderExtensionSlot(context, metricsArea, "settings");
+      renderExtensionSlot(context, metricsArea, "settings", owners => {
+        if (typeof Amaterasu.renderSessionExtensionSettings === "function")
+          Amaterasu.renderSessionExtensionSettings(context, sessionExtensionsArea, {kind:"host"}, undefined, owners);
+      });
       renderUpdaterSettings(context, updaterArea);
       renderSystemTraySettings(context, systemTrayArea);
       void loadPairing();
@@ -4990,16 +4996,16 @@ namespace Amaterasu {
             capture,
             settingsTextLiteral(`Automatic uses the startup backend. The current backend is ${settings.capture_provider ?? "unavailable"}; explicit providers fail if unavailable. X11 requires the host process's authorized DISPLAY and reads output pixels through the X server. DRM/KMS reads only an active primary plane and omits cursor/overlay planes and the CRTC color pipeline; it does not capture managed virtual displays. Save and reopen settings to list outputs for a new backend.`),
           ),
-          field(
+          markHostSettingsOwner("amaterasu.display", field(
             "Display and adapter policy (JSON)",
             displayPolicy,
             "Use the listed setting names and typed JSON values. This editor saves a full policy snapshot: omitted keys reset to the product default. Per-application and paired-client values may override stream-scoped settings. Native support remains platform/provider-specific and unsupported changes fail closed.",
-          ),
-          field(
+          )),
+          markHostSettingsOwner("amaterasu.display", field(
             "Capture output",
             outputName,
             "Choose a display for future Moonlight streams. Automatic retains the configured startup output.",
-          ),
+          )),
           field("Stream audio", streamAudio, "Enable host audio capture for future streams. Applications and paired clients may override this setting."),
           field("NVENC preset", nvencPreset, "Select NVENC preset P1 through P7 for future streams."),
           field("NVENC H.264 CAVLC", nvencH264Cavlc, "Request CAVLC entropy coding for NVENC H.264."),
@@ -5261,7 +5267,10 @@ namespace Amaterasu {
     void loadLutris();
     void loadPlaynite();
     void loadInput();
-    renderExtensionSlot(context, metricsArea, "settings");
+    renderExtensionSlot(context, metricsArea, "settings", owners => {
+        if (typeof Amaterasu.renderSessionExtensionSettings === "function")
+          Amaterasu.renderSessionExtensionSettings(context, sessionExtensionsArea, {kind:"host"}, undefined, owners);
+      });
     renderUpdaterSettings(context, updaterArea);
     renderSystemTraySettings(context, systemTrayArea);
     void loadPairing();

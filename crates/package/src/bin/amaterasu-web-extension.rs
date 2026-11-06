@@ -58,6 +58,8 @@ fn apply_ui_configuration(manifest: &mut extension::Manifest, bytes: &[u8]) -> R
         placements: Vec<String>,
         #[serde(default)]
         settings_provider: Option<String>,
+        #[serde(default)]
+        settings_owner: Option<String>,
     }
     let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
     if value.is_array() {
@@ -67,6 +69,7 @@ fn apply_ui_configuration(manifest: &mut extension::Manifest, bytes: &[u8]) -> R
         manifest.methods = config.methods;
         manifest.placements = config.placements;
         manifest.settings_provider = config.settings_provider;
+        manifest.settings_owner = config.settings_owner;
     }
     Ok(())
 }

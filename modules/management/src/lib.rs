@@ -431,9 +431,17 @@ fn package_selection_status(package_root: &str) -> Option<serde_json::Value> {
 
 fn package_selection_status_with_running(
     package_root: &str,
-    running: serde_json::Value,
+    mut running: serde_json::Value,
 ) -> Option<serde_json::Value> {
     let mut status = package_selection_status(package_root)?;
+    if running["available"] == true
+        && let Some(digest) = running["digest"]
+            .as_str()
+            .filter(|digest| is_sha256(digest))
+        && let Some(modules) = running_package_modules(Path::new(package_root), digest)
+    {
+        running["modules"] = modules;
+    }
     status["running"] = running;
     Some(status)
 }
@@ -445,6 +453,57 @@ fn running_package_status(runtime: &RuntimeClient) -> serde_json::Value {
         }
         _ => running_package_status_value(None),
     }
+}
+
+fn running_package_modules(root: &Path, digest: &str) -> Option<serde_json::Value> {
+    let path = amaterasu_package::package_directory(root, digest)
+        .ok()?
+        .join("manifest.json");
+    if path.canonicalize().ok()? != path {
+        return None;
+    }
+    let raw = amaterasu_package::read_bounded(&path, 4 * 1024 * 1024).ok()?;
+    // The running digest comes from the host's verified loaded bytes. Never
+    // derive this inventory from persisted active/pending selection or settings.
+    if amaterasu_package::sha256(&raw) != digest {
+        return None;
+    }
+    let manifest: amaterasu_package::ReleaseManifest = serde_json::from_slice(&raw).ok()?;
+    let modules: Vec<_> = manifest
+        .components
+        .iter()
+        .map(|component| amaterasu_module_sdk::RunningModuleIdentity {
+            id: component.id.clone(),
+            version: component.version.clone(),
+            sha256: component.sha256.clone(),
+            runtime: component.runtime,
+        })
+        .collect();
+    let value = serde_json::to_value(modules).ok()?;
+    valid_running_modules(&value).then_some(value)
+}
+
+fn valid_running_modules(value: &serde_json::Value) -> bool {
+    let Ok(modules) =
+        serde_json::from_value::<Vec<amaterasu_module_sdk::RunningModuleIdentity>>(value.clone())
+    else {
+        return false;
+    };
+    let mut ids = std::collections::BTreeSet::new();
+    !modules.is_empty()
+        && modules.len() <= 128
+        && modules.iter().all(|module| {
+            !module.id.is_empty()
+                && module.id.len() <= 128
+                && module.id.bytes().all(|byte| {
+                    byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._-".contains(&byte)
+                })
+                && !module.version.is_empty()
+                && module.version.len() <= 128
+                && !module.version.chars().any(char::is_control)
+                && is_sha256(&module.sha256)
+                && ids.insert(&module.id)
+        })
 }
 
 fn running_package_status_value(digest: Option<&str>) -> serde_json::Value {
@@ -944,6 +1003,55 @@ mod tests {
         assert!(package_selection_status(alias.to_str().unwrap()).is_none());
 
         std::fs::remove_file(alias).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn module_inventory_uses_the_running_manifest_and_rejects_tampered_bytes() {
+        let root = temporary_package_root();
+        let components: Vec<_> = [
+            "amaterasu.runtime",
+            "amaterasu.display",
+            "amaterasu.frame-limiter",
+        ]
+        .iter()
+        .enumerate()
+        .map(|(index, id)| {
+            json!({
+                "id": id,
+                "version": "0.1.0",
+                "file": "private-library.so",
+                "sha256": "b".repeat(64),
+                "size": 1,
+                "abi_major": 1,
+                "runtime": index == 0,
+                "requested": {}
+            })
+        })
+        .collect();
+        let raw = serde_json::to_vec(&json!({
+            "schema": 1,
+            "host_context_schema": 1,
+            "project": "amaterasu",
+            "sequence": 1,
+            "expires_unix": u64::MAX,
+            "target": "test",
+            "components": components
+        }))
+        .unwrap();
+        let digest = amaterasu_package::sha256(&raw);
+        let directory = amaterasu_package::package_directory(&root, &digest).unwrap();
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("manifest.json"), &raw).unwrap();
+        let modules = running_package_modules(&root, &digest).unwrap();
+        assert_eq!(modules[1]["id"], "amaterasu.display");
+        assert_eq!(modules[2]["id"], "amaterasu.frame-limiter");
+        assert!(modules[0].get("file").is_none());
+        assert!(
+            running_package_modules(&root, &"f".repeat(64)).is_none(),
+            "a persisted active digest is never a substitute for the host's running digest"
+        );
+        std::fs::write(directory.join("manifest.json"), b"{}").unwrap();
+        assert!(running_package_modules(&root, &digest).is_none());
         std::fs::remove_dir_all(root).unwrap();
     }
 }

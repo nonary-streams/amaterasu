@@ -76,7 +76,7 @@ impl Extensions {
         let extensions: Vec<Value> = self.entries.iter().filter_map(|entry| {
             let bundle = self.selected(entry)?;
             let methods: Vec<Value> = bundle.manifest.methods.iter().filter(|method| approved(entry, method) && permits(auth, method)).map(|method| json!({"alias":method.alias,"scope":method.scope,"min_role":method.min_role})).collect();
-            Some(json!({"id":bundle.manifest.id,"name":bundle.manifest.name,"digest":bundle.digest,"sdk_version":bundle.manifest.sdk_version,"entrypoint":bundle.manifest.entrypoint,"placements":bundle.manifest.placements,"settings_provider":bundle.manifest.settings_provider,"methods":methods}))
+            Some(json!({"id":bundle.manifest.id,"name":bundle.manifest.name,"digest":bundle.digest,"sdk_version":bundle.manifest.sdk_version,"entrypoint":bundle.manifest.entrypoint,"placements":bundle.manifest.placements,"settings_provider":bundle.manifest.settings_provider,"settings_owner":bundle.manifest.settings_owner,"methods":methods}))
         }).collect();
         json!({"ok":true,"extensions":extensions})
     }

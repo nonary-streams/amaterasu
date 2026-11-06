@@ -35,6 +35,9 @@ pub struct Manifest {
     /// This is presentation metadata, never an API grant.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settings_provider: Option<String>,
+    /// UI ownership can be declared independently of registry-backed settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings_owner: Option<String>,
     #[serde(default)]
     pub methods: Vec<MethodDeclaration>,
     pub files: BTreeMap<String, Asset>,
@@ -102,18 +105,22 @@ pub fn validate_manifest(manifest: &Manifest, now: u64) -> PackageResult<()> {
     {
         return Err("invalid extension UI placements".into());
     }
-    if let Some(provider) = &manifest.settings_provider
-        && (!manifest
+    for provider in [&manifest.settings_provider, &manifest.settings_owner]
+        .into_iter()
+        .flatten()
+    {
+        if !manifest
             .placements
             .iter()
-            .any(|place| place == "application")
+            .any(|place| place == "application" || place == "settings")
             || provider.is_empty()
             || provider.len() > 128
             || !provider.bytes().all(|byte| {
                 byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._-".contains(&byte)
-            }))
-    {
-        return Err("invalid application settings provider".into());
+            })
+        {
+            return Err("invalid extension settings owner".into());
+        }
     }
     let mut aliases = std::collections::BTreeSet::new();
     for method in &manifest.methods {
@@ -182,6 +189,7 @@ pub fn prepare_extension(
         entrypoint: entrypoint.into(),
         placements: default_placements(),
         settings_provider: None,
+        settings_owner: None,
         methods: Vec::new(),
         files,
     };
@@ -386,6 +394,13 @@ mod tests {
         manifest.settings_provider = Some("wrong/provider".into());
         assert!(validate_manifest(&manifest, 0).is_err());
         manifest.settings_provider = None;
+        manifest.settings_owner = Some("amaterasu.display".into());
+        assert!(validate_manifest(&manifest, 0).is_ok());
+        manifest.placements = vec!["settings".into()];
+        assert!(validate_manifest(&manifest, 0).is_ok());
+        manifest.settings_owner = Some("wrong/owner".into());
+        assert!(validate_manifest(&manifest, 0).is_err());
+        manifest.settings_owner = None;
         for placements in [vec![], vec!["application", "application"], vec!["unknown"]] {
             manifest.placements = placements.into_iter().map(str::to_owned).collect();
             assert!(validate_manifest(&manifest, 0).is_err());

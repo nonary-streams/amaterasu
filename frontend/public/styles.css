@@ -2095,3 +2095,13 @@ input, textarea, select {
 .plugin-chart-readout {min-height:2em;font-size:12px;overflow-wrap:anywhere}
 .plugin-chart-legend [aria-pressed=false] {opacity:.5}
 .plugin-surface {min-width:0}
+
+.module-digest { display: block; overflow-wrap: anywhere; }
+
+/* A selected module UI owns these legacy controls, including reparented rows. */
+.module-settings-claimed { display: none !important; }
+
+.module-card-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 280px), 1fr)); gap: 16px; }
+.module-card-grid > .panel { margin-bottom: 0; min-width: 0; }
+
+.module-repository-status > .section-meta { flex-wrap: wrap; justify-content: flex-start; }

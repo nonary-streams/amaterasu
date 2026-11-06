@@ -495,3 +495,16 @@ test("unchanged unknown encoder and frame generation options survive a save", ()
   fields.set("nvenc_twopass", "different-invalid-value");
   assert.throws(() => model.parseCatalogNvencSettingsOverrides(fields, saved));
 });
+
+test('core app drafts preserve plugin saves and reject conflicting concurrent edits',()=>{
+  const merge=context.Amaterasu.mergeCatalogEditorDraft;
+  const original={name:'Game',launch:{program:'/game'},config_overrides:{fec_percentage:20,display_policy:{dd_hdr_option:'auto'}}};
+  const draft=structuredClone(original);draft.name='Renamed';draft.config_overrides.fec_percentage=25;
+  const updated=structuredClone(original);updated.config_overrides.display_policy.dd_hdr_option='disabled';
+  const result=JSON.parse(JSON.stringify(merge(original,draft,updated)));
+  assert.equal(result.name,'Renamed');assert.equal(result.config_overrides.fec_percentage,25);assert.equal(result.config_overrides.display_policy.dd_hdr_option,'disabled');
+  assert.deepEqual(result.launch,original.launch);
+  const competing=structuredClone(updated);competing.name='Another name';assert.throws(()=>merge(original,draft,competing),/changed elsewhere/);
+  const removed=structuredClone(original);delete removed.config_overrides.fec_percentage;
+  assert.equal(Object.hasOwn(merge(original,removed,updated).config_overrides,'fec_percentage'),false);
+});

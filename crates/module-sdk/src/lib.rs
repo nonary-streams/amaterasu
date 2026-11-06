@@ -33,7 +33,7 @@ pub use amaterasu_contracts::encoder::{
 };
 pub use amaterasu_contracts::{
     ApiFieldKind, ApiMethod, ApiPrivilege, ApiSchema, Command, HOST_PACKAGE_BARRIER_SERVICE,
-    HostLifecycleAction, Response, RuntimeHostContext,
+    HostLifecycleAction, Response, RunningModuleIdentity, RuntimeHostContext,
 };
 pub use amaterasu_extension_api as extension_api;
 pub use amaterasu_media as media_abi;
