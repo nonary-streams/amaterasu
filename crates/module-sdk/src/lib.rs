@@ -3,6 +3,7 @@ pub mod application_library;
 pub mod audio;
 pub mod capture;
 pub mod data_plane;
+pub mod display;
 pub mod encode;
 pub mod exports;
 pub mod foreground_context;

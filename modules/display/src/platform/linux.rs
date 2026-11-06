@@ -255,6 +255,10 @@ impl Platform for LinuxPlatform {
         false
     }
 
+    fn supports_scoped_composition(&self) -> bool {
+        true
+    }
+
     fn enumerate(
         &mut self,
         display: Option<&str>,

@@ -1,3 +1,4 @@
+mod scoped;
 use crate::configuration_option::DisplayConfigurationOption;
 use crate::model::{
     Configuration, DisplayError, DisplayResult, Journal, Operation, Rational, RecoveryBaseline,
@@ -16,6 +17,8 @@ struct Context {
     request: u64,
     caller: String,
     deadline: Instant,
+    verified_scoped_target: Option<String>,
+    inherited_scoped: Vec<crate::scoped::ScopedReservation>,
 }
 struct Incoming {
     context: Context,
@@ -43,6 +46,16 @@ struct Pending {
     stage: Stage,
 }
 enum Stage {
+    ValidatingScoped(Operation),
+    ScopedArmed {
+        journal: Journal,
+        before: RecoveryBaseline,
+        configuration: Configuration,
+    },
+    Saved {
+        reply: Value,
+        active_lease: Option<String>,
+    },
     Loading(Operation),
     Armed {
         journal: Journal,
@@ -125,6 +138,8 @@ impl<P: Platform> Pipeline<P> {
                         request: id,
                         caller,
                         deadline: Instant::now() + Duration::from_millis(remaining_ms.min(30_000)),
+                        verified_scoped_target: None,
+                        inherited_scoped: Vec::new(),
                     },
                     operation,
                 });
@@ -138,6 +153,9 @@ impl<P: Platform> Pipeline<P> {
         incoming: Incoming,
         send: &mut impl FnMut(Command) -> Transport,
     ) -> ModuleResult<()> {
+        if matches!(incoming.operation, Operation::ScopedApply { .. }) {
+            return self.validate_scoped_owner(incoming, send);
+        }
         if let Operation::Apply {
             expected_mutation_domain_id,
             expected_mutation_domain_revision,
@@ -256,6 +274,16 @@ impl<P: Platform> Pipeline<P> {
         stage: Stage,
         send: &mut impl FnMut(Command) -> Transport,
     ) -> ModuleResult<()> {
+        self.submit_service(context, STATE_SERVICE, payload, stage, send)
+    }
+    fn submit_service(
+        &mut self,
+        context: Context,
+        service: &str,
+        payload: Value,
+        stage: Stage,
+        send: &mut impl FnMut(Command) -> Transport,
+    ) -> ModuleResult<()> {
         let timeout = context
             .deadline
             .saturating_duration_since(Instant::now())
@@ -272,7 +300,7 @@ impl<P: Platform> Pipeline<P> {
         }
         self.sequence = self.sequence.wrapping_add(1);
         match send(Command::Request {
-            service: STATE_SERVICE.into(),
+            service: service.into(),
             payload,
             timeout_ms: timeout,
             operation_id: format!("display.{}.{}", context.request, self.sequence),
@@ -302,6 +330,9 @@ impl<P: Platform> Pipeline<P> {
                 Ok(())
             }
             Response::Result { payload } => {
+                if matches!(&pending.stage, Stage::ValidatingScoped(_)) {
+                    return self.scoped_owner_validated(pending, payload, send);
+                }
                 if payload["ok"] != true {
                     return complete(
                         send,
@@ -321,6 +352,26 @@ impl<P: Platform> Pipeline<P> {
                     );
                 };
                 match pending.stage {
+                    Stage::ValidatingScoped(_) => unreachable!("validated above"),
+                    Stage::ScopedArmed {
+                        journal,
+                        before,
+                        configuration,
+                    } => self.apply_scoped(
+                        pending.context,
+                        revision,
+                        journal,
+                        before,
+                        configuration,
+                        send,
+                    ),
+                    Stage::Saved {
+                        reply,
+                        active_lease,
+                    } => {
+                        self.active_lease = active_lease;
+                        complete(send, pending.context.request, reply)
+                    }
                     Stage::Loading(operation) => {
                         self.loaded(pending.context, operation, revision, payload, send)
                     }
@@ -347,7 +398,7 @@ impl<P: Platform> Pipeline<P> {
     }
     fn loaded(
         &mut self,
-        context: Context,
+        mut context: Context,
         operation: Operation,
         revision: u64,
         payload: Value,
@@ -363,6 +414,8 @@ impl<P: Platform> Pipeline<P> {
                 .is_some_and(|journal| journal.owner == context.caller);
             let state = match &journal {
                 None => "idle",
+                Some(journal) if journal.scoped_pending.is_some() => "scoped_recovery_required",
+                Some(journal) if !journal.normal_active => "retained_targets",
                 Some(journal) if self.active_lease.as_ref() == Some(&journal.lease) => "leased",
                 Some(_) => "recovery_required",
             };
@@ -382,7 +435,12 @@ impl<P: Platform> Pipeline<P> {
                 ),
             );
         }
-        if !self.platform.supported() {
+        if !self.platform.supported()
+            && !(matches!(
+                operation,
+                Operation::ScopedApply { .. } | Operation::ScopedRelease { .. }
+            ) && self.platform.supports_scoped_composition())
+        {
             return complete(
                 send,
                 context.request,
@@ -391,6 +449,12 @@ impl<P: Platform> Pipeline<P> {
                     "native display mutation is supported only on Windows",
                 ),
             );
+        }
+        if matches!(
+            operation,
+            Operation::ScopedApply { .. } | Operation::ScopedRelease { .. }
+        ) {
+            return self.loaded_scoped(context, operation, revision, journal, send);
         }
         match operation {
             Operation::Apply {
@@ -412,7 +476,14 @@ impl<P: Platform> Pipeline<P> {
                     mode_policies: mode_policies.clone(),
                 })
                 .expect("parsed display request serializes");
-                if let Some(journal) = journal {
+                if let Some(journal) = journal.filter(|journal| {
+                    if !journal.normal_active && journal.scoped_pending.is_none() {
+                        context.inherited_scoped = journal.scoped_targets.clone();
+                        false
+                    } else {
+                        true
+                    }
+                }) {
                     if operation_id.is_some()
                         && operation_id == journal.operation_id
                         && journal.owner == context.caller
@@ -457,6 +528,12 @@ impl<P: Platform> Pipeline<P> {
                             "a display lease or recovery journal already exists",
                         ),
                     );
+                }
+                if !context.inherited_scoped.is_empty()
+                    && let Err(error) = self
+                        .validate_protected_configuration(&configuration, &context.inherited_scoped)
+                {
+                    return complete(send, context.request, error.payload());
                 }
                 match (
                     &expected_mutation_domain_id,
@@ -895,7 +972,10 @@ impl<P: Platform> Pipeline<P> {
                         failure("not_found", "no display recovery journal exists"),
                     );
                 };
-                if journal.owner != context.caller || journal.lease != lease {
+                if !journal.normal_active
+                    || journal.owner != context.caller
+                    || journal.lease != lease
+                {
                     return complete(
                         send,
                         context.request,
@@ -905,9 +985,31 @@ impl<P: Platform> Pipeline<P> {
                         ),
                     );
                 }
-                let result = restore_journal_snapshot(&mut self.platform, &journal, &mut || {
+                if journal.scoped_pending.is_some() {
+                    return complete(
+                        send,
+                        context.request,
+                        failure(
+                            "scoped_recovery_required",
+                            "a protected target mutation must settle before normal restore",
+                        ),
+                    );
+                }
+                let mut protected = journal.clone();
+                if let Err(error) = self.rebase_protected_restore(&mut protected) {
+                    return complete(
+                        send,
+                        context.request,
+                        recovery_failure(error, &journal.lease),
+                    );
+                }
+                let result = restore_journal_snapshot(&mut self.platform, &protected, &mut || {
                     check_request(send, &context)
                 });
+                if result.is_ok() && !journal.scoped_targets.is_empty() {
+                    return self
+                        .retain_scoped_after_restore(context, revision, journal, lease, send);
+                }
                 match result {
                     Ok(()) => self.clear(
                         context,
@@ -1001,6 +1103,9 @@ impl<P: Platform> Pipeline<P> {
         };
         let request_identity = operation_id.as_ref().map(|_| request_identity);
         let journal = Journal {
+            normal_active: true,
+            scoped_targets: context.inherited_scoped.clone(),
+            scoped_pending: None,
             owner: context.caller.clone(),
             lease: format!("display-{generation:016x}"),
             snapshot: RecoveryBaseline::KScreen(baseline),
@@ -1167,6 +1272,9 @@ impl<P: Platform> Pipeline<P> {
         };
         let request_identity = operation_id.as_ref().map(|_| request_identity);
         let journal = Journal {
+            normal_active: true,
+            scoped_targets: context.inherited_scoped.clone(),
+            scoped_pending: None,
             owner: context.caller.clone(),
             lease: format!("display-{generation:016x}"),
             snapshot: RecoveryBaseline::Ccd(snapshot),
@@ -1256,6 +1364,15 @@ impl<P: Platform> Pipeline<P> {
                     let mut reply = recovery_failure(error, &journal.lease);
                     reply["rollback_error"] = rollback.payload()["error"].clone();
                     return complete(send, context.request, reply);
+                }
+                if !journal.scoped_targets.is_empty() {
+                    return self.retain_scoped_after_error(
+                        context,
+                        revision,
+                        journal,
+                        error.payload(),
+                        send,
+                    );
                 }
                 self.clear(context, revision, error.payload(), send)
             }

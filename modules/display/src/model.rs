@@ -14,6 +14,19 @@ pub const MAX_DISPLAYS: usize = 16;
 // the serialized operation and durable request identity straightforward.
 #[allow(clippy::large_enum_variant)]
 pub enum Operation {
+    ScopedApply {
+        operation_id: String,
+        identity: String,
+        reference_id: String,
+        target: DisplaySetting,
+        expected_topology_revision: String,
+    },
+    ScopedRelease {
+        operation_id: String,
+        identity: String,
+        reference_id: String,
+        expected_topology_revision: String,
+    },
     Status,
     Snapshot,
     Enumerate {
@@ -919,6 +932,14 @@ impl RecoveryBaseline {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Journal {
+    /// Legacy journals represent one normal display lease. A scoped-only
+    /// journal remains durable while independently retained targets exist.
+    #[serde(default = "normal_lease_default", skip_serializing_if = "is_true")]
+    pub normal_active: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scoped_targets: Vec<crate::scoped::ScopedReservation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scoped_pending: Option<crate::scoped::ScopedPending>,
     pub owner: String,
     pub lease: String,
     /// Legacy CCD objects retain their exact JSON representation.
@@ -943,6 +964,12 @@ pub struct RouteBinding {
     pub source_address: Address,
     pub target_address: Address,
     pub output_technology: i32,
+}
+fn normal_lease_default() -> bool {
+    true
+}
+fn is_true(value: &bool) -> bool {
+    *value
 }
 impl Journal {
     pub fn validate(&self) -> Result<(), DisplayError> {
@@ -970,6 +997,7 @@ impl Journal {
                 "invalid display journal owner or lease",
             ));
         }
+        crate::scoped::validate_journal(self)?;
         self.snapshot.validate()
     }
 

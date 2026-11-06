@@ -16,6 +16,11 @@ pub enum TopologyShape {
 pub trait Platform {
     fn name(&self) -> &'static str;
     fn supported(&self) -> bool;
+    /// A narrower capability for caller-owned target composition. Providers may
+    /// offer this without enabling arbitrary desktop mutation.
+    fn supports_scoped_composition(&self) -> bool {
+        self.supported()
+    }
     fn enumerate(
         &mut self,
         display: Option<&str>,

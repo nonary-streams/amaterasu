@@ -5,6 +5,7 @@ pub mod mode_remapping;
 mod model;
 mod pipeline;
 mod platform;
+mod scoped;
 pub mod refresh_rate_option;
 pub mod resolution_option;
 
