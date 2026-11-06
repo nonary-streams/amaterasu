@@ -29,6 +29,8 @@ pub struct Settings {
     /// built-in implementation after policy lookup fails.
     pub session_presentation_provider: Option<String>,
     pub auxiliary_black_capture_provider: Option<crate::launch::CaptureProvider>,
+    /// Opaque source semantics resolved against the selected capture composition.
+    pub auxiliary_black_capture_route_key: Option<String>,
     pub auxiliary_exact_capture_provider: Option<crate::launch::CaptureProvider>,
     pub auxiliary_exact_capture_routes: BTreeMap<String, crate::launch::CaptureProvider>,
     pub http_bind: SocketAddr,
@@ -50,6 +52,7 @@ impl Default for Settings {
             audio_capture_provider: "amaterasu.audio/1".into(),
             session_presentation_provider: None,
             auxiliary_black_capture_provider: None,
+            auxiliary_black_capture_route_key: Some("synthetic_black".into()),
             auxiliary_exact_capture_provider: None,
             auxiliary_exact_capture_routes: BTreeMap::new(),
             http_bind: SocketAddr::from(([127, 0, 0, 1], 47989)),
@@ -90,6 +93,15 @@ impl Settings {
                 .any(|key| !amaterasu_contracts::valid_name(key))
         {
             return Err("invalid_auxiliary_capture_routes");
+        }
+        if self
+            .auxiliary_black_capture_route_key
+            .as_deref()
+            .is_some_and(|key| {
+                key.is_empty() || key.len() > 128 || key.chars().any(char::is_control)
+            })
+        {
+            return Err("invalid_auxiliary_black_capture_route_key");
         }
         let http_binds = self.resolved_http_binds()?;
         let https_binds = self.resolved_https_binds()?;
@@ -359,6 +371,10 @@ mod tests {
         let defaults: Settings = serde_json::from_str("{}").unwrap();
         assert!(defaults.session_presentation_provider.is_none());
         assert!(defaults.auxiliary_black_capture_provider.is_none());
+        assert_eq!(
+            defaults.auxiliary_black_capture_route_key.as_deref(),
+            Some("synthetic_black")
+        );
         assert!(defaults.auxiliary_exact_capture_provider.is_none());
         assert!(defaults.auxiliary_exact_capture_routes.is_empty());
         let configured: Settings = serde_json::from_value(serde_json::json!({
@@ -409,6 +425,34 @@ mod tests {
             invalid_routes.validate(),
             Err("invalid_auxiliary_capture_routes")
         );
+    }
+
+    #[test]
+    fn synthetic_source_route_is_opaque_bounded_and_can_be_disabled_explicitly() {
+        let disabled: Settings =
+            serde_json::from_value(serde_json::json!({"auxiliary_black_capture_route_key":null}))
+                .unwrap();
+        disabled.validate().unwrap();
+        assert!(disabled.auxiliary_black_capture_route_key.is_none());
+        let custom: Settings = serde_json::from_value(
+            serde_json::json!({"auxiliary_black_capture_route_key":"third-party.capture-route/2"}),
+        )
+        .unwrap();
+        custom.validate().unwrap();
+        assert_eq!(
+            custom.auxiliary_black_capture_route_key.as_deref(),
+            Some("third-party.capture-route/2")
+        );
+        for invalid in [String::new(), "x".repeat(129), "route\nkey".into()] {
+            let settings: Settings = serde_json::from_value(
+                serde_json::json!({"auxiliary_black_capture_route_key":invalid}),
+            )
+            .unwrap();
+            assert_eq!(
+                settings.validate(),
+                Err("invalid_auxiliary_black_capture_route_key")
+            );
+        }
     }
 
     #[test]
