@@ -23,6 +23,8 @@ pub const MAX_PROJECTIONS: usize = 4;
 pub const PROJECTION_TIMEOUT_MS: u64 = 30_000;
 pub const MAX_PAYLOAD_BYTES: usize = 12_000;
 pub const MAX_ARTWORK_BYTES: usize = 4_096;
+/// Includes provider-owned ordering/role labels around a catalog title.
+pub const MAX_TITLE_BYTES: usize = 192;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -508,7 +510,7 @@ impl Application {
         if token(&self.id)
             && self.uuid.len() <= 128
             && !self.uuid.chars().any(char::is_control)
-            && bounded_text(&self.title, 160)
+            && bounded_text(&self.title, MAX_TITLE_BYTES)
             && self.aliases.len() <= 16
             && self.aliases.iter().all(|alias| token(alias))
             && self.properties.is_object()

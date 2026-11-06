@@ -76,6 +76,25 @@ fn catalog_pages_enforce_rows_and_serialized_bytes_independently() {
 }
 
 #[test]
+fn decorated_catalog_titles_retain_their_complete_original_name() {
+    let mut decorated = app();
+    decorated.title = format!("     {}", "g".repeat(160));
+    assert!(decorated.validate().is_ok());
+    let projected = Reply::Projected {
+        presentation: Presentation {
+            busy: false,
+            current_game: None,
+            current_game_uuid: None,
+        },
+        entries: vec![decorated.clone()],
+        next_offset: None,
+    };
+    assert!(projected.validate().is_ok());
+    decorated.title = "x".repeat(MAX_TITLE_BYTES + 1);
+    assert!(decorated.validate().is_err());
+}
+
+#[test]
 fn identities_and_permissions_remain_authenticated_facts() {
     let mut request = context();
     request.client.paired = false;
