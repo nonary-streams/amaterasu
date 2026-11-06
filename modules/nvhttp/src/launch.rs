@@ -678,6 +678,21 @@ struct PendingResume {
     request: LaunchRequest,
     peer: PeerIdentity,
     retained: bool,
+    response_kind: StreamResponse,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum StreamResponse {
+    #[default]
+    Launch,
+    Resume,
+}
+
+#[derive(Default)]
+struct LaunchSource {
+    auxiliary: Option<amaterasu_module_sdk::session_presentation::AuxiliaryStreamPlan>,
+    shared_capture: Option<amaterasu_module_sdk::session_presentation::SharedCapture>,
+    response: StreamResponse,
 }
 
 pub struct Controller {
@@ -721,6 +736,7 @@ pub struct Controller {
     sequence: u64,
     last_scheduled_record: u64,
     auxiliary_black_capture_provider: Option<CaptureProvider>,
+    auxiliary_black_capture_route_key: Option<String>,
     auxiliary_exact_capture_provider: Option<CaptureProvider>,
     auxiliary_exact_capture_routes: BTreeMap<String, CaptureProvider>,
     pending_auxiliary: BTreeMap<String, auxiliary::PendingAuxiliary>,
@@ -775,6 +791,7 @@ impl Controller {
             sequence: 0,
             last_scheduled_record: 0,
             auxiliary_black_capture_provider: None,
+            auxiliary_black_capture_route_key: Some("synthetic_black".into()),
             auxiliary_exact_capture_provider: None,
             auxiliary_exact_capture_routes: BTreeMap::new(),
             pending_auxiliary: BTreeMap::new(),
@@ -1088,7 +1105,27 @@ impl Controller {
         peer: PeerIdentity,
         now: Instant,
     ) -> Option<Reply> {
-        self.launch_with_source(connection, request, peer, None, None, now)
+        self.launch_for_route(connection, request, peer, StreamResponse::Launch, now)
+    }
+
+    pub(crate) fn launch_for_route(
+        &mut self,
+        connection: u64,
+        request: LaunchRequest,
+        peer: PeerIdentity,
+        response: StreamResponse,
+        now: Instant,
+    ) -> Option<Reply> {
+        self.launch_with_source(
+            connection,
+            request,
+            peer,
+            LaunchSource {
+                response,
+                ..LaunchSource::default()
+            },
+            now,
+        )
     }
 
     fn launch_with_source(
@@ -1096,10 +1133,14 @@ impl Controller {
         connection: u64,
         request: LaunchRequest,
         peer: PeerIdentity,
-        auxiliary: Option<amaterasu_module_sdk::session_presentation::AuxiliaryStreamPlan>,
-        shared_capture: Option<amaterasu_module_sdk::session_presentation::SharedCapture>,
+        source: LaunchSource,
         now: Instant,
     ) -> Option<Reply> {
+        let LaunchSource {
+            auxiliary,
+            shared_capture,
+            response,
+        } = source;
         if peer.paired() {
             self.prune_finished_transports();
             if self.retired_stream_key(&request) {
@@ -1119,13 +1160,14 @@ impl Controller {
             return Some(private_error(401, "authenticated paired TLS is required"));
         }
         let desktop = auxiliary.is_some() || request.app_id == DESKTOP_APP_ID;
-        if request.app_id == 0
+        if (request.app_id == 0 && auxiliary.is_none())
             || request.app_id > i32::MAX as u32
             || (desktop && auxiliary.is_none() && !config.desktop.enabled)
             || !config.profile.accepts(&request)
             || !matches!(request.audio_channels, 2 | 6 | 8)
-            || (request.audio_channels == 6 && config.profile.audio_bitrate < 256_000)
-            || (request.audio_channels == 8 && config.profile.audio_bitrate < 512_000)
+            || (auxiliary.as_ref().is_none_or(|plan| plan.stream_audio)
+                && ((request.audio_channels == 6 && config.profile.audio_bitrate < 256_000)
+                    || (request.audio_channels == 8 && config.profile.audio_bitrate < 512_000)))
             || request
                 .device_name
                 .as_deref()
@@ -1180,6 +1222,11 @@ impl Controller {
         let global_capture_mode = self.configured_capture;
         let selected_capture_mode = peer.client_capture.unwrap_or(global_capture_mode);
         let requested_capture_output = capture_output.clone();
+        let source_capture_context =
+            match self.presentation_source_context(auxiliary.as_ref(), shared_capture.as_ref()) {
+                Ok(context) => context,
+                Err(code) => return Some(private_error(503, code)),
+            };
         let (capture_provider, constant_rate, capture_output) = match auxiliary
             .as_ref()
             .map(|plan| &plan.capture)
@@ -1208,6 +1255,7 @@ impl Controller {
             {
                 if matches!(record.state, State::Ready) {
                     record.launch_connection = Some(connection);
+                    record.response_kind = response;
                     return Some(success_reply(record));
                 }
                 if !record.state.terminal() {
@@ -1224,7 +1272,7 @@ impl Controller {
             return Some(private_error(503, "another stream is active"));
         }
         if auxiliary.is_none() && self.shared_application(request.app_id).is_some() {
-            return self.join_or_resume(connection, request, peer, now);
+            return self.join_or_resume(connection, request, peer, response, now);
         }
         if auxiliary.is_none()
             && self
@@ -1283,6 +1331,8 @@ impl Controller {
         record.lifecycle_required = self.session_lifecycle_required && auxiliary.is_none();
         record.lifecycle_capture_mode = self.session_lifecycle_capture_mode;
         record.desktop = desktop;
+        record.response_kind = response;
+        record.source_capture_context = source_capture_context;
         record.video_codec_offer = video_codec_offer;
         record.encoder_snapshot = self.encoder_snapshot.clone();
         record.global_display_revision = self.global_display_revision;
@@ -1318,7 +1368,6 @@ impl Controller {
         }
         if record.auxiliary.is_some() {
             record.capture_sink_without_routing = true;
-            record.global_configured_audio_sink = None;
             record.global_configured_virtual_sink = None;
             record.global_display_policy = json!({});
         }
@@ -1400,6 +1449,20 @@ impl Controller {
         peer: &PeerIdentity,
         now: Instant,
     ) -> Option<Reply> {
+        self.resume_for_route(connection, request, peer, StreamResponse::Resume, now)
+    }
+
+    pub(crate) fn resume_for_route(
+        &mut self,
+        connection: u64,
+        mut request: LaunchRequest,
+        peer: &PeerIdentity,
+        response: StreamResponse,
+        now: Instant,
+    ) -> Option<Reply> {
+        if request.app_id == 0 {
+            request.app_id = self.current_game(peer);
+        }
         if peer.paired() {
             self.prune_finished_transports();
             if self.retired_stream_key(&request) {
@@ -1410,7 +1473,7 @@ impl Controller {
             .shared_application(request.app_id)
             .is_some_and(|root| self.application_has_live_stream(root))
         {
-            return self.join_stream(connection, request, peer.clone(), now);
+            return self.join_stream(connection, request, peer.clone(), response, now);
         }
         if self.package_activation_pending {
             return Some(private_error(503, "plugin activation is pending"));
@@ -1485,6 +1548,7 @@ impl Controller {
             record.revoked = false;
             record.failure = None;
             record.resumed = true;
+            record.response_kind = response;
             record.adopted = false;
             record.resume_abandoned = false;
             record.launch_connection = Some(connection);
@@ -1497,6 +1561,7 @@ impl Controller {
                 request,
                 peer: peer.clone(),
                 retained: true,
+                response_kind: response,
             });
             return None;
         }
@@ -1515,6 +1580,7 @@ impl Controller {
             request,
             peer: peer.clone(),
             retained: false,
+            response_kind: response,
         });
         None
     }
@@ -1595,9 +1661,13 @@ impl Controller {
                         // The old record is terminal and no longer owns live input.
                         old_record.request.remote_input_key = [0; 16];
                     }
-                    if let Some(reply) =
-                        self.launch(pending.connection, pending.request, pending.peer, now)
-                    {
+                    if let Some(reply) = self.launch_for_route(
+                        pending.connection,
+                        pending.request,
+                        pending.peer,
+                        pending.response_kind,
+                        now,
+                    ) {
                         replies.push((pending.connection, reply));
                     } else if let Some(record) = self
                         .records
@@ -1832,18 +1902,22 @@ fn private_error(status: u16, message: &str) -> Reply {
 }
 
 fn success_reply(record: &Record) -> Reply {
+    let response_key = match record.response_kind {
+        StreamResponse::Launch => "gamesession",
+        StreamResponse::Resume => "resume",
+    };
     let stream_width = record.request.width.to_string();
     let stream_height = record.request.height.to_string();
     let stream_fps = record.request.fps.to_string();
     let physical_width = record.physical_display_mode.width.to_string();
     let physical_height = record.physical_display_mode.height.to_string();
     let physical_refresh = record.physical_display_mode.refresh_millihz.to_string();
-    let mut fields = vec![
+    let fields = vec![
         (
             "sessionUrl0",
             record.rtsp_url.as_deref().unwrap_or_default(),
         ),
-        ("gamesession", "1"),
+        (response_key, "1"),
         ("historyActivityState", record.history_state),
         ("streamWidth", stream_width.as_str()),
         ("streamHeight", stream_height.as_str()),
@@ -1872,9 +1946,6 @@ fn success_reply(record: &Record) -> Reply {
                 .unwrap_or_default(),
         ),
     ];
-    if record.resumed {
-        fields.push(("resume", "1"));
-    }
     let mut reply = xml::response(200, "OK", &fields);
     reply.requires_paired_tls = true;
     reply.permission = Some(record.delivery_permission);

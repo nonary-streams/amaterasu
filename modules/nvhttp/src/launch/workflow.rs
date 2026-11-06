@@ -777,7 +777,9 @@ impl Controller {
                             record.request.continuous_audio && record.effective_stream_audio,
                         "capture_sink_without_routing": record.capture_sink_without_routing,
                         "virtual_sink": record.resolved_virtual_sink,
-                        "channels": record.resolved_virtual_sink.as_ref().map(|_| record.request.audio_channels),
+                        "channels": (record.resolved_virtual_sink.is_some()
+                            || record.auxiliary.as_ref().is_some_and(|auxiliary| auxiliary.plan.stream_audio))
+                            .then_some(record.request.audio_channels),
                         "back_button_timeout": record.scoped_back_button_timeout,
                         "controller": record.scoped_controller,
                         "gamepad": record.scoped_gamepad,
@@ -851,6 +853,11 @@ impl Controller {
                 5_000,
             ),
         };
+        if matches!(phase, Phase::OpenRtsp)
+            && let Some(context) = &record.source_capture_context
+        {
+            payload["source_capture_context"] = json!(context);
+        }
         if matches!(phase, Phase::OpenRtsp) && record.history_reserved {
             payload["history_activity_id"] = json!(record.rtsp_operation);
         }
@@ -3273,10 +3280,7 @@ pub(super) fn project_application_policy(
         record.resolved_virtual_sink.as_deref(),
     );
     if record.request.audio_channels != 2
-        && !record
-            .auxiliary
-            .as_ref()
-            .is_some_and(|auxiliary| !auxiliary.plan.stream_audio)
+        && record.auxiliary.is_none()
         && (record.resolved_virtual_sink.is_none() || !record.effective_stream_audio)
     {
         return Err("surround_audio_requires_stream_sink");
@@ -4352,7 +4356,12 @@ fn rtsp_response<'a>(
         .as_u64()
         .filter(|ticket| *ticket != 0)
         .ok_or("invalid_rtsp_response")?;
-    if record
+    let expected_source_context = record
+        .source_capture_context
+        .as_ref()
+        .map(|context| json!(context));
+    if payload.get("source_capture_context").filter(|context| !context.is_null()) != expected_source_context.as_ref()
+        || record
         .rtsp_ticket
         .is_some_and(|expected| expected != ticket)
         || (record.lifecycle_required

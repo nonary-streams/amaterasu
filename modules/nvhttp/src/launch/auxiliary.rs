@@ -1,8 +1,8 @@
 //! Executes provider-selected stream plans without assigning product roles to
 //! the protocol consumer. Source ownership stays with the selected provider.
 use super::{
-    CaptureProvider, Controller, LaunchRequest, PeerIdentity, Reply, StreamProfile, fingerprint,
-    private_error,
+    CaptureProvider, Controller, LaunchRequest, LaunchSource, PeerIdentity, Reply, StreamProfile,
+    StreamResponse, fingerprint, private_error,
     record::{Record, State},
     workflow::{ApplicationConfigOverrides, project_application_policy},
 };
@@ -46,6 +46,7 @@ pub(super) struct PendingAuxiliary {
     pub(super) peer: PeerIdentity,
     plan: AuxiliaryStreamPlan,
     pub(super) delivery_permission: crate::wire::Permission,
+    response_kind: StreamResponse,
 }
 
 impl AuxiliaryRecord {
@@ -104,6 +105,49 @@ impl Controller {
         self.auxiliary_exact_capture_provider = exact;
     }
 
+    pub fn set_auxiliary_black_capture_route_key(&mut self, route_key: Option<String>) {
+        self.auxiliary_black_capture_route_key = route_key;
+    }
+
+    pub(super) fn presentation_source_context(
+        &self,
+        auxiliary: Option<&AuxiliaryStreamPlan>,
+        shared: Option<&SharedCapture>,
+    ) -> Result<Option<amaterasu_module_sdk::capture::SourceCaptureContext>, &'static str> {
+        use amaterasu_module_sdk::capture::{SourceCaptureContext, SourceMode};
+        let Some(capture) = auxiliary
+            .map(|plan| &plan.capture)
+            .or_else(|| shared.map(|source| &source.capture))
+        else {
+            return Ok(None);
+        };
+        let route_key = match capture {
+            CaptureSource::SyntheticBlack => self
+                .auxiliary_black_capture_route_key
+                .clone()
+                .ok_or("synthetic capture route is not selected")?,
+            CaptureSource::ExactOutput { route_key, .. } => route_key.clone(),
+        };
+        let source_mode = auxiliary
+            .and_then(|plan| plan.source_mode.as_ref())
+            .or_else(|| shared.map(|source| &source.mode))
+            .map(|mode| SourceMode {
+                width: mode.width,
+                height: mode.height,
+                refresh_millihz: mode.refresh_millihz,
+                hdr: mode.hdr,
+                bit_depth: None,
+            });
+        let context = SourceCaptureContext {
+            route_key,
+            source_mode,
+        };
+        context
+            .validate()
+            .map_err(|_| "invalid source capture context")?;
+        Ok(Some(context))
+    }
+
     pub fn set_auxiliary_exact_capture_routes(
         &mut self,
         routes: std::collections::BTreeMap<String, CaptureProvider>,
@@ -150,6 +194,7 @@ impl Controller {
         Context { client, game }
     }
 
+    #[cfg(test)]
     pub fn launch_auxiliary(
         &mut self,
         connection: u64,
@@ -158,6 +203,28 @@ impl Controller {
         plan: AuxiliaryStreamPlan,
         now: Instant,
     ) -> Option<Reply> {
+        self.launch_auxiliary_for_route(
+            connection,
+            request,
+            peer,
+            plan,
+            StreamResponse::Launch,
+            now,
+        )
+    }
+
+    pub fn launch_auxiliary_for_route(
+        &mut self,
+        connection: u64,
+        mut request: LaunchRequest,
+        peer: PeerIdentity,
+        plan: AuxiliaryStreamPlan,
+        response: StreamResponse,
+        now: Instant,
+    ) -> Option<Reply> {
+        // Auxiliary roles have no application identity. The selected policy
+        // already resolved the catalog tile before this generic admission.
+        request.app_id = 0;
         if !self.borrowed_capture_verification {
             return Some(private_error(
                 503,
@@ -198,21 +265,52 @@ impl Controller {
                     peer,
                     plan,
                     delivery_permission: crate::wire::Permission::Launch,
+                    response_kind: response,
                 },
             );
             return None;
         }
-        self.launch_with_source(connection, request, peer, Some(plan), None, now)
+        self.launch_with_source(
+            connection,
+            request,
+            peer,
+            LaunchSource {
+                auxiliary: Some(plan),
+                shared_capture: None,
+                response,
+            },
+            now,
+        )
     }
 
     /// Launch a normal application on an exact source already retained by a
     /// presentation provider. This is an explicit decision, never a fallback.
+    #[cfg(test)]
     pub fn launch_application_with_source(
         &mut self,
         connection: u64,
         request: LaunchRequest,
         peer: PeerIdentity,
         source: SharedCapture,
+        now: Instant,
+    ) -> Option<Reply> {
+        self.launch_application_with_source_for_route(
+            connection,
+            request,
+            peer,
+            source,
+            StreamResponse::Launch,
+            now,
+        )
+    }
+
+    pub fn launch_application_with_source_for_route(
+        &mut self,
+        connection: u64,
+        request: LaunchRequest,
+        peer: PeerIdentity,
+        source: SharedCapture,
+        response: StreamResponse,
         now: Instant,
     ) -> Option<Reply> {
         if source.validate().is_err() {
@@ -230,15 +328,26 @@ impl Controller {
                 "borrowed capture requires external lifecycle",
             ));
         }
-        self.launch_with_source(connection, request, peer, None, Some(source), now)
+        self.launch_with_source(
+            connection,
+            request,
+            peer,
+            LaunchSource {
+                shared_capture: Some(source),
+                response,
+                ..LaunchSource::default()
+            },
+            now,
+        )
     }
 
-    pub fn resume_with_source(
+    pub fn resume_with_source_for_route(
         &mut self,
         connection: u64,
         request: LaunchRequest,
         peer: &PeerIdentity,
         source: SharedCapture,
+        response: StreamResponse,
         now: Instant,
     ) -> Option<Reply> {
         if source.validate().is_err() || !self.borrowed_capture_verification {
@@ -307,7 +416,7 @@ impl Controller {
         }
         // The fresh reservation is frozen on the candidate created by the
         // ordinary resume admission. Native stream effects follow verification.
-        let reply = self.resume(connection, request, peer, now);
+        let reply = self.resume_for_route(connection, request, peer, response, now);
         if reply.is_none()
             && let Some(record) = self
                 .records
@@ -339,9 +448,9 @@ impl Controller {
                     .auxiliary_black_capture_provider
                     .clone()
                     .ok_or("synthetic capture provider is not selected")?;
-                // The selected black source exposes NV12 input. The encoder
-                // independently negotiates its output format; no real output
-                // is captured if the requested encoding cannot be served.
+                // The selected synthetic provider owns its negotiated frame
+                // representation; no real output is captured if the requested
+                // encoding cannot be served.
                 Ok((
                     provider,
                     false,
@@ -669,11 +778,12 @@ impl Controller {
                     private_error(401, "paired client is no longer trusted"),
                 ));
             } else {
-                if let Some(reply) = self.launch_auxiliary(
+                if let Some(reply) = self.launch_auxiliary_for_route(
                     pending.connection,
                     pending.request,
                     pending.peer,
                     pending.plan,
+                    pending.response_kind,
                     now,
                 ) {
                     replies.push((pending.connection, reply));
@@ -709,7 +819,18 @@ pub(super) fn prepare_auxiliary(
     record.effective_stream_audio = plan.stream_audio;
     record.capture_sink_without_routing = true;
     record.resolved_virtual_sink = None;
-    if !plan.stream_audio {
+    if plan.stream_audio {
+        // Auxiliary capture preserves host playback. A virtual-sink selection
+        // must not erase the independently selected regular capture endpoint.
+        let configured = match record.peer.client_audio_sink.as_deref() {
+            Some("") => None,
+            Some(endpoint) => Some(endpoint),
+            None => record.global_configured_audio_sink.as_deref(),
+        };
+        record.audio_endpoint = configured
+            .unwrap_or(&record.bootstrap_audio_endpoint)
+            .to_owned();
+    } else {
         record.audio_endpoint.clear();
     }
     record.application_display_overrides = None;

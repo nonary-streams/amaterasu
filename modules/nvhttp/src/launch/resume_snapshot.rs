@@ -133,6 +133,7 @@ impl ResumeSnapshot {
         stream.application_owner_client_id = retained.application_owner_client_id.clone();
         stream.presentation_client_id = retained.presentation_client_id.clone();
         stream.shared_capture = retained.shared_capture.clone();
+        stream.source_capture_context = retained.source_capture_context.clone();
         stream.borrowed_capture_verified = retained.borrowed_capture_verified;
         stream.rtsp_runtime_epoch = retained.rtsp_runtime_epoch.clone();
         stream.presentation_transport_bound = retained.presentation_transport_bound;
@@ -195,6 +196,7 @@ impl ResumeSnapshot {
         macro_rules! move_fields { ($($field:ident),+ $(,)?) => { $(retained.$field = stream.$field;)+ }; }
         move_fields!(
             shared_capture,
+            source_capture_context,
             borrowed_capture_verified,
             rtsp_runtime_epoch,
             presentation_transport_bound,

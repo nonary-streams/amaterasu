@@ -1685,7 +1685,7 @@ impl Broker {
             self.rtsp_nvenc_settings = payload["nvenc_settings"].clone();
             self.rtsp_nvenc_spatial_aq = payload["nvenc_spatial_aq"].clone();
             self.rtsp_display_policy_snapshot = payload.get("display_policy_snapshot").cloned();
-            self.rtsp_lifecycle_fields = ["lifecycle_session_target", "lifecycle_settings_revision", "lifecycle_intent", "lifecycle_capture_mode"]
+            self.rtsp_lifecycle_fields = ["lifecycle_session_target", "lifecycle_settings_revision", "lifecycle_intent", "lifecycle_capture_mode", "source_capture_context"]
                 .into_iter().filter_map(|field| payload.get(field).map(|value| (field.to_owned(), value.clone()))).collect();
             self.rtsp_display_request = payload.get("display_request").cloned();
         }

@@ -1,8 +1,8 @@
 //! Application ownership remains with a retained root. Joining clients own only
 //! their encrypted transport, input binding and history activity.
 use super::{
-    Controller, LaunchRequest, MAX_RECORDS, PeerIdentity, PendingResume, Reply, operation_id,
-    private_error, random_nonzero_u32,
+    Controller, LaunchRequest, MAX_RECORDS, PeerIdentity, PendingResume, Reply, StreamResponse,
+    operation_id, private_error, random_nonzero_u32,
     record::{Record, State},
     resume_snapshot::ResumeSnapshot,
     valid_device_name,
@@ -124,13 +124,14 @@ impl Controller {
         connection: u64,
         request: LaunchRequest,
         peer: PeerIdentity,
+        response: StreamResponse,
         now: Instant,
     ) -> Option<Reply> {
         let application = self.shared_application(request.app_id)?;
         if self.application_has_live_stream(application) {
-            self.join_stream(connection, request, peer, now)
+            self.join_stream(connection, request, peer, response, now)
         } else {
-            self.resume(connection, request, &peer, now)
+            self.resume_for_route(connection, request, &peer, response, now)
         }
     }
 
@@ -139,6 +140,7 @@ impl Controller {
         connection: u64,
         request: LaunchRequest,
         peer: PeerIdentity,
+        response: StreamResponse,
         now: Instant,
     ) -> Option<Reply> {
         if self.package_activation_pending {
@@ -158,6 +160,7 @@ impl Controller {
         {
             if record.peer == peer && record.request == request && record.state == State::Ready {
                 record.launch_connection = Some(connection);
+                record.response_kind = response;
                 return Some(super::success_reply(record));
             }
             return Some(private_error(
@@ -243,7 +246,8 @@ impl Controller {
             }
         };
         let operation = operation_id(&self.nonce, id, "rtsp");
-        let stream = candidate.into_join(retained, id, operation, connection, now);
+        let mut stream = candidate.into_join(retained, id, operation, connection, now);
+        stream.response_kind = response;
         self.records.insert(id, stream);
         self.pending_resume = Some(PendingResume {
             connection,
@@ -251,6 +255,7 @@ impl Controller {
             request,
             peer,
             retained: true,
+            response_kind: response,
         });
         None
     }
