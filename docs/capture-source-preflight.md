@@ -20,6 +20,14 @@ HDR source state. A missing selector permits checking a future managed-output
 class before the display exists. Bounds are not a lease or a promise that every
 intermediate mode works: always query the exact proposed mode.
 
+`mode.bit_depth` is optional before stream negotiation. Absence is unknown,
+not eight-bit. A final request supplies the negotiated depth, including ten-bit
+SDR independently from HDR. Capabilities list accepted `bit_depths`; an empty
+list is unknown and cannot authorize ten-bit input. `format_open: true` explicitly
+declares support for an Open `video_stream_format` field. Consumers preserve the
+legacy Open body when that marker is false, including generated-black sources
+whose resource negotiation selects P010 without a new Open field.
+
 The response echoes the request and returns `ready`, `unavailable`, or
 `unsupported`, a bounded reason code, and mode capability bounds. The SDK rejects
 wrong echoed facts, malformed bounds, excess replies, and readiness unsupported

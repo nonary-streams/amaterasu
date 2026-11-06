@@ -15,6 +15,7 @@ fn source_preflight_is_read_only_and_rejects_unsupported_classes_and_modes() {
             height: 1080,
             refresh_millihz: 60_000,
             hdr: true,
+            bit_depth: None,
         },
     };
     let ready = controller.preflight(&request);

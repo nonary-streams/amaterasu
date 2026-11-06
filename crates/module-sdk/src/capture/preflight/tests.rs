@@ -134,6 +134,7 @@ fn request() -> SourcePreflightRequest {
             height: 1080,
             refresh_millihz: 60_000,
             hdr: false,
+            bit_depth: None,
         },
     }
 }
@@ -150,6 +151,8 @@ fn ready(request: &SourcePreflightRequest) -> SourcePreflightResponse {
             max_refresh_millihz: 240_000,
             sdr: true,
             hdr: true,
+            bit_depths: vec![8, 10],
+            format_open: false,
         }],
     )
 }
@@ -376,6 +379,32 @@ fn payload_and_response_helpers_preserve_opaque_routes_and_reject_false_ready_fa
     let mut oversized = request.clone();
     oversized.route = Some("x".repeat(513));
     assert!(oversized.validate().is_err());
+}
+
+#[test]
+fn negotiated_sdr_ten_bit_and_format_aware_open_require_explicit_capabilities() {
+    let mut requested = request();
+    requested.mode.bit_depth = Some(10);
+    let mut response = ready(&requested);
+    response.validate(&requested).unwrap();
+    response.capabilities[0].bit_depths.clear();
+    assert!(
+        response.validate(&requested).is_err(),
+        "unknown depth never establishes ten-bit SDR"
+    );
+    requested.mode.bit_depth = Some(8);
+    response.request = requested.clone();
+    response.validate(&requested).unwrap();
+    response.capabilities[0].format_open = true;
+    assert!(
+        response.validate(&requested).is_err(),
+        "new Open schema needs explicit format capabilities"
+    );
+    requested.mode.hdr = true;
+    assert!(
+        requested.validate().is_err(),
+        "HDR cannot be declared eight-bit"
+    );
 }
 
 #[test]

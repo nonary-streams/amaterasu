@@ -30,6 +30,9 @@ pub struct SourceMode {
     pub height: u32,
     pub refresh_millihz: u32,
     pub hdr: bool,
+    /// Known only after stream negotiation. Absence never means eight-bit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bit_depth: Option<u8>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -47,6 +50,10 @@ impl SourcePreflightRequest {
         if !(1..=8192).contains(&self.mode.width)
             || !(1..=8192).contains(&self.mode.height)
             || !(1_000..=1_000_000).contains(&self.mode.refresh_millihz)
+            || self
+                .mode
+                .bit_depth
+                .is_some_and(|depth| !matches!(depth, 8 | 10) || (self.mode.hdr && depth != 10))
             || self.route.as_ref().is_some_and(|route| {
                 route.is_empty() || route.len() > 512 || route.chars().any(char::is_control)
             })
@@ -69,6 +76,13 @@ pub struct SourceModeCapabilities {
     pub max_refresh_millihz: u32,
     pub sdr: bool,
     pub hdr: bool,
+    /// Accepted negotiated depths; empty is unknown, never implied ten-bit.
+    #[serde(default)]
+    pub bit_depths: Vec<u8>,
+    /// The provider accepts an explicit `video_stream_format` on Open. A false
+    /// value preserves its original Open schema; it is never sent a new field.
+    #[serde(default)]
+    pub format_open: bool,
 }
 
 impl SourceModeCapabilities {
@@ -78,6 +92,10 @@ impl SourceModeCapabilities {
             && (self.min_height..=self.max_height).contains(&request.mode.height)
             && (self.min_refresh_millihz..=self.max_refresh_millihz)
                 .contains(&request.mode.refresh_millihz)
+            && request.mode.bit_depth.is_none_or(|depth| {
+                self.bit_depths.contains(&depth)
+                    || (depth == 8 && self.bit_depths.is_empty() && !request.mode.hdr)
+            })
             && if request.mode.hdr { self.hdr } else { self.sdr }
     }
 
@@ -92,6 +110,10 @@ impl SourceModeCapabilities {
             && self.min_refresh_millihz <= self.max_refresh_millihz
             && self.max_refresh_millihz <= 1_000_000
             && (self.sdr || self.hdr)
+            && self.bit_depths.len() <= 2
+            && self.bit_depths.iter().all(|depth| matches!(depth, 8 | 10))
+            && (self.bit_depths.len() != 2 || self.bit_depths[0] != self.bit_depths[1])
+            && (!self.format_open || !self.bit_depths.is_empty())
     }
 }
 

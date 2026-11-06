@@ -107,7 +107,7 @@ impl Controller {
             width: request.mode.width,
             height: request.mode.height,
             fps: request.mode.refresh_millihz / 1_000,
-            format: if request.mode.hdr {
+            format: if request.mode.hdr || request.mode.bit_depth == Some(10) {
                 PIXEL_P010
             } else {
                 PIXEL_NV12
@@ -147,6 +147,8 @@ impl Controller {
                 max_refresh_millihz: 240_000,
                 sdr: true,
                 hdr: true,
+                bit_depths: vec![8, 10],
+                format_open: false,
             }],
         )
     }
