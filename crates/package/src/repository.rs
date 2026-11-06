@@ -3,6 +3,8 @@
 //! A repository URL locates bytes; only a separately confirmed public-key
 //! fingerprint establishes publisher identity. Staging changes only the next
 //! development selection; native loading happens later in a worker.
+mod local;
+pub use local::import_local_native;
 mod store;
 mod transport;
 use crate::{ActivationState, NativeReleaseFloor, RepositorySet, RootLock, write_json_atomically};

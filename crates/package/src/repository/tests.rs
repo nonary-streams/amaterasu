@@ -174,6 +174,103 @@ impl Drop for Fixture {
 }
 
 #[test]
+fn local_import_verifies_offline_payload_without_publication_or_selection_changes() {
+    let fixture = Fixture::new();
+    let (package, candidate) = fixture.native_set();
+    let bundle = fixture.root.join("offline");
+    let payload = bundle.join("native/fixture-capture/1.0");
+    fs::create_dir_all(&payload).unwrap();
+    for entry in fs::read_dir(package).unwrap() {
+        let entry = entry.unwrap();
+        fs::copy(entry.path(), payload.join(entry.file_name())).unwrap();
+    }
+    let (raw, signature) = fixture.signed_catalog(vec![candidate.clone()], 7);
+    fs::write(bundle.join("catalog.json"), &raw).unwrap();
+    fs::write(bundle.join("catalog.sig"), &signature).unwrap();
+    let store = RepositoryStore::new(fixture.root.join("repositories")).unwrap();
+    store.approve(fixture.approved.clone()).unwrap();
+    // An approval alone cannot extend the installed bootstrap's trust.
+    assert!(
+        import_local_native(
+            &fixture.root,
+            &fixture.approved.id,
+            &bundle,
+            &candidate.manifest_sha256,
+            100
+        )
+        .is_err()
+    );
+    let mut bootstrap = fixture.bootstrap.clone();
+    bootstrap.development = false;
+    bootstrap.allow_unsigned = false;
+    bootstrap.trusted_keys = fixture.approved.keys();
+    write_json_atomically(&fixture.root.join("bootstrap.json"), &bootstrap).unwrap();
+    let original = fs::read(fixture.root.join("bootstrap.json")).unwrap();
+    // A corrupt artifact must not advance the catalog, and retry must work.
+    let artifact = fs::read(payload.join("capture.bin")).unwrap();
+    fs::write(payload.join("capture.bin"), b"corrupt").unwrap();
+    assert!(
+        import_local_native(
+            &fixture.root,
+            &fixture.approved.id,
+            &bundle,
+            &candidate.manifest_sha256,
+            100
+        )
+        .is_err()
+    );
+    assert!(
+        store
+            .catalog(&fixture.approved.id, &current_target(), 100)
+            .is_err()
+    );
+    fs::write(payload.join("capture.bin"), artifact).unwrap();
+    let digest = import_local_native(
+        &fixture.root,
+        &fixture.approved.id,
+        &bundle,
+        &candidate.manifest_sha256,
+        100,
+    )
+    .unwrap();
+    assert_eq!(digest, sha256(&raw));
+    assert_eq!(
+        original,
+        fs::read(fixture.root.join("bootstrap.json")).unwrap()
+    );
+    assert!(!fixture.root.join("selection.json").exists());
+    // Idempotent import is allowed; a lower signed catalog remains rejected.
+    import_local_native(
+        &fixture.root,
+        &fixture.approved.id,
+        &bundle,
+        &candidate.manifest_sha256,
+        100,
+    )
+    .unwrap();
+    let (older, signature) = fixture.signed_catalog(vec![candidate.clone()], 6);
+    fs::write(bundle.join("catalog.json"), older).unwrap();
+    fs::write(bundle.join("catalog.sig"), signature).unwrap();
+    assert!(
+        import_local_native(
+            &fixture.root,
+            &fixture.approved.id,
+            &bundle,
+            &candidate.manifest_sha256,
+            100
+        )
+        .is_err()
+    );
+    assert_eq!(
+        store
+            .catalog(&fixture.approved.id, &current_target(), 100)
+            .unwrap()
+            .digest(),
+        digest
+    );
+}
+
+#[test]
 fn approval_requires_an_independently_confirmed_fingerprint() {
     let fixture = Fixture::new();
     assert!(

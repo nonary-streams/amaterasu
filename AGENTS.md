@@ -69,6 +69,26 @@
 
 ## Installed stream recovery and package updates
 
+- A request to install locally authorizes preparing, signing with the existing
+  local publisher key, importing and activating that local candidate. Do not
+  require a shared repository publication or a separate signing approval for
+  routine local updates. Shared publication remains a separate action.
+- For a production local update, prepare the signed repository layout on disk
+  and run `amaterasu-release import-local-native ROOT REPOSITORY BUNDLE MANIFEST_DIGEST`.
+  This uses the existing publisher approval, verifies the complete package and
+  signed catalog, and advances the normal replay checkpoint without uploading.
+  Never enroll a new key or weaken trust just to install locally. Follow with
+  the installed host's authenticated activation or `activate-package-offline`
+  when the managed service is stopped. Retain policy and service-pin checks.
+  See `docs/local-package-updates.md` for the complete procedure.
+- Component-only updates may have byte-identical bootstrap policy. Do not
+  invent a policy change to satisfy activation: fix the transaction guard if
+  it rejects this case. Selection and the service package pin must still advance.
+- Preserve the original request through installation and verification. Preparing
+  a candidate is not completion. An idle service restart needed for installation
+  is authorized by the install request; check stream activity first and request
+  fresh permission before interrupting an active stream.
+
 - Diagnose the running service, selected manifest digest and exact launch/cleanup
   error before changing source or runtime state. Preserve a private snapshot of
   recovery journals before an authorized repair; preserve unrelated work.
@@ -80,7 +100,8 @@
   Use authenticated recovery operations and verify native resource retirement.
 - Inspect the installed bootstrap's production/development mode before staging.
   For production, generic `stage` plus a service restart is not activation.
-  Use the approved signed repository and authenticated host activation flow;
+  Use the approved signed publisher (local bundle import is supported) and
+  authenticated host activation flow;
   retain signature, publisher, sequence, policy and service-pin checks. Do not
   switch to development mode or rewrite the active selection to bypass them.
 - Use a release tool compatible with the installed bootstrap schema. Match the
