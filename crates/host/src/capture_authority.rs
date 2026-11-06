@@ -206,7 +206,16 @@ mod tests {
     fn approved_channel_hardening_survives_exec() {
         use std::os::unix::process::CommandExt;
         if std::env::var_os("AMATERASU_TEST_AUTHORITY_CHILD").is_some() {
-            super::adopt("example.capture", &"a".repeat(64)).unwrap();
+            let source_preflight = std::env::var_os("AMATERASU_TEST_AUTHORITY_V2").is_some();
+            if source_preflight {
+                super::adopt_v2("example.capture", &"a".repeat(64)).unwrap();
+            } else {
+                super::adopt("example.capture", &"a".repeat(64)).unwrap();
+            }
+            assert_eq!(
+                super::AUTHORITY.get().unwrap().source_preflight,
+                source_preflight
+            );
             // SAFETY: these queries observe this test child's own process/fd.
             assert_eq!(unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) }, 0);
             assert_eq!(
@@ -247,32 +256,38 @@ mod tests {
             )
         };
         let fd = child.as_raw_fd();
-        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
-        command
-            .arg("capture_authority::tests::approved_channel_hardening_survives_exec")
-            .arg("--exact")
-            .arg("--ignored")
-            .env_clear()
-            .env("AMATERASU_TEST_AUTHORITY_CHILD", "1");
-        // SAFETY: only async-signal-safe syscalls execute in forked child.
-        unsafe {
-            command.pre_exec(move || {
-                if libc::dup2(fd, super::CHANNEL_FD) < 0
-                    || libc::setgroups(0, std::ptr::null()) != 0
-                    || libc::setresgid(65534, 65534, 65534) != 0
-                    || libc::setresuid(65534, 65534, 65534) != 0
-                {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
+        for source_preflight in [false, true] {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .arg("capture_authority::tests::approved_channel_hardening_survives_exec")
+                .arg("--exact")
+                .arg("--ignored")
+                .env_clear()
+                .env("AMATERASU_TEST_AUTHORITY_CHILD", "1");
+            if source_preflight {
+                command.env("AMATERASU_TEST_AUTHORITY_V2", "1");
+            }
+            // SAFETY: only async-signal-safe syscalls execute in forked child.
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::dup2(fd, super::CHANNEL_FD) < 0
+                        || libc::setgroups(0, std::ptr::null()) != 0
+                        || libc::setresgid(65534, 65534, 65534) != 0
+                        || libc::setresuid(65534, 65534, 65534) != 0
+                    {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            assert!(command.status().unwrap().success());
         }
-        assert!(command.status().unwrap().success());
     }
 
     #[test]
     fn arbitrary_caller_cannot_adopt_a_privileged_channel() {
         // The normal test runner has no root-peer inherited fd198.
         assert!(super::adopt("example.capture", &"a".repeat(64)).is_err());
+        assert!(super::adopt_v2("example.capture", &"a".repeat(64)).is_err());
     }
 }
