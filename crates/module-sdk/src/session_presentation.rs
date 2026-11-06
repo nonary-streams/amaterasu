@@ -148,7 +148,12 @@ pub struct AuxiliaryStreamPlan {
     /// Provider-held admission reference, retained before consumer effects.
     pub reservation_id: String,
     pub capture: CaptureSource,
+    /// Negotiated client/encoded mode, independent of the retained source.
     pub mode: Mode,
+    /// Observed source mode. An absent value does not authorize substituting
+    /// the encoded mode; synthetic sources can derive their generated mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_mode: Option<Mode>,
     pub stream_audio: bool,
     pub host_audio: bool,
 }
@@ -660,6 +665,9 @@ impl AuxiliaryStreamPlan {
     pub fn validate(&self) -> Result<(), &'static str> {
         self.capture.validate()?;
         self.mode.validate()?;
+        if let Some(source_mode) = self.source_mode {
+            source_mode.validate()?;
+        }
         if !token(&self.session_id)
             || self.generation == 0
             || !token(&self.reservation_id)

@@ -164,6 +164,7 @@ fn input_only_plans_cannot_request_host_capture_or_audio() {
             hdr: false,
         },
         stream_audio: false,
+        source_mode: None,
         host_audio: false,
     };
     assert!(plan.validate().is_ok());
@@ -191,6 +192,45 @@ fn input_only_plans_cannot_request_host_capture_or_audio() {
         .validate()
         .is_err()
     );
+}
+
+#[test]
+fn auxiliary_source_mode_does_not_inherit_encoded_geometry_or_hdr() {
+    let encoded = Mode {
+        width: 1920,
+        height: 1080,
+        refresh_millihz: 60_000,
+        hdr: false,
+    };
+    let source = Mode {
+        width: 2560,
+        height: 1440,
+        refresh_millihz: 144_000,
+        hdr: true,
+    };
+    let mut plan = AuxiliaryStreamPlan {
+        session_id: "monitor".into(),
+        generation: 1,
+        reservation_id: "admission".into(),
+        capture: CaptureSource::ExactOutput {
+            output: "exact-selector".into(),
+            route_key: "desktop_output".into(),
+        },
+        mode: encoded,
+        source_mode: Some(source),
+        stream_audio: false,
+        host_audio: true,
+    };
+    assert!(plan.validate().is_ok());
+    let decoded: AuxiliaryStreamPlan =
+        serde_json::from_value(serde_json::to_value(&plan).unwrap()).unwrap();
+    assert_eq!(decoded.mode, encoded);
+    assert_eq!(decoded.source_mode, Some(source));
+    plan.source_mode = None;
+    let legacy = serde_json::to_value(&plan).unwrap();
+    assert!(legacy.get("source_mode").is_none());
+    let decoded: AuxiliaryStreamPlan = serde_json::from_value(legacy).unwrap();
+    assert_eq!(decoded.source_mode, None);
 }
 
 #[test]

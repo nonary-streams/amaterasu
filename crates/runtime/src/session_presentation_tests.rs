@@ -797,7 +797,15 @@ impl StatefulFixture {
                         owner: scope.clone(),
                         session: session.clone(),
                         generation: self.generation,
-                        mode,
+                        mode: match self.strategy {
+                            FixtureStrategy::Immediate => mode,
+                            FixtureStrategy::Staged => Mode {
+                                width: 2560,
+                                height: 1440,
+                                refresh_millihz: 144_000,
+                                hdr: true,
+                            },
+                        },
                         capture: CaptureSource::ExactOutput {
                             route_key: match self.strategy {
                                 FixtureStrategy::Immediate => "startup-capture-a".into(),
@@ -864,7 +872,8 @@ impl StatefulFixture {
                 generation: shared.generation,
                 reservation_id,
                 capture: shared.capture.clone(),
-                mode: shared.mode,
+                mode,
+                source_mode: Some(shared.mode),
                 stream_audio: true,
                 host_audio: true,
             };
@@ -1807,7 +1816,9 @@ fn as_shared(plan: &AuxiliaryStreamPlan) -> SharedCapture {
         generation: plan.generation,
         reservation_id: plan.reservation_id.clone(),
         capture: plan.capture.clone(),
-        mode: plan.mode,
+        mode: plan
+            .source_mode
+            .expect("exact fixture source has an observed mode"),
     }
 }
 

@@ -112,6 +112,13 @@ exact output. It contains an opaque session, generation, admission reservation,
 mode and audio requirements. A normal application can borrow a retained output
 through `SharedCapture`, which freezes the same source and mode. Neither type
 contains native providers, OS handles or native allocation ownership.
+
+`mode` describes encoded/client output. The optional `source_mode` carries the
+observed source geometry, refresh and HDR state independently; an HDR source can
+feed an SDR client through selected processing. An absent source observation
+must not be replaced with encoded-mode facts. Synthetic sources can derive the
+mode of the pixels they generate.
+
 An exact source carries an opaque `route_key`. Missing keys decode as the legacy
 `default` route; other bounded keys are extensible. Trusted startup composition
 maps each accepted key to an approved capture alias and required capabilities.
