@@ -40,7 +40,7 @@ fn presentation_send(broker: &mut Broker, command: Command) -> Transport {
         {
             Some(json!({"ok":true,"runtime_epoch":"a".repeat(32),"startup_reconciled":true,
                 "operation_id":null,"expected_runtime_epoch":null,"state":"ready","retired":false,
-                "cleanup_pending":false,"pending_admissions":0}))
+                "cleanup_pending":false,"pending_admissions":0,"active_operations":0}))
         }
         _ => None,
     };
