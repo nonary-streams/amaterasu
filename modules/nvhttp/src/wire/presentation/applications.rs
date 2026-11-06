@@ -43,17 +43,24 @@ enum Phase {
     Done,
 }
 
+enum Purpose {
+    Catalog,
+    Inventory,
+}
+
 pub(super) enum ProjectionCall {
     Library(Value),
     Provider(Box<Request>),
 }
 
-/// One caller-authorized catalog read. No partial list is published, and the
-/// completed XML remains held until the provider releases its transaction.
+/// One authenticated inventory refresh or public catalog projection. Public
+/// XML remains held until the provider releases the complete transaction;
+/// backend inventory refreshes never request user-visible projected rows.
 pub(super) struct CatalogProjection {
     context: Context,
     desktop_enabled: bool,
     hdr_supported: bool,
+    purpose: Purpose,
     phase: Phase,
     revision: Option<u64>,
     cursor: Option<Cursor>,
@@ -75,6 +82,7 @@ impl CatalogProjection {
             context,
             desktop_enabled,
             hdr_supported,
+            purpose: Purpose::Catalog,
             phase: Phase::Inventory,
             revision: None,
             cursor: None,
@@ -88,6 +96,15 @@ impl CatalogProjection {
             projected_ids: BTreeSet::new(),
             projected_pages: 0,
             body: PREFIX.into(),
+        }
+    }
+
+    /// Refresh backend occupancy for an independently authorized operation.
+    /// This does not request a user-visible projection or grant List authority.
+    pub(super) fn inventory(context: Context, desktop_enabled: bool, hdr_supported: bool) -> Self {
+        Self {
+            purpose: Purpose::Inventory,
+            ..Self::new(context, desktop_enabled, hdr_supported)
         }
     }
 
@@ -171,7 +188,10 @@ impl CatalogProjection {
                 }
                 self.upload_offset = end;
                 if complete {
-                    self.phase = Phase::Read { offset: 0 };
+                    self.phase = match self.purpose {
+                        Purpose::Catalog => Phase::Read { offset: 0 },
+                        Purpose::Inventory => Phase::Release,
+                    };
                     self.inventory.clear();
                 } else {
                     self.prepare_append()?;
@@ -191,6 +211,15 @@ impl CatalogProjection {
             (Phase::Release, session::Reply::Acknowledged {}) => {
                 self.phase = Phase::Done;
                 self.inventory.clear();
+                if matches!(self.purpose, Purpose::Inventory) {
+                    return Ok(Some(Reply {
+                        status: 200,
+                        content_type: "application/octet-stream",
+                        body: Vec::new(),
+                        requires_paired_tls: true,
+                        permission: None,
+                    }));
+                }
                 self.body.push_str(SUFFIX);
                 return Ok(Some(Reply {
                     status: 200,

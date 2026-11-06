@@ -6,6 +6,7 @@ fn context() -> Context {
         client: Client {
             id: "authenticated-client".into(),
             paired: true,
+            may_list: true,
             may_view: true,
             may_launch: true,
             may_terminate: false,
@@ -286,6 +287,124 @@ fn empty_inventory_is_uploaded_as_one_final_page() {
         }
         _ => panic!("expected explicit final page"),
     }
+}
+
+#[test]
+fn view_only_inventory_refresh_skips_public_reads_and_preserves_hidden_occupancy() {
+    let mut facts = context();
+    facts.client.may_list = false;
+    facts.client.may_view = true;
+    facts.client.may_launch = false;
+    let mut observed = application(2);
+    observed.id = "2".into();
+    observed.title = "Application".into();
+    facts.game = Some(Game {
+        application: observed,
+        owner_client_id: "owner".into(),
+        generation: 9,
+        source: None,
+    });
+    let mut list = CatalogProjection::inventory(facts, false, true);
+    assert!(matches!(list.next_call(), ProjectionCall::Library(_)));
+    let mut hidden = application(1);
+    hidden.visible = false;
+    hidden.aliases = vec!["app-000000000000002a".into()];
+    hidden.properties = json!({"retained":"profile facts"});
+    list.accept(inventory(7, vec![hidden], Some(1))).unwrap();
+    assert!(matches!(list.next_call(), ProjectionCall::Library(_)));
+    list.accept(inventory(7, vec![application(2)], None))
+        .unwrap();
+    match provider_request(&list) {
+        Request::BeginProject { context, .. } => {
+            assert!(!context.client.may_list);
+            assert!(context.client.may_view);
+            assert!(!context.client.may_launch);
+            assert_eq!(context.game.unwrap().application.title, "Game 2");
+        }
+        _ => panic!("expected backend inventory transaction"),
+    }
+    begin(&mut list);
+    match provider_request(&list) {
+        Request::AppendProject {
+            entries,
+            final_page,
+            ..
+        } => {
+            assert!(final_page);
+            assert_eq!(entries.len(), 2);
+            assert_eq!(entries[0].id, "1");
+            assert!(!entries[0].visible);
+            assert_eq!(entries[0].aliases, ["42"]);
+            assert_eq!(entries[0].properties, json!({"retained":"profile facts"}));
+        }
+        _ => panic!("expected complete occupancy upload"),
+    }
+    // The only provider calls are Begin, Append and Release. ReadProject would
+    // require independently granted List authority and must never occur here.
+    upload_all(&mut list);
+    assert!(matches!(
+        provider_request(&list),
+        Request::ReleaseProject { .. }
+    ));
+    assert!(list.release_request().is_some());
+    let completion = list
+        .accept(provider(session::Reply::Acknowledged {}))
+        .unwrap()
+        .expect("backend refresh completes only after release");
+    assert_eq!(completion.status, 200);
+    assert!(completion.body.is_empty());
+    assert!(completion.requires_paired_tls);
+    assert_eq!(completion.permission, None);
+    assert!(list.release_request().is_none());
+    assert!(!list.context().client.may_list);
+    assert!(list.context().client.may_view);
+}
+
+#[test]
+fn list_only_clients_keep_public_projection_without_stream_view_authority() {
+    let mut facts = context();
+    facts.client.may_list = true;
+    facts.client.may_view = false;
+    facts.client.may_launch = false;
+    let mut list = CatalogProjection::new(facts, false, false);
+    list.accept(inventory(1, vec![application(1)], None))
+        .unwrap();
+    match provider_request(&list) {
+        Request::BeginProject { context, .. } => {
+            assert!(context.client.may_list);
+            assert!(!context.client.may_view);
+        }
+        _ => panic!("expected public projection transaction"),
+    }
+    begin(&mut list);
+    upload_all(&mut list);
+    assert!(matches!(
+        provider_request(&list),
+        Request::ReadProject { .. }
+    ));
+    assert!(
+        list.accept(provider(session::Reply::Projected {
+            presentation: presentation(),
+            entries: vec![projected_application(1)],
+            next_offset: None,
+        }))
+        .unwrap()
+        .is_none()
+    );
+    assert!(matches!(
+        provider_request(&list),
+        Request::ReleaseProject { .. }
+    ));
+    let reply = list
+        .accept(provider(session::Reply::Acknowledged {}))
+        .unwrap()
+        .unwrap();
+    assert_eq!(reply.permission, Some(Permission::List));
+    assert!(
+        String::from_utf8(reply.body)
+            .unwrap()
+            .contains("<ID>1</ID>")
+    );
 }
 
 #[test]
