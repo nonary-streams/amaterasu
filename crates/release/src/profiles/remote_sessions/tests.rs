@@ -4,6 +4,31 @@ use amaterasu_contracts::{Command, Response};
 use amaterasu_runtime::Broker;
 use std::collections::{BTreeMap, BTreeSet};
 
+struct PrivateTestRoot(std::path::PathBuf);
+
+impl PrivateTestRoot {
+    fn new() -> Self {
+        let mut nonce = [0_u8; 8];
+        getrandom::fill(&mut nonce).unwrap();
+        let suffix: String = nonce.iter().map(|byte| format!("{byte:02x}")).collect();
+        let base = std::env::var_os("CARGO_TARGET_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let path = base.join(format!(
+            "remote-session-profile-{}-{suffix}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        Self(path)
+    }
+}
+
+impl Drop for PrivateTestRoot {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 #[test]
 fn product_graphs_select_the_plugin_and_synthetic_capture_without_dependency_cycles() {
     for profile in [
@@ -63,6 +88,10 @@ fn installer_selects_exact_contracts_and_keeps_hardware_disabled() {
         policy.settings["amaterasu.rtsp"]["retirement_status_principals"],
         json!([COMPONENT.id])
     );
+    assert_eq!(
+        policy.settings["amaterasu.launch"]["application_retirement_observers"][COMPONENT.id],
+        "amaterasu.nvhttp"
+    );
     assert!(
         !policy.settings["amaterasu.rtsp"]["allowed_principals"]
             .as_array()
@@ -72,6 +101,10 @@ fn installer_selects_exact_contracts_and_keeps_hardware_disabled() {
     assert_eq!(policy.settings["amaterasu.video"]["enabled"], false);
     assert_eq!(policy.settings["amaterasu.nvhttp"]["allow_remote"], false);
     assert_eq!(policy.settings[BLACK_CAPTURE.id], json!({"enabled":true}));
+    assert_eq!(
+        policy.settings["amaterasu.nvhttp"]["auxiliary_exact_capture_routes"],
+        json!({"managed_output":"dxgi","desktop_output":"dxgi"})
+    );
     assert_eq!(
         policy.settings["amaterasu.video"]["external_capture_providers"]["black"],
         json!({"service":"amaterasu.capture-black/1","frame_transport":"generic_cpu"})
@@ -100,6 +133,77 @@ fn installer_selects_exact_contracts_and_keeps_hardware_disabled() {
             method.callers,
             BTreeSet::from(["amaterasu.management".into()])
         );
+    }
+}
+
+#[test]
+fn linux_exact_desktop_route_requires_explicit_named_capture_authorization() {
+    let root = PrivateTestRoot::new();
+    let policy = linux_session::linux_session_policy(
+        &root.0,
+        &linux_session::options::LinuxSessionOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        policy.settings["amaterasu.nvhttp"]["auxiliary_exact_capture_routes"],
+        json!({"managed_output":"vkms"})
+    );
+
+    let root = PrivateTestRoot::new();
+    let mut authorized = linux_session::linux_session_policy(
+        &root.0,
+        &linux_session::options::LinuxSessionOptions {
+            enable_virtual_display: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        authorized.settings["amaterasu.nvhttp"]["auxiliary_exact_capture_routes"],
+        json!({"managed_output":"vkms","desktop_output":"pipewire"})
+    );
+    assert_eq!(
+        authorized.settings["amaterasu.input"]["allow_injection"],
+        false
+    );
+    assert_eq!(
+        authorized.settings["amaterasu.display"]["allow_mutation"],
+        false
+    );
+    authorized.principals.remove("amaterasu.capture-pipewire");
+    configure_capture_routes(&mut authorized);
+    assert!(
+        authorized.settings["amaterasu.nvhttp"]["auxiliary_exact_capture_routes"]
+            .get("desktop_output")
+            .is_none()
+    );
+}
+
+#[test]
+fn monitor_profiles_use_the_same_private_catalog_owner_as_the_protocol() {
+    for owner in [
+        linux_session::options::CatalogOwner::Management,
+        linux_session::options::CatalogOwner::Console,
+    ] {
+        let root = PrivateTestRoot::new();
+        let mut policy = linux_session::linux_session_policy(
+            &root.0,
+            &linux_session::options::LinuxSessionOptions {
+                catalog_owner: owner,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let catalog = &policy.settings["amaterasu.catalog"];
+        assert_eq!(
+            catalog["profile_principals"][COMPONENT.id],
+            catalog["export_principals"]["amaterasu.nvhttp"]
+        );
+        policy.settings.get_mut("amaterasu.catalog").unwrap()["profile_principals"][COMPONENT.id] =
+            json!("unrelated.owner");
+        let before = serde_json::to_value(&policy).unwrap();
+        assert!(install(&mut policy).is_err());
+        assert_eq!(serde_json::to_value(&policy).unwrap(), before);
     }
 }
 

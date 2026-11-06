@@ -7,6 +7,18 @@ use amaterasu_contracts::{ApiMethodApproval, RuntimeConfig};
 use amaterasu_module_sdk::session_presentation;
 use serde_json::json;
 
+const PROVIDER_DEPENDENCIES: &[&str] = &[
+    RUNTIME_ID,
+    "amaterasu.configuration",
+    "amaterasu.state",
+    "amaterasu.catalog",
+    "amaterasu.virtual-display",
+    "amaterasu.display",
+    "amaterasu.rtsp",
+    "amaterasu.launch",
+    "amaterasu.pairing",
+];
+
 pub(super) const COMPONENT: ComponentDefinition = ComponentDefinition {
     id: "amaterasu.remote-session",
     library: "amaterasu_remote_session",
@@ -18,19 +30,25 @@ pub(super) const COMPONENT: ComponentDefinition = ComponentDefinition {
         "amaterasu.virtual-display/1",
         "amaterasu.display/1",
         "amaterasu.rtsp/1",
+        "amaterasu.launch/1",
+        "amaterasu.pairing/1",
+        "amaterasu.video/1",
     ],
     publishes: &[],
-    dependencies: &[
-        RUNTIME_ID,
-        "amaterasu.configuration",
-        "amaterasu.state",
-        "amaterasu.catalog",
-        "amaterasu.virtual-display",
-        "amaterasu.display",
-        "amaterasu.rtsp",
-    ],
+    dependencies: &append::<{ PROVIDER_DEPENDENCIES.len() + 1 }>(
+        PROVIDER_DEPENDENCIES,
+        &["amaterasu.video"],
+    ),
     native_provides: &[],
     native_uses: &[],
+};
+
+pub(super) const LINUX_COMPONENT: ComponentDefinition = ComponentDefinition {
+    dependencies: &append::<{ PROVIDER_DEPENDENCIES.len() + 1 }>(
+        PROVIDER_DEPENDENCIES,
+        &[super::linux_session::VIDEO_COMPONENT_ID],
+    ),
+    ..COMPONENT
 };
 
 pub(super) const BLACK_CAPTURE: ComponentDefinition = ComponentDefinition {
@@ -163,6 +181,7 @@ pub(super) fn install(policy: &mut RuntimeConfig) -> Result<(), String> {
     }
     let mut candidate = policy.clone();
     configure_native_settings(&mut candidate)?;
+    configure_application_retirement_observer(&mut candidate)?;
     configure_catalog_profile_owner(&mut candidate)?;
     configure_capture_routes(&mut candidate);
     approve_protocol_methods(&mut candidate)?;
@@ -197,6 +216,9 @@ fn configure_native_settings(policy: &mut RuntimeConfig) -> Result<(), String> {
     if let Some(settings) = policy.settings.get_mut("amaterasu.virtual-display") {
         settings["target_verifiers"] = json!(["amaterasu.display"]);
     }
+    if let Some(settings) = policy.settings.get_mut("amaterasu.pairing") {
+        settings["authority_observer_principals"] = json!([COMPONENT.id]);
+    }
     if let Some(settings) = policy.settings.get_mut("amaterasu.rtsp") {
         settings["retirement_status_principals"] = json!([COMPONENT.id]);
         settings["max_live_tickets"] = json!(32);
@@ -212,6 +234,26 @@ fn configure_native_settings(policy: &mut RuntimeConfig) -> Result<(), String> {
         }
         settings["borrowed_capture_callers"] = json!(["amaterasu.nvhttp", "amaterasu.rtsp"]);
     }
+    Ok(())
+}
+
+fn configure_application_retirement_observer(policy: &mut RuntimeConfig) -> Result<(), String> {
+    let launch = policy
+        .settings
+        .entry("amaterasu.launch".into())
+        .or_insert_with(|| json!({}));
+    if launch.get("application_retirement_observers").is_none() {
+        launch["application_retirement_observers"] = json!({});
+    }
+    if launch["application_retirement_observers"]
+        .get(COMPONENT.id)
+        .is_some_and(|owner| owner != "amaterasu.nvhttp")
+    {
+        return Err(
+            "application retirement observer conflicts with selected transport owner".into(),
+        );
+    }
+    launch["application_retirement_observers"][COMPONENT.id] = json!("amaterasu.nvhttp");
     Ok(())
 }
 
@@ -253,10 +295,36 @@ fn configure_capture_routes(policy: &mut RuntimeConfig) {
     } else {
         "dxgi"
     };
+    let mut exact_routes = json!({"managed_output":exact_capture});
+    let linux_video = policy
+        .settings
+        .contains_key("amaterasu.linux-session-video");
+    if !linux_video {
+        exact_routes["desktop_output"] = json!("dxgi");
+    } else if policy
+        .principals
+        .get("amaterasu.capture-pipewire")
+        .is_some_and(|grants| {
+            grants
+                .native_provide
+                .contains("amaterasu.capture-pipewire/1")
+        })
+        && policy
+            .settings
+            .get("amaterasu.capture-pipewire")
+            .is_some_and(|settings| {
+                settings["enabled"] == true && settings["allow_named_outputs"] == true
+            })
+    {
+        // This is authorization and provider selection. The consumer must still
+        // probe that exact provider's compiled/runtime support before effects.
+        exact_routes["desktop_output"] = json!("pipewire");
+    }
     if let Some(settings) = policy.settings.get_mut("amaterasu.nvhttp") {
         settings["session_presentation_provider"] = json!(session_presentation::SERVICE);
         settings["auxiliary_black_capture_provider"] = json!("black");
         settings["auxiliary_exact_capture_provider"] = json!(exact_capture);
+        settings["auxiliary_exact_capture_routes"] = exact_routes.clone();
     }
     for video in ["amaterasu.video", "amaterasu.linux-session-video"] {
         if let Some(settings) = policy.settings.get_mut(video) {
@@ -267,6 +335,9 @@ fn configure_capture_routes(policy: &mut RuntimeConfig) {
                 "service":"amaterasu.capture-black/1",
                 "frame_transport":"generic_cpu",
             });
+            let mut preflight_routes = exact_routes.clone();
+            preflight_routes["synthetic_black"] = json!("black");
+            settings["source_preflight_routes"] = preflight_routes;
         }
     }
 }
