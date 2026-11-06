@@ -493,6 +493,7 @@ fn client_authorization(document: &Document, certificate_id: &str, now: u64) -> 
         "ok": true,
         "certificate_id": certificate_id,
         "paired": client.is_some(),
+        "may_list": unrestricted || permissions.is_some_and(|permissions| permissions.list_apps || permissions.view_streams || permissions.launch_apps),
         "may_view": unrestricted || permissions.is_some_and(|permissions| permissions.view_streams || permissions.launch_apps),
         "may_launch": unrestricted || permissions.is_some_and(|permissions| permissions.launch_apps),
         "may_terminate": unrestricted || permissions.is_some_and(|permissions| permissions.terminate_streams),
@@ -532,7 +533,7 @@ mod authorization_tests {
         assert_eq!(before["paired"], true);
         let expired = client_authorization(&document, &certificate.fingerprint, expires);
         assert_eq!(expired["paired"], false);
-        for permission in ["may_view", "may_launch", "may_terminate"] {
+        for permission in ["may_list", "may_view", "may_launch", "may_terminate"] {
             assert_eq!(expired[permission], false);
         }
         assert!(expired["name"].is_null());

@@ -2759,7 +2759,12 @@ fn authority_observer_reads_current_committed_membership_without_transport_or_ad
     let writes_before = state.writes;
     let authorization = observe_client_authorization(&mut state, &mut pipeline, fingerprint);
     assert!(authorization.paired);
-    assert!(authorization.may_view && authorization.may_launch && authorization.may_terminate);
+    assert!(
+        authorization.may_list
+            && authorization.may_view
+            && authorization.may_launch
+            && authorization.may_terminate
+    );
     assert_eq!(authorization.name.as_deref(), Some("Moonlight test"));
     assert_eq!(authorization.revision, state.revision);
     assert_eq!(state.writes, writes_before);
@@ -2805,7 +2810,12 @@ fn authority_observations_follow_permission_mode_updates_and_unpair_across_resta
     );
     assert_eq!(update["ok"], true);
     let legacy_mode = observe_client_authorization(&mut state, &mut pipeline, fingerprint);
-    assert!(legacy_mode.may_view && legacy_mode.may_launch && legacy_mode.may_terminate);
+    assert!(
+        legacy_mode.may_list
+            && legacy_mode.may_view
+            && legacy_mode.may_launch
+            && legacy_mode.may_terminate
+    );
     let mode = state.request(
         &mut pipeline,
         "console",
@@ -2816,7 +2826,7 @@ fn authority_observations_follow_permission_mode_updates_and_unpair_across_resta
     let mut restarted = Pipeline::new(settings());
     let limited = observe_client_authorization(&mut state, &mut restarted, fingerprint);
     // Launch includes view in the native identity permission contract.
-    assert!(limited.may_view && limited.may_launch);
+    assert!(limited.may_list && limited.may_view && limited.may_launch);
     assert!(!limited.may_terminate);
     assert!(limited.revision > legacy_mode.revision);
     let removed = state.request(
@@ -2828,7 +2838,9 @@ fn authority_observations_follow_permission_mode_updates_and_unpair_across_resta
     assert_eq!(removed["ok"], true);
     let revoked = observe_client_authorization(&mut state, &mut restarted, fingerprint);
     assert!(!revoked.paired);
-    assert!(!revoked.may_view && !revoked.may_launch && !revoked.may_terminate);
+    assert!(
+        !revoked.may_list && !revoked.may_view && !revoked.may_launch && !revoked.may_terminate
+    );
     assert!(revoked.name.is_none());
     assert!(revoked.revision > limited.revision);
 }
@@ -2862,7 +2874,13 @@ fn authority_observer_unknown_invalid_and_cancelled_queries_never_write_state() 
     let unknown_id = "ab".repeat(32);
     let writes_before = state.writes;
     let unknown = observe_client_authorization(&mut state, &mut pipeline, &unknown_id);
-    assert!(!unknown.paired && !unknown.may_view && !unknown.may_launch && !unknown.may_terminate);
+    assert!(
+        !unknown.paired
+            && !unknown.may_list
+            && !unknown.may_view
+            && !unknown.may_launch
+            && !unknown.may_terminate
+    );
     assert!(unknown.name.is_none());
     for payload in [
         json!({"action":"client_authorization","certificate_id":"AB".repeat(32)}),
@@ -2885,6 +2903,64 @@ fn authority_observer_unknown_invalid_and_cancelled_queries_never_write_state() 
     assert_eq!(cancelled["code"], "request_ended");
     assert!(cancelled.get("certificate_id").is_none());
     assert_eq!(state.writes, writes_before);
+}
+
+#[test]
+fn observed_listing_preserves_native_effective_permission_hierarchy() {
+    let mut state = Harness::new();
+    let mut pipeline = Pipeline::new(settings());
+    state.initialize(&mut pipeline);
+    let imported = import_client(&mut state, &mut pipeline, "moonlight", CLIENT_CERT);
+    let fingerprint = imported["certificate_id"].as_str().unwrap();
+    let enabled = state.request(
+        &mut pipeline,
+        "console",
+        json!({"action":"set_permission_mode","enabled":true,"expected_revision":state.revision}),
+        now(),
+    );
+    assert_eq!(enabled["ok"], true);
+    let der = crate::crypto::parse_certificate(CLIENT_CERT, None)
+        .unwrap()
+        .certificate
+        .to_der()
+        .unwrap();
+    for (list, view, launch, expected_list) in [
+        (true, false, false, true),
+        (false, true, false, true),
+        (false, false, true, true),
+        (false, false, false, false),
+    ] {
+        let update = state.request(
+            &mut pipeline,
+            "console",
+            json!({"action":"update_client_permissions","certificate_id":fingerprint,"permissions":{"list_apps":list,"view_streams":view,"launch_apps":launch,"terminate_streams":false},"expected_revision":state.revision}),
+            now(),
+        );
+        assert_eq!(update["ok"], true);
+        let observed = observe_client_authorization(&mut state, &mut pipeline, fingerprint);
+        assert_eq!(observed.may_list, expected_list);
+        assert_eq!(observed.may_view, view || launch);
+        assert_eq!(observed.may_launch, launch);
+        let document: Document = serde_json::from_value(state.document.clone().unwrap()).unwrap();
+        let native = crate::identity::Snapshot::prepare(&document, now())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            native
+                .check_permission(&der, now(), amaterasu_identity::PERMISSION_LIST)
+                .is_ok(),
+            observed.may_list,
+        );
+    }
+    let disabled = state.request(
+        &mut pipeline,
+        "console",
+        json!({"action":"set_permission_mode","enabled":false,"expected_revision":state.revision}),
+        now(),
+    );
+    assert_eq!(disabled["ok"], true);
+    let unrestricted = observe_client_authorization(&mut state, &mut pipeline, fingerprint);
+    assert!(unrestricted.may_list && unrestricted.may_view && unrestricted.may_launch);
 }
 
 #[test]

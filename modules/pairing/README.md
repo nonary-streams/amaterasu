@@ -25,11 +25,14 @@ An authority observer may use the public
 `amaterasu_module_sdk::pairing_authority` adapter to request
 `{"action":"client_authorization","certificate_id":"<64 lowercase hex>"}`.
 The response includes the exact queried fingerprint, current `paired` status,
-effective `may_view`, `may_launch`, and `may_terminate` privileges, durable State
+effective `may_list`, `may_view`, `may_launch`, and `may_terminate` privileges, durable State
 `revision`, and optional `name`. Unknown or expired certificates return
 `paired:false` with every privilege false and no name. Permission mode disabled
 retains legacy full access for a currently paired certificate; enabled mode uses
 the same certificate-bound policy as native identity checks.
+Effective listing includes any of list, view, or launch permission, and effective
+viewing includes view or launch permission. The SDK defaults an absent listing
+bit from older providers to false, without inferring it from another privilege.
 
 The observer list authorizes only this read operation. It does not authorize
 pairing, certificate import, administration, transport verification, or unpairing.

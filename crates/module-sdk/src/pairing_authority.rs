@@ -33,6 +33,9 @@ pub struct Authorization {
     pub ok: bool,
     pub certificate_id: String,
     pub paired: bool,
+    /// Older providers omit this field; absence grants no listing access.
+    #[serde(default)]
+    pub may_list: bool,
     pub may_view: bool,
     pub may_launch: bool,
     pub may_terminate: bool,
@@ -55,7 +58,8 @@ impl Authorization {
         if !response.ok
             || response.certificate_id != expected_certificate_id
             || (!response.paired
-                && (response.may_view
+                && (response.may_list
+                    || response.may_view
                     || response.may_launch
                     || response.may_terminate
                     || response.name.is_some()))
@@ -108,7 +112,7 @@ mod tests {
     use serde_json::json;
 
     fn payload(fingerprint: &str) -> Value {
-        json!({"ok":true,"certificate_id":fingerprint,"paired":true,"may_view":true,"may_launch":false,"may_terminate":false,"revision":7,"name":"Player"})
+        json!({"ok":true,"certificate_id":fingerprint,"paired":true,"may_list":true,"may_view":true,"may_launch":false,"may_terminate":false,"revision":7,"name":"Player"})
     }
 
     #[test]
@@ -150,10 +154,10 @@ mod tests {
                 panic!("request");
             };
             assert_eq!(service, SERVICE);
-            json!({"ok":true,"certificate_id":query["certificate_id"],"paired":false,"may_view":false,"may_launch":false,"may_terminate":false,"revision":8,"name":null})
+            json!({"ok":true,"certificate_id":query["certificate_id"],"paired":false,"may_list":false,"may_view":false,"may_launch":false,"may_terminate":false,"revision":8,"name":null})
         });
-        assert!(first.paired && first.may_view && !first.may_launch);
-        assert!(!replacement.paired);
+        assert!(first.paired && first.may_list && first.may_view && !first.may_launch);
+        assert!(!replacement.paired && !replacement.may_list);
         assert_eq!(replacement.revision, 8);
     }
 
@@ -192,5 +196,21 @@ mod tests {
             .validate()
             .is_err()
         );
+    }
+
+    #[test]
+    fn absent_list_bit_from_older_authority_defaults_to_least_privilege() {
+        let fingerprint = "ab".repeat(32);
+        let mut legacy = payload(&fingerprint);
+        legacy.as_object_mut().unwrap().remove("may_list");
+        let observation = Authorization::parse(&fingerprint, &legacy).unwrap();
+        assert!(!observation.may_list);
+        assert!(observation.may_view);
+        let mut unpaired = legacy;
+        unpaired["paired"] = json!(false);
+        unpaired["may_view"] = json!(false);
+        unpaired["name"] = Value::Null;
+        unpaired["may_list"] = json!(true);
+        assert!(Authorization::parse(&fingerprint, &unpaired).is_err());
     }
 }

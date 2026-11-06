@@ -134,9 +134,10 @@ fn pairing_authority_sdk_consumer_works_unchanged_with_selected_replacement_prov
         ));
         let actual = read_authority(&mut broker, provider, &fingerprint, |operation| {
             let Request::ClientAuthorization { certificate_id } = operation;
-            json!({"ok":true,"certificate_id":certificate_id,"paired":paired,"may_view":paired,"may_launch":false,"may_terminate":false,"revision":9,"name":paired.then_some("Player")})
+            json!({"ok":true,"certificate_id":certificate_id,"paired":paired,"may_list":paired,"may_view":paired,"may_launch":false,"may_terminate":false,"revision":9,"name":paired.then_some("Player")})
         });
         assert_eq!(actual.paired, paired);
+        assert_eq!(actual.may_list, paired);
         assert_eq!(actual.may_view, paired);
         assert!(matches!(
             broker.dispatch(unselected, Command::Poll {}),
