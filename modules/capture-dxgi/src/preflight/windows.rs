@@ -4,7 +4,7 @@ use amaterasu_module_sdk::capture::{EXACT_TARGET_PREFIX, exact_target_key, exact
 use amaterasu_windows_capture_geometry::resolve_target_matching;
 use windows::Win32::{
     Foundation::HANDLE,
-    Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1, IDXGIFactory2},
+    Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1, IDXGIFactory5},
     System::{
         LibraryLoader::GetModuleHandleW,
         RemoteDesktop::{
@@ -33,7 +33,7 @@ pub(super) fn query<B: Backend>(
     // for this interface-capability query; no device or output is opened.
     let factory = unsafe { CreateDXGIFactory1::<IDXGIFactory1>() };
     if factory
-        .and_then(|factory| factory.cast::<IDXGIFactory2>())
+        .and_then(|factory| factory.cast::<IDXGIFactory5>())
         .is_err()
     {
         return SourcePreflightResponse::unsupported(request, "desktop_duplication_unavailable");
@@ -41,6 +41,14 @@ pub(super) fn query<B: Backend>(
     if let Some(route) = request.route.as_deref() {
         if let Err(reason) = exact_output(backend, route, request) {
             return SourcePreflightResponse::unavailable(request, reason);
+        }
+        let format = crate::format::CaptureFormat {
+            ten_bit: request.mode.hdr || request.mode.bit_depth == Some(10),
+            hdr: request.mode.hdr,
+            explicit: request.mode.hdr || request.mode.bit_depth.is_some(),
+        };
+        if let Err(error) = backend.verify_source_format(route, format) {
+            return SourcePreflightResponse::unavailable(request, error.code);
         }
     }
     ready(request)

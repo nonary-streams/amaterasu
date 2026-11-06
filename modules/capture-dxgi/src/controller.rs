@@ -15,6 +15,7 @@ struct Stream {
     geometry: Option<CaptureGeometry>,
     touch_surface: Option<TouchSurface>,
     operation_id: Option<String>,
+    format: crate::format::CaptureFormat,
 }
 
 pub struct Controller<B: Backend> {
@@ -75,7 +76,8 @@ impl<B: Backend> Controller<B> {
             Operation::Open {
                 output,
                 operation_id,
-            } => self.open(caller, &output, operation_id, guard),
+                source_format,
+            } => self.open(caller, &output, operation_id, source_format.as_ref(), guard),
             Operation::Lookup { operation_id } => self.lookup(caller, &operation_id),
             Operation::Close { stream } => self.close(caller, stream).map(|()| json!({"ok":true})),
         };
@@ -87,8 +89,10 @@ impl<B: Backend> Controller<B> {
         caller: &str,
         output: &str,
         operation_id: Option<String>,
+        source_format: Option<&amaterasu_module_sdk::capture::SourceFormat>,
         guard: &mut impl FnMut() -> CaptureResult<()>,
     ) -> CaptureResult<Value> {
+        let format = crate::format::CaptureFormat::requested(source_format)?;
         if !self.enabled {
             return Err(CaptureError::new(
                 "capture_disabled",
@@ -98,7 +102,7 @@ impl<B: Backend> Controller<B> {
         if let Some(operation_id) = &operation_id {
             validate_operation_id(operation_id)?;
             if let Some((stream_id, existing)) = self.find_operation(caller, operation_id) {
-                if existing.output != output {
+                if existing.output != output || existing.format != format {
                     return Err(CaptureError::new(
                         "operation_conflict",
                         "operation ID already selected a different output",
@@ -118,9 +122,10 @@ impl<B: Backend> Controller<B> {
                 "at most four capture streams may be open",
             ));
         }
+        self.backend.verify_source_format(output, format)?;
         let id = self.next_stream_id()?;
         guard()?;
-        let mut session = self.backend.open(output)?;
+        let mut session = self.backend.open_with_format(output, format)?;
         let geometry = initial_geometry(&mut *session)?;
         let touch_surface = initial_touch_surface(&mut *session, geometry)?;
         // Opening may block in a driver. Recheck before retaining resources.
@@ -134,6 +139,7 @@ impl<B: Backend> Controller<B> {
                 geometry,
                 touch_surface,
                 operation_id,
+                format,
             },
         );
         self.opened_stream = Some(id);
@@ -224,10 +230,16 @@ impl<B: Backend> Controller<B> {
             .expect("authorized stream")
             .session
             .read(wait_ms);
-        if result
-            .as_ref()
-            .is_err_and(|error| error.code == "access_lost" || error.code == "device_lost")
-        {
+        if result.as_ref().is_err_and(|error| {
+            matches!(
+                error.code,
+                "access_lost"
+                    | "device_lost"
+                    | "source_color_unavailable"
+                    | "source_range_mismatch"
+                    | "unsupported_format"
+            )
+        }) {
             self.streams.remove(&id);
         }
         let frame = result?;
@@ -242,6 +254,50 @@ impl<B: Backend> Controller<B> {
             self.geometry(caller, id)?;
         }
         Ok(frame)
+    }
+
+    pub fn source_info(
+        &mut self,
+        caller: &str,
+        id: u64,
+    ) -> CaptureResult<Option<crate::format::SourceInfo>> {
+        self.authorize(caller, id)?;
+        let stream = self.streams.get_mut(&id).expect("authorized stream");
+        let result = stream.session.source_info().and_then(|info| {
+            if let Some(info) = info
+                && (info.format != stream.format
+                    || (info.format.ten_bit
+                        && info.encoding
+                            == amaterasu_module_sdk::capture::high_depth::RgbEncoding::Bgra8Srgb))
+            {
+                return Err(CaptureError::new(
+                    "access_lost",
+                    "native source no longer matches the admitted source format",
+                ));
+            }
+            Ok(info)
+        });
+        if result.as_ref().is_err_and(|e| {
+            matches!(
+                e.code,
+                "access_lost"
+                    | "device_lost"
+                    | "source_color_unavailable"
+                    | "source_range_mismatch"
+                    | "unsupported_format"
+            )
+        }) {
+            self.streams.remove(&id);
+        }
+        result
+    }
+    pub fn capture_format(
+        &self,
+        caller: &str,
+        id: u64,
+    ) -> CaptureResult<crate::format::CaptureFormat> {
+        self.authorize(caller, id)?;
+        Ok(self.streams.get(&id).expect("authorized stream").format)
     }
 
     pub fn geometry(&mut self, caller: &str, id: u64) -> CaptureResult<Option<CaptureGeometry>> {

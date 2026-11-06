@@ -83,6 +83,7 @@ pub enum Operation {
     Open {
         output: String,
         operation_id: Option<String>,
+        source_format: Option<amaterasu_module_sdk::capture::SourceFormat>,
     },
     Lookup {
         operation_id: String,
@@ -99,9 +100,9 @@ pub struct Frame {
     pub timestamp_us: u64,
     pub sequence: u64,
     pub bytes: Vec<u8>,
+    pub surface: Option<amaterasu_module_sdk::capture::high_depth::RgbSurface>,
 }
 
-#[cfg(any(windows, test))]
 pub fn frame_layout(width: u32, height: u32) -> CaptureResult<(u32, usize)> {
     let stride = width.checked_mul(4).ok_or_else(invalid_frame)?;
     let length = (stride as usize)
@@ -118,7 +119,6 @@ pub fn frame_layout(width: u32, height: u32) -> CaptureResult<(u32, usize)> {
     Ok((stride, length))
 }
 
-#[cfg(any(windows, test))]
 fn invalid_frame() -> CaptureError {
     CaptureError::new(
         "invalid_frame",
@@ -242,4 +242,80 @@ pub fn mapped_length(height: u32, row_pitch: u32, stride: u32) -> CaptureResult<
         .and_then(|length| length.checked_add(stride as usize))
         .filter(|length| *length <= 2 * amaterasu_media::MAX_FRAME_BYTES)
         .ok_or_else(invalid_frame)
+}
+
+/// Copy initialized high-depth RGB pixels into desktop orientation without
+/// constructing slices over uninitialized D3D row padding.
+/// # Safety
+/// `source` holds `surface_height` rows of at least
+/// `surface_width * encoding.bytes_per_pixel()` initialized readable bytes.
+#[cfg(any(windows, test))]
+pub unsafe fn orient_rgb_rows(
+    source_size: (u32, u32),
+    row_pitch: u32,
+    source: *const u8,
+    output_size: (u32, u32),
+    rotation: u32,
+    encoding: amaterasu_module_sdk::capture::high_depth::RgbEncoding,
+) -> CaptureResult<amaterasu_module_sdk::capture::high_depth::RgbSurface> {
+    let (surface_width, surface_height) = source_size;
+    let (output_width, output_height) = output_size;
+    use amaterasu_module_sdk::capture::high_depth::RgbSurface;
+    let bpp = encoding.bytes_per_pixel();
+    let row = surface_width.checked_mul(bpp).ok_or_else(invalid_frame)?;
+    mapped_length(surface_height, row_pitch, row)?;
+    let stride = output_width.checked_mul(bpp).ok_or_else(invalid_frame)?;
+    let length = (stride as usize)
+        .checked_mul(output_height as usize)
+        .filter(|length| *length <= 2 * amaterasu_media::MAX_FRAME_BYTES)
+        .ok_or_else(invalid_frame)?;
+    let expected = match rotation {
+        1 | 3 => (output_width, output_height),
+        2 | 4 => (output_height, output_width),
+        _ => {
+            return Err(CaptureError::new(
+                "unsupported_rotation",
+                "DXGI reported an unknown rotation",
+            ));
+        }
+    };
+    if (surface_width, surface_height) != expected
+        || source.is_null()
+        || output_width == 0
+        || output_height == 0
+        || output_width > 8192
+        || output_height > 8192
+    {
+        return Err(invalid_frame());
+    }
+    let mut bytes = vec![0; length];
+    for y in 0..output_height as usize {
+        for x in 0..output_width as usize {
+            let (sx, sy) = match rotation {
+                1 => (x, y),
+                2 => (y, surface_height as usize - 1 - x),
+                3 => (
+                    surface_width as usize - 1 - x,
+                    surface_height as usize - 1 - y,
+                ),
+                4 => (surface_width as usize - 1 - y, x),
+                _ => unreachable!(),
+            };
+            let from = sy * row_pitch as usize + sx * bpp as usize;
+            let to = y * stride as usize + x * bpp as usize;
+            // SAFETY: validated dimensions/pitch bound a complete initialized pixel;
+            // its padding is never borrowed and the source map outlives this call.
+            let pixel = unsafe { std::slice::from_raw_parts(source.add(from), bpp as usize) };
+            bytes[to..to + bpp as usize].copy_from_slice(pixel);
+        }
+    }
+    let surface = RgbSurface {
+        width: output_width,
+        height: output_height,
+        stride,
+        encoding,
+        bytes: std::sync::Arc::new(bytes),
+    };
+    surface.validate().map_err(|_| invalid_frame())?;
+    Ok(surface)
 }

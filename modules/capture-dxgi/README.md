@@ -33,11 +33,19 @@ Native modules are trusted code; these grants are not a native-code sandbox.
   Rotated outputs use the desktop rectangle's oriented dimensions for both
   frames and `touch_surface`; a changed mode or target closes the stream.
 - Open accepts optional `operation_id` (1..128 UTF-8 bytes). Repeating the same
-  caller/output/operation ID returns the existing live stream; changing output
-  returns `operation_conflict`. `{"action":"lookup","operation_id":"start-1"}`
+  caller/output/source-format/operation ID returns the existing live stream;
+  changing output or source format returns `operation_conflict`. `{"action":"lookup","operation_id":"start-1"}`
   recovers that caller's same `stream`/`output` reply after a lost control result.
   Closing or device loss removes the lookup mapping. Lookup and replay replies
   never mark a pre-existing stream as newly opened for completion-loss cleanup.
+- Open accepts `source_format:{"bit_depth":10,"dynamic_range":"sdr"}` or
+  `"hdr"`, independently of the encoder codec. Explicit eight-bit SDR is also
+  supported; HDR requires ten bits. A source-format request requires the public
+  preflight capability `format_open:true`; older providers receive unchanged
+  Open bodies. Explicit formats verify the exact native desktop's dynamic range
+  before capture allocation and during delivery. A range mismatch requires
+  explicit processing rather than silently clipping HDR. Omitting the field
+  preserves the legacy BGRA8 capture path.
 - `{"action":"close","stream":123}` closes only a stream owned by the
   runtime-authenticated caller. Unknown and foreign IDs both return `not_found`.
 
@@ -54,11 +62,11 @@ or an identity guaranteed across restart, adapter replacement, or topology chang
 Opening re-enumerates and matches the exact output. There is no automatic selection
 of another display. Enumeration is bounded to 32 adapters and 64 total outputs. Metadata replies
 exceeding 12,000 encoded bytes return `resource_exhausted` rather than exceeding
-the control transport envelope; output enumeration pagination is not implemented.
+the control transport envelope.
 
 ## Native frame interface
 
-Bind `CaptureApi` version 1.1 on the same service. Version 1.0 remains available
+Bind the public capture family on the same service. Version 1.0 remains available
 as the unchanged prefix for older consumers. The 1.1 `geometry` callback returns
 the open stream's validated `CaptureGeometry`, or `MEDIA_UNSUPPORTED` when open
 could not prove geometry. Once geometry was advertised, a changed rectangle,
@@ -78,7 +86,7 @@ The binding context retains shared state and serializes access with a mutex.
 Concurrent or reentrant reads return `MEDIA_BUSY` instead of blocking on that mutex.
 The mutex is released before the consumer callback runs.
 
-A successful read calls the sink once with tight BGRA8 pixels
+A successful legacy SDR read calls the sink once with tight BGRA8 pixels
 (`stride = width * 4`, `len = stride * height`). Only initialized pixel bytes are
 copied; GPU row padding is never included in a Rust slice or exported. The frame
 and its bytes are borrowed only during that synchronous callback. Consumers must
@@ -110,11 +118,33 @@ may continue without `desktop_geometry`; absolute pointer input remains disabled
 Topology can still change immediately after the last validation, so the mapping
 is revalidated before each delivered frame and is not an atomic snapshot with a frame.
 
+The shared SDK `CpuSourceFactory` publishes capture v1.10. Its v1.8 resource
+callbacks enumerate an exact nonzero generation and two P010 offers for a
+high-depth source, with distinct full/limited-range IDs. CPU schema v2 includes
+known color in negotiation; delivered frames carry the identical color tuple.
+SDR uses BT.709 primaries/transfer/matrix; HDR uses BT.2020/PQ/BT.2020 NCL. P010
+stores all ten meaningful bits in the high bits of little-endian words. The
+v1.10 provenance callback authenticates the owner and guarantees that source
+color is checked for every delivered presentation. A native range or precision
+change stops delivery. The v1.9 HDR-enabled observation is native-derived;
+unknown content mastering fields remain zero rather than copying display
+capabilities into content metadata.
+
+These are synchronous borrowed CPU resources. Retain returns UNSUPPORTED;
+consumers copy with the same public SDK adapter used for other CPU providers.
+Close retires the native session; an independent consumer copy remains valid.
+Each binding stores at most 64 selections, each with at most eight format offers.
+Stale generations or changed descriptions require explicit renegotiation.
+The optional v1.11 wrapper performs bounded, read-only source preflight before
+any capture allocation; unavailable targets never select another output.
+
 ## Windows implementation and remaining hardware gates
 
 The Windows backend uses official `windows` 0.62 COM wrappers:
 `CreateDXGIFactory1`/adapter-output enumeration, `D3D11CreateDevice` on the chosen
-adapter, `IDXGIOutput1::DuplicateOutput`, and `AcquireNextFrame(0)`. A successful
+adapter, `IDXGIOutput1::DuplicateOutput` for legacy BGRA8 and
+`IDXGIOutput5::DuplicateOutput1` with only FP16 accepted for explicit
+high-depth capture, and `AcquireNextFrame(0)`. A successful
 acquisition is always paired with `ReleaseFrame`, including error/unwind paths.
 The source is copied into a CPU-readable D3D11 staging texture. `Map` uses
 `DO_NOT_WAIT`; pending staging textures remain owned until a later read. One
@@ -131,11 +161,21 @@ Current limitations are explicit:
 - A separate DXGI hardware cursor is composed into returned BGRA frames when
   `PointerPosition.Visible` is true. Color, masked-color, and monochrome shapes
   are cached across move-only frames, clipped to the output, and captured with
-  the staging texture for delayed CPU readback. Hidden or desktop-embedded
+  the staging texture for delayed CPU readback. High-depth frames compose only
+  cursor-covered pixels in the original source encoding; uncovered HDR values
+  retain their original words. Hidden or desktop-embedded
   pointers are not drawn again. Physical cursor behavior still needs hardware
   validation, including rotated monitors and driver-specific shape formats.
-- HDR preservation/tone mapping, dirty/move rectangles, protected-content
-  diagnostics, zero-copy GPU frames, and GPU resource sharing are not implemented.
+- High-depth capture requests FP16 scRGB and preserves its precision through
+  conversion to public P010 resources. DXGI converts an original fullscreen
+  backbuffer into that explicit format; the provider does not infer an original
+  RGB10 application's transfer from scan-out HDR. Native Output6 color and
+  actual duplication texture precision must agree; display HDR alone cannot
+  establish source format. scRGB HDR uses Windows' 80-nit linear reference and is converted
+  to PQ/BT.2020; ten-bit SDR is converted independently using BT.709. HDR-to-SDR
+  tone mapping is an explicitly selected processor, outside this provider.
+- Dirty/move rectangles, protected-content diagnostics, zero-copy GPU frames,
+  and GPU resource sharing are not implemented.
 - CPU frames reuse one compatible staging texture after readback. Mode changes,
   readback errors, and stream teardown discard it. This remains an unbenchmarked
   CPU readback path.
@@ -145,8 +185,11 @@ Tests use fake sessions and owned byte arrays only. They cover rotation through
 90, 180, and 270 degrees with non-square, padded surfaces; native binding
 ownership/release, exact callback pixels, pending/busy/device-loss outcomes,
 row-pitch copying, cursor shape composition and movement, cancellation, capacity,
-and shutdown. Windows code and native
-ABI compile for x86_64 MSVC. **No physical desktop capture has been run.** Manual
+and shutdown. Public-resource replacement tests cover ten-bit SDR/HDR color,
+range negotiation, retained precision, close, native color loss, and consumer
+copies surviving source retirement. The new Windows branches have not been
+compiled in the Linux-only environment used for this increment; Windows target
+standard libraries are unavailable. **No physical desktop capture has been run.** Manual
 Windows validation still needs adapter selection, sustained frames, monitor mode
 switch/access loss, device removal, cursor behavior, protected content, and
 resource/memory measurements. Enable capture only for an explicitly requested
@@ -158,4 +201,7 @@ interfaces in `src/platform/windows/display.h`, and display history including
 Primary API references:
 [desktop duplication](https://learn.microsoft.com/en-us/windows/win32/direct3ddxgi/desktop-dup-api),
 [AcquireNextFrame](https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_2/nf-dxgi1_2-idxgioutputduplication-acquirenextframe),
-[ReleaseFrame](https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_2/nf-dxgi1_2-idxgioutputduplication-releaseframe).
+[ReleaseFrame](https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_2/nf-dxgi1_2-idxgioutputduplication-releaseframe),
+[DuplicateOutput1](https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_5/nf-dxgi1_5-idxgioutput5-duplicateoutput1),
+[Windows HDR/scRGB](https://learn.microsoft.com/en-us/windows/win32/direct3darticles/high-dynamic-range),
+[DXGI color spaces](https://learn.microsoft.com/en-us/windows/win32/api/dxgicommon/ne-dxgicommon-dxgi_color_space_type).

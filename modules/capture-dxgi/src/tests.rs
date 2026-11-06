@@ -213,6 +213,7 @@ fn enumeration_pages_all_outputs_without_changing_an_open_stream() {
     let opened = controller.handle(
         "owner",
         Operation::Open {
+            source_format: None,
             output: "output-000".into(),
             operation_id: None,
         },
@@ -367,6 +368,7 @@ fn sample_frame() -> Frame {
         timestamp_us: 1,
         sequence: 1,
         bytes: vec![1, 2, 3, 4],
+        surface: None,
     }
 }
 
@@ -531,6 +533,7 @@ fn touch_surface_is_published_only_when_provider_proves_valid_mapping() {
             setup_with_surfaces(true, VecDeque::from(geometries), VecDeque::from([provider]));
         let mut controller = controller.lock().unwrap();
         let request = || Operation::Open {
+            source_format: None,
             output: "fake".into(),
             operation_id: Some("touch".into()),
         };
@@ -590,6 +593,7 @@ fn open(controller: &mut Controller<FakeBackend>, owner: &str) -> u64 {
     let reply = controller.handle(
         owner,
         Operation::Open {
+            source_format: None,
             operation_id: None,
             output: "fake-output".into(),
         },
@@ -686,14 +690,16 @@ fn native_binding_enforces_owner_and_releases_its_state_reference_once() {
     let before = Arc::strong_count(&controller);
     let other = TestBinding::new(&factory, "other");
     let owner = TestBinding::new(&factory, "owner");
-    assert_eq!(Arc::strong_count(&controller), before + 2);
+    assert_eq!(Arc::strong_count(&controller), before);
+    // Bindings share the SDK provider; dropping registration keeps it alive.
+    drop(factory);
     let mut bytes = Vec::new();
     assert_eq!(other.read(stream, &mut bytes), MEDIA_CLOSED);
     assert_eq!(owner.read(stream, &mut bytes), MEDIA_PENDING);
     assert!(bytes.is_empty());
     drop(other);
     drop(owner);
-    assert_eq!(Arc::strong_count(&controller), before);
+    assert_eq!(Arc::strong_count(&controller), before - 1);
     controller.lock().unwrap().close("owner", stream).unwrap();
     assert_eq!(drops.load(Ordering::SeqCst), 1);
 }
@@ -704,6 +710,7 @@ fn disabled_and_cancelled_opens_do_not_leave_resources() {
     let result = controller.lock().unwrap().handle(
         "owner",
         Operation::Open {
+            source_format: None,
             operation_id: None,
             output: "fake".into(),
         },
@@ -716,6 +723,7 @@ fn disabled_and_cancelled_opens_do_not_leave_resources() {
     let result = controller.lock().unwrap().handle(
         "owner",
         Operation::Open {
+            source_format: None,
             operation_id: None,
             output: "fake".into(),
         },
@@ -744,6 +752,7 @@ fn stream_capacity_owner_close_and_shutdown_are_enforced() {
         controller.handle(
             "owner",
             Operation::Open {
+                source_format: None,
                 operation_id: None,
                 output: "fake".into()
             },
@@ -939,6 +948,7 @@ fn native_callback_delivers_pixels_then_reports_pending_and_device_loss() {
             timestamp_us: 1,
             sequence: 1,
             bytes: vec![1, 2, 3, 4, 5, 6, 7, 8],
+            surface: None,
         })),
         Ok(None),
         Err(CaptureError::new("access_lost", "test desktop switch")),
@@ -1044,6 +1054,7 @@ fn operation_lookup_recovers_owned_stream_without_marking_replays_as_new() {
     let (controller, drops) = setup(true);
     let mut controller = controller.lock().unwrap();
     let request = || Operation::Open {
+        source_format: None,
         output: "fake".into(),
         operation_id: Some("start-1".into()),
     };
@@ -1066,6 +1077,7 @@ fn operation_lookup_recovers_owned_stream_without_marking_replays_as_new() {
         "not_found"
     );
     let conflict = Operation::Open {
+        source_format: None,
         output: "different".into(),
         operation_id: Some("start-1".into()),
     };
@@ -1088,7 +1100,7 @@ fn native_factory_rejects_incompatible_table_without_allocating_a_binding() {
     let before = Arc::strong_count(&controller);
     for (major, size) in [
         (INTERFACE_MAJOR + 1, size_of::<CaptureApi>() as u32),
-        (INTERFACE_MAJOR, size_of::<CaptureApi>() as u32 + 1),
+        (INTERFACE_MAJOR, size_of::<CaptureApiV1_10>() as u32 + 1),
     ] {
         let query = NativeInterfaceQuery {
             header: AbiHeader::of::<NativeInterfaceQuery>(),
@@ -1117,6 +1129,7 @@ fn identical_operation_ids_are_scoped_to_each_owner() {
     let (controller, _) = setup(true);
     let mut controller = controller.lock().unwrap();
     let request = || Operation::Open {
+        source_format: None,
         output: "fake-output".into(),
         operation_id: Some("shared-operation-name".into()),
     };
@@ -1182,6 +1195,7 @@ fn callback_can_close_stream_without_invalidating_borrowed_pixels() {
         timestamp_us: 1,
         sequence: 1,
         bytes: vec![1, 2, 3, 4],
+        surface: None,
     }))])));
     let drops = Arc::new(AtomicUsize::new(0));
     let controller = Arc::new(Mutex::new(Controller::new(
@@ -1241,4 +1255,98 @@ fn native_enumeration_and_open_report_the_same_physical_output_rectangle() {
     assert_eq!(geometry.output.top, output.top);
     assert_eq!(geometry.output.width, output.width);
     assert_eq!(geometry.output.height, output.height);
+}
+
+#[test]
+fn high_depth_rotation_preserves_full_pixel_words_and_never_reads_row_padding() {
+    use amaterasu_module_sdk::capture::high_depth::RgbEncoding;
+    let pixels: [u64; 4] = [
+        0x123456789abcdef0,
+        0x123456789abc0001,
+        0x123456789abc0002,
+        0x123456789abc0003,
+    ];
+    let mut rows = Vec::new();
+    for row in pixels.as_slice().as_chunks::<2>().0 {
+        for pixel in row {
+            rows.extend_from_slice(&pixel.to_le_bytes());
+        }
+        rows.extend_from_slice(&[0xee; 8]);
+    }
+    // SAFETY: two initialized FP16 pixels per row remain live; padding is ignored.
+    let surface = unsafe {
+        crate::model::orient_rgb_rows(
+            (2, 2),
+            24,
+            rows.as_ptr(),
+            (2, 2),
+            2,
+            RgbEncoding::Rgba16FloatScRgb,
+        )
+    }
+    .unwrap();
+    let actual: Vec<u64> = surface
+        .bytes
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|b| u64::from_le_bytes(*b))
+        .collect();
+    assert_eq!(actual, vec![pixels[2], pixels[0], pixels[3], pixels[1]]);
+    assert_eq!(surface.stride, 16);
+    // SAFETY: same live allocation; malformed pitch fails before dereferencing.
+    assert!(
+        unsafe {
+            crate::model::orient_rgb_rows(
+                (2, 2),
+                15,
+                rows.as_ptr(),
+                (2, 2),
+                1,
+                RgbEncoding::Rgba16FloatScRgb,
+            )
+        }
+        .is_err()
+    );
+}
+
+#[test]
+fn hdr_cursor_edit_preserves_uncovered_high_depth_pixels() {
+    use amaterasu_module_sdk::capture::high_depth::{RgbEncoding, RgbSurface};
+    let bright = 0x4a40u16; // scRGB 12.5 = 1000 nits, not clipped SDR white.
+    let mut bytes = Vec::new();
+    for _ in 0..4 {
+        for channel in [bright, bright, bright, 0x3c00] {
+            bytes.extend_from_slice(&channel.to_le_bytes());
+        }
+    }
+    let original = bytes.clone();
+    let mut surface = RgbSurface {
+        width: 2,
+        height: 2,
+        stride: 16,
+        encoding: RgbEncoding::Rgba16FloatScRgb,
+        bytes: Arc::new(bytes),
+    };
+    let shape = crate::cursor::Shape::new(
+        crate::cursor::ShapeKind::Color,
+        1,
+        1,
+        4,
+        vec![0, 0, 255, 255],
+    )
+    .unwrap();
+    shape.compose_rgb(&mut surface, 0, 0).unwrap();
+    assert_eq!(&surface.bytes[8..], &original[8..]);
+    assert_eq!(
+        u16::from_le_bytes(surface.bytes[..2].try_into().unwrap()),
+        0x3c00
+    );
+    assert_eq!(&surface.bytes[2..6], &[0, 0, 0, 0]);
+    let invert =
+        crate::cursor::Shape::new(crate::cursor::ShapeKind::Monochrome, 1, 2, 1, vec![0x80, 0])
+            .unwrap();
+    let before = surface.bytes.clone();
+    invert.compose_rgb(&mut surface, 1, 1).unwrap();
+    assert_eq!(surface.bytes, before);
 }

@@ -1,10 +1,13 @@
 use super::{Backend, CaptureSession, TouchSurface};
 use crate::cursor::{CursorState, Shape, ShapeKind};
+use crate::format::{CaptureFormat, DesktopColor, SourceInfo};
 use crate::model::{
-    CaptureError, CaptureResult, Frame, Output, frame_layout, orient_bgra_rows, verify_output_mode,
+    CaptureError, CaptureResult, Frame, Output, frame_layout, orient_bgra_rows, orient_rgb_rows,
+    verify_output_mode,
 };
 use crate::staging::{StagingKey, StagingLifecycle};
 use amaterasu_media::{CaptureGeometry, DesktopRect};
+use amaterasu_module_sdk::capture::high_depth::RgbEncoding;
 use amaterasu_module_sdk::capture::{EXACT_TARGET_PREFIX, exact_target_key, exact_target_selector};
 use amaterasu_windows_capture_geometry::{
     GeometryError, SelectedOutput, resolve_target_matching, resolve_with,
@@ -43,10 +46,31 @@ impl Backend for WindowsBackend {
     }
 
     fn open(&self, id: &str) -> CaptureResult<Box<dyn CaptureSession>> {
+        self.open_with_format(id, CaptureFormat::default())
+    }
+    fn verify_source_format(&self, id: &str, format: CaptureFormat) -> CaptureResult<()> {
+        if !format.explicit {
+            return Ok(());
+        }
+        let (_, output) = resolve_output(id, None)?;
+        format.validate_dimensions(output.metadata.width, output.metadata.height)?;
+        observe_color(&output.output)?.verify(format)?;
+        if format.ten_bit {
+            let _: IDXGIOutput5 = output.output.cast().map_err(native_error)?;
+        }
+        Ok(())
+    }
+    fn open_with_format(
+        &self,
+        id: &str,
+        format: CaptureFormat,
+    ) -> CaptureResult<Box<dyn CaptureSession>> {
         let (target_id, output) = match resolve_output(id, None) {
             Ok((selection, output)) => (Some(selection.target_id), output),
             Err(error)
-                if error.code == "geometry_unavailable" && !id.starts_with(EXACT_TARGET_PREFIX) =>
+                if error.code == "geometry_unavailable"
+                    && !id.starts_with(EXACT_TARGET_PREFIX)
+                    && !format.explicit =>
             {
                 (None, find_output(id)?)
             }
@@ -76,8 +100,8 @@ impl Backend for WindowsBackend {
                 "DXGI reported an unknown output rotation",
             ));
         }
-        frame_layout(output.metadata.width, output.metadata.height)?;
-        Ok(Box::new(Session::open(output, target_id)?))
+        format.validate_dimensions(output.metadata.width, output.metadata.height)?;
+        Ok(Box::new(Session::open(output, target_id, format)?))
     }
 }
 
@@ -192,6 +216,16 @@ fn native_error(error: windows::core::Error) -> CaptureError {
     CaptureError::new(code, format!("DXGI/D3D11: {error}"))
 }
 
+fn observe_color(output: &IDXGIOutput) -> CaptureResult<DesktopColor> {
+    let output: IDXGIOutput6 = output.cast().map_err(native_error)?;
+    // SAFETY: exact output COM identity is retained for this read-only query.
+    let desc = unsafe { output.GetDesc1() }.map_err(native_error)?;
+    Ok(DesktopColor {
+        color_space: desc.ColorSpace.0,
+        bits_per_color: desc.BitsPerColor,
+    })
+}
+
 struct PendingTexture {
     texture: ID3D11Texture2D,
     key: StagingKey,
@@ -199,6 +233,7 @@ struct PendingTexture {
     height: u32,
     timestamp_us: u64,
     cursor: Option<(Shape, i32, i32)>,
+    encoding: RgbEncoding,
 }
 
 struct Session {
@@ -212,10 +247,16 @@ struct Session {
     started: Instant,
     sequence: u64,
     cursor: CursorState,
+    format: CaptureFormat,
+    source_encoding: RgbEncoding,
 }
 
 impl Session {
-    fn open(output: NativeOutput, target_id: Option<String>) -> CaptureResult<Self> {
+    fn open(
+        output: NativeOutput,
+        target_id: Option<String>,
+        format: CaptureFormat,
+    ) -> CaptureResult<Self> {
         let output_id = output.metadata.id.clone();
         let adapter = output.metadata.clone();
         let mut device = None;
@@ -241,10 +282,35 @@ impl Session {
             device.ok_or_else(|| CaptureError::new("backend_error", "D3D11 returned no device"))?;
         let context = context
             .ok_or_else(|| CaptureError::new("backend_error", "D3D11 returned no context"))?;
-        let output: IDXGIOutput1 = output.output.cast().map_err(native_error)?;
-        // SAFETY: the device was created on this output's adapter and remains
-        // owned by Session for the entire duplication lifetime.
-        let duplication = unsafe { output.DuplicateOutput(&device) }.map_err(native_error)?;
+        let color = if format.explicit {
+            Some(observe_color(&output.output)?)
+        } else {
+            None
+        };
+        if let Some(color) = color {
+            color.verify(format)?;
+        }
+        // DuplicateOutput always converts to BGRA8. Explicit high-depth capture
+        // uses DuplicateOutput1 and requests FP16 scRGB, so native RGB10
+        // backbuffers are converted by DXGI without guessing their transfer.
+        // SAFETY: device and exact adapter/output remain owned by this session.
+        let duplication = if format.ten_bit {
+            let output: IDXGIOutput5 = output.output.cast().map_err(native_error)?;
+            unsafe { output.DuplicateOutput1(&device, 0, &[DXGI_FORMAT_R16G16B16A16_FLOAT]) }
+                .map_err(native_error)?
+        } else {
+            let output: IDXGIOutput1 = output.output.cast().map_err(native_error)?;
+            unsafe { output.DuplicateOutput(&device) }.map_err(native_error)?
+        };
+        // SAFETY: duplication owns this immutable descriptor.
+        let desc = unsafe { duplication.GetDesc() };
+        let source_encoding = if format.ten_bit {
+            color
+                .expect("explicit high-depth format")
+                .encoding(desc.ModeDesc.Format.0 as u32, format)?
+        } else {
+            RgbEncoding::Bgra8Srgb
+        };
         Ok(Self {
             output_id,
             target_id,
@@ -256,7 +322,16 @@ impl Session {
             started: Instant::now(),
             sequence: 0,
             cursor: CursorState::default(),
+            format,
+            source_encoding,
         })
+    }
+
+    fn verify_color(&self) -> CaptureResult<DesktopColor> {
+        let (_, output) = resolve_output(&self.output_id, self.target_id.as_deref())?;
+        let color = observe_color(&output.output)?;
+        color.verify(self.format)?;
+        Ok(color)
     }
 
     fn acquire(&mut self, wait_ms: u32) -> CaptureResult<bool> {
@@ -373,11 +448,16 @@ impl Session {
         let mut description = D3D11_TEXTURE2D_DESC::default();
         // SAFETY: source is a valid texture; description is a writable local.
         unsafe { source.GetDesc(&mut description) };
-        if let Err(error) = frame_layout(description.Width, description.Height) {
-            self.staging.invalidate();
-            return Err(error);
-        }
-        if description.Format != DXGI_FORMAT_B8G8R8A8_UNORM
+        self.format
+            .validate_dimensions(description.Width, description.Height)?;
+        let encoding = if self.format.ten_bit {
+            self.verify_color()?
+                .encoding(description.Format.0 as u32, self.format)?
+        } else {
+            RgbEncoding::Bgra8Srgb
+        };
+        if encoding != self.source_encoding
+            || (!self.format.ten_bit && description.Format != DXGI_FORMAT_B8G8R8A8_UNORM)
             || description.SampleDesc.Count != 1
             || description.ArraySize != 1
             || description.MipLevels != 1
@@ -385,7 +465,7 @@ impl Session {
             self.staging.invalidate();
             return Err(CaptureError::new(
                 "unsupported_format",
-                "duplication texture must be single-plane BGRA8",
+                "duplication texture format changed or no longer preserves source precision",
             ));
         }
         description.Usage = D3D11_USAGE_STAGING;
@@ -424,6 +504,7 @@ impl Session {
             height: description.Height,
             timestamp_us: self.started.elapsed().as_micros().min(u64::MAX as u128) as u64,
             cursor: None,
+            encoding,
         })
     }
 
@@ -452,41 +533,64 @@ impl Session {
             context: &self.context,
             texture: &pending.texture,
         };
-        let (stride, _) = frame_layout(self.adapter.width, self.adapter.height)?;
-        // SAFETY: D3D11 guarantees initialized pixel bytes at each mapped
-        // texture row. The map guard outlives all copying, and row padding
-        // is never included in borrowed slices or the returned frame.
-        let bytes = unsafe {
-            orient_bgra_rows(
-                pending.width,
-                pending.height,
-                mapped.RowPitch,
-                mapped.pData.cast::<u8>(),
-                self.adapter.width,
-                self.adapter.height,
-                self.adapter.rotation,
-            )
-        };
-        let bytes = bytes.and_then(|mut bytes| {
-            if let Some((shape, x, y)) = &pending.cursor {
-                shape.compose(&mut bytes, self.adapter.width, self.adapter.height, *x, *y)?;
+        let result = if self.format.ten_bit {
+            // SAFETY: map guard retains initialized pixel rows; helper borrows
+            // only complete pixels and applies the exact output rotation.
+            let surface = unsafe {
+                orient_rgb_rows(
+                    (pending.width, pending.height),
+                    mapped.RowPitch,
+                    mapped.pData.cast(),
+                    (self.adapter.width, self.adapter.height),
+                    self.adapter.rotation,
+                    pending.encoding,
+                )
+            };
+            surface.and_then(|mut surface| {
+                if let Some((shape, x, y)) = &pending.cursor {
+                    shape.compose_rgb(&mut surface, *x, *y)?;
+                }
+                Ok((surface.stride, Vec::new(), Some(surface)))
+            })
+        } else {
+            let (stride, _) = frame_layout(self.adapter.width, self.adapter.height)?;
+            // SAFETY: initialized mapped BGRA rows outlive this bounded copy.
+            unsafe {
+                orient_bgra_rows(
+                    pending.width,
+                    pending.height,
+                    mapped.RowPitch,
+                    mapped.pData.cast(),
+                    self.adapter.width,
+                    self.adapter.height,
+                    self.adapter.rotation,
+                )
             }
-            Ok(bytes)
-        });
+            .and_then(|mut bytes| {
+                if let Some((shape, x, y)) = &pending.cursor {
+                    shape.compose(&mut bytes, self.adapter.width, self.adapter.height, *x, *y)?;
+                }
+                Ok((stride, bytes, None))
+            })
+        };
         drop(mapping);
-        let bytes = match bytes {
-            Ok(bytes) => bytes,
+        let (stride, bytes, surface) = match result {
+            Ok(value) => value,
             Err(error) => {
                 self.staging.invalidate();
                 return Err(error);
             }
         };
+        if self.format.explicit {
+            self.verify_color()?;
+        }
         self.sequence = self.sequence.saturating_add(1);
         let result = Frame {
             width: self.adapter.width,
             height: self.adapter.height,
             stride,
             bytes,
+            surface,
             timestamp_us: pending.timestamp_us,
             sequence: self.sequence,
         };
@@ -502,6 +606,32 @@ impl CaptureSession for Session {
             return Ok(None);
         }
         self.read_pending()
+    }
+
+    fn source_info(&mut self) -> CaptureResult<Option<SourceInfo>> {
+        if self.format.explicit {
+            self.verify_color()?;
+        }
+        if self.format.ten_bit {
+            let color = self.verify_color()?;
+            // SAFETY: duplication descriptor remains owned by this session.
+            if color.encoding(
+                unsafe { self.duplication.GetDesc() }.ModeDesc.Format.0 as u32,
+                self.format,
+            )? != self.source_encoding
+            {
+                return Err(CaptureError::new(
+                    "access_lost",
+                    "native capture texture encoding changed",
+                ));
+            }
+        }
+        Ok(Some(SourceInfo {
+            width: self.adapter.width,
+            height: self.adapter.height,
+            format: self.format,
+            encoding: self.source_encoding,
+        }))
     }
 
     fn geometry(&mut self) -> CaptureResult<Option<CaptureGeometry>> {

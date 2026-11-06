@@ -82,22 +82,16 @@ fn unsupported_mode(request: &SourcePreflightRequest) -> Option<SourcePreflightR
             "source_class_unsupported",
         ));
     }
-    // This provider currently publishes BGRA8 CPU frames. Display HDR alone
-    // cannot establish an HDR capture format or color provenance.
-    if request.mode.hdr {
-        return Some(SourcePreflightResponse::unsupported(
-            request,
-            "hdr_capture_unavailable",
-        ));
-    }
-    if request.mode.bit_depth == Some(10) {
-        return Some(SourcePreflightResponse::unsupported(
-            request,
-            "capture_depth_unavailable",
-        ));
-    }
-    let frame_bytes = u64::from(request.mode.width) * u64::from(request.mode.height) * 4;
-    if frame_bytes > MAX_FRAME_BYTES as u64 {
+    let high_depth = request.mode.hdr || request.mode.bit_depth == Some(10);
+    let pixels = u64::from(request.mode.width) * u64::from(request.mode.height);
+    if (high_depth
+        && (!request.mode.width.is_multiple_of(2) || !request.mode.height.is_multiple_of(2)))
+        || if high_depth {
+            pixels * 8 > 2 * MAX_FRAME_BYTES as u64 || pixels * 3 > MAX_FRAME_BYTES as u64
+        } else {
+            pixels * 4 > MAX_FRAME_BYTES as u64
+        }
+    {
         return Some(SourcePreflightResponse::unsupported(
             request,
             "source_frame_too_large",
@@ -121,9 +115,9 @@ fn ready(request: &SourcePreflightRequest) -> SourcePreflightResponse {
             min_refresh_millihz: 1000,
             max_refresh_millihz: 1_000_000,
             sdr: true,
-            hdr: false,
-            bit_depths: vec![8],
-            format_open: false,
+            hdr: true,
+            bit_depths: vec![8, 10],
+            format_open: true,
         }],
     )
 }
@@ -209,21 +203,18 @@ mod tests {
         }
     }
     #[test]
-    fn current_cpu_format_never_claims_hdr_or_unbounded_frame_storage() {
+    fn actual_source_formats_support_sdr_hdr_and_bounded_p010_storage() {
         let mut request = request();
         assert!(unsupported_mode(&request).is_none());
         ready(&request).validate(&request).unwrap();
         request.mode.hdr = true;
-        assert_eq!(
-            unsupported_mode(&request).unwrap().state,
-            SourceReadiness::Unsupported
-        );
+        assert!(unsupported_mode(&request).is_none());
+        assert!(ready(&request).capabilities[0].hdr);
         request.mode.hdr = false;
         request.mode.bit_depth = Some(10);
-        assert_eq!(
-            unsupported_mode(&request).unwrap().reason.as_deref(),
-            Some("capture_depth_unavailable")
-        );
+        assert!(unsupported_mode(&request).is_none());
+        assert!(ready(&request).capabilities[0].bit_depths.contains(&10));
+        assert!(ready(&request).capabilities[0].format_open);
         request.mode.bit_depth = None;
         request.mode.width = 8192;
         request.mode.height = 8192;

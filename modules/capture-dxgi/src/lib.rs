@@ -3,9 +3,12 @@ mod backend;
 mod controller;
 #[cfg(any(windows, test))]
 mod cursor;
+mod format;
 mod model;
 mod native;
 mod preflight;
+#[cfg(test)]
+mod resource_tests;
 #[cfg(any(windows, test))]
 mod staging;
 
