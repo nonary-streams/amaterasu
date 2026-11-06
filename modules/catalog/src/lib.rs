@@ -3,6 +3,7 @@ mod identity;
 mod model;
 mod pipeline;
 mod product;
+mod profiles;
 mod protocol;
 mod seed;
 
@@ -19,6 +20,8 @@ struct Settings {
     library_principal: String,
     launch_principals: std::collections::BTreeSet<String>,
     export_principals: std::collections::BTreeMap<String, String>,
+    /// Trusted profile coordinator -> existing client-facing catalog owner.
+    profile_principals: std::collections::BTreeMap<String, String>,
     steam_id_export_principals: std::collections::BTreeMap<String, String>,
     import_principals: std::collections::BTreeMap<String, String>,
     /// Authenticated importer principal -> configured provider key.
@@ -34,6 +37,7 @@ impl Default for Settings {
             library_principal: "amaterasu.library".into(),
             launch_principals: Default::default(),
             export_principals: Default::default(),
+            profile_principals: Default::default(),
             steam_id_export_principals: Default::default(),
             import_principals: Default::default(),
             provider_launch_principals: Default::default(),
@@ -59,6 +63,12 @@ impl Settings {
                 .iter()
                 .any(|principal| !valid_principal(principal))
             || self.export_principals.len() > 16
+            || self.profile_principals.len() > 16
+            || self.profile_principals.iter().any(|(consumer, owner)| {
+                !valid_principal(consumer)
+                    || !valid_principal(owner)
+                    || consumer == &self.library_principal
+            })
             || self
                 .export_principals
                 .iter()
@@ -133,6 +143,7 @@ impl ManagedModule for CatalogModule {
                 settings.import_principals,
             )
             .with_library_principal(settings.library_principal)
+            .with_profile_principals(settings.profile_principals)
             .with_provider_launch_principals(settings.provider_launch_principals)
             .with_desktop_seed(seeded_owners),
         })
@@ -149,6 +160,22 @@ amaterasu_module_sdk::export_module!(CatalogModule);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn profile_owner_mapping_is_startup_only_bounded_and_not_the_library_principal() {
+        let valid:Settings=serde_json::from_value(serde_json::json!({"profile_principals":{"amaterasu.remote-session":"amaterasu.management"}})).unwrap();
+        valid.validate().unwrap();
+        for principals in [
+            serde_json::json!({"amaterasu.library":"owner"}),
+            serde_json::json!({"remote":"bad/owner"}),
+            serde_json::json!({"":"owner"}),
+        ] {
+            let settings: Settings =
+                serde_json::from_value(serde_json::json!({"profile_principals":principals}))
+                    .unwrap();
+            assert!(settings.validate().is_err());
+        }
+    }
 
     #[test]
     fn selected_library_principal_is_validated_at_startup() {

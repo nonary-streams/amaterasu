@@ -159,6 +159,28 @@ pub struct LibraryResolveResponse {
 }
 
 pub const CATALOG_SERVICE: &str = "amaterasu.catalog/1";
+
+/// Narrow presentation-profile operations in the client-facing catalog selected
+/// by trusted startup composition. Payloads cannot choose a catalog owner. The
+/// catalog accepts mutations only from an approved profile coordinator with the
+/// authenticated management initiator, and only for marked inert profiles.
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum CatalogProfileRequest {
+    ProfileList {
+        cursor: Option<LibraryCursor>,
+        limit: Option<usize>,
+    },
+    ProfileUpsert {
+        id: String,
+        entry: Value,
+        expected_revision: u64,
+    },
+    ProfileDelete {
+        id: String,
+        expected_revision: u64,
+    },
+}
 pub const MAX_BATCH_INTENTS: usize = 8;
 pub const MAX_BATCH_BYTES: usize = 12_000;
 

@@ -3470,6 +3470,202 @@ fn identity_inventory_pages_bound_metadata_bytes_and_always_advance() {
     assert!(pages > 1);
 }
 
+fn monitor_profile_entry(uuid: &str, name: &str, scale: i32) -> Value {
+    json!({"name":name,"uuid":uuid,"remote_monitor_profile":true,"properties":{"remote_monitor":{"width":1920,"height":1080,"refresh_millihz":60000,"hdr_enabled":false},"dd_virtual_display_scale":scale,"monitor_target":{"kind":"owned"}},"config_overrides":{"dd_virtual_display_scale":scale},"launch":{"kind":"desktop"}})
+}
+
+#[test]
+fn profile_crud_uses_real_catalog_identity_and_preserves_existing_overrides() {
+    let mut backend = Backend::default();
+    let profile_owner = || {
+        Pipeline::default()
+            .with_profile_principals(BTreeMap::from([("remote".into(), "management".into())]))
+    };
+    let mut pipeline = profile_owner();
+    let ordinary = backend.run_for(
+        &mut pipeline,
+        json!({"action":"create","expected_revision":0,"entry":entry("Normal app")}),
+        "management",
+        "management",
+        "management",
+    );
+    assert_eq!(ordinary["id"], "app-0000000000000001");
+    let desired =
+        monitor_profile_entry("f920e4f5-e140-45e4-a737-947c8ce523c0", "Second screen", 125);
+    let created = backend.run_for(
+        &mut pipeline,
+        json!({"action":"profile_upsert","id":"","entry":desired,"expected_revision":1}),
+        "remote",
+        "amaterasu.management",
+        "management",
+    );
+    assert_eq!(created["ok"], true, "{created}");
+    assert_eq!(created["revision"], 2);
+    assert_eq!(created["profile"]["id"], "app-0000000000000002");
+    assert!(created.get("entry").is_none());
+    let id = created["profile"]["id"].as_str().unwrap().to_owned();
+    let mut existing = backend.entries[&id].clone();
+    existing["description"] = "Keep approved metadata".into();
+    existing["id_aliases"] = json!(["app-0000000000000064"]);
+    existing["config_overrides"]["keyboard"] = false.into();
+    existing["properties"]["other_plugin"] = json!({"value":"retained"});
+    existing["virtual-display-layout"] = "extended_primary".into();
+    existing["display-output"] = "approved-output".into();
+    let edited = backend.run_for(
+        &mut pipeline,
+        json!({"action":"update","id":id,"expected_revision":2,"entry":existing}),
+        "management",
+        "management",
+        "management",
+    );
+    assert_eq!(edited["ok"], true, "{edited}");
+    // A different plugin process sees the same durable application catalog.
+    let mut restarted = profile_owner();
+    let listed = backend.run_for(
+        &mut restarted,
+        json!({"action":"profile_list","limit":32}),
+        "remote",
+        "amaterasu.management",
+        "management",
+    );
+    assert_eq!(listed["revision"], 3);
+    assert_eq!(listed["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(listed["entries"][0]["id"], id);
+    let updated=backend.run_for(&mut restarted,json!({"action":"profile_upsert","id":id,"expected_revision":3,"entry":monitor_profile_entry("f920e4f5-e140-45e4-a737-947c8ce523c0","Renamed screen",150)}),"remote","amaterasu.management","management");
+    assert_eq!(updated["ok"], true, "{updated}");
+    assert_eq!(updated["revision"], 4);
+    assert_eq!(updated["profile"]["uuid"], created["profile"]["uuid"]);
+    assert_eq!(
+        updated["profile"]["properties"]["config_overrides"]["keyboard"],
+        false
+    );
+    assert_eq!(
+        updated["profile"]["properties"]["config_overrides"]["dd_virtual_display_scale"],
+        150
+    );
+    assert_eq!(
+        updated["profile"]["properties"]["other_plugin"]["value"],
+        "retained"
+    );
+    assert_eq!(
+        backend.entries[&id]["description"],
+        "Keep approved metadata"
+    );
+    assert_eq!(
+        backend.entries[&id]["id_aliases"][0],
+        "app-0000000000000064"
+    );
+    assert_eq!(
+        backend.entries[&id]["virtual-display-layout"],
+        "extended_primary"
+    );
+    assert_eq!(backend.entries[&id]["display-output"], "approved-output");
+    let deleted = backend.run_for(
+        &mut restarted,
+        json!({"action":"profile_delete","id":id,"expected_revision":4}),
+        "remote",
+        "amaterasu.management",
+        "management",
+    );
+    assert_eq!(deleted["ok"], true, "{deleted}");
+    assert_eq!(deleted["revision"], 5);
+    assert!(!backend.entries.contains_key(&id));
+    assert!(backend.entries.contains_key("app-0000000000000001"));
+}
+
+#[test]
+fn profile_mutations_cannot_retarget_regular_apps_or_change_uuid_or_launch_commands() {
+    let mut backend = Backend::default();
+    let mut pipeline = Pipeline::default()
+        .with_profile_principals(BTreeMap::from([("remote".into(), "management".into())]));
+    let ordinary = backend.run_for(
+        &mut pipeline,
+        json!({"action":"create","expected_revision":0,"entry":entry("Normal")}),
+        "management",
+        "management",
+        "management",
+    );
+    let profile = monitor_profile_entry("f920e4f5-e140-45e4-a737-947c8ce523c0", "Screen", 100);
+    let rejected=backend.run_for(&mut pipeline,json!({"action":"profile_upsert","id":ordinary["id"],"entry":profile,"expected_revision":1}),"remote","amaterasu.management","management");
+    assert_eq!(rejected["error"]["code"], "profile_identity_mismatch");
+    let deleted = backend.run_for(
+        &mut pipeline,
+        json!({"action":"profile_delete","id":ordinary["id"],"expected_revision":1}),
+        "remote",
+        "amaterasu.management",
+        "management",
+    );
+    assert_eq!(deleted["error"]["code"], "not_found");
+    for forged in [
+        json!({"launch":{"kind":"executable","program":"/private/tool","arguments":[]}}),
+        json!({"launch":{"kind":"desktop","working_directory":"/private"}}),
+        json!({"prep_cmd":[{"do":"arbitrary command"}]}),
+        json!({"output":"/private/log"}),
+    ] {
+        let mut invalid = profile.clone();
+        invalid
+            .as_object_mut()
+            .unwrap()
+            .extend(forged.as_object().unwrap().clone());
+        let rejected = backend.run_for(
+            &mut pipeline,
+            json!({"action":"profile_upsert","id":"","entry":invalid,"expected_revision":1}),
+            "remote",
+            "amaterasu.management",
+            "management",
+        );
+        assert_eq!(rejected["ok"], false, "{rejected}");
+    }
+    let created = backend.run_for(
+        &mut pipeline,
+        json!({"action":"profile_upsert","id":"","entry":profile,"expected_revision":1}),
+        "remote",
+        "amaterasu.management",
+        "management",
+    );
+    let retargeted=backend.run_for(&mut pipeline,json!({"action":"profile_upsert","id":created["profile"]["id"],"entry":monitor_profile_entry("4d7994f2-9f1c-4b67-b175-41ce5a7c8979","Other",100),"expected_revision":2}),"remote","amaterasu.management","management");
+    assert_eq!(retargeted["error"]["code"], "profile_identity_mismatch");
+    let stale = backend.run_for(
+        &mut pipeline,
+        json!({"action":"profile_delete","id":created["profile"]["id"],"expected_revision":1}),
+        "remote",
+        "amaterasu.management",
+        "management",
+    );
+    assert_eq!(stale["error"]["code"], "revision_conflict");
+    assert_eq!(backend.metadata["revision"], 2);
+}
+
+#[test]
+fn profile_catalog_owner_mapping_requires_coordinator_and_management_initiator() {
+    let pipeline = Pipeline::default()
+        .with_profile_principals(BTreeMap::from([("remote".into(), "owner".into())]));
+    let request = || Operation::ProfileList {
+        cursor: None,
+        limit: None,
+    };
+    assert_eq!(
+        pipeline
+            .select_catalog("remote", "amaterasu.management", request())
+            .unwrap()
+            .0,
+        "principal/owner"
+    );
+    for (caller, initiator) in [
+        ("outsider", "amaterasu.management"),
+        ("remote", "remote"),
+        ("amaterasu.management", "amaterasu.management"),
+    ] {
+        assert_eq!(
+            pipeline
+                .select_catalog(caller, initiator, request())
+                .err()
+                .unwrap()["error"]["code"],
+            "permission_denied"
+        );
+    }
+}
+
 #[test]
 fn provider_snapshots_are_caller_bound_replay_safe_and_delete_only_after_complete_finish() {
     let mut backend = Backend::default();

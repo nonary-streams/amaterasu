@@ -64,6 +64,19 @@ pub enum Operation {
         cursor: Option<Cursor>,
         limit: Option<usize>,
     },
+    ProfileList {
+        cursor: Option<Cursor>,
+        limit: Option<usize>,
+    },
+    ProfileUpsert {
+        id: String,
+        entry: Entry,
+        expected_revision: u64,
+    },
+    ProfileDelete {
+        id: String,
+        expected_revision: u64,
+    },
     /// Export only Steam IDs from the owner selected by steam_id_export_principals.
     ExportSteamIds {
         cursor: Option<Cursor>,
@@ -198,8 +211,20 @@ pub fn apply(operation: Operation, existing: Option<Document>) -> Result<Change,
         Operation::List { cursor, limit } => return page(&document, "", cursor, limit, false),
         Operation::ExportList { cursor, limit } => return page(&document, "", cursor, limit, true),
         Operation::ExportIdentityInventory { cursor, limit } => {
-            return identity_page(&document, cursor, limit);
+            return identity_page(&document, cursor, limit, false);
         }
+        Operation::ProfileList { cursor, limit } => {
+            return identity_page(&document, cursor, limit, true);
+        }
+        Operation::ProfileUpsert {
+            id,
+            entry,
+            expected_revision,
+        } => return crate::profiles::upsert(document, id, entry, expected_revision),
+        Operation::ProfileDelete {
+            id,
+            expected_revision,
+        } => return crate::profiles::delete(document, id, expected_revision),
         Operation::ExportSteamIds { cursor, limit } => {
             return page_steam_ids(&document, cursor, limit);
         }
@@ -432,6 +457,7 @@ fn identity_page(
     document: &Document,
     cursor: Option<Cursor>,
     limit: Option<usize>,
+    profiles_only: bool,
 ) -> Result<Change, Value> {
     let limit = limit.unwrap_or(20);
     if !(1..=32).contains(&limit) {
@@ -442,7 +468,12 @@ fn identity_page(
     }
     let after = if let Some(cursor) = &cursor {
         check_revision(document, cursor.revision)?;
-        if !cursor.query.is_empty() || !document.entries.contains_key(&cursor.after) {
+        let query = if profiles_only {
+            "remote_monitor_profiles"
+        } else {
+            ""
+        };
+        if cursor.query != query || !document.entries.contains_key(&cursor.after) {
             return Err(error(
                 "invalid_cursor",
                 "cursor does not match the identity inventory",
@@ -455,11 +486,9 @@ fn identity_page(
     let mut entries = Vec::new();
     let mut bytes = 0_usize;
     let mut more = false;
-    for (id, entry) in document
-        .entries
-        .iter()
-        .filter(|(id, _)| id.as_str() > after)
-    {
+    for (id, entry) in document.entries.iter().filter(|(id, entry)| {
+        id.as_str() > after && (!profiles_only || entry.remote_monitor_profile)
+    }) {
         let row = crate::identity::project(id, entry)
             .map_err(|message| error("invalid_entry", message))?;
         let size = serde_json::to_vec(&row)
@@ -476,7 +505,11 @@ fn identity_page(
         entries.last().map(|entry| Cursor {
             revision: document.revision,
             after: entry["id"].as_str().expect("identity ID").into(),
-            query: String::new(),
+            query: if profiles_only {
+                "remote_monitor_profiles".into()
+            } else {
+                String::new()
+            },
         })
     } else {
         None
