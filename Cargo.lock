@@ -623,6 +623,7 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "sha2",
  "ureq",
 ]
 
@@ -961,6 +962,7 @@ dependencies = [
  "amaterasu-contracts",
  "amaterasu-module-sdk",
  "amaterasu-storage",
+ "amaterasu-windows-capture-geometry",
  "cc",
  "getrandom 0.3.4",
  "serde",

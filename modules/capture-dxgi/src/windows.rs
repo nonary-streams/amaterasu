@@ -5,8 +5,10 @@ use crate::model::{
 };
 use crate::staging::{StagingKey, StagingLifecycle};
 use amaterasu_media::{CaptureGeometry, DesktopRect};
+use amaterasu_module_sdk::capture::{EXACT_TARGET_PREFIX, exact_target_key, exact_target_selector};
 use amaterasu_windows_capture_geometry::{
-    GeometryError, SelectedOutput, resolve_with, with_verified_physical_topology,
+    GeometryError, SelectedOutput, resolve_target_matching, resolve_with,
+    with_verified_physical_topology,
 };
 use serde_json::{Value, json};
 use std::time::Instant;
@@ -43,7 +45,11 @@ impl Backend for WindowsBackend {
     fn open(&self, id: &str) -> CaptureResult<Box<dyn CaptureSession>> {
         let (target_id, output) = match resolve_output(id, None) {
             Ok((selection, output)) => (Some(selection.target_id), output),
-            Err(error) if error.code == "geometry_unavailable" => (None, find_output(id)?),
+            Err(error)
+                if error.code == "geometry_unavailable" && !id.starts_with(EXACT_TARGET_PREFIX) =>
+            {
+                (None, find_output(id)?)
+            }
             Err(error) if error.code == "access_lost" => {
                 return Err(CaptureError::new(
                     "not_found",
@@ -555,12 +561,55 @@ fn resolve_output(
     amaterasu_windows_capture_geometry::CaptureSelection,
     NativeOutput,
 )> {
-    resolve_with(expected_target, || {
-        let output = enumerate_outputs()
+    let exact = if output_id.starts_with(EXACT_TARGET_PREFIX) {
+        if exact_target_key(output_id).is_none() {
+            return Err(CaptureError::new(
+                "invalid_request",
+                "invalid exact capture selector",
+            ));
+        }
+        Some(
+            resolve_target_matching(|target| {
+                exact_target_selector(&target.to_ascii_lowercase())
+                    .is_ok_and(|selector| selector == output_id)
+            })
+            .map_err(capture_geometry_error)?,
+        )
+    } else {
+        None
+    };
+    if let Some((selection, _)) = &exact
+        && expected_target
+            .is_some_and(|expected| !expected.eq_ignore_ascii_case(&selection.target_id))
+    {
+        return Err(capture_geometry_error(GeometryError::TargetChanged));
+    }
+    let target = exact
+        .as_ref()
+        .map(|(selection, _)| selection.target_id.as_str())
+        .or(expected_target);
+    resolve_with(target, || {
+        let mut outputs = enumerate_outputs()
             .map_err(|_| GeometryError::Unavailable("DXGI output enumeration failed"))?
             .into_iter()
-            .find(|output| output.metadata.id == output_id)
-            .ok_or(GeometryError::TargetChanged)?;
+            .filter(|output| {
+                exact.as_ref().map_or_else(
+                    || output.metadata.id == output_id,
+                    |(_, selected)| {
+                        output
+                            .metadata
+                            .device_name
+                            .eq_ignore_ascii_case(&selected.source_name)
+                            && output.monitor_handle == selected.monitor_handle
+                    },
+                )
+            });
+        let output = outputs.next().ok_or(GeometryError::TargetChanged)?;
+        if outputs.next().is_some() {
+            return Err(GeometryError::Unavailable(
+                "capture selector matches multiple DXGI outputs",
+            ));
+        }
         let rectangle = DesktopRect::new(
             output.metadata.left,
             output.metadata.top,

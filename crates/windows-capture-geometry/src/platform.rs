@@ -21,6 +21,17 @@ use windows::core::BOOL;
 
 const MAX_DISPLAYS: usize = 64;
 
+/// Resolve a private exact-target selector against the independently reconciled
+/// CCD, GDI and DXGI observations. No primary/active-output fallback is allowed.
+pub fn resolve_target_matching(
+    matches: impl FnMut(&str) -> bool,
+) -> Result<(CaptureSelection, SelectedOutput), GeometryError> {
+    let (topology, ()) = with_physical_topology(|| Ok(()))?;
+    let output = topology.select_target(matches)?;
+    let selection = topology.resolve(&output, None)?;
+    Ok((selection, output))
+}
+
 /// Resolve a provider-selected output while every coordinate-producing call is
 /// scoped to the same physical per-monitor DPI context.
 pub fn resolve_with<T>(

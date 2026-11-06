@@ -63,6 +63,29 @@ struct VerifiedDisplay {
 
 #[cfg(any(windows, test))]
 impl Topology {
+    /// Select one exact target from the fully reconciled topology. The caller
+    /// keeps its private target identity inside the provider's matcher.
+    pub(crate) fn select_target(
+        &self,
+        mut matches: impl FnMut(&str) -> bool,
+    ) -> Result<SelectedOutput, GeometryError> {
+        let mut matches = self
+            .displays
+            .iter()
+            .filter(|display| matches(&display.target_id));
+        let display = matches.next().ok_or(GeometryError::TargetChanged)?;
+        if matches.next().is_some() {
+            return Err(unavailable(
+                "exact capture selector matches more than one target",
+            ));
+        }
+        Ok(SelectedOutput {
+            source_name: display.source_name.clone(),
+            monitor_handle: display.monitor_handle,
+            rectangle: display.rectangle,
+        })
+    }
+
     pub(crate) fn reconcile(
         gdi: Vec<DisplaySnapshot>,
         dxgi: Vec<DisplaySnapshot>,

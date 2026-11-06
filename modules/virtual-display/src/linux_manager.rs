@@ -520,6 +520,14 @@ impl Manager {
                 self.release_borrow(caller, &identity, &reference_id, &borrow_id),
                 None,
             ),
+            Operation::VerifyOwnerTarget {
+                owner,
+                identity,
+                reference_id,
+            } => (
+                self.verify_owner_target(caller, &owner, &identity, &reference_id),
+                None,
+            ),
             Operation::Status {
                 identity,
                 reference_id,
@@ -681,6 +689,48 @@ impl Manager {
                 )
             }
         }
+    }
+
+    fn verify_owner_target(
+        &self,
+        caller: &str,
+        owner: &str,
+        identity: &str,
+        reference_id: &str,
+    ) -> Value {
+        if !self
+            .settings
+            .target_verifiers
+            .iter()
+            .any(|verifier| verifier == caller)
+        {
+            return failure("permission_denied");
+        }
+        if !crate::model::valid_principal(owner)
+            || !valid_identity(identity)
+            || !valid_reference_id(reference_id)
+        {
+            return failure("invalid_request");
+        }
+        let Some(monitor) = self.monitors.get(&(owner.into(), identity.into())) else {
+            return failure("owned_target_unavailable");
+        };
+        if !monitor
+            .references
+            .as_ref()
+            .is_some_and(|references| references.contains(reference_id))
+            || monitor.state != "ready"
+        {
+            return failure("owned_target_unavailable");
+        }
+        let Some(target) = monitor
+            .output
+            .as_deref()
+            .filter(|target| !target.is_empty())
+        else {
+            return failure("owned_target_unavailable");
+        };
+        json!({"ok":true,"owned":true,"target_id":target,"specification":monitor.specification,"active":true})
     }
     pub fn completion_lost(&mut self, admission: Option<Admission>) {
         if let Some(admission) = admission {
@@ -1515,5 +1565,77 @@ impl Drop for Manager {
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod owner_target_tests {
+    use super::*;
+
+    #[test]
+    fn cross_provider_target_proof_requires_explicit_verifier_and_live_exact_reference() {
+        let mut manager = Manager::start(Settings {
+            target_verifiers: vec!["amaterasu.display".into()],
+            ..Settings::default()
+        })
+        .unwrap();
+        let identity = "00000000-0000-0000-0000-000000000001";
+        let key = ("remote-plugin".into(), identity.into());
+        manager.monitors.insert(
+            key.clone(),
+            Monitor {
+                specification: Specification {
+                    hdr_enabled: false,
+                    identity: identity.into(),
+                    width: 1920,
+                    height: 1080,
+                    refresh_millihz: 60000,
+                    name: "Remote monitor".into(),
+                },
+                state: "ready",
+                output: Some("Virtual-9".into()),
+                error: None,
+                references: Some(["retained".into()].into()),
+                layout: VirtualDisplayLayout::Extended,
+                scale: ScaleSetting::Retain,
+            },
+        );
+        let verified =
+            manager.verify_owner_target("amaterasu.display", "remote-plugin", identity, "retained");
+        assert_eq!(verified["ok"], true);
+        assert_eq!(verified["owned"], true);
+        assert_eq!(verified["target_id"], "Virtual-9");
+        assert_eq!(verified["active"], true);
+        for (caller, owner, reference) in [
+            ("untrusted", "remote-plugin", "retained"),
+            ("remote-plugin", "remote-plugin", "retained"),
+            ("amaterasu.display", "other-plugin", "retained"),
+            ("amaterasu.display", "remote-plugin", "different"),
+        ] {
+            let refused = manager.verify_owner_target(caller, owner, identity, reference);
+            assert_eq!(refused["ok"], false);
+            assert!(refused.get("target_id").is_none());
+        }
+        manager.monitors.get_mut(&key).unwrap().state = "removing";
+        assert_eq!(
+            manager.verify_owner_target("amaterasu.display", "remote-plugin", identity, "retained")
+                ["code"],
+            "owned_target_unavailable"
+        );
+        manager.monitors.get_mut(&key).unwrap().state = "ready";
+        manager
+            .monitors
+            .get_mut(&key)
+            .unwrap()
+            .references
+            .as_mut()
+            .unwrap()
+            .clear();
+        assert_eq!(
+            manager.verify_owner_target("amaterasu.display", "remote-plugin", identity, "retained")
+                ["code"],
+            "owned_target_unavailable"
+        );
+        assert!(manager.sender.is_none());
     }
 }

@@ -46,7 +46,9 @@ impl Monitor {
     }
     fn response(&self, reference_id: Option<&str>) -> Value {
         json!({"ok":true,"monitor":{"specification":self.specification,"display_id":format!("{:016x}",self.display_id),
-            "state":self.state,"ready":self.ready,"error":self.error},
+            "state":self.state,"ready":self.ready,"error":self.error,
+            "capture_output":self.ready.as_ref().filter(|ready|ready.active).and_then(|ready| ready.capture_output.as_deref())
+                .filter(|output|amaterasu_module_sdk::capture::exact_target_key(output).is_some())},
             "reference_owned":reference_id.is_some_and(|reference| self.references.as_ref().is_some_and(|references| references.contains(reference)))})
     }
     fn finish_recovery(&mut self) {
@@ -321,6 +323,11 @@ impl<D: Driver> Manager<D> {
 
     pub fn handle(&mut self, caller: &str, operation: Operation) -> Value {
         match operation {
+            Operation::VerifyOwnerTarget {
+                owner,
+                identity,
+                reference_id,
+            } => self.verify_owner_target(caller, &owner, &identity, &reference_id),
             Operation::ReconfigureModeOnlyStatus {
                 operation_id,
                 identity,
@@ -442,7 +449,11 @@ impl<D: Driver> Manager<D> {
                 expected_topology_revision,
                 expected_topology_domain_id,
             } => {
-                if virtual_display_layout.is_some()
+                // Extended creation preserves peer outputs. Activation remains
+                // the display coordinator's job; only independent readback can
+                // publish the optional exact capture selector.
+                if virtual_display_layout
+                    .is_some_and(|layout| layout != crate::model::VirtualDisplayLayout::Extended)
                     || expected_topology_revision.is_some()
                     || expected_topology_domain_id.is_some()
                 {
@@ -497,6 +508,44 @@ impl<D: Driver> Manager<D> {
                 self.remove(caller, &identity, reference_id.as_deref())
             }
         }
+    }
+
+    fn verify_owner_target(
+        &self,
+        caller: &str,
+        owner: &str,
+        identity: &str,
+        reference_id: &str,
+    ) -> Value {
+        if !self
+            .settings
+            .target_verifiers
+            .iter()
+            .any(|verifier| verifier == caller)
+        {
+            return failure("permission_denied");
+        }
+        if !crate::model::valid_principal(owner)
+            || !valid_identity(identity)
+            || !valid_reference_id(reference_id)
+        {
+            return failure("invalid_request");
+        }
+        let Some(monitor) = self.monitors.get(&(owner.into(), identity.into())) else {
+            return failure("owned_target_unavailable");
+        };
+        if !monitor
+            .references
+            .as_ref()
+            .is_some_and(|references| references.contains(reference_id))
+            || monitor.state != "ready"
+        {
+            return failure("owned_target_unavailable");
+        }
+        let Some(ready) = &monitor.ready else {
+            return failure("owned_target_unavailable");
+        };
+        json!({"ok":true,"owned":true,"target_id":ready.device_path,"specification":monitor.specification,"active":ready.active})
     }
 
     fn status(
@@ -557,7 +606,7 @@ impl<D: Driver> Manager<D> {
             "activation_state":activation_state,
             "activation_error":activation_error,
             "monitors":monitors,"reference_owned":reference_id.map(|_| reference_owned),
-            "readiness":"monitor_identity_published_not_capture_ready"})
+            "readiness":"monitor_identity_with_optional_exact_capture_binding"})
     }
 
     fn create(

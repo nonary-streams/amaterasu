@@ -4,7 +4,7 @@ pub use model::{CaptureSelection, GeometryError, SelectedOutput};
 #[cfg(windows)]
 mod platform;
 #[cfg(windows)]
-pub use platform::{resolve_with, with_verified_physical_topology};
+pub use platform::{resolve_target_matching, resolve_with, with_verified_physical_topology};
 
 #[cfg(test)]
 mod topology_tests;

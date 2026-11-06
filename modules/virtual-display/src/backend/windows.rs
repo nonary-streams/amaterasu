@@ -1,4 +1,5 @@
 //! Win32 handle, overlapped-I/O and CCD boundaries. No driver code is bundled.
+use super::capture_target::CaptureReadback;
 use super::{Driver, Observation, Ready};
 use crate::model::Specification;
 use crate::protocol::{self, Binding};
@@ -111,7 +112,7 @@ impl Driver for NativeDriver {
         let lease_display_count = protocol::lease_display_count(&lease_state, lease)?;
         let ready = if exists {
             match binding {
-                Some(binding) => monitor_identity(binding)?,
+                Some(binding) => monitor_identity(binding, specification)?,
                 None => None,
             }
         } else {
@@ -265,7 +266,8 @@ fn ioctl(
     Ok(output)
 }
 
-fn monitor_identity(binding: Binding) -> Result<Option<Ready>, &'static str> {
+fn display_paths()
+-> Result<(Vec<DISPLAYCONFIG_PATH_INFO>, Vec<DISPLAYCONFIG_MODE_INFO>), &'static str> {
     let mut path_count = 0;
     let mut mode_count = 0;
     // SAFETY: scalar outputs are writable; this read-only CCD call has no side effects.
@@ -297,12 +299,27 @@ fn monitor_identity(binding: Binding) -> Result<Option<Ready>, &'static str> {
     {
         return Err("display_query_changed");
     }
-    let path = paths[..path_count as usize].iter().find(|path| {
-        path.targetInfo.adapterId.LowPart == binding.adapter_low
-            && path.targetInfo.adapterId.HighPart == binding.adapter_high
-            && path.targetInfo.id == binding.target
-            && path.targetInfo.targetAvailable != 0
-    });
+    paths.truncate(path_count as usize);
+    modes.truncate(mode_count as usize);
+    Ok((paths, modes))
+}
+
+fn owned_target(path: &DISPLAYCONFIG_PATH_INFO, binding: Binding) -> bool {
+    path.targetInfo.adapterId.LowPart == binding.adapter_low
+        && path.targetInfo.adapterId.HighPart == binding.adapter_high
+        && path.targetInfo.id == binding.target
+        && path.targetInfo.targetAvailable != 0
+}
+
+fn monitor_identity(
+    binding: Binding,
+    specification: &Specification,
+) -> Result<Option<Ready>, &'static str> {
+    let (paths, modes) = display_paths()?;
+    let path = paths
+        .iter()
+        .find(|path| owned_target(path, binding) && path.flags & DISPLAYCONFIG_PATH_ACTIVE != 0)
+        .or_else(|| paths.iter().find(|path| owned_target(path, binding)));
     let Some(path) = path else { return Ok(None) };
     let mut target = DISPLAYCONFIG_TARGET_DEVICE_NAME {
         header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
@@ -320,8 +337,116 @@ fn monitor_identity(binding: Binding) -> Result<Option<Ready>, &'static str> {
     let Some(device_path) = protocol::display_path(&target.monitorDevicePath)? else {
         return Ok(None);
     };
+    // Identity publication can precede display activation. Capture readiness is
+    // independently sampled and may remain unavailable while the coordinator
+    // composes the target into the desktop; this never selects another output.
+    let capture_readiness =
+        verified_capture_output(binding, specification, &device_path, &paths, &modes);
+    let capture_error = capture_readiness.as_ref().err().copied();
     Ok(Some(Ready {
         device_path,
         active: path.flags & DISPLAYCONFIG_PATH_ACTIVE != 0,
+        capture_output: capture_readiness.ok(),
+        capture_error,
     }))
+}
+
+fn active_owned_path(
+    paths: &[DISPLAYCONFIG_PATH_INFO],
+    binding: Binding,
+) -> Result<&DISPLAYCONFIG_PATH_INFO, &'static str> {
+    let mut matches = paths
+        .iter()
+        .filter(|path| owned_target(path, binding) && path.flags & DISPLAYCONFIG_PATH_ACTIVE != 0);
+    let path = matches.next().ok_or("capture_target_inactive")?;
+    if matches.next().is_some() {
+        return Err("capture_target_ambiguous");
+    }
+    Ok(path)
+}
+
+fn capture_readback(
+    path: &DISPLAYCONFIG_PATH_INFO,
+    modes: &[DISPLAYCONFIG_MODE_INFO],
+) -> Result<CaptureReadback, &'static str> {
+    // SAFETY: the query does not request virtual-mode-aware indices, so the
+    // documented modeInfoIdx union member indexes this owned snapshot.
+    let index = unsafe { path.sourceInfo.Anonymous.modeInfoIdx } as usize;
+    let source = modes
+        .get(index)
+        .filter(|mode| {
+            mode.infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE
+                && mode.id == path.sourceInfo.id
+                && mode.adapterId.LowPart == path.sourceInfo.adapterId.LowPart
+                && mode.adapterId.HighPart == path.sourceInfo.adapterId.HighPart
+        })
+        .ok_or("capture_target_mode_unavailable")?;
+    // SAFETY: the checked SOURCE tag selects sourceMode in the native union.
+    let source = unsafe { source.Anonymous.sourceMode };
+    let mut color = DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO {
+        header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
+            r#type: DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO,
+            size: std::mem::size_of::<DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO>() as u32,
+            adapterId: path.targetInfo.adapterId,
+            id: path.targetInfo.id,
+        },
+        ..Default::default()
+    };
+    // SAFETY: color owns the concrete writable packet described by its header.
+    let result = unsafe { DisplayConfigGetDeviceInfo(&mut color.header) };
+    let hdr_enabled = match result {
+        0 => {
+            // SAFETY: value is the documented raw bitfield view of this packet.
+            let flags = unsafe { color.Anonymous.value };
+            if flags & 4 != 0 || (flags & 2 != 0 && flags & 1 == 0) {
+                return Err("capture_target_color_unavailable");
+            }
+            flags & 2 != 0
+        }
+        value if value == ERROR_NOT_SUPPORTED as i32 => false,
+        _ => return Err("capture_target_color_unavailable"),
+    };
+    Ok(CaptureReadback {
+        active: path.flags & DISPLAYCONFIG_PATH_ACTIVE != 0,
+        width: source.width,
+        height: source.height,
+        refresh_numerator: path.targetInfo.refreshRate.Numerator,
+        refresh_denominator: path.targetInfo.refreshRate.Denominator,
+        hdr_enabled,
+    })
+}
+
+fn verified_capture_output(
+    binding: Binding,
+    specification: &Specification,
+    device_path: &str,
+    paths: &[DISPLAYCONFIG_PATH_INFO],
+    modes: &[DISPLAYCONFIG_MODE_INFO],
+) -> Result<String, &'static str> {
+    let before_path = active_owned_path(paths, binding)?;
+    let before = capture_readback(before_path, modes)?;
+    if !before.matches(specification) {
+        return Err("capture_target_mode_mismatch");
+    }
+    let (selection, selected) =
+        amaterasu_windows_capture_geometry::resolve_target_matching(|target| {
+            target.eq_ignore_ascii_case(device_path)
+        })
+        .map_err(|_| "capture_target_enumeration_unavailable")?;
+    if selected.rectangle.width != specification.width
+        || selected.rectangle.height != specification.height
+    {
+        return Err("capture_target_geometry_mismatch");
+    }
+    let (after_paths, after_modes) = display_paths()?;
+    let after_path = active_owned_path(&after_paths, binding)?;
+    let after = capture_readback(after_path, &after_modes)?;
+    if before != after
+        || after_path.sourceInfo.id != before_path.sourceInfo.id
+        || after_path.sourceInfo.adapterId.LowPart != before_path.sourceInfo.adapterId.LowPart
+        || after_path.sourceInfo.adapterId.HighPart != before_path.sourceInfo.adapterId.HighPart
+    {
+        return Err("capture_target_changed");
+    }
+    amaterasu_module_sdk::capture::exact_target_selector(&selection.target_id.to_ascii_lowercase())
 }

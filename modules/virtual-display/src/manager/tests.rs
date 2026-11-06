@@ -6,6 +6,8 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 const ID: &str = "00000000-0000-0000-0000-000000000001";
+const CAPTURE_OUTPUT: &str =
+    "exact-target:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 #[derive(Default)]
 struct Calls {
     supported_calls: usize,
@@ -18,6 +20,7 @@ struct Calls {
     exists: bool,
     pending: bool,
     ready: bool,
+    capture_ready: bool,
 }
 struct Fake(Rc<RefCell<Calls>>);
 impl Driver for Fake {
@@ -60,7 +63,9 @@ impl Driver for Fake {
             pending_departure: calls.pending,
             ready: calls.ready.then(|| Ready {
                 device_path: "owned-device".into(),
-                active: false,
+                active: calls.capture_ready,
+                capture_output: calls.capture_ready.then(|| CAPTURE_OUTPUT.into()),
+                capture_error: (!calls.capture_ready).then_some("capture_target_inactive"),
             }),
         })
     }
@@ -144,6 +149,127 @@ fn tick(manager: &mut Manager<Fake>) {
         monitor.next_poll = Instant::now();
     }
     manager.tick();
+}
+
+#[test]
+fn extended_monitor_intent_preserves_peer_topology_and_waits_for_exact_capture_readback() {
+    let (mut manager, calls) = setup(true);
+    let mut extended = create_with_reference("retained-owner");
+    if let Operation::Create {
+        virtual_display_layout,
+        ..
+    } = &mut extended
+    {
+        *virtual_display_layout = Some(crate::model::VirtualDisplayLayout::Extended);
+    }
+    assert_eq!(manager.handle("remote-plugin", extended)["ok"], true);
+    calls.borrow_mut().ready = true;
+    tick(&mut manager);
+    let status = || Operation::Status {
+        identity: Some(ID.into()),
+        reference_id: Some("retained-owner".into()),
+    };
+    let identity_only = manager.handle("remote-plugin", status());
+    assert_eq!(identity_only["monitors"][0]["state"], "ready");
+    assert_eq!(identity_only["monitors"][0]["ready"]["active"], false);
+    assert!(identity_only["monitors"][0]["capture_output"].is_null());
+    calls.borrow_mut().capture_ready = true;
+    tick(&mut manager);
+    assert_eq!(
+        manager.handle("remote-plugin", status())["monitors"][0]["capture_output"],
+        CAPTURE_OUTPUT
+    );
+    calls.borrow_mut().ready = false;
+    tick(&mut manager);
+    assert!(manager.handle("remote-plugin", status())["monitors"][0]["capture_output"].is_null());
+
+    let mut exclusive = create();
+    if let Operation::Create {
+        virtual_display_layout,
+        ..
+    } = &mut exclusive
+    {
+        *virtual_display_layout = Some(crate::model::VirtualDisplayLayout::Exclusive);
+    }
+    assert_eq!(
+        manager.handle("other", exclusive)["code"],
+        "unsupported_topology_domain"
+    );
+    assert_eq!(calls.borrow().creates.len(), 1);
+}
+
+#[test]
+fn owner_target_verification_requires_trusted_verifier_and_exact_live_reference() {
+    let verify = |owner: &str, reference: &str| Operation::VerifyOwnerTarget {
+        owner: owner.into(),
+        identity: ID.into(),
+        reference_id: reference.into(),
+    };
+    let (mut denied, _) = setup(true);
+    assert_eq!(
+        denied.handle("amaterasu.display", verify("remote-plugin", "retained"))["code"],
+        "permission_denied"
+    );
+    let (mut manager, calls) = setup_with(Settings {
+        enabled: true,
+        target_verifiers: vec!["amaterasu.display".into()],
+        ..Settings::default()
+    });
+    assert_eq!(
+        manager.handle("remote-plugin", create_with_reference("retained"))["ok"],
+        true
+    );
+    assert_eq!(
+        manager.handle("amaterasu.display", verify("remote-plugin", "retained"))["code"],
+        "owned_target_unavailable"
+    );
+    calls.borrow_mut().ready = true;
+    tick(&mut manager);
+    let proof = manager.handle("amaterasu.display", verify("remote-plugin", "retained"));
+    assert_eq!(proof["ok"], true);
+    assert_eq!(proof["owned"], true);
+    assert_eq!(proof["target_id"], "owned-device");
+    assert_eq!(proof["specification"]["identity"], ID);
+    assert_eq!(proof["active"], false);
+    for (caller, owner, reference) in [
+        ("untrusted", "remote-plugin", "retained"),
+        ("remote-plugin", "remote-plugin", "retained"),
+        ("amaterasu.display", "other-plugin", "retained"),
+        ("amaterasu.display", "remote-plugin", "different"),
+    ] {
+        let result = manager.handle(caller, verify(owner, reference));
+        assert_eq!(result["ok"], false);
+        assert!(result.get("target_id").is_none());
+    }
+    manager.handle(
+        "remote-plugin",
+        Operation::Remove {
+            identity: ID.into(),
+            reference_id: Some("retained".into()),
+        },
+    );
+    assert_eq!(
+        manager.handle("amaterasu.display", verify("remote-plugin", "retained"))["code"],
+        "owned_target_unavailable"
+    );
+    assert_eq!(calls.borrow().creates.len(), 1);
+}
+
+#[test]
+fn startup_verifier_policy_is_bounded_explicit_and_unambiguous() {
+    assert!(Settings::default().target_verifiers.is_empty());
+    let trusted: Settings =
+        serde_json::from_value(serde_json::json!({"target_verifiers":["amaterasu.display"]}))
+            .unwrap();
+    assert_eq!(trusted.target_verifiers, ["amaterasu.display"]);
+    for invalid in [
+        serde_json::json!({"target_verifiers":[""]}),
+        serde_json::json!({"target_verifiers":["amaterasu.display", "amaterasu.display"]}),
+        serde_json::json!({"target_verifiers":["untrusted principal"]}),
+        serde_json::json!({"target_verifiers":(0..17).map(|index|format!("provider-{index}")).collect::<Vec<_>>()}),
+    ] {
+        assert!(serde_json::from_value::<Settings>(invalid).is_err());
+    }
 }
 
 #[derive(Default)]

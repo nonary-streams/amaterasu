@@ -2,8 +2,10 @@ use super::{Backend, CaptureSession, TouchSurface};
 use crate::model::{CaptureError, CaptureResult, Frame, Output, frame_layout};
 use crate::worker::{FrameSource, Worker};
 use amaterasu_media::{CaptureGeometry, DesktopRect};
+use amaterasu_module_sdk::capture::{EXACT_TARGET_PREFIX, exact_target_key, exact_target_selector};
 use amaterasu_windows_capture_geometry::{
-    GeometryError, SelectedOutput, resolve_with, with_verified_physical_topology,
+    GeometryError, SelectedOutput, resolve_target_matching, resolve_with,
+    with_verified_physical_topology,
 };
 use serde_json::Value;
 use std::marker::PhantomData;
@@ -65,7 +67,12 @@ impl Backend for WindowsBackend {
     fn open(&self, output: &str) -> CaptureResult<Box<dyn CaptureSession>> {
         let target_id = match resolve_monitor(output, None) {
             Ok((selection, _)) => Some(selection.target_id),
-            Err(error) if error.code == "geometry_unavailable" => None,
+            Err(error)
+                if error.code == "geometry_unavailable"
+                    && !output.starts_with(EXACT_TARGET_PREFIX) =>
+            {
+                None
+            }
             Err(error) if error.code == "access_lost" => {
                 return Err(CaptureError::new(
                     "not_found",
@@ -285,12 +292,55 @@ fn resolve_monitor(
     amaterasu_windows_capture_geometry::CaptureSelection,
     monitors::Monitor,
 )> {
-    resolve_with(expected_target, || {
-        let monitor = monitors::enumerate()
+    let exact = if output_id.starts_with(EXACT_TARGET_PREFIX) {
+        if exact_target_key(output_id).is_none() {
+            return Err(CaptureError::new(
+                "invalid_request",
+                "invalid exact capture selector",
+            ));
+        }
+        Some(
+            resolve_target_matching(|target| {
+                exact_target_selector(&target.to_ascii_lowercase())
+                    .is_ok_and(|selector| selector == output_id)
+            })
+            .map_err(capture_geometry_error)?,
+        )
+    } else {
+        None
+    };
+    if let Some((selection, _)) = &exact
+        && expected_target
+            .is_some_and(|expected| !expected.eq_ignore_ascii_case(&selection.target_id))
+    {
+        return Err(capture_geometry_error(GeometryError::TargetChanged));
+    }
+    let target = exact
+        .as_ref()
+        .map(|(selection, _)| selection.target_id.as_str())
+        .or(expected_target);
+    resolve_with(target, || {
+        let mut monitors = monitors::enumerate()
             .map_err(|_| GeometryError::Unavailable("GDI monitor enumeration failed"))?
             .into_iter()
-            .find(|monitor| monitor.metadata.id == output_id)
-            .ok_or(GeometryError::TargetChanged)?;
+            .filter(|monitor| {
+                exact.as_ref().map_or_else(
+                    || monitor.metadata.id == output_id,
+                    |(_, selected)| {
+                        monitor
+                            .metadata
+                            .device_name
+                            .eq_ignore_ascii_case(&selected.source_name)
+                            && monitor.handle.0 as usize == selected.monitor_handle
+                    },
+                )
+            });
+        let monitor = monitors.next().ok_or(GeometryError::TargetChanged)?;
+        if monitors.next().is_some() {
+            return Err(GeometryError::Unavailable(
+                "capture selector matches multiple GDI monitors",
+            ));
+        }
         let rectangle = DesktopRect::new(
             monitor.metadata.left,
             monitor.metadata.top,

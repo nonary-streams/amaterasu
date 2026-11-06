@@ -20,7 +20,9 @@ touching the driver. When the module is enabled, create may manage a temporary
 monitor regardless of `dd_activate_virtual_display`. That setting requests
 stream-time topology activation; this service does not implement that behavior.
 On Windows an explicit create cannot activate topology or make its monitor the
-only active display. Linux owned creation activates only its new output.
+only active display. An `extended` create intent is accepted without changing
+peer outputs; the display coordinator activates it through the Display API.
+Linux owned creation activates only its new output.
 If `dd_use_sunshine_virtual_display_driver` is false, create returns
 `unsupported_driver`; this service has no alternative driver and does not silently
 select Sunshine. Builds without the optional Linux backend return
@@ -36,6 +38,30 @@ caller-specific IDs, `getrandom` supplies lease capabilities, and `windows-sys`
 provides documented Win32 bindings. Native code remains trusted, not sandboxed.
 
 ## API
+
+Windows monitor identity publication and capture readiness are separate. A ready
+monitor can expose its private device path to a trusted display coordinator for
+activation while `capture_output` remains absent. The optional `capture_output`
+is an opaque `exact-target:` selector shared by the DXGI and WGC Capture SDK
+adapters. Its digest does not publish a native target identity or OS handle.
+Publication requires the exact owned target to be active at the requested
+dimensions, rounded millihertz refresh rate and HDR state, agreement across CCD,
+GDI and DXGI enumeration, and unchanged mode/color readback. `ready.capture_error`
+explains missing capture readiness. Capture providers independently resolve the
+selector to one current target and retain its exact physical identity; malformed,
+missing or ambiguous selectors never select the primary output or permit a
+geometry fallback. Windows runtime and driver qualification remain separate from
+the platform-independent contract and state-machine tests.
+
+`verify_owner_target` lets an explicitly trusted display coordinator verify an
+existing caller-owned stable reference without impersonating that caller. Only
+principals listed in the provider's trusted startup `target_verifiers` setting
+may call it; the default is an empty list. The operation matches the exact owner,
+identity and live reference, returning its specification, local target name and
+activation state. It grants no creation or release authority and cannot change
+the verifier policy. The display coordinator must derive `owner` from its
+authenticated inbound broker caller, compare the exact target/specification,
+and preserve peer outputs when composing the requested display.
 
 The optional Linux `linux-libvirtualdisplay` feature directly links the pinned
 `third-party/libvirtualdisplay` CMake driver target. Initialize that submodule
