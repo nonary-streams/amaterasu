@@ -95,6 +95,27 @@ fn decorated_catalog_titles_retain_their_complete_original_name() {
 }
 
 #[test]
+fn complete_catalog_alias_inventory_fits_the_presentation_contract() {
+    let mut entry = app();
+    entry.aliases = (0..MAX_APPLICATION_ALIASES)
+        .map(|index| format!("retained-{index}"))
+        .collect();
+    assert!(entry.validate().is_ok());
+    assert!(
+        Request::AppendProject {
+            client_id: "client".into(),
+            projection_id: "projection".into(),
+            entries: vec![entry.clone()],
+            final_page: true
+        }
+        .validate()
+        .is_ok()
+    );
+    entry.aliases.push("one-alias-too-many".into());
+    assert!(entry.validate().is_err());
+}
+
+#[test]
 fn identities_and_permissions_remain_authenticated_facts() {
     let mut request = context();
     request.client.paired = false;

@@ -27,6 +27,7 @@ pub const MAX_PAYLOAD_BYTES: usize = 12_000;
 pub const MAX_ARTWORK_BYTES: usize = 4_096;
 /// Includes provider-owned ordering/role labels around a catalog title.
 pub const MAX_TITLE_BYTES: usize = 192;
+pub const MAX_APPLICATION_ALIASES: usize = 32;
 pub const DEFAULT_CAPTURE_ROUTE: &str = "default";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -601,7 +602,7 @@ impl Application {
             && self.uuid.len() <= 128
             && !self.uuid.chars().any(char::is_control)
             && bounded_text(&self.title, MAX_TITLE_BYTES)
-            && self.aliases.len() <= 16
+            && self.aliases.len() <= MAX_APPLICATION_ALIASES
             && self.aliases.iter().all(|alias| token(alias))
             && self.properties.is_object()
             && serde_json::to_vec(&self.properties).is_ok_and(|bytes| bytes.len() <= 4096)
