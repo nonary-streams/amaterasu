@@ -226,6 +226,10 @@ and conclusive missing-provider rejection. Native input is supplied by an
 in-memory probe; these results do not establish OS input delivery, monitor
 creation or Moonlight presentation.
 
+The same signed scenario also passes after replacing only the Remote Session
+library with its independently built release artifact from the exported SDK.
+The protocol, host and other native consumers remain unchanged in that run.
+
 Windows source compilation checks cover DXGI, WGC, Video, Audio, Encode,
 Display, Virtual Display and Remote Session using an isolated matching compiler
 and Windows standard library. These are compile checks, without Windows linking,
