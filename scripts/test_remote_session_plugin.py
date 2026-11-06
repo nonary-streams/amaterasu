@@ -342,8 +342,38 @@ def qualify_loaded_contract(console):
                          "intent": "launch", "selection": {"id": "2147483506", "uuid": None}, "mode": MODE})
     require(denied.get("decision", {}).get("kind") == "reject"
             and denied["decision"]["status_code"] == 403, "launch permission was bypassed", denied)
+    permission_split = qualify_catalog_permission_split(console)
     return {"interface": "1.0", "projected_entries": len(projected["entries"]),
-            "owner_busy": True, "secondary_busy": False, "projection_released": True}
+            "owner_busy": True, "secondary_busy": False, "projection_released": True,
+            "catalog_permissions": permission_split}
+
+
+def qualify_catalog_permission_split(console):
+    """List authorizes rows independently of the right to view a stream."""
+    for name, view, list_apps in (("list-only", False, True), ("view-only", True, False)):
+        client_id = f"fixture-{name}"
+        started = console.settled_api("begin_project", {
+            "context": context(client_id, game=False, launch=False, view=view, list_apps=list_apps),
+            "catalog_revision": f"native-{name}-revision",
+        })
+        require(started.get("result") == "started", "trusted inventory upload was not admitted", started)
+        projection = started["projection_id"]
+        try:
+            appended = console.api("append_project", {
+                "client_id": client_id, "projection_id": projection, "entries": [], "final_page": True,
+            })
+            require(appended.get("result") == "appended", "trusted inventory upload did not complete", appended)
+            rows = console.api("read_project", {
+                "client_id": client_id, "projection_id": projection, "offset": 0, "limit": 32,
+            })
+            if list_apps:
+                require(rows.get("result") == "projected", "List-only client could not read its catalog", rows)
+            else:
+                require(rows.get("result") == "error" and "entries" not in rows,
+                        "View-only client received catalog rows without List permission", rows)
+        finally:
+            console.api("release_project", {"client_id": client_id, "projection_id": projection})
+    return {"list_only_can_read": True, "view_only_rows_denied": True}
 
 
 def initialize_paired_wire(console, fixtures, *, select_software=True):
