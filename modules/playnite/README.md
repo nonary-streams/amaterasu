@@ -15,7 +15,7 @@ requires restarting the provider.
 Playnite cover artwork is scanned outside the UI thread with a rotating,
 bounded scan. A completed image produces an opaque SHA-256 revision; a missing
 cover clears its reference, while a failed or unfinished scan preserves the
-previous reference. Reads use revision-pinned 8 KiB chunks and accept PNG,
+previous reference. The external named-pipe protocol uses revision-pinned 8 KiB chunks; the provider assembles them into a binary-transfer SDK record for consumers. Images accept PNG,
 JPEG, and WebP signatures up to 16 MiB. The isolated scanner uses a bounded
 cache; evicted images are unavailable until rescanned. A slow file open can
 strand the scanner without blocking Playnite commands, and a restarted provider

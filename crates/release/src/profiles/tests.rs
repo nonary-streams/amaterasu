@@ -1637,7 +1637,7 @@ fn provider_imports_have_fixed_catalog_owners_and_narrow_service_grants() {
 }
 
 #[test]
-fn public_launch_packages_preserve_transitive_delegation_and_identity_only_native_access() {
+fn public_launch_packages_preserve_transitive_delegation_and_identity_and_artwork_native_access() {
     for profile in [PackageProfile::Platform, PackageProfile::StreamProbe] {
         let adapter = profile
             .components()
@@ -1658,7 +1658,11 @@ fn public_launch_packages_preserve_transitive_delegation_and_identity_only_nativ
         }
         assert_eq!(
             names(adapter.native_uses),
-            names(&["amaterasu.identity/1", "amaterasu.network/1"])
+            names(&[
+                "amaterasu.identity/1",
+                "amaterasu.network/1",
+                "amaterasu.library/1"
+            ])
         );
     }
 }

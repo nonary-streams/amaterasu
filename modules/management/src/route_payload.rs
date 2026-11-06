@@ -109,30 +109,24 @@ pub fn validate(route: Route, object: &Object) -> Result<(), &'static str> {
 }
 
 fn library_artwork(action: &str, object: &Object) -> Result<(), &'static str> {
-    match action {
-        "artwork_read" => fields(object, &["id", "offset", "transfer_id"], &["revision"]),
-        "artwork_release" => fields(object, &["id", "transfer_id"], &[]),
-        _ => Err(INVALID),
-    }?;
+    if action != "artwork_open" {
+        return Err(INVALID);
+    }
+    fields(object, &["id"], &["revision"])?;
+    if let Some(revision) = object.get("revision")
+        && revision
+            .as_str()
+            .is_none_or(|r| r.is_empty() || r.len() > 128 || r.chars().any(char::is_control))
+    {
+        return Err(INVALID);
+    }
     let id = text(object, "id")?;
-    let transfer = text(object, "transfer_id")?;
     if id.len() != 20
         || !id.starts_with("app-")
         || !id[4..]
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        || transfer.len() != 32
-        || !transfer
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        || object
-            .get("offset")
-            .is_some_and(|value| value.as_u64().is_none())
-        || object.get("revision").is_some_and(|value| {
-            value.as_str().is_none_or(|value| {
-                value.is_empty() || value.len() > 128 || value.chars().any(char::is_control)
-            })
-        })
+        || id[4..].bytes().all(|b| b == b'0')
     {
         return Err(INVALID);
     }
@@ -641,20 +635,15 @@ mod lutris_artwork_tests {
 
     #[test]
     fn artwork_payload_matches_provider_bounds_and_rejects_overrides() {
-        let route = resolve("/v1/lutris/artwork_read").unwrap();
+        let route = resolve("/v1/lutris/artwork").unwrap();
         let revision = "a".repeat(64);
-        for (game_id, offset) in [
-            (1_i64, 0_u64),
-            (i64::MAX, 8192),
-            (42, 16 * 1024 * 1024 - 8192),
-        ] {
-            let request = json!({"game_id":game_id,"revision":revision,"offset":offset});
+        for game_id in [1_i64, i64::MAX, 42] {
+            let request = json!({"game_id":game_id,"revision":revision});
             let forwarded = payload(route, request.to_string().as_bytes()).unwrap();
-            assert_eq!(forwarded["action"], "artwork_read");
+            assert_eq!(forwarded["action"], "artwork_open");
             assert_eq!(forwarded["game_id"], game_id);
-            assert_eq!(forwarded["offset"], offset);
         }
-        let valid = json!({"game_id":42,"revision":revision,"offset":8192});
+        let valid = json!({"game_id":42,"revision":revision});
         for (field, value) in [
             ("game_id", json!(0)),
             ("game_id", json!(-1)),
@@ -682,7 +671,7 @@ mod lutris_artwork_tests {
                 "{extra}"
             );
         }
-        for missing in ["game_id", "revision", "offset"] {
+        for missing in ["game_id", "revision"] {
             let mut invalid = valid.clone();
             invalid.as_object_mut().unwrap().remove(missing);
             assert!(
@@ -1119,6 +1108,26 @@ fn system_tray_settings_update(object: &Object) -> Result<(), &'static str> {
 }
 
 fn steam(action: &str, object: &Object) -> Result<(), &'static str> {
+    if action == "artwork_open" {
+        fields(object, &["app_id", "revision"], &[])?;
+        let id = object
+            .get("app_id")
+            .and_then(Value::as_u64)
+            .filter(|id| *id > 0)
+            .ok_or(INVALID)?;
+        let revision = text(object, "revision")?;
+        if id > u32::MAX as u64
+            || !revision.bytes().all(|b| b.is_ascii_digit())
+            || revision.len() > 20
+            || revision.is_empty()
+            || revision.len() > 128
+            || revision.chars().any(char::is_control)
+        {
+            return Err(INVALID);
+        }
+        return Ok(());
+    }
+
     match action {
         "settings_get" => fields(object, &[], &[]),
         "artwork_read" => {
@@ -1196,6 +1205,28 @@ fn steam(action: &str, object: &Object) -> Result<(), &'static str> {
 }
 
 fn lutris(action: &str, object: &Object) -> Result<(), &'static str> {
+    if action == "artwork_open" {
+        fields(object, &["game_id", "revision"], &[])?;
+        let id = object
+            .get("game_id")
+            .and_then(Value::as_u64)
+            .filter(|id| *id > 0)
+            .ok_or(INVALID)?;
+        let revision = text(object, "revision")?;
+        if id > i64::MAX as u64
+            || revision.len() != 64
+            || !revision
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            || revision.is_empty()
+            || revision.len() > 128
+            || revision.chars().any(char::is_control)
+        {
+            return Err(INVALID);
+        }
+        return Ok(());
+    }
+
     match action {
         "settings_get" | "status" | "refresh" => fields(object, &[], &[]),
         "artwork_read" => {

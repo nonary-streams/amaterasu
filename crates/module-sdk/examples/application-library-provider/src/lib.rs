@@ -2,7 +2,7 @@
 use amaterasu_module_sdk::{
     Command, ManagedModule, ModuleResult, Response, RuntimeClient,
     application_library::{
-        provider::{Application, ArtworkChunk, ArtworkReference, DiscoveryPage},
+        provider::{Application, ArtworkImage, ArtworkReference, DiscoveryPage},
         provider_adapter::{CallerPolicy, Identity, Provider, ProviderAdapter},
         provider_lifecycle::{
             Action, Observation, ProofKind, Request as LifecycleRequest, RetirementProof, State,
@@ -73,16 +73,13 @@ impl Provider for Fixture {
         &mut self,
         _: &Identity<'_>,
         reference: &ArtworkReference,
-        offset: u64,
-    ) -> Result<ArtworkChunk, &'static str> {
-        if reference.id != "fixture-cover" || reference.revision != "fixture-v1" || offset != 0 {
+    ) -> Result<ArtworkImage, &'static str> {
+        if reference.id != "fixture-cover" || reference.revision != "fixture-v1" {
             return Err("not_found");
         }
-        Ok(ArtworkChunk {
+        Ok(ArtworkImage {
             reference: reference.clone(),
             mime: "image/png".into(),
-            offset,
-            total_bytes: COVER.len() as u64,
             bytes: COVER.into(),
         })
     }
@@ -178,6 +175,7 @@ impl ManagedModule for Module {
         };
         let settings: Settings =
             serde_json::from_value(payload).map_err(|error| error.to_string())?;
+        let artwork_enabled = settings.callers.values().any(|policy| policy.artwork);
         let adapter = ProviderAdapter::with_policies(
             Fixture::new().map_err(str::to_owned)?,
             SERVICE.into(),
@@ -187,9 +185,16 @@ impl ManagedModule for Module {
         runtime.require_success(Command::Register {
             service: SERVICE.into(),
         })?;
+        if artwork_enabled {
+            // SAFETY: the adapter lives until dependent native consumers stop.
+            unsafe {
+                adapter.register_artwork(&runtime)?;
+            }
+        }
         Ok(Self { runtime, adapter })
     }
     fn tick(&mut self) -> ModuleResult<()> {
+        self.adapter.reap_artwork();
         if let Some(request) = self.runtime.poll_serialized()? {
             let response = self.adapter.dispatch(&request);
             self.runtime.complete_serialized(request.id, &response)?;
@@ -255,7 +260,8 @@ mod tests {
         let host = Host {
             commands: RefCell::new(vec![]),
             replies: RefCell::new(VecDeque::from([
-                json!({"kind":"result","payload":{"callers":{"library":{"initiators":["consumer"],"discovery":true}}}}),
+                json!({"kind":"result","payload":{"callers":{"library":{"initiators":["consumer"],"discovery":true,"artwork":true}}}}),
+                json!({"kind":"ok"}),
                 json!({"kind":"ok"}),
                 json!({"kind":"request","id":9,"caller":"library","initiator":"consumer","service":SERVICE,"payload":{"action":"discover","cursor":null,"limit":1},"remaining_ms":100}),
                 json!({"kind":"ok"}),
@@ -272,8 +278,8 @@ mod tests {
         module.tick().unwrap();
         let commands = host.commands.borrow();
         assert_eq!(commands[1]["service"], SERVICE);
-        assert_eq!(commands[3]["request"], 9);
-        assert_eq!(commands[3]["payload"]["entries"][0]["id"], "fixture-game");
+        assert_eq!(commands[4]["request"], 9);
+        assert_eq!(commands[4]["payload"]["entries"][0]["id"], "fixture-game");
     }
 
     #[test]
@@ -431,9 +437,9 @@ mod tests {
             json!({"action":"discover","cursor":null,"limit":20}),
         ));
         assert_eq!(discover["entries"][0]["id"], "fixture-game");
-        let cover = adapter.dispatch(&request(json!({"action":"artwork","reference":{"id":"fixture-cover","revision":"fixture-v1"},"offset":0})));
-        assert_eq!(cover["mime"], "image/png");
-        assert!(cover["data_base64"].as_str().unwrap().starts_with("iVBOR"));
+        let cover = adapter.dispatch(&request(json!({"action":"artwork_open","reference":{"id":"fixture-cover","revision":"fixture-v1"}})));
+        assert_eq!(cover["offer"]["mime_type"], "image/png");
+        assert!(cover.get("data_base64").is_none());
         let identity = adapter.dispatch(&request(json!({"action":"identity"})));
         let incarnation = identity["provider_incarnation"].as_str().unwrap();
         let launch = json!({"action":"launch","operation_id":"op1","application_id":"fixture-game","provider_incarnation":incarnation});

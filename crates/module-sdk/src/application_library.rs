@@ -247,7 +247,6 @@ pub mod provider {
     use std::collections::BTreeSet;
 
     pub const MAX_PAGE_ENTRIES: usize = 32;
-    pub const MAX_ARTWORK_CHUNK_BYTES: usize = 8 * 1024;
     pub const MAX_ARTWORK_BYTES: u64 = 16 * 1024 * 1024;
 
     fn token(value: &str) -> bool {
@@ -318,54 +317,25 @@ pub mod provider {
         }
     }
 
-    /// Artwork bytes are bounded per chunk and across the complete object. The
-    /// consumer must also check exact requested reference, offset, revision,
-    /// MIME, and contiguous progress across every chunk.
-    #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-    #[serde(deny_unknown_fields)]
-    pub struct ArtworkChunk {
+    /// Complete provider-owned image. The adapter moves its bytes over the
+    /// binary-transfer SDK; the broker receives only an owner-bound offer.
+    pub struct ArtworkImage {
         pub reference: ArtworkReference,
         pub mime: String,
-        pub offset: u64,
-        pub total_bytes: u64,
         pub bytes: Vec<u8>,
     }
-
-    impl ArtworkChunk {
-        /// Validate a chunk against the pinned reference and expected stream position.
-        pub fn validate_for(
-            &self,
-            reference: &ArtworkReference,
-            mime: &str,
-            offset: u64,
-            total_bytes: u64,
-        ) -> Result<(), &'static str> {
-            self.validate()?;
-            if &self.reference != reference
-                || self.mime != mime
-                || self.offset != offset
-                || self.total_bytes != total_bytes
-            {
-                return Err("artwork stream changed");
-            }
-            Ok(())
-        }
-
+    impl ArtworkImage {
         pub fn validate(&self) -> Result<(), &'static str> {
-            let end = self.offset.checked_add(self.bytes.len() as u64);
             if !token(&self.reference.id)
                 || !token(&self.reference.revision)
                 || !matches!(
                     self.mime.as_str(),
                     "image/png" | "image/jpeg" | "image/webp"
                 )
-                || self.total_bytes == 0
-                || self.total_bytes > MAX_ARTWORK_BYTES
                 || self.bytes.is_empty()
-                || self.bytes.len() > MAX_ARTWORK_CHUNK_BYTES
-                || end.is_none_or(|end| end > self.total_bytes)
+                || self.bytes.len() as u64 > MAX_ARTWORK_BYTES
             {
-                return Err("invalid artwork chunk");
+                return Err("invalid artwork image");
             }
             Ok(())
         }
@@ -377,25 +347,18 @@ mod provider_tests {
     use super::provider::*;
 
     #[test]
-    fn artwork_is_bounded_and_pinned_to_stream() {
-        let reference = ArtworkReference {
-            id: "cover".into(),
-            revision: "v1".into(),
-        };
-        let mut chunk = ArtworkChunk {
-            reference: reference.clone(),
+    fn artwork_is_bounded_and_has_an_opaque_revision() {
+        let mut image = ArtworkImage {
+            reference: ArtworkReference {
+                id: "cover".into(),
+                revision: "v1".into(),
+            },
             mime: "image/png".into(),
-            offset: 0,
-            total_bytes: 2,
             bytes: vec![1, 2],
         };
-        assert!(chunk.validate_for(&reference, "image/png", 0, 2).is_ok());
-        assert!(chunk.validate_for(&reference, "image/png", 1, 2).is_err());
-        chunk.offset = u64::MAX;
-        assert!(chunk.validate().is_err());
-        chunk.offset = 0;
-        chunk.bytes = vec![0; MAX_ARTWORK_CHUNK_BYTES + 1];
-        assert!(chunk.validate().is_err());
+        assert!(image.validate().is_ok());
+        image.bytes = vec![0; MAX_ARTWORK_BYTES as usize + 1];
+        assert!(image.validate().is_err());
     }
 
     #[test]

@@ -34,10 +34,13 @@ native code.
 A direct provider discovery payload is `{"action":"discover","cursor":null,
 "limit":20}`. Successful responses contain `ok`, a provider revision string,
 entries and `next_cursor`. Clients must pin revisions across pages and reject
-inconsistent scans. Artwork uses `{action:"artwork",reference:{id,revision},
-offset}` and returns base64 bytes with reference, MIME, offset and total length;
-check each against the pinned stream. Limits are 32 rows, 8 KiB per artwork
-chunk, 16 MiB per object, and 12,000 encoded bytes per response.
+inconsistent scans. Artwork uses `{action:"artwork_open",reference:{id,revision}}`
+and returns a metadata-only binary-transfer offer. Register the native table
+with `ProviderAdapter::register_artwork`, tick `reap_artwork`, and grant
+`native_provide`/`native_use` under the same service alias. The provider returns
+`ArtworkImage`; the adapter publishes its bytes through the shared SDK. The
+standard policy uses 256 KiB chunks and caps each image at 16 MiB. The 12,000-byte
+control response budget does not carry image bytes.
 
 The launch owner first requests `{action:"identity"}` and pins the returned
 random process incarnation. Lifecycle actions `launch`, `lookup`, and
@@ -91,11 +94,11 @@ provider alias. Its imported entry can carry this opaque reference:
 Provider alias and service selection come from trusted startup settings. Normal
 broker grants must cover the facade, catalog, state and selected provider for
 the initiating principal. The facade requests the SDK `describe` capability
-before the first artwork chunk, preserves reference/revision/MIME/total length,
+before opening artwork, preserves reference/revision/MIME/total length,
 and refuses unknown or unauthorized routes. The provider controls its resource
 identity and returns the same shared SDK artwork contract as other providers.
-This route uses the existing bounded chunk protocol; bulk binary migration is
-separate from provider substitutability.
+The unchanged facade consumes the same binary-transfer SDK from this separately
+compiled provider. See [artwork transfer](../../../../../docs/artwork-transfer.md).
 
 The independently compiled provider/facade check is opt-in:
 

@@ -139,15 +139,7 @@ pub fn resolve(path: &str) -> Option<Route> {
             "package_selection_status",
             Some("configuration.read"),
         ),
-        ("library", "artwork_read" | "artwork_release") => (
-            "amaterasu.library/1",
-            if action == "artwork_read" {
-                "artwork_read"
-            } else {
-                "artwork_release"
-            },
-            Some("catalog.read"),
-        ),
+        ("library", "artwork") => ("amaterasu.library/1", "artwork_open", Some("catalog.read")),
         ("catalog", action) => (
             "amaterasu.catalog/1",
             catalog_action(action)?,
@@ -233,7 +225,7 @@ pub fn resolve(path: &str) -> Option<Route> {
             Some("application.terminate"),
         ),
         ("steam", "list") => ("amaterasu.steam/1", "list", Some("steam.read")),
-        ("steam", "artwork_read") => ("amaterasu.steam/1", "artwork_read", Some("steam.read")),
+        ("steam", "artwork") => ("amaterasu.steam/1", "artwork_open", Some("steam.read")),
         ("steam", "status") => ("amaterasu.steam/1", "status", Some("steam.read")),
         ("steam", "refresh") => ("amaterasu.steam/1", "refresh", Some("steam.refresh")),
         ("steam", "force_sync") => ("amaterasu.steam/1", "force_sync", Some("steam.refresh")),
@@ -259,7 +251,7 @@ pub fn resolve(path: &str) -> Option<Route> {
         ),
         ("lutris", "status") => ("amaterasu.lutris/1", "status", Some("configuration.read")),
         ("lutris", "refresh") => ("amaterasu.lutris/1", "refresh", Some("configuration.write")),
-        ("lutris", "artwork_read") => ("amaterasu.lutris/1", "artwork_read", Some("lutris.read")),
+        ("lutris", "artwork") => ("amaterasu.lutris/1", "artwork_open", Some("lutris.read")),
         ("playnite", "settings") => (
             "amaterasu.playnite/1",
             "settings_get",
@@ -682,9 +674,9 @@ mod tests {
 
     #[test]
     fn lutris_artwork_route_pins_provider_action_and_read_scope() {
-        let route = resolve("/v1/lutris/artwork_read").unwrap();
+        let route = resolve("/v1/lutris/artwork").unwrap();
         assert_eq!(route.service, "amaterasu.lutris/1");
-        assert_eq!(route.action, "artwork_read");
+        assert_eq!(route.action, "artwork_open");
         assert_eq!(route.scope, Some("lutris.read"));
         assert!(!route.requires_empty_body);
         assert!(resolve("/v1/lutris/artwork_get").is_none());
@@ -1913,24 +1905,22 @@ mod tests {
     }
 
     #[test]
-    fn steam_artwork_route_is_read_scoped_and_accepts_only_a_bounded_cursor() {
-        let route = resolve("/v1/steam/artwork_read").unwrap();
+    fn steam_artwork_route_is_read_scoped_and_rejects_cursors() {
+        let route = resolve("/v1/steam/artwork").unwrap();
         assert_eq!(route.service, "amaterasu.steam/1");
-        assert_eq!(route.action, "artwork_read");
+        assert_eq!(route.action, "artwork_open");
         assert_eq!(route.scope, Some("steam.read"));
-        let valid = serde_json::json!({"app_id":42,"revision":"18446744073709551615","offset":16*1024*1024});
-        let forwarded = payload(route, &serde_json::to_vec(&valid).unwrap()).unwrap();
-        assert_eq!(forwarded["action"], "artwork_read");
-        for invalid in [
-            serde_json::json!({"app_id":0,"revision":"1","offset":0}),
-            serde_json::json!({"app_id":4294967296_u64,"revision":"1","offset":0}),
-            serde_json::json!({"app_id":42,"revision":"../art","offset":0}),
-            serde_json::json!({"app_id":42,"revision":"1","offset":1}),
-            serde_json::json!({"app_id":42,"revision":"1","offset":16*1024*1024+8192}),
-            serde_json::json!({"app_id":42,"revision":"1","offset":0,"path":"C:\\other.png"}),
-        ] {
+        let valid = serde_json::json!({"app_id":42,"revision":"18446744073709551615"});
+        assert_eq!(
+            payload(route, &serde_json::to_vec(&valid).unwrap()).unwrap()["action"],
+            "artwork_open"
+        );
+        for field in ["offset", "path", "service", "owner"] {
+            let mut invalid = valid.clone();
+            invalid[field] = serde_json::json!(0);
             assert!(payload(route, &serde_json::to_vec(&invalid).unwrap()).is_err());
         }
+        assert!(resolve("/v1/steam/artwork_read").is_none());
     }
 
     #[test]
@@ -2167,20 +2157,25 @@ mod tests {
 
     #[test]
     fn catalog_artwork_routes_cannot_select_a_provider_or_identity() {
-        let read = resolve("/v1/library/artwork_read").unwrap();
-        let release = resolve("/v1/library/artwork_release").unwrap();
+        let read = resolve("/v1/library/artwork").unwrap();
         assert_eq!(read.service, "amaterasu.library/1");
         assert_eq!(read.scope, Some("catalog.read"));
-        let valid = serde_json::json!({"id":"app-0000000000000001", "revision":"opaque revision", "offset":0, "transfer_id":"a".repeat(32)});
+        let valid = serde_json::json!({"id":"app-0000000000000001", "revision":"opaque revision"});
         assert!(payload(read, &serde_json::to_vec(&valid).unwrap()).is_ok());
-        for key in ["provider", "service", "owner", "initiator", "path"] {
+        for key in [
+            "provider",
+            "service",
+            "owner",
+            "initiator",
+            "path",
+            "offset",
+            "transfer_id",
+        ] {
             let mut injected = valid.clone();
             injected[key] = serde_json::json!("another-provider");
             assert!(payload(read, &serde_json::to_vec(&injected).unwrap()).is_err());
         }
-        let valid_release =
-            serde_json::json!({"id":"app-0000000000000001", "transfer_id":"a".repeat(32)});
-        assert!(payload(release, &serde_json::to_vec(&valid_release).unwrap()).is_ok());
-        assert!(payload(release, &serde_json::to_vec(&valid).unwrap()).is_err());
+        assert!(resolve("/v1/library/artwork_read").is_none());
+        assert!(resolve("/v1/library/artwork_release").is_none());
     }
 }

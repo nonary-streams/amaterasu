@@ -38,7 +38,7 @@ const REMOTE_FETCH_QUEUE_CAPACITY: usize = ARTWORK_QUEUE_CAPACITY;
 const LOCAL_VALIDATION_BATCH_TARGETS: usize = 256;
 const REMOTE_FAILURE_COOLDOWN: Duration = Duration::from_secs(10 * 60);
 const REMOTE_FETCH_TIMEOUT: Duration = Duration::from_secs(8);
-pub const ARTWORK_CHUNK_BYTES: usize = 8 * 1024;
+pub const ARTWORK_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ArtworkMetadata {
@@ -65,7 +65,7 @@ pub struct ArtworkChunk {
     pub total_bytes: u64,
     pub next_offset: Option<u64>,
     pub mime_type: &'static str,
-    pub data: String,
+    pub data: Vec<u8>,
 }
 
 #[derive(Clone)]
@@ -892,7 +892,7 @@ fn chunk_from_bytes(
         total_bytes,
         next_offset: (end < bytes.len()).then_some(end as u64),
         mime_type,
-        data: base64_encode(&bytes[start..end]),
+        data: bytes[start..end].to_vec(),
     })
 }
 
@@ -1690,7 +1690,7 @@ pub fn read_chunk_cached(
         total_bytes,
         next_offset: (next < total_bytes).then_some(next),
         mime_type,
-        data: base64_encode(&chunk),
+        data: chunk,
     })
 }
 
@@ -1748,6 +1748,7 @@ fn image_mime_from_header(header: &[u8]) -> Option<&'static str> {
     }
 }
 
+#[cfg(test)]
 fn base64_encode(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
@@ -2105,7 +2106,7 @@ mod tests {
     }
 
     #[test]
-    fn artwork_reads_are_fixed_chunks_bound_to_the_current_revision_and_mime() {
+    fn artwork_reads_are_complete_bytes_bound_to_the_current_revision_and_mime() {
         let root = TemporaryRoot::new();
         let cache = root.0.join("appcache/librarycache");
         fs::create_dir_all(&cache).unwrap();
@@ -2119,10 +2120,10 @@ mod tests {
 
         let first = read_chunk(&source_path, &revision, std::slice::from_ref(&root.0), 0).unwrap();
         assert_eq!(first.mime_type, "image/png");
-        assert!(first.data.starts_with("iVBOR"));
+        assert!(first.data.starts_with(b"\x89PNG\r\n\x1a\n"));
         assert_eq!(first.total_bytes, converted.len() as u64);
-        assert_eq!(first.next_offset, Some(ARTWORK_CHUNK_BYTES as u64));
-        assert_eq!(first.data, base64_encode(&converted[..ARTWORK_CHUNK_BYTES]));
+        assert_eq!(first.next_offset, None);
+        assert_eq!(first.data, converted.clone());
 
         let last = read_chunk(
             &source_path,
@@ -2133,7 +2134,7 @@ mod tests {
         .unwrap();
         assert_eq!(last.next_offset, None);
         let last_offset = (converted.len() - 1) / ARTWORK_CHUNK_BYTES * ARTWORK_CHUNK_BYTES;
-        assert_eq!(last.data, base64_encode(&converted[last_offset..]));
+        assert_eq!(last.data, converted[last_offset..].to_vec());
         assert_eq!(
             read_chunk(&source_path, &revision, std::slice::from_ref(&root.0), 1).unwrap_err(),
             "invalid_cursor"
@@ -2293,8 +2294,8 @@ mod tests {
             .unwrap();
         assert_eq!(first.mime_type, "image/png");
         assert_eq!(first.total_bytes, bytes.len() as u64);
-        assert_eq!(first.next_offset, Some(ARTWORK_CHUNK_BYTES as u64));
-        assert_eq!(first.data, base64_encode(&bytes[..ARTWORK_CHUNK_BYTES]));
+        assert_eq!(first.next_offset, None);
+        assert_eq!(first.data, bytes.clone());
 
         let last_offset = ((bytes.len() - 1) / ARTWORK_CHUNK_BYTES * ARTWORK_CHUNK_BYTES) as u64;
         let last = cache
@@ -2303,7 +2304,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(last.next_offset, None);
-        assert_eq!(last.data, base64_encode(&bytes[last_offset as usize..]));
+        assert_eq!(last.data, bytes[last_offset as usize..].to_vec());
         assert_eq!(last.revision, revision);
     }
 
@@ -2326,14 +2327,11 @@ mod tests {
 
         let mut restarted = RemoteArtworkCache::with_disk_root(Some(root.0.clone()));
         let from_disk = restarted
-            .read_chunk_with(42, 123, &revision, ARTWORK_CHUNK_BYTES as u64, now, |_| {
+            .read_chunk_with(42, 123, &revision, 0, now, |_| {
                 panic!("valid persistent portrait must not fetch")
             })
             .unwrap();
-        assert_eq!(
-            from_disk.data,
-            base64_encode(&bytes[ARTWORK_CHUNK_BYTES..2 * ARTWORK_CHUNK_BYTES])
-        );
+        assert_eq!(from_disk.data, bytes.clone());
 
         fs::write(&path, b"corrupt").unwrap();
         let mut recovered = RemoteArtworkCache::with_disk_root(Some(root.0.clone()));
@@ -2543,7 +2541,7 @@ mod tests {
             .read_chunk_with(42, 123, &revision, 0, Instant::now(), |_| Ok(valid))
             .unwrap();
         assert_eq!(first.total_bytes, bytes.len() as u64);
-        assert_eq!(first.next_offset, Some(ARTWORK_CHUNK_BYTES as u64));
+        assert_eq!(first.next_offset, None);
 
         let last_offset = ((bytes.len() - 1) / ARTWORK_CHUNK_BYTES * ARTWORK_CHUNK_BYTES) as u64;
         let last = cache
@@ -2553,7 +2551,7 @@ mod tests {
             .unwrap();
         assert_eq!(last.total_bytes, bytes.len() as u64);
         assert_eq!(last.next_offset, None);
-        assert_eq!(last.data, base64_encode(&bytes[last_offset as usize..]));
+        assert_eq!(last.data, bytes[last_offset as usize..].to_vec());
 
         let oversized = synthetic_jpeg(600, 900, MAX_ARTWORK_BYTES as usize + 1);
         assert!(!validate_remote_artwork(&oversized));

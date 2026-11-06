@@ -327,6 +327,10 @@ impl AuthenticationAdmission {
 }
 
 enum Stage {
+    Artwork {
+        request_id: u64,
+        service: String,
+    },
     Reading(Vec<u8>),
     Verifying {
         request_id: u64,
@@ -437,6 +441,50 @@ impl Connection {
                     _ => self.fail(503, "service_unavailable"),
                 }
             }
+            Stage::Artwork {
+                request_id,
+                service,
+            } => {
+                match runtime.send_ephemeral(Command::TakeResult {
+                    request: request_id,
+                })? {
+                    Response::Pending => {
+                        self.stage = Stage::Artwork {
+                            request_id,
+                            service,
+                        }
+                    }
+                    Response::Result { payload } => {
+                        let image = (|| -> ModuleResult<_> {
+                            if payload["ok"] != true {
+                                return Err("artwork unavailable".into());
+                            }
+                            let offer = serde_json::from_value(payload["offer"].clone())
+                                .map_err(|e| e.to_string())?;
+                            // SAFETY: only the authorized startup route selects this provider.
+                            unsafe {
+                                amaterasu_module_sdk::artwork_transfer::receive(
+                                    runtime, &service, offer,
+                                )
+                            }
+                        })();
+                        match image {
+                            Ok(image) => {
+                                self.stage = Stage::Writing {
+                                    bytes: http::image_response(
+                                        &image.mime_type,
+                                        image.bytes,
+                                        self.origin.as_deref(),
+                                    ),
+                                    offset: 0,
+                                }
+                            }
+                            Err(_) => self.fail(404, "artwork_unavailable"),
+                        }
+                    }
+                    _ => self.fail(503, "service_unavailable"),
+                }
+            }
             Stage::Writing { bytes, offset } => self.write_response(bytes, offset),
             Stage::Closed => {}
         }
@@ -473,7 +521,8 @@ impl Connection {
     }
 
     fn expire(&mut self, runtime: &RuntimeClient) {
-        if let Stage::Verifying { request_id, .. }
+        if let Stage::Artwork { request_id, .. }
+        | Stage::Verifying { request_id, .. }
         | Stage::Dispatching { request_id, .. }
         | Stage::ExtensionDispatching { request_id }
         | Stage::SessionExtensionDispatching { request_id, .. } = self.stage
@@ -720,7 +769,7 @@ impl Connection {
             }
             return;
         }
-        let end = (offset + 16_384).min(bytes.len());
+        let end = (offset + 256 * 1024).min(bytes.len());
         let write = match &mut self.tls {
             Some(tls) => tls.writer().write(&bytes[offset..end]),
             None => self.stream.write(&bytes[offset..end]),
@@ -912,6 +961,14 @@ impl Connection {
             request.payload,
             operation,
         )? {
+            if route.action == "artwork_open" {
+                self.deadline = Instant::now() + Duration::from_secs(30);
+                self.stage = Stage::Artwork {
+                    request_id,
+                    service: route.service.into(),
+                };
+                return Ok(());
+            }
             self.stage = Stage::Dispatching {
                 request_id,
                 login: route.scope.is_none(),
@@ -1379,7 +1436,8 @@ fn role_permits(payload: &Value, request: &http::Request) -> bool {
     }
     let read = matches!(
         (route.service, route.action),
-        ("amaterasu.catalog/1", "get" | "list" | "search")
+        ("amaterasu.library/1", "artwork_open")
+            | ("amaterasu.catalog/1", "get" | "list" | "search")
             | ("amaterasu.launch/1", "status" | "list")
             | ("amaterasu.application/1", "status" | "list")
             | ("amaterasu.session/1", "list" | "snapshot")
@@ -1390,8 +1448,8 @@ fn role_permits(payload: &Value, request: &http::Request) -> bool {
                 "amaterasu.management/1",
                 "extension_list" | "extension_call"
             )
-            | ("amaterasu.steam/1", "list" | "status" | "artwork_read")
-            | ("amaterasu.lutris/1", "status" | "artwork_read")
+            | ("amaterasu.steam/1", "list" | "status" | "artwork_open")
+            | ("amaterasu.lutris/1", "status" | "artwork_open")
             | ("amaterasu.playnite/1", "status")
             | ("amaterasu.display/1", "status" | "enumerate")
             | (
@@ -1679,9 +1737,7 @@ mod tests {
     #[test]
     fn lutris_artwork_scope_cannot_be_satisfied_by_configuration_or_steam_read() {
         let scope = request_scope(&http::Request {
-            target: http::RequestTarget::Api(
-                crate::routes::resolve("/v1/lutris/artwork_read").unwrap(),
-            ),
+            target: http::RequestTarget::Api(crate::routes::resolve("/v1/lutris/artwork").unwrap()),
             payload: json!({}),
             bearer: None,
             verified_identity: None,

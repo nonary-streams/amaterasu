@@ -29,7 +29,9 @@ unsafe extern "C" fn invoke_epoch_launch_host(
     // SAFETY: context points to the boxed fake host retained by the test.
     let host = unsafe { &mut *(context as *mut EpochLaunchHost) };
     let response = match &command {
-        Command::Register { .. } | Command::ReleaseResult { .. } => Response::Ok,
+        Command::Register { .. }
+        | Command::ReleaseResult { .. }
+        | Command::NativeRegisterTyped { .. } => Response::Ok,
         Command::GetSettings {} => Response::Result {
             payload: host.settings.clone().unwrap_or_else(|| json!({})),
         },
@@ -845,7 +847,7 @@ fn artwork_caller_is_limited_to_management_and_selected_library_broker() {
 }
 
 #[test]
-fn selected_library_identity_controls_artwork_requests_and_release() {
+fn selected_library_identity_controls_artwork_open_and_rejects_legacy_release() {
     let mut host = Box::new(EpochLaunchHost::default());
     host.settings = Some(json!({"library_principal":"custom.library"}));
     let endpoint = HostApi {
@@ -857,11 +859,9 @@ fn selected_library_identity_controls_artwork_requests_and_release() {
     let runtime = unsafe { RuntimeClient::from_endpoint(endpoint) };
     let mut module = PlayniteModule::start(runtime).unwrap();
     assert_eq!(module.library_principal, "custom.library");
-    let read = json!({"action":"artwork_read", "game_id":"a1b2c3d4-1234-5678-9abc-0123456789ab", "revision":"a".repeat(64), "offset":0, "transfer_id":"b".repeat(32)});
-    for action in [
-        read,
-        json!({"action":"artwork_release", "transfer_id":"invalid"}),
-    ] {
+    let read = json!({"action":"artwork_open", "game_id":"a1b2c3d4-1234-5678-9abc-0123456789ab", "revision":"a".repeat(64)});
+    {
+        let action = read;
         module
             .handle_request(1, LIBRARY_CALLER, action.clone())
             .unwrap();
@@ -873,6 +873,14 @@ fn selected_library_identity_controls_artwork_requests_and_release() {
         module.handle_request(3, "custom.library", action).unwrap();
         assert_ne!(host.completed.last().unwrap()["code"], "forbidden");
     }
+    module
+        .handle_request(
+            4,
+            "custom.library",
+            json!({"action":"artwork_release", "transfer_id":"invalid"}),
+        )
+        .unwrap();
+    assert_eq!(host.completed.last().unwrap()["code"], "invalid_request");
     assert!(artwork_revision_may_be_read(
         &BTreeMap::new(),
         false,

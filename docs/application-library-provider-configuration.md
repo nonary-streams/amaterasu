@@ -176,9 +176,13 @@ bootstrap, retaining the profile's other settings and mappings:
 The `callers` object is the SDK adapter policy shape; an independent provider
 must implement equivalent checks and may have its own settings schema. The
 library discovery route is optional for a provider used only for catalog import
-and launch. Generic discovery does not automatically enable generic catalog
-artwork routing: the current library artwork path recognizes its supported
-built-in provider types. Review all paths and grants separately.
+and launch. Generic discovery does not automatically enable catalog artwork
+routing. To opt in, configure `artwork.providers` with the selected service and
+allowed initiators, grant that service `native_provide`, and grant the library
+`native_use` plus a startup dependency. Implement `artwork_open` through
+`ProviderAdapter::register_artwork` and tick `reap_artwork`, or use the same
+`artwork_transfer::Source` directly. See [the artwork contract](artwork-transfer.md).
+Review all paths and grants separately.
 
 Catalog accepts a provider launch target only from its authenticated mapped
 importer, with `application_id` equal to the snapshot source ID. At resolution it

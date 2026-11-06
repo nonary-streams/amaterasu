@@ -1,630 +1,212 @@
+//! Exercise the unchanged library against two native provider implementations.
 use super::*;
-use amaterasu_module_sdk::abi::{self, AbiHeader, BorrowedBytes, HostApi, ReplySink};
-use std::collections::{BTreeMap, VecDeque};
+use amaterasu_contracts::{Grants, RuntimeConfig};
+use amaterasu_module_sdk::abi::{BorrowedBytes, HostApi, RuntimeApi, STATUS_OK};
+use amaterasu_runtime as _;
 use std::ffi::c_void;
-
-#[derive(Default)]
-struct FakeHost {
-    incoming: VecDeque<Response>,
-    results: BTreeMap<u64, Value>,
-    commands: Vec<Command>,
-    completions: BTreeMap<u64, Value>,
-    next_child: u64,
-    artwork_revision: &'static str,
-    fail_one_release: bool,
-    playnite: bool,
-    bad_release_echo: bool,
-    deny_detached: bool,
-    lose_take_once: bool,
-    external: bool,
-    unsupported_artwork: bool,
-    changed_mime: bool,
+unsafe extern "C" {
+    fn amaterasu_runtime_v1() -> *const RuntimeApi;
 }
 
-impl FakeHost {
-    fn dispatch(&mut self, command: Command) -> Response {
-        self.commands.push(command.clone());
-        match command {
-            Command::GetSettings {} => Response::Result {
-                payload: if self.external {
-                    json!({"artwork":{"providers":{"vendor":{"service":"vendor.artwork/1","allowed_initiators":["amaterasu.nvhttp"]}}}})
-                } else {
-                    json!({})
-                },
-            },
-            Command::Register { .. } => Response::Ok,
-            Command::Poll {} => self.incoming.pop_front().unwrap_or(Response::Pending),
-            Command::Request {
-                service,
-                payload,
-                parent,
-                ..
-            } => {
-                if let Some(parent) = parent {
-                    assert!((10..=12).contains(&parent));
-                } else {
-                    assert_eq!(service, "amaterasu.playnite/1");
-                    assert_eq!(payload["action"], "artwork_release");
-                }
-                self.next_child += 1;
-                let result = if service == CATALOG {
-                    assert_eq!(
-                        payload,
-                        json!({"action":"resolve_exported_artwork","id":"app-0000000000000001"})
-                    );
-                    if self.external {
-                        json!({"ok":true,"artwork":{"provider":"external","source":"vendor","reference":{"id":"opaque/cover","revision":"revision:17"}}})
-                    } else if self.playnite {
-                        json!({"ok":true,"artwork":{"provider":"playnite","game_id":"12345678-1234-1234-1234-123456789abc","revision":"a".repeat(64)}})
-                    } else {
-                        json!({"ok":true,"artwork":{"provider":"steam","app_id":42,"revision":self.artwork_revision}})
-                    }
-                } else if self.external {
-                    assert_eq!(service, "vendor.artwork/1");
-                    if payload["action"] == "describe" {
-                        json!({"ok":true,"capabilities":{"discovery":false,"artwork":!self.unsupported_artwork,"lifecycle":false}})
-                    } else {
-                        assert_eq!(payload["action"], "artwork");
-                        assert_eq!(
-                            payload["reference"],
-                            json!({"id":"opaque/cover","revision":"revision:17"})
-                        );
-                        json!({"ok":true,"reference":payload["reference"],"offset":0,"total_bytes":3,"mime":"image/png","data_base64":"YWJj"})
-                    }
-                } else if self.playnite {
-                    assert_eq!(service, "amaterasu.playnite/1");
-                    assert_eq!(payload["transfer_id"], "00000000000000000000000000000001");
-                    if payload["action"] == "artwork_release" {
-                        if parent.is_none() && self.deny_detached {
-                            return Response::error("forbidden", "denied");
-                        }
-                        let transfer_id = if self.bad_release_echo {
-                            self.bad_release_echo = false;
-                            json!("ffffffffffffffffffffffffffffffff")
-                        } else {
-                            payload["transfer_id"].clone()
-                        };
-                        json!({"ok":true,"transfer_id":transfer_id})
-                    } else {
-                        assert_eq!(payload["game_id"], "12345678-1234-1234-1234-123456789abc");
-                        json!({"ok":true,"game_id":"12345678-1234-1234-1234-123456789abc","transfer_id":payload["transfer_id"],"revision":"a".repeat(64),"offset":0,"next_offset":null,"total_bytes":3,"mime_type":"image/png","data":"YWJj"})
-                    }
-                } else {
-                    assert!(
-                        self.results.is_empty(),
-                        "catalog result must be released before provider admission"
-                    );
-                    assert_eq!(service, "amaterasu.steam/1");
-                    assert_eq!(payload["action"], "artwork_read");
-                    assert_eq!(payload["app_id"], 42);
-                    assert_eq!(payload["revision"], "17");
-                    let offset = payload["offset"].as_u64().unwrap();
-                    let data = if offset == 0 {
-                        format!("{}YWE=", "YWFh".repeat(2730))
-                    } else {
-                        "YWJj".to_owned()
-                    };
-                    json!({"ok":true,"app_id":42,"revision":"17","offset":offset,"next_offset":if offset == 0 { Some(8192) } else { None },"total_bytes":8195,"mime_type":if self.changed_mime { "image/jpeg" } else { "image/png" },"data":data})
-                };
-                self.results.insert(self.next_child, result);
-                Response::Accepted {
-                    id: self.next_child,
-                }
-            }
-            Command::TakeResult { request } => Response::Result {
-                payload: self.results[&request].clone(),
-            },
-            Command::ReleaseResult { request: _ } if self.fail_one_release => {
-                self.fail_one_release = false;
-                Response::error("transient", "try release again")
-            }
-            Command::ReleaseResult { request } => {
-                assert!(self.results.remove(&request).is_some());
-                Response::Ok
-            }
-            Command::Complete { request, payload } => {
-                assert!(
-                    self.results.is_empty() || payload["ok"] == false,
-                    "child result must be released before completion"
-                );
-                self.completions.insert(request, payload);
-                Response::Ok
-            }
-            _ => panic!("unexpected fake host command"),
-        }
-    }
-    fn enqueue(&mut self, id: u64, revision: Option<&str>, offset: u64) {
-        self.incoming.push_back(Response::Request {
-            id, caller: "amaterasu.nvhttp".into(), initiator: "amaterasu.nvhttp".into(),
-            service: SERVICE.into(), payload: json!({"action":"artwork_read","id":"app-0000000000000001","revision":revision,"offset":offset,"transfer_id":"00000000000000000000000000000001"}), remaining_ms: 30_000,
-        });
-    }
-}
-
-unsafe extern "C" fn invoke(
+struct Runtime {
+    api: &'static RuntimeApi,
     context: *mut c_void,
-    input: BorrowedBytes,
-    reply: ReplySink,
-) -> abi::Status {
-    // SAFETY: the test retains the host for the lifetime of the module and calls it serially.
-    let host = unsafe { &mut *context.cast::<FakeHost>() };
-    // SAFETY: the SDK supplies a valid input buffer for this synchronous call.
-    let Ok(bytes) = (unsafe { input.read() }) else {
-        return abi::STATUS_INVALID_ARGUMENT;
-    };
-    let Ok(command) = serde_json::from_slice(bytes) else {
-        return abi::STATUS_INVALID_ARGUMENT;
-    };
-    if host.lose_take_once && matches!(command, Command::TakeResult { .. }) {
-        host.lose_take_once = false;
-        return abi::STATUS_INTERNAL_ERROR;
-    }
-    let Ok(output) = serde_json::to_vec(&host.dispatch(command)) else {
-        return abi::STATUS_INTERNAL_ERROR;
-    };
-    // SAFETY: the reply sink copies the output before this call returns.
-    unsafe { reply.send(&output) };
-    abi::STATUS_OK
 }
-
-#[test]
-fn artwork_reads_resolve_every_chunk_release_results_and_reject_changed_revision() {
-    let mut host = FakeHost {
-        artwork_revision: "17",
-        fail_one_release: true,
-        ..Default::default()
-    };
-    let endpoint = HostApi {
-        header: AbiHeader::of::<HostApi>(),
-        context: (&mut host as *mut FakeHost).cast(),
-        invoke,
-    };
-    // SAFETY: host outlives the library and is accessed only on this test thread.
-    let mut library = Library::start(unsafe { RuntimeClient::from_endpoint(endpoint) }).unwrap();
-    host.enqueue(10, None, 0);
-    for _ in 0..12 {
-        library.tick().unwrap();
-    }
-    assert_eq!(host.completions[&10]["revision"], "17");
-    assert_eq!(host.completions[&10]["next_offset"], 8192);
-    host.enqueue(11, Some("17"), 8192);
-    for _ in 0..12 {
-        library.tick().unwrap();
-    }
-    assert_eq!(host.completions[&11]["data"], "YWJj");
-    assert!(host.completions[&11]["next_offset"].is_null());
-    host.artwork_revision = "18";
-    host.enqueue(12, Some("17"), 8192);
-    for _ in 0..12 {
-        library.tick().unwrap();
-    }
-    assert_eq!(host.completions[&12]["ok"], false);
-    let requests: Vec<_> = host
-        .commands
-        .iter()
-        .filter_map(|c| {
-            if let Command::Request {
-                service, parent, ..
-            } = c
-            {
-                Some((service.as_str(), *parent))
-            } else {
-                None
-            }
-        })
-        .collect();
-    assert_eq!(
-        requests,
-        vec![
-            (CATALOG, Some(10)),
-            ("amaterasu.steam/1", Some(10)),
-            (CATALOG, Some(11)),
-            ("amaterasu.steam/1", Some(11)),
-            (CATALOG, Some(12))
-        ]
-    );
-    assert_eq!(
-        host.commands
-            .iter()
-            .filter(|c| matches!(c, Command::ReleaseResult { .. }))
-            .count(),
-        6
-    );
-    assert!(host.results.is_empty());
-}
-
-#[test]
-fn release_waits_for_inflight_read_and_fences_late_reuse() {
-    let mut host = FakeHost {
-        artwork_revision: "17",
-        ..Default::default()
-    };
-    let endpoint = HostApi {
-        header: AbiHeader::of::<HostApi>(),
-        context: (&mut host as *mut FakeHost).cast(),
-        invoke,
-    };
-    // SAFETY: host remains live and is called synchronously while the library exists.
-    let mut library = Library::start(unsafe { RuntimeClient::from_endpoint(endpoint) }).unwrap();
-    host.enqueue(10, None, 0);
-    host.incoming.push_back(Response::Request { id: 11, caller: "amaterasu.nvhttp".into(), initiator: "amaterasu.nvhttp".into(), service: SERVICE.into(), payload: json!({"action":"artwork_release","id":"app-0000000000000001","transfer_id":"00000000000000000000000000000001"}), remaining_ms: 30_000 });
-    for _ in 0..12 {
-        library.tick().unwrap();
-    }
-    assert_eq!(host.completions[&10]["ok"], true);
-    assert_eq!(host.completions[&11]["ok"], true);
-    host.enqueue(12, None, 0);
-    for _ in 0..3 {
-        library.tick().unwrap();
-    }
-    assert_eq!(host.completions[&12]["ok"], false);
-    let provider_requests = host
-        .commands
-        .iter()
-        .filter(|c| matches!(c, Command::Request { service, .. } if service == "amaterasu.steam/1"))
-        .count();
-    assert_eq!(provider_requests, 1);
-}
-
-#[test]
-fn playnite_release_is_forwarded_after_read_and_is_idempotent() {
-    let mut host = FakeHost {
-        playnite: true,
-        ..Default::default()
-    };
-    let endpoint = HostApi {
-        header: AbiHeader::of::<HostApi>(),
-        context: (&mut host as *mut FakeHost).cast(),
-        invoke,
-    };
-    // SAFETY: host remains live and is called synchronously while the library exists.
-    let mut library = Library::start(unsafe { RuntimeClient::from_endpoint(endpoint) }).unwrap();
-    host.enqueue(10, None, 0);
-    host.incoming.push_back(Response::Request { id: 11, caller: "amaterasu.nvhttp".into(), initiator: "amaterasu.nvhttp".into(), service: SERVICE.into(), payload: json!({"action":"artwork_release","id":"app-0000000000000001","transfer_id":"00000000000000000000000000000001"}), remaining_ms: 30_000 });
-    for _ in 0..12 {
-        library.tick().unwrap();
-    }
-    assert_eq!(host.completions[&10]["ok"], true);
-    assert_eq!(host.completions[&11]["ok"], true);
-    let calls: Vec<_> = host
-        .commands
-        .iter()
-        .filter_map(|c| match c {
-            Command::Request {
-                service,
-                payload,
-                parent,
-                ..
-            } if service == "amaterasu.playnite/1" => {
-                Some((payload["action"].as_str().unwrap().to_owned(), *parent))
-            }
-            _ => None,
-        })
-        .collect();
-    assert_eq!(
-        calls,
-        vec![
-            ("artwork_read".into(), Some(10)),
-            ("artwork_release".into(), Some(11))
-        ]
-    );
-    host.incoming.push_back(Response::Request { id: 12, caller: "amaterasu.nvhttp".into(), initiator: "amaterasu.nvhttp".into(), service: SERVICE.into(), payload: json!({"action":"artwork_release","id":"app-0000000000000001","transfer_id":"00000000000000000000000000000001"}), remaining_ms: 30_000 });
-    library.tick().unwrap();
-    library.tick().unwrap();
-    assert_eq!(host.completions[&12]["ok"], true);
-}
-
-#[test]
-fn playnite_release_rejects_wrong_token_and_allows_retry() {
-    let mut host = FakeHost {
-        playnite: true,
-        bad_release_echo: true,
-        ..Default::default()
-    };
-    let endpoint = HostApi {
-        header: AbiHeader::of::<HostApi>(),
-        context: (&mut host as *mut FakeHost).cast(),
-        invoke,
-    };
-    // SAFETY: host remains live and is called synchronously while the library exists.
-    let mut library = Library::start(unsafe { RuntimeClient::from_endpoint(endpoint) }).unwrap();
-    host.enqueue(10, None, 0);
-    for _ in 0..8 {
-        library.tick().unwrap();
-    }
-    for id in [11, 12] {
-        host.incoming.push_back(Response::Request { id, caller: "amaterasu.nvhttp".into(), initiator: "amaterasu.nvhttp".into(), service: SERVICE.into(), payload: json!({"action":"artwork_release","id":"app-0000000000000001","transfer_id":"00000000000000000000000000000001"}), remaining_ms: 30_000 });
-        for _ in 0..8 {
-            library.tick().unwrap();
+impl Runtime {
+    fn new(service: &str) -> Self {
+        let mut config = RuntimeConfig::default();
+        for (name, grants) in [
+            (
+                "library",
+                Grants {
+                    provide: [SERVICE.into()].into(),
+                    native_provide: [SERVICE.into()].into(),
+                    call: [CATALOG.into(), service.into()].into(),
+                    native_use: [service.into()].into(),
+                    ..Default::default()
+                },
+            ),
+            (
+                "provider",
+                Grants {
+                    provide: [service.into()].into(),
+                    native_provide: [service.into()].into(),
+                    ..Default::default()
+                },
+            ),
+            (
+                "catalog",
+                Grants {
+                    provide: [CATALOG.into()].into(),
+                    ..Default::default()
+                },
+            ),
+            (
+                "consumer",
+                Grants {
+                    call: [SERVICE.into(), CATALOG.into(), service.into()].into(),
+                    native_use: [SERVICE.into(), service.into()].into(),
+                    ..Default::default()
+                },
+            ),
+            (
+                "outsider",
+                Grants {
+                    native_use: [SERVICE.into(), service.into()].into(),
+                    ..Default::default()
+                },
+            ),
+        ] {
+            config.principals.insert(name.into(), grants);
         }
-    }
-    assert_eq!(host.completions[&11]["ok"], false);
-    assert_eq!(host.completions[&12]["ok"], true);
-}
-
-#[test]
-fn expired_release_parent_triggers_recorded_detached_cleanup() {
-    let mut host = FakeHost {
-        playnite: true,
-        ..Default::default()
-    };
-    let endpoint = HostApi {
-        header: AbiHeader::of::<HostApi>(),
-        context: (&mut host as *mut FakeHost).cast(),
-        invoke,
-    };
-    // SAFETY: host remains live and is called synchronously while the library exists.
-    let mut library = Library::start(unsafe { RuntimeClient::from_endpoint(endpoint) }).unwrap();
-    host.enqueue(10, None, 0);
-    for _ in 0..8 {
-        library.tick().unwrap();
-    }
-    let token = "00000000000000000000000000000001";
-    let transfer = library.transfers.get_mut(token).unwrap();
-    transfer.release = Some((11, Instant::now() - Duration::from_millis(1)));
-    for _ in 0..8 {
-        library.tick().unwrap();
-    }
-    assert_eq!(host.completions[&11]["ok"], false);
-    assert!(host.commands.iter().any(|c| matches!(c, Command::Request { service, payload, parent: None, .. } if service == "amaterasu.playnite/1" && payload == &json!({"action":"artwork_release","transfer_id":token}))));
-    assert!(!library.cleanup.contains_key(token));
-    assert!(library.transfers[token].closed);
-}
-
-#[test]
-fn denied_detached_cleanup_retains_fence_until_acknowledged() {
-    let mut host = FakeHost {
-        playnite: true,
-        deny_detached: true,
-        ..Default::default()
-    };
-    let endpoint = HostApi {
-        header: AbiHeader::of::<HostApi>(),
-        context: (&mut host as *mut FakeHost).cast(),
-        invoke,
-    };
-    // SAFETY: host remains live and is called synchronously while the library exists.
-    let mut library = Library::start(unsafe { RuntimeClient::from_endpoint(endpoint) }).unwrap();
-    host.enqueue(10, None, 0);
-    for _ in 0..8 {
-        library.tick().unwrap();
-    }
-    let token = "00000000000000000000000000000001";
-    library.transfers.get_mut(token).unwrap().release =
-        Some((11, Instant::now() - Duration::from_millis(1)));
-    for _ in 0..4 {
-        library.tick().unwrap();
-    }
-    assert!(library.cleanup.contains_key(token));
-    assert!(library.transfers[token].active && library.transfers[token].closed);
-    for _ in 0..65 {
-        library.cleanup.get_mut(token).unwrap().retry_after = Instant::now();
-        library.tick().unwrap();
-    }
-    assert!(library.cleanup[token].attempts > 60);
-    assert!(
-        library.cleanup[token]
-            .retry_after
-            .duration_since(Instant::now())
-            > Duration::from_secs(29)
-    );
-    host.deny_detached = false;
-    library.cleanup.get_mut(token).unwrap().retry_after = Instant::now();
-    for _ in 0..4 {
-        library.tick().unwrap();
-    }
-    assert!(!library.cleanup.contains_key(token));
-    assert!(!library.transfers[token].active && library.transfers[token].closed);
-}
-#[test]
-fn another_initiator_cannot_release_a_transfer() {
-    let mut host = FakeHost {
-        artwork_revision: "17",
-        ..Default::default()
-    };
-    let endpoint = HostApi {
-        header: AbiHeader::of::<HostApi>(),
-        context: (&mut host as *mut FakeHost).cast(),
-        invoke,
-    };
-    // SAFETY: host remains live and is called synchronously while the library exists.
-    let mut library = Library::start(unsafe { RuntimeClient::from_endpoint(endpoint) }).unwrap();
-    host.enqueue(10, None, 0);
-    for _ in 0..8 {
-        library.tick().unwrap();
-    }
-    host.incoming.push_back(Response::Request { id: 11, caller: "other".into(), initiator: "other".into(), service: SERVICE.into(), payload: json!({"action":"artwork_release","id":"app-0000000000000001","transfer_id":"00000000000000000000000000000001"}), remaining_ms: 30_000 });
-    for _ in 0..3 {
-        library.tick().unwrap();
-    }
-    assert_eq!(host.completions[&11]["ok"], false);
-    assert!(!library.transfers["00000000000000000000000000000001"].closed);
-}
-
-#[test]
-fn detached_cleanup_retries_lost_result_reply() {
-    let mut host = FakeHost {
-        playnite: true,
-        ..Default::default()
-    };
-    let endpoint = HostApi {
-        header: AbiHeader::of::<HostApi>(),
-        context: (&mut host as *mut FakeHost).cast(),
-        invoke,
-    };
-    // SAFETY: host remains live and is called synchronously while the library exists.
-    let mut library = Library::start(unsafe { RuntimeClient::from_endpoint(endpoint) }).unwrap();
-    host.enqueue(10, None, 0);
-    for _ in 0..8 {
-        library.tick().unwrap();
-    }
-    let token = "00000000000000000000000000000001";
-    library.transfers.get_mut(token).unwrap().release =
-        Some((11, Instant::now() - Duration::from_millis(1)));
-    library.tick().unwrap();
-    library.tick().unwrap();
-    host.lose_take_once = true;
-    library.tick().unwrap();
-    assert!(library.cleanup.contains_key(token));
-    library.cleanup.get_mut(token).unwrap().retry_after = Instant::now();
-    for _ in 0..3 {
-        library.tick().unwrap();
-    }
-    assert!(!library.cleanup.contains_key(token));
-    assert!(host.results.is_empty());
-}
-#[test]
-fn transfer_fences_allow_thousands_and_enforce_bound() {
-    let mut host = FakeHost::default();
-    let endpoint = HostApi {
-        header: AbiHeader::of::<HostApi>(),
-        context: (&mut host as *mut FakeHost).cast(),
-        invoke,
-    };
-    // SAFETY: host remains live and is called synchronously while the library exists.
-    let mut library = Library::start(unsafe { RuntimeClient::from_endpoint(endpoint) }).unwrap();
-    assert_eq!(MAX_TRANSFERS, 4096);
-    for n in 0..MAX_TRANSFERS - 1 {
-        library.transfers.insert(
-            format!("{n:032x}"),
-            Transfer {
-                described: false,
-                stream: None,
-                initiator: "amaterasu.nvhttp".into(),
-                id: "app-0000000000000001".into(),
-                artwork: None,
-                active: false,
-                release: None,
-                closed: true,
-                proven: true,
-                touched: Instant::now(),
+        config.settings.insert("library".into(), json!({"artwork":{"providers":{"vendor":{"service":service,"allowed_initiators":["consumer"]}}}}));
+        // SAFETY: static runtime ABI, valid JSON and writable instance output.
+        let api = unsafe { &*amaterasu_runtime_v1() };
+        let mut context = std::ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                (api.create)(
+                    BorrowedBytes::new(&serde_json::to_vec(&config).unwrap()),
+                    &mut context,
+                )
             },
+            STATUS_OK
         );
+        Self { api, context }
     }
-    let send_release = |host: &mut FakeHost, id, transfer_id| {
-        host.incoming.push_back(Response::Request { id, caller: "amaterasu.nvhttp".into(), initiator: "amaterasu.nvhttp".into(), service: SERVICE.into(), payload: json!({"action":"artwork_release","id":"app-0000000000000001","transfer_id":transfer_id}), remaining_ms: 30_000 })
-    };
-    send_release(&mut host, 11, "fffffffffffffffffffffffffffffffe");
-    for _ in 0..3 {
-        library.tick().unwrap();
+    fn client(&self, principal: &str) -> RuntimeClient {
+        let mut host = std::mem::MaybeUninit::<HostApi>::uninit();
+        // SAFETY: runtime outlives clients and fills the complete endpoint table.
+        assert_eq!(
+            unsafe {
+                (self.api.endpoint)(
+                    self.context,
+                    BorrowedBytes::new(principal.as_bytes()),
+                    host.as_mut_ptr(),
+                )
+            },
+            STATUS_OK
+        );
+        unsafe { RuntimeClient::from_endpoint(host.assume_init()) }
     }
-    assert_eq!(host.completions[&11]["ok"], false);
-    assert_eq!(library.transfers.len(), MAX_TRANSFERS);
-    send_release(&mut host, 12, "ffffffffffffffffffffffffffffffff");
-    for _ in 0..3 {
-        library.tick().unwrap();
+}
+impl Drop for Runtime {
+    fn drop(&mut self) {
+        unsafe { (self.api.destroy)(self.context) };
     }
-    assert_eq!(host.completions[&12]["ok"], false);
-    assert_eq!(library.transfers.len(), MAX_TRANSFERS);
 }
 
 #[test]
-fn unknown_release_is_unverified_and_fences_late_read() {
-    let mut host = FakeHost::default();
-    let endpoint = HostApi {
-        header: AbiHeader::of::<HostApi>(),
-        context: (&mut host as *mut FakeHost).cast(),
-        invoke,
-    };
-    // SAFETY: host remains live and is called synchronously while the library exists.
-    let mut library = Library::start(unsafe { RuntimeClient::from_endpoint(endpoint) }).unwrap();
-    for id in [10, 11] {
-        host.incoming.push_back(Response::Request { id, caller: "amaterasu.nvhttp".into(), initiator: "amaterasu.nvhttp".into(), service: SERVICE.into(), payload: json!({"action":"artwork_release","id":"app-0000000000000001","transfer_id":"00000000000000000000000000000001"}), remaining_ms: 30_000 });
-        for _ in 0..3 {
-            library.tick().unwrap();
-        }
-        assert_eq!(host.completions[&id]["ok"], false);
-    }
-    host.enqueue(12, None, 0);
-    for _ in 0..3 {
-        library.tick().unwrap();
-    }
-    assert_eq!(host.completions[&12]["ok"], false);
-    assert!(
-        !host
-            .commands
-            .iter()
-            .any(|c| matches!(c, Command::Request { .. }))
-    );
-}
-
-#[test]
-fn external_artwork_uses_sdk_route_and_negotiates_capability_once() {
-    for supported in [true, false] {
-        let mut host = FakeHost {
-            external: true,
-            unsupported_artwork: !supported,
-            ..Default::default()
-        };
-        let endpoint = HostApi {
-            header: AbiHeader::of::<HostApi>(),
-            context: (&mut host as *mut FakeHost).cast(),
-            invoke,
-        };
-        // SAFETY: host allocation outlives its single-threaded library instance.
-        let mut library =
-            Library::start(unsafe { RuntimeClient::from_endpoint(endpoint) }).unwrap();
-        host.enqueue(10, None, 0);
-        for _ in 0..20 {
-            library.tick().unwrap();
-        }
-        if supported {
-            assert_eq!(
-                host.completions[&10],
-                json!({"ok":true,"revision":"revision:17","offset":0,"next_offset":null,"total_bytes":3,"mime_type":"image/png","data":"YWJj"})
-            );
-            host.enqueue(11, Some("revision:17"), 0);
-            for _ in 0..20 {
-                library.tick().unwrap();
-            }
-            assert_eq!(host.completions[&11]["ok"], true);
-            let descriptions = host
-                .commands
-                .iter()
-                .filter(|command| {
-                    matches!(command, Command::Request { service, payload, .. }
-                if service == "vendor.artwork/1" && payload["action"] == "describe")
-                })
-                .count();
-            assert_eq!(descriptions, 1);
+fn interchangeable_native_providers_deliver_large_artwork_without_json_bytes() {
+    for service in ["vendor.artwork/1", "replacement.covers/1"] {
+        let host = Runtime::new(service);
+        let provider = host.client("provider");
+        let catalog = host.client("catalog");
+        let consumer = host.client("consumer");
+        let outsider = host.client("outsider");
+        provider
+            .require_success(Command::Register {
+                service: service.into(),
+            })
+            .unwrap();
+        catalog
+            .require_success(Command::Register {
+                service: CATALOG.into(),
+            })
+            .unwrap();
+        let mut source = Source::with_chunk_bytes(if service.starts_with("vendor") {
+            256 * 1024
         } else {
-            assert_eq!(
-                host.completions[&10]["error"]["code"],
-                "artwork_unsupported"
+            64 * 1024
+        })
+        .unwrap();
+        // SAFETY: source is retained beyond the library and every binding.
+        unsafe {
+            source.register(&provider, service).unwrap();
+        }
+        let mut library = Library::start(host.client("library")).unwrap();
+        let expected = vec![0xab; 1024 * 1024 + 37];
+        for attempt in 0..9 {
+            let Response::Accepted { id } = consumer
+                .send(Command::Request {
+                    service: SERVICE.into(),
+                    payload: json!({"action":"artwork_open","id":"app-0000000000000001","revision":if attempt == 8 { Some("stale") } else { None }}),
+                    timeout_ms: 30_000,
+                    operation_id: format!("open.{attempt}"),
+                    parent: None,
+                })
+                .unwrap()
+            else {
+                panic!()
+            };
+            let mut response = None;
+            for _ in 0..40 {
+                library.tick().unwrap();
+                if let Response::Request { id, payload, .. } =
+                    catalog.send(Command::Poll {}).unwrap()
+                {
+                    assert_eq!(payload["action"], "resolve_exported_artwork");
+                    catalog.require_success(Command::Complete { request: id, payload: json!({"ok":true,"artwork":{"provider":"external","source":"vendor","reference":{"id":"opaque/cover","revision":"rev1"}}}) }).unwrap();
+                }
+                if let Response::Request {
+                    id,
+                    caller,
+                    payload,
+                    ..
+                } = provider.send(Command::Poll {}).unwrap()
+                {
+                    let response = if payload["action"] == "describe" {
+                        json!({"ok":true,"capabilities":{"discovery":false,"artwork":true,"lifecycle":false}})
+                    } else {
+                        assert_eq!(
+                            payload,
+                            json!({"action":"artwork_open","reference":{"id":"opaque/cover","revision":"rev1"}})
+                        );
+                        json!({"ok":true,"offer":source.publish(&caller,"rev1".into(),"image/png".into(),expected.clone()).unwrap()})
+                    };
+                    provider
+                        .require_success(Command::Complete {
+                            request: id,
+                            payload: response,
+                        })
+                        .unwrap();
+                }
+                if let Response::Result { payload } =
+                    consumer.send(Command::TakeResult { request: id }).unwrap()
+                {
+                    response = Some(payload);
+                    break;
+                }
+            }
+            let response = response.expect("completed");
+            if attempt == 8 {
+                assert_eq!(response["ok"], false);
+                continue;
+            }
+            assert_eq!(response["ok"], true, "{response}");
+            assert!(serde_json::to_vec(&response).unwrap().len() < 1500);
+            let offer: Offer = serde_json::from_value(response["offer"].clone()).unwrap();
+            assert!(
+                unsafe { artwork_transfer::receive(&outsider, SERVICE, offer.clone()) }.is_err()
             );
-            assert!(!host.commands.iter().any(
-                |command| matches!(command, Command::Request { service, payload, .. }
-                if service == "vendor.artwork/1" && payload["action"] == "artwork")
-            ));
+            let image =
+                unsafe { artwork_transfer::receive(&consumer, SERVICE, offer.clone()) }.unwrap();
+            assert_eq!(image.bytes, expected);
+            assert_eq!(image.revision, "rev1");
+            assert!(unsafe { artwork_transfer::receive(&consumer, SERVICE, offer) }.is_err());
+            consumer
+                .require_success(Command::ReleaseResult { request: id })
+                .unwrap();
         }
     }
 }
 
 #[test]
-fn artwork_transfer_pins_mime_across_successive_chunks() {
-    let mut host = FakeHost {
-        artwork_revision: "17",
-        ..Default::default()
-    };
-    let endpoint = HostApi {
-        header: AbiHeader::of::<HostApi>(),
-        context: (&mut host as *mut FakeHost).cast(),
-        invoke,
-    };
-    // SAFETY: boxed endpoint context remains live on this test's single thread.
-    let mut library = Library::start(unsafe { RuntimeClient::from_endpoint(endpoint) }).unwrap();
-    host.enqueue(10, None, 0);
-    for _ in 0..12 {
-        library.tick().unwrap();
-    }
-    assert_eq!(host.completions[&10]["ok"], true);
-    host.changed_mime = true;
-    host.enqueue(11, Some("17"), 8192);
-    for _ in 0..12 {
-        library.tick().unwrap();
-    }
-    assert_eq!(
-        host.completions[&11]["error"]["code"],
-        "invalid_artwork_response"
+fn library_rejects_the_removed_chunk_protocol() {
+    assert!(
+        serde_json::from_value::<Action>(
+            json!({"action":"artwork_read","id":"app-0000000000000001","offset":0})
+        )
+        .is_err()
     );
 }

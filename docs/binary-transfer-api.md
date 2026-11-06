@@ -13,7 +13,7 @@ fix, a PyroWave implementation, or evidence of physical network throughput.
 
 ## Why the boundary is needed
 
-Artwork currently uses repeated 8 KiB JSON/base64 reads. The existing media
+Artwork uses the shared binary-transfer SDK; see [artwork transfer](artwork-transfer.md). The existing media
 interfaces already use native buffers, but the legacy packet validation and
 transport negotiation still restrict codecs, and the generic encoder output
 has its own 16 MiB limit. Increasing the JSON limit would neither remove the

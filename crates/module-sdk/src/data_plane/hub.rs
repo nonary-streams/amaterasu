@@ -117,6 +117,15 @@ impl Hub {
             }
         }
     }
+    /// Whether a channel still owns its reservation. Binding release removes it.
+    pub fn contains(&self, id: ChannelId) -> bool {
+        self.0
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entries
+            .contains_key(&id)
+    }
     /// Only provider destruction should call this, after stopping control admission.
     pub fn close_all(&self) {
         let ids: Vec<_> = self

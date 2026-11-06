@@ -512,17 +512,17 @@ fn artwork_reads_allow_library_and_require_a_current_discovery_record() {
     host.queue_service_request(
         10,
         "amaterasu.console",
-        json!({"action":"artwork_read","app_id":42,"revision":"1","offset":0}),
+        json!({"action":"artwork_open","app_id":42,"revision":"1"}),
     );
     host.queue_service_request(
         11,
         MANAGEMENT_CALLER,
-        json!({"action":"artwork_read","app_id":42,"revision":"1","offset":0}),
+        json!({"action":"artwork_open","app_id":42,"revision":"1"}),
     );
     host.queue_service_request(
         12,
         LIBRARY_CALLER,
-        json!({"action":"artwork_read","app_id":42,"revision":"1","offset":0}),
+        json!({"action":"artwork_open","app_id":42,"revision":"1"}),
     );
     host.queue_service_request(13, LIBRARY_CALLER, json!({"action":"refresh"}));
     host.queue_service_request(14, LIBRARY_CALLER, json!({"action":"status"}));
@@ -553,14 +553,14 @@ fn custom_library_principal_replaces_default_for_artwork() {
     host.product_get_results
         .push_back(persisted_settings(true, 1));
     for (id, caller, action) in [
-        (30, "custom.library", "artwork_read"),
+        (30, "custom.library", "artwork_open"),
         (31, "custom.library", "status"),
-        (32, LIBRARY_CALLER, "artwork_read"),
+        (32, LIBRARY_CALLER, "artwork_open"),
         (33, LIBRARY_CALLER, "status"),
-        (34, "amaterasu.nvhttp", "artwork_read"),
+        (34, "amaterasu.nvhttp", "artwork_open"),
     ] {
-        let payload = if action == "artwork_read" {
-            json!({"action":action,"app_id":42,"revision":"1","offset":0})
+        let payload = if action == "artwork_open" {
+            json!({"action":action,"app_id":42,"revision":"1"})
         } else {
             json!({"action":action})
         };
@@ -587,7 +587,7 @@ fn nvhttp_cannot_call_steam_directly_but_library_may_forward_artwork() {
         (22, json!({"action":"refresh"})),
         (
             23,
-            json!({"action":"artwork_read","app_id":42,"revision":"1","offset":0}),
+            json!({"action":"artwork_open","app_id":42,"revision":"1"}),
         ),
     ] {
         host.queue_service_request(id, "amaterasu.nvhttp", payload);
@@ -597,7 +597,7 @@ fn nvhttp_cannot_call_steam_directly_but_library_may_forward_artwork() {
         caller: LIBRARY_CALLER.into(),
         initiator: "amaterasu.nvhttp".into(),
         service: SERVICE.into(),
-        payload: json!({"action":"artwork_read","app_id":42,"revision":"1","offset":0}),
+        payload: json!({"action":"artwork_open","app_id":42,"revision":"1"}),
         remaining_ms: CONFIGURATION_TIMEOUT_MS,
     });
     let mut module = start_test_module(&mut host);
@@ -885,7 +885,7 @@ impl FakeHost {
                     .clone()
                     .unwrap_or_else(|| json!({"roots":[]})),
             },
-            Command::Register { .. } => Response::Ok,
+            Command::Register { .. } | Command::NativeRegisterTyped { .. } => Response::Ok,
             Command::NativeBindTyped {
                 service,
                 interface_major,

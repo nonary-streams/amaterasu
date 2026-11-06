@@ -238,6 +238,7 @@ struct LutrisModule {
     configuration: configuration::ProductConfiguration,
     catalog: catalog_sync::CatalogSync,
     artwork: artwork::ArtworkStore,
+    binary_artwork: amaterasu_module_sdk::artwork_transfer::Source,
     snapshot_worker: SnapshotWorker,
     steam_read: Option<PendingSteamRead>,
     settings_epoch: u64,
@@ -266,12 +267,18 @@ impl ManagedModule for LutrisModule {
         runtime.require_success(Command::Register {
             service: SERVICE.into(),
         })?;
+        let binary_artwork = amaterasu_module_sdk::artwork_transfer::Source::new()?;
+        // SAFETY: this module retains the factory until all dependent consumers stop.
+        unsafe {
+            binary_artwork.register(&runtime, SERVICE)?;
+        }
         Ok(Self {
             runtime,
             library_principal: settings.library_principal,
             configuration: configuration::ProductConfiguration::new(),
             catalog: catalog_sync::CatalogSync::default(),
             artwork: artwork::ArtworkStore::default(),
+            binary_artwork,
             snapshot_worker: SnapshotWorker::default(),
             steam_read: None,
             settings_epoch: 0,
@@ -291,6 +298,7 @@ impl ManagedModule for LutrisModule {
     }
 
     fn tick(&mut self) -> ModuleResult<()> {
+        self.binary_artwork.reap();
         self.configuration
             .advance(&self.runtime, &mut self.settings_epoch)?;
         self.observe_settings();
@@ -319,6 +327,7 @@ impl LutrisModule {
         }
         self.observed_settings_epoch = self.settings_epoch;
         self.artwork.clear();
+        self.binary_artwork.clear();
         self.last_artwork_revisions.clear();
         self.last_reconciled_source = None;
         self.last_reconciled_at = None;
@@ -515,6 +524,43 @@ impl LutrisModule {
     }
 
     fn handle_request(&mut self, request: u64, caller: &str, payload: Value) -> ModuleResult<()> {
+        if payload.get("action").and_then(Value::as_str) == Some("artwork_open") {
+            if caller != self.library_principal && !is_management_caller(caller) {
+                return self.complete(request, json!({"ok":false,"code":"forbidden"}));
+            }
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Open {
+                action: String,
+                game_id: i64,
+                revision: String,
+            }
+            let result = serde_json::from_value::<Open>(payload)
+                .map_err(|_| "invalid_request")
+                .and_then(|open| {
+                    let _ = open.action;
+                    if !self.configuration.settings().enabled {
+                        return Err("lutris_disabled");
+                    }
+                    let (revision, mime, bytes) =
+                        self.artwork.open(open.game_id, &open.revision)?;
+                    self.binary_artwork.publish(caller, revision, mime, bytes)
+                });
+            return self.complete(
+                request,
+                match result {
+                    Ok(offer) => json!({"ok":true,"offer":offer}),
+                    Err(code) => json!({"ok":false,"code":code}),
+                },
+            );
+        }
+        if payload
+            .get("action")
+            .and_then(Value::as_str)
+            .is_some_and(|action| matches!(action, "artwork_read" | "artwork_release"))
+        {
+            return self.complete(request, json!({"ok":false,"code":"invalid_request"}));
+        }
         let action = match serde_json::from_value::<Action>(payload) {
             Ok(action) => action,
             Err(_) => return self.complete(request, json!({"ok":false,"code":"invalid_request"})),
@@ -1743,7 +1789,7 @@ mod launch_status_access_tests {
         let command: Command = serde_json::from_slice(unsafe { input.read().unwrap() }).unwrap();
         let response = match command {
             Command::GetSettings {} => Response::Result { payload: json!({}) },
-            Command::Register { .. } => Response::Ok,
+            Command::Register { .. } | Command::NativeRegisterTyped { .. } => Response::Ok,
             Command::Request { .. } => Response::Accepted { id: 99 },
             Command::TakeResult { request: 99 } if !host.load_ready => Response::Pending,
             Command::TakeResult { request: 99 } => Response::Result {
@@ -1849,7 +1895,7 @@ mod launch_status_access_tests {
             json!({"action":"settings_get"}),
             json!({"action":"settings_update","enabled":true,"expected_revision":4}),
             json!({"action":"artwork_get","game_id":7}),
-            json!({"action":"artwork_read","game_id":7,"revision":"a","offset":0}),
+            json!({"action":"artwork_open","game_id":7,"revision":"a"}),
         ] {
             host.requests.push_back((2, LAUNCH_CALLER.into(), action));
             module.tick().unwrap();

@@ -207,6 +207,7 @@ const RTX_HDR_VIDEO: ComponentDefinition = ComponentDefinition {
 //   nvhttp -> launch / catalog / application / session / input / pairing / encode
 // The Linux session excludes Playnite, so only grant providers present in this profile.
 const LINUX_SESSION_LIBRARY: ComponentDefinition = ComponentDefinition {
+    native_uses: &["amaterasu.steam/1", "amaterasu.lutris/1"],
     calls: &[
         "amaterasu.catalog/1",
         "amaterasu.state/1",

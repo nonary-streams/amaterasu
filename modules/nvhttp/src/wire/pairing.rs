@@ -470,10 +470,7 @@ impl Router {
                 }
                 None
             }
-            Purpose::Cleanup
-            | Purpose::Applications { .. }
-            | Purpose::Artwork { .. }
-            | Purpose::ArtworkRelease { .. } => None,
+            Purpose::Cleanup | Purpose::Applications { .. } | Purpose::Artwork { .. } => None,
         }
     }
 

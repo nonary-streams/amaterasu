@@ -766,7 +766,11 @@ fn nvhttp_chain_grants_match_the_agreed_services_exactly() {
     );
     assert_eq!(
         component(NVHTTP_ID).grants().native_use,
-        expected(&["amaterasu.identity/1", "amaterasu.network/1"])
+        expected(&[
+            "amaterasu.identity/1",
+            "amaterasu.network/1",
+            "amaterasu.library/1"
+        ])
     );
 }
 

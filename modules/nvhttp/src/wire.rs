@@ -145,10 +145,6 @@ enum Purpose {
         transfer_id: String,
         certificate: Vec<u8>,
     },
-    ArtworkRelease {
-        id: String,
-        transfer_id: String,
-    },
     Applications {
         desktop_enabled: bool,
         certificate: Vec<u8>,
@@ -524,10 +520,25 @@ impl Router {
         runtime: &RuntimeClient,
         allowed: impl FnMut(&[u8], Permission) -> bool,
     ) -> Vec<(u64, Reply)> {
-        self.poll_with_identity(
+        self.poll_artwork_with_identity(
             Instant::now(),
             &mut |command| runtime.send_ephemeral(command),
             allowed,
+            &mut |payload| {
+                if payload["ok"] != true {
+                    return Err("artwork unavailable".into());
+                }
+                let offer =
+                    serde_json::from_value(payload["offer"].clone()).map_err(|e| e.to_string())?;
+                // SAFETY: startup-selected library dependency retains the native provider.
+                unsafe {
+                    amaterasu_module_sdk::artwork_transfer::receive(
+                        runtime,
+                        "amaterasu.library/1",
+                        offer,
+                    )
+                }
+            },
         )
     }
 
@@ -540,11 +551,23 @@ impl Router {
         self.poll_with_identity(now, send, |_, _| true)
     }
 
+    #[cfg(test)]
     fn poll_with_identity(
         &mut self,
         now: Instant,
         send: &mut impl FnMut(Command) -> ModuleResult<Response>,
+        allowed: impl FnMut(&[u8], Permission) -> bool,
+    ) -> Vec<(u64, Reply)> {
+        self.poll_artwork_with_identity(now, send, allowed, &mut |_| {
+            Err("native artwork reader required".into())
+        })
+    }
+    fn poll_artwork_with_identity(
+        &mut self,
+        now: Instant,
+        send: &mut impl FnMut(Command) -> ModuleResult<Response>,
         mut allowed: impl FnMut(&[u8], Permission) -> bool,
+        receive: &mut impl FnMut(Value) -> ModuleResult<amaterasu_module_sdk::artwork_transfer::Image>,
     ) -> Vec<(u64, Reply)> {
         self.poll_cancellations(now, send);
         let mut replies = self.launches.poll_with_trust(now, send, |certificate| {
@@ -592,10 +615,8 @@ impl Router {
                 self.jobs.insert(key, job);
                 continue;
             };
-            let continued = if matches!(job.purpose, Purpose::ArtworkRelease { .. }) {
-                self.resolve_artwork_release(job, result, now)
-            } else if matches!(job.purpose, Purpose::Artwork { .. }) {
-                self.resolve_artwork(job, result, now, &mut replies)
+            let continued = if matches!(job.purpose, Purpose::Artwork { .. }) {
+                self.resolve_artwork(job, result, now, &mut replies, receive)
             } else if matches!(job.purpose, Purpose::Applications { .. }) {
                 self.resolve_applications(job, result, now, &mut replies)
             } else {
@@ -745,23 +766,10 @@ impl Router {
         if let Some(connection) = job.connection {
             replies.push((connection, xml::error(504, "request expired")));
         }
-        if matches!(job.purpose, Purpose::Artwork { .. }) {
-            let started = job
-                .connection
-                .is_some_and(|connection| self.artwork_reservations.remove(&connection));
-            if started {
-                Some(artwork::release_job(job, now))
-            } else {
-                None
-            }
-        } else {
-            if matches!(job.purpose, Purpose::ArtworkRelease { .. }) {
-                eprintln!(
-                    "amaterasu nvhttp artwork transfer release remains unconfirmed after retry deadline"
-                );
-            }
-            None
+        if let Some(connection) = job.connection {
+            self.artwork_reservations.remove(&connection);
         }
+        None
     }
 
     fn abort_transcript(&mut self, client: &str, now: Instant) {
@@ -783,8 +791,6 @@ impl Purpose {
     fn service(&self) -> &'static str {
         if matches!(self, Self::Applications { .. }) {
             applications::LIBRARY_SERVICE
-        } else if matches!(self, Self::ArtworkRelease { .. }) {
-            "amaterasu.library/1"
         } else {
             PAIRING_SERVICE
         }

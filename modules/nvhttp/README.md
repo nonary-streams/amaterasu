@@ -566,7 +566,7 @@ also falls back (`:556-562`).
 Pairing (`nvpairingmanager.cpp:233-366`): `paired`, `plaincert`, `challengeresponse`,
 `pairingsecret`, then HTTPS `pairchallenge`; the query carries `devicename` and
 `updateState`, both accepted. `/appasset` requires paired TLS and list permission.
-It uses the library broker for exported, revision-pinned provider chunks, with
+It opens one shared binary-transfer SDK record through the library broker, with
 a 16 MiB image limit and four concurrent artwork response reservations held
 until delivery or disconnect. Further requests wait within the bounded request
 queue. Missing or unavailable artwork returns 404,

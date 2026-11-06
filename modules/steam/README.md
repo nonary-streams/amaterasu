@@ -162,8 +162,7 @@ the largest bounded image of that class across the configured Steam roots. A
 supported local PNG is served from its source file; local JPEG and WebP are
 decoded to bounded PNG and cached by source revision for chunk reads. Otherwise list records
 carry a stable opaque reference to the fixed Steam CDN portrait. The authenticated
-`POST /v1/steam/artwork_read` action fetches that image on demand and returns the
-same bounded chunks as local artwork. The selected trusted library principal may call `artwork_read` only. The CDN fetch follows no redirects, uses
+`POST /v1/steam/artwork` fetches a binary image response. The selected trusted library principal may call `artwork_open`; its metadata-only offer binds the shared binary-transfer SDK. The CDN fetch follows no redirects, uses
 an eight-second timeout, accepts only JPEG portraits up to 16 MiB, converts
 them to bounded PNG before publication, keeps up to four images in memory,
 and cools down failed app IDs for ten minutes. The

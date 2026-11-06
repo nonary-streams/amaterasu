@@ -5,10 +5,10 @@
 //! fixed at startup; no identity or service selector is taken from the payload.
 //! Grants route trusted native code and are not a sandbox. An adapter cannot
 //! prove effects, persistence, lifecycle retirement, or host-side selection.
-use super::provider::{ArtworkChunk, ArtworkReference, DiscoveryPage};
+use super::provider::{ArtworkImage, ArtworkReference, DiscoveryPage};
 use super::provider_lifecycle::{self, Action, Observation, Request as LifecycleRequest};
+use crate::artwork_transfer::Source;
 use crate::requests::IncomingRequest;
-use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -23,9 +23,8 @@ enum Request {
         cursor: Option<String>,
         limit: usize,
     },
-    Artwork {
+    ArtworkOpen {
         reference: ArtworkReference,
-        offset: u64,
     },
     Identity {},
     Launch {
@@ -84,8 +83,7 @@ pub trait Provider {
         &mut self,
         identity: &Identity<'_>,
         reference: &ArtworkReference,
-        offset: u64,
-    ) -> Result<ArtworkChunk, &'static str>;
+    ) -> Result<ArtworkImage, &'static str>;
     /// Must be unique to this provider incarnation and stable while dispatching.
     fn incarnation(&self) -> &str;
     fn lifecycle(
@@ -100,6 +98,7 @@ pub struct ProviderAdapter<P> {
     provider: P,
     service: String,
     callers: BTreeMap<String, CallerPolicy>,
+    artwork: Source,
 }
 
 /// Startup authorization for a single immediate caller. Grants are independent;
@@ -172,12 +171,29 @@ impl<P: Provider> ProviderAdapter<P> {
             provider,
             service,
             callers,
+            artwork: Source::new().map_err(|_| "artwork source unavailable")?,
         })
+    }
+
+    /// Register the shared binary transfer table under the configured service.
+    /// # Safety
+    /// Retain this adapter until all dependent consumers have stopped.
+    pub unsafe fn register_artwork(
+        &self,
+        runtime: &crate::RuntimeClient,
+    ) -> crate::ModuleResult<()> {
+        unsafe { self.artwork.register(runtime, &self.service) }
+    }
+
+    /// Call on every provider tick, including idle ticks, to retire abandoned offers.
+    pub fn reap_artwork(&mut self) {
+        self.artwork.reap();
     }
 
     /// Dispatch exactly one broker-delivered request. Returns a JSON response
     /// suitable for `RuntimeClient::complete_serialized`.
     pub fn dispatch(&mut self, incoming: &IncomingRequest<Value>) -> Value {
+        self.artwork.reap();
         if incoming.service != self.service
             || !self
                 .callers
@@ -197,7 +213,7 @@ impl<P: Provider> ProviderAdapter<P> {
         let authorized = match &request {
             Request::Describe {} => true,
             Request::Discover { .. } => policy.discovery && capabilities.discovery,
-            Request::Artwork { .. } => policy.artwork && capabilities.artwork,
+            Request::ArtworkOpen { .. } => policy.artwork && capabilities.artwork,
             Request::Identity { .. }
             | Request::Launch { .. }
             | Request::Lookup { .. }
@@ -238,27 +254,24 @@ impl<P: Provider> ProviderAdapter<P> {
                         serde_json::to_value(page).map_err(|_| "invalid_provider_response")
                     })
             }
-            Request::Artwork { reference, offset } => {
-                if !valid_cursor(&reference.id)
-                    || !valid_cursor(&reference.revision)
-                    || offset >= super::provider::MAX_ARTWORK_BYTES
-                {
+            Request::ArtworkOpen { reference } => {
+                if !valid_cursor(&reference.id) || !valid_cursor(&reference.revision) {
                     return failure("invalid_request");
                 }
                 self.provider
-                    .artwork(&identity, &reference, offset)
-                    .and_then(|chunk| {
-                        chunk.validate()?;
-                        if chunk.reference != reference || chunk.offset != offset {
+                    .artwork(&identity, &reference)
+                    .and_then(|image| {
+                        image.validate()?;
+                        if image.reference != reference {
                             return Err("invalid_provider_response");
                         }
-                        Ok(json!({
-                            "reference": chunk.reference,
-                            "mime": chunk.mime,
-                            "offset": chunk.offset,
-                            "total_bytes": chunk.total_bytes,
-                            "data_base64": STANDARD.encode(&chunk.bytes),
-                        }))
+                        let offer = self.artwork.publish(
+                            identity.caller,
+                            image.reference.revision,
+                            image.mime,
+                            image.bytes,
+                        )?;
+                        Ok(json!({"offer":offer}))
                     })
             }
             Request::Identity {} => {

@@ -77,7 +77,7 @@ function apiHarness(responder, options = {}) {
   const context = vm.createContext({
     Error,
     URL,
-    AbortController,
+    AbortController, Blob, Uint8Array,
     crypto: webcrypto,
     clearTimeout,
     localStorage: storage,
@@ -1706,4 +1706,22 @@ test("caller AbortSignal cancels a pending protected request without retry", asy
   await assert.rejects(pending, /request was cancelled/);
   assert.equal(calls[1].options.signal.aborted, true);
   assert.equal(calls.length, 2, "an aborted request is not retried");
+});
+
+test("binary artwork shares authenticated requests and enforces declared bounds", async () => {
+  for (const [bytes, length, mime, valid] of [
+    ["abc", "3", "image/png", true],
+    ["abc", "2", "image/png", false],
+    ["abc", "4", "image/png", false],
+    ["abc", "16777217", "image/png", false],
+    ["abc", "3", "text/html", false],
+  ]) {
+    const { api, calls } = apiHarness(() => new Response(bytes, { headers: { "Content-Type": mime, "Content-Length": length } }));
+    await api.useToken(secret("a"));
+    const promise = api.post("library/artwork", { id: "app-0000000000000001" });
+    if (valid) assert.equal(await (await promise).text(), "abc");
+    else await assert.rejects(promise);
+    assert.equal(calls.at(-1).options.headers.Authorization, `Bearer ${secret("a")}`);
+    assert.equal(calls.at(-1).options.cache, "no-store");
+  }
 });

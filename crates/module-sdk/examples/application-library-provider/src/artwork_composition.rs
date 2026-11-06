@@ -2,46 +2,58 @@
 //! IDs and startup-selected SDK routing. No provider-specific facade code exists.
 use super::*;
 use amaterasu_contracts::{Grants, RuntimeConfig};
-use amaterasu_module_sdk::abi::{
-    AbiHeader, BorrowedBytes, HostApi, ModuleApi, ModuleEntry, ReplySink, STATUS_INTERNAL_ERROR,
-    STATUS_OK,
-};
-use amaterasu_runtime::Broker;
-use base64::{Engine, engine::general_purpose::STANDARD};
+use amaterasu_module_sdk::abi::{BorrowedBytes, HostApi, ModuleApi, ModuleEntry, STATUS_OK};
+use amaterasu_module_sdk::artwork_transfer;
+use amaterasu_runtime as _;
 use serde_json::json;
-use std::{cell::RefCell, ffi::c_void, rc::Rc};
+use std::ffi::c_void;
 
 const LIBRARY: &str = "amaterasu.library/1";
 const CATALOG: &str = "amaterasu.catalog/1";
 const APP: &str = "app-0000000000000001";
-const TRANSFER: &str = "0123456789abcdef0123456789abcdef";
-struct Endpoint {
-    name: &'static str,
-    broker: Rc<RefCell<Broker>>,
+unsafe extern "C" {
+    fn amaterasu_runtime_v1() -> *const amaterasu_module_sdk::abi::RuntimeApi;
 }
-unsafe extern "C" fn invoke(context: *mut c_void, input: BorrowedBytes, sink: ReplySink) -> i32 {
-    // SAFETY: harness retains endpoint/input for this synchronous runtime call.
-    let endpoint = unsafe { &*context.cast::<Endpoint>() };
-    let Ok(bytes) = (unsafe { input.read() }) else {
-        return STATUS_INTERNAL_ERROR;
-    };
-    let Ok(command) = serde_json::from_slice(bytes) else {
-        return STATUS_INTERNAL_ERROR;
-    };
-    let response = endpoint
-        .broker
-        .borrow_mut()
-        .dispatch(endpoint.name, command);
-    let output = serde_json::to_vec(&response).unwrap();
-    // SAFETY: SDK sink copies its reply before returning.
-    unsafe { sink.send(&output) };
-    STATUS_OK
+struct Runtime {
+    api: &'static amaterasu_module_sdk::abi::RuntimeApi,
+    instance: *mut c_void,
 }
-fn host(endpoint: &mut Endpoint) -> HostApi {
-    HostApi {
-        header: AbiHeader::of::<HostApi>(),
-        context: (endpoint as *mut Endpoint).cast(),
-        invoke,
+impl Runtime {
+    fn new(config: RuntimeConfig) -> Self {
+        let api = unsafe { &*amaterasu_runtime_v1() };
+        let mut instance = std::ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                (api.create)(
+                    BorrowedBytes::new(&serde_json::to_vec(&config).unwrap()),
+                    &mut instance,
+                )
+            },
+            STATUS_OK
+        );
+        Self { api, instance }
+    }
+    fn endpoint(&self, name: &str) -> HostApi {
+        let mut host = std::mem::MaybeUninit::uninit();
+        assert_eq!(
+            unsafe {
+                (self.api.endpoint)(
+                    self.instance,
+                    BorrowedBytes::new(name.as_bytes()),
+                    host.as_mut_ptr(),
+                )
+            },
+            STATUS_OK
+        );
+        unsafe { host.assume_init() }
+    }
+    fn client(&self, name: &str) -> RuntimeClient {
+        unsafe { RuntimeClient::from_endpoint(self.endpoint(name)) }
+    }
+}
+impl Drop for Runtime {
+    fn drop(&mut self) {
+        unsafe { (self.api.destroy)(self.instance) };
     }
 }
 struct Loaded {
@@ -81,62 +93,52 @@ impl Drop for Loaded {
 fn third_party_artwork_flows_through_unmodified_facade_and_shared_sdk() {
     for allowed in [true, false] {
         let config = RuntimeConfig { principals: [
-            ("library".into(), Grants { provide: [LIBRARY.into()].into(), call: [CATALOG.into(), SERVICE.into()].into(), ..Default::default() }),
-            ("provider".into(), Grants { provide: [SERVICE.into()].into(), ..Default::default() }),
+            ("library".into(), Grants { provide: [LIBRARY.into()].into(), call: [CATALOG.into(), SERVICE.into()].into(), native_provide: [LIBRARY.into()].into(), native_use: [SERVICE.into()].into(), ..Default::default() }),
+            ("provider".into(), Grants { provide: [SERVICE.into()].into(), native_provide: [SERVICE.into()].into(), ..Default::default() }),
             ("catalog".into(), Grants { provide: [CATALOG.into()].into(), ..Default::default() }),
-            ("consumer".into(), Grants { call: [LIBRARY.into(), CATALOG.into(), SERVICE.into()].into(), ..Default::default() }),
+            ("consumer".into(), Grants { call: [LIBRARY.into(), CATALOG.into(), SERVICE.into()].into(), native_use: [LIBRARY.into()].into(), ..Default::default() }),
         ].into(), settings: [
             ("library".into(), json!({"artwork":{"providers":{"vendor":{"service":SERVICE,"allowed_initiators":["consumer"]}}}})),
             ("provider".into(), json!({"callers":{"library":{"initiators":["consumer"],"artwork":allowed}}})),
         ].into(), ..Default::default() };
-        let broker = Rc::new(RefCell::new(Broker::new(config).unwrap()));
-        assert!(matches!(
-            broker.borrow_mut().dispatch(
-                "catalog",
-                Command::Register {
-                    service: CATALOG.into()
-                }
-            ),
-            Response::Ok
-        ));
-        let mut library_endpoint = Endpoint {
-            name: "library",
-            broker: broker.clone(),
-        };
-        let mut provider_endpoint = Endpoint {
-            name: "provider",
-            broker: broker.clone(),
-        };
-        let mut consumer_endpoint = Endpoint {
-            name: "consumer",
-            broker: broker.clone(),
-        };
-        let library_host = host(&mut library_endpoint);
-        let provider_host = host(&mut provider_endpoint);
-        let consumer = unsafe { RuntimeClient::from_endpoint(host(&mut consumer_endpoint)) };
+        let runtime = Runtime::new(config);
+        let catalog = runtime.client("catalog");
+        catalog
+            .require_success(Command::Register {
+                service: CATALOG.into(),
+            })
+            .unwrap();
+        let library_host = runtime.endpoint("library");
+        let provider_host = runtime.endpoint("provider");
+        let consumer = runtime.client("consumer");
         let library_path = std::env::var_os("AMATERASU_LIBRARY_PLUGIN").expect("library path");
         let provider_path = std::env::var_os("AMATERASU_PROVIDER_PLUGIN").expect("provider path");
         let provider = unsafe { Loaded::new(&provider_path, &provider_host) };
         let library = unsafe { Loaded::new(&library_path, &library_host) };
-        let Response::Accepted { id } = consumer.send(Command::Request { service: LIBRARY.into(),
-            payload: json!({"action":"artwork_read","id":APP,"revision":null,"offset":0,"transfer_id":TRANSFER}),
-            timeout_ms: 30_000, operation_id: "opaque-artwork".into(), parent: None }).unwrap() else { panic!("request rejected") };
+        let Response::Accepted { id } = consumer
+            .send(Command::Request {
+                service: LIBRARY.into(),
+                payload: json!({"action":"artwork_open","id":APP}),
+                timeout_ms: 30_000,
+                operation_id: "opaque-artwork".into(),
+                parent: None,
+            })
+            .unwrap()
+        else {
+            panic!("request rejected")
+        };
         let mut completed = None;
         for _ in 0..30 {
             library.tick();
-            let catalog_request = broker.borrow_mut().dispatch("catalog", Command::Poll {});
+            let catalog_request = catalog.send(Command::Poll {}).unwrap();
             if let Response::Request { id, .. } = catalog_request {
                 let response = json!({"ok":true,"artwork":{"provider":"external","source":"vendor","reference":{"id":"fixture-cover","revision":"fixture-v1"}}});
-                assert!(matches!(
-                    broker.borrow_mut().dispatch(
-                        "catalog",
-                        Command::Complete {
-                            request: id,
-                            payload: response
-                        }
-                    ),
-                    Response::Ok
-                ));
+                catalog
+                    .require_success(Command::Complete {
+                        request: id,
+                        payload: response,
+                    })
+                    .unwrap();
             }
             // A real provider DLL handles its own discovery/capability/image work.
             provider.tick();
@@ -150,13 +152,11 @@ fn third_party_artwork_flows_through_unmodified_facade_and_shared_sdk() {
         let response = completed.expect("artwork operation completed");
         if allowed {
             assert_eq!(response["ok"], true, "{response}");
-            assert_eq!(response["revision"], "fixture-v1");
-            assert_eq!(response["total_bytes"], COVER.len());
-            assert_eq!(response["mime_type"], "image/png");
-            assert_eq!(
-                STANDARD.decode(response["data"].as_str().unwrap()).unwrap(),
-                COVER
-            );
+            let offer = serde_json::from_value(response["offer"].clone()).unwrap();
+            let image = unsafe { artwork_transfer::receive(&consumer, LIBRARY, offer) }.unwrap();
+            assert_eq!(image.revision, "fixture-v1");
+            assert_eq!(image.mime_type, "image/png");
+            assert_eq!(image.bytes, COVER);
             assert!(response.get("reference").is_none());
         } else {
             assert_eq!(

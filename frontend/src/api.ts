@@ -1404,7 +1404,9 @@ namespace Amaterasu {
       const controller = new AbortController();
       const abortRequest = (): void => controller.abort();
       signal?.addEventListener("abort", abortRequest, { once: true });
-      const timer = window.setTimeout(() => controller.abort(), 12_000);
+      if (signal?.aborted) controller.abort();
+      const artworkRoute = ["library/artwork", "steam/artwork", "lutris/artwork"].includes(route);
+      const timer = window.setTimeout(() => controller.abort(), artworkRoute ? 30_000 : 12_000);
       this.requests.add(controller);
       if (route === "auth/refresh" || route === "auth/browser/refresh")
         this.refreshRequests.add(controller);
@@ -1423,6 +1425,27 @@ namespace Amaterasu {
           cache: "no-store",
           referrerPolicy: "no-referrer",
         });
+        if (response.ok && artworkRoute) {
+          const mime = response.headers.get("Content-Type")?.split(";")[0]?.trim();
+          const length = Number(response.headers.get("Content-Length"));
+          if (!mime || !["image/png", "image/jpeg", "image/webp"].includes(mime) ||
+              !Number.isSafeInteger(length) || length < 1 || length > 16 * 1024 * 1024 || !response.body)
+            throw new Error("Invalid artwork response.");
+          const reader = response.body.getReader();
+          const chunks: Uint8Array<ArrayBuffer>[] = [];
+          let received = 0;
+          try {
+            while (true) {
+              const { value, done } = await reader.read();
+              if (done) break;
+              received += value.byteLength;
+              if (received > length) throw new Error("Artwork exceeds its declared size.");
+              chunks.push(new Uint8Array(value));
+            }
+            if (received !== length) throw new Error("Incomplete artwork response.");
+            return new Blob(chunks, { type: mime }) as T;
+          } finally { await reader.cancel().catch(() => {}); }
+        }
         const body = (await response.json()) as Payload;
         if (!response.ok || body.ok !== true)
           throw this.failure(body, response.status);

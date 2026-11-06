@@ -100,7 +100,7 @@ store or accept arbitrary provider paths and commands from clients.
 
 A selected replacement for `amaterasu.library/1` can own its storage, metadata,
 overlays, sync and artwork. NVHTTP already calls the selected library for
-`artwork_read`/`artwork_release`, so a conforming replacement can supply its own
+`artwork_open` and the binary-transfer SDK, so a conforming replacement can supply its own
 images without changing Catalog's artwork enum. An approved management extension
 can call replacement-specific services. These are implementation opportunities,
 not features proved by the read-only demonstration replacement.

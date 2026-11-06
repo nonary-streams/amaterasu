@@ -604,13 +604,12 @@ mod tests {
     fn lutris_artwork_requires_bearer_and_forwards_only_validated_fields() {
         let body = serde_json::json!({
             "game_id":42,
-            "revision":"a".repeat(64),
-            "offset":8192
+            "revision":"a".repeat(64)
         })
         .to_string();
         let request = |authorization: &str, body: &str| {
             format!(
-                "POST /v1/lutris/artwork_read HTTP/1.1\r\nHost: {HOST}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{authorization}\r\n{body}",
+                "POST /v1/lutris/artwork HTTP/1.1\r\nHost: {HOST}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{authorization}\r\n{body}",
                 body.len()
             )
         };
@@ -629,19 +628,19 @@ mod tests {
                 .api_request
                 .as_ref()
                 .map(|context| (context.path.as_str(), context.method.as_str())),
-            Some(("/v1/lutris/artwork_read", "POST"))
+            Some(("/v1/lutris/artwork", "POST"))
         );
         assert!(matches!(
             parsed.target,
             RequestTarget::Api(Route {
                 service: "amaterasu.lutris/1",
-                action: "artwork_read",
+                action: "artwork_open",
                 scope: Some("lutris.read"),
                 ..
             })
         ));
         assert_eq!(parsed.payload["game_id"], 42);
-        assert_eq!(parsed.payload["action"], "artwork_read");
+        assert_eq!(parsed.payload["action"], "artwork_open");
         let bad_body =
             serde_json::json!({"game_id":42,"revision":"A".repeat(64),"offset":0}).to_string();
         assert_eq!(
@@ -999,5 +998,50 @@ mod tests {
         let reply = response(200, &json!({"huge":"x".repeat(MAX_RESPONSE)}), None);
         assert!(reply.starts_with(b"HTTP/1.1 502"));
         assert!(reply.len() < 1024);
+    }
+}
+
+/// Authenticated artwork is private and never stored by shared caches.
+pub fn image_response(mime: &str, body: Vec<u8>, origin: Option<&str>) -> Vec<u8> {
+    if !matches!(mime, "image/png" | "image/jpeg" | "image/webp")
+        || body.is_empty()
+        || body.len() > amaterasu_module_sdk::artwork_transfer::MAX_BYTES
+    {
+        return response(
+            502,
+            &json!({"ok":false,"code":"invalid_artwork_response"}),
+            origin,
+        );
+    }
+    let mut header = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n",
+        body.len()
+    );
+    if let Some(origin) = origin {
+        header.push_str(&format!("Access-Control-Allow-Origin: {origin}\r\nAccess-Control-Allow-Credentials: true\r\nVary: Origin\r\n"));
+    }
+    header.push_str("\r\n");
+    let mut response = header.into_bytes();
+    response.extend(body);
+    response
+}
+
+#[cfg(test)]
+mod binary_artwork_tests {
+    use super::*;
+    #[test]
+    fn artwork_response_has_exact_binary_body_and_private_headers() {
+        let body = vec![0, 255, 128, b'\r', b'\n'];
+        let reply = image_response("image/png", body.clone(), Some("https://example.test"));
+        let split = reply.windows(4).position(|v| v == b"\r\n\r\n").unwrap() + 4;
+        assert_eq!(&reply[split..], body);
+        let headers = std::str::from_utf8(&reply[..split]).unwrap();
+        assert!(headers.contains("Content-Length: 5\r\n"));
+        assert!(headers.contains("Cache-Control: no-store"));
+        assert!(headers.contains("X-Content-Type-Options: nosniff"));
+        assert!(
+            image_response("image/png\r\nInjected: yes", vec![1], None)
+                .starts_with(b"HTTP/1.1 502")
+        );
     }
 }

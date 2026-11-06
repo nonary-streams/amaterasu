@@ -267,6 +267,9 @@ struct PlayniteModule {
     fullscreen_entry_sync: fullscreen_entry::FullscreenEntrySync,
     next_discovery: Instant,
     pending_launches: VecDeque<PendingLaunch>,
+    binary_artwork: amaterasu_module_sdk::artwork_transfer::Source,
+    binary_requests: BTreeMap<u64, BinaryArtwork>,
+    binary_releases: BTreeMap<String, BinaryRelease>,
     artwork_revisions: BTreeMap<String, String>,
     artwork_snapshot_current: bool,
     pending_artwork: Vec<PendingArtwork>,
@@ -278,6 +281,18 @@ struct PlayniteModule {
     discovery_call_count: std::cell::Cell<usize>,
 }
 
+struct BinaryArtwork {
+    owner: String,
+    bytes: Vec<u8>,
+    mime: Option<String>,
+    total: Option<usize>,
+    deadline: Instant,
+}
+struct BinaryRelease {
+    processes: Vec<discovery::ProcessImage>,
+    receiver: Option<Receiver<Result<(), String>>>,
+    retry_at: Instant,
+}
 struct PendingArtworkRelease {
     request: u64,
     transfer_id: String,
@@ -337,6 +352,11 @@ impl ManagedModule for PlayniteModule {
         runtime.require_success(Command::Register {
             service: SERVICE.into(),
         })?;
+        let binary_artwork = amaterasu_module_sdk::artwork_transfer::Source::new()?;
+        // SAFETY: dependencies retain this module and its registered factory.
+        unsafe {
+            binary_artwork.register(&runtime, SERVICE)?;
+        }
         connector::start_sunshine_actor();
         Ok(Self {
             runtime,
@@ -360,6 +380,9 @@ impl ManagedModule for PlayniteModule {
             fullscreen_entry_sync: fullscreen_entry::FullscreenEntrySync::default(),
             next_discovery: Instant::now(),
             pending_launches: VecDeque::new(),
+            binary_artwork,
+            binary_requests: BTreeMap::new(),
+            binary_releases: BTreeMap::new(),
             artwork_revisions: BTreeMap::new(),
             artwork_snapshot_current: false,
             pending_artwork: Vec::new(),
@@ -373,6 +396,8 @@ impl ManagedModule for PlayniteModule {
     }
 
     fn tick(&mut self) -> ModuleResult<()> {
+        self.binary_artwork.reap();
+        self.poll_binary_releases();
         self.configuration
             .advance(&self.runtime, &mut self.settings_epoch)?;
         self.observe_settings();
@@ -469,6 +494,7 @@ impl PlayniteModule {
         );
         if !same_catalog_policy {
             self.artwork_revisions.clear();
+            self.binary_artwork.clear();
             self.artwork_snapshot_current = false;
             self.catalog.revoke_epoch();
             self.configuration.require_epoch_for_deferred_response();
@@ -512,6 +538,7 @@ impl PlayniteModule {
             Instant::now(),
         ) {
             self.artwork_revisions.clear();
+            self.binary_artwork.clear();
             self.artwork_snapshot_current = false;
             self.catalog.cancel_after_process_change();
             self.catalog.revoke_epoch();
@@ -542,6 +569,7 @@ impl PlayniteModule {
             Instant::now(),
         ) {
             self.artwork_revisions.clear();
+            self.binary_artwork.clear();
             self.artwork_snapshot_current = false;
             self.catalog.cancel_after_process_change();
             self.catalog.revoke_epoch();
@@ -675,6 +703,57 @@ impl PlayniteModule {
     }
 
     fn handle_request(&mut self, id: u64, caller: &str, payload: Value) -> ModuleResult<()> {
+        if payload.get("action").and_then(Value::as_str) == Some("artwork_open") {
+            if caller != self.library_principal && caller != MANAGEMENT_CALLER {
+                return self.complete(id, json!({"ok":false,"code":"forbidden"}));
+            }
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Open {
+                action: String,
+                game_id: String,
+                revision: String,
+            }
+            let Ok(open) = serde_json::from_value::<Open>(payload) else {
+                return self.complete(id, json!({"ok":false,"code":"invalid_request"}));
+            };
+            let _ = open.action;
+            if self.binary_requests.len() + self.binary_releases.len() >= 4 {
+                return self.complete(id, json!({"ok":false,"code":"artwork_busy"}));
+            }
+            let mut random = [0u8; 16];
+            getrandom::fill(&mut random).map_err(|_| "artwork entropy unavailable")?;
+            let token: String = random.iter().map(|b| format!("{b:02x}")).collect();
+            self.binary_requests.insert(
+                id,
+                BinaryArtwork {
+                    owner: caller.into(),
+                    bytes: Vec::new(),
+                    mime: None,
+                    total: None,
+                    deadline: Instant::now() + Duration::from_secs(25),
+                },
+            );
+            self.request_artwork(
+                id,
+                open.game_id,
+                open.revision,
+                0,
+                token,
+                caller == self.library_principal,
+            )?;
+            if !self.pending_artwork.iter().any(|item| item.request == id) {
+                self.binary_requests.remove(&id);
+            }
+            return Ok(());
+        }
+        if payload
+            .get("action")
+            .and_then(Value::as_str)
+            .is_some_and(|action| matches!(action, "artwork_read" | "artwork_release"))
+        {
+            return self.complete(id, json!({"ok":false,"code":"invalid_request"}));
+        }
         let action = match serde_json::from_value::<Action>(payload) {
             Ok(action) => action,
             Err(_) => return self.complete(id, json!({"ok":false,"code":"invalid_request"})),
@@ -1083,6 +1162,131 @@ impl PlayniteModule {
         Ok(())
     }
 
+    fn poll_binary_releases(&mut self) {
+        for (token, mut release) in std::mem::take(&mut self.binary_releases) {
+            if Instant::now() < release.retry_at {
+                self.binary_releases.insert(token, release);
+                continue;
+            }
+            if let Some(receiver) = &release.receiver {
+                match receiver.try_recv() {
+                    Ok(Ok(())) => continue,
+                    Err(mpsc::TryRecvError::Empty) => {
+                        self.binary_releases.insert(token, release);
+                        continue;
+                    }
+                    _ => release.receiver = None,
+                }
+            }
+            if release.receiver.is_none() {
+                release.receiver =
+                    connector::release_artwork_transfer(&release.processes, &token).ok();
+                release.retry_at = Instant::now() + Duration::from_secs(1);
+            }
+            self.binary_releases.insert(token, release);
+        }
+    }
+    fn accept_binary_artwork(
+        &mut self,
+        item: PendingArtwork,
+        chunk: Option<connector::ArtworkChunk>,
+        current: bool,
+    ) -> ModuleResult<()> {
+        use base64::Engine;
+        use sha2::{Digest, Sha256};
+        let mut transfer = self.binary_requests.remove(&item.request).unwrap();
+        let result = (|| -> Result<bool, &'static str> {
+            if !current || Instant::now() >= transfer.deadline {
+                return Err("artwork_changed");
+            }
+            let chunk = chunk.ok_or("artwork_unavailable")?;
+            if chunk.total_bytes == 0
+                || chunk.total_bytes > amaterasu_module_sdk::artwork_transfer::MAX_BYTES
+                || chunk.offset >= chunk.total_bytes
+                || chunk.offset != transfer.bytes.len()
+                || transfer.total.is_some_and(|n| n != chunk.total_bytes)
+                || transfer
+                    .mime
+                    .as_ref()
+                    .is_some_and(|m| m != &chunk.mime_type)
+                || !matches!(
+                    chunk.mime_type.as_str(),
+                    "image/png" | "image/jpeg" | "image/webp"
+                )
+                || chunk.data_base64.len() > 10924
+            {
+                return Err("invalid_artwork_response");
+            }
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(chunk.data_base64)
+                .map_err(|_| "invalid_artwork_response")?;
+            let expected = (chunk.total_bytes - chunk.offset).min(8192);
+            if bytes.len() != expected {
+                return Err("invalid_artwork_response");
+            }
+            transfer.total = Some(chunk.total_bytes);
+            transfer.mime = Some(chunk.mime_type);
+            transfer.bytes.extend(bytes);
+            let complete = transfer.bytes.len() == chunk.total_bytes;
+            if complete && format!("{:x}", Sha256::digest(&transfer.bytes)) != item.revision {
+                return Err("artwork_changed");
+            }
+            Ok(complete)
+        })();
+        if matches!(result, Ok(false)) {
+            let offset = transfer.bytes.len();
+            self.binary_requests.insert(item.request, transfer);
+            self.request_artwork(
+                item.request,
+                item.game_id,
+                item.revision,
+                offset,
+                item.transfer_id.clone(),
+                item.catalog_reference,
+            )?;
+            if self
+                .pending_artwork
+                .iter()
+                .any(|next| next.request == item.request)
+            {
+                return Ok(());
+            }
+            self.binary_requests.remove(&item.request);
+            self.binary_releases.insert(
+                item.transfer_id,
+                BinaryRelease {
+                    processes: item.processes,
+                    receiver: None,
+                    retry_at: Instant::now(),
+                },
+            );
+            return Ok(());
+        }
+        self.binary_releases.insert(
+            item.transfer_id,
+            BinaryRelease {
+                processes: item.processes,
+                receiver: None,
+                retry_at: Instant::now(),
+            },
+        );
+        let offer = result.and_then(|_| {
+            self.binary_artwork.publish(
+                &transfer.owner,
+                item.revision,
+                transfer.mime.unwrap(),
+                transfer.bytes,
+            )
+        });
+        self.complete(
+            item.request,
+            match offer {
+                Ok(offer) => json!({"ok":true,"offer":offer}),
+                Err(code) => json!({"ok":false,"code":code}),
+            },
+        )
+    }
+
     fn poll_artwork(&mut self) -> ModuleResult<()> {
         let mut pending = std::mem::take(&mut self.pending_artwork);
         for item in pending.drain(..) {
@@ -1102,6 +1306,10 @@ impl PlayniteModule {
                     &item.game_id,
                     &item.revision,
                 );
+            if self.binary_requests.contains_key(&item.request) {
+                self.accept_binary_artwork(item, result.ok().and_then(Result::ok), current)?;
+                continue;
+            }
             let payload = match result {
                 Ok(Ok(chunk)) if current => {
                     let next = (chunk.offset + 8192).min(chunk.total_bytes);

@@ -15,6 +15,7 @@ image = { version = "0.25.10", default-features = false, features = ["jpeg", "pn
 ureq = { version = "3.4", default-features = false, features = ["rustls", "platform-verifier"] }
 
 [dev-dependencies]
+base64 = "0.22"
 amaterasu-network-sockets.workspace = true
 
 [lints]

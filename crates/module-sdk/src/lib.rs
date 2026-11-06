@@ -454,3 +454,6 @@ mod logging_tests {
         assert!(validate_log_record("module.target", "private\0credential").is_err());
     }
 }
+
+/// Shared binary artwork provider and consumer adapter.
+pub mod artwork_transfer;

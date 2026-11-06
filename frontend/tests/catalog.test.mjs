@@ -4,7 +4,7 @@ import test from "node:test";
 import vm from "node:vm";
 import ts from "typescript";
 
-const context = vm.createContext({ atob, Blob, Error, TextEncoder });
+const context = vm.createContext({ atob, Blob, Error, TextEncoder, AbortController, window: { setInterval, clearInterval } });
 for (const source of ["src/model.ts", "src/catalog.ts"]) {
   vm.runInContext(
     ts.transpile(readFileSync(source, "utf8"), {
@@ -295,159 +295,40 @@ test("catalog reads back 10-bit SDR overrides without collapsing false or accept
   }
 });
 
-test("Steam artwork chunks assemble into the expected image without a local path", async () => {
-  const source = Buffer.alloc(8195, 0x5a);
-  const offsets = [];
-  const api = {
-    async post(path, request) {
-      assert.equal(path, "steam/artwork_read");
-      assert.equal(request.app_id, 730);
-      assert.equal(request.revision, "42");
-      offsets.push(request.offset);
-      const end = Math.min(request.offset + 8192, source.length);
-      return {
-        ok: true,
-        app_id: 730,
-        revision: "42",
-        offset: request.offset,
-        next_offset: end === source.length ? null : end,
-        total_bytes: source.length,
-        mime_type: "image/png",
-        data: source.subarray(request.offset, end).toString("base64"),
-      };
-    },
-  };
-  const image = await readSteamArtwork(api, reference);
-  assert.deepEqual(offsets, [0, 8192]);
-  assert.equal(image.type, "image/png");
-  assert.deepEqual(Buffer.from(await image.arrayBuffer()), source);
-});
-
-test("Steam artwork transfer stops on changed revision and invalid cursors", async () => {
-  const api = {
-    async post(_path, request) {
-      return {
-        ok: true,
-        app_id: 730,
-        revision: request.offset ? "43" : "42",
-        offset: request.offset,
-        next_offset: request.offset ? null : 8192,
-        total_bytes: 8193,
-        mime_type: "image/png",
-        data: Buffer.alloc(request.offset ? 1 : 8192).toString("base64"),
-      };
-    },
-  };
-  await assert.rejects(readSteamArtwork(api, reference), /changed during transfer/);
-  await assert.rejects(readSteamArtwork(api, { ...reference, revision: "../art" }), /Invalid Steam artwork reference/);
-  const invalidCursor = {
-    post: async () => ({
-      ok: true, app_id: 730, revision: "42", offset: 0,
-      next_offset: 1, total_bytes: 8193, mime_type: "image/png",
-      data: Buffer.alloc(8192).toString("base64"),
-    }),
-  };
-  await assert.rejects(readSteamArtwork(invalidCursor, reference), /Invalid Steam artwork cursor/);
-});
-
-test("Steam artwork accepts a 16 MiB transfer declaration but rejects larger images", async () => {
-  let calls = 0;
-  const api = {
-    async post(_path, request) {
-      calls++;
-      return {
-        ok: true, app_id: 730, revision: request.offset ? "43" : "42",
-        offset: request.offset, next_offset: 8192,
-        total_bytes: 16 * 1024 * 1024,
-        mime_type: "image/jpeg",
-        data: Buffer.alloc(8192).toString("base64"),
-      };
-    },
-  };
-  await assert.rejects(readSteamArtwork(api, reference), /changed during transfer/);
-  assert.equal(calls, 2);
-  calls = 0;
-  const oversized = { post: async (path, request) => ({
-    ...await api.post(path, request), total_bytes: 16 * 1024 * 1024 + 1,
-  }) };
-  await assert.rejects(readSteamArtwork(oversized, reference), /changed during transfer/);
-  assert.equal(calls, 1);
-});
-
-test("Lutris artwork reads signed 8 KiB chunks for the catalog digest", async () => {
-  const source = Buffer.alloc(8197, 0x51);
-  const offsets = [];
-  const api = { async post(route, request) {
-    assert.equal(route, "lutris/artwork_read");
-    assert.equal(request.game_id, lutrisReference.game_id);
-    assert.equal(request.revision, lutrisReference.revision);
-    offsets.push(request.offset);
-    const end = Math.min(request.offset + 8192, source.length);
-    return {
-      ok: true, game_id: request.game_id, revision: request.revision,
-      offset: request.offset, next_offset: end === source.length ? null : end,
-      total_bytes: source.length, mime_type: "image/webp",
-      data: source.subarray(request.offset, end).toString("base64"),
-    };
-  } };
-  const image = await readLutrisArtwork(api, lutrisReference);
-  assert.deepEqual(offsets, [0, 8192]);
-  assert.equal(image.type, "image/webp");
-  assert.deepEqual(Buffer.from(await image.arrayBuffer()), source);
-});
-
-test("provider artwork stops requesting chunks when the view is removed", async () => {
-  for (const [read, ref, idField, id] of [
-    [readSteamArtwork, reference, "app_id", 730],
-    [readLutrisArtwork, lutrisReference, "game_id", 42],
-  ]) {
-    let active = true;
+test("providers fetch one binary image with pinned identity and cancellation", async () => {
+  for (const [read, ref, route, key] of [[readSteamArtwork, reference, "steam/artwork", "app_id"], [readLutrisArtwork, lutrisReference, "lutris/artwork", "game_id"]]) {
     let calls = 0;
-    const api = { async post(_route, request) {
+    const bytes = Buffer.alloc(1024 * 1024 + 31, 0x51);
+    const api = { async post(path, payload, protectedRoute, signal) {
       calls++;
-      active = false;
-      return {ok:true, [idField]:id, revision:ref.revision, offset:request.offset,
-        next_offset:8192, total_bytes:8193, mime_type:"image/png", data:Buffer.alloc(8192).toString("base64")};
+      assert.equal(path, route);
+      assert.equal(payload[key], ref[key]);
+      assert.equal(payload.revision, ref.revision);
+      assert.equal(Object.hasOwn(payload, "offset"), false);
+      assert.equal(protectedRoute, true);
+      assert.equal(signal.aborted, false);
+      return new Blob([bytes], { type: "image/png" });
     } };
-    await assert.rejects(read(api, ref, () => active), /transfer cancelled/i);
+    const image = await read(api, ref);
+    assert.deepEqual(Buffer.from(await image.arrayBuffer()), bytes);
+    assert.equal(calls, 1);
+    await assert.rejects(read(api, ref, () => false), /cancelled/);
     assert.equal(calls, 1);
   }
 });
-
-test("Lutris artwork rejects malformed references, changed digests, cursors and size", async () => {
-  const valid = {
-    ok: true, game_id: 42, revision: lutrisReference.revision,
-    offset: 0, next_offset: null, total_bytes: 1,
-    mime_type: "image/png", data: Buffer.from([0x51]).toString("base64"),
-  };
-  for (const invalid of [
-    { ...lutrisReference, game_id: 0 },
-    { ...lutrisReference, game_id: Number.MAX_SAFE_INTEGER + 1 },
-    { ...lutrisReference, revision: "A".repeat(64) },
-    { ...lutrisReference, revision: "a".repeat(63) },
-  ]) {
-    await assert.rejects(readLutrisArtwork({ post: () => { throw new Error("request sent"); } }, invalid), /Invalid Lutris artwork reference/);
-  }
-  for (const reply of [
-    { ...valid, ok: false, code: "artwork_changed" },
-    { ...valid, game_id: 43 },
-    { ...valid, revision: "b".repeat(64) },
-    { ...valid, offset: 8192 },
-    { ...valid, total_bytes: 16 * 1024 * 1024 + 1 },
-    { ...valid, mime_type: "text/html" },
-    { ...valid, data: "!!!" },
-    { ...valid, data: Buffer.alloc(8193).toString("base64"), total_bytes: 8193 },
-    { ...valid, next_offset: 1, total_bytes: 2 },
-    { ...valid, next_offset: null, total_bytes: 2 },
-  ]) {
-    await assert.rejects(readLutrisArtwork({ post: async () => reply }, lutrisReference));
-  }
-  const changedSecondChunk = { async post(_route, request) {
-    return request.offset === 0
-      ? { ...valid, total_bytes: 8193, next_offset: 8192, data: Buffer.alloc(8192).toString("base64") }
-      : { ...valid, offset: 8192, total_bytes: 8193, revision: "b".repeat(64) };
+test("provider references reject malformed IDs before requesting bytes", async () => {
+  const api = { post() { throw new Error("unexpected request"); } };
+  await assert.rejects(readSteamArtwork(api, { ...reference, revision: "../art" }), /Invalid Steam/);
+  await assert.rejects(readLutrisArtwork(api, { ...lutrisReference, game_id: 0 }), /Invalid Lutris/);
+  await assert.rejects(readLutrisArtwork(api, { ...lutrisReference, revision: "x" }), /Invalid Lutris/);
+});
+test("removing a view aborts an in-flight binary response", async () => {
+  let active = true;
+  const api = { post(_route, _payload, _protected, signal) {
+    active = false;
+    return new Promise((_, reject) => signal.addEventListener("abort", () => reject(new Error("cancelled")), { once: true }));
   } };
-  await assert.rejects(readLutrisArtwork(changedSecondChunk, lutrisReference), /changed during transfer/);
+  await assert.rejects(readSteamArtwork(api, reference, () => active), /cancelled/);
 });
 
 test("Lutris card refresh ignores stale A and revokes B on load or removal", async () => {
@@ -462,7 +343,7 @@ test("Lutris card refresh ignores stale A and revokes B on load or removal", asy
   const revoked = [];
   const observers = [];
   const artworkContext = vm.createContext({
-    atob, Blob, Error, queueMicrotask,
+    atob, Blob, Error, AbortController, queueMicrotask, window: { setInterval, clearInterval },
     URL: {
       createObjectURL(blob) { created.push(blob); return `blob:${created.length}`; },
       revokeObjectURL(url) { revoked.push(url); },
@@ -487,7 +368,7 @@ test("Lutris card refresh ignores stale A and revokes B on load or removal", asy
   const api = {
     allows: (scope) => scope === "lutris.read",
     post(route, request) {
-      assert.equal(route, "lutris/artwork_read");
+      assert.equal(route, "lutris/artwork");
       return new Promise((resolve) => pending.set(request.revision, resolve));
     },
   };
@@ -499,10 +380,7 @@ test("Lutris card refresh ignores stale A and revokes B on load or removal", asy
   oldArt.isConnected = false;
   show(api, b, newArt, content);
   await new Promise(setImmediate);
-  pending.get(b.revision)({
-    ok: true, game_id: 42, revision: b.revision, offset: 0,
-    next_offset: null, total_bytes: 1, mime_type: "image/png", data: "UQ==",
-  });
+  pending.get(b.revision)(new Blob(["Q"], { type: "image/png" }));
   await new Promise(setImmediate);
   assert.equal(oldArt.children.length, 0);
   assert.equal(newArt.children.length, 1);
@@ -513,10 +391,7 @@ test("Lutris card refresh ignores stale A and revokes B on load or removal", asy
   const removedArt = new Element();
   show(api, b, removedArt, content);
   await new Promise(setImmediate);
-  pending.get(b.revision)({
-    ok: true, game_id: 42, revision: b.revision, offset: 0,
-    next_offset: null, total_bytes: 1, mime_type: "image/png", data: "UQ==",
-  });
+  pending.get(b.revision)(new Blob(["Q"], { type: "image/png" }));
   await new Promise(setImmediate);
   removedArt.isConnected = false;
   for (const observer of observers) observer.notify();
@@ -531,12 +406,8 @@ test("Lutris card refresh ignores stale A and revokes B on load or removal", asy
   show({
     allows: (scope) => scope === "steam.read",
     async post(route, request) {
-      assert.equal(route, "steam/artwork_read");
-      return {
-        ok: true, app_id: request.app_id, revision: request.revision,
-        offset: 0, next_offset: null, total_bytes: 1,
-        mime_type: "image/png", data: "UQ==",
-      };
+      assert.equal(route, "steam/artwork");
+      return new Blob(["Q"], { type: "image/png" });
     },
   }, reference, steamArt, content);
   await new Promise(setImmediate);
@@ -546,37 +417,15 @@ test("Lutris card refresh ignores stale A and revokes B on load or removal", asy
   assert.deepEqual(revoked, ["blob:1", "blob:2", "blob:3"]);
 });
 
-test("catalog artwork uses an opaque catalog identity and releases its transfer", async () => {
+test("catalog artwork uses only the catalog identity and expected revision", async () => {
   const calls = [];
-  const token = "c".repeat(32);
   const api = { async post(route, request) {
     calls.push({ route, request: { ...request } });
-    if (route === "library/artwork_release") return { ok: true };
-    return { ok: true, revision: "vendor revision", offset: 0, next_offset: null,
-      total_bytes: 3, mime_type: "image/png", data: "YWJj" };
+    return new Blob(["abc"], { type: "image/png" });
   } };
-  const image = await context.Amaterasu.readCatalogArtwork(api, "app-0000000000000001", "vendor revision", () => true, token);
+  const image = await context.Amaterasu.readCatalogArtwork(api, "app-0000000000000001", "vendor revision");
   assert.equal(await image.text(), "abc");
-  assert.deepEqual(calls, [
-    { route: "library/artwork_read", request: { id: "app-0000000000000001", revision: "vendor revision", offset: 0, transfer_id: token } },
-    { route: "library/artwork_release", request: { id: "app-0000000000000001", transfer_id: token } },
-  ]);
-});
-
-test("catalog artwork rejects changed revisions and releases on cancellation", async () => {
-  const id = "app-0000000000000001";
-  const token = "d".repeat(32);
-  const calls = [];
-  const api = { async post(route) {
-    calls.push(route);
-    return { ok: true, revision: "different", offset: 0, next_offset: null,
-      total_bytes: 3, mime_type: "image/png", data: "YWJj" };
-  } };
-  await assert.rejects(context.Amaterasu.readCatalogArtwork(api, id, "expected", () => true, token), /changed during transfer/);
-  assert.equal(calls.at(-1), "library/artwork_release");
-  calls.length = 0;
-  await assert.rejects(context.Amaterasu.readCatalogArtwork(api, id, "expected", () => false, token), /cancelled/);
-  assert.deepEqual(calls, ["library/artwork_release"]);
+  assert.deepEqual(calls, [{ route: "library/artwork", request: { id: "app-0000000000000001", revision: "vendor revision" } }]);
 });
 
 test("catalog covers wait for attachment, bound concurrent transfers, and skip removed cards", async () => {
@@ -590,7 +439,7 @@ test("catalog covers wait for attachment, bound concurrent transfers, and skip r
   const revoked = [];
   let nextUrl = 0;
   const artworkContext = vm.createContext({
-    atob, Blob, Error, queueMicrotask,
+    atob, Blob, Error, queueMicrotask, AbortController, window: { setInterval, clearInterval },
     crypto: { getRandomValues(bytes) { bytes.fill(++nextUrl); return bytes; } },
     URL: { createObjectURL: () => `blob:${nextUrl}`, revokeObjectURL: (url) => revoked.push(url) },
     document: { createElement: () => new Element() },
@@ -601,17 +450,12 @@ test("catalog covers wait for attachment, bound concurrent transfers, and skip r
   vm.runInContext(ts.transpile(readFileSync("src/catalog.ts", "utf8"), { target: ts.ScriptTarget.ES2022 }), artworkContext);
   const pending = [];
   let reads = 0;
-  let releases = 0;
   const api = {
     allows: (scope) => scope === "catalog.read",
     post(route, request) {
-      if (route === "library/artwork_release") { releases++; return Promise.resolve({ ok: true }); }
-      assert.equal(route, "library/artwork_read");
+      assert.equal(route, "library/artwork");
       reads++;
-      return new Promise((resolve) => pending.push(() => resolve({
-        ok: true, revision: request.revision, offset: 0, next_offset: null,
-        total_bytes: 1, mime_type: "image/png", data: "UQ==",
-      })));
+      return new Promise((resolve) => pending.push(() => resolve(new Blob(["Q"], { type: "image/png" }))));
     },
   };
   const content = new Element(true);
@@ -635,7 +479,6 @@ test("catalog covers wait for attachment, bound concurrent transfers, and skip r
   while (pending.length) pending.shift()();
   await new Promise(setImmediate);
   assert.equal(reads, 6);
-  assert.equal(releases, 6);
   for (const art of arts) art.children[0]?.fire("load");
   assert.equal(revoked.length, 6);
 });

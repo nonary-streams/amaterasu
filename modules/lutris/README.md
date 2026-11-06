@@ -142,9 +142,8 @@ The provider can discover local cover art by safe game slug in Lutris `coverart`
 icons from 256 through 48 pixels. Only regular images within the discovered
 user's data tree, up to 16 MiB, are accepted. The signed management principal
 can call `artwork_get` with a numeric `game_id` to obtain an opaque revision,
-MIME type, and byte count, then `artwork_read` with that ID, revision, and an
-8 KiB aligned offset for base64 chunks. The startup setting `library_principal` selects the trusted principal allowed to
-call `artwork_read` only, defaulting to `amaterasu.library`. It must contain
+MIME type, and byte count. `artwork_open` with that ID and revision returns a binary-transfer offer. The startup setting `library_principal` selects the trusted principal allowed to
+call `artwork_open`, defaulting to `amaterasu.library`. It must contain
 1–128 ASCII letters, digits, dots, underscores, or hyphens; `amaterasu.nvhttp`,
 `amaterasu.management`, `amaterasu.launch`, and `amaterasu.catalog` are reserved.
 Changed images reject stale revisions;

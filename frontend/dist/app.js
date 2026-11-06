@@ -1795,7 +1795,10 @@ var Amaterasu;
             const controller = new AbortController();
             const abortRequest = () => controller.abort();
             signal?.addEventListener("abort", abortRequest, { once: true });
-            const timer = window.setTimeout(() => controller.abort(), 12_000);
+            if (signal?.aborted)
+                controller.abort();
+            const artworkRoute = ["library/artwork", "steam/artwork", "lutris/artwork"].includes(route);
+            const timer = window.setTimeout(() => controller.abort(), artworkRoute ? 30_000 : 12_000);
             this.requests.add(controller);
             if (route === "auth/refresh" || route === "auth/browser/refresh")
                 this.refreshRequests.add(controller);
@@ -1816,6 +1819,33 @@ var Amaterasu;
                     cache: "no-store",
                     referrerPolicy: "no-referrer",
                 });
+                if (response.ok && artworkRoute) {
+                    const mime = response.headers.get("Content-Type")?.split(";")[0]?.trim();
+                    const length = Number(response.headers.get("Content-Length"));
+                    if (!mime || !["image/png", "image/jpeg", "image/webp"].includes(mime) ||
+                        !Number.isSafeInteger(length) || length < 1 || length > 16 * 1024 * 1024 || !response.body)
+                        throw new Error("Invalid artwork response.");
+                    const reader = response.body.getReader();
+                    const chunks = [];
+                    let received = 0;
+                    try {
+                        while (true) {
+                            const { value, done } = await reader.read();
+                            if (done)
+                                break;
+                            received += value.byteLength;
+                            if (received > length)
+                                throw new Error("Artwork exceeds its declared size.");
+                            chunks.push(new Uint8Array(value));
+                        }
+                        if (received !== length)
+                            throw new Error("Incomplete artwork response.");
+                        return new Blob(chunks, { type: mime });
+                    }
+                    finally {
+                        await reader.cancel().catch(() => { });
+                    }
+                }
                 const body = (await response.json());
                 if (!response.ok || body.ok !== true)
                     throw this.failure(body, response.status);
@@ -7129,159 +7159,38 @@ var Amaterasu;
         };
     }
     Amaterasu.parseCatalogApplicationDisplaySettings = parseCatalogApplicationDisplaySettings;
-    async function readSteamArtwork(api, reference, active = () => true) {
-        if (reference.provider !== "steam" ||
-            !Number.isSafeInteger(reference.app_id) ||
-            reference.app_id < 1 ||
-            reference.app_id > 0xffff_ffff ||
-            !/^[0-9]{1,20}$/.test(reference.revision))
-            throw new Error("Invalid Steam artwork reference.");
-        let offset = 0;
-        let totalBytes = null;
-        let mimeType = null;
-        const chunks = [];
-        while (true) {
-            const reply = await api.post("steam/artwork_read", {
-                app_id: reference.app_id,
-                revision: reference.revision,
-                offset,
-            });
+    async function fetchArtwork(api, route, payload, active) {
+        const controller = new AbortController();
+        if (!active())
+            throw new Error("Artwork transfer cancelled.");
+        const timer = window.setInterval(() => { if (!active())
+            controller.abort(); }, 100);
+        try {
+            const image = await api.post(route, payload, true, controller.signal);
             if (!active())
                 throw new Error("Artwork transfer cancelled.");
-            if (reply.ok !== true ||
-                reply.app_id !== reference.app_id ||
-                reply.revision !== reference.revision ||
-                reply.offset !== offset ||
-                !Number.isSafeInteger(reply.total_bytes) ||
-                reply.total_bytes < 1 ||
-                reply.total_bytes > 16 * 1024 * 1024 ||
-                !["image/png", "image/jpeg", "image/webp"].includes(reply.mime_type) ||
-                typeof reply.data !== "string" ||
-                reply.data.length > 10924 ||
-                (totalBytes !== null && totalBytes !== reply.total_bytes) ||
-                (mimeType !== null && mimeType !== reply.mime_type))
-                throw new Error("Steam artwork changed during transfer.");
-            totalBytes = reply.total_bytes;
-            mimeType = reply.mime_type;
-            const decoded = atob(reply.data);
-            if (decoded.length < 1 || decoded.length > 8192 || offset + decoded.length > totalBytes)
-                throw new Error("Invalid Steam artwork chunk.");
-            const bytes = new Uint8Array(decoded.length);
-            for (let index = 0; index < decoded.length; index++)
-                bytes[index] = decoded.charCodeAt(index);
-            chunks.push(bytes.buffer);
-            const end = offset + decoded.length;
-            if (reply.next_offset === null) {
-                if (end !== totalBytes)
-                    throw new Error("Incomplete Steam artwork transfer.");
-                return new Blob(chunks, { type: mimeType });
-            }
-            if (reply.next_offset !== end || end >= totalBytes || end % 8192 !== 0)
-                throw new Error("Invalid Steam artwork cursor.");
-            offset = end;
+            return image;
         }
+        finally {
+            window.clearInterval(timer);
+        }
+    }
+    async function readSteamArtwork(api, reference, active = () => true) {
+        if (!Number.isSafeInteger(reference.app_id) || reference.app_id < 1 || reference.app_id > 0xffff_ffff || !/^[0-9]{1,20}$/.test(reference.revision))
+            throw new Error("Invalid Steam artwork reference.");
+        return fetchArtwork(api, "steam/artwork", { app_id: reference.app_id, revision: reference.revision }, active);
     }
     Amaterasu.readSteamArtwork = readSteamArtwork;
     async function readLutrisArtwork(api, reference, active = () => true) {
-        if (reference.provider !== "lutris" ||
-            !Number.isSafeInteger(reference.game_id) ||
-            reference.game_id < 1 ||
-            !/^[0-9a-f]{64}$/.test(reference.revision))
+        if (!Number.isSafeInteger(reference.game_id) || reference.game_id < 1 || !/^[0-9a-f]{64}$/.test(reference.revision))
             throw new Error("Invalid Lutris artwork reference.");
-        let offset = 0;
-        let totalBytes = null;
-        let mimeType = null;
-        const chunks = [];
-        while (true) {
-            const reply = await api.post("lutris/artwork_read", {
-                game_id: reference.game_id,
-                revision: reference.revision,
-                offset,
-            });
-            if (!active())
-                throw new Error("Artwork transfer cancelled.");
-            if (reply.ok !== true ||
-                reply.game_id !== reference.game_id ||
-                reply.revision !== reference.revision ||
-                reply.offset !== offset ||
-                !Number.isSafeInteger(reply.total_bytes) ||
-                reply.total_bytes < 1 ||
-                reply.total_bytes > 16 * 1024 * 1024 ||
-                !["image/png", "image/jpeg", "image/webp"].includes(reply.mime_type) ||
-                typeof reply.data !== "string" ||
-                reply.data.length > 10924 ||
-                (totalBytes !== null && totalBytes !== reply.total_bytes) ||
-                (mimeType !== null && mimeType !== reply.mime_type))
-                throw new Error("Lutris artwork changed during transfer.");
-            totalBytes = reply.total_bytes;
-            mimeType = reply.mime_type;
-            const decoded = atob(reply.data);
-            if (decoded.length < 1 || decoded.length > 8192 || offset + decoded.length > totalBytes)
-                throw new Error("Invalid Lutris artwork chunk.");
-            const bytes = new Uint8Array(decoded.length);
-            for (let index = 0; index < decoded.length; index++)
-                bytes[index] = decoded.charCodeAt(index);
-            chunks.push(bytes.buffer);
-            const end = offset + decoded.length;
-            if (reply.next_offset === null) {
-                if (end !== totalBytes)
-                    throw new Error("Incomplete Lutris artwork transfer.");
-                return new Blob(chunks, { type: mimeType });
-            }
-            if (reply.next_offset !== end || end >= totalBytes || end % 8192 !== 0)
-                throw new Error("Invalid Lutris artwork cursor.");
-            offset = end;
-        }
+        return fetchArtwork(api, "lutris/artwork", { game_id: reference.game_id, revision: reference.revision }, active);
     }
     Amaterasu.readLutrisArtwork = readLutrisArtwork;
-    async function readCatalogArtwork(api, id, revision, active = () => true, transferId = Array.from(crypto.getRandomValues(new Uint8Array(16)), (byte) => byte.toString(16).padStart(2, "0")).join("")) {
-        if (!/^app-[0-9a-f]{16}$/.test(id) || typeof revision !== "string" || !revision ||
-            revision.length > 128 || /[\u0000-\u001f\u007f-\u009f]/u.test(revision) ||
-            !/^[0-9a-f]{32}$/.test(transferId))
+    async function readCatalogArtwork(api, id, revision, active = () => true) {
+        if (!/^app-[0-9a-f]{16}$/.test(id) || !revision || revision.length > 128)
             throw new Error("Invalid catalog artwork reference.");
-        const chunks = [];
-        let offset = 0;
-        let totalBytes = null;
-        let mimeType = null;
-        try {
-            while (true) {
-                if (!active())
-                    throw new Error("Artwork transfer cancelled.");
-                const reply = await api.post("library/artwork_read", {
-                    id, revision, offset, transfer_id: transferId,
-                });
-                if (!active())
-                    throw new Error("Artwork transfer cancelled.");
-                if (reply.ok !== true || reply.revision !== revision || reply.offset !== offset ||
-                    !Number.isSafeInteger(reply.total_bytes) || reply.total_bytes < 1 || reply.total_bytes > 16 * 1024 * 1024 ||
-                    !["image/png", "image/jpeg", "image/webp"].includes(reply.mime_type) ||
-                    typeof reply.data !== "string" || reply.data.length > 10924 ||
-                    (totalBytes !== null && totalBytes !== reply.total_bytes) ||
-                    (mimeType !== null && mimeType !== reply.mime_type))
-                    throw new Error("Catalog artwork changed during transfer.");
-                totalBytes = reply.total_bytes;
-                mimeType = reply.mime_type;
-                const decoded = atob(reply.data);
-                if (!decoded.length || decoded.length > 8192 || offset + decoded.length > totalBytes)
-                    throw new Error("Invalid catalog artwork chunk.");
-                const bytes = new Uint8Array(decoded.length);
-                for (let index = 0; index < decoded.length; index++)
-                    bytes[index] = decoded.charCodeAt(index);
-                chunks.push(bytes.buffer);
-                const end = offset + decoded.length;
-                if (reply.next_offset === null) {
-                    if (end !== totalBytes)
-                        throw new Error("Incomplete catalog artwork transfer.");
-                    return new Blob(chunks, { type: mimeType });
-                }
-                if (reply.next_offset !== end || end >= totalBytes || end % 8192 !== 0)
-                    throw new Error("Invalid catalog artwork cursor.");
-                offset = end;
-            }
-        }
-        finally {
-            await api.post("library/artwork_release", { id, transfer_id: transferId }).catch(() => { });
-        }
+        return fetchArtwork(api, "library/artwork", { id, revision }, active);
     }
     Amaterasu.readCatalogArtwork = readCatalogArtwork;
     const catalogArtworkQueue = [];

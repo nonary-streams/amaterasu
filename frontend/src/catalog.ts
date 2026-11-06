@@ -108,189 +108,28 @@ namespace Amaterasu {
     };
   }
 
-  interface SteamArtworkChunk {
-    ok: boolean;
-    app_id: number;
-    revision: string;
-    offset: number;
-    next_offset: number | null;
-    total_bytes: number;
-    mime_type: string;
-    data: string;
-  }
-
-  interface LutrisArtworkChunk {
-    ok: boolean;
-    game_id: number;
-    revision: string;
-    offset: number;
-    next_offset: number | null;
-    total_bytes: number;
-    mime_type: string;
-    data: string;
-  }
-
-  export async function readSteamArtwork(
-    api: Pick<Api, "post">,
-    reference: Extract<NonNullable<Entry["artwork"]>, { provider: "steam" }>,
-    active: () => boolean = () => true,
-  ): Promise<Blob> {
-    if (
-      reference.provider !== "steam" ||
-      !Number.isSafeInteger(reference.app_id) ||
-      reference.app_id < 1 ||
-      reference.app_id > 0xffff_ffff ||
-      !/^[0-9]{1,20}$/.test(reference.revision)
-    ) throw new Error("Invalid Steam artwork reference.");
-    let offset = 0;
-    let totalBytes: number | null = null;
-    let mimeType: string | null = null;
-    const chunks: ArrayBuffer[] = [];
-    while (true) {
-      const reply = await api.post<SteamArtworkChunk>("steam/artwork_read", {
-        app_id: reference.app_id,
-        revision: reference.revision,
-        offset,
-      });
-      if (!active()) throw new Error("Artwork transfer cancelled.");
-      if (
-        reply.ok !== true ||
-        reply.app_id !== reference.app_id ||
-        reply.revision !== reference.revision ||
-        reply.offset !== offset ||
-        !Number.isSafeInteger(reply.total_bytes) ||
-        reply.total_bytes < 1 ||
-        reply.total_bytes > 16 * 1024 * 1024 ||
-        !["image/png", "image/jpeg", "image/webp"].includes(reply.mime_type) ||
-        typeof reply.data !== "string" ||
-        reply.data.length > 10924 ||
-        (totalBytes !== null && totalBytes !== reply.total_bytes) ||
-        (mimeType !== null && mimeType !== reply.mime_type)
-      ) throw new Error("Steam artwork changed during transfer.");
-      totalBytes = reply.total_bytes;
-      mimeType = reply.mime_type;
-      const decoded = atob(reply.data);
-      if (decoded.length < 1 || decoded.length > 8192 || offset + decoded.length > totalBytes)
-        throw new Error("Invalid Steam artwork chunk.");
-      const bytes = new Uint8Array(decoded.length);
-      for (let index = 0; index < decoded.length; index++)
-        bytes[index] = decoded.charCodeAt(index);
-      chunks.push(bytes.buffer);
-      const end = offset + decoded.length;
-      if (reply.next_offset === null) {
-        if (end !== totalBytes) throw new Error("Incomplete Steam artwork transfer.");
-        return new Blob(chunks, { type: mimeType });
-      }
-      if (reply.next_offset !== end || end >= totalBytes || end % 8192 !== 0)
-        throw new Error("Invalid Steam artwork cursor.");
-      offset = end;
-    }
-  }
-
-  export async function readLutrisArtwork(
-    api: Pick<Api, "post">,
-    reference: Extract<NonNullable<Entry["artwork"]>, { provider: "lutris" }>,
-    active: () => boolean = () => true,
-  ): Promise<Blob> {
-    if (
-      reference.provider !== "lutris" ||
-      !Number.isSafeInteger(reference.game_id) ||
-      reference.game_id < 1 ||
-      !/^[0-9a-f]{64}$/.test(reference.revision)
-    ) throw new Error("Invalid Lutris artwork reference.");
-    let offset = 0;
-    let totalBytes: number | null = null;
-    let mimeType: string | null = null;
-    const chunks: ArrayBuffer[] = [];
-    while (true) {
-      const reply = await api.post<LutrisArtworkChunk>("lutris/artwork_read", {
-        game_id: reference.game_id,
-        revision: reference.revision,
-        offset,
-      });
-      if (!active()) throw new Error("Artwork transfer cancelled.");
-      if (
-        reply.ok !== true ||
-        reply.game_id !== reference.game_id ||
-        reply.revision !== reference.revision ||
-        reply.offset !== offset ||
-        !Number.isSafeInteger(reply.total_bytes) ||
-        reply.total_bytes < 1 ||
-        reply.total_bytes > 16 * 1024 * 1024 ||
-        !["image/png", "image/jpeg", "image/webp"].includes(reply.mime_type) ||
-        typeof reply.data !== "string" ||
-        reply.data.length > 10924 ||
-        (totalBytes !== null && totalBytes !== reply.total_bytes) ||
-        (mimeType !== null && mimeType !== reply.mime_type)
-      ) throw new Error("Lutris artwork changed during transfer.");
-      totalBytes = reply.total_bytes;
-      mimeType = reply.mime_type;
-      const decoded = atob(reply.data);
-      if (decoded.length < 1 || decoded.length > 8192 || offset + decoded.length > totalBytes)
-        throw new Error("Invalid Lutris artwork chunk.");
-      const bytes = new Uint8Array(decoded.length);
-      for (let index = 0; index < decoded.length; index++)
-        bytes[index] = decoded.charCodeAt(index);
-      chunks.push(bytes.buffer);
-      const end = offset + decoded.length;
-      if (reply.next_offset === null) {
-        if (end !== totalBytes) throw new Error("Incomplete Lutris artwork transfer.");
-        return new Blob(chunks, { type: mimeType });
-      }
-      if (reply.next_offset !== end || end >= totalBytes || end % 8192 !== 0)
-        throw new Error("Invalid Lutris artwork cursor.");
-      offset = end;
-    }
-  }
-
-  /** Catalog identity selects the provider on the host; the browser never supplies a service route. */
-  export async function readCatalogArtwork(
-    api: Pick<Api, "post">,
-    id: string,
-    revision: string,
-    active: () => boolean = () => true,
-    transferId = Array.from(crypto.getRandomValues(new Uint8Array(16)), (byte) => byte.toString(16).padStart(2, "0")).join(""),
-  ): Promise<Blob> {
-    if (!/^app-[0-9a-f]{16}$/.test(id) || typeof revision !== "string" || !revision ||
-        revision.length > 128 || /[\u0000-\u001f\u007f-\u009f]/u.test(revision) ||
-        !/^[0-9a-f]{32}$/.test(transferId)) throw new Error("Invalid catalog artwork reference.");
-    const chunks: ArrayBuffer[] = [];
-    let offset = 0;
-    let totalBytes: number | null = null;
-    let mimeType: string | null = null;
+  async function fetchArtwork(api: Pick<Api, "post">, route: string, payload: Payload, active: () => boolean): Promise<Blob> {
+    const controller = new AbortController();
+    if (!active()) throw new Error("Artwork transfer cancelled.");
+    const timer = window.setInterval(() => { if (!active()) controller.abort(); }, 100);
     try {
-      while (true) {
-        if (!active()) throw new Error("Artwork transfer cancelled.");
-        const reply = await api.post<Omit<SteamArtworkChunk, "app_id">>("library/artwork_read", {
-          id, revision, offset, transfer_id: transferId,
-        });
-        if (!active()) throw new Error("Artwork transfer cancelled.");
-        if (reply.ok !== true || reply.revision !== revision || reply.offset !== offset ||
-            !Number.isSafeInteger(reply.total_bytes) || reply.total_bytes < 1 || reply.total_bytes > 16 * 1024 * 1024 ||
-            !["image/png", "image/jpeg", "image/webp"].includes(reply.mime_type) ||
-            typeof reply.data !== "string" || reply.data.length > 10924 ||
-            (totalBytes !== null && totalBytes !== reply.total_bytes) ||
-            (mimeType !== null && mimeType !== reply.mime_type)) throw new Error("Catalog artwork changed during transfer.");
-        totalBytes = reply.total_bytes;
-        mimeType = reply.mime_type;
-        const decoded = atob(reply.data);
-        if (!decoded.length || decoded.length > 8192 || offset + decoded.length > totalBytes)
-          throw new Error("Invalid catalog artwork chunk.");
-        const bytes = new Uint8Array(decoded.length);
-        for (let index = 0; index < decoded.length; index++) bytes[index] = decoded.charCodeAt(index);
-        chunks.push(bytes.buffer);
-        const end = offset + decoded.length;
-        if (reply.next_offset === null) {
-          if (end !== totalBytes) throw new Error("Incomplete catalog artwork transfer.");
-          return new Blob(chunks, { type: mimeType });
-        }
-        if (reply.next_offset !== end || end >= totalBytes || end % 8192 !== 0)
-          throw new Error("Invalid catalog artwork cursor.");
-        offset = end;
-      }
-    } finally {
-      await api.post("library/artwork_release", { id, transfer_id: transferId }).catch(() => {});
-    }
+      const image = await api.post<Blob>(route, payload, true, controller.signal);
+      if (!active()) throw new Error("Artwork transfer cancelled.");
+      return image;
+    } finally { window.clearInterval(timer); }
+  }
+  export async function readSteamArtwork(api: Pick<Api, "post">, reference: Extract<NonNullable<Entry["artwork"]>, { provider: "steam" }>, active: () => boolean = () => true): Promise<Blob> {
+    if (!Number.isSafeInteger(reference.app_id) || reference.app_id < 1 || reference.app_id > 0xffff_ffff || !/^[0-9]{1,20}$/.test(reference.revision)) throw new Error("Invalid Steam artwork reference.");
+    return fetchArtwork(api, "steam/artwork", { app_id: reference.app_id, revision: reference.revision }, active);
+  }
+  export async function readLutrisArtwork(api: Pick<Api, "post">, reference: Extract<NonNullable<Entry["artwork"]>, { provider: "lutris" }>, active: () => boolean = () => true): Promise<Blob> {
+    if (!Number.isSafeInteger(reference.game_id) || reference.game_id < 1 || !/^[0-9a-f]{64}$/.test(reference.revision)) throw new Error("Invalid Lutris artwork reference.");
+    return fetchArtwork(api, "lutris/artwork", { game_id: reference.game_id, revision: reference.revision }, active);
+  }
+  /** Only catalog identity crosses HTTP; provider routing stays on the host. */
+  export async function readCatalogArtwork(api: Pick<Api, "post">, id: string, revision: string, active: () => boolean = () => true): Promise<Blob> {
+    if (!/^app-[0-9a-f]{16}$/.test(id) || !revision || revision.length > 128) throw new Error("Invalid catalog artwork reference.");
+    return fetchArtwork(api, "library/artwork", { id, revision }, active);
   }
 
   // Cards are assembled before insertion. Defer reads until rendering finishes,

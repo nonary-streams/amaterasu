@@ -174,6 +174,21 @@ impl ArtworkStore {
         }
     }
 
+    pub fn open(
+        &self,
+        game_id: i64,
+        revision: &str,
+    ) -> Result<(String, String, Vec<u8>), &'static str> {
+        if !valid_revision(revision) {
+            return Err("invalid_request");
+        }
+        let source = self.resolve(game_id)?;
+        if source.revision != revision {
+            return Err("artwork_changed");
+        }
+        Ok((source.revision, source.mime.into(), source.bytes.to_vec()))
+    }
+
     pub fn read(&self, game_id: i64, revision: &str, offset: u64) -> Result<Value, &'static str> {
         if !valid_revision(revision)
             || !offset.is_multiple_of(CHUNK_BYTES)

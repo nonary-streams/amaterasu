@@ -75,6 +75,8 @@ struct Provider {
     remote_artwork: artwork::RemoteArtworkWorker,
     local_artwork: artwork::LocalArtworkWorker,
     local_artwork_responses: VecDeque<(u64, Value)>,
+    binary_artwork: Option<amaterasu_module_sdk::artwork_transfer::Source>,
+    artwork_owners: BTreeMap<u64, String>,
     artwork_validation_pending: bool,
     artwork_validation_complete: bool,
     artwork_validation_results: BTreeMap<u32, artwork::ArtworkMetadata>,
@@ -124,6 +126,9 @@ impl Provider {
         self.artwork_generation = self.artwork_generation.saturating_add(1);
         self.local_artwork.set_generation(self.artwork_generation);
         if !enabled {
+            if let Some(source) = &mut self.binary_artwork {
+                source.clear();
+            }
             self.scan = None;
             self.artwork_validation_pending = false;
             self.artwork_validation_complete = false;
@@ -536,10 +541,11 @@ impl Provider {
                         json!({"ok":false,"code":"artwork_changed"})
                     } else {
                         match result {
-                            Ok(chunk) => artwork_chunk_payload(app_id, offset, chunk),
+                            Ok(chunk) => self.artwork_payload(request_id, app_id, offset, chunk),
                             Err(code) => json!({"ok":false,"code":code}),
                         }
                     };
+                    self.artwork_owners.remove(&request_id);
                     self.local_artwork_responses
                         .push_back((request_id, payload));
                 }
@@ -643,7 +649,12 @@ impl Provider {
                 json!({"ok":false,"code":"artwork_changed"})
             } else {
                 match completion.result {
-                    Ok(chunk) => artwork_chunk_payload(completion.app_id, completion.offset, chunk),
+                    Ok(chunk) => self.artwork_payload(
+                        completion.request_id,
+                        completion.app_id,
+                        completion.offset,
+                        chunk,
+                    ),
                     Err(code) => json!({"ok":false,"code":code}),
                 }
             };
@@ -658,6 +669,7 @@ impl Provider {
                 self.revision += 1;
                 payload = json!({"ok":false,"code":"artwork_changed"});
             }
+            self.artwork_owners.remove(&completion.request_id);
             responses.push((completion.request_id, payload));
         }
         responses
@@ -705,17 +717,42 @@ impl Provider {
     }
 }
 
-fn artwork_chunk_payload(app_id: u32, offset: u64, chunk: artwork::ArtworkChunk) -> Value {
-    json!({
-        "ok":true,
-        "app_id":app_id,
-        "revision":chunk.revision,
-        "offset":offset,
-        "next_offset":chunk.next_offset,
-        "total_bytes":chunk.total_bytes,
-        "mime_type":chunk.mime_type,
-        "data":chunk.data
-    })
+impl Provider {
+    fn artwork_payload(
+        &mut self,
+        request: u64,
+        app_id: u32,
+        offset: u64,
+        chunk: artwork::ArtworkChunk,
+    ) -> Value {
+        if let Some(owner) = self.artwork_owners.remove(&request) {
+            if offset != 0
+                || chunk.next_offset.is_some()
+                || chunk.total_bytes != chunk.data.len() as u64
+            {
+                return json!({"ok":false,"code":"invalid_artwork_response"});
+            }
+            let result = self
+                .binary_artwork
+                .as_mut()
+                .expect("registered artwork source")
+                .publish(&owner, chunk.revision, chunk.mime_type.into(), chunk.data);
+            return match result {
+                Ok(offer) => json!({"ok":true,"offer":offer}),
+                Err(code) => json!({"ok":false,"code":code}),
+            };
+        }
+        #[cfg(test)]
+        {
+            use base64::Engine;
+            json!({"ok":true,"app_id":app_id,"revision":chunk.revision,"offset":offset,"next_offset":chunk.next_offset,"total_bytes":chunk.total_bytes,"mime_type":chunk.mime_type,"data":base64::engine::general_purpose::STANDARD.encode(chunk.data)})
+        }
+        #[cfg(not(test))]
+        {
+            let _ = (app_id, offset, chunk);
+            json!({"ok":false,"code":"invalid_request"})
+        }
+    }
 }
 
 enum ActionResult {
@@ -794,10 +831,16 @@ impl ManagedModule for SteamModule {
         runtime.require_success(Command::Register {
             service: SERVICE.into(),
         })?;
+        let binary_artwork = amaterasu_module_sdk::artwork_transfer::Source::new()?;
+        // SAFETY: module owns the factory; startup dependencies retain it for consumers.
+        unsafe {
+            binary_artwork.register(&runtime, SERVICE)?;
+        }
         Ok(Self {
             runtime,
             provider: {
                 let mut provider = Provider::new(settings.roots);
+                provider.binary_artwork = Some(binary_artwork);
                 provider.remote_artwork.set_network(network);
                 provider
                     .remote_artwork
@@ -812,6 +855,7 @@ impl ManagedModule for SteamModule {
     }
 
     fn tick(&mut self) -> ModuleResult<()> {
+        self.provider.binary_artwork.as_mut().unwrap().reap();
         self.provider.tick();
         for (request, payload) in self.provider.drain_local_artwork() {
             self.complete(
@@ -860,6 +904,43 @@ impl SteamModule {
         payload: Value,
         remaining_ms: u64,
     ) -> ModuleResult<()> {
+        if payload.get("action").and_then(Value::as_str) == Some("artwork_open") {
+            if caller != self.library_principal && !is_management_caller(caller) {
+                return self.complete(id, json!({"ok":false,"code":"forbidden"}));
+            }
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Open {
+                action: String,
+                app_id: u32,
+                revision: String,
+            }
+            let Ok(open) = serde_json::from_value::<Open>(payload) else {
+                return self.complete(id, json!({"ok":false,"code":"invalid_request"}));
+            };
+            let _ = open.action;
+            self.provider.artwork_owners.insert(id, caller.to_owned());
+            return match self.provider.read_artwork(
+                id,
+                open.app_id,
+                &open.revision,
+                0,
+                remaining_ms,
+            ) {
+                Ok(None) => Ok(()),
+                _ => {
+                    self.provider.artwork_owners.remove(&id);
+                    self.complete(id, json!({"ok":false,"code":"artwork_unavailable"}))
+                }
+            };
+        }
+        if payload
+            .get("action")
+            .and_then(Value::as_str)
+            .is_some_and(|action| matches!(action, "artwork_read" | "artwork_release"))
+        {
+            return self.complete(id, json!({"ok":false,"code":"invalid_request"}));
+        }
         let action = match serde_json::from_value::<Action>(payload) {
             Ok(action) => action,
             Err(_) => return self.complete(id, json!({"ok":false,"code":"invalid_request"})),

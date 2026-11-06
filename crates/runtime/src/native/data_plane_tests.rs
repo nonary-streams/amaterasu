@@ -387,3 +387,68 @@ fn independently_built_binary_provider_transfers_large_assets_and_retained_frame
     unsafe { (api.destroy)(module) };
     drop(library);
 }
+
+#[test]
+fn artwork_records_enforce_owner_size_and_binding_retirement() {
+    use amaterasu_module_sdk::artwork_transfer::{self, MAX_BYTES, Source};
+    let runtime = Runtime::new();
+    let provider = runtime.client("provider");
+    let consumer = runtime.client("consumer");
+    let outsider = runtime.client("outsider");
+    let mut source = Source::with_chunk_bytes(64 * 1024).unwrap();
+    // SAFETY: runtime and source outlive every synchronous consumer call.
+    unsafe {
+        source.register(&provider, SERVICE).unwrap();
+    }
+    assert!(
+        source
+            .publish("consumer", "r1".into(), "text/html".into(), vec![1])
+            .is_err()
+    );
+    assert!(
+        source
+            .publish(
+                "consumer",
+                "r1".into(),
+                "image/png".into(),
+                vec![1; MAX_BYTES + 1]
+            )
+            .is_err()
+    );
+    for length in [1, 256 * 1024 + 3, MAX_BYTES] {
+        let bytes = vec![0x5a; length];
+        let offer = source
+            .publish("consumer", "r1".into(), "image/png".into(), bytes.clone())
+            .unwrap();
+        assert!(serde_json::to_vec(&offer).unwrap().len() < 1024);
+        assert!(unsafe { artwork_transfer::receive(&outsider, SERVICE, offer.clone()) }.is_err());
+        let image =
+            unsafe { artwork_transfer::receive(&consumer, SERVICE, offer.clone()) }.unwrap();
+        assert_eq!(image.bytes, bytes);
+        assert!(unsafe { artwork_transfer::receive(&consumer, SERVICE, offer) }.is_err());
+    }
+    let mut offers = Vec::new();
+    for _ in 0..4 {
+        offers.push(
+            source
+                .publish("consumer", "r1".into(), "image/png".into(), vec![1])
+                .unwrap(),
+        );
+    }
+    assert!(
+        source
+            .publish("consumer", "r1".into(), "image/png".into(), vec![1])
+            .is_err()
+    );
+    let offer = offers.pop().unwrap();
+    let client =
+        unsafe { TransferClient::bind(&consumer, SERVICE, offer.channel, offer.description) }
+            .unwrap();
+    assert_eq!(client.cancel(), STATUS_OK);
+    drop(client);
+    assert!(
+        source
+            .publish("consumer", "r1".into(), "image/png".into(), vec![1])
+            .is_ok()
+    );
+}

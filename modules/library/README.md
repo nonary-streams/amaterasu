@@ -27,26 +27,9 @@ Discovery does not import catalog entries or integrate provider launch.
 
 ## Exported artwork
 
-The built-in client artwork broker serves artwork only for an exported catalog
-entry. A caller sends `artwork_read` with its canonical catalog `id`, a unique
-32-character lowercase hexadecimal `transfer_id`, and an `offset` aligned to
-8 KiB. The first request uses offset zero and may omit `revision`; the response
-supplies the revision to include on subsequent requests. Successful responses
-contain base64 `data`, `mime_type`, `total_bytes`, `offset`, and `next_offset`
-(`null` for the final chunk). An image is limited to 16 MiB; accepted MIME types
-are PNG, JPEG, and WebP. The caller must retain the same transfer ID, revision,
-and catalog ID for the whole image, and verify contiguous chunks and consistent
-size and MIME type.
-
-After the final chunk or cancellation, the caller sends `artwork_release` with
-the same catalog `id` and `transfer_id`. The broker binds each transfer to its
-initiator and exported reference, resolves that reference again on each read,
-and fences release against in-flight work. A failed or unknown release is not
-proof of cleanup; Playnite cleanup can continue asynchronously after the caller
-goes away. Transfers and cleanup state are in memory, and provider idle expiry
-is a fallback after a module restart, not a durable cleanup acknowledgment.
-
-The catalog-backed broker currently supports Steam, Lutris, and Playnite
-artwork. The SDK discovery artwork reference is a separate optional provider
-capability: advertising one does not import it into the catalog or make it
-available through this broker. Neither interface exposes provider file paths.
+`artwork_open {id, revision?}` resolves an exported catalog reference and returns
+an owner-bound binary-transfer offer. Providers and both NVHTTP/browser consumers
+use the shared SDK. The old JSON/base64 chunk and explicit release protocol has
+been replaced; binding release and expiring unclaimed offers bound retention.
+See [the artwork contract](../../docs/artwork-transfer.md) for limits, grants,
+provider substitution, cleanup and HTTP behavior.

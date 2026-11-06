@@ -72,9 +72,9 @@ composition.
 
 ## Remaining work
 
-The shared binary-transfer SDK is available, but artwork still uses its legacy
-8 KiB JSON/base64 wire contract. Moving those consumers onto binary streams and
-revision-aware caches remains a separate performance migration.
+Artwork providers and NVHTTP/management consumers use the shared binary-transfer
+SDK. See [artwork transfer](artwork-transfer.md) for the revision-pinned record,
+provider grants, cleanup bounds, and remaining external Playnite protocol boundary.
 
 The legacy encoded packet path accepts H.264/HEVC/AV1 and has a 16 MiB packet
 limit. Generic format identifiers exist elsewhere, but full nonstandard-codec

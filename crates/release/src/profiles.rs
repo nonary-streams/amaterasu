@@ -215,8 +215,12 @@ const LIBRARY: ComponentDefinition = ComponentDefinition {
         "amaterasu.playnite/1",
     ],
     publishes: &[],
-    native_provides: &[],
-    native_uses: &[],
+    native_provides: &["amaterasu.library/1"],
+    native_uses: &[
+        "amaterasu.steam/1",
+        "amaterasu.lutris/1",
+        "amaterasu.playnite/1",
+    ],
     dependencies: &[
         RUNTIME_ID,
         "amaterasu.catalog",
@@ -271,7 +275,7 @@ const STEAM: ComponentDefinition = ComponentDefinition {
         "amaterasu.state/1",
     ],
     publishes: &[],
-    native_provides: &[],
+    native_provides: &["amaterasu.steam/1"],
     native_uses: &["amaterasu.network/1"],
     dependencies: &[
         "amaterasu.network",
@@ -292,7 +296,7 @@ const PLAYNITE: ComponentDefinition = ComponentDefinition {
         "amaterasu.state/1",
     ],
     publishes: &[],
-    native_provides: &[],
+    native_provides: &["amaterasu.playnite/1"],
     native_uses: &[],
     dependencies: &[
         RUNTIME_ID,
@@ -313,7 +317,7 @@ const LUTRIS: ComponentDefinition = ComponentDefinition {
         "amaterasu.steam/1",
     ],
     publishes: &[],
-    native_provides: &[],
+    native_provides: &["amaterasu.lutris/1"],
     native_uses: &[],
     dependencies: &[
         RUNTIME_ID,
@@ -393,7 +397,11 @@ const NVHTTP: ComponentDefinition = ComponentDefinition {
     ],
     publishes: &[],
     native_provides: &[],
-    native_uses: &["amaterasu.network/1", "amaterasu.identity/1"],
+    native_uses: &[
+        "amaterasu.library/1",
+        "amaterasu.network/1",
+        "amaterasu.identity/1",
+    ],
     dependencies: &[
         "amaterasu.network",
         RUNTIME_ID,
@@ -800,6 +808,7 @@ const PAIRING_DESKTOP_SMOKE: ComponentDefinition = ComponentDefinition {
 };
 
 const NVHTTP_DESKTOP_SMOKE: ComponentDefinition = ComponentDefinition {
+    native_uses: &["amaterasu.network/1", "amaterasu.identity/1"],
     calls: &[
         "amaterasu.configuration/1",
         "amaterasu.input/1",
@@ -1123,7 +1132,12 @@ const MANAGEMENT: ComponentDefinition = ComponentDefinition {
     ],
     publishes: &[],
     native_provides: &[],
-    native_uses: &["amaterasu.network/1"],
+    native_uses: &[
+        "amaterasu.library/1",
+        "amaterasu.steam/1",
+        "amaterasu.lutris/1",
+        "amaterasu.network/1",
+    ],
     dependencies: &[
         "amaterasu.library",
         "amaterasu.network",
