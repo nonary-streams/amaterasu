@@ -134,6 +134,45 @@ impl NativeBackend {
 }
 
 impl Backend for NativeBackend {
+    #[cfg(amaterasu_kwin)]
+    fn preflight_output(
+        &self,
+        output: Option<&str>,
+        managed: bool,
+        mode: &amaterasu_module_sdk::capture::SourceMode,
+    ) -> CaptureResult<()> {
+        unsafe extern "C" {
+            fn am_kwin_preflight(
+                output: *const c_char,
+                managed: i32,
+                width: u32,
+                height: u32,
+                refresh: u32,
+            ) -> i32;
+        }
+        let output = output
+            .map(CString::new)
+            .transpose()
+            .map_err(|_| "invalid_named_output")?;
+        // SAFETY: optional selector is a retained NUL-terminated borrow. The
+        // adapter reads registry/output metadata only and bounds its deadline.
+        if unsafe {
+            am_kwin_preflight(
+                output
+                    .as_ref()
+                    .map_or(std::ptr::null(), |value| value.as_ptr()),
+                i32::from(managed),
+                mode.width,
+                mode.height,
+                mode.refresh_millihz,
+            )
+        } == 0
+        {
+            Ok(())
+        } else {
+            Err("compositor_source_unavailable")
+        }
+    }
     fn availability(&self) -> Availability {
         self.availability
     }

@@ -13,6 +13,9 @@ pub struct Settings {
     pub selection_timeout_seconds: u32,
     pub remember_source: bool,
     pub allow_named_outputs: bool,
+    /// Separately approved physical/existing desktop output capture. The old
+    /// named-output approval remains restricted to managed Virtual-N outputs.
+    pub allow_desktop_outputs: bool,
 }
 
 impl Default for Settings {
@@ -25,6 +28,7 @@ impl Default for Settings {
             selection_timeout_seconds: 120,
             remember_source: false,
             allow_named_outputs: false,
+            allow_desktop_outputs: false,
         }
     }
 }

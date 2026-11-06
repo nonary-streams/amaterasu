@@ -16,6 +16,7 @@ pub struct Driver {
     pub diagnostics: Mutex<SourceDiagnostics>,
     pub mailbox: Arc<Mailbox>,
     pub selections: AtomicUsize,
+    pub preflights: AtomicUsize,
     pub drops: AtomicUsize,
     pub state_reads: AtomicUsize,
     pub revoke_at_read: AtomicUsize,
@@ -53,6 +54,19 @@ pub struct FakeBackend {
 struct FakeSession(Arc<Driver>);
 
 impl Backend for FakeBackend {
+    fn preflight_output(
+        &self,
+        _output: Option<&str>,
+        _managed: bool,
+        _mode: &amaterasu_module_sdk::capture::SourceMode,
+    ) -> CaptureResult<()> {
+        self.driver.preflights.fetch_add(1, Ordering::SeqCst);
+        if self.availability.available {
+            Ok(())
+        } else {
+            Err("compositor_source_unavailable")
+        }
+    }
     fn can_restore(&self, _: &str, _: SourceType) -> bool {
         self.driver.restore_available.load(Ordering::SeqCst)
     }
@@ -102,6 +116,7 @@ pub fn setup(settings: Settings) -> (Controller<FakeBackend>, Arc<Driver>) {
         diagnostics: Mutex::new(SourceDiagnostics::default()),
         mailbox: Arc::new(Mailbox::default()),
         selections: AtomicUsize::new(0),
+        preflights: AtomicUsize::new(0),
         drops: AtomicUsize::new(0),
         state_reads: AtomicUsize::new(0),
         revoke_at_read: AtomicUsize::new(usize::MAX),
@@ -130,5 +145,6 @@ pub fn settings() -> Settings {
         selection_timeout_seconds: 5,
         remember_source: false,
         allow_named_outputs: false,
+        allow_desktop_outputs: false,
     }
 }

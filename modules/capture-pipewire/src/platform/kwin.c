@@ -211,6 +211,37 @@ static void stream_created(void *data,struct zkde_screencast_stream_unstable_v1 
 static void stream_failed(void *data,struct zkde_screencast_stream_unstable_v1 *stream,const char *error) { (void)stream;(void)error;((struct am_kwin *)data)->failed=true; }
 static void stream_serial(void *data,struct zkde_screencast_stream_unstable_v1 *stream,uint32_t high,uint32_t low) { (void)stream;((struct am_kwin *)data)->serial=((uint64_t)high<<32)|low; }
 static const struct zkde_screencast_stream_unstable_v1_listener stream_listener={.closed=stream_closed,.created=stream_created,.failed=stream_failed,.serial=stream_serial};
+int am_kwin_preflight(const char *output,int managed,uint32_t width,uint32_t height,uint32_t refresh_millihz) {
+    struct am_kwin *connection=calloc(1,sizeof(*connection));
+    if (!connection) return -1;
+    int result=-1;
+    const atomic_bool stopped=false;
+    const int64_t deadline=g_get_monotonic_time()+250000;
+    connection->selected=SIZE_MAX;
+    connection->display=wl_display_connect(NULL);
+    if (!connection->display) goto done;
+    connection->registry=wl_display_get_registry(connection->display);
+    if (!connection->registry) goto done;
+    wl_registry_add_listener(connection->registry,&registry_listener,connection);
+    if (synchronize(connection,&stopped,deadline)<0 || !connection->manager || !connection->xdg_manager) goto done;
+    for (size_t i=0;i<connection->count;i++) if (!connection->outputs[i].xdg) {
+        connection->outputs[i].xdg=zxdg_output_manager_v1_get_xdg_output(connection->xdg_manager,connection->outputs[i].object);
+        zxdg_output_v1_add_listener(connection->outputs[i].xdg,&logical_listener,&connection->outputs[i]);
+    }
+    if (synchronize(connection,&stopped,deadline)<0) goto done;
+    if (!output && managed) { result=0; goto done; }
+    size_t matches=0;
+    for (size_t i=0;i<connection->count;i++) {
+        const struct output *candidate=&connection->outputs[i];
+        if (!candidate->removed && candidate->mode_width>0 && candidate->mode_height>0 &&
+            (!output || (strcmp(candidate->name,output)==0 && candidate->mode_width==width && candidate->mode_height==height && candidate->refresh_millihz==refresh_millihz))) ++matches;
+    }
+    if ((output && matches==1) || (!output && matches>0)) result=0;
+done:
+    /* No stream_output request, PipeWire session or worker exists on this path. */
+    am_kwin_close(connection);
+    return result;
+}
 struct am_kwin *am_kwin_open(const char *output,const atomic_bool *stopped,int64_t deadline) {
     if (!output || !stopped) return NULL;
     struct am_kwin *connection=calloc(1,sizeof(*connection));
@@ -287,3 +318,4 @@ void am_kwin_close(struct am_kwin *connection) {
 }
 
 __attribute__((used)) const char amaterasu_kwin_marker[] = "AMATERASU_KWIN_CAPTURE=1";
+__attribute__((used)) const char amaterasu_kwin_desktop_marker[] = "AMATERASU_KWIN_DESKTOP_CAPTURE=1";

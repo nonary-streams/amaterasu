@@ -7,6 +7,10 @@ mod controller;
 mod model;
 mod native;
 
+use amaterasu_module_sdk::capture::{
+    SourcePreflightFactory, SourcePreflightProvider, SourcePreflightRequest,
+    SourcePreflightResponse,
+};
 use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};
 use backend::NativeBackend;
 use controller::Controller;
@@ -19,10 +23,26 @@ use std::{
 
 const SERVICE: &str = "amaterasu.capture-pipewire/1";
 
+struct PipewirePreflight(native::Shared<NativeBackend>);
+impl SourcePreflightProvider for PipewirePreflight {
+    fn query(
+        &self,
+        caller: &str,
+        request: &SourcePreflightRequest,
+    ) -> Result<SourcePreflightResponse, amaterasu_module_sdk::abi::Status> {
+        let controller = self.0.try_lock().map_err(|error| match error {
+            std::sync::TryLockError::WouldBlock => amaterasu_media::MEDIA_BUSY,
+            std::sync::TryLockError::Poisoned(_) => amaterasu_media::MEDIA_BACKEND_ERROR,
+        })?;
+        Ok(controller.preflight(caller, request))
+    }
+}
+
 struct CaptureModule {
     runtime: RuntimeClient,
     controller: native::Shared<NativeBackend>,
     _factory: Box<native::Factory<NativeBackend>>,
+    _preflight_factory: Box<SourcePreflightFactory<PipewirePreflight>>,
     epoch: Instant,
     pending_opens: Vec<PendingOpen>,
 }
@@ -46,6 +66,14 @@ impl ManagedModule for CaptureModule {
         }
         let controller = Arc::new(Mutex::new(Controller::new(backend, settings)));
         let factory = native::Factory::new(controller.clone());
+        // SAFETY: the retained inner factory binds controller metadata only;
+        // its preflight inspects registry metadata without opening a source.
+        let preflight_factory = unsafe {
+            SourcePreflightFactory::new(
+                &factory.api,
+                Arc::new(PipewirePreflight(controller.clone())),
+            )
+        };
         runtime.require_success(Command::Register {
             service: SERVICE.into(),
         })?;
@@ -55,13 +83,14 @@ impl ManagedModule for CaptureModule {
             runtime.register_native_typed(
                 SERVICE,
                 amaterasu_module_sdk::media::native_contracts::CAPTURE,
-                &factory.api,
+                &preflight_factory.api,
             )
         }?;
         Ok(Self {
             runtime,
             controller,
             _factory: factory,
+            _preflight_factory: preflight_factory,
             epoch: Instant::now(),
             pending_opens: Vec::new(),
         })

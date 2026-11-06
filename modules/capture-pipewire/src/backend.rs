@@ -44,6 +44,16 @@ pub trait Backend: Send {
     fn select_output(&self, _output: &str, _timeout: u32) -> CaptureResult<Box<dyn SourceSession>> {
         Err("named_capture_unavailable")
     }
+    /// Inspect only compositor capabilities/output inventory. Never create a
+    /// screencast stream, a portal selection, a worker, or a display.
+    fn preflight_output(
+        &self,
+        _output: Option<&str>,
+        _managed: bool,
+        _mode: &amaterasu_module_sdk::capture::SourceMode,
+    ) -> CaptureResult<()> {
+        Err("named_capture_unavailable")
+    }
     fn forget(&self, _owner: &str, _source: SourceType) {}
 }
 
