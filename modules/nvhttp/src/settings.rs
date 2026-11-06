@@ -23,6 +23,12 @@ pub struct Settings {
     pub enabled: bool,
     pub network_provider: String,
     pub audio_capture_provider: String,
+    /// Trusted startup selection of the optional, versioned client-session policy.
+    /// A selected provider must be available; requests never fall back to a
+    /// built-in implementation after policy lookup fails.
+    pub session_presentation_provider: Option<String>,
+    pub auxiliary_black_capture_provider: Option<crate::launch::CaptureProvider>,
+    pub auxiliary_exact_capture_provider: Option<crate::launch::CaptureProvider>,
     pub http_bind: SocketAddr,
     pub https_bind: SocketAddr,
     pub address_family: Option<AddressFamily>,
@@ -40,6 +46,9 @@ impl Default for Settings {
             enabled: false,
             network_provider: "amaterasu.network/1".into(),
             audio_capture_provider: "amaterasu.audio/1".into(),
+            session_presentation_provider: None,
+            auxiliary_black_capture_provider: None,
+            auxiliary_exact_capture_provider: None,
             http_bind: SocketAddr::from(([127, 0, 0, 1], 47989)),
             https_bind: SocketAddr::from(([127, 0, 0, 1], 47984)),
             address_family: None,
@@ -63,6 +72,13 @@ impl Settings {
         }
         if !amaterasu_module_sdk::network::valid_provider(&self.audio_capture_provider) {
             return Err("invalid_audio_capture_provider");
+        }
+        if self
+            .session_presentation_provider
+            .as_deref()
+            .is_some_and(|provider| provider != amaterasu_module_sdk::session_presentation::SERVICE)
+        {
+            return Err("invalid_session_presentation_provider");
         }
         let http_binds = self.resolved_http_binds()?;
         let https_binds = self.resolved_https_binds()?;
@@ -327,6 +343,49 @@ pub fn https_port(port: u16) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn session_presentation_and_auxiliary_routes_require_explicit_startup_selection() {
+        let defaults: Settings = serde_json::from_str("{}").unwrap();
+        assert!(defaults.session_presentation_provider.is_none());
+        assert!(defaults.auxiliary_black_capture_provider.is_none());
+        assert!(defaults.auxiliary_exact_capture_provider.is_none());
+        let configured: Settings = serde_json::from_value(serde_json::json!({
+            "session_presentation_provider":amaterasu_module_sdk::session_presentation::SERVICE,
+            "auxiliary_black_capture_provider":"black",
+            "auxiliary_exact_capture_provider":"virtual_screen"
+        }))
+        .unwrap();
+        configured.validate().unwrap();
+        assert_eq!(
+            configured
+                .auxiliary_black_capture_provider
+                .unwrap()
+                .as_str(),
+            "black"
+        );
+        assert_eq!(
+            configured
+                .auxiliary_exact_capture_provider
+                .unwrap()
+                .as_str(),
+            "virtual_screen"
+        );
+        let invalid: Settings = serde_json::from_value(serde_json::json!({
+            "session_presentation_provider":"other.session-presentation/1"
+        }))
+        .unwrap();
+        assert_eq!(
+            invalid.validate(),
+            Err("invalid_session_presentation_provider")
+        );
+        assert!(
+            serde_json::from_value::<Settings>(serde_json::json!({
+                "auxiliary_black_capture_provider":"../host-capture"
+            }))
+            .is_err()
+        );
+    }
+
     #[test]
     fn defaults_bind_nothing_and_remote_opt_in_is_explicit() {
         let settings: Settings = serde_json::from_str("{}").unwrap();
