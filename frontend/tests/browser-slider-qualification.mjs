@@ -237,6 +237,26 @@ try {
   console.log("PASS: form labels/descriptions, readonly keyboard shortcuts, and radio focus survive real browser interactions");
   console.log("PASS: plugin forms retain accessible states and descriptions across dynamic choices");
   console.log("PASS: shared and plugin sliders synchronize, enforce steps, expose callback errors, and dispose listeners");
+  await evaluate(`
+    window.saved = null;
+    document.body.innerHTML = '<main><section id="catalog"><input type="search"><div class="catalog-override-catalog"></div></section><div id="plugins"></div></main>';
+    const rtxDescriptor = { provider: 'amaterasu.rtx-hdr', display_name: 'RTX HDR', options: [{ id: 'rtx_hdr_enable', label: 'Enable RTX HDR', help: 'Convert SDR to HDR', definition: {type:'boolean', default:false}, allowed_scopes:['host','application'], apply_policy:'next_session' }], actions: [] };
+    const sharedContext = { content: document.querySelector('main'), notify() {}, api: { allows: () => true, post: async (route, payload) => {
+      if (route.endsWith('/list')) return { items: [rtxDescriptor], next: null, revision: 1 };
+      if (route.endsWith('/settings_get')) return { revision: window.saved ? 2 : 1, values: window.saved ?? {}, effective: {rtx_hdr_enable:{value:window.saved?.rtx_hdr_enable ?? false,source:null}} };
+      window.saved = payload.values; return {revision:2};
+    } } };
+    Amaterasu.renderApplicationPluginOverrides(sharedContext, document.querySelector('#plugins'), 'game', document.querySelector('#catalog'));
+  `);
+  for (let attempt = 0; attempt < 100 && !await evaluate(`!!document.querySelector('.catalog-override-choice')`); attempt++) await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal(await evaluate(`document.querySelector('.catalog-override-choice').textContent`), 'Enable RTX HDR');
+  await evaluate(`document.querySelector('#catalog input').value = 'rtx hdr'; document.querySelector('#catalog input').dispatchEvent(new Event('input')); document.querySelector('.catalog-override-choice').click()`);
+  assert.equal(await evaluate(`document.querySelector('.catalog-override-choice').hidden`), false);
+  await evaluate(`document.querySelector('#plugins input[type=checkbox]').checked = true; document.querySelector('#plugins form').requestSubmit()`);
+  for (let attempt = 0; attempt < 100 && !await evaluate(`window.saved !== null`); attempt++) await new Promise(resolve => setTimeout(resolve, 20));
+  assert.deepEqual(await evaluate(`window.saved`), {rtx_hdr_enable:true});
+  assert.equal(await evaluate(`window.failure ?? null`), null);
+  console.log("PASS: native slider keyboard input synchronizes and saves both scoped editors");
 } finally {
   socket?.close();
   browser.kill();
