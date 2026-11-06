@@ -545,8 +545,11 @@ def exercise_remote_input(console, https, tls, oracle, directory):
 
 
 def reject_unavailable_monitor(console, fingerprint):
+    # Use a valid managed-monitor source size so this checks disabled providers,
+    # independently of the deliberately small black-input video stream.
+    monitor_mode = {**MODE, "width": 320, "height": 200}
     arguments = {"context": context(fingerprint, game=False), "operation_id": "disabled-monitor-request",
-                 "intent": "launch", "selection": {"id": "2147483505", "uuid": None}, "mode": MODE}
+                 "intent": "launch", "selection": {"id": "2147483505", "uuid": None}, "mode": monitor_mode}
     deadline = time.monotonic() + 1
     while time.monotonic() < deadline:
         response = console.api("dispatch", arguments)
