@@ -33,6 +33,9 @@ pub trait LifecycleHandler: Sized {
 pub struct LifecycleSettings {
     pub capture_binding_mode: amaterasu_extension_api::CaptureBindingMode,
     pub trusted_callers: BTreeSet<String>,
+    /// Installed transport callers allowed to attest an already verified and
+    /// retained source reservation for an external capture pipeline.
+    pub borrowed_capture_callers: BTreeSet<String>,
     /// Broker identities granted delegation by installed operator policy.
     pub session_delegates: BTreeSet<String>,
     pub input_actions: BTreeSet<String>,
@@ -68,6 +71,7 @@ impl Default for LifecycleSettings {
         Self {
             capture_binding_mode: Default::default(),
             trusted_callers: BTreeSet::new(),
+            borrowed_capture_callers: BTreeSet::new(),
             session_delegates: BTreeSet::new(),
             input_actions: BTreeSet::new(),
             input_provider: None,
@@ -443,6 +447,16 @@ impl LifecycleSettings {
                 .any(|caller| !valid_identifier(caller))
         {
             return Err("invalid lifecycle trusted callers".into());
+        }
+        if self.borrowed_capture_callers.len() > 32
+            || (!self.borrowed_capture_callers.is_empty()
+                && !self.capture_binding_mode.is_external())
+            || self
+                .borrowed_capture_callers
+                .iter()
+                .any(|caller| !valid_identifier(caller) || !self.trusted_callers.contains(caller))
+        {
+            return Err("invalid lifecycle borrowed capture callers".into());
         }
         if self.session_delegates.len() > 128
             || self.session_delegates.iter().any(|delegate| {

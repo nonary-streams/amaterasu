@@ -11,6 +11,7 @@ mod action_release_proof;
 mod action_root_retirement;
 mod action_target;
 mod application;
+mod borrowed_capture;
 mod checkpoint_queries;
 #[allow(dead_code)] // Checkpoint integration is not yet enabled.
 mod closed_stream;
@@ -391,6 +392,8 @@ enum StreamPhase {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StreamRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    borrowed_capture: Option<amaterasu_extension_api::BorrowedCaptureContext>,
     #[serde(default)]
     provider_graph: Option<ProviderGraph>,
     generation: u64,
@@ -674,17 +677,18 @@ fn validate_journal(journal: &Journal) -> io::Result<()> {
             })
         })
         || journal.sessions.values().any(|session| {
-            session
-                .application_retirement_proof
-                .as_ref()
-                .is_some_and(|_| {
-                    let target = LifecycleTarget::Session {
-                        host_epoch: session.host_epoch.clone(),
-                        session_id: session.id.clone(),
-                        generation: session.generation,
-                    };
-                    !application::valid_retirement_proof(session, &target)
-                })
+            !borrowed_capture::valid_session(session)
+                || session
+                    .application_retirement_proof
+                    .as_ref()
+                    .is_some_and(|_| {
+                        let target = LifecycleTarget::Session {
+                            host_epoch: session.host_epoch.clone(),
+                            session_id: session.id.clone(),
+                            generation: session.generation,
+                        };
+                        !application::valid_retirement_proof(session, &target)
+                    })
                 || session.resource_generations.len() > 32
                 || session
                     .resource_generations

@@ -512,6 +512,7 @@ mod tests {
             streams: [(
                 "stream".into(),
                 StreamRecord {
+                    borrowed_capture: None,
                     join_context: None,
                     provider_graph: None,
                     generation: 1,

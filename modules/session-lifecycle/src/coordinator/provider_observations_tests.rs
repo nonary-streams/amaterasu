@@ -726,6 +726,7 @@ fn retired_stream_without_proof_keeps_its_admission() {
     session.streams.insert(
         "stream".into(),
         StreamRecord {
+            borrowed_capture: None,
             provider_graph: None,
             generation: 1,
             phase: StreamPhase::Retired,
@@ -767,6 +768,7 @@ fn forged_stream_proof_cannot_close_admissions() {
         .insert(
             "stream".into(),
             StreamRecord {
+                borrowed_capture: None,
                 provider_graph: None,
                 generation: 1,
                 phase: StreamPhase::Retired,
