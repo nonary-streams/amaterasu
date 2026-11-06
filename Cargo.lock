@@ -747,6 +747,7 @@ dependencies = [
  "amaterasu-configuration-schema",
  "amaterasu-contracts",
  "amaterasu-extension-api",
+ "amaterasu-module-sdk",
  "amaterasu-nvhttp",
  "amaterasu-package",
  "amaterasu-runtime",

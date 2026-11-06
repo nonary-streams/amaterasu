@@ -4,6 +4,10 @@ use amaterasu_contracts::{ApiMethod, ApiMethodApproval, RuntimeConfig};
 pub(super) fn install(policy: &mut RuntimeConfig) -> Result<(), String> {
     for (provider, methods) in [
         (
+            "amaterasu.remote-session",
+            include_str!("../../../../modules/remote-session/metadata/api.json"),
+        ),
+        (
             "amaterasu.host-metrics",
             include_str!("../../../../modules/stats/metadata/api.json"),
         ),

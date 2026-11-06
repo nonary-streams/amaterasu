@@ -19,12 +19,13 @@ use super::default_extensions::{
     COORDINATOR_COMPONENT as SESSION_LIFECYCLE, PROVIDER_COMPONENT as LINUX_FRAME_LIMITER,
     REGISTRY_COMPONENT as EXTENSION_REGISTRY,
 };
+use super::remote_sessions::{BLACK_CAPTURE, COMPONENT as REMOTE_SESSION, RETAINED_DISPLAY};
 use super::{
     APPLICATION, AUDIO, AUDIO_ENCODE, AUTHENTICATION, CAPTURE_KMS, CAPTURE_PIPEWIRE, CAPTURE_VKMS,
-    CATALOG, CONFIGURATION, CONTROL_TRANSPORT, ComponentDefinition, DISPLAY, ENCODE, HOST_METRICS,
-    INPUT, LAUNCH, LIBRARY, LUTRIS, MANAGEMENT, MEDIA_TRANSPORT, NETWORK, NVHTTP, PAIRING, RTSP,
-    RUNTIME, RUNTIME_ID, SESSION, SESSION_HISTORY, STATE, STEAM, STREAM_SESSION, VIDEO,
-    VIRTUAL_DISPLAY, names,
+    CATALOG, CONFIGURATION, CONTROL_TRANSPORT, ComponentDefinition, ENCODE, HOST_METRICS, INPUT,
+    LAUNCH, LIBRARY, LUTRIS, MANAGEMENT, MEDIA_TRANSPORT, NETWORK, NVHTTP, PAIRING, RTSP, RUNTIME,
+    RUNTIME_ID, SESSION, SESSION_HISTORY, STATE, STEAM, STREAM_SESSION, VIDEO, VIRTUAL_DISPLAY,
+    names,
 };
 use amaterasu_contracts::{Grants, RuntimeConfig};
 use amaterasu_package::{PackageResult, create_private_directory};
@@ -122,18 +123,21 @@ const LINUX_SESSION_LAUNCH: ComponentDefinition = ComponentDefinition {
 const LINUX_SESSION_VIDEO: ComponentDefinition = ComponentDefinition {
     id: VIDEO_COMPONENT_ID,
     calls: &[
+        "amaterasu.capture-black/1",
         "amaterasu.capture-kms/1",
         "amaterasu.capture-pipewire/1",
         "amaterasu.capture-vkms/1",
         "amaterasu.encode/1",
     ],
     native_uses: &[
+        "amaterasu.capture-black/1",
         "amaterasu.capture-kms/1",
         "amaterasu.capture-pipewire/1",
         "amaterasu.capture-vkms/1",
         "amaterasu.encode/1",
     ],
     dependencies: &[
+        "amaterasu.capture-black",
         RUNTIME_ID,
         "amaterasu.capture-kms",
         "amaterasu.capture-pipewire",
@@ -172,6 +176,7 @@ const FOREGROUND_CONTEXT: ComponentDefinition = ComponentDefinition {
 
 const RTX_HDR_VIDEO: ComponentDefinition = ComponentDefinition {
     calls: &[
+        "amaterasu.capture-black/1",
         "amaterasu.capture-kms/1",
         "amaterasu.capture-pipewire/1",
         "amaterasu.capture-vkms/1",
@@ -179,6 +184,7 @@ const RTX_HDR_VIDEO: ComponentDefinition = ComponentDefinition {
         "amaterasu.session-lifecycle/1",
     ],
     native_uses: &[
+        "amaterasu.capture-black/1",
         "amaterasu.capture-kms/1",
         "amaterasu.capture-pipewire/1",
         "amaterasu.capture-vkms/1",
@@ -186,6 +192,7 @@ const RTX_HDR_VIDEO: ComponentDefinition = ComponentDefinition {
         "amaterasu.rtx-hdr/1",
     ],
     dependencies: &[
+        "amaterasu.capture-black",
         RUNTIME_ID,
         "amaterasu.capture-kms",
         "amaterasu.capture-pipewire",
@@ -226,6 +233,8 @@ const LINUX_SESSION_LIBRARY: ComponentDefinition = ComponentDefinition {
 
 const LINUX_SESSION_NVHTTP: ComponentDefinition = ComponentDefinition {
     calls: &[
+        "nonary.session-presentation/1",
+        "amaterasu.capture-black/1",
         "amaterasu.host-package-barrier/1",
         "amaterasu.session-lifecycle/1",
         "amaterasu.extension-registry/1",
@@ -256,6 +265,7 @@ const LINUX_SESSION_NVHTTP: ComponentDefinition = ComponentDefinition {
         "amaterasu.encode/1",
     ],
     dependencies: &[
+        "amaterasu.remote-session",
         "amaterasu.network",
         RUNTIME_ID,
         "amaterasu.configuration",
@@ -274,6 +284,7 @@ const LINUX_SESSION_NVHTTP: ComponentDefinition = ComponentDefinition {
 
 const LINUX_SESSION_RTSP: ComponentDefinition = ComponentDefinition {
     calls: &[
+        "amaterasu.capture-black/1",
         "amaterasu.session-lifecycle/1",
         "amaterasu.extension-registry/1",
         "nonary.frame-limiter/1",
@@ -299,6 +310,7 @@ const LINUX_SESSION_RTSP: ComponentDefinition = ComponentDefinition {
 
 const LINUX_SESSION_STREAM_SESSION: ComponentDefinition = ComponentDefinition {
     calls: &[
+        "amaterasu.capture-black/1",
         "amaterasu.host-package-barrier/1",
         "amaterasu.session-lifecycle/1",
         "amaterasu.extension-registry/1",
@@ -342,6 +354,7 @@ const LINUX_SESSION_STREAM_SESSION: ComponentDefinition = ComponentDefinition {
 
 const LINUX_SESSION_MANAGEMENT: ComponentDefinition = ComponentDefinition {
     calls: &[
+        "nonary.remote-session/1",
         "nonary.stats/1",
         "nonary.stats-history/1",
         "nonary.stream-status/1",
@@ -387,6 +400,7 @@ const LINUX_SESSION_MANAGEMENT: ComponentDefinition = ComponentDefinition {
         "amaterasu.stream-session/1",
     ],
     dependencies: &[
+        "amaterasu.remote-session",
         "amaterasu.library",
         "amaterasu.network",
         "amaterasu.steam",
@@ -435,10 +449,12 @@ pub const COMPONENTS: &[ComponentDefinition] = &[
     LINUX_SESSION_MANAGEMENT,
     LINUX_SESSION_PAIRING,
     LINUX_SESSION_NVHTTP,
-    DISPLAY,
+    RETAINED_DISPLAY,
     LINUX_SESSION_LAUNCH,
     INPUT,
     VIRTUAL_DISPLAY,
+    REMOTE_SESSION,
+    BLACK_CAPTURE,
     CAPTURE_KMS,
     CAPTURE_PIPEWIRE,
     CAPTURE_VKMS,
@@ -509,10 +525,12 @@ pub const RTX_HDR_COMPONENTS: &[ComponentDefinition] = &[
     RTX_HDR_MANAGEMENT,
     LINUX_SESSION_PAIRING,
     RTX_HDR_NVHTTP,
-    DISPLAY,
+    RETAINED_DISPLAY,
     LINUX_SESSION_LAUNCH,
     INPUT,
     VIRTUAL_DISPLAY,
+    REMOTE_SESSION,
+    BLACK_CAPTURE,
     CAPTURE_KMS,
     CAPTURE_PIPEWIRE,
     CAPTURE_VKMS,
@@ -560,10 +578,12 @@ pub const EXTENSION_COMPONENTS: &[ComponentDefinition] = &[
     LINUX_SESSION_MANAGEMENT,
     LINUX_SESSION_PAIRING,
     LINUX_SESSION_NVHTTP,
-    DISPLAY,
+    RETAINED_DISPLAY,
     LINUX_SESSION_LAUNCH,
     INPUT,
     VIRTUAL_DISPLAY,
+    REMOTE_SESSION,
+    BLACK_CAPTURE,
     CAPTURE_KMS,
     CAPTURE_PIPEWIRE,
     CAPTURE_VKMS,
@@ -646,6 +666,7 @@ pub fn linux_session_policy(
     if let Some(runtime_directory) = &options.rtx_hdr_runtime_directory {
         enable_rtx_hdr(&mut policy, runtime_directory)?;
     }
+    super::remote_sessions::install(&mut policy)?;
     super::operation_apis::install(&mut policy)?;
     Ok(policy)
 }
