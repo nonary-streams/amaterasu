@@ -66,6 +66,7 @@ impl Change {
             "reference_id":self.reference_id,
             "expected_reference_ids":self.expected_reference_ids,
             "expected_mode_revision":self.expected_revision,
+            "requested_specification":self.desired,
             "specification":if self.aborted {&self.old} else {&self.desired},
             "mode_revision":self.mode_revision()})
     }

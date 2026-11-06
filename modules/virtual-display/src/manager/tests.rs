@@ -1825,6 +1825,10 @@ fn retained_mode_abort_requires_old_native_readback_and_fences_stale_replays() {
     calls.borrow_mut().observed_mode = Some(old);
     let aborted = manager.handle("remote-plugin", abort());
     assert_eq!(aborted["state"], "aborted");
+    assert_eq!(aborted["specification"]["width"], 1920);
+    assert_eq!(aborted["requested_specification"]["width"], 1280);
+    assert_eq!(aborted["specification"]["hdr_enabled"], false);
+    assert_eq!(aborted["requested_specification"]["hdr_enabled"], true);
     assert_eq!(aborted["mode_revision"], 1);
     assert_eq!(manager.handle("remote-plugin", abort()), aborted);
     let status = manager.handle(
