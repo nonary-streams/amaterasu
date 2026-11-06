@@ -1105,3 +1105,51 @@ fn shutdown_recovers_a_lost_history_admission_then_cancels_and_releases_it() {
     assert!(host.broker.history_requests.is_empty());
     assert_eq!(host.broker.history_calls(), 1);
 }
+
+#[test]
+fn management_can_stop_the_selected_live_stream_without_changing_its_owner() {
+    let mut host = Harness::new();
+    let session = prepare_and_start(&mut host);
+    let public_id = format!("stream-session-{session:016x}");
+    let stop = json!({"action":"stop_stream","session_id":public_id});
+    assert_eq!(
+        host.response_from(10, "other", stop.clone())["code"],
+        "permission_denied"
+    );
+    assert_eq!(
+        host.response(11, json!({"action":"status","session":session}))["state"],
+        "active"
+    );
+    assert_eq!(
+        host.response_from(12, "amaterasu.management", stop)["state"],
+        "stopped"
+    );
+    assert_eq!(
+        host.response(13, json!({"action":"status","session":session}))["state"],
+        "stopped"
+    );
+}
+
+#[test]
+fn approved_native_api_snapshot_keeps_the_callers_real_identity() {
+    let mut host = Harness::new();
+    host.broker
+        .enqueue_api(20, "example.stats-reader", "snapshot", json!({}));
+    for _ in 0..100 {
+        host.tick();
+        if host.broker.replies.contains_key(&20) {
+            break;
+        }
+    }
+    let result = host.broker.replies.remove(&20).expect("API snapshot");
+    assert_eq!(result["ok"], true);
+    assert!(result["sessions"].as_array().unwrap().is_empty());
+    assert_eq!(
+        host.response_from(
+            21,
+            "example.stats-reader",
+            json!({"action":"management_live_sessions"})
+        )["code"],
+        "permission_denied"
+    );
+}

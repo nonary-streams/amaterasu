@@ -7,9 +7,15 @@ enum StartMode {
     WhenAuthenticated,
 }
 
+pub(super) struct RequestCaller {
+    pub(super) principal: String,
+    pub(super) approved_api: bool,
+}
+
 struct Incoming {
     request: u64,
     owner: String,
+    approved_api: bool,
     now: u64,
     remaining: u64,
 }
@@ -18,12 +24,16 @@ impl Pipeline {
     pub(super) fn receive(
         &mut self,
         request: u64,
-        owner: String,
+        caller: RequestCaller,
         operation: Operation,
         now: u64,
         remaining: u64,
         send: &mut Send<'_>,
     ) {
+        let RequestCaller {
+            principal: owner,
+            approved_api,
+        } = caller;
         let opens_session = matches!(
             &operation,
             Operation::Prepare(_)
@@ -52,6 +62,7 @@ impl Pipeline {
         let input = Incoming {
             request,
             owner,
+            approved_api,
             now,
             remaining,
         };
@@ -116,6 +127,9 @@ impl Pipeline {
                 self.stop(input, session, send)
             }
             Operation::Status { session } => self.status(input, session, send),
+            Operation::ManagementStopStream { session_id } => {
+                self.management_stop_stream(input, &session_id, send)
+            }
             Operation::ManagementLiveSessions {} => self.management_live_sessions(input, send),
             Operation::Lookup { operation_id } => self.lookup(input, operation_id, send),
         }
@@ -142,6 +156,7 @@ impl Pipeline {
             owner,
             now,
             remaining,
+            ..
         } = input;
 
         if let Err(code) = config.validate(self.settings.allow_remote) {
@@ -246,6 +261,7 @@ impl Pipeline {
             owner,
             now,
             remaining,
+            ..
         } = input;
 
         if configuration.client_feature_flags.is_some() && owner != "amaterasu.rtsp" {
@@ -529,8 +545,40 @@ impl Pipeline {
         rpc::complete(send, request, reply);
     }
 
+    fn management_stop_stream(
+        &mut self,
+        mut input: Incoming,
+        session_id: &str,
+        send: &mut Send<'_>,
+    ) {
+        if input.owner != "amaterasu.management" && !input.approved_api {
+            rpc::complete(send, input.request, error("permission_denied"));
+            return;
+        }
+        if session_id.is_empty()
+            || session_id.len() > 128
+            || session_id.chars().any(char::is_control)
+        {
+            rpc::complete(send, input.request, error("invalid_session_id"));
+            return;
+        }
+        let selected = self.records.values().find(|record| {
+            matches!(record.state, State::Active | State::Stopping)
+                && record.history.live_identity().0 == session_id
+        });
+        let Some(record) = selected else {
+            rpc::complete(send, input.request, error("session_not_found"));
+            return;
+        };
+        let id = record.id;
+        // This explicit management operation authorizes stopping a particular
+        // visible stream. Cleanup retains that stream's original transport owner.
+        input.owner = record.owner.clone();
+        self.stop(input, id, send);
+    }
+
     fn management_live_sessions(&mut self, input: Incoming, send: &mut Send<'_>) {
-        if input.owner != "amaterasu.management" {
+        if input.owner != "amaterasu.management" && !input.approved_api {
             rpc::complete(send, input.request, error("permission_denied"));
             return;
         }

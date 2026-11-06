@@ -1,0 +1,42 @@
+[
+  {
+    "service": "nonary.stream-status/1",
+    "method": "snapshot",
+    "interface_major": 1,
+    "interface_minor": 0,
+    "request": {
+      "required": {},
+      "optional": {},
+      "allow_extra": false
+    },
+    "response": {
+      "required": {
+        "ok": "boolean"
+      },
+      "optional": {},
+      "allow_extra": true
+    },
+    "privilege": "user"
+  },
+  {
+    "service": "nonary.stream-status/1",
+    "method": "stop_stream",
+    "interface_major": 1,
+    "interface_minor": 0,
+    "request": {
+      "required": {
+        "session_id": "string"
+      },
+      "optional": {},
+      "allow_extra": false
+    },
+    "response": {
+      "required": {
+        "ok": "boolean"
+      },
+      "optional": {},
+      "allow_extra": true
+    },
+    "privilege": "user"
+  }
+]

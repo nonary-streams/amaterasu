@@ -2,7 +2,11 @@
   "compilerOptions": {
     "target": "ES2022",
     "module": "none",
-    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "lib": [
+      "ES2022",
+      "DOM",
+      "DOM.Iterable"
+    ],
     "strict": true,
     "noUncheckedIndexedAccess": true,
     "noUnusedLocals": true,
@@ -12,6 +16,7 @@
     "forceConsistentCasingInFileNames": true
   },
   "files": [
+    "../sdk/web/amaterasu-ui.d.ts",
     "src/types.ts",
     "src/model.ts",
     "src/api.ts",
@@ -31,14 +36,10 @@
     "src/integrations.ts",
     "src/updates.ts",
     "src/locale.ts",
-    "src/live_streams.ts",
     "src/stream_controls.ts",
-    "src/host_metrics.ts",
     "src/updater.ts",
     "src/system_tray.ts",
     "src/host_logs.ts",
-    "src/session_history.ts",
-    "src/session_timeline.ts",
     "src/pages.ts",
     "src/permission-management.ts",
     "src/management.ts",
@@ -50,6 +51,8 @@
     "src/extension_ui_tabs.ts",
     "src/extension_ui_feedback.ts",
     "src/extension_ui_dialog.ts",
+    "src/extension_ui_charts.ts",
+    "src/extension_slots.ts",
     "src/extensions.ts",
     "src/extension_fields.ts",
     "src/session_extension_actions.ts",

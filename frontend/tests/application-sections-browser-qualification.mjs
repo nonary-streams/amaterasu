@@ -49,7 +49,7 @@ try {
     return result.result.value;
   };
   for (let i = 0; i < 100 && !await evaluate(`!!document.querySelector('#sections')`); i++) await new Promise(resolve => setTimeout(resolve, 20));
-  const source = ['locale-catalogs.ts','locale.ts','ui.ts','extension_ui.ts','extension_ui_layout.ts','extension_ui_tabs.ts','extension_ui_feedback.ts','extension_ui_dialog.ts','extensions.ts','extension_fields.ts','session_extensions.ts'].map(file => readFileSync(`src/${file}`, 'utf8')).join('\n');
+  const source = ['locale-catalogs.ts','locale.ts','ui.ts','extension_ui.ts','extension_ui_layout.ts','extension_ui_tabs.ts','extension_ui_feedback.ts','extension_ui_dialog.ts','extension_ui_charts.ts','extension_slots.ts','extensions.ts','extension_fields.ts','session_extensions.ts'].map(file => readFileSync(`src/${file}`, 'utf8')).join('\n');
   await evaluate(ts.transpile(source, { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None }));
   const descriptor = JSON.parse(readFileSync('../modules/rtx-hdr/metadata/linux.json', 'utf8')).descriptor;
   await evaluate(`

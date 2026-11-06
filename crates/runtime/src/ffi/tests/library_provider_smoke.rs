@@ -341,3 +341,153 @@ fn playnite_transfer_release_retries_through_broker() {
         destroy_runtime(runtime);
     }
 }
+
+#[test]
+#[ignore = "requires an independently built stats native artifact"]
+fn stats_api_accepts_an_approved_native_reader_without_management_identity() {
+    use amaterasu_module_sdk::requests::ApiRequestOptions;
+    const PROVIDER: &str = "amaterasu.host-metrics";
+    const PUBLIC: &str = "nonary.stats/1";
+    const LEGACY: &str = "amaterasu.host-metrics/1";
+    let methods: Vec<amaterasu_contracts::ApiMethod> = serde_json::from_str(include_str!(
+        "../../../../../modules/stats/metadata/api.json"
+    ))
+    .unwrap();
+    let configuration = RuntimeConfig {
+        principals: [
+            (
+                PROVIDER.into(),
+                Grants {
+                    provide: [PUBLIC.into(), LEGACY.into()].into(),
+                    call: ["amaterasu.configuration/1".into()].into(),
+                    ..Default::default()
+                },
+            ),
+            (
+                "reader".into(),
+                Grants {
+                    call: [PUBLIC.into(), LEGACY.into()].into(),
+                    ..Default::default()
+                },
+            ),
+            (
+                "administrator".into(),
+                Grants {
+                    call: [PUBLIC.into()].into(),
+                    ..Default::default()
+                },
+            ),
+        ]
+        .into(),
+        api_methods: methods
+            .into_iter()
+            .map(|method| amaterasu_contracts::ApiMethodApproval {
+                provider: PROVIDER.into(),
+                callers: [if method.method == "stats_read" {
+                    "reader".into()
+                } else {
+                    "administrator".into()
+                }]
+                .into(),
+                method,
+            })
+            .collect(),
+        ..Default::default()
+    };
+    let mut runtime = std::ptr::null_mut();
+    let bytes = serde_json::to_vec(&configuration).unwrap();
+    // SAFETY: serialized input and output slot live throughout creation.
+    assert_eq!(
+        unsafe { create_runtime(BorrowedBytes::new(&bytes), &mut runtime) },
+        STATUS_OK
+    );
+    // SAFETY: explicitly supplied trusted artifact remains loaded until destroy.
+    let library = unsafe {
+        libloading::Library::new(
+            std::env::var_os("AMATERASU_STATS_LIBRARY").expect("stats artifact"),
+        )
+    }
+    .unwrap();
+    let entry: libloading::Symbol<ModuleEntry> =
+        unsafe { library.get(b"amaterasu_module_v1\0") }.unwrap();
+    let api = unsafe { &*entry() };
+    assert!(api.header.supports::<ModuleApi>());
+    let mut instance = std::ptr::null_mut();
+    // SAFETY: runtime endpoint and module table outlive the instance.
+    assert_eq!(
+        unsafe { (api.create)(&endpoint(runtime, PROVIDER), &mut instance) },
+        STATUS_OK
+    );
+    let client = unsafe { RuntimeClient::from_endpoint(endpoint(runtime, "reader")) };
+    let request = client
+        .call_api_serialized(
+            ApiRequestOptions {
+                request: RequestOptions {
+                    service: PUBLIC,
+                    timeout_ms: 1000,
+                    operation_id: "public-read",
+                    parent: None,
+                },
+                method: "stats_read",
+                interface_major: 1,
+                interface_minor: 0,
+            },
+            &json!({}),
+        )
+        .unwrap();
+    let mut observed = false;
+    for _ in 0..8 {
+        assert_eq!(unsafe { (api.tick)(instance) }, STATUS_OK);
+        if let Some(result) = client.take_serialized::<Value>(request).unwrap() {
+            observed = true;
+            assert_eq!(result["ok"], true, "{result}");
+            assert!(result["host"].is_object());
+            client
+                .require_success(Command::ReleaseResult { request })
+                .unwrap();
+            break;
+        }
+    }
+    assert!(observed, "native stats read did not settle");
+    // Public approval must not permit settings writes or raw legacy reads.
+    assert!(
+        client
+            .call_api_serialized(
+                ApiRequestOptions {
+                    request: RequestOptions {
+                        service: PUBLIC,
+                        timeout_ms: 1000,
+                        operation_id: "denied-settings",
+                        parent: None
+                    },
+                    method: "settings_get",
+                    interface_major: 1,
+                    interface_minor: 0,
+                },
+                &json!({})
+            )
+            .is_err()
+    );
+    let legacy = client
+        .request_serialized(
+            RequestOptions {
+                service: LEGACY,
+                timeout_ms: 1000,
+                operation_id: "legacy-read",
+                parent: None,
+            },
+            &json!({"action":"stats_read"}),
+        )
+        .unwrap();
+    assert_eq!(unsafe { (api.tick)(instance) }, STATUS_OK);
+    let denied = client.take_serialized::<Value>(legacy).unwrap().unwrap();
+    assert_eq!(denied["code"], "permission_denied");
+    client
+        .require_success(Command::ReleaseResult { request: legacy })
+        .unwrap();
+    // SAFETY: all admitted results are released before module/runtime retirement.
+    unsafe {
+        (api.destroy)(instance);
+        destroy_runtime(runtime);
+    }
+}

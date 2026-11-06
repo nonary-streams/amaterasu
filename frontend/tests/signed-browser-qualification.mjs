@@ -267,7 +267,7 @@ async function initial(options) {
     return activity && !activity.textContent.includes('Loading host stream activity');
   })()`, "native overview activity");
   await wait(overview, `(() => {
-    const telemetry = document.querySelector('.overview-host-metrics');
+    const telemetry = document.querySelector('.overview-plugin-sections');
     return telemetry && !telemetry.textContent.includes('Loading live host metrics');
   })()`, "native overview telemetry");
   check(await evaluate(overview, "document.querySelector('.overview-activity-area').textContent.includes('No active streams reported')"),

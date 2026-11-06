@@ -288,7 +288,7 @@ Write ownership: `modules/catalog/`, `modules/application/`, `modules/launch/`, 
 
 ### luna-06
 
-Write ownership: `modules/management/`, `frontend/`, `modules/diagnostics/`, `modules/session-history/`, `modules/updater/`, `modules/system-tray/`, `modules/host-metrics/`.
+Write ownership: `modules/management/`, `frontend/`, `modules/diagnostics/`, `modules/stats/history/`, `modules/updater/`, `modules/system-tray/`, `modules/stats/`.
 
 | Stable ID | Status |
 | --- | --- |
@@ -329,7 +329,7 @@ Coordinator decisions and dependency acknowledgments are tracked here and in the
 | Pairing identity comment parsing | L01 owns package migration; L02 owns `modules/pairing/src/migration.rs` and will strip inline `#` comments from pkey/cert path lines while retaining containment checks and original archived bytes. | Dependency identified by L01; bounded L02 correction requested. |
 | Capture and encoder selection | L03 owns runtime selection; L02 owns global/client persistence and immutable stream snapshot; L05 owns app storage/lifecycle; L06 owns editor. Preserve empty/auto, `ddx`, `wgc`, and `wgcc` capture values and use stable encoder identity rather than enumeration order. | The capture-mode video adapter is on main and its package tests pass. Product field names/defaults, persistence, availability fallback, encoder identity, and launch projection remain pending; any new persistence uses the existing v17 batch. |
 | Playnite path controls | Pinned reference removed both install/path overrides and the current provider discovers its executable without consuming them. Do not invent semantics for `global:playnite_install_dir` or `global:playnite_extensions_dir`. | Classified as removed/inert reference controls; keep stable IDs pending until the coverage inventory supports a retired status. |
-| Updater, tray and host metrics | `luna-06` owns `modules/updater/**`, `modules/system-tray/**`, and `modules/host-metrics/**`; `luna-01` owns host startup integration in `crates/host/**`; `luna-02` owns stream-session metric emission. | Path ownership assigned; module contracts and lifecycle integration pending. |
+| Updater, tray and host metrics | `luna-06` owns `modules/updater/**`, `modules/system-tray/**`, and `modules/stats/**`; `luna-01` owns host startup integration in `crates/host/**`; `luna-02` owns stream-session metric emission. | Path ownership assigned; module contracts and lifecycle integration pending. |
 
 ## Mainline cherry-pick queue
 
@@ -392,7 +392,7 @@ All six were launched with `gpt-6-luna` at `max`, multi-agent delegation enabled
 | luna-05 | `steam_slice` | not yet reported | `gpt-6-luna` / `xhigh` requested | `modules/steam/` | startup confirmation pending |
 | luna-05 | `launchers_slice` | not yet reported | `gpt-6-luna` / `xhigh` requested | `modules/playnite/`, `modules/lutris/` | startup confirmation pending |
 | luna-06 | `diagnostics` | `01a0d51a-45be-7bd0-b4d8-08923ae89823` | `gpt-6-luna` / `xhigh` confirmed before edits | `modules/diagnostics/` | active |
-| luna-06 | `session_history` | `01a0d51a-69e9-7532-873f-55552f306fae` | `gpt-6-luna` / `xhigh` confirmed before edits | `modules/session-history/` | active |
+| luna-06 | `session_history` | `01a0d51a-69e9-7532-873f-55552f306fae` | `gpt-6-luna` / `xhigh` confirmed before edits | `modules/stats/history/` | active |
 
 ## Current session snapshot (2026-09-25; latest process check)
 

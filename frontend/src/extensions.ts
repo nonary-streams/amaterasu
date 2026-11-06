@@ -6,13 +6,15 @@ namespace Amaterasu {
     digest: string;
     sdk_version: number;
     entrypoint: string;
-    placements?: ("page" | "application")[];
+    placements?: ("page" | "application" | "overview" | "settings")[];
     settings_provider?: string | null;
     methods: ExtensionMethod[];
   }
   interface ExtensionPage {
     title: string;
     mount?(container: HTMLElement, sdk: ExtensionPageSdk): void | (() => void);
+    mountOverview?(container: HTMLElement, sdk: ExtensionPageSdk): void | (() => void);
+    mountSettings?(container: HTMLElement, sdk: ExtensionPageSdk): void | (() => void);
     mountApplication?(container: HTMLElement, sdk: ExtensionPageSdk): void | (() => void);
   }
   export interface ApplicationExtensionContext { readonly id: string; readonly name: string }
@@ -38,7 +40,9 @@ namespace Amaterasu {
     readonly version: 1;
     readonly signal: AbortSignal;
     readonly features?: readonly string[];
-    readonly ui?: ExtensionUiWithDialogsV1 & ExtensionUiTabsV1;
+    readonly ui?: ExtensionUiWithDialogsV1 & ExtensionUiTabsV1 & ExtensionUiChartsV1;
+    readonly assets?: { stylesheet(path: string): Promise<void> };
+    canCall?(method: string): boolean;
     readonly application?: ApplicationExtensionContext;
     readonly settings?: ApplicationSettingsApi;
     setDirty?(dirty: boolean): void;
@@ -58,9 +62,11 @@ namespace Amaterasu {
         if (!(script instanceof HTMLScriptElement) || pendingScripts.get(script)?.split("@")[0] !== id ||
             registrations.has(pendingScripts.get(script)!) || typeof page !== "object" || page === null ||
             typeof page.title !== "string" || !page.title.trim() || page.title.length > 128 ||
-            (typeof page.mount !== "function" && typeof page.mountApplication !== "function") ||
+            (typeof page.mount !== "function" && typeof page.mountApplication !== "function" && typeof page.mountOverview !== "function" && typeof page.mountSettings !== "function") ||
             (page.mount !== undefined && typeof page.mount !== "function") ||
-            (page.mountApplication !== undefined && typeof page.mountApplication !== "function")) throw new Error("Invalid extension registration.");
+            (page.mountApplication !== undefined && typeof page.mountApplication !== "function") ||
+            (page.mountOverview !== undefined && typeof page.mountOverview !== "function") ||
+            (page.mountSettings !== undefined && typeof page.mountSettings !== "function")) throw new Error("Invalid extension registration.");
         registrations.set(pendingScripts.get(script)!, page);
       },
     },
@@ -76,8 +82,8 @@ namespace Amaterasu {
       typeof record.name === "string" && !!record.name.trim() && record.name.length <= 128 &&
       typeof record.digest === "string" && /^[a-f0-9]{64}$/.test(record.digest) &&
       record.sdk_version === 1 && typeof record.entrypoint === "string" &&
-      (record.placements === undefined || (Array.isArray(record.placements) && record.placements.length > 0 && record.placements.length <= 2 &&
-        new Set(record.placements).size === record.placements.length && record.placements.every((place: unknown) => place === "page" || place === "application"))) &&
+      (record.placements === undefined || (Array.isArray(record.placements) && record.placements.length > 0 && record.placements.length <= 4 &&
+        new Set(record.placements).size === record.placements.length && record.placements.every((place: unknown) => place === "page" || place === "application" || place === "overview" || place === "settings"))) &&
       (record.settings_provider == null || (typeof record.settings_provider === "string" && /^[a-z0-9._-]{1,128}$/.test(record.settings_provider) &&
         Array.isArray(record.placements) && record.placements.includes("application"))) &&
       /^[a-zA-Z0-9._/-]+\.js$/.test(record.entrypoint) &&
@@ -92,6 +98,10 @@ namespace Amaterasu {
     private cleanup: (() => void) | null = null;
     private controller: AbortController | null = null;
     private generation = 0;
+    private dirty = false;
+    private busy = false;
+    isDirty(): boolean { return this.dirty || this.busy; }
+    isBusy(): boolean { return this.busy; }
     private applicationMounts = new Set<ApplicationExtensionMount>();
     constructor(private readonly api: Api) {}
 
@@ -111,6 +121,7 @@ namespace Amaterasu {
       this.applicationMounts.clear();
       this.controller?.abort();
       this.controller = null;
+      this.dirty = false; this.busy = false;
       const cleanup = this.cleanup;
       this.cleanup = null;
       try { cleanup?.(); } catch (error) { console.error("Extension cleanup failed", error); }
@@ -147,11 +158,11 @@ namespace Amaterasu {
     }
 
     async mount(id: string, container: HTMLElement, application?: ApplicationExtensionContext,
-      state?: (kind: "dirty" | "busy", value: boolean) => void): Promise<void> {
+      state?: (kind: "dirty" | "busy", value: boolean) => void, slot?: "overview" | "settings"): Promise<void> {
       this.dispose();
       const descriptor = this.descriptors.get(id);
       if (!descriptor) throw new Error("Extension is unavailable.");
-      const placement = application ? "application" : "page";
+      const placement = slot ?? (application ? "application" : "page");
       if (!(descriptor.placements ?? ["page"]).includes(placement)) throw new Error("Extension is unavailable in this location.");
       const controller = new AbortController();
       this.controller = controller;
@@ -182,33 +193,36 @@ namespace Amaterasu {
         }
         page = await loading;
       }
-      if (controller.signal.aborted || (application && container.isConnected === false)) return;
+      if (controller.signal.aborted || container.isConnected === false) return;
       if (!page) throw new Error("Extension did not register a page.");
       const aliases = new Set(descriptor.methods.map((method) => method.alias));
       const sdk: ExtensionPageSdk = Object.freeze({
         version: 1 as const,
         signal: controller.signal,
-        features: Object.freeze(["ui.controls/1", "ui.forms/1", "ui.forms/2", "ui.controls/2", "ui.feedback/1", "ui.layout/1", "ui.tabs/1", "ui.dialog/1", ...(application ? ["ui.application-section/1", ...(descriptor.settings_provider ? ["ui.application-settings/1"] : [])] : [])]),
+        features: Object.freeze(["ui.controls/1", "ui.forms/1", "ui.forms/2", "ui.controls/2", "ui.feedback/1", "ui.layout/1", "ui.tabs/1", "ui.dialog/1", "ui.charts/1", "ui.assets/1", ...(application ? ["ui.application-section/1", ...(descriptor.settings_provider ? ["ui.application-settings/1"] : [])] : [])]),
         ui: Object.freeze({
           ...createExtensionUiWithDialogsV1(controller.signal),
           ...createExtensionUiTabsV1(controller.signal),
+          ...createExtensionUiChartsV1(controller.signal),
         }),
+        assets: Object.freeze({ stylesheet: (path: string) => loadExtensionStylesheet(id, descriptor.digest, path, controller.signal) }),
+        canCall: (method: string) => !controller.signal.aborted && aliases.has(method),
         call: (method: string, payload: Payload = {}) => {
           if (controller.signal.aborted || !aliases.has(method)) return Promise.reject(new Error("Extension method is unavailable."));
-          return this.api.post<{ result: unknown }>("extensions/call", { id, digest: descriptor.digest, method, payload })
+          return this.api.post<{ result: unknown }>("extensions/call", { id, digest: descriptor.digest, method, payload }, true, controller.signal)
             .then((reply) => {
               if (!Object.hasOwn(reply, "result")) throw new Error("Invalid extension response.");
               return reply.result;
             });
         },
+        setDirty: (value: boolean) => { if (typeof value !== "boolean") throw new Error("Invalid plugin draft state."); if (!controller.signal.aborted) { this.dirty = value; state?.("dirty", value); } },
+        setBusy: (value: boolean) => { if (typeof value !== "boolean") throw new Error("Invalid plugin busy state."); if (!controller.signal.aborted) { this.busy = value; state?.("busy", value); } },
         ...(application ? {
           application: Object.freeze({ id: application.id, name: application.name }),
-          setDirty: (value: boolean) => { if (!controller.signal.aborted) state?.("dirty", value); },
-          setBusy: (value: boolean) => { if (!controller.signal.aborted) state?.("busy", value); },
           ...(descriptor.settings_provider ? { settings: this.applicationSettings(descriptor.settings_provider, application, controller.signal) } : {}),
         } : {}),
       });
-      const callback = application ? page.mountApplication : page.mount;
+      const callback = slot === "overview" ? page.mountOverview : slot === "settings" ? page.mountSettings : application ? page.mountApplication : page.mount;
       if (typeof callback !== "function") throw new Error("Extension did not register this UI location.");
       try {
         const cleanup = callback(container, sdk);
@@ -220,6 +234,10 @@ namespace Amaterasu {
         this.dispose();
         throw error;
       }
+    }
+
+    async mountSlot(id: string, container: HTMLElement, slot: "overview" | "settings"): Promise<void> {
+      return this.mount(id, container, undefined, undefined, slot);
     }
 
     private applicationSettings(provider: string, application: ApplicationExtensionContext, signal: AbortSignal): ApplicationSettingsApi {

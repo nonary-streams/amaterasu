@@ -338,3 +338,54 @@ The [application section example](../examples/web-extension/application.js)
 uses the existing greeting provider and declares no settings overrides. Package
 it with [application-ui.json](../examples/web-extension/application-ui.json)
 using the same approved publisher and method-authorization workflow as a page.
+
+## Overview, settings, and dashboard widgets
+
+Plugins can attach `mountOverview(container, sdk)` and
+`mountSettings(container, sdk)` callbacks by declaring `overview` and `settings`
+placements in the signed configuration. A plugin can select any nonempty subset
+of `page`, `application`, `overview`, and `settings`. The shell provides generic
+surfaces and owns no product-specific renderer. Each mount gets an independent
+lifecycle; closing one surface does not retire another. Page and slot mounts
+support `setDirty(boolean)` and `setBusy(boolean)` for navigation guards.
+
+`sdk.canCall(alias)` reports whether the signed declaration and local approvals
+make that alias available to the current account. It does not grant authority.
+Calls are bound to the current signed digest and cancelled with the mount signal.
+`sdk.assets.stylesheet(relativePath)` loads CSS only from that same selected,
+verified bundle, and removes it when the surface closes. Styles should be scoped
+to the plugin's own root element.
+
+The reusable `ui.charts/1` capability exposes:
+
+```js
+const gauge = sdk.ui.metricGauge({label: 'Load', value: 25, detail: 'Measured'});
+const chart = sdk.ui.metricChart({
+  label: 'Measured rate', unit: 'units/s', minimum: 0,
+  series: [{id: 'primary', label: 'Primary', points: [
+    {time: 1700000000000, value: 1},
+    {time: 1700000001000, value: null},
+    {time: 1700000002000, value: 3},
+  ]}],
+});
+container.append(gauge.element, chart.element);
+gauge.setValue(30, 'New measurement');
+chart.setData(nextSeries); // preserves the mounted control and zoom
+return () => { gauge.dispose(); chart.dispose(); };
+```
+
+Gauges accept an optional positive `maximum` (default 100) and `unit` (default
+`%`). Null is unavailable, distinct from zero. Charts accept at most eight unique
+series, each with at most 2,000 ordered finite timestamps and finite or null
+values. Null values break lines. Optional finite minimum and maximum set the
+scale; the minimum must be less than the maximum. Charts provide zoom, series
+visibility, and keyboard/pointer inspection. Data updates validate completely
+before replacing the existing data. Owners dispose controls they remove before
+the mount closes; the lifecycle signal also retires them. The SDK does not
+collect data, infer missing values, or equate a stored sample with remote delivery.
+
+Public TypeScript declarations are published in
+[`sdk/web/amaterasu-ui.d.ts`](../sdk/web/amaterasu-ui.d.ts). They are generated
+from the SDK interfaces by `npm run export-sdk` in `frontend`; importing them
+does not import the shell. The independently built
+[Stats plugin](../modules/stats/README.md) is a full consumer example.

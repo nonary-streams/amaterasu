@@ -1220,7 +1220,12 @@ pub enum Operation {
     Status {
         session: Option<u64>,
     },
+    #[serde(alias = "snapshot")]
     ManagementLiveSessions {},
+    #[serde(rename = "stop_stream")]
+    ManagementStopStream {
+        session_id: String,
+    },
     Lookup {
         operation_id: String,
     },

@@ -36,6 +36,7 @@ function setup(entries, { applicationOnly = false, deferLoad = false, write = tr
   context.createExtensionUiV1 = (signal) => Object.freeze({ version: 1, signal });
   context.createExtensionUiWithFeedbackV1 = (signal) => Object.freeze({ version: 1, signal, feedback: true, card() {}, table() {} });
   context.createExtensionUiWithDialogsV1 = (signal) => Object.freeze({ version: 1, signal, feedback: true, card() {}, table() {}, dialog: true });
+  context.createExtensionUiChartsV1 = () => Object.freeze({});
   context.createExtensionUiTabsV1 = (signal) => Object.freeze({ signal, tabs: true });
   const source = readFileSync(new URL("../src/extensions.ts", import.meta.url), "utf8");
   vm.runInContext(ts.transpile(source, { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None }), context);
@@ -56,7 +57,7 @@ test("extension registration is bound to a loaded signed script and calls use de
   assert.equal((await env.pages.discover()).length, 1);
   await env.pages.mount("hello", {});
   assert.equal(env.mounts(), 1);
-  assert.deepEqual(Array.from(env.sdk().features), ["ui.controls/1", "ui.forms/1", "ui.forms/2", "ui.controls/2", "ui.feedback/1", "ui.layout/1", "ui.tabs/1", "ui.dialog/1"]);
+  assert.deepEqual(Array.from(env.sdk().features), ["ui.controls/1", "ui.forms/1", "ui.forms/2", "ui.controls/2", "ui.feedback/1", "ui.layout/1", "ui.tabs/1", "ui.dialog/1", "ui.charts/1", "ui.assets/1"]);
   assert.equal(Object.isFrozen(env.sdk().features), true);
   assert.equal(env.sdk().ui.version, 1);
   assert.equal(env.sdk().ui.signal, env.sdk().signal);

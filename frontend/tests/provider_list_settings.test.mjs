@@ -179,7 +179,7 @@ function fixture() {
   }
   vm.runInContext(`
     globalThis.ApiError = Amaterasu.ApiError;
-    globalThis.renderHostMetricsSettings = () => {};
+    globalThis.renderExtensionSlot = () => {};
     globalThis.renderHostMetricsDashboard = () => {};
     globalThis.renderUpdaterSettings = () => {};
     globalThis.renderSystemTraySettings = () => {};

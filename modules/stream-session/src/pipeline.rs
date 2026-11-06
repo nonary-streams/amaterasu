@@ -360,10 +360,28 @@ impl Pipeline {
                     payload,
                     ..
                 } => {
-                    if service == SERVICE
-                        && let Ok(operation) = serde_json::from_value::<Operation>(payload)
+                    if (service == SERVICE || service == "nonary.stream-status/1")
+                        && let Ok(operation) = amaterasu_module_sdk::operation_api::decode_delivery(
+                            payload,
+                            &service,
+                            SERVICE,
+                            &crate::public_api_methods(),
+                        )
+                        .and_then(|payload| {
+                            serde_json::from_value::<Operation>(payload).map_err(|e| e.to_string())
+                        })
                     {
-                        self.receive(id, caller, operation, now, 0, send);
+                        self.receive(
+                            id,
+                            actions::RequestCaller {
+                                principal: caller,
+                                approved_api: service == "nonary.stream-status/1",
+                            },
+                            operation,
+                            now,
+                            0,
+                            send,
+                        );
                     } else {
                         rpc::complete(send, id, error("restart_recovery_unconfirmed"));
                     }
@@ -399,12 +417,30 @@ impl Pipeline {
                 ..
             } => {
                 self.background_turn = true;
-                if service != SERVICE {
+                if service != SERVICE && service != "nonary.stream-status/1" {
                     rpc::complete(send, id, error("invalid_service"));
                     return Ok(());
                 }
-                match serde_json::from_value::<Operation>(payload) {
-                    Ok(operation) => self.receive(id, caller, operation, now, remaining_ms, send),
+                match amaterasu_module_sdk::operation_api::decode_delivery(
+                    payload,
+                    &service,
+                    SERVICE,
+                    &crate::public_api_methods(),
+                )
+                .and_then(|payload| {
+                    serde_json::from_value::<Operation>(payload).map_err(|e| e.to_string())
+                }) {
+                    Ok(operation) => self.receive(
+                        id,
+                        actions::RequestCaller {
+                            principal: caller,
+                            approved_api: service == "nonary.stream-status/1",
+                        },
+                        operation,
+                        now,
+                        remaining_ms,
+                        send,
+                    ),
                     Err(_) => {
                         rpc::complete(send, id, error("invalid_request"));
                     }

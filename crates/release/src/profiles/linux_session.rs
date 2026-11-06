@@ -342,6 +342,9 @@ const LINUX_SESSION_STREAM_SESSION: ComponentDefinition = ComponentDefinition {
 
 const LINUX_SESSION_MANAGEMENT: ComponentDefinition = ComponentDefinition {
     calls: &[
+        "nonary.stats/1",
+        "nonary.stats-history/1",
+        "nonary.stream-status/1",
         "amaterasu.host-package-activation/1",
         "amaterasu.extension-registry/1",
         "nonary.frame-limiter/1",
@@ -643,6 +646,7 @@ pub fn linux_session_policy(
     if let Some(runtime_directory) = &options.rtx_hdr_runtime_directory {
         enable_rtx_hdr(&mut policy, runtime_directory)?;
     }
+    super::operation_apis::install(&mut policy)?;
     Ok(policy)
 }
 

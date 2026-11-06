@@ -7,3 +7,6 @@
 [submodule "modules/rtx-hdr"]
 	path = modules/rtx-hdr
 	url = https://github.com/nonary-streams/amaterasu-rtx-hdr.git
+[submodule "modules/stats"]
+	path = modules/stats
+	url = https://github.com/nonary-streams/amaterasu-stats.git

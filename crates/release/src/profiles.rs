@@ -7,6 +7,7 @@ use std::path::Path;
 
 mod default_extensions;
 pub mod linux_session;
+mod operation_apis;
 mod platform_extensions;
 
 pub const RUNTIME_ID: &str = "amaterasu.runtime";
@@ -129,7 +130,7 @@ const SESSION: ComponentDefinition = ComponentDefinition {
 const SESSION_HISTORY: ComponentDefinition = ComponentDefinition {
     id: "amaterasu.session-history",
     library: "amaterasu_session_history",
-    provides: &["amaterasu.session-history/1"],
+    provides: &["amaterasu.session-history/1", "nonary.stats-history/1"],
     // Configuration delegates durable state calls under the original caller.
     calls: &["amaterasu.configuration/1", "amaterasu.state/1"],
     publishes: &[],
@@ -141,7 +142,7 @@ const SESSION_HISTORY: ComponentDefinition = ComponentDefinition {
 const HOST_METRICS: ComponentDefinition = ComponentDefinition {
     id: "amaterasu.host-metrics",
     library: "amaterasu_host_metrics",
-    provides: &["amaterasu.host-metrics/1"],
+    provides: &["amaterasu.host-metrics/1", "nonary.stats/1"],
     // Configuration delegates durable state calls under the original caller.
     calls: &["amaterasu.configuration/1", "amaterasu.state/1"],
     publishes: &[],
@@ -661,7 +662,7 @@ const FRAME_LIMITER: ComponentDefinition = ComponentDefinition {
 const STREAM_SESSION: ComponentDefinition = ComponentDefinition {
     id: "amaterasu.stream-session",
     library: "amaterasu_stream_session",
-    provides: &["amaterasu.stream-session/1"],
+    provides: &["amaterasu.stream-session/1", "nonary.stream-status/1"],
     calls: &[
         "amaterasu.input/1",
         "amaterasu.session/1",
@@ -1090,6 +1091,9 @@ const MANAGEMENT: ComponentDefinition = ComponentDefinition {
     library: "amaterasu_management",
     provides: &["amaterasu.management/1"],
     calls: &[
+        "nonary.stats/1",
+        "nonary.stats-history/1",
+        "nonary.stream-status/1",
         "amaterasu.library/1",
         // Loopback `/healthz` asks this component's fixed, status-only
         // operation to drive bounded checks of its imported dependencies.
@@ -1903,6 +1907,7 @@ fn development_policy_with_extensions(
             &journal_directory,
         )?;
     }
+    operation_apis::install(&mut policy)?;
     Ok(policy)
 }
 
@@ -1987,6 +1992,7 @@ pub fn desktop_stream_smoke_policy(
             }),
         ),
     ]));
+    operation_apis::install(&mut policy)?;
     Ok(policy)
 }
 
@@ -2106,6 +2112,7 @@ pub fn installer_policy(
         &[platform_extensions::WINDOWS_METADATA],
     )
     .expect("bundled default extension metadata must be valid");
+    operation_apis::install(&mut policy).expect("valid module operation contracts");
     policy
 }
 

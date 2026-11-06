@@ -596,6 +596,7 @@ namespace Amaterasu {
       };
       if (page.startsWith("extension/")) {
         fresh.append(el("p", "muted", "Loading extension…"));
+        this.draftGuards.register(() => this.extensions.isDirty(), () => this.extensions.dispose());
         void this.extensions.mount(page.slice(10), fresh).catch((error) => {
           if (fresh.isConnected) fresh.replaceChildren(errorPanel(error));
         });

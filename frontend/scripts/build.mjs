@@ -1,5 +1,6 @@
 import { mkdir, copyFile } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
+await import("./export-ui-sdk.mjs");
 const result = spawnSync(
   process.execPath,
   ["node_modules/typescript/bin/tsc"],

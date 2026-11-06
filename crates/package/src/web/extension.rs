@@ -86,11 +86,13 @@ pub fn validate_manifest(manifest: &Manifest, now: u64) -> PackageResult<()> {
         return Err("too many extension method declarations".into());
     }
     if manifest.placements.is_empty()
-        || manifest.placements.len() > 2
-        || manifest
-            .placements
-            .iter()
-            .any(|place| place != "page" && place != "application")
+        || manifest.placements.len() > 4
+        || manifest.placements.iter().any(|place| {
+            !matches!(
+                place.as_str(),
+                "page" | "application" | "overview" | "settings"
+            )
+        })
         || manifest
             .placements
             .iter()

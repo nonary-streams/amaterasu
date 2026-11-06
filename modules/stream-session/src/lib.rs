@@ -9,6 +9,19 @@ use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, Runti
 use model::Settings;
 use pipeline::Pipeline;
 
+pub(crate) fn public_api_methods() -> Vec<amaterasu_module_sdk::ApiMethod> {
+    use amaterasu_module_sdk::{ApiFieldKind, operation_api};
+    vec![
+        operation_api::method("nonary.stream-status/1", "snapshot", &[], &[]),
+        operation_api::method(
+            "nonary.stream-status/1",
+            "stop_stream",
+            &[("session_id", ApiFieldKind::String)],
+            &[],
+        ),
+    ]
+}
+
 const SERVICE: &str = "amaterasu.stream-session/1";
 struct StreamSession {
     runtime: RuntimeClient,
@@ -26,6 +39,9 @@ impl ManagedModule for StreamSession {
         runtime.require_success(Command::Register {
             service: SERVICE.into(),
         })?;
+        for method in public_api_methods() {
+            runtime.require_success(Command::RegisterApi { method })?;
+        }
         // A host may select this provider as its non-disruptive activation
         // barrier. Older hosts and profiles continue without the capability.
         if matches!(

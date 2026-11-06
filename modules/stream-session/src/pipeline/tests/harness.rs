@@ -185,6 +185,13 @@ impl Broker {
         });
     }
 
+    pub fn enqueue_api(&mut self, request: u64, owner: &str, method: &str, arguments: Value) {
+        self.incoming.push_back(Response::Request {
+            id:request,caller:owner.into(),initiator:owner.into(),service:"nonary.stream-status/1".into(),
+            payload:json!({"method":method,"interface_major":1,"interface_minor":0,"arguments":arguments}),remaining_ms:30000,
+        });
+    }
+
     pub fn cancel_parent(&mut self, request: u64) {
         self.cancelled.insert(request);
     }
