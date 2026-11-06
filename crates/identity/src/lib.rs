@@ -13,6 +13,9 @@ pub const INTERFACE_MINOR_PERMISSIONS: u32 = 1;
 pub const PERMISSION_LIST: u32 = 1;
 pub const PERMISSION_LAUNCH: u32 = 2;
 pub const PERMISSION_VIEW: u32 = 3;
+/// Requires the client's explicit stream-termination permission. Providers that
+/// predate this selector reject it; consumers must treat that result as denial.
+pub const PERMISSION_TERMINATE: u32 = 4;
 pub const MAX_MESSAGE_BYTES: usize = 65536;
 pub const MAX_CERTIFICATE_BYTES: usize = 8192;
 pub const MAX_SIGNATURE_BYTES: usize = 512;
@@ -49,7 +52,8 @@ pub struct IdentityApiV1_1 {
     pub v1_0: IdentityApi,
     /// Checks exact DER membership, certificate validity and current committed
     /// policy synchronously. List is allowed by list, view or launch; view by
-    /// view or launch. Returns STATUS_OK only when allowed, IDENTITY_UNTRUSTED
+    /// view or launch; termination requires terminate permission. Returns
+    /// STATUS_OK only when allowed, IDENTITY_UNTRUSTED
     /// for an invalid or unpaired certificate, IDENTITY_FORBIDDEN for a denied
     /// permission, STATUS_INVALID_ARGUMENT for an unknown selector, and
     /// IDENTITY_UNAVAILABLE when committed policy cannot be consulted. Callers

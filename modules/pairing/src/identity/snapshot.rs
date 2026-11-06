@@ -207,7 +207,7 @@ impl Snapshot {
     pub fn check_permission(&self, der: &[u8], now: u64, permission: u32) -> Result<(), Status> {
         if !matches!(
             permission,
-            PERMISSION_LIST | PERMISSION_LAUNCH | PERMISSION_VIEW
+            PERMISSION_LIST | PERMISSION_LAUNCH | PERMISSION_VIEW | PERMISSION_TERMINATE
         ) {
             return Err(amaterasu_module_sdk::abi::STATUS_INVALID_ARGUMENT);
         }
@@ -222,6 +222,7 @@ impl Snapshot {
                 PERMISSION_LIST => p.list_apps || p.view_streams || p.launch_apps,
                 PERMISSION_VIEW => p.view_streams || p.launch_apps,
                 PERMISSION_LAUNCH => p.launch_apps,
+                PERMISSION_TERMINATE => p.terminate_streams,
                 _ => unreachable!(),
             };
         if allowed {
