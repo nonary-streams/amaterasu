@@ -72,6 +72,13 @@ fn run() -> PackageResult<()> {
             capture_authority::adopt(component, digest)?;
             worker::serve_interactive(Path::new(root), digest, Path::new(state_root), None)?;
         }
+        #[cfg(target_os = "linux")]
+        [command, root, digest, state_root, component]
+            if command == "worker-authorized-serve-v2" =>
+        {
+            capture_authority::adopt_v2(component, digest)?;
+            worker::serve_interactive(Path::new(root), digest, Path::new(state_root), None)?;
+        }
         [command, root, digest] if command == "worker-serve" => {
             worker::serve(Path::new(root), digest)?;
         }

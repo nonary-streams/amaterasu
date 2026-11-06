@@ -107,7 +107,7 @@ fn worker(args: &[String]) {
     use std::os::fd::AsRawFd;
     assert_eq!(
         args.get(1).map(String::as_str),
-        Some("worker-authorized-serve")
+        Some("worker-authorized-serve-v2")
     );
     assert_eq!((unsafe { geteuid() }, unsafe { getegid() }), (65534, 65534));
     assert!(std::env::var_os("LD_PRELOAD").is_none());
@@ -121,6 +121,14 @@ fn worker(args: &[String]) {
             .success()
     );
     let state = Path::new(&args[4]);
+    let package = Path::new(&args[2]).join("sets").join(&args[3]);
+    assert!(!package.join("helper-pids").exists());
+    precheck();
+    assert!(
+        !package.join("helper-pids").exists(),
+        "precheck must not execute a helper"
+    );
+    fs::write(state.join("precheck-ready"), b"yes").unwrap();
     let scope = open_session();
     hello(scope.as_raw_fd());
     send(scope.as_raw_fd(), &request(2, 2, 1));
@@ -143,6 +151,31 @@ fn worker(args: &[String]) {
     assert!(receive(active.as_raw_fd(), &mut reply) <= 0);
     fs::write(state.join("session-closed"), b"yes").unwrap();
     std::thread::sleep(std::time::Duration::from_secs(30));
+}
+
+fn precheck() {
+    send(198, b"AMACAP01");
+    let mut bytes = [0u8; 9];
+    let mut vector = IoVec {
+        base: bytes.as_mut_ptr().cast(),
+        len: bytes.len(),
+    };
+    let mut control = [0usize; 8];
+    let mut message = Message {
+        name: std::ptr::null_mut(),
+        name_len: 0,
+        vectors: &mut vector,
+        vector_count: 1,
+        control: control.as_mut_ptr().cast(),
+        control_len: std::mem::size_of_val(&control),
+        flags: 0,
+    };
+    assert_eq!(unsafe { recvmsg(198, &mut message, 0x40000000) }, 8);
+    assert_eq!(&bytes[..8], b"AMACAPOK");
+    assert_eq!(
+        message.control_len, 0,
+        "pure precheck carries no descriptors"
+    );
 }
 fn helper() {
     use std::io::Write;

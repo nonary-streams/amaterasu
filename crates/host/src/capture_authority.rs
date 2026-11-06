@@ -11,12 +11,23 @@ struct AuthorityContext {
     component: String,
     digest: String,
     channel: OwnedFd,
+    source_preflight: bool,
 }
 static AUTHORITY: OnceLock<AuthorityContext> = OnceLock::new();
 
 /// Adopts only the private root-peer channel. A caller naming a component or
 /// setting a number in package JSON does not create authority.
 pub fn adopt(component: &str, digest: &str) -> PackageResult<()> {
+    adopt_protocol(component, digest, false)
+}
+
+/// The precheck-aware protected launcher uses a distinct command. A legacy
+/// launcher keeps the legacy command and can never authorize a new opcode.
+pub fn adopt_v2(component: &str, digest: &str) -> PackageResult<()> {
+    adopt_protocol(component, digest, true)
+}
+
+fn adopt_protocol(component: &str, digest: &str, source_preflight: bool) -> PackageResult<()> {
     if !amaterasu_contracts::valid_name(component)
         || digest.len() != 64
         || !digest
@@ -57,6 +68,7 @@ pub fn adopt(component: &str, digest: &str) -> PackageResult<()> {
             component: component.to_owned(),
             digest: digest.to_owned(),
             channel,
+            source_preflight,
         })
         .map_err(|_| "approved capture channel already adopted".to_owned())
 }
@@ -65,12 +77,7 @@ pub fn inject(
     package: &VerifiedPackage,
     settings: &mut std::collections::BTreeMap<String, serde_json::Value>,
 ) -> PackageResult<()> {
-    // Never trust fd numbers from a signed or user-supplied settings document.
-    for value in settings.values_mut() {
-        if let Some(object) = value.as_object_mut() {
-            object.remove("authority_channel_fd");
-        }
-    }
+    let precheck_requests = reserved_settings(settings)?;
     if let Some(authority) = AUTHORITY.get() {
         if package.digest != authority.digest
             || !package.privileged_requests.iter().any(|r| {
@@ -96,6 +103,13 @@ pub fn inject(
             "authority_channel_fd".into(),
             authority.channel.as_raw_fd().into(),
         );
+        // Only new components explicitly requesting this reserved injection
+        // receive it; old deny-unknown-fields schemas remain byte-compatible.
+        inject_precheck(
+            value,
+            precheck_requests.contains(&authority.component),
+            authority.source_preflight,
+        );
     }
     for (component, value) in settings.iter() {
         if value
@@ -114,8 +128,79 @@ pub fn inject(
     Ok(())
 }
 
+fn reserved_settings(
+    settings: &mut std::collections::BTreeMap<String, serde_json::Value>,
+) -> PackageResult<std::collections::BTreeSet<String>> {
+    let mut requests = std::collections::BTreeSet::new();
+    for (component, value) in settings {
+        if let Some(object) = value.as_object_mut() {
+            object.remove("authority_channel_fd");
+            match object.remove("authority_precheck_supported") {
+                None => {}
+                Some(serde_json::Value::Bool(false)) => {
+                    requests.insert(component.clone());
+                }
+                Some(_) => {
+                    return Err(
+                        "authority_precheck_supported is a reserved false injection placeholder"
+                            .into(),
+                    );
+                }
+            }
+        }
+    }
+    Ok(requests)
+}
+
+fn inject_precheck(
+    settings: &mut serde_json::Map<String, serde_json::Value>,
+    requested: bool,
+    supported: bool,
+) {
+    if requested {
+        settings.insert("authority_precheck_supported".into(), supported.into());
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn protocol_support_is_reserved_and_old_component_settings_stay_unchanged() {
+        use serde_json::json;
+        for supported in [false, true] {
+            let mut settings = std::collections::BTreeMap::from([
+                (
+                    "old.capture".into(),
+                    json!({"enabled":true,"authority_channel_fd":100}),
+                ),
+                (
+                    "new.capture".into(),
+                    json!({"enabled":true,"authority_precheck_supported":false}),
+                ),
+            ]);
+            let requests = super::reserved_settings(&mut settings).unwrap();
+            assert_eq!(requests, ["new.capture".to_owned()].into());
+            for (component, value) in &mut settings {
+                super::inject_precheck(
+                    value.as_object_mut().unwrap(),
+                    requests.contains(component),
+                    supported,
+                );
+            }
+            assert_eq!(settings["old.capture"], json!({"enabled":true}));
+            assert_eq!(
+                settings["new.capture"]["authority_precheck_supported"],
+                supported
+            );
+        }
+        for invalid in [json!(true), json!(1), json!(null)] {
+            let mut settings = std::collections::BTreeMap::from([(
+                "capture".into(),
+                json!({"authority_precheck_supported":invalid}),
+            )]);
+            assert!(super::reserved_settings(&mut settings).is_err());
+        }
+    }
     #[test]
     #[ignore = "requires root to launch a disposable unprivileged authority worker"]
     fn approved_channel_hardening_survives_exec() {

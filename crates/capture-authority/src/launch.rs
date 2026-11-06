@@ -325,7 +325,7 @@ fn spawn_worker(
     let mut command = Command::new(format!("/proc/self/fd/{}", executable.as_raw_fd()));
     command
         .arg0("amaterasu")
-        .arg("worker-authorized-serve")
+        .arg("worker-authorized-serve-v2")
         .arg(&options.package_root)
         .arg(&approval.request.manifest_digest)
         .arg(&options.state_root)
