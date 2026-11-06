@@ -1,0 +1,43 @@
+[
+  {
+    "service": "nonary.host-settings/1",
+    "method": "read",
+    "interface_major": 1,
+    "interface_minor": 0,
+    "request": {
+      "required": {},
+      "optional": {},
+      "allow_extra": false
+    },
+    "response": {
+      "required": {
+        "ok": "boolean"
+      },
+      "optional": {},
+      "allow_extra": true
+    },
+    "privilege": "user"
+  },
+  {
+    "service": "nonary.host-settings/1",
+    "method": "update",
+    "interface_major": 1,
+    "interface_minor": 0,
+    "request": {
+      "required": {
+        "values": "object",
+        "expected_revision": "integer"
+      },
+      "optional": {},
+      "allow_extra": false
+    },
+    "response": {
+      "required": {
+        "ok": "boolean"
+      },
+      "optional": {},
+      "allow_extra": true
+    },
+    "privilege": "user"
+  }
+]

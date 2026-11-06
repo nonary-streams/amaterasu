@@ -468,10 +468,15 @@ impl Pipeline {
                 id,
                 caller,
                 initiator,
+                service,
                 payload,
                 remaining_ms,
                 ..
             } => {
+                let payload = match crate::api::decode(payload, &service) {
+                    Ok(payload) => payload,
+                    Err(reason) => return complete(send, id, error("invalid_request", reason)),
+                };
                 let operation = match serde_json::from_value::<Operation>(payload) {
                     Ok(operation) => operation,
                     Err(failure) => {

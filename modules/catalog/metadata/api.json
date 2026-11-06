@@ -1,0 +1,63 @@
+[
+  {
+    "service": "nonary.catalog/1",
+    "method": "get",
+    "interface_major": 1,
+    "interface_minor": 0,
+    "request": {
+      "required": {
+        "id": "string"
+      },
+      "optional": {},
+      "allow_extra": false
+    },
+    "response": {
+      "required": {},
+      "optional": {},
+      "allow_extra": true
+    },
+    "privilege": "user"
+  },
+  {
+    "service": "nonary.catalog/1",
+    "method": "update",
+    "interface_major": 1,
+    "interface_minor": 0,
+    "request": {
+      "required": {
+        "id": "string",
+        "entry": "object",
+        "expected_revision": "integer"
+      },
+      "optional": {},
+      "allow_extra": false
+    },
+    "response": {
+      "required": {},
+      "optional": {},
+      "allow_extra": true
+    },
+    "privilege": "user"
+  },
+  {
+    "service": "nonary.catalog/1",
+    "method": "update_provider_overrides",
+    "interface_major": 1,
+    "interface_minor": 0,
+    "request": {
+      "required": {
+        "id": "string",
+        "config_overrides": "object",
+        "expected_revision": "integer"
+      },
+      "optional": {},
+      "allow_extra": false
+    },
+    "response": {
+      "required": {},
+      "optional": {},
+      "allow_extra": true
+    },
+    "privilege": "user"
+  }
+]

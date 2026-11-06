@@ -10,3 +10,9 @@
 [submodule "modules/stats"]
 	path = modules/stats
 	url = https://github.com/nonary-streams/amaterasu-stats.git
+[submodule "modules/display"]
+	path = modules/display
+	url = https://github.com/nonary-streams/amaterasu-display.git
+[submodule "modules/frame-limiter"]
+	path = modules/frame-limiter
+	url = https://github.com/nonary-streams/amaterasu-frame-limiter.git

@@ -385,6 +385,9 @@ const LINUX_SESSION_MANAGEMENT: ComponentDefinition = ComponentDefinition {
         "amaterasu.control-transport/1",
         "amaterasu.session-history/1",
         "amaterasu.stream-session/1",
+        "nonary.display/1",
+        "nonary.catalog/1",
+        "nonary.host-settings/1",
     ],
     dependencies: &[
         "amaterasu.library",

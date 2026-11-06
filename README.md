@@ -32,14 +32,22 @@ Opus also requires CMake and a compatible C compiler. The independent Python
 cryptographic checks in `test_native_media.py`, `test_control_transport.py` and `test_nvhttp.py` require the
 `cryptography` package in the test environment.
 
-Initialize the capture provider submodule before building it. It has its own
+Initialize all core plugin submodules before building the workspace. Display,
+Frame limiting, Stats and RTX HDR have independent source repositories and pinned
+versions. Their browser settings surfaces use the shared SDK and approved APIs.
+See [Display](https://github.com/nonary-streams/amaterasu-display) and
+[Frame limiting](https://github.com/nonary-streams/amaterasu-frame-limiter) for
+standalone build and UI packaging instructions. Source extraction does not
+activate a package on an installed host.
+
+The capture provider is also a submodule. It has its own
 lockfile and is validated separately from the parent workspace. Its helper-wire crate also builds the privileged helper; its shared wire
 sources must match the broker library in this repository. Run
 `python3 scripts/check_vkms_wire_sync.py` after changing either copy. Update and
 test both copies together, publish the provider change, then advance the pin.
 
 ```sh
-git submodule update --init modules/capture-vkms
+git submodule update --init --recursive
 python3 scripts/check_vkms_wire_sync.py
 cargo build --workspace --locked
 cargo build --manifest-path modules/capture-vkms/helper-wire/Cargo.toml --locked

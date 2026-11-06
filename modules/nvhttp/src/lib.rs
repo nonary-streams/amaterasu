@@ -1,5 +1,6 @@
 //! Bounded HTTP/TLS transport for Moonlight-compatible control and pairing.
 #![recursion_limit = "256"]
+mod api;
 
 mod audio_driver_install;
 mod encoder_refresh;
@@ -300,6 +301,7 @@ impl ManagedModule for NvhttpModule {
         runtime.require_success(Command::Register {
             service: SERVICE.into(),
         })?;
+        amaterasu_module_sdk::operation_api::register_selected(&runtime, &api::methods())?;
         // Host filtering and file policy are applied downstream. Keep this
         // lifecycle event free of configured addresses and request contents.
         let _ = runtime.log(
@@ -685,13 +687,17 @@ impl NvhttpModule {
                 remaining_ms,
                 ..
             } => {
-                if service != SERVICE {
-                    return complete_control(
-                        &self.runtime,
-                        id,
-                        json!({"ok":false,"code":"invalid_request"}),
-                    );
-                }
+                let approved_api = service == api::SERVICE;
+                let payload = match api::decode(payload, &service) {
+                    Ok(payload) => payload,
+                    Err(_) => {
+                        return complete_control(
+                            &self.runtime,
+                            id,
+                            json!({"ok":false,"code":"invalid_request"}),
+                        );
+                    }
+                };
                 let operation = match serde_json::from_value::<Operation>(payload) {
                     Ok(operation) => operation,
                     Err(_) => {
@@ -780,7 +786,7 @@ impl NvhttpModule {
                     ),
                     settings_action @ (Operation::SettingsGet
                     | Operation::SettingsUpdate { .. }) => {
-                        if caller != MANAGEMENT_PRINCIPAL {
+                        if caller != MANAGEMENT_PRINCIPAL && !approved_api {
                             return complete_control(
                                 &self.runtime,
                                 id,

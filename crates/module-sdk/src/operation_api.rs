@@ -4,6 +4,31 @@ use crate::{ApiFieldKind, ApiMethod, ApiPrivilege, ApiSchema, ModuleResult};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
+/// Register additive methods selected by trusted startup composition. An
+/// unapproved method remains unavailable; consumers never use its legacy route
+/// as a substitute. Other failures remain errors. This allows older policies to
+/// keep using the provider's original interface without requiring new grants.
+pub fn register_selected(
+    runtime: &crate::RuntimeClient,
+    methods: &[ApiMethod],
+) -> ModuleResult<usize> {
+    let mut registered = 0;
+    for method in methods {
+        match runtime.send(crate::Command::RegisterApi {
+            method: method.clone(),
+        })? {
+            crate::Response::Ok => registered += 1,
+            crate::Response::Error { code, .. } if code == "permission_denied" => {}
+            response => {
+                return Err(format!(
+                    "unexpected operation API registration: {response:?}"
+                ));
+            }
+        }
+    }
+    Ok(registered)
+}
+
 pub fn method(
     service: &str,
     name: &str,

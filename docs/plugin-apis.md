@@ -23,3 +23,32 @@ exact cumulative values in browser clients. Derive mean milliseconds only from
 newly measured frames between compatible epochs; no new measurement is unknown,
 not zero or a repeated average. See [the encoder SDK](encoder-plugin-sdk.md#optional-measured-timing)
 for timing bounds, optional native interfaces and provider responsibilities.
+
+
+Core modules also supply these independently approved methods:
+
+| Public service | Methods | Owning module |
+| --- | --- | --- |
+| `nonary.display/1` | `status`, `snapshot`, `enumerate`, `apply`, `restore`, `recover` | [Display](https://github.com/nonary-streams/amaterasu-display) |
+| `nonary.catalog/1` | `get`, `update`, `update_provider_overrides` | Catalog |
+| `nonary.host-settings/1` | `read`, `update` | NVHTTP settings provider |
+
+The exact request/response schemas live in each module's `metadata/api.json`.
+Catalog updates require an application ID and expected revision. A normal update
+carries the complete entry; provider-managed entries use the override-only method.
+Host settings updates carry `values` and `expected_revision`; omitted, null and
+explicit values retain their existing distinct meanings. Readback confirms stored
+values, not native application to a stream. Display effects retain provider-owned
+mutation approval, topology checks, leases and durable recovery.
+
+`operation_api::register_selected` registers only additive methods selected by
+trusted composition. Older policies can continue using their original services;
+unapproved public methods remain unavailable. API consumers never silently use
+a raw legacy service or another implementation. The release profile imports the
+module-owned schemas and grants only matching existing callers. The public
+browser UI uses signed method aliases and its authenticated user's permissions.
+
+The generic Modules & UI inventory projects bounded identities from the exact
+verified manifest selected by the running worker's digest. Missing or changed
+manifest bytes leave inventory unavailable; the persisted selection is never
+presented as proof of a running component's health.

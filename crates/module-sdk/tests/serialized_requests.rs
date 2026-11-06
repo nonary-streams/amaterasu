@@ -120,3 +120,39 @@ fn serialized_requests_preserve_identity_pending_and_retry_state() {
             .any(|command| command["op"] == "release_result")
     );
 }
+
+#[test]
+fn selected_operation_registration_preserves_old_policies_and_surfaces_failures() {
+    use amaterasu_module_sdk::operation_api;
+    let methods = [
+        operation_api::method("example.selected/1", "read", &[], &[]),
+        operation_api::method("example.selected/1", "write", &[], &[]),
+    ];
+    let fixture = Fixture {
+        commands: RefCell::new(Vec::new()),
+        replies: RefCell::new(VecDeque::from([
+            json!({"kind":"error","code":"permission_denied","message":"not selected"}),
+            json!({"kind":"ok"}),
+            json!({"kind":"error","code":"invalid_request","message":"unavailable"}),
+        ])),
+    };
+    let endpoint = HostApi {
+        header: AbiHeader::of::<HostApi>(),
+        context: (&fixture as *const Fixture).cast_mut().cast(),
+        invoke,
+    };
+    // SAFETY: fixture outlives the client and these synchronous calls.
+    let runtime = unsafe { RuntimeClient::from_endpoint(endpoint) };
+    assert_eq!(
+        operation_api::register_selected(&runtime, &methods).unwrap(),
+        1
+    );
+    assert!(operation_api::register_selected(&runtime, &methods[..1]).is_err());
+    let commands = fixture.commands.borrow();
+    assert_eq!(commands.len(), 3);
+    assert!(
+        commands
+            .iter()
+            .all(|command| command["op"] == "register_api")
+    );
+}

@@ -4,6 +4,18 @@ use amaterasu_contracts::{ApiMethod, ApiMethodApproval, RuntimeConfig};
 pub(super) fn install(policy: &mut RuntimeConfig) -> Result<(), String> {
     for (provider, methods) in [
         (
+            "amaterasu.display",
+            include_str!("../../../../modules/display/metadata/api.json"),
+        ),
+        (
+            "amaterasu.catalog",
+            include_str!("../../../../modules/catalog/metadata/api.json"),
+        ),
+        (
+            "amaterasu.nvhttp",
+            include_str!("../../../../modules/nvhttp/metadata/api.json"),
+        ),
+        (
             "amaterasu.host-metrics",
             include_str!("../../../../modules/stats/metadata/api.json"),
         ),

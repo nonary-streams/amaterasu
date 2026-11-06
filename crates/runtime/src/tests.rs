@@ -2324,91 +2324,130 @@ fn package_activation_requires_host_capability_management_grant_and_bounded_queu
 #[test]
 fn operation_api_consumers_remain_unchanged_when_the_provider_is_replaced() {
     use amaterasu_module_sdk::operation_api;
-    let service = "example.telemetry/1";
-    let method = operation_api::method(service, "snapshot", &[], &[]);
-    // This consumer knows only the versioned API, never either implementation.
-    let read = || Command::CallApi {
-        service: service.into(),
-        method: "snapshot".into(),
-        interface_major: 1,
-        interface_minor: 0,
-        payload: json!({}),
-        timeout_ms: 1000,
-        operation_id: "sample".into(),
-        parent: None,
-    };
-    for (provider, reading) in [("vendor.primary", 42), ("vendor.replacement", 73)] {
-        let mut config = RuntimeConfig::default();
-        config.principals.insert(
-            provider.into(),
-            Grants {
-                provide: names(&[service]),
-                ..Default::default()
-            },
+    let mut contracts = vec![operation_api::method(
+        "example.telemetry/1",
+        "snapshot",
+        &[],
+        &[],
+    )];
+    for (schema, name) in [
+        (
+            include_str!("../../../modules/display/metadata/api.json"),
+            "snapshot",
+        ),
+        (
+            include_str!("../../../modules/catalog/metadata/api.json"),
+            "get",
+        ),
+        (
+            include_str!("../../../modules/nvhttp/metadata/api.json"),
+            "read",
+        ),
+    ] {
+        let methods: Vec<amaterasu_contracts::ApiMethod> = serde_json::from_str(schema).unwrap();
+        contracts.push(
+            methods
+                .into_iter()
+                .find(|method| method.method == name)
+                .unwrap(),
         );
-        config.principals.insert(
-            "consumer".into(),
-            Grants {
-                call: names(&[service]),
-                ..Default::default()
-            },
-        );
-        config.api_methods.push(ApiMethodApproval {
-            provider: provider.into(),
-            callers: names(&["consumer"]),
-            method: method.clone(),
-        });
-        let mut broker = Broker::new(config).unwrap();
-        assert!(matches!(
-            broker.dispatch(
-                provider,
-                Command::RegisterApi {
-                    method: method.clone()
-                }
-            ),
-            Response::Ok
-        ));
-        let Response::Accepted { id } = broker.dispatch("consumer", read()) else {
-            panic!("admission");
+    }
+    for method in contracts {
+        let service = method.service.as_str();
+        let arguments = if method.method == "get" {
+            json!({"id":"app-0000000000000001"})
+        } else {
+            json!({})
         };
-        let Response::Request { payload, .. } = broker.dispatch(provider, Command::Poll {}) else {
-            panic!("delivery");
+        // This consumer knows only the versioned API, never either implementation.
+        let read = || Command::CallApi {
+            service: service.into(),
+            method: method.method.clone(),
+            interface_major: 1,
+            interface_minor: 0,
+            payload: arguments.clone(),
+            timeout_ms: 1000,
+            operation_id: "sample".into(),
+            parent: None,
         };
-        assert_eq!(
-            operation_api::decode_delivery(
-                payload,
-                service,
-                "legacy/1",
-                std::slice::from_ref(&method)
-            )
-            .unwrap(),
-            json!({"action":"snapshot"})
-        );
-        assert!(matches!(
-            broker.dispatch(
-                provider,
-                Command::Complete {
-                    request: id,
-                    payload: json!({"ok":true,"value":reading})
+        for (provider, reading) in [("vendor.primary", 42), ("vendor.replacement", 73)] {
+            let mut config = RuntimeConfig::default();
+            config.principals.insert(
+                provider.into(),
+                Grants {
+                    provide: names(&[service]),
+                    ..Default::default()
+                },
+            );
+            config.principals.insert(
+                "consumer".into(),
+                Grants {
+                    call: names(&[service]),
+                    ..Default::default()
+                },
+            );
+            config.api_methods.push(ApiMethodApproval {
+                provider: provider.into(),
+                callers: names(&["consumer"]),
+                method: method.clone(),
+            });
+            let mut broker = Broker::new(config).unwrap();
+            assert!(matches!(
+                broker.dispatch(
+                    provider,
+                    Command::RegisterApi {
+                        method: method.clone()
+                    }
+                ),
+                Response::Ok
+            ));
+            let Response::Accepted { id } = broker.dispatch("consumer", read()) else {
+                panic!("admission");
+            };
+            let Response::Request { payload, .. } = broker.dispatch(provider, Command::Poll {})
+            else {
+                panic!("delivery");
+            };
+            assert_eq!(
+                operation_api::decode_delivery(
+                    payload,
+                    service,
+                    "legacy/1",
+                    std::slice::from_ref(&method)
+                )
+                .unwrap(),
+                {
+                    let mut expected = arguments.clone();
+                    expected["action"] = method.method.clone().into();
+                    expected
                 }
-            ),
-            Response::Ok
-        ));
-        assert!(
-            matches!(broker.dispatch("consumer",Command::TakeResult {request:id}),Response::Result {payload} if payload["value"]==reading)
-        );
-        assert!(matches!(
-            broker.dispatch("consumer", Command::ReleaseResult { request: id }),
-            Response::Ok
-        ));
-        assert!(
-            operation_api::decode_delivery(
-                json!({"action":"write"}),
-                service,
-                "legacy/1",
-                std::slice::from_ref(&method)
-            )
-            .is_err()
-        );
+            );
+            assert!(matches!(
+                broker.dispatch(
+                    provider,
+                    Command::Complete {
+                        request: id,
+                        payload: json!({"ok":true,"value":reading})
+                    }
+                ),
+                Response::Ok
+            ));
+            assert!(
+                matches!(broker.dispatch("consumer",Command::TakeResult {request:id}),Response::Result {payload} if payload["value"]==reading)
+            );
+            assert!(matches!(
+                broker.dispatch("consumer", Command::ReleaseResult { request: id }),
+                Response::Ok
+            ));
+            assert!(
+                operation_api::decode_delivery(
+                    json!({"action":"write"}),
+                    service,
+                    "legacy/1",
+                    std::slice::from_ref(&method)
+                )
+                .is_err()
+            );
+        }
     }
 }

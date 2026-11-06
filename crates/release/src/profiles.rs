@@ -196,7 +196,7 @@ const CONFIGURATION: ComponentDefinition = ComponentDefinition {
 const CATALOG: ComponentDefinition = ComponentDefinition {
     id: "amaterasu.catalog",
     library: "amaterasu_catalog",
-    provides: &["amaterasu.catalog/1"],
+    provides: &["amaterasu.catalog/1", "nonary.catalog/1"],
     calls: &["amaterasu.state/1"],
     publishes: &[],
     native_provides: &[],
@@ -369,7 +369,7 @@ const PLATFORM_PAIRING: ComponentDefinition = ComponentDefinition {
 const NVHTTP: ComponentDefinition = ComponentDefinition {
     id: "amaterasu.nvhttp",
     library: "amaterasu_nvhttp",
-    provides: &["amaterasu.nvhttp/1"],
+    provides: &["amaterasu.nvhttp/1", "nonary.host-settings/1"],
     calls: &[
         "amaterasu.configuration/1",
         "amaterasu.input/1",
@@ -423,7 +423,7 @@ const NVHTTP: ComponentDefinition = ComponentDefinition {
 const DISPLAY: ComponentDefinition = ComponentDefinition {
     id: "amaterasu.display",
     library: "amaterasu_display",
-    provides: &["amaterasu.display/1"],
+    provides: &["amaterasu.display/1", "nonary.display/1"],
     calls: &["amaterasu.state/1"],
     publishes: &[],
     native_provides: &[],
@@ -1133,6 +1133,9 @@ const MANAGEMENT: ComponentDefinition = ComponentDefinition {
         "amaterasu.system-tray/1",
         "amaterasu.host-lifecycle/1",
         "amaterasu.host-logs/1",
+        "nonary.display/1",
+        "nonary.catalog/1",
+        "nonary.host-settings/1",
     ],
     publishes: &[],
     native_provides: &[],
@@ -1219,6 +1222,9 @@ const MANAGEMENT_EXTENSION_EXAMPLE: ComponentDefinition = ComponentDefinition {
         "amaterasu.host-lifecycle/1",
         "amaterasu.host-logs/1",
         "example.extension/1",
+        "nonary.display/1",
+        "nonary.catalog/1",
+        "nonary.host-settings/1",
     ],
     ..MANAGEMENT
 };
@@ -1443,6 +1449,9 @@ const LINUX_MANAGEMENT: ComponentDefinition = ComponentDefinition {
         "amaterasu.media-transport",
         "amaterasu.control-transport",
         "amaterasu.session-history",
+        "nonary.display/1",
+        "nonary.catalog/1",
+        "nonary.host-settings/1",
     ],
     dependencies: &[
         "amaterasu.library",

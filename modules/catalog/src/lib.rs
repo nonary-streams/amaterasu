@@ -1,4 +1,5 @@
 //! Durable, caller-scoped manual application catalogs.
+mod api;
 mod model;
 mod pipeline;
 mod product;
@@ -118,6 +119,7 @@ impl ManagedModule for CatalogModule {
         runtime.require_success(Command::Register {
             service: SERVICE.into(),
         })?;
+        amaterasu_module_sdk::operation_api::register_selected(&runtime, &api::methods())?;
         let seeded_owners: std::collections::BTreeSet<String> = if settings.seed_desktop_entry {
             settings.export_principals.values().cloned().collect()
         } else {
