@@ -52,6 +52,13 @@ impl NativeDriver {
 }
 
 impl Driver for NativeDriver {
+    fn capture_target(
+        &mut self,
+        binding: Option<Binding>,
+        expected: &Specification,
+    ) -> Result<Option<Ready>, &'static str> {
+        binding.map_or(Ok(None), |binding| monitor_identity(binding, expected))
+    }
     fn supported(&self) -> bool {
         true
     }

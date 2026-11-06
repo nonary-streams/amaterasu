@@ -10,6 +10,7 @@ mod linux_manager;
 #[cfg(any(not(amaterasu_libvirtualdisplay), test))]
 mod manager;
 mod model;
+mod retained_mode;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod protocol;
 mod scale;

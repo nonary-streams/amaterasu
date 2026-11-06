@@ -41,6 +41,33 @@ where
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Operation {
+    PrepareRetainedMode {
+        operation_id: String,
+        identity: String,
+        reference_id: String,
+        expected_reference_ids: Vec<String>,
+        expected_mode_revision: u64,
+        width: u32,
+        height: u32,
+        refresh_millihz: u32,
+        hdr_enabled: bool,
+    },
+    VerifyRetainedMode {
+        owner: String,
+        identity: String,
+        reference_id: String,
+        operation_id: String,
+    },
+    CommitRetainedMode {
+        operation_id: String,
+        identity: String,
+        reference_id: String,
+    },
+    AbortRetainedMode {
+        operation_id: String,
+        identity: String,
+        reference_id: String,
+    },
     /// Read-only cross-provider verification for an explicitly trusted startup
     /// verifier. The provider derives verifier authority from the broker caller,
     /// never from `owner`. This does not transfer or release the owner's lease.

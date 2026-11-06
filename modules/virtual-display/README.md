@@ -398,3 +398,28 @@ This domain covers only changes admitted by this provider, not external KScreen
 or broker effects. The independent compositor/output observation and continuing
 validation remain necessary. Windows rejects explicit per-request layout or
 revision with `unsupported_topology_domain`; its prior requests remain valid.
+
+Retained outputs can change their effective mode and HDR state without replacing
+or releasing their allocation. The owning coordinator must retire every capture
+consumer first. `prepare_retained_mode` binds a unique operation ID to the exact
+identity, owning reference, complete expected reference set and observed
+`mode_revision`; unaccounted references and native borrows reject admission.
+The provider syncs its old/new intent before a trusted display coordinator may
+verify it with `verify_retained_mode` and perform `scoped_reconfigure`. Preparation
+keeps the effective specification unchanged and withdraws capture readiness.
+
+`commit_retained_mode` publishes the desired specification only after independent
+native mode, HDR and exact target observation. Windows preserves the driver's
+immutable allocation specification separately from the effective desktop mode.
+Linux serializes preparation and completion through its journal-owning actor and
+reads back the exact KScreen output. Neither operation recreates the connector or
+changes a reference's ownership. An unsupported advertised mode remains a failure.
+
+After a rejected or rolled-back display request, `abort_retained_mode` can unfreeze
+the original source only when the exact old mode and HDR state are independently
+observed. Unknown partial effects remain prepared for reconciliation or explicit
+owned cleanup. Successful commit and observed abort both advance `mode_revision`,
+so a late older operation cannot undo a later transaction. Identical retries are
+idempotent and conflicting payloads cannot reuse an operation ID. Status exposes
+the effective specification, observation revision and retained-mode transaction;
+readiness remains distinct from preparation or local request admission.

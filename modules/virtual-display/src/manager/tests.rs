@@ -21,22 +21,40 @@ struct Calls {
     pending: bool,
     ready: bool,
     capture_ready: bool,
+    allocation: Option<Specification>,
+    observed_mode: Option<Specification>,
+    inspected_specifications: Vec<Specification>,
 }
 struct Fake(Rc<RefCell<Calls>>);
 impl Driver for Fake {
+    fn capture_target(
+        &mut self,
+        _: Option<Binding>,
+        expected: &Specification,
+    ) -> Result<Option<Ready>, &'static str> {
+        let calls = self.0.borrow();
+        Ok(calls.exists.then(|| Ready {
+            device_path: "owned-device".into(),
+            active: true,
+            capture_output: (calls.observed_mode.as_ref() == Some(expected))
+                .then(|| CAPTURE_OUTPUT.into()),
+            capture_error: None,
+        }))
+    }
     fn supported(&self) -> bool {
         self.0.borrow_mut().supported_calls += 1;
         true
     }
     fn create(
         &mut self,
-        _: &Specification,
+        specification: &Specification,
         lease: u64,
         display: u64,
         _: &[u8; 32],
     ) -> Result<Binding, &'static str> {
         let mut calls = self.0.borrow_mut();
         calls.creates.push((lease, display));
+        calls.allocation = Some(specification.clone());
         calls.exists = true;
         if calls.ambiguous_create {
             return Err("driver_io_timeout");
@@ -52,13 +70,14 @@ impl Driver for Fake {
         _: u64,
         _: u64,
         _: Option<Binding>,
-        _: &Specification,
+        specification: &Specification,
     ) -> Result<Observation, &'static str> {
-        let calls = self.0.borrow();
+        let mut calls = self.0.borrow_mut();
+        calls.inspected_specifications.push(specification.clone());
         Ok(Observation {
             exists: calls.exists,
             occupied_by_other_lease: false,
-            specification_matches: true,
+            specification_matches: calls.allocation.as_ref() == Some(specification),
             lease_display_count: u32::from(calls.exists),
             pending_departure: calls.pending,
             ready: calls.ready.then(|| Ready {
@@ -387,6 +406,8 @@ fn recovery_record(prospective_lease: Option<u64>) -> Record {
         _ => unreachable!(),
     };
     Record {
+        allocation_specification: None,
+        retained_mode: None,
         owner: "alice".into(),
         display_id: display_id("alice", ID),
         specification,
@@ -1515,4 +1536,325 @@ fn lost_completion_cleans_new_monitor_but_preserves_idempotent_retry() {
     tick(&mut manager);
     assert_eq!(manager.monitors.values().next().unwrap().state, "ready");
     assert_eq!(calls.borrow().feeds.len(), 1);
+}
+
+#[test]
+fn retained_mode_intent_never_recreates_or_publishes_unobserved_effective_mode() {
+    let (mut manager, calls) = setup_with(Settings {
+        enabled: true,
+        target_verifiers: vec!["amaterasu.display".into()],
+        ..Settings::default()
+    });
+    manager.handle("remote-plugin", create_with_reference("monitor-role"));
+    manager.handle("remote-plugin", create_with_reference("source-lifetime"));
+    calls.borrow_mut().ready = true;
+    calls.borrow_mut().capture_ready = true;
+    tick(&mut manager);
+    let allocation = manager
+        .monitors
+        .values()
+        .next()
+        .unwrap()
+        .specification
+        .clone();
+    let prepare = || Operation::PrepareRetainedMode {
+        operation_id: "mode-change-1".into(),
+        identity: ID.into(),
+        reference_id: "monitor-role".into(),
+        expected_mode_revision: 0,
+        expected_reference_ids: vec!["monitor-role".into(), "source-lifetime".into()],
+        width: 1280,
+        height: 720,
+        refresh_millihz: 120000,
+        hdr_enabled: true,
+    };
+    let prepared = manager.handle("remote-plugin", prepare());
+    assert_eq!(prepared["state"], "prepared");
+    assert_eq!(manager.handle("remote-plugin", prepare()), prepared);
+    let status = || Operation::Status {
+        identity: Some(ID.into()),
+        reference_id: Some("monitor-role".into()),
+    };
+    let before = manager.handle("remote-plugin", status());
+    assert_eq!(before["monitors"][0]["specification"]["width"], 1920);
+    assert!(before["monitors"][0]["capture_output"].is_null());
+    let verifier = || Operation::VerifyRetainedMode {
+        owner: "remote-plugin".into(),
+        identity: ID.into(),
+        reference_id: "monitor-role".into(),
+        operation_id: "mode-change-1".into(),
+    };
+    assert_eq!(
+        manager.handle("untrusted", verifier())["code"],
+        "permission_denied"
+    );
+    let proof = manager.handle("amaterasu.display", verifier());
+    assert_eq!(proof["specification"]["width"], 1280);
+    assert_eq!(proof["specification"]["hdr_enabled"], true);
+    assert_eq!(
+        manager.handle("remote-plugin", create_with_reference("unaccounted-peer"))["code"],
+        "reconfigure_pending"
+    );
+    let commit = || Operation::CommitRetainedMode {
+        operation_id: "mode-change-1".into(),
+        identity: ID.into(),
+        reference_id: "monitor-role".into(),
+    };
+    assert_eq!(
+        manager.handle("remote-plugin", commit())["code"],
+        "retained_mode_readback_pending"
+    );
+    assert_eq!(
+        manager.handle("remote-plugin", status())["monitors"][0]["specification"]["width"],
+        1920
+    );
+    let desired = manager
+        .monitors
+        .values()
+        .next()
+        .unwrap()
+        .retained_mode
+        .as_ref()
+        .unwrap()
+        .desired
+        .clone();
+    calls.borrow_mut().observed_mode = Some(desired);
+    assert_eq!(
+        manager.handle("remote-plugin", commit())["state"],
+        "succeeded"
+    );
+    assert_eq!(
+        manager.handle("remote-plugin", commit())["state"],
+        "succeeded"
+    );
+    tick(&mut manager);
+    let after = manager.handle("remote-plugin", status());
+    assert_eq!(after["monitors"][0]["specification"]["width"], 1280);
+    assert_eq!(after["monitors"][0]["specification"]["hdr_enabled"], true);
+    assert_eq!(after["monitors"][0]["capture_output"], CAPTURE_OUTPUT);
+    assert_eq!(calls.borrow().creates.len(), 1);
+    assert!(
+        calls
+            .borrow()
+            .inspected_specifications
+            .iter()
+            .all(|specification| specification == &allocation)
+    );
+    calls.borrow_mut().remove_completes = true;
+    for reference in ["monitor-role", "source-lifetime"] {
+        manager.handle(
+            "remote-plugin",
+            Operation::Remove {
+                identity: ID.into(),
+                reference_id: Some(reference.into()),
+            },
+        );
+    }
+    tick(&mut manager);
+    assert!(manager.monitors.is_empty());
+}
+
+#[test]
+fn retained_mode_admission_is_bound_to_the_complete_reference_set_and_operation() {
+    let (mut manager, calls) = setup(true);
+    manager.handle("remote-plugin", create_with_reference("monitor-role"));
+    manager.handle("remote-plugin", create_with_reference("source-lifetime"));
+    calls.borrow_mut().ready = true;
+    tick(&mut manager);
+    let prepare = |operation: &str, references: Vec<&str>, width| Operation::PrepareRetainedMode {
+        operation_id: operation.into(),
+        identity: ID.into(),
+        reference_id: "monitor-role".into(),
+        expected_mode_revision: 0,
+        expected_reference_ids: references.into_iter().map(str::to_owned).collect(),
+        width,
+        height: 720,
+        refresh_millihz: 60000,
+        hdr_enabled: false,
+    };
+    assert_eq!(
+        manager.handle(
+            "remote-plugin",
+            prepare("mode-1", vec!["monitor-role"], 1280)
+        )["code"],
+        "reference_conflict"
+    );
+    assert_eq!(
+        manager.handle(
+            "remote-plugin",
+            prepare("mode-1", vec!["monitor-role", "monitor-role"], 1280)
+        )["code"],
+        "invalid_request"
+    );
+    assert_eq!(
+        manager.handle(
+            "remote-plugin",
+            prepare("mode-1", vec!["monitor-role", "source-lifetime"], 1280)
+        )["state"],
+        "prepared"
+    );
+    assert_eq!(
+        manager.handle(
+            "remote-plugin",
+            prepare("mode-1", vec!["monitor-role", "source-lifetime"], 1366)
+        )["code"],
+        "reconfigure_conflict"
+    );
+    assert_eq!(
+        manager.handle(
+            "remote-plugin",
+            prepare("mode-2", vec!["monitor-role", "source-lifetime"], 1280)
+        )["code"],
+        "reconfigure_pending"
+    );
+    manager.handle(
+        "remote-plugin",
+        Operation::Remove {
+            identity: ID.into(),
+            reference_id: Some("source-lifetime".into()),
+        },
+    );
+    assert_eq!(
+        manager.handle(
+            "remote-plugin",
+            Operation::CommitRetainedMode {
+                operation_id: "mode-1".into(),
+                identity: ID.into(),
+                reference_id: "monitor-role".into()
+            }
+        )["code"],
+        "mode_change_unavailable"
+    );
+    assert_eq!(calls.borrow().creates.len(), 1);
+}
+
+#[test]
+fn retained_mode_journal_keeps_allocation_and_unobserved_intent_across_reload() {
+    let (journal, root) = recovery_journal();
+    let calls = Rc::new(RefCell::new(Calls::default()));
+    let mut manager = Manager::with_journal(
+        Settings {
+            enabled: true,
+            ..Settings::default()
+        },
+        Fake(calls.clone()),
+        journal,
+    )
+    .unwrap();
+    manager.handle("remote-plugin", create_with_reference("monitor-role"));
+    calls.borrow_mut().ready = true;
+    tick(&mut manager);
+    let original = manager
+        .monitors
+        .values()
+        .next()
+        .unwrap()
+        .specification
+        .clone();
+    let prepare = Operation::PrepareRetainedMode {
+        operation_id: "durable-mode".into(),
+        identity: ID.into(),
+        reference_id: "monitor-role".into(),
+        expected_mode_revision: 0,
+        expected_reference_ids: vec!["monitor-role".into()],
+        width: 1280,
+        height: 720,
+        refresh_millihz: 120000,
+        hdr_enabled: true,
+    };
+    assert_eq!(
+        manager.handle("remote-plugin", prepare)["state"],
+        "prepared"
+    );
+    let record = manager.journal.as_ref().unwrap().records().next().unwrap();
+    assert_eq!(record.specification, original);
+    assert_eq!(record.allocation_specification, Some(original.clone()));
+    assert!(!record.retained_mode.as_ref().unwrap().completed);
+    drop(manager);
+    let journal = Journal::open(&root.join("leases.jsonl")).unwrap();
+    let recovered = journal.records().next().unwrap();
+    assert_eq!(recovered.specification, original);
+    assert_eq!(recovered.allocation_specification, Some(original));
+    assert_eq!(
+        recovered.retained_mode.as_ref().unwrap().desired.width,
+        1280
+    );
+    assert!(!recovered.retained_mode.as_ref().unwrap().completed);
+    drop(journal);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn retained_mode_abort_requires_old_native_readback_and_fences_stale_replays() {
+    let (mut manager, calls) = setup(true);
+    manager.handle("remote-plugin", create_with_reference("retained"));
+    calls.borrow_mut().ready = true;
+    calls.borrow_mut().capture_ready = true;
+    tick(&mut manager);
+    let old = manager
+        .monitors
+        .values()
+        .next()
+        .unwrap()
+        .specification
+        .clone();
+    let prepare = |operation: &str, revision| Operation::PrepareRetainedMode {
+        operation_id: operation.into(),
+        identity: ID.into(),
+        reference_id: "retained".into(),
+        expected_reference_ids: vec!["retained".into()],
+        expected_mode_revision: revision,
+        width: 1280,
+        height: 720,
+        refresh_millihz: 120000,
+        hdr_enabled: true,
+    };
+    assert_eq!(
+        manager.handle("remote-plugin", prepare("rejected-mode", 0))["state"],
+        "prepared"
+    );
+    let abort = || Operation::AbortRetainedMode {
+        operation_id: "rejected-mode".into(),
+        identity: ID.into(),
+        reference_id: "retained".into(),
+    };
+    assert_eq!(
+        manager.handle("remote-plugin", abort())["code"],
+        "retained_mode_readback_pending"
+    );
+    calls.borrow_mut().observed_mode = Some(old);
+    let aborted = manager.handle("remote-plugin", abort());
+    assert_eq!(aborted["state"], "aborted");
+    assert_eq!(aborted["mode_revision"], 1);
+    assert_eq!(manager.handle("remote-plugin", abort()), aborted);
+    let status = manager.handle(
+        "remote-plugin",
+        Operation::Status {
+            identity: Some(ID.into()),
+            reference_id: Some("retained".into()),
+        },
+    );
+    assert_eq!(status["monitors"][0]["mode_revision"], 1);
+    assert_eq!(status["monitors"][0]["specification"]["width"], 1920);
+    assert_eq!(status["monitors"][0]["capture_output"], CAPTURE_OUTPUT);
+    assert_eq!(
+        manager.handle(
+            "remote-plugin",
+            Operation::CommitRetainedMode {
+                operation_id: "rejected-mode".into(),
+                identity: ID.into(),
+                reference_id: "retained".into()
+            }
+        )["code"],
+        "mode_change_unavailable"
+    );
+    assert_eq!(
+        manager.handle("remote-plugin", prepare("new-mode", 0))["code"],
+        "mode_revision_conflict"
+    );
+    assert_eq!(
+        manager.handle("remote-plugin", prepare("new-mode", 1))["state"],
+        "prepared"
+    );
+    assert_eq!(calls.borrow().creates.len(), 1);
 }

@@ -29,6 +29,15 @@ pub struct Observation {
 }
 
 pub trait Driver {
+    /// Independently observe a requested effective mode. This never changes the
+    /// native allocation and cannot stand in for ownership inspection.
+    fn capture_target(
+        &mut self,
+        _binding: Option<Binding>,
+        _expected: &Specification,
+    ) -> Result<Option<Ready>, &'static str> {
+        Err("unsupported_mode_observation")
+    }
     fn supported(&self) -> bool;
     fn create(
         &mut self,

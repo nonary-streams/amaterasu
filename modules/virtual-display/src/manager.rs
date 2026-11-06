@@ -5,6 +5,7 @@ use crate::model::{
 };
 use crate::protocol::Binding;
 use crate::scale::ScaleSetting;
+mod retained_mode;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
@@ -16,6 +17,8 @@ const POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 struct Monitor {
     specification: Specification,
+    allocation_specification: Specification,
+    retained_mode: Option<crate::retained_mode::Change>,
     display_id: u64,
     lease: u64,
     prospective_lease: Option<u64>,
@@ -36,6 +39,8 @@ impl Monitor {
         Record {
             owner: owner.into(),
             specification: self.specification.clone(),
+            allocation_specification: Some(self.allocation_specification.clone()),
+            retained_mode: self.retained_mode.clone(),
             display_id: self.display_id,
             lease: self.lease,
             prospective_lease: self.prospective_lease,
@@ -45,11 +50,42 @@ impl Monitor {
         }
     }
     fn response(&self, reference_id: Option<&str>) -> Value {
-        json!({"ok":true,"monitor":{"specification":self.specification,"display_id":format!("{:016x}",self.display_id),
-            "state":self.state,"ready":self.ready,"error":self.error,
-            "capture_output":self.ready.as_ref().filter(|ready|ready.active).and_then(|ready| ready.capture_output.as_deref())
-                .filter(|output|amaterasu_module_sdk::capture::exact_target_key(output).is_some())},
-            "reference_owned":reference_id.is_some_and(|reference| self.references.as_ref().is_some_and(|references| references.contains(reference)))})
+        let mode_revision = self
+            .retained_mode
+            .as_ref()
+            .map_or(0, |change| change.mode_revision());
+        let retained_mode = self.retained_mode.as_ref().map(|change| change.response());
+        let capture_output = self
+            .ready
+            .as_ref()
+            .filter(|ready| {
+                ready.active
+                    && self
+                        .retained_mode
+                        .as_ref()
+                        .is_none_or(|change| !change.is_pending())
+            })
+            .and_then(|ready| ready.capture_output.as_deref())
+            .filter(|output| amaterasu_module_sdk::capture::exact_target_key(output).is_some());
+        let reference_owned = reference_id.is_some_and(|reference| {
+            self.references
+                .as_ref()
+                .is_some_and(|references| references.contains(reference))
+        });
+        json!({
+            "ok": true,
+            "monitor": {
+                "specification": self.specification,
+                "mode_revision": mode_revision,
+                "retained_mode": retained_mode,
+                "display_id": format!("{:016x}", self.display_id),
+                "state": self.state,
+                "ready": self.ready,
+                "error": self.error,
+                "capture_output": capture_output,
+            },
+            "reference_owned": reference_owned,
+        })
     }
     fn finish_recovery(&mut self) {
         if self.references.as_ref().is_some_and(BTreeSet::is_empty) {
@@ -106,6 +142,10 @@ impl<D: Driver> Manager<D> {
         let now = Instant::now();
         let key = (record.owner.clone(), record.specification.identity.clone());
         let mut monitor = Monitor {
+            allocation_specification: record
+                .allocation_specification
+                .unwrap_or_else(|| record.specification.clone()),
+            retained_mode: record.retained_mode,
             specification: record.specification,
             display_id: record.display_id,
             lease: record.lease,
@@ -143,14 +183,14 @@ impl<D: Driver> Manager<D> {
                 monitor.lease,
                 monitor.display_id,
                 monitor.binding,
-                &monitor.specification,
+                &monitor.allocation_specification,
             );
             let next = monitor.prospective_lease.map(|lease| {
                 self.driver.inspect(
                     lease,
                     monitor.display_id,
                     monitor.binding,
-                    &monitor.specification,
+                    &monitor.allocation_specification,
                 )
             });
             let (Ok(old), next) = (old, next) else {
@@ -231,7 +271,7 @@ impl<D: Driver> Manager<D> {
                     new_lease,
                     monitor.display_id,
                     monitor.binding,
-                    &monitor.specification,
+                    &monitor.allocation_specification,
                 ) else {
                     continue;
                 };
@@ -323,6 +363,44 @@ impl<D: Driver> Manager<D> {
 
     pub fn handle(&mut self, caller: &str, operation: Operation) -> Value {
         match operation {
+            Operation::PrepareRetainedMode {
+                operation_id,
+                identity,
+                reference_id,
+                expected_reference_ids,
+                expected_mode_revision,
+                width,
+                height,
+                refresh_millihz,
+                hdr_enabled,
+            } => self.prepare_retained_mode(
+                caller,
+                operation_id,
+                identity,
+                reference_id,
+                expected_reference_ids,
+                expected_mode_revision,
+                width,
+                height,
+                refresh_millihz,
+                hdr_enabled,
+            ),
+            Operation::VerifyRetainedMode {
+                owner,
+                identity,
+                reference_id,
+                operation_id,
+            } => self.verify_retained_mode(caller, &owner, &identity, &reference_id, &operation_id),
+            Operation::CommitRetainedMode {
+                operation_id,
+                identity,
+                reference_id,
+            } => self.commit_retained_mode(caller, &identity, &reference_id, &operation_id),
+            Operation::AbortRetainedMode {
+                operation_id,
+                identity,
+                reference_id,
+            } => self.abort_retained_mode(caller, &identity, &reference_id, &operation_id),
             Operation::VerifyOwnerTarget {
                 owner,
                 identity,
@@ -534,6 +612,13 @@ impl<D: Driver> Manager<D> {
         let Some(monitor) = self.monitors.get(&(owner.into(), identity.into())) else {
             return failure("owned_target_unavailable");
         };
+        if monitor
+            .retained_mode
+            .as_ref()
+            .is_some_and(|change| change.is_pending())
+        {
+            return failure("reconfigure_pending");
+        }
         if !monitor
             .references
             .as_ref()
@@ -643,6 +728,13 @@ impl<D: Driver> Manager<D> {
             if references.contains(&reference_id) {
                 return existing.response(Some(&reference_id));
             }
+            if existing
+                .retained_mode
+                .as_ref()
+                .is_some_and(|change| change.is_pending())
+            {
+                return failure("reconfigure_pending");
+            }
             if existing.state == "removing" || existing.state == "cleanup_failed" {
                 return failure("cleanup_pending");
             }
@@ -695,6 +787,8 @@ impl<D: Driver> Manager<D> {
         // Record exact ownership before issuing create: a failed acknowledgement may
         // still have created a monitor. Cleanup never searches by friendly name.
         let mut monitor = Monitor {
+            allocation_specification: specification.clone(),
+            retained_mode: None,
             specification,
             display_id,
             lease,
@@ -717,10 +811,12 @@ impl<D: Driver> Manager<D> {
         {
             return failure("journal_unavailable");
         }
-        match self
-            .driver
-            .create(&monitor.specification, lease, display_id, &capability)
-        {
+        match self.driver.create(
+            &monitor.allocation_specification,
+            lease,
+            display_id,
+            &capability,
+        ) {
             Ok(binding) => {
                 monitor.binding = Some(binding);
                 if let Some(journal) = &mut self.journal
@@ -870,7 +966,7 @@ fn maintain(driver: &mut impl Driver, monitor: &mut Monitor, now: Instant) {
         monitor.lease,
         monitor.display_id,
         monitor.binding,
-        &monitor.specification,
+        &monitor.allocation_specification,
     ) {
         Ok(observation)
             if observation.occupied_by_other_lease
@@ -886,7 +982,27 @@ fn maintain(driver: &mut impl Driver, monitor: &mut Monitor, now: Instant) {
             monitor.begin_cleanup(Some("lease_departing"));
         }
         Ok(observation) if observation.exists && observation.ready.is_some() => {
-            monitor.ready = observation.ready;
+            let mut ready = observation.ready;
+            if monitor.specification != monitor.allocation_specification {
+                match driver.capture_target(monitor.binding, &monitor.specification) {
+                    Ok(Some(observed)) => ready = Some(observed),
+                    _ => {
+                        if let Some(ready) = &mut ready {
+                            ready.capture_output = None;
+                            ready.capture_error = Some("effective_mode_unverified");
+                        }
+                    }
+                }
+            }
+            if monitor
+                .retained_mode
+                .as_ref()
+                .is_some_and(|change| change.is_pending())
+                && let Some(ready) = &mut ready
+            {
+                ready.capture_output = None;
+            }
+            monitor.ready = ready;
             monitor.state = "ready";
         }
         Ok(observation) if !observation.exists => monitor.begin_cleanup(Some("monitor_departed")),
@@ -921,7 +1037,7 @@ fn cleanup(driver: &mut impl Driver, monitor: &mut Monitor) -> bool {
         monitor.lease,
         monitor.display_id,
         monitor.binding,
-        &monitor.specification,
+        &monitor.allocation_specification,
     ) {
         Ok(observation)
             if observation.occupied_by_other_lease
@@ -950,7 +1066,7 @@ fn cleanup(driver: &mut impl Driver, monitor: &mut Monitor) -> bool {
         monitor.lease,
         monitor.display_id,
         monitor.binding,
-        &monitor.specification,
+        &monitor.allocation_specification,
     ) {
         Ok(observation) if !observation.exists && !observation.pending_departure => true,
         Ok(_) => {
