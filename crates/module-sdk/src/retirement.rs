@@ -153,8 +153,10 @@ fn command(
     })
 }
 
-/// Validate the fixed epoch response. Transport must finish startup native
-/// recovery and pending admission cleanup before a new operation can bind it.
+/// Validate the fixed epoch response. Transport must finish old-runtime native
+/// recovery before a new operation can bind it. Other current-epoch operations
+/// may still have admissions or cleanup pending; reading admission identity
+/// neither waits for them nor proves their resources have retired.
 /// Launch's epoch is admission identity only, with no cross-restart proof.
 pub fn parse_epoch(contract: Contract, value: &Value) -> ModuleResult<String> {
     validate_response_size(value)?;
@@ -168,8 +170,18 @@ pub fn parse_epoch(contract: Contract, value: &Value) -> ModuleResult<String> {
                 || value.get("retired") != Some(&Value::Bool(false))
                 || value.get("operation_id") != Some(&Value::Null)
                 || value.get("expected_runtime_epoch") != Some(&Value::Null)
-                || value.get("cleanup_pending") != Some(&Value::Bool(false))
-                || value.get("pending_admissions").and_then(Value::as_u64) != Some(0)
+                || value
+                    .get("cleanup_pending")
+                    .and_then(Value::as_bool)
+                    .is_none()
+                || value
+                    .get("pending_admissions")
+                    .and_then(Value::as_u64)
+                    .is_none()
+                || value
+                    .get("active_operations")
+                    .and_then(Value::as_u64)
+                    .is_none()
             {
                 return Err("transport admission epoch is not ready".into());
             }

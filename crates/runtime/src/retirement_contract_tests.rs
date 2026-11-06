@@ -280,6 +280,9 @@ fn retirement_contract_epoch_fences_require_authoritative_native_recovery() {
         ("startup_reconciled", json!(false)),
         ("cleanup_pending", json!(true)),
         ("pending_admissions", json!(1)),
+        ("cleanup_pending", json!("false")),
+        ("pending_admissions", json!("0")),
+        ("active_operations", json!(null)),
         ("runtime_epoch", json!(EPOCH)),
         ("retired", json!(false)),
     ] {
@@ -396,8 +399,9 @@ fn retirement_contract_epoch_reads_bind_before_effects_without_claiming_retireme
     );
     for (field, value) in [
         ("startup_reconciled", json!(false)),
-        ("cleanup_pending", json!(true)),
-        ("pending_admissions", json!(1)),
+        ("cleanup_pending", json!("false")),
+        ("pending_admissions", json!("0")),
+        ("active_operations", json!(null)),
         ("retired", json!(true)),
         ("operation_id", json!("unexpected-operation")),
         ("expected_runtime_epoch", json!(EPOCH)),
@@ -438,4 +442,59 @@ fn retirement_contract_epoch_reads_bind_before_effects_without_claiming_retireme
     };
     assert_eq!(service, Contract::Transport.service());
     assert_eq!(payload, json!({"action":"reconcile_startup"}));
+}
+
+#[test]
+fn retirement_contract_epoch_binding_does_not_wait_for_unrelated_current_operations() {
+    for provider in [
+        "vendor.first-retirement-provider",
+        "vendor.replacement-retirement-provider",
+    ] {
+        let contract = Contract::Transport;
+        let mut broker = broker(provider, contract);
+        let Response::Accepted { id } = broker.dispatch(
+            CONSUMER,
+            retirement::epoch_command(options(contract), contract).unwrap(),
+        ) else {
+            panic!("fixed epoch read was not admitted");
+        };
+        let Response::Request {
+            id: delivered,
+            service,
+            payload,
+            ..
+        } = broker.dispatch(provider, Command::Poll {})
+        else {
+            panic!("selected provider did not receive epoch read");
+        };
+        assert_eq!(delivered, id);
+        assert_eq!(service, contract.service());
+        assert_eq!(payload, json!({"action":"retirement_status"}));
+        let busy = json!({"ok":true,"runtime_epoch":EPOCH,"operation_id":null,
+            "expected_runtime_epoch":null,"startup_reconciled":true,"state":"ready",
+            "retired":false,"active_operations":2,"pending_admissions":1,"cleanup_pending":true});
+        assert_ok(broker.dispatch(
+            provider,
+            Command::Complete {
+                request: id,
+                payload: busy.clone(),
+            },
+        ));
+        let Response::Result { payload } =
+            broker.dispatch(CONSUMER, Command::TakeResult { request: id })
+        else {
+            panic!("consumer did not receive epoch result");
+        };
+        assert_eq!(retirement::parse_epoch(contract, &payload).unwrap(), EPOCH);
+        assert_ok(broker.dispatch(CONSUMER, Command::ReleaseResult { request: id }));
+        // Current work cannot excuse missing or unfinished old-runtime cleanup.
+        for state in ["ready", "recovery_pending", "recovery_blocked"] {
+            let mut unreconciled = busy.clone();
+            unreconciled["startup_reconciled"] = json!(false);
+            unreconciled["state"] = json!(state);
+            assert!(retirement::parse_epoch(contract, &unreconciled).is_err());
+        }
+        // The admission snapshot remains unsuitable as any exact retirement proof.
+        assert!(retirement::parse_status(contract, &reference(contract), &busy).is_err());
+    }
 }
