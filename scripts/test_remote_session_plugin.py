@@ -351,7 +351,7 @@ def qualify_loaded_contract(console):
     released = console.api("read_project", {"client_id": "fixture-secondary", "projection_id": projection,
                            "offset": 0, "limit": 32})
     require(released["result"] == "error", "released projection remained readable", released)
-    denied = console.settled_api("dispatch", {"context": context(game=False, launch=False), "operation_id": "denied-input",
+    denied = console.settled_api("dispatch", {"context": context("0" * 64, game=False, launch=False), "operation_id": "denied-input",
                          "intent": "launch", "selection": {"id": "2147483506", "uuid": None}, "mode": MODE})
     require(denied.get("decision", {}).get("kind") == "reject"
             and denied["decision"]["status_code"] == 403, "launch permission was bypassed", denied)
@@ -417,8 +417,8 @@ def initialize_paired_wire(console, fixtures, *, select_software=True):
         require(status == 200 and encoders.get("software_encoder", {}).get("available") is True,
                 "artifact needs amaterasu-encode/software-x264 and compatible libx264", encoders)
     http, https = "http://" + state["http_address"], "https://" + state["https_address"]
-    pair(console, http)
-    return https, tls_context()
+    fingerprint = pair(console, http)
+    return https, tls_context(), fingerprint
 
 
 def complete_h264_units(datagrams, key):
@@ -544,8 +544,8 @@ def exercise_remote_input(console, https, tls, oracle, directory):
             association.close()
 
 
-def reject_unavailable_monitor(console):
-    arguments = {"context": context("disabled-monitor-client", game=False), "operation_id": "disabled-monitor-request",
+def reject_unavailable_monitor(console, fingerprint):
+    arguments = {"context": context(fingerprint, game=False), "operation_id": "disabled-monitor-request",
                  "intent": "launch", "selection": {"id": "2147483505", "uuid": None}, "mode": MODE}
     deadline = time.monotonic() + 1
     while time.monotonic() < deadline:
@@ -573,7 +573,7 @@ def qualify_missing_provider(fixture, fixtures):
                     "missing-provider startup did not reach a conclusive rejection",
                     "".join(console.errors))
             return {"selected_provider_missing": True, "host_failed_closed": True}
-        https, tls = initialize_paired_wire(console, fixtures, select_software=False)
+        https, tls, _ = initialize_paired_wire(console, fixtures, select_software=False)
         status, response = get(https, "/applist", {"uniqueid": "missing-plugin-client"}, tls, timeout=40)
         require(status != 200 or response.get("status_code") != "200",
                 "selected missing provider silently fell back to an ordinary catalog", response.attrib)
@@ -733,9 +733,11 @@ def main():
             pid = worker_pid(console)
             evidence["native_contract"] = qualify_loaded_contract(console)
             if not arguments.loader_only:
-                https, tls = initialize_paired_wire(console, fixtures)
+                https, tls, fingerprint = initialize_paired_wire(console, fixtures)
                 evidence["remote_input"] = exercise_remote_input(console, https, tls, oracle, directory)
-            evidence["monitor_refusal"] = reject_unavailable_monitor(console)
+            else:
+                _, _, fingerprint = initialize_paired_wire(console, fixtures, select_software=False)
+            evidence["monitor_refusal"] = reject_unavailable_monitor(console, fingerprint)
             console.eof()
             wait_gone(pid)
         finally:
