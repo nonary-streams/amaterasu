@@ -206,6 +206,7 @@ impl PresentationRouter {
         Ok(Client {
             id: fingerprint(certificate),
             paired: true,
+            may_list: peer.list_allowed,
             may_view: peer.view_allowed,
             may_launch: peer.launch_allowed,
             may_terminate: peer.terminate_allowed,
@@ -321,7 +322,7 @@ impl PresentationRouter {
             intent,
         } = submission;
         let operation_id = format!("session-{}-{}", self.operation_prefix, self.next_job + 1);
-        let projection = projection(context.clone(), launches);
+        let projection = inventory(context.clone(), launches);
         self.queue(
             Some(connection),
             certificate,
@@ -349,7 +350,7 @@ impl PresentationRouter {
         launches: &Controller,
         now: Instant,
     ) -> Option<Reply> {
-        let projection = projection(context.clone(), launches);
+        let projection = inventory(context.clone(), launches);
         match self.queue(
             Some(connection),
             certificate,
@@ -1217,6 +1218,7 @@ impl PresentationRouter {
                 client: Client {
                     id: client_id.clone(),
                     paired: true,
+                    may_list: false,
                     may_view: false,
                     may_launch: false,
                     may_terminate: false,
@@ -1256,6 +1258,7 @@ impl PresentationRouter {
                 client: Client {
                     id: observation.client_id.clone(),
                     paired: true,
+                    may_list: false,
                     may_view: false,
                     may_launch: false,
                     may_terminate: false,
@@ -1372,6 +1375,14 @@ fn projection(context: Context, launches: &Controller) -> Box<CatalogProjection>
     ))
 }
 
+fn inventory(context: Context, launches: &Controller) -> Box<CatalogProjection> {
+    Box::new(CatalogProjection::inventory(
+        context,
+        launches.desktop_enabled(),
+        launches.codec_advertisement().codec_mode_support & 0x20200 != 0,
+    ))
+}
+
 fn context_current(context: &Context, launches: &Controller) -> bool {
     let current = launches.session_presentation_context(context.client.clone());
     match (&context.game, &current.game) {
@@ -1393,6 +1404,7 @@ fn permissions_unchanged(work: &Work, allowed: &mut impl FnMut(&[u8], Permission
     let client = &work.context.client;
     allowed(&work.certificate, Permission::Paired)
         && (!work.list_required || allowed(&work.certificate, Permission::List))
+        && (!client.may_list || allowed(&work.certificate, Permission::List))
         && (!client.may_view || allowed(&work.certificate, Permission::View))
         && (!client.may_launch || allowed(&work.certificate, Permission::Launch))
         && (!client.may_terminate || allowed(&work.certificate, Permission::Terminate))

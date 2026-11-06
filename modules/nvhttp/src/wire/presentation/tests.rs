@@ -236,6 +236,105 @@ fn unchanged_wire_consumer_uses_each_selected_policy_implementation() {
 }
 
 #[test]
+fn list_only_clients_receive_catalog_and_artwork_without_stream_view_authority() {
+    for target in ["/applist", "/appasset?appid=42"] {
+        let mut router = router();
+        let mut provider = Provider::new("List-only tile");
+        let now = Instant::now();
+        let context = RequestContext {
+            list_allowed: true,
+            view_allowed: false,
+            launch_allowed: false,
+            terminate_allowed: false,
+            ..peer()
+        };
+        assert!(dispatch(&mut router, target, context, now).is_none());
+        let reply = complete(&mut router, &mut provider, now);
+        assert_eq!(reply.status, 200);
+        assert_eq!(reply.permission, Some(Permission::List));
+        let begin = &provider
+            .calls
+            .iter()
+            .find(|(method, _)| method == "begin_project")
+            .unwrap()
+            .1;
+        assert_eq!(begin["context"]["client"]["may_list"], true);
+        assert_eq!(begin["context"]["client"]["may_view"], false);
+        if target == "/applist" {
+            assert!(String::from_utf8_lossy(&reply.body).contains("List-only tile"));
+        } else {
+            assert_eq!(reply.content_type, "image/png");
+        }
+    }
+}
+
+#[test]
+fn clients_without_effective_list_authority_cannot_project_or_read_artwork() {
+    for target in ["/applist", "/appasset?appid=42"] {
+        let mut router = router();
+        let now = Instant::now();
+        let context = RequestContext {
+            list_allowed: false,
+            view_allowed: false,
+            launch_allowed: false,
+            terminate_allowed: false,
+            ..peer()
+        };
+        assert_eq!(
+            dispatch(&mut router, target, context, now).unwrap().status,
+            403
+        );
+        assert!(router.presentation.as_ref().unwrap().jobs.is_empty());
+        assert!(router.jobs.is_empty());
+    }
+}
+
+#[test]
+fn generic_view_only_cached_resume_refreshes_identities_without_reading_a_user_app_list() {
+    let mut router = router();
+    let mut provider = Provider::new("resume");
+    let now = Instant::now();
+    let context = RequestContext {
+        list_allowed: false,
+        view_allowed: true,
+        launch_allowed: false,
+        terminate_allowed: false,
+        ..peer()
+    };
+    let target = format!(
+        "/resume?appid=42&mode=1920x1080x60&rikey={}&rikeyid=7",
+        "11".repeat(16)
+    );
+    assert!(dispatch(&mut router, &target, context, now).is_none());
+    let reply = complete(&mut router, &mut provider, now);
+    assert_eq!(reply.status, 200);
+    let methods: Vec<_> = provider
+        .calls
+        .iter()
+        .map(|(method, _)| method.as_str())
+        .collect();
+    for expected in [
+        "identity_inventory",
+        "begin_project",
+        "append_project",
+        "release_project",
+        "dispatch",
+    ] {
+        assert!(methods.contains(&expected));
+    }
+    assert!(!methods.contains(&"read_project"));
+    let request = &provider
+        .calls
+        .iter()
+        .find(|(method, _)| method == "dispatch")
+        .unwrap()
+        .1;
+    assert_eq!(request["intent"], "resume");
+    assert_eq!(request["context"]["client"]["may_list"], false);
+    assert_eq!(request["context"]["client"]["may_view"], true);
+}
+
+#[test]
 fn paired_server_info_uses_the_policy_projection_and_retains_transport_authorization() {
     let mut router = router();
     let mut provider = Provider::new("policy");
