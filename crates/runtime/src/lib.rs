@@ -16,3 +16,5 @@ mod pairing_authority_tests;
 mod tests;
 #[cfg(test)]
 mod session_presentation_tests;
+#[cfg(test)]
+mod display_target_tests;
