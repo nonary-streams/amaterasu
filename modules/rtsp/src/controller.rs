@@ -77,6 +77,12 @@ struct DisplayAdmission {
     call: Call,
 }
 
+struct DisplayCleanup {
+    owner: String,
+    operation_id: String,
+    call: Call,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RecoveryPhase {
     List,
@@ -170,7 +176,7 @@ pub struct Controller {
     pending_network: VecDeque<PendingNetwork>,
     job: Option<Job>,
     display_admission: Option<DisplayAdmission>,
-    display_cleanup: Vec<Call>,
+    display_cleanup: Vec<DisplayCleanup>,
     startup_recovery: StartupRecovery,
     runtime_epoch: String,
     retired_operations: BTreeSet<(String, String)>,
@@ -272,8 +278,8 @@ impl Controller {
         if let Some(admission) = self.display_admission.as_mut() {
             admission.call.shutdown(runtime);
         }
-        for call in &mut self.display_cleanup {
-            call.shutdown(runtime);
+        for cleanup in &mut self.display_cleanup {
+            cleanup.call.shutdown(runtime);
         }
         for record in self.records.values_mut() {
             if let Some(call) = record.uncertain.as_mut() {

@@ -137,6 +137,7 @@ fn retirement_observations_distinguish_runtime_fences_from_missing_tickets() {
     let settings = Settings {
         allowed_principals: vec!["caller".into()],
         retirement_status_principals: vec!["observer".into()],
+        retirement_status_owners: BTreeMap::from([("observer".into(), "caller".into())]),
         ..Settings::default()
     };
     let mut controller = Controller::new(settings).unwrap();
@@ -190,6 +191,89 @@ fn retirement_observations_distinguish_runtime_fences_from_missing_tickets() {
     assert_eq!(endpoint.completions[6].1["code"], "permission_denied");
     controller.reconcile_startup(8, "observer", 0, &runtime);
     assert_eq!(endpoint.completions[7].1["code"], "permission_denied");
+}
+
+#[test]
+fn retirement_observers_are_pinned_to_one_owner_and_epoch_reads_ignore_current_occupancy() {
+    let mut controller = Controller::new(Settings {
+        allowed_principals: vec!["caller".into(), "foreign-owner".into()],
+        retirement_status_owners: BTreeMap::from([
+            ("observer".into(), "caller".into()),
+            ("foreign-observer".into(), "foreign-owner".into()),
+        ]),
+        ..Settings::default()
+    })
+    .unwrap();
+    let epoch = controller.runtime_epoch.clone();
+    let mut owned = record(State::Closed);
+    owned.config.operation_id = "colliding-operation".into();
+    owned.cleanup_confirmed = true;
+    let mut foreign = record(State::Playing);
+    foreign.id = 6;
+    foreign.owner = "foreign-owner".into();
+    foreign.config.operation_id = "colliding-operation".into();
+    controller.records.insert(owned.id, owned);
+    controller.records.insert(foreign.id, foreign);
+    controller.display_cleanup.push(DisplayCleanup {
+        owner: "foreign-owner".into(),
+        operation_id: "foreign-pending".into(),
+        call: Call::new(json!({"action":"verify"}), "foreign-cleanup".into(), None),
+    });
+    let mut endpoint = Endpoint::default();
+    let runtime = client(&mut endpoint);
+    controller.retirement_status(
+        1,
+        "observer",
+        Some("colliding-operation"),
+        Some(&epoch),
+        &runtime,
+    );
+    assert_eq!(endpoint.completions[0].1["retired"], true);
+    assert_eq!(endpoint.completions[0].1["active_operations"], 0);
+    assert_eq!(endpoint.completions[0].1["cleanup_pending"], false);
+    controller.retirement_status(
+        2,
+        "foreign-observer",
+        Some("colliding-operation"),
+        Some(&epoch),
+        &runtime,
+    );
+    assert_eq!(endpoint.completions[1].1["retired"], false);
+    assert_eq!(endpoint.completions[1].1["active_operations"], 1);
+    assert_eq!(endpoint.completions[1].1["cleanup_pending"], true);
+    controller.retirement_status(3, "caller", None, None, &runtime);
+    assert_eq!(endpoint.completions[2].1["active_operations"], 0);
+    assert_eq!(endpoint.completions[2].1["cleanup_pending"], false);
+    controller
+        .retired_operations
+        .insert(("foreign-owner".into(), "foreign-fence".into()));
+    controller.retirement_status(4, "observer", Some("foreign-fence"), Some(&epoch), &runtime);
+    assert_eq!(endpoint.completions[3].1["state"], "unknown");
+    assert_eq!(endpoint.completions[3].1["retired"], false);
+    controller.display_cleanup.push(DisplayCleanup {
+        owner: "caller".into(),
+        operation_id: "colliding-operation".into(),
+        call: Call::new(json!({"action":"verify"}), "owned-cleanup".into(), None),
+    });
+    controller.retirement_status(5, "observer", None, None, &runtime);
+    assert_eq!(endpoint.completions[4].1["startup_reconciled"], true);
+    assert_eq!(endpoint.completions[4].1["state"], "ready");
+    assert_eq!(endpoint.completions[4].1["cleanup_pending"], true);
+    controller.retirement_status(
+        6,
+        "observer",
+        Some("colliding-operation"),
+        Some(&epoch),
+        &runtime,
+    );
+    assert_eq!(endpoint.completions[5].1["retired"], false);
+    assert_eq!(endpoint.completions[5].1["state"], "active");
+    assert!(
+        serde_json::from_value::<Operation>(
+            json!({"action":"retirement_status", "owner":"foreign-owner"})
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -284,6 +368,7 @@ fn exact_operation_retirement_fences_delayed_admission_and_waits_for_native_clos
     let mut controller = Controller::new(Settings {
         allowed_principals: vec!["caller".into()],
         retirement_status_principals: vec!["observer".into()],
+        retirement_status_owners: BTreeMap::from([("observer".into(), "caller".into())]),
         ..Settings::default()
     })
     .unwrap();

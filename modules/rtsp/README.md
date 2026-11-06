@@ -168,15 +168,20 @@ documents persistence, scope precedence and platform qualification limits.
 
 ## Retained-source retirement observations
 
-Trusted startup may select `retirement_status_principals` for observation only.
+Trusted startup selects `retirement_status_owners`, mapping each observer to one
+original transport owner, for observation only. The older
+`retirement_status_principals` list is accepted only when every listed observer
+has an explicit owner mapping; an unscoped observer policy fails validation.
 They may call `amaterasu.rtsp/1` with
 `{"action":"retirement_status","operation_id":"opaque-transport","expected_runtime_epoch":"32-lowercase-hex-digits"}`.
 Both selectors are optional for a startup snapshot. Replies identify
 `runtime_epoch`, `startup_reconciled`, `operation_id`, `state`, `retired`,
 `active_operations`, `pending_admissions`, and `cleanup_pending`. Observers never
 receive stream keys, peer addresses or private ticket URLs. Normal transport
-owners see only their operations; an explicitly installed retirement observer
-may inspect the exact opaque operation supplied to it across owners.
+owners see only their operations; an installed retirement observer sees only its
+selected owner's operations, admission fences, and occupancy counts. Requests
+cannot select another owner. Each selected owner must already have an installed
+transport admission grant.
 
 Persist the observed runtime epoch before admitting a retained-source transport,
 then send it as `expected_runtime_epoch` on Open. Late requests for a previous
@@ -186,7 +191,10 @@ after the downstream durable cleanup journal and RTSP's native startup cleanup
 have reconciled. Existing tickets override epoch fencing until exact native
 retirement is confirmed. A snapshot with `active_operations: 0` proves only the
 scoped operations currently known to this runtime; also require reconciled
-startup, no pending admission and no pending cleanup.
+startup, no pending admission and no pending cleanup. `startup_reconciled` names
+the prior-runtime native recovery barrier: current-epoch admission or cleanup
+does not make a fresh epoch observation unready. Its separate occupancy fields
+still describe the exact selected owner's current work.
 
 A normal owner may call `retire_operation` with the exact operation and saved
 epoch. It installs an owner-bound admission fence before looking up effects,

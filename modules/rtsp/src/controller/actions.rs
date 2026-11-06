@@ -399,7 +399,11 @@ impl Controller {
                         admission.request,
                         error("display_admission_unavailable"),
                     );
-                    self.display_cleanup.push(admission.call);
+                    self.display_cleanup.push(DisplayCleanup {
+                        owner: admission.caller,
+                        operation_id: admission.config.operation_id,
+                        call: admission.call,
+                    });
                 } else {
                     self.display_admission = Some(admission);
                 }
@@ -446,18 +450,22 @@ impl Controller {
                     admission.request,
                     error("display_admission_unavailable"),
                 );
-                self.display_cleanup.push(admission.call);
+                self.display_cleanup.push(DisplayCleanup {
+                    owner: admission.caller,
+                    operation_id: admission.config.operation_id,
+                    call: admission.call,
+                });
             }
         }
     }
 
     pub(super) fn advance_display_cleanup(&mut self, runtime: &RuntimeClient) {
         self.display_cleanup
-            .retain_mut(|call| match call.poll(runtime) {
+            .retain_mut(|cleanup| match cleanup.call.poll(runtime) {
                 Outcome::SettledFailure => false,
                 Outcome::Waiting => true,
                 Outcome::Uncertain | Outcome::Result(_) => {
-                    call.retry_settlement();
+                    cleanup.call.retry_settlement();
                     true
                 }
             });

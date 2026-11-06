@@ -9,6 +9,7 @@ use amaterasu_module_sdk::{EncoderSelection, network::Network};
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+use std::collections::BTreeMap;
 #[cfg(test)]
 use std::net::UdpSocket;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -41,6 +42,8 @@ pub struct Settings {
     pub allowed_principals: Vec<String>,
     /// Installed observers may only read generation-bound transport retirement.
     pub retirement_status_principals: Vec<String>,
+    /// Each observer is pinned to an original transport owner by signed startup.
+    pub retirement_status_owners: BTreeMap<String, String>,
     pub max_live_tickets: usize,
 }
 impl Default for Settings {
@@ -54,6 +57,7 @@ impl Default for Settings {
             bind_address: None,
             allowed_principals: Vec::new(),
             retirement_status_principals: Vec::new(),
+            retirement_status_owners: BTreeMap::new(),
             max_live_tickets: 2,
         }
     }
@@ -70,7 +74,17 @@ impl Settings {
             || self
                 .retirement_status_principals
                 .iter()
-                .any(|name| !valid_name(name))
+                .any(|name| !valid_name(name) || !self.retirement_status_owners.contains_key(name))
+            || self.retirement_status_owners.len() > 16
+            || self
+                .retirement_status_owners
+                .iter()
+                .any(|(observer, owner)| {
+                    !valid_name(observer)
+                        || !valid_name(owner)
+                        || !self.allowed_principals.contains(owner)
+                        || (self.allowed_principals.contains(observer) && observer != owner)
+                })
             || !(1..=32).contains(&self.max_live_tickets)
         {
             return Err("invalid_settings");
@@ -2375,6 +2389,9 @@ mod tests {
             json!({"allowed_principals": [""]}),
             json!({"allowed_principals": ["line\nfeed"]}),
             json!({"retirement_status_principals":[""]}),
+            json!({"allowed_principals":["owner"],"retirement_status_principals":["observer"]}),
+            json!({"retirement_status_owners":{"observer":"unapproved-owner"}}),
+            json!({"allowed_principals":["owner","other"],"retirement_status_owners":{"owner":"other"}}),
             json!({"max_live_tickets":0}),
             json!({"max_live_tickets":33}),
         ] {
@@ -2385,6 +2402,12 @@ mod tests {
                 Err("invalid_settings")
             );
         }
+        let scoped: Settings = serde_json::from_value(json!({
+            "allowed_principals":["owner"],
+            "retirement_status_owners":{"observer":"owner"}
+        }))
+        .unwrap();
+        assert!(scoped.validate().is_ok());
     }
 
     #[test]

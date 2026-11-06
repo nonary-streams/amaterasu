@@ -11,57 +11,63 @@ impl Controller {
         expected_epoch: Option<&str>,
         runtime: &RuntimeClient,
     ) {
-        let observer = self
+        let owner = if self
             .settings
-            .retirement_status_principals
+            .allowed_principals
             .iter()
-            .any(|principal| principal == caller);
-        if !observer
-            && !self
-                .settings
-                .allowed_principals
-                .iter()
-                .any(|principal| principal == caller)
+            .any(|principal| principal == caller)
         {
+            caller
+        } else if let Some(owner) = self.settings.retirement_status_owners.get(caller) {
+            owner.as_str()
+        } else {
             rpc::complete(runtime, request, error("permission_denied"));
             return;
-        }
+        };
         if operation.is_some_and(|id| !valid_name(id))
             || expected_epoch.is_some_and(|epoch| !crate::model::valid_runtime_epoch(epoch))
         {
             rpc::complete(runtime, request, error("invalid_retirement_reference"));
             return;
         }
-        let reconciled = self.startup_recovery.ready() && self.display_cleanup.is_empty();
+        // This describes the prior-runtime native reconciliation barrier.
+        // Current-epoch work has separate owner-scoped occupancy observations.
+        let reconciled = self.startup_recovery.ready();
         let active_operations = self
             .records
             .values()
-            .filter(|record| (observer || record.owner == caller) && !retirement_confirmed(record))
+            .filter(|record| record.owner == owner && !retirement_confirmed(record))
             .count();
         let pending_admissions = usize::from(
             self.display_admission
                 .as_ref()
-                .is_some_and(|admission| observer || admission.caller == caller),
+                .is_some_and(|admission| admission.caller == owner),
         );
-        let cleanup_pending = !self.display_cleanup.is_empty()
+        let cleanup_pending = self
+            .display_cleanup
+            .iter()
+            .any(|cleanup| cleanup.owner == owner)
             || self.records.values().any(|record| {
-                (observer || record.owner == caller)
+                record.owner == owner
                     && !retirement_confirmed(record)
                     && matches!(record.state, State::Closing | State::CleanupFailed)
             });
         let (state, retired) = if let Some(operation) = operation {
-            let record = self.records.values().find(|record| {
-                (observer || record.owner == caller) && record.config.operation_id == operation
-            });
+            let record = self
+                .records
+                .values()
+                .find(|record| record.owner == owner && record.config.operation_id == operation);
             let deferred = self.display_admission.as_ref().is_some_and(|admission| {
-                (observer || admission.caller == caller)
-                    && admission.config.operation_id == operation
-            });
-            if let Some(record) = record {
+                admission.caller == owner && admission.config.operation_id == operation
+            }) || self
+                .display_cleanup
+                .iter()
+                .any(|cleanup| cleanup.owner == owner && cleanup.operation_id == operation);
+            if deferred {
+                ("active", false)
+            } else if let Some(record) = record {
                 let retired = retirement_confirmed(record);
                 (if retired { "retired" } else { "active" }, retired)
-            } else if deferred {
-                ("active", false)
             } else if !reconciled {
                 (self.recovery_observation_state(), false)
             } else if expected_epoch.is_some_and(|epoch| epoch != self.runtime_epoch) {
@@ -72,7 +78,7 @@ impl Controller {
             } else if self
                 .retired_operations
                 .iter()
-                .any(|(owner, id)| (observer || owner == caller) && id == operation)
+                .any(|(fence_owner, id)| fence_owner == owner && id == operation)
             {
                 ("operation_fenced", true)
             } else {
