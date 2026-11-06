@@ -198,7 +198,8 @@ def configure_fixture(policy, base_port):
         settings[name]["enabled"] = False
     settings["amaterasu.linux-session-video"] = {
         "enabled": True, "capture_providers": [],
-        "source_preflight_routes": {"synthetic_black": "black"},
+        "source_preflight_routes": {"synthetic_black": {"provider": "black", "class": "synthetic"}},
+        "preflight_only_principals": [PLUGIN],
         "external_capture_providers": {
             "black": {"service": "amaterasu.capture-black/1", "frame_transport": "generic_cpu"},
         },
@@ -221,7 +222,10 @@ def assert_device_isolation(policy):
         "black": {"service": "amaterasu.capture-black/1", "frame_transport": "generic_cpu"}},
         "capture is not restricted to the explicit black source")
     require(settings["amaterasu.linux-session-video"]["source_preflight_routes"] == {
-        "synthetic_black": "black"}, "preflight can select a managed or desktop source")
+        "synthetic_black": {"provider": "black", "class": "synthetic"}},
+        "preflight can select a managed or desktop source")
+    require(settings["amaterasu.linux-session-video"]["preflight_only_principals"] == [PLUGIN],
+            "remote provider is not limited to read-only Video preflight")
     require(settings["amaterasu.input"] == {"enabled": True}, "input fixture settings changed")
     rtsp = settings["amaterasu.rtsp"]
     require(rtsp["allowed_principals"] == ["amaterasu.nvhttp"],
@@ -296,8 +300,8 @@ def wait_ready(console, seconds=120):
     require(console.process.poll() is None, "signed native worker failed to load", "".join(console.errors))
 
 
-def context(client="fixture-secondary", *, game=True, launch=True):
-    return {"client": {"id": client, "paired": True, "may_view": True,
+def context(client="fixture-secondary", *, game=True, launch=True, view=True, list_apps=True):
+    return {"client": {"id": client, "paired": True, "may_view": view, "may_list": list_apps,
                        "may_launch": launch, "may_terminate": True},
             "game": {"application": {"id": "42", "uuid": "fixture-game-uuid", "title": "Fixture game",
                                      "aliases": [], "visible": True, "monitor_profile": False, "properties": {}},
@@ -585,10 +589,14 @@ class HarnessSelfTests(unittest.TestCase):
         }
         configure_fixture(policy, 47989)
         video = policy["settings"]["amaterasu.linux-session-video"]
-        video["source_preflight_routes"]["managed_output"] = "black"
+        video["source_preflight_routes"]["managed_output"] = {"provider": "black", "class": "managed"}
         with self.assertRaisesRegex(AssertionError, "preflight can select"):
             assert_device_isolation(policy)
         del video["source_preflight_routes"]["managed_output"]
+        video["preflight_only_principals"] = []
+        with self.assertRaisesRegex(AssertionError, "read-only Video preflight"):
+            assert_device_isolation(policy)
+        video["preflight_only_principals"] = [PLUGIN]
         policy["settings"]["amaterasu.rtsp"]["allowed_principals"].append("amaterasu.console")
         with self.assertRaisesRegex(AssertionError, "open or close authority"):
             assert_device_isolation(policy)
