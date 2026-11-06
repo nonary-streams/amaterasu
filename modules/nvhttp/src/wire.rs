@@ -222,6 +222,10 @@ impl Router {
         self.launches.set_auxiliary_exact_capture_routes(routes);
     }
 
+    pub(crate) fn set_auxiliary_black_capture_route_key(&mut self, key: Option<String>) {
+        self.launches.set_auxiliary_black_capture_route_key(key);
+    }
+
     pub fn set_encoder_snapshot(&mut self, snapshot: crate::encoder_snapshot::EncoderSnapshot) {
         self.launches.set_encoder_snapshot(snapshot);
     }

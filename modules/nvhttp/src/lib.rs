@@ -281,6 +281,9 @@ impl ManagedModule for NvhttpModule {
                 settings.auxiliary_black_capture_provider.clone(),
                 settings.auxiliary_exact_capture_provider.clone(),
             );
+            router.set_auxiliary_black_capture_route_key(
+                settings.auxiliary_black_capture_route_key.clone(),
+            );
             router.set_auxiliary_exact_capture_routes(
                 settings.auxiliary_exact_capture_routes.clone(),
             );
