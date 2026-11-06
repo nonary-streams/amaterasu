@@ -25,6 +25,10 @@ pub struct BorrowedCaptureContext {
     pub transport_epoch: String,
     /// Logical selector resolved by the installed capture provider.
     pub output: String,
+    /// Opaque route selected by trusted startup composition. Changing this key
+    /// changes the retained source even when its logical output is unchanged.
+    #[serde(default = "default_route", skip_serializing_if = "is_default_route")]
+    pub route_key: String,
     /// The retained source mode, distinct from the requested stream mode.
     pub mode: VideoMode,
 }
@@ -41,6 +45,7 @@ impl BorrowedCaptureContext {
         .into_iter()
         .all(|id| valid_opaque_id(id))
             || self.generation == 0
+            || !valid_opaque_id(&self.route_key)
             || self.output.is_empty()
             || self.output.len() > 512
             || self.output.chars().any(char::is_control)
@@ -56,6 +61,14 @@ impl BorrowedCaptureContext {
         }
         Ok(())
     }
+}
+
+fn default_route() -> String {
+    "default".into()
+}
+
+fn is_default_route(route: &str) -> bool {
+    route == "default"
 }
 
 /// Read context only from the authenticated lifecycle coordinator response.
@@ -96,6 +109,7 @@ mod tests {
             transport_id: "transport-operation".into(),
             transport_epoch: "transport-host-epoch".into(),
             output: "exact-target:logical-selector".into(),
+            route_key: default_route(),
             mode: VideoMode {
                 width: 2560,
                 height: 1440,
@@ -132,6 +146,7 @@ mod tests {
             "reservation_id",
             "transport_id",
             "transport_epoch",
+            "route_key",
         ] {
             let mut value = json!(source());
             value[field] = json!("x".repeat(129));
@@ -156,5 +171,28 @@ mod tests {
             assert!(borrowed_capture_from_application(&application).is_err());
         }
         assert_eq!(borrowed_capture_from_application(&json!({})).unwrap(), None);
+    }
+
+    #[test]
+    fn omitted_route_preserves_legacy_default_and_explicit_routes_round_trip() {
+        let legacy = serde_json::to_value(source()).unwrap();
+        assert!(legacy.get("route_key").is_none());
+        let decoded: BorrowedCaptureContext = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(decoded.route_key, "default");
+        decoded.validate().unwrap();
+        let mut explicit = legacy;
+        explicit["route_key"] = json!("retained-monitor-route");
+        let decoded: BorrowedCaptureContext = serde_json::from_value(explicit.clone()).unwrap();
+        decoded.validate().unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap(), explicit);
+        for invalid in ["", "route\nchanged"] {
+            explicit["route_key"] = json!(invalid);
+            assert!(
+                serde_json::from_value::<BorrowedCaptureContext>(explicit.clone())
+                    .unwrap()
+                    .validate()
+                    .is_err()
+            );
+        }
     }
 }

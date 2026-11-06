@@ -79,6 +79,7 @@ fn same_source(frozen: &BorrowedCaptureContext, source: &BorrowedCaptureContext)
     frozen.session_id == source.session_id
         && frozen.generation == source.generation
         && frozen.output == source.output
+        && frozen.route_key == source.route_key
         && frozen.mode == source.mode
 }
 
@@ -340,6 +341,7 @@ mod tests {
             ("session_id", json!("different-source")),
             ("generation", json!(4)),
             ("output", json!("exact-target:different-monitor")),
+            ("route_key", json!("different-capture-route")),
             (
                 "mode",
                 json!({"width":1920,"height":1080,"refresh_millihz":60000,"hdr":false}),
