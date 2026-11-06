@@ -104,6 +104,7 @@ fn identities_and_permissions_remain_authenticated_facts() {
         application: app(),
         owner_client_id: "owner".into(),
         generation: 0,
+        source: None,
     });
     assert!(Request::Info { context: request }.validate().is_err());
     let mut bad = client();
@@ -209,7 +210,7 @@ fn replies_reject_malformed_state_and_unbounded_retry_or_artwork() {
 #[test]
 fn method_contracts_have_unique_exact_identity_and_no_raw_action_field() {
     let methods = methods();
-    assert_eq!(methods.len(), 12);
+    assert_eq!(methods.len(), 14);
     let names: std::collections::BTreeSet<_> = methods.iter().map(|m| m.method.as_str()).collect();
     assert_eq!(methods.len(), names.len());
     for method in methods {
@@ -219,6 +220,101 @@ fn method_contracts_have_unique_exact_identity_and_no_raw_action_field() {
         assert!(!method.request.required.contains_key("action"));
         assert_eq!(method.response.required["result"], ApiFieldKind::String);
     }
+}
+
+#[test]
+fn game_source_is_optional_but_a_present_association_must_be_valid() {
+    let mut value = Context {
+        client: client(),
+        game: Some(Game {
+            application: app(),
+            owner_client_id: "owner".into(),
+            generation: 7,
+            source: None,
+        }),
+    };
+    let legacy = serde_json::to_value(&value).unwrap();
+    assert!(legacy["game"].get("source").is_none());
+    let decoded: Context = serde_json::from_value(legacy).unwrap();
+    assert_eq!(decoded, value);
+    value.game.as_mut().unwrap().source = Some(SharedCapture {
+        session_id: "retained-screen".into(),
+        generation: 2,
+        reservation_id: "original-game-source".into(),
+        capture: CaptureSource::ExactOutput {
+            output: "logical-selector".into(),
+        },
+        mode: Mode {
+            width: 1920,
+            height: 1080,
+            refresh_millihz: 60_000,
+            hdr: false,
+        },
+    });
+    assert!(value.validate().is_ok());
+    value
+        .game
+        .as_mut()
+        .unwrap()
+        .source
+        .as_mut()
+        .unwrap()
+        .generation = 0;
+    assert!(value.validate().is_err());
+}
+
+#[test]
+fn client_revocation_requires_no_fabricated_live_session_identity() {
+    let revoke = Request::RevokeClient {
+        client_id: "authenticated-revoked-client".into(),
+    };
+    assert!(revoke.validate().is_ok());
+    let Command::CallApi {
+        method, payload, ..
+    } = command(
+        RequestOptions {
+            service: SERVICE,
+            timeout_ms: 1000,
+            operation_id: "revoke",
+            parent: None,
+        },
+        &revoke,
+    )
+    .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(method, "revoke_client");
+    assert_eq!(payload, json!({"client_id":"authenticated-revoked-client"}));
+    assert!(
+        Request::RevokeClient {
+            client_id: String::new()
+        }
+        .validate()
+        .is_err()
+    );
+}
+
+#[test]
+fn application_source_binding_is_independent_of_transport_retirement() {
+    let binding = Request::BindApplication {
+        client_id: "client".into(),
+        session_id: "source-session".into(),
+        generation: 3,
+        reservation_id: "root-source".into(),
+        application_operation_id: "ale1-epoch-application-op".into(),
+        application_epoch: "ale1-epoch".into(),
+        application_generation: 11,
+    };
+    assert!(binding.validate().is_ok());
+    let mut invalid = binding;
+    if let Request::BindApplication {
+        application_epoch, ..
+    } = &mut invalid
+    {
+        application_epoch.clear();
+    }
+    assert!(invalid.validate().is_err());
 }
 
 #[test]

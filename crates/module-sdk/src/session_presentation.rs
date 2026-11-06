@@ -69,6 +69,11 @@ pub struct Game {
     pub application: Application,
     pub owner_client_id: String,
     pub generation: u64,
+    /// Actual application-root source, supplied by the trusted coordinator.
+    /// A secondary attach requires a fresh reservation after the provider
+    /// validates this original owner's live source association.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<SharedCapture>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -172,6 +177,11 @@ pub enum Decision {
     Auxiliary {
         plan: AuxiliaryStreamPlan,
     },
+    /// Resume an existing retained auxiliary role under View permission.
+    /// This cannot authorize creation of a new retained role.
+    ResumeAuxiliary {
+        plan: AuxiliaryStreamPlan,
+    },
     StopAuxiliary {
         session_id: String,
         generation: u64,
@@ -224,7 +234,7 @@ pub struct Observation {
     pub transport_id: String,
     /// Runtime identity of the transport owner. A different reconciled epoch
     /// proves retirement only through that owner's authenticated status API.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transport_epoch: Option<String>,
     pub event: SessionEvent,
 }
@@ -282,6 +292,11 @@ pub enum Request {
         client_id: String,
         operation_id: String,
     },
+    /// Called by the trusted adapter after the pairing authority confirms
+    /// revocation. Acknowledgment follows actual owned cleanup.
+    RevokeClient {
+        client_id: String,
+    },
     VerifySource {
         client_id: String,
         source: SharedCapture,
@@ -297,13 +312,25 @@ pub enum Request {
         transport_id: String,
         transport_epoch: String,
     },
+    /// Retain an application's source independently of its transport. The
+    /// epoch and operation come from the selected execution provider, and this
+    /// binding must be durable before application or lifecycle effects.
+    BindApplication {
+        client_id: String,
+        session_id: String,
+        generation: u64,
+        reservation_id: String,
+        application_operation_id: String,
+        application_epoch: String,
+        application_generation: u64,
+    },
     Observe {
         client_id: String,
         session_id: String,
         generation: u64,
         reservation_id: String,
         transport_id: String,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         transport_epoch: Option<String>,
         event: SessionEvent,
     },
@@ -413,6 +440,19 @@ pub fn methods() -> Vec<ApiMethod> {
         (
             "cancel_dispatch",
             vec![("client_id", Text), ("operation_id", Text)],
+        ),
+        ("revoke_client", vec![("client_id", Text)]),
+        (
+            "bind_application",
+            vec![
+                ("client_id", Text),
+                ("session_id", Text),
+                ("generation", Integer),
+                ("reservation_id", Text),
+                ("application_operation_id", Text),
+                ("application_epoch", Text),
+                ("application_generation", Integer),
+            ],
         ),
         (
             "verify_source",
@@ -541,6 +581,9 @@ impl Context {
         self.client.validate()?;
         if let Some(game) = &self.game {
             game.application.validate()?;
+            if let Some(source) = &game.source {
+                source.validate()?;
+            }
             if game.generation == 0 || !token(&game.owner_client_id) {
                 return Err("invalid_game_snapshot");
             }
@@ -685,6 +728,31 @@ impl Request {
                     return Err("invalid_dispatch_operation");
                 }
             }
+            Self::RevokeClient { client_id } => {
+                if !token(client_id) {
+                    return Err("invalid_revoked_client");
+                }
+            }
+            Self::BindApplication {
+                client_id,
+                session_id,
+                generation,
+                reservation_id,
+                application_operation_id,
+                application_epoch,
+                application_generation,
+            } => {
+                if !token(client_id)
+                    || !token(session_id)
+                    || *generation == 0
+                    || !token(reservation_id)
+                    || !token(application_operation_id)
+                    || !token(application_epoch)
+                    || *application_generation == 0
+                {
+                    return Err("invalid_application_source_binding");
+                }
+            }
             Self::VerifySource { client_id, source } => {
                 if !token(client_id) {
                     return Err("invalid_source_owner");
@@ -795,7 +863,7 @@ impl Decision {
                 }
                 completion.validate()?;
             }
-            Self::Auxiliary { plan } => plan.validate()?,
+            Self::Auxiliary { plan } | Self::ResumeAuxiliary { plan } => plan.validate()?,
             Self::StopAuxiliary {
                 session_id,
                 generation,

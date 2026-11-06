@@ -86,17 +86,30 @@ selected library under current authorization.
 and mode. A provider may return `Pending`; poll with the same operation identity
 and unchanged arguments. A different payload must not reuse the transition.
 `CancelDispatch` retires provisional work when the adapter abandons admission.
+After authority-confirmed unpairing, `RevokeClient` stops new admissions and
+retires that exact client's retained roles and reservations. It remains pending
+until ownership and native cleanup are verified; an idle retained source does
+not require the caller to invent a live session tuple.
 
 The decision describes an application launch, resume, replacement, stop,
 auxiliary stream or completed control. A replacement or stop includes the
 observed application generation. The consumer must compare it with current state
 before acting, so a delayed control cannot stop a successor application.
+`Auxiliary` requires Launch permission to create a role; `ResumeAuxiliary`
+requires View permission for an already retained role. A synthetic Resume tile
+may arrive through a protocol's launch route, so the HTTP path cannot determine
+this semantic permission. Recheck the required live permission before effects
+and delivery.
 
 An `AuxiliaryStreamPlan` requests a selected synthetic black source or a verified
 exact output. It contains an opaque session, generation, admission reservation,
 mode and audio requirements. A normal application can borrow a retained output
 through `SharedCapture`, which freezes the same source and mode. Neither type
 contains native providers, OS handles or native allocation ownership.
+`Game.source`, when present, is the trusted coordinator's original application
+source association. The provider checks that original owner's source and game
+generation before issuing a secondary client a fresh independent reservation.
+An attach must not reuse another client's reservation unchanged.
 
 Before any source-consuming effects:
 
@@ -108,6 +121,15 @@ Before any source-consuming effects:
    `BindTransport` with the exact future transport operation and epoch.
 4. The policy provider acknowledges only after persisting that binding and its
    source hold. The consumer opens the transport with that expected owner epoch.
+
+An application source has a longer lifetime than a transport. Before application
+or lifecycle effects, `BindApplication` persists the original source reservation
+with the execution provider's exact application operation, authoritative launch
+epoch and root application generation. Keep that source through a transport
+pause, and allocate separate reservations for resumed or joined transports. The
+original source hold retires only after actual application cleanup or the
+execution provider's authenticated application-retirement proof. Retiring an old
+RTSP operation does not prove that its application no longer needs the output.
 
 Native capture still resolves the logical exact selector and checks readiness.
 An unavailable target must fail rather than capture another display. A borrowed
