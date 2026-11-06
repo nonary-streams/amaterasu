@@ -20,3 +20,5 @@ mod session_presentation_tests;
 mod retirement_contract_tests;
 #[cfg(test)]
 mod display_target_tests;
+#[cfg(test)]
+mod scoped_display_contract_tests;
