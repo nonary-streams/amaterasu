@@ -79,7 +79,7 @@ pub struct SourceModeCapabilities {
     /// Accepted negotiated depths; empty is unknown, never implied ten-bit.
     #[serde(default)]
     pub bit_depths: Vec<u8>,
-    /// The provider accepts an explicit `video_stream_format` on Open. A false
+    /// The provider accepts an explicit `source_format` on Open. A false
     /// value preserves its original Open schema; it is never sent a new field.
     #[serde(default)]
     pub format_open: bool,

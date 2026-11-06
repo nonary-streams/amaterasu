@@ -6,6 +6,7 @@ mod preflight;
 mod provenance;
 mod publisher;
 mod selector;
+mod source_format;
 mod subscription;
 
 pub use connection::{ConnectionError, ResourceConnection};
@@ -24,6 +25,7 @@ pub use preflight::{
 pub use provenance::color_provenance;
 pub use publisher::{CaptureFrames, CapturePublisher, PublishError, capture_channel};
 pub use selector::{EXACT_TARGET_PREFIX, exact_target_key, exact_target_selector};
+pub use source_format::SourceFormat;
 pub use subscription::{CaptureNotice, CaptureNotifications, CaptureSubscription};
 
 #[derive(Clone, Debug, Eq, PartialEq)]

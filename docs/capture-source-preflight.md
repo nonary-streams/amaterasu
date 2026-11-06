@@ -24,7 +24,9 @@ intermediate mode works: always query the exact proposed mode.
 not eight-bit. A final request supplies the negotiated depth, including ten-bit
 SDR independently from HDR. Capabilities list accepted `bit_depths`; an empty
 list is unknown and cannot authorize ten-bit input. `format_open: true` explicitly
-declares support for an Open `video_stream_format` field. Consumers preserve the
+declares support for an Open `source_format` field. Its SDK `SourceFormat`
+contains bit depth and dynamic range, independently of encoder codec/output.
+Consumers preserve the
 legacy Open body when that marker is false, including generated-black sources
 whose resource negotiation selects P010 without a new Open field.
 
