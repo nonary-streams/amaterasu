@@ -557,7 +557,7 @@ def reject_unavailable_monitor(console, fingerprint):
             break
         time.sleep(0.02)
     cancelled = console.settled_api("cancel_dispatch", {
-        "client_id": "disabled-monitor-client", "operation_id": "disabled-monitor-request",
+        "client_id": fingerprint, "operation_id": "disabled-monitor-request",
     })
     require(cancelled.get("result") == "acknowledged", "failed monitor admission retained uncertain ownership", cancelled)
     return {"native_display_disabled": True, "never_capture_ready": True, "admission_cancelled": True}
