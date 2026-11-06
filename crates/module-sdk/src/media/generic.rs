@@ -131,7 +131,7 @@ impl<'a> BorrowedResourceFrame<'a> {
         self.frame
     }
 
-    /// Copy a standard CPU v1 presentation and its metadata into independent
+    /// Copy a standard CPU v1 or v2 presentation and its metadata into independent
     /// storage. Metadata must agree between the presentation and CPU descriptor.
     /// This does not retain the source resource or interpret color/clock values.
     pub fn copy_cpu(&self) -> Result<OwnedResourceCpuFrame, Status> {
@@ -139,7 +139,7 @@ impl<'a> BorrowedResourceFrame<'a> {
         let sync = &self.frame.acquire_sync;
         if self.frame.reserved != 0
             || resource.kind != FRAME_RESOURCE_CPU
-            || resource.version != 1
+            || !matches!(resource.version, 1 | 2)
             || resource.reserved != 0
             || resource.namespace != [0; 16]
             || (resource.size as usize) < std::mem::size_of::<CpuFrame>()
@@ -153,6 +153,31 @@ impl<'a> BorrowedResourceFrame<'a> {
             || !sync.data.is_null()
         {
             return Err(STATUS_INVALID_ARGUMENT);
+        }
+        if resource.version == 2 {
+            use amaterasu_media::*;
+            let color = self.frame.color;
+            if color.version != 1
+                || color.size != size_of::<FrameColorMetadata>() as u32
+                || !matches!(
+                    color.primaries,
+                    FRAME_PRIMARIES_BT709 | FRAME_PRIMARIES_BT2020
+                )
+                || !matches!(
+                    color.transfer,
+                    FRAME_TRANSFER_SRGB
+                        | FRAME_TRANSFER_BT709
+                        | FRAME_TRANSFER_PQ
+                        | FRAME_TRANSFER_HLG
+                )
+                || !matches!(
+                    color.matrix,
+                    FRAME_MATRIX_RGB | FRAME_MATRIX_BT709 | FRAME_MATRIX_BT2020_NCL
+                )
+                || !matches!(color.range, FRAME_RANGE_FULL | FRAME_RANGE_LIMITED)
+            {
+                return Err(STATUS_INVALID_ARGUMENT);
+            }
         }
         // SAFETY: construction guarantees descriptor data is live and readable;
         // the schema, size and alignment were checked above.
@@ -313,8 +338,25 @@ mod tests {
             ),
             (1, 32, 8, 0, [9; 16])
         );
-        frame.resource.version = 2;
+        frame.resource.version = 3;
         // SAFETY: same fixture lifetime; the unknown schema is rejected.
+        assert!(
+            unsafe { BorrowedResourceFrame::from_descriptor(&frame) }
+                .copy_cpu()
+                .is_err()
+        );
+        frame.resource.version = 2;
+        frame.color = crate::capture::high_depth::p010_color(
+            true,
+            crate::capture::high_depth::YuvRange::Limited,
+        );
+        // SAFETY: V2 retains the canonical CPU frame layout and known color.
+        let explicit = unsafe { BorrowedResourceFrame::from_descriptor(&frame) }
+            .copy_cpu()
+            .unwrap();
+        assert_eq!(explicit.color.transfer, amaterasu_media::FRAME_TRANSFER_PQ);
+        frame.color.range = 0;
+        // SAFETY: same fixture, but V2 cannot omit negotiated color.
         assert!(
             unsafe { BorrowedResourceFrame::from_descriptor(&frame) }
                 .copy_cpu()

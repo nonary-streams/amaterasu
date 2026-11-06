@@ -65,6 +65,9 @@ pub trait CpuSourceProvider: Send + Sync {
             .ok_or(MEDIA_UNSUPPORTED)?;
         self.read(caller, stream, format)
     }
+    /// Called after a foreign sink rejects a presentation, except BUSY, which
+    /// leaves it retryable. Providers can invalidate a cadence cache here.
+    fn delivery_failed(&self, _caller: &str, _stream: u64, _status: Status) {}
     fn geometry(&self, caller: &str, stream: u64) -> Result<CaptureGeometry, Status>;
 }
 pub struct CpuSourceFactory<P: CpuSourceProvider> {
@@ -204,6 +207,12 @@ impl<P: CpuSourceProvider> Binding<P> {
             return Err(MEDIA_UNSUPPORTED);
         }
         Ok(p)
+    }
+    fn finish_delivery(&self, stream: u64, status: Status) -> Status {
+        if status != STATUS_OK && status != MEDIA_BUSY {
+            self.provider.delivery_failed(&self.caller, stream, status);
+        }
+        status
     }
     fn legacy(&self, stream: u64) -> Result<CpuSourcePresentation, Status> {
         let p = self
@@ -357,7 +366,7 @@ unsafe extern "C" fn legacy<P: CpuSourceProvider>(
             Ok(p) => p,
             Err(e) => return e,
         }; // SAFETY: owned presentation keeps bytes alive through the synchronous sink.
-        unsafe { sink.send(&p.frame()) }
+        b.finish_delivery(s, unsafe { sink.send(&p.frame()) })
     })
 }
 unsafe extern "C" fn fresh<P: CpuSourceProvider>(
@@ -374,7 +383,7 @@ unsafe extern "C" fn fresh<P: CpuSourceProvider>(
             Ok(p) => p,
             Err(e) => return e,
         }; // SAFETY: owned presentation keeps bytes alive through the synchronous sink.
-        unsafe { sink.send(&p.frame(), p.freshness) }
+        b.finish_delivery(s, unsafe { sink.send(&p.frame(), p.freshness) })
     })
 }
 unsafe extern "C" fn timed<P: CpuSourceProvider>(
@@ -391,7 +400,7 @@ unsafe extern "C" fn timed<P: CpuSourceProvider>(
             Ok(p) => p,
             Err(e) => return e,
         }; // SAFETY: owned presentation keeps bytes alive through the synchronous sink.
-        unsafe {
+        b.finish_delivery(s, unsafe {
             sink.send(
                 &CaptureFrameV1_3 {
                     frame: p.frame(),
@@ -399,7 +408,7 @@ unsafe extern "C" fn timed<P: CpuSourceProvider>(
                 },
                 p.freshness,
             )
-        }
+        })
     })
 }
 unsafe extern "C" fn geometry<P: CpuSourceProvider>(
@@ -586,7 +595,7 @@ unsafe extern "C" fn read_resource<P: CpuSourceProvider>(
         };
         // SAFETY: immutable Arc storage, frame and descriptor live until callback
         // returns. Borrowed-only retention is explicitly rejected.
-        unsafe { (sink.write)(sink.context, &frame) }
+        b.finish_delivery(s, unsafe { (sink.write)(sink.context, &frame) })
     })
 }
 unsafe extern "C" fn hdr<P: CpuSourceProvider>(

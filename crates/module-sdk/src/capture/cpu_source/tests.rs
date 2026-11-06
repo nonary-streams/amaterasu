@@ -4,6 +4,7 @@ struct Provider {
     open: AtomicBool,
     generation: AtomicU64,
     reads: AtomicU64,
+    failures: AtomicU64,
 }
 impl CpuSourceProvider for Provider {
     fn describe(&self, caller: &str, stream: u64) -> Result<CpuSourceDescription, Status> {
@@ -49,6 +50,9 @@ impl CpuSourceProvider for Provider {
             freshness: CAPTURE_FRAME_FRESH,
         }))
     }
+    fn delivery_failed(&self, _: &str, _: u64, _: Status) {
+        self.failures.fetch_add(1, Ordering::SeqCst);
+    }
     fn geometry(&self, _: &str, _: u64) -> Result<CaptureGeometry, Status> {
         Err(MEDIA_UNSUPPORTED)
     }
@@ -58,6 +62,7 @@ fn provider() -> Arc<Provider> {
         open: AtomicBool::new(true),
         generation: AtomicU64::new(1),
         reads: AtomicU64::new(0),
+        failures: AtomicU64::new(0),
     })
 }
 unsafe fn bind_table(factory: &CpuSourceFactory<Provider>, caller: &str) -> *const CaptureApiV1_10 {
@@ -101,6 +106,12 @@ unsafe extern "C" fn frame_sink(
 ) -> Status {
     // SAFETY: callback receives borrowed descriptors; copy only the CPU bytes.
     let frame = unsafe { &*frame };
+    // SAFETY: the native producer lends the complete frame to this callback.
+    let owned = unsafe { crate::media::BorrowedResourceFrame::from_descriptor(frame) }
+        .copy_cpu()
+        .unwrap();
+    assert_eq!(owned.color.transfer, FRAME_TRANSFER_PQ);
+    assert_eq!(owned.pixels.pixels(), &[0; 12]);
     let cpu = unsafe { &*frame.resource.data.cast::<CpuFrame>() };
     assert_eq!(frame.resource.version, 2);
     assert_eq!(frame.offer_generation, 1);
@@ -145,12 +156,28 @@ fn negotiated_color_lifetime_sink_backpressure_and_generation_are_preserved() {
         };
         assert_eq!((api.base.read_resource_frame)(c, 7, sink), MEDIA_BUSY);
         assert_eq!(copied, vec![0; 12]);
+        assert_eq!(p.failures.load(Ordering::SeqCst), 0);
+        unsafe extern "C" fn reject(_: *mut c_void, _: *const CaptureResourceFrame) -> Status {
+            MEDIA_BACKEND_ERROR
+        }
+        assert_eq!(
+            (api.base.read_resource_frame)(
+                c,
+                7,
+                CaptureResourceFrameSink {
+                    write: reject,
+                    ..sink
+                }
+            ),
+            MEDIA_BACKEND_ERROR
+        );
+        assert_eq!(p.failures.load(Ordering::SeqCst), 1);
         p.generation.store(2, Ordering::SeqCst);
         assert_eq!(
             (api.base.read_resource_frame)(c, 7, sink),
             MEDIA_UNSUPPORTED
         );
-        assert_eq!(p.reads.load(Ordering::SeqCst), 1);
+        assert_eq!(p.reads.load(Ordering::SeqCst), 2);
         assert_eq!((api.base.select_resource)(c, 7, 1, 1), MEDIA_UNSUPPORTED);
         p.open.store(false, Ordering::SeqCst);
         assert_eq!((api.base.read_resource_frame)(c, 7, sink), MEDIA_CLOSED);

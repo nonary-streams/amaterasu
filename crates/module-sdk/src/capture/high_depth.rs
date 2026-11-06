@@ -176,6 +176,56 @@ impl RgbSurface {
         })
     }
 
+    /// Edit one initialized pixel in linear BT.709/scRGB units. This supports
+    /// small native overlays without quantizing the rest of a high-depth
+    /// presentation. HDR scRGB uses 80 nits per unit; the caller supplies any
+    /// independently observed SDR reference-white scaling for its overlay.
+    pub fn transform_linear_pixel(
+        &mut self,
+        x: u32,
+        y: u32,
+        transform: impl FnOnce([f64; 3]) -> [f64; 3],
+    ) -> Result<(), Status> {
+        self.validate()?;
+        if x >= self.width || y >= self.height {
+            return Err(STATUS_INVALID_ARGUMENT);
+        }
+        let rgb = transform(self.linear_709(x, y)?);
+        if rgb.iter().any(|v| !v.is_finite()) {
+            return Err(STATUS_INVALID_ARGUMENT);
+        }
+        let offset = y as usize * self.stride as usize
+            + x as usize * self.encoding.bytes_per_pixel() as usize;
+        let encoded = match self.encoding {
+            RgbEncoding::Rgba16FloatScRgb => {
+                let mut pixel = [0u8; 8];
+                for (index, value) in rgb.into_iter().chain(std::iter::once(1.0)).enumerate() {
+                    pixel[index * 2..index * 2 + 2].copy_from_slice(&to_half(value)?.to_le_bytes());
+                }
+                pixel.to_vec()
+            }
+            RgbEncoding::Bgra8Srgb => vec![
+                (srgb(rgb[2]) * 255.0).round() as u8,
+                (srgb(rgb[1]) * 255.0).round() as u8,
+                (srgb(rgb[0]) * 255.0).round() as u8,
+                255,
+            ],
+            RgbEncoding::Rgb10A2Srgb | RgbEncoding::Rgb10A2Pq2020 => {
+                let encoded = if self.encoding == RgbEncoding::Rgb10A2Srgb {
+                    rgb.map(srgb)
+                } else {
+                    linear_709_to_2020(rgb).map(|v| pq(v * 80.0))
+                };
+                let values = encoded.map(|v| (v * 1023.0).round().clamp(0.0, 1023.0) as u32);
+                (values[0] | values[1] << 10 | values[2] << 20 | 3 << 30)
+                    .to_le_bytes()
+                    .to_vec()
+            }
+        };
+        Arc::make_mut(&mut self.bytes)[offset..offset + encoded.len()].copy_from_slice(&encoded);
+        Ok(())
+    }
+
     fn encoded_rgb(&self, x: u32, y: u32, hdr: bool) -> Result<[f64; 3], Status> {
         if self.encoding == RgbEncoding::Rgb10A2Pq2020 {
             return Ok(self.packed_rgb(x, y));
@@ -184,11 +234,7 @@ impl RgbSurface {
         if hdr {
             // Linear BT.709 to BT.2020, then absolute ST.2084. Windows HDR
             // scRGB white is 80 nits; SDR scRGB is display-referred instead.
-            let wide = [
-                0.627404 * rgb[0] + 0.329283 * rgb[1] + 0.043313 * rgb[2],
-                0.069097 * rgb[0] + 0.919540 * rgb[1] + 0.011362 * rgb[2],
-                0.016392 * rgb[0] + 0.088013 * rgb[1] + 0.895595 * rgb[2],
-            ];
+            let wide = linear_709_to_2020(rgb);
             Ok(wide.map(|value| pq(value * 80.0)))
         } else {
             Ok(rgb.map(bt709))
@@ -217,7 +263,14 @@ impl RgbSurface {
                 Ok(rgb)
             }
             RgbEncoding::Rgb10A2Srgb => Ok(self.packed_rgb(x, y).map(inverse_srgb)),
-            RgbEncoding::Rgb10A2Pq2020 => Err(MEDIA_UNSUPPORTED),
+            RgbEncoding::Rgb10A2Pq2020 => {
+                let rgb = self.packed_rgb(x, y).map(|v| inverse_pq(v) / 80.0);
+                Ok([
+                    1.660491 * rgb[0] - 0.587641 * rgb[1] - 0.072850 * rgb[2],
+                    -0.124550 * rgb[0] + 1.132900 * rgb[1] - 0.008349 * rgb[2],
+                    -0.018151 * rgb[0] - 0.100579 * rgb[1] + 1.118730 * rgb[2],
+                ])
+            }
         }
     }
 
@@ -234,6 +287,50 @@ impl RgbSurface {
             f64::from((pixel >> 20) & 1023) / 1023.0,
         ]
     }
+}
+
+fn linear_709_to_2020(rgb: [f64; 3]) -> [f64; 3] {
+    [
+        0.627404 * rgb[0] + 0.329283 * rgb[1] + 0.043313 * rgb[2],
+        0.069097 * rgb[0] + 0.919540 * rgb[1] + 0.011362 * rgb[2],
+        0.016392 * rgb[0] + 0.088013 * rgb[1] + 0.895595 * rgb[2],
+    ]
+}
+fn inverse_pq(value: f64) -> f64 {
+    let powered = value.clamp(0.0, 1.0).powf(32.0 / 2523.0);
+    ((powered - 3424.0 / 4096.0).max(0.0) / (2413.0 / 128.0 - 2392.0 / 128.0 * powered))
+        .max(0.0)
+        .powf(16384.0 / 2610.0)
+        * 10_000.0
+}
+fn to_half(value: f64) -> Result<u16, Status> {
+    let f = value as f32;
+    if !f.is_finite() {
+        return Err(STATUS_INVALID_ARGUMENT);
+    }
+    let bits = f.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exponent = ((bits >> 23) & 255) as i32 - 127 + 15;
+    let fraction = bits & 0x7fffff;
+    if exponent >= 31 {
+        return Err(STATUS_INVALID_ARGUMENT);
+    }
+    if exponent <= 0 {
+        if exponent < -10 {
+            return Ok(sign);
+        }
+        let mantissa = fraction | 0x800000;
+        let shift = (14 - exponent) as u32;
+        let halfway = 1u32 << (shift - 1);
+        let rounded = (mantissa + halfway - 1 + ((mantissa >> shift) & 1)) >> shift;
+        return Ok(sign | rounded as u16);
+    }
+    let rounded = fraction + 0xfff + ((fraction >> 13) & 1);
+    let packed = ((exponent as u32) << 10) + (rounded >> 13);
+    if packed >= 0x7c00 {
+        return Err(STATUS_INVALID_ARGUMENT);
+    }
+    Ok(sign | packed as u16)
 }
 
 fn half(value: u16) -> Result<f64, Status> {
