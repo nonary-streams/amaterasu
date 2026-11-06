@@ -5,6 +5,7 @@ mod controller;
 mod cursor;
 mod model;
 mod native;
+mod preflight;
 #[cfg(any(windows, test))]
 mod staging;
 
@@ -27,6 +28,9 @@ struct Settings {
 struct CaptureModule {
     runtime: RuntimeClient,
     controller: SharedController,
+    _preflight_factory: Box<
+        amaterasu_module_sdk::capture::SourcePreflightFactory<preflight::Provider<NativeBackend>>,
+    >,
     _factory: Box<native::Factory<NativeBackend>>,
 }
 
@@ -39,6 +43,15 @@ impl ManagedModule for CaptureModule {
             serde_json::from_value(payload).map_err(|error| error.to_string())?;
         let controller = Arc::new(Mutex::new(Controller::new(NativeBackend, settings.enabled)));
         let factory = native::Factory::new(controller.clone());
+        // SAFETY: the original factory's bind allocates binding metadata only.
+        // Both boxed factories outlive all bindings; the query provider retains
+        // caller-scoped controller state and never opens a capture source.
+        let preflight_factory = unsafe {
+            amaterasu_module_sdk::capture::SourcePreflightFactory::new(
+                &factory.api,
+                Arc::new(preflight::Provider::new(controller.clone())),
+            )
+        };
         runtime.require_success(Command::Register {
             service: SERVICE.into(),
         })?;
@@ -48,13 +61,14 @@ impl ManagedModule for CaptureModule {
             runtime.register_native_typed(
                 SERVICE,
                 amaterasu_module_sdk::media::native_contracts::CAPTURE,
-                &factory.api,
+                &preflight_factory.api,
             )
         }?;
         Ok(Self {
             runtime,
             controller,
             _factory: factory,
+            _preflight_factory: preflight_factory,
         })
     }
 

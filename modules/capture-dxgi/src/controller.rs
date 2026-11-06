@@ -25,6 +25,22 @@ pub struct Controller<B: Backend> {
 }
 
 impl<B: Backend> Controller<B> {
+    pub(crate) fn source_preflight(
+        &self,
+        caller: &str,
+        request: &amaterasu_module_sdk::capture::SourcePreflightRequest,
+    ) -> Result<
+        amaterasu_module_sdk::capture::SourcePreflightResponse,
+        amaterasu_module_sdk::abi::Status,
+    > {
+        crate::preflight::query(
+            &self.backend,
+            self.enabled,
+            self.streams.len() < MAX_STREAMS,
+            caller,
+            request,
+        )
+    }
     pub fn new(backend: B, enabled: bool) -> Self {
         Self {
             backend,
