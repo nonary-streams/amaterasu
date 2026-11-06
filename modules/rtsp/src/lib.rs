@@ -13,6 +13,21 @@ use model::Settings;
 use std::time::Instant;
 
 const SERVICE: &str = "amaterasu.rtsp/1";
+
+/// Validate signed startup composition without binding a provider or opening a
+/// network listener. Package builders use the same private settings schema and
+/// policy validation as the installed module.
+pub fn validate_startup_settings(payload: &serde_json::Value) -> Result<(), String> {
+    decode_startup_settings(payload).map(|_| ())
+}
+
+fn decode_startup_settings(payload: &serde_json::Value) -> ModuleResult<Settings> {
+    let settings: Settings =
+        serde_json::from_value(payload.clone()).map_err(|_| "invalid RTSP settings".to_owned())?;
+    settings.validate().map_err(str::to_owned)?;
+    Ok(settings)
+}
+
 struct RtspModule {
     runtime: RuntimeClient,
     controller: Controller,
@@ -24,8 +39,7 @@ impl ManagedModule for RtspModule {
         let Response::Result { payload } = runtime.send(Command::GetSettings {})? else {
             return Err("RTSP settings unavailable".into());
         };
-        let settings: Settings =
-            serde_json::from_value(payload.clone()).map_err(|_| "invalid RTSP settings")?;
+        let settings = decode_startup_settings(&payload)?;
         let network = Network::from_settings(&runtime, &payload)?;
         let controller = Controller::with_network(settings, network)?;
         runtime.require_success(Command::Register {
@@ -66,6 +80,7 @@ mod network_startup_tests {
         bound_service: Option<String>,
         bound_contract: Option<String>,
         registered: bool,
+        invalid_settings: bool,
     }
 
     unsafe extern "C" fn invoke(
@@ -82,9 +97,13 @@ mod network_startup_tests {
         };
         let host = unsafe { &mut *context.cast::<Host>() };
         let response = match command {
-            Command::GetSettings {} => Response::Result {
-                payload: json!({"enabled":true,"bind":"127.0.0.1:0","network_provider":"example.network/1"}),
-            },
+            Command::GetSettings {} => {
+                let mut payload = json!({"enabled":true,"bind":"127.0.0.1:0","network_provider":"example.network/1"});
+                if host.invalid_settings {
+                    payload["retirement_status_principals"] = json!(["unscoped-observer"]);
+                }
+                Response::Result { payload }
+            }
             Command::NativeBindTyped {
                 service, contract, ..
             } => {
@@ -120,6 +139,39 @@ mod network_startup_tests {
             host.bound_contract.as_deref(),
             Some("amaterasu.network-interface/1")
         );
+        assert!(!host.registered);
+    }
+
+    #[test]
+    fn startup_composition_validation_uses_the_owned_schema_without_binding_network() {
+        let settings = json!({"enabled":true,"bind":"127.0.0.1:0",
+            "network_provider":"example.network/1", "allowed_principals":["amaterasu.nvhttp"],
+            "retirement_status_principals":["observer"],
+            "retirement_status_owners":{"observer":"amaterasu.nvhttp"},
+            "max_live_tickets":32});
+        assert!(validate_startup_settings(&settings).is_ok());
+        for invalid in [
+            json!({"allowed_principals":["amaterasu.nvhttp"],"retirement_status_principals":["observer"]}),
+            json!({"allowed_principals":["amaterasu.nvhttp"],"retirement_status_owners":{"observer":"foreign-owner"}}),
+            json!({"max_live_tickets":33}),
+            json!({"unknown_policy":true}),
+        ] {
+            assert!(validate_startup_settings(&invalid).is_err(), "{invalid}");
+        }
+        let mut host = Host {
+            invalid_settings: true,
+            ..Host::default()
+        };
+        let endpoint = HostApi {
+            header: AbiHeader::of::<HostApi>(),
+            context: (&mut host as *mut Host).cast(),
+            invoke,
+        };
+        // SAFETY: the host remains alive during synchronous startup. Invalid
+        // policy prevents a provider binding or a module from escaping.
+        let runtime = unsafe { RuntimeClient::from_endpoint(endpoint) };
+        assert!(RtspModule::start(runtime).is_err());
+        assert!(host.bound_service.is_none());
         assert!(!host.registered);
     }
 }
