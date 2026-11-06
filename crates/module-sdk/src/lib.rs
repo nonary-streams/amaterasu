@@ -18,6 +18,7 @@ pub mod pairing_authority;
 pub mod processing;
 pub mod requests;
 pub mod retained_options;
+pub mod retirement;
 pub mod session_presentation;
 pub mod threading;
 pub mod transport;
