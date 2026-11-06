@@ -74,6 +74,30 @@ impl Controller {
             Operation::Lookup { operation_id } => {
                 self.lookup(request, &caller, &operation_id, runtime)
             }
+            Operation::RetirementStatus {
+                operation_id,
+                expected_runtime_epoch,
+            } => self.retirement_status(
+                request,
+                &caller,
+                operation_id.as_deref(),
+                expected_runtime_epoch.as_deref(),
+                runtime,
+            ),
+            Operation::ReconcileStartup {} => {
+                self.reconcile_startup(request, &caller, now, runtime)
+            }
+            Operation::RetireTransport {
+                operation_id,
+                expected_runtime_epoch,
+            } => self.retire_operation(
+                request,
+                &caller,
+                &operation_id,
+                &expected_runtime_epoch,
+                now,
+                runtime,
+            ),
         }
     }
 
@@ -91,6 +115,14 @@ impl Controller {
             deadline,
             display_preflight_deadline,
         } = input;
+        if config
+            .expected_runtime_epoch
+            .as_deref()
+            .is_some_and(|epoch| epoch != self.runtime_epoch)
+        {
+            rpc::complete(runtime, request, error("runtime_epoch_changed"));
+            return;
+        }
         if !self.startup_recovery.ready() {
             rpc::complete(
                 runtime,
@@ -114,6 +146,13 @@ impl Controller {
             .any(|allowed| allowed == &caller)
         {
             rpc::complete(runtime, request, error("permission_denied"));
+            return;
+        }
+        if self
+            .retired_operations
+            .contains(&(caller.clone(), config.operation_id.clone()))
+        {
+            rpc::complete(runtime, request, error("operation_retired"));
             return;
         }
         if let Err(code) = config.validate(self.settings.allow_remote) {
@@ -164,7 +203,7 @@ impl Controller {
                 .values()
                 .filter(|record| !record.state.terminal())
                 .count()
-                >= MAX_LIVE_TICKETS
+                >= self.settings.max_live_tickets
         {
             rpc::complete(runtime, request, error("capacity_exceeded"));
             return;

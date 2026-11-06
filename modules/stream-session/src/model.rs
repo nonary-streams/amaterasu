@@ -14,6 +14,7 @@ pub struct Settings {
     pub enabled: bool,
     pub allow_remote: bool,
     pub allowed_principals: Vec<String>,
+    pub max_live_sessions: usize,
     pub prepare_timeout_ms: u64,
     pub drain_timeout_ms: u64,
     pub enable_input: bool,
@@ -27,6 +28,7 @@ impl Default for Settings {
             enabled: false,
             allow_remote: false,
             allowed_principals: Vec::new(),
+            max_live_sessions: 2,
             prepare_timeout_ms: 5000,
             drain_timeout_ms: 5000,
             enable_input: false,
@@ -48,6 +50,7 @@ impl Settings {
             || !(100..=5000).contains(&self.prepare_timeout_ms)
             || !(100..=30000).contains(&self.drain_timeout_ms)
             || !(1000..=30000).contains(&self.input_lease_ttl_ms)
+            || !(1..=32).contains(&self.max_live_sessions)
         {
             return Err("invalid_settings");
         }
@@ -396,6 +399,8 @@ pub struct PrepareConfig {
     /// This is the original NVHTTP operation, never a native display handle.
     #[serde(default)]
     pub shared_source_operation_id: Option<String>,
+    #[serde(default)]
+    pub borrowed_capture: Option<amaterasu_extension_api::BorrowedCaptureContext>,
     /// Complete, frozen display Apply request from the authenticated launch.
     #[serde(default)]
     pub display_request: Option<Box<DisplayRequest>>,
@@ -440,6 +445,16 @@ pub struct PrepareConfig {
 }
 impl PrepareConfig {
     pub fn validate(&self, allow_remote: bool) -> Result<(), &'static str> {
+        if let Some(source) = &self.borrowed_capture
+            && (source.validate().is_err()
+                || !self.lifecycle_capture_mode.is_external()
+                || self.lifecycle_session_target.is_none()
+                || Some(source.transport_id.as_str()) != self.rtsp_operation_id.as_deref()
+                || self.display_request.is_some()
+                || self.virtual_display_intent.is_some())
+        {
+            return Err("invalid_borrowed_capture");
+        }
         if self.lifecycle_capture_mode.is_external() && self.lifecycle_session_target.is_none() {
             return Err("invalid_lifecycle_identity");
         }
@@ -1778,6 +1793,8 @@ mod tests {
             json!({"drain_timeout_ms":30001}),
             json!({"input_lease_ttl_ms":999}),
             json!({"input_lease_ttl_ms":30001}),
+            json!({"max_live_sessions":0}),
+            json!({"max_live_sessions":33}),
         ] {
             assert_eq!(
                 serde_json::from_value::<Settings>(value)

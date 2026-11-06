@@ -6,6 +6,7 @@ mod network;
 #[cfg(test)]
 mod ownership_tests;
 mod record;
+mod recovery_status;
 mod retirement;
 #[cfg(test)]
 mod tests;
@@ -42,7 +43,6 @@ const MAX_CLEANUP_RETRIES: u8 = 2;
 const CLEANUP_RETRY_DELAYS_MS: [u64; 2] = [250, 1_000];
 const STATUS_INTERVAL_MS: u64 = 250;
 const MAX_RECORDS: usize = 128;
-const MAX_LIVE_TICKETS: usize = 2;
 const MAX_PENDING_NETWORK: usize = 16;
 const MAX_DISPLAY_CLEANUP: usize = 16;
 const STARTUP_RECONCILIATION_TIMEOUT_MS: u64 = 45_000;
@@ -172,6 +172,8 @@ pub struct Controller {
     display_admission: Option<DisplayAdmission>,
     display_cleanup: Vec<Call>,
     startup_recovery: StartupRecovery,
+    runtime_epoch: String,
+    retired_operations: BTreeSet<(String, String)>,
     sequence: u64,
     status_after: u64,
 }
@@ -184,8 +186,13 @@ impl Controller {
 
     pub fn with_network(settings: Settings, network: Network) -> Result<Self, &'static str> {
         settings.validate()?;
-        let mut recovery_nonce = [0; 8];
-        getrandom::fill(&mut recovery_nonce).map_err(|_| "random_unavailable")?;
+        let mut epoch_bytes = [0; 16];
+        getrandom::fill(&mut epoch_bytes).map_err(|_| "random_unavailable")?;
+        let recovery_nonce = u64::from_ne_bytes(epoch_bytes[..8].try_into().expect("fixed slice"));
+        let runtime_epoch = epoch_bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
         let network_base_port = settings.default_base_port();
         let (transport, locals, local) = if settings.enabled {
             let transport = Transport::bind_all_with_network(
@@ -200,12 +207,10 @@ impl Controller {
             (None, Vec::new(), None)
         };
         #[cfg(test)]
-        let startup_recovery = StartupRecovery::completed(u64::from_ne_bytes(recovery_nonce));
+        let startup_recovery = StartupRecovery::completed(recovery_nonce);
         #[cfg(not(test))]
-        let startup_recovery = StartupRecovery::new(
-            u64::from_ne_bytes(recovery_nonce),
-            STARTUP_RECONCILIATION_TIMEOUT_MS,
-        );
+        let startup_recovery =
+            StartupRecovery::new(recovery_nonce, STARTUP_RECONCILIATION_TIMEOUT_MS);
         Ok(Self {
             network,
             bootstrap_settings: settings.clone(),
@@ -228,6 +233,8 @@ impl Controller {
             display_admission: None,
             display_cleanup: Vec::new(),
             startup_recovery,
+            runtime_epoch,
+            retired_operations: BTreeSet::new(),
             sequence: 0,
             status_after: 0,
         })
@@ -365,8 +372,8 @@ impl Controller {
         if recovery.phase == RecoveryPhase::Blocked {
             if let Some(call) = recovery.call.as_mut() {
                 match call.poll(runtime) {
-                    Outcome::SettledFailure => recovery.call = None,
-                    Outcome::Waiting | Outcome::Uncertain | Outcome::Result(_) => {}
+                    Outcome::SettledFailure | Outcome::Result(_) => recovery.call = None,
+                    Outcome::Waiting | Outcome::Uncertain => {}
                 }
             }
             return;
@@ -383,6 +390,9 @@ impl Controller {
         if recovery.call.is_none() {
             match recovery.phase {
                 RecoveryPhase::List => {
+                    if now < recovery.retry_status_at {
+                        return;
+                    }
                     let operation = recovery.operation_id("list", None);
                     recovery.call = Some(Call::new(json!({"action":"status"}), operation, None));
                 }
@@ -435,14 +445,21 @@ impl Controller {
             Outcome::Result(payload) => {
                 recovery.call = None;
                 let result = match phase {
-                    RecoveryPhase::List => recovery_list(&payload).map(|sessions| {
-                        recovery.stale_sessions = sessions;
-                        recovery.phase = if recovery.stale_sessions.is_empty() {
-                            RecoveryPhase::Complete
-                        } else {
-                            RecoveryPhase::Stop
-                        };
-                    }),
+                    RecoveryPhase::List => match payload["startup_reconciled"].as_bool() {
+                        Some(false) if payload["ok"] == true => {
+                            recovery.retry_status_at = now.saturating_add(STATUS_INTERVAL_MS);
+                            Ok(())
+                        }
+                        Some(true) => recovery_list(&payload).map(|sessions| {
+                            recovery.stale_sessions = sessions;
+                            recovery.phase = if recovery.stale_sessions.is_empty() {
+                                RecoveryPhase::Complete
+                            } else {
+                                RecoveryPhase::Stop
+                            };
+                        }),
+                        _ => Err("startup_reconciliation_response_invalid"),
+                    },
                     RecoveryPhase::Stop => {
                         let Some(session) = recovery.current_session else {
                             recovery.error = Some("startup_reconciliation_state_invalid");
@@ -547,15 +564,22 @@ impl Controller {
             .active_network_base_port
             .or(self.listener_base_port)
             .and_then(|port| self.settings.media_binds_on(port, local_address).ok())?;
-        // Reserve predictable ports for the two concurrent NVHTTP clients so
+        // Reserve predictable ports for the signed concurrent-client bound so
         // administrators can permit a bounded UDP range through the firewall.
         // Keep a slot occupied until cleanup is confirmed, including pending
         // opens and failed or uncertain retirement.
-        for offset in [0, 3] {
+        for slot in 0..self.settings.max_live_tickets {
+            let offset = u16::try_from(slot).ok()?.checked_mul(3)?;
             let mut candidate = binds;
-            candidate.video.set_port(binds.video.port() + offset);
-            candidate.control.set_port(binds.control.port() + offset);
-            candidate.audio.set_port(binds.audio.port() + offset);
+            candidate
+                .video
+                .set_port(binds.video.port().checked_add(offset)?);
+            candidate
+                .control
+                .set_port(binds.control.port().checked_add(offset)?);
+            candidate
+                .audio
+                .set_port(binds.audio.port().checked_add(offset)?);
             let occupied = self.records.values().any(|record| {
                 record.media_binds == Some(candidate)
                     && (!record.state.terminal() || !record.cleanup_confirmed)
@@ -714,9 +738,9 @@ fn recovery_list(payload: &Value) -> Result<VecDeque<u64>, &'static str> {
         .as_bool()
         .ok_or("startup_reconciliation_response_invalid")?;
     if payload["ok"] != true
-        || sessions.len() > 16
+        || sessions.len() > 32
         || total < sessions.len() as u64
-        || (truncated && sessions.len() != 16)
+        || (truncated && sessions.len() != 32)
         || (!truncated && total != sessions.len() as u64)
     {
         return Err("startup_reconciliation_response_invalid");
@@ -724,7 +748,7 @@ fn recovery_list(payload: &Value) -> Result<VecDeque<u64>, &'static str> {
 
     // Stream-session status is broker-scoped to this RTSP module principal and
     // places all nonterminal records before retained terminal history. Its live
-    // record limit is two, so the bounded status page includes every orphan.
+    // live record limit is at most 32, so this page includes every orphan.
     let mut stale = VecDeque::new();
     let mut seen = BTreeSet::new();
     for session in sessions {
@@ -749,14 +773,22 @@ fn recovery_list(payload: &Value) -> Result<VecDeque<u64>, &'static str> {
 
 fn recovery_stop_response(payload: &Value, expected_session: u64) -> Result<bool, &'static str> {
     if payload["ok"] == false && payload["code"] == "session_not_found" {
-        return Ok(true);
+        return if payload["startup_reconciled"] == true {
+            Ok(true)
+        } else {
+            Err("startup_reconciliation_unconfirmed")
+        };
     }
     recovery_session_state(payload, expected_session)
 }
 
 fn recovery_status_response(payload: &Value, expected_session: u64) -> Result<bool, &'static str> {
     if payload["ok"] == false && payload["code"] == "session_not_found" {
-        return Ok(true);
+        return if payload["startup_reconciled"] == true {
+            Ok(true)
+        } else {
+            Err("startup_reconciliation_unconfirmed")
+        };
     }
     recovery_session_state(payload, expected_session)
 }
@@ -831,11 +863,19 @@ fn local_port(payload: &Value, field: &str) -> Result<u16, &'static str> {
 }
 
 fn authenticated_disconnect_reason(record: &Record, payload: &Value) -> Option<&'static str> {
-    if record.lifecycle_target.is_none()
-        || !clean_terminal(record, payload)
-        || payload["state"] != "failed"
-    {
+    if !clean_terminal(record, payload) || payload["state"] != "failed" {
         return None;
+    }
+    if record.lifecycle_target.is_none() {
+        let proof = &payload["authenticated_disconnect"];
+        if proof["version"] != 1
+            || proof["session"].as_u64() != record.session
+            || proof["operation_id"] != record.operation()
+            || proof["control_authenticated"] != true
+            || proof["reason"] != payload["authenticated_disconnect_reason"]
+        {
+            return None;
+        }
     }
     match payload["authenticated_disconnect_reason"].as_str()? {
         "peer_disconnected" => Some("peer_disconnected"),

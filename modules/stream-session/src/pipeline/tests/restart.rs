@@ -98,6 +98,42 @@ fn uncertain_restart_cleanup_keeps_journal_and_blocks_new_sessions() {
 }
 
 #[test]
+fn retirement_snapshot_only_clears_after_retry_retires_the_exact_journaled_resource() {
+    const RECORD_ID: u64 = 0xabcd;
+    let mut host = Harness::with_restart_state(journal_with_owned_session(RECORD_ID), 7);
+    host.broker.seed_session("ss-abcd-session");
+    host.broker.fail_session_stop = true;
+    host.idle();
+    let status = host.response(1, json!({"action":"status"}));
+    assert_eq!(status["startup_reconciled"], false);
+    assert!(
+        !host.broker.state_value.as_ref().unwrap()["entries"]
+            .as_object()
+            .unwrap()
+            .is_empty()
+    );
+    let missing = host.response(2, json!({"action":"status","session":77}));
+    assert_eq!(missing["code"], "session_not_found");
+    assert_eq!(missing["startup_reconciled"], false);
+    host.broker.fail_session_stop = false;
+    let stopped = host.response(3, json!({"action":"stop","session":RECORD_ID}));
+    assert_eq!(stopped["state"], "stopped", "{stopped}");
+    host.idle();
+    assert!(
+        host.broker
+            .session_is_stopped_without_leases("ss-abcd-session")
+    );
+    assert_eq!(
+        host.broker.state_value.as_ref().unwrap()["entries"],
+        json!({})
+    );
+    assert_eq!(
+        host.response(4, json!({"action":"status"}))["startup_reconciled"],
+        true
+    );
+}
+
+#[test]
 fn failed_intent_cas_never_reaches_a_provider_open() {
     let mut host =
         Harness::with_restart_state(serde_json::to_value(Document::default()).unwrap(), 0);

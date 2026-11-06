@@ -420,7 +420,7 @@ impl Record {
     }
 
     pub fn response(&self) -> Value {
-        json!({
+        let mut response = json!({
             "ok": true,
             "session": self.id,
             "lifecycle_session_target": self.config.lifecycle_session_target,
@@ -491,7 +491,17 @@ impl Record {
                 && self.input_controller_supported,
             "input_events_sent": self.input_events_sent,
             "input_batches": self.input_batches,
-        })
+        });
+        if let Some(source) = &self.config.borrowed_capture {
+            response["borrowed_capture"] = json!(source);
+        }
+        if let Some(reason) = self.authenticated_disconnect_reason
+            && self.control_authenticated
+        {
+            response["authenticated_disconnect"] = json!({"version":1,"session":self.id,
+                "operation_id":self.config.operation_id,"control_authenticated":true,"reason":reason});
+        }
+        response
     }
 
     pub fn open(&self, resource: Resource) -> Value {

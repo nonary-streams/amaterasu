@@ -39,6 +39,9 @@ pub struct Settings {
     pub address_family: Option<AddressFamily>,
     pub bind_address: Option<String>,
     pub allowed_principals: Vec<String>,
+    /// Installed observers may only read generation-bound transport retirement.
+    pub retirement_status_principals: Vec<String>,
+    pub max_live_tickets: usize,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -50,6 +53,8 @@ impl Default for Settings {
             address_family: None,
             bind_address: None,
             allowed_principals: Vec::new(),
+            retirement_status_principals: Vec::new(),
+            max_live_tickets: 2,
         }
     }
 }
@@ -61,6 +66,12 @@ impl Settings {
             .is_some_and(|service| !amaterasu_contracts::valid_name(service))
             || self.allowed_principals.len() > 16
             || self.allowed_principals.iter().any(|name| !valid_name(name))
+            || self.retirement_status_principals.len() > 16
+            || self
+                .retirement_status_principals
+                .iter()
+                .any(|name| !valid_name(name))
+            || !(1..=32).contains(&self.max_live_tickets)
         {
             return Err("invalid_settings");
         }
@@ -608,6 +619,11 @@ pub struct VideoEncryptionPolicySnapshot {
 #[serde(deny_unknown_fields)]
 pub struct Open {
     pub operation_id: String,
+    /// Runtime observation persisted before this transport's admission.
+    #[serde(default)]
+    pub expected_runtime_epoch: Option<String>,
+    #[serde(default)]
+    pub borrowed_capture: Option<amaterasu_extension_api::BorrowedCaptureContext>,
     /// Coordinator-issued session selector; it grants no authority by itself.
     #[serde(default)]
     pub lifecycle_session_target: Option<amaterasu_extension_api::LifecycleTarget>,
@@ -758,6 +774,24 @@ impl Open {
     }
 
     pub fn validate(&self, allow_remote: bool) -> Result<[u8; 16], &'static str> {
+        if self
+            .expected_runtime_epoch
+            .as_deref()
+            .is_some_and(|epoch| !valid_runtime_epoch(epoch))
+        {
+            return Err("invalid_runtime_epoch");
+        }
+        if let Some(source) = &self.borrowed_capture
+            && (source.validate().is_err()
+                || !self.lifecycle_capture_mode.is_external()
+                || self.lifecycle_session_target.is_none()
+                || source.transport_id != self.operation_id
+                || Some(source.transport_epoch.as_str()) != self.expected_runtime_epoch.as_deref()
+                || source.output != self.capture.output
+                || self.display_admission_required())
+        {
+            return Err("invalid_borrowed_capture");
+        }
         match (&self.app_id, self.catalog_revision) {
             (Some(app_id), Some(_)) if valid_name(app_id) => {}
             (None, None) => {}
@@ -1165,6 +1199,9 @@ impl Open {
         }
         if let Some(source) = &self.shared_source_operation_id {
             payload["shared_source_operation_id"] = serde_json::json!(source);
+        }
+        if let Some(source) = &self.borrowed_capture {
+            payload["borrowed_capture"] = serde_json::json!(source);
         }
         if let Some(session) = &self.lifecycle_session_target {
             payload["lifecycle_session_target"] = serde_json::json!(session);
@@ -1642,6 +1679,25 @@ pub enum Operation {
     Lookup {
         operation_id: String,
     },
+    RetirementStatus {
+        #[serde(default)]
+        operation_id: Option<String>,
+        #[serde(default)]
+        expected_runtime_epoch: Option<String>,
+    },
+    ReconcileStartup {},
+    #[serde(rename = "retire_operation")]
+    RetireTransport {
+        operation_id: String,
+        expected_runtime_epoch: String,
+    },
+}
+
+pub(super) fn valid_runtime_epoch(value: &str) -> bool {
+    value.len() == 32
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 pub fn valid_name(value: &str) -> bool {
@@ -2311,12 +2367,16 @@ mod tests {
         assert!(settings.address_family.is_none());
         assert!(settings.bind_address.is_none());
         assert!(settings.allowed_principals.is_empty());
+        assert_eq!(settings.max_live_tickets, 2);
         assert_eq!(settings.validate(), Ok(()));
 
         for value in [
             json!({"allowed_principals": vec!["owner"; 17]}),
             json!({"allowed_principals": [""]}),
             json!({"allowed_principals": ["line\nfeed"]}),
+            json!({"retirement_status_principals":[""]}),
+            json!({"max_live_tickets":0}),
+            json!({"max_live_tickets":33}),
         ] {
             assert_eq!(
                 serde_json::from_value::<Settings>(value)
@@ -2718,6 +2778,42 @@ mod tests {
             let malformed: Open = serde_json::from_value(input).unwrap();
             assert_eq!(malformed.validate(false), Err("invalid_profile"));
         }
+    }
+
+    #[test]
+    fn borrowed_capture_context_is_bound_to_the_admitted_runtime_and_exact_output() {
+        let source = json!({"client_id":"paired-client","session_id":"retained-source",
+            "generation":7,"reservation_id":"source-hold","transport_id":"launch-one",
+            "transport_epoch":"ab".repeat(16),"output":"kwin:Virtual-17",
+            "mode":{"width":2560,"height":1440,"refresh_millihz":144000,"hdr":true}});
+        let mut request = open_json();
+        request["lifecycle_capture_mode"] = json!("external");
+        request["lifecycle_session_target"] =
+            json!({"kind":"session","host_epoch":"host","session_id":"app","generation":1});
+        request["lifecycle_settings_revision"] = json!("revision");
+        request["lifecycle_intent"] = json!("initial");
+        request["expected_runtime_epoch"] = json!("ab".repeat(16));
+        request["capture"]["output"] = json!("kwin:Virtual-17");
+        request["borrowed_capture"] = source.clone();
+        let admitted: Open = serde_json::from_value(request.clone()).unwrap();
+        assert!(admitted.validate(false).is_ok());
+        assert_eq!(
+            admitted.prepare("provider-operation", None)["borrowed_capture"],
+            source
+        );
+        for field in ["transport_id", "transport_epoch", "output"] {
+            let mut changed = request.clone();
+            changed["borrowed_capture"][field] = json!("changed");
+            let rejected: Open = serde_json::from_value(changed).unwrap();
+            assert_eq!(
+                rejected.validate(false),
+                Err("invalid_borrowed_capture"),
+                "{field}"
+            );
+        }
+        request["lifecycle_capture_mode"] = json!("managed");
+        let rejected: Open = serde_json::from_value(request).unwrap();
+        assert_eq!(rejected.validate(false), Err("invalid_borrowed_capture"));
     }
 
     #[test]

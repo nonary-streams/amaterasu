@@ -104,3 +104,60 @@ fn borrowed_exact_output_never_creates_or_releases_the_retained_monitor() {
         );
     }
 }
+
+#[test]
+fn signed_session_capacity_keeps_every_cleanup_intent_in_the_journal() {
+    let mut host = Harness::new();
+    host.pipeline.settings.max_live_sessions = 3;
+    for sequence in 1..=3 {
+        let mut request = prepare();
+        request["operation_id"] = json!(format!("concurrent-{sequence}"));
+        request["stream_audio"] = json!(false);
+        assert_eq!(host.response(sequence, request)["state"], "prepared");
+    }
+    assert_eq!(host.pipeline.journal.document.entries.len(), 3);
+    let mut request = prepare();
+    request["operation_id"] = json!("over-capacity");
+    assert_eq!(host.response(4, request)["code"], "capacity_exceeded");
+    assert_eq!(host.pipeline.journal.document.entries.len(), 3);
+}
+
+#[test]
+fn borrowed_capture_readback_freezes_the_exact_source_before_stream_effects() {
+    let mut host = Harness::new();
+    host.pipeline
+        .settings
+        .allowed_principals
+        .push("amaterasu.rtsp".into());
+    host.broker.lifecycle_success = true;
+    let source = json!({"client_id":"paired-client","session_id":"retained-source",
+        "generation":7,"reservation_id":"source-hold","transport_id":"nvhttp-transport",
+        "transport_epoch":"ab".repeat(16),"output":"kwin:Virtual-17",
+        "mode":{"width":2560,"height":1440,"refresh_millihz":144000,"hdr":false}});
+    let mut request = prepare();
+    request["lifecycle_capture_mode"] = json!("external");
+    request["lifecycle_session_target"] =
+        json!({"kind":"session","host_epoch":"host","session_id":"app","generation":1});
+    request["rtsp_operation_id"] = json!("nvhttp-transport");
+    request["borrowed_capture"] = source.clone();
+    let prepared = host.response_from(1, "amaterasu.rtsp", request);
+    assert_eq!(prepared["state"], "prepared", "{prepared}");
+    assert_eq!(prepared["borrowed_capture"], source);
+    let session = prepared["session"].as_u64().unwrap();
+    let mut configuration = start(session);
+    configuration["configuration"]["lifecycle_capture_mode"] = json!("external");
+    configuration["configuration"]["lifecycle_target"] = json!({"kind":"stream","host_epoch":"host","session_id":"app","stream_id":"transport","generation":1});
+    let rejected = host.response_from(2, "amaterasu.rtsp", configuration.clone());
+    assert_eq!(rejected["code"], "borrowed_capture_changed");
+    assert!(
+        !host
+            .broker
+            .calls
+            .iter()
+            .any(|call| call.service == Resource::Video.service())
+    );
+    configuration["configuration"]["output"] = json!("kwin:Virtual-17");
+    let active = host.response_from(3, "amaterasu.rtsp", configuration);
+    assert_eq!(active["state"], "active", "{active}");
+    assert_no_display_calls(&host);
+}

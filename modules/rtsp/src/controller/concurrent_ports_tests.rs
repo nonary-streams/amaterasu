@@ -391,3 +391,49 @@ fn pending_and_uncertain_transport_reservations_keep_distinct_bounded_ports() {
     let second_slot = controller.media_binds_for_open(address).unwrap();
     assert_eq!(second_slot.video.port(), fixed.video.port() + 3);
 }
+
+#[test]
+fn signed_client_capacity_reserves_distinct_slots_until_cleanup_is_confirmed() {
+    let _guard = super::tests::NETWORK_TEST_LOCK.lock().unwrap();
+    let address = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    let (mut controller, endpoint, runtime) = fixture(address);
+    controller.settings.max_live_tickets = 4;
+    let mut slots = BTreeSet::new();
+    let first = admit(&mut controller, &runtime, address, 1);
+    let first_binds = controller.records[&first].media_binds.unwrap();
+    for client in 2..=4 {
+        admit(&mut controller, &runtime, address, client);
+    }
+    for record in controller.records.values() {
+        let binds = record.media_binds.unwrap();
+        for lane in [binds.video, binds.control, binds.audio] {
+            assert!(slots.insert(lane));
+        }
+    }
+    assert_eq!(slots.len(), 12);
+    assert!(controller.media_binds_for_open(address).is_none());
+    controller.open(
+        OpenRequest {
+            request: 5,
+            caller: "amaterasu.nvhttp".into(),
+            config: request(address, 5),
+            deadline: 5000,
+            display_preflight_deadline: None,
+        },
+        0,
+        &runtime,
+        false,
+    );
+    assert_eq!(
+        endpoint.completed.last().unwrap()["code"],
+        "capacity_exceeded"
+    );
+    controller.records.get_mut(&first).unwrap().state = State::Failed;
+    assert!(controller.media_binds_for_open(address).is_none());
+    controller
+        .records
+        .get_mut(&first)
+        .unwrap()
+        .cleanup_confirmed = true;
+    assert_eq!(controller.media_binds_for_open(address), Some(first_binds));
+}

@@ -190,7 +190,7 @@ impl Controller {
             };
             let operation = format!("{}-lifecycle-prepare", record.operation());
             record.lifecycle_prepare_outstanding = true;
-            let request = json!({"operation":"prepare_stream", "operation_id":operation,
+            let mut request = json!({"operation":"prepare_stream", "operation_id":operation,
                 "target":target, "intent":record.config.lifecycle_intent,
                 "client_context":record.config.lifecycle_client_context,
                 "settings_revision":record.config.lifecycle_settings_revision,
@@ -198,6 +198,9 @@ impl Controller {
                     "refresh_millihz":video.fps * 1000,
                     "hdr":format.dynamic_range == amaterasu_module_sdk::DynamicRange::Hdr},
                 "consumer_requirements":if input_required && record.config.lifecycle_capture_mode.is_managed() { vec!["capture", "input"] } else { vec!["capture"] }});
+            if let Some(source) = &record.config.borrowed_capture {
+                request["borrowed_capture"] = json!(source);
+            }
             let call = Call::for_service(
                 "amaterasu.session-lifecycle/1",
                 request,

@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub(super) const KEY: &str = "stream-session/lifecycle/v1";
 const FORMAT_VERSION: u32 = 1;
-const MAX_ENTRIES: usize = 2;
+const MAX_ENTRIES: usize = 32;
 
 fn is_false(value: &bool) -> bool {
     !*value
