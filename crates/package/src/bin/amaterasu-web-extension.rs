@@ -24,7 +24,7 @@ fn run() -> Result<(), String> {
             let mut manifest = extension::prepare_extension(Path::new(&args[1]), Path::new(&args[2]), &args[3], &args[4], &args[5], sequence, expiry)?;
             if let Some(methods_path) = args.get(9) {
                 let bytes = amaterasu_package::read_bounded(Path::new(methods_path), 65_536)?;
-                manifest.methods = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+                apply_ui_configuration(&mut manifest, &bytes)?;
             }
             extension::validate_manifest(&manifest, unix_timestamp())?;
             let raw = serde_json::to_vec(&manifest).map_err(|e| e.to_string())?;
@@ -45,6 +45,28 @@ fn run() -> Result<(), String> {
             println!("selected digest: {digest}");
             Ok(())
         }
-        _ => Err("usage: amaterasu-web-extension pack SOURCE OUTPUT ID NAME ENTRYPOINT SEQUENCE EXPIRES_UNIX SECRET_HEX_FILE [METHODS_JSON] | stage BUNDLE DEDICATED_ROOT APPROVED_FINGERPRINT APPROVED_PUBLIC_KEY_HEX [PREVIOUS_FINGERPRINT PREVIOUS_PUBLIC_KEY_HEX]".into()),
+        _ => Err("usage: amaterasu-web-extension pack SOURCE OUTPUT ID NAME ENTRYPOINT SEQUENCE EXPIRES_UNIX SECRET_HEX_FILE [METHODS_OR_UI_JSON] | stage BUNDLE DEDICATED_ROOT APPROVED_FINGERPRINT APPROVED_PUBLIC_KEY_HEX [PREVIOUS_FINGERPRINT PREVIOUS_PUBLIC_KEY_HEX]".into()),
     }
+}
+
+fn apply_ui_configuration(manifest: &mut extension::Manifest, bytes: &[u8]) -> Result<(), String> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct UiConfiguration {
+        #[serde(default)]
+        methods: Vec<extension::MethodDeclaration>,
+        placements: Vec<String>,
+        #[serde(default)]
+        settings_provider: Option<String>,
+    }
+    let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+    if value.is_array() {
+        manifest.methods = serde_json::from_value(value).map_err(|e| e.to_string())?;
+    } else {
+        let config: UiConfiguration = serde_json::from_value(value).map_err(|e| e.to_string())?;
+        manifest.methods = config.methods;
+        manifest.placements = config.placements;
+        manifest.settings_provider = config.settings_provider;
+    }
+    Ok(())
 }

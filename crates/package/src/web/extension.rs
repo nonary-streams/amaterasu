@@ -28,9 +28,20 @@ pub struct Manifest {
     pub expires_unix: u64,
     pub sdk_version: u32,
     pub entrypoint: String,
+    /// Signed UI locations. Existing extensions remain standalone pages.
+    #[serde(default = "default_placements")]
+    pub placements: Vec<String>,
+    /// Associates an application UI with its provider's existing settings.
+    /// This is presentation metadata, never an API grant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings_provider: Option<String>,
     #[serde(default)]
     pub methods: Vec<MethodDeclaration>,
     pub files: BTreeMap<String, Asset>,
+}
+
+fn default_placements() -> Vec<String> {
+    vec!["page".into()]
 }
 
 pub struct VerifiedExtension {
@@ -73,6 +84,34 @@ pub fn validate_manifest(manifest: &Manifest, now: u64) -> PackageResult<()> {
     }
     if manifest.methods.len() > 64 {
         return Err("too many extension method declarations".into());
+    }
+    if manifest.placements.is_empty()
+        || manifest.placements.len() > 2
+        || manifest
+            .placements
+            .iter()
+            .any(|place| place != "page" && place != "application")
+        || manifest
+            .placements
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            != manifest.placements.len()
+    {
+        return Err("invalid extension UI placements".into());
+    }
+    if let Some(provider) = &manifest.settings_provider
+        && (!manifest
+            .placements
+            .iter()
+            .any(|place| place == "application")
+            || provider.is_empty()
+            || provider.len() > 128
+            || !provider.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._-".contains(&byte)
+            }))
+    {
+        return Err("invalid application settings provider".into());
     }
     let mut aliases = std::collections::BTreeSet::new();
     for method in &manifest.methods {
@@ -139,6 +178,8 @@ pub fn prepare_extension(
         expires_unix,
         sdk_version: 1,
         entrypoint: entrypoint.into(),
+        placements: default_placements(),
+        settings_provider: None,
         methods: Vec::new(),
         files,
     };
@@ -328,6 +369,26 @@ mod tests {
     use super::*;
     use crate::{encode_hex, write_json_atomically};
     use ed25519_dalek::{Signer, SigningKey};
+
+    #[test]
+    fn application_placements_are_bounded_and_legacy_pages_keep_their_default() {
+        let legacy = serde_json::json!({"schema":1,"project":"amaterasu.web.extension",
+            "id":"hello","name":"Hello","sequence":1,"expires_unix":100,
+            "sdk_version":1,"entrypoint":"main.js","methods":[],
+            "files":{"main.js":{"sha256":"a".repeat(64),"size":1}}});
+        let mut manifest: Manifest = serde_json::from_value(legacy).unwrap();
+        assert_eq!(manifest.placements, ["page"]);
+        manifest.placements = vec!["application".into()];
+        manifest.settings_provider = Some("amaterasu.rtx-hdr".into());
+        assert!(validate_manifest(&manifest, 0).is_ok());
+        manifest.settings_provider = Some("wrong/provider".into());
+        assert!(validate_manifest(&manifest, 0).is_err());
+        manifest.settings_provider = None;
+        for placements in [vec![], vec!["application", "application"], vec!["unknown"]] {
+            manifest.placements = placements.into_iter().map(str::to_owned).collect();
+            assert!(validate_manifest(&manifest, 0).is_err());
+        }
+    }
 
     #[test]
     fn signed_extension_is_selected_and_replay_and_tampering_are_rejected() {

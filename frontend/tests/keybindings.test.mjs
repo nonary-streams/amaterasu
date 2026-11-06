@@ -244,7 +244,7 @@ test("configuration-only users can open application plugin overrides", async () 
     vm.runInContext("Object.assign(globalThis, Amaterasu)", context);
   }
   let opened = null;
-  context.renderApplicationPluginOverrides = (_context, _area, id) => { opened = id; };
+  context.renderApplicationPluginSections = (_context, _area, application) => { opened = application.id; };
   const content = new Element("main");
   content.setConnected(true);
   context.Amaterasu.renderCatalog({ content, notify() {}, api: {

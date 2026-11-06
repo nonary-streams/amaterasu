@@ -786,7 +786,7 @@ pub fn enable_rtx_hdr(policy: &mut RuntimeConfig, runtime_directory: &Path) -> P
         .get_mut("amaterasu.stream-session")
         .and_then(Value::as_object_mut)
         .ok_or("stream session settings missing")?;
-    let plan = json!({"provider":"amaterasu.rtx-hdr", "control_service":"nonary.rtx-hdr/1", "processor_service":"amaterasu.rtx-hdr/1", "omit_disabled":true});
+    let plan = json!({"provider":"amaterasu.rtx-hdr", "control_service":"nonary.rtx-hdr/1", "processor_service":"amaterasu.rtx-hdr/1", "interface_minor":1, "omit_disabled":true});
     if stream
         .get("processing_plan")
         .is_some_and(|existing| !existing.is_null() && *existing != plan)
@@ -799,7 +799,7 @@ pub fn enable_rtx_hdr(policy: &mut RuntimeConfig, runtime_directory: &Path) -> P
         .get_mut("amaterasu.session-lifecycle")
         .and_then(Value::as_object_mut)
         .ok_or("session lifecycle settings missing")?;
-    let plan = json!({"provider":"amaterasu.rtx-hdr", "service":"nonary.rtx-hdr/1", "processor_service":"amaterasu.rtx-hdr/1", "source_mode_providers":[]});
+    let plan = json!({"provider":"amaterasu.rtx-hdr", "service":"nonary.rtx-hdr/1", "processor_service":"amaterasu.rtx-hdr/1", "interface_minor":1, "source_mode_providers":[]});
     if lifecycle
         .get("processing_policy")
         .is_some_and(|existing| !existing.is_null() && *existing != plan)

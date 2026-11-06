@@ -136,3 +136,13 @@ source directory and use the `amaterasu-web-extension pack` workflow
 above with ID `showcase`, title `UI Elements`, entrypoint `showcase.js`, and no
 method declarations. Stage and approve the signed extension through the normal
 host workflow before opening it.
+
+## Application editor example
+
+Copy `application.js` into the source directory instead of `example.js`, use it
+as the entrypoint, and pass `application-ui.json` in place of `methods.json`.
+The signed configuration selects only the application editor location. The
+example receives the selected app's ID/name and uses the existing `greet` method
+without registering any settings or overrides. It reports unsaved work and busy
+operations through the lifecycle-bound application SDK. It requires a host with
+`ui.application-section/1`; older page-only hosts do not support this placement.

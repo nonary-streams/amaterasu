@@ -428,6 +428,7 @@ namespace Amaterasu {
       void this.extensions.discover().then((entries) => {
         if (!this.signedIn || !shell.isConnected) return;
         for (const entry of entries) {
+          if (!(entry.placements ?? ["page"]).includes("page")) continue;
           this.extensionIds.add(entry.id);
           const page = `extension/${entry.id}`;
           const item = button(appTextLiteral(entry.name), () => {

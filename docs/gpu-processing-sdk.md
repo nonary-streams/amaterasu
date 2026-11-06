@@ -78,6 +78,22 @@ or a newly observed revision only establishes that configuration was stored or
 read. It does not establish that the processor accepted an update or that the
 result reached a client display.
 
+The versioned `processing_intent` API describes pipeline participation separately
+from the effect's settings. Version 1.1 adds optional `output_hdr` to the existing
+`target`, `revision`, and `settings` request. Trusted composition selects
+`interface_minor: 1` in both the lifecycle `processing_policy` and stream-session
+`processing_plan`; omitted versions remain 1.0 and receive the original request
+shape. Consumers build either request with the shared SDK's
+`processing_intent_payload` helper.
+
+For an HDR output, a provider can return `enabled: true` to reserve its processing
+path while its own effect switch is false. It must still supply matching source
+and output range requirements and preserve the frozen settings. The source is
+selected before capture begins. Live effect changes then use `update_gpu_stream`
+without changing negotiated formats or replacing the stream. For example, RTX
+HDR retains an SDR source and PQ output while its disabled effect maps SDR into
+that output; its enable option is a `live_action` at all supported scopes.
+
 The [RTX HDR module](../modules/rtx-hdr/README.md) implements this interface using
 NVIDIA TrueHDR. The SDK's replacement test runs an unchanged consumer with two
 independent effect types, including sink rejection, retained output and teardown.

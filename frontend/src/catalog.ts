@@ -1330,6 +1330,7 @@ namespace Amaterasu {
       if ((catalogDraftDirty() || pluginDirty()) && !window.confirm("Discard your unsaved application and plugin changes?")) return false;
       editorLifecycle?.abort();
       editorLifecycle = null;
+      if (pluginArea && typeof disposeApplicationPluginSections === "function") disposeApplicationPluginSections(pluginArea);
       pluginArea = null;
       editorGeneration += 1;
       editor.replaceChildren();
@@ -1579,12 +1580,11 @@ namespace Amaterasu {
             "The Playnite game identity and provider-managed launch metadata stay unchanged.",
           ),
           el("div", "catalog-editor-layout", cover.figure, form),
-          el("section", "catalog-editor-section", el("h3", "", "Plugin overrides"), pluginArea = el("div")),
+          el("section", "catalog-editor-section", el("h3", "", "Plugin settings"), pluginArea = el("div")),
           ...(!api.allows("catalog.write") ? [button("Close", () => { closeEditor(); })] : []),
         ),
       );
-      if (api.allows("configuration.read") && typeof renderApplicationPluginOverrides === "function") renderApplicationPluginOverrides(context, pluginArea, row.id, form.hidden ? undefined : form.querySelector<HTMLElement>(".catalog-overrides") ?? undefined);
-      else pluginArea.textContent = "Plugin settings require configuration read access.";
+      if (typeof renderApplicationPluginSections === "function") renderApplicationPluginSections(context, pluginArea, { id: row.id, name: row.entry.name }, form.hidden ? undefined : form.querySelector<HTMLElement>(".catalog-overrides") ?? undefined);
       showCatalogArtwork(api, row.entry.artwork, cover.art, content, () => { cover.fallback.hidden = true; }, row.id);
       editor.scrollIntoView({ behavior: "smooth", block: "start" });
       fec.focus();
@@ -1676,12 +1676,11 @@ namespace Amaterasu {
             "Save launch metadata for this host. Adding an entry does not launch it.",
           ),
           cover ? el("div", "catalog-editor-layout", cover.figure, form) : form,
-          el("section", "catalog-editor-section", el("h3", "", "Plugin overrides"), pluginArea = el("div", "", ...(row ? [] : [el("p", "muted", "Plugin overrides are available after creating this application.")]))),
+          el("section", "catalog-editor-section", el("h3", "", "Plugin settings"), pluginArea = el("div", "", ...(row ? [] : [el("p", "muted", "Plugin sections are available after creating this application.")]))),
           ...(!api.allows("catalog.write") ? [button("Close", () => { closeEditor(); })] : []),
         ),
       );
-      if (row && api.allows("configuration.read") && typeof renderApplicationPluginOverrides === "function") renderApplicationPluginOverrides(context, pluginArea, row.id, form.hidden ? undefined : form.querySelector<HTMLElement>(".catalog-overrides") ?? undefined);
-      else if (row && !api.allows("configuration.read")) pluginArea.textContent = "Plugin settings require configuration read access.";
+      if (row && typeof renderApplicationPluginSections === "function") renderApplicationPluginSections(context, pluginArea, { id: row.id, name: row.entry.name }, form.hidden ? undefined : form.querySelector<HTMLElement>(".catalog-overrides") ?? undefined);
       if (cover && row) showCatalogArtwork(api, row.entry.artwork, cover.art, content, () => { cover.fallback.hidden = true; }, row.id);
       editor.scrollIntoView({ behavior: "smooth", block: "start" });
       form.querySelector("input")?.focus();

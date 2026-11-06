@@ -1021,6 +1021,12 @@ fn rtx_hdr_composition_is_explicit_and_authorizes_the_processor() {
         enabled.settings["amaterasu.stream-session"]["processing_plan"]["omit_disabled"],
         true
     );
+    for (component, key) in [
+        ("amaterasu.stream-session", "processing_plan"),
+        ("amaterasu.session-lifecycle", "processing_policy"),
+    ] {
+        assert_eq!(enabled.settings[component][key]["interface_minor"], 1);
+    }
     assert_eq!(
         enabled.settings["amaterasu.session-lifecycle"]["processing_policy"]["processor_service"],
         "amaterasu.rtx-hdr/1"

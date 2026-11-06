@@ -2,7 +2,7 @@
 use amaterasu_extension_api::{LifecycleTarget, VideoMode};
 use amaterasu_module_sdk::{Command, ModuleResult, Response};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::time::{Duration, Instant};
 
 const MAX_RESPONSE_BYTES: usize = 16 * 1024;
@@ -44,6 +44,7 @@ enum Stage {
 /// returning the decision, and never issues a state-changing provider command.
 pub(super) struct ProcessingPreflightJob {
     service: String,
+    interface_minor: u32,
     processor_service: String,
     target: LifecycleTarget,
     revision: String,
@@ -56,13 +57,15 @@ pub(super) struct ProcessingPreflightJob {
 impl ProcessingPreflightJob {
     pub(super) fn new(
         service: String,
+        interface_minor: u32,
         processor_service: String,
         target: LifecycleTarget,
         revision: String,
         settings: Value,
         requested_video: Option<VideoMode>,
     ) -> ModuleResult<Self> {
-        if service.is_empty()
+        if interface_minor > 1
+            || service.is_empty()
             || service.len() > 128
             || processor_service.is_empty()
             || processor_service.len() > 128
@@ -76,6 +79,7 @@ impl ProcessingPreflightJob {
         }
         Ok(Self {
             service,
+            interface_minor,
             processor_service,
             target,
             revision,
@@ -110,8 +114,14 @@ impl ProcessingPreflightJob {
                     service: self.service.clone(),
                     method: "processing_intent".into(),
                     interface_major: 1,
-                    interface_minor: 0,
-                    payload: json!({"target":self.target,"revision":self.revision,"settings":self.settings}),
+                    interface_minor: self.interface_minor,
+                    payload: amaterasu_module_sdk::requests::processing_intent_payload(
+                        self.interface_minor,
+                        &self.target,
+                        &self.revision,
+                        &self.settings,
+                        self.requested_video.as_ref().map(|video| video.hdr),
+                    )?,
                     timeout_ms: 5000,
                     operation_id,
                     parent: None,
@@ -238,6 +248,7 @@ impl ProcessingPreflightJob {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use std::collections::VecDeque;
 
     fn fixture() -> (ProcessingPreflightJob, Value) {
@@ -251,6 +262,7 @@ mod tests {
             "source_hdr_required":false,"output_hdr_required":true,"processor_settings":settings,"processor_service":"processor/1"});
         let job = ProcessingPreflightJob::new(
             "policy/1".into(),
+            0,
             "processor/1".into(),
             target,
             "rev".into(),
@@ -312,6 +324,39 @@ mod tests {
         let decision = job.advance(&mut send).unwrap().unwrap();
         assert!(!decision.source_video_mode.unwrap().hdr);
         assert_eq!(kinds, ["request", "take", "take", "release"]);
+    }
+
+    #[test]
+    fn version_one_one_supplies_output_range_before_effect_enablement() {
+        let (mut job, mut response) = fixture();
+        job.interface_minor = 1;
+        job.settings = json!({"enabled":false});
+        response["processor_settings"] = job.settings.clone();
+        let mut send = |command| match command {
+            Command::CallApi {
+                interface_minor,
+                payload,
+                ..
+            } => {
+                assert_eq!(interface_minor, 1);
+                assert_eq!(payload["output_hdr"], true);
+                assert_eq!(payload["settings"]["enabled"], false);
+                Ok(Response::Accepted { id: 4 })
+            }
+            Command::TakeResult { .. } => Ok(Response::Result {
+                payload: response.clone(),
+            }),
+            Command::ReleaseResult { .. } => Ok(Response::Ok),
+            _ => unreachable!(),
+        };
+        assert!(job.advance(&mut send).unwrap().is_none());
+        assert!(job.advance(&mut send).unwrap().is_none());
+        let decision = job.advance(&mut send).unwrap().unwrap();
+        assert!(
+            decision.enabled,
+            "effect-off still selects the compatible pipeline"
+        );
+        assert!(!decision.source_video_mode.unwrap().hdr);
     }
 
     #[test]

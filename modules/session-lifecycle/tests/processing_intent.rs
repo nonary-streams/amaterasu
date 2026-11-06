@@ -203,7 +203,8 @@ impl PolicyProvider {
                 assert_eq!(caller, COORDINATOR);
                 let args = &payload["arguments"];
                 let response = if payload["method"] == "processing_intent" {
-                    let enabled = args["settings"]["rtx_hdr_enable"].as_bool().unwrap();
+                    let enabled = args["settings"]["rtx_hdr_enable"].as_bool().unwrap()
+                        || args["output_hdr"] == true;
                     let mut configuration = args["settings"].clone();
                     configuration["replacement_context"] =
                         json!({"target":args["target"],"version":1});
@@ -288,7 +289,7 @@ impl Fixture {
             "capture_binding_mode":"external","trusted_callers":["transport",PROVIDER],"session_delegates":["transport"],
             "consumers":{"capture":["transport"]},"operation_grants":{"transport":["prepare","prepare_stream","lookup","snapshot"]},
             "consumer_requirements":{"execution_domain":"desktop","capture_providers":[],"selector_schemas":[]},
-            "processing_policy":{"provider":PROVIDER,"service":POLICY,"processor_service":PROCESSOR,"source_mode_providers":[]},
+            "processing_policy":{"provider":PROVIDER,"service":POLICY,"processor_service":PROCESSOR,"interface_minor":1,"source_mode_providers":[]},
             "participants":[{"provider":PROVIDER,"plan_method":method("resource_plan"),"callback_method":method("lifecycle_callback"),
                 "status_method":method("lifecycle_status"),"settings_revision":"registry-0","settings":frozen_settings(enabled),
                 "capabilities":[],"cleanup_methods":[method("lifecycle_callback")]}]})).unwrap();
@@ -432,7 +433,7 @@ fn installed_processing_context_and_replacement_pass_unchanged_coordinator_prefl
                 "session and stream preflights use the selected provider"
             );
             for intent in fixture.provider.intents() {
-                assert_eq!(intent["enabled"], enabled);
+                assert_eq!(intent["enabled"], enabled || hdr);
                 let configuration = &intent["processor_settings"];
                 for (key, value) in frozen_settings(enabled).as_object().unwrap() {
                     assert_eq!(&configuration[key], value);

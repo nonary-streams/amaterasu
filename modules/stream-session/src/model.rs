@@ -62,6 +62,9 @@ pub struct ProcessingPlanProvider {
     pub provider: String,
     pub control_service: String,
     pub processor_service: String,
+    /// Version 1.1 supplies the negotiated output range to the provider.
+    #[serde(default)]
+    pub interface_minor: u32,
     /// Signed composition must also set video's gpu_processor_opt_in when true.
     #[serde(default)]
     pub omit_disabled: bool,
@@ -69,7 +72,8 @@ pub struct ProcessingPlanProvider {
 
 impl ProcessingPlanProvider {
     fn validate(&self) -> Result<(), &'static str> {
-        if !amaterasu_contracts::valid_name(&self.provider)
+        if self.interface_minor > 1
+            || !amaterasu_contracts::valid_name(&self.provider)
             || self.provider.contains('/')
             || !amaterasu_contracts::valid_name(&self.control_service)
             || !amaterasu_contracts::valid_name(&self.processor_service)

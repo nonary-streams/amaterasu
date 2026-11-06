@@ -785,7 +785,7 @@ impl Coordinator {
                     service: policy.service.clone(),
                     method: "processing_intent".into(),
                     interface_major: 1,
-                    interface_minor: 0,
+                    interface_minor: policy.interface_minor,
                     schema_revision: 1,
                 },
             )?;
@@ -1198,7 +1198,7 @@ impl Coordinator {
                     approval.method.service == policy.service
                         && approval.method.method == "processing_intent"
                         && approval.method.interface_major == 1
-                        && approval.method.interface_minor == 0
+                        && approval.method.interface_minor == policy.interface_minor
                         && approval.broker_approval["provider"] == policy.provider
                 })
             })
@@ -1226,6 +1226,7 @@ impl Coordinator {
                 key.to_owned(),
                 super::processing_preflight::ProcessingPreflightJob::new(
                     policy.service,
+                    policy.interface_minor,
                     policy.processor_service,
                     work.target.clone(),
                     snapshot.revision,

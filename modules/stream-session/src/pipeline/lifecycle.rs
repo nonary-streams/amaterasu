@@ -394,7 +394,17 @@ impl Pipeline {
             .clone()
             .unwrap_or_else(|| format!("ss-{:x}-{}", record.id, self.sequence));
         let pending = if job.step == Step::PlanGpuProcessing {
-            rpc::Pending::processing_api(&service, payload, operation_id, parent)
+            rpc::Pending::processing_api(
+                &service,
+                record
+                    .processing_plan_provider
+                    .as_ref()
+                    .expect("processing provider")
+                    .interface_minor,
+                payload,
+                operation_id,
+                parent,
+            )
         } else {
             rpc::Pending::new(&service, payload, operation_id, parent)
         };

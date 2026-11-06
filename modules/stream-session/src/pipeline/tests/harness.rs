@@ -478,7 +478,10 @@ impl Broker {
         if call.service == "example.processing-control/1" {
             assert_eq!(call.payload["method"], "processing_intent");
             assert_eq!(call.payload["interface_major"], 1);
-            assert_eq!(call.payload["interface_minor"], 0);
+            let minor = call.payload["interface_minor"].as_u64().unwrap();
+            assert!(minor <= 1);
+            let prepared = self.processing_plan_enabled
+                || (minor == 1 && call.payload["arguments"]["output_hdr"] == true);
             let mut settings = call.payload["arguments"]["settings"].clone();
             if let Some(context) = &self.processing_plan_context {
                 settings
@@ -488,9 +491,9 @@ impl Broker {
             }
             return json!({"status":"succeeded", "target":call.payload["arguments"]["target"],
                 "revision":if self.processing_plan_bad_revision {"wrong"} else {"r1"},
-                "enabled":self.processing_plan_enabled,
-                "source_hdr_required":if self.processing_plan_enabled && !self.processing_plan_omit_ranges {Some(self.processing_plan_source_hdr)} else {None},
-                "output_hdr_required":if self.processing_plan_enabled && !self.processing_plan_omit_ranges {Some(true)} else {None},
+                "enabled":prepared,
+                "source_hdr_required":if prepared && !self.processing_plan_omit_ranges {Some(self.processing_plan_source_hdr)} else {None},
+                "output_hdr_required":if prepared && !self.processing_plan_omit_ranges {Some(true)} else {None},
                 "processor_settings":settings,
                 "processor_service":"example.gpu/1"});
         }

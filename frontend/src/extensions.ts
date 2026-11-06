@@ -6,17 +6,43 @@ namespace Amaterasu {
     digest: string;
     sdk_version: number;
     entrypoint: string;
+    placements?: ("page" | "application")[];
+    settings_provider?: string | null;
     methods: ExtensionMethod[];
   }
   interface ExtensionPage {
     title: string;
-    mount(container: HTMLElement, sdk: ExtensionPageSdk): void | (() => void);
+    mount?(container: HTMLElement, sdk: ExtensionPageSdk): void | (() => void);
+    mountApplication?(container: HTMLElement, sdk: ExtensionPageSdk): void | (() => void);
   }
-  interface ExtensionPageSdk {
+  export interface ApplicationExtensionContext { readonly id: string; readonly name: string }
+  export interface ApplicationSettingsDocument {
+    revision: number;
+    values: Record<string, unknown>;
+    effective: Record<string, { value: unknown; source: unknown }>;
+  }
+  export interface ApplicationSettingsApi {
+    readonly version: 1;
+    readonly provider: string;
+    readonly canWrite: boolean;
+    read(): Promise<ApplicationSettingsDocument>;
+    update(expectedRevision: number, values: Payload): Promise<{ revision: number }>;
+  }
+  export interface ApplicationExtensionMount {
+    readonly ready: Promise<void>;
+    dispose(): void;
+    isDirty(): boolean;
+    isBusy(): boolean;
+  }
+  export interface ExtensionPageSdk {
     readonly version: 1;
     readonly signal: AbortSignal;
     readonly features?: readonly string[];
     readonly ui?: ExtensionUiWithDialogsV1 & ExtensionUiTabsV1;
+    readonly application?: ApplicationExtensionContext;
+    readonly settings?: ApplicationSettingsApi;
+    setDirty?(dirty: boolean): void;
+    setBusy?(busy: boolean): void;
     call(method: string, payload?: Payload): Promise<unknown>;
   }
   interface ExtensionRegistry {
@@ -32,7 +58,9 @@ namespace Amaterasu {
         if (!(script instanceof HTMLScriptElement) || pendingScripts.get(script)?.split("@")[0] !== id ||
             registrations.has(pendingScripts.get(script)!) || typeof page !== "object" || page === null ||
             typeof page.title !== "string" || !page.title.trim() || page.title.length > 128 ||
-            typeof page.mount !== "function") throw new Error("Invalid extension registration.");
+            (typeof page.mount !== "function" && typeof page.mountApplication !== "function") ||
+            (page.mount !== undefined && typeof page.mount !== "function") ||
+            (page.mountApplication !== undefined && typeof page.mountApplication !== "function")) throw new Error("Invalid extension registration.");
         registrations.set(pendingScripts.get(script)!, page);
       },
     },
@@ -48,6 +76,10 @@ namespace Amaterasu {
       typeof record.name === "string" && !!record.name.trim() && record.name.length <= 128 &&
       typeof record.digest === "string" && /^[a-f0-9]{64}$/.test(record.digest) &&
       record.sdk_version === 1 && typeof record.entrypoint === "string" &&
+      (record.placements === undefined || (Array.isArray(record.placements) && record.placements.length > 0 && record.placements.length <= 2 &&
+        new Set(record.placements).size === record.placements.length && record.placements.every((place: unknown) => place === "page" || place === "application"))) &&
+      (record.settings_provider == null || (typeof record.settings_provider === "string" && /^[a-z0-9._-]{1,128}$/.test(record.settings_provider) &&
+        Array.isArray(record.placements) && record.placements.includes("application"))) &&
       /^[a-zA-Z0-9._/-]+\.js$/.test(record.entrypoint) &&
       !record.entrypoint.split("/").some((part) => !part || part === "." || part === "..") &&
       Array.isArray(record.methods) && record.methods.length <= 64 &&
@@ -60,6 +92,7 @@ namespace Amaterasu {
     private cleanup: (() => void) | null = null;
     private controller: AbortController | null = null;
     private generation = 0;
+    private applicationMounts = new Set<ApplicationExtensionMount>();
     constructor(private readonly api: Api) {}
 
     async discover(): Promise<ExtensionDescriptor[]> {
@@ -74,6 +107,8 @@ namespace Amaterasu {
     }
 
     dispose(): void {
+      for (const mount of this.applicationMounts) mount.dispose();
+      this.applicationMounts.clear();
       this.controller?.abort();
       this.controller = null;
       const cleanup = this.cleanup;
@@ -87,10 +122,37 @@ namespace Amaterasu {
       this.descriptors.clear();
     }
 
-    async mount(id: string, container: HTMLElement): Promise<void> {
+    mountApplication(id: string, container: HTMLElement, application: ApplicationExtensionContext): ApplicationExtensionMount {
+      if (typeof application.id !== "string" || !/^app-[0-9a-f]{16}$/.test(application.id) ||
+          application.id === "app-0000000000000000" || typeof application.name !== "string" ||
+          !application.name || application.name.length > 512 || /[\u0000-\u001f\u007f-\u009f]/u.test(application.name))
+        throw new Error("Invalid application context.");
+      const child = new ExtensionPages(this.api);
+      child.descriptors = new Map(this.descriptors);
+      let dirty = false;
+      let busy = false;
+      const state = (kind: "dirty" | "busy", value: boolean) => {
+        if (typeof value !== "boolean") throw new Error("Invalid application section state.");
+        if (kind === "dirty") dirty = value;
+        else busy = value;
+      };
+      const mount: ApplicationExtensionMount = {
+        ready: child.mount(id, container, application, state),
+        dispose: () => { child.dispose(); dirty = false; busy = false; this.applicationMounts.delete(mount); },
+        isDirty: () => dirty || busy,
+        isBusy: () => busy,
+      };
+      this.applicationMounts.add(mount);
+      return mount;
+    }
+
+    async mount(id: string, container: HTMLElement, application?: ApplicationExtensionContext,
+      state?: (kind: "dirty" | "busy", value: boolean) => void): Promise<void> {
       this.dispose();
       const descriptor = this.descriptors.get(id);
       if (!descriptor) throw new Error("Extension is unavailable.");
+      const placement = application ? "application" : "page";
+      if (!(descriptor.placements ?? ["page"]).includes(placement)) throw new Error("Extension is unavailable in this location.");
       const controller = new AbortController();
       this.controller = controller;
       const registrationKey = `${id}@${descriptor.digest}`;
@@ -120,13 +182,13 @@ namespace Amaterasu {
         }
         page = await loading;
       }
-      if (controller.signal.aborted) return;
+      if (controller.signal.aborted || (application && container.isConnected === false)) return;
       if (!page) throw new Error("Extension did not register a page.");
       const aliases = new Set(descriptor.methods.map((method) => method.alias));
       const sdk: ExtensionPageSdk = Object.freeze({
         version: 1 as const,
         signal: controller.signal,
-        features: Object.freeze(["ui.controls/1", "ui.forms/1", "ui.forms/2", "ui.controls/2", "ui.feedback/1", "ui.layout/1", "ui.tabs/1", "ui.dialog/1"]),
+        features: Object.freeze(["ui.controls/1", "ui.forms/1", "ui.forms/2", "ui.controls/2", "ui.feedback/1", "ui.layout/1", "ui.tabs/1", "ui.dialog/1", ...(application ? ["ui.application-section/1", ...(descriptor.settings_provider ? ["ui.application-settings/1"] : [])] : [])]),
         ui: Object.freeze({
           ...createExtensionUiWithDialogsV1(controller.signal),
           ...createExtensionUiTabsV1(controller.signal),
@@ -139,9 +201,45 @@ namespace Amaterasu {
               return reply.result;
             });
         },
+        ...(application ? {
+          application: Object.freeze({ id: application.id, name: application.name }),
+          setDirty: (value: boolean) => { if (!controller.signal.aborted) state?.("dirty", value); },
+          setBusy: (value: boolean) => { if (!controller.signal.aborted) state?.("busy", value); },
+          ...(descriptor.settings_provider ? { settings: this.applicationSettings(descriptor.settings_provider, application, controller.signal) } : {}),
+        } : {}),
       });
-      const cleanup = page.mount(container, sdk);
-      if (typeof cleanup === "function") this.cleanup = cleanup;
+      const callback = application ? page.mountApplication : page.mount;
+      if (typeof callback !== "function") throw new Error("Extension did not register this UI location.");
+      try {
+        const cleanup = callback(container, sdk);
+        if (typeof cleanup === "function") {
+          if (controller.signal.aborted) cleanup();
+          else this.cleanup = cleanup;
+        }
+      } catch (error) {
+        this.dispose();
+        throw error;
+      }
+    }
+
+    private applicationSettings(provider: string, application: ApplicationExtensionContext, signal: AbortSignal): ApplicationSettingsApi {
+      const scope = Object.freeze({ kind: "application", id: application.id });
+      const request = async <T>(route: string, payload: Payload): Promise<T> => {
+        if (signal.aborted) throw new Error("Application section is closed.");
+        const response = await this.api.post<T>(route, { ...payload, provider, scope }, true, signal);
+        if (signal.aborted) throw new Error("Application section is closed.");
+        return response;
+      };
+      return Object.freeze({
+        version: 1 as const,
+        provider,
+        canWrite: this.api.allows("configuration.write"),
+        read: () => request<ApplicationSettingsDocument>("session-extensions/settings_get", {}),
+        update: (expectedRevision: number, values: Payload) => {
+          if (!this.api.allows("configuration.write")) return Promise.reject(new Error("Plugin settings are read-only."));
+          return request<{ revision: number }>("session-extensions/settings_update", { expected_revision: expectedRevision, values });
+        },
+      });
     }
   }
 }

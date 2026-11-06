@@ -7,12 +7,13 @@ import ts from "typescript";
 const plain = value => JSON.parse(JSON.stringify(value));
 const settle = async () => { for (let i = 0; i < 20; i++) await Promise.resolve(); };
 
-function fixture(scope, write = true, values = { enabled: false }, provider) {
+function fixture(scope, write = true, values = { enabled: false }, provider, fullControls = false) {
   class Element {
     children = [];
     listeners = {};
     isConnected = true;
     checked = false;
+    value = "";
     append(...children) { this.children.push(...children); }
     replaceChildren(...children) { this.children = children; }
     addEventListener(name, callback) { this.listeners[name] = callback; }
@@ -32,10 +33,11 @@ function fixture(scope, write = true, values = { enabled: false }, provider) {
     { id: "enabled", label: "Enabled", help: "", definition: { type: "boolean", default: true }, allowed_scopes: ["host", "application", "paired_client"], apply_policy: "next_stream" },
     { id: "installation", label: "Installation", help: "", definition: { type: "string", default: "" }, allowed_scopes: ["host"], apply_policy: "next_session" },
   ] };
-  const runtime = vm.createContext({ Amaterasu: {
+  const runtime = vm.createContext({ structuredClone, Amaterasu: {
     literalText: value => ({ kind: "literal", value }),
     el: element,
     input: () => element("input"),
+    button: (label, click) => { const node = element("button", "", label); node.listeners.click = click; return node; },
     panel: (title, ...children) => element("panel", "", title, ...children),
     extensionFieldEditor: (definition, initial) => {
       const editor = { node: element("editor"), initial, definition, value: () => initial };
@@ -44,6 +46,11 @@ function fixture(scope, write = true, values = { enabled: false }, provider) {
     },
     extensionRadioGroupEditor: (definition, initial, label, choiceLabels) => {
       const editor = { node: element("radio-group"), initial, definition, label, choiceLabels, value: () => initial };
+      editors.push(editor);
+      return editor;
+    },
+    extensionSliderEditor: (definition, initial, label) => {
+      const editor = { node: element("slider"), initial, definition, label, value: () => initial };
       editors.push(editor);
       return editor;
     },
@@ -63,15 +70,31 @@ function fixture(scope, write = true, values = { enabled: false }, provider) {
     async post(route, payload) {
       calls.push([route, plain(payload)]);
       if (route.endsWith("/list")) return { items: [descriptor], next: null, revision: 3 };
-      if (route.endsWith("/settings_get")) return { revision: 7, values, effective: {
+      if (route.endsWith("/settings_get")) return { revision: fullControls && calls.some(([route]) => route.endsWith("/settings_update")) ? 8 : 7, values, effective: {
         enabled: { value: false, source: scope }, installation: { value: "", source: null },
       } };
       return { ok: true, revision: 8 };
     },
   } };
-  runtime.Amaterasu.renderSessionExtensionSettings(context, area, scope, provider);
+  if (fullControls) runtime.Amaterasu.renderApplicationPluginOverrides(context, area, scope.id, undefined, true);
+  else runtime.Amaterasu.renderSessionExtensionSettings(context, area, scope, provider);
   return { area, calls, nodes, editors, pending, errors, notifications, descriptor };
 }
+
+test("application cards expose inherited plugin controls before an override exists", async () => {
+  const env = fixture({ kind: "application", id: "app-0000000000000001" }, true, {}, undefined, true);
+  await settle();
+  assert.equal(env.editors.length, 1, "application controls render immediately, host-only options stay hidden");
+  const inherit = env.nodes.find(node => node.tag === "label" && node.children.includes(" Use inherited value")).children[0];
+  assert.equal(inherit.checked, true);
+  env.editors[0].value = () => true;
+  env.editors[0].node.listeners.input();
+  assert.equal(inherit.checked, false);
+  env.nodes.find(node => node.tag === "form").listeners.submit({ preventDefault() {} });
+  await Promise.all(env.pending);
+  assert.deepEqual(env.calls.find(([route]) => route.endsWith("/settings_update"))[1].values, { enabled: true });
+  assert.deepEqual(env.errors, []);
+});
 
 for (const scope of [{ kind: "application", id: "game" }, { kind: "paired_client", id: "client" }]) {
   test(`${scope.kind} settings use the generic scope and preserve explicit false`, async () => {

@@ -8170,6 +8170,8 @@ var Amaterasu;
                 return false;
             editorLifecycle?.abort();
             editorLifecycle = null;
+            if (pluginArea && typeof Amaterasu.disposeApplicationPluginSections === "function")
+                Amaterasu.disposeApplicationPluginSections(pluginArea);
             pluginArea = null;
             editorGeneration += 1;
             editor.replaceChildren();
@@ -8315,11 +8317,9 @@ var Amaterasu;
                 });
             });
             const cover = catalogEditorCover(row);
-            editor.replaceChildren(Amaterasu.panel("Playnite streaming settings", Amaterasu.el("p", "muted", catalogTextLiteral(`${row.entry.name} · Playnite game ${row.entry.launch.kind === "playnite" ? row.entry.launch.game_id : ""}`)), Amaterasu.el("p", "muted", "The Playnite game identity and provider-managed launch metadata stay unchanged."), Amaterasu.el("div", "catalog-editor-layout", cover.figure, form), Amaterasu.el("section", "catalog-editor-section", Amaterasu.el("h3", "", "Plugin overrides"), pluginArea = Amaterasu.el("div")), ...(!api.allows("catalog.write") ? [Amaterasu.button("Close", () => { closeEditor(); })] : [])));
-            if (api.allows("configuration.read") && typeof Amaterasu.renderApplicationPluginOverrides === "function")
-                Amaterasu.renderApplicationPluginOverrides(context, pluginArea, row.id, form.hidden ? undefined : form.querySelector(".catalog-overrides") ?? undefined);
-            else
-                pluginArea.textContent = "Plugin settings require configuration read access.";
+            editor.replaceChildren(Amaterasu.panel("Playnite streaming settings", Amaterasu.el("p", "muted", catalogTextLiteral(`${row.entry.name} · Playnite game ${row.entry.launch.kind === "playnite" ? row.entry.launch.game_id : ""}`)), Amaterasu.el("p", "muted", "The Playnite game identity and provider-managed launch metadata stay unchanged."), Amaterasu.el("div", "catalog-editor-layout", cover.figure, form), Amaterasu.el("section", "catalog-editor-section", Amaterasu.el("h3", "", "Plugin settings"), pluginArea = Amaterasu.el("div")), ...(!api.allows("catalog.write") ? [Amaterasu.button("Close", () => { closeEditor(); })] : [])));
+            if (typeof Amaterasu.renderApplicationPluginSections === "function")
+                Amaterasu.renderApplicationPluginSections(context, pluginArea, { id: row.id, name: row.entry.name }, form.hidden ? undefined : form.querySelector(".catalog-overrides") ?? undefined);
             showCatalogArtwork(api, row.entry.artwork, cover.art, content, () => { cover.fallback.hidden = true; }, row.id);
             editor.scrollIntoView({ behavior: "smooth", block: "start" });
             fec.focus();
@@ -8383,11 +8383,9 @@ var Amaterasu;
                 });
             });
             const cover = row ? catalogEditorCover(row) : null;
-            editor.replaceChildren(Amaterasu.panel(row ? "Edit application" : "Add application", Amaterasu.el("p", "muted", "Save launch metadata for this host. Adding an entry does not launch it."), cover ? Amaterasu.el("div", "catalog-editor-layout", cover.figure, form) : form, Amaterasu.el("section", "catalog-editor-section", Amaterasu.el("h3", "", "Plugin overrides"), pluginArea = Amaterasu.el("div", "", ...(row ? [] : [Amaterasu.el("p", "muted", "Plugin overrides are available after creating this application.")]))), ...(!api.allows("catalog.write") ? [Amaterasu.button("Close", () => { closeEditor(); })] : [])));
-            if (row && api.allows("configuration.read") && typeof Amaterasu.renderApplicationPluginOverrides === "function")
-                Amaterasu.renderApplicationPluginOverrides(context, pluginArea, row.id, form.hidden ? undefined : form.querySelector(".catalog-overrides") ?? undefined);
-            else if (row && !api.allows("configuration.read"))
-                pluginArea.textContent = "Plugin settings require configuration read access.";
+            editor.replaceChildren(Amaterasu.panel(row ? "Edit application" : "Add application", Amaterasu.el("p", "muted", "Save launch metadata for this host. Adding an entry does not launch it."), cover ? Amaterasu.el("div", "catalog-editor-layout", cover.figure, form) : form, Amaterasu.el("section", "catalog-editor-section", Amaterasu.el("h3", "", "Plugin settings"), pluginArea = Amaterasu.el("div", "", ...(row ? [] : [Amaterasu.el("p", "muted", "Plugin sections are available after creating this application.")]))), ...(!api.allows("catalog.write") ? [Amaterasu.button("Close", () => { closeEditor(); })] : [])));
+            if (row && typeof Amaterasu.renderApplicationPluginSections === "function")
+                Amaterasu.renderApplicationPluginSections(context, pluginArea, { id: row.id, name: row.entry.name }, form.hidden ? undefined : form.querySelector(".catalog-overrides") ?? undefined);
             if (cover && row)
                 showCatalogArtwork(api, row.entry.artwork, cover.art, content, () => { cover.fallback.hidden = true; }, row.id);
             editor.scrollIntoView({ behavior: "smooth", block: "start" });
@@ -21684,7 +21682,9 @@ var Amaterasu;
                 if (!(script instanceof HTMLScriptElement) || pendingScripts.get(script)?.split("@")[0] !== id ||
                     registrations.has(pendingScripts.get(script)) || typeof page !== "object" || page === null ||
                     typeof page.title !== "string" || !page.title.trim() || page.title.length > 128 ||
-                    typeof page.mount !== "function")
+                    (typeof page.mount !== "function" && typeof page.mountApplication !== "function") ||
+                    (page.mount !== undefined && typeof page.mount !== "function") ||
+                    (page.mountApplication !== undefined && typeof page.mountApplication !== "function"))
                     throw new Error("Invalid extension registration.");
                 registrations.set(pendingScripts.get(script), page);
             },
@@ -21701,6 +21701,10 @@ var Amaterasu;
             typeof record.name === "string" && !!record.name.trim() && record.name.length <= 128 &&
             typeof record.digest === "string" && /^[a-f0-9]{64}$/.test(record.digest) &&
             record.sdk_version === 1 && typeof record.entrypoint === "string" &&
+            (record.placements === undefined || (Array.isArray(record.placements) && record.placements.length > 0 && record.placements.length <= 2 &&
+                new Set(record.placements).size === record.placements.length && record.placements.every((place) => place === "page" || place === "application"))) &&
+            (record.settings_provider == null || (typeof record.settings_provider === "string" && /^[a-z0-9._-]{1,128}$/.test(record.settings_provider) &&
+                Array.isArray(record.placements) && record.placements.includes("application"))) &&
             /^[a-zA-Z0-9._/-]+\.js$/.test(record.entrypoint) &&
             !record.entrypoint.split("/").some((part) => !part || part === "." || part === "..") &&
             Array.isArray(record.methods) && record.methods.length <= 64 &&
@@ -21713,6 +21717,7 @@ var Amaterasu;
         cleanup = null;
         controller = null;
         generation = 0;
+        applicationMounts = new Set();
         constructor(api) {
             this.api = api;
         }
@@ -21729,6 +21734,9 @@ var Amaterasu;
             return [...this.descriptors.values()];
         }
         dispose() {
+            for (const mount of this.applicationMounts)
+                mount.dispose();
+            this.applicationMounts.clear();
             this.controller?.abort();
             this.controller = null;
             const cleanup = this.cleanup;
@@ -21745,11 +21753,40 @@ var Amaterasu;
             this.dispose();
             this.descriptors.clear();
         }
-        async mount(id, container) {
+        mountApplication(id, container, application) {
+            if (typeof application.id !== "string" || !/^app-[0-9a-f]{16}$/.test(application.id) ||
+                application.id === "app-0000000000000000" || typeof application.name !== "string" ||
+                !application.name || application.name.length > 512 || /[\u0000-\u001f\u007f-\u009f]/u.test(application.name))
+                throw new Error("Invalid application context.");
+            const child = new ExtensionPages(this.api);
+            child.descriptors = new Map(this.descriptors);
+            let dirty = false;
+            let busy = false;
+            const state = (kind, value) => {
+                if (typeof value !== "boolean")
+                    throw new Error("Invalid application section state.");
+                if (kind === "dirty")
+                    dirty = value;
+                else
+                    busy = value;
+            };
+            const mount = {
+                ready: child.mount(id, container, application, state),
+                dispose: () => { child.dispose(); dirty = false; busy = false; this.applicationMounts.delete(mount); },
+                isDirty: () => dirty || busy,
+                isBusy: () => busy,
+            };
+            this.applicationMounts.add(mount);
+            return mount;
+        }
+        async mount(id, container, application, state) {
             this.dispose();
             const descriptor = this.descriptors.get(id);
             if (!descriptor)
                 throw new Error("Extension is unavailable.");
+            const placement = application ? "application" : "page";
+            if (!(descriptor.placements ?? ["page"]).includes(placement))
+                throw new Error("Extension is unavailable in this location.");
             const controller = new AbortController();
             this.controller = controller;
             const registrationKey = `${id}@${descriptor.digest}`;
@@ -21781,7 +21818,7 @@ var Amaterasu;
                 }
                 page = await loading;
             }
-            if (controller.signal.aborted)
+            if (controller.signal.aborted || (application && container.isConnected === false))
                 return;
             if (!page)
                 throw new Error("Extension did not register a page.");
@@ -21789,7 +21826,7 @@ var Amaterasu;
             const sdk = Object.freeze({
                 version: 1,
                 signal: controller.signal,
-                features: Object.freeze(["ui.controls/1", "ui.forms/1", "ui.forms/2", "ui.controls/2", "ui.feedback/1", "ui.layout/1", "ui.tabs/1", "ui.dialog/1"]),
+                features: Object.freeze(["ui.controls/1", "ui.forms/1", "ui.forms/2", "ui.controls/2", "ui.feedback/1", "ui.layout/1", "ui.tabs/1", "ui.dialog/1", ...(application ? ["ui.application-section/1", ...(descriptor.settings_provider ? ["ui.application-settings/1"] : [])] : [])]),
                 ui: Object.freeze({
                     ...Amaterasu.createExtensionUiWithDialogsV1(controller.signal),
                     ...Amaterasu.createExtensionUiTabsV1(controller.signal),
@@ -21804,10 +21841,53 @@ var Amaterasu;
                         return reply.result;
                     });
                 },
+                ...(application ? {
+                    application: Object.freeze({ id: application.id, name: application.name }),
+                    setDirty: (value) => { if (!controller.signal.aborted)
+                        state?.("dirty", value); },
+                    setBusy: (value) => { if (!controller.signal.aborted)
+                        state?.("busy", value); },
+                    ...(descriptor.settings_provider ? { settings: this.applicationSettings(descriptor.settings_provider, application, controller.signal) } : {}),
+                } : {}),
             });
-            const cleanup = page.mount(container, sdk);
-            if (typeof cleanup === "function")
-                this.cleanup = cleanup;
+            const callback = application ? page.mountApplication : page.mount;
+            if (typeof callback !== "function")
+                throw new Error("Extension did not register this UI location.");
+            try {
+                const cleanup = callback(container, sdk);
+                if (typeof cleanup === "function") {
+                    if (controller.signal.aborted)
+                        cleanup();
+                    else
+                        this.cleanup = cleanup;
+                }
+            }
+            catch (error) {
+                this.dispose();
+                throw error;
+            }
+        }
+        applicationSettings(provider, application, signal) {
+            const scope = Object.freeze({ kind: "application", id: application.id });
+            const request = async (route, payload) => {
+                if (signal.aborted)
+                    throw new Error("Application section is closed.");
+                const response = await this.api.post(route, { ...payload, provider, scope }, true, signal);
+                if (signal.aborted)
+                    throw new Error("Application section is closed.");
+                return response;
+            };
+            return Object.freeze({
+                version: 1,
+                provider,
+                canWrite: this.api.allows("configuration.write"),
+                read: () => request("session-extensions/settings_get", {}),
+                update: (expectedRevision, values) => {
+                    if (!this.api.allows("configuration.write"))
+                        return Promise.reject(new Error("Plugin settings are read-only."));
+                    return request("session-extensions/settings_update", { expected_revision: expectedRevision, values });
+                },
+            });
         }
     }
     Amaterasu.ExtensionPages = ExtensionPages;
@@ -22373,6 +22453,81 @@ var Amaterasu;
     Amaterasu.renderSessionExtensionSettings = renderSessionExtensionSettings;
     const applicationOverrideGuards = new WeakMap();
     const applicationOverrideSaves = new WeakMap();
+    const applicationSectionDisposers = new WeakMap();
+    function disposeApplicationPluginSections(area) {
+        applicationSectionDisposers.get(area)?.();
+    }
+    Amaterasu.disposeApplicationPluginSections = disposeApplicationPluginSections;
+    function renderApplicationPluginSections(context, area, application, overrideCatalog) {
+        disposeApplicationPluginSections(area);
+        const settings = Amaterasu.el("div", "application-plugin-settings");
+        const custom = Amaterasu.el("div", "application-plugin-sections");
+        const nativeDisposers = [];
+        let unregister;
+        area.replaceChildren(settings, custom);
+        const renderFallback = (claimed) => {
+            if (context.api.allows("configuration.read"))
+                renderApplicationPluginOverrides({ ...context, registerDraftGuard: (_check, cleanup) => {
+                        nativeDisposers.push(cleanup);
+                        return cleanup;
+                    } }, settings, application.id, overrideCatalog, true, claimed);
+        };
+        const pages = new Amaterasu.ExtensionPages(context.api);
+        const mounts = new Set();
+        let disposed = false;
+        const dispose = () => {
+            if (disposed)
+                return;
+            disposed = true;
+            observer?.disconnect();
+            pages.reset();
+            for (const mount of mounts)
+                mount.dispose();
+            mounts.clear();
+            for (const cleanup of nativeDisposers.splice(0))
+                cleanup();
+            applicationOverrideGuards.delete(area);
+            applicationOverrideSaves.delete(area);
+            applicationSectionDisposers.delete(area);
+            unregister?.();
+        };
+        const observer = typeof MutationObserver === "function" ? new MutationObserver(() => {
+            if (!area.isConnected)
+                dispose();
+        }) : undefined;
+        observer?.observe(context.content, { childList: true, subtree: true });
+        const dirty = () => applicationPluginOverridesDirty(settings) || [...mounts].some((mount) => mount.isDirty());
+        applicationOverrideGuards.set(area, dirty);
+        applicationOverrideSaves.set(area, () => applicationPluginOverridesSaving(settings) || [...mounts].some((mount) => mount.isBusy()));
+        applicationSectionDisposers.set(area, dispose);
+        unregister = context.registerDraftGuard?.(() => area.isConnected && dirty(), dispose);
+        void pages.discover().then((descriptors) => {
+            if (disposed || !area.isConnected)
+                return;
+            const sections = descriptors.filter((entry) => entry.placements?.includes("application"));
+            renderFallback(new Set(sections.flatMap((entry) => entry.settings_provider ? [entry.settings_provider] : [])));
+            for (const descriptor of sections) {
+                const container = Amaterasu.el("div");
+                const section = Amaterasu.panel(Amaterasu.literalText(descriptor.name), container);
+                section.classList.add("application-plugin-section");
+                custom.append(section);
+                const mount = pages.mountApplication(descriptor.id, container, application);
+                mounts.add(mount);
+                void mount.ready.catch((error) => {
+                    mount.dispose();
+                    mounts.delete(mount);
+                    if (!disposed && container.isConnected)
+                        container.replaceChildren(Amaterasu.errorPanel(error));
+                });
+            }
+        }).catch((error) => {
+            if (!disposed && custom.isConnected) {
+                renderFallback(new Set());
+                custom.replaceChildren(Amaterasu.errorPanel(error));
+            }
+        });
+    }
+    Amaterasu.renderApplicationPluginSections = renderApplicationPluginSections;
     function applicationPluginOverridesSaving(area) {
         return applicationOverrideSaves.get(area)?.() ?? false;
     }
@@ -22381,9 +22536,10 @@ var Amaterasu;
         return applicationOverrideGuards.get(area)?.() ?? false;
     }
     Amaterasu.applicationPluginOverridesDirty = applicationPluginOverridesDirty;
-    function renderApplicationPluginOverrides(context, area, applicationId, overrideCatalog) {
+    function renderApplicationPluginOverrides(context, area, applicationId, overrideCatalog, showAllOptions = false, claimedProviders = new Set()) {
         const scope = { kind: "application", id: applicationId };
         let busy = false;
+        let disposed = false;
         const catalogSearch = overrideCatalog?.querySelector('input[type="search"]');
         const catalogChoices = overrideCatalog?.querySelector(".catalog-override-catalog");
         const sharedChoices = catalogSearch && catalogChoices ? { search: catalogSearch, list: catalogChoices } : undefined;
@@ -22398,10 +22554,13 @@ var Amaterasu;
         applicationOverrideGuards.set(area, isDirty);
         applicationOverrideSaves.set(area, () => busy);
         context.registerDraftGuard?.(() => area.isConnected && isDirty(), () => {
+            disposed = true;
             applicationOverrideGuards.delete(area);
             applicationOverrideSaves.delete(area);
         });
         async function load() {
+            if (disposed)
+                return;
             for (const group of sharedGroups.splice(0))
                 group.remove();
             sharedRefreshers.length = 0;
@@ -22425,16 +22584,16 @@ var Amaterasu;
                     if (descriptors.length > 1024)
                         throw new Error("Too many extensions.");
                 } while (after);
-                const providers = descriptors.filter((descriptor) => Array.isArray(descriptor.options) &&
+                const providers = descriptors.filter((descriptor) => !claimedProviders.has(descriptor.provider) && Array.isArray(descriptor.options) &&
                     descriptor.options.some((option) => Array.isArray(option.allowed_scopes) && option.allowed_scopes.includes("application")));
                 const documents = [];
                 for (let offset = 0; offset < providers.length; offset += 4) {
                     const batch = providers.slice(offset, offset + 4);
                     documents.push(...await Promise.all(batch.map((descriptor) => context.api.post("session-extensions/settings_get", { provider: descriptor.provider, scope }))));
-                    if (!context.content.isConnected || !area.isConnected)
+                    if (disposed || !context.content.isConnected || !area.isConnected)
                         return;
                 }
-                if (!context.content.isConnected || !area.isConnected)
+                if (disposed || !context.content.isConnected || !area.isConnected)
                     return;
                 const panels = providers.map((descriptor, index) => {
                     const document = documents[index];
@@ -22499,7 +22658,7 @@ var Amaterasu;
                         }
                         describeInherited();
                     };
-                    const addOption = (option, value) => {
+                    const addOption = (option, value, inherited = false) => {
                         const editor = option.presentation === "keybinding"
                             ? Amaterasu.extensionKeybindingSettingEditor(option.definition, value)
                             : option.presentation === "slider" ? Amaterasu.extensionSliderEditor(option.definition, value, option.label)
@@ -22509,11 +22668,20 @@ var Amaterasu;
                         if (controls.length === 1)
                             controls[0].setAttribute("aria-label", option.label);
                         const row = Amaterasu.el("fieldset", "session-extension-option catalog-plugin-override-row", Amaterasu.el("legend", "field-label", Amaterasu.literalText(option.label)), editor.node);
+                        const inherit = showAllOptions ? Amaterasu.input("", "", "checkbox") : undefined;
+                        if (inherit) {
+                            inherit.checked = inherited;
+                            row.append(Amaterasu.el("label", "session-extension-inherit", inherit, " Use inherited value"));
+                            const edited = () => { inherit.checked = false; };
+                            editor.node.addEventListener("input", edited);
+                            editor.node.addEventListener("change", edited);
+                        }
                         if (option.help)
                             row.append(Amaterasu.el("small", "muted", Amaterasu.literalText(option.help)));
                         row.append(Amaterasu.el("small", "muted", sessionExtensionApplyPolicyHelp(option.apply_policy)));
-                        row.append(Amaterasu.button("Remove override", () => { entries.delete(option.id); row.remove(); refreshChoices(); }));
-                        entries.set(option.id, { editor });
+                        if (!showAllOptions)
+                            row.append(Amaterasu.button("Remove override", () => { entries.delete(option.id); row.remove(); refreshChoices(); }));
+                        entries.set(option.id, { editor, inherit });
                         rows.append(row);
                     };
                     const add = Amaterasu.button("Add override", () => {
@@ -22549,15 +22717,24 @@ var Amaterasu;
                     }
                     search.addEventListener("input", refreshChoices);
                     choices.addEventListener("change", describeInherited);
-                    for (const option of options)
-                        if (Object.hasOwn(document.values, option.id))
-                            addOption(option, document.values[option.id]);
+                    const populate = () => {
+                        for (const option of options) {
+                            const overridden = Object.hasOwn(document.values, option.id);
+                            if (overridden || showAllOptions) {
+                                const effective = document.effective[option.id];
+                                if (!overridden && !effective)
+                                    throw new Error("Missing effective plugin setting.");
+                                addOption(option, overridden ? document.values[option.id] : effective.value, !overridden);
+                            }
+                        }
+                    };
+                    populate();
                     refreshChoices();
                     const values = () => {
                         const result = { ...document.values };
                         for (const option of options) {
                             const entry = entries.get(option.id);
-                            if (entry)
+                            if (entry && !entry.inherit?.checked)
                                 result[option.id] = entry.editor.value();
                             else
                                 delete result[option.id];
@@ -22575,7 +22752,7 @@ var Amaterasu;
                     save.type = "submit";
                     const chooser = Amaterasu.el("details", "catalog-override-chooser catalog-plugin-override-chooser", Amaterasu.el("summary", "", "Add override"), Amaterasu.el("div", "catalog-plugin-override-chooser-content", search, choices, inherited, add));
                     const actions = Amaterasu.el("div", "catalog-plugin-overrides-actions", save);
-                    fields.append(rows, ...(sharedChoices ? [] : [chooser]), actions);
+                    fields.append(rows, ...(sharedChoices || showAllOptions ? [] : [chooser]), actions);
                     form.append(fields, status);
                     form.addEventListener("submit", (event) => {
                         event.preventDefault();
@@ -22605,6 +22782,11 @@ var Amaterasu;
                                         throw new Error("Settings changed during refresh.");
                                     document.effective = refreshed.effective;
                                     effectiveAvailable = true;
+                                    if (showAllOptions) {
+                                        entries.clear();
+                                        rows.replaceChildren();
+                                        populate();
+                                    }
                                     refreshChoices();
                                 }
                                 catch {
@@ -22623,10 +22805,14 @@ var Amaterasu;
                 });
                 if (sharedChoices)
                     sharedChoices.list.append(...sharedGroups);
-                area.replaceChildren(Amaterasu.el("p", "muted", "Plugin overrides are saved separately from application changes."), ...(panels.length ? panels : [Amaterasu.el("p", "muted", "No plugin settings are available for this application.")]));
+                if (showAllOptions && !panels.length) {
+                    area.replaceChildren();
+                    return;
+                }
+                area.replaceChildren(Amaterasu.el("p", "muted", showAllOptions ? "Plugin settings are saved separately from application changes." : "Plugin overrides are saved separately from application changes."), ...(panels.length ? panels : [Amaterasu.el("p", "muted", "No plugin settings are available for this application.")]));
             }
             catch (error) {
-                if (context.content.isConnected && area.isConnected)
+                if (!disposed && context.content.isConnected && area.isConnected)
                     area.replaceChildren(Amaterasu.errorPanel(error, load));
             }
         }
@@ -22975,6 +23161,8 @@ var Amaterasu;
                 if (!this.signedIn || !shell.isConnected)
                     return;
                 for (const entry of entries) {
+                    if (!(entry.placements ?? ["page"]).includes("page"))
+                        continue;
                     this.extensionIds.add(entry.id);
                     const page = `extension/${entry.id}`;
                     const item = Amaterasu.button(appTextLiteral(entry.name), () => {

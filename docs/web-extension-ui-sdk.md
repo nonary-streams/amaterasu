@@ -228,3 +228,113 @@ Both components expose `element` and idempotent `dispose()`. The host lifecycle
 signal disposes them on navigation or signout; disposal removes the component
 from the DOM and prevents later updates. Call `dispose()` sooner when removing a
 component before its page ends.
+
+## Application editor sections
+
+With `ui.application-section/1`, a signed extension can add its own section to
+an existing application's editor. This surface is independent of the settings
+registry: a section can provide actions, status, help, or a complete plugin UI
+without declaring configuration overrides. The host invokes the selected plugin;
+it does not hard-code plugin-specific controls.
+
+Declare the locations in the signed manifest:
+
+```json
+{"placements": ["application"]}
+```
+
+Use `["page", "application"]` for both a navigation page and an app section.
+Existing manifests without `placements` retain `["page"]`. Unknown, duplicate,
+or empty placements are rejected. Application-only extensions do not add a
+navigation item. The publisher's optional JSON configuration accepts either the
+existing method array or an object containing `placements` and `methods`.
+
+Register `mountApplication` for the new surface:
+
+```js
+window.AmaterasuExtensions.v1.register('my-plugin', {
+  title: 'My plugin',
+  mountApplication(container, sdk) {
+    const app = sdk.application;
+    const action = sdk.ui.button({
+      label: 'Inspect application',
+      onClick: async () => {
+        sdk.setBusy(true);
+        try {
+          await sdk.call('inspect', { application_id: app.id });
+        } finally {
+          sdk.setBusy(false);
+        }
+      },
+    });
+    container.append(action.element);
+    return () => action.dispose();
+  },
+});
+```
+
+The frozen `sdk.application` contains the catalog `id` and display `name`.
+It is context, not an authorization grant. `sdk.call` still permits only methods
+in the signed manifest and the host's independent method approvals. Provider
+methods must validate their inputs and permissions; adding a section does not
+create a new API route or widen a user's access.
+
+Each mounted section has its own SDK, `AbortSignal`, controls, and cleanup
+function. Changing applications, closing the editor, navigating, or signing out
+aborts the signal and invokes cleanup. Late script loads never mount into a
+closed editor. Check the signal before applying asynchronous results. Multiple
+app sections can coexist without sharing draft or lifecycle state.
+
+Call `sdk.setDirty(true)` for unsaved work and clear it only after saving or
+explicitly discarding that work. `sdk.setBusy(true)` prevents closing the editor
+while a plugin operation is in progress. The host includes both states in its
+navigation and application-save guards. These methods are available on the
+application surface and do not persist settings themselves.
+
+A selected plugin can own its settings UI by adding a `settings_provider` to
+its signed application configuration:
+
+```json
+{"placements": ["application"], "settings_provider": "amaterasu.rtx-hdr", "methods": []}
+```
+
+This advertises `ui.application-settings/1` and supplies `sdk.settings`, with
+`provider`, `canWrite`, `read()`, and `update(expectedRevision, values)`. Requests
+are pinned to that provider and the mounted application's scope. They use the
+existing authenticated settings endpoints, configuration permissions, native
+value validation, and revision checks. The declaration is an association for
+presentation, not an authorization grant. `sdk.call` retains its separate signed
+method declarations and approvals.
+
+The plugin owns its controls, layout, inheritance behavior, and choice of manual
+or automatic saving. `read()` returns the existing settings document containing
+`revision`, sparse `values`, and `effective` values. `update()` saves sparse values;
+omitting a key restores inheritance. It does not itself prove live application.
+The RTX HDR plugin's `ui/application.js` uses this helper and serializes debounced
+slider saves while preserving edits made during a pending request.
+
+Saving during a stream uses the same settings contract as saving while idle.
+For options declared `live_action`, the active consumer reads the latest scoped
+values through the Module SDK's `read_live_provider_settings` contract and
+applies them through the selected provider's runtime API. The consumer retains
+the stream's original values for options that require the next session. A UI
+section alone does not make a provider's settings live: the provider must declare
+the live options and its consumer must implement their runtime application.
+
+For RTX HDR, the plugin debounces edits by 200 ms and the video consumer polls
+live settings once per second. Tuning changes therefore apply during an existing
+RTX HDR stream after saving and the next poll, without restarting the stream.
+The enable toggle also applies live when the stream has prepared the compatible
+HDR processing path, including a stream started with conversion disabled. SDR
+streams keep their negotiated output range. A successful save confirms
+persistence; it is not an acknowledgement that a rendered frame used the value.
+
+The host places plugin-owned cards in the dedicated **Plugin settings** area and
+suppresses the generic form for a provider with a selected custom UI. Providers
+without custom UI retain the generated settings card as a fallback. Plugins
+without settings can attach sections by omitting `settings_provider`.
+
+The [application section example](../examples/web-extension/application.js)
+uses the existing greeting provider and declares no settings overrides. Package
+it with [application-ui.json](../examples/web-extension/application-ui.json)
+using the same approved publisher and method-authorization workflow as a page.

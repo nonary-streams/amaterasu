@@ -150,6 +150,76 @@ namespace Amaterasu {
   const applicationOverrideGuards = new WeakMap<HTMLElement, () => boolean>();
 
   const applicationOverrideSaves = new WeakMap<HTMLElement, () => boolean>();
+  const applicationSectionDisposers = new WeakMap<HTMLElement, () => void>();
+
+  export function disposeApplicationPluginSections(area: HTMLElement): void {
+    applicationSectionDisposers.get(area)?.();
+  }
+
+  export function renderApplicationPluginSections(context: PageContext, area: HTMLElement,
+    application: ApplicationExtensionContext, overrideCatalog?: HTMLElement): void {
+    disposeApplicationPluginSections(area);
+    const settings = el("div", "application-plugin-settings");
+    const custom = el("div", "application-plugin-sections");
+    const nativeDisposers: Array<() => void> = [];
+    let unregister: (() => void) | undefined;
+    area.replaceChildren(settings, custom);
+    const renderFallback = (claimed: ReadonlySet<string>) => {
+      if (context.api.allows("configuration.read"))
+        renderApplicationPluginOverrides({ ...context, registerDraftGuard: (_check, cleanup) => {
+          nativeDisposers.push(cleanup);
+          return cleanup;
+        } }, settings, application.id, overrideCatalog, true, claimed);
+    };
+    const pages = new ExtensionPages(context.api);
+    const mounts = new Set<ApplicationExtensionMount>();
+    let disposed = false;
+    const dispose = () => {
+      if (disposed) return;
+      disposed = true;
+      observer?.disconnect();
+      pages.reset();
+      for (const mount of mounts) mount.dispose();
+      mounts.clear();
+      for (const cleanup of nativeDisposers.splice(0)) cleanup();
+      applicationOverrideGuards.delete(area);
+      applicationOverrideSaves.delete(area);
+      applicationSectionDisposers.delete(area);
+      unregister?.();
+    };
+    const observer = typeof MutationObserver === "function" ? new MutationObserver(() => {
+      if (!area.isConnected) dispose();
+    }) : undefined;
+    observer?.observe(context.content, { childList: true, subtree: true });
+    const dirty = () => applicationPluginOverridesDirty(settings) || [...mounts].some((mount) => mount.isDirty());
+    applicationOverrideGuards.set(area, dirty);
+    applicationOverrideSaves.set(area, () => applicationPluginOverridesSaving(settings) || [...mounts].some((mount) => mount.isBusy()));
+    applicationSectionDisposers.set(area, dispose);
+    unregister = context.registerDraftGuard?.(() => area.isConnected && dirty(), dispose);
+    void pages.discover().then((descriptors) => {
+      if (disposed || !area.isConnected) return;
+      const sections = descriptors.filter((entry) => entry.placements?.includes("application"));
+      renderFallback(new Set(sections.flatMap((entry) => entry.settings_provider ? [entry.settings_provider] : [])));
+      for (const descriptor of sections) {
+        const container = el("div");
+        const section = panel(literalText(descriptor.name), container);
+        section.classList.add("application-plugin-section");
+        custom.append(section);
+        const mount = pages.mountApplication(descriptor.id, container, application);
+        mounts.add(mount);
+        void mount.ready.catch((error) => {
+          mount.dispose();
+          mounts.delete(mount);
+          if (!disposed && container.isConnected) container.replaceChildren(errorPanel(error));
+        });
+      }
+    }).catch((error) => {
+      if (!disposed && custom.isConnected) {
+        renderFallback(new Set());
+        custom.replaceChildren(errorPanel(error));
+      }
+    });
+  }
 
   export function applicationPluginOverridesSaving(area: HTMLElement): boolean {
     return applicationOverrideSaves.get(area)?.() ?? false;
@@ -159,9 +229,10 @@ namespace Amaterasu {
     return applicationOverrideGuards.get(area)?.() ?? false;
   }
 
-  export function renderApplicationPluginOverrides(context: PageContext, area: HTMLElement, applicationId: string, overrideCatalog?: HTMLElement): void {
+  export function renderApplicationPluginOverrides(context: PageContext, area: HTMLElement, applicationId: string, overrideCatalog?: HTMLElement, showAllOptions = false, claimedProviders: ReadonlySet<string> = new Set()): void {
     const scope: SessionExtensionScope = { kind: "application", id: applicationId };
     let busy = false;
+    let disposed = false;
     const catalogSearch = overrideCatalog?.querySelector<HTMLInputElement>('input[type="search"]');
     const catalogChoices = overrideCatalog?.querySelector<HTMLElement>(".catalog-override-catalog");
     const sharedChoices = catalogSearch && catalogChoices ? { search: catalogSearch, list: catalogChoices } : undefined;
@@ -175,11 +246,13 @@ namespace Amaterasu {
     applicationOverrideGuards.set(area, isDirty);
     applicationOverrideSaves.set(area, () => busy);
     context.registerDraftGuard?.(() => area.isConnected && isDirty(), () => {
+      disposed = true;
       applicationOverrideGuards.delete(area);
       applicationOverrideSaves.delete(area);
     });
 
     async function load(): Promise<void> {
+      if (disposed) return;
       for (const group of sharedGroups.splice(0)) group.remove();
       sharedRefreshers.length = 0;
       try {
@@ -199,7 +272,7 @@ namespace Amaterasu {
           if (after) seen.add(after);
           if (descriptors.length > 1024) throw new Error("Too many extensions.");
         } while (after);
-        const providers = descriptors.filter((descriptor) => Array.isArray(descriptor.options) &&
+        const providers = descriptors.filter((descriptor) => !claimedProviders.has(descriptor.provider) && Array.isArray(descriptor.options) &&
           descriptor.options.some((option) => Array.isArray(option.allowed_scopes) && option.allowed_scopes.includes("application")));
         const documents: SessionExtensionSettings[] = [];
         // Keep discovery from exhausting the registry's bounded pending requests.
@@ -207,9 +280,9 @@ namespace Amaterasu {
           const batch = providers.slice(offset, offset + 4);
           documents.push(...await Promise.all(batch.map((descriptor) => context.api.post<SessionExtensionSettings>(
             "session-extensions/settings_get", { provider: descriptor.provider, scope }))));
-          if (!context.content.isConnected || !area.isConnected) return;
+          if (disposed || !context.content.isConnected || !area.isConnected) return;
         }
-        if (!context.content.isConnected || !area.isConnected) return;
+        if (disposed || !context.content.isConnected || !area.isConnected) return;
         const panels = providers.map((descriptor, index) => {
           const document = documents[index];
           if (!document || !document.values || !document.effective || !Number.isSafeInteger(document.revision))
@@ -218,7 +291,7 @@ namespace Amaterasu {
           let effectiveAvailable = true;
           let baseline = JSON.stringify(document.values);
           const options = descriptor.options.filter((option) => Array.isArray(option.allowed_scopes) && option.allowed_scopes.includes("application"));
-          const entries = new Map<string, { editor: ExtensionFieldEditor }>();
+          const entries = new Map<string, { editor: ExtensionFieldEditor; inherit?: HTMLInputElement }>();
           const form = el("form", "settings-form catalog-plugin-overrides-form");
           const fields = el("fieldset", "catalog-plugin-overrides-fields");
           fields.disabled = !context.api.allows("configuration.write");
@@ -267,7 +340,7 @@ namespace Amaterasu {
             }
             describeInherited();
           };
-          const addOption = (option: SessionExtensionOption, value: unknown) => {
+          const addOption = (option: SessionExtensionOption, value: unknown, inherited = false) => {
             const editor = option.presentation === "keybinding"
               ? extensionKeybindingSettingEditor(option.definition, value)
               : option.presentation === "slider" ? extensionSliderEditor(option.definition, value, option.label)
@@ -276,10 +349,18 @@ namespace Amaterasu {
             const controls = editor.node.matches("input,select,textarea") ? [editor.node] : Array.from(editor.node.querySelectorAll("input,select,textarea"));
             if (controls.length === 1) controls[0]!.setAttribute("aria-label", option.label);
             const row = el("fieldset", "session-extension-option catalog-plugin-override-row", el("legend", "field-label", literalText(option.label)), editor.node);
+            const inherit = showAllOptions ? input("", "", "checkbox") : undefined;
+            if (inherit) {
+              inherit.checked = inherited;
+              row.append(el("label", "session-extension-inherit", inherit, " Use inherited value"));
+              const edited = () => { inherit.checked = false; };
+              editor.node.addEventListener("input", edited);
+              editor.node.addEventListener("change", edited);
+            }
             if (option.help) row.append(el("small", "muted", literalText(option.help)));
             row.append(el("small", "muted", sessionExtensionApplyPolicyHelp(option.apply_policy)));
-            row.append(button("Remove override", () => { entries.delete(option.id); row.remove(); refreshChoices(); }));
-            entries.set(option.id, { editor });
+            if (!showAllOptions) row.append(button("Remove override", () => { entries.delete(option.id); row.remove(); refreshChoices(); }));
+            entries.set(option.id, { editor, inherit });
             rows.append(row);
           };
           const add = button("Add override", () => {
@@ -312,13 +393,23 @@ namespace Amaterasu {
           }
           search.addEventListener("input", refreshChoices);
           choices.addEventListener("change", describeInherited);
-          for (const option of options) if (Object.hasOwn(document.values, option.id)) addOption(option, document.values[option.id]);
+          const populate = () => {
+            for (const option of options) {
+              const overridden = Object.hasOwn(document.values, option.id);
+              if (overridden || showAllOptions) {
+                const effective = document.effective[option.id];
+                if (!overridden && !effective) throw new Error("Missing effective plugin setting.");
+                addOption(option, overridden ? document.values[option.id] : effective!.value, !overridden);
+              }
+            }
+          };
+          populate();
           refreshChoices();
           const values = (): Payload => {
             const result: Payload = { ...document.values };
             for (const option of options) {
               const entry = entries.get(option.id);
-              if (entry) result[option.id] = entry.editor.value();
+              if (entry && !entry.inherit?.checked) result[option.id] = entry.editor.value();
               else delete result[option.id];
             }
             return result;
@@ -331,7 +422,7 @@ namespace Amaterasu {
             el("summary", "", "Add override"),
             el("div", "catalog-plugin-override-chooser-content", search, choices, inherited, add));
           const actions = el("div", "catalog-plugin-overrides-actions", save);
-          fields.append(rows, ...(sharedChoices ? [] : [chooser]), actions);
+          fields.append(rows, ...(sharedChoices || showAllOptions ? [] : [chooser]), actions);
           form.append(fields, status);
           form.addEventListener("submit", (event) => {
             event.preventDefault();
@@ -358,6 +449,7 @@ namespace Amaterasu {
                     throw new Error("Settings changed during refresh.");
                   document.effective = refreshed.effective;
                   effectiveAvailable = true;
+                  if (showAllOptions) { entries.clear(); rows.replaceChildren(); populate(); }
                   refreshChoices();
                 } catch {
                   throw new Error("Plugin overrides were saved, but inherited values could not be refreshed. Reopen the application editor before adding an override.");
@@ -373,10 +465,11 @@ namespace Amaterasu {
           return panel(literalText(descriptor.display_name || descriptor.provider), form);
         });
         if (sharedChoices) sharedChoices.list.append(...sharedGroups);
-        area.replaceChildren(el("p", "muted", "Plugin overrides are saved separately from application changes."),
+        if (showAllOptions && !panels.length) { area.replaceChildren(); return; }
+        area.replaceChildren(el("p", "muted", showAllOptions ? "Plugin settings are saved separately from application changes." : "Plugin overrides are saved separately from application changes."),
           ...(panels.length ? panels : [el("p", "muted", "No plugin settings are available for this application.")]));
       } catch (error) {
-        if (context.content.isConnected && area.isConnected) area.replaceChildren(errorPanel(error, load));
+        if (!disposed && context.content.isConnected && area.isConnected) area.replaceChildren(errorPanel(error, load));
       }
     }
     void load();

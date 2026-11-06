@@ -47,6 +47,54 @@ pub struct LiveProviderSettings {
     pub settings: Value,
 }
 
+/// Build the selected processing-intent contract. Version 1.0 keeps its exact
+/// legacy shape; 1.1 adds the requested output range so a provider can reserve
+/// a compatible processing path even when its effect is initially disabled.
+pub fn processing_intent_payload(
+    interface_minor: u32,
+    target: &crate::extension_api::LifecycleTarget,
+    revision: &str,
+    settings: &Value,
+    output_hdr: Option<bool>,
+) -> ModuleResult<Value> {
+    if interface_minor > 1
+        || revision.is_empty()
+        || revision.len() > 128
+        || revision.chars().any(char::is_control)
+        || !settings.is_object()
+    {
+        return Err("invalid processing intent".into());
+    }
+    let mut payload = serde_json::json!({"target":target,"revision":revision,"settings":settings});
+    if interface_minor == 1
+        && let Some(output_hdr) = output_hdr
+    {
+        payload["output_hdr"] = Value::Bool(output_hdr);
+    }
+    Ok(payload)
+}
+
+#[cfg(test)]
+mod processing_intent_tests {
+    use super::*;
+
+    #[test]
+    fn output_range_is_only_sent_with_the_selected_version_one_one_contract() {
+        let target = serde_json::from_value(serde_json::json!({"kind":"stream","host_epoch":"epoch","session_id":"session","stream_id":"stream","generation":1})).unwrap();
+        let settings = serde_json::json!({"enabled":false});
+        let legacy =
+            processing_intent_payload(0, &target, "revision", &settings, Some(true)).unwrap();
+        assert_eq!(legacy.as_object().unwrap().len(), 3);
+        for hdr in [false, true] {
+            let current =
+                processing_intent_payload(1, &target, "revision", &settings, Some(hdr)).unwrap();
+            assert_eq!(current["output_hdr"], hdr);
+            assert_eq!(current["settings"], settings);
+        }
+        assert!(processing_intent_payload(2, &target, "revision", &settings, Some(true)).is_err());
+    }
+}
+
 /// Build a retryable live-settings admission for an exact stream and provider.
 /// Reuse the returned command unchanged if the admission response is lost.
 pub fn live_provider_settings_command(

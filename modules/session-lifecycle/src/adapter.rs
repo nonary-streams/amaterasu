@@ -106,6 +106,9 @@ pub struct ProcessingPolicy {
     pub provider: String,
     pub service: String,
     pub processor_service: String,
+    /// Version 1.1 supplies the requested output range before source selection.
+    #[serde(default)]
+    pub interface_minor: u32,
     /// Participants explicitly advertising the generic source mode contract.
     pub source_mode_providers: BTreeSet<String>,
 }
@@ -375,7 +378,8 @@ impl LifecycleSettings {
 
     pub(crate) fn validate(&self) -> ModuleResult<()> {
         if self.processing_policy.as_ref().is_some_and(|policy| {
-            !valid_identifier(&policy.provider)
+            policy.interface_minor > 1
+                || !valid_identifier(&policy.provider)
                 || !valid_identifier(&policy.service)
                 || !valid_identifier(&policy.processor_service)
                 || !self

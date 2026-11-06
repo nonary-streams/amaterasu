@@ -48,6 +48,7 @@ impl Pending {
 
     pub fn processing_api(
         service: &str,
+        interface_minor: u32,
         payload: Value,
         operation: String,
         parent: Option<u64>,
@@ -57,7 +58,7 @@ impl Pending {
             service: service.into(),
             method: "processing_intent".into(),
             interface_major: 1,
-            interface_minor: 0,
+            interface_minor,
             payload,
             timeout_ms: 5000,
             operation_id: operation,

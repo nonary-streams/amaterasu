@@ -338,10 +338,23 @@ impl Job {
                 let plan = record.processing_plan_provider.as_ref().expect("provider");
                 let (revision, settings) =
                     record.processing_frozen.as_ref().expect("frozen settings");
+                let start = record.start.as_ref().expect("start");
                 (
                     plan.control_service.clone(),
-                    json!({"target":record.start.as_ref().expect("start").lifecycle_target,
-                    "revision":revision, "settings":settings}),
+                    amaterasu_module_sdk::requests::processing_intent_payload(
+                        plan.interface_minor,
+                        start
+                            .lifecycle_target
+                            .as_ref()
+                            .expect("validated lifecycle target"),
+                        revision,
+                        settings,
+                        Some(
+                            start.configuration.video_stream_format.dynamic_range
+                                == amaterasu_module_sdk::DynamicRange::Hdr,
+                        ),
+                    )
+                    .expect("validated processing configuration"),
                 )
             }
             Step::ObserveLifecycleCapture | Step::ObserveActiveBinding => (
