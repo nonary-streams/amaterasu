@@ -151,6 +151,24 @@ of the existing managed-only `allow_named_outputs` permission. Packaging and
 service preflight require the linked physical-capture feature marker from the
 exact PipeWire artifact. The scoped KDE executable declaration is still required.
 
+CPU HDR processing is an optional external-provider selection. Video's signed
+`resource_processor_service` binds the existing
+`amaterasu.frame-resource-processor.native/1` family through the public
+`processing::resource` SDK. It is mutually exclusive with
+`cpu_processor_service` and `gpu_processor_service`; composition supplies the
+exact native-use grant and dependency, and the lifecycle processing selection
+must name that same service. Version 1.0 accepts empty per-stream settings and
+does not support live updates.
+
+Source and output color/format offers negotiate independently. The provider
+must transform the pixels and retire its work; changing metadata is not a
+conversion. The SDK and unchanged Video consumer validate the selected offers,
+source provenance and output ownership. Replacement fixtures verify neutral
+black output codes and lifecycle behavior, rather than a general tone-mapping
+algorithm. No stock resource processor or CPU tone mapper is selected. See
+[CPU resource processing](resource-frame-processing.md) for the contract and
+composition example.
+
 ## Verification and remaining qualification
 
 The implementation has distinct verification layers:
@@ -177,6 +195,13 @@ qualification are required for those modes. The Linux KWin PipeWire CPU capture
 path remains BGRA8 and cannot supply HDR physical-output pixels. These are
 confirmed source capability boundaries, not merely missing hardware tests.
 
+Windows-style CPU-v2 P010 HDR capture with an SDR client also requires an
+explicitly selected compatible CPU resource processor. The stock GPU effects
+consume DMA-BUF leases and cannot process that CPU source. The new SDK/Video
+route enables a replacement to provide HDR-to-SDR conversion; default
+composition still rejects it. This does not add HDR encoding to the stock MFT
+encoder or recover HDR pixels from the BGRA8 PipeWire source.
+
 Local SDK exports and VKMS candidate pins used for validation are unpublished
 implementation artifacts. A local build or passing qualification does not
 publish those dependencies to a shared repository.
@@ -185,6 +210,11 @@ The executor's current retirement proof does not attest native resources from a
 previous runtime epoch. Such a source stays held until its owning executor can
 produce authenticated cleanup evidence. A service restart is not retirement
 proof; crash recovery of that case remains a specific qualification limit.
+
+The isolated signed native run reached worker `READY` but did not complete its
+shutdown-drain checks. This establishes loader readiness only. Full signed
+stream, cleanup and shutdown acceptance remains pending; source and replacement
+tests must not be reported as a complete native pass.
 
 For isolated signed native acceptance, build the complete Linux session profile,
 the in-memory input probe, host and release utility, plus software x264 encoding
