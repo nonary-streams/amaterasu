@@ -446,7 +446,7 @@ pub fn methods() -> Vec<ApiMethod> {
     .collect()
 }
 
-/// Produce an exact RequestApi invocation. No raw-operation route or built-in
+/// Produce an exact API invocation. No raw-operation route or built-in
 /// fallback is provided when the selected implementation is unavailable.
 pub fn command(options: RequestOptions<'_>, request: &Request) -> ModuleResult<Command> {
     if options.service != SERVICE {
