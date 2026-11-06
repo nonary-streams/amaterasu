@@ -3667,6 +3667,76 @@ fn profile_catalog_owner_mapping_requires_coordinator_and_management_initiator()
 }
 
 #[test]
+fn profile_pages_cover_more_than_sixteen_rows_and_reject_a_changed_revision() {
+    let entries: BTreeMap<String, Value> = (1..=80)
+        .map(|number| {
+            let entry = if number % 2 == 0 {
+                monitor_profile_entry(
+                    &format!("f920e4f5-e140-45e4-a737-{number:012x}"),
+                    &format!("Screen {number}"),
+                    100,
+                )
+            } else {
+                json!({"name":format!("Ordinary {number}"),"launch":{"kind":"desktop"}})
+            };
+            (format!("app-{number:016x}"), entry)
+        })
+        .collect();
+    let mut backend = Backend {
+        revision: 3,
+        metadata: json!({"revision":7,"next_id":81}),
+        entries,
+        ..Default::default()
+    };
+    let mut pipeline = Pipeline::default()
+        .with_profile_principals(BTreeMap::from([("remote".into(), "owner".into())]));
+    let mut cursor = Value::Null;
+    let mut first = Value::Null;
+    let mut ids = Vec::new();
+    let mut pages = 0;
+    loop {
+        let reply = backend.run_for(
+            &mut pipeline,
+            json!({"action":"profile_list","cursor":cursor,"limit":16}),
+            "remote",
+            "amaterasu.management",
+            "owner",
+        );
+        assert_eq!(reply["ok"], true, "{reply}");
+        assert_eq!(reply["revision"], 7);
+        let entries = reply["entries"].as_array().unwrap();
+        assert!(entries.len() <= 16);
+        for entry in entries {
+            assert_eq!(entry["monitor_profile"], true);
+            ids.push(entry["id"].as_str().unwrap().to_owned());
+        }
+        pages += 1;
+        cursor = reply["next_cursor"].clone();
+        if cursor.is_null() {
+            break;
+        }
+        if first.is_null() {
+            first = cursor.clone();
+        }
+        assert_eq!(cursor["query"], "remote_monitor_profiles");
+        assert!(pages < 10);
+    }
+    assert_eq!(ids.len(), 40);
+    assert_eq!(pages, 3);
+    assert!(ids.windows(2).all(|pair| pair[0] < pair[1]));
+    backend.metadata["revision"] = 8.into();
+    let stale = backend.run_for(
+        &mut pipeline,
+        json!({"action":"profile_list","cursor":first,"limit":16}),
+        "remote",
+        "amaterasu.management",
+        "owner",
+    );
+    assert_eq!(stale["error"]["code"], "revision_conflict");
+    assert_eq!(backend.metadata["revision"], 8);
+}
+
+#[test]
 fn provider_snapshots_are_caller_bound_replay_safe_and_delete_only_after_complete_finish() {
     let mut backend = Backend::default();
     let mut pipeline = steam_importer();
