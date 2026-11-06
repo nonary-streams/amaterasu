@@ -169,7 +169,11 @@ impl Shape {
         surface: &mut amaterasu_module_sdk::capture::high_depth::RgbSurface,
         left: i32,
         top: i32,
+        white_scale: f64,
     ) -> CaptureResult<()> {
+        if !white_scale.is_finite() || white_scale <= 0.0 || white_scale > 125.0 {
+            return Err(invalid_shape());
+        }
         let shape_height = if self.kind == ShapeKind::Monochrome {
             self.height / 2
         } else {
@@ -194,6 +198,7 @@ impl Shape {
                             }
                             let color = [pixel[2], pixel[1], pixel[0]].map(|v| {
                                 cursor_linear((f64::from(v) / 255.0 / alpha).clamp(0.0, 1.0))
+                                    * white_scale
                             });
                             std::array::from_fn(|i| {
                                 color[i] * alpha + background[i] * (1.0 - alpha)
@@ -208,9 +213,9 @@ impl Shape {
                                     f64::from(if pixel[3] == 0 {
                                         color[i]
                                     } else {
-                                        cursor_srgb(background[i]) ^ color[i]
+                                        cursor_srgb(background[i] / white_scale) ^ color[i]
                                     }) / 255.0,
-                                )
+                                ) * white_scale
                             })
                         }
                         ShapeKind::Monochrome => {
@@ -226,10 +231,10 @@ impl Shape {
                             background.map(|v| {
                                 cursor_linear(
                                     f64::from(
-                                        (if and { cursor_srgb(v) } else { 0 })
+                                        (if and { cursor_srgb(v / white_scale) } else { 0 })
                                             ^ if xor { 255 } else { 0 },
                                     ) / 255.0,
-                                )
+                                ) * white_scale
                             })
                         }
                     })

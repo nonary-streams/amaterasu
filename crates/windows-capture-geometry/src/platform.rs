@@ -32,6 +32,46 @@ pub fn resolve_target_matching(
     Ok((selection, output))
 }
 
+/// Observe the native SDR reference white of one exact active CCD target.
+/// This is a luminance multiplier in scRGB units, never a display mutation.
+/// A reconciled before/after topology prevents borrowing another target's value.
+pub fn sdr_white_level_for_target(target_id: &str) -> Result<f64, GeometryError> {
+    if target_id.is_empty() || target_id.len() > 4096 {
+        return Err(unavailable("invalid target identity"));
+    }
+    let (topology, white) = with_physical_topology(|| {
+        let (paths, modes) = active_configuration()?;
+        let mut selected = None;
+        for path in &paths {
+            let snapshot = ccd_snapshot(path, &modes)?;
+            if snapshot.target_id.eq_ignore_ascii_case(target_id) {
+                if selected.is_some() {
+                    return Err(unavailable("SDR white target is ambiguous"));
+                }
+                selected = Some(path);
+            }
+        }
+        let path = selected.ok_or_else(|| unavailable("SDR white target is not active"))?;
+        let mut white = DISPLAYCONFIG_SDR_WHITE_LEVEL {
+            header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
+                r#type: DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL,
+                size: size_of::<DISPLAYCONFIG_SDR_WHITE_LEVEL>() as u32,
+                adapterId: path.targetInfo.adapterId,
+                id: path.targetInfo.id,
+            },
+            ..Default::default()
+        };
+        // SAFETY: this exact-target read-only packet owns all writable storage
+        // specified by its header; no target handle escapes the call.
+        if unsafe { DisplayConfigGetDeviceInfo(&mut white.header) } != 0 {
+            return Err(unavailable("native SDR white level unavailable"));
+        }
+        crate::model::reference_white_scale(white.SDRWhiteLevel)
+    })?;
+    topology.select_target(|identity| identity.eq_ignore_ascii_case(target_id))?;
+    Ok(white)
+}
+
 /// Resolve a provider-selected output while every coordinate-producing call is
 /// scoped to the same physical per-monitor DPI context.
 pub fn resolve_with<T>(
@@ -236,6 +276,15 @@ fn finish_dxgi(displays: Vec<DisplaySnapshot>) -> Result<Vec<DisplaySnapshot>, G
 }
 
 fn enumerate_ccd() -> Result<Vec<CcdSnapshot>, GeometryError> {
+    let (paths, modes) = active_configuration()?;
+    paths
+        .iter()
+        .map(|path| ccd_snapshot(path, &modes))
+        .collect()
+}
+
+fn active_configuration()
+-> Result<(Vec<DISPLAYCONFIG_PATH_INFO>, Vec<DISPLAYCONFIG_MODE_INFO>), GeometryError> {
     for _ in 0..4 {
         let mut path_count = 0;
         let mut mode_count = 0;
@@ -276,10 +325,7 @@ fn enumerate_ccd() -> Result<Vec<CcdSnapshot>, GeometryError> {
         if paths.is_empty() {
             return Err(unavailable("CCD reports no active paths"));
         }
-        return paths
-            .iter()
-            .map(|path| ccd_snapshot(path, &modes))
-            .collect();
+        return Ok((paths, modes));
     }
     Err(unavailable(
         "CCD topology changed repeatedly during enumeration",

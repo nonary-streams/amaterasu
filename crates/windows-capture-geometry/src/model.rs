@@ -224,3 +224,14 @@ fn source_key(source_name: &str) -> String {
 pub(crate) fn unavailable(message: &'static str) -> GeometryError {
     GeometryError::Unavailable(message)
 }
+
+/// CCD encodes an SDR-white multiplier of 80 nits, scaled by 1000.
+#[cfg(any(windows, test))]
+pub(crate) fn reference_white_scale(value: u32) -> Result<f64, GeometryError> {
+    if value == 0 || value > 125_000 {
+        return Err(GeometryError::Unavailable(
+            "native SDR white level is outside representable HDR luminance",
+        ));
+    }
+    Ok(f64::from(value) / 1000.0)
+}

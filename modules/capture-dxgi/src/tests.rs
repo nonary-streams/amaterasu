@@ -1336,7 +1336,7 @@ fn hdr_cursor_edit_preserves_uncovered_high_depth_pixels() {
         vec![0, 0, 255, 255],
     )
     .unwrap();
-    shape.compose_rgb(&mut surface, 0, 0).unwrap();
+    shape.compose_rgb(&mut surface, 0, 0, 1.0).unwrap();
     assert_eq!(&surface.bytes[8..], &original[8..]);
     assert_eq!(
         u16::from_le_bytes(surface.bytes[..2].try_into().unwrap()),
@@ -1347,6 +1347,58 @@ fn hdr_cursor_edit_preserves_uncovered_high_depth_pixels() {
         crate::cursor::Shape::new(crate::cursor::ShapeKind::Monochrome, 1, 2, 1, vec![0x80, 0])
             .unwrap();
     let before = surface.bytes.clone();
-    invert.compose_rgb(&mut surface, 1, 1).unwrap();
+    invert.compose_rgb(&mut surface, 1, 1, 1.0).unwrap();
     assert_eq!(surface.bytes, before);
+}
+
+#[test]
+fn hdr_cursor_white_uses_observed_sdr_reference_without_changing_scene() {
+    use amaterasu_module_sdk::capture::high_depth::{RgbEncoding, RgbSurface};
+    let mut bytes = vec![0; 32];
+    bytes[14..16].copy_from_slice(&0x4a40u16.to_le_bytes());
+    let scene = bytes[8..].to_vec();
+    let mut surface = RgbSurface {
+        width: 2,
+        height: 2,
+        stride: 16,
+        encoding: RgbEncoding::Rgba16FloatScRgb,
+        bytes: Arc::new(bytes),
+    };
+    let cursor =
+        crate::cursor::Shape::new(crate::cursor::ShapeKind::Color, 1, 1, 4, vec![255; 4]).unwrap();
+    cursor.compose_rgb(&mut surface, 0, 0, 2.5).unwrap();
+    for word in surface.bytes[..6].as_chunks::<2>().0 {
+        assert_eq!(u16::from_le_bytes(*word), 0x4100);
+    }
+    assert_eq!(&surface.bytes[8..], scene);
+    assert!(cursor.compose_rgb(&mut surface, 0, 0, 0.0).is_err());
+}
+
+#[test]
+fn hdr_masked_and_monochrome_cursor_whites_use_the_same_native_reference() {
+    use amaterasu_module_sdk::capture::high_depth::{RgbEncoding, RgbSurface};
+    for shape in [
+        crate::cursor::Shape::new(
+            crate::cursor::ShapeKind::MaskedColor,
+            1,
+            1,
+            4,
+            vec![255, 255, 255, 0],
+        )
+        .unwrap(),
+        crate::cursor::Shape::new(crate::cursor::ShapeKind::Monochrome, 1, 2, 1, vec![0, 0x80])
+            .unwrap(),
+    ] {
+        let mut surface = RgbSurface {
+            width: 2,
+            height: 2,
+            stride: 16,
+            encoding: RgbEncoding::Rgba16FloatScRgb,
+            bytes: Arc::new(vec![0; 32]),
+        };
+        shape.compose_rgb(&mut surface, 0, 0, 2.5).unwrap();
+        for word in surface.bytes[..6].as_chunks::<2>().0 {
+            assert_eq!(u16::from_le_bytes(*word), 0x4100);
+        }
+    }
 }

@@ -11,7 +11,7 @@ use amaterasu_module_sdk::capture::high_depth::RgbEncoding;
 use amaterasu_module_sdk::capture::{EXACT_TARGET_PREFIX, exact_target_key, exact_target_selector};
 use amaterasu_windows_capture_geometry::{
     GeometryError, SelectedOutput, resolve_target_matching, resolve_with,
-    with_verified_physical_topology,
+    sdr_white_level_for_target, with_verified_physical_topology,
 };
 use serde_json::{Value, json};
 use std::time::Instant;
@@ -234,6 +234,7 @@ struct PendingTexture {
     timestamp_us: u64,
     cursor: Option<(Shape, i32, i32)>,
     encoding: RgbEncoding,
+    cursor_white_scale: f64,
 }
 
 struct Session {
@@ -391,6 +392,13 @@ impl Session {
         cursor.update(shape, position);
         let mut pending = self.copy_resource(resource)?;
         pending.cursor = cursor.snapshot();
+        if self.format.hdr && pending.cursor.is_some() {
+            let target = self.target_id.as_deref().ok_or_else(|| {
+                CaptureError::new("access_lost", "HDR cursor target identity is unavailable")
+            })?;
+            pending.cursor_white_scale =
+                sdr_white_level_for_target(target).map_err(capture_geometry_error)?;
+        }
         Ok((pending, cursor))
     }
 
@@ -505,6 +513,7 @@ impl Session {
             timestamp_us: self.started.elapsed().as_micros().min(u64::MAX as u128) as u64,
             cursor: None,
             encoding,
+            cursor_white_scale: 1.0,
         })
     }
 
@@ -548,7 +557,7 @@ impl Session {
             };
             surface.and_then(|mut surface| {
                 if let Some((shape, x, y)) = &pending.cursor {
-                    shape.compose_rgb(&mut surface, *x, *y)?;
+                    shape.compose_rgb(&mut surface, *x, *y, pending.cursor_white_scale)?;
                 }
                 Ok((surface.stride, Vec::new(), Some(surface)))
             })

@@ -309,3 +309,12 @@ fn selected_monitor_must_still_match_handle_name_and_rectangle() {
         },
     );
 }
+
+#[test]
+fn reference_white_is_a_native_multiplier_without_an_invented_default() {
+    assert_eq!(super::model::reference_white_scale(1000), Ok(1.0));
+    assert_eq!(super::model::reference_white_scale(2500), Ok(2.5));
+    assert_eq!(super::model::reference_white_scale(125000), Ok(125.0));
+    assert!(super::model::reference_white_scale(0).is_err());
+    assert!(super::model::reference_white_scale(125001).is_err());
+}

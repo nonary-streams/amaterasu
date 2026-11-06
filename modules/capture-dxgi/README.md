@@ -163,7 +163,10 @@ Current limitations are explicit:
   are cached across move-only frames, clipped to the output, and captured with
   the staging texture for delayed CPU readback. High-depth frames compose only
   cursor-covered pixels in the original source encoding; uncovered HDR values
-  retain their original words. Hidden or desktop-embedded
+  retain their original words. HDR cursor white uses the exact active CCD
+  target's observed SDR reference-white multiplier, sampled with the pending
+  frame; an unavailable or ambiguous target does not acquire a guessed value.
+  Hidden or desktop-embedded
   pointers are not drawn again. Physical cursor behavior still needs hardware
   validation, including rotated monitors and driver-specific shape formats.
 - High-depth capture requests FP16 scRGB and preserves its precision through
@@ -204,4 +207,5 @@ Primary API references:
 [ReleaseFrame](https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_2/nf-dxgi1_2-idxgioutputduplication-releaseframe),
 [DuplicateOutput1](https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_5/nf-dxgi1_5-idxgioutput5-duplicateoutput1),
 [Windows HDR/scRGB](https://learn.microsoft.com/en-us/windows/win32/direct3darticles/high-dynamic-range),
-[DXGI color spaces](https://learn.microsoft.com/en-us/windows/win32/api/dxgicommon/ne-dxgicommon-dxgi_color_space_type).
+[DXGI color spaces](https://learn.microsoft.com/en-us/windows/win32/api/dxgicommon/ne-dxgicommon-dxgi_color_space_type),
+[SDR white level](https://learn.microsoft.com/en-us/windows/win32/api/wingdi/ns-wingdi-displayconfig_sdr_white_level).
