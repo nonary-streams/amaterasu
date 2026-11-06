@@ -19,6 +19,7 @@ use std::{
 };
 
 type Transport = ModuleResult<Response>;
+mod retirement;
 
 fn display_admission_eligible(record: &crate::records::Record, now: Instant) -> bool {
     record.catalog_selection == CatalogSelection::Exported
@@ -80,6 +81,7 @@ pub struct Pipeline {
     ingress_since_monitor: u8,
     environment: BTreeMap<String, String>,
     retirement_observers: BTreeSet<String>,
+    application_retirement_observers: BTreeMap<String, String>,
     provider_routes: BTreeMap<String, ProviderRoute>,
     library_routes: BTreeMap<String, crate::library::Route>,
     prepared_context_service: Option<String>,
@@ -94,6 +96,7 @@ impl Pipeline {
             ingress_since_monitor: 0,
             environment,
             retirement_observers: BTreeSet::new(),
+            application_retirement_observers: BTreeMap::new(),
             provider_routes: BTreeMap::new(),
             library_routes: BTreeMap::new(),
             prepared_context_service: None,
@@ -246,7 +249,7 @@ impl Pipeline {
                 remaining_ms,
             } => {
                 self.ingress_since_monitor = self.ingress_since_monitor.saturating_add(1);
-                let operation = crate::library::decode(&service, payload, &caller, &initiator);
+                let operation = self.decode_operation(&service, payload, &caller, &initiator);
                 match operation {
                     Ok(operation) => {
                         self.receive(id, &caller, &initiator, remaining_ms, operation, &mut send)
@@ -279,11 +282,31 @@ impl Pipeline {
         else {
             return Ok(());
         };
-        let operation = crate::library::decode(&service, payload, &caller, &initiator);
+        let operation = self.decode_operation(&service, payload, &caller, &initiator);
         let response = match operation {
             Ok(Operation::EpochRead {}) => {
                 serde_json::json!({"ok":true,"operation_epoch":self.records.operation_epoch()})
             }
+            Ok(Operation::ApplicationRetirementStatus {
+                operation_id,
+                expected_runtime_epoch,
+            }) => {
+                self.application_retirement_status(&caller, &operation_id, &expected_runtime_epoch)
+            }
+            Ok(Operation::RetireOwned {
+                operation_id,
+                expected_runtime_epoch,
+            }) => match self.retire_operation(&caller, &operation_id, &expected_runtime_epoch) {
+                Ok(retirement::RetirementAction::Fenced(response)) => response,
+                Ok(retirement::RetirementAction::Stop(launch_id)) if launch_id == active_launch => {
+                    self.records
+                        .owned(&caller, launch_id)
+                        .map(|record| record.response())
+                        .unwrap_or_else(error)
+                }
+                Ok(_) => error("workflow_busy"),
+                Err(code) => error(code),
+            },
             Ok(Operation::VerifyRetirement {
                 owner,
                 launch_id,
@@ -330,8 +353,44 @@ impl Pipeline {
         else {
             return Ok(false);
         };
-        let operation = crate::library::decode(&service, payload, &caller, &initiator);
+        let operation = self.decode_operation(&service, payload, &caller, &initiator);
         match operation {
+            Ok(Operation::RetireOwned {
+                operation_id,
+                expected_runtime_epoch,
+            }) => {
+                let response =
+                    match self.retire_operation(&caller, &operation_id, &expected_runtime_epoch) {
+                        Ok(retirement::RetirementAction::Fenced(response)) => Some(response),
+                        Ok(retirement::RetirementAction::Stop(launch_id))
+                            if launch_id == job.launch_id =>
+                        {
+                            match self.begin_retirement_cleanup(&caller, launch_id, id, job) {
+                                Ok(response) => response,
+                                Err(code) => Some(error(code)),
+                            }
+                        }
+                        Ok(_) => Some(error("workflow_busy")),
+                        Err(code) => Some(error(code)),
+                    };
+                if let Some(response) = response {
+                    complete(send, id, response)?;
+                }
+            }
+            Ok(Operation::ApplicationRetirementStatus {
+                operation_id,
+                expected_runtime_epoch,
+            }) => {
+                complete(
+                    send,
+                    id,
+                    self.application_retirement_status(
+                        &caller,
+                        &operation_id,
+                        &expected_runtime_epoch,
+                    ),
+                )?;
+            }
             Ok(Operation::EpochRead {}) => {
                 complete(
                     send,
@@ -478,6 +537,31 @@ impl Pipeline {
                 request,
                 serde_json::json!({"ok":true,"operation_epoch":self.records.operation_epoch()}),
             ),
+            Operation::ApplicationRetirementStatus {
+                operation_id,
+                expected_runtime_epoch,
+            } => complete(
+                send,
+                request,
+                self.application_retirement_status(caller, &operation_id, &expected_runtime_epoch),
+            ),
+            Operation::RetireOwned {
+                operation_id,
+                expected_runtime_epoch,
+            } => match self.retire_operation(caller, &operation_id, &expected_runtime_epoch) {
+                Ok(retirement::RetirementAction::Fenced(response)) => {
+                    complete(send, request, response)
+                }
+                Ok(retirement::RetirementAction::Stop(launch_id)) => self.receive(
+                    request,
+                    caller,
+                    initiator,
+                    remaining_ms,
+                    Operation::Stop { launch_id },
+                    send,
+                ),
+                Err(code) => complete(send, request, error(code)),
+            },
             Operation::VerifyRetirement {
                 owner,
                 launch_id,
@@ -1880,8 +1964,10 @@ impl Pipeline {
             .expect("workflow record");
         record.state = record.cleanup_outcome.state();
         record.cleanup_error = None;
+        record.native_retirement_confirmed = true;
         record.retire_target();
         record.provider_ticket = None;
+        self.records.record_native_retirement(job.launch_id);
         self.reply(job, send)
     }
     fn reply(

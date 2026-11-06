@@ -125,6 +125,9 @@ pub struct Record {
     // Retained until cancellation and broker release are confirmed.
     #[serde(skip)]
     pub outstanding_request: Option<u64>,
+    /// Set only by the completed provider cleanup workflow, never a status label.
+    #[serde(skip)]
+    pub native_retirement_confirmed: bool,
 }
 
 pub struct DisplayAdmission {
@@ -167,6 +170,7 @@ pub struct Records {
     next_id: u64,
     admitted_operations: BTreeSet<(String, String)>,
     retired_operations: BTreeSet<(String, String)>,
+    cleaned_operations: BTreeSet<(String, String)>,
 }
 impl Records {
     pub fn new() -> Result<Self, &'static str> {
@@ -181,6 +185,7 @@ impl Records {
             next_id: 0,
             admitted_operations: BTreeSet::new(),
             retired_operations: BTreeSet::new(),
+            cleaned_operations: BTreeSet::new(),
         })
     }
     pub fn start(
@@ -207,7 +212,7 @@ impl Records {
                 return Err("stale_operation_epoch");
             }
             let key = (caller.to_owned(), operation_id.clone());
-            if self.retired_operations.contains(&key) {
+            if self.retired_operations.contains(&key) || self.cleaned_operations.contains(&key) {
                 return Err("operation_retired");
             }
             if self.admitted_operations.contains(&key)
@@ -287,6 +292,7 @@ impl Records {
                 prepared_environment: None,
                 state: State::Starting,
                 outstanding_request: None,
+                native_retirement_confirmed: false,
                 session_id: None,
                 process_id: None,
                 failure: None,
@@ -345,18 +351,32 @@ impl Records {
     }
 
     pub fn current_epoch_operation(&self, operation_id: &str) -> bool {
-        let Some(suffix) = operation_id.strip_prefix("ale1:") else {
-            return false;
+        tracked_operation_epoch(operation_id) == Some(self.operation_epoch.as_str())
+    }
+
+    /// Preserve same-runtime terminal proof after bounded launch records are
+    /// pruned. The tracked admission already reserved this tombstone capacity.
+    pub fn record_native_retirement(&mut self, id: u64) {
+        let Some(record) = self.values.get(&id) else {
+            return;
         };
-        let Some((epoch, nonce)) = suffix.split_once(':') else {
-            return false;
-        };
-        epoch == self.operation_epoch
-            && !nonce.is_empty()
-            && nonce.len() <= 80
-            && nonce
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+        if !record.native_retirement_confirmed
+            || !record.state.terminal()
+            || record.cleanup_error.is_some()
+            || record.outstanding_request.is_some()
+            || !self.current_epoch_operation(&record.operation_id)
+        {
+            return;
+        }
+        let key = (record.owner.clone(), record.operation_id.clone());
+        if self.admitted_operations.contains(&key) {
+            self.cleaned_operations.insert(key);
+        }
+    }
+
+    pub fn native_retired(&self, owner: &str, operation_id: &str) -> bool {
+        self.cleaned_operations
+            .contains(&(owner.to_owned(), operation_id.to_owned()))
     }
 
     pub fn tombstone_absent(
@@ -467,6 +487,20 @@ impl Records {
         };
         json!({"ok":true,"launches":records,"next_offset":next})
     }
+}
+
+pub(crate) fn tracked_operation_epoch(operation_id: &str) -> Option<&str> {
+    let (epoch, nonce) = operation_id.strip_prefix("ale1:")?.split_once(':')?;
+    (epoch.len() == 32
+        && epoch
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        && !nonce.is_empty()
+        && nonce.len() <= 80
+        && nonce
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte)))
+    .then_some(epoch)
 }
 
 impl Record {

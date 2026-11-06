@@ -29,6 +29,7 @@ impl ManagedModule for LaunchModule {
             .map_err(str::to_owned)?;
         let mut pipeline = Pipeline::new(environment).map_err(str::to_owned)?;
         pipeline.set_retirement_observers(settings.retirement_observers);
+        pipeline.set_application_retirement_observers(settings.application_retirement_observers);
         pipeline.set_provider_routes(settings.provider_routes);
         pipeline.set_library_routes(settings.library_routes);
         pipeline.set_prepared_context_service(settings.prepared_context_service);
