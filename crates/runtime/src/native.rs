@@ -347,3 +347,6 @@ mod data_plane_tests;
 
 #[cfg(test)]
 mod network_typed_tests;
+
+#[cfg(test)]
+mod capture_preflight_tests;
