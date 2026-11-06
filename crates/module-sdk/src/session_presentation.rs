@@ -313,6 +313,20 @@ pub enum Request {
     },
 }
 
+impl From<Observation> for Request {
+    fn from(observation: Observation) -> Self {
+        Self::Observe {
+            client_id: observation.client_id,
+            session_id: observation.session_id,
+            generation: observation.generation,
+            reservation_id: observation.reservation_id,
+            transport_id: observation.transport_id,
+            transport_epoch: observation.transport_epoch,
+            event: observation.event,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Reply {

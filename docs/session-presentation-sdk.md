@@ -37,6 +37,15 @@ The runtime authenticates module principals. The adapter must separately derive
 terminate permissions. A query-string client identifier is not that authority.
 Native plugins remain trusted code; these grants do not sandbox native code.
 
+Amaterasu's pairing authority grants permissions independently per certificate.
+Its supplied client labels are not unique: two approved certificates may share
+one label and have different permissions. The built-in adapter therefore uses
+the authenticated certificate fingerprint consistently for game ownership,
+retained roles and layouts. A rotated or newly paired certificate is a distinct
+identity. Cross-certificate continuity requires a future explicit association
+owned by the pairing authority; labels or protocol `uniqueid` values cannot
+establish it.
+
 An explicitly selected provider's absence, incompatible schema or rejected
 request is an error. Consumers must not silently select a built-in policy.
 
@@ -111,6 +120,8 @@ transport operation and runtime epoch. `StreamStarted` follows actual startup.
 `StreamEnded` follows native retirement, and `FailedStart` releases the exact
 provisional reservation. Retire broker results and retry uncertain observations
 without retargeting their identities.
+`Request::from(observation)` preserves the complete observation when forwarding
+it through the API adapter.
 
 `ExplicitDisconnect` applies to the auxiliary role. A normal application can
 continue holding an independently admitted reservation on the same output. The
