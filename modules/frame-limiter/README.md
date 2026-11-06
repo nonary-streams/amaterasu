@@ -249,6 +249,15 @@ current user's Steam roots. Trusted plugin startup settings may instead supply
 `proton_runtime_directory` and `proton_steam_roots`; paths must be absolute and
 the worker still checks ownership before writing.
 
+The lifecycle journal is persistent: it lives under
+`$XDG_STATE_HOME/amaterasu/frame-limiter`, falling back to
+`$HOME/.local/state/amaterasu/frame-limiter`. It retains provider revisions,
+receipts and cleanup ownership across logout and reboot. On first use, the
+provider imports an existing runtime journal while holding both journal locks;
+an existing persistent journal always takes precedence. Worker sockets and
+temporary policies remain under the runtime directory. Trusted startup settings
+may override journal storage with the absolute `proton_state_directory` path.
+
 When Steam's pressure-vessel runtime hides that directory, the Proton hook
 reads its policy from the live plugin worker over a bounded Unix abstract
 socket. Both ends check the peer's user ID; the socket is specific to that

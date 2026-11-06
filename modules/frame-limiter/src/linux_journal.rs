@@ -277,7 +277,51 @@ pub(crate) struct Journal {
 }
 
 impl Journal {
+    /// Keep lifecycle revisions and ownership across login sessions and reboots.
+    /// The worker's sockets and transient policy files still use the runtime
+    /// directory. Import its old journal only on the first persistent open,
+    /// holding both journal locks throughout the copy.
+    pub(crate) fn open_persistent(
+        root: &Path,
+        legacy_root: Option<&Path>,
+    ) -> Result<(Self, State, bool), &'static str> {
+        use std::os::unix::fs::DirBuilderExt;
+        if !root.is_absolute() {
+            return Err("state_directory_unavailable");
+        }
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(root)
+            .map_err(|_| "state_directory_unavailable")?;
+        let destination = root.join("amaterasu/frame-limiter/lifecycle.json");
+        let legacy = legacy_root.filter(|legacy| *legacy != root);
+        let imported = if destination
+            .try_exists()
+            .map_err(|_| "journal_unavailable")?
+        {
+            None
+        } else if let Some(legacy) = legacy
+            && legacy
+                .join("amaterasu/frame-limiter/lifecycle.json")
+                .try_exists()
+                .map_err(|_| "journal_unavailable")?
+        {
+            Some(Self::open(legacy)?)
+        } else {
+            None
+        };
+        if let Some((_legacy_lock, imported, _recovering)) = imported {
+            return Self::open_seeded(root, Some(imported));
+        }
+        Self::open(root)
+    }
+
     pub(crate) fn open(root: &Path) -> Result<(Self, State, bool), &'static str> {
+        Self::open_seeded(root, None)
+    }
+
+    fn open_seeded(root: &Path, seed: Option<State>) -> Result<(Self, State, bool), &'static str> {
         use std::os::unix::fs::OpenOptionsExt;
         if !root.is_absolute() {
             return Err("runtime_directory_unavailable");
@@ -335,9 +379,15 @@ impl Journal {
                 Ok((journal, state, recovery))
             }
             None => {
-                let state = State::new()?;
+                let state = match seed {
+                    Some(state) => state,
+                    None => State::new()?,
+                };
+                let recovering = !state.receipts.is_empty()
+                    || !state.worker_policies.is_empty()
+                    || state.pending_policies.is_some();
                 journal.save(&state)?;
-                Ok((journal, state, false))
+                Ok((journal, state, recovering))
             }
         }
     }
@@ -471,6 +521,31 @@ fn open_at(
 mod tests {
     use super::*;
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt, symlink};
+
+    #[test]
+    fn persistent_journal_survives_runtime_directory_loss() {
+        let runtime = Fixture::new();
+        let persistent = Fixture::new();
+        let (mut legacy, mut state, _) = Journal::open(&runtime.0).unwrap();
+        state.revision = 197;
+        legacy.save(&state).unwrap();
+        let owner = state.owner_id.clone();
+        drop(legacy);
+
+        let (journal, state, _) =
+            Journal::open_persistent(&persistent.0, Some(&runtime.0)).unwrap();
+        assert_eq!(state.revision, 197);
+        assert_eq!(state.owner_id, owner);
+        drop(journal);
+        std::fs::remove_dir_all(runtime.0.join("amaterasu")).unwrap();
+
+        // A reboot creates a fresh runtime directory and a revision-1 journal.
+        let (legacy, _, _) = Journal::open(&runtime.0).unwrap();
+        drop(legacy);
+        let (_, state, _) = Journal::open_persistent(&persistent.0, Some(&runtime.0)).unwrap();
+        assert_eq!(state.revision, 197);
+        assert_eq!(state.owner_id, owner);
+    }
 
     struct Fixture(std::path::PathBuf);
     impl Fixture {

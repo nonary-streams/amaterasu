@@ -45,6 +45,7 @@ struct Record {
 pub(crate) struct Backend {
     mangohud: crate::linux_availability::MangoHudProbe,
     runtime_root: Option<PathBuf>,
+    journal_root: Option<PathBuf>,
     steam_roots: Vec<PathBuf>,
     worker: Option<ProtonWorker>,
     ready: bool,
@@ -68,6 +69,13 @@ impl Backend {
                 return Err("invalid_runtime_directory");
             }
             backend.runtime_root = Some(path);
+        }
+        if let Some(root) = settings.get("proton_state_directory") {
+            let path = PathBuf::from(root.as_str().ok_or("invalid_state_directory")?);
+            if !path.is_absolute() {
+                return Err("invalid_state_directory");
+            }
+            backend.journal_root = Some(path);
         }
         if let Some(roots) = settings.get("proton_steam_roots") {
             let roots: Vec<PathBuf> =
@@ -108,12 +116,19 @@ impl Backend {
             .map(PathBuf::from)
             .map(|home| vec![home.join(".steam/steam"), home.join(".local/share/Steam")])
             .unwrap_or_default();
-        Self::new(runtime_root, steam_roots)
+        let mut backend = Self::new(runtime_root, steam_roots);
+        backend.journal_root = std::env::var_os("XDG_STATE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state"))
+            });
+        backend
     }
 
     fn new(runtime_root: Option<PathBuf>, steam_roots: Vec<PathBuf>) -> Self {
         Self {
             mangohud: crate::linux_availability::MangoHudProbe::from_environment(),
+            journal_root: runtime_root.clone(),
             runtime_root,
             steam_roots,
             worker: None,
@@ -131,11 +146,12 @@ impl Backend {
 
     fn initialize(&mut self) -> Result<(), &'static str> {
         if self.journal.is_none() {
-            let (journal, state, recovering) = Journal::open(
-                self.runtime_root
-                    .as_deref()
-                    .ok_or("runtime_directory_unavailable")?,
-            )?;
+            let root = self
+                .journal_root
+                .as_deref()
+                .ok_or("state_directory_unavailable")?;
+            let (journal, state, recovering) =
+                Journal::open_persistent(root, self.runtime_root.as_deref())?;
             self.journal = Some(journal);
             self.state = state;
             self.recovering = recovering;
@@ -723,6 +739,7 @@ mod tests {
             self.backend = Backend::new(None, vec![]);
             self.backend = Backend::configured(&json!({
                 "proton_runtime_directory":self.root,
+                "proton_state_directory":self.root,
                 "proton_steam_roots":[self.root.join("steam")]
             }))
             .unwrap();
@@ -973,7 +990,7 @@ mod tests {
     #[test]
     fn externally_changed_journal_blocks_effects_and_second_owner_cannot_open_it() {
         let mut fixture = Fixture::new();
-        assert!(Backend::configured(&json!({"proton_runtime_directory":fixture.root})).is_err());
+        assert!(Backend::configured(&json!({"proton_runtime_directory":fixture.root,"proton_state_directory":fixture.root})).is_err());
         let path = fixture.root.join("amaterasu/frame-limiter/lifecycle.json");
         let mut bytes = std::fs::read(&path).unwrap();
         bytes.push(b' ');
