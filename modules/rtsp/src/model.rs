@@ -1051,7 +1051,8 @@ impl Open {
             return Err("invalid_profile");
         }
         match (&self.virtual_sink, self.channels) {
-            (None, None) if valid_label(&self.capture.audio_endpoint, 4096) => {}
+            (None, None)
+                if !self.stream_audio || valid_label(&self.capture.audio_endpoint, 4096) => {}
             (None, _) => return Err("invalid_virtual_sink_channels"),
             (Some(selector), Some(channels))
                 if selector.len() <= 4096
@@ -2680,6 +2681,43 @@ mod tests {
         assert_eq!(payload["audio"]["packet_ms"], 10);
         assert_eq!(payload["audio"]["bitrate"], 128_000);
         assert_eq!(payload["encrypt_audio"], true);
+    }
+
+    #[test]
+    fn auxiliary_capture_without_audio_needs_no_audio_endpoint_or_display_admission() {
+        for (provider, output) in [("black", "black"), ("virtual_screen", "kwin:Virtual-17")] {
+            let mut input = open_json();
+            input["stream_audio"] = json!(false);
+            input["capture_sink_without_routing"] = json!(true);
+            input["capture"]["capture_provider"] = json!(provider);
+            input["capture"]["output"] = json!(output);
+            input["capture"]["audio_endpoint"] = json!("");
+            input["capture"]["host_audio_enabled"] = json!(true);
+            let selected: Open = serde_json::from_value(input.clone()).unwrap();
+            assert_eq!(selected.validate(false), decode_key(&selected.key_hex));
+            assert!(!selected.display_admission_required());
+            let prepare = selected.prepare("auxiliary", None);
+            assert_eq!(prepare["stream_audio"], false);
+            assert!(prepare.get("display_request").is_none());
+            assert!(prepare.get("virtual_display_intent").is_none());
+            assert!(prepare.get("lifecycle_session_target").is_none());
+            let arm = selected.arm(51);
+            assert_eq!(arm["configuration"]["capture_provider"], provider);
+            assert_eq!(arm["configuration"]["output"], output);
+            assert_eq!(arm["configuration"]["audio_endpoint"], "");
+            assert_eq!(arm["configuration"]["capture_sink_without_routing"], true);
+
+            input["stream_audio"] = json!(true);
+            let missing_endpoint: Open = serde_json::from_value(input.clone()).unwrap();
+            assert_eq!(
+                missing_endpoint.validate(false),
+                Err("invalid_virtual_sink_channels")
+            );
+            input["stream_audio"] = json!(false);
+            input["capture"]["audio_endpoint"] = json!("invalid\nendpoint");
+            let malformed: Open = serde_json::from_value(input).unwrap();
+            assert_eq!(malformed.validate(false), Err("invalid_profile"));
+        }
     }
 
     #[test]
