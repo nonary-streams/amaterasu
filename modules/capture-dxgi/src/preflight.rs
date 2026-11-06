@@ -90,6 +90,12 @@ fn unsupported_mode(request: &SourcePreflightRequest) -> Option<SourcePreflightR
             "hdr_capture_unavailable",
         ));
     }
+    if request.mode.bit_depth == Some(10) {
+        return Some(SourcePreflightResponse::unsupported(
+            request,
+            "capture_depth_unavailable",
+        ));
+    }
     let frame_bytes = u64::from(request.mode.width) * u64::from(request.mode.height) * 4;
     if frame_bytes > MAX_FRAME_BYTES as u64 {
         return Some(SourcePreflightResponse::unsupported(
@@ -116,6 +122,8 @@ fn ready(request: &SourcePreflightRequest) -> SourcePreflightResponse {
             max_refresh_millihz: 1_000_000,
             sdr: true,
             hdr: false,
+            bit_depths: vec![8],
+            format_open: false,
         }],
     )
 }
@@ -196,6 +204,7 @@ mod tests {
                 height: 1080,
                 refresh_millihz: 60_000,
                 hdr: false,
+                bit_depth: None,
             },
         }
     }
@@ -210,6 +219,12 @@ mod tests {
             SourceReadiness::Unsupported
         );
         request.mode.hdr = false;
+        request.mode.bit_depth = Some(10);
+        assert_eq!(
+            unsupported_mode(&request).unwrap().reason.as_deref(),
+            Some("capture_depth_unavailable")
+        );
+        request.mode.bit_depth = None;
         request.mode.width = 8192;
         request.mode.height = 8192;
         assert_eq!(
