@@ -16,6 +16,8 @@ use std::{
 };
 
 const OPEN_SESSION: &[u8] = b"AMACA001";
+const PRECHECK: &[u8] = b"AMACAP01";
+const PRECHECK_READY: &[u8] = b"AMACAPOK";
 const SESSION_READY: &[u8] = b"AMACAOK1";
 const SESSION_DENIED: &[u8] = b"AMACANO1";
 const MAX_SESSIONS: usize = 8;
@@ -183,25 +185,21 @@ fn serve_control(
         if received.is_end_of_stream() {
             return Ok(());
         }
-        if received.truncated
-            || received.descriptors_truncated
-            || !received.descriptors.is_empty()
-            || &buffer[..received.len] != OPEN_SESSION
+        if received.truncated || received.descriptors_truncated || !received.descriptors.is_empty()
         {
             return Err("malformed authority control request".into());
         }
-        if sessions.len() >= MAX_SESSIONS {
-            control
-                .send(SESSION_DENIED, &[])
-                .map_err(|e| e.to_string())?;
+        let Some(executable) =
+            prepare_control_request(control, &buffer[..received.len], sessions.len(), || {
+                // Recheck publisher, exact package, protected helper hash and
+                // capabilities for both operations. This only reads installation
+                // state; PRECHECK never enters the session allocation branch.
+                verify_installation(options, approval)?;
+                files::verify_file(helper_path, &approval.request.helper.sha256, true, true)
+            })?
+        else {
             continue;
-        }
-        // Recheck the protected publisher trust and exact package before new
-        // sessions. Existing sessions are revoked by removing the approval.
-        verify_installation(options, approval)?;
-        // Fresh same-inode hash and capability checks before each execution.
-        let executable =
-            files::verify_file(helper_path, &approval.request.helper.sha256, true, true)?;
+        };
         let (server, client) = SeqpacketChannel::pair().map_err(|e| e.to_string())?;
         let shutdown = server.shutdown_handle().map_err(|e| e.to_string())?;
         let session_store = store.try_clone()?;
@@ -222,6 +220,87 @@ fn serve_control(
             return Err(error.to_string());
         }
         sessions.push((shutdown, handle));
+    }
+}
+
+/// Return an executable only for an authorized OPEN. PRECHECK shares all
+/// protected verification and returns an empty acknowledgement: no session
+/// socketpair, SCM_RIGHTS descriptor, helper process or worker is allocated.
+fn prepare_control_request(
+    control: &SeqpacketChannel,
+    bytes: &[u8],
+    active_sessions: usize,
+    verify: impl FnOnce() -> AuthorityResult<File>,
+) -> AuthorityResult<Option<File>> {
+    if bytes == PRECHECK {
+        drop(verify()?);
+        control
+            .send(PRECHECK_READY, &[])
+            .map_err(|error| error.to_string())?;
+        return Ok(None);
+    }
+    if bytes != OPEN_SESSION {
+        return Err("malformed authority control request".into());
+    }
+    if active_sessions >= MAX_SESSIONS {
+        control
+            .send(SESSION_DENIED, &[])
+            .map_err(|error| error.to_string())?;
+        return Ok(None);
+    }
+    verify().map(Some)
+}
+
+#[cfg(test)]
+mod precheck_tests {
+    use super::*;
+    #[test]
+    fn precheck_transcript_rechecks_authority_without_allocating_a_session() {
+        let (client, server) = SeqpacketChannel::pair().unwrap();
+        client.send(PRECHECK, &[]).unwrap();
+        let mut bytes = [0; 9];
+        let packet = server.receive(&mut bytes).unwrap();
+        assert!(!packet.truncated && packet.descriptors.is_empty());
+        let verified = std::cell::Cell::new(0);
+        let opened = prepare_control_request(&server, &bytes[..packet.len], MAX_SESSIONS, || {
+            verified.set(verified.get() + 1);
+            File::open("/dev/null").map_err(|error| error.to_string())
+        })
+        .unwrap();
+        assert!(
+            opened.is_none(),
+            "no execution/session continuation is returned"
+        );
+        assert_eq!(
+            verified.get(),
+            1,
+            "precheck does not reuse an admission result"
+        );
+        let reply = client.receive(&mut bytes).unwrap();
+        assert_eq!(&bytes[..reply.len], PRECHECK_READY);
+        assert!(!reply.truncated && !reply.descriptors_truncated && reply.descriptors.is_empty());
+    }
+    #[test]
+    fn revoked_precheck_and_unknown_requests_cannot_reach_session_creation() {
+        let (client, server) = SeqpacketChannel::pair().unwrap();
+        client
+            .set_receive_timeout(Some(Duration::from_millis(1)))
+            .unwrap();
+        let error =
+            prepare_control_request(&server, PRECHECK, 0, || Err("approval revoked".into()))
+                .err()
+                .unwrap();
+        assert_eq!(error, "approval revoked");
+        assert!(
+            client.receive(&mut [0; 9]).is_err(),
+            "no readiness acknowledgement follows failed verification"
+        );
+        assert!(
+            prepare_control_request(&server, b"AMACAP00", 0, || panic!(
+                "unknown opcode must not verify or open"
+            ))
+            .is_err()
+        );
     }
 }
 
