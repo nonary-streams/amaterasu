@@ -353,6 +353,7 @@ fn configure_capture_routes(policy: &mut RuntimeConfig) {
     if let Some(settings) = policy.settings.get_mut("amaterasu.nvhttp") {
         settings["session_presentation_provider"] = json!(session_presentation::SERVICE);
         settings["auxiliary_black_capture_provider"] = json!("black");
+        settings["auxiliary_black_capture_route_key"] = json!("synthetic_black");
         settings["auxiliary_exact_capture_provider"] = json!(exact_capture);
         settings["auxiliary_exact_capture_routes"] = exact_routes.clone();
     }

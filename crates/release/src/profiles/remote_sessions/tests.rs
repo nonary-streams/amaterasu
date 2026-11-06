@@ -71,6 +71,10 @@ fn installer_selects_exact_contracts_and_keeps_hardware_disabled() {
         policy.settings["amaterasu.nvhttp"]["session_presentation_provider"],
         session_presentation::SERVICE
     );
+    assert_eq!(
+        policy.settings["amaterasu.nvhttp"]["auxiliary_black_capture_route_key"],
+        "synthetic_black"
+    );
     assert_eq!(policy.settings["amaterasu.input"]["allow_injection"], false);
     assert_eq!(
         policy.settings["amaterasu.display"]["allow_mutation"],
