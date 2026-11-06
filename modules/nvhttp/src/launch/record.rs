@@ -37,6 +37,9 @@ impl State {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stage {
+    ReadRtspRuntimeEpoch,
+    BindPresentationTransport,
+    VerifyBorrowedCapture,
     ReserveHistory,
     ReadProtonPolicy,
     PreflightApplication,
@@ -67,8 +70,22 @@ pub struct Record {
     /// Joining transports borrow the application/session retained by this root.
     /// Only the root may terminate the application or end the lifecycle session.
     pub application_session: Option<u64>,
+    pub application_owner_client_id: String,
+    pub presentation_client_id: Option<String>,
     pub transport_only_cleanup: bool,
     pub desktop: bool,
+    pub auxiliary: Option<super::auxiliary::AuxiliaryRecord>,
+    pub shared_capture: Option<amaterasu_module_sdk::session_presentation::SharedCapture>,
+    pub application_source: Option<super::auxiliary::ApplicationSourceHold>,
+    pub source_started_reported: bool,
+    pub source_ended_reported: bool,
+    pub borrowed_capture_verified: bool,
+    pub rtsp_runtime_epoch: Option<String>,
+    pub presentation_transport_bound: bool,
+    pub presentation_continue_stage: Stage,
+    pub presentation_application_bound: bool,
+    pub authenticated_client_disconnected: bool,
+    pub delivery_permission: crate::wire::Permission,
     pub resumed: bool,
     pub peer: PeerIdentity,
     pub request: LaunchRequest,
@@ -258,9 +275,12 @@ impl Record {
             height: request.height,
             refresh_millihz: request.fps * 1_000,
         });
+        let application_owner_client_id = super::fingerprint(peer.certificate());
         Self {
             id,
             application_session: None,
+            application_owner_client_id,
+            presentation_client_id: None,
             transport_only_cleanup: false,
             encoder_snapshot: None,
             video_codec_offer: CodecOffer {
@@ -268,6 +288,18 @@ impl Record {
                 software_limited: true,
             },
             desktop: false,
+            auxiliary: None,
+            shared_capture: None,
+            application_source: None,
+            source_started_reported: false,
+            source_ended_reported: false,
+            borrowed_capture_verified: false,
+            rtsp_runtime_epoch: None,
+            presentation_transport_bound: false,
+            presentation_continue_stage: Stage::ReserveHistory,
+            presentation_application_bound: false,
+            authenticated_client_disconnected: false,
+            delivery_permission: crate::wire::Permission::Launch,
             resumed: false,
             peer,
             request,

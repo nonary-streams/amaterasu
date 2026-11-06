@@ -16,6 +16,7 @@ use amaterasu_contracts::virtual_display::{
     VirtualDisplayRefreshRateOption, VirtualDisplayResolutionOption, VirtualDisplayResolverContext,
 };
 use amaterasu_module_sdk::LogLevel;
+use amaterasu_module_sdk::retirement::{self, Contract};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -30,6 +31,10 @@ const SESSION_LIFECYCLE_SERVICE: &str = "amaterasu.session-lifecycle/1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
+    BindPresentationApplication,
+    ReadRtspRuntimeEpoch,
+    BindPresentationTransport,
+    VerifyBorrowedCapture,
     ReadLaunchEpoch,
     PrepareLifecycle,
     LookupLifecycle,
@@ -70,6 +75,10 @@ impl Phase {
 
     fn response_reported_failure(self, payload: &Value) -> bool {
         match self {
+            Self::BindPresentationTransport | Self::BindPresentationApplication => {
+                payload["result"] != "acknowledged"
+            }
+            Self::VerifyBorrowedCapture => payload["result"] != "verified",
             Self::PrepareLifecycle
             | Self::LookupLifecycle
             | Self::BindApplication
@@ -140,16 +149,20 @@ fn log_monitor_problem(
 
 impl Controller {
     pub(super) fn schedule(&mut self, now: Instant) {
+        let eligible = |record: &&Record| {
+            needs_work(record, now) && !self.application_cleanup_waits_for_clients(record)
+        };
         let Some(id) = self
             .records
             .values()
-            .find(|record| {
-                needs_work(record, now) && !self.application_cleanup_waits_for_clients(record)
-            })
+            .filter(|record| record.id > self.last_scheduled_record)
+            .find(eligible)
+            .or_else(|| self.records.values().find(eligible))
             .map(|record| record.id)
         else {
             return;
         };
+        self.last_scheduled_record = id;
         let Some(mut record) = self.records.remove(&id) else {
             return;
         };
@@ -184,6 +197,14 @@ impl Controller {
             && (record.global_display_revision.is_none() || record.peer.client_id.is_none())
         {
             record.request_cleanup(Some("lifecycle_context_unavailable"), now);
+            self.records.insert(id, record);
+            return;
+        }
+        if phase == Phase::PrepareLifecycle
+            && record.shared_capture.is_some()
+            && !record.borrowed_capture_verified
+        {
+            record.request_cleanup(Some("borrowed_capture_unverified"), now);
             self.records.insert(id, record);
             return;
         }
@@ -231,7 +252,11 @@ impl Controller {
             Outcome::Result(payload) => {
                 if matches!(
                     job.phase,
-                    Phase::ReadLaunchEpoch
+                    Phase::BindPresentationApplication
+                        | Phase::ReadRtspRuntimeEpoch
+                        | Phase::BindPresentationTransport
+                        | Phase::VerifyBorrowedCapture
+                        | Phase::ReadLaunchEpoch
                         | Phase::PrepareLifecycle
                         | Phase::LookupLifecycle
                         | Phase::BindApplication
@@ -309,7 +334,11 @@ impl Controller {
                     | Phase::LookupApplication => {
                         record.application_cleanup_blocked = true;
                     }
-                    Phase::PreflightApplication
+                    Phase::BindPresentationApplication
+                    | Phase::ReadRtspRuntimeEpoch
+                    | Phase::BindPresentationTransport
+                    | Phase::VerifyBorrowedCapture
+                    | Phase::PreflightApplication
                     | Phase::ReadProtonPolicy
                     | Phase::SnapshotDisplay
                     | Phase::EnumerateDisplay
@@ -335,6 +364,18 @@ impl Controller {
 
     fn advance_after_history(config: Option<&StreamingConfig>, record: &mut Record, now: Instant) {
         if record.state != State::Starting {
+            return;
+        }
+        if record.auxiliary.is_some() {
+            match config {
+                Some(config) => {
+                    match super::auxiliary::prepare_auxiliary(record, &config.profile) {
+                        Ok(()) => record.stage = Stage::OpenRtsp,
+                        Err(code) => fail_record(record, code, now),
+                    }
+                }
+                None => fail_record(record, "streaming_disabled", now),
+            }
             return;
         }
         if record.resumed && record.lifecycle_session_target.is_some() {
@@ -386,6 +427,121 @@ impl Controller {
     }
 
     fn make_call(&mut self, record: &mut Record, phase: Phase) -> Call {
+        if matches!(phase, Phase::ReadRtspRuntimeEpoch | Phase::ReadLaunchEpoch) {
+            let contract = if phase == Phase::ReadRtspRuntimeEpoch {
+                Contract::Transport
+            } else {
+                Contract::Application
+            };
+            let operation = self.next_operation(record, phase.name());
+            let command = retirement::epoch_command(
+                amaterasu_module_sdk::requests::RequestOptions {
+                    service: contract.service(),
+                    timeout_ms: 5_000,
+                    operation_id: &operation,
+                    parent: None,
+                },
+                contract,
+            )
+            .expect("validated owner epoch request");
+            return Call::from_command(command);
+        }
+        if phase == Phase::BindPresentationApplication {
+            let operation = self.next_operation(record, phase.name());
+            let source = record
+                .application_source
+                .as_ref()
+                .expect("shared application source");
+            let application_epoch = record
+                .application_operation
+                .strip_prefix("ale1:")
+                .and_then(|value| value.split_once(':').map(|(epoch, _)| epoch))
+                .expect("authoritative launch epoch");
+            let command = amaterasu_module_sdk::session_presentation::command(
+                amaterasu_module_sdk::requests::RequestOptions {
+                    service: amaterasu_module_sdk::session_presentation::SERVICE,
+                    timeout_ms: 5_000,
+                    operation_id: &operation,
+                    parent: None,
+                },
+                &amaterasu_module_sdk::session_presentation::Request::BindApplication {
+                    client_id: source.client_id.clone(),
+                    session_id: source.source.session_id.clone(),
+                    generation: source.source.generation,
+                    reservation_id: source.source.reservation_id.clone(),
+                    application_operation_id: record.application_operation.clone(),
+                    application_epoch: application_epoch.into(),
+                    application_generation: record.id,
+                },
+            )
+            .expect("validated application source binding");
+            return Call::from_command(command);
+        }
+        if phase == Phase::BindPresentationTransport {
+            let operation = self.next_operation(record, phase.name());
+            let (session_id, generation, reservation_id) =
+                if let Some(auxiliary) = record.auxiliary.as_ref() {
+                    (
+                        &auxiliary.plan.session_id,
+                        auxiliary.plan.generation,
+                        &auxiliary.plan.reservation_id,
+                    )
+                } else {
+                    let source = record.shared_capture.as_ref().expect("presentation source");
+                    (
+                        &source.session_id,
+                        source.generation,
+                        &source.reservation_id,
+                    )
+                };
+            let command = amaterasu_module_sdk::session_presentation::command(
+                amaterasu_module_sdk::requests::RequestOptions {
+                    service: amaterasu_module_sdk::session_presentation::SERVICE,
+                    timeout_ms: 5_000,
+                    operation_id: &operation,
+                    parent: None,
+                },
+                &amaterasu_module_sdk::session_presentation::Request::BindTransport {
+                    client_id: record
+                        .presentation_client_id
+                        .clone()
+                        .unwrap_or_else(|| super::fingerprint(record.peer.certificate())),
+                    session_id: session_id.clone(),
+                    generation,
+                    reservation_id: reservation_id.clone(),
+                    transport_id: record.rtsp_operation.clone(),
+                    transport_epoch: record
+                        .rtsp_runtime_epoch
+                        .clone()
+                        .expect("observed runtime epoch"),
+                },
+            )
+            .expect("validated transport reservation binding");
+            return Call::from_command(command);
+        }
+        if phase == Phase::VerifyBorrowedCapture {
+            let operation = self.next_operation(record, phase.name());
+            let command = amaterasu_module_sdk::session_presentation::command(
+                amaterasu_module_sdk::requests::RequestOptions {
+                    service: amaterasu_module_sdk::session_presentation::SERVICE,
+                    timeout_ms: 5_000,
+                    operation_id: &operation,
+                    parent: None,
+                },
+                &amaterasu_module_sdk::session_presentation::Request::VerifySource {
+                    client_id: record
+                        .presentation_client_id
+                        .clone()
+                        .unwrap_or_else(|| super::fingerprint(record.peer.certificate())),
+                    source: record
+                        .shared_capture
+                        .clone()
+                        .expect("validated shared source"),
+                },
+            )
+            .expect("validated borrowed capture verification request");
+            return Call::from_command(command);
+        }
         if record.rtsp_reconcile == Some(phase) {
             record.rtsp_reconcile = None;
         }
@@ -393,7 +549,16 @@ impl Controller {
             record.application_reconcile = None;
         }
         let (service, mut payload, timeout_ms) = match phase {
-            Phase::ReadLaunchEpoch => (LAUNCH_SERVICE, json!({"action":"operation_epoch"}), 5_000),
+            Phase::BindPresentationApplication => {
+                unreachable!("handled before ordinary broker calls")
+            }
+            Phase::ReadRtspRuntimeEpoch | Phase::ReadLaunchEpoch => {
+                unreachable!("handled by the public retirement adapter")
+            }
+            Phase::BindPresentationTransport => {
+                unreachable!("handled before ordinary broker calls")
+            }
+            Phase::VerifyBorrowedCapture => unreachable!("handled before ordinary broker calls"),
             Phase::PrepareLifecycle => {
                 record.lifecycle_prepare_dispatched = true;
                 (
@@ -558,7 +723,7 @@ impl Controller {
                     "output":record.capture_output,
                     "encoder":record.selected_encoder,
                     "audio_endpoint":record.audio_endpoint,
-                    "host_audio_enabled":record.request.host_audio_enabled,
+                    "host_audio_enabled":record.auxiliary.as_ref().map_or(record.request.host_audio_enabled, |auxiliary| auxiliary.plan.host_audio),
                 });
                 let mut profile = json!({
                     "width": record.request.width,
@@ -714,6 +879,44 @@ impl Controller {
             payload["lifecycle_client_context"] = json!(record.peer.client_id.as_ref().map(|id| json!({"client_ref":id,"properties":record.peer.client_properties,
                 "display_mode":record.peer.client_display_mode.map(|mode| json!({"width":mode.width,"height":mode.height,"refresh_millihz":mode.refresh_millihz}))})));
         }
+        if matches!(phase, Phase::PrepareLifecycle | Phase::OpenRtsp)
+            && let Some(source) = record.shared_capture.as_ref()
+            && let amaterasu_module_sdk::session_presentation::CaptureSource::ExactOutput {
+                output,
+                route_key,
+            } = &source.capture
+        {
+            payload["borrowed_capture"] = json!({
+                "client_id":record.presentation_client_id.clone().unwrap_or_else(||super::fingerprint(record.peer.certificate())),
+                "session_id":source.session_id,
+                "generation":source.generation,
+                "reservation_id":source.reservation_id,
+                "transport_id":record.rtsp_operation,
+                "transport_epoch":record.rtsp_runtime_epoch,
+                "output":output,
+                "route_key":route_key,
+                "mode":source.mode,
+            });
+        }
+        if matches!(phase, Phase::OpenRtsp) && record.shared_capture.is_some() {
+            for key in [
+                "display_policy_snapshot",
+                "display_request",
+                "application_display_settings",
+                "virtual_display_intent",
+                "display_admission_token",
+            ] {
+                payload
+                    .as_object_mut()
+                    .expect("RTSP open payload")
+                    .remove(key);
+            }
+        }
+        if matches!(phase, Phase::OpenRtsp)
+            && let Some(epoch) = record.rtsp_runtime_epoch.as_ref()
+        {
+            payload["expected_runtime_epoch"] = json!(epoch);
+        }
         if matches!(phase, Phase::OpenRtsp)
             && let Some(policy) = record.video_encryption_policy
         {
@@ -729,6 +932,7 @@ impl Controller {
                 .remove("display_request");
         }
         if matches!(phase, Phase::OpenRtsp)
+            && record.shared_capture.is_none()
             && (record.display_request.is_some()
                 || record.virtual_display_intent.is_some()
                 || record.application_display_settings.is_some())
@@ -849,16 +1053,70 @@ impl Controller {
             return;
         }
         match job.phase {
-            Phase::ReadLaunchEpoch => {
-                let epoch = payload["operation_epoch"].as_str().filter(|value| {
-                    value.len() == 32
-                        && value
-                            .bytes()
-                            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-                });
-                if payload["ok"] == true
-                    && let Some(epoch) = epoch
+            Phase::BindPresentationApplication => {
+                let bound = amaterasu_module_sdk::session_presentation::decode_reply(payload)
+                    .is_ok_and(|reply| {
+                        matches!(
+                            reply,
+                            amaterasu_module_sdk::session_presentation::Reply::Acknowledged {}
+                        )
+                    });
+                if bound && record.state == State::Starting {
+                    record.presentation_application_bound = true;
+                } else {
+                    fail_record(record, "presentation_application_unbound", now);
+                }
+            }
+            Phase::ReadRtspRuntimeEpoch => {
+                if let Ok(epoch) = retirement::parse_epoch(Contract::Transport, &payload) {
+                    record.rtsp_runtime_epoch = Some(epoch);
+                    record.stage = Stage::BindPresentationTransport;
+                } else if payload["ok"] == true
+                    && (payload["startup_reconciled"] == false
+                        || payload["cleanup_pending"] == true
+                        || payload["pending_admissions"]
+                            .as_u64()
+                            .is_some_and(|count| count > 0))
                 {
+                    record.next_monitor = now + CLEANUP_POLL_INTERVAL;
+                } else {
+                    fail_record(record, "rtsp_runtime_epoch_unavailable", now);
+                }
+            }
+            Phase::BindPresentationTransport => {
+                let bound = amaterasu_module_sdk::session_presentation::decode_reply(payload)
+                    .is_ok_and(|reply| {
+                        matches!(
+                            reply,
+                            amaterasu_module_sdk::session_presentation::Reply::Acknowledged {}
+                        )
+                    });
+                if bound && record.state == State::Starting {
+                    record.presentation_transport_bound = true;
+                    if let Some(hold) = record.application_source.as_mut() {
+                        hold.transport_epoch = record.rtsp_runtime_epoch.clone();
+                    }
+                    record.stage = if record.shared_capture.is_some() {
+                        Stage::VerifyBorrowedCapture
+                    } else {
+                        record.presentation_continue_stage
+                    };
+                } else {
+                    fail_record(record, "presentation_transport_unbound", now);
+                }
+            }
+            Phase::VerifyBorrowedCapture => {
+                let verified = amaterasu_module_sdk::session_presentation::decode_reply(payload)
+                    .is_ok_and(|reply| matches!(reply, amaterasu_module_sdk::session_presentation::Reply::Verified { source } if record.shared_capture.as_ref() == Some(&source)));
+                if verified && record.state == State::Starting {
+                    record.borrowed_capture_verified = true;
+                    record.stage = record.presentation_continue_stage;
+                } else {
+                    fail_record(record, "borrowed_capture_unverified", now);
+                }
+            }
+            Phase::ReadLaunchEpoch => {
+                if let Ok(epoch) = retirement::parse_epoch(Contract::Application, &payload) {
                     record.application_operation =
                         format!("ale1:{epoch}:{}", record.application_operation);
                     record.lifecycle_launch_epoch_ready = true;
@@ -1050,7 +1308,11 @@ impl Controller {
                         payload.get("config_overrides"),
                     ));
                     record.application_display_settings = application_display_settings;
-                    record.virtual_display_intent = match virtual_display_intent(record) {
+                    record.virtual_display_intent = match if record.shared_capture.is_some() {
+                        Ok(None)
+                    } else {
+                        virtual_display_intent(record)
+                    } {
                         Ok(intent) => intent,
                         Err(code) => {
                             fail_record(record, code, now);
@@ -1058,11 +1320,13 @@ impl Controller {
                             return;
                         }
                     };
-                    if let Err(code) = route_capture(
-                        record,
-                        selected_capture_mode,
-                        record.virtual_display_intent.is_some(),
-                    ) {
+                    if record.shared_capture.is_none()
+                        && let Err(code) = route_capture(
+                            record,
+                            selected_capture_mode,
+                            record.virtual_display_intent.is_some(),
+                        )
+                    {
                         fail_record(record, code, now);
                         self.finish_or_retain(job.record, now, replies);
                         return;
@@ -1086,7 +1350,13 @@ impl Controller {
                         self.finish_or_retain(job.record, now, replies);
                         return;
                     }
-                    if record
+                    if record.shared_capture.is_some() {
+                        record.stage = if record.application_display_settings.is_some() {
+                            Stage::PrepareDisplayAdmission
+                        } else {
+                            Stage::LaunchApplication
+                        };
+                    } else if record
                         .virtual_display_intent
                         .as_ref()
                         .is_some_and(VirtualDisplayIntent::active)
@@ -1288,51 +1558,64 @@ impl Controller {
                     fail_record(record, code, now)
                 }
             },
-            Phase::MonitorRtsp => match rtsp_response(record, &payload) {
-                Ok((_, _, "ready" | "arming" | "playing", true)) => record.monitored(now),
-                Ok((_, _, "closed" | "failed", true))
-                    if record.lifecycle_required
-                        && !record.stop_on_stream_end
-                        && rtsp_stream_consumers_retired(record, &payload) =>
-                {
-                    if payload["state"] == "failed" {
-                        log_monitor_problem(logger.as_ref(), job.phase, "stream_failed");
-                    } else if let Some(logger) = logger.as_ref() {
-                        let _ =
-                            logger.emit(LogLevel::Info, "launch", "phase=MonitorRtsp event=closed");
-                    }
-                    record.rtsp_requested = false;
-                    record.rtsp_ticket = None;
-                    record.rtsp_url = None;
-                    record.transport_only_cleanup = true;
-                    if record.application_session.is_some() {
-                        record.request_transport_cleanup(None, now);
-                    } else {
-                        record.stage = if record.history_release_required {
-                            Stage::ReleasePausedHistory
+            Phase::MonitorRtsp => {
+                if matches!(
+                    payload["authenticated_disconnect_reason"].as_str(),
+                    Some("peer_disconnected" | "authenticated_peer_idle" | "peer_timeout")
+                ) && rtsp_response(record, &payload).is_ok_and(|(_, _, state, healthy)| {
+                    healthy && matches!(state, "closed" | "failed")
+                }) {
+                    record.authenticated_client_disconnected = true;
+                }
+                match rtsp_response(record, &payload) {
+                    Ok((_, _, "ready" | "arming" | "playing", true)) => record.monitored(now),
+                    Ok((_, _, "closed" | "failed", true))
+                        if record.lifecycle_required
+                            && !record.stop_on_stream_end
+                            && rtsp_stream_consumers_retired(record, &payload) =>
+                    {
+                        if payload["state"] == "failed" {
+                            log_monitor_problem(logger.as_ref(), job.phase, "stream_failed");
+                        } else if let Some(logger) = logger.as_ref() {
+                            let _ = logger.emit(
+                                LogLevel::Info,
+                                "launch",
+                                "phase=MonitorRtsp event=closed",
+                            );
+                        }
+                        record.rtsp_requested = false;
+                        record.rtsp_ticket = None;
+                        record.rtsp_url = None;
+                        record.transport_only_cleanup = true;
+                        if record.application_session.is_some() {
+                            record.request_transport_cleanup(None, now);
                         } else {
-                            Stage::VerifyPaused
-                        };
+                            record.stage = if record.history_release_required {
+                                Stage::ReleasePausedHistory
+                            } else {
+                                Stage::VerifyPaused
+                            };
+                        }
+                        record.deadline = now + INITIAL_DEADLINE;
                     }
-                    record.deadline = now + INITIAL_DEADLINE;
-                }
-                Ok(_) => {
-                    log_monitor_problem(logger.as_ref(), job.phase, "unhealthy");
-                    if record.lifecycle_session_target.is_some() {
-                        record.request_transport_cleanup(Some("stream_ended"), now);
-                    } else {
-                        record.request_cleanup(Some("stream_ended"), now);
+                    Ok(_) => {
+                        log_monitor_problem(logger.as_ref(), job.phase, "unhealthy");
+                        if record.lifecycle_session_target.is_some() {
+                            record.request_transport_cleanup(Some("stream_ended"), now);
+                        } else {
+                            record.request_cleanup(Some("stream_ended"), now);
+                        }
+                    }
+                    Err(code) => {
+                        log_monitor_problem(logger.as_ref(), job.phase, "invalid_response");
+                        if record.lifecycle_session_target.is_some() {
+                            record.request_transport_cleanup(Some(code), now);
+                        } else {
+                            fail_record(record, code, now);
+                        }
                     }
                 }
-                Err(code) => {
-                    log_monitor_problem(logger.as_ref(), job.phase, "invalid_response");
-                    if record.lifecycle_session_target.is_some() {
-                        record.request_transport_cleanup(Some(code), now);
-                    } else {
-                        fail_record(record, code, now);
-                    }
-                }
-            },
+            }
             Phase::StopRtsp | Phase::VerifyRtspStopped => {
                 if clean_rtsp_terminal(record, &payload) {
                     record.rtsp_requested = false;
@@ -1437,6 +1720,12 @@ impl Controller {
             Phase::RefreshResumePolicy => {
                 self.pending_resume = None;
                 reject_resume(record, replies);
+            }
+            Phase::BindPresentationApplication
+            | Phase::ReadRtspRuntimeEpoch
+            | Phase::BindPresentationTransport
+            | Phase::VerifyBorrowedCapture => {
+                record.request_cleanup(Some("borrowed_capture_unverified"), now);
             }
             Phase::ReadLaunchEpoch
             | Phase::VerifyPaused
@@ -1559,6 +1848,12 @@ impl Controller {
             return;
         }
         match job.phase {
+            Phase::BindPresentationApplication
+            | Phase::ReadRtspRuntimeEpoch
+            | Phase::BindPresentationTransport
+            | Phase::VerifyBorrowedCapture => {
+                record.request_cleanup(Some("borrowed_capture_unverified"), now);
+            }
             Phase::ReadLaunchEpoch
             | Phase::RefreshResumePolicy
             | Phase::VerifyPaused
@@ -1791,6 +2086,10 @@ pub(super) fn lifecycle_session_target(
 impl Phase {
     fn name(self) -> &'static str {
         match self {
+            Self::BindPresentationApplication => "bind-presentation-application",
+            Self::ReadRtspRuntimeEpoch => "read-rtsp-runtime-epoch",
+            Self::BindPresentationTransport => "bind-presentation-transport",
+            Self::VerifyBorrowedCapture => "verify-borrowed-capture",
             Self::ReadLaunchEpoch => "read-launch-epoch",
             Self::PrepareLifecycle => "prepare-lifecycle",
             Self::LookupLifecycle => "lookup-lifecycle",
@@ -1844,7 +2143,11 @@ fn needs_work(record: &Record, now: Instant) -> bool {
     if record.state == State::CleanupFailed {
         return false;
     }
-    if record.stage == Stage::VerifyPaused && now < record.next_monitor {
+    if matches!(
+        record.stage,
+        Stage::VerifyPaused | Stage::ReadRtspRuntimeEpoch
+    ) && now < record.next_monitor
+    {
         return false;
     }
     if record.retrying_uncertainty {
@@ -1867,7 +2170,10 @@ fn needs_work(record: &Record, now: Instant) -> bool {
     }
     matches!(
         record.stage,
-        Stage::ReserveHistory
+        Stage::ReadRtspRuntimeEpoch
+            | Stage::BindPresentationTransport
+            | Stage::VerifyBorrowedCapture
+            | Stage::ReserveHistory
             | Stage::ReadProtonPolicy
             | Stage::PreflightApplication
             | Stage::SnapshotDisplay
@@ -1907,6 +2213,18 @@ pub(super) fn next_phase(record: &Record) -> Phase {
         )
     {
         return Phase::ReadLaunchEpoch;
+    }
+    if record.state == State::Starting
+        && record.shared_capture.is_some()
+        && record.application_session.is_none()
+        && record.lifecycle_launch_epoch_ready
+        && !record.presentation_application_bound
+        && matches!(
+            record.stage,
+            Stage::LaunchApplication | Stage::PrepareDisplayAdmission | Stage::OpenRtsp
+        )
+    {
+        return Phase::BindPresentationApplication;
     }
     if record.state == State::Starting
         && record.lifecycle_required
@@ -1960,6 +2278,9 @@ pub(super) fn next_phase(record: &Record) -> Phase {
         }
     }
     match record.stage {
+        Stage::ReadRtspRuntimeEpoch => Phase::ReadRtspRuntimeEpoch,
+        Stage::BindPresentationTransport => Phase::BindPresentationTransport,
+        Stage::VerifyBorrowedCapture => Phase::VerifyBorrowedCapture,
         Stage::ReserveHistory => Phase::ReserveHistory,
         Stage::ReadProtonPolicy => Phase::ReadProtonPolicy,
         Stage::PreflightApplication => Phase::PreflightApplication,
@@ -2952,6 +3273,10 @@ pub(super) fn project_application_policy(
         record.resolved_virtual_sink.as_deref(),
     );
     if record.request.audio_channels != 2
+        && !record
+            .auxiliary
+            .as_ref()
+            .is_some_and(|auxiliary| !auxiliary.plan.stream_audio)
         && (record.resolved_virtual_sink.is_none() || !record.effective_stream_audio)
     {
         return Err("surround_audio_requires_stream_sink");
@@ -4054,10 +4379,9 @@ fn rtsp_response<'a>(
         || payload.get("cleanup_error").is_none()
         || payload.get("display_policy_snapshot")
             != Some(
-                record
-                    .display_policy_snapshot
-                    .as_ref()
-                    .unwrap_or(&Value::Null),
+                if record.shared_capture.is_some() { &Value::Null } else {
+                    record.display_policy_snapshot.as_ref().unwrap_or(&Value::Null)
+                },
             )
         || payload.get("display_request")
             != Some(record.display_request.as_ref().unwrap_or(&Value::Null))

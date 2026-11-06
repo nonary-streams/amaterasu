@@ -18,6 +18,14 @@ pub struct Call {
 }
 
 impl Call {
+    pub(super) fn from_command(command: Command) -> Self {
+        Self {
+            command,
+            request: None,
+            cancelling: false,
+            failures: 0,
+        }
+    }
     pub fn release_result(&mut self, send: &mut Send<'_>) -> bool {
         let Some(request) = self.request else {
             return false;

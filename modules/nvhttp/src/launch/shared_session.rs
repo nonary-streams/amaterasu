@@ -80,8 +80,9 @@ impl Controller {
                 .records
                 .values()
                 .find(|record| {
-                    record.application_session.is_some()
+                    (record.application_session.is_some() || record.auxiliary.is_some())
                         && record.state.terminal()
+                        && record.source_observations_emitted()
                         && record.uncertain.is_empty()
                         && !record.rtsp_requested
                         && !record.history_release_required

@@ -38,6 +38,12 @@ impl ResumeSnapshot {
     }
 
     pub(super) fn legacy_display_conflict(&self) -> bool {
+        if self.stream.shared_capture.is_some()
+            && self.stream.borrowed_capture_verified
+            && self.stream.lifecycle_capture_mode.is_external()
+        {
+            return false;
+        }
         if self.stream.lifecycle_capture_mode.is_external() {
             return false;
         }
@@ -124,6 +130,14 @@ impl ResumeSnapshot {
             retained.deadline,
         );
         stream.desktop = retained.desktop;
+        stream.application_owner_client_id = retained.application_owner_client_id.clone();
+        stream.presentation_client_id = retained.presentation_client_id.clone();
+        stream.shared_capture = retained.shared_capture.clone();
+        stream.borrowed_capture_verified = retained.borrowed_capture_verified;
+        stream.rtsp_runtime_epoch = retained.rtsp_runtime_epoch.clone();
+        stream.presentation_transport_bound = retained.presentation_transport_bound;
+        stream.presentation_continue_stage = retained.presentation_continue_stage;
+        stream.presentation_application_bound = retained.presentation_application_bound;
         stream.resumed = true;
         stream.requested_capture_output = output;
         stream.encoder_snapshot = controller.encoder_snapshot.clone();
@@ -147,13 +161,25 @@ impl ResumeSnapshot {
             .unwrap_or_default();
         let mut profile = config.profile.clone();
         workflow::project_application_policy(&mut stream, &application, &mut profile)?;
-        stream.virtual_display_intent = workflow::virtual_display_intent(&stream)?;
+        stream.virtual_display_intent = if stream.shared_capture.is_some() {
+            None
+        } else {
+            workflow::virtual_display_intent(&stream)?
+        };
         let selected_mode = peer
             .client_capture
             .or(application.capture)
             .unwrap_or(stream.global_capture_mode);
         let virtual_intent = stream.virtual_display_intent.is_some();
-        workflow::route_capture(&mut stream, selected_mode, virtual_intent)?;
+        if let Some(source) = &stream.shared_capture {
+            let (provider, constant_rate, output) =
+                controller.presentation_capture_route(&source.capture, &stream.request)?;
+            stream.capture_provider = provider;
+            stream.constant_rate = constant_rate;
+            stream.capture_output = output;
+        } else {
+            workflow::route_capture(&mut stream, selected_mode, virtual_intent)?;
+        }
         stream.display_policy_snapshot = if stream.desktop {
             None
         } else {
@@ -168,6 +194,11 @@ impl ResumeSnapshot {
         let stream = self.stream;
         macro_rules! move_fields { ($($field:ident),+ $(,)?) => { $(retained.$field = stream.$field;)+ }; }
         move_fields!(
+            shared_capture,
+            borrowed_capture_verified,
+            rtsp_runtime_epoch,
+            presentation_transport_bound,
+            presentation_continue_stage,
             peer,
             request,
             physical_display_mode,
