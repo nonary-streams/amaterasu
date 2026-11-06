@@ -93,6 +93,7 @@ impl Controller {
             request,
             json!({"ok":true,"runtime_epoch":self.runtime_epoch,
                 "startup_reconciled":reconciled,"operation_id":operation,
+                "expected_runtime_epoch":expected_epoch,
                 "state":state,"retired":retired,"active_operations":active_operations,
                 "pending_admissions":pending_admissions,"cleanup_pending":cleanup_pending}),
         );

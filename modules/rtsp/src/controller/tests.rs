@@ -156,9 +156,16 @@ fn retirement_observations_distinguish_runtime_fences_from_missing_tickets() {
     );
     assert_eq!(endpoint.completions[0].1["state"], "unknown");
     assert_eq!(endpoint.completions[0].1["retired"], false);
+    assert!(endpoint.completions[0].1["expected_runtime_epoch"].is_null());
     assert_eq!(endpoint.completions[1].1["retired"], false);
+    assert_eq!(endpoint.completions[1].1["expected_runtime_epoch"], epoch);
     assert_eq!(endpoint.completions[2].1["state"], "epoch_fenced");
     assert_eq!(endpoint.completions[2].1["retired"], true);
+    assert_eq!(
+        endpoint.completions[2].1["expected_runtime_epoch"],
+        old_epoch
+    );
+    assert_eq!(endpoint.completions[2].1["runtime_epoch"], epoch);
     let mut current = record(State::Ready);
     current.config.operation_id = "persisted-op".into();
     controller.records.insert(current.id, current);
