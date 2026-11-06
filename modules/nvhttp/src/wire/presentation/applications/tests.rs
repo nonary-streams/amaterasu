@@ -204,6 +204,7 @@ fn active_game_metadata_is_enriched_before_provider_context_is_frozen() {
         application: observed,
         owner_client_id: "owner".into(),
         generation: 9,
+        source: None,
     });
     let mut list = CatalogProjection::new(facts, false, false);
     list.accept(inventory(7, vec![application(1)], Some(1)))
