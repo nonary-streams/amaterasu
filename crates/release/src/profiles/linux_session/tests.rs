@@ -877,6 +877,49 @@ fn package_authority_profile_uses_only_the_inherited_channel() {
 }
 
 #[test]
+fn precheck_is_an_explicit_false_placeholder_and_old_profile_schema_stays_unchanged() {
+    let parse = |args: &[&str]| {
+        LinuxSessionOptions::from_arguments(
+            &args
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect::<Vec<_>>(),
+        )
+    };
+    let base = [
+        "--enable-capture",
+        "--enable-virtual-display",
+        "--capture-authority-helper",
+        "/build/amaterasu-vkms-frame-helper",
+    ];
+    let old = parse(&base).unwrap();
+    assert!(!old.capture_authority_precheck);
+    let old_settings = vkms_capture_settings(&old);
+    assert!(old_settings.get("authority_precheck_supported").is_none());
+    let mut args = base.to_vec();
+    args.push("--capture-authority-precheck");
+    let new = parse(&args).unwrap();
+    assert_eq!(
+        vkms_capture_settings(&new)["authority_precheck_supported"],
+        false
+    );
+    let mut expected = old_settings;
+    expected["authority_precheck_supported"] = json!(false);
+    assert_eq!(vkms_capture_settings(&new), expected);
+    args.push("--capture-authority-precheck");
+    assert!(parse(&args).is_err());
+    assert!(parse(&["--capture-authority-precheck"]).is_err());
+    assert!(
+        LinuxSessionOptions {
+            capture_authority_precheck: true,
+            ..Default::default()
+        }
+        .validate()
+        .is_err()
+    );
+}
+
+#[test]
 fn session_extensions_profile_adds_actions_to_default_extension_services() {
     let extra = [
         (

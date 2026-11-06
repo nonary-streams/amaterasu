@@ -151,6 +151,7 @@ digest, cleanup and readiness separately from client playback.
 | `--enable-virtual-screen-capture` | Selects the existing `virtual_screen` alias for the VKMS plugin and requires `--enable-capture`, `--enable-virtual-display`, the default capture output, and one helper mode below. |
 | `--capture-authority-helper ABSOLUTE_SOURCE` | Packages helper bytes and requests broker-mediated authority for the capture plugin. Requires `--enable-capture`, `--enable-virtual-display`, and the default capture output. This declares a request, not an approval or installation. |
 | `--capture-authority-card CARD` | Exact DRM card scope for the packaged request, from 0 through 63; default 0. Requires `--capture-authority-helper`, including when CARD is explicitly 0. |
+| `--capture-authority-precheck` | Explicitly requests nonallocating source capability negotiation from a compatible capture artifact. Requires `--capture-authority-helper`; package and service checks verify the new artifact capability. Default off, preserving older settings schemas. |
 | `--frame-helper ABSOLUTE_PATH` | Legacy direct-helper mode, mutually exclusive with `--capture-authority-helper`. The root-owned capability-bearing executable must already be installed and authorized separately; it is independent of package approval. |
 | `--enable-input` | Sets `amaterasu.input` `allow_injection=true` and stream-session `enable_input=true`. A relative pointer can leave an owned screen and move the live cursor; keep this off on a shared desktop. |
 | `--enable-display-mutation` | Sets `amaterasu.display` `allow_mutation=true`. |
@@ -174,6 +175,23 @@ the signed package and records the exact helper digest, component and card
 scope. The new mode sets `authority_channel:true` and `gpu_snapshot:false`; a
 missing approved channel is an explicit availability
 failure and does not fall back to the legacy helper.
+
+For the new capture module, add `--capture-authority-precheck` at initialization
+to emit the reserved `authority_precheck_supported:false` placeholder. Package
+construction and user-service preflight require the exact compiled
+`AMATERASU_CAPTURE_AUTHORITY_PRECHECK=1` NUL-terminated artifact marker. Older
+profiles omit the field; this option is never silently enabled or applied to an
+older artifact with a strict settings schema. Generated package settings never
+serialize trusted `true` themselves.
+
+The option and marker establish configuration/protocol support only. They do
+not approve native admission or assert actual readiness. The host injects
+support only after adopting the verified root-peer v2 launcher channel; the
+real read-only PRECHECK still verifies current protected approval, publisher,
+package and helper without opening a capture session. An older launcher leaves
+support false, so the new provider returns unsupported without sending an
+unknown opcode. No installed policy or running service changes during package
+construction or these checks.
 
 Run `capture-authority-review` to inspect the verified publisher, package,
 component, helper, worker and scope. A later explicit administrator invocation of

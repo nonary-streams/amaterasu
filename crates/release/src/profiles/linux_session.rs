@@ -1086,12 +1086,18 @@ fn portal_capture_settings() -> Value {
 /// remains a separate explicit compatibility mode.
 fn vkms_capture_settings(options: &LinuxSessionOptions) -> Value {
     if options.capture_authority_helper.is_some() {
-        return json!({
+        let mut settings = json!({
             "enabled": options.enable_capture,
             "capture_principals": [VIDEO_COMPONENT_ID],
             "authority_channel": true,
             "gpu_snapshot": false,
         });
+        if options.capture_authority_precheck {
+            // Reserved false placeholder: only the verified v2 root-peer
+            // launcher may inject true. Older profiles omit the field.
+            settings["authority_precheck_supported"] = json!(false);
+        }
+        return settings;
     }
     match &options.frame_helper {
         Some(helper) => json!({

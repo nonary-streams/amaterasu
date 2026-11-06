@@ -43,6 +43,7 @@ pub enum OptionError {
     InvalidCaptureAuthorityCard(String),
     CaptureAuthorityRequirements,
     CaptureAuthorityCardWithoutHelper,
+    CaptureAuthorityPrecheckWithoutHelper,
     ConflictingCaptureHelpers,
     VirtualScreenCaptureRequirements,
     DesktopOutputCaptureRequirements,
@@ -108,6 +109,7 @@ impl fmt::Display for OptionError {
             Self::CaptureAuthorityCardWithoutHelper => formatter.write_str(
                 "--capture-authority-card requires --capture-authority-helper"
             ),
+            Self::CaptureAuthorityPrecheckWithoutHelper=>formatter.write_str("--capture-authority-precheck requires --capture-authority-helper and a compatible capture artifact"),
             Self::ConflictingCaptureHelpers => formatter.write_str(
                 "--capture-authority-helper and --frame-helper are mutually exclusive"
             ),
@@ -336,6 +338,9 @@ pub struct LinuxSessionOptions {
     pub capture_authority_helper: Option<String>,
     /// Exact DRM card included in the package's requested authority.
     pub capture_authority_card: u32,
+    /// Request nonallocating source capability negotiation on a compatible
+    /// artifact; the protected launcher still determines actual support.
+    pub capture_authority_precheck: bool,
 }
 
 impl Default for LinuxSessionOptions {
@@ -358,6 +363,7 @@ impl Default for LinuxSessionOptions {
             rtx_hdr_runtime_directory: None,
             capture_authority_helper: None,
             capture_authority_card: 0,
+            capture_authority_precheck: false,
         }
     }
 }
@@ -448,6 +454,10 @@ impl LinuxSessionOptions {
                     let card = required_value(&mut arguments, "--capture-authority-card")?;
                     options.capture_authority_card = parse_capture_authority_card(&card)?;
                 }
+                "--capture-authority-precheck" => {
+                    seen.once("--capture-authority-precheck")?;
+                    options.capture_authority_precheck = true;
+                }
                 "--enable-virtual-display" => {
                     seen.once("--enable-virtual-display")?;
                     options.enable_virtual_display = true;
@@ -483,6 +493,9 @@ impl LinuxSessionOptions {
 
     /// Reject inconsistent opt-in settings for both parsed and programmatic profiles.
     pub fn validate(&self) -> Result<(), OptionError> {
+        if self.capture_authority_precheck && self.capture_authority_helper.is_none() {
+            return Err(OptionError::CaptureAuthorityPrecheckWithoutHelper);
+        }
         if self.enable_desktop_output_capture && !self.enable_capture {
             return Err(OptionError::DesktopOutputCaptureRequirements);
         }

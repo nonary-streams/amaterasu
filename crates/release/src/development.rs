@@ -354,9 +354,45 @@ pub fn build_package_with_library_selection(
     call_grants: Option<&Path>,
     replacement_id: Option<&str>,
 ) -> PackageResult<()> {
+    build_package_with_library_selection_and_probe(
+        root,
+        artifacts,
+        output,
+        sequence,
+        profile,
+        external,
+        call_grants,
+        replacement_id,
+        x264_runtime_available,
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // Preserve the injected codec-runtime verification boundary.
+fn build_package_with_library_selection_and_probe(
+    root: &Path,
+    artifacts: &Path,
+    output: &Path,
+    sequence: u64,
+    profile: PackageProfile,
+    external: &[(&Path, &Path)],
+    call_grants: Option<&Path>,
+    replacement_id: Option<&str>,
+    runtime_available: impl FnOnce(u32) -> bool,
+) -> PackageResult<()> {
     let bootstrap: BootstrapConfig = read_json(&root.join("bootstrap.json"))?;
     if !bootstrap.development {
         return Err("development publisher cannot use a production root".into());
+    }
+    if crate::capture_precheck::requested(&bootstrap.policy.settings)? {
+        let capture = profile
+            .components()
+            .iter()
+            .find(|component| component.id == crate::capture_precheck::COMPONENT)
+            .ok_or("capture authority precheck provider is absent from the selected package")?;
+        crate::capture_precheck::validate_artifact(&read_bounded(
+            &artifacts.join(library_filename(capture.library)),
+            256 * 1024 * 1024,
+        )?)?;
     }
     if crate::linux_owned_display::desktop_capture_enabled(&bootstrap.policy.settings) {
         let capture = profile
@@ -430,7 +466,7 @@ pub fn build_package_with_library_selection(
         profile,
         &signing_key,
         DEVELOPMENT_KEY_ID,
-        x264_runtime_available,
+        runtime_available,
         authority.as_ref(),
         &external,
         &call_grants,
@@ -2548,6 +2584,120 @@ mod provision_tests {
         .unwrap_err();
         assert!(error.contains("desktop output capture requires"));
         assert!(!output.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn authority_precheck_init_pack_and_service_checks_preserve_the_reserved_request() {
+        let root = fixture("authority-precheck-profile");
+        let installation = root.join("host");
+        let helper = root.join("helper-source");
+        fs::write(&helper, b"reviewed helper fixture").unwrap();
+        let options = LinuxSessionOptions {
+            enable_capture: true,
+            enable_virtual_display: true,
+            capture_authority_helper: Some(helper.to_str().unwrap().into()),
+            capture_authority_precheck: true,
+            ..Default::default()
+        };
+        initialize_linux_session(&installation, &options).unwrap();
+        let bootstrap: BootstrapConfig = read_json(&installation.join("bootstrap.json")).unwrap();
+        assert_eq!(
+            bootstrap.policy.settings[crate::capture_precheck::COMPONENT]["authority_precheck_supported"],
+            false
+        );
+        assert!(
+            bootstrap.policy.settings[crate::capture_precheck::COMPONENT]
+                .get("authority_channel_fd")
+                .is_none()
+        );
+        let original = fs::read(installation.join("bootstrap.json")).unwrap();
+        let artifacts = root.join("artifacts");
+        fs::create_dir(&artifacts).unwrap();
+        for definition in PackageProfile::LinuxSession.components() {
+            fs::write(
+                artifacts.join(library_filename(definition.library)),
+                definition.id.as_bytes(),
+            )
+            .unwrap();
+        }
+        let output = root.join("package");
+        let error = build_package(
+            &installation,
+            &artifacts,
+            &output,
+            1,
+            PackageProfile::LinuxSession,
+        )
+        .unwrap_err();
+        assert!(error.contains("capture artifact marker"));
+        assert!(!output.exists());
+        assert_eq!(
+            fs::read(installation.join("bootstrap.json")).unwrap(),
+            original
+        );
+        fs::write(
+            artifacts.join(library_filename("amaterasu_capture_vkms")),
+            crate::capture_precheck::MARKER,
+        )
+        .unwrap();
+        fs::write(
+            artifacts.join(library_filename("amaterasu_encode")),
+            b"AMATERASU_X264_BUILD=164\0",
+        )
+        .unwrap();
+        // Only the pre-existing codec-runtime dependency is injected. Actual
+        // profile generation, artifact selection, helper request, signing and
+        // package verification remain the normal production code paths.
+        build_package_with_library_selection_and_probe(
+            &installation,
+            &artifacts,
+            &output,
+            1,
+            PackageProfile::LinuxSession,
+            &[],
+            None,
+            None,
+            |_| true,
+        )
+        .unwrap();
+        let verified = verify_package(
+            &output,
+            &bootstrap,
+            VerificationPolicy {
+                minimum_sequence: 0,
+                allow_historical: false,
+                now: unix_timestamp(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            verified.runtime_config.settings[crate::capture_precheck::COMPONENT]["authority_precheck_supported"],
+            false
+        );
+        assert_eq!(verified.privileged_requests.len(), 1);
+        crate::capture_precheck::validate_package(
+            &output,
+            &verified.manifest.components,
+            &verified.runtime_config.settings,
+        )
+        .unwrap();
+        let mut old_settings = verified.runtime_config.settings.clone();
+        old_settings
+            .get_mut(crate::capture_precheck::COMPONENT)
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("authority_precheck_supported");
+        // The same service boundary leaves an older strict-schema component
+        // untouched: it requires neither a new field nor a new artifact marker.
+        crate::capture_precheck::validate_package(
+            &root.join("absent-old-package"),
+            &[],
+            &old_settings,
+        )
+        .unwrap();
         let _ = fs::remove_dir_all(root);
     }
 
