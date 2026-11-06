@@ -10,10 +10,16 @@ pub const MAX_CLIENTS: usize = 8;
 pub struct Settings {
     pub administrator_principals: BTreeSet<String>,
     pub transport_principals: BTreeSet<String>,
+    /// Read-only current certificate authorization; no pairing administration.
+    pub authority_observer_principals: BTreeSet<String>,
 }
 impl Settings {
     pub fn validate(&self) -> Result<(), &'static str> {
-        for principals in [&self.administrator_principals, &self.transport_principals] {
+        for principals in [
+            &self.administrator_principals,
+            &self.transport_principals,
+            &self.authority_observer_principals,
+        ] {
             if principals.len() > 16 || principals.iter().any(|value| !identifier(value, 128)) {
                 return Err("invalid_settings");
             }
@@ -87,6 +93,11 @@ pub enum Operation {
     },
     CheckClientCertificate {
         certificate_pem: String,
+    },
+    /// Observes committed membership and effective permissions by the authority's
+    /// certificate fingerprint. It never authenticates a live TLS connection.
+    ClientAuthorization {
+        certificate_id: String,
     },
     /// Removes exactly the certificate a trusted transport authenticated on a
     /// live TLS connection. Never selected by client ID or fingerprint.
@@ -164,6 +175,12 @@ impl Operation {
             Self::UpdateClientPermissions { certificate_id, .. } => hex_length(certificate_id, 32),
             Self::CheckClientCertificate { certificate_pem }
             | Self::UnpairPresentedClient { certificate_pem } => certificate_pem.len() <= 4096,
+            Self::ClientAuthorization { certificate_id } => {
+                certificate_id.len() == 64
+                    && certificate_id
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            }
             _ => true,
         };
         if valid {

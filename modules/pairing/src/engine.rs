@@ -41,6 +41,20 @@ impl Engine {
         if operation.transport_only() && !self.settings.transport_principals.contains(caller) {
             return Err("forbidden");
         }
+        if matches!(operation, Operation::ClientAuthorization { .. })
+            && !self.settings.authority_observer_principals.contains(caller)
+        {
+            return Err("forbidden");
+        }
+        // An observation grant must not become a route to the otherwise public
+        // pairing handshake operations, which carry transport responsibilities.
+        if self.settings.authority_observer_principals.contains(caller)
+            && !self.settings.administrator_principals.contains(caller)
+            && !self.settings.transport_principals.contains(caller)
+            && !matches!(operation, Operation::ClientAuthorization { .. })
+        {
+            return Err("forbidden");
+        }
         Ok(())
     }
     pub fn apply(
@@ -147,6 +161,9 @@ impl Engine {
             Operation::CheckClientCertificate { certificate_pem } => {
                 Self::check_certificate(&document, &certificate_pem, now)
             }
+            Operation::ClientAuthorization { certificate_id } => Ok(Change::Read(
+                client_authorization(&document, &certificate_id, now),
+            )),
             Operation::UnpairPresentedClient { certificate_pem } => {
                 self.unpair_presented(document, &certificate_pem, now)
             }
@@ -463,4 +480,61 @@ fn client_metadata(document: &Document) -> Value {
         })
         .collect();
     json!({"ok":true,"clients":clients,"permission_mode_enabled":document.permission_mode_enabled})
+}
+
+fn client_authorization(document: &Document, certificate_id: &str, now: u64) -> Value {
+    let client = document.clients.iter().find(|client| {
+        client.certificate_id == certificate_id
+            && crypto::parse_certificate(&client.certificate_pem, Some(now)).is_ok()
+    });
+    let permissions = client.map(|client| client.permissions);
+    let unrestricted = client.is_some() && !document.permission_mode_enabled;
+    json!({
+        "ok": true,
+        "certificate_id": certificate_id,
+        "paired": client.is_some(),
+        "may_view": unrestricted || permissions.is_some_and(|permissions| permissions.view_streams || permissions.launch_apps),
+        "may_launch": unrestricted || permissions.is_some_and(|permissions| permissions.launch_apps),
+        "may_terminate": unrestricted || permissions.is_some_and(|permissions| permissions.terminate_streams),
+        "name": client.map(|client| client.name.as_str()),
+    })
+}
+
+#[cfg(test)]
+mod authorization_tests {
+    use super::*;
+
+    #[test]
+    fn expired_certificate_record_never_retains_observed_permissions() {
+        let pem = include_str!("../tests/fixtures/client-cert.pem");
+        let certificate = crypto::parse_certificate(pem, None).unwrap();
+        let expires = certificate
+            .certificate
+            .tbs_certificate
+            .validity
+            .not_after
+            .to_unix_duration()
+            .as_secs();
+        let document = Document {
+            identity: None,
+            clients: vec![Client {
+                certificate_id: certificate.fingerprint.clone(),
+                client_id: "metadata".into(),
+                name: "Expired client".into(),
+                certificate_pem: pem.into(),
+                paired_at: expires - 1,
+                permissions: ClientPermissions::default(),
+                config_overrides: ClientConfigOverrides::default(),
+            }],
+            permission_mode_enabled: false,
+        };
+        let before = client_authorization(&document, &certificate.fingerprint, expires - 1);
+        assert_eq!(before["paired"], true);
+        let expired = client_authorization(&document, &certificate.fingerprint, expires);
+        assert_eq!(expired["paired"], false);
+        for permission in ["may_view", "may_launch", "may_terminate"] {
+            assert_eq!(expired[permission], false);
+        }
+        assert!(expired["name"].is_null());
+    }
 }

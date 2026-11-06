@@ -44,6 +44,7 @@ fn settings() -> Settings {
     Settings {
         administrator_principals: BTreeSet::from(["console".into()]),
         transport_principals: BTreeSet::from(["nvhttp".into()]),
+        authority_observer_principals: BTreeSet::from(["session-observer".into()]),
     }
 }
 
@@ -2731,6 +2732,159 @@ fn check_client(state: &mut Harness, pipeline: &mut Pipeline, pem: &str) -> Valu
         json!({"action":"check_client_certificate","certificate_pem":pem}),
         now(),
     )
+}
+
+fn observe_client_authorization(
+    state: &mut Harness,
+    pipeline: &mut Pipeline,
+    certificate_id: &str,
+) -> amaterasu_module_sdk::pairing_authority::Authorization {
+    let reply = state.request(
+        pipeline,
+        "session-observer",
+        json!({"action":"client_authorization","certificate_id":certificate_id}),
+        now(),
+    );
+    amaterasu_module_sdk::pairing_authority::Authorization::parse(certificate_id, &reply)
+        .unwrap_or_else(|code| panic!("{code}: {reply}"))
+}
+
+#[test]
+fn authority_observer_reads_current_committed_membership_without_transport_or_admin_grants() {
+    let mut state = Harness::new();
+    let mut pipeline = Pipeline::new(settings());
+    state.initialize(&mut pipeline);
+    let imported = import_client(&mut state, &mut pipeline, "moonlight", CLIENT_CERT);
+    let fingerprint = imported["certificate_id"].as_str().unwrap();
+    let writes_before = state.writes;
+    let authorization = observe_client_authorization(&mut state, &mut pipeline, fingerprint);
+    assert!(authorization.paired);
+    assert!(authorization.may_view && authorization.may_launch && authorization.may_terminate);
+    assert_eq!(authorization.name.as_deref(), Some("Moonlight test"));
+    assert_eq!(authorization.revision, state.revision);
+    assert_eq!(state.writes, writes_before);
+
+    for payload in [
+        json!({"action":"list_clients"}),
+        json!({"action":"identity"}),
+        json!({"action":"initialize"}),
+        json!({"action":"check_client_certificate","certificate_pem":CLIENT_CERT}),
+        json!({"action":"unpair_presented_client","certificate_pem":CLIENT_CERT}),
+        json!({"action":"unpair","certificate_id":fingerprint}),
+        json!({"action":"begin","client_id":"caller-selected","name":"Caller","client_certificate_pem":CLIENT_CERT,"salt":"aa".repeat(16)}),
+    ] {
+        let reply = state.request(&mut pipeline, "session-observer", payload, now());
+        assert_eq!(reply["code"], "forbidden", "{reply}");
+    }
+    for caller in ["unrelated", "console", "nvhttp"] {
+        let reply = state.request(
+            &mut pipeline,
+            caller,
+            json!({"action":"client_authorization","certificate_id":fingerprint}),
+            now(),
+        );
+        assert_eq!(reply["code"], "forbidden", "caller {caller}: {reply}");
+    }
+    assert_eq!(state.writes, writes_before);
+}
+
+#[test]
+fn authority_observations_follow_permission_mode_updates_and_unpair_across_restart() {
+    let mut state = Harness::new();
+    let mut pipeline = Pipeline::new(settings());
+    state.initialize(&mut pipeline);
+    let imported = import_client(&mut state, &mut pipeline, "moonlight", CLIENT_CERT);
+    let fingerprint = imported["certificate_id"].as_str().unwrap();
+    let permissions =
+        json!({"list_apps":true,"view_streams":false,"launch_apps":true,"terminate_streams":false});
+    let update = state.request(
+        &mut pipeline,
+        "console",
+        json!({"action":"update_client_permissions","certificate_id":fingerprint,"permissions":permissions,"expected_revision":state.revision}),
+        now(),
+    );
+    assert_eq!(update["ok"], true);
+    let legacy_mode = observe_client_authorization(&mut state, &mut pipeline, fingerprint);
+    assert!(legacy_mode.may_view && legacy_mode.may_launch && legacy_mode.may_terminate);
+    let mode = state.request(
+        &mut pipeline,
+        "console",
+        json!({"action":"set_permission_mode","enabled":true,"expected_revision":state.revision}),
+        now(),
+    );
+    assert_eq!(mode["ok"], true);
+    let mut restarted = Pipeline::new(settings());
+    let limited = observe_client_authorization(&mut state, &mut restarted, fingerprint);
+    // Launch includes view in the native identity permission contract.
+    assert!(limited.may_view && limited.may_launch);
+    assert!(!limited.may_terminate);
+    assert!(limited.revision > legacy_mode.revision);
+    let removed = state.request(
+        &mut restarted,
+        "console",
+        json!({"action":"unpair","certificate_id":fingerprint,"expected_revision":state.revision}),
+        now(),
+    );
+    assert_eq!(removed["ok"], true);
+    let revoked = observe_client_authorization(&mut state, &mut restarted, fingerprint);
+    assert!(!revoked.paired);
+    assert!(!revoked.may_view && !revoked.may_launch && !revoked.may_terminate);
+    assert!(revoked.name.is_none());
+    assert!(revoked.revision > limited.revision);
+}
+
+#[test]
+fn duplicate_caller_supplied_client_ids_do_not_merge_certificate_authority() {
+    let mut state = Harness::new();
+    let mut pipeline = Pipeline::new(settings());
+    state.initialize(&mut pipeline);
+    let first = import_client(&mut state, &mut pipeline, "shared-name", CLIENT_CERT);
+    let second = import_client(&mut state, &mut pipeline, "shared-name", HOST_CERT);
+    let first_id = first["certificate_id"].as_str().unwrap();
+    let second_id = second["certificate_id"].as_str().unwrap();
+    assert_ne!(first_id, second_id);
+    let removed = state.request(
+        &mut pipeline,
+        "console",
+        json!({"action":"unpair","certificate_id":first_id}),
+        now(),
+    );
+    assert_eq!(removed["ok"], true);
+    assert!(!observe_client_authorization(&mut state, &mut pipeline, first_id).paired);
+    assert!(observe_client_authorization(&mut state, &mut pipeline, second_id).paired);
+}
+
+#[test]
+fn authority_observer_unknown_invalid_and_cancelled_queries_never_write_state() {
+    let mut state = Harness::new();
+    let mut pipeline = Pipeline::new(settings());
+    state.initialize(&mut pipeline);
+    let unknown_id = "ab".repeat(32);
+    let writes_before = state.writes;
+    let unknown = observe_client_authorization(&mut state, &mut pipeline, &unknown_id);
+    assert!(!unknown.paired && !unknown.may_view && !unknown.may_launch && !unknown.may_terminate);
+    assert!(unknown.name.is_none());
+    for payload in [
+        json!({"action":"client_authorization","certificate_id":"AB".repeat(32)}),
+        json!({"action":"client_authorization","certificate_id":"ab".repeat(31)}),
+        json!({"action":"client_authorization","certificate_id":"z".repeat(64)}),
+        json!({"action":"client_authorization","certificate_id":unknown_id,"client_id":"selected"}),
+    ] {
+        assert_eq!(
+            state.request(&mut pipeline, "session-observer", payload, now())["code"],
+            "invalid_request"
+        );
+    }
+    state.check_cancelled = true;
+    let cancelled = state.request(
+        &mut pipeline,
+        "session-observer",
+        json!({"action":"client_authorization","certificate_id":unknown_id}),
+        now(),
+    );
+    assert_eq!(cancelled["code"], "request_ended");
+    assert!(cancelled.get("certificate_id").is_none());
+    assert_eq!(state.writes, writes_before);
 }
 
 #[test]

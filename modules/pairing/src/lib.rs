@@ -95,4 +95,24 @@ mod settings_tests {
     fn host_configuration_marker_must_be_boolean() {
         assert!(parse_settings(json!({"host_configuration":"enabled"})).is_err());
     }
+
+    #[test]
+    fn authority_observer_selection_is_explicit_and_bounded() {
+        let (settings, _) = parse_settings(json!({
+            "authority_observer_principals":["amaterasu.remote-session"]
+        }))
+        .unwrap();
+        assert!(
+            settings
+                .authority_observer_principals
+                .contains("amaterasu.remote-session")
+        );
+        assert!(settings.administrator_principals.is_empty());
+        assert!(settings.transport_principals.is_empty());
+        assert!(
+            parse_settings(json!({"authority_observer_principals":["bad principal"]})).is_err()
+        );
+        let too_many: Vec<_> = (0..17).map(|index| format!("observer-{index}")).collect();
+        assert!(parse_settings(json!({"authority_observer_principals":too_many})).is_err());
+    }
 }

@@ -1179,7 +1179,10 @@ impl Pipeline {
                 json!({"ok":false,"code":"revision_conflict","current_revision":revision}),
             );
         }
-        let include_revision = matches!(&operation, Operation::ListClients {});
+        let include_revision = matches!(
+            &operation,
+            Operation::ListClients {} | Operation::ClientAuthorization { .. }
+        );
         let initialize = matches!(&operation, Operation::Initialize {});
         let persisted_identity = document.identity.clone();
         let mut engine_now = now;
