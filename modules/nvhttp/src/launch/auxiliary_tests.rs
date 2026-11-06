@@ -1259,3 +1259,375 @@ fn cached_application_source_retry_keeps_original_application_lifetime_hold() {
         409
     );
 }
+
+fn presentation_binding_requests<'a>(broker: &'a Broker, expected: &str) -> Vec<&'a Value> {
+    broker
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            Command::CallApi {
+                service,
+                method,
+                payload,
+                ..
+            } if service == amaterasu_module_sdk::session_presentation::SERVICE
+                && method == expected =>
+            {
+                Some(payload)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn auxiliary_transport_binding_waits_for_durable_ack_with_original_tuple_and_budget() {
+    let now = Instant::now();
+    let mut controller = auxiliary_controller();
+    let mut broker = Broker::default();
+    controller.launch_auxiliary(
+        10,
+        request(1),
+        peer(1),
+        auxiliary_plan(1, CaptureSource::SyntheticBlack),
+        now,
+    );
+    let deadline = controller.records.values().next().unwrap().deadline;
+    for _ in 0..64 {
+        assert!(controller.poll(now, &mut |command| {
+            let binding = matches!(&command, Command::CallApi {method,..} if method == "bind_transport");
+            let result = presentation_send(&mut broker, command)?;
+            if binding && let Response::Accepted {id} = &result {
+                broker.results.insert(*id, json!({"result":"pending","retry_after_ms":50}));
+            }
+            Ok(result)
+        }).is_empty());
+        if controller.records.values().any(|record| {
+            record.stage == Stage::BindPresentationTransport && record.next_monitor > now
+        }) {
+            break;
+        }
+    }
+    let record = controller.records.values().next().unwrap();
+    assert_eq!(record.state, State::Starting);
+    assert!(!record.presentation_transport_bound);
+    assert_eq!(record.deadline, deadline);
+    assert_eq!(
+        presentation_binding_requests(&broker, "bind_transport").len(),
+        1
+    );
+    for _ in 0..16 {
+        assert!(
+            controller
+                .poll(now + Duration::from_millis(49), &mut |command| {
+                    presentation_send(&mut broker, command)
+                })
+                .is_empty()
+        );
+    }
+    assert_eq!(
+        presentation_binding_requests(&broker, "bind_transport").len(),
+        1
+    );
+    assert!(
+        !broker
+            .actions()
+            .iter()
+            .any(|(service, action)| *service == "amaterasu.rtsp/1" && *action == "open")
+    );
+    let (_, reply) = auxiliary_ready(
+        &mut controller,
+        &mut broker,
+        now + Duration::from_millis(50),
+    );
+    assert_eq!(reply.status, 200);
+    let bindings = presentation_binding_requests(&broker, "bind_transport");
+    assert_eq!(bindings.len(), 2);
+    assert_eq!(bindings[0], bindings[1]);
+}
+
+#[test]
+fn application_source_binding_waits_for_durable_ack_before_lifecycle_or_launch() {
+    let now = Instant::now();
+    let mut controller = auxiliary_controller();
+    controller.set_session_lifecycle_required(true);
+    controller.set_session_lifecycle_capture_mode(
+        amaterasu_module_sdk::extension_api::CaptureBindingMode::External,
+    );
+    controller.set_global_display_policy(7, json!({}));
+    let mut broker = SharedSessionBroker::default();
+    controller.launch_application_with_source(
+        10,
+        request(1),
+        peer(1),
+        borrowed_source("application-source"),
+        now,
+    );
+    let deadline = controller.records.values().next().unwrap().deadline;
+    let mut pending = 2;
+    let mut got_reply = None;
+    for tick in 0..128 {
+        let time = now + Duration::from_millis(tick * 10);
+        let replies = controller.poll(time, &mut |command| {
+            let binding =
+                matches!(&command, Command::CallApi {method,..} if method == "bind_application");
+            if binding && pending > 0 {
+                assert!(
+                    !broker
+                        .broker
+                        .actions()
+                        .iter()
+                        .any(
+                            |(service, action)| (*service == "amaterasu.session-lifecycle/1"
+                                && *action == "prepare")
+                                || (*service == "amaterasu.launch/1" && *action == "launch_export")
+                        )
+                );
+            }
+            let result = borrowed_send(&mut broker, command)?;
+            if binding
+                && pending > 0
+                && let Response::Accepted { id } = &result
+            {
+                pending -= 1;
+                broker
+                    .broker
+                    .results
+                    .insert(*id, json!({"result":"pending","retry_after_ms":25}));
+            }
+            Ok(result)
+        });
+        if pending > 0 {
+            assert_eq!(
+                controller.records.values().next().unwrap().deadline,
+                deadline
+            );
+        }
+        if let Some((_, reply)) = replies.into_iter().next() {
+            got_reply = Some(reply);
+            break;
+        }
+    }
+    let reply = got_reply.expect("bounded durable application binding");
+    assert_eq!(
+        reply.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&reply.body)
+    );
+    let bindings = presentation_binding_requests(&broker.broker, "bind_application");
+    assert_eq!(bindings.len(), 3);
+    assert!(bindings.windows(2).all(|pair| pair[0] == pair[1]));
+    assert!(
+        controller
+            .records
+            .values()
+            .next()
+            .unwrap()
+            .presentation_application_bound
+    );
+}
+
+#[test]
+fn indefinitely_pending_transport_binding_expires_without_stream_effects() {
+    let now = Instant::now();
+    let mut controller = auxiliary_controller();
+    let mut broker = Broker::default();
+    controller.launch_auxiliary(
+        10,
+        request(1),
+        peer(1),
+        auxiliary_plan(1, CaptureSource::SyntheticBlack),
+        now,
+    );
+    for _ in 0..64 {
+        controller.poll(now, &mut |command| {
+            let binding =
+                matches!(&command, Command::CallApi {method,..} if method == "bind_transport");
+            let result = presentation_send(&mut broker, command)?;
+            if binding && let Response::Accepted { id } = &result {
+                broker
+                    .results
+                    .insert(*id, json!({"result":"pending","retry_after_ms":1000}));
+            }
+            Ok(result)
+        });
+        if controller.records.values().any(|record| {
+            record.stage == Stage::BindPresentationTransport && record.next_monitor > now
+        }) {
+            break;
+        }
+    }
+    let (_, reply) = auxiliary_ready(&mut controller, &mut broker, now + INITIAL_DEADLINE);
+    assert_eq!(reply.status, 503);
+    assert_eq!(
+        presentation_binding_requests(&broker, "bind_transport").len(),
+        1
+    );
+    assert!(
+        !broker
+            .actions()
+            .iter()
+            .any(|(service, action)| *service == "amaterasu.rtsp/1" && *action == "open")
+    );
+    let events = controller.take_auxiliary_events();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].event, SessionEvent::FailedStart);
+}
+
+#[test]
+fn malformed_pending_transport_binding_never_authorizes_stream_effects() {
+    for delay in [0, 1001] {
+        let now = Instant::now();
+        let mut controller = auxiliary_controller();
+        let mut broker = Broker::default();
+        controller.launch_auxiliary(
+            10,
+            request(1),
+            peer(1),
+            auxiliary_plan(1, CaptureSource::SyntheticBlack),
+            now,
+        );
+        let mut reply = None;
+        for _ in 0..64 {
+            let replies = controller.poll(now, &mut |command| {
+                let binding =
+                    matches!(&command, Command::CallApi {method,..} if method == "bind_transport");
+                let result = presentation_send(&mut broker, command)?;
+                if binding && let Response::Accepted { id } = &result {
+                    broker
+                        .results
+                        .insert(*id, json!({"result":"pending","retry_after_ms":delay}));
+                }
+                Ok(result)
+            });
+            if let Some((_, result)) = replies.into_iter().next() {
+                reply = Some(result);
+                break;
+            }
+        }
+        assert_eq!(reply.unwrap().status, 503);
+        assert!(
+            !broker
+                .actions()
+                .iter()
+                .any(|(service, action)| *service == "amaterasu.rtsp/1" && *action == "open")
+        );
+    }
+}
+
+#[test]
+fn pending_application_binding_expires_without_lifecycle_or_application_effects() {
+    let now = Instant::now();
+    let mut controller = auxiliary_controller();
+    controller.set_session_lifecycle_required(true);
+    controller.set_session_lifecycle_capture_mode(
+        amaterasu_module_sdk::extension_api::CaptureBindingMode::External,
+    );
+    controller.set_global_display_policy(7, json!({}));
+    let mut broker = SharedSessionBroker::default();
+    controller.launch_application_with_source(
+        10,
+        request(1),
+        peer(1),
+        borrowed_source("application-source"),
+        now,
+    );
+    for tick in 0..128 {
+        let time = now + Duration::from_millis(tick * 10);
+        assert!(controller.poll(time, &mut |command| {
+            let binding = matches!(&command, Command::CallApi {method,..} if method == "bind_application");
+            let result = borrowed_send(&mut broker, command)?;
+            if binding && let Response::Accepted {id} = &result {
+                broker.broker.results.insert(*id, json!({"result":"pending","retry_after_ms":1000}));
+            }
+            Ok(result)
+        }).is_empty());
+        if controller.records.values().any(|record| {
+            workflow::next_phase(record) == workflow::Phase::BindPresentationApplication
+                && record.next_monitor > time
+        }) {
+            break;
+        }
+    }
+    assert_eq!(
+        presentation_binding_requests(&broker.broker, "bind_application").len(),
+        1
+    );
+    let (_, reply) = borrowed_ready(&mut controller, &mut broker, now + INITIAL_DEADLINE);
+    assert_eq!(reply.status, 503);
+    assert_eq!(
+        presentation_binding_requests(&broker.broker, "bind_application").len(),
+        1
+    );
+    assert!(
+        !broker
+            .broker
+            .actions()
+            .iter()
+            .any(
+                |(service, action)| (*service == "amaterasu.session-lifecycle/1"
+                    && *action == "prepare")
+                    || (*service == "amaterasu.launch/1" && *action == "launch_export")
+                    || (*service == "amaterasu.rtsp/1" && *action == "open")
+            )
+    );
+}
+
+#[test]
+fn revocation_while_transport_binding_is_pending_prevents_retry_and_stream_effects() {
+    let now = Instant::now();
+    let mut controller = auxiliary_controller();
+    let mut broker = Broker::default();
+    controller.launch_auxiliary(
+        10,
+        request(1),
+        peer(1),
+        auxiliary_plan(1, CaptureSource::SyntheticBlack),
+        now,
+    );
+    for _ in 0..64 {
+        controller.poll(now, &mut |command| {
+            let binding =
+                matches!(&command, Command::CallApi {method,..} if method == "bind_transport");
+            let result = presentation_send(&mut broker, command)?;
+            if binding && let Response::Accepted { id } = &result {
+                broker
+                    .results
+                    .insert(*id, json!({"result":"pending","retry_after_ms":1000}));
+            }
+            Ok(result)
+        });
+        if controller.records.values().any(|record| {
+            record.stage == Stage::BindPresentationTransport && record.next_monitor > now
+        }) {
+            break;
+        }
+    }
+    assert_eq!(controller.revoke_unauthorized(now, |_, _| false), vec![10]);
+    for _ in 0..64 {
+        assert!(
+            controller
+                .poll(now + Duration::from_secs(1), &mut |command| {
+                    presentation_send(&mut broker, command)
+                })
+                .is_empty()
+        );
+    }
+    assert_eq!(
+        presentation_binding_requests(&broker, "bind_transport").len(),
+        1
+    );
+    assert!(
+        !broker
+            .actions()
+            .iter()
+            .any(|(service, action)| *service == "amaterasu.rtsp/1" && *action == "open")
+    );
+    assert!(
+        controller
+            .records
+            .values()
+            .all(|record| record.state.terminal())
+    );
+}

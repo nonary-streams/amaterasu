@@ -76,7 +76,14 @@ impl Phase {
     fn response_reported_failure(self, payload: &Value) -> bool {
         match self {
             Self::BindPresentationTransport | Self::BindPresentationApplication => {
-                payload["result"] != "acknowledged"
+                !amaterasu_module_sdk::session_presentation::decode_reply(payload.clone())
+                    .is_ok_and(|reply| {
+                        matches!(
+                            reply,
+                            amaterasu_module_sdk::session_presentation::Reply::Acknowledged {}
+                                | amaterasu_module_sdk::session_presentation::Reply::Pending { .. }
+                        )
+                    })
             }
             Self::VerifyBorrowedCapture => payload["result"] != "verified",
             Self::PrepareLifecycle
@@ -98,6 +105,21 @@ impl Phase {
 mod phase_logging_tests {
     use super::Phase;
     use serde_json::json;
+
+    #[test]
+    fn durable_binding_pending_is_a_normal_response_but_invalid_delays_are_failures() {
+        for phase in [
+            Phase::BindPresentationApplication,
+            Phase::BindPresentationTransport,
+        ] {
+            assert!(
+                !phase.response_reported_failure(&json!({"result":"pending","retry_after_ms":25}))
+            );
+            assert!(
+                phase.response_reported_failure(&json!({"result":"pending","retry_after_ms":0}))
+            );
+        }
+    }
 
     #[test]
     fn successful_monitoring_is_quiet_but_failures_are_recorded() {
@@ -181,6 +203,15 @@ impl Controller {
             record.retrying_uncertainty = false;
         }
         let phase = next_phase(&record);
+        if matches!(
+            phase,
+            Phase::BindPresentationApplication | Phase::BindPresentationTransport
+        ) && now >= record.deadline
+        {
+            record.request_cleanup(Some("launch_deadline_exceeded"), now);
+            self.records.insert(id, record);
+            return;
+        }
         if matches!(phase, Phase::PrepareLifecycle | Phase::LookupLifecycle)
             && now >= record.deadline
         {
@@ -1061,17 +1092,10 @@ impl Controller {
         }
         match job.phase {
             Phase::BindPresentationApplication => {
-                let bound = amaterasu_module_sdk::session_presentation::decode_reply(payload)
-                    .is_ok_and(|reply| {
-                        matches!(
-                            reply,
-                            amaterasu_module_sdk::session_presentation::Reply::Acknowledged {}
-                        )
-                    });
-                if bound && record.state == State::Starting {
-                    record.presentation_application_bound = true;
-                } else {
-                    fail_record(record, "presentation_application_unbound", now);
+                match presentation_binding_reply(payload, record, now) {
+                    Ok(true) => record.presentation_application_bound = true,
+                    Ok(false) => {}
+                    Err(()) => fail_record(record, "presentation_application_unbound", now),
                 }
             }
             Phase::ReadRtspRuntimeEpoch => {
@@ -1091,25 +1115,20 @@ impl Controller {
                 }
             }
             Phase::BindPresentationTransport => {
-                let bound = amaterasu_module_sdk::session_presentation::decode_reply(payload)
-                    .is_ok_and(|reply| {
-                        matches!(
-                            reply,
-                            amaterasu_module_sdk::session_presentation::Reply::Acknowledged {}
-                        )
-                    });
-                if bound && record.state == State::Starting {
-                    record.presentation_transport_bound = true;
-                    if let Some(hold) = record.application_source.as_mut() {
-                        hold.transport_epoch = record.rtsp_runtime_epoch.clone();
+                match presentation_binding_reply(payload, record, now) {
+                    Ok(true) => {
+                        record.presentation_transport_bound = true;
+                        if let Some(hold) = record.application_source.as_mut() {
+                            hold.transport_epoch = record.rtsp_runtime_epoch.clone();
+                        }
+                        record.stage = if record.shared_capture.is_some() {
+                            Stage::VerifyBorrowedCapture
+                        } else {
+                            record.presentation_continue_stage
+                        };
                     }
-                    record.stage = if record.shared_capture.is_some() {
-                        Stage::VerifyBorrowedCapture
-                    } else {
-                        record.presentation_continue_stage
-                    };
-                } else {
-                    fail_record(record, "presentation_transport_unbound", now);
+                    Ok(false) => {}
+                    Err(()) => fail_record(record, "presentation_transport_unbound", now),
                 }
             }
             Phase::VerifyBorrowedCapture => {
@@ -2146,8 +2165,42 @@ fn negotiation_mode_limit(config: &StreamingConfig, offer: &CodecOffer) -> (u32,
     )
 }
 
+/// A binding acknowledgment follows durable persistence. Pending retries the
+/// frozen source tuple and does not authorize downstream effects or a new budget.
+fn presentation_binding_reply(
+    payload: Value,
+    record: &mut Record,
+    now: Instant,
+) -> Result<bool, ()> {
+    use amaterasu_module_sdk::session_presentation::{Reply, decode_reply};
+    if record.state != State::Starting || now >= record.deadline {
+        return Err(());
+    }
+    match decode_reply(payload) {
+        Ok(Reply::Acknowledged {}) => {
+            record.next_monitor = now;
+            Ok(true)
+        }
+        Ok(Reply::Pending { retry_after_ms }) => {
+            record.next_monitor = now + Duration::from_millis(retry_after_ms);
+            Ok(false)
+        }
+        _ => Err(()),
+    }
+}
+
 fn needs_work(record: &Record, now: Instant) -> bool {
     if record.state == State::CleanupFailed {
+        return false;
+    }
+    if record.state == State::Starting
+        && matches!(
+            next_phase(record),
+            Phase::BindPresentationApplication | Phase::BindPresentationTransport
+        )
+        && now < record.next_monitor
+        && now < record.deadline
+    {
         return false;
     }
     if matches!(
