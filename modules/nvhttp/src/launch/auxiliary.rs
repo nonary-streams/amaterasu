@@ -47,6 +47,7 @@ pub(super) struct PendingAuxiliary {
     plan: AuxiliaryStreamPlan,
     pub(super) delivery_permission: crate::wire::Permission,
     response_kind: StreamResponse,
+    retiring_sources: Vec<(String, u64)>,
 }
 
 impl AuxiliaryRecord {
@@ -246,16 +247,48 @@ impl Controller {
                 "auxiliary reconnect is already in progress",
             ));
         }
-        if self.records.values().any(|record| {
-            record.auxiliary.is_some()
-                && !record.state.terminal()
-                && record.peer.certificate() == peer.certificate()
-                && record.request.remote_input_key != request.remote_input_key
-        }) {
-            if let Err(code) =
-                self.stop_auxiliary_for_client(&plan.session_id, plan.generation, &client, now)
-            {
-                return Some(private_error(409, code));
+        if let Err(reply) = self.validate_stream_request(&request, &peer, Some(plan.stream_audio)) {
+            return Some(reply);
+        }
+        if let Err(code) = self
+            .presentation_source_context(Some(&plan), None)
+            .and_then(|_| self.presentation_capture_route(&plan.capture, &request))
+        {
+            return Some(private_error(503, code));
+        }
+        if let Err(code) = self.codec_offer(
+            self.config.as_ref().expect("validated streaming config"),
+            &request,
+        ) {
+            return Some(private_error(503, code));
+        }
+        // A used or conflicting key must not retire a different live stream.
+        let existing_key = self.retired_stream_key(&request)
+            || self
+                .records
+                .values()
+                .any(|record| record.request.remote_input_key == request.remote_input_key);
+        let retiring_sources: Vec<_> = if existing_key {
+            Vec::new()
+        } else {
+            self.records
+                .values()
+                .filter_map(|record| {
+                    let auxiliary = record.auxiliary.as_ref()?;
+                    (!record.state.terminal() && record.peer.certificate() == peer.certificate())
+                        .then(|| (auxiliary.plan.session_id.clone(), auxiliary.plan.generation))
+                })
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect()
+        };
+        if !retiring_sources.is_empty() {
+            for (session_id, generation) in &retiring_sources {
+                if let Err(code) =
+                    self.stop_auxiliary_for_client(session_id, *generation, &client, now)
+                {
+                    return Some(private_error(409, code));
+                }
             }
             self.pending_auxiliary.insert(
                 client,
@@ -266,6 +299,7 @@ impl Controller {
                     plan,
                     delivery_permission: crate::wire::Permission::Launch,
                     response_kind: response,
+                    retiring_sources,
                 },
             );
             return None;
@@ -762,7 +796,13 @@ impl Controller {
         let clients: Vec<_> = self.pending_auxiliary.keys().cloned().collect();
         for client in clients {
             let pending = &self.pending_auxiliary[&client];
-            let outcome = self.auxiliary_stopped(&pending.plan.session_id, pending.plan.generation);
+            let outcome = pending.retiring_sources.iter().try_fold(
+                true,
+                |retired, (session_id, generation)| {
+                    self.auxiliary_stopped(session_id, *generation)
+                        .map(|source_retired| retired && source_retired)
+                },
+            );
             if matches!(outcome, Ok(false)) {
                 continue;
             }
@@ -794,6 +834,60 @@ impl Controller {
                 );
             }
         }
+    }
+}
+
+/// A retry may reserve the same logical source again. Its unused provisional
+/// reservation is released by the wire consumer; the live bound hold stays put.
+pub(super) fn same_auxiliary_source(
+    left: Option<&AuxiliaryStreamPlan>,
+    right: Option<&AuxiliaryStreamPlan>,
+) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) => {
+            let AuxiliaryStreamPlan {
+                session_id,
+                generation,
+                reservation_id: _,
+                capture,
+                mode,
+                source_mode,
+                stream_audio,
+                host_audio,
+            } = left;
+            session_id == &right.session_id
+                && generation == &right.generation
+                && capture == &right.capture
+                && mode == &right.mode
+                && source_mode == &right.source_mode
+                && stream_audio == &right.stream_audio
+                && host_audio == &right.host_audio
+        }
+        _ => false,
+    }
+}
+
+pub(super) fn same_shared_source(
+    left: Option<&SharedCapture>,
+    right: Option<&SharedCapture>,
+) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) => {
+            let SharedCapture {
+                session_id,
+                generation,
+                reservation_id: _,
+                capture,
+                mode,
+            } = left;
+            session_id == &right.session_id
+                && generation == &right.generation
+                && capture == &right.capture
+                && mode == &right.mode
+        }
+        _ => false,
     }
 }
 

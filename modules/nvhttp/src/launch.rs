@@ -1128,6 +1128,43 @@ impl Controller {
         )
     }
 
+    fn validate_stream_request(
+        &self,
+        request: &LaunchRequest,
+        peer: &PeerIdentity,
+        auxiliary_audio: Option<bool>,
+    ) -> Result<(), Reply> {
+        if self.package_activation_pending {
+            return Err(private_error(503, "plugin activation is pending"));
+        }
+        let Some(config) = &self.config else {
+            return Err(private_error(503, "streaming is disabled"));
+        };
+        if !self.output_settings_ready {
+            return Err(private_error(503, "stream settings are loading"));
+        }
+        if !peer.paired() {
+            return Err(private_error(401, "authenticated paired TLS is required"));
+        }
+        let desktop = auxiliary_audio.is_some() || request.app_id == DESKTOP_APP_ID;
+        if (request.app_id == 0 && auxiliary_audio.is_none())
+            || request.app_id > i32::MAX as u32
+            || (desktop && auxiliary_audio.is_none() && !config.desktop.enabled)
+            || !config.profile.accepts(request)
+            || !matches!(request.audio_channels, 2 | 6 | 8)
+            || (auxiliary_audio.unwrap_or(true)
+                && ((request.audio_channels == 6 && config.profile.audio_bitrate < 256_000)
+                    || (request.audio_channels == 8 && config.profile.audio_bitrate < 512_000)))
+            || request
+                .device_name
+                .as_deref()
+                .is_some_and(|name| !valid_device_name(name))
+        {
+            return Err(private_error(400, "unsupported streaming request"));
+        }
+        Ok(())
+    }
+
     fn launch_with_source(
         &mut self,
         connection: u64,
@@ -1147,34 +1184,15 @@ impl Controller {
                 return Some(private_error(409, "launch key was already used"));
             }
         }
-        if self.package_activation_pending {
-            return Some(private_error(503, "plugin activation is pending"));
+        if let Err(reply) = self.validate_stream_request(
+            &request,
+            &peer,
+            auxiliary.as_ref().map(|plan| plan.stream_audio),
+        ) {
+            return Some(reply);
         }
-        let Some(config) = &self.config else {
-            return Some(private_error(503, "streaming is disabled"));
-        };
-        if !self.output_settings_ready {
-            return Some(private_error(503, "stream settings are loading"));
-        }
-        if !peer.paired() {
-            return Some(private_error(401, "authenticated paired TLS is required"));
-        }
+        let config = self.config.as_ref().expect("validated streaming config");
         let desktop = auxiliary.is_some() || request.app_id == DESKTOP_APP_ID;
-        if (request.app_id == 0 && auxiliary.is_none())
-            || request.app_id > i32::MAX as u32
-            || (desktop && auxiliary.is_none() && !config.desktop.enabled)
-            || !config.profile.accepts(&request)
-            || !matches!(request.audio_channels, 2 | 6 | 8)
-            || (auxiliary.as_ref().is_none_or(|plan| plan.stream_audio)
-                && ((request.audio_channels == 6 && config.profile.audio_bitrate < 256_000)
-                    || (request.audio_channels == 8 && config.profile.audio_bitrate < 512_000)))
-            || request
-                .device_name
-                .as_deref()
-                .is_some_and(|name| !valid_device_name(name))
-        {
-            return Some(private_error(400, "unsupported streaming request"));
-        }
         let device_name = request
             .device_name
             .as_deref()
@@ -1250,8 +1268,14 @@ impl Controller {
         {
             if record.peer == peer
                 && record.request == request
-                && record.auxiliary.as_ref().map(|auxiliary| &auxiliary.plan) == auxiliary.as_ref()
-                && record.shared_capture.as_ref() == shared_capture.as_ref()
+                && auxiliary::same_auxiliary_source(
+                    record.auxiliary.as_ref().map(|auxiliary| &auxiliary.plan),
+                    auxiliary.as_ref(),
+                )
+                && auxiliary::same_shared_source(
+                    record.shared_capture.as_ref(),
+                    shared_capture.as_ref(),
+                )
             {
                 if matches!(record.state, State::Ready) {
                     record.launch_connection = Some(connection);

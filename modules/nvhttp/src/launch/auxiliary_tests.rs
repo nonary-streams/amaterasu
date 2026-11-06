@@ -1015,3 +1015,247 @@ fn changed_source_context_readback_retires_the_transport_before_rejecting() {
             .all(|event| event.event != SessionEvent::StreamStarted)
     );
 }
+
+#[test]
+fn auxiliary_switch_waits_for_the_exact_previous_source_and_generation() {
+    for replace_generation in [false, true] {
+        let now = Instant::now();
+        let mut controller = auxiliary_controller();
+        let mut broker = Broker::default();
+        controller.launch_auxiliary(
+            10,
+            request(1),
+            peer(1),
+            auxiliary_plan(1, CaptureSource::SyntheticBlack),
+            now,
+        );
+        assert_eq!(
+            auxiliary_ready(&mut controller, &mut broker, now).1.status,
+            200
+        );
+        controller.reply_delivered(10, now);
+        controller.take_auxiliary_events();
+        let first = *controller.records.keys().next().unwrap();
+        let mut next = auxiliary_plan(
+            2,
+            CaptureSource::ExactOutput {
+                output: "kwin:Virtual-7".into(),
+                route_key: "default".into(),
+            },
+        );
+        if replace_generation {
+            next.generation += 1;
+        } else {
+            next.session_id = "another-source".into();
+        }
+        let expected_session = next.session_id.clone();
+        let expected_generation = next.generation;
+        assert!(
+            controller
+                .launch_auxiliary_for_route(
+                    20,
+                    request(2),
+                    peer(1),
+                    next,
+                    StreamResponse::Resume,
+                    now
+                )
+                .is_none()
+        );
+        assert_eq!(controller.records[&first].state, State::Stopping);
+        assert_eq!(
+            controller.records.len(),
+            1,
+            "new source waits for exact old native retirement"
+        );
+        assert_stream_response(
+            &auxiliary_ready(&mut controller, &mut broker, now).1,
+            StreamResponse::Resume,
+        );
+        let next = controller
+            .records
+            .values()
+            .find(|record| record.request.remote_input_key == request(2).remote_input_key)
+            .unwrap();
+        assert_eq!(
+            next.auxiliary.as_ref().unwrap().plan.session_id,
+            expected_session
+        );
+        assert_eq!(
+            next.auxiliary.as_ref().unwrap().plan.generation,
+            expected_generation
+        );
+        let actions = broker.actions();
+        let close = actions
+            .iter()
+            .position(|(service, action)| *service == "amaterasu.rtsp/1" && *action == "close")
+            .unwrap();
+        let reopen = actions
+            .iter()
+            .rposition(|(service, action)| *service == "amaterasu.rtsp/1" && *action == "open")
+            .unwrap();
+        assert!(close < reopen);
+        assert_eq!(controller.records[&first].state, State::Stopped);
+        assert_eq!(
+            controller.take_auxiliary_events()[0].event,
+            SessionEvent::StreamEnded
+        );
+    }
+}
+
+#[test]
+fn rejected_auxiliary_replacement_does_not_retire_the_current_transport() {
+    let now = Instant::now();
+    let mut controller = auxiliary_controller();
+    let mut broker = Broker::default();
+    controller.launch_auxiliary(
+        10,
+        request(1),
+        peer(1),
+        auxiliary_plan(1, CaptureSource::SyntheticBlack),
+        now,
+    );
+    auxiliary_ready(&mut controller, &mut broker, now);
+    controller.reply_delivered(10, now);
+    let first = *controller.records.keys().next().unwrap();
+    let unselected = auxiliary_plan(
+        2,
+        CaptureSource::ExactOutput {
+            output: "kwin:DP-1".into(),
+            route_key: "unselected".into(),
+        },
+    );
+    assert_eq!(
+        controller
+            .launch_auxiliary(20, request(2), peer(1), unselected, now)
+            .unwrap()
+            .status,
+        503
+    );
+    let mut unsupported = request(2);
+    unsupported.width = 4096;
+    let mut plan = auxiliary_plan(2, CaptureSource::SyntheticBlack);
+    plan.mode.width = unsupported.width;
+    assert_eq!(
+        controller
+            .launch_auxiliary(20, unsupported, peer(1), plan, now)
+            .unwrap()
+            .status,
+        400
+    );
+    assert_eq!(controller.records[&first].state, State::Ready);
+    assert!(controller.pending_auxiliary.is_empty());
+    assert!(!broker.rtsp_closed);
+}
+
+#[test]
+fn cached_auxiliary_retry_keeps_bound_reservation_and_requires_identical_source() {
+    let now = Instant::now();
+    let mut controller = auxiliary_controller();
+    let mut broker = Broker::default();
+    let plan = auxiliary_plan(1, CaptureSource::SyntheticBlack);
+    controller.launch_auxiliary(10, request(1), peer(1), plan.clone(), now);
+    auxiliary_ready(&mut controller, &mut broker, now);
+    controller.reply_delivered(10, now);
+    let commands_before = broker.commands.len();
+    let mut retry = plan;
+    retry.reservation_id = "fresh-provisional-reservation".into();
+    let cached = controller
+        .launch_auxiliary_for_route(
+            20,
+            request(1),
+            peer(1),
+            retry.clone(),
+            StreamResponse::Resume,
+            now,
+        )
+        .unwrap();
+    assert_stream_response(&cached, StreamResponse::Resume);
+    let record = controller.records.values().next().unwrap();
+    assert_eq!(
+        record.auxiliary.as_ref().unwrap().plan.reservation_id,
+        "reservation-1"
+    );
+    assert_eq!(broker.commands.len(), commands_before);
+    retry.source_mode = Some(Mode {
+        width: 2560,
+        height: 1440,
+        refresh_millihz: 60_000,
+        hdr: false,
+    });
+    assert_eq!(
+        controller
+            .launch_auxiliary(21, request(1), peer(1), retry, now)
+            .unwrap()
+            .status,
+        409
+    );
+    assert!(controller.pending_auxiliary.is_empty());
+    assert_eq!(
+        controller.records.values().next().unwrap().state,
+        State::Ready
+    );
+}
+
+#[test]
+fn cached_application_source_retry_keeps_original_application_lifetime_hold() {
+    let now = Instant::now();
+    let mut controller = auxiliary_controller();
+    controller.set_session_lifecycle_required(true);
+    controller.set_session_lifecycle_capture_mode(
+        amaterasu_module_sdk::extension_api::CaptureBindingMode::External,
+    );
+    controller.set_global_display_policy(7, json!({}));
+    let source = borrowed_source("original-application-source");
+    let mut broker = SharedSessionBroker::default();
+    controller.launch_application_with_source(10, request(1), peer(1), source.clone(), now);
+    assert_eq!(
+        borrowed_ready(&mut controller, &mut broker, now).1.status,
+        200
+    );
+    controller.reply_delivered(10, now);
+    let commands_before = broker.broker.commands.len();
+    let mut retry = source;
+    retry.reservation_id = "fresh-provisional-reservation".into();
+    let cached = controller
+        .launch_application_with_source_for_route(
+            20,
+            request(1),
+            peer(1),
+            retry.clone(),
+            StreamResponse::Resume,
+            now,
+        )
+        .unwrap();
+    assert_stream_response(&cached, StreamResponse::Resume);
+    assert_eq!(broker.broker.commands.len(), commands_before);
+    let record = controller.records.values().next().unwrap();
+    assert_eq!(
+        record.shared_capture.as_ref().unwrap().reservation_id,
+        "original-application-source"
+    );
+    assert_eq!(
+        record
+            .application_source
+            .as_ref()
+            .unwrap()
+            .source
+            .reservation_id,
+        "original-application-source"
+    );
+    retry.mode.width += 2;
+    assert_eq!(
+        controller
+            .launch_application_with_source_for_route(
+                21,
+                request(1),
+                peer(1),
+                retry,
+                StreamResponse::Launch,
+                now
+            )
+            .unwrap()
+            .status,
+        409
+    );
+}
