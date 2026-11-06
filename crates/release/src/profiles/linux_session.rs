@@ -1030,6 +1030,9 @@ fn settings(
     if options.enable_virtual_display {
         capture_settings["allow_named_outputs"] = json!(true);
     }
+    if options.enable_desktop_output_capture {
+        capture_settings["allow_desktop_outputs"] = json!(true);
+    }
     insert("amaterasu.capture-pipewire", capture_settings);
     insert("amaterasu.capture-vkms", vkms_capture_settings(options));
     insert(

@@ -143,7 +143,7 @@ fn installer_selects_exact_contracts_and_keeps_hardware_disabled() {
 }
 
 #[test]
-fn linux_exact_desktop_route_requires_explicit_named_capture_authorization() {
+fn linux_exact_desktop_route_requires_its_own_explicit_destination_permission() {
     let root = PrivateTestRoot::new();
     let policy = linux_session::linux_session_policy(
         &root.0,
@@ -156,7 +156,7 @@ fn linux_exact_desktop_route_requires_explicit_named_capture_authorization() {
     );
 
     let root = PrivateTestRoot::new();
-    let mut authorized = linux_session::linux_session_policy(
+    let managed = linux_session::linux_session_policy(
         &root.0,
         &linux_session::options::LinuxSessionOptions {
             enable_virtual_display: true,
@@ -165,8 +165,53 @@ fn linux_exact_desktop_route_requires_explicit_named_capture_authorization() {
     )
     .unwrap();
     assert_eq!(
+        managed.settings["amaterasu.nvhttp"]["auxiliary_exact_capture_routes"],
+        json!({"managed_output":"vkms"})
+    );
+    assert_eq!(
+        managed.settings["amaterasu.capture-pipewire"]["allow_named_outputs"],
+        true
+    );
+    assert!(
+        managed.settings["amaterasu.capture-pipewire"]
+            .get("allow_desktop_outputs")
+            .is_none()
+    );
+
+    let root = PrivateTestRoot::new();
+    let mut authorized = linux_session::linux_session_policy(
+        &root.0,
+        &linux_session::options::LinuxSessionOptions {
+            enable_capture: true,
+            enable_desktop_output_capture: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
         authorized.settings["amaterasu.nvhttp"]["auxiliary_exact_capture_routes"],
         json!({"managed_output":"vkms","desktop_output":"pipewire"})
+    );
+    assert_eq!(
+        authorized.settings["amaterasu.capture-pipewire"]["allow_desktop_outputs"],
+        true
+    );
+    assert_eq!(
+        authorized.settings["amaterasu.virtual-display"]["enabled"],
+        false
+    );
+    assert_eq!(
+        authorized.settings[linux_session::VIDEO_COMPONENT_ID]["source_preflight_routes"],
+        json!({
+            "managed_output":{"provider":"vkms","class":"managed_output"},
+            "desktop_output":{"provider":"pipewire","class":"desktop_output"},
+            "synthetic_black":{"provider":"black","class":"synthetic"}
+        })
+    );
+    assert!(
+        authorized.settings[linux_session::VIDEO_COMPONENT_ID]
+            .get("capture_source_classes")
+            .is_none()
     );
     assert_eq!(
         authorized.settings["amaterasu.input"]["allow_injection"],
@@ -182,6 +227,47 @@ fn linux_exact_desktop_route_requires_explicit_named_capture_authorization() {
         authorized.settings["amaterasu.nvhttp"]["auxiliary_exact_capture_routes"]
             .get("desktop_output")
             .is_none()
+    );
+}
+
+#[test]
+fn desktop_capture_option_requires_capture_and_preserves_duplicate_validation() {
+    use linux_session::options::{LinuxSessionOptions, OptionError};
+    let arguments = |values: &[&str]| {
+        values
+            .iter()
+            .map(|value| (*value).to_owned())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        LinuxSessionOptions::from_arguments(&arguments(&["--enable-desktop-output-capture"]))
+            .unwrap_err(),
+        OptionError::DesktopOutputCaptureRequirements
+    );
+    let options = LinuxSessionOptions::from_arguments(&arguments(&[
+        "--enable-desktop-output-capture",
+        "--enable-capture",
+    ]))
+    .unwrap();
+    assert!(options.enable_desktop_output_capture);
+    assert!(!options.enable_virtual_display);
+    assert!(matches!(
+        LinuxSessionOptions::from_arguments(&arguments(&[
+            "--enable-capture",
+            "--enable-desktop-output-capture",
+            "--enable-desktop-output-capture"
+        ])),
+        Err(OptionError::RepeatedOption(
+            "--enable-desktop-output-capture"
+        ))
+    ));
+    assert_eq!(
+        LinuxSessionOptions {
+            enable_desktop_output_capture: true,
+            ..Default::default()
+        }
+        .validate(),
+        Err(OptionError::DesktopOutputCaptureRequirements)
     );
 }
 

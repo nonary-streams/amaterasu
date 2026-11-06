@@ -358,6 +358,17 @@ pub fn build_package_with_library_selection(
     if !bootstrap.development {
         return Err("development publisher cannot use a production root".into());
     }
+    if crate::linux_owned_display::desktop_capture_enabled(&bootstrap.policy.settings) {
+        let capture = profile
+            .components()
+            .iter()
+            .find(|component| component.id == "amaterasu.capture-pipewire")
+            .ok_or("desktop output capture provider is absent from the selected package")?;
+        crate::linux_owned_display::validate_desktop_capture_artifact(&read_bounded(
+            &artifacts.join(library_filename(capture.library)),
+            256 * 1024 * 1024,
+        )?)?;
+    }
     let external = external
         .iter()
         .map(|(template, artifact)| read_external_component(template, artifact, &bootstrap))
@@ -2503,6 +2514,41 @@ mod provision_tests {
         ] {
             assert!(embedded_ffmpeg_abi(artifact).is_err());
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn physical_desktop_capture_rejects_a_managed_only_artifact_before_packaging() {
+        let root = fixture("physical-capture-preflight");
+        let installation = root.join("host");
+        initialize_linux_session(
+            &installation,
+            &LinuxSessionOptions {
+                enable_capture: true,
+                enable_desktop_output_capture: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let artifacts = root.join("artifacts");
+        fs::create_dir_all(&artifacts).unwrap();
+        fs::write(
+            artifacts.join(library_filename("amaterasu_capture_pipewire")),
+            b"AMATERASU_KWIN_CAPTURE=1\0",
+        )
+        .unwrap();
+        let output = root.join("package");
+        let error = build_package(
+            &installation,
+            &artifacts,
+            &output,
+            1,
+            PackageProfile::LinuxSession,
+        )
+        .unwrap_err();
+        assert!(error.contains("desktop output capture requires"));
+        assert!(!output.exists());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[cfg(target_os = "linux")]

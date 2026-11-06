@@ -838,7 +838,6 @@ fn each_effect_option_enables_only_its_own_setting() {
             "--enable-virtual-display",
             vec![
                 "amaterasu.capture-pipewire",
-                VIDEO_COMPONENT_ID,
                 "amaterasu.nvhttp",
                 "amaterasu.virtual-display",
             ],

@@ -343,7 +343,7 @@ fn configure_capture_routes(policy: &mut RuntimeConfig) {
             .settings
             .get("amaterasu.capture-pipewire")
             .is_some_and(|settings| {
-                settings["enabled"] == true && settings["allow_named_outputs"] == true
+                settings["enabled"] == true && settings["allow_desktop_outputs"] == true
             })
     {
         // This is authorization and provider selection. The consumer must still
@@ -365,9 +365,19 @@ fn configure_capture_routes(policy: &mut RuntimeConfig) {
                 "service":"amaterasu.capture-black/1",
                 "frame_transport":"generic_cpu",
             });
-            let mut preflight_routes = exact_routes.clone();
-            preflight_routes["synthetic_black"] = json!("black");
-            settings["source_preflight_routes"] = preflight_routes;
+            let mut preflight_routes = serde_json::Map::new();
+            for route in ["managed_output", "desktop_output"] {
+                if let Some(provider) = exact_routes.get(route) {
+                    preflight_routes
+                        .insert(route.into(), json!({"provider":provider,"class":route}));
+                }
+            }
+            preflight_routes.insert(
+                "synthetic_black".into(),
+                json!({"provider":"black","class":"synthetic"}),
+            );
+            settings["source_preflight_routes"] = serde_json::Value::Object(preflight_routes);
+            settings["preflight_only_principals"] = json!([COMPONENT.id]);
         }
     }
 }

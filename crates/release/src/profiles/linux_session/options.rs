@@ -45,6 +45,7 @@ pub enum OptionError {
     CaptureAuthorityCardWithoutHelper,
     ConflictingCaptureHelpers,
     VirtualScreenCaptureRequirements,
+    DesktopOutputCaptureRequirements,
     InvalidLabel(&'static str),
 }
 
@@ -81,6 +82,9 @@ impl fmt::Display for OptionError {
             ),
             Self::VirtualScreenCaptureRequirements => formatter.write_str(
                 "--enable-virtual-screen-capture requires --enable-capture, --enable-virtual-display, a --capture-authority-helper or already configured --frame-helper, and the default capture output"
+            ),
+            Self::DesktopOutputCaptureRequirements => formatter.write_str(
+                "--enable-desktop-output-capture requires --enable-capture"
             ),
             Self::InvalidRtxHdrRuntime(value) => write!(
                 formatter,
@@ -308,6 +312,9 @@ pub struct LinuxSessionOptions {
     /// Enables video processing and explicit KMS capture; portal selection
     /// and a configured frame helper retain their own authorization rules.
     pub enable_capture: bool,
+    /// Allows direct capture of existing physical KWin outputs through the
+    /// selected PipeWire provider. Managed-output permission stays separate.
+    pub enable_desktop_output_capture: bool,
     /// Enables host audio capture.
     pub enable_audio: bool,
     /// Enables the owned virtual display provider.
@@ -341,6 +348,7 @@ impl Default for LinuxSessionOptions {
             capture_output: DEFAULT_CAPTURE_OUTPUT.into(),
             audio_endpoint: DEFAULT_AUDIO_ENDPOINT.into(),
             enable_capture: false,
+            enable_desktop_output_capture: false,
             enable_audio: false,
             enable_virtual_display: false,
             enable_virtual_screen_capture: false,
@@ -408,6 +416,10 @@ impl LinuxSessionOptions {
                     seen.once("--enable-capture")?;
                     options.enable_capture = true;
                 }
+                "--enable-desktop-output-capture" => {
+                    seen.once("--enable-desktop-output-capture")?;
+                    options.enable_desktop_output_capture = true;
+                }
                 "--enable-audio" => {
                     seen.once("--enable-audio")?;
                     options.enable_audio = true;
@@ -471,6 +483,9 @@ impl LinuxSessionOptions {
 
     /// Reject inconsistent opt-in settings for both parsed and programmatic profiles.
     pub fn validate(&self) -> Result<(), OptionError> {
+        if self.enable_desktop_output_capture && !self.enable_capture {
+            return Err(OptionError::DesktopOutputCaptureRequirements);
+        }
         if self.capture_authority_helper.is_some() && self.frame_helper.is_some() {
             return Err(OptionError::ConflictingCaptureHelpers);
         }
