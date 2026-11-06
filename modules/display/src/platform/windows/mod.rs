@@ -126,6 +126,61 @@ fn reject_foreign_restore_state(
 #[derive(Default)]
 pub struct WindowsPlatform;
 impl Platform for WindowsPlatform {
+    fn capture_targets(&mut self) -> DisplayResult<Vec<crate::targets::NativeTarget>> {
+        let before = query::snapshot()?;
+        let labels = query::monitors()?;
+        let configuration = before.configuration()?;
+        let mut targets = Vec::new();
+        for setting in configuration.displays {
+            let label = labels
+                .iter()
+                .find(|row| {
+                    row["id"]
+                        .as_str()
+                        .is_some_and(|id| id.eq_ignore_ascii_case(&setting.id))
+                })
+                .and_then(|row| row["name"].as_str())
+                .unwrap_or("Display");
+            let observed =
+                amaterasu_windows_capture_geometry::resolve_target_matching(|identity| {
+                    identity.eq_ignore_ascii_case(&setting.id)
+                });
+            let exact = observed
+                .as_ref()
+                .ok()
+                .filter(|(_, output)| {
+                    output.rectangle.width == setting.width
+                        && output.rectangle.height == setting.height
+                })
+                .and_then(|(selection, _)| {
+                    amaterasu_module_sdk::capture::exact_target_selector(
+                        &selection.target_id.to_ascii_lowercase(),
+                    )
+                    .ok()
+                });
+            let ready = exact.is_some();
+            let target = crate::targets::NativeTarget::observed(
+                self.name(),
+                setting,
+                label,
+                exact.unwrap_or_else(|| "unavailable".into()),
+            )?;
+            targets.push(if ready {
+                target
+            } else {
+                target.unavailable("capture_topology_unverified")
+            });
+        }
+        let after = query::snapshot()?;
+        if !before.equivalent(&after) {
+            return Err(DisplayError::new(
+                "capture_target_changed",
+                "Windows exact capture inventory changed during observation",
+            ));
+        }
+        crate::targets::validate_inventory(&targets)?;
+        Ok(targets)
+    }
     fn name(&self) -> &'static str {
         "windows_ccd"
     }

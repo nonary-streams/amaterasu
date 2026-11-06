@@ -5,7 +5,7 @@ use crate::refresh_rate_option::{RefreshRateOption, parse_manual_refresh_rate};
 use crate::resolution_option::{ManualResolution, ResolutionOption, select_additional_resolution};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub const MAX_DISPLAYS: usize = 16;
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -14,12 +14,28 @@ pub const MAX_DISPLAYS: usize = 16;
 // the serialized operation and durable request identity straightforward.
 #[allow(clippy::large_enum_variant)]
 pub enum Operation {
+    CaptureTargets {},
+    ResolveCaptureTarget {
+        selector: String,
+    },
+    BorrowTarget {
+        operation_id: String,
+        selector: String,
+        reference_id: String,
+    },
+    ReleaseTarget {
+        operation_id: String,
+        selector: String,
+        reference_id: String,
+    },
     ScopedApply {
         operation_id: String,
         identity: String,
         reference_id: String,
         target: DisplaySetting,
         expected_topology_revision: String,
+        #[serde(default)]
+        primary: bool,
     },
     ScopedRelease {
         operation_id: String,
@@ -295,6 +311,33 @@ impl Configuration {
         Ok(())
     }
     pub fn validate(&self) -> Result<(), DisplayError> {
+        self.validate_with_scales(None)
+    }
+    pub fn validate_kscreen(&self, baseline: &KScreenSnapshot) -> Result<(), DisplayError> {
+        baseline.validate()?;
+        let scales = baseline
+            .outputs
+            .iter()
+            .filter(|output| output.connected && output.enabled)
+            .map(|output| (output.id.to_ascii_lowercase(), output.scale))
+            .collect::<BTreeMap<_, _>>();
+        self.validate_with_scales(Some(&scales))
+    }
+    pub fn validate_with_scales(
+        &self,
+        scales: Option<&BTreeMap<String, f64>>,
+    ) -> Result<(), DisplayError> {
+        if let Some(scales) = scales
+            && (scales.len() > MAX_DISPLAYS
+                || scales
+                    .values()
+                    .any(|scale| !scale.is_finite() || !(0.25..=5.0).contains(scale)))
+        {
+            return Err(DisplayError::new(
+                "invalid_snapshot",
+                "invalid observed display scale",
+            ));
+        }
         if self.displays.is_empty() || self.displays.len() > MAX_DISPLAYS {
             return Err(DisplayError::new(
                 "invalid_request",
@@ -337,16 +380,38 @@ impl Configuration {
                 "one display must begin at the primary origin (0,0)",
             ));
         }
+        let footprint = |display: &DisplaySetting| -> Result<(i64, i64), DisplayError> {
+            let Some(scales) = scales else {
+                return Ok((i64::from(display.width), i64::from(display.height)));
+            };
+            let scale = scales
+                .get(&display.id.to_ascii_lowercase())
+                .ok_or_else(|| {
+                    DisplayError::new("invalid_snapshot", "display scale is not observed")
+                })?;
+            let (width, height) =
+                if matches!(display.rotation, Rotation::Rotate90 | Rotation::Rotate270) {
+                    (display.height, display.width)
+                } else {
+                    (display.width, display.height)
+                };
+            Ok((
+                (f64::from(width) / scale).ceil() as i64,
+                (f64::from(height) / scale).ceil() as i64,
+            ))
+        };
         for (index, left) in self.displays.iter().enumerate() {
+            let (left_width, left_height) = footprint(left)?;
             for right in self.displays.iter().skip(index + 1) {
-                if i64::from(left.x) < i64::from(right.x) + i64::from(right.width)
-                    && i64::from(right.x) < i64::from(left.x) + i64::from(left.width)
-                    && i64::from(left.y) < i64::from(right.y) + i64::from(right.height)
-                    && i64::from(right.y) < i64::from(left.y) + i64::from(left.height)
+                let (right_width, right_height) = footprint(right)?;
+                if i64::from(left.x) < i64::from(right.x) + right_width
+                    && i64::from(right.x) < i64::from(left.x) + left_width
+                    && i64::from(left.y) < i64::from(right.y) + right_height
+                    && i64::from(right.y) < i64::from(left.y) + left_height
                     && (left.x != right.x
                         || left.y != right.y
-                        || left.width != right.width
-                        || left.height != right.height)
+                        || left_width != right_width
+                        || left_height != right_height)
                 {
                     return Err(DisplayError::new(
                         "unsupported_topology",
@@ -560,7 +625,6 @@ impl KScreenSnapshot {
         configuration: &Configuration,
     ) -> Result<(), DisplayError> {
         self.validate()?;
-        configuration.validate()?;
         let active_outputs = self
             .outputs
             .iter()
@@ -578,6 +642,7 @@ impl KScreenSnapshot {
                 "KScreen apply currently requires the same connected active outputs",
             ));
         }
+        configuration.validate_kscreen(self)?;
         let saved_primary = active_outputs.iter().find(|output| output.primary);
         let requested_primary = configuration
             .displays
@@ -593,6 +658,32 @@ impl KScreenSnapshot {
             ));
         }
         Ok(())
+    }
+
+    pub fn scoped_primary_baseline(&self, target_id: &str) -> Result<Self, DisplayError> {
+        self.validate()?;
+        let target = self
+            .outputs
+            .iter()
+            .find(|output| {
+                output.id.eq_ignore_ascii_case(target_id) && output.connected && output.enabled
+            })
+            .ok_or_else(|| {
+                DisplayError::new("unsupported_display", "scoped primary target is not active")
+            })?;
+        let prior_priority = target.priority.max(2);
+        let mut expected = self.clone();
+        for output in &mut expected.outputs {
+            if output.id.eq_ignore_ascii_case(target_id) {
+                output.priority = 1;
+                output.primary = true;
+            } else if output.primary {
+                output.priority = prior_priority;
+                output.primary = false;
+            }
+        }
+        expected.validate()?;
+        Ok(expected)
     }
 
     pub fn matches_configuration(&self, baseline: &Self, configuration: &Configuration) -> bool {
@@ -940,6 +1031,8 @@ pub struct Journal {
     pub scoped_targets: Vec<crate::scoped::ScopedReservation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scoped_pending: Option<crate::scoped::ScopedPending>,
+    #[serde(default, skip_serializing_if = "zero_offset")]
+    pub scoped_origin_shift: (i32, i32),
     pub owner: String,
     pub lease: String,
     /// Legacy CCD objects retain their exact JSON representation.
@@ -964,6 +1057,9 @@ pub struct RouteBinding {
     pub source_address: Address,
     pub target_address: Address,
     pub output_technology: i32,
+}
+fn zero_offset(value: &(i32, i32)) -> bool {
+    *value == (0, 0)
 }
 fn normal_lease_default() -> bool {
     true

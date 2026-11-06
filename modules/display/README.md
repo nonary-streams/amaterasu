@@ -402,3 +402,36 @@ This is a cooperative fence for mutations through this provider. Session
 coordination must separately fence its known consumers, and external desktop
 applications may change topology between observations. Linux physical mutation
 remains gated by its provider capability.
+
+## Existing capture targets
+
+The public SDK's `display::targets` module defines read-only selection and
+caller-owned source references on `amaterasu.display/1`:
+
+- `capture_targets` returns at most sixteen rows containing an opaque `selector`,
+  a display label, readiness, and the observed source mode and HDR state.
+- `resolve_capture_target { selector }` resolves that exact row to a provider-issued
+  capture selector and a semantic capture route. An absent or ambiguous output
+  is an error; resolution never selects a different display.
+- `borrow_target { operation_id, selector, reference_id }` durably protects an
+  existing output before returning its exact capture binding. The broker caller
+  owns the reference. Its output, source mode, HDR state and capture route remain
+  frozen across retries and provider restarts. Native readback after the state
+  write must still match the frozen binding.
+- `release_target { operation_id, selector, reference_id }` retires only that
+  caller's reference. It reports `native_removed: false` and never creates,
+  reconfigures or deletes a physical output.
+
+The journal can retain several authenticated references to one unchanged source.
+Normal display changes must preserve protected sources, and normal restoration
+retains their current exact targets. A shared source cannot be independently
+reconfigured or removed while another reference remains. Releasing a borrowed
+physical target preserves the original normal restoration baseline.
+
+Windows resolves each target against independently reconciled CCD, GDI and DXGI
+observations and checks the complete CCD snapshot again afterward. KScreen
+selection observes the same exact output and topology revision twice. Public
+inventory rows contain no native device paths or operating-system handles.
+These observations establish source selection and display state. The selected
+capture route must separately prove its exact-output capability before consumer
+effects; inventory readiness is not proof of an opened capture or client playback.

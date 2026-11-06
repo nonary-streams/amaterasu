@@ -15,6 +15,7 @@ impl<P: Platform> Pipeline<P> {
             reference_id,
             target,
             expected_topology_revision,
+            ..
         } = &incoming.operation
         else {
             unreachable!("scoped apply validation")
@@ -153,42 +154,46 @@ impl<P: Platform> Pipeline<P> {
     ) -> DisplayResult<(Journal, RecoveryBaseline, Configuration, Option<Value>)> {
         let request_identity = serde_json::to_value(&operation)
             .map_err(|error| DisplayError::new("invalid_request", error.to_string()))?;
-        let (operation_id, identity, reference_id, requested, expected_revision) = match operation {
-            Operation::ScopedApply {
-                operation_id,
-                identity,
-                reference_id,
-                target,
-                expected_topology_revision,
-            } => {
-                if context.verified_scoped_target.as_deref() != Some(&target.id) {
-                    return Err(DisplayError::new(
-                        "target_ownership_unverified",
-                        "scoped target verification is missing",
-                    ));
-                }
-                (
+        let (operation_id, identity, reference_id, requested, expected_revision, primary) =
+            match operation {
+                Operation::ScopedApply {
                     operation_id,
                     identity,
                     reference_id,
-                    Some(target),
+                    target,
                     expected_topology_revision,
-                )
-            }
-            Operation::ScopedRelease {
-                operation_id,
-                identity,
-                reference_id,
-                expected_topology_revision,
-            } => (
-                operation_id,
-                identity,
-                reference_id,
-                None,
-                expected_topology_revision,
-            ),
-            _ => unreachable!("scoped operations only"),
-        };
+                    primary,
+                } => {
+                    if context.verified_scoped_target.as_deref() != Some(&target.id) {
+                        return Err(DisplayError::new(
+                            "target_ownership_unverified",
+                            "scoped target verification is missing",
+                        ));
+                    }
+                    (
+                        operation_id,
+                        identity,
+                        reference_id,
+                        Some(target),
+                        expected_topology_revision,
+                        primary,
+                    )
+                }
+                Operation::ScopedRelease {
+                    operation_id,
+                    identity,
+                    reference_id,
+                    expected_topology_revision,
+                } => (
+                    operation_id,
+                    identity,
+                    reference_id,
+                    None,
+                    expected_topology_revision,
+                    false,
+                ),
+                _ => unreachable!("scoped operations only"),
+            };
         for value in [&operation_id, &identity, &reference_id, &expected_revision] {
             scoped::validate_identity(value)?;
         }
@@ -203,8 +208,8 @@ impl<P: Platform> Pipeline<P> {
             .map_err(|_| {
                 DisplayError::new("invalid_snapshot", "display provider omitted configuration")
             })?;
-        current.validate()?;
         let before = self.capture_scoped_baseline()?;
+        validate_scoped_configuration(&current, &before)?;
         if baseline_revision(&before)? != current_revision {
             return Err(DisplayError::new(
                 "topology_changed",
@@ -215,6 +220,7 @@ impl<P: Platform> Pipeline<P> {
             normal_active: false,
             scoped_targets: Vec::new(),
             scoped_pending: None,
+            scoped_origin_shift: (0, 0),
             owner: context.caller.clone(),
             lease: format!("scoped-{revision:016x}"),
             snapshot: before.clone(),
@@ -247,7 +253,8 @@ impl<P: Platform> Pipeline<P> {
             ));
         }
         let existing = journal.scoped_targets.iter().position(|target| {
-            target.owner == context.caller
+            !target.borrowed
+                && target.owner == context.caller
                 && target.identity == identity
                 && target.reference_id == reference_id
         });
@@ -264,10 +271,15 @@ impl<P: Platform> Pipeline<P> {
                     ));
                 }
                 if requested.as_ref().is_some_and(|requested| {
+                    let mut effective = requested.clone();
+                    if primary {
+                        effective.x = 0;
+                        effective.y = 0;
+                    }
                     current
                         .displays
                         .iter()
-                        .any(|observed| scoped::same_setting(requested, observed))
+                        .any(|observed| scoped::same_setting(&effective, observed))
                 }) {
                     let reply = json!({"ok":true,"applied":false,"reconciled":true,"target_id":reserved.target_id,"operation_id":operation_id});
                     return Ok((journal, before, current, Some(reply)));
@@ -283,7 +295,8 @@ impl<P: Platform> Pipeline<P> {
         let target_id = if let Some(target) = &requested {
             if existing.is_some_and(|index| journal.scoped_targets[index].target_id != target.id)
                 || journal.scoped_targets.iter().any(|owned| {
-                    owned.target_id.eq_ignore_ascii_case(&target.id)
+                    !owned.borrowed
+                        && owned.target_id.eq_ignore_ascii_case(&target.id)
                         && (owned.owner != context.caller
                             || owned.identity != identity
                             || owned.reference_id != reference_id)
@@ -310,6 +323,16 @@ impl<P: Platform> Pipeline<P> {
             let reply = json!({"ok":true,"released":true,"already_complete":true});
             return Ok((journal, before, current, Some(reply)));
         };
+        if journal
+            .scoped_targets
+            .iter()
+            .any(|target| target.borrowed && target.target_id.eq_ignore_ascii_case(&target_id))
+        {
+            return Err(DisplayError::new(
+                "target_in_use",
+                "existing source consumers must retire before this owned target can change or release",
+            ));
+        }
         if releasing {
             journal.scoped_targets.retain(|owned| {
                 !(owned.owner == context.caller
@@ -334,7 +357,14 @@ impl<P: Platform> Pipeline<P> {
                 let reply = json!({"ok":true,"applied":!released,"released":released,"reconciled":true,"target_id":target_id,"operation_id":operation_id});
                 return Ok((journal, before, current, Some(reply)));
             }
-            if !same_peers(&pending.before_configuration, &current, &target_id) {
+            if !same_peers(&pending.before_configuration, &current, &target_id)
+                && !same_peers_shifted(
+                    &pending.before_configuration,
+                    &current,
+                    &target_id,
+                    pending.origin_shift,
+                )
+            {
                 return Err(DisplayError::new(
                     "scoped_recovery_required",
                     "unrelated outputs changed during an uncertain scoped operation",
@@ -355,6 +385,9 @@ impl<P: Platform> Pipeline<P> {
                 target_id: target_id.clone(),
                 operation_id: operation_id.clone(),
                 request_identity: Some(request_identity.clone()),
+                primary,
+                borrowed: false,
+                borrow_binding: None,
             });
         }
         let mut desired = current.clone();
@@ -364,8 +397,27 @@ impl<P: Platform> Pipeline<P> {
         if let Some(target) = requested {
             desired.displays.push(target);
         }
-        desired.validate()?;
-        if !same_peers(&current, &desired, &target_id) {
+        let origin_shift = if primary {
+            let target = desired
+                .displays
+                .iter()
+                .find(|display| display.id.eq_ignore_ascii_case(&target_id))
+                .expect("admitted target");
+            let shift = (
+                target.x.checked_neg().ok_or_else(|| {
+                    DisplayError::new("invalid_request", "primary origin overflow")
+                })?,
+                target.y.checked_neg().ok_or_else(|| {
+                    DisplayError::new("invalid_request", "primary origin overflow")
+                })?,
+            );
+            scoped::translate_configuration(&mut desired, shift)?;
+            shift
+        } else {
+            (0, 0)
+        };
+        validate_scoped_configuration(&desired, &before)?;
+        if !same_peers_shifted(&current, &desired, &target_id, origin_shift) {
             return Err(DisplayError::new(
                 "peer_preservation_failed",
                 "scoped mutation would change an unrelated output",
@@ -376,7 +428,11 @@ impl<P: Platform> Pipeline<P> {
         // are still guarded by the durable state write and the broker request.
         match &before {
             RecoveryBaseline::KScreen(snapshot) => {
-                self.platform.prepare_kscreen_snapshot(&desired, snapshot)?;
+                self.platform.prepare_scoped_kscreen_snapshot(
+                    &desired,
+                    snapshot,
+                    primary.then_some(target_id.as_str()),
+                )?;
             }
             RecoveryBaseline::Ccd(snapshot) => {
                 if !current
@@ -390,7 +446,11 @@ impl<P: Platform> Pipeline<P> {
                     &desired,
                     &target_id,
                     pending_route.as_ref(),
-                    TopologyShape::PreserveActive,
+                    if primary {
+                        TopologyShape::PrimaryActive
+                    } else {
+                        TopologyShape::PreserveActive
+                    },
                 )?;
                 if prepared.revision()? != baseline_revision(&before)? {
                     return Err(DisplayError::new(
@@ -409,6 +469,19 @@ impl<P: Platform> Pipeline<P> {
             desired_configuration: desired.clone(),
             releasing: false,
             route: pending_route,
+            primary,
+            origin_shift,
+            observed_scales: match &before {
+                RecoveryBaseline::Ccd(_) => None,
+                RecoveryBaseline::KScreen(snapshot) => Some(
+                    snapshot
+                        .outputs
+                        .iter()
+                        .filter(|output| output.connected && output.enabled)
+                        .map(|output| (output.id.to_ascii_lowercase(), output.scale))
+                        .collect(),
+                ),
+            },
         });
         Ok((journal, before, desired, None))
     }
@@ -426,12 +499,18 @@ impl<P: Platform> Pipeline<P> {
             Err(error)
         } else {
             match &before {
-                RecoveryBaseline::KScreen(snapshot) => apply_kscreen_transaction(
-                    &mut self.platform,
-                    snapshot,
-                    &configuration,
-                    &mut || check_request(send, &context),
-                ),
+                RecoveryBaseline::KScreen(snapshot) => {
+                    let pending = journal
+                        .scoped_pending
+                        .as_ref()
+                        .expect("armed scoped target");
+                    self.platform.apply_scoped_kscreen_snapshot(
+                        &configuration,
+                        snapshot,
+                        pending.primary.then_some(pending.target_id.as_str()),
+                        &mut || check_request(send, &context),
+                    )
+                }
                 RecoveryBaseline::Ccd(snapshot) => {
                     let pending = journal
                         .scoped_pending
@@ -442,7 +521,11 @@ impl<P: Platform> Pipeline<P> {
                         snapshot,
                         &pending.target_id,
                         pending.route.as_ref(),
-                        TopologyShape::PreserveActive,
+                        if pending.primary {
+                            TopologyShape::PrimaryActive
+                        } else {
+                            TopologyShape::PreserveActive
+                        },
                         &mut || check_request(send, &context),
                     )
                 }
@@ -517,20 +600,45 @@ impl<P: Platform> Pipeline<P> {
             });
             scoped::forget_target(&mut journal.snapshot, &pending.target_id)?;
         } else {
+            let target_is_primary = scoped::is_primary(current, &pending.target_id);
+            if target_is_primary {
+                for target in &mut journal.scoped_targets {
+                    target.primary = false;
+                }
+            }
             if let Some(target) = journal.scoped_targets.iter_mut().find(|target| {
                 target.owner == pending.owner && target.target_id == pending.target_id
             }) {
                 target.operation_id = pending.operation_id;
                 target.request_identity = Some(pending.request_identity);
+                target.primary = target_is_primary;
             }
-            if !journal.normal_active {
+            if journal.normal_active {
+                journal.scoped_origin_shift = (
+                    journal
+                        .scoped_origin_shift
+                        .0
+                        .checked_add(pending.origin_shift.0)
+                        .ok_or_else(|| {
+                            DisplayError::new("invalid_journal", "scoped origin overflow")
+                        })?,
+                    journal
+                        .scoped_origin_shift
+                        .1
+                        .checked_add(pending.origin_shift.1)
+                        .ok_or_else(|| {
+                            DisplayError::new("invalid_journal", "scoped origin overflow")
+                        })?,
+                );
+            } else {
                 journal.snapshot = current.clone();
+                journal.scoped_origin_shift = (0, 0);
             }
         }
         Ok(())
     }
 
-    fn persist_scoped(
+    pub(super) fn persist_scoped(
         &mut self,
         context: Context,
         revision: u64,
@@ -556,7 +664,7 @@ impl<P: Platform> Pipeline<P> {
         )
     }
 
-    fn capture_scoped_baseline(&mut self) -> DisplayResult<RecoveryBaseline> {
+    pub(super) fn capture_scoped_baseline(&mut self) -> DisplayResult<RecoveryBaseline> {
         match self.platform.capture_kscreen_snapshot()? {
             Some(snapshot) => Ok(RecoveryBaseline::KScreen(snapshot)),
             None => self.platform.snapshot().map(RecoveryBaseline::Ccd),
@@ -603,10 +711,23 @@ impl<P: Platform> Pipeline<P> {
             return Ok(());
         }
         let current = self.capture_scoped_baseline()?;
+        let origin = if journal.scoped_origin_shift != (0, 0)
+            || journal.scoped_targets.iter().any(|target| target.primary)
+        {
+            scoped::observed_origin_shift(&journal.snapshot, &current)
+                .unwrap_or(journal.scoped_origin_shift)
+        } else {
+            (0, 0)
+        };
+        scoped::translate_baseline(&mut journal.snapshot, origin)?;
+        journal.scoped_origin_shift = (0, 0);
         for target in &journal.scoped_targets {
             scoped::merge_current_target(&mut journal.snapshot, &current, &target.target_id)?;
         }
-        Ok(())
+        if let Some(target) = journal.scoped_targets.iter().find(|target| target.primary) {
+            scoped::align_primary_metadata(&mut journal.snapshot, &current, &target.target_id)?;
+        }
+        journal.snapshot.validate()
     }
 
     pub(super) fn retain_scoped_after_error(
@@ -628,6 +749,7 @@ impl<P: Platform> Pipeline<P> {
             }
         };
         journal.normal_active = false;
+        journal.scoped_origin_shift = (0, 0);
         journal.owner = "amaterasu.display.scoped".into();
         journal.operation_id = None;
         journal.requested_configuration = None;
@@ -650,6 +772,7 @@ impl<P: Platform> Pipeline<P> {
             Err(error) => return complete(send, context.request, recovery_failure(error, &lease)),
         };
         journal.normal_active = false;
+        journal.scoped_origin_shift = (0, 0);
         journal.owner = "amaterasu.display.scoped".into();
         journal.operation_id = None;
         journal.requested_configuration = None;
@@ -695,4 +818,27 @@ fn same_peers(before: &Configuration, after: &Configuration, target_id: &str) ->
             .collect(),
     };
     scoped::same_configuration(&without_target(before), &without_target(after))
+}
+
+fn same_peers_shifted(
+    before: &Configuration,
+    after: &Configuration,
+    target_id: &str,
+    shift: (i32, i32),
+) -> bool {
+    let mut translated = before.clone();
+    if scoped::translate_configuration(&mut translated, shift).is_err() {
+        return false;
+    }
+    same_peers(&translated, after, target_id)
+}
+
+fn validate_scoped_configuration(
+    configuration: &Configuration,
+    baseline: &RecoveryBaseline,
+) -> DisplayResult<()> {
+    match baseline {
+        RecoveryBaseline::Ccd(_) => configuration.validate(),
+        RecoveryBaseline::KScreen(snapshot) => configuration.validate_kscreen(snapshot),
+    }
 }

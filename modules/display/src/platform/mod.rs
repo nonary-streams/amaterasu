@@ -16,6 +16,14 @@ pub enum TopologyShape {
 pub trait Platform {
     fn name(&self) -> &'static str;
     fn supported(&self) -> bool;
+    /// Read-only observations of independently resolved exact capture sources.
+    /// Missing support is explicit; callers may not select an arbitrary output.
+    fn capture_targets(&mut self) -> DisplayResult<Vec<crate::targets::NativeTarget>> {
+        Err(DisplayError::new(
+            "unsupported_capture_inventory",
+            "this display provider has no exact capture-target inventory",
+        ))
+    }
     /// A narrower capability for caller-owned target composition. Providers may
     /// offer this without enabling arbitrary desktop mutation.
     fn supports_scoped_composition(&self) -> bool {
@@ -81,6 +89,35 @@ pub trait Platform {
             "unsupported_platform",
             "KScreen apply is not implemented by this provider",
         ))
+    }
+    fn prepare_scoped_kscreen_snapshot(
+        &mut self,
+        configuration: &Configuration,
+        baseline: &KScreenSnapshot,
+        primary: Option<&str>,
+    ) -> DisplayResult<()> {
+        if primary.is_some() {
+            return Err(DisplayError::new(
+                "unsupported_primary",
+                "scoped primary selection is not implemented by this provider",
+            ));
+        }
+        self.prepare_kscreen_snapshot(configuration, baseline)
+    }
+    fn apply_scoped_kscreen_snapshot(
+        &mut self,
+        configuration: &Configuration,
+        baseline: &KScreenSnapshot,
+        primary: Option<&str>,
+        guard: &mut dyn FnMut() -> DisplayResult<()>,
+    ) -> DisplayResult<()> {
+        if primary.is_some() {
+            return Err(DisplayError::new(
+                "unsupported_primary",
+                "scoped primary selection is not implemented by this provider",
+            ));
+        }
+        self.apply_kscreen_snapshot(configuration, baseline, guard)
     }
     fn prepare(&mut self, configuration: &Configuration) -> DisplayResult<Snapshot>;
     fn bind_inactive(&mut self, display: &str, before: &Snapshot) -> DisplayResult<RouteBinding>;

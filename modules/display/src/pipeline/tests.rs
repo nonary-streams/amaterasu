@@ -633,6 +633,9 @@ fn hdr_apply(option: &str, requested: Option<bool>) -> Value {
 }
 #[derive(Default)]
 struct FakePlatform {
+    capture_target_queries: usize,
+    capture_targets_unavailable: bool,
+    drift_capture_target_after: Option<usize>,
     scoped_readback: bool,
     scoped_only: bool,
     current_snapshot: Option<Snapshot>,
@@ -676,6 +679,31 @@ struct FakePlatform {
     kscreen_restore_calls: usize,
 }
 impl Platform for FakePlatform {
+    fn capture_targets(&mut self) -> DisplayResult<Vec<crate::targets::NativeTarget>> {
+        if self.capture_targets_unavailable {
+            return Err(DisplayError::new(
+                "capture_target_unavailable",
+                "source observation unavailable",
+            ));
+        }
+        self.capture_target_queries += 1;
+        let mut snapshot = self.current_snapshot.clone().unwrap_or_else(snapshot);
+        if self
+            .drift_capture_target_after
+            .is_some_and(|after| self.capture_target_queries >= after)
+        {
+            snapshot.paths[0].refresh.numerator = 75;
+        }
+        snapshot
+            .configuration()?
+            .displays
+            .into_iter()
+            .map(|setting| {
+                let output = format!("exact-test-source:{}", setting.id);
+                crate::targets::NativeTarget::observed(self.name(), setting, "Living room", output)
+            })
+            .collect()
+    }
     fn name(&self) -> &'static str {
         "fake_platform_test_only"
     }
@@ -729,7 +757,11 @@ impl Platform for FakePlatform {
         guard: &mut dyn FnMut() -> DisplayResult<()>,
     ) -> DisplayResult<()> {
         baseline.validate()?;
-        configuration.validate()?;
+        if self.scoped_readback {
+            configuration.validate_kscreen(baseline)?;
+        } else {
+            configuration.validate()?;
+        }
         guard()?;
         let mut readback = baseline.clone();
         for display in &configuration.displays {
@@ -870,7 +902,63 @@ impl Platform for FakePlatform {
             output_technology: 5,
         })
     }
+    fn prepare_scoped_kscreen_snapshot(
+        &mut self,
+        configuration: &Configuration,
+        baseline: &KScreenSnapshot,
+        primary: Option<&str>,
+    ) -> DisplayResult<()> {
+        let expected = if let Some(target) = primary {
+            baseline.scoped_primary_baseline(target)?
+        } else {
+            baseline.clone()
+        };
+        expected.validate_requested_topology(configuration)
+    }
+    fn apply_scoped_kscreen_snapshot(
+        &mut self,
+        configuration: &Configuration,
+        baseline: &KScreenSnapshot,
+        primary: Option<&str>,
+        guard: &mut dyn FnMut() -> DisplayResult<()>,
+    ) -> DisplayResult<()> {
+        let expected = if let Some(target) = primary {
+            baseline.scoped_primary_baseline(target)?
+        } else {
+            baseline.clone()
+        };
+        self.apply_kscreen_snapshot(configuration, baseline, guard)?;
+        if primary.is_some() {
+            for output in &mut self.kscreen_baseline.as_mut().unwrap().outputs {
+                let metadata = expected
+                    .outputs
+                    .iter()
+                    .find(|candidate| candidate.id == output.id)
+                    .unwrap();
+                output.priority = metadata.priority;
+                output.primary = metadata.primary;
+            }
+        }
+        if !self
+            .kscreen_baseline
+            .as_ref()
+            .unwrap()
+            .matches_configuration(&expected, configuration)
+        {
+            return Err(
+                DisplayError::new("verification_failed", "scoped fake readback mismatch")
+                    .after_mutation(),
+            );
+        }
+        Ok(())
+    }
     fn snapshot(&mut self) -> DisplayResult<Snapshot> {
+        if self.capture_targets_unavailable {
+            return Err(DisplayError::new(
+                "capture_target_unavailable",
+                "source observation unavailable",
+            ));
+        }
         if let Some(current) = &self.current_snapshot {
             return Ok(current.clone());
         }
@@ -1284,6 +1372,10 @@ impl State {
         caller: &str,
         payload: Value,
     ) -> Value {
+        let native_mutation = !matches!(
+            payload["action"].as_str(),
+            Some("borrow_target" | "release_target")
+        );
         let mut input = Some(payload);
         let mut state_reply = None;
         let mut result = None;
@@ -1336,7 +1428,7 @@ impl State {
                     }
                     Command::CheckRequest { request } => {
                         assert_eq!(request, 7);
-                        assert!(self.journal.is_some(), "native effect requires durable journal");
+                        assert!(!native_mutation || self.journal.is_some(), "native effect requires durable journal");
                         if self.deny_guard { Response::error("request_ended", "cancelled at native boundary") } else { Response::Ok }
                     }
                     Command::Complete { payload, .. } => {
@@ -3791,6 +3883,7 @@ fn expired_native_boundary_keeps_recovery_without_effects() {
         normal_active: true,
         scoped_targets: Vec::new(),
         scoped_pending: None,
+        scoped_origin_shift: (0, 0),
         owner: "owner".into(),
         lease: "display-0000000000000001".into(),
         snapshot: RecoveryBaseline::Ccd(snapshot()),
@@ -3861,6 +3954,7 @@ fn invalid_journals_and_stale_leases_are_never_overwritten() {
             normal_active: true,
             scoped_targets: Vec::new(),
             scoped_pending: None,
+            scoped_origin_shift: (0, 0),
             owner: "owner".into(),
             lease: "current".into(),
             snapshot: RecoveryBaseline::Ccd(snapshot()),
@@ -3898,6 +3992,7 @@ fn versioned_kscreen_journal_roundtrips_without_breaking_legacy_ccd_records() {
         normal_active: true,
         scoped_targets: Vec::new(),
         scoped_pending: None,
+        scoped_origin_shift: (0, 0),
         owner: "owner".into(),
         lease: "kscreen-lease".into(),
         snapshot: RecoveryBaseline::KScreen(kscreen_snapshot()),
@@ -4176,6 +4271,7 @@ fn interrupted_kscreen_lease_holds_on_hotplug_and_readback_failure() {
         normal_active: true,
         scoped_targets: Vec::new(),
         scoped_pending: None,
+        scoped_origin_shift: (0, 0),
         owner: "owner".into(),
         lease: "display-kscreen-interrupted".into(),
         snapshot: RecoveryBaseline::KScreen(kscreen_snapshot()),
@@ -4289,3 +4385,4 @@ fn physical_domain_tracks_durable_lease_revision_and_rejects_stale_plans() {
 }
 
 mod scoped;
+mod targets;

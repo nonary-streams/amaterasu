@@ -61,6 +61,66 @@ fn reference_kde_configuration() -> Value {
     json!({ "outputs": [first, second] })
 }
 
+#[test]
+fn scoped_primary_changes_only_common_origin_and_explicit_priority_pair() {
+    let raw = reference_kde_configuration();
+    let before = typed_snapshot(&validated_outputs(&raw).unwrap()).unwrap();
+    let mut requested: Configuration = serde_json::from_value(
+        configuration_snapshot(&raw, "test").unwrap()["configuration"].clone(),
+    )
+    .unwrap();
+    for display in &mut requested.displays {
+        display.x -= 2560;
+    }
+    let mut runner = FakeKScreenRunner {
+        current: Some(raw.clone()),
+        ..Default::default()
+    };
+    apply_scoped_kscreen_snapshot_with(&mut runner, &requested, &before, Some("DP-2"), &mut || {
+        Ok(())
+    })
+    .unwrap();
+    let observed =
+        typed_snapshot(&validated_outputs(runner.current.as_ref().unwrap()).unwrap()).unwrap();
+    assert_eq!(observed.outputs[0].position.x, -2560);
+    assert_eq!(observed.outputs[0].scale, before.outputs[0].scale);
+    assert_eq!(observed.outputs[0].mode, before.outputs[0].mode);
+    assert_eq!(observed.outputs[0].rotation, before.outputs[0].rotation);
+    assert_eq!(
+        observed.outputs[0].hdr_enabled,
+        before.outputs[0].hdr_enabled
+    );
+    assert_eq!(observed.outputs[0].priority, 2);
+    assert_eq!(observed.outputs[1].priority, 1);
+    let actions = runner
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            KScreenCommand::Configure(actions) => Some(actions),
+            _ => None,
+        })
+        .flatten();
+    assert!(actions.into_iter().all(|action| matches!(
+        action,
+        KScreenAction::Position { .. } | KScreenAction::Priority { .. }
+    )));
+    let mut partial = FakeKScreenRunner {
+        current: Some(raw),
+        partial_configuration: true,
+        ..Default::default()
+    };
+    let failed = apply_scoped_kscreen_snapshot_with(
+        &mut partial,
+        &requested,
+        &before,
+        Some("DP-2"),
+        &mut || Ok(()),
+    )
+    .unwrap_err();
+    assert!(failed.may_have_changed);
+    assert_eq!(failed.code, "verification_failed");
+}
+
 fn configuration() -> Value {
     json!({
         "outputs": [

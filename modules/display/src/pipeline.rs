@@ -1,4 +1,5 @@
 mod scoped;
+mod targets;
 use crate::configuration_option::DisplayConfigurationOption;
 use crate::model::{
     Configuration, DisplayError, DisplayResult, Journal, Operation, Rational, RecoveryBaseline,
@@ -46,6 +47,11 @@ struct Pending {
     stage: Stage,
 }
 enum Stage {
+    TargetsSaved {
+        reply: Value,
+        selector: String,
+        active_lease: Option<String>,
+    },
     ValidatingScoped(Operation),
     ScopedArmed {
         journal: Journal,
@@ -153,6 +159,12 @@ impl<P: Platform> Pipeline<P> {
         incoming: Incoming,
         send: &mut impl FnMut(Command) -> Transport,
     ) -> ModuleResult<()> {
+        if matches!(
+            incoming.operation,
+            Operation::CaptureTargets {} | Operation::ResolveCaptureTarget { .. }
+        ) {
+            return self.start_targets(incoming, send);
+        }
         if matches!(incoming.operation, Operation::ScopedApply { .. }) {
             return self.validate_scoped_owner(incoming, send);
         }
@@ -352,6 +364,17 @@ impl<P: Platform> Pipeline<P> {
                     );
                 };
                 match pending.stage {
+                    Stage::TargetsSaved {
+                        reply,
+                        selector,
+                        active_lease,
+                    } => self.finish_target_borrow(
+                        pending.context,
+                        reply,
+                        selector,
+                        active_lease,
+                        send,
+                    ),
                     Stage::ValidatingScoped(_) => unreachable!("validated above"),
                     Stage::ScopedArmed {
                         journal,
@@ -424,6 +447,12 @@ impl<P: Platform> Pipeline<P> {
                 context.request,
                 json!({"ok":true,"platform":self.platform.name(),"native_supported":self.platform.supported(),"mutation_enabled":self.allow_mutation,"state":state,"owned_by_caller":own,"lease":journal.as_ref().filter(|_| own).map(|journal| &journal.lease),"operation_id":journal.as_ref().filter(|_| own).and_then(|journal| journal.operation_id.as_ref()),"mutation_domain":self.mutation_domain_id.as_ref().filter(|_| self.platform.supported()).map(|id|json!({"id":id,"revision":revision,"active_leases":usize::from(journal.is_some()),"scope":"provider_lease_only","external_borrowers_known":false}))}),
             );
+        }
+        if matches!(
+            operation,
+            Operation::BorrowTarget { .. } | Operation::ReleaseTarget { .. }
+        ) {
+            return self.loaded_targets(context, operation, revision, journal, send);
         }
         if !self.allow_mutation {
             return complete(
@@ -1044,6 +1073,12 @@ impl<P: Platform> Pipeline<P> {
         if let Err(error) = configuration.validate() {
             return complete(send, context.request, error.payload());
         }
+        if !context.inherited_scoped.is_empty()
+            && let Err(error) =
+                self.validate_protected_configuration(&configuration, &context.inherited_scoped)
+        {
+            return complete(send, context.request, error.payload());
+        }
         if let Err(error) = baseline.validate_requested_topology(&configuration) {
             return complete(send, context.request, error.payload());
         }
@@ -1106,6 +1141,7 @@ impl<P: Platform> Pipeline<P> {
             normal_active: true,
             scoped_targets: context.inherited_scoped.clone(),
             scoped_pending: None,
+            scoped_origin_shift: (0, 0),
             owner: context.caller.clone(),
             lease: format!("display-{generation:016x}"),
             snapshot: RecoveryBaseline::KScreen(baseline),
@@ -1160,6 +1196,12 @@ impl<P: Platform> Pipeline<P> {
             pending_route,
         } = intent;
         if let Err(error) = configuration.validate() {
+            return complete(send, context.request, error.payload());
+        }
+        if !context.inherited_scoped.is_empty()
+            && let Err(error) =
+                self.validate_protected_configuration(&configuration, &context.inherited_scoped)
+        {
             return complete(send, context.request, error.payload());
         }
         if let Some(selected_revision) = &selection_revision {
@@ -1275,6 +1317,7 @@ impl<P: Platform> Pipeline<P> {
             normal_active: true,
             scoped_targets: context.inherited_scoped.clone(),
             scoped_pending: None,
+            scoped_origin_shift: (0, 0),
             owner: context.caller.clone(),
             lease: format!("display-{generation:016x}"),
             snapshot: RecoveryBaseline::Ccd(snapshot),

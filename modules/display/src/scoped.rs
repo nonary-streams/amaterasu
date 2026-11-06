@@ -4,7 +4,7 @@ use crate::model::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub const MAX_SCOPED_TARGETS: usize = 8;
 
@@ -18,6 +18,12 @@ pub struct ScopedReservation {
     pub operation_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_identity: Option<Value>,
+    #[serde(default)]
+    pub primary: bool,
+    #[serde(default)]
+    pub borrowed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub borrow_binding: Option<amaterasu_module_sdk::display::targets::Binding>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -32,6 +38,12 @@ pub struct ScopedPending {
     pub releasing: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route: Option<crate::model::RouteBinding>,
+    #[serde(default)]
+    pub primary: bool,
+    #[serde(default)]
+    pub origin_shift: (i32, i32),
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_scales: Option<BTreeMap<String, f64>>,
 }
 
 pub fn validate_identity(value: &str) -> DisplayResult<()> {
@@ -51,17 +63,40 @@ pub fn validate_journal(journal: &Journal) -> DisplayResult<()> {
             "too many protected targets",
         ));
     }
-    let mut targets = BTreeSet::new();
+    let mut targets: BTreeMap<String, Vec<&ScopedReservation>> = BTreeMap::new();
     let mut references = BTreeSet::new();
     for target in &journal.scoped_targets {
         validate_identity(&target.owner)?;
         validate_identity(&target.identity)?;
         validate_identity(&target.reference_id)?;
         validate_identity(&target.operation_id)?;
+        if target.borrowed != target.borrow_binding.is_some()
+            || target
+                .borrow_binding
+                .as_ref()
+                .is_some_and(|binding| binding.validate().is_err())
+        {
+            return Err(DisplayError::new(
+                "invalid_journal",
+                "borrowed target proof is missing or invalid",
+            ));
+        }
+        let previous = targets.entry(target.target_id.to_lowercase()).or_default();
+        if previous.iter().any(|previous| {
+            !previous.borrowed && !target.borrowed
+                || previous.borrowed
+                    && target.borrowed
+                    && previous.borrow_binding != target.borrow_binding
+        }) {
+            return Err(DisplayError::new(
+                "invalid_journal",
+                "protected target has conflicting owners",
+            ));
+        }
+        previous.push(target);
         if target.target_id.is_empty()
             || target.target_id.len() > 4096
             || target.target_id.chars().any(char::is_control)
-            || !targets.insert(target.target_id.to_lowercase())
             || !references.insert((&target.owner, &target.identity, &target.reference_id))
         {
             return Err(DisplayError::new(
@@ -73,8 +108,12 @@ pub fn validate_journal(journal: &Journal) -> DisplayResult<()> {
     if let Some(pending) = &journal.scoped_pending {
         validate_identity(&pending.owner)?;
         validate_identity(&pending.operation_id)?;
-        pending.before_configuration.validate()?;
-        pending.desired_configuration.validate()?;
+        pending
+            .before_configuration
+            .validate_with_scales(pending.observed_scales.as_ref())?;
+        pending
+            .desired_configuration
+            .validate_with_scales(pending.observed_scales.as_ref())?;
         if !journal
             .scoped_targets
             .iter()
@@ -155,7 +194,7 @@ pub fn merge_current_target(
                 .paths
                 .retain(|path| !path.id.eq_ignore_ascii_case(target_id));
             saved.paths.push(target.clone());
-            saved.validate()
+            Ok(())
         }
         (RecoveryBaseline::KScreen(saved), RecoveryBaseline::KScreen(observed)) => {
             let target = observed
@@ -174,7 +213,7 @@ pub fn merge_current_target(
                 .outputs
                 .retain(|output| !output.id.eq_ignore_ascii_case(target_id));
             saved.outputs.push(target.clone());
-            saved.validate()
+            Ok(())
         }
         _ => Err(DisplayError::new(
             "unsupported_snapshot",
@@ -193,4 +232,137 @@ pub fn forget_target(baseline: &mut RecoveryBaseline, target_id: &str) -> Displa
             .retain(|output| !output.id.eq_ignore_ascii_case(target_id)),
     }
     baseline.validate()
+}
+
+pub fn translate_configuration(
+    configuration: &mut Configuration,
+    shift: (i32, i32),
+) -> DisplayResult<()> {
+    for display in &mut configuration.displays {
+        display.x = display
+            .x
+            .checked_add(shift.0)
+            .ok_or_else(|| DisplayError::new("invalid_request", "display coordinate overflow"))?;
+        display.y = display
+            .y
+            .checked_add(shift.1)
+            .ok_or_else(|| DisplayError::new("invalid_request", "display coordinate overflow"))?;
+    }
+    Ok(())
+}
+
+pub fn translate_baseline(baseline: &mut RecoveryBaseline, shift: (i32, i32)) -> DisplayResult<()> {
+    match baseline {
+        RecoveryBaseline::Ccd(snapshot) => {
+            for path in &mut snapshot.paths {
+                path.source.x = path.source.x.checked_add(shift.0).ok_or_else(|| {
+                    DisplayError::new("invalid_journal", "display coordinate overflow")
+                })?;
+                path.source.y = path.source.y.checked_add(shift.1).ok_or_else(|| {
+                    DisplayError::new("invalid_journal", "display coordinate overflow")
+                })?;
+            }
+        }
+        RecoveryBaseline::KScreen(snapshot) => {
+            for output in &mut snapshot.outputs {
+                output.position.x = output.position.x.checked_add(shift.0).ok_or_else(|| {
+                    DisplayError::new("invalid_journal", "display coordinate overflow")
+                })?;
+                output.position.y = output.position.y.checked_add(shift.1).ok_or_else(|| {
+                    DisplayError::new("invalid_journal", "display coordinate overflow")
+                })?;
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn align_primary_metadata(
+    baseline: &mut RecoveryBaseline,
+    current: &RecoveryBaseline,
+    target_id: &str,
+) -> DisplayResult<()> {
+    match (baseline, current) {
+        (RecoveryBaseline::Ccd(saved), RecoveryBaseline::Ccd(_)) => {
+            let index = saved
+                .paths
+                .iter()
+                .position(|path| path.id.eq_ignore_ascii_case(target_id))
+                .ok_or_else(|| {
+                    DisplayError::new(
+                        "protected_target_unavailable",
+                        "protected primary is missing",
+                    )
+                })?;
+            let primary = saved.paths.remove(index);
+            saved.paths.insert(0, primary);
+        }
+        (RecoveryBaseline::KScreen(saved), RecoveryBaseline::KScreen(observed)) => {
+            for output in &mut saved.outputs {
+                if output.id.eq_ignore_ascii_case(target_id) {
+                    output.primary = true;
+                    output.priority = 1;
+                } else if output.primary {
+                    output.primary = false;
+                    output.priority = observed
+                        .outputs
+                        .iter()
+                        .find(|current| current.id.eq_ignore_ascii_case(&output.id))
+                        .map_or(2, |current| current.priority.max(2));
+                }
+            }
+        }
+        _ => {
+            return Err(DisplayError::new(
+                "unsupported_snapshot",
+                "display provider changed",
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub fn is_primary(baseline: &RecoveryBaseline, target_id: &str) -> bool {
+    match baseline {
+        RecoveryBaseline::Ccd(snapshot) => snapshot.paths.iter().any(|path| {
+            path.id.eq_ignore_ascii_case(target_id) && path.source.x == 0 && path.source.y == 0
+        }),
+        RecoveryBaseline::KScreen(snapshot) => snapshot
+            .outputs
+            .iter()
+            .any(|output| output.id.eq_ignore_ascii_case(target_id) && output.primary),
+    }
+}
+
+pub fn observed_origin_shift(
+    saved: &RecoveryBaseline,
+    current: &RecoveryBaseline,
+) -> Option<(i32, i32)> {
+    match (saved, current) {
+        (RecoveryBaseline::Ccd(saved), RecoveryBaseline::Ccd(current)) => {
+            let original = saved
+                .paths
+                .iter()
+                .find(|path| path.source.x == 0 && path.source.y == 0)?;
+            let observed = current
+                .paths
+                .iter()
+                .find(|path| path.id.eq_ignore_ascii_case(&original.id))?;
+            Some((
+                observed.source.x.checked_sub(original.source.x)?,
+                observed.source.y.checked_sub(original.source.y)?,
+            ))
+        }
+        (RecoveryBaseline::KScreen(saved), RecoveryBaseline::KScreen(current)) => {
+            let original = saved.outputs.iter().find(|output| output.primary)?;
+            let observed = current.outputs.iter().find(|output| {
+                output.id.eq_ignore_ascii_case(&original.id) && output.connected && output.enabled
+            })?;
+            Some((
+                observed.position.x.checked_sub(original.position.x)?,
+                observed.position.y.checked_sub(original.position.y)?,
+            ))
+        }
+        _ => None,
+    }
 }

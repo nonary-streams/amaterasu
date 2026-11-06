@@ -346,3 +346,105 @@ fn kscreen_scoped_target_moves_without_changing_peer_mode_scale_rotation_or_hdr(
     assert_eq!(readback.outputs[2].position.y, 200);
     assert_eq!(pipeline.platform.effects, ["apply_kscreen"]);
 }
+
+#[test]
+fn primary_monitor_translates_one_coordinate_origin_and_survives_game_restore() {
+    let mut state = State::default();
+    let mut pipeline = pipeline();
+    let request = normal_request(&pipeline, 75);
+    let normal = state.run(&mut pipeline, "game", request);
+    let mut request = add_request(&pipeline, "monitor-primary");
+    request["primary"] = json!(true);
+    let repeated = request.clone();
+    let applied = state.run(&mut pipeline, "remote", request);
+    assert_eq!(applied["applied"], true, "{applied}");
+    let current = pipeline.platform.current_snapshot.as_ref().unwrap();
+    let physical = current
+        .paths
+        .iter()
+        .find(|path| path.id == "monitor.one")
+        .unwrap();
+    let remote = current
+        .paths
+        .iter()
+        .find(|path| path.id == "monitor.remote")
+        .unwrap();
+    assert_eq!((physical.source.x, physical.source.y), (-1920, 0));
+    assert_eq!((remote.source.x, remote.source.y), (0, 0));
+    assert_eq!(physical.refresh.numerator, 75);
+    assert_eq!(
+        state.run(&mut pipeline, "remote", repeated)["reconciled"],
+        true
+    );
+    let restored = state.run(
+        &mut pipeline,
+        "game",
+        json!({"action":"restore","lease":normal["lease"]}),
+    );
+    assert_eq!(restored["restored"], true, "{restored}");
+    let current = pipeline.platform.current_snapshot.as_ref().unwrap();
+    let physical = current
+        .paths
+        .iter()
+        .find(|path| path.id == "monitor.one")
+        .unwrap();
+    let remote = current
+        .paths
+        .iter()
+        .find(|path| path.id == "monitor.remote")
+        .unwrap();
+    assert_eq!((physical.source.x, physical.source.y), (-1920, 0));
+    assert_eq!(physical.refresh.numerator, 60);
+    assert_eq!((remote.source.x, remote.source.y), (0, 0));
+    assert_eq!(current.paths[0].id, "monitor.remote");
+}
+
+#[test]
+fn scaled_desktop_and_primary_priorities_use_observed_logical_footprints() {
+    let mut baseline = kscreen_snapshot();
+    baseline.outputs[0].mode = Some(KScreenModeSnapshot {
+        id: "4k".into(),
+        width: 3840,
+        height: 2160,
+        refresh_millihz: 60000,
+    });
+    baseline.outputs[0].scale = 2.0;
+    baseline.outputs[1].id = "Virtual-1".into();
+    baseline.outputs[1].position = KScreenPosition { x: 1920, y: 0 };
+    baseline.outputs[1].rotation = 1;
+    baseline.outputs[1].mode = Some(KScreenModeSnapshot {
+        id: "remote".into(),
+        width: 1280,
+        height: 720,
+        refresh_millihz: 60000,
+    });
+    let revision = baseline.revision().unwrap();
+    let peer = baseline.outputs[0].clone();
+    let mut pipeline = Pipeline::new(
+        FakePlatform {
+            kscreen_baseline: Some(baseline),
+            scoped_readback: true,
+            scoped_only: true,
+            ..Default::default()
+        },
+        true,
+    );
+    let mut state = State {
+        scoped_verifier_response: Some(
+            json!({"ok":true,"owned":true,"target_id":"Virtual-1","specification":{"identity":"00000000-0000-0000-0000-000000000001","name":"Remote Monitor","hdr_enabled":false,"width":1280,"height":720,"refresh_millihz":60000},"active":true}),
+        ),
+        ..Default::default()
+    };
+    let request = json!({"action":"scoped_apply","operation_id":"scaled-primary","identity":"00000000-0000-0000-0000-000000000001","reference_id":"retained","expected_topology_revision":revision,"primary":true,
+        "target":{"id":"Virtual-1","width":1280,"height":720,"x":1920,"y":0,"refresh":{"numerator":60000,"denominator":1000},"rotation":"identity","hdr_enabled":false}});
+    let applied = state.run(&mut pipeline, "remote", request);
+    assert_eq!(applied["applied"], true, "{applied}");
+    let current = pipeline.platform.kscreen_baseline.as_ref().unwrap();
+    assert_eq!(current.outputs[0].position.x, -1920);
+    assert_eq!(current.outputs[0].scale, peer.scale);
+    assert_eq!(current.outputs[0].mode, peer.mode);
+    assert_eq!(current.outputs[0].hdr_enabled, peer.hdr_enabled);
+    assert!(!current.outputs[0].primary);
+    assert!(current.outputs[1].primary);
+    assert_eq!(current.outputs[1].position.x, 0);
+}

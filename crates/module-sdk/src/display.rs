@@ -5,6 +5,7 @@
 //! reference before it changes its exact target; all observed peers are retained.
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+pub mod targets;
 
 pub const SERVICE: &str = "amaterasu.display/1";
 
@@ -50,6 +51,8 @@ pub enum ScopedOperation {
         reference_id: String,
         target: Target,
         expected_topology_revision: String,
+        #[serde(default)]
+        primary: bool,
     },
     ScopedRelease {
         operation_id: String,

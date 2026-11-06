@@ -245,6 +245,42 @@ fn command_error(command: &KScreenCommand, error: DisplayError) -> DisplayError 
 pub struct LinuxPlatform;
 
 impl Platform for LinuxPlatform {
+    fn capture_targets(&mut self) -> DisplayResult<Vec<crate::targets::NativeTarget>> {
+        let before = query_configuration()?;
+        let snapshot = configuration_snapshot(&before, self.name())?;
+        let configuration: Configuration =
+            serde_json::from_value(snapshot["configuration"].clone()).map_err(|_| {
+                DisplayError::new(
+                    "invalid_snapshot",
+                    "KScreen source configuration is invalid",
+                )
+            })?;
+        let labels = enumeration_rows(&before, None)?;
+        let mut targets = Vec::new();
+        for setting in configuration.displays {
+            let label = labels
+                .iter()
+                .find(|row| row["id"] == setting.id)
+                .and_then(|row| row["name"].as_str())
+                .unwrap_or("Display");
+            let output = format!("kwin:{}", setting.id);
+            targets.push(crate::targets::NativeTarget::observed(
+                self.name(),
+                setting,
+                label,
+                output,
+            )?);
+        }
+        let after = configuration_snapshot(&query_configuration()?, self.name())?;
+        if snapshot["topology_revision"] != after["topology_revision"] {
+            return Err(DisplayError::new(
+                "capture_target_changed",
+                "KScreen source configuration changed during observation",
+            ));
+        }
+        crate::targets::validate_inventory(&targets)?;
+        Ok(targets)
+    }
     fn name(&self) -> &'static str {
         "linux_kscreen"
     }
@@ -382,6 +418,40 @@ impl Platform for LinuxPlatform {
     ) -> DisplayResult<()> {
         let mut runner = SystemKScreenCommandRunner;
         apply_kscreen_snapshot_with(&mut runner, configuration, baseline, guard)
+    }
+
+    fn prepare_scoped_kscreen_snapshot(
+        &mut self,
+        requested: &Configuration,
+        baseline: &KScreenSnapshot,
+        primary: Option<&str>,
+    ) -> DisplayResult<()> {
+        let expected = if let Some(target) = primary {
+            baseline.scoped_primary_baseline(target)?
+        } else {
+            baseline.clone()
+        };
+        expected.validate_requested_topology(requested)?;
+        let current = query_configuration()?;
+        let observed = typed_snapshot(&validated_outputs(&current)?)?;
+        if observed.revision()? != baseline.revision()? {
+            return Err(DisplayError::new(
+                "topology_changed",
+                "KScreen changed before scoped preparation",
+            ));
+        }
+        scoped_apply_actions(requested, &current, baseline, primary)?;
+        Ok(())
+    }
+    fn apply_scoped_kscreen_snapshot(
+        &mut self,
+        configuration: &Configuration,
+        baseline: &KScreenSnapshot,
+        primary: Option<&str>,
+        guard: &mut dyn FnMut() -> DisplayResult<()>,
+    ) -> DisplayResult<()> {
+        let mut runner = SystemKScreenCommandRunner;
+        apply_scoped_kscreen_snapshot_with(&mut runner, configuration, baseline, primary, guard)
     }
 
     fn snapshot(&mut self) -> DisplayResult<Snapshot> {
@@ -537,7 +607,22 @@ fn apply_kscreen_snapshot_with(
     baseline: &KScreenSnapshot,
     guard: &mut dyn FnMut() -> DisplayResult<()>,
 ) -> DisplayResult<()> {
-    baseline.validate_requested_topology(configuration)?;
+    apply_scoped_kscreen_snapshot_with(runner, configuration, baseline, None, guard)
+}
+
+fn apply_scoped_kscreen_snapshot_with(
+    runner: &mut impl KScreenCommandRunner,
+    configuration: &Configuration,
+    baseline: &KScreenSnapshot,
+    primary: Option<&str>,
+    guard: &mut dyn FnMut() -> DisplayResult<()>,
+) -> DisplayResult<()> {
+    let expected = if let Some(target) = primary {
+        baseline.scoped_primary_baseline(target)?
+    } else {
+        baseline.clone()
+    };
+    expected.validate_requested_topology(configuration)?;
     guard()?;
     let before_raw = query_configuration_with(runner)?;
     let before_outputs = validated_outputs(&before_raw)?;
@@ -554,7 +639,7 @@ fn apply_kscreen_snapshot_with(
             "KScreen output state changed after the recovery lease was armed",
         ));
     }
-    apply_actions(configuration, &before_raw)?;
+    scoped_apply_actions(configuration, &before_raw, baseline, primary)?;
     guard()?;
     let final_raw = query_configuration_with(runner)?;
     let final_outputs = validated_outputs(&final_raw)?;
@@ -571,12 +656,12 @@ fn apply_kscreen_snapshot_with(
             "KScreen output state changed immediately before configuration",
         ));
     }
-    let actions = apply_actions(configuration, &final_raw)?;
+    let actions = scoped_apply_actions(configuration, &final_raw, baseline, primary)?;
     run_configuration_with(runner, actions)?;
     let after = query_configuration_with(runner).map_err(DisplayError::after_mutation)?;
     let after_outputs = validated_outputs(&after).map_err(DisplayError::after_mutation)?;
     let after = typed_snapshot(&after_outputs).map_err(DisplayError::after_mutation)?;
-    if !after.matches_configuration(baseline, configuration) {
+    if !after.matches_configuration(&expected, configuration) {
         return Err(DisplayError::new(
             "verification_failed",
             "KScreen did not read back the requested display configuration",
@@ -1189,12 +1274,38 @@ fn restoration_actions(
     Ok(actions)
 }
 
+fn scoped_apply_actions(
+    configuration: &Configuration,
+    current: &Value,
+    baseline: &KScreenSnapshot,
+    primary: Option<&str>,
+) -> DisplayResult<Vec<KScreenAction>> {
+    let mut actions = apply_actions(configuration, current)?;
+    if let Some(target) = primary {
+        let expected = baseline.scoped_primary_baseline(target)?;
+        for output in &expected.outputs {
+            let previous = baseline
+                .outputs
+                .iter()
+                .find(|old| old.id == output.id)
+                .expect("same inventory");
+            if output.priority != previous.priority {
+                actions.push(KScreenAction::Priority {
+                    output: output.id.clone(),
+                    priority: output.priority,
+                });
+            }
+        }
+    }
+    Ok(actions)
+}
+
 fn apply_actions(
     configuration: &Configuration,
     current: &Value,
 ) -> DisplayResult<Vec<KScreenAction>> {
-    configuration.validate()?;
     let outputs = validated_outputs(current)?;
+    configuration.validate_kscreen(&typed_snapshot(&outputs)?)?;
     let by_name: BTreeMap<_, _> = outputs
         .iter()
         .map(|output| {
