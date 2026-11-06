@@ -173,7 +173,9 @@ pub(super) fn verify_outputs<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use amaterasu_module_sdk::capture::{SourceMode, SourceReadiness};
+    use amaterasu_module_sdk::capture::SourceMode;
+    #[cfg(not(windows))]
+    use amaterasu_module_sdk::capture::SourceReadiness;
     struct NoEffectsBackend;
     impl Backend for NoEffectsBackend {
         fn supported(&self) -> bool {

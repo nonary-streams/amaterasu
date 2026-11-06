@@ -1,6 +1,8 @@
 //! Windows metadata checks. This module never creates a D3D device or capture.
-use super::*;
+use super::{ExactGeometry, OutputObservation, ready, verify_outputs};
+use crate::backend::Backend;
 use amaterasu_module_sdk::capture::{EXACT_TARGET_PREFIX, exact_target_key, exact_target_selector};
+use amaterasu_module_sdk::capture::{SourcePreflightRequest, SourcePreflightResponse};
 use amaterasu_windows_capture_geometry::resolve_target_matching;
 use windows::Win32::{
     Foundation::HANDLE,
