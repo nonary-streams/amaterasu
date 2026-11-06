@@ -62,7 +62,12 @@ impl Change {
 
     pub fn response(&self) -> Value {
         json!({"ok":true,"state":if self.completed {"succeeded"} else if self.aborted {"aborted"} else {"prepared"},
-            "operation_id":self.operation_id,"specification":if self.aborted {&self.old} else {&self.desired},"mode_revision":self.mode_revision()})
+            "operation_id":self.operation_id,
+            "reference_id":self.reference_id,
+            "expected_reference_ids":self.expected_reference_ids,
+            "expected_mode_revision":self.expected_revision,
+            "specification":if self.aborted {&self.old} else {&self.desired},
+            "mode_revision":self.mode_revision()})
     }
 
     pub fn mode_revision(&self) -> u64 {
