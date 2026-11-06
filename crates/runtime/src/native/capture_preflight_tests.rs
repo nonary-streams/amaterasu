@@ -254,10 +254,11 @@ fn request() -> SourcePreflightRequest {
             height: 1080,
             refresh_millihz: 60_000,
             hdr: true,
+            bit_depth: Some(10),
         },
     }
 }
-fn capability(max_width: u32, hdr: bool) -> SourceModeCapabilities {
+fn capability(max_width: u32, hdr: bool, bit_depths: Vec<u8>) -> SourceModeCapabilities {
     SourceModeCapabilities {
         source_class: SourceClass::ManagedOutput,
         min_width: 1,
@@ -268,6 +269,8 @@ fn capability(max_width: u32, hdr: bool) -> SourceModeCapabilities {
         max_refresh_millihz: 240_000,
         sdr: true,
         hdr,
+        bit_depths,
+        format_open: true,
     }
 }
 fn observe_query(counts: &Counts, caller: &str) {
@@ -284,7 +287,7 @@ impl SourcePreflightProvider for ReadyProvider {
         observe_query(&self.0, caller);
         Ok(SourcePreflightResponse::ready(
             request,
-            vec![capability(8192, true)],
+            vec![capability(8192, true, vec![10])],
         ))
     }
 }
@@ -297,8 +300,8 @@ impl SourcePreflightProvider for SdrOnlyProvider {
     ) -> Result<SourcePreflightResponse, Status> {
         observe_query(&self.0, caller);
         Ok(SourcePreflightResponse {
-            capabilities: vec![capability(3840, false)],
-            ..SourcePreflightResponse::unsupported(request, "hdr_unavailable")
+            capabilities: vec![capability(3840, false, vec![8])],
+            ..SourcePreflightResponse::unsupported(request, "source_format_unsupported")
         })
     }
 }
@@ -373,10 +376,18 @@ fn capture_preflight_replaces_selected_providers_through_authenticated_runtime()
     );
     assert_eq!(ready.state, SourceReadiness::Ready);
     assert!(ready.capabilities[0].hdr);
+    assert_eq!(ready.request.mode.bit_depth, Some(10));
+    assert_eq!(ready.capabilities[0].bit_depths, [10]);
+    assert!(ready.capabilities[0].format_open);
     assert_eq!(ready.capabilities[0].max_width, 8192);
     assert_eq!(unsupported.state, SourceReadiness::Unsupported);
-    assert_eq!(unsupported.reason.as_deref(), Some("hdr_unavailable"));
+    assert_eq!(
+        unsupported.reason.as_deref(),
+        Some("source_format_unsupported")
+    );
     assert!(!unsupported.capabilities[0].hdr);
+    assert_eq!(unsupported.capabilities[0].bit_depths, [8]);
+    assert!(unsupported.capabilities[0].format_open);
     assert_eq!(unsupported.capabilities[0].max_width, 3840);
     assert_eq!(ready.request, unsupported.request);
 }
