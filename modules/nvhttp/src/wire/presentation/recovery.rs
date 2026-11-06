@@ -52,6 +52,7 @@ enum Phase {
 struct Attempt {
     item: RecoveryWorkItem,
     deadline: Instant,
+    owner_reconciled: bool,
 }
 
 struct BrokerCall {
@@ -118,14 +119,18 @@ impl RecoveryPump {
                 return;
             }
             if now >= attempt.deadline && self.call.is_none() {
-                self.retry_scan(now);
+                self.defer_current(now, RETRY_INTERVAL);
                 return;
             }
         }
         if self.call.is_none() {
             self.observed_empty = false;
             let Ok(call) = self.prepare_call(now) else {
-                self.retry_scan(now);
+                if self.current.is_some() {
+                    self.defer_current(now, RETRY_INTERVAL);
+                } else {
+                    self.retry_scan(now);
+                }
                 return;
             };
             self.call = Some(call);
@@ -145,11 +150,22 @@ impl RecoveryPump {
             .cancelling;
         self.call = None;
         if expired {
-            self.retry_scan(now);
+            if self.current.is_some() {
+                // The exact broker attempt has settled, but its durable
+                // retirement intent remains with the policy. Give linked
+                // resources a turn instead of restarting at the first item.
+                self.defer_current(now, RETRY_INTERVAL);
+            } else {
+                self.retry_scan(now);
+            }
             return;
         }
         let Ok(payload) = result else {
-            self.retry_scan(now);
+            if self.current.is_some() {
+                self.defer_current(now, RETRY_INTERVAL);
+            } else {
+                self.retry_scan(now);
+            }
             return;
         };
         match self.phase {
@@ -162,6 +178,9 @@ impl RecoveryPump {
             }
             Phase::Status => self.accept_status(payload, now),
             Phase::ReconcileOwner => {
+                if let Some(attempt) = &mut self.current {
+                    attempt.owner_reconciled = true;
+                }
                 self.phase = Phase::Status;
                 self.next_poll = Some(now + RETRY_INTERVAL);
             }
@@ -171,9 +190,12 @@ impl RecoveryPump {
                     self.schedule_next(now);
                 }
                 Ok(session::Reply::Pending { retry_after_ms }) => {
-                    self.next_poll = Some(now + Duration::from_millis(retry_after_ms));
+                    // One source may require both its application and its
+                    // transport to retire. Waiting on this acknowledgment
+                    // would prevent the complementary intent from running.
+                    self.defer_current(now, Duration::from_millis(retry_after_ms));
                 }
-                _ => self.retry_scan(now),
+                _ => self.defer_current(now, RETRY_INTERVAL),
             },
         }
     }
@@ -303,13 +325,16 @@ impl RecoveryPump {
         if status.as_ref().is_some_and(|status| status.retired) {
             self.phase = Phase::ReconcilePolicy;
         } else if matches!(attempt.item.binding, RecoveryBinding::Transport { .. })
+            && !attempt.owner_reconciled
             && status
                 .as_ref()
                 .is_some_and(|status| status.state == State::RecoveryBlocked)
         {
             self.phase = Phase::ReconcileOwner;
         } else {
-            self.next_poll = Some(now + RETRY_INTERVAL);
+            // Native application cleanup may itself depend on the paired
+            // transport. Revisit this exact durable intent in a later scan.
+            self.defer_current(now, RETRY_INTERVAL);
         }
     }
 
@@ -318,6 +343,7 @@ impl RecoveryPump {
             self.current = Some(Attempt {
                 deadline: now + Duration::from_millis(item.budget_ms),
                 item,
+                owner_reconciled: false,
             });
             self.phase = Phase::Retire;
             return;
@@ -337,6 +363,23 @@ impl RecoveryPump {
         self.queued.clear();
         self.reset_scan();
         self.next_poll = Some(now + RETRY_INTERVAL);
+    }
+
+    fn defer_current(&mut self, now: Instant, backoff: Duration) {
+        debug_assert!(
+            self.call.is_none(),
+            "deferred broker attempt must be retired"
+        );
+        self.current = None;
+        self.schedule_next(now);
+        let retry_at = now + backoff;
+        let next_poll = self.next_poll.map_or(retry_at, |next| next.max(retry_at));
+        if let Some(attempt) = &mut self.current {
+            // The next item's budget starts when it can actually run, rather
+            // than expiring while the previous item owns the retry backoff.
+            attempt.deadline += next_poll.saturating_duration_since(now);
+        }
+        self.next_poll = Some(next_poll);
     }
 
     fn reset_scan(&mut self) {
