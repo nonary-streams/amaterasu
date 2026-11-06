@@ -3,6 +3,8 @@ use crate::wire::{Request as HttpRequest, Router};
 use session::{Application, Presentation};
 use std::collections::BTreeSet;
 
+mod broker_tests;
+
 struct Provider {
     title: String,
     next: u64,

@@ -24,6 +24,9 @@ use std::time::{Duration, Instant};
 const MAX_JOBS: usize = 16;
 const MAX_KNOWN_CLIENTS: usize = 64;
 const WORK_TIMEOUT: Duration = Duration::from_secs(40);
+// A complete transaction may span several calls; each broker admission has
+// the runtime's independent 30-second request limit.
+const BROKER_TIMEOUT: Duration = Duration::from_secs(30);
 const CLEANUP_RETRY: Duration = Duration::from_millis(100);
 const LIBRARY_SERVICE: &str = "amaterasu.library/1";
 
@@ -612,7 +615,7 @@ impl PresentationRouter {
         } else {
             work.deadline.saturating_duration_since(now)
         };
-        let timeout_ms = remaining.min(WORK_TIMEOUT).as_millis().clamp(1, 40_000) as u64;
+        let timeout_ms = remaining.min(BROKER_TIMEOUT).as_millis().max(1) as u64;
         match spec {
             CallSpec::Provider(request) => session::command(
                 RequestOptions {
