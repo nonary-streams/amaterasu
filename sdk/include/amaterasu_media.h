@@ -422,6 +422,14 @@ typedef struct {
 typedef struct {
     uint32_t version, size, primaries, transfer, matrix, range;
 } AmaterasuFrameColorMetadata;
+/* CPU resource schema v2 offers negotiate explicit known color/range. Each
+ * color tuple has its own offer ID. Frame descriptors also use version=2 with
+ * the unchanged AmaterasuCpuFrame payload; outer frame color must equal the
+ * selected tuple on every presentation. Unknown color is never authoritative. */
+typedef struct {
+    AmaterasuCpuResourceCapabilities base;
+    AmaterasuFrameColorMetadata color;
+} AmaterasuCpuResourceCapabilitiesV2;
 typedef struct {
     uint32_t version, size, domain, reserved;
     uint8_t epoch_id[16];
