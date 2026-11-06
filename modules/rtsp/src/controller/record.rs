@@ -174,7 +174,7 @@ impl Record {
                 "retirement_pending"
             }
         });
-        json!({"ok":true,"ticket":self.id,"state":self.state,"local":self.local,
+        let mut response = json!({"ok":true,"ticket":self.id,"state":self.state,"local":self.local,
             "rtsp_url":self.url,"session":self.session,"stream_state":self.stream_state,
             "lifecycle_session_target":self.config.lifecycle_session_target,
             "lifecycle_capture_mode":self.config.lifecycle_capture_mode,
@@ -196,7 +196,11 @@ impl Record {
             "display_policy_snapshot":self.config.display_policy_snapshot,
             "display_request":self.config.display_request,
             "display_applied":self.display_applied,
-            "failure":self.failure,"cleanup_error":self.cleanup_error})
+            "failure":self.failure,"cleanup_error":self.cleanup_error});
+        if let Some(context) = &self.config.source_capture_context {
+            response["source_capture_context"] = json!(context);
+        }
+        response
     }
 
     pub fn close(&mut self, reason: Option<&'static str>) {

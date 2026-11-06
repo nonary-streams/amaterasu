@@ -123,6 +123,70 @@ fn signed_session_capacity_keeps_every_cleanup_intent_in_the_journal() {
 }
 
 #[test]
+fn source_capture_route_is_frozen_before_video_open_and_is_independent_of_encoder_settings() {
+    for context in [
+        json!({"route_key":"synthetic_black"}),
+        json!({"route_key":"selected-desktop", "source_mode":{"width":2560,"height":1440,"refresh_millihz":144000,"hdr":false,"bit_depth":10}}),
+    ] {
+        let mut host = Harness::new();
+        let mut request = prepare();
+        request["stream_audio"] = json!(false);
+        request["source_capture_context"] = context.clone();
+        let prepared = host.response(1, request.clone());
+        assert_eq!(prepared["state"], "prepared", "{prepared}");
+        assert_eq!(prepared["source_capture_context"], context);
+        request["source_capture_context"]["route_key"] = json!("changed-after-admission");
+        assert_eq!(host.response(2, request)["code"], "operation_conflict");
+        let session = prepared["session"].as_u64().unwrap();
+        let mut configuration = start(session);
+        configuration["configuration"]["audio_endpoint"] = json!("");
+        assert_eq!(
+            host.response(3, configuration.clone())["code"],
+            "source_capture_context_changed"
+        );
+        assert!(
+            !host
+                .broker
+                .calls
+                .iter()
+                .any(|call| call.service == Resource::Video.service())
+        );
+        configuration["configuration"]["source_capture_context"] = context.clone();
+        let active = host.response(4, configuration.clone());
+        assert_eq!(active["state"], "active", "{active}");
+        let video = host
+            .broker
+            .calls
+            .iter()
+            .find(|call| {
+                call.service == Resource::Video.service() && call.payload["action"] == "open"
+            })
+            .unwrap();
+        assert_eq!(video.payload["source_capture_context"], context);
+        assert!(
+            video.payload["configuration"]
+                .get("source_capture_context")
+                .is_none()
+        );
+        configuration["configuration"]["source_capture_context"]["route_key"] =
+            json!("changed-while-running");
+        assert_eq!(
+            host.response(5, configuration)["code"],
+            "source_capture_context_changed"
+        );
+        assert_eq!(
+            host.broker
+                .calls
+                .iter()
+                .filter(|call| call.service == Resource::Video.service()
+                    && call.payload["action"] == "open")
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
 fn borrowed_capture_readback_freezes_the_exact_source_before_stream_effects() {
     let mut host = Harness::new();
     host.pipeline

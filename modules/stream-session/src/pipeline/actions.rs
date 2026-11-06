@@ -364,6 +364,10 @@ impl Pipeline {
             rpc::complete(send, request, error(code));
             return;
         }
+        if configuration.source_capture_context != record.config.source_capture_context {
+            rpc::complete(send, request, error("source_capture_context_changed"));
+            return;
+        }
         if let Some(source) = &record.config.borrowed_capture
             && (configuration.output != source.output || configuration.source_id.is_some())
         {

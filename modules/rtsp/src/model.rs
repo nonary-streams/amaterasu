@@ -638,6 +638,8 @@ pub struct Open {
     pub expected_runtime_epoch: Option<String>,
     #[serde(default)]
     pub borrowed_capture: Option<amaterasu_extension_api::BorrowedCaptureContext>,
+    #[serde(default)]
+    pub source_capture_context: Option<amaterasu_module_sdk::capture::SourceCaptureContext>,
     /// Coordinator-issued session selector; it grants no authority by itself.
     #[serde(default)]
     pub lifecycle_session_target: Option<amaterasu_extension_api::LifecycleTarget>,
@@ -789,6 +791,13 @@ impl Open {
 
     pub fn validate(&self, allow_remote: bool) -> Result<[u8; 16], &'static str> {
         if self
+            .source_capture_context
+            .as_ref()
+            .is_some_and(|context| context.validate().is_err())
+        {
+            return Err("invalid_source_capture_context");
+        }
+        if self
             .expected_runtime_epoch
             .as_deref()
             .is_some_and(|epoch| !valid_runtime_epoch(epoch))
@@ -802,6 +811,7 @@ impl Open {
                 || source.transport_id != self.operation_id
                 || Some(source.transport_epoch.as_str()) != self.expected_runtime_epoch.as_deref()
                 || source.output != self.capture.output
+                || !borrowed_source_context_matches(self.source_capture_context.as_ref(), source)
                 || self.display_admission_required())
         {
             return Err("invalid_borrowed_capture");
@@ -1217,6 +1227,9 @@ impl Open {
         if let Some(source) = &self.borrowed_capture {
             payload["borrowed_capture"] = serde_json::json!(source);
         }
+        if let Some(context) = &self.source_capture_context {
+            payload["source_capture_context"] = serde_json::json!(context);
+        }
         if let Some(session) = &self.lifecycle_session_target {
             payload["lifecycle_session_target"] = serde_json::json!(session);
             payload["lifecycle_capture_mode"] = serde_json::json!(self.lifecycle_capture_mode);
@@ -1280,6 +1293,9 @@ impl Open {
         }
         if let Some(continuous_audio) = self.continuous_audio {
             payload["configuration"]["continuous_audio"] = serde_json::json!(continuous_audio);
+        }
+        if let Some(context) = &self.source_capture_context {
+            payload["configuration"]["source_capture_context"] = serde_json::json!(context);
         }
         payload
     }
@@ -1712,6 +1728,24 @@ pub(super) fn valid_runtime_epoch(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn borrowed_source_context_matches(
+    context: Option<&amaterasu_module_sdk::capture::SourceCaptureContext>,
+    source: &amaterasu_extension_api::BorrowedCaptureContext,
+) -> bool {
+    match context {
+        None => source.route_key == "default",
+        Some(context) => {
+            context.route_key == source.route_key
+                && context.source_mode.is_some_and(|mode| {
+                    mode.width == source.mode.width
+                        && mode.height == source.mode.height
+                        && mode.refresh_millihz == source.mode.refresh_millihz
+                        && mode.hdr == source.mode.hdr
+                })
+        }
+    }
 }
 
 pub fn valid_name(value: &str) -> bool {
@@ -2837,6 +2871,92 @@ mod tests {
         request["lifecycle_capture_mode"] = json!("managed");
         let rejected: Open = serde_json::from_value(request).unwrap();
         assert_eq!(rejected.validate(false), Err("invalid_borrowed_capture"));
+    }
+
+    #[test]
+    fn source_capture_context_stays_outside_encoder_configuration_and_omits_legacy_none() {
+        let legacy = open();
+        assert!(
+            legacy
+                .prepare("legacy", None)
+                .get("source_capture_context")
+                .is_none()
+        );
+        assert!(
+            legacy.arm(51)["configuration"]
+                .get("source_capture_context")
+                .is_none()
+        );
+        for context in [
+            json!({"route_key":"synthetic_black"}),
+            json!({"route_key":"selected-desktop", "source_mode":{"width":2560,"height":1440,"refresh_millihz":144000,"hdr":false,"bit_depth":10}}),
+        ] {
+            let mut request = open_json();
+            request["source_capture_context"] = context.clone();
+            let selected: Open = serde_json::from_value(request.clone()).unwrap();
+            assert!(selected.validate(false).is_ok());
+            assert_eq!(
+                selected.prepare("prepare", None)["source_capture_context"],
+                context
+            );
+            let arm = selected.arm(51);
+            assert_eq!(arm["configuration"]["source_capture_context"], context);
+            assert!(
+                arm["configuration"]["configuration"]
+                    .get("source_capture_context")
+                    .is_none()
+            );
+            request["source_capture_context"]["route_key"] = json!("");
+            let invalid: Open = serde_json::from_value(request).unwrap();
+            assert_eq!(
+                invalid.validate(false),
+                Err("invalid_source_capture_context")
+            );
+        }
+        let mut forged = open_json();
+        forged["source_capture_context"] = json!({"route_key":"selected-desktop","provider":"chosen-provider","source_class":"synthetic"});
+        assert!(serde_json::from_value::<Open>(forged).is_err());
+    }
+
+    #[test]
+    fn nondefault_borrowed_routes_require_the_exact_frozen_source_mode() {
+        let source = json!({"client_id":"paired-client","session_id":"retained-source",
+            "generation":7,"reservation_id":"source-hold","transport_id":"launch-one",
+            "transport_epoch":"ab".repeat(16),"output":"kwin:Virtual-17","route_key":"retained-route",
+            "mode":{"width":2560,"height":1440,"refresh_millihz":144000,"hdr":true}});
+        let mut request = open_json();
+        request["lifecycle_capture_mode"] = json!("external");
+        request["lifecycle_session_target"] =
+            json!({"kind":"session","host_epoch":"host","session_id":"app","generation":1});
+        request["lifecycle_settings_revision"] = json!("revision");
+        request["lifecycle_intent"] = json!("initial");
+        request["expected_runtime_epoch"] = json!("ab".repeat(16));
+        request["capture"]["output"] = source["output"].clone();
+        request["borrowed_capture"] = source.clone();
+        let missing: Open = serde_json::from_value(request.clone()).unwrap();
+        assert_eq!(missing.validate(false), Err("invalid_borrowed_capture"));
+        request["source_capture_context"] =
+            json!({"route_key":"retained-route", "source_mode":source["mode"]});
+        let valid: Open = serde_json::from_value(request.clone()).unwrap();
+        assert!(valid.validate(false).is_ok());
+        for (field, value) in [
+            ("width", json!(1280)),
+            ("height", json!(720)),
+            ("refresh_millihz", json!(60000)),
+            ("hdr", json!(false)),
+        ] {
+            let mut changed = request.clone();
+            changed["source_capture_context"]["source_mode"][field] = value;
+            let invalid: Open = serde_json::from_value(changed).unwrap();
+            assert_eq!(
+                invalid.validate(false),
+                Err("invalid_borrowed_capture"),
+                "{field}"
+            );
+        }
+        request["source_capture_context"]["route_key"] = json!("other-route");
+        let changed: Open = serde_json::from_value(request).unwrap();
+        assert_eq!(changed.validate(false), Err("invalid_borrowed_capture"));
     }
 
     #[test]

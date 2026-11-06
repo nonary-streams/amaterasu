@@ -220,3 +220,13 @@ the exact operation/epoch/output, and rejects display mutation admission. The
 stream consumer checks the unchanged context before opening its exact source.
 App-independent streams report authenticated client disconnect only after exact
 native retirement and a control witness bound to their owned stream operation.
+
+
+The optional top-level `source_capture_context` carries a public Capture SDK
+logical route and optional actual source mode. RTSP freezes it through Prepare
+and Start; stream-session forwards it unchanged to Video Open, outside encoder
+configuration. The installed video provider resolves the logical route's provider
+and source class. A nondefault borrowed route requires the context's explicit
+source mode to match its frozen retained geometry and range. Missing context
+preserves the legacy default route; unknown source mode or depth does not imply
+eight-bit capture. Changing the context after admission fails before capture.

@@ -401,6 +401,8 @@ pub struct PrepareConfig {
     pub shared_source_operation_id: Option<String>,
     #[serde(default)]
     pub borrowed_capture: Option<amaterasu_extension_api::BorrowedCaptureContext>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_capture_context: Option<amaterasu_module_sdk::capture::SourceCaptureContext>,
     /// Complete, frozen display Apply request from the authenticated launch.
     #[serde(default)]
     pub display_request: Option<Box<DisplayRequest>>,
@@ -445,12 +447,20 @@ pub struct PrepareConfig {
 }
 impl PrepareConfig {
     pub fn validate(&self, allow_remote: bool) -> Result<(), &'static str> {
+        if self
+            .source_capture_context
+            .as_ref()
+            .is_some_and(|context| context.validate().is_err())
+        {
+            return Err("invalid_source_capture_context");
+        }
         if let Some(source) = &self.borrowed_capture
             && (source.validate().is_err()
                 || !self.lifecycle_capture_mode.is_external()
                 || self.lifecycle_session_target.is_none()
                 || Some(source.transport_id.as_str()) != self.rtsp_operation_id.as_deref()
                 || self.display_request.is_some()
+                || !borrowed_source_context_matches(self.source_capture_context.as_ref(), source)
                 || self.virtual_display_intent.is_some())
         {
             return Err("invalid_borrowed_capture");
@@ -818,6 +828,8 @@ fn is_default_qp(value: &i32) -> bool {
 #[derive(Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct StartConfigData {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_capture_context: Option<amaterasu_module_sdk::capture::SourceCaptureContext>,
     #[serde(
         default,
         skip_serializing_if = "amaterasu_extension_api::CaptureBindingMode::is_managed"
@@ -921,6 +933,7 @@ impl Serialize for StartConfig {
                 "constant_rate",
                 "minimum_fps_target",
                 "wgc_pacing_smoothing",
+                "source_capture_context",
             ] {
                 object.remove(field);
             }
@@ -950,6 +963,7 @@ impl<'de> Deserialize<'de> for StartConfig {
                 "constant_rate",
                 "minimum_fps_target",
                 "wgc_pacing_smoothing",
+                "source_capture_context",
             ] {
                 if value.get(field).is_some() {
                     return Err(serde::de::Error::custom(
@@ -989,6 +1003,16 @@ impl StartConfig {
     }
 
     pub fn validate(&self, stream_audio: bool) -> Result<(), &'static str> {
+        if self.source_id.is_some() && self.source_capture_context.is_some() {
+            return Err("source_mode_cannot_select_capture_context");
+        }
+        if self
+            .source_capture_context
+            .as_ref()
+            .is_some_and(|context| context.validate().is_err())
+        {
+            return Err("invalid_source_capture_context");
+        }
         if let Some(source) = &self.lifecycle_shared_source {
             use amaterasu_extension_api::{
                 LifecycleTarget, StreamRetirementProof, validate_stream_retirement_proof,
@@ -1105,6 +1129,24 @@ impl StartConfig {
             (Some(_), _) => return Err("invalid_virtual_sink_channels"),
         }
         Ok(())
+    }
+}
+
+fn borrowed_source_context_matches(
+    context: Option<&amaterasu_module_sdk::capture::SourceCaptureContext>,
+    source: &amaterasu_extension_api::BorrowedCaptureContext,
+) -> bool {
+    match context {
+        None => source.route_key == "default",
+        Some(context) => {
+            context.route_key == source.route_key
+                && context.source_mode.is_some_and(|mode| {
+                    mode.width == source.mode.width
+                        && mode.height == source.mode.height
+                        && mode.refresh_millihz == source.mode.refresh_millihz
+                        && mode.hdr == source.mode.hdr
+                })
+        }
     }
 }
 

@@ -495,6 +495,9 @@ impl Record {
         if let Some(source) = &self.config.borrowed_capture {
             response["borrowed_capture"] = json!(source);
         }
+        if let Some(context) = &self.config.source_capture_context {
+            response["source_capture_context"] = json!(context);
+        }
         if let Some(reason) = self.authenticated_disconnect_reason
             && self.control_authenticated
         {
@@ -554,6 +557,9 @@ impl Record {
                 }
                 if let Some(options) = &start.encoder_options {
                     payload["encoder_options"] = options.clone();
+                }
+                if let Some(context) = &start.source_capture_context {
+                    payload["source_capture_context"] = json!(context);
                 }
                 if let Some(source_id) = start.source_id {
                     payload["source_id"] = json!(source_id);
