@@ -30,6 +30,7 @@ extern "C" {
 #define AMATERASU_VIDEO_ENCODER_CONTRACT "amaterasu.video-encoder.native/1"
 #define AMATERASU_ENCODER_PROVIDER_CONTRACT "amaterasu.encoder-provider.native/1"
 #define AMATERASU_FRAME_RESOURCE_CONSUMER_CONTRACT "amaterasu.frame-resource-consumer.native/1"
+#define AMATERASU_FRAME_RESOURCE_PROCESSOR_CONTRACT "amaterasu.frame-resource-processor.native/1"
 #define AMATERASU_CPU_FRAME_PROCESSOR_CONTRACT "amaterasu.cpu-frame-processor.native/1"
 #define AMATERASU_GPU_FRAME_PROCESSOR_CONTRACT "amaterasu.gpu-frame-processor.native/1"
 #define AMATERASU_AUDIO_CAPTURE_CONTRACT "amaterasu.audio-capture.native/1"

@@ -18,6 +18,7 @@ _Static_assert(AMATERASU_CAPTURE_API_V1_8_SIZE == sizeof(AmaterasuCaptureApiV1_8
 _Static_assert(offsetof(AmaterasuCaptureApiV1_10, color_provenance) == sizeof(AmaterasuCaptureApiV1_9), "capture v1.9 prefix preserved");
 _Static_assert(AMATERASU_CAPTURE_API_V1_10_SIZE == sizeof(AmaterasuCaptureApiV1_10), "capture provenance table size");
 _Static_assert(offsetof(AmaterasuFrameResourceProcessorApi, base) == 0, "resource consumer prefix");
+_Static_assert(sizeof(AMATERASU_FRAME_RESOURCE_PROCESSOR_CONTRACT) == sizeof("amaterasu.frame-resource-processor.native/1"), "resource processor contract spelling");
 _Static_assert(offsetof(AmaterasuFrameResourceProcessorApi, enumerate_outputs) == sizeof(AmaterasuFrameResourceConsumerApi), "resource processor extension");
 _Static_assert(sizeof(AmaterasuFrameDescriptor) == 40, "resource descriptor layout");
 _Static_assert(sizeof(AmaterasuCaptureResourceOffer) == 144, "resource offer layout");

@@ -7,6 +7,7 @@ pub mod native_contracts {
     pub const ENCODER: &str = "amaterasu.video-encoder.native/1";
     pub const ENCODER_PROVIDER: &str = "amaterasu.encoder-provider.native/1";
     pub const FRAME_RESOURCE_CONSUMER: &str = "amaterasu.frame-resource-consumer.native/1";
+    pub const FRAME_RESOURCE_PROCESSOR: &str = "amaterasu.frame-resource-processor.native/1";
     pub const CPU_PROCESSOR: &str = "amaterasu.cpu-frame-processor.native/1";
     pub const GPU_PROCESSOR: &str = "amaterasu.gpu-frame-processor.native/1";
 }
