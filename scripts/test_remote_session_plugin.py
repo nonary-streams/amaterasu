@@ -51,6 +51,19 @@ SOURCE_ROOT = Path(__file__).resolve().parents[1]
 SESSION_SERVICE = "nonary.session-presentation/1"
 PLUGIN = "amaterasu.remote-session"
 INPUT_METRICS = "test.input-probe/1"
+# Direct console helpers plus configuration/state calls delegated under the
+# original initiator. These fixture grants do not change production policy.
+FIXTURE_CONSOLE_CALLS = (
+    SESSION_SERVICE,
+    INPUT_METRICS,
+    "amaterasu.rtsp/1",
+    "amaterasu.management/1",
+    "amaterasu.authentication/1",
+    "amaterasu.nvhttp/1",
+    "amaterasu.pairing/1",
+    "amaterasu.configuration/1",
+    "amaterasu.state/1",
+)
 WIDTH, HEIGHT, FPS = 64, 48, 30
 MODE = {"width": WIDTH, "height": HEIGHT, "refresh_millihz": FPS * 1000, "hdr": False}
 
@@ -138,7 +151,7 @@ class Fixture:
 
 def approve_fixture_console(policy):
     calls = policy["principals"]["amaterasu.console"].setdefault("call", [])
-    for service in (SESSION_SERVICE, INPUT_METRICS, "amaterasu.rtsp/1"):
+    for service in FIXTURE_CONSOLE_CALLS:
         if service not in calls:
             calls.append(service)
     for approval in policy.get("api_methods", []):
@@ -574,6 +587,45 @@ def qualify_missing_provider(fixture, fixtures):
 
 
 class HarnessSelfTests(unittest.TestCase):
+    def test_console_can_initialize_the_shared_management_helper(self):
+        policy = {
+            "principals": {"amaterasu.console": {"call": ["existing.service/1"]}},
+            "settings": {PLUGIN: {}},
+            "api_methods": [
+                {"method": {"service": SESSION_SERVICE}, "callers": ["amaterasu.nvhttp"]},
+                {"method": {"service": "unrelated.api/1"}, "callers": []},
+            ],
+        }
+        approve_fixture_console(policy)
+        approve_fixture_console(policy)
+        calls = policy["principals"]["amaterasu.console"]["call"]
+        self.assertEqual(set(calls), {
+            "existing.service/1", SESSION_SERVICE, INPUT_METRICS,
+            "amaterasu.rtsp/1", "amaterasu.management/1", "amaterasu.authentication/1",
+            "amaterasu.nvhttp/1", "amaterasu.pairing/1", "amaterasu.configuration/1",
+            "amaterasu.state/1",
+        })
+        self.assertEqual(len(calls), len(set(calls)))
+        self.assertEqual(policy["api_methods"][0]["callers"], ["amaterasu.nvhttp", "amaterasu.console"])
+        self.assertEqual(policy["api_methods"][1]["callers"], [])
+
+        requests = []
+
+        class GrantedConsole:
+            def request(self, service, payload):
+                require(service in calls, "operation not granted to endpoint", service)
+                requests.append((service, payload))
+                if payload["action"] == "product_get":
+                    return {"ok": True}
+                return {"ok": True, "enabled": True, "bound_address": "127.0.0.1:49152"}
+
+        api = Api(GrantedConsole())
+        self.assertEqual((api.host, api.port), ("127.0.0.1", 49152))
+        self.assertEqual(requests, [
+            ("amaterasu.management/1", {"action": "product_get"}),
+            ("amaterasu.management/1", {"action": "status"}),
+        ])
+
     def test_input_substitution_preserves_identity_and_uses_exact_fixture_bytes(self):
         with tempfile.TemporaryDirectory() as temporary:
             artifact = Path(temporary) / "libamaterasu_input_probe.so"
