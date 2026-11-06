@@ -405,7 +405,7 @@ def initialize_paired_wire(console, fixtures, *, select_software=True):
     require(status == 200 and login.get("ok"), "isolated management login failed", login)
     bearer = login["bearer"]
     if select_software:
-        status, settings, _ = api.post("/v1/nvhttp/settings", bearer=bearer)
+        status, settings, _ = api.post("/v1/nvhttp/settings", token=bearer)
         require(status == 200 and settings.get("ok"), "NVHTTP settings unavailable", settings)
         status, updated, _ = api.post("/v1/nvhttp/settings_update", {
             "hostname": settings["hostname"], "port": settings["port"], "expected_revision": settings["revision"],
@@ -413,7 +413,7 @@ def initialize_paired_wire(console, fixtures, *, select_software=True):
             "min_threads": 2,
         }, bearer)
         require(status == 200 and updated.get("ok"), "software encoder selection failed", updated)
-        status, encoders, _ = api.post("/v1/media/encoders", bearer=bearer)
+        status, encoders, _ = api.post("/v1/media/encoders", token=bearer)
         require(status == 200 and encoders.get("software_encoder", {}).get("available") is True,
                 "artifact needs amaterasu-encode/software-x264 and compatible libx264", encoders)
     http, https = "http://" + state["http_address"], "https://" + state["https_address"]
