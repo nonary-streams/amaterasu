@@ -165,7 +165,10 @@ impl<P: Platform> Pipeline<P> {
         ) {
             return self.start_targets(incoming, send);
         }
-        if matches!(incoming.operation, Operation::ScopedApply { .. }) {
+        if matches!(
+            incoming.operation,
+            Operation::ScopedApply { .. } | Operation::ScopedReconfigure { .. }
+        ) {
             return self.validate_scoped_owner(incoming, send);
         }
         if let Operation::Apply {
@@ -454,6 +457,9 @@ impl<P: Platform> Pipeline<P> {
         ) {
             return self.loaded_targets(context, operation, revision, journal, send);
         }
+        if matches!(operation, Operation::ScopedReconcile { .. }) {
+            return self.reconcile_scoped(context, operation, revision, journal, send);
+        }
         if !self.allow_mutation {
             return complete(
                 send,
@@ -467,7 +473,9 @@ impl<P: Platform> Pipeline<P> {
         if !self.platform.supported()
             && !(matches!(
                 operation,
-                Operation::ScopedApply { .. } | Operation::ScopedRelease { .. }
+                Operation::ScopedApply { .. }
+                    | Operation::ScopedReconfigure { .. }
+                    | Operation::ScopedRelease { .. }
             ) && self.platform.supports_scoped_composition())
         {
             return complete(
@@ -481,7 +489,9 @@ impl<P: Platform> Pipeline<P> {
         }
         if matches!(
             operation,
-            Operation::ScopedApply { .. } | Operation::ScopedRelease { .. }
+            Operation::ScopedApply { .. }
+                | Operation::ScopedReconfigure { .. }
+                | Operation::ScopedRelease { .. }
         ) {
             return self.loaded_scoped(context, operation, revision, journal, send);
         }

@@ -1387,7 +1387,7 @@ impl State {
                     Command::Request { service, payload, parent, .. } => {
                         assert_eq!(parent, Some(7));
                         if service == amaterasu_module_sdk::virtual_display::SERVICE {
-                            assert_eq!(payload["action"],"verify_owner_target");
+                            assert!(matches!(payload["action"].as_str(),Some("verify_owner_target"|"verify_retained_mode")));
                             assert_eq!(payload["owner"],caller);
                             state_reply = Some(self.scoped_verifier_response.clone().unwrap_or_else(|| json!({"ok":true,"owned":true,"target_id":"monitor.remote","specification":{"identity":payload["identity"],"name":"Remote Monitor","hdr_enabled":false,"width":1280,"height":720,"refresh_millihz":60000},"active":true})));
                             return Ok(Response::Accepted {id:20});

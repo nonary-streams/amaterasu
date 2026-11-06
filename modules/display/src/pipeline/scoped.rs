@@ -9,14 +9,22 @@ impl<P: Platform> Pipeline<P> {
         incoming: Incoming,
         send: &mut impl FnMut(Command) -> Transport,
     ) -> ModuleResult<()> {
-        let Operation::ScopedApply {
+        let (Operation::ScopedApply {
             operation_id,
             identity,
             reference_id,
             target,
             expected_topology_revision,
             ..
-        } = &incoming.operation
+        }
+        | Operation::ScopedReconfigure {
+            operation_id,
+            identity,
+            reference_id,
+            target,
+            expected_topology_revision,
+            ..
+        }) = &incoming.operation
         else {
             unreachable!("scoped apply validation")
         };
@@ -44,12 +52,27 @@ impl<P: Platform> Pipeline<P> {
                 failure("invalid_request", "invalid scoped target"),
             );
         }
-        let payload = serde_json::to_value(virtual_display::Operation::VerifyOwnerTarget {
-            owner: incoming.context.caller.clone(),
-            identity: identity.clone(),
-            reference_id: reference_id.clone(),
-        })
-        .map_err(|error| error.to_string())?;
+        let verifier = if let Operation::ScopedReconfigure {
+            mode_operation_id, ..
+        } = &incoming.operation
+        {
+            if let Err(error) = scoped::validate_identity(mode_operation_id) {
+                return complete(send, incoming.context.request, error.payload());
+            }
+            virtual_display::Operation::VerifyRetainedMode {
+                owner: incoming.context.caller.clone(),
+                identity: identity.clone(),
+                reference_id: reference_id.clone(),
+                operation_id: mode_operation_id.clone(),
+            }
+        } else {
+            virtual_display::Operation::VerifyOwnerTarget {
+                owner: incoming.context.caller.clone(),
+                identity: identity.clone(),
+                reference_id: reference_id.clone(),
+            }
+        };
+        let payload = serde_json::to_value(verifier).map_err(|error| error.to_string())?;
         self.submit_service(
             incoming.context,
             virtual_display::SERVICE,
@@ -68,17 +91,44 @@ impl<P: Platform> Pipeline<P> {
         let Stage::ValidatingScoped(operation) = pending.stage else {
             unreachable!("scoped validation stage")
         };
-        let Operation::ScopedApply {
+        let (Operation::ScopedApply {
             ref target,
             ref identity,
             ..
-        } = operation
+        }
+        | Operation::ScopedReconfigure {
+            ref target,
+            ref identity,
+            ..
+        }) = operation
         else {
             unreachable!("scoped apply")
         };
+        let retained_mode = if let Operation::ScopedReconfigure {
+            ref mode_operation_id,
+            ..
+        } = operation
+        {
+            Some(mode_operation_id)
+        } else {
+            None
+        };
+        if retained_mode.is_some_and(|expected| {
+            payload["mode_operation_id"].as_str() != Some(expected.as_str())
+        }) {
+            return complete(
+                send,
+                pending.context.request,
+                failure(
+                    "retained_mode_unverified",
+                    "provider returned a different retained mode operation",
+                ),
+            );
+        }
         let proof = virtual_display::owner_target_from_reply(payload, identity);
         let verified = proof.is_ok_and(|proof| {
-            proof.target_id == target.id
+            (retained_mode.is_none() || target.hdr_enabled == Some(proof.specification.hdr_enabled))
+                && proof.target_id == target.id
                 && proof.specification.width == target.width
                 && proof.specification.height == target.height
                 && u64::from(proof.specification.refresh_millihz)
@@ -102,6 +152,188 @@ impl<P: Platform> Pipeline<P> {
             json!({"action":"get","key":JOURNAL_KEY}),
             Stage::Loading(operation),
             send,
+        )
+    }
+
+    pub(super) fn reconcile_scoped(
+        &mut self,
+        context: Context,
+        operation: Operation,
+        revision: u64,
+        journal: Option<Journal>,
+        send: &mut impl FnMut(Command) -> Transport,
+    ) -> ModuleResult<()> {
+        let Operation::ScopedReconcile {
+            operation_id,
+            identity,
+            reference_id,
+        } = operation
+        else {
+            unreachable!("scoped reconcile only")
+        };
+        for value in [&operation_id, &identity, &reference_id] {
+            if let Err(error) = scoped::validate_identity(value) {
+                return complete(send, context.request, error.payload());
+            }
+        }
+        let Some(mut journal) = journal else {
+            return complete(
+                send,
+                context.request,
+                failure(
+                    "scoped_operation_not_found",
+                    "the selected operation has no durable admission",
+                ),
+            );
+        };
+        let Some(target) = journal
+            .scoped_targets
+            .iter()
+            .find(|target| {
+                !target.borrowed
+                    && target.owner == context.caller
+                    && target.identity == identity
+                    && target.reference_id == reference_id
+            })
+            .cloned()
+        else {
+            return complete(
+                send,
+                context.request,
+                failure(
+                    "scoped_operation_not_found",
+                    "the caller has no matching protected target reference",
+                ),
+            );
+        };
+        let current = match self.capture_scoped_baseline() {
+            Ok(current) => current,
+            Err(error) => return complete(send, context.request, error.payload()),
+        };
+        let view = match self.platform.read_configuration_snapshot() {
+            Ok(view) => view,
+            Err(error) => return complete(send, context.request, error.payload()),
+        };
+        if view["topology_revision"].as_str()
+            != baseline_revision(&current)
+                .as_ref()
+                .ok()
+                .map(String::as_str)
+        {
+            return complete(
+                send,
+                context.request,
+                failure(
+                    "topology_changed",
+                    "display observations changed during scoped reconciliation",
+                ),
+            );
+        }
+        let observed: Configuration = match serde_json::from_value(view["configuration"].clone()) {
+            Ok(observed) => observed,
+            Err(_) => {
+                return complete(
+                    send,
+                    context.request,
+                    failure("invalid_snapshot", "current configuration is unavailable"),
+                );
+            }
+        };
+        if let Some(pending) = journal.scoped_pending.as_ref() {
+            if pending.owner != context.caller
+                || pending.operation_id != operation_id
+                || pending.target_id != target.target_id
+            {
+                return complete(
+                    send,
+                    context.request,
+                    failure(
+                        "operation_conflict",
+                        "a different scoped operation remains pending",
+                    ),
+                );
+            }
+            let mode_operation_id = pending
+                .request_identity
+                .get("mode_operation_id")
+                .cloned()
+                .unwrap_or(Value::Null);
+            if scoped::same_configuration(&pending.desired_configuration, &observed) {
+                if let Err(error) = self.finish_scoped_journal(&mut journal, &current) {
+                    return complete(send, context.request, error.payload());
+                }
+                if let Err(error) = check_request(send, &context) {
+                    return complete(send, context.request, error.payload());
+                }
+                return self.persist_scoped(context,revision,journal,json!({"ok":true,"state":"succeeded","reconciled":true,"operation_id":operation_id,"mode_operation_id":mode_operation_id,"target_id":target.target_id}),send);
+            }
+            if scoped::same_configuration(&pending.before_configuration, &observed) {
+                journal.scoped_pending = None;
+                if let Err(error) = check_request(send, &context) {
+                    return complete(send, context.request, error.payload());
+                }
+                return self.persist_scoped(context,revision,journal,json!({"ok":true,"state":"not_applied","reconciled":true,"operation_id":operation_id,"mode_operation_id":mode_operation_id,"target_id":target.target_id,"reference_retained":true}),send);
+            }
+            return complete(
+                send,
+                context.request,
+                json!({"ok":false,"state":"recovery_required","operation_id":operation_id,"code":"scoped_readback_uncertain"}),
+            );
+        }
+        if target.operation_id != operation_id {
+            return complete(
+                send,
+                context.request,
+                failure(
+                    "scoped_operation_not_found",
+                    "the operation is not the target's completed admission",
+                ),
+            );
+        }
+        let Some(identity) = target.request_identity else {
+            return complete(
+                send,
+                context.request,
+                failure(
+                    "scoped_operation_not_found",
+                    "completed request identity is unavailable",
+                ),
+            );
+        };
+        let mut desired = match serde_json::from_value::<crate::model::DisplaySetting>(
+            identity["target"].clone(),
+        ) {
+            Ok(desired) => desired,
+            Err(_) => {
+                return complete(
+                    send,
+                    context.request,
+                    failure(
+                        "invalid_journal",
+                        "completed target configuration is unavailable",
+                    ),
+                );
+            }
+        };
+        if identity["primary"] == true {
+            desired.x = 0;
+            desired.y = 0;
+        }
+        if !observed
+            .displays
+            .iter()
+            .any(|display| scoped::same_setting(&desired, display))
+        {
+            return complete(
+                send,
+                context.request,
+                json!({"ok":false,"state":"recovery_required","operation_id":operation_id,"code":"scoped_readback_changed"}),
+            );
+        }
+        complete(
+            send,
+            context.request,
+            json!({"ok":true,"state":"succeeded","reconciled":true,"operation_id":operation_id,"mode_operation_id":identity["mode_operation_id"],"target_id":target.target_id}),
         )
     }
 
@@ -163,6 +395,15 @@ impl<P: Platform> Pipeline<P> {
                     target,
                     expected_topology_revision,
                     primary,
+                }
+                | Operation::ScopedReconfigure {
+                    operation_id,
+                    identity,
+                    reference_id,
+                    target,
+                    expected_topology_revision,
+                    primary,
+                    ..
                 } => {
                     if context.verified_scoped_target.as_deref() != Some(&target.id) {
                         return Err(DisplayError::new(
@@ -292,6 +533,12 @@ impl<P: Platform> Pipeline<P> {
                 "scoped request topology revision is stale",
             ));
         }
+        if request_identity["action"] == "scoped_reconfigure" && existing.is_none() {
+            return Err(DisplayError::new(
+                "not_found",
+                "retained mode changes require an existing owned composition reference",
+            ));
+        }
         let target_id = if let Some(target) = &requested {
             if existing.is_some_and(|index| journal.scoped_targets[index].target_id != target.id)
                 || journal.scoped_targets.iter().any(|owned| {
@@ -411,6 +658,15 @@ impl<P: Platform> Pipeline<P> {
                     DisplayError::new("invalid_request", "primary origin overflow")
                 })?,
             );
+            if shift != (0, 0)
+                && (journal.normal_active
+                    || journal.scoped_targets.iter().any(|target| target.borrowed))
+            {
+                return Err(DisplayError::new(
+                    "target_in_use",
+                    "primary origin changes must wait for normal game and borrowed source lifetimes to retire",
+                ));
+            }
             scoped::translate_configuration(&mut desired, shift)?;
             shift
         } else {
@@ -557,6 +813,21 @@ impl<P: Platform> Pipeline<P> {
                 );
             }
         };
+        if view["topology_revision"].as_str()
+            != baseline_revision(&current)
+                .as_ref()
+                .ok()
+                .map(String::as_str)
+        {
+            return complete(
+                send,
+                context.request,
+                failure(
+                    "scoped_recovery_required",
+                    "display observations changed before scoped commit",
+                ),
+            );
+        }
         let observed = serde_json::from_value::<Configuration>(view["configuration"].clone());
         if observed.as_ref().is_err()
             || !scoped::same_configuration(&configuration, observed.as_ref().unwrap())

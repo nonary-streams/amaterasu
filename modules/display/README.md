@@ -435,3 +435,36 @@ inventory rows contain no native device paths or operating-system handles.
 These observations establish source selection and display state. The selected
 capture route must separately prove its exact-output capability before consumer
 effects; inventory readiness is not proof of an opened capture or client playback.
+
+## Retained monitor composition
+
+`display::ScopedOperation` exposes target-only composition. `scoped_apply` names
+an exact caller-owned virtual-display identity/reference, a complete target
+setting, an operation ID and the observed topology revision. The display provider
+verifies ownership through the selected virtual-display provider before it
+journals or applies the request. Other outputs retain their mode, scale,
+rotation and HDR state. KScreen geometry uses observed logical footprints.
+
+The optional `primary` flag selects the target by translating the common desktop
+origin and changing the explicit primary priority pair. A nonzero origin change
+returns `target_in_use` while a normal game lease or borrowed source reference is
+held. Session coordination also waits for its known peer captures to retire.
+An independently retained target survives a normal game's display restoration.
+`scoped_release` retires composition ownership and reports `native_removed: false`;
+the virtual-display owner must separately remove its native output and verify
+that operation's result.
+
+For a retained mode change, first prepare the exact transaction through the
+virtual-display SDK. `scoped_reconfigure` additionally names that
+`mode_operation_id`; the display provider verifies its prepared dimensions,
+refresh rate and HDR state before any native change. The virtual-display
+provider independently reads back the result before committing its effective
+mode revision.
+
+After a lost reply or consumer restart,
+`scoped_reconcile { operation_id, identity, reference_id }` settles only an
+existing caller-owned admission. Observed requested state returns `succeeded`.
+Observed pre-mutation state retires the pending transition as `not_applied`,
+while retaining its target reference. An ambiguous observation keeps the
+recovery fence. Reconciliation never accepts a new configuration or replays an
+unknown native mutation.

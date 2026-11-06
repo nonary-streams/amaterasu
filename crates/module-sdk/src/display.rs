@@ -45,6 +45,19 @@ pub enum Rotation {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ScopedOperation {
+    /// Apply a provider-prepared retained mode; the display owner verifies the
+    /// exact mode operation before native changes. Provider commit remains a
+    /// separate independently observed step.
+    ScopedReconfigure {
+        operation_id: String,
+        mode_operation_id: String,
+        identity: String,
+        reference_id: String,
+        target: Target,
+        expected_topology_revision: String,
+        #[serde(default)]
+        primary: bool,
+    },
     ScopedApply {
         operation_id: String,
         identity: String,
@@ -53,6 +66,13 @@ pub enum ScopedOperation {
         expected_topology_revision: String,
         #[serde(default)]
         primary: bool,
+    },
+    /// Settle an already journaled exact operation from native observation.
+    /// This never admits a new configuration or replays an unknown mutation.
+    ScopedReconcile {
+        operation_id: String,
+        identity: String,
+        reference_id: String,
     },
     ScopedRelease {
         operation_id: String,

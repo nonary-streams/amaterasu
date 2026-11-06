@@ -28,6 +28,19 @@ pub enum Operation {
         selector: String,
         reference_id: String,
     },
+    /// Apply a provider-prepared retained mode; the display owner verifies the
+    /// exact mode operation before native changes. Provider commit remains a
+    /// separate independently observed step.
+    ScopedReconfigure {
+        operation_id: String,
+        mode_operation_id: String,
+        identity: String,
+        reference_id: String,
+        target: DisplaySetting,
+        expected_topology_revision: String,
+        #[serde(default)]
+        primary: bool,
+    },
     ScopedApply {
         operation_id: String,
         identity: String,
@@ -36,6 +49,13 @@ pub enum Operation {
         expected_topology_revision: String,
         #[serde(default)]
         primary: bool,
+    },
+    /// Settle an already journaled exact operation from native observation.
+    /// This never admits a new configuration or replays an unknown mutation.
+    ScopedReconcile {
+        operation_id: String,
+        identity: String,
+        reference_id: String,
     },
     ScopedRelease {
         operation_id: String,

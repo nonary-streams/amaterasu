@@ -128,7 +128,8 @@ pub fn validate_journal(journal: &Journal) -> DisplayResult<()> {
             serde_json::from_value::<crate::model::Operation>(pending.request_identity.clone())
                 .map_err(|_| DisplayError::new("invalid_journal", "invalid scoped operation"))?;
         let consistent = match operation {
-            crate::model::Operation::ScopedApply { operation_id, .. } => {
+            crate::model::Operation::ScopedApply { operation_id, .. }
+            | crate::model::Operation::ScopedReconfigure { operation_id, .. } => {
                 !pending.releasing && operation_id == pending.operation_id
             }
             crate::model::Operation::ScopedRelease { operation_id, .. } => {
