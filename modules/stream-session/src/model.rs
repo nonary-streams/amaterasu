@@ -900,6 +900,8 @@ pub struct StartConfigData {
     pub device_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub virtual_sink: Option<String>,
+    /// Negotiated PCM/encoder channels; a native sink layout is selected only
+    /// when `virtual_sink` is present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channels: Option<u32>,
     #[serde(default)]
@@ -1119,6 +1121,11 @@ impl StartConfig {
                     return Err("invalid_start_configuration");
                 }
             }
+            (None, Some(channels))
+                if stream_audio
+                    && self.capture_sink_without_routing
+                    && valid_label(&self.audio_endpoint, 4096)
+                    && matches!(channels, 2 | 6 | 8) => {}
             (None, Some(_)) => return Err("invalid_virtual_sink_channels"),
             (Some(selector), Some(channels))
                 if selector.len() <= 4096

@@ -92,20 +92,28 @@ consumer cleanup while source resources remain retained. Full
 The selected capture and encoder providers still determine which independent
 output sizes and formats they can deliver from that source.
 
-1. `prepare` allocates a session record, a stereo Opus encoder, media UDP sockets
+1. `prepare` allocates a session record, an Opus encoder, media UDP sockets
    and an authenticated control endpoint. It returns the bound ports and actual
    encoded audio packet size before opening capture hardware.
 2. The client completes the ENet handshake and proves possession of the control
    key. `start` checks authenticated control before acquiring capture resources.
    A premature start leaves the prepared allocation available for a retry.
 3. `start` opens video with explicit access-unit boundaries, opens audio, validates
-   48 kHz stereo PCM, acquires shared capture leases and activates the coordination
+   48 kHz PCM in the prepared 2/6/8-channel layout, acquires shared capture leases and activates the coordination
    session. `host_audio_enabled` is snapshotted with the start configuration and
    passed to AudioCapture for sink policy. When trusted input policy is enabled, it
    also acquires the session's exclusive input lease before reporting success.
 4. `stop` releases held input, stops new capture, drains video and Opus, waits for
    the local transport queue to empty, closes providers and releases session
    leases. This confirms local cleanup, not client receipt or playback.
+
+For host audio capture, `start.channels` may select 2, 6 or 8 channels without a
+`virtual_sink` when `capture_sink_without_routing` is true and `audio_endpoint`
+names a capture endpoint. The channel count must match `prepare.audio.channels`.
+AudioCapture receives the requested PCM layout through `capture_format`, while
+its native sink-layout `channels` and `virtual_sink` remain null. The provider
+must confirm the endpoint, capture-only and host playback policy and report the
+actual PCM format; a mismatch triggers owned cleanup before media forwarding.
 
 `lookup` reconciles a caller's prepare operation ID. Reusing the same ID with a
 changed configuration is rejected. `status` and `close` are owner scoped; status

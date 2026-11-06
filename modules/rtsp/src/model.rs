@@ -729,6 +729,8 @@ pub struct Open {
     pub capture_sink_without_routing: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub virtual_sink: Option<String>,
+    /// Stream channel count. Capture-only host endpoints request PCM conversion;
+    /// only an explicit virtual sink also selects a native sink layout.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channels: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1111,6 +1113,11 @@ impl Open {
         match (&self.virtual_sink, self.channels) {
             (None, None)
                 if !self.stream_audio || valid_label(&self.capture.audio_endpoint, 4096) => {}
+            (None, Some(channels))
+                if self.stream_audio
+                    && self.capture_sink_without_routing
+                    && valid_label(&self.capture.audio_endpoint, 4096)
+                    && matches!(channels, 2 | 6 | 8) => {}
             (None, _) => return Err("invalid_virtual_sink_channels"),
             (Some(selector), Some(channels))
                 if selector.len() <= 4096
@@ -2798,6 +2805,42 @@ mod tests {
         assert_eq!(payload["audio"]["packet_ms"], 10);
         assert_eq!(payload["audio"]["bitrate"], 128_000);
         assert_eq!(payload["encrypt_audio"], true);
+    }
+
+    #[test]
+    fn host_capture_channels_are_stream_format_without_a_virtual_sink_selection() {
+        for channels in [2, 6, 8] {
+            let mut selected = open();
+            selected.channels = Some(channels);
+            selected.capture_sink_without_routing = true;
+            selected.capture.host_audio_enabled = true;
+            selected.profile.audio_bitrate = if channels == 2 { 128000 } else { 512000 };
+            assert!(selected.validate(false).is_ok());
+            let prepare = selected.prepare("host-capture", None);
+            if channels != 2 {
+                assert_eq!(prepare["audio"]["channels"], channels);
+                assert_eq!(
+                    prepare["audio"]["channel_mask"],
+                    audio_channel_mask(channels)
+                );
+            }
+            let arm = selected.arm(51);
+            assert_eq!(arm["configuration"]["channels"], channels);
+            assert!(arm["configuration"]["virtual_sink"].is_null());
+            assert_eq!(arm["configuration"]["host_audio_enabled"], true);
+            assert_eq!(arm["configuration"]["capture_sink_without_routing"], true);
+            selected.capture_sink_without_routing = false;
+            assert_eq!(
+                selected.validate(false),
+                Err("invalid_virtual_sink_channels")
+            );
+            selected.capture_sink_without_routing = true;
+            selected.capture.audio_endpoint.clear();
+            assert_eq!(
+                selected.validate(false),
+                Err("invalid_virtual_sink_channels")
+            );
+        }
     }
 
     #[test]

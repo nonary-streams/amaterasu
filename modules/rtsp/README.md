@@ -25,6 +25,10 @@ or a configured external alias), optional `constant_rate`
 (default false), `output`, `encoder`, `audio_endpoint` and optional
 `host_audio_enabled` (default false). That flag snapshots Moonlight's
 `localAudioPlayMode` choice and is forwarded through stream-session to AudioCapture.
+Top-level `channels` may request 2, 6 or 8 stream channels for a regular
+`audio_endpoint` when `stream_audio` and `capture_sink_without_routing` are true.
+This requests capture-format conversion without selecting a virtual sink layout;
+`virtual_sink` remains absent and the selected host playback policy is preserved.
 External aliases are 1–64 lowercase ASCII letters, digits, underscores or hyphens;
 Video resolves them against its configured providers and rejects unknown aliases.
 Constant-rate capture is accepted only with WGC and is forwarded to stream-session

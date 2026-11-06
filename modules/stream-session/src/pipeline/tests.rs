@@ -3,6 +3,7 @@ mod auxiliary;
 mod display;
 mod harness;
 mod history;
+mod host_audio;
 mod input;
 mod providers;
 mod restart;

@@ -1317,6 +1317,20 @@ impl Pipeline {
                 };
             }
             Resource::AudioCapture => {
+                let start = record
+                    .start
+                    .as_ref()
+                    .expect("validated audio capture start");
+                if start.virtual_sink.is_none()
+                    && start.channels.is_some()
+                    && (payload.get("virtual_sink") != Some(&Value::Null)
+                        || payload.get("channels") != Some(&Value::Null)
+                        || payload["capture_sink_without_routing"] != true
+                        || payload["host_audio_enabled"] != start.host_audio_enabled
+                        || payload["requested_endpoint"] != start.audio_endpoint)
+                {
+                    return Err("audio_capture_policy_unverified");
+                }
                 let format = &payload["format"];
                 if format["sample_rate"] != 48000
                     || format["channels"] != record.config.audio.channels
