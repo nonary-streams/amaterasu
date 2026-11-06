@@ -84,9 +84,15 @@ fn installer_selects_exact_contracts_and_keeps_hardware_disabled() {
         policy.settings["amaterasu.virtual-display"]["target_verifiers"],
         json!(["amaterasu.display"])
     );
-    assert_eq!(
-        policy.settings["amaterasu.rtsp"]["retirement_status_principals"],
-        json!([COMPONENT.id])
+    assert!(
+        policy.settings["amaterasu.rtsp"]
+            .get("retirement_status_principals")
+            .is_none()
+    );
+    assert!(
+        policy.settings["amaterasu.rtsp"]
+            .get("retirement_status_owners")
+            .is_none()
     );
     assert_eq!(
         policy.settings["amaterasu.launch"]["application_retirement_observers"][COMPONENT.id],
@@ -241,6 +247,26 @@ fn linux_capture_call_chain_reaches_only_the_selected_native_provider() {
             caller == linux_session::VIDEO_COMPONENT_ID
         );
     }
+}
+
+#[test]
+fn transport_recovery_observer_is_bound_to_an_already_approved_stream_owner() {
+    let root = PrivateTestRoot::new();
+    let policy = linux_session::linux_session_policy(
+        &root.0,
+        &linux_session::options::LinuxSessionOptions::default(),
+    )
+    .unwrap();
+    let rtsp = &policy.settings["amaterasu.rtsp"];
+    assert_eq!(rtsp["allowed_principals"], json!(["amaterasu.nvhttp"]));
+    assert_eq!(rtsp["retirement_status_principals"], json!([COMPONENT.id]));
+    assert_eq!(
+        rtsp["retirement_status_owners"][COMPONENT.id],
+        "amaterasu.nvhttp"
+    );
+    let mut conflict = rtsp.clone();
+    conflict["retirement_status_owners"][COMPONENT.id] = json!("foreign.owner");
+    assert!(configure_transport_retirement_observer(&mut conflict).is_err());
 }
 
 #[test]

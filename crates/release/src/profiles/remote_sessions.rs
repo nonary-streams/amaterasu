@@ -220,7 +220,7 @@ fn configure_native_settings(policy: &mut RuntimeConfig) -> Result<(), String> {
         settings["authority_observer_principals"] = json!([COMPONENT.id]);
     }
     if let Some(settings) = policy.settings.get_mut("amaterasu.rtsp") {
-        settings["retirement_status_principals"] = json!([COMPONENT.id]);
+        configure_transport_retirement_observer(settings)?;
         settings["max_live_tickets"] = json!(32);
     }
     if let Some(settings) = policy.settings.get_mut("amaterasu.stream-session") {
@@ -234,6 +234,36 @@ fn configure_native_settings(policy: &mut RuntimeConfig) -> Result<(), String> {
         }
         settings["borrowed_capture_callers"] = json!(["amaterasu.nvhttp", "amaterasu.rtsp"]);
     }
+    Ok(())
+}
+
+fn configure_transport_retirement_observer(settings: &mut serde_json::Value) -> Result<(), String> {
+    let approved_owner = settings["allowed_principals"]
+        .as_array()
+        .is_some_and(|owners| owners.contains(&json!("amaterasu.nvhttp")));
+    if !approved_owner {
+        // An inert seed does not select an RTSP owner. It must not gain one
+        // merely to make a remote observer's recovery request admissible.
+        return Ok(());
+    }
+    let mut observers = settings["retirement_status_principals"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    if !observers.contains(&json!(COMPONENT.id)) {
+        observers.push(json!(COMPONENT.id));
+    }
+    if settings.get("retirement_status_owners").is_none() {
+        settings["retirement_status_owners"] = json!({});
+    }
+    if settings["retirement_status_owners"]
+        .get(COMPONENT.id)
+        .is_some_and(|owner| owner != "amaterasu.nvhttp")
+    {
+        return Err("transport retirement observer conflicts with selected stream owner".into());
+    }
+    settings["retirement_status_principals"] = json!(observers);
+    settings["retirement_status_owners"][COMPONENT.id] = json!("amaterasu.nvhttp");
     Ok(())
 }
 
