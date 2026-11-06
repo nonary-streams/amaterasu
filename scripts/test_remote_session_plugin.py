@@ -567,11 +567,11 @@ def qualify_missing_provider(fixture, fixtures):
     console = NativeConsole(fixture, environment=fixture.environment)
     try:
         try:
-            wait_ready(console, seconds=30)
+            wait_ready(console)
         except AssertionError:
-            require(console.process.poll() is not None or not any(
-                "Development worker ready: pid=" in line for line in console.errors),
-                "unexpected readiness state after missing-provider failure")
+            require(console.process.poll() is not None,
+                    "missing-provider startup did not reach a conclusive rejection",
+                    "".join(console.errors))
             return {"selected_provider_missing": True, "host_failed_closed": True}
         https, tls = initialize_paired_wire(console, fixtures, select_software=False)
         status, response = get(https, "/applist", {"uniqueid": "missing-plugin-client"}, tls, timeout=40)
