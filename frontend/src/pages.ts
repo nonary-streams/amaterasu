@@ -106,11 +106,11 @@ namespace Amaterasu {
         "section", "overview-status",
         el("div", "overview-status-icon", available === snapshots.length ? "✓" : "!"),
         el("div", "overview-status-copy",
-          el("p", "overview-status-label", "SERVICE ACCESS"),
-          el("h2", "", available === snapshots.length ? "Services responding" : "Some information is unavailable"),
+          el("p", "overview-status-label", "MANAGEMENT SERVICE ACCESS"),
+          el("h2", "", available === snapshots.length ? "Management services responding" : "Some information is unavailable"),
           el("p", "muted", available === snapshots.length
-            ? "Catalog, session coordination, applications, and Steam responded to the latest refresh."
-            : "Some service requests could not be completed. Check service access below for details.")),
+            ? "Catalog, session coordination, applications, and Steam responded to the latest refresh. This does not indicate stream readiness."
+            : "Some management requests could not be completed. Check service access below for details.")),
       );
       const quickActions = el("div", "quick-actions");
       for (const [page, label, detail, scope] of [
@@ -137,6 +137,9 @@ namespace Amaterasu {
           ? messageOf(snapshot.reason)
           : pagesTextMessage("Responded to the latest refresh"),
       ]);
+      status.setAttribute("role", "status");
+      status.setAttribute("aria-live", "polite");
+      status.setAttribute("aria-atomic", "true");
       const details = el("div", "overview-details", panel("Service access", table(["Service", "Status", "Details"], serviceRows)));
       if (quickActions.hasChildNodes()) details.append(panel("Quick actions", quickActions));
       area.replaceChildren(status, metrics, details);
@@ -152,6 +155,9 @@ namespace Amaterasu {
     }
 
     const summary = el("strong", "", "Loading host stream activity…");
+    summary.setAttribute("role", "status");
+    summary.setAttribute("aria-live", "polite");
+    summary.setAttribute("aria-atomic", "true");
     const launchStatus = el("p", "muted");
     const observation = el("p", "muted");
     const icon = el("div", "overview-status-icon", "↗");

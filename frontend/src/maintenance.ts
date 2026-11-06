@@ -74,6 +74,7 @@ namespace Amaterasu {
             context.notify(acknowledged ? "Session revoked." : "That session had already ended.");
           });
         }, "quiet danger-text");
+        revoke.setAttribute("aria-label", `Revoke management session for ${session.subject}, refresh expires ${new Date(session.refreshExpiresAt * 1000).toLocaleString()}`);
         return el("section", "browser-session-card", title, details, revoke);
       });
       sessionsArea.replaceChildren(...cards);

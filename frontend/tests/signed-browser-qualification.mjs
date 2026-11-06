@@ -509,6 +509,8 @@ async function initial(options) {
   const logs = await page(`${origin}/#diagnostics`);
   await signedIn(logs);
   await wait(logs, "document.querySelector('.host-log-output')?.textContent.includes('signed browser host log marker')", "native host log snapshot");
+  const secureClipboard = await evaluate(logs, "({secure:isSecureContext,writeText:typeof navigator.clipboard?.writeText === 'function'})");
+  check(secureClipboard.secure && secureClipboard.writeText, "host log copy was not exposed in a secure browser context");
   check(await evaluate(logs, `(() => {
     const search = document.querySelector('input[name=host_log_search]');
     search.value = 'signed browser host log marker';
@@ -519,6 +521,24 @@ async function initial(options) {
   await debuggerClient.command("Browser.setDownloadBehavior", {behavior:"allow",downloadPath:options.download_directory});
   await button(logs, "Download support bundle");
   await wait(logs, "/[0-9]+ retained sessions? included/.test(document.body.textContent)", "native retained support bundle download");
+  await evaluate(logs, `(() => {
+    window.__copyStatus = document.querySelector('.host-log-copy-status');
+    window.__clipboardStarted = false;
+    window.__clipboardFinished = false;
+    Object.defineProperty(navigator, 'clipboard', { configurable:true, value:{ writeText:() => new Promise(resolve => {
+      window.__clipboardStarted = true;
+      window.__resolveClipboardWrite = () => { window.__clipboardFinished = true; resolve(); };
+    }) }});
+    const copy = [...document.querySelectorAll('button')].find(button => button.textContent.trim() === 'Copy rendered log preview');
+    if (!copy || copy.disabled) throw new Error('rendered log preview copy control unavailable');
+    copy.click();
+  })()`);
+  await wait(logs, "window.__clipboardStarted === true", "deferred clipboard write");
+  await evaluate(logs, "location.hash = 'overview'");
+  await wait(logs, "location.hash === '#overview' && !document.querySelector('.host-log-output')", "navigation away from host logs");
+  await evaluate(logs, "window.__resolveClipboardWrite()");
+  await wait(logs, "window.__clipboardFinished === true", "deferred clipboard completion");
+  check(await evaluate(logs, "window.__copyStatus.textContent === ''"), "late clipboard completion updated the removed host-log view");
   const forged = await evaluate(logs, `(async () => {
     const response = await fetch('/v1/host-logs/open', {method:'POST', credentials:'same-origin',
       headers:{'Content-Type':'application/json','X-Amaterasu-CSRF':'1'}, body:JSON.stringify({owner:'forged',path:'/etc/passwd'})});
@@ -727,7 +747,11 @@ async function initial(options) {
     window.confirm = () => true;
     [...card.querySelectorAll('button')].find(button => button.textContent.trim() === 'Remove device').click();
   })()`);
-  await wait(devices, "!document.querySelector('.client-settings-card') && document.body.textContent.includes('No paired clients remain.')", "native device removal readback");
+  await wait(
+    devices,
+    "(() => { const empty = document.querySelector('.client-search-empty'); return !document.querySelector('.client-settings-card') && !!empty && !empty.hidden; })()",
+    "native device removal readback",
+  );
   check(observed.some((request) => request.path === "/v1/pairing/unpair" && request.status === 200),
     "native browser device removal request missing");
   await debuggerClient.command("Target.closeTarget", { targetId: devices.targetId });

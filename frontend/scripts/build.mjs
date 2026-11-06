@@ -8,7 +8,7 @@ const result = spawnSync(
 if (result.status !== 0) process.exit(result.status ?? 1);
 await mkdir("dist", { recursive: true });
 await Promise.all(
-  ["index.html", "styles.css"].map((name) =>
+  ["index.html", "styles.css", "okami-mountains.svg", "okami-botanical.svg"].map((name) =>
     copyFile(`public/${name}`, `dist/${name}`),
   ),
 );

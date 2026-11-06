@@ -15,6 +15,38 @@ namespace Amaterasu {
     }
   }
 
+  function settingsComponentField(label: string, control: HTMLElement, hint: string): HTMLElement {
+    return el("div", "field",
+      el("span", "field-label", settingsTextMessage(label)),
+      control,
+      el("small", "muted", settingsTextMessage(hint)),
+    );
+  }
+
+  function settingsDispatchDraftEvent(target: HTMLElement, type: "input" | "change"): void {
+    target.dispatchEvent(new Event(type, { bubbles: true }));
+  }
+
+  function settingsSetDraftCheckbox(control: HTMLInputElement, value: boolean): void {
+    control.checked = value;
+    settingsDispatchDraftEvent(control, "change");
+  }
+
+  function settingsSetDraftNumber(control: HTMLInputElement, value: number): void {
+    control.value = String(value);
+    settingsDispatchDraftEvent(control, "input");
+  }
+
+  function setSettingsFormDisabled(form: HTMLElement, disabled: boolean): void {
+    const visit = (node: Element): void => {
+      if (!node || typeof node.tagName !== "string") return;
+      if (["INPUT", "BUTTON", "SELECT", "TEXTAREA"].includes(node.tagName))
+        (node as Element & { disabled: boolean }).disabled = disabled;
+      for (const child of Array.from(node.children)) visit(child);
+    };
+    visit(form);
+  }
+
   function settingsLocalizedAttributeTemplate(
     target: Element,
     source: string,
@@ -2563,6 +2595,7 @@ namespace Amaterasu {
     onSaveBusy: (busy: boolean) => void = () => {},
   ): () => Promise<void> {
     const pairingLoads = new PairingClientsLoadGate();
+    let removeClientFromDirectory: (key: string) => void = () => {};
     async function loadPairing(rebase?: PairingRebaseSource): Promise<void> {
       if (!rebase) pairingArea.replaceChildren(el("p", "muted", "Loading paired clients…"));
       try {
@@ -2913,7 +2946,7 @@ namespace Amaterasu {
                 const index = rows.findIndex((row) => row.client.certificate_id === client.certificate_id);
                 if (index !== -1) rows.splice(index, 1);
                 revisionBadge.textContent = `Revision ${settings.revision}`;
-                filterClients();
+                removeClientFromDirectory(client.certificate_id);
                 context.notify(`${client.name} was removed from paired devices. Existing stream termination is not confirmed.`);
               } catch (error) {
                 if (!context.content.isConnected) return;
@@ -2941,10 +2974,13 @@ namespace Amaterasu {
           }, "danger");
           remove.disabled = !context.api.allows("pairing.admin");
           clientSaveControls.push({ control: remove, allowed: !remove.disabled });
+          const pairedDate = client.paired_at > 0
+            ? "Paired " + new Date(client.paired_at * 1000).toLocaleDateString()
+            : "Pair date unavailable";
           const identity = el(
             "summary", "client-settings-summary",
             el("span", "client-settings-name", settingsTextLiteral(client.name)),
-            el("small", "muted", settingsTextLiteral(`${client.client_id} · certificate ${client.certificate_id.slice(0, 12)}…`)),
+            el("small", "muted", settingsTextLiteral(client.client_id + " · " + pairedDate + " · certificate " + client.certificate_id.slice(0, 12) + "…")),
           );
           const audioSettings = el("details", "client-settings-group",
             el("summary", "", "Audio"),
@@ -3042,34 +3078,20 @@ namespace Amaterasu {
             controls.forEach((control, index) => rebaseBaselines.set(control, pairingStateSignature(latestStates[index]!)));
           }
         }
-        const clientSearch = input("client_search", "", "search");
-        clientSearch.setAttribute("data-draft-ignore", "");
-        clientSearch.placeholder = "Search clients";
-        if (rebase) clientSearch.value = rebase.search.value;
-        const searchSummary = el("p", "muted client-search-summary");
-        searchSummary.setAttribute("role", "status");
-        const noMatches = el("p", "muted client-search-empty", "No paired clients match this search.");
-        function filterClients(): void {
-          const query = clientSearch.value.trim().toLocaleLowerCase();
-          let visible = 0;
-          for (const { client, card } of rows) {
-            const identity = `${client.name} ${client.client_id} ${client.certificate_id}`.toLocaleLowerCase();
-            card.hidden = !!query && !identity.includes(query);
-            if (!card.hidden) visible++;
-          }
-          searchSummary.textContent = `${visible} of ${rows.length} paired clients`;
-          noMatches.hidden = visible !== 0;
-          noMatches.textContent = rows.length === 0 ? "No paired clients remain." : "No paired clients match this search.";
-        }
-        clientSearch.addEventListener("input", filterClients);
-        filterClients();
+        const directory = createClientDirectory(rows.map(({ client, card }) => ({
+          key: client.certificate_id,
+          name: client.name,
+          searchText: client.name + " " + client.client_id + " " + client.certificate_id,
+          pairedAt: client.paired_at,
+          card,
+        })), rebase?.search.value ?? "");
+        const clientSearch = directory.search;
+        removeClientFromDirectory = directory.remove;
         pairingArea.replaceChildren(
           panel(
             "Paired client overrides",
             el("p", "muted", "Open a client to review its streaming overrides. Saves confirm the stored pairing revision; input preferences apply when the next stream acquires its input lease."),
-            el("div", "client-search", field("Search paired clients", clientSearch), searchSummary),
-            noMatches,
-            el("div", "client-settings-list", ...rows.map(({ card }) => card)),
+            directory.element,
             el("div", "actions", revisionBadge),
           ),
         );
@@ -3092,6 +3114,35 @@ namespace Amaterasu {
     return !needle || parts.join(" ").toLocaleLowerCase().includes(needle);
   }
 
+  type PendingProviderDraft = {
+    baseline: Record<string, unknown>;
+    submitted: Record<string, unknown>;
+    latest?: Record<string, unknown>;
+    merged?: Record<string, unknown>;
+    overlaps: string[];
+    reviewed: boolean;
+  };
+
+  function rebaseProviderDraft(
+    pending: PendingProviderDraft,
+    latest: Record<string, unknown>,
+  ): { merged: Record<string, unknown>; overlaps: string[] } {
+    const merged = { ...latest };
+    const overlaps: string[] = [];
+    for (const field of Object.keys(pending.submitted)) {
+      const baselineValue = pending.baseline[field];
+      const submittedValue = pending.submitted[field];
+      const latestValue = latest[field];
+      if (sameConfigurationValue(submittedValue, baselineValue)) continue;
+      if (!sameConfigurationValue(latestValue, baselineValue)) {
+        overlaps.push(field);
+        continue;
+      }
+      merged[field] = submittedValue;
+    }
+    return { merged, overlaps };
+  }
+
   export function renderSettings(context: PageContext): void {
     const area = el("div", "settings-area-registered");
     const sessionExtensionsArea = el("div", "settings-area-session-extensions");
@@ -3105,10 +3156,13 @@ namespace Amaterasu {
     const pipewireArea = el("div", "settings-area-pipewire");
     const steamArea = el("div", "settings-area-steam");
     const steamLoads = new ImportSettingsLoadGate<SteamSettings>();
+    let activeSteamExclusionPicker: SteamExclusionPicker | null = null;
     const lutrisArea = el("div", "settings-area-lutris");
     const lutrisLoads = new ImportSettingsLoadGate<{ settings: LutrisSettings; runtime: LutrisStatus }>();
+    let activeLutrisExclusionEditor: AccessibleListEditor<LutrisExclusion> | null = null;
     const playniteArea = el("div", "settings-area-playnite");
     const playniteLoads = new PlayniteSettingsLoadGate();
+    let activePlayniteListEditors: AccessibleListEditor<string>[] = [];
     const inputArea = el("div", "settings-area-input");
     const inputLoads = new InputPolicyLoadGate();
     const historyArea = el("div", "settings-area-history");
@@ -3118,12 +3172,41 @@ namespace Amaterasu {
     const historyLoads = new HistorySettingsLoadGate();
     const pairingArea = el("div", "settings-area-pairing");
     let drafts: DraftTracker | null = null;
+    const pendingProviderDrafts = new Map<string, PendingProviderDraft>();
     let clientSaveBusy = false;
     const updateDraftStatus = () => {
-      const dirty = drafts?.isDirty() ?? false;
+      const dirty = (drafts?.isDirty() ?? false) || pendingProviderDrafts.size > 0;
       refreshSettings.disabled = dirty || clientSaveBusy;
       dirtyNotice.hidden = !dirty && !clientSaveBusy;
       settingsSetLocalizedTextContent(dirtyNotice, clientSaveBusy ? "Saving changes…" : "Unsaved changes");
+    };
+    const configureProviderConflictReview = (
+      provider: string,
+      status: HTMLElement,
+      save: HTMLButtonElement,
+      applyValues: (values: Record<string, unknown>, fields: readonly string[]) => void,
+    ): void => {
+      const pending = pendingProviderDrafts.get(provider);
+      if (!pending || pending.overlaps.length === 0) return;
+      save.disabled = true;
+      const message = el("p", "error", `Overlapping fields: ${pending.overlaps.join(", ")}. Latest values are kept until you choose an action.`);
+      const review = button("Review and keep latest values", () => {
+        pending.reviewed = true;
+        if (pending.latest) applyValues(pending.latest, pending.overlaps);
+        save.disabled = !context.api.allows("configuration.write");
+        message.textContent = `Reviewed overlapping fields: ${pending.overlaps.join(", ")}. Latest values will be saved.`;
+        review.disabled = true;
+        overwrite.disabled = true;
+      }, "secondary");
+      const overwrite = button("Overwrite overlapping fields", () => {
+        pending.reviewed = true;
+        applyValues(pending.submitted, pending.overlaps);
+        save.disabled = !context.api.allows("configuration.write");
+        message.textContent = `Overwriting overlapping fields: ${pending.overlaps.join(", ")}. Review the draft before saving.`;
+        review.disabled = true;
+        overwrite.disabled = true;
+      }, "secondary");
+      status.append(message, review, overwrite);
     };
     const loadPairing = createPairedClientEditor(context, pairingArea, () => drafts, (busy) => {
       clientSaveBusy = busy;
@@ -3272,7 +3355,18 @@ namespace Amaterasu {
     );
     if (context.registerDraftGuard) {
       drafts = trackDrafts(categoryContent, updateDraftStatus);
-      context.registerDraftGuard(() => clientSaveBusy || (drafts?.isDirty() ?? false), drafts.dispose);
+      context.registerDraftGuard(() => clientSaveBusy || pendingProviderDrafts.size > 0 || (drafts?.isDirty() ?? false), () => {
+        steamLoads.invalidate();
+        lutrisLoads.invalidate();
+        playniteLoads.invalidate();
+        activeSteamExclusionPicker?.dispose();
+        activeSteamExclusionPicker = null;
+        activeLutrisExclusionEditor?.dispose();
+        activeLutrisExclusionEditor = null;
+        for (const editor of activePlayniteListEditors) editor.dispose();
+        activePlayniteListEditors = [];
+        drafts?.dispose();
+      });
     }
     renderManagementPolicy(context, managementArea);
     renderCsrfPolicy(context, csrfArea);
@@ -3559,36 +3653,54 @@ namespace Amaterasu {
           hostLoggingArea.replaceChildren(errorPanel(new Error("Host logging policy could not be loaded. Try again."), loadHostLogging));
       }
     }
-    async function loadSteam(): Promise<void> {
+    async function loadSteam(
+      draftValues?: SteamSettings["values"],
+      draftNotice?: string,
+    ): Promise<void> {
+      activeSteamExclusionPicker?.dispose();
+      activeSteamExclusionPicker = null;
       steamArea.replaceChildren(el("p", "muted", "Loading Steam settings…"));
       try {
         const loaded = await steamLoads.read(() => readSteamSettings(context.api));
         if (loaded === null) return;
         const { value: settings, generation } = loaded;
         if (!context.content.isConnected) return;
+        const pendingDraft = pendingProviderDrafts.get("steam");
+        if (pendingDraft) {
+          const rebased = rebaseProviderDraft(pendingDraft, settings.values as unknown as Record<string, unknown>);
+          pendingDraft.latest = settings.values as unknown as Record<string, unknown>;
+          pendingDraft.merged = rebased.merged;
+          pendingDraft.overlaps = rebased.overlaps;
+          pendingDraft.reviewed = rebased.overlaps.length === 0;
+          draftValues = rebased.merged as SteamSettings["values"];
+          draftNotice = rebased.overlaps.length
+            ? "Conflicting fields need review. Non-overlapping edits were rebased."
+            : "Settings changed elsewhere. Non-overlapping edits were rebased; review before saving again.";
+        }
+        const valuesForForm = settings.values;
         const form = el("form", "settings-form");
         const enabled = input("steam_enabled", "", "checkbox");
-        enabled.checked = settings.values.enabled;
+        enabled.checked = valuesForForm.enabled;
         const autoSync = input("steam_auto_sync", "", "checkbox");
-        autoSync.checked = settings.values.auto_sync;
+        autoSync.checked = valuesForForm.auto_sync;
         const includeTools = input("steam_include_tools", "", "checkbox");
-        includeTools.checked = settings.values.include_tools;
+        includeTools.checked = valuesForForm.include_tools;
         const syncAllInstalled = input(
           "steam_sync_all_installed",
           "",
           "checkbox",
         );
-        syncAllInstalled.checked = settings.values.sync_all_installed;
+        syncAllInstalled.checked = valuesForForm.sync_all_installed;
         const autosyncRemoveUninstalled = input(
           "steam_autosync_remove_uninstalled",
           "",
           "checkbox",
         );
         autosyncRemoveUninstalled.checked =
-          settings.values.autosync_remove_uninstalled;
+          valuesForForm.autosync_remove_uninstalled;
         const recentGames = input(
           "steam_recent_games",
-          String(settings.values.recent_games),
+          String(valuesForForm.recent_games),
           "number",
         );
         recentGames.required = true;
@@ -3597,19 +3709,23 @@ namespace Amaterasu {
         recentGames.step = "1";
         const recentMaxAgeDays = input(
           "steam_recent_max_age_days",
-          String(settings.values.recent_max_age_days),
+          String(valuesForForm.recent_max_age_days),
           "number",
         );
         recentMaxAgeDays.required = true;
         recentMaxAgeDays.min = "0";
         recentMaxAgeDays.max = "36500";
         recentMaxAgeDays.step = "1";
-        const exclusions = el("textarea");
-        exclusions.name = "steam_exclude_games";
-        exclusions.rows = 10;
-        exclusions.spellcheck = false;
-        exclusions.value = JSON.stringify(settings.values.exclude_games, null, 2);
+        const exclusions = steamExclusionPicker(context.api, valuesForForm.exclude_games);
+        activeSteamExclusionPicker = exclusions;
+        const exclusionsField = el(
+          "div",
+          "field",
+          el("span", "field-label", settingsTextMessage("Excluded games")),
+          exclusions.node,
+        );
         const status = el("div");
+        if (draftNotice) settingsSetLocalizedTextContent(status, draftNotice);
         const runtimeStatus = el(
           "p",
           "muted",
@@ -3618,6 +3734,14 @@ namespace Amaterasu {
         const save = el("button", "button primary", "Save Steam settings");
         save.type = "submit";
         save.disabled = !context.api.allows("configuration.write");
+        let actionInProgress = false;
+        const cancel = button(settingsTextMessage("Cancel"), () => {
+          if (!actionInProgress) {
+            pendingProviderDrafts.delete("steam");
+            updateDraftStatus();
+            void loadSteam();
+          }
+        }, "secondary");
         form.append(
           field(
             "Enable Steam library discovery",
@@ -3654,25 +3778,24 @@ namespace Amaterasu {
             recentMaxAgeDays,
             "Ignore games older than this age (0–36500); zero disables the age cutoff.",
           ),
-          field(
-            "Excluded games (JSON)",
-            exclusions,
-            'Use objects with "id" (canonical app ID), "name", or both. ID takes precedence; name-only entries match without case sensitivity.',
-          ),
+          exclusionsField,
           runtimeStatus,
           status,
-          el("div", "actions", save, badge(settingsTextLiteral(`Revision ${settings.revision}`))),
+          el("div", "actions", save, cancel, badge(settingsTextLiteral(`Revision ${settings.revision}`))),
         );
         form.addEventListener("submit", (event) => {
           event.preventDefault();
           void runAction(save, status, async () => {
+            actionInProgress = true;
+            cancel.disabled = true;
             steamLoads.invalidate();
             let saveStarted = false;
+            let requestedValues: SteamSettings["values"] | null = null;
             try {
               const values = {
                 enabled: enabled.checked,
                 auto_sync: autoSync.checked,
-                exclude_games: parseSteamExclusions(exclusions.value),
+                exclude_games: parseSteamExclusions(JSON.stringify(exclusions.value())),
                 ...parseSteamImportSettings(
                   includeTools.checked,
                   syncAllInstalled.checked,
@@ -3681,32 +3804,85 @@ namespace Amaterasu {
                   recentMaxAgeDays.valueAsNumber,
                 ),
               };
+              requestedValues = values;
+              const existingPending = pendingProviderDrafts.get("steam");
+              if (existingPending?.overlaps.length && !existingPending.reviewed)
+                throw new Error("Review overlapping fields before saving again.");
+              pendingProviderDrafts.set("steam", {
+                baseline: settings.values as unknown as Record<string, unknown>,
+                submitted: values as unknown as Record<string, unknown>,
+                overlaps: [],
+                reviewed: true,
+              });
+              updateDraftStatus();
+              setSettingsFormDisabled(form, true);
+              exclusions.setDisabled(true);
               saveStarted = true;
               const saved = await saveSteamSettings(context.api, settings, values);
+              pendingProviderDrafts.delete("steam");
+              updateDraftStatus();
               await loadSteam();
               context.notify(!values.enabled && saved.values.enabled
                 ? settingsTextMessage("Steam settings saved and confirmed. Steam discovery remains enabled by Linux host policy; scan status is shown below.")
                 : settingsTextMessage("Steam settings saved and confirmed. Scan status is shown below."));
             } catch (error) {
               if (saveStarted) {
-                await loadSteam();
-                context.notify(error instanceof ApiError && error.code === "revision_conflict"
-                  ? settingsTextMessage("Steam settings changed elsewhere. Review the latest values before saving again.")
-                  : settingsTextMessage("Steam save could not be confirmed. Review the latest values before saving again."));
+                const conflict = error instanceof ApiError && error.code === "revision_conflict";
+                const nextDraft = requestedValues ?? undefined;
+                const notice = conflict
+                  ? "Settings changed elsewhere. Your draft is preserved; review it before saving again."
+                  : "Steam save could not be confirmed. Your submitted draft is preserved for review against the latest saved values.";
+                await loadSteam(nextDraft, notice);
+                context.notify(settingsTextMessage(conflict
+                  ? "Steam settings changed elsewhere. Your draft is preserved for review."
+                  : "Steam save could not be confirmed. Review your preserved draft against the latest saved values before saving again."));
                 return;
               }
               throw error;
+            } finally {
+              actionInProgress = false;
+              if (form.isConnected) setSettingsFormDisabled(form, false);
+              exclusions.setDisabled(false);
+              cancel.disabled = false;
             }
           });
         });
         steamArea.replaceChildren(panel("Steam", form));
+        if (draftValues) {
+          const baseline = drafts?.capture(steamArea);
+          if (baseline) drafts?.markSaved(baseline);
+          settingsSetDraftCheckbox(enabled, draftValues.enabled);
+          settingsSetDraftCheckbox(autoSync, draftValues.auto_sync);
+          settingsSetDraftCheckbox(includeTools, draftValues.include_tools);
+          settingsSetDraftCheckbox(syncAllInstalled, draftValues.sync_all_installed);
+          settingsSetDraftCheckbox(autosyncRemoveUninstalled, draftValues.autosync_remove_uninstalled);
+          settingsSetDraftNumber(recentGames, draftValues.recent_games);
+          settingsSetDraftNumber(recentMaxAgeDays, draftValues.recent_max_age_days);
+          exclusions.setValue(draftValues.exclude_games);
+          configureProviderConflictReview("steam", status, save, (values, fields) => {
+            const selected = new Set(fields);
+            if (selected.has("enabled")) settingsSetDraftCheckbox(enabled, values.enabled as boolean);
+            if (selected.has("auto_sync")) settingsSetDraftCheckbox(autoSync, values.auto_sync as boolean);
+            if (selected.has("include_tools")) settingsSetDraftCheckbox(includeTools, values.include_tools as boolean);
+            if (selected.has("sync_all_installed")) settingsSetDraftCheckbox(syncAllInstalled, values.sync_all_installed as boolean);
+            if (selected.has("autosync_remove_uninstalled")) settingsSetDraftCheckbox(autosyncRemoveUninstalled, values.autosync_remove_uninstalled as boolean);
+            if (selected.has("recent_games")) settingsSetDraftNumber(recentGames, values.recent_games as number);
+            if (selected.has("recent_max_age_days")) settingsSetDraftNumber(recentMaxAgeDays, values.recent_max_age_days as number);
+            if (selected.has("exclude_games")) exclusions.setValue(values.exclude_games as SteamSettings["values"]["exclude_games"]);
+          });
+        }
         void loadSteamRuntimeStatus(runtimeStatus, context, settings, generation);
       } catch (error) {
         if (context.content.isConnected)
-          steamArea.replaceChildren(errorPanel(error, loadSteam));
+          steamArea.replaceChildren(errorPanel(error, () => { void loadSteam(draftValues, draftNotice); }));
       }
     }
-    async function loadLutris(): Promise<void> {
+    async function loadLutris(
+      draftValues?: LutrisSettings["values"],
+      draftNotice?: string,
+    ): Promise<void> {
+      activeLutrisExclusionEditor?.dispose();
+      activeLutrisExclusionEditor = null;
       lutrisArea.replaceChildren(el("p", "muted", "Loading Lutris settings…"));
       try {
         const loaded = await lutrisLoads.read(async () => {
@@ -3717,26 +3893,49 @@ namespace Amaterasu {
         if (loaded === null) return;
         const { settings, runtime } = loaded.value;
         if (!context.content.isConnected) return;
+        const pendingDraft = pendingProviderDrafts.get("lutris");
+        if (pendingDraft) {
+          const rebased = rebaseProviderDraft(pendingDraft, settings.values as unknown as Record<string, unknown>);
+          pendingDraft.latest = settings.values as unknown as Record<string, unknown>;
+          pendingDraft.merged = rebased.merged;
+          pendingDraft.overlaps = rebased.overlaps;
+          pendingDraft.reviewed = rebased.overlaps.length === 0;
+          draftValues = rebased.merged as LutrisSettings["values"];
+          draftNotice = rebased.overlaps.length
+            ? "Conflicting fields need review. Non-overlapping edits were rebased."
+            : "Settings changed elsewhere. Non-overlapping edits were rebased; review before saving again.";
+        }
+        const valuesForForm = settings.values;
         const form = el("form", "settings-form");
         const enabled = input("lutris_enabled", "", "checkbox");
-        enabled.checked = settings.values.enabled;
+        enabled.checked = valuesForForm.enabled;
         enabled.disabled = !runtime.platform_supported;
         const autoSync = input("lutris_auto_sync", "", "checkbox");
-        autoSync.checked = settings.values.auto_sync;
+        autoSync.checked = valuesForForm.auto_sync;
         const removeUninstalled = input(
           "lutris_autosync_remove_uninstalled",
           "",
           "checkbox",
         );
-        removeUninstalled.checked = settings.values.autosync_remove_uninstalled;
+        removeUninstalled.checked = valuesForForm.autosync_remove_uninstalled;
         const includeSteam = input("lutris_include_steam", "", "checkbox");
-        includeSteam.checked = settings.values.include_steam;
-        const exclusions = el("textarea");
-        exclusions.name = "lutris_exclude_games";
-        exclusions.rows = 8;
-        exclusions.maxLength = 12_000;
-        exclusions.spellcheck = false;
-        exclusions.value = JSON.stringify(settings.values.exclude_games, null, 2);
+        includeSteam.checked = valuesForForm.include_steam;
+        const exclusions = accessibleListEditor<LutrisExclusion>({
+          label: "Excluded Lutris games",
+          description: 'Enter a positive ID, or an object such as {"id":"123","name":"Game"}. Existing IDs missing from discovery remain in the list.',
+          values: valuesForForm.exclude_games,
+          formatValue: (value) => typeof value === "string" ? value : JSON.stringify(value),
+          parseValue: (text) => {
+            const source = text.trimStart().startsWith("{")
+              ? `[${text}]`
+              : JSON.stringify([text]);
+            const parsed = parseLutrisExclusions(source);
+            if (!parsed[0]) throw new Error("Each Lutris exclusion needs a positive ID or a name.");
+            return parsed[0];
+          },
+        });
+        activeLutrisExclusionEditor = exclusions;
+        const exclusionsField = el("div", "field", exclusions.element);
         const runtimeStatus = el(
           "p",
           runtime.last_error ? "error" : "muted",
@@ -3747,24 +3946,33 @@ namespace Amaterasu {
             : lutrisStatusDescription(runtime),
         );
         const saveStatus = el("div");
+        if (draftNotice) settingsSetLocalizedTextContent(saveStatus, draftNotice);
         const refreshStatus = el("div");
         const save = el("button", "button primary", "Save Lutris settings");
         save.type = "submit";
         save.disabled = !context.api.allows("configuration.write");
+        let actionInProgress = false;
+        const cancel = button(settingsTextMessage("Cancel"), () => {
+          if (!actionInProgress) {
+            pendingProviderDrafts.delete("lutris");
+            updateDraftStatus();
+            void loadLutris();
+          }
+        }, "secondary");
         const refresh = button(
           "Refresh now",
           () => runAction(refresh, refreshStatus, async () => {
-            const updated = await context.api.post<LutrisStatus>("lutris/refresh");
+            const updated = await refreshLutrisProvider(context.api);
             if (!runtimeStatus.isConnected || !lutrisLoads.isCurrent(loaded.generation)) return;
             runtimeStatus.className = updated.last_error ? "error" : "muted";
-            runtimeStatus.textContent = lutrisStatusDescription(updated);
+            settingsSetLocalizedTextContent(runtimeStatus, lutrisStatusDescription(updated));
             context.notify(settingsTextMessage("Lutris refresh requested."));
           }),
         );
         refresh.disabled =
           !context.api.allows("configuration.write") ||
           !runtime.platform_supported ||
-          !settings.values.enabled;
+          !valuesForForm.enabled;
         enabled.addEventListener("change", () => {
           refresh.disabled =
             !context.api.allows("configuration.write") ||
@@ -3794,41 +4002,63 @@ namespace Amaterasu {
             includeSteam,
             "Read a complete Steam catalog before import; the direct Steam catalog record takes precedence for matching app IDs.",
           ),
-          field(
-            "Excluded games (JSON)",
-            exclusions,
-            'Use a positive decimal ID string or an object with "id", "name", or both. ID takes precedence; name-only entries match without case sensitivity.',
-          ),
+          exclusionsField,
           runtimeStatus,
           saveStatus,
-          el("div", "actions", save, badge(settingsTextLiteral(`Revision ${settings.revision}`))),
+          el("div", "actions", save, cancel, badge(settingsTextLiteral(`Revision ${settings.revision}`))),
         );
         form.addEventListener("submit", (event) => {
           event.preventDefault();
           void runAction(save, saveStatus, async () => {
+            actionInProgress = true;
+            cancel.disabled = true;
             lutrisLoads.invalidate();
             let saveStarted = false;
+            let requestedValues: LutrisSettings["values"] | null = null;
             try {
               const values = {
                 enabled: enabled.checked,
                 auto_sync: autoSync.checked,
                 autosync_remove_uninstalled: removeUninstalled.checked,
                 include_steam: includeSteam.checked,
-                exclude_games: parseLutrisExclusions(exclusions.value),
+                exclude_games: parseLutrisExclusions(JSON.stringify(exclusions.values())),
               };
+              requestedValues = values;
+              const existingPending = pendingProviderDrafts.get("lutris");
+              if (existingPending?.overlaps.length && !existingPending.reviewed)
+                throw new Error("Review overlapping fields before saving again.");
+              pendingProviderDrafts.set("lutris", {
+                baseline: settings.values as unknown as Record<string, unknown>,
+                submitted: values as unknown as Record<string, unknown>,
+                overlaps: [],
+                reviewed: true,
+              });
+              updateDraftStatus();
+              setSettingsFormDisabled(form, true);
               saveStarted = true;
               await saveLutrisSettings(context.api, settings, values);
+              pendingProviderDrafts.delete("lutris");
+              updateDraftStatus();
               await loadLutris();
               context.notify(settingsTextMessage("Lutris settings saved and confirmed. Scan status is shown below."));
             } catch (error) {
               if (saveStarted) {
-                await loadLutris();
-                context.notify(error instanceof ApiError && error.code === "revision_conflict"
-                  ? settingsTextMessage("Lutris settings changed elsewhere. Review the latest values before saving again.")
-                  : settingsTextMessage("Lutris save could not be confirmed. Review the latest values before saving again."));
+                const conflict = error instanceof ApiError && error.code === "revision_conflict";
+                const nextDraft = requestedValues ?? undefined;
+                const notice = conflict
+                  ? "Settings changed elsewhere. Your draft is preserved; review it before saving again."
+                  : "Lutris save could not be confirmed. Your submitted draft is preserved for review against the latest saved values.";
+                await loadLutris(nextDraft, notice);
+                context.notify(settingsTextMessage(conflict
+                  ? "Lutris settings changed elsewhere. Your draft is preserved for review."
+                  : "Lutris save could not be confirmed. Review your preserved draft against the latest saved values before saving again."));
                 return;
               }
               throw error;
+            } finally {
+              actionInProgress = false;
+              if (form.isConnected) setSettingsFormDisabled(form, false);
+              cancel.disabled = false;
             }
           });
         });
@@ -3840,12 +4070,34 @@ namespace Amaterasu {
             el("div", "actions", refresh, refreshStatus),
           ),
         );
+        if (draftValues) {
+          const baseline = drafts?.capture(lutrisArea);
+          if (baseline) drafts?.markSaved(baseline);
+          settingsSetDraftCheckbox(enabled, draftValues.enabled);
+          settingsSetDraftCheckbox(autoSync, draftValues.auto_sync);
+          settingsSetDraftCheckbox(removeUninstalled, draftValues.autosync_remove_uninstalled);
+          settingsSetDraftCheckbox(includeSteam, draftValues.include_steam);
+          exclusions.setValues(draftValues.exclude_games);
+          configureProviderConflictReview("lutris", saveStatus, save, (values, fields) => {
+            const selected = new Set(fields);
+            if (selected.has("enabled")) settingsSetDraftCheckbox(enabled, values.enabled as boolean);
+            if (selected.has("auto_sync")) settingsSetDraftCheckbox(autoSync, values.auto_sync as boolean);
+            if (selected.has("autosync_remove_uninstalled")) settingsSetDraftCheckbox(removeUninstalled, values.autosync_remove_uninstalled as boolean);
+            if (selected.has("include_steam")) settingsSetDraftCheckbox(includeSteam, values.include_steam as boolean);
+            if (selected.has("exclude_games")) exclusions.setValues(values.exclude_games as LutrisSettings["values"]["exclude_games"]);
+          });
+        }
       } catch (error) {
         if (context.content.isConnected)
-          lutrisArea.replaceChildren(errorPanel(error, loadLutris));
+          lutrisArea.replaceChildren(errorPanel(error, () => { void loadLutris(draftValues, draftNotice); }));
       }
     }
-    async function loadPlaynite(): Promise<void> {
+    async function loadPlaynite(
+      draftValues?: PlayniteSettings["values"],
+      draftNotice?: string,
+    ): Promise<void> {
+      for (const editor of activePlayniteListEditors) editor.dispose();
+      activePlayniteListEditors = [];
       playniteArea.replaceChildren(el("p", "muted", "Loading Playnite settings…"));
       try {
         const loaded = await playniteLoads.read(
@@ -3855,26 +4107,39 @@ namespace Amaterasu {
         if (loaded === null) return;
         const { settings, runtime } = loaded;
         if (!context.content.isConnected) return;
+        const pendingDraft = pendingProviderDrafts.get("playnite");
+        if (pendingDraft) {
+          const rebased = rebaseProviderDraft(pendingDraft, settings.values as unknown as Record<string, unknown>);
+          pendingDraft.latest = settings.values as unknown as Record<string, unknown>;
+          pendingDraft.merged = rebased.merged;
+          pendingDraft.overlaps = rebased.overlaps;
+          pendingDraft.reviewed = rebased.overlaps.length === 0;
+          draftValues = rebased.merged as PlayniteSettings["values"];
+          draftNotice = rebased.overlaps.length
+            ? "Conflicting fields need review. Non-overlapping edits were rebased."
+            : "Settings changed elsewhere. Non-overlapping edits were rebased; review before saving again.";
+        }
+        const valuesForForm = settings.values;
         const form = el("form", "settings-form");
         const enabled = input("playnite_enabled", "", "checkbox");
-        enabled.checked = settings.values.enabled;
+        enabled.checked = valuesForForm.enabled;
         const autoSync = input("playnite_auto_sync", "", "checkbox");
-        autoSync.checked = settings.values.auto_sync;
+        autoSync.checked = valuesForForm.auto_sync;
         const syncAllInstalled = input(
           "playnite_sync_all_installed",
           "",
           "checkbox",
         );
-        syncAllInstalled.checked = settings.values.sync_all_installed;
+        syncAllInstalled.checked = valuesForForm.sync_all_installed;
         const removeUninstalled = input(
           "playnite_autosync_remove_uninstalled",
           "",
           "checkbox",
         );
-        removeUninstalled.checked = settings.values.autosync_remove_uninstalled;
+        removeUninstalled.checked = valuesForForm.autosync_remove_uninstalled;
         const deleteAfterDays = input(
           "playnite_autosync_delete_after_days",
-          String(settings.values.autosync_delete_after_days),
+          String(valuesForForm.autosync_delete_after_days),
           "number",
         );
         deleteAfterDays.required = true;
@@ -3886,10 +4151,10 @@ namespace Amaterasu {
           "",
           "checkbox",
         );
-        requireReplacement.checked = settings.values.autosync_require_replacement;
+        requireReplacement.checked = valuesForForm.autosync_require_replacement;
         const focusAttempts = input(
           "playnite_focus_attempts",
-          String(settings.values.focus_attempts),
+          String(valuesForForm.focus_attempts),
           "number",
         );
         focusAttempts.required = true;
@@ -3898,7 +4163,7 @@ namespace Amaterasu {
         focusAttempts.step = "1";
         const focusTimeoutSecs = input(
           "playnite_focus_timeout_secs",
-          String(settings.values.focus_timeout_secs),
+          String(valuesForForm.focus_timeout_secs),
           "number",
         );
         focusTimeoutSecs.required = true;
@@ -3906,12 +4171,12 @@ namespace Amaterasu {
         focusTimeoutSecs.max = "2147483647";
         focusTimeoutSecs.step = "1";
         const focusExitOnFirst = input("playnite_focus_exit_on_first", "", "checkbox");
-        focusExitOnFirst.checked = settings.values.focus_exit_on_first;
+        focusExitOnFirst.checked = valuesForForm.focus_exit_on_first;
         const fullscreenEntryEnabled = input("playnite_fullscreen_entry_enabled", "", "checkbox");
-        fullscreenEntryEnabled.checked = settings.values.fullscreen_entry_enabled;
+        fullscreenEntryEnabled.checked = valuesForForm.fullscreen_entry_enabled;
         const recentGames = input(
           "playnite_recent_games",
-          String(settings.values.recent_games),
+          String(valuesForForm.recent_games),
           "number",
         );
         recentGames.required = true;
@@ -3920,42 +4185,47 @@ namespace Amaterasu {
         recentGames.step = "1";
         const recentMaxAgeDays = input(
           "playnite_recent_max_age_days",
-          String(settings.values.recent_max_age_days),
+          String(valuesForForm.recent_max_age_days),
           "number",
         );
         recentMaxAgeDays.required = true;
         recentMaxAgeDays.min = "0";
         recentMaxAgeDays.max = "36500";
         recentMaxAgeDays.step = "1";
-        const filterList = (name: string, values: string[]): HTMLTextAreaElement => {
-          const control = el("textarea");
-          control.name = name;
-          control.rows = 5;
-          control.maxLength = 12_000;
-          control.spellcheck = false;
-          control.value = JSON.stringify(values, null, 2);
+        const filterList = (
+          name: string,
+          label: string,
+          values: string[],
+        ): AccessibleListEditor<string> => {
+          const control = accessibleListEditor<string>({
+            label,
+            description: "Add, edit, or remove list values. Unknown values are kept in their current order.",
+            values,
+            maxItems: 256,
+            formatValue: (value) => value,
+            parseValue: (value) => parsePlayniteFilterList(JSON.stringify([value]), label)[0]!,
+          });
+          control.element.setAttribute("data-provider-field", name);
+          activePlayniteListEditors.push(control);
           return control;
         };
+        const filterField = (editor: AccessibleListEditor<string>): HTMLElement => editor.element;
         const syncCategories = filterList(
-          "playnite_sync_categories",
-          settings.values.sync_categories,
+          "playnite_sync_categories", "Included categories", valuesForForm.sync_categories,
         );
         const excludeCategories = filterList(
-          "playnite_exclude_categories",
-          settings.values.exclude_categories,
+          "playnite_exclude_categories", "Excluded categories", valuesForForm.exclude_categories,
         );
         const syncPlugins = filterList(
-          "playnite_sync_plugins",
-          settings.values.sync_plugins,
+          "playnite_sync_plugins", "Included plugin IDs", valuesForForm.sync_plugins,
         );
         const excludePlugins = filterList(
-          "playnite_exclude_plugins",
-          settings.values.exclude_plugins,
+          "playnite_exclude_plugins", "Excluded plugin IDs", valuesForForm.exclude_plugins,
         );
         const excludeGames = filterList(
-          "playnite_exclude_games",
-          settings.values.exclude_games,
+          "playnite_exclude_games", "Excluded game IDs", valuesForForm.exclude_games,
         );
+        let currentRuntime = runtime;
         const runtimeStatus = el(
           "p",
           runtime.last_error ? "error" : "muted",
@@ -3965,24 +4235,41 @@ namespace Amaterasu {
             : playniteStatusDescription(runtime),
         );
         const saveStatus = el("div");
+        if (draftNotice) settingsSetLocalizedTextContent(saveStatus, draftNotice);
         const refreshStatus = el("div");
         const save = el("button", "button primary", "Save Playnite settings");
         save.type = "submit";
         save.disabled = !context.api.allows("configuration.write");
+        let actionInProgress = false;
+        const cancel = button(settingsTextMessage("Cancel"), () => {
+          if (!actionInProgress) {
+            pendingProviderDrafts.delete("playnite");
+            updateDraftStatus();
+            void loadPlaynite();
+          }
+        }, "secondary");
         const refresh = button(
           "Refresh now",
           () => runAction(refresh, refreshStatus, async () => {
-            await context.api.post("playnite/refresh");
+            const updated = await refreshPlayniteProvider(context.api);
+            if (!runtimeStatus.isConnected) return;
+            currentRuntime = updated;
+            runtimeStatus.className = updated.last_error ? "error" : "muted";
+            settingsSetLocalizedTextContent(runtimeStatus,
+              updated.revision !== settings.revision || updated.enabled !== settings.values.enabled ||
+              updated.auto_sync !== settings.values.auto_sync
+                ? "Saved Playnite settings are not yet reflected in provider status. Refresh to check application."
+                : playniteStatusDescription(updated));
+            updateRefreshAvailability();
             context.notify(settingsTextMessage("Playnite refresh requested."));
-            await loadPlaynite();
           }),
         );
         const updateRefreshAvailability = (): void => {
           refresh.disabled =
             !context.api.allows("configuration.write") ||
             !enabled.checked ||
-            !runtime.playnite_running ||
-            runtime.snapshot_pending;
+            !currentRuntime.playnite_running ||
+            currentRuntime.snapshot_pending;
         };
         updateRefreshAvailability();
         enabled.addEventListener("change", updateRefreshAvailability);
@@ -4047,40 +4334,43 @@ namespace Amaterasu {
             recentMaxAgeDays,
             "Ignore recent games older than this age (0–36500); zero disables the age cutoff.",
           ),
-          field(
-            "Included categories (JSON)",
-            syncCategories,
+          settingsComponentField(
+            "Included categories",
+            filterField(syncCategories),
             "Additional installed games whose category matches any listed value; an empty list adds no category matches.",
           ),
-          field(
-            "Excluded categories (JSON)",
-            excludeCategories,
+          settingsComponentField(
+            "Excluded categories",
+            filterField(excludeCategories),
             "Games in these categories are excluded even if another setting would include them.",
           ),
-          field(
-            "Included plugin IDs (JSON)",
-            syncPlugins,
+          settingsComponentField(
+            "Included plugin IDs",
+            filterField(syncPlugins),
             "Additional installed games from any listed Playnite plugin; an empty list adds no plugin matches.",
           ),
-          field(
-            "Excluded plugin IDs (JSON)",
-            excludePlugins,
+          settingsComponentField(
+            "Excluded plugin IDs",
+            filterField(excludePlugins),
             "Games from these plugin IDs are excluded even if another setting would include them.",
           ),
-          field(
-            "Excluded game IDs (JSON)",
-            excludeGames,
+          settingsComponentField(
+            "Excluded game IDs",
+            filterField(excludeGames),
             "Game IDs to omit from every import selection.",
           ),
           runtimeStatus,
           saveStatus,
-          el("div", "actions", save, badge(settingsTextLiteral(`Revision ${settings.revision}`))),
+          el("div", "actions", save, cancel, badge(settingsTextLiteral(`Revision ${settings.revision}`))),
         );
         form.addEventListener("submit", (event) => {
           event.preventDefault();
           void runAction(save, saveStatus, async () => {
+            actionInProgress = true;
+            cancel.disabled = true;
             playniteLoads.invalidate();
             let saveStarted = false;
+            let requestedValues: PlayniteSettings["values"] | null = null;
             try {
               const values = parsePlayniteSettings({
                 enabled: enabled.checked,
@@ -4096,42 +4386,62 @@ namespace Amaterasu {
                 recent_games: recentGames.valueAsNumber,
                 recent_max_age_days: recentMaxAgeDays.valueAsNumber,
                 sync_categories: parsePlayniteFilterList(
-                  syncCategories.value,
+                  JSON.stringify(syncCategories.values()),
                   "Sync categories",
                 ),
                 exclude_categories: parsePlayniteFilterList(
-                  excludeCategories.value,
+                  JSON.stringify(excludeCategories.values()),
                   "Excluded categories",
                 ),
                 sync_plugins: parsePlayniteFilterList(
-                  syncPlugins.value,
+                  JSON.stringify(syncPlugins.values()),
                   "Sync plugin IDs",
                 ),
                 exclude_plugins: parsePlayniteFilterList(
-                  excludePlugins.value,
+                  JSON.stringify(excludePlugins.values()),
                   "Excluded plugin IDs",
                 ),
                 exclude_games: parsePlayniteFilterList(
-                  excludeGames.value,
+                  JSON.stringify(excludeGames.values()),
                   "Excluded game IDs",
                 ),
               });
+              requestedValues = values;
+              const existingPending = pendingProviderDrafts.get("playnite");
+              if (existingPending?.overlaps.length && !existingPending.reviewed)
+                throw new Error("Review overlapping fields before saving again.");
+              pendingProviderDrafts.set("playnite", {
+                baseline: settings.values as unknown as Record<string, unknown>,
+                submitted: values as unknown as Record<string, unknown>,
+                overlaps: [],
+                reviewed: true,
+              });
+              updateDraftStatus();
+              setSettingsFormDisabled(form, true);
               saveStarted = true;
               await savePlayniteSettings(context.api, settings, values);
+              pendingProviderDrafts.delete("playnite");
+              updateDraftStatus();
               await loadPlaynite();
               context.notify(settingsTextMessage("Playnite settings saved and confirmed. Runtime status is shown below."));
             } catch (error) {
               if (error instanceof ApiError && error.code === "revision_conflict") {
-                context.notify(settingsTextMessage("Playnite settings changed elsewhere. The latest values have been reloaded."));
-                await loadPlaynite();
+                await loadPlaynite(requestedValues ?? undefined,
+                  "Settings changed elsewhere. Your draft is preserved; review it before saving again.");
+                context.notify(settingsTextMessage("Playnite settings changed elsewhere. Your draft is preserved for review."));
                 return;
               }
               if (saveStarted) {
-                await loadPlaynite();
-                context.notify(settingsTextMessage("Playnite save could not be confirmed. Review the latest values before saving again."));
+                await loadPlaynite(requestedValues ?? undefined,
+                  "Playnite save could not be confirmed. Your draft is preserved for review against the latest saved values.");
+                context.notify(settingsTextMessage("Playnite save could not be confirmed. Review your preserved draft against the latest saved values before saving again."));
                 return;
               }
               throw error;
+            } finally {
+              actionInProgress = false;
+              if (form.isConnected) setSettingsFormDisabled(form, false);
+              cancel.disabled = false;
             }
           });
         });
@@ -4143,9 +4453,50 @@ namespace Amaterasu {
             el("div", "actions", refresh, refreshStatus),
           ),
         );
+        if (draftValues) {
+          const baseline = drafts?.capture(playniteArea);
+          if (baseline) drafts?.markSaved(baseline);
+          settingsSetDraftCheckbox(enabled, draftValues.enabled);
+          settingsSetDraftCheckbox(autoSync, draftValues.auto_sync);
+          settingsSetDraftCheckbox(syncAllInstalled, draftValues.sync_all_installed);
+          settingsSetDraftCheckbox(removeUninstalled, draftValues.autosync_remove_uninstalled);
+          settingsSetDraftNumber(deleteAfterDays, draftValues.autosync_delete_after_days);
+          settingsSetDraftCheckbox(requireReplacement, draftValues.autosync_require_replacement);
+          settingsSetDraftNumber(focusAttempts, draftValues.focus_attempts);
+          settingsSetDraftNumber(focusTimeoutSecs, draftValues.focus_timeout_secs);
+          settingsSetDraftCheckbox(focusExitOnFirst, draftValues.focus_exit_on_first);
+          settingsSetDraftCheckbox(fullscreenEntryEnabled, draftValues.fullscreen_entry_enabled);
+          settingsSetDraftNumber(recentGames, draftValues.recent_games);
+          settingsSetDraftNumber(recentMaxAgeDays, draftValues.recent_max_age_days);
+          syncCategories.setValues(draftValues.sync_categories);
+          excludeCategories.setValues(draftValues.exclude_categories);
+          syncPlugins.setValues(draftValues.sync_plugins);
+          excludePlugins.setValues(draftValues.exclude_plugins);
+          excludeGames.setValues(draftValues.exclude_games);
+          configureProviderConflictReview("playnite", saveStatus, save, (values, fields) => {
+            const selected = new Set(fields);
+            if (selected.has("enabled")) settingsSetDraftCheckbox(enabled, values.enabled as boolean);
+            if (selected.has("auto_sync")) settingsSetDraftCheckbox(autoSync, values.auto_sync as boolean);
+            if (selected.has("sync_all_installed")) settingsSetDraftCheckbox(syncAllInstalled, values.sync_all_installed as boolean);
+            if (selected.has("autosync_remove_uninstalled")) settingsSetDraftCheckbox(removeUninstalled, values.autosync_remove_uninstalled as boolean);
+            if (selected.has("autosync_delete_after_days")) settingsSetDraftNumber(deleteAfterDays, values.autosync_delete_after_days as number);
+            if (selected.has("autosync_require_replacement")) settingsSetDraftCheckbox(requireReplacement, values.autosync_require_replacement as boolean);
+            if (selected.has("focus_attempts")) settingsSetDraftNumber(focusAttempts, values.focus_attempts as number);
+            if (selected.has("focus_timeout_secs")) settingsSetDraftNumber(focusTimeoutSecs, values.focus_timeout_secs as number);
+            if (selected.has("focus_exit_on_first")) settingsSetDraftCheckbox(focusExitOnFirst, values.focus_exit_on_first as boolean);
+            if (selected.has("fullscreen_entry_enabled")) settingsSetDraftCheckbox(fullscreenEntryEnabled, values.fullscreen_entry_enabled as boolean);
+            if (selected.has("recent_games")) settingsSetDraftNumber(recentGames, values.recent_games as number);
+            if (selected.has("recent_max_age_days")) settingsSetDraftNumber(recentMaxAgeDays, values.recent_max_age_days as number);
+            if (selected.has("sync_categories")) syncCategories.setValues(values.sync_categories as string[]);
+            if (selected.has("exclude_categories")) excludeCategories.setValues(values.exclude_categories as string[]);
+            if (selected.has("sync_plugins")) syncPlugins.setValues(values.sync_plugins as string[]);
+            if (selected.has("exclude_plugins")) excludePlugins.setValues(values.exclude_plugins as string[]);
+            if (selected.has("exclude_games")) excludeGames.setValues(values.exclude_games as string[]);
+          });
+        }
       } catch (error) {
         if (context.content.isConnected)
-          playniteArea.replaceChildren(errorPanel(error, loadPlaynite));
+          playniteArea.replaceChildren(errorPanel(error, () => { void loadPlaynite(draftValues, draftNotice); }));
       }
     }
     async function loadHistorySettings(): Promise<void> {
@@ -4478,15 +4829,16 @@ namespace Amaterasu {
       try {
         const status = await context.api.post<SteamStatus>("steam/status");
         if (!target.isConnected || !steamLoads.isCurrent(generation)) return;
-        target.textContent = status.settings_ready && status.enabled !== settings.values.enabled
-          ? "Saved Steam discovery setting is not yet reflected in provider status. Refresh to check application."
-          : steamStatusDescription(status);
+        settingsSetLocalizedTextContent(target,
+          status.settings_ready && status.enabled !== settings.values.enabled
+            ? "Saved Steam discovery setting is not yet reflected in provider status. Refresh to check application."
+            : steamStatusDescription(status));
       } catch (error) {
         if (!target.isConnected || !steamLoads.isCurrent(generation)) return;
-        target.textContent =
+        settingsSetLocalizedTextContent(target,
           error instanceof ApiError && error.code === "forbidden"
             ? "Runtime status requires steam.read; settings remain available with configuration access."
-            : "Current provider status is unavailable; settings remain editable.";
+            : "Current provider status is unavailable; settings remain editable.");
       }
     }
     async function loadHost(): Promise<void> {

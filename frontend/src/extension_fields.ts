@@ -28,32 +28,30 @@ namespace Amaterasu {
     if ((definition.type !== "integer" && definition.type !== "decimal") ||
         typeof min !== "number" || !Number.isFinite(min) ||
         typeof max !== "number" || !Number.isFinite(max) || min >= max ||
-        (definition.type === "integer" && (!Number.isSafeInteger(min) || !Number.isSafeInteger(max))))
+        (definition.type === "integer" && (!Number.isSafeInteger(min) || !Number.isSafeInteger(max))) ||
+        typeof value !== "number")
       throw new Error("Invalid slider setting.");
-    const number = input("", String(value), "number");
-    const slider = input("", "", "range");
-    for (const control of [number, slider]) {
-      control.min = String(min);
-      control.max = String(max);
-      control.step = definition.type === "integer" ? "1" : "any";
-    }
-    slider.value = String(value);
-    slider.setAttribute("aria-label", `${label} slider`);
-    number.setAttribute("aria-label", `${label} value`);
-    const validNumber = (): boolean => {
-      const parsed = Number(number.value);
-      return number.value !== "" && number.validity.valid && Number.isFinite(parsed) &&
-        parsed >= min && parsed <= max && (definition.type !== "integer" || Number.isSafeInteger(parsed));
-    };
-    slider.addEventListener("input", () => { number.value = slider.value; });
-    number.addEventListener("input", () => { if (validNumber()) slider.value = number.value; });
-    return {
-      node: el("div", "extension-slider", slider, number),
-      value: () => {
-        if (!validNumber()) throw new Error(`Enter a valid number from ${min} to ${max}.`);
-        return Number(number.value);
-      },
-    };
+    const slider = boundedSlider(min, max, value, label, definition.type === "integer", "extension-slider");
+    return { node: slider.node, value: slider.value };
+  }
+
+  export function extensionRadioGroupEditor(
+    definition: ExtensionFieldDefinition,
+    value: unknown,
+    label: string,
+    choiceLabels: Record<string, string> = {},
+  ): ExtensionFieldEditor {
+    if (definition.type !== "enum" || !Array.isArray(definition.options) ||
+        typeof value !== "string" || !definition.options.includes(value))
+      throw new Error("Invalid radio group setting.");
+    const choices = definition.options.map((option) => ({
+      value: option,
+      label: typeof Amaterasu.literalText === "function"
+        ? Amaterasu.literalText(choiceLabels[option] ?? option)
+        : choiceLabels[option] ?? option,
+    }));
+    const control = radioGroup(label, choices, value);
+    return { node: control.node, value: control.value };
   }
 
   export function extensionFieldEditor(definition: ExtensionFieldDefinition, value: unknown, choiceLabels: Record<string, string> = {}): ExtensionFieldEditor {

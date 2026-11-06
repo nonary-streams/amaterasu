@@ -351,6 +351,9 @@ namespace Amaterasu {
       const setupUsername = input("enrollment_username"); setupUsername.required = true; setupUsername.autocomplete = "username";
       const setupPassword = input("enrollment_password", "", "password"); setupPassword.required = true; setupPassword.autocomplete = "new-password";
       const setupStatus = el("div");
+      setupStatus.setAttribute("role", "status");
+      setupStatus.setAttribute("aria-live", "polite");
+      setupStatus.setAttribute("aria-atomic", "true");
       const setupSubmit = el("button", "button primary", "Create administrator"); setupSubmit.type = "submit";
       const setupForm = el("form", "settings-form", field("Code shown on the host", setupCode), field("Username", setupUsername), field("Password", setupPassword), setupSubmit, setupStatus);
       setupForm.addEventListener("submit", (event) => {

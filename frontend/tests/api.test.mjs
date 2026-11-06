@@ -1687,3 +1687,23 @@ test("browser session role controls actions and missing role fails closed", asyn
     assert.equal(api.allows("application.terminate"), false);
   }
 });
+
+test("caller AbortSignal cancels a pending protected request without retry", async () => {
+  const { api, calls } = apiHarness((url, request) => {
+    if (url.endsWith("/auth/login"))
+      return Response.json(sessionReply(secret("a"), secret("b"), future(3600), future(7200)));
+    return new Promise((_resolve, reject) => {
+      request.signal.addEventListener("abort", () => reject(new Error("fetch aborted")), { once: true });
+    });
+  });
+  await api.login("admin", "password", false);
+  const controller = new AbortController();
+  const pending = api.post("steam/list", { limit: 16 }, true, controller.signal);
+  await new Promise(setImmediate);
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1].options.signal.aborted, false);
+  controller.abort();
+  await assert.rejects(pending, /request was cancelled/);
+  assert.equal(calls[1].options.signal.aborted, true);
+  assert.equal(calls.length, 2, "an aborted request is not retried");
+});

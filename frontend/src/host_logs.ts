@@ -6,6 +6,17 @@ namespace Amaterasu {
   const SUPPORT_BUNDLE_MAX_BYTES = 96 * 1024 * 1024;
   const SUPPORT_BUNDLE_CHUNK_BYTES = 8192;
 
+  function hostLogText(source: string): TextValue {
+    return typeof Amaterasu.localizedMessage === "function"
+      ? Amaterasu.localizedMessage(source)
+      : source;
+  }
+
+  function hostLogSetLocalizedText(target: HTMLElement, source: string): void {
+    if (typeof Amaterasu.setLocalizedTextContent === "function") Amaterasu.setLocalizedTextContent(target, source);
+    else target.textContent = source;
+  }
+
   function hostLogReply(value: unknown): Record<string, unknown> {
     if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("The host returned an invalid log response.");
     const reply = value as Record<string, unknown>;
@@ -39,7 +50,10 @@ namespace Amaterasu {
     let observer: MutationObserver | undefined;
     let exportGeneration = 0;
     let exportBusy = false;
+    let copyBusy = false;
     const following = el("span", "muted", "Following");
+    following.setAttribute("role", "status");
+    following.setAttribute("aria-live", "polite");
     const status = el("p", "muted");
     status.setAttribute("role", "status");
     const progress = el("p", "muted");
@@ -78,12 +92,24 @@ namespace Amaterasu {
       link.click();
       window.setTimeout(() => URL.revokeObjectURL(url), 0);
     });
+    const copyStatus = el("p", "muted host-log-copy-status");
+    copyStatus.setAttribute("role", "status");
+    copyStatus.setAttribute("aria-live", "polite");
+    const copyVisible = button(hostLogText("Copy rendered log preview"), () => void copyVisibleLog());
     const refresh = button("Refresh host log", () => load());
-    const controls = el("div", "diagnostics-toolbar", field("Search host log", search), field("Level", level), followLabel, pause, refresh, download);
+    const controls = el(
+      "div", "diagnostics-toolbar", field("Search host log", search), field("Level", level),
+      followLabel, pause, refresh, copyVisible, download,
+    );
     const matchControls = el("div", "diagnostics-match-navigation", previous, next, status);
     matchControls.setAttribute("role", "group");
     matchControls.setAttribute("aria-label", "Host log search navigation");
-    const box = panel("Host log", el("p", "muted", "Current host session only; older rotated segments may have been discarded."), controls, following, showLatest, progress, matchControls, output,
+    const box = panel(
+      "Host log",
+      el("p", "muted", "Current host session only; older rotated segments may have been discarded."),
+      controls,
+      el("p", "muted", hostLogText("Copies every rendered line, including search context. Log content is raw and may contain identifying details.")),
+      copyStatus, following, showLatest, progress, matchControls, output,
       el("div", "support-log-export", exportButton, cancelExport, exportStatus,
         el("p", "muted", "The support bundle includes retained sessions from the current log location. Common identifying details are redacted; review it before sharing.")));
     target.append(box);
@@ -117,6 +143,25 @@ namespace Amaterasu {
           ? `Showing the last ${HOST_LOG_PREVIEW_LINES} of ${filtered.length} matching lines. Search covers the full snapshot.`
           : `${filtered.length} matching lines in this snapshot.`;
         output.textContent = filtered.slice(-HOST_LOG_PREVIEW_LINES).map((index) => lines[index] ?? "").join("\n");
+      }
+      copyVisible.disabled = copyBusy || !output.textContent;
+    }
+    async function copyVisibleLog(): Promise<void> {
+      if (copyBusy || disposed || !target.isConnected) return;
+      const visibleText = output.textContent ?? "";
+      if (!visibleText) return;
+      copyBusy = true;
+      copyVisible.disabled = true;
+      try {
+        if (!navigator.clipboard?.writeText) throw new Error("Clipboard access is unavailable.");
+        await navigator.clipboard.writeText(visibleText);
+        if (!disposed && target.isConnected) hostLogSetLocalizedText(copyStatus, "Rendered log preview copied to the clipboard.");
+      } catch {
+        if (!disposed && target.isConnected)
+          hostLogSetLocalizedText(copyStatus, "Could not copy the rendered log preview. Clipboard access may be unavailable in this browser context.");
+      } finally {
+        copyBusy = false;
+        if (!disposed && target.isConnected) copyVisible.disabled = !output.textContent;
       }
     }
     function nearBottom(): boolean {

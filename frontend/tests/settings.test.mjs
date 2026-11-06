@@ -15,6 +15,12 @@ context.Amaterasu.renderHostMetricsDashboard = () => {};
 context.Amaterasu.renderSystemTraySettings = () => {};
 vm.runInContext("Object.assign(globalThis, Amaterasu)", context);
 vm.runInContext(
+  ts.transpile(readFileSync("src/client_directory.ts", "utf8"), {
+    target: ts.ScriptTarget.ES2022,
+  }),
+  context,
+);
+vm.runInContext(
   ts.transpile(readFileSync("src/settings.ts", "utf8"), {
     target: ts.ScriptTarget.ES2022,
   }),
@@ -33,6 +39,21 @@ vm.runInContext(
 const parse = context.Amaterasu.parseSteamExclusions;
 const ordinary = (value) => JSON.parse(JSON.stringify(value));
 const diagnosticsResult = (status) => ({ status, error: null });
+
+test("paired client directory filters names and fingerprints and sorts by recency or name", () => {
+  const sort = context.Amaterasu.sortClientDirectoryEntries;
+  const entries = [
+    { key: "a", name: "Living room", searchText: "Living room client-a aaaa", pairedAt: 10, card: {} },
+    { key: "b", name: "Bedroom", searchText: "Bedroom client-b bbbb", pairedAt: 30, card: {} },
+    { key: "c", name: "Office", searchText: "Office client-c cccc", pairedAt: 20, card: {} },
+  ];
+  assert.deepEqual(sort(entries, "", "recent").map((entry) => entry.key), ["b", "c", "a"]);
+  assert.deepEqual(sort(entries, "", "name").map((entry) => entry.key), ["b", "a", "c"]);
+  assert.deepEqual(sort(entries, "CLIENT-C", "recent").map((entry) => entry.key), ["c"]);
+  assert.deepEqual(sort(entries, "cccc", "recent").map((entry) => entry.key), ["c"]);
+  assert.deepEqual(sort(entries, "no match", "recent"), []);
+  assert.deepEqual(sort(entries, "", "recent").map((entry) => entry.key), ["b", "c", "a"]);
+});
 
 test("settings search matches labels, descriptions, category and keys case insensitively", () => {
   const matches = context.Amaterasu.settingsSearchMatches;
@@ -504,7 +525,7 @@ test("host logging form refreshes its revision after an ambiguous persisted save
   };
   const dom = vm.createContext({ TextEncoder, URL, Error,
     document: { createElement: (name) => new Element(name) } });
-  for (const source of ["src/model.ts", "src/ui.ts", "src/pages.ts", "src/management-policy.ts", "src/csrf-policy.ts", "src/settings.ts", "src/updater.ts"]) {
+  for (const source of ["src/model.ts", "src/ui.ts", "src/pages.ts", "src/management-policy.ts", "src/csrf-policy.ts", "src/client_directory.ts", "src/settings.ts", "src/updater.ts"]) {
     vm.runInContext(ts.transpile(readFileSync(source, "utf8"), { target: ts.ScriptTarget.ES2022 }), dom);
     if (source === "src/settings.ts") {
       vm.runInContext("Amaterasu.renderHostMetricsSettings = () => {}; Amaterasu.renderHostMetricsDashboard = () => {};", dom);
@@ -1054,7 +1075,7 @@ test("history form keeps retention controls visible and saves them while recordi
   };
   const dom = vm.createContext({ TextEncoder, URL, Error,
     document: { createElement: (name) => new Element(name) } });
-  for (const source of ["src/model.ts", "src/ui.ts", "src/pages.ts", "src/management-policy.ts", "src/csrf-policy.ts", "src/settings.ts", "src/updater.ts"]) {
+  for (const source of ["src/model.ts", "src/ui.ts", "src/pages.ts", "src/management-policy.ts", "src/csrf-policy.ts", "src/client_directory.ts", "src/settings.ts", "src/updater.ts"]) {
     vm.runInContext(ts.transpile(readFileSync(source, "utf8"), { target: ts.ScriptTarget.ES2022 }), dom);
     vm.runInContext("Object.assign(globalThis, Amaterasu)", dom);
     vm.runInContext("globalThis.renderHostMetricsSettings = () => {}; globalThis.renderHostMetricsDashboard = () => {}; globalThis.renderSystemTraySettings = () => {};", dom);
@@ -1647,7 +1668,7 @@ test("input form confirms cleanup-pending save, then reloads after a revision co
     TextEncoder, URL, Error,
     document: { createElement: (name) => new Element(name) },
   });
-  for (const source of ["src/model.ts", "src/ui.ts", "src/pages.ts", "src/management-policy.ts", "src/csrf-policy.ts", "src/settings.ts", "src/updater.ts"]) {
+  for (const source of ["src/model.ts", "src/ui.ts", "src/pages.ts", "src/management-policy.ts", "src/csrf-policy.ts", "src/client_directory.ts", "src/settings.ts", "src/updater.ts"]) {
     vm.runInContext(ts.transpile(readFileSync(source, "utf8"), {
       target: ts.ScriptTarget.ES2022,
     }), dom);
@@ -1815,11 +1836,11 @@ test("Playnite settings and runtime load discards stale success and failure", as
 test("recent-games UI preserves the provider's 10000 Playnite range", () => {
   const settingsSource = readFileSync("src/settings.ts", "utf8");
   const steamSettingsUi = settingsSource.slice(
-    settingsSource.indexOf("async function loadSteam(): Promise<void>"),
+    settingsSource.indexOf("async function loadSteam("),
     settingsSource.indexOf("async function loadLutris(): Promise<void>"),
   );
   const playniteSettingsUi = settingsSource.slice(
-    settingsSource.indexOf("async function loadPlaynite(): Promise<void>"),
+    settingsSource.indexOf("async function loadPlaynite("),
     settingsSource.indexOf(
       "async function loadHistorySettings(): Promise<void>",
     ),
@@ -2254,7 +2275,7 @@ test("paired-client form preserves drafts on conflict and opaque fields after re
     document: { createElement: (name) => new Element(name) },
     window: { confirm: () => true },
   });
-  for (const source of ["src/model.ts", "src/ui.ts", "src/pages.ts", "src/management-policy.ts", "src/csrf-policy.ts", "src/settings.ts", "src/updater.ts"]) {
+  for (const source of ["src/model.ts", "src/ui.ts", "src/pages.ts", "src/management-policy.ts", "src/csrf-policy.ts", "src/client_directory.ts", "src/settings.ts", "src/updater.ts"]) {
     vm.runInContext(ts.transpile(readFileSync(source, "utf8"), {
       target: ts.ScriptTarget.ES2022,
     }), dom);
@@ -2329,15 +2350,18 @@ test("paired-client form preserves drafts on conflict and opaque fields after re
   });
   await new Promise(setImmediate);
   const pairingArea = find(content, (node) => node.className === "settings-area-pairing");
-  const fec = find(pairingArea, (node) => node.name === `fec_${"a".repeat(64)}`);
-  const ds4BackClick = find(pairingArea, (node) => node.name === "ds4_back_as_touchpad_click");
-  const save = find(pairingArea, (node) => node.tagName === "button" && node.textContent === "Save");
+  const clientCard = (name) => find(pairingArea, (node) =>
+    node.className === "client-settings-card" && node.textContent.includes(name));
+  const livingRoomCard = clientCard("Living room");
+  const fec = find(livingRoomCard, (node) => node.name === `fec_${"a".repeat(64)}`);
+  const ds4BackClick = find(livingRoomCard, (node) => node.name === "ds4_back_as_touchpad_click");
+  const save = find(livingRoomCard, (node) => node.tagName === "button" && node.textContent === "Save");
   assert.ok(fec);
   assert.ok(ds4BackClick);
   assert.equal(ds4BackClick.value, "false");
   assert.equal(ds4BackClick.attributes.get("aria-label"), "DS4 Back as touchpad click override for Living room");
   assert.ok(save);
-  const keybindings = find(pairingArea, (node) => node.name === "keybindings");
+  const keybindings = find(livingRoomCard, (node) => node.name === "keybindings");
   assert.equal(keybindings.value, "[65,66,65,67]");
   keybindings.value = "[true,0]";
   save.fire("click");
@@ -2345,21 +2369,21 @@ test("paired-client form preserves drafts on conflict and opaque fields after re
   assert.equal(updates, 0);
   keybindings.value = "[]";
   assert.match(pairingArea.textContent, /Advanced input and encoding/);
-  const presetMode = find(pairingArea, (node) => node.name === "sw_preset_mode");
-  const presetValue = find(pairingArea, (node) => node.name === "sw_preset_value");
+  const presetMode = find(livingRoomCard, (node) => node.name === "sw_preset_mode");
+  const presetValue = find(livingRoomCard, (node) => node.name === "sw_preset_value");
   assert.equal(presetMode.value, "value");
   assert.equal(presetValue.value, "");
   assert.equal(presetValue.disabled, false);
-  const tuneMode = find(pairingArea, (node) => node.name === "sw_tune_mode");
-  const tuneValue = find(pairingArea, (node) => node.name === "sw_tune_value");
+  const tuneMode = find(livingRoomCard, (node) => node.name === "sw_tune_mode");
+  const tuneValue = find(livingRoomCard, (node) => node.name === "sw_tune_value");
   assert.equal(tuneMode.value, "inherit");
   assert.equal(tuneValue.disabled, true);
   tuneMode.value = "value";
   tuneMode.fire("change");
   assert.equal(tuneValue.disabled, false);
   tuneValue.value = "  film,zerolatency  ";
-  find(pairingArea, (node) => node.name === "min_threads").value = "2";
-  assert.equal(find(pairingArea, (node) => node.name === "encoder_backend").value, "software");
+  find(livingRoomCard, (node) => node.name === "min_threads").value = "2";
+  assert.equal(find(livingRoomCard, (node) => node.name === "encoder_backend").value, "software");
   fec.value = "35";
   const otherClientFec = find(pairingArea, (node) => node.name === `fec_${"b".repeat(64)}`);
   otherClientFec.value = "42";
@@ -2374,10 +2398,10 @@ test("paired-client form preserves drafts on conflict and opaque fields after re
   clientSearch.value = "";
   clientSearch.fire("input");
   assert.equal(firstCard.hidden, false);
-  find(pairingArea, (node) => node.name === "native_pen_touch").value = "true";
-  find(pairingArea, (node) => node.name === "keybindings").value = "[]";
+  find(livingRoomCard, (node) => node.name === "native_pen_touch").value = "true";
+  find(livingRoomCard, (node) => node.name === "keybindings").value = "[]";
   for (const [key, value] of Object.entries({high_resolution_scrolling: "false", always_send_scancodes: "false", key_rightalt_to_key_win: "true", key_repeat_delay: "0", key_repeat_frequency: "0"}))
-    find(pairingArea, (node) => node.name === key).value = value;
+    find(livingRoomCard, (node) => node.name === key).value = value;
   save.fire("click");
   await new Promise(setImmediate);
   assert.equal(updates, 1);
@@ -2385,12 +2409,12 @@ test("paired-client form preserves drafts on conflict and opaque fields after re
   assert.equal(find(pairingArea, (node) => node.name === `fec_${"b".repeat(64)}`), otherClientFec);
   assert.equal(otherClientFec.value, "42", "saving one client must preserve another client's draft");
   assert.match(notices.at(-1), /Stored overrides confirmed.*Active stream application is not confirmed/);
-  assert.equal(find(pairingArea, (node) => node.name === "sw_preset_mode").value, "value");
-  assert.equal(find(pairingArea, (node) => node.name === "sw_preset_value").value, "");
-  assert.equal(find(pairingArea, (node) => node.name === "sw_tune_value").value, "  film,zerolatency  ");
-  const freshSave = find(pairingArea, (node) => node.tagName === "button" && node.textContent === "Save");
+  assert.equal(find(livingRoomCard, (node) => node.name === "sw_preset_mode").value, "value");
+  assert.equal(find(livingRoomCard, (node) => node.name === "sw_preset_value").value, "");
+  assert.equal(find(livingRoomCard, (node) => node.name === "sw_tune_value").value, "  film,zerolatency  ");
+  const freshSave = find(livingRoomCard, (node) => node.tagName === "button" && node.textContent === "Save");
   for (const [key, value] of Object.entries({keybindings: "[]", high_resolution_scrolling: "false", always_send_scancodes: "false", key_rightalt_to_key_win: "true", key_repeat_delay: "0", key_repeat_frequency: "0"})) {
-    const control = find(pairingArea, (node) => node.name === key);
+    const control = find(livingRoomCard, (node) => node.name === key);
     assert.equal(control.value, value);
     control.value = "";
   }
@@ -2409,7 +2433,7 @@ test("paired-client form preserves drafts on conflict and opaque fields after re
   assert.doesNotMatch(pairingArea.textContent, /cannot preserve/);
   const remainingDraft = find(pairingArea, (node) => node.name === `fec_${"b".repeat(64)}`);
   remainingDraft.value = "42";
-  const remove = find(pairingArea, (node) => node.tagName === "button" && node.textContent === "Remove device");
+  const remove = find(clientCard("Living room"), (node) => node.tagName === "button" && node.textContent === "Remove device");
   assert.ok(remove, "paired client should expose removal even when its overrides are unsupported");
   remove.fire("click");
   await new Promise(setImmediate);
@@ -2417,7 +2441,7 @@ test("paired-client form preserves drafts on conflict and opaque fields after re
   assert.equal(find(pairingArea, (node) => node.name === `fec_${"b".repeat(64)}`), remainingDraft);
   assert.equal(remainingDraft.value, "42");
   assert.match(pairingArea.textContent, /Revision 10/);
-  assert.match(pairingArea.textContent, /1 of 1 paired clients/);
+  assert.match(pairingArea.textContent, /1 of 1 paired clients?/);
   const remainingRemove = find(pairingArea, (node) => node.tagName === "button" && node.textContent === "Remove device");
   remainingRemove.fire("click");
   await new Promise(setImmediate);
@@ -2931,7 +2955,7 @@ test("Moonlight host form reloads its revision and listener status after a persi
     TextEncoder, URL, Error,
     document: { createElement: (tagName) => new Element(tagName) },
   });
-  for (const source of ["src/model.ts", "src/ui.ts", "src/pages.ts", "src/management-policy.ts", "src/csrf-policy.ts", "src/settings.ts", "src/updater.ts"]) {
+  for (const source of ["src/model.ts", "src/ui.ts", "src/pages.ts", "src/management-policy.ts", "src/csrf-policy.ts", "src/client_directory.ts", "src/settings.ts", "src/updater.ts"]) {
     vm.runInContext(ts.transpile(readFileSync(source, "utf8"), {
       target: ts.ScriptTarget.ES2022,
     }), dom);
@@ -3313,7 +3337,9 @@ test("Steam form reloads normalized Linux settings and explains the enabled poli
       this.append(...children);
     }
     addEventListener(name, callback) { this.listeners.set(name, callback); }
+    dispatchEvent(event) { this.listeners.get(event.type)?.(event); return true; }
     setAttribute() {}
+    removeAttribute() {}
     reportValidity() { return true; }
     setCustomValidity() {}
     get options() { return this.children.filter((child) => child?.tagName === "option"); }
@@ -3334,10 +3360,11 @@ test("Steam form reloads normalized Linux settings and explains the enabled poli
     return null;
   };
   const dom = vm.createContext({
-    TextEncoder, URL, Error,
+    TextEncoder, URL, Error, AbortController,
+    Event: class Event { constructor(type, init = {}) { this.type = type; this.bubbles = init.bubbles ?? false; } },
     document: { createElement: (name) => new Element(name) },
   });
-  for (const source of ["src/model.ts", "src/ui.ts", "src/pages.ts", "src/management-policy.ts", "src/csrf-policy.ts", "src/settings.ts", "src/updater.ts"]) {
+  for (const source of ["src/model.ts", "src/ui.ts", "src/pages.ts", "src/management-policy.ts", "src/csrf-policy.ts", "src/client_directory.ts", "src/list_editor.ts", "src/steam_exclusion_picker.ts", "src/settings.ts", "src/updater.ts"]) {
     vm.runInContext(ts.transpile(readFileSync(source, "utf8"), {
       target: ts.ScriptTarget.ES2022,
     }), dom);

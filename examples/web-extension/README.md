@@ -9,6 +9,9 @@ The host calls `mount(container, api)` with `api.version`, an `AbortSignal` in
 `api.signal`, and `api.call(alias, payload)`. Calls are limited to aliases
 declared in the signed manifest and approved by the host. `mount` may return a
 cleanup function, which the host invokes on navigation or signout.
+The additive `api.ui` v1 contract supplies reusable accessible controls; see
+[the UI SDK contract](../../docs/web-extension-ui-sdk.md) and the standalone
+[controls consumer](controls.js).
 
 ```sh
 mkdir -p /tmp/hello-source
@@ -115,3 +118,21 @@ the host is stopped. When revoking an extension, remove its local entry and any
 no-longer-needed grants; close open browser tabs because already loaded trusted
 JavaScript cannot be recalled from them. Advance the authentication policy
 generation when changing scopes or administrator principals.
+
+## Component showcase
+
+The `showcase.js` page consumes the versioned `sdk.ui` controls and displays
+light and dark semantic theme samples, button and field states, keyboard tabs,
+status and alert panels, a native dialog, and a responsive table. Page styles
+use host semantic theme tokens. Its stylesheet is a separate signed same-origin
+asset to satisfy the host's `style-src 'self'` policy. If the asset cannot load,
+the page reports the issue and keeps the controls usable with host styles.
+
+Before mounting the stylesheet or shared controls, the showcase checks SDK v1,
+UI SDK v1, and the `ui.controls/1` feature. Older hosts receive a native-control
+fallback. The showcase is an extension consumer and does not replace or modify
+shared controls. To package it, copy `showcase.js` and `showcase.css` into a clean
+source directory and use the `amaterasu-web-extension pack` workflow
+above with ID `showcase`, title `UI Elements`, entrypoint `showcase.js`, and no
+method declarations. Stage and approve the signed extension through the normal
+host workflow before opening it.

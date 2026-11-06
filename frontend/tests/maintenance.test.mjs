@@ -9,7 +9,7 @@ class Element {
   append(...children) { this.children.push(...children.filter((child) => child != null)); }
   replaceChildren(...children) { this.children = []; this.append(...children); }
   addEventListener(name, callback) { this.listeners.set(name, callback); }
-  setAttribute() {}
+  setAttribute(name, value) { (this.attributes ??= {})[name] = String(value); }
   get textContent() { return this.children.map((child) => typeof child === "string" ? child : child?.textContent ?? "").join(""); }
   set textContent(value) { this.replaceChildren(String(value)); }
   click() { this.listeners.get("click")?.(); }
@@ -46,6 +46,8 @@ test("maintenance protects the current session and confirms peer revocation by r
   await wait(() => content.textContent.includes("This session") && content.textContent.includes("viewer"));
   const cards = descend(content).filter((el) => el.className === "browser-session-card");
   assert.equal(cards.length, 2);
+  const peerRevoke = find(cards[1], (el) => el.tagName === "button" && el.textContent === "Revoke session");
+  assert.match(peerRevoke.attributes["aria-label"], /viewer, refresh expires/);
   assert.equal(find(cards[0], (el) => el.tagName === "button" && el.textContent === "Revoke session"), undefined);
   find(cards[1], (el) => el.tagName === "button" && el.textContent === "Revoke session").click();
   await wait(() => notices.includes("Session revoked."));

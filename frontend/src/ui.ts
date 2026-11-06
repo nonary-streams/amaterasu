@@ -71,6 +71,336 @@ namespace Amaterasu {
     return node;
   }
 
+  export interface RadioGroupOption {
+    value: string;
+    label: TextValue | Node;
+  }
+
+  export interface RadioGroupBehavior {
+    disabled?: boolean;
+    readOnly?: boolean;
+    required?: boolean;
+  }
+
+  export interface RadioGroupControl {
+    node: HTMLElement;
+    controls: readonly HTMLInputElement[];
+    value(): string;
+    setValue(value: string): void;
+    setChoices(options: readonly RadioGroupOption[], value?: string): void;
+    setBehavior(behavior: RadioGroupBehavior): void;
+    dispose(): void;
+  }
+
+  let nextRadioGroupId = 0;
+
+  // Native radio inputs keep arrow-key navigation and selection semantics.
+  // The labelled group exposes the same accessible control to every consumer.
+  export function radioGroup(
+    label: TextValue | Node,
+    options: readonly RadioGroupOption[],
+    selected: string,
+    onChange: (value: string) => void = () => {},
+    signal?: AbortSignal,
+    behavior: RadioGroupBehavior = {},
+  ): RadioGroupControl {
+    const validate = (choices: readonly RadioGroupOption[], value: string): void => {
+      if (!choices.length || new Set(choices.map((option) => option.value)).size !== choices.length ||
+          !choices.some((option) => option.value === value) ||
+          choices.some((option) => typeof option.value !== "string" || !option.value || typeof option.label === "undefined"))
+        throw new Error("Invalid radio group options or selection.");
+    };
+    if (typeof onChange !== "function") throw new Error("Invalid radio group callback.");
+    validate(options, selected);
+    const controller = new AbortController();
+    let disposed = false;
+    let currentValue = selected;
+    let currentOptions = options;
+    let controls: HTMLInputElement[] = [];
+    let currentBehavior: RadioGroupBehavior = { ...behavior };
+    let choiceController = new AbortController();
+    const dispose = (): void => {
+      if (disposed) return;
+      disposed = true;
+      controller.abort();
+      choiceController.abort();
+      signal?.removeEventListener("abort", dispose);
+    };
+    if (signal?.aborted) dispose();
+    else signal?.addEventListener("abort", dispose, { once: true });
+    const name = `amaterasu-radio-${++nextRadioGroupId}`;
+    const group = el("div", "radio-group");
+    group.setAttribute("role", "radiogroup");
+    const labelNode = el("span", "radio-group-label", label);
+    labelNode.id = `amaterasu-radio-label-${nextRadioGroupId}`;
+    const optionsNode = el("div", "radio-options");
+    group.setAttribute("aria-labelledby", labelNode.id);
+    const applyBehavior = (): void => {
+      if (currentBehavior.disabled) group.setAttribute("aria-disabled", "true"); else group.removeAttribute("aria-disabled");
+      if (currentBehavior.readOnly) group.setAttribute("aria-readonly", "true"); else group.removeAttribute("aria-readonly");
+      if (currentBehavior.required) group.setAttribute("aria-required", "true"); else group.removeAttribute("aria-required");
+      for (const control of controls) {
+        control.disabled = currentBehavior.disabled === true;
+        control.required = currentBehavior.required === true;
+        if (currentBehavior.readOnly) control.setAttribute("aria-readonly", "true"); else control.removeAttribute("aria-readonly");
+      }
+    };
+    group.append(labelNode, optionsNode);
+    const render = (): void => {
+      choiceController.abort();
+      choiceController = new AbortController();
+      controls = currentOptions.map((option) => {
+        const control = input(name, option.value, "radio");
+        control.checked = option.value === currentValue;
+        control.disabled = currentBehavior.disabled === true;
+        control.required = currentBehavior.required === true;
+        if (currentBehavior.readOnly) control.setAttribute("aria-readonly", "true");
+        control.addEventListener("click", (event) => {
+          if (currentBehavior.readOnly) {
+            event.preventDefault();
+            event.stopImmediatePropagation();
+          }
+        }, { capture: true, signal: choiceController.signal });
+        control.addEventListener("keydown", (event) => {
+          if (!currentBehavior.readOnly || event.ctrlKey || event.metaKey || event.altKey) return;
+          const index = controls.indexOf(control);
+          const focusIndex = event.key === "ArrowDown" || event.key === "ArrowRight" ? (index + 1) % controls.length
+            : event.key === "ArrowUp" || event.key === "ArrowLeft" ? (index + controls.length - 1) % controls.length
+            : event.key === "Home" ? 0 : event.key === "End" ? controls.length - 1 : -1;
+          if (focusIndex >= 0) {
+            event.preventDefault();
+            event.stopImmediatePropagation();
+            controls[focusIndex]?.focus();
+            return;
+          }
+          const mutatingKey = event.key.length === 1 || ["PageUp", "PageDown", "Enter", " ", "Spacebar", "Backspace", "Delete"].includes(event.key);
+          if (mutatingKey) {
+            event.preventDefault();
+            event.stopImmediatePropagation();
+          }
+        }, { capture: true, signal: choiceController.signal });
+        control.addEventListener("change", (event) => {
+          if (currentBehavior.disabled || currentBehavior.readOnly) {
+            for (const peer of controls) peer.checked = peer.value === currentValue;
+            event.preventDefault();
+            event.stopImmediatePropagation();
+            return;
+          }
+          if (!control.checked) return;
+          currentValue = control.value;
+          for (const peer of controls) peer.checked = peer === control;
+          onChange(control.value);
+        }, { capture: true, signal: choiceController.signal });
+        return control;
+      });
+      optionsNode.replaceChildren(...currentOptions.map((option, index) =>
+        el("label", "radio-option", controls[index], el("span", "", option.label))));
+    };
+    render();
+    applyBehavior();
+    return {
+      node: group,
+      get controls() { return controls; },
+      value: () => currentValue,
+      setValue: (value) => {
+        if (!currentOptions.some((option) => option.value === value)) throw new Error("Unsupported radio group value.");
+        currentValue = value;
+        for (const control of controls) control.checked = control.value === value;
+      },
+      setBehavior: (nextBehavior) => {
+        currentBehavior = { ...nextBehavior };
+        applyBehavior();
+      },
+      setChoices: (nextOptions, nextValue = currentValue) => {
+        if (disposed) return;
+        validate(nextOptions, nextValue);
+        const focusedValue = controls.find((control) => control === document.activeElement)?.value;
+        currentOptions = [...nextOptions];
+        currentValue = nextValue;
+        render();
+        if (focusedValue !== undefined) {
+          (controls.find((control) => control.value === focusedValue) ??
+            controls.find((control) => control.value === currentValue))?.focus();
+        }
+      },
+      dispose,
+    };
+  }
+
+  export interface BoundedSliderControl {
+    node: HTMLElement;
+    range: HTMLInputElement;
+    number: HTMLInputElement;
+    value(): number;
+    setValue(value: number): void;
+    setBehavior(behavior: Pick<BoundedSliderOptions, "disabled" | "readOnly" | "required">): void;
+    dispose(): void;
+  }
+
+  export interface BoundedSliderOptions {
+    step?: number | "any";
+    onChange?: (value: number) => void;
+    signal?: AbortSignal;
+    accessibleLabel?: Node;
+    disabled?: boolean;
+    readOnly?: boolean;
+    required?: boolean;
+  }
+
+  let nextBoundedSliderId = 0;
+
+  export function boundedSlider(
+    minimum: number,
+    maximum: number,
+    value: number,
+    label: string,
+    integer = false,
+    className = "bounded-slider",
+    options: BoundedSliderOptions = {},
+  ): BoundedSliderControl {
+    const step = options.step ?? (integer ? 1 : "any");
+    if (!Number.isFinite(minimum) || !Number.isFinite(maximum) || minimum >= maximum ||
+        (integer && (!Number.isSafeInteger(minimum) || !Number.isSafeInteger(maximum))) ||
+        (step !== "any" && (!Number.isFinite(step) || step <= 0)) ||
+        (options.onChange !== undefined && typeof options.onChange !== "function") ||
+        !isValidSliderValue(value, minimum, maximum, integer, step))
+      throw new Error("Invalid bounded slider limits, step, or value.");
+
+    const number = input("", String(value), "number");
+    const range = input("", "", "range");
+    for (const control of [number, range]) {
+      control.min = String(minimum);
+      control.max = String(maximum);
+      control.step = String(step);
+      control.disabled = options.disabled === true;
+      control.required = options.required === true;
+      if (options.readOnly) control.setAttribute("aria-readonly", "true");
+    }
+    if (options.readOnly) number.readOnly = true;
+    if (options.accessibleLabel) {
+      if (!(options.accessibleLabel as HTMLElement).id)
+        (options.accessibleLabel as HTMLElement).id = `amaterasu-slider-label-${++nextBoundedSliderId}`;
+      range.setAttribute("aria-labelledby", (options.accessibleLabel as HTMLElement).id);
+      number.setAttribute("aria-labelledby", (options.accessibleLabel as HTMLElement).id);
+    } else {
+      range.setAttribute("aria-label", `${label} slider`);
+      number.setAttribute("aria-label", `${label} value`);
+    }
+    range.value = String(value);
+    const controller = new AbortController();
+    let disposed = false;
+    let currentValue = value;
+    let currentBehavior = { disabled: options.disabled === true, readOnly: options.readOnly === true, required: options.required === true };
+    const applyBehavior = (): void => {
+      for (const control of [range, number]) {
+        control.disabled = currentBehavior.disabled;
+        control.required = currentBehavior.required;
+        if (currentBehavior.readOnly) control.setAttribute("aria-readonly", "true"); else control.removeAttribute("aria-readonly");
+      }
+      number.readOnly = currentBehavior.readOnly;
+    };
+    const dispose = (): void => {
+      if (disposed) return;
+      disposed = true;
+      controller.abort();
+      options.signal?.removeEventListener("abort", dispose);
+    };
+    if (options.signal?.aborted) dispose();
+    else options.signal?.addEventListener("abort", dispose, { once: true });
+
+    const readValue = (control: HTMLInputElement): number => {
+      const parsed = Number(control.value);
+      if (!control.value || !control.validity.valid ||
+          !isValidSliderValue(parsed, minimum, maximum, integer, step))
+        throw new Error(`Enter a valid number from ${minimum} to ${maximum} on step ${step}.`);
+      return parsed;
+    };
+    const restoreCurrentValue = (): void => {
+      number.value = String(currentValue);
+      range.value = String(currentValue);
+    };
+    range.addEventListener("click", (event) => {
+      if (currentBehavior.readOnly) { event.preventDefault(); event.stopImmediatePropagation(); }
+    }, { capture: true, signal: controller.signal });
+    range.addEventListener("pointerdown", (event) => {
+      if (currentBehavior.readOnly) { event.preventDefault(); event.stopImmediatePropagation(); }
+    }, { capture: true, signal: controller.signal });
+    range.addEventListener("keydown", (event) => {
+      const valueMutationKey = ["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Home", "End", "PageUp", "PageDown"].includes(event.key);
+      if (currentBehavior.readOnly && valueMutationKey) { event.preventDefault(); event.stopImmediatePropagation(); }
+    }, { capture: true, signal: controller.signal });
+    for (const control of [range, number]) {
+      control.addEventListener("input", (event) => {
+        if (currentBehavior.disabled || currentBehavior.readOnly) {
+          restoreCurrentValue();
+          event.preventDefault();
+          event.stopImmediatePropagation();
+        }
+      }, { capture: true, signal: controller.signal });
+    }
+    range.addEventListener("input", () => {
+      let nextValue: number;
+      try { nextValue = readValue(range); } catch { return; }
+      number.value = String(nextValue);
+      currentValue = nextValue;
+      options.onChange?.(nextValue);
+    }, { signal: controller.signal });
+    number.addEventListener("input", () => {
+      let nextValue: number;
+      try { nextValue = readValue(number); } catch { return; }
+      range.value = String(nextValue);
+      if (Number(range.value) !== nextValue) return;
+      currentValue = nextValue;
+      options.onChange?.(nextValue);
+    }, { signal: controller.signal });
+    const node = el("div", className, range, number);
+    return {
+      node,
+      range,
+      number,
+      value: () => readValue(number),
+      setBehavior: (nextBehavior) => {
+        currentBehavior = { disabled: nextBehavior.disabled === true, readOnly: nextBehavior.readOnly === true, required: nextBehavior.required === true };
+        applyBehavior();
+      },
+      setValue: (nextValue) => {
+        if (!isValidSliderValue(nextValue, minimum, maximum, integer, step))
+          throw new Error(`Slider value must be between ${minimum} and ${maximum} on step ${step}.`);
+        const previousNumber = number.value;
+        const previousRange = range.value;
+        number.value = String(nextValue);
+        range.value = String(nextValue);
+        if (Number(range.value) !== nextValue) {
+          number.value = previousNumber;
+          range.value = previousRange;
+          throw new Error("Slider value cannot be represented by the range control.");
+        }
+        currentValue = nextValue;
+      },
+      dispose,
+    };
+  }
+
+  export function isValidNumberControlValue(
+    value: number,
+    minimum?: number,
+    maximum?: number,
+    step: number | "any" = "any",
+    integer = false,
+  ): boolean {
+    if (!Number.isFinite(value) || minimum !== undefined && value < minimum || maximum !== undefined && value > maximum ||
+        (integer && !Number.isSafeInteger(value))) return false;
+    if (step === "any") return true;
+    if (!Number.isFinite(step) || step <= 0) return false;
+    const stepCount = (value - (minimum ?? 0)) / step;
+    return Number.isFinite(stepCount) &&
+      Math.abs(stepCount - Math.round(stepCount)) <= Number.EPSILON * Math.max(1, Math.abs(stepCount)) * 4;
+  }
+
+  function isValidSliderValue(value: number, minimum: number, maximum: number, integer: boolean, step: number | "any"): boolean {
+    return isValidNumberControlValue(value, minimum, maximum, step, integer);
+  }
+
   export function sectionHeading(
     title: TextValue,
     description: TextValue,

@@ -915,12 +915,14 @@ var Amaterasu;
             return (this.role === "administrator" || this.role === "operator" || this.role === "token") &&
                 (this.scopes === null || this.scopes.includes(scope));
         }
-        async post(route, payload = {}, protectedRoute = true) {
+        async post(route, payload = {}, protectedRoute = true, signal) {
+            if (signal?.aborted)
+                throw new Error("The request was cancelled.");
             if (this.loggingOut) {
                 throw new ApiError("Sign out is already in progress.", "unauthorized", 401);
             }
             if (protectedRoute && this.cookieSession)
-                return this.postWithCookies(route, payload);
+                return this.postWithCookies(route, payload, signal);
             if (protectedRoute && !this.bearer)
                 throw new ApiError("Sign in to continue.", "unauthorized", 401);
             if (protectedRoute &&
@@ -928,19 +930,25 @@ var Amaterasu;
                 this.accessExpiresAt - Date.now() / 1000 <= 60) {
                 await this.refreshOrClear();
             }
+            if (signal?.aborted)
+                throw new Error("The request was cancelled.");
             if (protectedRoute && !this.bearer)
                 throw new ApiError("Sign in to continue.", "unauthorized", 401);
             const bearerUsed = this.bearer;
             const authGeneration = this.authGeneration;
             const tokenGeneration = this.tokenGeneration;
             try {
-                const response = await this.send(route, payload, protectedRoute, bearerUsed);
+                const response = await this.send(route, payload, protectedRoute, bearerUsed, false, signal);
+                if (signal?.aborted)
+                    throw new Error("The request was cancelled.");
                 if (this.loggingOut) {
                     throw new ApiError("Sign out is already in progress.", "unauthorized", 401);
                 }
                 return response;
             }
             catch (error) {
+                if (signal?.aborted)
+                    throw new Error("The request was cancelled.");
                 if (!protectedRoute ||
                     !(error instanceof ApiError) ||
                     error.code !== "unauthorized" ||
@@ -953,7 +961,11 @@ var Amaterasu;
                     await this.refreshOrClear();
                 if (authGeneration !== this.authGeneration || !this.bearer)
                     throw error;
-                const response = await this.send(route, payload, true, this.bearer);
+                if (signal?.aborted)
+                    throw new Error("The request was cancelled.");
+                const response = await this.send(route, payload, true, this.bearer, false, signal);
+                if (signal?.aborted)
+                    throw new Error("The request was cancelled.");
                 if (this.loggingOut) {
                     throw new ApiError("Sign out is already in progress.", "unauthorized", 401);
                 }
@@ -1065,22 +1077,28 @@ var Amaterasu;
                     this.cookieRefreshInFlight = null;
             }
         }
-        async postWithCookies(route, payload) {
+        async postWithCookies(route, payload, signal) {
             if (this.pendingCookieLogout())
                 throw new ApiError("Sign-out is still pending. Retry when the host is reachable.", "logout_unconfirmed", 503);
             if (this.accessExpiresAt - Date.now() / 1000 <= 60)
                 await this.refreshCookieSession();
+            if (signal?.aborted)
+                throw new Error("The request was cancelled.");
             if (!this.cookieSession || this.loggingOut)
                 throw new ApiError("Sign in to continue.", "unauthorized", 401);
             const generation = this.authGeneration;
             const tokenGeneration = this.tokenGeneration;
             try {
-                const reply = await this.send(route, payload, true, "", true);
+                const reply = await this.send(route, payload, true, "", true, signal);
+                if (signal?.aborted)
+                    throw new Error("The request was cancelled.");
                 if (generation !== this.authGeneration || this.loggingOut)
                     throw new ApiError("Sign in to continue.", "unauthorized", 401);
                 return reply;
             }
             catch (error) {
+                if (signal?.aborted)
+                    throw new Error("The request was cancelled.");
                 if (!(error instanceof ApiError) || error.status !== 401 ||
                     generation !== this.authGeneration || this.loggingOut)
                     throw error;
@@ -1088,13 +1106,19 @@ var Amaterasu;
                     await this.refreshCookieSession();
                 if (!this.cookieSession || generation !== this.authGeneration)
                     throw error;
+                if (signal?.aborted)
+                    throw new Error("The request was cancelled.");
                 try {
-                    const reply = await this.send(route, payload, true, "", true);
+                    const reply = await this.send(route, payload, true, "", true, signal);
+                    if (signal?.aborted)
+                        throw new Error("The request was cancelled.");
                     if (generation !== this.authGeneration || this.loggingOut)
                         throw new ApiError("Sign in to continue.", "unauthorized", 401);
                     return reply;
                 }
                 catch (retryError) {
+                    if (signal?.aborted)
+                        throw new Error("The request was cancelled.");
                     if (retryError instanceof ApiError &&
                         retryError.status === 401 &&
                         generation === this.authGeneration) {
@@ -1765,8 +1789,12 @@ var Amaterasu;
                 }
             }
         }
-        async send(route, payload, protectedRoute, bearer, cookieAuth = false) {
+        async send(route, payload, protectedRoute, bearer, cookieAuth = false, signal) {
+            if (signal?.aborted)
+                throw new Error("The request was cancelled.");
             const controller = new AbortController();
+            const abortRequest = () => controller.abort();
+            signal?.addEventListener("abort", abortRequest, { once: true });
             const timer = window.setTimeout(() => controller.abort(), 12_000);
             this.requests.add(controller);
             if (route === "auth/refresh" || route === "auth/browser/refresh")
@@ -1801,6 +1829,7 @@ var Amaterasu;
                 throw new Error("Could not reach the host. Check its address, connection, and allowed browser origin.");
             }
             finally {
+                signal?.removeEventListener("abort", abortRequest);
                 clearTimeout(timer);
                 this.requests.delete(controller);
                 this.refreshRequests.delete(controller);
@@ -1858,6 +1887,57 @@ var Amaterasu;
         "Delete",
         "Try again",
         "Unable to complete request",
+        "Choose a Steam game",
+        "Select",
+        "Search discovered games",
+        "Search by game name or app ID",
+        "Restart",
+        "Clear search",
+        "Keep current directory",
+        "Clear current directory",
+        "Review fields",
+        "Steam games",
+        "App ID",
+        "Install directory",
+        "Install directory unavailable",
+        "Select {name}",
+        "Search found matches in the first 512 games. Browse later pages or refine your search.",
+        "Search stopped after the first 512 games. Browse later pages or refine your search.",
+        "Review Steam directory",
+        "The selected game has no install directory. Your current directory may belong to another game.",
+        "Choose whether to keep or clear the current directory, or review fields without applying.",
+        "Steam read permission is required. You can enter the app ID manually.",
+        "Loading Steam games…",
+        "Choose a discovered game.",
+        "No Steam games are available.",
+        "Steam is scanning. Refresh later to see discovered games.",
+        "Steam games changed. Restart to load the current list.",
+        "Steam pagination failed. Restart to continue.",
+        "Steam games are unavailable. Retry or enter the app ID manually.",
+        "Searching Steam games…",
+        "Steam games changed. Restart to search the current list.",
+        "Search complete. Choose a discovered game.",
+        "No Steam games matched.",
+        "Enter a game name or app ID.",
+        "Found matches within {count} checked games. Browse later pages or refine your search.",
+        "Checked {count} games across 32 pages. Browse later pages or refine your search.",
+        "Selection was not applied. Review the Steam fields and choose again.",
+        "A required permission changed; the selection was not applied.",
+        "Steam game selected. Other application edits were kept.",
+        "Steam game selected. Kept the existing directory by choice.",
+        "Steam game selected. Cleared the existing directory by choice.",
+        "Steam game selected. Its install directory is unavailable; the existing directory was kept.",
+        "Select a discovered game to use its Steam app ID and optional install directory.",
+        "Application editor sections",
+        "SECTIONS",
+        "Identity",
+        "Launch",
+        "Settings overrides",
+        "Inheritance is field-specific. Use the field's Inherit option or placeholder; Automatic audio selection and exact empty encoder strings are explicit choices.",
+        "Copy rendered log preview",
+        "Copies every rendered line, including search context. Log content is raw and may contain identifying details.",
+        "Rendered log preview copied to the clipboard.",
+        "Could not copy the rendered log preview. Clipboard access may be unavailable in this browser context.",
     ];
     const SHELL_MESSAGE_KEYS = [
         "WORKSPACE",
@@ -1876,7 +1956,57 @@ var Amaterasu;
             ],
             ui: [
                 "← Предишна", "Следваща →", "Обновяване", "Запазване", "Отказ", "Затвори", "Търсене",
-                "Редактиране", "Изтриване", "Опитай отново", "Заявката не можа да бъде изпълнена",
+                "Редактиране", "Изтриване", "Опитай отново", "Заявката не можа да бъде изпълнена", "Избор на Steam игра",
+                "Избор",
+                "Търсене на открити игри",
+                "Търсене по име на игра или ID на приложение",
+                "Рестартиране",
+                "Изчистване на търсенето",
+                "Запазване на текущата папка",
+                "Изчистване на текущата папка",
+                "Преглед на полетата",
+                "Steam игри",
+                "ID на приложението",
+                "Папка за инсталиране",
+                "Папката за инсталиране не е налична",
+                "Избор на {name}",
+                "Намерени са съвпадения сред първите 512 игри. Прегледайте следващите страници или прецизирайте търсенето.",
+                "Търсенето спря след първите 512 игри. Прегледайте следващите страници или прецизирайте търсенето.",
+                "Преглед на Steam папката",
+                "Избраната игра няма инсталационна папка. Текущата папка може да е за друга игра.",
+                "Изберете дали да запазите или изчистите текущата папка, или прегледайте полетата без прилагане.",
+                "Необходимо е разрешение за Steam. Можете да въведете ID на приложението ръчно.",
+                "Зареждане на Steam игри…",
+                "Изберете открита игра.",
+                "Няма налични Steam игри.",
+                "Steam сканира. Обновете по-късно.",
+                "Списъкът със Steam игри се промени. Рестартирайте, за да заредите текущия списък.",
+                "Страниците на Steam не се заредиха. Рестартирайте.",
+                "Steam игрите не са налични. Опитайте отново или въведете ID ръчно.",
+                "Търсене на Steam игри…",
+                "Списъкът се промени. Рестартирайте търсенето.",
+                "Търсенето завърши. Изберете открита игра.",
+                "Няма съвпадащи Steam игри.",
+                "Въведете име на игра или ID на приложение.",
+                "Намерени са съвпадения сред {count} проверени игри. Прегледайте следващите страници или прецизирайте търсенето.",
+                "Проверени са {count} игри в 32 страници. Прегледайте следващите страници или прецизирайте търсенето.",
+                "Изборът не е приложен. Прегледайте Steam полетата и изберете отново.",
+                "Необходимо разрешение се промени; изборът не е приложен.",
+                "Steam играта е избрана. Другите промени са запазени.",
+                "Steam играта е избрана. Текущата папка е запазена по ваш избор.",
+                "Steam играта е избрана. Текущата папка е изчистена по ваш избор.",
+                "Steam играта е избрана. Папката ѝ липсва; текущата папка е запазена.",
+                "Изберете открита игра, за да използвате нейния Steam ID на приложението и незадължителната инсталационна папка.",
+                "Раздели на редактора на приложения",
+                "РАЗДЕЛИ",
+                "Идентичност",
+                "Стартиране",
+                "Замени на настройките",
+                "Наследяването зависи от полето. Използвайте опцията или подсказката „Inherit“; автоматичният аудио избор и точните празни низове за кодиране са изрични стойности.",
+                "Копирай изобразения преглед на дневника",
+                "Копира всички показани редове, включително контекста на търсенето. Суровото съдържание на дневника може да съдържа идентифицираща информация.",
+                "Изобразеният преглед на дневника е копиран в клипборда.",
+                "Неуспешно копиране на изобразения преглед на дневника. Достъпът до клипборда може да не е наличен в този контекст на браузъра.",
             ],
         },
         cs: {
@@ -1888,7 +2018,57 @@ var Amaterasu;
             ],
             ui: [
                 "← Předchozí", "Další →", "Obnovit", "Uložit", "Zrušit", "Zavřít", "Hledat", "Upravit",
-                "Odstranit", "Zkusit znovu", "Požadavek se nepodařilo dokončit",
+                "Odstranit", "Zkusit znovu", "Požadavek se nepodařilo dokončit", "Vybrat hru na Steamu",
+                "Vybrat",
+                "Hledat nalezené hry",
+                "Hledat podle názvu hry nebo ID aplikace",
+                "Restartovat",
+                "Vymazat hledání",
+                "Ponechat aktuální složku",
+                "Vymazat aktuální složku",
+                "Zkontrolovat pole",
+                "Hry na Steamu",
+                "ID aplikace",
+                "Instalační složka",
+                "Instalační složka není dostupná",
+                "Vybrat {name}",
+                "Shody nalezeny mezi prvními 512 hrami. Projděte další stránky nebo upřesněte hledání.",
+                "Hledání se zastavilo po prvních 512 hrách. Projděte další stránky nebo upřesněte hledání.",
+                "Kontrola složky Steam",
+                "Vybraná hra nemá instalační složku. Aktuální složka může patřit jiné hře.",
+                "Rozhodněte, zda aktuální složku ponechat či vymazat, nebo zkontrolujte pole bez použití výběru.",
+                "Je vyžadováno oprávnění ke službě Steam. ID aplikace lze zadat ručně.",
+                "Načítání her ve službě Steam…",
+                "Vyberte nalezenou hru.",
+                "Nejsou dostupné žádné hry ve službě Steam.",
+                "Steam právě prohledává. Obnovte později.",
+                "Seznam her ve službě Steam se změnil. Restartujte načtení aktuálního seznamu.",
+                "Stránkování služby Steam selhalo. Restartujte.",
+                "Hry ve službě Steam nejsou dostupné. Zkuste to znovu nebo zadejte ID ručně.",
+                "Hledání her ve službě Steam…",
+                "Seznam se změnil. Restartujte hledání.",
+                "Hledání dokončeno. Vyberte nalezenou hru.",
+                "Nebyly nalezeny žádné hry ve službě Steam.",
+                "Zadejte název hry nebo ID aplikace.",
+                "Shody nalezeny mezi {count} zkontrolovanými hrami. Projděte další stránky nebo upřesněte hledání.",
+                "Na 32 stránkách bylo zkontrolováno {count} her. Projděte další stránky nebo upřesněte hledání.",
+                "Výběr nebyl použit. Zkontrolujte pole služby Steam a vyberte znovu.",
+                "Změnilo se požadované oprávnění; výběr nebyl použit.",
+                "Hra ve službě Steam vybrána. Ostatní úpravy zůstaly zachovány.",
+                "Hra ve službě Steam vybrána. Aktuální složka zůstala zachována podle vaší volby.",
+                "Hra ve službě Steam vybrána. Aktuální složka byla vymazána podle vaší volby.",
+                "Hra ve službě Steam vybrána. Její složka není dostupná; aktuální složka zůstala zachována.",
+                "Vyberte nalezenou hru a použijte její ID aplikace Steam a volitelnou instalační složku.",
+                "Sekce editoru aplikace",
+                "SEKCE",
+                "Identita",
+                "Spuštění",
+                "Přepsání nastavení",
+                "Dědění závisí na poli. Použijte volbu nebo nápovědu Inherit; automatický výběr zvuku a přesné prázdné řetězce kodéru jsou výslovné hodnoty.",
+                "Kopírovat vykreslený náhled výpisu",
+                "Zkopírují se všechny vykreslené řádky včetně kontextu hledání. Surový obsah výpisu může obsahovat identifikační údaje.",
+                "Vykreslený náhled výpisu byl zkopírován do schránky.",
+                "Vykreslený náhled výpisu se nepodařilo zkopírovat. Přístup ke schránce nemusí být v tomto kontextu prohlížeče dostupný.",
             ],
         },
         de: {
@@ -1900,7 +2080,57 @@ var Amaterasu;
             ],
             ui: [
                 "← Zurück", "Weiter →", "Aktualisieren", "Speichern", "Abbrechen", "Schließen", "Suchen",
-                "Bearbeiten", "Löschen", "Erneut versuchen", "Anfrage konnte nicht ausgeführt werden",
+                "Bearbeiten", "Löschen", "Erneut versuchen", "Anfrage konnte nicht ausgeführt werden", "Steam-Spiel auswählen",
+                "Auswählen",
+                "Entdeckte Spiele durchsuchen",
+                "Nach Spielname oder App-ID suchen",
+                "Neu starten",
+                "Suche löschen",
+                "Aktuelles Verzeichnis behalten",
+                "Aktuelles Verzeichnis löschen",
+                "Felder prüfen",
+                "Steam-Spiele",
+                "App-ID",
+                "Installationsverzeichnis",
+                "Installationsverzeichnis nicht verfügbar",
+                "{name} auswählen",
+                "Treffer in den ersten 512 Spielen gefunden. Durchsuche spätere Seiten oder grenze die Suche ein.",
+                "Suche nach den ersten 512 Spielen beendet. Durchsuche spätere Seiten oder grenze die Suche ein.",
+                "Steam-Verzeichnis prüfen",
+                "Das ausgewählte Spiel hat kein Installationsverzeichnis. Das aktuelle Verzeichnis gehört möglicherweise zu einem anderen Spiel.",
+                "Wähle, ob du das aktuelle Verzeichnis behalten oder löschen möchtest, oder prüfe die Felder ohne Übernahme.",
+                "Steam-Leseberechtigung erforderlich. Du kannst die App-ID manuell eingeben.",
+                "Steam-Spiele werden geladen…",
+                "Wähle ein gefundenes Spiel.",
+                "Keine Steam-Spiele verfügbar.",
+                "Steam sucht noch. Aktualisiere später erneut.",
+                "Die Steam-Spieleliste hat sich geändert. Starte neu, um die aktuelle Liste zu laden.",
+                "Steam-Seiten konnten nicht geladen werden. Starte neu.",
+                "Steam-Spiele sind nicht verfügbar. Versuche es erneut oder gib die App-ID ein.",
+                "Steam-Spiele werden gesucht…",
+                "Die Liste hat sich geändert. Starte die Suche neu.",
+                "Suche abgeschlossen. Wähle ein gefundenes Spiel.",
+                "Keine Steam-Spiele gefunden.",
+                "Gib einen Spielnamen oder eine App-ID ein.",
+                "Treffer unter {count} geprüften Spielen. Durchsuche weitere Seiten oder grenze die Suche ein.",
+                "{count} Spiele auf 32 Seiten geprüft. Durchsuche weitere Seiten oder grenze die Suche ein.",
+                "Auswahl nicht übernommen. Prüfe die Steam-Felder und wähle erneut.",
+                "Eine erforderliche Berechtigung hat sich geändert; die Auswahl wurde nicht übernommen.",
+                "Steam-Spiel ausgewählt. Andere Änderungen wurden beibehalten.",
+                "Steam-Spiel ausgewählt. Aktuelles Verzeichnis wie gewünscht beibehalten.",
+                "Steam-Spiel ausgewählt. Aktuelles Verzeichnis wie gewünscht gelöscht.",
+                "Steam-Spiel ausgewählt. Verzeichnis nicht verfügbar; aktuelles Verzeichnis beibehalten.",
+                "Wähle ein gefundenes Spiel, um seine Steam-App-ID und ein optionales Installationsverzeichnis zu verwenden.",
+                "Abschnitte des Anwendungseditors",
+                "BEREICHE",
+                "Identität",
+                "Start",
+                "Einstellungsüberschreibungen",
+                "Die Vererbung hängt vom Feld ab. Nutze die Option oder den Hinweis „Inherit“; automatische Audioauswahl und exakt leere Encoder-Zeichenfolgen sind ausdrückliche Werte.",
+                "Gerenderte Protokollvorschau kopieren",
+                "Es werden alle gerenderten Zeilen einschließlich des Suchkontexts kopiert. Das Rohprotokoll kann identifizierende Angaben enthalten.",
+                "Die gerenderte Protokollvorschau wurde in die Zwischenablage kopiert.",
+                "Die gerenderte Protokollvorschau konnte nicht kopiert werden. Der Zugriff auf die Zwischenablage ist in diesem Browserkontext möglicherweise nicht verfügbar.",
             ],
         },
         es: {
@@ -1912,7 +2142,57 @@ var Amaterasu;
             ],
             ui: [
                 "← Anterior", "Siguiente →", "Actualizar", "Guardar", "Cancelar", "Cerrar", "Buscar", "Editar",
-                "Eliminar", "Intentar de nuevo", "No se pudo completar la solicitud",
+                "Eliminar", "Intentar de nuevo", "No se pudo completar la solicitud", "Elegir un juego de Steam",
+                "Seleccionar",
+                "Buscar juegos detectados",
+                "Buscar por nombre del juego o ID de aplicación",
+                "Reiniciar",
+                "Borrar búsqueda",
+                "Mantener el directorio actual",
+                "Borrar el directorio actual",
+                "Revisar campos",
+                "Juegos de Steam",
+                "ID de aplicación",
+                "Directorio de instalación",
+                "Directorio de instalación no disponible",
+                "Seleccionar {name}",
+                "Se encontraron coincidencias entre los primeros 512 juegos. Explora páginas posteriores o afina la búsqueda.",
+                "La búsqueda se detuvo tras los primeros 512 juegos. Explora páginas posteriores o afina la búsqueda.",
+                "Revisar directorio de Steam",
+                "El juego elegido no tiene directorio de instalación. El directorio actual podría pertenecer a otro juego.",
+                "Elige si quieres conservar o borrar el directorio actual, o revisa los campos sin aplicar la selección.",
+                "Se requiere permiso de lectura de Steam. Puedes introducir el ID manualmente.",
+                "Cargando juegos de Steam…",
+                "Elige un juego detectado.",
+                "No hay juegos de Steam disponibles.",
+                "Steam está buscando. Actualiza más tarde.",
+                "La lista de Steam cambió. Reinicia para cargar la lista actual.",
+                "Falló la paginación de Steam. Reinicia.",
+                "Los juegos de Steam no están disponibles. Reintenta o introduce el ID.",
+                "Buscando juegos de Steam…",
+                "La lista cambió. Reinicia la búsqueda.",
+                "Búsqueda completada. Elige un juego detectado.",
+                "No se encontraron juegos de Steam.",
+                "Introduce un nombre de juego o ID de aplicación.",
+                "Hay coincidencias entre {count} juegos revisados. Explora páginas posteriores o afina la búsqueda.",
+                "Se revisaron {count} juegos en 32 páginas. Explora páginas posteriores o afina la búsqueda.",
+                "No se aplicó la selección. Revisa los campos de Steam y vuelve a elegir.",
+                "Cambió un permiso necesario; no se aplicó la selección.",
+                "Juego de Steam seleccionado. Se conservaron los demás cambios.",
+                "Juego de Steam seleccionado. Se conservó el directorio actual por elección.",
+                "Juego de Steam seleccionado. Se borró el directorio actual por elección.",
+                "Juego de Steam seleccionado. No hay directorio; se conservó el actual.",
+                "Elige un juego detectado para usar su ID de aplicación de Steam y su directorio de instalación opcional.",
+                "Secciones del editor de aplicaciones",
+                "SECCIONES",
+                "Identidad",
+                "Inicio",
+                "Anulaciones de ajustes",
+                "La herencia depende del campo. Usa la opción o la indicación Inherit; la selección de audio automática y las cadenas de codificador exactamente vacías son valores explícitos.",
+                "Copiar vista previa renderizada del registro",
+                "Se copian todas las líneas renderizadas, incluido el contexto de búsqueda. El contenido sin procesar del registro puede incluir datos identificativos.",
+                "La vista previa renderizada del registro se copió en el portapapeles.",
+                "No se pudo copiar la vista previa renderizada del registro. Es posible que el acceso al portapapeles no esté disponible en este contexto del navegador.",
             ],
         },
         fr: {
@@ -1924,7 +2204,57 @@ var Amaterasu;
             ],
             ui: [
                 "← Précédent", "Suivant →", "Actualiser", "Enregistrer", "Annuler", "Fermer", "Rechercher",
-                "Modifier", "Supprimer", "Réessayer", "Impossible de terminer la requête",
+                "Modifier", "Supprimer", "Réessayer", "Impossible de terminer la requête", "Choisir un jeu Steam",
+                "Choisir",
+                "Rechercher les jeux détectés",
+                "Rechercher par nom de jeu ou ID d’application",
+                "Redémarrer",
+                "Effacer la recherche",
+                "Conserver le répertoire actuel",
+                "Effacer le répertoire actuel",
+                "Vérifier les champs",
+                "Jeux Steam",
+                "ID d’application",
+                "Répertoire d’installation",
+                "Répertoire d’installation indisponible",
+                "Choisir le jeu {name}",
+                "Des résultats ont été trouvés parmi les 512 premiers jeux. Parcourez les pages suivantes ou affinez la recherche.",
+                "La recherche s’est arrêtée après les 512 premiers jeux. Parcourez les pages suivantes ou affinez la recherche.",
+                "Vérifier le dossier Steam",
+                "Le jeu choisi n’a pas de dossier d’installation. Le dossier actuel peut appartenir à un autre jeu.",
+                "Choisissez de conserver ou d’effacer le dossier actuel, ou vérifiez les champs sans appliquer la sélection.",
+                "L’autorisation de lecture Steam est requise. Vous pouvez saisir l’ID manuellement.",
+                "Chargement des jeux Steam…",
+                "Choisissez un jeu détecté.",
+                "Aucun jeu Steam n’est disponible.",
+                "Steam effectue une recherche. Actualisez plus tard.",
+                "La liste Steam a changé. Redémarrez pour charger la liste actuelle.",
+                "La pagination Steam a échoué. Redémarrez.",
+                "Les jeux Steam sont indisponibles. Réessayez ou saisissez l’ID.",
+                "Recherche des jeux Steam…",
+                "La liste a changé. Redémarrez la recherche.",
+                "Recherche terminée. Choisissez un jeu détecté.",
+                "Aucun jeu Steam ne correspond.",
+                "Saisissez un nom de jeu ou un ID d’application.",
+                "Des résultats figurent parmi les {count} jeux vérifiés. Parcourez les pages suivantes ou affinez la recherche.",
+                "{count} jeux vérifiés sur 32 pages. Parcourez les pages suivantes ou affinez la recherche.",
+                "Sélection non appliquée. Vérifiez les champs Steam et choisissez à nouveau.",
+                "Une autorisation requise a changé ; la sélection n’a pas été appliquée.",
+                "Jeu Steam sélectionné. Les autres modifications sont conservées.",
+                "Jeu Steam sélectionné. Le dossier actuel est conservé selon votre choix.",
+                "Jeu Steam sélectionné. Le dossier actuel est effacé selon votre choix.",
+                "Jeu Steam sélectionné. Dossier indisponible ; dossier actuel conservé.",
+                "Choisissez un jeu détecté pour utiliser son ID d’application Steam et son dossier d’installation facultatif.",
+                "Sections de l’éditeur d’application",
+                "SECTIONS",
+                "Identité",
+                "Lancement",
+                "Remplacements des paramètres",
+                "L’héritage dépend de chaque champ. Utilisez son option ou son indication « Inherit » ; la sélection audio automatique et les chaînes d’encodeur exactement vides sont des choix explicites.",
+                "Copier l’aperçu rendu du journal",
+                "Toutes les lignes affichées sont copiées, y compris le contexte de recherche. Le journal brut peut contenir des informations identifiantes.",
+                "L’aperçu rendu du journal a été copié dans le presse-papiers.",
+                "Impossible de copier l’aperçu rendu du journal. L’accès au presse-papiers n’est peut-être pas disponible dans ce contexte du navigateur.",
             ],
         },
         hu: {
@@ -1936,7 +2266,57 @@ var Amaterasu;
             ],
             ui: [
                 "← Előző", "Következő →", "Frissítés", "Mentés", "Mégse", "Bezárás", "Keresés", "Szerkesztés",
-                "Törlés", "Próbálja újra", "A kérést nem sikerült végrehajtani",
+                "Törlés", "Próbálja újra", "A kérést nem sikerült végrehajtani", "Steam-játék kiválasztása",
+                "Kiválasztás",
+                "Felfedezett játékok keresése",
+                "Keresés játék neve vagy alkalmazásazonosító alapján",
+                "Újraindítás",
+                "Keresés törlése",
+                "Jelenlegi könyvtár megtartása",
+                "Jelenlegi könyvtár törlése",
+                "Mezők áttekintése",
+                "Steam-játékok",
+                "Alkalmazásazonosító",
+                "Telepítési könyvtár",
+                "A telepítési könyvtár nem érhető el",
+                "{name} kiválasztása",
+                "Találatok az első 512 játék között. Böngésszen tovább vagy pontosítsa a keresést.",
+                "A keresés az első 512 játék után leállt. Böngésszen tovább vagy pontosítsa a keresést.",
+                "Steam-könyvtár áttekintése",
+                "A kiválasztott játéknak nincs telepítési könyvtára. A jelenlegi könyvtár másik játékhoz tartozhat.",
+                "Válaszd ki, hogy megtartod vagy törlöd a jelenlegi könyvtárat, vagy nézd át a mezőket alkalmazás nélkül.",
+                "Steam-olvasási engedély szükséges. Az alkalmazásazonosító kézzel is megadható.",
+                "Steam-játékok betöltése…",
+                "Válassz egy felismert játékot.",
+                "Nem érhetők el Steam-játékok.",
+                "A Steam keres. Frissíts később.",
+                "A Steam-játéklista megváltozott. Indítsd újra a betöltést.",
+                "A Steam-lapozás nem sikerült. Indítsd újra.",
+                "A Steam-játékok nem érhetők el. Próbáld újra, vagy add meg az azonosítót.",
+                "Steam-játékok keresése…",
+                "A lista megváltozott. Indítsd újra a keresést.",
+                "Keresés kész. Válassz egy felismert játékot.",
+                "Nincs egyező Steam-játék.",
+                "Adj meg játéknevet vagy alkalmazásazonosítót.",
+                "Egyezés található az ellenőrzött {count} játék között. Lapozz tovább vagy pontosítsd a keresést.",
+                "{count} játék ellenőrizve 32 oldalon. Lapozz tovább vagy pontosítsd a keresést.",
+                "A kijelölés nem lett alkalmazva. Tekintsd át a Steam-mezőket, és válassz újra.",
+                "Egy szükséges engedély megváltozott; a kijelölés nem lett alkalmazva.",
+                "Steam-játék kiválasztva. A többi módosítás megmaradt.",
+                "Steam-játék kiválasztva. A jelenlegi könyvtárat megtartottuk a kérésedre.",
+                "Steam-játék kiválasztva. A jelenlegi könyvtárat töröltük a kérésedre.",
+                "Steam-játék kiválasztva. Nincs telepítési könyvtár; a jelenlegi megmaradt.",
+                "Válassz egy felismert játékot a Steam-alkalmazásazonosító és az opcionális telepítési könyvtár használatához.",
+                "Alkalmazásszerkesztő szakaszai",
+                "SZAKASZOK",
+                "Identitás",
+                "Indítás",
+                "Beállítás-felülbírálások",
+                "Az öröklés mezőnként eltér. Használd az Inherit lehetőséget vagy súgót; az automatikus hangválasztás és a pontosan üres kódolósztring kifejezett érték.",
+                "Megjelenített naplóelőnézet másolása",
+                "Minden megjelenített sor másolódik, a keresési környezettel együtt. A nyers naplótartalom azonosító adatokat tartalmazhat.",
+                "A megjelenített naplóelőnézet a vágólapra került.",
+                "A megjelenített naplóelőnézet nem másolható. Lehet, hogy ebben a böngészőkörnyezetben nem érhető el a vágólap.",
             ],
         },
         it: {
@@ -1948,7 +2328,57 @@ var Amaterasu;
             ],
             ui: [
                 "← Precedente", "Successivo →", "Aggiorna", "Salva", "Annulla", "Chiudi", "Cerca", "Modifica",
-                "Elimina", "Riprova", "Impossibile completare la richiesta",
+                "Elimina", "Riprova", "Impossibile completare la richiesta", "Scegli un gioco Steam",
+                "Seleziona",
+                "Cerca giochi rilevati",
+                "Cerca per nome del gioco o ID app",
+                "Riavvia",
+                "Cancella ricerca",
+                "Mantieni la cartella attuale",
+                "Cancella la cartella attuale",
+                "Rivedi i campi",
+                "Giochi Steam",
+                "ID app",
+                "Cartella di installazione",
+                "Cartella di installazione non disponibile",
+                "Seleziona {name}",
+                "Trovate corrispondenze tra i primi 512 giochi. Sfoglia le pagine successive o affina la ricerca.",
+                "Ricerca interrotta dopo i primi 512 giochi. Sfoglia le pagine successive o affina la ricerca.",
+                "Controlla la cartella Steam",
+                "Il gioco scelto non ha una cartella di installazione. La cartella attuale potrebbe appartenere a un altro gioco.",
+                "Scegli se mantenere o cancellare la cartella attuale, oppure rivedi i campi senza applicare la selezione.",
+                "È necessario il permesso di lettura Steam. Puoi inserire manualmente l’ID.",
+                "Caricamento giochi Steam…",
+                "Scegli un gioco rilevato.",
+                "Nessun gioco Steam disponibile.",
+                "Steam sta cercando. Aggiorna più tardi.",
+                "L’elenco Steam è cambiato. Riavvia per caricare l’elenco aggiornato.",
+                "Impaginazione Steam non riuscita. Riavvia.",
+                "Giochi Steam non disponibili. Riprova o inserisci l’ID.",
+                "Ricerca giochi Steam…",
+                "L’elenco è cambiato. Riavvia la ricerca.",
+                "Ricerca completata. Scegli un gioco rilevato.",
+                "Nessun gioco Steam corrispondente.",
+                "Inserisci il nome del gioco o l’ID app.",
+                "Trovate corrispondenze tra i {count} giochi controllati. Sfoglia le pagine successive o affina la ricerca.",
+                "Controllati {count} giochi su 32 pagine. Sfoglia le pagine successive o affina la ricerca.",
+                "Selezione non applicata. Rivedi i campi Steam e scegli di nuovo.",
+                "Un permesso necessario è cambiato; la selezione non è stata applicata.",
+                "Gioco Steam selezionato. Le altre modifiche sono state mantenute.",
+                "Gioco Steam selezionato. Cartella attuale mantenuta come richiesto.",
+                "Gioco Steam selezionato. Cartella attuale cancellata come richiesto.",
+                "Gioco Steam selezionato. Cartella non disponibile; mantenuta quella attuale.",
+                "Scegli un gioco rilevato per usare il suo ID app Steam e la cartella di installazione facoltativa.",
+                "Sezioni dell’editor applicazione",
+                "SEZIONI",
+                "Identità",
+                "Avvio",
+                "Override impostazioni",
+                "L’ereditarietà dipende dal campo. Usa l’opzione o il suggerimento Inherit; la selezione audio automatica e le stringhe encoder esattamente vuote sono valori espliciti.",
+                "Copia anteprima renderizzata del registro",
+                "Vengono copiate tutte le righe visualizzate, incluso il contesto della ricerca. Il registro non elaborato può contenere dati identificativi.",
+                "L’anteprima renderizzata del registro è stata copiata negli appunti.",
+                "Impossibile copiare l’anteprima renderizzata del registro. L’accesso agli appunti potrebbe non essere disponibile in questo contesto del browser.",
             ],
         },
         ja: {
@@ -1959,7 +2389,57 @@ var Amaterasu;
             ],
             ui: [
                 "← 前へ", "次へ →", "更新", "保存", "キャンセル", "閉じる", "検索", "編集", "削除", "再試行",
-                "リクエストを完了できませんでした",
+                "リクエストを完了できませんでした", "Steam ゲームを選択",
+                "選択",
+                "検出済みゲームを検索",
+                "ゲーム名またはアプリ ID で検索",
+                "再起動",
+                "検索をクリア",
+                "現在のディレクトリを保持",
+                "現在のディレクトリをクリア",
+                "項目を確認",
+                "Steam ゲーム",
+                "アプリ ID",
+                "インストール先",
+                "インストール先はありません",
+                "{name} を選択",
+                "最初の 512 件に一致するゲームがあります。後のページを表示するか、検索を絞り込んでください。",
+                "最初の 512 件で検索を終了しました。後のページを表示するか、検索を絞り込んでください。",
+                "Steam ディレクトリを確認",
+                "選択したゲームにはインストール先がありません。現在のディレクトリは別のゲーム用かもしれません。",
+                "現在のディレクトリを保持または消去するか、選択を適用せず項目を確認してください。",
+                "Steam の読み取り権限が必要です。アプリ ID は手動入力できます。",
+                "Steam ゲームを読み込み中…",
+                "検出されたゲームを選択してください。",
+                "Steam ゲームはありません。",
+                "Steam を検索中です。後でもう一度更新してください。",
+                "Steam の一覧が変わりました。再起動して最新の一覧を読み込みます。",
+                "Steam のページ取得に失敗しました。再起動してください。",
+                "Steam ゲームを利用できません。再試行するかアプリ ID を入力してください。",
+                "Steam ゲームを検索中…",
+                "一覧が変わりました。検索を再起動してください。",
+                "検索完了。検出されたゲームを選択してください。",
+                "一致する Steam ゲームはありません。",
+                "ゲーム名またはアプリ ID を入力してください。",
+                "確認した {count} 件のゲーム内に一致があります。後のページを表示するか検索を絞り込んでください。",
+                "32 ページで {count} 件を確認しました。後のページを表示するか検索を絞り込んでください。",
+                "選択は適用されませんでした。Steam の項目を確認して選び直してください。",
+                "必要な権限が変更されたため、選択を適用しませんでした。",
+                "Steam ゲームを選択しました。他の編集内容は保持しました。",
+                "選択に従って現在のディレクトリを保持しました。",
+                "選択に従って現在のディレクトリを消去しました。",
+                "Steam ゲームを選択しました。インストール先がないため現在のディレクトリを保持しました。",
+                "検出されたゲームを選択すると、Steam アプリ ID と任意のインストール先を使用できます。",
+                "アプリケーションエディターのセクション",
+                "セクション",
+                "ID 情報",
+                "起動",
+                "設定の上書き",
+                "継承の扱いは項目ごとに異なります。項目の Inherit 選択肢またはヒントを確認してください。音声の自動選択と空文字列のエンコーダー値は明示的な設定です。",
+                "表示中のログプレビューをコピー",
+                "検索コンテキストを含む、描画済みのすべての行をコピーします。ログの生データには個人を特定できる情報が含まれる場合があります。",
+                "表示中のログプレビューをクリップボードにコピーしました。",
+                "表示中のログプレビューをコピーできませんでした。このブラウザー環境ではクリップボードを利用できない可能性があります。",
             ],
         },
         ko: {
@@ -1970,7 +2450,57 @@ var Amaterasu;
             ],
             ui: [
                 "← 이전", "다음 →", "새로 고침", "저장", "취소", "닫기", "검색", "편집", "삭제", "다시 시도",
-                "요청을 완료할 수 없습니다",
+                "요청을 완료할 수 없습니다", "Steam 게임 선택",
+                "선택",
+                "검색된 게임 찾기",
+                "게임 이름 또는 앱 ID로 검색",
+                "다시 시작",
+                "검색 지우기",
+                "현재 디렉터리 유지",
+                "현재 디렉터리 지우기",
+                "필드 검토",
+                "Steam 게임",
+                "앱 ID",
+                "설치 디렉터리",
+                "설치 디렉터리 없음",
+                "{name} 선택",
+                "처음 512개 게임에서 일치 항목을 찾았습니다. 이후 페이지를 둘러보거나 검색을 구체화하세요.",
+                "처음 512개 게임 뒤에 검색을 멈췄습니다. 이후 페이지를 둘러보거나 검색을 구체화하세요.",
+                "Steam 디렉터리 검토",
+                "선택한 게임에 설치 디렉터리가 없습니다. 현재 디렉터리가 다른 게임에 속할 수 있습니다.",
+                "현재 디렉터리를 유지하거나 지우고, 선택을 적용하지 않은 채 필드를 검토하세요.",
+                "Steam 읽기 권한이 필요합니다. 앱 ID를 직접 입력할 수 있습니다.",
+                "Steam 게임 불러오는 중…",
+                "발견된 게임을 선택하세요.",
+                "사용 가능한 Steam 게임이 없습니다.",
+                "Steam 검색 중입니다. 나중에 새로 고치세요.",
+                "Steam 목록이 변경되었습니다. 다시 시작해 현재 목록을 불러오세요.",
+                "Steam 페이지를 불러오지 못했습니다. 다시 시작하세요.",
+                "Steam 게임을 사용할 수 없습니다. 다시 시도하거나 앱 ID를 입력하세요.",
+                "Steam 게임 검색 중…",
+                "목록이 변경되었습니다. 검색을 다시 시작하세요.",
+                "검색 완료. 발견된 게임을 선택하세요.",
+                "일치하는 Steam 게임이 없습니다.",
+                "게임 이름 또는 앱 ID를 입력하세요.",
+                "확인한 {count}개 게임에서 일치 항목을 찾았습니다. 이후 페이지를 둘러보거나 검색을 구체화하세요.",
+                "32페이지에서 {count}개 게임을 확인했습니다. 이후 페이지를 둘러보거나 검색을 구체화하세요.",
+                "선택을 적용하지 않았습니다. Steam 필드를 검토하고 다시 선택하세요.",
+                "필수 권한이 변경되어 선택을 적용하지 않았습니다.",
+                "Steam 게임을 선택했습니다. 다른 편집 내용은 유지했습니다.",
+                "요청에 따라 현재 디렉터리를 유지했습니다.",
+                "요청에 따라 현재 디렉터리를 지웠습니다.",
+                "Steam 게임을 선택했습니다. 설치 디렉터리가 없어 현재 디렉터리를 유지했습니다.",
+                "발견된 게임을 선택하면 Steam 앱 ID와 선택적 설치 디렉터리를 사용할 수 있습니다.",
+                "애플리케이션 편집기 섹션",
+                "섹션",
+                "ID 정보",
+                "실행",
+                "설정 재정의",
+                "상속 방식은 필드마다 다릅니다. 필드의 Inherit 옵션이나 안내를 사용하세요. 자동 오디오 선택과 정확히 빈 인코더 문자열은 명시적 값입니다.",
+                "렌더링된 로그 미리보기 복사",
+                "검색 문맥을 포함해 렌더링된 모든 줄을 복사합니다. 원시 로그 내용에 식별 정보가 포함될 수 있습니다.",
+                "렌더링된 로그 미리보기를 클립보드에 복사했습니다.",
+                "렌더링된 로그 미리보기를 복사할 수 없습니다. 이 브라우저 환경에서는 클립보드를 사용하지 못할 수 있습니다.",
             ],
         },
         pl: {
@@ -1982,7 +2512,57 @@ var Amaterasu;
             ],
             ui: [
                 "← Poprzednia", "Następna →", "Odśwież", "Zapisz", "Anuluj", "Zamknij", "Szukaj", "Edytuj", "Usuń",
-                "Spróbuj ponownie", "Nie można wykonać żądania",
+                "Spróbuj ponownie", "Nie można wykonać żądania", "Wybierz grę Steam",
+                "Wybierz",
+                "Szukaj wykrytych gier",
+                "Szukaj według nazwy gry lub ID aplikacji",
+                "Uruchom ponownie",
+                "Wyczyść wyszukiwanie",
+                "Zachowaj bieżący katalog",
+                "Wyczyść bieżący katalog",
+                "Sprawdź pola",
+                "Gry Steam",
+                "ID aplikacji",
+                "Katalog instalacji",
+                "Katalog instalacji jest niedostępny",
+                "Wybierz {name}",
+                "Znaleziono wyniki wśród pierwszych 512 gier. Przejrzyj dalsze strony lub zawęź wyszukiwanie.",
+                "Wyszukiwanie zatrzymało się po pierwszych 512 grach. Przejrzyj dalsze strony lub zawęź wyszukiwanie.",
+                "Sprawdź katalog Steam",
+                "Wybrana gra nie ma katalogu instalacji. Bieżący katalog może należeć do innej gry.",
+                "Zdecyduj, czy zachować lub wyczyścić bieżący katalog, albo sprawdź pola bez stosowania wyboru.",
+                "Wymagane jest uprawnienie odczytu Steam. Możesz ręcznie wpisać ID aplikacji.",
+                "Wczytywanie gier Steam…",
+                "Wybierz wykrytą grę.",
+                "Brak dostępnych gier Steam.",
+                "Steam skanuje. Odśwież później.",
+                "Lista Steam uległa zmianie. Uruchom ponownie, aby wczytać aktualną listę.",
+                "Stronicowanie Steam nie powiodło się. Uruchom ponownie.",
+                "Gry Steam są niedostępne. Spróbuj ponownie lub wpisz ID aplikacji.",
+                "Wyszukiwanie gier Steam…",
+                "Lista uległa zmianie. Uruchom wyszukiwanie ponownie.",
+                "Wyszukiwanie zakończone. Wybierz wykrytą grę.",
+                "Nie znaleziono pasujących gier Steam.",
+                "Wpisz nazwę gry lub ID aplikacji.",
+                "Znaleziono wyniki wśród {count} sprawdzonych gier. Przejrzyj dalsze strony lub zawęź wyszukiwanie.",
+                "Sprawdzono {count} gier na 32 stronach. Przejrzyj dalsze strony lub zawęź wyszukiwanie.",
+                "Wybór nie został zastosowany. Sprawdź pola Steam i wybierz ponownie.",
+                "Zmieniono wymagane uprawnienie; wybór nie został zastosowany.",
+                "Wybrano grę Steam. Pozostałe zmiany zachowano.",
+                "Zgodnie z wyborem zachowano bieżący katalog.",
+                "Zgodnie z wyborem wyczyszczono bieżący katalog.",
+                "Wybrano grę Steam. Brak katalogu instalacji; zachowano bieżący katalog.",
+                "Wybierz wykrytą grę, aby użyć jej identyfikatora aplikacji Steam i opcjonalnego katalogu instalacji.",
+                "Sekcje edytora aplikacji",
+                "SEKCJE",
+                "Tożsamość",
+                "Uruchamianie",
+                "Nadpisania ustawień",
+                "Dziedziczenie zależy od pola. Użyj opcji lub podpowiedzi Inherit; automatyczny wybór dźwięku i dokładnie puste ciągi kodera są wartościami jawnymi.",
+                "Kopiuj wyrenderowany podgląd dziennika",
+                "Kopiowane są wszystkie wyrenderowane wiersze, łącznie z kontekstem wyszukiwania. Surowy dziennik może zawierać dane identyfikujące.",
+                "Wyrenderowany podgląd dziennika skopiowano do schowka.",
+                "Nie udało się skopiować wyrenderowanego podglądu dziennika. Dostęp do schowka może być niedostępny w tym kontekście przeglądarki.",
             ],
         },
         pt: {
@@ -1994,7 +2574,57 @@ var Amaterasu;
             ],
             ui: [
                 "← Anterior", "Próxima →", "Atualizar", "Salvar", "Cancelar", "Fechar", "Pesquisar", "Editar",
-                "Excluir", "Tentar novamente", "Não foi possível concluir a solicitação",
+                "Excluir", "Tentar novamente", "Não foi possível concluir a solicitação", "Escolher jogo Steam",
+                "Selecionar",
+                "Pesquisar jogos detetados",
+                "Pesquisar por nome do jogo ou ID da aplicação",
+                "Reiniciar",
+                "Limpar pesquisa",
+                "Manter diretório atual",
+                "Limpar diretório atual",
+                "Rever campos",
+                "Jogos Steam",
+                "ID da aplicação",
+                "Diretório de instalação",
+                "Diretório de instalação indisponível",
+                "Selecionar {name}",
+                "Foram encontrados resultados nos primeiros 512 jogos. Explore páginas seguintes ou refine a pesquisa.",
+                "A pesquisa parou após os primeiros 512 jogos. Explore páginas seguintes ou refine a pesquisa.",
+                "Rever diretório do Steam",
+                "O jogo escolhido não tem diretório de instalação. O diretório atual pode pertencer a outro jogo.",
+                "Escolha manter ou limpar o diretório atual, ou reveja os campos sem aplicar a seleção.",
+                "É necessária permissão de leitura do Steam. Pode introduzir o ID manualmente.",
+                "A carregar jogos Steam…",
+                "Escolha um jogo detetado.",
+                "Não há jogos Steam disponíveis.",
+                "O Steam está a pesquisar. Atualize mais tarde.",
+                "A lista Steam mudou. Reinicie para carregar a lista atual.",
+                "A paginação do Steam falhou. Reinicie.",
+                "Os jogos Steam estão indisponíveis. Tente novamente ou introduza o ID.",
+                "A pesquisar jogos Steam…",
+                "A lista mudou. Reinicie a pesquisa.",
+                "Pesquisa concluída. Escolha um jogo detetado.",
+                "Não foram encontrados jogos Steam.",
+                "Introduza o nome do jogo ou o ID da aplicação.",
+                "Foram encontradas correspondências entre {count} jogos verificados. Explore páginas seguintes ou refine a pesquisa.",
+                "Foram verificados {count} jogos em 32 páginas. Explore páginas seguintes ou refine a pesquisa.",
+                "A seleção não foi aplicada. Reveja os campos Steam e escolha novamente.",
+                "Uma permissão necessária mudou; a seleção não foi aplicada.",
+                "Jogo Steam selecionado. As restantes alterações foram mantidas.",
+                "Diretório atual mantido conforme escolhido.",
+                "Diretório atual limpo conforme escolhido.",
+                "Jogo Steam selecionado. Sem diretório de instalação; o atual foi mantido.",
+                "Escolha um jogo detetado para usar o respetivo ID de aplicação Steam e o diretório de instalação opcional.",
+                "Secções do editor de aplicações",
+                "SECÇÕES",
+                "Identidade",
+                "Arranque",
+                "Substituições de definições",
+                "A herança depende do campo. Use a opção ou a indicação Inherit; a seleção automática de áudio e as cadeias de codificação exatamente vazias são escolhas explícitas.",
+                "Copiar pré-visualização apresentada do registo",
+                "São copiadas todas as linhas apresentadas, incluindo o contexto da pesquisa. O conteúdo bruto do registo pode conter dados identificativos.",
+                "A pré-visualização apresentada do registo foi copiada para a área de transferência.",
+                "Não foi possível copiar a pré-visualização apresentada do registo. O acesso à área de transferência poderá não estar disponível neste contexto do navegador.",
             ],
         },
         pt_BR: {
@@ -2007,6 +2637,45 @@ var Amaterasu;
             ui: [
                 "← Anterior", "Próxima →", "Atualizar", "Salvar", "Cancelar", "Fechar", "Pesquisar", "Editar",
                 "Excluir", "Tentar novamente", "Não foi possível concluir a solicitação",
+                "Escolher jogo do Steam", "Selecionar", "Pesquisar jogos descobertos", "Pesquisar por nome do jogo ou ID do aplicativo",
+                "Reiniciar", "Limpar pesquisa", "Manter diretório atual", "Limpar diretório atual", "Revisar campos", "Jogos do Steam",
+                "ID do aplicativo", "Diretório de instalação", "Diretório de instalação indisponível", "Selecionar {name}",
+                "Foram encontrados resultados nos primeiros 512 jogos. Navegue pelas páginas seguintes ou refine a pesquisa.",
+                "A pesquisa parou após os primeiros 512 jogos. Navegue pelas páginas seguintes ou refine a pesquisa.", "Revisar diretório do Steam",
+                "O jogo escolhido não tem diretório de instalação. O diretório atual pode pertencer a outro jogo.",
+                "Escolha manter ou limpar o diretório atual, ou revise os campos sem aplicar a seleção.",
+                "É necessária permissão de leitura do Steam. Você pode informar o ID manualmente.",
+                "Carregando jogos do Steam…",
+                "Escolha um jogo encontrado.",
+                "Não há jogos do Steam disponíveis.",
+                "O Steam está pesquisando. Atualize mais tarde.",
+                "A lista do Steam mudou. Reinicie para carregar a lista atual.",
+                "A paginação do Steam falhou. Reinicie.",
+                "Os jogos do Steam estão indisponíveis. Tente novamente ou informe o ID.",
+                "Pesquisando jogos do Steam…",
+                "A lista mudou. Reinicie a pesquisa.",
+                "Pesquisa concluída. Escolha um jogo encontrado.",
+                "Nenhum jogo do Steam corresponde.",
+                "Informe o nome do jogo ou o ID do aplicativo.",
+                "Foram encontradas correspondências entre {count} jogos verificados. Navegue pelas próximas páginas ou refine a pesquisa.",
+                "{count} jogos verificados em 32 páginas. Navegue pelas próximas páginas ou refine a pesquisa.",
+                "A seleção não foi aplicada. Revise os campos do Steam e escolha novamente.",
+                "Uma permissão necessária mudou; a seleção não foi aplicada.",
+                "Jogo do Steam selecionado. As outras alterações foram mantidas.",
+                "Diretório atual mantido conforme sua escolha.",
+                "Diretório atual limpo conforme sua escolha.",
+                "Jogo do Steam selecionado. Sem diretório de instalação; o atual foi mantido.",
+                "Escolha um jogo encontrado para usar o ID do aplicativo Steam e o diretório de instalação opcional.",
+                "Seções do editor de aplicativos",
+                "SEÇÕES",
+                "Identidade",
+                "Inicialização",
+                "Substituições de configurações",
+                "A herança depende do campo. Use a opção ou a indicação Inherit; a seleção automática de áudio e as strings de codificador exatamente vazias são escolhas explícitas.",
+                "Copiar prévia renderizada do log",
+                "Todas as linhas renderizadas são copiadas, inclusive o contexto da busca. O conteúdo bruto do log pode conter dados de identificação.",
+                "A prévia renderizada do log foi copiada para a área de transferência.",
+                "Não foi possível copiar a prévia renderizada do log. O acesso à área de transferência pode não estar disponível neste contexto do navegador.",
             ],
         },
         ru: {
@@ -2017,7 +2686,57 @@ var Amaterasu;
             ],
             ui: [
                 "← Назад", "Далее →", "Обновить", "Сохранить", "Отмена", "Закрыть", "Поиск", "Изменить", "Удалить",
-                "Повторить попытку", "Не удалось выполнить запрос",
+                "Повторить попытку", "Не удалось выполнить запрос", "Выбрать игру Steam",
+                "Выбрать",
+                "Поиск обнаруженных игр",
+                "Поиск по названию игры или ID приложения",
+                "Перезапустить",
+                "Очистить поиск",
+                "Оставить текущую папку",
+                "Очистить текущую папку",
+                "Проверить поля",
+                "Игры Steam",
+                "ID приложения",
+                "Папка установки",
+                "Папка установки недоступна",
+                "Выбрать {name}",
+                "Совпадения найдены среди первых 512 игр. Просмотрите следующие страницы или уточните запрос.",
+                "Поиск остановлен после первых 512 игр. Просмотрите следующие страницы или уточните запрос.",
+                "Проверить папку Steam",
+                "У выбранной игры нет папки установки. Текущая папка может принадлежать другой игре.",
+                "Оставьте или очистите текущую папку либо проверьте поля без применения выбора.",
+                "Требуется разрешение на чтение Steam. ID приложения можно ввести вручную.",
+                "Загрузка игр Steam…",
+                "Выберите найденную игру.",
+                "Игры Steam недоступны.",
+                "Steam выполняет поиск. Обновите позже.",
+                "Список Steam изменился. Перезапустите загрузку актуального списка.",
+                "Не удалось загрузить страницы Steam. Перезапустите.",
+                "Игры Steam недоступны. Повторите попытку или введите ID приложения.",
+                "Поиск игр Steam…",
+                "Список изменился. Перезапустите поиск.",
+                "Поиск завершен. Выберите найденную игру.",
+                "Совпадений с играми Steam нет.",
+                "Введите название игры или ID приложения.",
+                "Совпадения найдены среди {count} проверенных игр. Просмотрите следующие страницы или уточните запрос.",
+                "Проверено {count} игр на 32 страницах. Просмотрите следующие страницы или уточните запрос.",
+                "Выбор не применен. Проверьте поля Steam и выберите снова.",
+                "Необходимое разрешение изменилось; выбор не применен.",
+                "Игра Steam выбрана. Остальные изменения сохранены.",
+                "Текущая папка оставлена по вашему выбору.",
+                "Текущая папка очищена по вашему выбору.",
+                "У игры Steam нет папки установки; текущая папка оставлена.",
+                "Выберите найденную игру, чтобы использовать ее ID приложения Steam и необязательную папку установки.",
+                "Разделы редактора приложения",
+                "РАЗДЕЛЫ",
+                "Идентификация",
+                "Запуск",
+                "Переопределения настроек",
+                "Наследование зависит от поля. Используйте вариант или подсказку Inherit; автоматический выбор аудио и точно пустые строки кодировщика являются явными значениями.",
+                "Копировать отображаемый фрагмент журнала",
+                "Копируются все отображаемые строки, включая контекст поиска. Исходный журнал может содержать идентифицирующие сведения.",
+                "Отображаемый фрагмент журнала скопирован в буфер обмена.",
+                "Не удалось скопировать отображаемый фрагмент журнала. В этом контексте браузера доступ к буферу обмена может быть недоступен.",
             ],
         },
         sv: {
@@ -2028,7 +2747,57 @@ var Amaterasu;
             ],
             ui: [
                 "← Föregående", "Nästa →", "Uppdatera", "Spara", "Avbryt", "Stäng", "Sök", "Redigera", "Ta bort",
-                "Försök igen", "Det gick inte att slutföra begäran",
+                "Försök igen", "Det gick inte att slutföra begäran", "Välj ett Steam-spel",
+                "Välj",
+                "Sök bland upptäckta spel",
+                "Sök efter spelnamn eller app-ID",
+                "Starta om",
+                "Rensa sökning",
+                "Behåll aktuell katalog",
+                "Rensa aktuell katalog",
+                "Granska fält",
+                "Steam-spel",
+                "App-ID",
+                "Installationskatalog",
+                "Installationskatalog saknas",
+                "Välj {name}",
+                "Träffar hittades bland de första 512 spelen. Bläddra på senare sidor eller förfina sökningen.",
+                "Sökningen stoppades efter de första 512 spelen. Bläddra på senare sidor eller förfina sökningen.",
+                "Granska Steam-katalog",
+                "Det valda spelet saknar installationskatalog. Den aktuella katalogen kan tillhöra ett annat spel.",
+                "Välj om den aktuella katalogen ska behållas eller rensas, eller granska fälten utan att tillämpa valet.",
+                "Läsbehörighet till Steam krävs. Du kan ange app-ID:t manuellt.",
+                "Läser in Steam-spel…",
+                "Välj ett upptäckt spel.",
+                "Inga Steam-spel är tillgängliga.",
+                "Steam söker. Uppdatera senare.",
+                "Steam-listan ändrades. Starta om för att läsa in den aktuella listan.",
+                "Steam-sidindelningen misslyckades. Starta om.",
+                "Steam-spel är otillgängliga. Försök igen eller ange app-ID:t.",
+                "Söker efter Steam-spel…",
+                "Listan ändrades. Starta om sökningen.",
+                "Sökningen är klar. Välj ett upptäckt spel.",
+                "Inga Steam-spel matchade.",
+                "Ange ett spelnamn eller app-ID.",
+                "Träffar hittades bland {count} kontrollerade spel. Bläddra på senare sidor eller förfina sökningen.",
+                "{count} spel kontrollerades på 32 sidor. Bläddra på senare sidor eller förfina sökningen.",
+                "Valet tillämpades inte. Granska Steam-fälten och välj igen.",
+                "En nödvändig behörighet ändrades; valet tillämpades inte.",
+                "Steam-spel valt. Övriga ändringar behölls.",
+                "Den aktuella katalogen behölls enligt ditt val.",
+                "Den aktuella katalogen rensades enligt ditt val.",
+                "Steam-spel valt. Installationskatalog saknas; den aktuella behölls.",
+                "Välj ett upptäckt spel för att använda dess Steam-app-ID och valfria installationskatalog.",
+                "Programredigerarens avsnitt",
+                "AVSNITT",
+                "Identitet",
+                "Start",
+                "Inställningsöverskridningar",
+                "Arvet beror på fältet. Använd fältets Inherit-val eller platshållare; automatiskt ljudval och exakt tomma kodarsträngar är uttryckliga värden.",
+                "Kopiera återgiven loggförhandsvisning",
+                "Alla återgivna rader kopieras, inklusive söksammanhanget. Rå loggtext kan innehålla identifierande uppgifter.",
+                "Den återgivna loggförhandsvisningen har kopierats till urklipp.",
+                "Det gick inte att kopiera den återgivna loggförhandsvisningen. Åtkomst till urklipp kanske inte är tillgänglig i den här webbläsarkontexten.",
             ],
         },
         tr: {
@@ -2039,7 +2808,57 @@ var Amaterasu;
             ],
             ui: [
                 "← Önceki", "Sonraki →", "Yenile", "Kaydet", "İptal", "Kapat", "Ara", "Düzenle", "Sil", "Tekrar dene",
-                "İstek tamamlanamadı",
+                "İstek tamamlanamadı", "Steam oyunu seç",
+                "Seç",
+                "Bulunan oyunlarda ara",
+                "Oyun adına veya uygulama kimliğine göre ara",
+                "Yeniden başlat",
+                "Aramayı temizle",
+                "Geçerli dizini koru",
+                "Geçerli dizini temizle",
+                "Alanları gözden geçir",
+                "Steam oyunları",
+                "Uygulama kimliği",
+                "Yükleme dizini",
+                "Yükleme dizini kullanılamıyor",
+                "{name} oyununu seç",
+                "İlk 512 oyunda eşleşmeler bulundu. Sonraki sayfalara göz atın veya aramayı daraltın.",
+                "Arama ilk 512 oyundan sonra durdu. Sonraki sayfalara göz atın veya aramayı daraltın.",
+                "Steam dizinini gözden geçir",
+                "Seçilen oyunun yükleme dizini yok. Geçerli dizin başka bir oyuna ait olabilir.",
+                "Geçerli dizini tutmayı veya temizlemeyi seçin ya da seçimi uygulamadan alanları gözden geçirin.",
+                "Steam okuma izni gerekiyor. Uygulama kimliğini elle girebilirsiniz.",
+                "Steam oyunları yükleniyor…",
+                "Bulunan bir oyunu seçin.",
+                "Kullanılabilir Steam oyunu yok.",
+                "Steam tarıyor. Daha sonra yenileyin.",
+                "Steam listesi değişti. Güncel listeyi yüklemek için yeniden başlatın.",
+                "Steam sayfaları yüklenemedi. Yeniden başlatın.",
+                "Steam oyunları kullanılamıyor. Yeniden deneyin veya kimliği girin.",
+                "Steam oyunları aranıyor…",
+                "Liste değişti. Aramayı yeniden başlatın.",
+                "Arama tamamlandı. Bulunan bir oyunu seçin.",
+                "Eşleşen Steam oyunu yok.",
+                "Oyun adını veya uygulama kimliğini girin.",
+                "Kontrol edilen {count} oyunda eşleşmeler bulundu. Sonraki sayfalara göz atın veya aramayı daraltın.",
+                "32 sayfada {count} oyun kontrol edildi. Sonraki sayfalara göz atın veya aramayı daraltın.",
+                "Seçim uygulanmadı. Steam alanlarını gözden geçirip yeniden seçin.",
+                "Gerekli bir izin değişti; seçim uygulanmadı.",
+                "Steam oyunu seçildi. Diğer düzenlemeler korundu.",
+                "Geçerli dizin seçiminize göre korundu.",
+                "Geçerli dizin seçiminize göre temizlendi.",
+                "Steam oyunu seçildi. Yükleme dizini yok; geçerli dizin korundu.",
+                "Steam uygulama kimliğini ve isteğe bağlı yükleme dizinini kullanmak için bulunan bir oyunu seçin.",
+                "Uygulama düzenleyici bölümleri",
+                "BÖLÜMLER",
+                "Kimlik",
+                "Başlatma",
+                "Ayar geçersiz kılmaları",
+                "Devralma alan bazında değişir. Alanın Inherit seçeneğini veya ipucunu kullanın; otomatik ses seçimi ve tamamen boş kodlayıcı dizeleri açık değerlerdir.",
+                "Oluşturulan günlük önizlemesini kopyala",
+                "Arama bağlamı dahil oluşturulan tüm satırlar kopyalanır. Ham günlük içeriği kimlik belirleyici bilgiler içerebilir.",
+                "Oluşturulan günlük önizlemesi panoya kopyalandı.",
+                "Oluşturulan günlük önizlemesi kopyalanamadı. Bu tarayıcı bağlamında pano erişimi kullanılamıyor olabilir.",
             ],
         },
         uk: {
@@ -2051,7 +2870,57 @@ var Amaterasu;
             ],
             ui: [
                 "← Назад", "Далі →", "Оновити", "Зберегти", "Скасувати", "Закрити", "Пошук", "Редагувати", "Видалити",
-                "Спробувати знову", "Не вдалося виконати запит",
+                "Спробувати знову", "Не вдалося виконати запит", "Вибрати гру Steam",
+                "Вибрати",
+                "Пошук знайдених ігор",
+                "Пошук за назвою гри або ID програми",
+                "Перезапустити",
+                "Очистити пошук",
+                "Залишити поточний каталог",
+                "Очистити поточний каталог",
+                "Переглянути поля",
+                "Ігри Steam",
+                "ID програми",
+                "Каталог встановлення",
+                "Каталог встановлення недоступний",
+                "Вибрати {name}",
+                "Збіги знайдено серед перших 512 ігор. Перегляньте наступні сторінки або уточніть пошук.",
+                "Пошук зупинено після перших 512 ігор. Перегляньте наступні сторінки або уточніть пошук.",
+                "Переглянути каталог Steam",
+                "У вибраної гри немає каталогу встановлення. Поточний каталог може належати іншій грі.",
+                "Залиште або очистьте поточний каталог чи перегляньте поля без застосування вибору.",
+                "Потрібен дозвіл на читання Steam. ID програми можна ввести вручну.",
+                "Завантаження ігор Steam…",
+                "Виберіть знайдену гру.",
+                "Ігри Steam недоступні.",
+                "Steam виконує пошук. Оновіть пізніше.",
+                "Список Steam змінився. Перезапустіть, щоб завантажити актуальний список.",
+                "Не вдалося завантажити сторінки Steam. Перезапустіть.",
+                "Ігри Steam недоступні. Спробуйте ще раз або введіть ID програми.",
+                "Пошук ігор Steam…",
+                "Список змінився. Перезапустіть пошук.",
+                "Пошук завершено. Виберіть знайдену гру.",
+                "Збігів з іграми Steam немає.",
+                "Введіть назву гри або ID програми.",
+                "Збіги знайдено серед {count} перевірених ігор. Перегляньте наступні сторінки або уточніть пошук.",
+                "Перевірено {count} ігор на 32 сторінках. Перегляньте наступні сторінки або уточніть пошук.",
+                "Вибір не застосовано. Перевірте поля Steam і виберіть знову.",
+                "Необхідний дозвіл змінився; вибір не застосовано.",
+                "Гру Steam вибрано. Інші зміни збережено.",
+                "Поточний каталог залишено за вашим вибором.",
+                "Поточний каталог очищено за вашим вибором.",
+                "У гри Steam немає каталогу встановлення; поточний каталог залишено.",
+                "Виберіть знайдену гру, щоб використати її ID програми Steam і необов’язковий каталог встановлення.",
+                "Розділи редактора програми",
+                "РОЗДІЛИ",
+                "Ідентифікація",
+                "Запуск",
+                "Перевизначення налаштувань",
+                "Успадкування залежить від поля. Використовуйте варіант або підказку Inherit; автоматичний вибір аудіо й точно порожні рядки кодера є явними значеннями.",
+                "Копіювати відображений попередній перегляд журналу",
+                "Копіюються всі відображені рядки, зокрема контекст пошуку. Необроблений журнал може містити ідентифікаційні дані.",
+                "Відображений попередній перегляд журналу скопійовано до буфера обміну.",
+                "Не вдалося скопіювати відображений попередній перегляд журналу. У цьому контексті браузера доступ до буфера обміну може бути недоступний.",
             ],
         },
         vi: {
@@ -2063,7 +2932,57 @@ var Amaterasu;
             ],
             ui: [
                 "← Trước", "Tiếp →", "Làm mới", "Lưu", "Hủy", "Đóng", "Tìm kiếm", "Chỉnh sửa", "Xóa", "Thử lại",
-                "Không thể hoàn tất yêu cầu",
+                "Không thể hoàn tất yêu cầu", "Chọn trò chơi Steam",
+                "Chọn",
+                "Tìm trò chơi đã phát hiện",
+                "Tìm theo tên trò chơi hoặc ID ứng dụng",
+                "Khởi động lại",
+                "Xóa tìm kiếm",
+                "Giữ thư mục hiện tại",
+                "Xóa thư mục hiện tại",
+                "Xem lại các trường",
+                "Trò chơi Steam",
+                "ID ứng dụng",
+                "Thư mục cài đặt",
+                "Không có thư mục cài đặt",
+                "Chọn {name}",
+                "Đã tìm thấy kết quả trong 512 trò chơi đầu tiên. Hãy duyệt các trang sau hoặc thu hẹp tìm kiếm.",
+                "Đã dừng tìm kiếm sau 512 trò chơi đầu tiên. Hãy duyệt các trang sau hoặc thu hẹp tìm kiếm.",
+                "Xem lại thư mục Steam",
+                "Trò chơi đã chọn không có thư mục cài đặt. Thư mục hiện tại có thể thuộc trò chơi khác.",
+                "Chọn giữ hoặc xóa thư mục hiện tại, hoặc xem lại các trường mà không áp dụng lựa chọn.",
+                "Cần quyền đọc Steam. Bạn có thể nhập ID ứng dụng thủ công.",
+                "Đang tải trò chơi Steam…",
+                "Chọn trò chơi đã tìm thấy.",
+                "Không có trò chơi Steam khả dụng.",
+                "Steam đang quét. Hãy làm mới sau.",
+                "Danh sách Steam đã thay đổi. Khởi động lại để tải danh sách hiện tại.",
+                "Không thể tải trang Steam. Hãy khởi động lại.",
+                "Trò chơi Steam không khả dụng. Thử lại hoặc nhập ID ứng dụng.",
+                "Đang tìm trò chơi Steam…",
+                "Danh sách đã thay đổi. Khởi động lại tìm kiếm.",
+                "Đã tìm kiếm xong. Chọn trò chơi đã tìm thấy.",
+                "Không có trò chơi Steam phù hợp.",
+                "Nhập tên trò chơi hoặc ID ứng dụng.",
+                "Tìm thấy kết quả trong {count} trò chơi đã kiểm tra. Hãy duyệt các trang sau hoặc thu hẹp tìm kiếm.",
+                "Đã kiểm tra {count} trò chơi trong 32 trang. Hãy duyệt các trang sau hoặc thu hẹp tìm kiếm.",
+                "Chưa áp dụng lựa chọn. Xem lại các trường Steam và chọn lại.",
+                "Quyền bắt buộc đã thay đổi; lựa chọn chưa được áp dụng.",
+                "Đã chọn trò chơi Steam. Các chỉnh sửa khác được giữ nguyên.",
+                "Đã giữ thư mục hiện tại theo lựa chọn của bạn.",
+                "Đã xóa thư mục hiện tại theo lựa chọn của bạn.",
+                "Trò chơi Steam không có thư mục cài đặt; đã giữ thư mục hiện tại.",
+                "Chọn trò chơi đã tìm thấy để dùng ID ứng dụng Steam và thư mục cài đặt tùy chọn của trò chơi.",
+                "Các mục của trình chỉnh sửa ứng dụng",
+                "CÁC MỤC",
+                "Danh tính",
+                "Khởi chạy",
+                "Ghi đè cài đặt",
+                "Cách kế thừa tùy theo trường. Hãy dùng tùy chọn hoặc gợi ý Inherit của trường; lựa chọn âm thanh tự động và chuỗi bộ mã hóa rỗng chính xác là giá trị tường minh.",
+                "Sao chép bản xem trước nhật ký đã hiển thị",
+                "Sao chép mọi dòng đang hiển thị, bao gồm ngữ cảnh tìm kiếm. Nội dung nhật ký thô có thể chứa thông tin nhận dạng.",
+                "Đã sao chép bản xem trước nhật ký đã hiển thị vào bảng tạm.",
+                "Không thể sao chép bản xem trước nhật ký đã hiển thị. Có thể không truy cập được bảng tạm trong ngữ cảnh trình duyệt này.",
             ],
         },
         zh: {
@@ -2073,7 +2992,57 @@ var Amaterasu;
                 "此语言会翻译导航菜单和部分标签；其他文本将以英语显示。",
             ],
             ui: [
-                "← 上一页", "下一页 →", "刷新", "保存", "取消", "关闭", "搜索", "编辑", "删除", "重试", "无法完成请求",
+                "← 上一页", "下一页 →", "刷新", "保存", "取消", "关闭", "搜索", "编辑", "删除", "重试", "无法完成请求", "选择 Steam 游戏",
+                "选择",
+                "搜索已发现的游戏",
+                "按游戏名称或应用 ID 搜索",
+                "重新开始",
+                "清除搜索",
+                "保留当前目录",
+                "清除当前目录",
+                "检查字段",
+                "Steam 游戏",
+                "应用 ID",
+                "安装目录",
+                "安装目录不可用",
+                "选择 {name}",
+                "前 512 个游戏中找到匹配项。请浏览后续页面或缩小搜索范围。",
+                "搜索已在前 512 个游戏后停止。请浏览后续页面或缩小搜索范围。",
+                "检查 Steam 目录",
+                "所选游戏没有安装目录。当前目录可能属于其他游戏。",
+                "选择保留或清除当前目录，也可以查看字段而不应用选择。",
+                "需要 Steam 读取权限。你可以手动输入应用 ID。",
+                "正在加载 Steam 游戏…",
+                "选择已发现的游戏。",
+                "没有可用的 Steam 游戏。",
+                "Steam 正在扫描。稍后刷新。",
+                "Steam 游戏列表已更改。重新开始以加载当前列表。",
+                "Steam 分页失败。请重新开始。",
+                "Steam 游戏不可用。请重试或输入应用 ID。",
+                "正在搜索 Steam 游戏…",
+                "列表已更改。重新开始搜索。",
+                "搜索完成。选择已发现的游戏。",
+                "没有匹配的 Steam 游戏。",
+                "输入游戏名称或应用 ID。",
+                "在已检查的 {count} 个游戏中找到匹配项。请浏览后续页面或缩小搜索范围。",
+                "已在 32 页中检查 {count} 个游戏。请浏览后续页面或缩小搜索范围。",
+                "未应用所选内容。请检查 Steam 字段并重新选择。",
+                "所需权限已更改；未应用所选内容。",
+                "已选择 Steam 游戏。保留了其他编辑内容。",
+                "按你的选择保留当前目录。",
+                "按你的选择清除了当前目录。",
+                "已选择 Steam 游戏。没有安装目录；保留了当前目录。",
+                "选择已发现的游戏，以使用其 Steam 应用 ID 和可选安装目录。",
+                "应用编辑器分区",
+                "分区",
+                "身份",
+                "启动",
+                "设置覆盖",
+                "继承方式因字段而异。请使用字段的 Inherit 选项或提示；自动音频选择和精确的空编码器字符串都是明确值。",
+                "复制已渲染的日志预览",
+                "复制所有已渲染的行，包括搜索上下文。原始日志内容可能包含身份识别信息。",
+                "已将已渲染的日志预览复制到剪贴板。",
+                "无法复制已渲染的日志预览。此浏览器上下文可能无法使用剪贴板。",
             ],
         },
         zh_TW: {
@@ -2084,6 +3053,44 @@ var Amaterasu;
             ],
             ui: [
                 "← 上一頁", "下一頁 →", "重新整理", "儲存", "取消", "關閉", "搜尋", "編輯", "刪除", "重試", "無法完成要求",
+                "選擇 Steam 遊戲", "選擇", "搜尋已發現的遊戲", "依遊戲名稱或應用程式 ID 搜尋", "重新開始", "清除搜尋",
+                "保留目前目錄", "清除目前目錄", "檢查欄位", "Steam 遊戲", "應用程式 ID", "安裝目錄", "無法使用安裝目錄",
+                "選擇 {name}", "在前 512 個遊戲中找到相符項目。請瀏覽後續頁面或縮小搜尋範圍。",
+                "搜尋已在前 512 個遊戲後停止。請瀏覽後續頁面或縮小搜尋範圍。", "檢查 Steam 目錄",
+                "所選遊戲沒有安裝目錄。目前的目錄可能屬於其他遊戲。",
+                "選擇保留或清除目前目錄，也可以檢查欄位而不套用選擇。",
+                "需要 Steam 讀取權限。您可以手動輸入應用程式 ID。",
+                "正在載入 Steam 遊戲…",
+                "選擇已找到的遊戲。",
+                "沒有可用的 Steam 遊戲。",
+                "Steam 正在掃描。請稍後重新整理。",
+                "Steam 遊戲清單已變更。重新開始以載入目前清單。",
+                "Steam 分頁失敗。請重新開始。",
+                "Steam 遊戲無法使用。請重試或輸入應用程式 ID。",
+                "正在搜尋 Steam 遊戲…",
+                "清單已變更。重新開始搜尋。",
+                "搜尋完成。選擇已找到的遊戲。",
+                "沒有相符的 Steam 遊戲。",
+                "輸入遊戲名稱或應用程式 ID。",
+                "在已檢查的 {count} 個遊戲中找到相符項目。請瀏覽後續頁面或縮小搜尋範圍。",
+                "已在 32 頁中檢查 {count} 個遊戲。請瀏覽後續頁面或縮小搜尋範圍。",
+                "未套用所選項目。請檢查 Steam 欄位並重新選擇。",
+                "必要權限已變更；未套用所選項目。",
+                "已選擇 Steam 遊戲。保留其他編輯內容。",
+                "依照您的選擇保留目前目錄。",
+                "依照您的選擇清除目前目錄。",
+                "已選擇 Steam 遊戲。沒有安裝目錄；保留目前目錄。",
+                "選擇已找到的遊戲，以使用其 Steam 應用程式 ID 和選用安裝目錄。",
+                "應用程式編輯器區段",
+                "區段",
+                "識別資訊",
+                "啟動",
+                "設定覆寫",
+                "繼承方式依欄位而異。請使用欄位的 Inherit 選項或提示；自動音訊選擇與完全空白的編碼器字串都是明確值。",
+                "複製已呈現的記錄預覽",
+                "複製所有已呈現的行，包括搜尋內容。原始記錄可能含有可識別個人身分的資訊。",
+                "已將已呈現的記錄預覽複製到剪貼簿。",
+                "無法複製已呈現的記錄預覽。此瀏覽器環境可能無法使用剪貼簿。",
             ],
         },
     };
@@ -2162,6 +3169,122 @@ var Amaterasu;
         zh_TW: [
             "工作區", "開發預覽版", "本地主機管理主控台", "串流功能仍在開發中。", "切換導覽選單",
         ],
+    };
+    const pairedClientTranslations = {
+        bg: {
+            "Search paired clients": "Търсене на сдвоени клиенти", "Sort by": "Сортиране по",
+            "Recently paired": "Наскоро сдвоени", "No paired clients match this search.": "Няма сдвоени клиенти, отговарящи на търсенето.",
+            "Showing {visible} of {total} paired client": "Показване на {visible} от {total} сдвоен клиент",
+            "Showing {visible} of {total} paired clients": "Показване на {visible} от {total} сдвоени клиенти",
+        },
+        cs: {
+            "Search paired clients": "Hledat spárované klienty", "Sort by": "Řadit podle",
+            "Recently paired": "Nedávno spárovaní", "No paired clients match this search.": "Hledání neodpovídají žádní spárovaní klienti.",
+            "Showing {visible} of {total} paired client": "Zobrazen {visible} z {total} spárovaného klienta",
+            "Showing {visible} of {total} paired clients": "Zobrazeno {visible} z {total} spárovaných klientů",
+        },
+        de: {
+            "Search paired clients": "Gekoppelte Clients suchen", "Sort by": "Sortieren nach",
+            "Recently paired": "Zuletzt gekoppelt", "No paired clients match this search.": "Keine gekoppelten Clients entsprechen dieser Suche.",
+            "Showing {visible} of {total} paired client": "{visible} von {total} gekoppelten Clients werden angezeigt",
+            "Showing {visible} of {total} paired clients": "{visible} von {total} gekoppelten Clients werden angezeigt",
+        },
+        es: {
+            "Search paired clients": "Buscar clientes emparejados", "Sort by": "Ordenar por",
+            "Recently paired": "Emparejados recientemente", "No paired clients match this search.": "Ningún cliente emparejado coincide con esta búsqueda.",
+            "Showing {visible} of {total} paired client": "Se muestra {visible} de {total} cliente emparejado",
+            "Showing {visible} of {total} paired clients": "Se muestran {visible} de {total} clientes emparejados",
+        },
+        fr: {
+            "Search paired clients": "Rechercher des clients associés", "Sort by": "Trier par",
+            "Recently paired": "Associés récemment", "No paired clients match this search.": "Aucun client associé ne correspond à cette recherche.",
+            "Showing {visible} of {total} paired client": "Affichage de {visible} sur {total} client associé",
+            "Showing {visible} of {total} paired clients": "Affichage de {visible} sur {total} clients associés",
+        },
+        hu: {
+            "Search paired clients": "Párosított kliensek keresése", "Sort by": "Rendezés",
+            "Recently paired": "Legutóbb párosított", "No paired clients match this search.": "Nincs a keresésnek megfelelő párosított kliens.",
+            "Showing {visible} of {total} paired client": "{visible}/{total} párosított kliens megjelenítve",
+            "Showing {visible} of {total} paired clients": "{visible}/{total} párosított kliens megjelenítve",
+        },
+        it: {
+            "Search paired clients": "Cerca client associati", "Sort by": "Ordina per",
+            "Recently paired": "Associati di recente", "No paired clients match this search.": "Nessun client associato corrisponde alla ricerca.",
+            "Showing {visible} of {total} paired client": "Visualizzazione di {visible} client associato su {total}",
+            "Showing {visible} of {total} paired clients": "Visualizzazione di {visible} client associati su {total}",
+        },
+        ja: {
+            "Search paired clients": "ペアリング済みクライアントを検索", "Sort by": "並べ替え",
+            "Recently paired": "最近ペアリングした順", "No paired clients match this search.": "検索に一致するペアリング済みクライアントはありません。",
+            "Showing {visible} of {total} paired client": "{total} 台中 {visible} 台のペアリング済みクライアントを表示",
+            "Showing {visible} of {total} paired clients": "{total} 台中 {visible} 台のペアリング済みクライアントを表示",
+        },
+        ko: {
+            "Search paired clients": "페어링된 클라이언트 검색", "Sort by": "정렬 기준",
+            "Recently paired": "최근 페어링 순", "No paired clients match this search.": "검색과 일치하는 페어링된 클라이언트가 없습니다.",
+            "Showing {visible} of {total} paired client": "{total}개 중 {visible}개의 페어링된 클라이언트 표시",
+            "Showing {visible} of {total} paired clients": "{total}개 중 {visible}개의 페어링된 클라이언트 표시",
+        },
+        pl: {
+            "Search paired clients": "Szukaj sparowanych klientów", "Sort by": "Sortuj według",
+            "Recently paired": "Ostatnio sparowani", "No paired clients match this search.": "Brak sparowanych klientów pasujących do wyszukiwania.",
+            "Showing {visible} of {total} paired client": "Wyświetlanie {visible} z {total} sparowanego klienta",
+            "Showing {visible} of {total} paired clients": "Wyświetlanie {visible} z {total} sparowanych klientów",
+        },
+        pt: {
+            "Search paired clients": "Pesquisar clientes emparelhados", "Sort by": "Ordenar por",
+            "Recently paired": "Emparelhados recentemente", "No paired clients match this search.": "Nenhum cliente emparelhado corresponde a esta pesquisa.",
+            "Showing {visible} of {total} paired client": "A mostrar {visible} de {total} cliente emparelhado",
+            "Showing {visible} of {total} paired clients": "A mostrar {visible} de {total} clientes emparelhados",
+        },
+        pt_BR: {
+            "Search paired clients": "Buscar clientes pareados", "Sort by": "Ordenar por",
+            "Recently paired": "Pareados recentemente", "No paired clients match this search.": "Nenhum cliente pareado corresponde a esta busca.",
+            "Showing {visible} of {total} paired client": "Exibindo {visible} de {total} cliente pareado",
+            "Showing {visible} of {total} paired clients": "Exibindo {visible} de {total} clientes pareados",
+        },
+        ru: {
+            "Search paired clients": "Поиск сопряжённых клиентов", "Sort by": "Сортировать по",
+            "Recently paired": "Недавно сопряжённые", "No paired clients match this search.": "Нет сопряжённых клиентов, соответствующих запросу.",
+            "Showing {visible} of {total} paired client": "Показано {visible} из {total} сопряжённых клиентов",
+            "Showing {visible} of {total} paired clients": "Показано {visible} из {total} сопряжённых клиентов",
+        },
+        sv: {
+            "Search paired clients": "Sök parkopplade klienter", "Sort by": "Sortera efter",
+            "Recently paired": "Nyligen parkopplade", "No paired clients match this search.": "Inga parkopplade klienter matchar sökningen.",
+            "Showing {visible} of {total} paired client": "Visar {visible} av {total} parkopplad klient",
+            "Showing {visible} of {total} paired clients": "Visar {visible} av {total} parkopplade klienter",
+        },
+        tr: {
+            "Search paired clients": "Eşleştirilmiş istemcileri ara", "Sort by": "Sıralama ölçütü",
+            "Recently paired": "Son eşleştirilenler", "No paired clients match this search.": "Bu aramayla eşleşen eşleştirilmiş istemci yok.",
+            "Showing {visible} of {total} paired client": "{total} eşleştirilmiş istemciden {visible} tanesi gösteriliyor",
+            "Showing {visible} of {total} paired clients": "{total} eşleştirilmiş istemciden {visible} tanesi gösteriliyor",
+        },
+        uk: {
+            "Search paired clients": "Шукати сполучені клієнти", "Sort by": "Сортувати за",
+            "Recently paired": "Нещодавно сполучені", "No paired clients match this search.": "Немає сполучених клієнтів, що відповідають запиту.",
+            "Showing {visible} of {total} paired client": "Показано {visible} з {total} сполученого клієнта",
+            "Showing {visible} of {total} paired clients": "Показано {visible} з {total} сполучених клієнтів",
+        },
+        vi: {
+            "Search paired clients": "Tìm ứng dụng khách đã ghép nối", "Sort by": "Sắp xếp theo",
+            "Recently paired": "Được ghép nối gần đây", "No paired clients match this search.": "Không có ứng dụng khách đã ghép nối nào khớp với tìm kiếm.",
+            "Showing {visible} of {total} paired client": "Đang hiển thị {visible}/{total} ứng dụng khách đã ghép nối",
+            "Showing {visible} of {total} paired clients": "Đang hiển thị {visible}/{total} ứng dụng khách đã ghép nối",
+        },
+        zh: {
+            "Search paired clients": "搜索已配对客户端", "Sort by": "排序方式",
+            "Recently paired": "最近配对", "No paired clients match this search.": "没有符合此搜索条件的已配对客户端。",
+            "Showing {visible} of {total} paired client": "显示 {total} 个已配对客户端中的 {visible} 个",
+            "Showing {visible} of {total} paired clients": "显示 {total} 个已配对客户端中的 {visible} 个",
+        },
+        zh_TW: {
+            "Search paired clients": "搜尋已配對的用戶端", "Sort by": "排序依據",
+            "Recently paired": "最近配對", "No paired clients match this search.": "沒有符合此搜尋條件的已配對用戶端。",
+            "Showing {visible} of {total} paired client": "顯示 {total} 個已配對用戶端中的 {visible} 個",
+            "Showing {visible} of {total} paired clients": "顯示 {total} 個已配對用戶端中的 {visible} 個",
+        },
     };
     const productTranslations = {
         bg: {
@@ -2325,6 +3448,63 @@ var Amaterasu;
             "Core console labels and selected notices are translated; some descriptions remain English.": "Las etiquetas principales y algunos avisos están traducidos; algunas descripciones siguen en inglés.",
         },
         fr: {
+            "Choose excluded Steam games": "Choisir les jeux Steam à exclure",
+            "Search discoveries and select games to exclude. Existing name-only or unavailable exclusions are preserved.": "Recherchez les jeux détectés et sélectionnez ceux à exclure. Les exclusions existantes sans nom ou indisponibles sont conservées.",
+            "Search Steam games": "Rechercher des jeux Steam",
+            "Search games": "Rechercher des jeux",
+            "Steam discovery is unavailable without steam.read permission. Saved exclusions can still be edited.": "La découverte Steam est indisponible sans l’autorisation steam.read. Les exclusions enregistrées restent modifiables.",
+            "Loading Steam games…": "Chargement des jeux Steam…",
+            "Steam game list has not been loaded.": "La liste des jeux Steam n’a pas été chargée.",
+            "Steam games could not be loaded. Your current draft is preserved.": "Impossible de charger les jeux Steam. Votre brouillon actuel est conservé.",
+            "Current exclusions": "Exclusions actuelles",
+            "Current Steam exclusions": "Exclusions Steam actuelles",
+            "Load more games": "Charger plus de jeux",
+            "Retry loading games": "Réessayer de charger les jeux",
+            "Steam app {appId}": "Application Steam {appId}",
+            "Name-only exclusion": "Exclusion par nom uniquement",
+            "Edit excluded Steam app ID": "Modifier l’identifiant d’application Steam exclu",
+            "Optional Steam app ID": "Identifiant d’application Steam facultatif",
+            "Edit excluded Steam game name": "Modifier le nom du jeu Steam exclu",
+            "Edit name-only Steam exclusion": "Modifier l’exclusion Steam par nom uniquement",
+            "Remove exclusion": "Supprimer l’exclusion",
+            "Remove exclusion {index}": "Supprimer l’exclusion {index}",
+            "You can exclude up to 256 Steam games. Remove an exclusion before adding another.": "Vous pouvez exclure jusqu’à 256 jeux Steam. Supprimez une exclusion avant d’en ajouter une autre.",
+            "{matchingCount} matching loaded games · {exclusionCount} exclusions": "{matchingCount} jeux chargés correspondants · {exclusionCount} exclusions",
+            "{matchingCount} matching loaded games; {exclusionCount} exclusions": "{matchingCount} jeux chargés correspondants ; {exclusionCount} exclusions",
+            "No matching Steam games on loaded pages.": "Aucun jeu Steam correspondant dans les pages chargées.",
+            "No Steam discoveries are available.": "Aucun jeu Steam détecté n’est disponible.",
+            "The Steam list changed while paging; restarted at the latest revision.": "La liste Steam a changé pendant le chargement. La pagination a repris à la dernière révision.",
+            "Steam scan is still in progress.": "L’analyse Steam est toujours en cours.",
+            "Steam scan is incomplete; existing exclusions are preserved.": "L’analyse Steam est incomplète ; les exclusions existantes sont conservées.",
+            "Add item": "Ajouter un élément",
+            "Remove {label} item {index}": "Supprimer l’élément {label} {index}",
+            "This list can contain at most {maxItems} items.": "Cette liste peut contenir au maximum {maxItems} éléments.",
+            "Add, edit, or remove list values. Unknown values are kept in their current order.": "Ajoutez, modifiez ou supprimez des valeurs. Les valeurs inconnues conservent leur ordre actuel.",
+            "Enter a value for the new item.": "Saisissez une valeur pour le nouvel élément.",
+            "This value is invalid.": "Cette valeur n’est pas valide.",
+            "Resolve invalid list entries before reading their values.": "Corrigez les éléments non valides avant de lire les valeurs de la liste.",
+            "Settings changed elsewhere. Your draft is preserved; review it before saving again.": "Les paramètres ont été modifiés ailleurs. Votre brouillon est conservé ; vérifiez-le avant de réessayer.",
+            "Steam save could not be confirmed. Your submitted draft is preserved for review against the latest saved values.": "L’enregistrement Steam n’a pas pu être confirmé. Votre brouillon soumis est conservé pour comparaison avec les dernières valeurs enregistrées.",
+            "Lutris save could not be confirmed. Your submitted draft is preserved for review against the latest saved values.": "L’enregistrement Lutris n’a pas pu être confirmé. Votre brouillon soumis est conservé pour comparaison avec les dernières valeurs enregistrées.",
+            "Playnite save could not be confirmed. Your draft is preserved for review against the latest saved values.": "L’enregistrement Playnite n’a pas pu être confirmé. Votre brouillon est conservé pour comparaison avec les dernières valeurs enregistrées.",
+            "Steam app IDs must be canonical nonzero decimal strings.": "Les identifiants d’application Steam doivent être des nombres décimaux canoniques non nuls.",
+            "Each Lutris exclusion needs a positive ID or a name.": "Chaque exclusion Lutris doit contenir un identifiant positif ou un nom.",
+            "Excluded Lutris games": "Jeux Lutris exclus",
+            "Included categories": "Catégories incluses",
+            "Excluded categories": "Catégories exclues",
+            "Included plugin IDs": "Identifiants des extensions incluses",
+            "Excluded plugin IDs": "Identifiants des extensions exclues",
+            "Excluded game IDs": "Identifiants des jeux exclus",
+            "Steam settings saved and confirmed. Scan status is shown below.": "Paramètres Steam enregistrés et confirmés. L’état de l’analyse est affiché ci-dessous.",
+            "Steam settings saved and confirmed. Steam discovery remains enabled by Linux host policy; scan status is shown below.": "Paramètres Steam enregistrés et confirmés. La détection Steam reste activée par la politique de l’hôte Linux ; l’état de l’analyse est affiché ci-dessous.",
+            "Steam settings changed elsewhere. Your draft is preserved for review.": "Les paramètres Steam ont été modifiés ailleurs. Votre brouillon est conservé pour vérification.",
+            "Steam save could not be confirmed. Review your preserved draft against the latest saved values before saving again.": "L’enregistrement Steam n’a pas pu être confirmé. Comparez votre brouillon conservé aux dernières valeurs enregistrées avant de réessayer.",
+            "Lutris settings saved and confirmed. Scan status is shown below.": "Paramètres Lutris enregistrés et confirmés. L’état de l’analyse est affiché ci-dessous.",
+            "Lutris settings changed elsewhere. Your draft is preserved for review.": "Les paramètres Lutris ont été modifiés ailleurs. Votre brouillon est conservé pour vérification.",
+            "Lutris save could not be confirmed. Review your preserved draft against the latest saved values before saving again.": "L’enregistrement Lutris n’a pas pu être confirmé. Comparez votre brouillon conservé aux dernières valeurs enregistrées avant de réessayer.",
+            "Playnite settings saved and confirmed. Runtime status is shown below.": "Paramètres Playnite enregistrés et confirmés. L’état d’exécution est affiché ci-dessous.",
+            "Playnite settings changed elsewhere. Your draft is preserved for review.": "Les paramètres Playnite ont été modifiés ailleurs. Votre brouillon est conservé pour vérification.",
+            "Playnite save could not be confirmed. Review your preserved draft against the latest saved values before saving again.": "L’enregistrement Playnite n’a pas pu être confirmé. Comparez votre brouillon conservé aux dernières valeurs enregistrées avant de réessayer.",
             "Host overview": "Vue d’ensemble de l’hôte", "Your host, your library": "Votre hôte, votre bibliothèque",
             "A home for your applications.": "Un espace pour vos applications.",
             "Your applications, sessions, and local services in one place.": "Vos applications, sessions et services locaux réunis au même endroit.",
@@ -2445,6 +3625,63 @@ var Amaterasu;
             "Core console labels and selected notices are translated; some descriptions remain English.": "Le etichette principali e alcuni avvisi sono tradotti; alcune descrizioni restano in inglese.",
         },
         ja: {
+            "Choose excluded Steam games": "除外する Steam ゲームを選択",
+            "Search discoveries and select games to exclude. Existing name-only or unavailable exclusions are preserved.": "検出されたゲームを検索して除外対象を選択します。名前のみ、または利用できない既存の除外項目は保持されます。",
+            "Search Steam games": "Steam ゲームを検索",
+            "Search games": "ゲームを検索",
+            "Steam discovery is unavailable without steam.read permission. Saved exclusions can still be edited.": "steam.read 権限がないため Steam の検出一覧は利用できません。保存済みの除外項目は引き続き編集できます。",
+            "Loading Steam games…": "Steam ゲームを読み込み中…",
+            "Steam game list has not been loaded.": "Steam ゲーム一覧はまだ読み込まれていません。",
+            "Steam games could not be loaded. Your current draft is preserved.": "Steam ゲームを読み込めませんでした。現在の下書きは保持されています。",
+            "Current exclusions": "現在の除外項目",
+            "Current Steam exclusions": "現在の Steam 除外項目",
+            "Load more games": "さらにゲームを読み込む",
+            "Retry loading games": "ゲームの読み込みを再試行",
+            "Steam app {appId}": "Steam アプリ {appId}",
+            "Name-only exclusion": "名前のみの除外項目",
+            "Edit excluded Steam app ID": "除外する Steam アプリ ID を編集",
+            "Optional Steam app ID": "任意の Steam アプリ ID",
+            "Edit excluded Steam game name": "除外する Steam ゲーム名を編集",
+            "Edit name-only Steam exclusion": "名前のみの Steam 除外項目を編集",
+            "Remove exclusion": "除外項目を削除",
+            "Remove exclusion {index}": "除外項目 {index} を削除",
+            "You can exclude up to 256 Steam games. Remove an exclusion before adding another.": "Steam ゲームは最大 256 件まで除外できます。追加する前に既存の項目を削除してください。",
+            "{matchingCount} matching loaded games · {exclusionCount} exclusions": "一致した読み込み済みゲーム {matchingCount} 件 · 除外 {exclusionCount} 件",
+            "{matchingCount} matching loaded games; {exclusionCount} exclusions": "一致した読み込み済みゲーム {matchingCount} 件、除外 {exclusionCount} 件",
+            "No matching Steam games on loaded pages.": "読み込み済みページに一致する Steam ゲームはありません。",
+            "No Steam discoveries are available.": "利用可能な Steam 検出結果はありません。",
+            "The Steam list changed while paging; restarted at the latest revision.": "ページ読み込み中に Steam 一覧が変更されました。最新のリビジョンから再開しました。",
+            "Steam scan is still in progress.": "Steam のスキャンはまだ進行中です。",
+            "Steam scan is incomplete; existing exclusions are preserved.": "Steam のスキャンは未完了です。既存の除外項目は保持されます。",
+            "Add item": "項目を追加",
+            "Remove {label} item {index}": "{label} 項目 {index} を削除",
+            "This list can contain at most {maxItems} items.": "このリストには最大 {maxItems} 件の項目を登録できます。",
+            "Add, edit, or remove list values. Unknown values are kept in their current order.": "リストの値を追加、編集、削除できます。不明な値も現在の順序で保持されます。",
+            "Enter a value for the new item.": "新しい項目の値を入力してください。",
+            "This value is invalid.": "この値は無効です。",
+            "Resolve invalid list entries before reading their values.": "リストの値を読み取る前に、無効な項目を修正してください。",
+            "Settings changed elsewhere. Your draft is preserved; review it before saving again.": "設定が別の場所で変更されました。下書きを保持しています。確認してから再度保存してください。",
+            "Steam save could not be confirmed. Your submitted draft is preserved for review against the latest saved values.": "Steam の保存を確認できませんでした。送信した下書きを保持しています。最新の保存値と比較してください。",
+            "Lutris save could not be confirmed. Your submitted draft is preserved for review against the latest saved values.": "Lutris の保存を確認できませんでした。送信した下書きを保持しています。最新の保存値と比較してください。",
+            "Playnite save could not be confirmed. Your draft is preserved for review against the latest saved values.": "Playnite の保存を確認できませんでした。下書きを保持しています。最新の保存値と比較してください。",
+            "Steam app IDs must be canonical nonzero decimal strings.": "Steam アプリ ID は正規形式の 0 以外の 10 進文字列である必要があります。",
+            "Each Lutris exclusion needs a positive ID or a name.": "Lutris の除外項目には正の ID または名前が必要です。",
+            "Excluded Lutris games": "除外する Lutris ゲーム",
+            "Included categories": "含めるカテゴリ",
+            "Excluded categories": "除外するカテゴリ",
+            "Included plugin IDs": "含めるプラグイン ID",
+            "Excluded plugin IDs": "除外するプラグイン ID",
+            "Excluded game IDs": "除外するゲーム ID",
+            "Steam settings saved and confirmed. Scan status is shown below.": "Steam の設定を保存し、確認しました。スキャン状態を以下に表示します。",
+            "Steam settings saved and confirmed. Steam discovery remains enabled by Linux host policy; scan status is shown below.": "Steam の設定を保存し、確認しました。Linux ホストのポリシーにより Steam 検出は有効なままです。スキャン状態を以下に表示します。",
+            "Steam settings changed elsewhere. Your draft is preserved for review.": "Steam の設定が別の場所で変更されました。確認用に下書きを保持しています。",
+            "Steam save could not be confirmed. Review your preserved draft against the latest saved values before saving again.": "Steam の保存を確認できませんでした。再保存する前に、保持された下書きと最新の保存値を比較してください。",
+            "Lutris settings saved and confirmed. Scan status is shown below.": "Lutris の設定を保存し、確認しました。スキャン状態を以下に表示します。",
+            "Lutris settings changed elsewhere. Your draft is preserved for review.": "Lutris の設定が別の場所で変更されました。確認用に下書きを保持しています。",
+            "Lutris save could not be confirmed. Review your preserved draft against the latest saved values before saving again.": "Lutris の保存を確認できませんでした。再保存する前に、保持された下書きと最新の保存値を比較してください。",
+            "Playnite settings saved and confirmed. Runtime status is shown below.": "Playnite の設定を保存し、確認しました。実行状態を以下に表示します。",
+            "Playnite settings changed elsewhere. Your draft is preserved for review.": "Playnite の設定が別の場所で変更されました。確認用に下書きを保持しています。",
+            "Playnite save could not be confirmed. Review your preserved draft against the latest saved values before saving again.": "Playnite の保存を確認できませんでした。再保存する前に、保持された下書きと最新の保存値を比較してください。",
             "Host overview": "ホストの概要", "Your host, your library": "あなたのホスト、あなたのライブラリ",
             "A home for your applications.": "アプリケーションのホーム。",
             "Your applications, sessions, and local services in one place.": "アプリケーション、セッション、ローカルサービスをひとまとめにします。",
@@ -3250,6 +4487,521 @@ var Amaterasu;
             "Maximum retained samples": "最多保留的樣本數", "Pause after the dashboard is hidden": "隱藏儀表板後暫停", "Show host statistics": "顯示主機統計資料",
         },
     };
+    const INTEGRATION_COPY_TRANSLATIONS = {
+        de: {
+            Integrations: "Integrationen",
+            "Connect and manage integrations on this host.": "Integrationen auf diesem Host verbinden und verwalten.",
+            "Refresh provider statuses": "Providerstatus aktualisieren",
+            "Refresh now": "Jetzt aktualisieren",
+            "Manage Steam library": "Steam-Bibliothek verwalten",
+            "Discover games from local Steam libraries.": "Spiele aus lokalen Steam-Bibliotheken erkennen.",
+            "Discover games from the current user's Lutris library.": "Spiele aus der Lutris-Bibliothek des aktuellen Benutzers erkennen.",
+            "Sync a Playnite library and provider-managed applications.": "Eine Playnite-Bibliothek und vom Provider verwaltete Anwendungen synchronisieren.",
+            "Loading provider status...": "Providerstatus wird geladen...",
+            "Status observed": "Status erfasst",
+            "Refreshing provider...": "Provider wird aktualisiert...",
+            "Refresh request accepted. Checking provider status.": "Aktualisierungsanfrage angenommen. Providerstatus wird geprüft.",
+            "Refresh accepted; current provider status was read back.": "Aktualisierung angenommen; der aktuelle Providerstatus wurde erneut abgefragt.",
+            "Refresh failed. Check provider status before retrying.": "Aktualisierung fehlgeschlagen. Prüfe den Providerstatus, bevor du es erneut versuchst.",
+            "Provider status reports an issue.": "Der Providerstatus meldet ein Problem.",
+            "This account cannot read this provider's status.": "Dieses Konto kann den Status dieses Providers nicht lesen.",
+            "Provider status read completed; no provider refresh was requested.": "Statusabfrage abgeschlossen; es wurde keine Aktualisierung des Providers angefordert.",
+            "Provider status check failed.": "Statusabfrage fehlgeschlagen.",
+            "Refresh accepted, but status readback failed. Check status before retrying.": "Aktualisierung angenommen, Status konnte jedoch nicht abgerufen werden. Prüfe den Status vor einem erneuten Versuch.",
+            "Refresh outcome is uncertain. Check status before retrying.": "Ergebnis der Aktualisierung ungewiss. Prüfe den Status vor einem erneuten Versuch.",
+            "Request a {provider} refresh": "Aktualisierung für {provider} anfordern",
+            "Discovered games: {count}. Scan warnings: {warnings}.": "Entdeckte Spiele: {count}. Scan-Warnungen: {warnings}.",
+            "Discovered games: {count}.": "Entdeckte Spiele: {count}.",
+            "Games in the last snapshot: {count}.": "Spiele im letzten Snapshot: {count}.",
+            "Refresh accepted; provider status reports an issue.": "Aktualisierung angenommen; der Providerstatus meldet ein Problem.",
+        },
+        es: {
+            Integrations: "Integraciones",
+            "Connect and manage integrations on this host.": "Conecta y administra las integraciones de este host.",
+            "Refresh provider statuses": "Actualizar estados de proveedores",
+            "Refresh now": "Actualizar ahora",
+            "Manage Steam library": "Administrar biblioteca de Steam",
+            "Discover games from local Steam libraries.": "Detecta juegos en las bibliotecas locales de Steam.",
+            "Discover games from the current user's Lutris library.": "Detecta juegos en la biblioteca de Lutris del usuario actual.",
+            "Sync a Playnite library and provider-managed applications.": "Sincroniza una biblioteca de Playnite y las aplicaciones administradas por el proveedor.",
+            "Loading provider status...": "Cargando estado del proveedor...",
+            "Status observed": "Estado observado",
+            "Refreshing provider...": "Actualizando proveedor...",
+            "Refresh request accepted. Checking provider status.": "Solicitud aceptada. Comprobando el estado del proveedor.",
+            "Refresh accepted; current provider status was read back.": "Solicitud aceptada; se volvió a consultar el estado actual del proveedor.",
+            "Refresh failed. Check provider status before retrying.": "No se pudo actualizar. Comprueba el estado antes de volver a intentarlo.",
+            "Provider status reports an issue.": "El estado del proveedor informa de un problema.",
+            "This account cannot read this provider's status.": "Esta cuenta no puede leer el estado de este proveedor.",
+            "Provider status read completed; no provider refresh was requested.": "Consulta de estado completada; no se solicitó actualizar el proveedor.",
+            "Provider status check failed.": "No se pudo consultar el estado del proveedor.",
+            "Refresh accepted, but status readback failed. Check status before retrying.": "Se aceptó la actualización, pero no se pudo leer el estado. Compruébalo antes de volver a intentarlo.",
+            "Refresh outcome is uncertain. Check status before retrying.": "El resultado de la actualización es incierto. Comprueba el estado antes de volver a intentarlo.",
+            "Request a {provider} refresh": "Solicitar actualización de {provider}",
+            "Discovered games: {count}. Scan warnings: {warnings}.": "Juegos detectados: {count}. Advertencias del análisis: {warnings}.",
+            "Discovered games: {count}.": "Juegos detectados: {count}.",
+            "Games in the last snapshot: {count}.": "Juegos en la última instantánea: {count}.",
+            "Refresh accepted; provider status reports an issue.": "Se aceptó la actualización; el estado del proveedor informa de un problema.",
+        },
+        fr: {
+            Integrations: "Intégrations",
+            "Connect and manage integrations on this host.": "Connectez et gérez les intégrations sur cet hôte.",
+            "Refresh provider statuses": "Actualiser les états des fournisseurs",
+            "Refresh now": "Actualiser",
+            "Manage Steam library": "Gérer la bibliothèque Steam",
+            "Discover games from local Steam libraries.": "Détecter les jeux des bibliothèques Steam locales.",
+            "Discover games from the current user's Lutris library.": "Détecter les jeux de la bibliothèque Lutris de l’utilisateur actuel.",
+            "Sync a Playnite library and provider-managed applications.": "Synchroniser une bibliothèque Playnite et les applications gérées par le fournisseur.",
+            "Loading provider status...": "Chargement de l’état du fournisseur...",
+            "Status observed": "État observé",
+            "Refreshing provider...": "Actualisation du fournisseur...",
+            "Refresh request accepted. Checking provider status.": "Demande acceptée. Vérification de l’état du fournisseur.",
+            "Refresh accepted; current provider status was read back.": "Demande acceptée ; l’état actuel du fournisseur a été relu.",
+            "Refresh failed. Check provider status before retrying.": "Échec de l’actualisation. Vérifiez l’état du fournisseur avant de réessayer.",
+            "Provider status reports an issue.": "L’état du fournisseur signale un problème.",
+            "This account cannot read this provider's status.": "Ce compte ne peut pas lire l’état de ce fournisseur.",
+            "Provider status read completed; no provider refresh was requested.": "État du fournisseur consulté ; aucune actualisation n’a été demandée.",
+            "Provider status check failed.": "Échec de la vérification de l’état du fournisseur.",
+            "Refresh accepted, but status readback failed. Check status before retrying.": "Actualisation acceptée, mais état non récupéré. Vérifiez l’état avant de réessayer.",
+            "Refresh outcome is uncertain. Check status before retrying.": "Le résultat de l’actualisation est incertain. Vérifiez l’état avant de réessayer.",
+            "Request a {provider} refresh": "Demander l’actualisation de {provider}",
+            "Discovered games: {count}. Scan warnings: {warnings}.": "Jeux détectés : {count}. Avertissements d’analyse : {warnings}.",
+            "Discovered games: {count}.": "Jeux détectés : {count}.",
+            "Games in the last snapshot: {count}.": "Jeux dans le dernier instantané : {count}.",
+            "Refresh accepted; provider status reports an issue.": "Actualisation acceptée ; l’état du fournisseur signale un problème.",
+        },
+        ja: {
+            Integrations: "連携",
+            "Connect and manage integrations on this host.": "このホストの連携を接続および管理します。",
+            "Refresh provider statuses": "プロバイダーの状態を更新",
+            "Refresh now": "今すぐ更新",
+            "Manage Steam library": "Steam ライブラリを管理",
+            "Discover games from local Steam libraries.": "ローカルの Steam ライブラリからゲームを検出します。",
+            "Discover games from the current user's Lutris library.": "現在のユーザーの Lutris ライブラリからゲームを検出します。",
+            "Sync a Playnite library and provider-managed applications.": "Playnite ライブラリとプロバイダー管理アプリを同期します。",
+            "Loading provider status...": "プロバイダーの状態を読み込み中...",
+            "Status observed": "状態の確認時刻",
+            "Refreshing provider...": "プロバイダーを更新中...",
+            "Refresh request accepted. Checking provider status.": "更新要求を受け付けました。状態を確認しています。",
+            "Refresh accepted; current provider status was read back.": "更新要求を受け付け、現在のプロバイダー状態を再取得しました。",
+            "Refresh failed. Check provider status before retrying.": "更新に失敗しました。再試行する前に状態を確認してください。",
+            "Provider status reports an issue.": "プロバイダーの状態に問題があります。",
+            "This account cannot read this provider's status.": "このアカウントにはプロバイダーの状態を読み取る権限がありません。",
+            "Provider status read completed; no provider refresh was requested.": "状態の確認が完了しました。プロバイダーの更新要求は行っていません。",
+            "Provider status check failed.": "プロバイダーの状態を確認できませんでした。",
+            "Refresh accepted, but status readback failed. Check status before retrying.": "更新要求は受け付けられましたが、状態を取得できませんでした。再試行前に状態を確認してください。",
+            "Refresh outcome is uncertain. Check status before retrying.": "更新結果を確認できません。再試行前に状態を確認してください。",
+            "Request a {provider} refresh": "{provider} の更新をリクエスト",
+            "Discovered games: {count}. Scan warnings: {warnings}.": "検出したゲーム: {count}。スキャンの警告: {warnings}。",
+            "Discovered games: {count}.": "検出したゲーム: {count}。",
+            "Games in the last snapshot: {count}.": "最新のスナップショット内のゲーム: {count}。",
+            "Refresh accepted; provider status reports an issue.": "更新要求を受け付けましたが、プロバイダーの状態に問題があります。",
+        },
+        zh: {
+            Integrations: "集成",
+            "Connect and manage integrations on this host.": "连接并管理此主机上的集成。",
+            "Refresh provider statuses": "刷新提供程序状态",
+            "Refresh now": "立即刷新",
+            "Manage Steam library": "管理 Steam 库",
+            "Discover games from local Steam libraries.": "从本地 Steam 库发现游戏。",
+            "Discover games from the current user's Lutris library.": "从当前用户的 Lutris 库发现游戏。",
+            "Sync a Playnite library and provider-managed applications.": "同步 Playnite 库和由提供程序管理的应用。",
+            "Loading provider status...": "正在加载提供程序状态...",
+            "Status observed": "状态观测时间",
+            "Refreshing provider...": "正在刷新提供程序...",
+            "Refresh request accepted. Checking provider status.": "已接受刷新请求。正在检查提供程序状态。",
+            "Refresh accepted; current provider status was read back.": "已接受刷新请求，并重新读取当前提供程序状态。",
+            "Refresh failed. Check provider status before retrying.": "刷新失败。重试前请检查提供程序状态。",
+            "Provider status reports an issue.": "提供程序状态报告了问题。",
+            "This account cannot read this provider's status.": "此帐户无权读取该提供程序的状态。",
+            "Provider status read completed; no provider refresh was requested.": "已完成状态读取；未请求刷新提供程序。",
+            "Provider status check failed.": "无法检查提供程序状态。",
+            "Refresh accepted, but status readback failed. Check status before retrying.": "已接受刷新，但无法读取状态。重试前请检查状态。",
+            "Refresh outcome is uncertain. Check status before retrying.": "刷新结果不确定。重试前请检查状态。",
+            "Request a {provider} refresh": "请求刷新 {provider}",
+            "Discovered games: {count}. Scan warnings: {warnings}.": "发现的游戏：{count}。扫描警告：{warnings}。",
+            "Discovered games: {count}.": "发现的游戏：{count}。",
+            "Games in the last snapshot: {count}.": "上次快照中的游戏：{count}。",
+            "Refresh accepted; provider status reports an issue.": "已接受刷新请求；提供程序状态报告了问题。",
+        },
+        zh_TW: {
+            Integrations: "整合",
+            "Connect and manage integrations on this host.": "連線並管理此主機上的整合。",
+            "Refresh provider statuses": "重新整理提供者狀態",
+            "Refresh now": "立即重新整理",
+            "Manage Steam library": "管理 Steam 程式庫",
+            "Discover games from local Steam libraries.": "從本機 Steam 程式庫探索遊戲。",
+            "Discover games from the current user's Lutris library.": "從目前使用者的 Lutris 程式庫探索遊戲。",
+            "Sync a Playnite library and provider-managed applications.": "同步 Playnite 程式庫和由提供者管理的應用程式。",
+            "Loading provider status...": "正在載入提供者狀態...",
+            "Status observed": "狀態觀測時間",
+            "Refreshing provider...": "正在重新整理提供者...",
+            "Refresh request accepted. Checking provider status.": "已接受重新整理要求。正在檢查提供者狀態。",
+            "Refresh accepted; current provider status was read back.": "已接受重新整理要求，並重新讀取目前的提供者狀態。",
+            "Refresh failed. Check provider status before retrying.": "重新整理失敗。重試前請檢查提供者狀態。",
+            "Provider status reports an issue.": "提供者狀態回報問題。",
+            "This account cannot read this provider's status.": "此帳戶無法讀取此提供者的狀態。",
+            "Provider status read completed; no provider refresh was requested.": "已完成狀態讀取；未要求重新整理提供者。",
+            "Provider status check failed.": "無法檢查提供者狀態。",
+            "Refresh accepted, but status readback failed. Check status before retrying.": "已接受重新整理，但無法讀取狀態。重試前請檢查狀態。",
+            "Refresh outcome is uncertain. Check status before retrying.": "重新整理結果不確定。重試前請檢查狀態。",
+            "Request a {provider} refresh": "要求重新整理 {provider}",
+            "Discovered games: {count}. Scan warnings: {warnings}.": "探索到的遊戲：{count}。掃描警告：{warnings}。",
+            "Discovered games: {count}.": "探索到的遊戲：{count}。",
+            "Games in the last snapshot: {count}.": "上次快照中的遊戲：{count}。",
+            "Refresh accepted; provider status reports an issue.": "已接受重新整理要求；提供者狀態回報問題。",
+        },
+        bg: {
+            Integrations: "Интеграции",
+            "Connect and manage integrations on this host.": "Свързвайте и управлявайте интеграциите на този хост.",
+            "Refresh provider statuses": "Обновяване на състоянията",
+            "Refresh now": "Обнови сега",
+            "Manage Steam library": "Управление на Steam библиотеката",
+            "Discover games from local Steam libraries.": "Открива игри от локалните Steam библиотеки.",
+            "Discover games from the current user's Lutris library.": "Открива игри от Lutris библиотеката на текущия потребител.",
+            "Sync a Playnite library and provider-managed applications.": "Синхронизира Playnite библиотека и управлявани от доставчика приложения.",
+            "Status observed": "Състоянието е проверено",
+            "Loading provider status...": "Зареждане на състоянието на доставчика...",
+            "Refreshing provider...": "Обновяване на доставчика...",
+            "Refresh request accepted. Checking provider status.": "Заявката за обновяване е приета. Проверява се състоянието на доставчика.",
+            "Refresh accepted; current provider status was read back.": "Обновяването е прието; текущото състояние на доставчика е прочетено повторно.",
+            "Refresh failed. Check provider status before retrying.": "Обновяването не бе успешно. Проверете състоянието на доставчика, преди да опитате отново.",
+            "Provider status reports an issue.": "Състоянието на доставчика съобщава за проблем.",
+            "This account cannot read this provider's status.": "Този акаунт няма достъп за четене на състоянието на този доставчик.",
+            "Provider status read completed; no provider refresh was requested.": "Проверката на състоянието приключи; заявка за обновяване не е изпращана.",
+            "Provider status check failed.": "Проверката на състоянието не бе успешна.",
+            "Refresh accepted, but status readback failed. Check status before retrying.": "Обновяването е прието, но състоянието не може да бъде прочетено. Проверете го, преди да опитате отново.",
+            "Refresh outcome is uncertain. Check status before retrying.": "Резултатът от обновяването е неизвестен. Проверете състоянието, преди да опитате отново.",
+            "Request a {provider} refresh": "Заявка за обновяване на {provider}",
+            "Discovered games: {count}. Scan warnings: {warnings}.": "Открити игри: {count}. Предупреждения от сканирането: {warnings}.",
+            "Discovered games: {count}.": "Открити игри: {count}.",
+            "Games in the last snapshot: {count}.": "Игри в последната снимка: {count}.",
+            "Refresh accepted; provider status reports an issue.": "Заявката за обновяване е приета; състоянието на доставчика показва проблем.",
+        },
+        cs: {
+            Integrations: "Integrace",
+            "Connect and manage integrations on this host.": "Připojujte a spravujte integrace na tomto hostiteli.",
+            "Refresh provider statuses": "Obnovit stavy poskytovatelů",
+            "Refresh now": "Obnovit",
+            "Manage Steam library": "Spravovat knihovnu služby Steam",
+            "Discover games from local Steam libraries.": "Vyhledá hry v místních knihovnách služby Steam.",
+            "Discover games from the current user's Lutris library.": "Vyhledá hry v knihovně Lutris aktuálního uživatele.",
+            "Sync a Playnite library and provider-managed applications.": "Synchronizuje knihovnu Playnite a aplikace spravované poskytovatelem.",
+            "Status observed": "Stav zjištěn",
+            "Loading provider status...": "Načítání stavu poskytovatele...",
+            "Refreshing provider...": "Aktualizace poskytovatele...",
+            "Refresh request accepted. Checking provider status.": "Požadavek na aktualizaci byl přijat. Ověřuje se stav poskytovatele.",
+            "Refresh accepted; current provider status was read back.": "Aktualizace byla přijata; aktuální stav poskytovatele byl znovu načten.",
+            "Refresh failed. Check provider status before retrying.": "Aktualizace se nezdařila. Před dalším pokusem ověřte stav poskytovatele.",
+            "Provider status reports an issue.": "Stav poskytovatele hlásí problém.",
+            "This account cannot read this provider's status.": "Tento účet nemůže číst stav tohoto poskytovatele.",
+            "Provider status read completed; no provider refresh was requested.": "Kontrola stavu byla dokončena; poskytovatel nebyl obnoven.",
+            "Provider status check failed.": "Kontrola stavu se nezdařila.",
+            "Refresh accepted, but status readback failed. Check status before retrying.": "Poskytovatel přijal požadavek, ale stav se nepodařilo načíst. Před dalším pokusem stav ověřte.",
+            "Refresh outcome is uncertain. Check status before retrying.": "Výsledek aktualizace není jistý. Před dalším pokusem ověřte stav.",
+            "Request a {provider} refresh": "Požádat o aktualizaci poskytovatele {provider}",
+            "Discovered games: {count}. Scan warnings: {warnings}.": "Nalezené hry: {count}. Upozornění skenování: {warnings}.",
+            "Discovered games: {count}.": "Nalezené hry: {count}.",
+            "Games in the last snapshot: {count}.": "Hry v posledním snímku: {count}.",
+            "Refresh accepted; provider status reports an issue.": "Požadavek na aktualizaci byl přijat; stav poskytovatele hlásí problém.",
+        },
+        hu: {
+            Integrations: "Integrációk",
+            "Connect and manage integrations on this host.": "Integrációk csatlakoztatása és kezelése ezen a gazdagépen.",
+            "Refresh provider statuses": "Szolgáltatói állapotok frissítése",
+            "Refresh now": "Frissítés most",
+            "Manage Steam library": "Steam-könyvtár kezelése",
+            "Discover games from local Steam libraries.": "Játékok keresése a helyi Steam-könyvtárakban.",
+            "Discover games from the current user's Lutris library.": "Játékok keresése az aktuális felhasználó Lutris-könyvtárában.",
+            "Sync a Playnite library and provider-managed applications.": "Playnite-könyvtár és szolgáltató által kezelt alkalmazások szinkronizálása.",
+            "Status observed": "Állapot időpontja",
+            "Loading provider status...": "Szolgáltatói állapot betöltése...",
+            "Refreshing provider...": "Szolgáltató frissítése...",
+            "Refresh request accepted. Checking provider status.": "A frissítési kérés elfogadva. A szolgáltatói állapot ellenőrzése folyamatban.",
+            "Refresh accepted; current provider status was read back.": "A frissítés elfogadva; a szolgáltató aktuális állapotát újra lekértük.",
+            "Refresh failed. Check provider status before retrying.": "A frissítés nem sikerült. Újrapróbálás előtt ellenőrizze a szolgáltató állapotát.",
+            "Provider status reports an issue.": "A szolgáltató állapota problémát jelez.",
+            "This account cannot read this provider's status.": "Ez a fiók nem olvashatja a szolgáltató állapotát.",
+            "Provider status read completed; no provider refresh was requested.": "Az állapot lekérdezése befejeződött; szolgáltatói frissítést nem kértünk.",
+            "Provider status check failed.": "Nem sikerült lekérni a szolgáltató állapotát.",
+            "Refresh accepted, but status readback failed. Check status before retrying.": "A frissítést elfogadták, de az állapot nem olvasható. Újrapróbálás előtt ellenőrizze az állapotot.",
+            "Refresh outcome is uncertain. Check status before retrying.": "A frissítés eredménye bizonytalan. Újrapróbálás előtt ellenőrizze az állapotot.",
+            "Request a {provider} refresh": "{provider} frissítésének kérése",
+            "Discovered games: {count}. Scan warnings: {warnings}.": "Felfedezett játékok: {count}. Vizsgálati figyelmeztetések: {warnings}.",
+            "Discovered games: {count}.": "Felfedezett játékok: {count}.",
+            "Games in the last snapshot: {count}.": "Játékok az utolsó pillanatképben: {count}.",
+            "Refresh accepted; provider status reports an issue.": "A frissítési kérést elfogadták; a szolgáltató állapota problémát jelez.",
+        },
+        it: {
+            Integrations: "Integrazioni",
+            "Connect and manage integrations on this host.": "Collega e gestisci le integrazioni su questo host.",
+            "Refresh provider statuses": "Aggiorna gli stati dei provider",
+            "Refresh now": "Aggiorna ora",
+            "Manage Steam library": "Gestisci la libreria Steam",
+            "Discover games from local Steam libraries.": "Rileva i giochi dalle librerie Steam locali.",
+            "Discover games from the current user's Lutris library.": "Rileva i giochi dalla libreria Lutris dell'utente corrente.",
+            "Sync a Playnite library and provider-managed applications.": "Sincronizza una libreria Playnite e le applicazioni gestite dal provider.",
+            "Status observed": "Stato rilevato",
+            "Loading provider status...": "Caricamento dello stato del provider...",
+            "Refreshing provider...": "Aggiornamento del provider...",
+            "Refresh request accepted. Checking provider status.": "Richiesta di aggiornamento accettata. Verifica dello stato del provider.",
+            "Refresh accepted; current provider status was read back.": "Aggiornamento accettato; lo stato attuale del provider è stato riletto.",
+            "Refresh failed. Check provider status before retrying.": "Aggiornamento non riuscito. Controlla lo stato del provider prima di riprovare.",
+            "Provider status reports an issue.": "Lo stato del provider segnala un problema.",
+            "This account cannot read this provider's status.": "Questo account non può leggere lo stato di questo provider.",
+            "Provider status read completed; no provider refresh was requested.": "Controllo dello stato completato; non è stato richiesto alcun aggiornamento del provider.",
+            "Provider status check failed.": "Controllo dello stato del provider non riuscito.",
+            "Refresh accepted, but status readback failed. Check status before retrying.": "Aggiornamento accettato, ma impossibile leggere lo stato. Verificalo prima di riprovare.",
+            "Refresh outcome is uncertain. Check status before retrying.": "Esito dell’aggiornamento incerto. Verifica lo stato prima di riprovare.",
+            "Request a {provider} refresh": "Richiedi aggiornamento di {provider}",
+            "Discovered games: {count}. Scan warnings: {warnings}.": "Giochi rilevati: {count}. Avvisi della scansione: {warnings}.",
+            "Discovered games: {count}.": "Giochi rilevati: {count}.",
+            "Games in the last snapshot: {count}.": "Giochi nell’ultima istantanea: {count}.",
+            "Refresh accepted; provider status reports an issue.": "Aggiornamento accettato; lo stato del provider segnala un problema.",
+        },
+        ko: {
+            Integrations: "통합",
+            "Connect and manage integrations on this host.": "이 호스트의 통합을 연결하고 관리합니다.",
+            "Refresh provider statuses": "공급자 상태 새로 고침",
+            "Refresh now": "지금 새로 고침",
+            "Manage Steam library": "Steam 라이브러리 관리",
+            "Discover games from local Steam libraries.": "로컬 Steam 라이브러리에서 게임을 검색합니다.",
+            "Discover games from the current user's Lutris library.": "현재 사용자의 Lutris 라이브러리에서 게임을 검색합니다.",
+            "Sync a Playnite library and provider-managed applications.": "Playnite 라이브러리와 공급자 관리 앱을 동기화합니다.",
+            "Status observed": "상태 확인 시각",
+            "Loading provider status...": "공급자 상태 로드 중...",
+            "Refreshing provider...": "공급자 새로 고침 중...",
+            "Refresh request accepted. Checking provider status.": "새로 고침 요청을 수락했습니다. 공급자 상태를 확인하고 있습니다.",
+            "Refresh accepted; current provider status was read back.": "새로 고침을 수락하고 현재 공급자 상태를 다시 읽었습니다.",
+            "Refresh failed. Check provider status before retrying.": "새로 고침에 실패했습니다. 다시 시도하기 전에 공급자 상태를 확인하세요.",
+            "Provider status reports an issue.": "공급자 상태에서 문제가 보고되었습니다.",
+            "This account cannot read this provider's status.": "이 계정은 해당 공급자 상태를 읽을 수 없습니다.",
+            "Provider status read completed; no provider refresh was requested.": "상태 확인이 완료되었습니다. 공급자 새로 고침은 요청하지 않았습니다.",
+            "Provider status check failed.": "공급자 상태 확인에 실패했습니다.",
+            "Refresh accepted, but status readback failed. Check status before retrying.": "새로 고침은 수락되었지만 상태를 읽지 못했습니다. 다시 시도하기 전에 상태를 확인하세요.",
+            "Refresh outcome is uncertain. Check status before retrying.": "새로 고침 결과를 확인할 수 없습니다. 다시 시도하기 전에 상태를 확인하세요.",
+            "Request a {provider} refresh": "{provider} 새로 고침 요청",
+            "Discovered games: {count}. Scan warnings: {warnings}.": "검색된 게임: {count}. 검색 경고: {warnings}.",
+            "Discovered games: {count}.": "검색된 게임: {count}.",
+            "Games in the last snapshot: {count}.": "마지막 스냅샷의 게임: {count}.",
+            "Refresh accepted; provider status reports an issue.": "새로 고침 요청을 수락했지만 공급자 상태에서 문제가 보고되었습니다.",
+        },
+        pl: {
+            Integrations: "Integracje",
+            "Connect and manage integrations on this host.": "Połącz integracje i zarządzaj nimi na tym hoście.",
+            "Refresh provider statuses": "Odśwież stany dostawców",
+            "Refresh now": "Odśwież teraz",
+            "Manage Steam library": "Zarządzaj biblioteką Steam",
+            "Discover games from local Steam libraries.": "Wykrywaj gry w lokalnych bibliotekach Steam.",
+            "Discover games from the current user's Lutris library.": "Wykrywaj gry w bibliotece Lutris bieżącego użytkownika.",
+            "Sync a Playnite library and provider-managed applications.": "Synchronizuj bibliotekę Playnite i aplikacje zarządzane przez dostawcę.",
+            "Status observed": "Czas odczytu stanu",
+            "Loading provider status...": "Ładowanie stanu dostawcy...",
+            "Refreshing provider...": "Odświeżanie dostawcy...",
+            "Refresh request accepted. Checking provider status.": "Przyjęto żądanie odświeżenia. Sprawdzanie stanu dostawcy.",
+            "Refresh accepted; current provider status was read back.": "Przyjęto odświeżenie; ponownie odczytano bieżący stan dostawcy.",
+            "Refresh failed. Check provider status before retrying.": "Odświeżanie nie powiodło się. Sprawdź stan dostawcy przed ponowną próbą.",
+            "Provider status reports an issue.": "Stan dostawcy zgłasza problem.",
+            "This account cannot read this provider's status.": "To konto nie może odczytać stanu tego dostawcy.",
+            "Provider status read completed; no provider refresh was requested.": "Odczyt stanu zakończony; nie zażądano odświeżenia dostawcy.",
+            "Provider status check failed.": "Nie udało się odczytać stanu dostawcy.",
+            "Refresh accepted, but status readback failed. Check status before retrying.": "Przyjęto odświeżenie, ale nie udało się odczytać stanu. Sprawdź go przed ponowną próbą.",
+            "Refresh outcome is uncertain. Check status before retrying.": "Wynik odświeżania jest niepewny. Sprawdź stan przed ponowną próbą.",
+            "Request a {provider} refresh": "Poproś o odświeżenie {provider}",
+            "Discovered games: {count}. Scan warnings: {warnings}.": "Wykryte gry: {count}. Ostrzeżenia skanowania: {warnings}.",
+            "Discovered games: {count}.": "Wykryte gry: {count}.",
+            "Games in the last snapshot: {count}.": "Gry w ostatnim zrzucie: {count}.",
+            "Refresh accepted; provider status reports an issue.": "Przyjęto odświeżenie; stan dostawcy zgłasza problem.",
+        },
+        pt: {
+            Integrations: "Integrações",
+            "Connect and manage integrations on this host.": "Ligue e gere as integrações neste anfitrião.",
+            "Refresh provider statuses": "Atualizar estados dos fornecedores",
+            "Refresh now": "Atualizar agora",
+            "Manage Steam library": "Gerir biblioteca Steam",
+            "Discover games from local Steam libraries.": "Detetar jogos nas bibliotecas Steam locais.",
+            "Discover games from the current user's Lutris library.": "Detetar jogos na biblioteca Lutris do utilizador atual.",
+            "Sync a Playnite library and provider-managed applications.": "Sincronizar uma biblioteca Playnite e aplicações geridas pelo fornecedor.",
+            "Status observed": "Estado observado",
+            "Loading provider status...": "A carregar o estado do fornecedor...",
+            "Refreshing provider...": "A atualizar o fornecedor...",
+            "Refresh request accepted. Checking provider status.": "Pedido de atualização aceite. A verificar o estado do fornecedor.",
+            "Refresh accepted; current provider status was read back.": "Atualização aceite; o estado atual do fornecedor foi consultado novamente.",
+            "Refresh failed. Check provider status before retrying.": "A atualização falhou. Verifique o estado do fornecedor antes de tentar novamente.",
+            "Provider status reports an issue.": "O estado do fornecedor indica um problema.",
+            "This account cannot read this provider's status.": "Esta conta não pode ler o estado deste fornecedor.",
+            "Provider status read completed; no provider refresh was requested.": "Consulta do estado concluída; não foi pedida uma atualização do fornecedor.",
+            "Provider status check failed.": "Falha ao consultar o estado do fornecedor.",
+            "Refresh accepted, but status readback failed. Check status before retrying.": "Atualização aceite, mas não foi possível ler o estado. Verifique-o antes de tentar novamente.",
+            "Refresh outcome is uncertain. Check status before retrying.": "O resultado da atualização é incerto. Verifique o estado antes de tentar novamente.",
+            "Request a {provider} refresh": "Pedir atualização de {provider}",
+            "Discovered games: {count}. Scan warnings: {warnings}.": "Jogos detetados: {count}. Avisos da análise: {warnings}.",
+            "Discovered games: {count}.": "Jogos detetados: {count}.",
+            "Games in the last snapshot: {count}.": "Jogos no último instantâneo: {count}.",
+            "Refresh accepted; provider status reports an issue.": "Atualização aceite; o estado do fornecedor indica um problema.",
+        },
+        pt_BR: {
+            Integrations: "Integrações",
+            "Connect and manage integrations on this host.": "Conecte e gerencie as integrações neste host.",
+            "Refresh provider statuses": "Atualizar status dos provedores",
+            "Refresh now": "Atualizar agora",
+            "Manage Steam library": "Gerenciar biblioteca Steam",
+            "Discover games from local Steam libraries.": "Descubra jogos nas bibliotecas locais do Steam.",
+            "Discover games from the current user's Lutris library.": "Descubra jogos na biblioteca Lutris do usuário atual.",
+            "Sync a Playnite library and provider-managed applications.": "Sincronize uma biblioteca Playnite e aplicativos gerenciados pelo provedor.",
+            "Status observed": "Status observado",
+            "Loading provider status...": "Carregando status do provedor...",
+            "Refreshing provider...": "Atualizando provedor...",
+            "Refresh request accepted. Checking provider status.": "Solicitação de atualização aceita. Verificando o status do provedor.",
+            "Refresh accepted; current provider status was read back.": "Atualização aceita; o status atual do provedor foi consultado novamente.",
+            "Refresh failed. Check provider status before retrying.": "Falha ao atualizar. Verifique o status do provedor antes de tentar novamente.",
+            "Provider status reports an issue.": "O status do provedor informa um problema.",
+            "This account cannot read this provider's status.": "Esta conta não pode ler o status deste provedor.",
+            "Provider status read completed; no provider refresh was requested.": "Consulta de status concluída; nenhuma atualização do provedor foi solicitada.",
+            "Provider status check failed.": "Falha ao consultar o status do provedor.",
+            "Refresh accepted, but status readback failed. Check status before retrying.": "Atualização aceita, mas não foi possível ler o status. Confira antes de tentar novamente.",
+            "Refresh outcome is uncertain. Check status before retrying.": "O resultado da atualização é incerto. Confira o status antes de tentar novamente.",
+            "Request a {provider} refresh": "Solicitar atualização de {provider}",
+            "Discovered games: {count}. Scan warnings: {warnings}.": "Jogos descobertos: {count}. Avisos da verificação: {warnings}.",
+            "Discovered games: {count}.": "Jogos descobertos: {count}.",
+            "Games in the last snapshot: {count}.": "Jogos no último instantâneo: {count}.",
+            "Refresh accepted; provider status reports an issue.": "Atualização aceita; o status do provedor informa um problema.",
+        },
+        ru: {
+            Integrations: "Интеграции",
+            "Connect and manage integrations on this host.": "Подключайте интеграции и управляйте ими на этом хосте.",
+            "Refresh provider statuses": "Обновить статусы провайдеров",
+            "Refresh now": "Обновить",
+            "Manage Steam library": "Управление библиотекой Steam",
+            "Discover games from local Steam libraries.": "Находит игры в локальных библиотеках Steam.",
+            "Discover games from the current user's Lutris library.": "Находит игры в библиотеке Lutris текущего пользователя.",
+            "Sync a Playnite library and provider-managed applications.": "Синхронизирует библиотеку Playnite и приложения под управлением провайдера.",
+            "Status observed": "Время проверки состояния",
+            "Loading provider status...": "Загрузка статуса провайдера...",
+            "Refreshing provider...": "Обновление провайдера...",
+            "Refresh request accepted. Checking provider status.": "Запрос на обновление принят. Проверяется статус провайдера.",
+            "Refresh accepted; current provider status was read back.": "Обновление принято; текущий статус провайдера повторно получен.",
+            "Refresh failed. Check provider status before retrying.": "Не удалось обновить. Проверьте статус провайдера перед повторной попыткой.",
+            "Provider status reports an issue.": "Статус провайдера сообщает о проблеме.",
+            "This account cannot read this provider's status.": "Эта учетная запись не может читать статус провайдера.",
+            "Provider status read completed; no provider refresh was requested.": "Проверка состояния завершена; обновление провайдера не запрашивалось.",
+            "Provider status check failed.": "Не удалось проверить состояние провайдера.",
+            "Refresh accepted, but status readback failed. Check status before retrying.": "Запрос принят, но состояние не удалось прочитать. Проверьте его перед повторной попыткой.",
+            "Refresh outcome is uncertain. Check status before retrying.": "Результат обновления неизвестен. Проверьте состояние перед повторной попыткой.",
+            "Request a {provider} refresh": "Запросить обновление {provider}",
+            "Discovered games: {count}. Scan warnings: {warnings}.": "Найдено игр: {count}. Предупреждения сканирования: {warnings}.",
+            "Discovered games: {count}.": "Найдено игр: {count}.",
+            "Games in the last snapshot: {count}.": "Игр в последнем снимке: {count}.",
+            "Refresh accepted; provider status reports an issue.": "Запрос на обновление принят; состояние провайдера сообщает о проблеме.",
+        },
+        sv: {
+            Integrations: "Integrationer",
+            "Connect and manage integrations on this host.": "Anslut och hantera integrationer på den här värden.",
+            "Refresh provider statuses": "Uppdatera leverantörsstatus",
+            "Refresh now": "Uppdatera nu",
+            "Manage Steam library": "Hantera Steam-bibliotek",
+            "Discover games from local Steam libraries.": "Identifiera spel från lokala Steam-bibliotek.",
+            "Discover games from the current user's Lutris library.": "Identifiera spel från den aktuella användarens Lutris-bibliotek.",
+            "Sync a Playnite library and provider-managed applications.": "Synkronisera ett Playnite-bibliotek och program som hanteras av leverantören.",
+            "Status observed": "Status avläst",
+            "Loading provider status...": "Läser in leverantörsstatus...",
+            "Refreshing provider...": "Uppdaterar leverantören...",
+            "Refresh request accepted. Checking provider status.": "Uppdateringsbegäran har godkänts. Kontrollerar leverantörens status.",
+            "Refresh accepted; current provider status was read back.": "Uppdateringen godkändes; aktuell leverantörsstatus lästes in igen.",
+            "Refresh failed. Check provider status before retrying.": "Det gick inte att uppdatera. Kontrollera leverantörens status innan du försöker igen.",
+            "Provider status reports an issue.": "Leverantörsstatusen rapporterar ett problem.",
+            "This account cannot read this provider's status.": "Det här kontot kan inte läsa leverantörens status.",
+            "Provider status read completed; no provider refresh was requested.": "Statuskontrollen är klar; ingen uppdatering av leverantören begärdes.",
+            "Provider status check failed.": "Det gick inte att läsa leverantörens status.",
+            "Refresh accepted, but status readback failed. Check status before retrying.": "Uppdateringen godkändes, men status kunde inte läsas. Kontrollera status innan du försöker igen.",
+            "Refresh outcome is uncertain. Check status before retrying.": "Resultatet av uppdateringen är osäkert. Kontrollera status innan du försöker igen.",
+            "Request a {provider} refresh": "Begär uppdatering av {provider}",
+            "Discovered games: {count}. Scan warnings: {warnings}.": "Upptäckta spel: {count}. Sökningsvarningar: {warnings}.",
+            "Discovered games: {count}.": "Upptäckta spel: {count}.",
+            "Games in the last snapshot: {count}.": "Spel i den senaste ögonblicksbilden: {count}.",
+            "Refresh accepted; provider status reports an issue.": "Uppdateringen godkändes; leverantörens status rapporterar ett problem.",
+        },
+        tr: {
+            Integrations: "Entegrasyonlar",
+            "Connect and manage integrations on this host.": "Bu ana bilgisayardaki entegrasyonları bağlayın ve yönetin.",
+            "Refresh provider statuses": "Sağlayıcı durumlarını yenile",
+            "Refresh now": "Şimdi yenile",
+            "Manage Steam library": "Steam kitaplığını yönet",
+            "Discover games from local Steam libraries.": "Yerel Steam kitaplıklarındaki oyunları keşfeder.",
+            "Discover games from the current user's Lutris library.": "Geçerli kullanıcının Lutris kitaplığındaki oyunları keşfeder.",
+            "Sync a Playnite library and provider-managed applications.": "Playnite kitaplığını ve sağlayıcı tarafından yönetilen uygulamaları eşitler.",
+            "Status observed": "Durumun gözlemlendiği zaman",
+            "Loading provider status...": "Sağlayıcı durumu yükleniyor...",
+            "Refreshing provider...": "Sağlayıcı yenileniyor...",
+            "Refresh request accepted. Checking provider status.": "Yenileme isteği kabul edildi. Sağlayıcı durumu kontrol ediliyor.",
+            "Refresh accepted; current provider status was read back.": "Yenileme kabul edildi; güncel sağlayıcı durumu yeniden okundu.",
+            "Refresh failed. Check provider status before retrying.": "Yenileme başarısız oldu. Yeniden denemeden önce sağlayıcı durumunu kontrol edin.",
+            "Provider status reports an issue.": "Sağlayıcı durumu bir sorun bildiriyor.",
+            "This account cannot read this provider's status.": "Bu hesap sağlayıcının durumunu okuyamaz.",
+            "Provider status read completed; no provider refresh was requested.": "Durum denetimi tamamlandı; sağlayıcı yenilemesi istenmedi.",
+            "Provider status check failed.": "Sağlayıcı durumu denetlenemedi.",
+            "Refresh accepted, but status readback failed. Check status before retrying.": "Yenileme kabul edildi ancak durum okunamadı. Yeniden denemeden önce durumu kontrol edin.",
+            "Refresh outcome is uncertain. Check status before retrying.": "Yenileme sonucu belirsiz. Yeniden denemeden önce durumu kontrol edin.",
+            "Request a {provider} refresh": "{provider} yenilemesi iste",
+            "Discovered games: {count}. Scan warnings: {warnings}.": "Bulunan oyunlar: {count}. Tarama uyarıları: {warnings}.",
+            "Discovered games: {count}.": "Bulunan oyunlar: {count}.",
+            "Games in the last snapshot: {count}.": "Son anlık görüntüdeki oyunlar: {count}.",
+            "Refresh accepted; provider status reports an issue.": "Yenileme kabul edildi; sağlayıcı durumu bir sorun bildiriyor.",
+        },
+        uk: {
+            Integrations: "Інтеграції",
+            "Connect and manage integrations on this host.": "Підключайте інтеграції та керуйте ними на цьому хості.",
+            "Refresh provider statuses": "Оновити стани провайдерів",
+            "Refresh now": "Оновити зараз",
+            "Manage Steam library": "Керувати бібліотекою Steam",
+            "Discover games from local Steam libraries.": "Знаходить ігри в локальних бібліотеках Steam.",
+            "Discover games from the current user's Lutris library.": "Знаходить ігри в бібліотеці Lutris поточного користувача.",
+            "Sync a Playnite library and provider-managed applications.": "Синхронізує бібліотеку Playnite та програми під керуванням провайдера.",
+            "Status observed": "Час перевірки стану",
+            "Loading provider status...": "Завантаження стану провайдера...",
+            "Refreshing provider...": "Оновлення провайдера...",
+            "Refresh request accepted. Checking provider status.": "Запит на оновлення прийнято. Перевіряється стан провайдера.",
+            "Refresh accepted; current provider status was read back.": "Оновлення прийнято; поточний стан провайдера повторно зчитано.",
+            "Refresh failed. Check provider status before retrying.": "Не вдалося оновити. Перевірте стан провайдера перед повторною спробою.",
+            "Provider status reports an issue.": "Стан провайдера повідомляє про проблему.",
+            "This account cannot read this provider's status.": "Цей обліковий запис не може читати стан провайдера.",
+            "Provider status read completed; no provider refresh was requested.": "Перевірку стану завершено; оновлення провайдера не запитували.",
+            "Provider status check failed.": "Не вдалося перевірити стан провайдера.",
+            "Refresh accepted, but status readback failed. Check status before retrying.": "Запит прийнято, але стан не вдалося прочитати. Перевірте його перед повторною спробою.",
+            "Refresh outcome is uncertain. Check status before retrying.": "Результат оновлення невідомий. Перевірте стан перед повторною спробою.",
+            "Request a {provider} refresh": "Запросити оновлення {provider}",
+            "Discovered games: {count}. Scan warnings: {warnings}.": "Знайдено ігор: {count}. Попередження сканування: {warnings}.",
+            "Discovered games: {count}.": "Знайдено ігор: {count}.",
+            "Games in the last snapshot: {count}.": "Ігор в останньому знімку: {count}.",
+            "Refresh accepted; provider status reports an issue.": "Запит на оновлення прийнято; стан провайдера повідомляє про проблему.",
+        },
+        vi: {
+            Integrations: "Tích hợp",
+            "Connect and manage integrations on this host.": "Kết nối và quản lý các tích hợp trên máy chủ này.",
+            "Refresh provider statuses": "Làm mới trạng thái nhà cung cấp",
+            "Refresh now": "Làm mới ngay",
+            "Manage Steam library": "Quản lý thư viện Steam",
+            "Discover games from local Steam libraries.": "Tìm trò chơi trong thư viện Steam cục bộ.",
+            "Discover games from the current user's Lutris library.": "Tìm trò chơi trong thư viện Lutris của người dùng hiện tại.",
+            "Sync a Playnite library and provider-managed applications.": "Đồng bộ thư viện Playnite và ứng dụng do nhà cung cấp quản lý.",
+            "Status observed": "Thời điểm ghi nhận trạng thái",
+            "Loading provider status...": "Đang tải trạng thái nhà cung cấp...",
+            "Refreshing provider...": "Đang làm mới nhà cung cấp...",
+            "Refresh request accepted. Checking provider status.": "Đã chấp nhận yêu cầu làm mới. Đang kiểm tra trạng thái nhà cung cấp.",
+            "Refresh accepted; current provider status was read back.": "Đã chấp nhận làm mới; trạng thái nhà cung cấp hiện tại đã được đọc lại.",
+            "Refresh failed. Check provider status before retrying.": "Làm mới thất bại. Hãy kiểm tra trạng thái trước khi thử lại.",
+            "Provider status reports an issue.": "Trạng thái nhà cung cấp báo có sự cố.",
+            "This account cannot read this provider's status.": "Tài khoản này không thể đọc trạng thái của nhà cung cấp.",
+            "Provider status read completed; no provider refresh was requested.": "Đã đọc xong trạng thái; không yêu cầu làm mới nhà cung cấp.",
+            "Provider status check failed.": "Không thể kiểm tra trạng thái nhà cung cấp.",
+            "Refresh accepted, but status readback failed. Check status before retrying.": "Đã chấp nhận làm mới nhưng không đọc được trạng thái. Hãy kiểm tra trước khi thử lại.",
+            "Refresh outcome is uncertain. Check status before retrying.": "Kết quả làm mới chưa xác định. Hãy kiểm tra trạng thái trước khi thử lại.",
+            "Request a {provider} refresh": "Yêu cầu làm mới {provider}",
+            "Discovered games: {count}. Scan warnings: {warnings}.": "Trò chơi được phát hiện: {count}. Cảnh báo quét: {warnings}.",
+            "Discovered games: {count}.": "Trò chơi được phát hiện: {count}.",
+            "Games in the last snapshot: {count}.": "Trò chơi trong ảnh chụp gần nhất: {count}.",
+            "Refresh accepted; provider status reports an issue.": "Đã chấp nhận làm mới; trạng thái nhà cung cấp báo có sự cố.",
+        },
+    };
     const PAGE_COPY_KEYS = [
         "A durable catalog of the applications on your host.",
         "Discover local Steam games and optionally sync a complete scan into the catalog.",
@@ -3814,6 +5566,7 @@ var Amaterasu;
         const englishProduct = englishCatalog([
             ...new Set([
                 ...Object.keys(productTranslations.bg ?? {}),
+                ...Object.keys(pairedClientTranslations.bg ?? {}),
                 ...Object.keys(specializedTranslations.bg ?? {}),
                 ...PAGE_COPY_KEYS,
                 ...ATTRIBUTE_TEMPLATE_KEYS,
@@ -3829,7 +5582,7 @@ var Amaterasu;
         const localeAttributeTemplates = catalogFromTranslations(ATTRIBUTE_TEMPLATE_KEYS, attributeTemplateTranslations[locale]);
         const localeInputOverrideLabels = catalogFromTranslations(INPUT_OVERRIDE_LABEL_KEYS, inputOverrideLabelTranslations[locale]);
         const localeMetricLabels = catalogFromTranslations(METRIC_LABEL_KEYS, metricLabelTranslations[locale]);
-        return mergeLocaleMessages(mergeLocaleMessages(mergeLocaleMessages(mergeLocaleMessages(mergeLocaleMessages(englishBase, englishUi), englishShell), localeBase), mergeLocaleMessages(localeUi, localeShell)), mergeLocaleMessages(mergeLocaleMessages(englishProduct, productTranslations[locale] ?? {}), mergeLocaleMessages(specializedTranslations[locale] ?? {}, mergeLocaleMessages(mergeLocaleMessages(localePageCopy, localeAttributeTemplates), mergeLocaleMessages(localeInputOverrideLabels, localeMetricLabels)))));
+        return mergeLocaleMessages(mergeLocaleMessages(mergeLocaleMessages(mergeLocaleMessages(mergeLocaleMessages(englishBase, englishUi), englishShell), localeBase), mergeLocaleMessages(localeUi, localeShell)), mergeLocaleMessages(mergeLocaleMessages(englishProduct, mergeLocaleMessages(productTranslations[locale] ?? {}, pairedClientTranslations[locale] ?? {})), mergeLocaleMessages(mergeLocaleMessages(specializedTranslations[locale] ?? {}, INTEGRATION_COPY_TRANSLATIONS[locale] ?? {}), mergeLocaleMessages(mergeLocaleMessages(localePageCopy, localeAttributeTemplates), mergeLocaleMessages(localeInputOverrideLabels, localeMetricLabels)))));
     }
     Amaterasu.localeMessagesFor = localeMessagesFor;
     function translateLocaleMessage(source, messages) {
@@ -3888,6 +5641,322 @@ var Amaterasu;
         return node;
     }
     Amaterasu.input = input;
+    let nextRadioGroupId = 0;
+    function radioGroup(label, options, selected, onChange = () => { }, signal, behavior = {}) {
+        const validate = (choices, value) => {
+            if (!choices.length || new Set(choices.map((option) => option.value)).size !== choices.length ||
+                !choices.some((option) => option.value === value) ||
+                choices.some((option) => typeof option.value !== "string" || !option.value || typeof option.label === "undefined"))
+                throw new Error("Invalid radio group options or selection.");
+        };
+        if (typeof onChange !== "function")
+            throw new Error("Invalid radio group callback.");
+        validate(options, selected);
+        const controller = new AbortController();
+        let disposed = false;
+        let currentValue = selected;
+        let currentOptions = options;
+        let controls = [];
+        let currentBehavior = { ...behavior };
+        let choiceController = new AbortController();
+        const dispose = () => {
+            if (disposed)
+                return;
+            disposed = true;
+            controller.abort();
+            choiceController.abort();
+            signal?.removeEventListener("abort", dispose);
+        };
+        if (signal?.aborted)
+            dispose();
+        else
+            signal?.addEventListener("abort", dispose, { once: true });
+        const name = `amaterasu-radio-${++nextRadioGroupId}`;
+        const group = el("div", "radio-group");
+        group.setAttribute("role", "radiogroup");
+        const labelNode = el("span", "radio-group-label", label);
+        labelNode.id = `amaterasu-radio-label-${nextRadioGroupId}`;
+        const optionsNode = el("div", "radio-options");
+        group.setAttribute("aria-labelledby", labelNode.id);
+        const applyBehavior = () => {
+            if (currentBehavior.disabled)
+                group.setAttribute("aria-disabled", "true");
+            else
+                group.removeAttribute("aria-disabled");
+            if (currentBehavior.readOnly)
+                group.setAttribute("aria-readonly", "true");
+            else
+                group.removeAttribute("aria-readonly");
+            if (currentBehavior.required)
+                group.setAttribute("aria-required", "true");
+            else
+                group.removeAttribute("aria-required");
+            for (const control of controls) {
+                control.disabled = currentBehavior.disabled === true;
+                control.required = currentBehavior.required === true;
+                if (currentBehavior.readOnly)
+                    control.setAttribute("aria-readonly", "true");
+                else
+                    control.removeAttribute("aria-readonly");
+            }
+        };
+        group.append(labelNode, optionsNode);
+        const render = () => {
+            choiceController.abort();
+            choiceController = new AbortController();
+            controls = currentOptions.map((option) => {
+                const control = input(name, option.value, "radio");
+                control.checked = option.value === currentValue;
+                control.disabled = currentBehavior.disabled === true;
+                control.required = currentBehavior.required === true;
+                if (currentBehavior.readOnly)
+                    control.setAttribute("aria-readonly", "true");
+                control.addEventListener("click", (event) => {
+                    if (currentBehavior.readOnly) {
+                        event.preventDefault();
+                        event.stopImmediatePropagation();
+                    }
+                }, { capture: true, signal: choiceController.signal });
+                control.addEventListener("keydown", (event) => {
+                    if (!currentBehavior.readOnly || event.ctrlKey || event.metaKey || event.altKey)
+                        return;
+                    const index = controls.indexOf(control);
+                    const focusIndex = event.key === "ArrowDown" || event.key === "ArrowRight" ? (index + 1) % controls.length
+                        : event.key === "ArrowUp" || event.key === "ArrowLeft" ? (index + controls.length - 1) % controls.length
+                            : event.key === "Home" ? 0 : event.key === "End" ? controls.length - 1 : -1;
+                    if (focusIndex >= 0) {
+                        event.preventDefault();
+                        event.stopImmediatePropagation();
+                        controls[focusIndex]?.focus();
+                        return;
+                    }
+                    const mutatingKey = event.key.length === 1 || ["PageUp", "PageDown", "Enter", " ", "Spacebar", "Backspace", "Delete"].includes(event.key);
+                    if (mutatingKey) {
+                        event.preventDefault();
+                        event.stopImmediatePropagation();
+                    }
+                }, { capture: true, signal: choiceController.signal });
+                control.addEventListener("change", (event) => {
+                    if (currentBehavior.disabled || currentBehavior.readOnly) {
+                        for (const peer of controls)
+                            peer.checked = peer.value === currentValue;
+                        event.preventDefault();
+                        event.stopImmediatePropagation();
+                        return;
+                    }
+                    if (!control.checked)
+                        return;
+                    currentValue = control.value;
+                    for (const peer of controls)
+                        peer.checked = peer === control;
+                    onChange(control.value);
+                }, { capture: true, signal: choiceController.signal });
+                return control;
+            });
+            optionsNode.replaceChildren(...currentOptions.map((option, index) => el("label", "radio-option", controls[index], el("span", "", option.label))));
+        };
+        render();
+        applyBehavior();
+        return {
+            node: group,
+            get controls() { return controls; },
+            value: () => currentValue,
+            setValue: (value) => {
+                if (!currentOptions.some((option) => option.value === value))
+                    throw new Error("Unsupported radio group value.");
+                currentValue = value;
+                for (const control of controls)
+                    control.checked = control.value === value;
+            },
+            setBehavior: (nextBehavior) => {
+                currentBehavior = { ...nextBehavior };
+                applyBehavior();
+            },
+            setChoices: (nextOptions, nextValue = currentValue) => {
+                if (disposed)
+                    return;
+                validate(nextOptions, nextValue);
+                const focusedValue = controls.find((control) => control === document.activeElement)?.value;
+                currentOptions = [...nextOptions];
+                currentValue = nextValue;
+                render();
+                if (focusedValue !== undefined) {
+                    (controls.find((control) => control.value === focusedValue) ??
+                        controls.find((control) => control.value === currentValue))?.focus();
+                }
+            },
+            dispose,
+        };
+    }
+    Amaterasu.radioGroup = radioGroup;
+    let nextBoundedSliderId = 0;
+    function boundedSlider(minimum, maximum, value, label, integer = false, className = "bounded-slider", options = {}) {
+        const step = options.step ?? (integer ? 1 : "any");
+        if (!Number.isFinite(minimum) || !Number.isFinite(maximum) || minimum >= maximum ||
+            (integer && (!Number.isSafeInteger(minimum) || !Number.isSafeInteger(maximum))) ||
+            (step !== "any" && (!Number.isFinite(step) || step <= 0)) ||
+            (options.onChange !== undefined && typeof options.onChange !== "function") ||
+            !isValidSliderValue(value, minimum, maximum, integer, step))
+            throw new Error("Invalid bounded slider limits, step, or value.");
+        const number = input("", String(value), "number");
+        const range = input("", "", "range");
+        for (const control of [number, range]) {
+            control.min = String(minimum);
+            control.max = String(maximum);
+            control.step = String(step);
+            control.disabled = options.disabled === true;
+            control.required = options.required === true;
+            if (options.readOnly)
+                control.setAttribute("aria-readonly", "true");
+        }
+        if (options.readOnly)
+            number.readOnly = true;
+        if (options.accessibleLabel) {
+            if (!options.accessibleLabel.id)
+                options.accessibleLabel.id = `amaterasu-slider-label-${++nextBoundedSliderId}`;
+            range.setAttribute("aria-labelledby", options.accessibleLabel.id);
+            number.setAttribute("aria-labelledby", options.accessibleLabel.id);
+        }
+        else {
+            range.setAttribute("aria-label", `${label} slider`);
+            number.setAttribute("aria-label", `${label} value`);
+        }
+        range.value = String(value);
+        const controller = new AbortController();
+        let disposed = false;
+        let currentValue = value;
+        let currentBehavior = { disabled: options.disabled === true, readOnly: options.readOnly === true, required: options.required === true };
+        const applyBehavior = () => {
+            for (const control of [range, number]) {
+                control.disabled = currentBehavior.disabled;
+                control.required = currentBehavior.required;
+                if (currentBehavior.readOnly)
+                    control.setAttribute("aria-readonly", "true");
+                else
+                    control.removeAttribute("aria-readonly");
+            }
+            number.readOnly = currentBehavior.readOnly;
+        };
+        const dispose = () => {
+            if (disposed)
+                return;
+            disposed = true;
+            controller.abort();
+            options.signal?.removeEventListener("abort", dispose);
+        };
+        if (options.signal?.aborted)
+            dispose();
+        else
+            options.signal?.addEventListener("abort", dispose, { once: true });
+        const readValue = (control) => {
+            const parsed = Number(control.value);
+            if (!control.value || !control.validity.valid ||
+                !isValidSliderValue(parsed, minimum, maximum, integer, step))
+                throw new Error(`Enter a valid number from ${minimum} to ${maximum} on step ${step}.`);
+            return parsed;
+        };
+        const restoreCurrentValue = () => {
+            number.value = String(currentValue);
+            range.value = String(currentValue);
+        };
+        range.addEventListener("click", (event) => {
+            if (currentBehavior.readOnly) {
+                event.preventDefault();
+                event.stopImmediatePropagation();
+            }
+        }, { capture: true, signal: controller.signal });
+        range.addEventListener("pointerdown", (event) => {
+            if (currentBehavior.readOnly) {
+                event.preventDefault();
+                event.stopImmediatePropagation();
+            }
+        }, { capture: true, signal: controller.signal });
+        range.addEventListener("keydown", (event) => {
+            const valueMutationKey = ["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Home", "End", "PageUp", "PageDown"].includes(event.key);
+            if (currentBehavior.readOnly && valueMutationKey) {
+                event.preventDefault();
+                event.stopImmediatePropagation();
+            }
+        }, { capture: true, signal: controller.signal });
+        for (const control of [range, number]) {
+            control.addEventListener("input", (event) => {
+                if (currentBehavior.disabled || currentBehavior.readOnly) {
+                    restoreCurrentValue();
+                    event.preventDefault();
+                    event.stopImmediatePropagation();
+                }
+            }, { capture: true, signal: controller.signal });
+        }
+        range.addEventListener("input", () => {
+            let nextValue;
+            try {
+                nextValue = readValue(range);
+            }
+            catch {
+                return;
+            }
+            number.value = String(nextValue);
+            currentValue = nextValue;
+            options.onChange?.(nextValue);
+        }, { signal: controller.signal });
+        number.addEventListener("input", () => {
+            let nextValue;
+            try {
+                nextValue = readValue(number);
+            }
+            catch {
+                return;
+            }
+            range.value = String(nextValue);
+            if (Number(range.value) !== nextValue)
+                return;
+            currentValue = nextValue;
+            options.onChange?.(nextValue);
+        }, { signal: controller.signal });
+        const node = el("div", className, range, number);
+        return {
+            node,
+            range,
+            number,
+            value: () => readValue(number),
+            setBehavior: (nextBehavior) => {
+                currentBehavior = { disabled: nextBehavior.disabled === true, readOnly: nextBehavior.readOnly === true, required: nextBehavior.required === true };
+                applyBehavior();
+            },
+            setValue: (nextValue) => {
+                if (!isValidSliderValue(nextValue, minimum, maximum, integer, step))
+                    throw new Error(`Slider value must be between ${minimum} and ${maximum} on step ${step}.`);
+                const previousNumber = number.value;
+                const previousRange = range.value;
+                number.value = String(nextValue);
+                range.value = String(nextValue);
+                if (Number(range.value) !== nextValue) {
+                    number.value = previousNumber;
+                    range.value = previousRange;
+                    throw new Error("Slider value cannot be represented by the range control.");
+                }
+                currentValue = nextValue;
+            },
+            dispose,
+        };
+    }
+    Amaterasu.boundedSlider = boundedSlider;
+    function isValidNumberControlValue(value, minimum, maximum, step = "any", integer = false) {
+        if (!Number.isFinite(value) || minimum !== undefined && value < minimum || maximum !== undefined && value > maximum ||
+            (integer && !Number.isSafeInteger(value)))
+            return false;
+        if (step === "any")
+            return true;
+        if (!Number.isFinite(step) || step <= 0)
+            return false;
+        const stepCount = (value - (minimum ?? 0)) / step;
+        return Number.isFinite(stepCount) &&
+            Math.abs(stepCount - Math.round(stepCount)) <= Number.EPSILON * Math.max(1, Math.abs(stepCount)) * 4;
+    }
+    Amaterasu.isValidNumberControlValue = isValidNumberControlValue;
+    function isValidSliderValue(value, minimum, maximum, integer, step) {
+        return isValidNumberControlValue(value, minimum, maximum, step, integer);
+    }
     function sectionHeading(title, description, ...actions) {
         return el("header", "page-heading", el("div", "", el("h1", "", title), el("p", "muted", description)), el("div", "actions", ...actions));
     }
@@ -4181,6 +6250,256 @@ var Amaterasu;
 })(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
 (function (Amaterasu) {
+    async function refreshLutrisProvider(api, accepted) {
+        const status = await api.post("lutris/refresh");
+        if (!status || status.ok !== true)
+            throw new Error("Lutris refresh was not accepted.");
+        accepted?.();
+        return status;
+    }
+    Amaterasu.refreshLutrisProvider = refreshLutrisProvider;
+    async function refreshPlayniteProvider(api, accepted) {
+        const response = await api.post("playnite/refresh");
+        if (!response || typeof response !== "object" || Array.isArray(response) ||
+            response.ok !== true)
+            throw new Error("Playnite refresh was not accepted.");
+        accepted?.();
+        return api.post("playnite/status");
+    }
+    Amaterasu.refreshPlayniteProvider = refreshPlayniteProvider;
+})(Amaterasu || (Amaterasu = {}));
+var Amaterasu;
+(function (Amaterasu) {
+    let nextListEditorId = 0;
+    function listEditorSetText(target, source) {
+        if (typeof Amaterasu.setLocalizedTextContent === "function")
+            Amaterasu.setLocalizedTextContent(target, source);
+        else
+            target.textContent = source;
+    }
+    function listEditorSetAttribute(target, attribute, source) {
+        if (typeof Amaterasu.setLocalizedAttribute === "function")
+            Amaterasu.setLocalizedAttribute(target, attribute, source);
+        else
+            target.setAttribute(attribute, source);
+    }
+    function listEditorSetTextTemplate(target, source, values) {
+        const format = (locale) => {
+            let rendered = typeof Amaterasu.translateText === "function"
+                ? Amaterasu.translateText(source) : source;
+            const formatter = new Intl.NumberFormat(locale);
+            for (const [name, value] of Object.entries(values)) {
+                const raw = typeof value === "string" ? value : value.value;
+                const formatted = /^\d+$/.test(raw) ? formatter.format(Number(raw)) : raw;
+                rendered = rendered.replaceAll(`{${name}}`, () => formatted);
+            }
+            return rendered;
+        };
+        if (typeof Amaterasu.localeFormattedTextNode === "function")
+            target.replaceChildren(Amaterasu.localeFormattedTextNode(format));
+        else
+            target.textContent = format("en");
+    }
+    function listEditorSetTemplate(target, source, values) {
+        if (typeof Amaterasu.setLocalizedAttributeTemplate === "function")
+            Amaterasu.setLocalizedAttributeTemplate(target, "aria-label", source, values);
+        else {
+            let label = source;
+            for (const [name, value] of Object.entries(values)) {
+                const text = typeof value === "string" ? value : value.value;
+                label = label.replaceAll(`{${name}}`, () => text);
+            }
+            target.setAttribute("aria-label", label);
+        }
+    }
+    function accessibleListEditor(options) {
+        const maxItems = options.maxItems ?? 256;
+        if (typeof options.label !== "string" || !options.label.trim() ||
+            !Array.isArray(options.values) || typeof options.formatValue !== "function" ||
+            typeof options.parseValue !== "function" ||
+            (options.onChange !== undefined && typeof options.onChange !== "function") ||
+            !Number.isInteger(maxItems) || maxItems < 1 || options.values.length > maxItems) {
+            throw new Error("Invalid list editor options.");
+        }
+        const id = ++nextListEditorId;
+        const root = document.createElement("fieldset");
+        root.className = "list-editor";
+        const legend = document.createElement("legend");
+        listEditorSetText(legend, options.label);
+        const description = options.description ? document.createElement("small") : null;
+        if (description && options.description) {
+            description.id = `amaterasu-list-editor-description-${id}`;
+            description.className = "list-editor-description muted";
+            listEditorSetText(description, options.description);
+        }
+        const list = document.createElement("ol");
+        list.className = "list-editor-items";
+        listEditorSetAttribute(list, "aria-label", `${options.label} items`);
+        const status = document.createElement("p");
+        status.id = `amaterasu-list-editor-status-${id}`;
+        status.className = "list-editor-status muted";
+        status.setAttribute("aria-live", "polite");
+        status.setAttribute("aria-atomic", "true");
+        const add = document.createElement("button");
+        add.type = "button";
+        add.className = "button secondary";
+        listEditorSetText(add, "Add item");
+        const draftSignal = document.createElement("input");
+        draftSignal.type = "text";
+        draftSignal.hidden = true;
+        draftSignal.tabIndex = -1;
+        draftSignal.setAttribute("aria-hidden", "true");
+        draftSignal.name = "list_editor_draft";
+        const rootController = new AbortController();
+        let rowController = new AbortController();
+        let disposed = false;
+        let entries = options.values.map((value) => ({
+            text: options.formatValue(value),
+            value,
+            valid: true,
+        }));
+        root.append(legend);
+        if (description)
+            root.append(description);
+        root.append(list, status, add, draftSignal);
+        draftSignal.value = JSON.stringify(entries.map((entry) => entry.text));
+        function signalDraft() {
+            draftSignal.value = JSON.stringify(entries.map((entry) => entry.text));
+            draftSignal.dispatchEvent(new Event("input", { bubbles: true }));
+        }
+        function currentValues() {
+            if (entries.some((entry) => !entry.valid || entry.value === undefined))
+                throw new Error("Resolve invalid list entries before reading their values.");
+            return entries.map((entry) => entry.value);
+        }
+        function publish() {
+            if (entries.every((entry) => entry.valid && entry.value !== undefined))
+                options.onChange?.(currentValues());
+        }
+        function setStatus(message) {
+            listEditorSetText(status, message);
+        }
+        function renderRows(focusIndex) {
+            rowController.abort();
+            rowController = new AbortController();
+            list.replaceChildren();
+            entries.forEach((entry, index) => {
+                const item = document.createElement("li");
+                item.className = "list-editor-item";
+                const input = document.createElement("input");
+                input.type = "text";
+                input.className = "list-editor-input";
+                input.value = entry.text;
+                const errorElement = document.createElement("small");
+                errorElement.id = `amaterasu-list-editor-error-${id}-${index}`;
+                errorElement.className = "list-editor-error";
+                listEditorSetText(errorElement, entry.validationMessage ?? "");
+                if (!entry.valid)
+                    input.setAttribute("aria-invalid", "true");
+                listEditorSetTemplate(input, "{label}, item {index}", {
+                    label: typeof Amaterasu.localizedMessage === "function"
+                        ? Amaterasu.localizedMessage(options.label) : options.label,
+                    index: typeof Amaterasu.literalText === "function"
+                        ? Amaterasu.literalText(String(index + 1)) : String(index + 1),
+                });
+                input.setAttribute("aria-describedby", [description?.id, status.id, errorElement.id].filter(Boolean).join(" "));
+                input.addEventListener("input", () => {
+                    entry.text = input.value;
+                    signalDraft();
+                    let value;
+                    try {
+                        value = options.parseValue(input.value);
+                        if (value === undefined)
+                            throw new Error("The value is invalid.");
+                    }
+                    catch (error) {
+                        entry.value = undefined;
+                        entry.valid = false;
+                        const message = error && typeof error === "object" && "message" in error
+                            ? error.message
+                            : undefined;
+                        entry.validationMessage = typeof message === "string"
+                            ? message : "This value is invalid.";
+                        input.setAttribute("aria-invalid", "true");
+                        listEditorSetText(errorElement, entry.validationMessage);
+                        setStatus(entry.validationMessage);
+                        return;
+                    }
+                    entry.value = value;
+                    entry.valid = true;
+                    entry.validationMessage = undefined;
+                    input.removeAttribute("aria-invalid");
+                    listEditorSetText(errorElement, "");
+                    setStatus("");
+                    publish();
+                }, { signal: rowController.signal });
+                const remove = document.createElement("button");
+                remove.type = "button";
+                remove.className = "button secondary list-editor-remove";
+                listEditorSetText(remove, "Remove");
+                listEditorSetTemplate(remove, "Remove {label} item {index}", {
+                    label: typeof Amaterasu.localizedMessage === "function"
+                        ? Amaterasu.localizedMessage(options.label) : options.label,
+                    index: typeof Amaterasu.literalText === "function"
+                        ? Amaterasu.literalText(String(index + 1)) : String(index + 1),
+                });
+                remove.addEventListener("click", () => {
+                    entries.splice(index, 1);
+                    signalDraft();
+                    setStatus("");
+                    renderRows(Math.min(index, entries.length - 1));
+                    publish();
+                }, { signal: rowController.signal });
+                item.append(input, remove, errorElement);
+                list.append(item);
+            });
+            add.disabled = entries.length >= maxItems;
+            if (focusIndex !== undefined && focusIndex >= 0) {
+                const row = list.children.item(focusIndex);
+                row?.querySelector("input")?.focus();
+            }
+        }
+        add.addEventListener("click", () => {
+            if (entries.length >= maxItems) {
+                listEditorSetTextTemplate(status, "This list can contain at most {maxItems} items.", {
+                    maxItems: typeof Amaterasu.literalText === "function"
+                        ? Amaterasu.literalText(String(maxItems)) : String(maxItems),
+                });
+                return;
+            }
+            entries.push({ text: "", value: undefined, valid: false });
+            signalDraft();
+            setStatus("Enter a value for the new item.");
+            renderRows(entries.length - 1);
+        }, { signal: rootController.signal });
+        renderRows();
+        return {
+            element: root,
+            values: currentValues,
+            setValues(values) {
+                if (disposed)
+                    throw new Error("The list editor has been disposed.");
+                if (!Array.isArray(values) || values.length > maxItems)
+                    throw new Error(`The list can contain at most ${maxItems} items.`);
+                entries = values.map((value) => ({ text: options.formatValue(value), value, valid: true }));
+                signalDraft();
+                setStatus("");
+                renderRows();
+            },
+            dispose() {
+                if (disposed)
+                    return;
+                disposed = true;
+                rootController.abort();
+                rowController.abort();
+                root.replaceChildren();
+            },
+        };
+    }
+    Amaterasu.accessibleListEditor = accessibleListEditor;
+})(Amaterasu || (Amaterasu = {}));
+var Amaterasu;
+(function (Amaterasu) {
     function parseThemePreference(value) {
         return value === "dark" || value === "light" || value === "auto" ? value : "auto";
     }
@@ -4235,6 +6554,497 @@ var Amaterasu;
         }
     }
     Amaterasu.ThemeController = ThemeController;
+})(Amaterasu || (Amaterasu = {}));
+var Amaterasu;
+(function (Amaterasu) {
+    function steamChooserMessage(value) {
+        return typeof Amaterasu.localizedMessage === "function"
+            ? Amaterasu.localizedMessage(value)
+            : value;
+    }
+    function steamChooserSetText(target, value) {
+        if (typeof Amaterasu.setLocalizedTextContent === "function")
+            Amaterasu.setLocalizedTextContent(target, value);
+        else
+            target.textContent = value;
+    }
+    function steamChooserSetFormattedText(target, source, values) {
+        if (typeof Amaterasu.localeFormattedTextNode === "function" &&
+            typeof Amaterasu.translateText === "function") {
+            const node = Amaterasu.localeFormattedTextNode(() => {
+                let rendered = Amaterasu.translateText(source);
+                for (const [name, value] of Object.entries(values))
+                    rendered = rendered.replaceAll(`{${name}}`, () => value);
+                return rendered;
+            });
+            target.replaceChildren(node);
+        }
+        else {
+            let rendered = source;
+            for (const [name, value] of Object.entries(values))
+                rendered = rendered.replaceAll(`{${name}}`, () => value);
+            target.textContent = rendered;
+        }
+    }
+    function steamChooserSetAttribute(target, attribute, value) {
+        if (typeof Amaterasu.setLocalizedAttribute === "function")
+            Amaterasu.setLocalizedAttribute(target, attribute, value);
+        else
+            target.setAttribute(attribute, value);
+    }
+    function steamChooserSetAttributeTemplate(target, attribute, source, values) {
+        if (typeof Amaterasu.setLocalizedAttributeTemplate === "function")
+            Amaterasu.setLocalizedAttributeTemplate(target, attribute, source, values);
+        else {
+            let rendered = source;
+            for (const [name, value] of Object.entries(values)) {
+                const literal = typeof value === "string" ? value : value.value;
+                rendered = rendered.replaceAll(`{${name}}`, () => literal);
+            }
+            target.setAttribute(attribute, rendered);
+        }
+    }
+    const steamChooserPageSize = 16;
+    const steamChooserSearchMaxPages = 32;
+    function validateSteamChooserReply(value) {
+        if (!value || typeof value !== "object" || Array.isArray(value))
+            throw new Error("Steam game discovery returned an invalid response.");
+        const reply = value;
+        if (!Number.isSafeInteger(reply.revision) || reply.revision < 0 ||
+            !Array.isArray(reply.games) || reply.games.length > steamChooserPageSize ||
+            (reply.next_after !== null && !Number.isSafeInteger(reply.next_after)) ||
+            typeof reply.scanning !== "boolean" || typeof reply.complete !== "boolean")
+            throw new Error("Steam game discovery returned an invalid response.");
+        const seen = new Set();
+        const games = reply.games.map((value) => {
+            if (!value || typeof value !== "object" || Array.isArray(value))
+                throw new Error("Steam game discovery returned an invalid game.");
+            const game = value;
+            const directory = typeof game.install_directory === "string" &&
+                game.install_directory.trim() !== "" ? game.install_directory : undefined;
+            if (!Number.isSafeInteger(game.app_id) || game.app_id <= 0 ||
+                typeof game.name !== "string" || !game.name.trim() ||
+                seen.has(game.app_id) ||
+                (game.install_directory !== undefined && typeof game.install_directory !== "string"))
+                throw new Error("Steam game discovery returned an invalid game.");
+            seen.add(game.app_id);
+            return {
+                app_id: game.app_id,
+                name: game.name,
+                ...(directory === undefined ? {} : { install_directory: directory }),
+            };
+        });
+        const nextAfter = reply.next_after;
+        if (nextAfter !== null && nextAfter < 0)
+            throw new Error("Steam game discovery returned an invalid cursor.");
+        return {
+            revision: reply.revision,
+            games,
+            next_after: nextAfter,
+            scanning: reply.scanning,
+            complete: reply.complete,
+        };
+    }
+    function steamChooserSetFocus(target) {
+        if (target.isConnected)
+            target.focus();
+    }
+    function chooseSteamGame(api, signal) {
+        return new Promise((resolve) => {
+            if (signal?.aborted) {
+                resolve(null);
+                return;
+            }
+            const opener = document.activeElement;
+            const dialog = Amaterasu.el("dialog", "steam-game-chooser-dialog");
+            steamChooserSetAttribute(dialog, "aria-label", "Choose a Steam game");
+            const status = Amaterasu.el("p", "steam-game-chooser-status");
+            status.setAttribute("role", "status");
+            status.setAttribute("aria-live", "polite");
+            const list = Amaterasu.el("ul", "steam-game-chooser-list");
+            steamChooserSetAttribute(list, "aria-label", "Steam games");
+            const searchInput = Amaterasu.input("steam_game_search");
+            searchInput.type = "search";
+            searchInput.maxLength = 128;
+            steamChooserSetAttribute(searchInput, "aria-label", "Search discovered games");
+            if (typeof Amaterasu.setLocalizedAttribute === "function")
+                Amaterasu.setLocalizedAttribute(searchInput, "placeholder", "Search by game name or app ID");
+            else
+                searchInput.placeholder = "Search by game name or app ID";
+            const searchButton = Amaterasu.button(steamChooserMessage("Search"), () => void searchGames());
+            const searchForm = Amaterasu.el("form", "steam-game-chooser-search", Amaterasu.field(steamChooserMessage("Search discovered games"), searchInput), searchButton);
+            const previous = Amaterasu.button(steamChooserMessage("← Previous"), () => void showPage(pageIndex - 1));
+            const next = Amaterasu.button(steamChooserMessage("Next →"), () => void showPage(pageIndex + 1), "primary");
+            const restart = Amaterasu.button(steamChooserMessage("Restart"), () => void restartDiscovery());
+            restart.hidden = true;
+            const clearSearch = Amaterasu.button(steamChooserMessage("Clear search"), () => {
+                searchInput.value = "";
+                activeSearchTerm = "";
+                activeRequestController?.abort();
+                activeRequestController = null;
+                operationToken += 1;
+                loading = false;
+                searching = false;
+                pageIndex = 0;
+                cursors.length = 1;
+                list.replaceChildren();
+                restart.hidden = true;
+                void showPage(0);
+            });
+            clearSearch.hidden = true;
+            const cancel = Amaterasu.button(steamChooserMessage("Cancel"), () => finish(null));
+            steamChooserSetAttribute(cancel, "aria-label", "Cancel");
+            const pagination = Amaterasu.el("div", "actions steam-game-chooser-pagination", previous, next);
+            const recovery = Amaterasu.el("div", "actions steam-game-chooser-recovery", restart, clearSearch);
+            const heading = Amaterasu.el("h2", "", steamChooserMessage("Choose a Steam game"));
+            heading.id = "steam-game-chooser-title";
+            dialog.setAttribute("aria-labelledby", heading.id);
+            dialog.append(heading, Amaterasu.el("p", "muted", steamChooserMessage("Select a discovered game to use its Steam app ID and optional install directory.")), searchForm, status, list, pagination, recovery, Amaterasu.el("div", "actions", cancel));
+            let settled = false;
+            let loading = false;
+            let searching = false;
+            let revision;
+            let pageIndex = 0;
+            let activeSearchTerm = "";
+            let cursors = [null];
+            let operationToken = 0;
+            let activeRequestController = null;
+            const beginOperation = () => {
+                activeRequestController?.abort();
+                const controller = new AbortController();
+                activeRequestController = controller;
+                const token = ++operationToken;
+                const abortWithEditor = () => controller.abort();
+                signal?.addEventListener("abort", abortWithEditor, { once: true });
+                return {
+                    token,
+                    requestSignal: controller.signal,
+                    cleanup: () => signal?.removeEventListener("abort", abortWithEditor),
+                };
+            };
+            const finish = (selection) => {
+                if (settled)
+                    return;
+                settled = true;
+                activeRequestController?.abort();
+                activeRequestController = null;
+                operationToken += 1;
+                signal?.removeEventListener("abort", onAbort);
+                dialog.close();
+                dialog.remove();
+                if (opener)
+                    steamChooserSetFocus(opener);
+                resolve(selection);
+            };
+            const onAbort = () => finish(null);
+            const updatePager = (hasNext) => {
+                previous.disabled = loading || searching || pageIndex === 0;
+                next.disabled = loading || searching || !hasNext;
+                pagination.hidden = searching || (pageIndex === 0 && !hasNext);
+                searchInput.disabled = loading || !api.allows("steam.read");
+                searchButton.disabled = loading || !api.allows("steam.read");
+                restart.disabled = loading;
+                clearSearch.hidden = !activeSearchTerm;
+            };
+            const showRestart = (message) => {
+                list.replaceChildren();
+                steamChooserSetText(status, message);
+                restart.hidden = false;
+                updatePager(false);
+            };
+            const permissionLost = () => {
+                list.replaceChildren();
+                steamChooserSetText(status, "Steam read permission is required. You can enter the app ID manually.");
+                restart.hidden = true;
+                updatePager(false);
+            };
+            const renderGames = (games) => {
+                list.replaceChildren();
+                for (const game of games) {
+                    const select = Amaterasu.button(steamChooserMessage("Select"), () => finish(game));
+                    steamChooserSetAttributeTemplate(select, "aria-label", "Select {name}", {
+                        name: typeof Amaterasu.literalText === "function"
+                            ? Amaterasu.literalText(game.name)
+                            : game.name,
+                    });
+                    const directory = game.install_directory;
+                    list.append(Amaterasu.el("li", "steam-game-chooser-item", Amaterasu.el("div", "steam-game-chooser-copy", Amaterasu.el("strong", "", typeof Amaterasu.literalText === "function"
+                        ? Amaterasu.literalText(game.name)
+                        : game.name), Amaterasu.el("span", "steam-game-chooser-details", steamChooserMessage("App ID"), " ", String(game.app_id), " · ", steamChooserMessage(directory ? "Install directory" : "Install directory unavailable"), ...(directory ? [" ", typeof Amaterasu.literalText === "function"
+                            ? Amaterasu.literalText(directory)
+                            : directory] : []))), select));
+                }
+            };
+            const showPage = async (requestedPage) => {
+                if (settled || loading || searching || requestedPage < 0 ||
+                    requestedPage > pageIndex + 1)
+                    return;
+                if (!api.allows("steam.read")) {
+                    permissionLost();
+                    return;
+                }
+                loading = true;
+                searching = false;
+                const operation = beginOperation();
+                pageIndex = requestedPage;
+                const cursor = cursors[pageIndex] ?? null;
+                cursors.length = pageIndex + 1;
+                list.replaceChildren();
+                restart.hidden = true;
+                steamChooserSetText(status, "Loading Steam games…");
+                updatePager(false);
+                try {
+                    const raw = await api.post("steam/list", {
+                        ...(revision !== undefined ? { revision } : {}),
+                        ...(cursor !== null ? { after: cursor } : {}),
+                        limit: steamChooserPageSize,
+                    }, true, operation.requestSignal);
+                    if (settled || signal?.aborted || operation.token !== operationToken)
+                        return;
+                    if (!api.allows("steam.read")) {
+                        permissionLost();
+                        return;
+                    }
+                    const reply = validateSteamChooserReply(raw);
+                    if (revision !== undefined && reply.revision !== revision) {
+                        showRestart("Steam games changed. Restart to load the current list.");
+                        return;
+                    }
+                    revision = reply.revision;
+                    if (reply.next_after !== null &&
+                        ((cursor !== null && reply.next_after <= cursor) ||
+                            cursors.slice(0, pageIndex + 1).includes(reply.next_after))) {
+                        showRestart("Steam pagination failed. Restart to continue.");
+                        return;
+                    }
+                    if (reply.next_after !== null)
+                        cursors[pageIndex + 1] = reply.next_after;
+                    else
+                        cursors.length = pageIndex + 1;
+                    renderGames(reply.games);
+                    steamChooserSetText(status, reply.games.length
+                        ? "Choose a discovered game."
+                        : reply.complete ? "No Steam games are available."
+                            : reply.scanning ? "Steam is scanning. Refresh later to see discovered games."
+                                : "No Steam games are available.");
+                    updatePager(reply.next_after !== null);
+                }
+                catch (error) {
+                    if (settled || signal?.aborted || operation.token !== operationToken)
+                        return;
+                    if (!api.allows("steam.read")) {
+                        permissionLost();
+                        return;
+                    }
+                    if (error instanceof Amaterasu.ApiError && error.code === "revision_conflict") {
+                        showRestart("Steam games changed. Restart to load the current list.");
+                        return;
+                    }
+                    showRestart("Steam games are unavailable. Retry or enter the app ID manually.");
+                }
+                finally {
+                    operation.cleanup();
+                    if (operation.token === operationToken) {
+                        loading = false;
+                        activeRequestController = null;
+                        if (!settled && !signal?.aborted)
+                            updatePager(cursors[pageIndex + 1] !== undefined);
+                    }
+                }
+            };
+            const searchGames = async () => {
+                if (settled || loading || !searchInput.value.trim()) {
+                    if (!settled && !searchInput.value.trim())
+                        steamChooserSetText(status, "Enter a game name or app ID.");
+                    return;
+                }
+                if (!api.allows("steam.read")) {
+                    permissionLost();
+                    return;
+                }
+                const query = searchInput.value.trim().toLocaleLowerCase();
+                activeSearchTerm = query;
+                loading = true;
+                searching = true;
+                const operation = beginOperation();
+                list.replaceChildren();
+                restart.hidden = true;
+                clearSearch.hidden = false;
+                steamChooserSetText(status, "Searching Steam games…");
+                updatePager(false);
+                const matches = [];
+                const seenCursors = new Set();
+                let cursor = null;
+                let pagesRead = 0;
+                let entriesChecked = 0;
+                let complete = false;
+                try {
+                    while (pagesRead < steamChooserSearchMaxPages) {
+                        if (settled || signal?.aborted || operation.token !== operationToken)
+                            return;
+                        if (!api.allows("steam.read")) {
+                            permissionLost();
+                            return;
+                        }
+                        const reply = validateSteamChooserReply(await api.post("steam/list", {
+                            ...(revision !== undefined ? { revision } : {}),
+                            ...(cursor !== null ? { after: cursor } : {}),
+                            limit: steamChooserPageSize,
+                        }, true, operation.requestSignal));
+                        if (settled || signal?.aborted || operation.token !== operationToken)
+                            return;
+                        if (!api.allows("steam.read")) {
+                            permissionLost();
+                            return;
+                        }
+                        if (revision !== undefined && reply.revision !== revision) {
+                            showRestart("Steam games changed. Restart to search the current list.");
+                            return;
+                        }
+                        revision = reply.revision;
+                        pagesRead += 1;
+                        entriesChecked += reply.games.length;
+                        matches.push(...reply.games.filter((game) => game.name.toLocaleLowerCase().includes(query) ||
+                            String(game.app_id).includes(query)));
+                        if (reply.next_after === null) {
+                            complete = true;
+                            break;
+                        }
+                        if ((cursor !== null && reply.next_after <= cursor) ||
+                            seenCursors.has(reply.next_after)) {
+                            showRestart("Steam pagination failed. Restart to continue.");
+                            return;
+                        }
+                        seenCursors.add(reply.next_after);
+                        cursor = reply.next_after;
+                    }
+                    renderGames(matches);
+                    if (matches.length) {
+                        if (complete)
+                            steamChooserSetText(status, "Search complete. Choose a discovered game.");
+                        else
+                            steamChooserSetFormattedText(status, "Found matches within {count} checked games. Browse later pages or refine your search.", { count: String(entriesChecked) });
+                    }
+                    else {
+                        if (complete)
+                            steamChooserSetText(status, "No Steam games matched.");
+                        else
+                            steamChooserSetFormattedText(status, "Checked {count} games across 32 pages. Browse later pages or refine your search.", { count: String(entriesChecked) });
+                    }
+                    restart.hidden = true;
+                    updatePager(false);
+                }
+                catch (error) {
+                    if (settled || signal?.aborted || operation.token !== operationToken)
+                        return;
+                    if (!api.allows("steam.read")) {
+                        permissionLost();
+                        return;
+                    }
+                    if (error instanceof Amaterasu.ApiError && error.code === "revision_conflict") {
+                        showRestart("Steam games changed. Restart to search the current list.");
+                        return;
+                    }
+                    showRestart("Steam games are unavailable. Retry or enter the app ID manually.");
+                }
+                finally {
+                    operation.cleanup();
+                    if (operation.token === operationToken) {
+                        loading = false;
+                        activeRequestController = null;
+                        if (!settled && !signal?.aborted)
+                            updatePager(false);
+                    }
+                }
+            };
+            const restartDiscovery = async () => {
+                if (settled || loading)
+                    return;
+                revision = undefined;
+                pageIndex = 0;
+                cursors = [null];
+                const query = activeSearchTerm;
+                activeSearchTerm = "";
+                restart.hidden = true;
+                if (query) {
+                    searchInput.value = query;
+                    await searchGames();
+                }
+                else {
+                    await showPage(0);
+                }
+            };
+            searchForm.addEventListener("submit", (event) => {
+                event.preventDefault();
+                void searchGames();
+            });
+            dialog.addEventListener("cancel", (event) => {
+                event.preventDefault();
+                finish(null);
+            });
+            signal?.addEventListener("abort", onAbort, { once: true });
+            if (signal?.aborted) {
+                finish(null);
+                return;
+            }
+            document.body.append(dialog);
+            dialog.showModal();
+            cancel.focus();
+            if (api.allows("steam.read"))
+                void showPage(0);
+            else
+                permissionLost();
+        });
+    }
+    Amaterasu.chooseSteamGame = chooseSteamGame;
+    function chooseSteamDirectoryChange(signal) {
+        return new Promise((resolve) => {
+            if (signal?.aborted) {
+                resolve(null);
+                return;
+            }
+            const opener = document.activeElement;
+            const dialog = Amaterasu.el("dialog", "steam-game-chooser-dialog");
+            steamChooserSetAttribute(dialog, "aria-label", "Review Steam directory");
+            const heading = Amaterasu.el("h2", "", steamChooserMessage("Review Steam directory"));
+            heading.id = "steam-directory-review-title";
+            dialog.setAttribute("aria-labelledby", heading.id);
+            const status = Amaterasu.el("p", "muted", steamChooserMessage("The selected game has no install directory. Your current directory may belong to another game."));
+            status.setAttribute("role", "status");
+            status.setAttribute("aria-live", "polite");
+            const keep = Amaterasu.button(steamChooserMessage("Keep current directory"), () => finish("keep"));
+            const clear = Amaterasu.button(steamChooserMessage("Clear current directory"), () => finish("clear"), "danger");
+            const review = Amaterasu.button(steamChooserMessage("Review fields"), () => finish("review"));
+            steamChooserSetAttribute(review, "aria-label", "Review fields");
+            dialog.append(heading, status, Amaterasu.el("p", "muted", steamChooserMessage("Choose whether to keep or clear the current directory, or review fields without applying.")), Amaterasu.el("div", "actions", review, keep, clear));
+            let settled = false;
+            const finish = (choice) => {
+                if (settled)
+                    return;
+                settled = true;
+                signal?.removeEventListener("abort", onAbort);
+                dialog.close();
+                dialog.remove();
+                if (opener)
+                    steamChooserSetFocus(opener);
+                resolve(choice);
+            };
+            const onAbort = () => finish(null);
+            dialog.addEventListener("cancel", (event) => {
+                event.preventDefault();
+                finish("review");
+            });
+            signal?.addEventListener("abort", onAbort, { once: true });
+            if (signal?.aborted) {
+                finish(null);
+                return;
+            }
+            document.body.append(dialog);
+            dialog.showModal();
+            review.focus();
+        });
+    }
+    Amaterasu.chooseSteamDirectoryChange = chooseSteamDirectoryChange;
 })(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
 (function (Amaterasu) {
@@ -4995,6 +7805,7 @@ var Amaterasu;
         const editor = Amaterasu.el("div");
         const editorDrafts = context.registerDraftGuard ? Amaterasu.trackDrafts(editor) : null;
         let editorSaving = false;
+        let editorLifecycle = null;
         const catalogDraftDirty = () => {
             const form = editor.querySelector(".editor-form");
             return !!form && !!editorDrafts?.isDirty(form);
@@ -5002,7 +7813,11 @@ var Amaterasu;
         let pluginArea = null;
         const pluginDirty = () => !!pluginArea && typeof Amaterasu.applicationPluginOverridesDirty === "function" && Amaterasu.applicationPluginOverridesDirty(pluginArea);
         if (editorDrafts)
-            context.registerDraftGuard?.(() => editorSaving || catalogDraftDirty() || pluginDirty(), editorDrafts.dispose);
+            context.registerDraftGuard?.(() => editorSaving || catalogDraftDirty() || pluginDirty(), () => {
+                editorLifecycle?.abort();
+                editorLifecycle = null;
+                editorDrafts.dispose();
+            });
         let editorGeneration = 0;
         const status = Amaterasu.el("div");
         const selectionCount = Amaterasu.el("span", "muted");
@@ -5444,6 +8259,8 @@ var Amaterasu;
             }
             if ((catalogDraftDirty() || pluginDirty()) && !window.confirm("Discard your unsaved application and plugin changes?"))
                 return false;
+            editorLifecycle?.abort();
+            editorLifecycle = null;
             pluginArea = null;
             editorGeneration += 1;
             editor.replaceChildren();
@@ -5610,7 +8427,9 @@ var Amaterasu;
         }
         function renderEditor(row, runtimeStatus, capabilities) {
             const editRevision = revision;
-            const form = entryForm(row?.entry, runtimeStatus, capabilities);
+            const lifecycle = new AbortController();
+            editorLifecycle = lifecycle;
+            const form = entryForm(row?.entry, runtimeStatus, capabilities, api, lifecycle.signal);
             form.hidden = !api.allows("catalog.write");
             const feedback = Amaterasu.el("div");
             const save = Amaterasu.el("button", "button primary", row ? "Save changes" : "Add application");
@@ -5640,6 +8459,9 @@ var Amaterasu;
                             entry,
                             expected_revision: editRevision,
                         });
+                        lifecycle.abort();
+                        if (editorLifecycle === lifecycle)
+                            editorLifecycle = null;
                         editor.replaceChildren();
                         notify(catalogTextMessage(row ? "Application updated." : "Application added."));
                         reset();
@@ -5675,10 +8497,39 @@ var Amaterasu;
         return { figure, art, fallback };
     }
     function catalogEditorSection(title, description, ...children) {
-        return Amaterasu.el("section", "catalog-editor-section", Amaterasu.el("div", "catalog-editor-heading", Amaterasu.el("h3", "", title), Amaterasu.el("p", "muted", description)), ...children);
+        const heading = Amaterasu.el("h3", "", title);
+        heading.tabIndex = -1;
+        return Amaterasu.el("section", "catalog-editor-section", Amaterasu.el("div", "catalog-editor-heading", heading, Amaterasu.el("p", "muted", description)), ...children);
     }
     function catalogEditorDisclosure(title, description, ...children) {
         return Amaterasu.el("details", "catalog-editor-section catalog-editor-disclosure", Amaterasu.el("summary", "", Amaterasu.el("strong", "", title), Amaterasu.el("small", "muted", description)), Amaterasu.el("div", "catalog-editor-disclosure-content", ...children));
+    }
+    function catalogEditorNavigation(items) {
+        const navigation = Amaterasu.el("nav", "catalog-editor-nav");
+        catalogLocalizedAttribute(navigation, "aria-label", "Application editor sections");
+        navigation.append(Amaterasu.el("span", "catalog-editor-nav-label", catalogTextMessage("SECTIONS")));
+        for (const item of items) {
+            const control = Amaterasu.button(catalogTextMessage(item.label), () => {
+                if (item.target.tagName.toLowerCase() === "details")
+                    item.target.open = true;
+                if (item.reveal)
+                    item.reveal.open = true;
+                const reduceMotion = typeof window !== "undefined" &&
+                    typeof window.matchMedia === "function" &&
+                    window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+                item.target.scrollIntoView({ behavior: reduceMotion ? "auto" : "smooth", block: "start" });
+                const focusTarget = item.reveal?.querySelector("summary") ??
+                    (item.target.tagName.toLowerCase() === "details"
+                        ? item.target.querySelector("summary")
+                        : item.target.querySelector("h3"));
+                if (focusTarget instanceof HTMLElement)
+                    focusTarget.focus();
+            }, "quiet");
+            control.className += " catalog-editor-nav-item";
+            control.setAttribute("aria-controls", item.target.id);
+            navigation.append(control);
+        }
+        return navigation;
     }
     function catalogOverrideEditor(sections, saved) {
         const removed = new Set();
@@ -5757,7 +8608,9 @@ var Amaterasu;
             empty.hidden = rows.some(item => item.selected);
         }
         search.addEventListener("input", update);
-        const node = Amaterasu.el("section", "catalog-editor-section catalog-overrides", Amaterasu.el("div", "catalog-editor-heading", Amaterasu.el("h3", "", "Settings overrides"), Amaterasu.el("p", "muted", "Only selected settings override the host defaults. Remove an override to inherit.")), marker, Amaterasu.el("div", "catalog-override-layout", Amaterasu.el("div", "catalog-override-browser", Amaterasu.el("div", "catalog-override-pane-heading", Amaterasu.el("h4", "", "Browse settings"), Amaterasu.el("p", "muted", "Choose a setting to add or edit.")), search, list), Amaterasu.el("div", "catalog-override-editor", Amaterasu.el("div", "catalog-override-pane-heading", Amaterasu.el("h4", "", "Active overrides"), Amaterasu.el("p", "muted", "Changes apply to this application.")), empty, active)));
+        const heading = Amaterasu.el("h3", "", catalogTextMessage("Settings overrides"));
+        heading.tabIndex = -1;
+        const node = Amaterasu.el("section", "catalog-editor-section catalog-overrides", Amaterasu.el("div", "catalog-editor-heading", heading, Amaterasu.el("p", "muted", catalogTextMessage("Inheritance is field-specific. Use the field's Inherit option or placeholder; Automatic audio selection and exact empty encoder strings are explicit choices."))), marker, Amaterasu.el("div", "catalog-override-layout", Amaterasu.el("div", "catalog-override-browser", Amaterasu.el("div", "catalog-override-pane-heading", Amaterasu.el("h4", "", "Browse settings"), Amaterasu.el("p", "muted", "Choose a setting to add or edit.")), search, list), Amaterasu.el("div", "catalog-override-editor", Amaterasu.el("div", "catalog-override-pane-heading", Amaterasu.el("h4", "", "Active overrides"), Amaterasu.el("p", "muted", "Changes apply to this application.")), empty, active)));
         update();
         return { node, removed };
     }
@@ -5777,7 +8630,7 @@ var Amaterasu;
         }, true);
     }
     const catalogRemovedOverrides = new WeakMap();
-    function entryForm(entry, runtimeStatus, capabilities) {
+    function entryForm(entry, runtimeStatus, capabilities, api, lifecycle) {
         const form = Amaterasu.el("form", "editor-form");
         const name = Amaterasu.input("name", entry?.name ?? "");
         name.required = true;
@@ -5941,6 +8794,71 @@ var Amaterasu;
         const pathField = Amaterasu.field("Absolute application path", path);
         const steamIdField = Amaterasu.field("Steam app ID", steamId, "Optional canonical Steam app ID for provider-aware process tracking.");
         const steamInstallDirField = Amaterasu.field("Steam install directory", steamInstallDir, "Optional absolute game directory; Linux tracks only newly launched processes inside it.");
+        const steamChooserStatus = Amaterasu.el("p", "muted");
+        steamChooserStatus.setAttribute("role", "status");
+        steamChooserStatus.hidden = true;
+        const setSteamChooserStatus = (message) => {
+            steamChooserStatus.hidden = false;
+            if (typeof Amaterasu.setLocalizedTextContent === "function")
+                Amaterasu.setLocalizedTextContent(steamChooserStatus, message);
+            else
+                steamChooserStatus.textContent = message;
+        };
+        const chooseSteamGameButton = Amaterasu.button(catalogTextMessage("Choose a Steam game"), async () => {
+            if (!api.allows("catalog.write") || lifecycle.aborted || !form.isConnected)
+                return;
+            const selected = await Amaterasu.chooseSteamGame(api, lifecycle);
+            if (!selected || lifecycle.aborted || !form.isConnected)
+                return;
+            if (!api.allows("catalog.write") || !api.allows("steam.read")) {
+                setSteamChooserStatus("A required permission changed; the selection was not applied.");
+                return;
+            }
+            const selectedId = String(selected.app_id);
+            const directoryAvailable = selected.install_directory !== undefined &&
+                selected.install_directory.trim() !== "";
+            const changingGame = steamId.value !== selectedId;
+            let keepDirectory = false;
+            let clearDirectory = false;
+            if (!directoryAvailable && changingGame && steamInstallDir.value.trim() !== "") {
+                const choice = await Amaterasu.chooseSteamDirectoryChange(lifecycle);
+                if (!choice || lifecycle.aborted || !form.isConnected)
+                    return;
+                if (choice === "review") {
+                    setSteamChooserStatus("Selection was not applied. Review the Steam fields and choose again.");
+                    return;
+                }
+                if (!api.allows("catalog.write") || !api.allows("steam.read")) {
+                    setSteamChooserStatus("A required permission changed; the selection was not applied.");
+                    return;
+                }
+                keepDirectory = choice === "keep";
+                clearDirectory = choice === "clear";
+            }
+            steamId.value = selectedId;
+            steamId.dispatchEvent(new Event("input", { bubbles: true }));
+            steamId.dispatchEvent(new Event("change", { bubbles: true }));
+            if (directoryAvailable) {
+                steamInstallDir.value = selected.install_directory;
+                steamInstallDir.dispatchEvent(new Event("input", { bubbles: true }));
+                steamInstallDir.dispatchEvent(new Event("change", { bubbles: true }));
+            }
+            else if (clearDirectory) {
+                steamInstallDir.value = "";
+                steamInstallDir.dispatchEvent(new Event("input", { bubbles: true }));
+                steamInstallDir.dispatchEvent(new Event("change", { bubbles: true }));
+            }
+            const status = directoryAvailable
+                ? "Steam game selected. Other application edits were kept."
+                : keepDirectory
+                    ? "Steam game selected. Kept the existing directory by choice."
+                    : clearDirectory
+                        ? "Steam game selected. Cleared the existing directory by choice."
+                        : "Steam game selected. Its install directory is unavailable; the existing directory was kept.";
+            setSteamChooserStatus(status);
+        });
+        catalogLocalizedAttribute(chooseSteamGameButton, "aria-label", "Choose a Steam game");
+        const steamGameChooser = Amaterasu.el("div", "catalog-steam-chooser", chooseSteamGameButton, steamChooserStatus);
         const fullscreen = Amaterasu.field("Exit timeout (seconds)", fullscreenTimeout, "Graceful session close window, from 0 to 300 seconds.");
         const showKind = () => {
             executable.hidden = kind.value !== "executable";
@@ -5953,6 +8871,7 @@ var Amaterasu;
             path.required = !processless;
             steamIdField.hidden = processless;
             steamInstallDirField.hidden = processless;
+            steamGameChooser.hidden = processless;
             sharedLaunchOptions.hidden = kind.value === "application";
             directory.disabled = kind.value === "application";
             path.placeholder =
@@ -5961,18 +8880,511 @@ var Amaterasu;
                     : "/Applications/Example.app";
         };
         kind.addEventListener("change", showKind);
-        form.append(catalogEditorSection("Identity", "Name and describe this application in your library.", Amaterasu.field("Name", name), Amaterasu.field("Description", description), Amaterasu.field("Tags", tags, "Separate tags with commas.")), catalogEditorDisclosure("Launch", "Choose how the host starts and tracks the application.", Amaterasu.field("Launch type", kind), pathField, steamIdField, steamInstallDirField, fullscreen, sharedLaunchOptions, executable, Amaterasu.field("Command output", outputMode, "Use default discards command output without saving an output value."), outputFile, rawPreparation, Amaterasu.field("Skip global preparation commands", excludeGlobalPreparation, "Do not run the host-wide preparation commands for this application.")), catalogEditorDisclosure("Display", "Choose display and virtual-screen overrides.", Amaterasu.field("Display output override", displayOutput, "Leave empty to inherit the next display selection. This is separate from the command output file."), Amaterasu.field("Virtual screen request", virtualScreen, "Inherit the host setting or explicitly request or avoid a virtual screen."), Amaterasu.field("Virtual display mode", virtualDisplayMode, "Inherit the host mode or explicitly disable, use per-client, or share a virtual display."), Amaterasu.field("Virtual display layout", virtualDisplayLayout, "Inherit the host layout or select how virtual displays are arranged."), ...refreshRateOptionFields, Amaterasu.field("Display and adapter policy (JSON)", displayPolicy, "Sparse application overrides. Use null or empty values to inherit; global-only keys are rejected."), Amaterasu.field("10-bit SDR preference", prefer10BitSdr, "Inherit the next setting scope, or set an explicit preference for this application.")), catalogEditorDisclosure("Streaming and audio", "Override streaming, frame limiting, and audio for this application.", Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global streaming setting; supported values are 1–255."), ...sessionPolicyFields, Amaterasu.field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this application streams audio."), audioSink.controls, virtualSink.controls, Amaterasu.field("Capture audio without changing default outputs", captureOnly, "Inherit the host setting, enable capture only, or allow Windows default-output routing.")), catalogEditorDisclosure("Input", "Set per-application controller, keyboard, and mouse preferences.", Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "Leave blank to inherit. Use -1 to disable the timeout; other signed 32-bit values set the duration."), Amaterasu.field("Controller input", controller, "Inherit the next scope, or enable/disable gamepad input for this application."), Amaterasu.field("Gamepad profile", gamepad, "Inherit the next scope. Recognized profiles unavailable on this backend stay selectable and are labeled unavailable."), Amaterasu.field("Keyboard input", keyboard, "Inherit the next scope, or enable/disable keyboard input for this application."), Amaterasu.field("Mouse input", mouse, "Inherit the next scope, or enable/disable mouse input for this application."), ...inputCompatibilityFields, ...advancedInput.fields), catalogEditorDisclosure("Encoder", "Override software and NVENC encoder settings.", ...softwareEncoder.fields, ...nvencSettingsFields));
-        form.children[1].open = !entry;
+        form.append(catalogEditorSection("Identity", "Name and describe this application in your library.", Amaterasu.field("Name", name), Amaterasu.field("Description", description), Amaterasu.field("Tags", tags, "Separate tags with commas.")), catalogEditorDisclosure("Launch", "Choose how the host starts and tracks the application.", Amaterasu.field("Launch type", kind), pathField, steamIdField, steamInstallDirField, steamGameChooser, fullscreen, sharedLaunchOptions, executable, Amaterasu.field("Command output", outputMode, "Use default discards command output without saving an output value."), outputFile, rawPreparation, Amaterasu.field("Skip global preparation commands", excludeGlobalPreparation, "Do not run the host-wide preparation commands for this application.")), catalogEditorDisclosure("Display", "Choose display and virtual-screen overrides.", Amaterasu.field("Display output override", displayOutput, "Leave empty to inherit the next display selection. This is separate from the command output file."), Amaterasu.field("Virtual screen request", virtualScreen, "Inherit the host setting or explicitly request or avoid a virtual screen."), Amaterasu.field("Virtual display mode", virtualDisplayMode, "Inherit the host mode or explicitly disable, use per-client, or share a virtual display."), Amaterasu.field("Virtual display layout", virtualDisplayLayout, "Inherit the host layout or select how virtual displays are arranged."), ...refreshRateOptionFields, Amaterasu.field("Display and adapter policy (JSON)", displayPolicy, "Sparse application overrides. Use null or empty values to inherit; global-only keys are rejected."), Amaterasu.field("10-bit SDR preference", prefer10BitSdr, "Inherit the next setting scope, or set an explicit preference for this application.")), catalogEditorDisclosure("Streaming and audio", "Override streaming, frame limiting, and audio for this application.", Amaterasu.field("FEC percentage", fec, "Leave blank to inherit the global streaming setting; supported values are 1–255."), ...sessionPolicyFields, Amaterasu.field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this application streams audio."), audioSink.controls, virtualSink.controls, Amaterasu.field("Capture audio without changing default outputs", captureOnly, "Inherit the host setting, enable capture only, or allow Windows default-output routing.")), catalogEditorDisclosure("Input", "Set per-application controller, keyboard, and mouse preferences.", Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "Leave blank to inherit. Use -1 to disable the timeout; other signed 32-bit values set the duration."), Amaterasu.field("Controller input", controller, "Inherit the next scope, or enable/disable gamepad input for this application."), Amaterasu.field("Gamepad profile", gamepad, "Inherit the next scope. Recognized profiles unavailable on this backend stay selectable and are labeled unavailable."), Amaterasu.field("Keyboard input", keyboard, "Inherit the next scope, or enable/disable keyboard input for this application."), Amaterasu.field("Mouse input", mouse, "Inherit the next scope, or enable/disable mouse input for this application."), ...inputCompatibilityFields, ...advancedInput.fields), catalogEditorDisclosure("Encoder", "Override software and NVENC encoder settings.", ...softwareEncoder.fields, ...nvencSettingsFields));
+        const identitySection = form.children[0];
+        const launchSection = form.children[1];
+        identitySection.id = "catalog-editor-identity";
+        launchSection.id = "catalog-editor-launch";
+        launchSection.open = !entry;
         const sections = Array.from(form.children).slice(2);
         const overrides = catalogOverrideEditor(catalogOverrideSections(sections), { ...entry, ...entry?.config_overrides });
         for (const section of sections)
             section.remove();
-        form.append(overrides.node);
+        overrides.node.id = "catalog-editor-overrides";
+        form.replaceChildren(catalogEditorNavigation([
+            { label: "Identity", target: identitySection },
+            { label: "Launch", target: launchSection },
+            {
+                label: "Settings overrides",
+                target: overrides.node,
+                reveal: overrides.node.querySelector("details"),
+            },
+        ]), identitySection, launchSection, overrides.node);
         catalogRemovedOverrides.set(form, overrides.removed);
         revealInvalidEditorControls(form);
         showKind();
         return form;
     }
+})(Amaterasu || (Amaterasu = {}));
+var Amaterasu;
+(function (Amaterasu) {
+    function steamPickerMessage(source) {
+        return typeof Amaterasu.localizedMessage === "function"
+            ? Amaterasu.localizedMessage(source) : source;
+    }
+    function steamPickerLiteral(source) {
+        return typeof Amaterasu.literalText === "function"
+            ? Amaterasu.literalText(source) : source;
+    }
+    function steamPickerSetText(target, source) {
+        if (typeof Amaterasu.setLocalizedTextContent === "function")
+            Amaterasu.setLocalizedTextContent(target, source);
+        else
+            target.textContent = source;
+    }
+    function steamPickerSetTextTemplate(target, source, values) {
+        const format = (locale) => {
+            let rendered = typeof Amaterasu.translateText === "function"
+                ? Amaterasu.translateText(source) : source;
+            const formatter = new Intl.NumberFormat(locale);
+            for (const [name, value] of Object.entries(values)) {
+                const raw = typeof value === "string" ? value : value.value;
+                const formatted = /^\d+$/.test(raw) ? formatter.format(Number(raw)) : raw;
+                rendered = rendered.replaceAll(`{${name}}`, () => formatted);
+            }
+            return rendered;
+        };
+        if (typeof Amaterasu.localeFormattedTextNode === "function") {
+            target.replaceChildren(Amaterasu.localeFormattedTextNode(format));
+        }
+        else {
+            steamPickerSetText(target, format("en"));
+        }
+    }
+    function steamPickerSetAttribute(target, attribute, source) {
+        if (typeof Amaterasu.setLocalizedAttribute === "function")
+            Amaterasu.setLocalizedAttribute(target, attribute, source);
+        else
+            target.setAttribute(attribute, source);
+    }
+    function steamPickerSetTemplate(target, attribute, source, values) {
+        if (typeof Amaterasu.setLocalizedAttributeTemplate === "function")
+            Amaterasu.setLocalizedAttributeTemplate(target, attribute, source, values);
+        else {
+            let rendered = source;
+            for (const [name, value] of Object.entries(values)) {
+                const text = typeof value === "string" ? value : value.value;
+                rendered = rendered.replaceAll(`{${name}}`, () => text);
+            }
+            target.setAttribute(attribute, rendered);
+        }
+    }
+    function steamExclusionPicker(api, initial, onChange = () => { }) {
+        const root = document.createElement("section");
+        root.className = "steam-exclusion-picker";
+        const heading = document.createElement("h3");
+        steamPickerSetText(heading, "Choose excluded Steam games");
+        const help = document.createElement("p");
+        steamPickerSetText(help, "Search discoveries and select games to exclude. Existing name-only or unavailable exclusions are preserved.");
+        const search = document.createElement("input");
+        search.type = "search";
+        search.autocomplete = "off";
+        steamPickerSetAttribute(search, "aria-label", "Search Steam games");
+        steamPickerSetAttribute(search, "placeholder", "Search games");
+        const status = document.createElement("p");
+        status.setAttribute("role", "status");
+        status.setAttribute("aria-live", "polite");
+        const savedLabel = document.createElement("h4");
+        steamPickerSetText(savedLabel, "Current exclusions");
+        const saved = document.createElement("div");
+        saved.className = "steam-exclusion-saved";
+        steamPickerSetAttribute(saved, "aria-label", "Current Steam exclusions");
+        const manualAdd = document.createElement("div");
+        manualAdd.className = "steam-exclusion-manual-add";
+        const manualId = document.createElement("input");
+        manualId.type = "text";
+        manualId.inputMode = "numeric";
+        steamPickerSetAttribute(manualId, "aria-label", "Steam app ID to exclude");
+        steamPickerSetAttribute(manualId, "placeholder", "Optional Steam app ID");
+        const manualName = document.createElement("input");
+        manualName.type = "text";
+        steamPickerSetAttribute(manualName, "aria-label", "Steam game name to exclude");
+        steamPickerSetAttribute(manualName, "placeholder", "Game name");
+        const manualAddButton = document.createElement("button");
+        manualAddButton.type = "button";
+        manualAddButton.className = "button secondary";
+        steamPickerSetText(manualAddButton, "Add exclusion");
+        const manualAddStatus = document.createElement("p");
+        manualAddStatus.setAttribute("role", "status");
+        manualAddStatus.setAttribute("aria-live", "polite");
+        manualAdd.append(manualId, manualName, manualAddButton, manualAddStatus);
+        const warning = document.createElement("p");
+        warning.className = "steam-exclusion-warning";
+        warning.setAttribute("role", "status");
+        warning.setAttribute("aria-live", "polite");
+        const results = document.createElement("div");
+        steamPickerSetAttribute(results, "aria-label", "Steam games");
+        const more = document.createElement("button");
+        more.type = "button";
+        more.className = "button secondary";
+        steamPickerSetText(more, "Load more games");
+        const draftSignal = document.createElement("input");
+        draftSignal.type = "text";
+        draftSignal.hidden = true;
+        draftSignal.tabIndex = -1;
+        draftSignal.name = "steam_exclusion_draft";
+        draftSignal.setAttribute("aria-hidden", "true");
+        const lifecycle = new AbortController();
+        let draft = initial.map((entry) => ({ ...entry }));
+        let revision = null;
+        let after = null;
+        let games = [];
+        let loading = false;
+        let scanWarning = "";
+        let loadError = "";
+        let revisionChanged = false;
+        let revisionRetries = 0;
+        let disabled = false;
+        let disposed = false;
+        const MAX_EXCLUSIONS = 256;
+        function signalDraft() {
+            draftSignal.value = JSON.stringify(draft);
+            draftSignal.dispatchEvent(new Event("input", { bubbles: true }));
+        }
+        signalDraft();
+        function renderStatus() {
+            status.removeAttribute("title");
+            status.removeAttribute("aria-label");
+            if (!api.allows("steam.read")) {
+                steamPickerSetText(status, "Steam discovery is unavailable without steam.read permission. Saved exclusions can still be edited.");
+                more.hidden = true;
+            }
+            else if (loading) {
+                steamPickerSetText(status, "Loading Steam games…");
+            }
+            else if (loadError) {
+                steamPickerSetText(status, "Steam games could not be loaded. Your current draft is preserved.");
+                steamPickerSetAttribute(status, "title", loadError);
+            }
+            else if (revision === null) {
+                steamPickerSetText(status, "Steam game list has not been loaded.");
+            }
+            else {
+                const matching = games.filter((game) => game.name.toLocaleLowerCase().includes(search.value.trim().toLocaleLowerCase())).length;
+                steamPickerSetTextTemplate(status, "{matchingCount} matching loaded games · {exclusionCount} exclusions", {
+                    matchingCount: steamPickerLiteral(String(matching)),
+                    exclusionCount: steamPickerLiteral(String(draft.length)),
+                });
+                steamPickerSetTemplate(status, "aria-label", "{matchingCount} matching loaded games; {exclusionCount} exclusions", {
+                    matchingCount: steamPickerLiteral(String(matching)),
+                    exclusionCount: steamPickerLiteral(String(draft.length)),
+                });
+            }
+            const warnings = [scanWarning, revisionChanged
+                    ? "The Steam list changed while paging; restarted at the latest revision."
+                    : ""].filter(Boolean);
+            warning.replaceChildren();
+            warnings.forEach((source, index) => {
+                if (index > 0)
+                    warning.append(document.createTextNode(" "));
+                const item = document.createElement("span");
+                steamPickerSetText(item, source);
+                warning.append(item);
+            });
+            warning.hidden = warnings.length === 0;
+            more.hidden = (!loadError && after === null) || disposed || !api.allows("steam.read");
+            more.disabled = disabled || loading || disposed;
+            steamPickerSetText(more, loadError ? "Retry loading games" : "Load more games");
+            root.setAttribute("aria-busy", String(loading));
+        }
+        function renderSaved() {
+            saved.replaceChildren();
+            draft.forEach((entry, index) => {
+                const row = document.createElement("div");
+                row.className = "steam-exclusion-saved-item";
+                const idInput = document.createElement("input");
+                idInput.type = "text";
+                idInput.inputMode = "numeric";
+                idInput.setAttribute("data-focus-key", "saved-" + index + "-id");
+                idInput.disabled = disabled;
+                idInput.value = entry.id ?? "";
+                steamPickerSetAttribute(idInput, "aria-label", "Edit excluded Steam app ID");
+                steamPickerSetAttribute(idInput, "placeholder", "Optional Steam app ID");
+                idInput.addEventListener("input", () => {
+                    if (disposed || disabled)
+                        return;
+                    const id = idInput.value.trim();
+                    if (id)
+                        draft[index] = { ...draft[index], id };
+                    else {
+                        const current = draft[index];
+                        if (!current)
+                            return;
+                        const { id: _oldId, ...withoutId } = current;
+                        draft[index] = withoutId;
+                    }
+                    signalDraft();
+                    onChange(draft.map((value) => ({ ...value })));
+                    renderStatus();
+                }, { signal: lifecycle.signal });
+                const name = document.createElement("input");
+                name.type = "text";
+                name.value = entry.name ?? "";
+                name.setAttribute("data-focus-key", "saved-" + index + "-name");
+                name.disabled = disabled;
+                steamPickerSetAttribute(name, "aria-label", entry.id
+                    ? "Edit excluded Steam game name"
+                    : "Edit name-only Steam exclusion");
+                name.addEventListener("input", () => {
+                    if (disposed || disabled)
+                        return;
+                    const current = draft[index];
+                    if (!current)
+                        return;
+                    const nextName = name.value.trim();
+                    if (nextName)
+                        draft[index] = { ...current, name: name.value };
+                    else {
+                        const { name: _oldName, ...withoutName } = current;
+                        draft[index] = withoutName;
+                    }
+                    signalDraft();
+                    onChange(draft.map((value) => ({ ...value })));
+                    renderStatus();
+                }, { signal: lifecycle.signal });
+                const remove = document.createElement("button");
+                remove.type = "button";
+                remove.setAttribute("data-focus-key", "saved-" + index + "-remove");
+                remove.disabled = disabled;
+                remove.className = "button secondary";
+                steamPickerSetText(remove, "Remove exclusion");
+                steamPickerSetTemplate(remove, "aria-label", "Remove exclusion {index}", {
+                    index: steamPickerLiteral(String(index + 1)),
+                });
+                remove.addEventListener("click", () => {
+                    if (disposed || disabled)
+                        return;
+                    draft = draft.filter((_, currentIndex) => currentIndex !== index);
+                    signalDraft();
+                    onChange(draft.map((value) => ({ ...value })));
+                    render(true);
+                    const nextFocusKey = draft[index]
+                        ? `saved-${index}-remove`
+                        : draft.length
+                            ? `saved-${draft.length - 1}-remove`
+                            : "manual-id";
+                    allElements(root).find((element) => element.getAttribute?.("data-focus-key") === nextFocusKey)?.focus();
+                }, { signal: lifecycle.signal });
+                row.append(idInput, name, remove);
+                saved.append(row);
+            });
+        }
+        function renderResults() {
+            const query = search.value.trim().toLocaleLowerCase();
+            const visible = games.filter((game) => game.name.toLocaleLowerCase().includes(query));
+            results.replaceChildren();
+            const selected = new Set(draft.flatMap((entry) => entry.id ? [entry.id] : []));
+            for (const game of visible) {
+                const label = document.createElement("label");
+                label.className = "steam-exclusion-option";
+                const checkbox = document.createElement("input");
+                checkbox.type = "checkbox";
+                checkbox.setAttribute("data-focus-key", "game-" + game.app_id);
+                checkbox.disabled = disabled;
+                checkbox.checked = selected.has(String(game.app_id));
+                checkbox.addEventListener("change", () => {
+                    if (disposed || disabled)
+                        return;
+                    const id = String(game.app_id);
+                    draft = draft.filter((entry) => entry.id !== id);
+                    if (checkbox.checked) {
+                        if (draft.length >= MAX_EXCLUSIONS) {
+                            checkbox.checked = false;
+                            steamPickerSetText(status, "You can exclude up to 256 Steam games. Remove an exclusion before adding another.");
+                            return;
+                        }
+                        draft.push({ id, name: game.name });
+                    }
+                    signalDraft();
+                    onChange(draft.map((entry) => ({ ...entry })));
+                    render(true);
+                }, { signal: lifecycle.signal });
+                const name = document.createElement("span");
+                name.textContent = game.name;
+                const id = document.createElement("small");
+                steamPickerSetTemplate(id, "aria-label", "Steam app {appId}", {
+                    appId: steamPickerLiteral(String(game.app_id)),
+                });
+                steamPickerSetTextTemplate(id, "Steam app {appId}", {
+                    appId: steamPickerLiteral(String(game.app_id)),
+                });
+                label.append(checkbox, name, id);
+                results.append(label);
+            }
+            if (revision !== null && visible.length === 0 && !loading) {
+                const emptyMessage = query
+                    ? "No matching Steam games on loaded pages."
+                    : "No Steam discoveries are available.";
+                results.append(typeof Amaterasu.textValueNode === "function"
+                    ? Amaterasu.textValueNode(steamPickerMessage(emptyMessage))
+                    : emptyMessage);
+            }
+        }
+        function render(preserveFocus = false) {
+            if (disposed)
+                return;
+            const active = preserveFocus ? document.activeElement : null;
+            const focusKey = active && root.contains(active) ? active.getAttribute("data-focus-key") : null;
+            const selectionStart = active?.selectionStart ?? null;
+            const selectionEnd = active?.selectionEnd ?? null;
+            search.disabled = disabled;
+            manualId.disabled = disabled;
+            manualName.disabled = disabled;
+            manualAddButton.disabled = disabled;
+            renderStatus();
+            renderSaved();
+            renderResults();
+            if (focusKey) {
+                const replacement = allElements(root).find((element) => element.getAttribute("data-focus-key") === focusKey);
+                replacement?.focus();
+                if (replacement && selectionStart !== null && selectionEnd !== null)
+                    replacement.setSelectionRange?.(selectionStart, selectionEnd);
+            }
+        }
+        function allElements(parent) {
+            return [parent, ...Array.from(parent.children ?? []).flatMap((child) => allElements(child))];
+        }
+        async function load() {
+            if (disposed || disabled || !api.allows("steam.read") || loading)
+                return;
+            loading = true;
+            loadError = "";
+            renderStatus();
+            try {
+                const reply = await api.post("steam/list", {
+                    ...(revision !== null ? { revision } : {}),
+                    ...(after !== null ? { after } : {}),
+                    limit: 32,
+                });
+                if (disposed)
+                    return;
+                if (!Number.isSafeInteger(reply.revision) || reply.revision < 0 ||
+                    !Array.isArray(reply.games) ||
+                    !(reply.next_after === null || Number.isSafeInteger(reply.next_after)) ||
+                    typeof reply.scanning !== "boolean" || typeof reply.complete !== "boolean") {
+                    throw new Error("Steam game list response is invalid.");
+                }
+                if (revision !== null && reply.revision !== revision) {
+                    if (revisionRetries >= 2) {
+                        throw new Error("Steam game list kept changing. Retry loading games to try again.");
+                    }
+                    revisionRetries += 1;
+                    revision = null;
+                    after = null;
+                    games = [];
+                    revisionChanged = true;
+                    loading = false;
+                    await load();
+                    return;
+                }
+                revisionRetries = 0;
+                revision = reply.revision;
+                const uniqueGames = new Map(games.map((game) => [game.app_id, game]));
+                for (const game of reply.games) {
+                    if (!Number.isSafeInteger(game.app_id) || game.app_id < 1 || typeof game.name !== "string")
+                        throw new Error("Steam game list contains an invalid entry.");
+                    uniqueGames.set(game.app_id, game);
+                }
+                games = [...uniqueGames.values()];
+                after = reply.next_after;
+                scanWarning = reply.scanning
+                    ? "Steam scan is still in progress."
+                    : !reply.complete
+                        ? "Steam scan is incomplete; existing exclusions are preserved."
+                        : "";
+            }
+            catch (error) {
+                if (disposed)
+                    return;
+                const revisionConflict = typeof error === "object" && error !== null &&
+                    "code" in error && error.code === "revision_conflict";
+                if (revisionConflict && revisionRetries < 2) {
+                    revisionRetries += 1;
+                    revision = null;
+                    after = null;
+                    games = [];
+                    revisionChanged = true;
+                    loading = false;
+                    await load();
+                    return;
+                }
+                loadError = revisionConflict
+                    ? "Steam game list kept changing. Retry loading games to try again."
+                    : error instanceof Error ? error.message : "Unable to load Steam games.";
+            }
+            finally {
+                loading = false;
+                if (!disposed)
+                    render(true);
+            }
+        }
+        search.setAttribute("data-focus-key", "search");
+        manualId.setAttribute("data-focus-key", "manual-id");
+        manualName.setAttribute("data-focus-key", "manual-name");
+        search.addEventListener("input", () => { if (!disabled)
+            render(true); }, { signal: lifecycle.signal });
+        const addManualExclusion = () => {
+            if (disposed || disabled)
+                return;
+            const id = manualId.value.trim();
+            const name = manualName.value.trim();
+            if (!id && !name) {
+                steamPickerSetText(manualAddStatus, "Enter a Steam app ID or game name.");
+                return;
+            }
+            if (draft.length >= MAX_EXCLUSIONS) {
+                steamPickerSetText(manualAddStatus, "You can exclude up to 256 Steam games. Remove an exclusion before adding another.");
+                return;
+            }
+            if (id && draft.some((entry) => entry.id === id)) {
+                steamPickerSetText(manualAddStatus, "That Steam app ID is already excluded.");
+                return;
+            }
+            draft.push({ ...(id ? { id } : {}), ...(name ? { name } : {}) });
+            manualId.value = "";
+            manualName.value = "";
+            steamPickerSetText(manualAddStatus, "Exclusion added.");
+            signalDraft();
+            onChange(draft.map((entry) => ({ ...entry })));
+            render(true);
+            manualName.focus();
+        };
+        manualAddButton.addEventListener("click", addManualExclusion, { signal: lifecycle.signal });
+        for (const field of [manualId, manualName])
+            field.addEventListener("keydown", (event) => {
+                if (event.key !== "Enter")
+                    return;
+                event.preventDefault();
+                addManualExclusion();
+            }, { signal: lifecycle.signal });
+        more.addEventListener("click", () => {
+            if (disposed || disabled)
+                return;
+            if (loadError)
+                revisionRetries = 0;
+            void load();
+        }, { signal: lifecycle.signal });
+        root.append(heading, help, savedLabel, saved, search, status, results, more, draftSignal, manualAdd, warning);
+        render();
+        void load();
+        return {
+            node: root,
+            value: () => draft.map((entry) => ({ ...entry })),
+            setValue(values) {
+                if (disposed)
+                    throw new Error("The Steam exclusion picker has been disposed.");
+                if (!Array.isArray(values))
+                    throw new Error("Steam exclusions must be a list.");
+                draft = values.map((entry) => ({ ...entry }));
+                signalDraft();
+                render(true);
+            },
+            setDisabled(value) {
+                if (disposed)
+                    return;
+                disabled = Boolean(value);
+                render();
+            },
+            dispose() {
+                if (disposed)
+                    return;
+                disposed = true;
+                lifecycle.abort();
+                root.replaceChildren();
+            },
+        };
+    }
+    Amaterasu.steamExclusionPicker = steamExclusionPicker;
 })(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
 (function (Amaterasu) {
@@ -6246,6 +9658,132 @@ var Amaterasu;
 })(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
 (function (Amaterasu) {
+    function clientDirectoryTextNode(source) {
+        return typeof Amaterasu.localizedTextNode === "function"
+            ? Amaterasu.localizedTextNode(source)
+            : source;
+    }
+    function clientDirectorySetText(target, source) {
+        if (typeof Amaterasu.setLocalizedTextContent === "function")
+            Amaterasu.setLocalizedTextContent(target, source);
+        else
+            target.textContent = source;
+    }
+    function clientDirectorySetPlaceholder(target, source) {
+        if (typeof Amaterasu.setLocalizedAttribute === "function")
+            Amaterasu.setLocalizedAttribute(target, "placeholder", source);
+        else
+            target.setAttribute("placeholder", source);
+    }
+    function clientDirectoryCountNode(visible, total) {
+        const format = (locale) => {
+            const source = total === 1
+                ? "Showing {visible} of {total} paired client"
+                : "Showing {visible} of {total} paired clients";
+            const message = typeof Amaterasu.translateText === "function"
+                ? Amaterasu.translateText(source)
+                : source;
+            return message
+                .replaceAll("{visible}", new Intl.NumberFormat(locale).format(visible))
+                .replaceAll("{total}", new Intl.NumberFormat(locale).format(total));
+        };
+        return typeof Amaterasu.localeFormattedTextNode === "function"
+            ? Amaterasu.localeFormattedTextNode(format)
+            : format("en");
+    }
+    function sortClientDirectoryEntries(entries, query, sort, locale) {
+        const needle = query.trim().toLocaleLowerCase(locale);
+        const collator = new Intl.Collator(locale, { sensitivity: "base", numeric: true });
+        return entries
+            .filter((entry) => !needle || entry.searchText.toLocaleLowerCase(locale).includes(needle))
+            .slice()
+            .sort((left, right) => {
+            if (sort === "recent") {
+                const leftDate = Number.isSafeInteger(left.pairedAt) ? left.pairedAt : 0;
+                const rightDate = Number.isSafeInteger(right.pairedAt) ? right.pairedAt : 0;
+                if (leftDate !== rightDate)
+                    return rightDate - leftDate;
+            }
+            return collator.compare(left.name, right.name) || left.key.localeCompare(right.key);
+        });
+    }
+    Amaterasu.sortClientDirectoryEntries = sortClientDirectoryEntries;
+    function createClientDirectory(entries, initialQuery = "", locale) {
+        let directoryEntries = [...entries];
+        const search = document.createElement("input");
+        search.type = "search";
+        search.name = "client_search";
+        search.value = initialQuery;
+        search.setAttribute("data-draft-ignore", "");
+        clientDirectorySetPlaceholder(search, "Search paired clients");
+        const sort = document.createElement("select");
+        sort.name = "client_sort";
+        sort.value = "recent";
+        sort.setAttribute("data-draft-ignore", "");
+        const recent = document.createElement("option");
+        recent.value = "recent";
+        recent.append(clientDirectoryTextNode("Recently paired"));
+        const name = document.createElement("option");
+        name.value = "name";
+        name.append(clientDirectoryTextNode("Name"));
+        sort.append(recent, name);
+        const count = document.createElement("p");
+        count.className = "muted client-search-summary";
+        count.setAttribute("role", "status");
+        count.setAttribute("aria-live", "polite");
+        count.setAttribute("aria-atomic", "true");
+        const empty = document.createElement("p");
+        empty.className = "muted client-search-empty";
+        const list = document.createElement("div");
+        list.className = "client-settings-list";
+        const searchLabel = document.createElement("label");
+        searchLabel.className = "field";
+        const searchText = document.createElement("span");
+        searchText.className = "field-label";
+        searchText.append(clientDirectoryTextNode("Search paired clients"));
+        searchLabel.append(searchText, search);
+        const sortLabel = document.createElement("label");
+        sortLabel.className = "field";
+        const sortText = document.createElement("span");
+        sortText.className = "field-label";
+        sortText.append(clientDirectoryTextNode("Sort by"));
+        sortLabel.append(sortText, sort);
+        const controls = document.createElement("div");
+        controls.className = "client-search";
+        controls.append(searchLabel, sortLabel, count);
+        const update = () => {
+            const visible = sortClientDirectoryEntries(directoryEntries, search.value, sort.value, locale);
+            count.replaceChildren(clientDirectoryCountNode(visible.length, directoryEntries.length));
+            empty.hidden = visible.length !== 0;
+            clientDirectorySetText(empty, directoryEntries.length === 0
+                ? "No paired clients"
+                : "No paired clients match this search.");
+            for (const entry of directoryEntries)
+                entry.card.hidden = !visible.includes(entry);
+            list.replaceChildren(...visible.map((entry) => entry.card));
+            for (const entry of directoryEntries) {
+                if (!visible.includes(entry))
+                    list.append(entry.card);
+            }
+        };
+        search.addEventListener("input", update);
+        sort.addEventListener("change", update);
+        update();
+        const element = document.createElement("section");
+        element.append(controls, empty, list);
+        return {
+            element,
+            search,
+            remove: (key) => {
+                directoryEntries = directoryEntries.filter((entry) => entry.key !== key);
+                update();
+            },
+        };
+    }
+    Amaterasu.createClientDirectory = createClientDirectory;
+})(Amaterasu || (Amaterasu = {}));
+var Amaterasu;
+(function (Amaterasu) {
     function settingsTextLiteral(value) {
         return typeof Amaterasu.literalText === "function" ? Amaterasu.literalText(value) : value;
     }
@@ -6259,6 +9797,31 @@ var Amaterasu;
         else {
             target.textContent = source;
         }
+    }
+    function settingsComponentField(label, control, hint) {
+        return Amaterasu.el("div", "field", Amaterasu.el("span", "field-label", settingsTextMessage(label)), control, Amaterasu.el("small", "muted", settingsTextMessage(hint)));
+    }
+    function settingsDispatchDraftEvent(target, type) {
+        target.dispatchEvent(new Event(type, { bubbles: true }));
+    }
+    function settingsSetDraftCheckbox(control, value) {
+        control.checked = value;
+        settingsDispatchDraftEvent(control, "change");
+    }
+    function settingsSetDraftNumber(control, value) {
+        control.value = String(value);
+        settingsDispatchDraftEvent(control, "input");
+    }
+    function setSettingsFormDisabled(form, disabled) {
+        const visit = (node) => {
+            if (!node || typeof node.tagName !== "string")
+                return;
+            if (["INPUT", "BUTTON", "SELECT", "TEXTAREA"].includes(node.tagName))
+                node.disabled = disabled;
+            for (const child of Array.from(node.children))
+                visit(child);
+        };
+        visit(form);
     }
     function settingsLocalizedAttributeTemplate(target, source, values) {
         if (typeof Amaterasu.setLocalizedAttributeTemplate === "function") {
@@ -8484,6 +12047,7 @@ var Amaterasu;
     }
     function createPairedClientEditor(context, pairingArea, draftTracker = () => null, onSaveBusy = () => { }) {
         const pairingLoads = new PairingClientsLoadGate();
+        let removeClientFromDirectory = () => { };
         async function loadPairing(rebase) {
             if (!rebase)
                 pairingArea.replaceChildren(Amaterasu.el("p", "muted", "Loading paired clients…"));
@@ -8776,7 +12340,7 @@ var Amaterasu;
                                 if (index !== -1)
                                     rows.splice(index, 1);
                                 revisionBadge.textContent = `Revision ${settings.revision}`;
-                                filterClients();
+                                removeClientFromDirectory(client.certificate_id);
                                 context.notify(`${client.name} was removed from paired devices. Existing stream termination is not confirmed.`);
                             }
                             catch (error) {
@@ -8807,7 +12371,10 @@ var Amaterasu;
                     }, "danger");
                     remove.disabled = !context.api.allows("pairing.admin");
                     clientSaveControls.push({ control: remove, allowed: !remove.disabled });
-                    const identity = Amaterasu.el("summary", "client-settings-summary", Amaterasu.el("span", "client-settings-name", settingsTextLiteral(client.name)), Amaterasu.el("small", "muted", settingsTextLiteral(`${client.client_id} · certificate ${client.certificate_id.slice(0, 12)}…`)));
+                    const pairedDate = client.paired_at > 0
+                        ? "Paired " + new Date(client.paired_at * 1000).toLocaleDateString()
+                        : "Pair date unavailable";
+                    const identity = Amaterasu.el("summary", "client-settings-summary", Amaterasu.el("span", "client-settings-name", settingsTextLiteral(client.name)), Amaterasu.el("small", "muted", settingsTextLiteral(client.client_id + " · " + pairedDate + " · certificate " + client.certificate_id.slice(0, 12) + "…")));
                     const audioSettings = Amaterasu.el("details", "client-settings-group", Amaterasu.el("summary", "", "Audio"), Amaterasu.el("div", "form-grid", Amaterasu.field("Audio streaming", streamAudio), Amaterasu.field("Audio capture endpoint", audioSinkMode), Amaterasu.field("Specific endpoint ID", audioSinkId), Amaterasu.field("Virtual audio sink", virtualSinkMode), Amaterasu.field("Virtual sink ID or name", virtualSinkSelector), Amaterasu.field("Capture audio without changing default outputs", captureOnly)));
                     const inputSettings = Amaterasu.el("details", "client-settings-group", Amaterasu.el("summary", "", "Input"), Amaterasu.el("div", "form-grid", Amaterasu.field("Controller input", controller), Amaterasu.field("Gamepad profile", gamepad), Amaterasu.field("Keyboard input", keyboard), Amaterasu.field("Mouse input", mouse), Amaterasu.field("Native pen and touch", nativePenTouch), Amaterasu.field("DS4 Back as touchpad click", ds4BackAsTouchpadClick), Amaterasu.field("Motion selects DS4", motionAsDs4), Amaterasu.field("Touchpad selects DS4", touchpadAsDs4), Amaterasu.field("DS5 random MAC", ds5InputtinoRandomizeMac), Amaterasu.field("Proton DualSense compatibility", protonDualsenseCompatibility)));
                     const advancedSettings = Amaterasu.el("details", "client-settings-group", Amaterasu.el("summary", "", "Advanced input and encoding"), Amaterasu.el("div", "form-grid", ...advancedInput.fields, ...softwareEncoder.fields, ...nvencSettings.fields));
@@ -8873,30 +12440,16 @@ var Amaterasu;
                         controls.forEach((control, index) => rebaseBaselines.set(control, pairingStateSignature(latestStates[index])));
                     }
                 }
-                const clientSearch = Amaterasu.input("client_search", "", "search");
-                clientSearch.setAttribute("data-draft-ignore", "");
-                clientSearch.placeholder = "Search clients";
-                if (rebase)
-                    clientSearch.value = rebase.search.value;
-                const searchSummary = Amaterasu.el("p", "muted client-search-summary");
-                searchSummary.setAttribute("role", "status");
-                const noMatches = Amaterasu.el("p", "muted client-search-empty", "No paired clients match this search.");
-                function filterClients() {
-                    const query = clientSearch.value.trim().toLocaleLowerCase();
-                    let visible = 0;
-                    for (const { client, card } of rows) {
-                        const identity = `${client.name} ${client.client_id} ${client.certificate_id}`.toLocaleLowerCase();
-                        card.hidden = !!query && !identity.includes(query);
-                        if (!card.hidden)
-                            visible++;
-                    }
-                    searchSummary.textContent = `${visible} of ${rows.length} paired clients`;
-                    noMatches.hidden = visible !== 0;
-                    noMatches.textContent = rows.length === 0 ? "No paired clients remain." : "No paired clients match this search.";
-                }
-                clientSearch.addEventListener("input", filterClients);
-                filterClients();
-                pairingArea.replaceChildren(Amaterasu.panel("Paired client overrides", Amaterasu.el("p", "muted", "Open a client to review its streaming overrides. Saves confirm the stored pairing revision; input preferences apply when the next stream acquires its input lease."), Amaterasu.el("div", "client-search", Amaterasu.field("Search paired clients", clientSearch), searchSummary), noMatches, Amaterasu.el("div", "client-settings-list", ...rows.map(({ card }) => card)), Amaterasu.el("div", "actions", revisionBadge)));
+                const directory = Amaterasu.createClientDirectory(rows.map(({ client, card }) => ({
+                    key: client.certificate_id,
+                    name: client.name,
+                    searchText: client.name + " " + client.client_id + " " + client.certificate_id,
+                    pairedAt: client.paired_at,
+                    card,
+                })), rebase?.search.value ?? "");
+                const clientSearch = directory.search;
+                removeClientFromDirectory = directory.remove;
+                pairingArea.replaceChildren(Amaterasu.panel("Paired client overrides", Amaterasu.el("p", "muted", "Open a client to review its streaming overrides. Saves confirm the stored pairing revision; input preferences apply when the next stream acquires its input lease."), directory.element, Amaterasu.el("div", "actions", revisionBadge)));
                 if (rebase) {
                     draftTracker()?.markSaved(rebaseBaselines);
                     context.notify("Latest paired devices loaded. Your non-conflicting edits are still unsaved.");
@@ -8919,6 +12472,23 @@ var Amaterasu;
         return !needle || parts.join(" ").toLocaleLowerCase().includes(needle);
     }
     Amaterasu.settingsSearchMatches = settingsSearchMatches;
+    function rebaseProviderDraft(pending, latest) {
+        const merged = { ...latest };
+        const overlaps = [];
+        for (const field of Object.keys(pending.submitted)) {
+            const baselineValue = pending.baseline[field];
+            const submittedValue = pending.submitted[field];
+            const latestValue = latest[field];
+            if (sameConfigurationValue(submittedValue, baselineValue))
+                continue;
+            if (!sameConfigurationValue(latestValue, baselineValue)) {
+                overlaps.push(field);
+                continue;
+            }
+            merged[field] = submittedValue;
+        }
+        return { merged, overlaps };
+    }
     function renderSettings(context) {
         const area = Amaterasu.el("div", "settings-area-registered");
         const sessionExtensionsArea = Amaterasu.el("div", "settings-area-session-extensions");
@@ -8932,10 +12502,13 @@ var Amaterasu;
         const pipewireArea = Amaterasu.el("div", "settings-area-pipewire");
         const steamArea = Amaterasu.el("div", "settings-area-steam");
         const steamLoads = new ImportSettingsLoadGate();
+        let activeSteamExclusionPicker = null;
         const lutrisArea = Amaterasu.el("div", "settings-area-lutris");
         const lutrisLoads = new ImportSettingsLoadGate();
+        let activeLutrisExclusionEditor = null;
         const playniteArea = Amaterasu.el("div", "settings-area-playnite");
         const playniteLoads = new PlayniteSettingsLoadGate();
+        let activePlayniteListEditors = [];
         const inputArea = Amaterasu.el("div", "settings-area-input");
         const inputLoads = new InputPolicyLoadGate();
         const historyArea = Amaterasu.el("div", "settings-area-history");
@@ -8945,12 +12518,38 @@ var Amaterasu;
         const historyLoads = new HistorySettingsLoadGate();
         const pairingArea = Amaterasu.el("div", "settings-area-pairing");
         let drafts = null;
+        const pendingProviderDrafts = new Map();
         let clientSaveBusy = false;
         const updateDraftStatus = () => {
-            const dirty = drafts?.isDirty() ?? false;
+            const dirty = (drafts?.isDirty() ?? false) || pendingProviderDrafts.size > 0;
             refreshSettings.disabled = dirty || clientSaveBusy;
             dirtyNotice.hidden = !dirty && !clientSaveBusy;
             settingsSetLocalizedTextContent(dirtyNotice, clientSaveBusy ? "Saving changes…" : "Unsaved changes");
+        };
+        const configureProviderConflictReview = (provider, status, save, applyValues) => {
+            const pending = pendingProviderDrafts.get(provider);
+            if (!pending || pending.overlaps.length === 0)
+                return;
+            save.disabled = true;
+            const message = Amaterasu.el("p", "error", `Overlapping fields: ${pending.overlaps.join(", ")}. Latest values are kept until you choose an action.`);
+            const review = Amaterasu.button("Review and keep latest values", () => {
+                pending.reviewed = true;
+                if (pending.latest)
+                    applyValues(pending.latest, pending.overlaps);
+                save.disabled = !context.api.allows("configuration.write");
+                message.textContent = `Reviewed overlapping fields: ${pending.overlaps.join(", ")}. Latest values will be saved.`;
+                review.disabled = true;
+                overwrite.disabled = true;
+            }, "secondary");
+            const overwrite = Amaterasu.button("Overwrite overlapping fields", () => {
+                pending.reviewed = true;
+                applyValues(pending.submitted, pending.overlaps);
+                save.disabled = !context.api.allows("configuration.write");
+                message.textContent = `Overwriting overlapping fields: ${pending.overlaps.join(", ")}. Review the draft before saving.`;
+                review.disabled = true;
+                overwrite.disabled = true;
+            }, "secondary");
+            status.append(message, review, overwrite);
         };
         const loadPairing = createPairedClientEditor(context, pairingArea, () => drafts, (busy) => {
             clientSaveBusy = busy;
@@ -9099,7 +12698,19 @@ var Amaterasu;
         context.content.append(Amaterasu.sectionHeading("Settings", "Configure your host, streaming, integrations, and access.", refreshSettings), Amaterasu.el("div", "settings-tools", search, dirtyNotice), Amaterasu.el("div", "settings-layout", settingsNavigation, categoryContent));
         if (context.registerDraftGuard) {
             drafts = Amaterasu.trackDrafts(categoryContent, updateDraftStatus);
-            context.registerDraftGuard(() => clientSaveBusy || (drafts?.isDirty() ?? false), drafts.dispose);
+            context.registerDraftGuard(() => clientSaveBusy || pendingProviderDrafts.size > 0 || (drafts?.isDirty() ?? false), () => {
+                steamLoads.invalidate();
+                lutrisLoads.invalidate();
+                playniteLoads.invalidate();
+                activeSteamExclusionPicker?.dispose();
+                activeSteamExclusionPicker = null;
+                activeLutrisExclusionEditor?.dispose();
+                activeLutrisExclusionEditor = null;
+                for (const editor of activePlayniteListEditors)
+                    editor.dispose();
+                activePlayniteListEditors = [];
+                drafts?.dispose();
+            });
         }
         Amaterasu.renderManagementPolicy(context, managementArea);
         Amaterasu.renderCsrfPolicy(context, csrfArea);
@@ -9362,7 +12973,9 @@ var Amaterasu;
                     hostLoggingArea.replaceChildren(Amaterasu.errorPanel(new Error("Host logging policy could not be loaded. Try again."), loadHostLogging));
             }
         }
-        async function loadSteam() {
+        async function loadSteam(draftValues, draftNotice) {
+            activeSteamExclusionPicker?.dispose();
+            activeSteamExclusionPicker = null;
             steamArea.replaceChildren(Amaterasu.el("p", "muted", "Loading Steam settings…"));
             try {
                 const loaded = await steamLoads.read(() => readSteamSettings(context.api));
@@ -9371,53 +12984,92 @@ var Amaterasu;
                 const { value: settings, generation } = loaded;
                 if (!context.content.isConnected)
                     return;
+                const pendingDraft = pendingProviderDrafts.get("steam");
+                if (pendingDraft) {
+                    const rebased = rebaseProviderDraft(pendingDraft, settings.values);
+                    pendingDraft.latest = settings.values;
+                    pendingDraft.merged = rebased.merged;
+                    pendingDraft.overlaps = rebased.overlaps;
+                    pendingDraft.reviewed = rebased.overlaps.length === 0;
+                    draftValues = rebased.merged;
+                    draftNotice = rebased.overlaps.length
+                        ? "Conflicting fields need review. Non-overlapping edits were rebased."
+                        : "Settings changed elsewhere. Non-overlapping edits were rebased; review before saving again.";
+                }
+                const valuesForForm = settings.values;
                 const form = Amaterasu.el("form", "settings-form");
                 const enabled = Amaterasu.input("steam_enabled", "", "checkbox");
-                enabled.checked = settings.values.enabled;
+                enabled.checked = valuesForForm.enabled;
                 const autoSync = Amaterasu.input("steam_auto_sync", "", "checkbox");
-                autoSync.checked = settings.values.auto_sync;
+                autoSync.checked = valuesForForm.auto_sync;
                 const includeTools = Amaterasu.input("steam_include_tools", "", "checkbox");
-                includeTools.checked = settings.values.include_tools;
+                includeTools.checked = valuesForForm.include_tools;
                 const syncAllInstalled = Amaterasu.input("steam_sync_all_installed", "", "checkbox");
-                syncAllInstalled.checked = settings.values.sync_all_installed;
+                syncAllInstalled.checked = valuesForForm.sync_all_installed;
                 const autosyncRemoveUninstalled = Amaterasu.input("steam_autosync_remove_uninstalled", "", "checkbox");
                 autosyncRemoveUninstalled.checked =
-                    settings.values.autosync_remove_uninstalled;
-                const recentGames = Amaterasu.input("steam_recent_games", String(settings.values.recent_games), "number");
+                    valuesForForm.autosync_remove_uninstalled;
+                const recentGames = Amaterasu.input("steam_recent_games", String(valuesForForm.recent_games), "number");
                 recentGames.required = true;
                 recentGames.min = "0";
                 recentGames.max = "10000";
                 recentGames.step = "1";
-                const recentMaxAgeDays = Amaterasu.input("steam_recent_max_age_days", String(settings.values.recent_max_age_days), "number");
+                const recentMaxAgeDays = Amaterasu.input("steam_recent_max_age_days", String(valuesForForm.recent_max_age_days), "number");
                 recentMaxAgeDays.required = true;
                 recentMaxAgeDays.min = "0";
                 recentMaxAgeDays.max = "36500";
                 recentMaxAgeDays.step = "1";
-                const exclusions = Amaterasu.el("textarea");
-                exclusions.name = "steam_exclude_games";
-                exclusions.rows = 10;
-                exclusions.spellcheck = false;
-                exclusions.value = JSON.stringify(settings.values.exclude_games, null, 2);
+                const exclusions = Amaterasu.steamExclusionPicker(context.api, valuesForForm.exclude_games);
+                activeSteamExclusionPicker = exclusions;
+                const exclusionsField = Amaterasu.el("div", "field", Amaterasu.el("span", "field-label", settingsTextMessage("Excluded games")), exclusions.node);
                 const status = Amaterasu.el("div");
+                if (draftNotice)
+                    settingsSetLocalizedTextContent(status, draftNotice);
                 const runtimeStatus = Amaterasu.el("p", "muted", "Loading current provider status…");
                 const save = Amaterasu.el("button", "button primary", "Save Steam settings");
                 save.type = "submit";
                 save.disabled = !context.api.allows("configuration.write");
-                form.append(Amaterasu.field("Enable Steam library discovery", enabled, "Controls whether the provider exposes discovered Steam games and accepts scans. On Linux the provider keeps discovery enabled."), Amaterasu.field("Automatic synchronization", autoSync, "Controls automatic scans of the configured Steam library roots."), Amaterasu.field("Include tools", includeTools, "Includes tools alongside games when importing the library."), Amaterasu.field("Synchronize all installed games", syncAllInstalled, "When off, import recently played games instead of every installed game."), Amaterasu.field("Remove uninstalled games during synchronization", autosyncRemoveUninstalled, "Applies when synchronizing all installed games. Recent-game mode always removes stale imported entries."), Amaterasu.field("Recent games to import", recentGames, "Maximum number of recently played games (0–10000); zero imports none in recent-only mode."), Amaterasu.field("Recent game age limit (days)", recentMaxAgeDays, "Ignore games older than this age (0–36500); zero disables the age cutoff."), Amaterasu.field("Excluded games (JSON)", exclusions, 'Use objects with "id" (canonical app ID), "name", or both. ID takes precedence; name-only entries match without case sensitivity.'), runtimeStatus, status, Amaterasu.el("div", "actions", save, Amaterasu.badge(settingsTextLiteral(`Revision ${settings.revision}`))));
+                let actionInProgress = false;
+                const cancel = Amaterasu.button(settingsTextMessage("Cancel"), () => {
+                    if (!actionInProgress) {
+                        pendingProviderDrafts.delete("steam");
+                        updateDraftStatus();
+                        void loadSteam();
+                    }
+                }, "secondary");
+                form.append(Amaterasu.field("Enable Steam library discovery", enabled, "Controls whether the provider exposes discovered Steam games and accepts scans. On Linux the provider keeps discovery enabled."), Amaterasu.field("Automatic synchronization", autoSync, "Controls automatic scans of the configured Steam library roots."), Amaterasu.field("Include tools", includeTools, "Includes tools alongside games when importing the library."), Amaterasu.field("Synchronize all installed games", syncAllInstalled, "When off, import recently played games instead of every installed game."), Amaterasu.field("Remove uninstalled games during synchronization", autosyncRemoveUninstalled, "Applies when synchronizing all installed games. Recent-game mode always removes stale imported entries."), Amaterasu.field("Recent games to import", recentGames, "Maximum number of recently played games (0–10000); zero imports none in recent-only mode."), Amaterasu.field("Recent game age limit (days)", recentMaxAgeDays, "Ignore games older than this age (0–36500); zero disables the age cutoff."), exclusionsField, runtimeStatus, status, Amaterasu.el("div", "actions", save, cancel, Amaterasu.badge(settingsTextLiteral(`Revision ${settings.revision}`))));
                 form.addEventListener("submit", (event) => {
                     event.preventDefault();
                     void Amaterasu.runAction(save, status, async () => {
+                        actionInProgress = true;
+                        cancel.disabled = true;
                         steamLoads.invalidate();
                         let saveStarted = false;
+                        let requestedValues = null;
                         try {
                             const values = {
                                 enabled: enabled.checked,
                                 auto_sync: autoSync.checked,
-                                exclude_games: parseSteamExclusions(exclusions.value),
+                                exclude_games: parseSteamExclusions(JSON.stringify(exclusions.value())),
                                 ...parseSteamImportSettings(includeTools.checked, syncAllInstalled.checked, autosyncRemoveUninstalled.checked, recentGames.valueAsNumber, recentMaxAgeDays.valueAsNumber),
                             };
+                            requestedValues = values;
+                            const existingPending = pendingProviderDrafts.get("steam");
+                            if (existingPending?.overlaps.length && !existingPending.reviewed)
+                                throw new Error("Review overlapping fields before saving again.");
+                            pendingProviderDrafts.set("steam", {
+                                baseline: settings.values,
+                                submitted: values,
+                                overlaps: [],
+                                reviewed: true,
+                            });
+                            updateDraftStatus();
+                            setSettingsFormDisabled(form, true);
+                            exclusions.setDisabled(true);
                             saveStarted = true;
                             const saved = await saveSteamSettings(context.api, settings, values);
+                            pendingProviderDrafts.delete("steam");
+                            updateDraftStatus();
                             await loadSteam();
                             context.notify(!values.enabled && saved.values.enabled
                                 ? settingsTextMessage("Steam settings saved and confirmed. Steam discovery remains enabled by Linux host policy; scan status is shown below.")
@@ -9425,25 +13077,71 @@ var Amaterasu;
                         }
                         catch (error) {
                             if (saveStarted) {
-                                await loadSteam();
-                                context.notify(error instanceof Amaterasu.ApiError && error.code === "revision_conflict"
-                                    ? settingsTextMessage("Steam settings changed elsewhere. Review the latest values before saving again.")
-                                    : settingsTextMessage("Steam save could not be confirmed. Review the latest values before saving again."));
+                                const conflict = error instanceof Amaterasu.ApiError && error.code === "revision_conflict";
+                                const nextDraft = requestedValues ?? undefined;
+                                const notice = conflict
+                                    ? "Settings changed elsewhere. Your draft is preserved; review it before saving again."
+                                    : "Steam save could not be confirmed. Your submitted draft is preserved for review against the latest saved values.";
+                                await loadSteam(nextDraft, notice);
+                                context.notify(settingsTextMessage(conflict
+                                    ? "Steam settings changed elsewhere. Your draft is preserved for review."
+                                    : "Steam save could not be confirmed. Review your preserved draft against the latest saved values before saving again."));
                                 return;
                             }
                             throw error;
                         }
+                        finally {
+                            actionInProgress = false;
+                            if (form.isConnected)
+                                setSettingsFormDisabled(form, false);
+                            exclusions.setDisabled(false);
+                            cancel.disabled = false;
+                        }
                     });
                 });
                 steamArea.replaceChildren(Amaterasu.panel("Steam", form));
+                if (draftValues) {
+                    const baseline = drafts?.capture(steamArea);
+                    if (baseline)
+                        drafts?.markSaved(baseline);
+                    settingsSetDraftCheckbox(enabled, draftValues.enabled);
+                    settingsSetDraftCheckbox(autoSync, draftValues.auto_sync);
+                    settingsSetDraftCheckbox(includeTools, draftValues.include_tools);
+                    settingsSetDraftCheckbox(syncAllInstalled, draftValues.sync_all_installed);
+                    settingsSetDraftCheckbox(autosyncRemoveUninstalled, draftValues.autosync_remove_uninstalled);
+                    settingsSetDraftNumber(recentGames, draftValues.recent_games);
+                    settingsSetDraftNumber(recentMaxAgeDays, draftValues.recent_max_age_days);
+                    exclusions.setValue(draftValues.exclude_games);
+                    configureProviderConflictReview("steam", status, save, (values, fields) => {
+                        const selected = new Set(fields);
+                        if (selected.has("enabled"))
+                            settingsSetDraftCheckbox(enabled, values.enabled);
+                        if (selected.has("auto_sync"))
+                            settingsSetDraftCheckbox(autoSync, values.auto_sync);
+                        if (selected.has("include_tools"))
+                            settingsSetDraftCheckbox(includeTools, values.include_tools);
+                        if (selected.has("sync_all_installed"))
+                            settingsSetDraftCheckbox(syncAllInstalled, values.sync_all_installed);
+                        if (selected.has("autosync_remove_uninstalled"))
+                            settingsSetDraftCheckbox(autosyncRemoveUninstalled, values.autosync_remove_uninstalled);
+                        if (selected.has("recent_games"))
+                            settingsSetDraftNumber(recentGames, values.recent_games);
+                        if (selected.has("recent_max_age_days"))
+                            settingsSetDraftNumber(recentMaxAgeDays, values.recent_max_age_days);
+                        if (selected.has("exclude_games"))
+                            exclusions.setValue(values.exclude_games);
+                    });
+                }
                 void loadSteamRuntimeStatus(runtimeStatus, context, settings, generation);
             }
             catch (error) {
                 if (context.content.isConnected)
-                    steamArea.replaceChildren(Amaterasu.errorPanel(error, loadSteam));
+                    steamArea.replaceChildren(Amaterasu.errorPanel(error, () => { void loadSteam(draftValues, draftNotice); }));
             }
         }
-        async function loadLutris() {
+        async function loadLutris(draftValues, draftNotice) {
+            activeLutrisExclusionEditor?.dispose();
+            activeLutrisExclusionEditor = null;
             lutrisArea.replaceChildren(Amaterasu.el("p", "muted", "Loading Lutris settings…"));
             try {
                 const loaded = await lutrisLoads.read(async () => {
@@ -9456,44 +13154,78 @@ var Amaterasu;
                 const { settings, runtime } = loaded.value;
                 if (!context.content.isConnected)
                     return;
+                const pendingDraft = pendingProviderDrafts.get("lutris");
+                if (pendingDraft) {
+                    const rebased = rebaseProviderDraft(pendingDraft, settings.values);
+                    pendingDraft.latest = settings.values;
+                    pendingDraft.merged = rebased.merged;
+                    pendingDraft.overlaps = rebased.overlaps;
+                    pendingDraft.reviewed = rebased.overlaps.length === 0;
+                    draftValues = rebased.merged;
+                    draftNotice = rebased.overlaps.length
+                        ? "Conflicting fields need review. Non-overlapping edits were rebased."
+                        : "Settings changed elsewhere. Non-overlapping edits were rebased; review before saving again.";
+                }
+                const valuesForForm = settings.values;
                 const form = Amaterasu.el("form", "settings-form");
                 const enabled = Amaterasu.input("lutris_enabled", "", "checkbox");
-                enabled.checked = settings.values.enabled;
+                enabled.checked = valuesForForm.enabled;
                 enabled.disabled = !runtime.platform_supported;
                 const autoSync = Amaterasu.input("lutris_auto_sync", "", "checkbox");
-                autoSync.checked = settings.values.auto_sync;
+                autoSync.checked = valuesForForm.auto_sync;
                 const removeUninstalled = Amaterasu.input("lutris_autosync_remove_uninstalled", "", "checkbox");
-                removeUninstalled.checked = settings.values.autosync_remove_uninstalled;
+                removeUninstalled.checked = valuesForForm.autosync_remove_uninstalled;
                 const includeSteam = Amaterasu.input("lutris_include_steam", "", "checkbox");
-                includeSteam.checked = settings.values.include_steam;
-                const exclusions = Amaterasu.el("textarea");
-                exclusions.name = "lutris_exclude_games";
-                exclusions.rows = 8;
-                exclusions.maxLength = 12_000;
-                exclusions.spellcheck = false;
-                exclusions.value = JSON.stringify(settings.values.exclude_games, null, 2);
+                includeSteam.checked = valuesForForm.include_steam;
+                const exclusions = Amaterasu.accessibleListEditor({
+                    label: "Excluded Lutris games",
+                    description: 'Enter a positive ID, or an object such as {"id":"123","name":"Game"}. Existing IDs missing from discovery remain in the list.',
+                    values: valuesForForm.exclude_games,
+                    formatValue: (value) => typeof value === "string" ? value : JSON.stringify(value),
+                    parseValue: (text) => {
+                        const source = text.trimStart().startsWith("{")
+                            ? `[${text}]`
+                            : JSON.stringify([text]);
+                        const parsed = parseLutrisExclusions(source);
+                        if (!parsed[0])
+                            throw new Error("Each Lutris exclusion needs a positive ID or a name.");
+                        return parsed[0];
+                    },
+                });
+                activeLutrisExclusionEditor = exclusions;
+                const exclusionsField = Amaterasu.el("div", "field", exclusions.element);
                 const runtimeStatus = Amaterasu.el("p", runtime.last_error ? "error" : "muted", runtime.settings_revision !== settings.revision ||
                     runtime.enabled !== settings.values.enabled ||
                     runtime.auto_sync !== settings.values.auto_sync
                     ? "Saved Lutris settings are not yet reflected in provider status. Refresh to check application."
                     : lutrisStatusDescription(runtime));
                 const saveStatus = Amaterasu.el("div");
+                if (draftNotice)
+                    settingsSetLocalizedTextContent(saveStatus, draftNotice);
                 const refreshStatus = Amaterasu.el("div");
                 const save = Amaterasu.el("button", "button primary", "Save Lutris settings");
                 save.type = "submit";
                 save.disabled = !context.api.allows("configuration.write");
+                let actionInProgress = false;
+                const cancel = Amaterasu.button(settingsTextMessage("Cancel"), () => {
+                    if (!actionInProgress) {
+                        pendingProviderDrafts.delete("lutris");
+                        updateDraftStatus();
+                        void loadLutris();
+                    }
+                }, "secondary");
                 const refresh = Amaterasu.button("Refresh now", () => Amaterasu.runAction(refresh, refreshStatus, async () => {
-                    const updated = await context.api.post("lutris/refresh");
+                    const updated = await Amaterasu.refreshLutrisProvider(context.api);
                     if (!runtimeStatus.isConnected || !lutrisLoads.isCurrent(loaded.generation))
                         return;
                     runtimeStatus.className = updated.last_error ? "error" : "muted";
-                    runtimeStatus.textContent = lutrisStatusDescription(updated);
+                    settingsSetLocalizedTextContent(runtimeStatus, lutrisStatusDescription(updated));
                     context.notify(settingsTextMessage("Lutris refresh requested."));
                 }));
                 refresh.disabled =
                     !context.api.allows("configuration.write") ||
                         !runtime.platform_supported ||
-                        !settings.values.enabled;
+                        !valuesForForm.enabled;
                 enabled.addEventListener("change", () => {
                     refresh.disabled =
                         !context.api.allows("configuration.write") ||
@@ -9502,46 +13234,100 @@ var Amaterasu;
                 });
                 form.append(Amaterasu.field("Enable Lutris discovery", enabled, runtime.platform_supported
                     ? "Controls discovery for the current Linux user."
-                    : "Lutris discovery is available only on Linux; this option cannot be enabled on this platform."), Amaterasu.field("Automatic synchronization", autoSync, "Scan the current user's installed Lutris games automatically."), Amaterasu.field("Remove uninstalled games", removeUninstalled, "After a successful complete scan, remove Lutris-owned games that are no longer installed."), Amaterasu.field("Include matching Steam games", includeSteam, "Read a complete Steam catalog before import; the direct Steam catalog record takes precedence for matching app IDs."), Amaterasu.field("Excluded games (JSON)", exclusions, 'Use a positive decimal ID string or an object with "id", "name", or both. ID takes precedence; name-only entries match without case sensitivity.'), runtimeStatus, saveStatus, Amaterasu.el("div", "actions", save, Amaterasu.badge(settingsTextLiteral(`Revision ${settings.revision}`))));
+                    : "Lutris discovery is available only on Linux; this option cannot be enabled on this platform."), Amaterasu.field("Automatic synchronization", autoSync, "Scan the current user's installed Lutris games automatically."), Amaterasu.field("Remove uninstalled games", removeUninstalled, "After a successful complete scan, remove Lutris-owned games that are no longer installed."), Amaterasu.field("Include matching Steam games", includeSteam, "Read a complete Steam catalog before import; the direct Steam catalog record takes precedence for matching app IDs."), exclusionsField, runtimeStatus, saveStatus, Amaterasu.el("div", "actions", save, cancel, Amaterasu.badge(settingsTextLiteral(`Revision ${settings.revision}`))));
                 form.addEventListener("submit", (event) => {
                     event.preventDefault();
                     void Amaterasu.runAction(save, saveStatus, async () => {
+                        actionInProgress = true;
+                        cancel.disabled = true;
                         lutrisLoads.invalidate();
                         let saveStarted = false;
+                        let requestedValues = null;
                         try {
                             const values = {
                                 enabled: enabled.checked,
                                 auto_sync: autoSync.checked,
                                 autosync_remove_uninstalled: removeUninstalled.checked,
                                 include_steam: includeSteam.checked,
-                                exclude_games: parseLutrisExclusions(exclusions.value),
+                                exclude_games: parseLutrisExclusions(JSON.stringify(exclusions.values())),
                             };
+                            requestedValues = values;
+                            const existingPending = pendingProviderDrafts.get("lutris");
+                            if (existingPending?.overlaps.length && !existingPending.reviewed)
+                                throw new Error("Review overlapping fields before saving again.");
+                            pendingProviderDrafts.set("lutris", {
+                                baseline: settings.values,
+                                submitted: values,
+                                overlaps: [],
+                                reviewed: true,
+                            });
+                            updateDraftStatus();
+                            setSettingsFormDisabled(form, true);
                             saveStarted = true;
                             await saveLutrisSettings(context.api, settings, values);
+                            pendingProviderDrafts.delete("lutris");
+                            updateDraftStatus();
                             await loadLutris();
                             context.notify(settingsTextMessage("Lutris settings saved and confirmed. Scan status is shown below."));
                         }
                         catch (error) {
                             if (saveStarted) {
-                                await loadLutris();
-                                context.notify(error instanceof Amaterasu.ApiError && error.code === "revision_conflict"
-                                    ? settingsTextMessage("Lutris settings changed elsewhere. Review the latest values before saving again.")
-                                    : settingsTextMessage("Lutris save could not be confirmed. Review the latest values before saving again."));
+                                const conflict = error instanceof Amaterasu.ApiError && error.code === "revision_conflict";
+                                const nextDraft = requestedValues ?? undefined;
+                                const notice = conflict
+                                    ? "Settings changed elsewhere. Your draft is preserved; review it before saving again."
+                                    : "Lutris save could not be confirmed. Your submitted draft is preserved for review against the latest saved values.";
+                                await loadLutris(nextDraft, notice);
+                                context.notify(settingsTextMessage(conflict
+                                    ? "Lutris settings changed elsewhere. Your draft is preserved for review."
+                                    : "Lutris save could not be confirmed. Review your preserved draft against the latest saved values before saving again."));
                                 return;
                             }
                             throw error;
+                        }
+                        finally {
+                            actionInProgress = false;
+                            if (form.isConnected)
+                                setSettingsFormDisabled(form, false);
+                            cancel.disabled = false;
                         }
                     });
                 });
                 refreshStatus.className = "muted";
                 lutrisArea.replaceChildren(Amaterasu.panel("Lutris", form, Amaterasu.el("div", "actions", refresh, refreshStatus)));
+                if (draftValues) {
+                    const baseline = drafts?.capture(lutrisArea);
+                    if (baseline)
+                        drafts?.markSaved(baseline);
+                    settingsSetDraftCheckbox(enabled, draftValues.enabled);
+                    settingsSetDraftCheckbox(autoSync, draftValues.auto_sync);
+                    settingsSetDraftCheckbox(removeUninstalled, draftValues.autosync_remove_uninstalled);
+                    settingsSetDraftCheckbox(includeSteam, draftValues.include_steam);
+                    exclusions.setValues(draftValues.exclude_games);
+                    configureProviderConflictReview("lutris", saveStatus, save, (values, fields) => {
+                        const selected = new Set(fields);
+                        if (selected.has("enabled"))
+                            settingsSetDraftCheckbox(enabled, values.enabled);
+                        if (selected.has("auto_sync"))
+                            settingsSetDraftCheckbox(autoSync, values.auto_sync);
+                        if (selected.has("autosync_remove_uninstalled"))
+                            settingsSetDraftCheckbox(removeUninstalled, values.autosync_remove_uninstalled);
+                        if (selected.has("include_steam"))
+                            settingsSetDraftCheckbox(includeSteam, values.include_steam);
+                        if (selected.has("exclude_games"))
+                            exclusions.setValues(values.exclude_games);
+                    });
+                }
             }
             catch (error) {
                 if (context.content.isConnected)
-                    lutrisArea.replaceChildren(Amaterasu.errorPanel(error, loadLutris));
+                    lutrisArea.replaceChildren(Amaterasu.errorPanel(error, () => { void loadLutris(draftValues, draftNotice); }));
             }
         }
-        async function loadPlaynite() {
+        async function loadPlaynite(draftValues, draftNotice) {
+            for (const editor of activePlayniteListEditors)
+                editor.dispose();
+            activePlayniteListEditors = [];
             playniteArea.replaceChildren(Amaterasu.el("p", "muted", "Loading Playnite settings…"));
             try {
                 const loaded = await playniteLoads.read(() => readPlayniteSettings(context.api), () => context.api.post("playnite/status"));
@@ -9550,89 +13336,129 @@ var Amaterasu;
                 const { settings, runtime } = loaded;
                 if (!context.content.isConnected)
                     return;
+                const pendingDraft = pendingProviderDrafts.get("playnite");
+                if (pendingDraft) {
+                    const rebased = rebaseProviderDraft(pendingDraft, settings.values);
+                    pendingDraft.latest = settings.values;
+                    pendingDraft.merged = rebased.merged;
+                    pendingDraft.overlaps = rebased.overlaps;
+                    pendingDraft.reviewed = rebased.overlaps.length === 0;
+                    draftValues = rebased.merged;
+                    draftNotice = rebased.overlaps.length
+                        ? "Conflicting fields need review. Non-overlapping edits were rebased."
+                        : "Settings changed elsewhere. Non-overlapping edits were rebased; review before saving again.";
+                }
+                const valuesForForm = settings.values;
                 const form = Amaterasu.el("form", "settings-form");
                 const enabled = Amaterasu.input("playnite_enabled", "", "checkbox");
-                enabled.checked = settings.values.enabled;
+                enabled.checked = valuesForForm.enabled;
                 const autoSync = Amaterasu.input("playnite_auto_sync", "", "checkbox");
-                autoSync.checked = settings.values.auto_sync;
+                autoSync.checked = valuesForForm.auto_sync;
                 const syncAllInstalled = Amaterasu.input("playnite_sync_all_installed", "", "checkbox");
-                syncAllInstalled.checked = settings.values.sync_all_installed;
+                syncAllInstalled.checked = valuesForForm.sync_all_installed;
                 const removeUninstalled = Amaterasu.input("playnite_autosync_remove_uninstalled", "", "checkbox");
-                removeUninstalled.checked = settings.values.autosync_remove_uninstalled;
-                const deleteAfterDays = Amaterasu.input("playnite_autosync_delete_after_days", String(settings.values.autosync_delete_after_days), "number");
+                removeUninstalled.checked = valuesForForm.autosync_remove_uninstalled;
+                const deleteAfterDays = Amaterasu.input("playnite_autosync_delete_after_days", String(valuesForForm.autosync_delete_after_days), "number");
                 deleteAfterDays.required = true;
                 deleteAfterDays.min = "0";
                 deleteAfterDays.max = "2147483647";
                 deleteAfterDays.step = "1";
                 const requireReplacement = Amaterasu.input("playnite_autosync_require_replacement", "", "checkbox");
-                requireReplacement.checked = settings.values.autosync_require_replacement;
-                const focusAttempts = Amaterasu.input("playnite_focus_attempts", String(settings.values.focus_attempts), "number");
+                requireReplacement.checked = valuesForForm.autosync_require_replacement;
+                const focusAttempts = Amaterasu.input("playnite_focus_attempts", String(valuesForForm.focus_attempts), "number");
                 focusAttempts.required = true;
                 focusAttempts.min = "0";
                 focusAttempts.max = "2147483647";
                 focusAttempts.step = "1";
-                const focusTimeoutSecs = Amaterasu.input("playnite_focus_timeout_secs", String(settings.values.focus_timeout_secs), "number");
+                const focusTimeoutSecs = Amaterasu.input("playnite_focus_timeout_secs", String(valuesForForm.focus_timeout_secs), "number");
                 focusTimeoutSecs.required = true;
                 focusTimeoutSecs.min = "0";
                 focusTimeoutSecs.max = "2147483647";
                 focusTimeoutSecs.step = "1";
                 const focusExitOnFirst = Amaterasu.input("playnite_focus_exit_on_first", "", "checkbox");
-                focusExitOnFirst.checked = settings.values.focus_exit_on_first;
+                focusExitOnFirst.checked = valuesForForm.focus_exit_on_first;
                 const fullscreenEntryEnabled = Amaterasu.input("playnite_fullscreen_entry_enabled", "", "checkbox");
-                fullscreenEntryEnabled.checked = settings.values.fullscreen_entry_enabled;
-                const recentGames = Amaterasu.input("playnite_recent_games", String(settings.values.recent_games), "number");
+                fullscreenEntryEnabled.checked = valuesForForm.fullscreen_entry_enabled;
+                const recentGames = Amaterasu.input("playnite_recent_games", String(valuesForForm.recent_games), "number");
                 recentGames.required = true;
                 recentGames.min = "0";
                 recentGames.max = "10000";
                 recentGames.step = "1";
-                const recentMaxAgeDays = Amaterasu.input("playnite_recent_max_age_days", String(settings.values.recent_max_age_days), "number");
+                const recentMaxAgeDays = Amaterasu.input("playnite_recent_max_age_days", String(valuesForForm.recent_max_age_days), "number");
                 recentMaxAgeDays.required = true;
                 recentMaxAgeDays.min = "0";
                 recentMaxAgeDays.max = "36500";
                 recentMaxAgeDays.step = "1";
-                const filterList = (name, values) => {
-                    const control = Amaterasu.el("textarea");
-                    control.name = name;
-                    control.rows = 5;
-                    control.maxLength = 12_000;
-                    control.spellcheck = false;
-                    control.value = JSON.stringify(values, null, 2);
+                const filterList = (name, label, values) => {
+                    const control = Amaterasu.accessibleListEditor({
+                        label,
+                        description: "Add, edit, or remove list values. Unknown values are kept in their current order.",
+                        values,
+                        maxItems: 256,
+                        formatValue: (value) => value,
+                        parseValue: (value) => parsePlayniteFilterList(JSON.stringify([value]), label)[0],
+                    });
+                    control.element.setAttribute("data-provider-field", name);
+                    activePlayniteListEditors.push(control);
                     return control;
                 };
-                const syncCategories = filterList("playnite_sync_categories", settings.values.sync_categories);
-                const excludeCategories = filterList("playnite_exclude_categories", settings.values.exclude_categories);
-                const syncPlugins = filterList("playnite_sync_plugins", settings.values.sync_plugins);
-                const excludePlugins = filterList("playnite_exclude_plugins", settings.values.exclude_plugins);
-                const excludeGames = filterList("playnite_exclude_games", settings.values.exclude_games);
+                const filterField = (editor) => editor.element;
+                const syncCategories = filterList("playnite_sync_categories", "Included categories", valuesForForm.sync_categories);
+                const excludeCategories = filterList("playnite_exclude_categories", "Excluded categories", valuesForForm.exclude_categories);
+                const syncPlugins = filterList("playnite_sync_plugins", "Included plugin IDs", valuesForForm.sync_plugins);
+                const excludePlugins = filterList("playnite_exclude_plugins", "Excluded plugin IDs", valuesForForm.exclude_plugins);
+                const excludeGames = filterList("playnite_exclude_games", "Excluded game IDs", valuesForForm.exclude_games);
+                let currentRuntime = runtime;
                 const runtimeStatus = Amaterasu.el("p", runtime.last_error ? "error" : "muted", runtime.revision !== settings.revision || runtime.enabled !== settings.values.enabled ||
                     runtime.auto_sync !== settings.values.auto_sync
                     ? "Saved Playnite settings are not yet reflected in runtime status. Refresh to check application."
                     : playniteStatusDescription(runtime));
                 const saveStatus = Amaterasu.el("div");
+                if (draftNotice)
+                    settingsSetLocalizedTextContent(saveStatus, draftNotice);
                 const refreshStatus = Amaterasu.el("div");
                 const save = Amaterasu.el("button", "button primary", "Save Playnite settings");
                 save.type = "submit";
                 save.disabled = !context.api.allows("configuration.write");
+                let actionInProgress = false;
+                const cancel = Amaterasu.button(settingsTextMessage("Cancel"), () => {
+                    if (!actionInProgress) {
+                        pendingProviderDrafts.delete("playnite");
+                        updateDraftStatus();
+                        void loadPlaynite();
+                    }
+                }, "secondary");
                 const refresh = Amaterasu.button("Refresh now", () => Amaterasu.runAction(refresh, refreshStatus, async () => {
-                    await context.api.post("playnite/refresh");
+                    const updated = await Amaterasu.refreshPlayniteProvider(context.api);
+                    if (!runtimeStatus.isConnected)
+                        return;
+                    currentRuntime = updated;
+                    runtimeStatus.className = updated.last_error ? "error" : "muted";
+                    settingsSetLocalizedTextContent(runtimeStatus, updated.revision !== settings.revision || updated.enabled !== settings.values.enabled ||
+                        updated.auto_sync !== settings.values.auto_sync
+                        ? "Saved Playnite settings are not yet reflected in provider status. Refresh to check application."
+                        : playniteStatusDescription(updated));
+                    updateRefreshAvailability();
                     context.notify(settingsTextMessage("Playnite refresh requested."));
-                    await loadPlaynite();
                 }));
                 const updateRefreshAvailability = () => {
                     refresh.disabled =
                         !context.api.allows("configuration.write") ||
                             !enabled.checked ||
-                            !runtime.playnite_running ||
-                            runtime.snapshot_pending;
+                            !currentRuntime.playnite_running ||
+                            currentRuntime.snapshot_pending;
                 };
                 updateRefreshAvailability();
                 enabled.addEventListener("change", updateRefreshAvailability);
-                form.append(Amaterasu.field("Enable Playnite synchronization", enabled, "Controls whether Playnite games are imported. The setting is preserved on hosts where Playnite process discovery is unavailable."), Amaterasu.field("Automatic synchronization", autoSync, "Periodically scan Playnite while its desktop or fullscreen client is running."), Amaterasu.field("Synchronize all installed games", syncAllInstalled, "When off, import recent games plus installed games selected by category or plugin filters."), Amaterasu.field("Remove uninstalled Playnite games", removeUninstalled, "Remove imported games explicitly reported as uninstalled by a complete Playnite snapshot."), Amaterasu.field("Delete expired Playnite games after (days)", deleteAfterDays, "Remove eligible Playnite imports after this age when they have not been played since import. Zero disables this cleanup."), Amaterasu.field("Require a replacement for recent-game cleanup", requireReplacement, "Limit removal of unselected recent imports to the count of newly selected games."), Amaterasu.field("Focus attempts after game start", focusAttempts, "Try to focus the confirmed Playnite game process this many times. Zero disables focus."), Amaterasu.field("Focus timeout (seconds)", focusTimeoutSecs, "Stop trying after this many seconds. Zero disables focus."), Amaterasu.field("Stop focus attempts after first success", focusExitOnFirst, "When enabled, stop retrying once the game is confirmed in the foreground."), Amaterasu.field("Show Playnite Fullscreen in the catalog", fullscreenEntryEnabled, "Add or remove the provider-managed Playnite Fullscreen launch entry. Manual Fullscreen entries remain available."), Amaterasu.field("Recent games to import", recentGames, "Maximum number of recent games (0–10000); zero disables recent-game selection."), Amaterasu.field("Recent game age limit (days)", recentMaxAgeDays, "Ignore recent games older than this age (0–36500); zero disables the age cutoff."), Amaterasu.field("Included categories (JSON)", syncCategories, "Additional installed games whose category matches any listed value; an empty list adds no category matches."), Amaterasu.field("Excluded categories (JSON)", excludeCategories, "Games in these categories are excluded even if another setting would include them."), Amaterasu.field("Included plugin IDs (JSON)", syncPlugins, "Additional installed games from any listed Playnite plugin; an empty list adds no plugin matches."), Amaterasu.field("Excluded plugin IDs (JSON)", excludePlugins, "Games from these plugin IDs are excluded even if another setting would include them."), Amaterasu.field("Excluded game IDs (JSON)", excludeGames, "Game IDs to omit from every import selection."), runtimeStatus, saveStatus, Amaterasu.el("div", "actions", save, Amaterasu.badge(settingsTextLiteral(`Revision ${settings.revision}`))));
+                form.append(Amaterasu.field("Enable Playnite synchronization", enabled, "Controls whether Playnite games are imported. The setting is preserved on hosts where Playnite process discovery is unavailable."), Amaterasu.field("Automatic synchronization", autoSync, "Periodically scan Playnite while its desktop or fullscreen client is running."), Amaterasu.field("Synchronize all installed games", syncAllInstalled, "When off, import recent games plus installed games selected by category or plugin filters."), Amaterasu.field("Remove uninstalled Playnite games", removeUninstalled, "Remove imported games explicitly reported as uninstalled by a complete Playnite snapshot."), Amaterasu.field("Delete expired Playnite games after (days)", deleteAfterDays, "Remove eligible Playnite imports after this age when they have not been played since import. Zero disables this cleanup."), Amaterasu.field("Require a replacement for recent-game cleanup", requireReplacement, "Limit removal of unselected recent imports to the count of newly selected games."), Amaterasu.field("Focus attempts after game start", focusAttempts, "Try to focus the confirmed Playnite game process this many times. Zero disables focus."), Amaterasu.field("Focus timeout (seconds)", focusTimeoutSecs, "Stop trying after this many seconds. Zero disables focus."), Amaterasu.field("Stop focus attempts after first success", focusExitOnFirst, "When enabled, stop retrying once the game is confirmed in the foreground."), Amaterasu.field("Show Playnite Fullscreen in the catalog", fullscreenEntryEnabled, "Add or remove the provider-managed Playnite Fullscreen launch entry. Manual Fullscreen entries remain available."), Amaterasu.field("Recent games to import", recentGames, "Maximum number of recent games (0–10000); zero disables recent-game selection."), Amaterasu.field("Recent game age limit (days)", recentMaxAgeDays, "Ignore recent games older than this age (0–36500); zero disables the age cutoff."), settingsComponentField("Included categories", filterField(syncCategories), "Additional installed games whose category matches any listed value; an empty list adds no category matches."), settingsComponentField("Excluded categories", filterField(excludeCategories), "Games in these categories are excluded even if another setting would include them."), settingsComponentField("Included plugin IDs", filterField(syncPlugins), "Additional installed games from any listed Playnite plugin; an empty list adds no plugin matches."), settingsComponentField("Excluded plugin IDs", filterField(excludePlugins), "Games from these plugin IDs are excluded even if another setting would include them."), settingsComponentField("Excluded game IDs", filterField(excludeGames), "Game IDs to omit from every import selection."), runtimeStatus, saveStatus, Amaterasu.el("div", "actions", save, cancel, Amaterasu.badge(settingsTextLiteral(`Revision ${settings.revision}`))));
                 form.addEventListener("submit", (event) => {
                     event.preventDefault();
                     void Amaterasu.runAction(save, saveStatus, async () => {
+                        actionInProgress = true;
+                        cancel.disabled = true;
                         playniteLoads.invalidate();
                         let saveStarted = false;
+                        let requestedValues = null;
                         try {
                             const values = parsePlayniteSettings({
                                 enabled: enabled.checked,
@@ -9647,38 +13473,117 @@ var Amaterasu;
                                 fullscreen_entry_enabled: fullscreenEntryEnabled.checked,
                                 recent_games: recentGames.valueAsNumber,
                                 recent_max_age_days: recentMaxAgeDays.valueAsNumber,
-                                sync_categories: parsePlayniteFilterList(syncCategories.value, "Sync categories"),
-                                exclude_categories: parsePlayniteFilterList(excludeCategories.value, "Excluded categories"),
-                                sync_plugins: parsePlayniteFilterList(syncPlugins.value, "Sync plugin IDs"),
-                                exclude_plugins: parsePlayniteFilterList(excludePlugins.value, "Excluded plugin IDs"),
-                                exclude_games: parsePlayniteFilterList(excludeGames.value, "Excluded game IDs"),
+                                sync_categories: parsePlayniteFilterList(JSON.stringify(syncCategories.values()), "Sync categories"),
+                                exclude_categories: parsePlayniteFilterList(JSON.stringify(excludeCategories.values()), "Excluded categories"),
+                                sync_plugins: parsePlayniteFilterList(JSON.stringify(syncPlugins.values()), "Sync plugin IDs"),
+                                exclude_plugins: parsePlayniteFilterList(JSON.stringify(excludePlugins.values()), "Excluded plugin IDs"),
+                                exclude_games: parsePlayniteFilterList(JSON.stringify(excludeGames.values()), "Excluded game IDs"),
                             });
+                            requestedValues = values;
+                            const existingPending = pendingProviderDrafts.get("playnite");
+                            if (existingPending?.overlaps.length && !existingPending.reviewed)
+                                throw new Error("Review overlapping fields before saving again.");
+                            pendingProviderDrafts.set("playnite", {
+                                baseline: settings.values,
+                                submitted: values,
+                                overlaps: [],
+                                reviewed: true,
+                            });
+                            updateDraftStatus();
+                            setSettingsFormDisabled(form, true);
                             saveStarted = true;
                             await savePlayniteSettings(context.api, settings, values);
+                            pendingProviderDrafts.delete("playnite");
+                            updateDraftStatus();
                             await loadPlaynite();
                             context.notify(settingsTextMessage("Playnite settings saved and confirmed. Runtime status is shown below."));
                         }
                         catch (error) {
                             if (error instanceof Amaterasu.ApiError && error.code === "revision_conflict") {
-                                context.notify(settingsTextMessage("Playnite settings changed elsewhere. The latest values have been reloaded."));
-                                await loadPlaynite();
+                                await loadPlaynite(requestedValues ?? undefined, "Settings changed elsewhere. Your draft is preserved; review it before saving again.");
+                                context.notify(settingsTextMessage("Playnite settings changed elsewhere. Your draft is preserved for review."));
                                 return;
                             }
                             if (saveStarted) {
-                                await loadPlaynite();
-                                context.notify(settingsTextMessage("Playnite save could not be confirmed. Review the latest values before saving again."));
+                                await loadPlaynite(requestedValues ?? undefined, "Playnite save could not be confirmed. Your draft is preserved for review against the latest saved values.");
+                                context.notify(settingsTextMessage("Playnite save could not be confirmed. Review your preserved draft against the latest saved values before saving again."));
                                 return;
                             }
                             throw error;
+                        }
+                        finally {
+                            actionInProgress = false;
+                            if (form.isConnected)
+                                setSettingsFormDisabled(form, false);
+                            cancel.disabled = false;
                         }
                     });
                 });
                 refreshStatus.className = "muted";
                 playniteArea.replaceChildren(Amaterasu.panel("Playnite", form, Amaterasu.el("div", "actions", refresh, refreshStatus)));
+                if (draftValues) {
+                    const baseline = drafts?.capture(playniteArea);
+                    if (baseline)
+                        drafts?.markSaved(baseline);
+                    settingsSetDraftCheckbox(enabled, draftValues.enabled);
+                    settingsSetDraftCheckbox(autoSync, draftValues.auto_sync);
+                    settingsSetDraftCheckbox(syncAllInstalled, draftValues.sync_all_installed);
+                    settingsSetDraftCheckbox(removeUninstalled, draftValues.autosync_remove_uninstalled);
+                    settingsSetDraftNumber(deleteAfterDays, draftValues.autosync_delete_after_days);
+                    settingsSetDraftCheckbox(requireReplacement, draftValues.autosync_require_replacement);
+                    settingsSetDraftNumber(focusAttempts, draftValues.focus_attempts);
+                    settingsSetDraftNumber(focusTimeoutSecs, draftValues.focus_timeout_secs);
+                    settingsSetDraftCheckbox(focusExitOnFirst, draftValues.focus_exit_on_first);
+                    settingsSetDraftCheckbox(fullscreenEntryEnabled, draftValues.fullscreen_entry_enabled);
+                    settingsSetDraftNumber(recentGames, draftValues.recent_games);
+                    settingsSetDraftNumber(recentMaxAgeDays, draftValues.recent_max_age_days);
+                    syncCategories.setValues(draftValues.sync_categories);
+                    excludeCategories.setValues(draftValues.exclude_categories);
+                    syncPlugins.setValues(draftValues.sync_plugins);
+                    excludePlugins.setValues(draftValues.exclude_plugins);
+                    excludeGames.setValues(draftValues.exclude_games);
+                    configureProviderConflictReview("playnite", saveStatus, save, (values, fields) => {
+                        const selected = new Set(fields);
+                        if (selected.has("enabled"))
+                            settingsSetDraftCheckbox(enabled, values.enabled);
+                        if (selected.has("auto_sync"))
+                            settingsSetDraftCheckbox(autoSync, values.auto_sync);
+                        if (selected.has("sync_all_installed"))
+                            settingsSetDraftCheckbox(syncAllInstalled, values.sync_all_installed);
+                        if (selected.has("autosync_remove_uninstalled"))
+                            settingsSetDraftCheckbox(removeUninstalled, values.autosync_remove_uninstalled);
+                        if (selected.has("autosync_delete_after_days"))
+                            settingsSetDraftNumber(deleteAfterDays, values.autosync_delete_after_days);
+                        if (selected.has("autosync_require_replacement"))
+                            settingsSetDraftCheckbox(requireReplacement, values.autosync_require_replacement);
+                        if (selected.has("focus_attempts"))
+                            settingsSetDraftNumber(focusAttempts, values.focus_attempts);
+                        if (selected.has("focus_timeout_secs"))
+                            settingsSetDraftNumber(focusTimeoutSecs, values.focus_timeout_secs);
+                        if (selected.has("focus_exit_on_first"))
+                            settingsSetDraftCheckbox(focusExitOnFirst, values.focus_exit_on_first);
+                        if (selected.has("fullscreen_entry_enabled"))
+                            settingsSetDraftCheckbox(fullscreenEntryEnabled, values.fullscreen_entry_enabled);
+                        if (selected.has("recent_games"))
+                            settingsSetDraftNumber(recentGames, values.recent_games);
+                        if (selected.has("recent_max_age_days"))
+                            settingsSetDraftNumber(recentMaxAgeDays, values.recent_max_age_days);
+                        if (selected.has("sync_categories"))
+                            syncCategories.setValues(values.sync_categories);
+                        if (selected.has("exclude_categories"))
+                            excludeCategories.setValues(values.exclude_categories);
+                        if (selected.has("sync_plugins"))
+                            syncPlugins.setValues(values.sync_plugins);
+                        if (selected.has("exclude_plugins"))
+                            excludePlugins.setValues(values.exclude_plugins);
+                        if (selected.has("exclude_games"))
+                            excludeGames.setValues(values.exclude_games);
+                    });
+                }
             }
             catch (error) {
                 if (context.content.isConnected)
-                    playniteArea.replaceChildren(Amaterasu.errorPanel(error, loadPlaynite));
+                    playniteArea.replaceChildren(Amaterasu.errorPanel(error, () => { void loadPlaynite(draftValues, draftNotice); }));
             }
         }
         async function loadHistorySettings() {
@@ -9836,17 +13741,16 @@ var Amaterasu;
                 const status = await context.api.post("steam/status");
                 if (!target.isConnected || !steamLoads.isCurrent(generation))
                     return;
-                target.textContent = status.settings_ready && status.enabled !== settings.values.enabled
+                settingsSetLocalizedTextContent(target, status.settings_ready && status.enabled !== settings.values.enabled
                     ? "Saved Steam discovery setting is not yet reflected in provider status. Refresh to check application."
-                    : steamStatusDescription(status);
+                    : steamStatusDescription(status));
             }
             catch (error) {
                 if (!target.isConnected || !steamLoads.isCurrent(generation))
                     return;
-                target.textContent =
-                    error instanceof Amaterasu.ApiError && error.code === "forbidden"
-                        ? "Runtime status requires steam.read; settings remain available with configuration access."
-                        : "Current provider status is unavailable; settings remain editable.";
+                settingsSetLocalizedTextContent(target, error instanceof Amaterasu.ApiError && error.code === "forbidden"
+                    ? "Runtime status requires steam.read; settings remain available with configuration access."
+                    : "Current provider status is unavailable; settings remain editable.");
             }
         }
         async function loadHost() {
@@ -10550,6 +14454,8 @@ var Amaterasu;
                 state: scanning ? "Scanning" : complete ? "Scan complete" : "Awaiting scan",
                 tone: "",
                 detail: `${count} discovered games · ${warnings} scan warnings.`,
+                detailTemplate: "Discovered games: {count}. Scan warnings: {warnings}.",
+                detailValues: { count, warnings },
             };
         }
         if (name === "lutris") {
@@ -10567,8 +14473,12 @@ var Amaterasu;
             const lastError = record.last_error;
             if (lastError !== null && typeof lastError !== "string")
                 throw new Error("Provider status is invalid.");
-            return { state: lastError ? "Scan issue" : pending ? "Scanning" : "Available", tone: lastError ? "bad" : "",
-                detail: lastError ? `Last scan issue: ${lastError}` : `${count} discovered games.` };
+            return {
+                state: lastError ? "Scan issue" : pending ? "Scanning" : "Available",
+                tone: lastError ? "bad" : "",
+                detail: lastError ? `Last scan issue: ${lastError}` : `${count} discovered games.`,
+                ...(!lastError ? { detailTemplate: "Discovered games: {count}.", detailValues: { count } } : {}),
+            };
         }
         const running = providerBoolean(record, "playnite_running");
         const count = providerCount(record, "snapshot_game_count");
@@ -10580,6 +14490,7 @@ var Amaterasu;
             state: lastError ? "Sync issue" : pending ? "Syncing" : running ? "Running" : "Not detected",
             tone: lastError ? "bad" : "",
             detail: lastError ? `Last sync issue: ${lastError}` : `${count} games in the last snapshot.`,
+            ...(!lastError ? { detailTemplate: "Games in the last snapshot: {count}.", detailValues: { count } } : {}),
         };
     }
     Amaterasu.summarizeProvider = summarizeProvider;
@@ -10591,38 +14502,168 @@ var Amaterasu;
             { name: "playnite", label: "Playnite", description: "Sync a Playnite library and provider-managed applications.", scope: "configuration.read" },
         ];
         let generation = 0;
+        const activeRefreshes = new Set();
+        let currentCards = [];
         const rtxHdrArea = Amaterasu.el("div");
-        context.content.append(Amaterasu.sectionHeading("Integrations", "Connect and manage integrations on this host.", Amaterasu.button("Refresh", load)), rtxHdrArea, area);
-        async function load() {
+        const refreshStatuses = Amaterasu.button(Amaterasu.localizedMessage("Refresh provider statuses"), () => load(true));
+        if (typeof Amaterasu.setLocalizedAttribute === "function")
+            Amaterasu.setLocalizedAttribute(refreshStatuses, "aria-label", "Refresh provider statuses");
+        context.content.append(Amaterasu.sectionHeading("Integrations", "Connect and manage integrations on this host.", refreshStatuses), rtxHdrArea, area);
+        async function load(announceReadback = false) {
             const request = ++generation;
+            refreshStatuses.disabled = true;
             Amaterasu.renderRtxHdrIntegration(context, rtxHdrArea);
             const cards = providers.map((provider) => {
-                const status = Amaterasu.el("div", "integration-status", Amaterasu.el("p", "muted", "Loading provider status…"));
-                const settings = Amaterasu.button("Configure", () => context.navigate("settings/integrations"));
+                const status = Amaterasu.el("div", "integration-status", Amaterasu.el("p", "muted", Amaterasu.localizedMessage("Loading provider status...")));
+                const feedback = Amaterasu.el("div", "integration-action-status");
+                feedback.setAttribute("role", "status");
+                feedback.setAttribute("aria-live", "polite");
+                feedback.setAttribute("aria-atomic", "true");
+                const settings = Amaterasu.button(Amaterasu.localizedMessage("Configure"), () => context.navigate("settings/integrations"));
                 settings.disabled = !context.api.allows("configuration.read");
                 const actions = Amaterasu.el("div", "actions", settings);
-                if (provider.name === "steam" && context.api.allows("steam.read"))
-                    actions.append(Amaterasu.button("Browse games", () => context.navigate("steam")));
-                const card = Amaterasu.el("section", "panel integration-card", Amaterasu.el("h2", "", provider.label), Amaterasu.el("p", "muted", provider.description), status, actions);
-                return { provider, status, card };
+                let refreshButton = null;
+                if (provider.name === "steam" && context.api.allows("steam.read")) {
+                    actions.append(Amaterasu.button(Amaterasu.localizedMessage("Manage Steam library"), () => context.navigate("steam")));
+                }
+                else if (provider.name !== "steam") {
+                    refreshButton = Amaterasu.button(Amaterasu.localizedMessage("Refresh now"), () => refreshProvider(provider.name));
+                    if (typeof Amaterasu.setLocalizedAttributeTemplate === "function")
+                        Amaterasu.setLocalizedAttributeTemplate(refreshButton, "aria-label", "Request a {provider} refresh", { provider: Amaterasu.literalText(provider.label) });
+                    refreshButton.disabled = true;
+                    refreshButton.hidden = !context.api.allows("configuration.write");
+                    actions.append(refreshButton);
+                }
+                const card = Amaterasu.el("section", "panel integration-card", Amaterasu.el("h2", "", provider.label), Amaterasu.el("p", "muted", Amaterasu.localizedMessage(provider.description)), status, actions, feedback);
+                const item = {
+                    provider, status, feedback, card, refreshButton, providerStatus: null,
+                    setProviderStatus(value) {
+                        item.providerStatus = value && typeof value === "object" && !Array.isArray(value)
+                            ? value : null;
+                        if (refreshButton)
+                            refreshButton.disabled = !canRefresh(provider.name, item.providerStatus) ||
+                                !context.api.allows("configuration.write");
+                    },
+                };
+                return item;
             });
+            currentCards = cards;
             area.replaceChildren(...cards.map((item) => item.card));
-            await Promise.all(cards.map(async ({ provider, status }) => {
-                if (!context.api.allows(provider.scope)) {
-                    status.replaceChildren(Amaterasu.badge("Unavailable"), Amaterasu.el("p", "muted", "This account cannot read this provider's status."));
-                    return;
-                }
-                try {
-                    const summary = summarizeProvider(provider.name, await context.api.post(`${provider.name}/status`));
-                    if (!context.content.isConnected || request !== generation)
+            try {
+                await Promise.all(cards.map(async ({ provider, status, setProviderStatus }) => {
+                    if (!context.api.allows(provider.scope)) {
+                        status.replaceChildren(Amaterasu.badge("Unavailable"), Amaterasu.el("p", "muted", Amaterasu.localizedMessage("This account cannot read this provider's status.")));
                         return;
-                    status.replaceChildren(Amaterasu.badge(summary.state, summary.tone), Amaterasu.el("p", "muted", Amaterasu.literalText(summary.detail)));
-                }
-                catch (error) {
-                    if (context.content.isConnected && request === generation)
-                        status.replaceChildren(Amaterasu.errorPanel(error));
-                }
-            }));
+                    }
+                    try {
+                        const value = await context.api.post(`${provider.name}/status`);
+                        if (!context.content.isConnected || request !== generation)
+                            return;
+                        const summary = summarizeProvider(provider.name, value);
+                        showProviderStatus(status, summary);
+                        setProviderStatus(value);
+                        if (announceReadback && !activeRefreshes.has(provider.name))
+                            cards.find((item) => item.provider.name === provider.name)?.feedback.replaceChildren(Amaterasu.el("span", "", Amaterasu.localizedMessage("Provider status read completed; no provider refresh was requested.")));
+                    }
+                    catch (error) {
+                        if (context.content.isConnected && request === generation) {
+                            status.replaceChildren(Amaterasu.errorPanel(error));
+                            if (announceReadback)
+                                cards.find((item) => item.provider.name === provider.name)?.feedback.replaceChildren(Amaterasu.el("span", "", Amaterasu.localizedMessage("Provider status check failed.")), Amaterasu.el("span", "", Amaterasu.literalText(error instanceof Error ? error.message : String(error))));
+                        }
+                    }
+                }));
+            }
+            finally {
+                if (context.content.isConnected && request === generation)
+                    refreshStatuses.disabled = false;
+            }
+        }
+        function showProviderStatus(target, summary) {
+            const observedAt = new Date();
+            const detail = summary.tone === "bad"
+                ? Amaterasu.literalText(summary.detail)
+                : summary.detailTemplate
+                    ? providerCountTemplate(summary.detailTemplate, summary.detailValues ?? {})
+                    : Amaterasu.localizedMessage(summary.detail);
+            const timestamp = Amaterasu.el("time", "", Amaterasu.literalText(observedAt.toISOString()));
+            timestamp.dateTime = observedAt.toISOString();
+            const observed = Amaterasu.el("p", "muted", Amaterasu.localizedMessage("Status observed"), " ", timestamp);
+            target.replaceChildren(Amaterasu.badge(Amaterasu.localizedMessage(summary.state), summary.tone), Amaterasu.el("p", "muted", detail), observed);
+        }
+        function providerCountTemplate(template, values) {
+            const format = (locale) => {
+                let message = typeof Amaterasu.translateText === "function"
+                    ? Amaterasu.translateText(template) : template;
+                for (const [key, value] of Object.entries(values))
+                    message = message.replaceAll(`{${key}}`, new Intl.NumberFormat(locale).format(value));
+                return message;
+            };
+            return typeof Amaterasu.localeFormattedTextNode === "function"
+                ? Amaterasu.localeFormattedTextNode(format)
+                : format("en");
+        }
+        function currentCard(item) {
+            return context.content.isConnected && item.card.parentElement === area;
+        }
+        function canRefresh(name, status) {
+            if (activeRefreshes.has(name))
+                return false;
+            if (!status || status.ok !== true || status.settings_ready !== true || status.enabled !== true)
+                return false;
+            if (name === "lutris")
+                return status.platform_supported === true && status.available === true && status.refresh_pending !== true;
+            if (name === "playnite")
+                return status.playnite_running === true && status.snapshot_pending !== true;
+            return false;
+        }
+        async function refreshProvider(name) {
+            const item = currentCards.find((candidate) => candidate.provider.name === name);
+            if (!item?.refreshButton || item.refreshButton.disabled)
+                return;
+            const target = item.refreshButton;
+            if (activeRefreshes.has(name))
+                return;
+            activeRefreshes.add(name);
+            try {
+                await Amaterasu.runAction(target, item.feedback, async () => {
+                    item.feedback.replaceChildren(Amaterasu.el("span", "", Amaterasu.localizedMessage("Refreshing provider...")));
+                    let requestAccepted = false;
+                    const accepted = () => {
+                        requestAccepted = true;
+                        if (currentCard(item))
+                            item.feedback.replaceChildren(Amaterasu.el("span", "", Amaterasu.localizedMessage("Refresh request accepted. Checking provider status.")));
+                    };
+                    try {
+                        const updated = name === "lutris"
+                            ? await Amaterasu.refreshLutrisProvider(context.api, accepted)
+                            : await Amaterasu.refreshPlayniteProvider(context.api, accepted);
+                        if (!currentCard(item))
+                            return;
+                        const summary = summarizeProvider(name, updated);
+                        showProviderStatus(item.status, summary);
+                        item.feedback.replaceChildren(summary.tone === "bad"
+                            ? Amaterasu.el("span", "", Amaterasu.localizedMessage("Refresh accepted; provider status reports an issue."), " ", Amaterasu.literalText(summary.detail))
+                            : Amaterasu.el("span", "", Amaterasu.localizedMessage("Refresh accepted; current provider status was read back.")));
+                        item.setProviderStatus(updated);
+                    }
+                    catch (error) {
+                        item.setProviderStatus(null);
+                        if (currentCard(item))
+                            item.feedback.replaceChildren(Amaterasu.el("span", "", Amaterasu.localizedMessage(requestAccepted
+                                ? "Refresh accepted, but status readback failed. Check status before retrying."
+                                : "Refresh outcome is uncertain. Check status before retrying.")), Amaterasu.el("span", "", Amaterasu.literalText(error instanceof Error ? error.message : String(error))));
+                    }
+                });
+            }
+            finally {
+                activeRefreshes.delete(name);
+                if (currentCard(item))
+                    target.disabled = !context.api.allows("configuration.write") ||
+                        !canRefresh(name, item.providerStatus);
+                else if (context.content.isConnected)
+                    void load();
+            }
         }
         void load();
     }
@@ -10933,6 +14974,7 @@ var Amaterasu;
     const localizedTextSources = new WeakMap();
     const localizedTextFormatters = new WeakMap();
     const localizedAttributeTemplates = new WeakMap();
+    const localizedAttributeFormatters = new WeakMap();
     let currentPageTitle = null;
     const LOCALIZED_ATTRIBUTES = ["aria-label", "title", "placeholder"];
     function literalText(value) {
@@ -11081,11 +15123,24 @@ var Amaterasu;
     Amaterasu.textValueNode = textValueNode;
     function setLocalizedAttribute(target, attribute, source) {
         localizedAttributeTemplates.get(target)?.delete(attribute);
+        localizedAttributeFormatters.get(target)?.delete(attribute);
         target.setAttribute(attribute, translateText(source));
         target.setAttribute(`data-locale-${attribute}`, source);
     }
     Amaterasu.setLocalizedAttribute = setLocalizedAttribute;
+    function setLocalizedAttributeFormatter(target, attribute, format) {
+        if (typeof format !== "function")
+            throw new Error("Invalid localized attribute formatter.");
+        localizedAttributeTemplates.get(target)?.delete(attribute);
+        const formatters = localizedAttributeFormatters.get(target) ?? new Map();
+        formatters.set(attribute, format);
+        localizedAttributeFormatters.set(target, formatters);
+        target.setAttribute(attribute, format(activeIntlLocale()));
+        target.setAttribute(`data-locale-${attribute}`, "");
+    }
+    Amaterasu.setLocalizedAttributeFormatter = setLocalizedAttributeFormatter;
     function setLocalizedAttributeTemplate(target, attribute, source, values) {
+        localizedAttributeFormatters.get(target)?.delete(attribute);
         const templates = localizedAttributeTemplates.get(target) ?? new Map();
         templates.set(attribute, { source, values: { ...values } });
         localizedAttributeTemplates.set(target, templates);
@@ -11112,10 +15167,13 @@ var Amaterasu;
                 const source = element.getAttribute(`data-locale-${attribute}`);
                 if (source === null)
                     continue;
+                const formatter = localizedAttributeFormatters.get(element)?.get(attribute);
                 const template = localizedAttributeTemplates.get(element)?.get(attribute);
-                element.setAttribute(attribute, template
-                    ? formatLocalizedAttributeTemplate(template.source, template.values)
-                    : translateText(source));
+                element.setAttribute(attribute, formatter
+                    ? formatter(activeIntlLocale())
+                    : template
+                        ? formatLocalizedAttributeTemplate(template.source, template.values)
+                        : translateText(source));
             }
         }
     }
@@ -12635,6 +16693,17 @@ var Amaterasu;
     const HOST_LOG_REFRESH_MS = 5000;
     const SUPPORT_BUNDLE_MAX_BYTES = 96 * 1024 * 1024;
     const SUPPORT_BUNDLE_CHUNK_BYTES = 8192;
+    function hostLogText(source) {
+        return typeof Amaterasu.localizedMessage === "function"
+            ? Amaterasu.localizedMessage(source)
+            : source;
+    }
+    function hostLogSetLocalizedText(target, source) {
+        if (typeof Amaterasu.setLocalizedTextContent === "function")
+            Amaterasu.setLocalizedTextContent(target, source);
+        else
+            target.textContent = source;
+    }
     function hostLogReply(value) {
         if (!value || typeof value !== "object" || Array.isArray(value))
             throw new Error("The host returned an invalid log response.");
@@ -12668,7 +16737,10 @@ var Amaterasu;
         let observer;
         let exportGeneration = 0;
         let exportBusy = false;
+        let copyBusy = false;
         const following = Amaterasu.el("span", "muted", "Following");
+        following.setAttribute("role", "status");
+        following.setAttribute("aria-live", "polite");
         const status = Amaterasu.el("p", "muted");
         status.setAttribute("role", "status");
         const progress = Amaterasu.el("p", "muted");
@@ -12710,12 +16782,16 @@ var Amaterasu;
             link.click();
             window.setTimeout(() => URL.revokeObjectURL(url), 0);
         });
+        const copyStatus = Amaterasu.el("p", "muted host-log-copy-status");
+        copyStatus.setAttribute("role", "status");
+        copyStatus.setAttribute("aria-live", "polite");
+        const copyVisible = Amaterasu.button(hostLogText("Copy rendered log preview"), () => void copyVisibleLog());
         const refresh = Amaterasu.button("Refresh host log", () => load());
-        const controls = Amaterasu.el("div", "diagnostics-toolbar", Amaterasu.field("Search host log", search), Amaterasu.field("Level", level), followLabel, pause, refresh, download);
+        const controls = Amaterasu.el("div", "diagnostics-toolbar", Amaterasu.field("Search host log", search), Amaterasu.field("Level", level), followLabel, pause, refresh, copyVisible, download);
         const matchControls = Amaterasu.el("div", "diagnostics-match-navigation", previous, next, status);
         matchControls.setAttribute("role", "group");
         matchControls.setAttribute("aria-label", "Host log search navigation");
-        const box = Amaterasu.panel("Host log", Amaterasu.el("p", "muted", "Current host session only; older rotated segments may have been discarded."), controls, following, showLatest, progress, matchControls, output, Amaterasu.el("div", "support-log-export", exportButton, cancelExport, exportStatus, Amaterasu.el("p", "muted", "The support bundle includes retained sessions from the current log location. Common identifying details are redacted; review it before sharing.")));
+        const box = Amaterasu.panel("Host log", Amaterasu.el("p", "muted", "Current host session only; older rotated segments may have been discarded."), controls, Amaterasu.el("p", "muted", hostLogText("Copies every rendered line, including search context. Log content is raw and may contain identifying details.")), copyStatus, following, showLatest, progress, matchControls, output, Amaterasu.el("div", "support-log-export", exportButton, cancelExport, exportStatus, Amaterasu.el("p", "muted", "The support bundle includes retained sessions from the current log location. Common identifying details are redacted; review it before sharing.")));
         target.append(box);
         function render() {
             const query = search.value.trim().toLocaleLowerCase();
@@ -12751,6 +16827,32 @@ var Amaterasu;
                     ? `Showing the last ${HOST_LOG_PREVIEW_LINES} of ${filtered.length} matching lines. Search covers the full snapshot.`
                     : `${filtered.length} matching lines in this snapshot.`;
                 output.textContent = filtered.slice(-HOST_LOG_PREVIEW_LINES).map((index) => lines[index] ?? "").join("\n");
+            }
+            copyVisible.disabled = copyBusy || !output.textContent;
+        }
+        async function copyVisibleLog() {
+            if (copyBusy || disposed || !target.isConnected)
+                return;
+            const visibleText = output.textContent ?? "";
+            if (!visibleText)
+                return;
+            copyBusy = true;
+            copyVisible.disabled = true;
+            try {
+                if (!navigator.clipboard?.writeText)
+                    throw new Error("Clipboard access is unavailable.");
+                await navigator.clipboard.writeText(visibleText);
+                if (!disposed && target.isConnected)
+                    hostLogSetLocalizedText(copyStatus, "Rendered log preview copied to the clipboard.");
+            }
+            catch {
+                if (!disposed && target.isConnected)
+                    hostLogSetLocalizedText(copyStatus, "Could not copy the rendered log preview. Clipboard access may be unavailable in this browser context.");
+            }
+            finally {
+                copyBusy = false;
+                if (!disposed && target.isConnected)
+                    copyVisible.disabled = !output.textContent;
             }
         }
         function nearBottom() {
@@ -13210,6 +17312,9 @@ var Amaterasu;
         const status = Amaterasu.el("p", "muted recorded-session-range-status");
         const legend = Amaterasu.el("p", "muted live-session-legend");
         const charts = Amaterasu.el("div");
+        const exportButton = Amaterasu.button("Download chart data (CSV)", () => downloadChartCsv(), "quiet");
+        const exportStatus = Amaterasu.el("p", "muted");
+        exportStatus.setAttribute("role", "status");
         const choices = [];
         const sourceChoices = [];
         let mode = "combined";
@@ -13220,12 +17325,16 @@ var Amaterasu;
         let rounded = false;
         let retentionSeconds = 300;
         let maxPoints = 300;
+        let currentPoints = [];
+        let currentSession = null;
         function draw() {
             for (const choice of sourceChoices)
                 choice.node.setAttribute("aria-pressed", String(choice.mode === mode));
             for (const choice of choices)
                 choice.node.setAttribute("aria-pressed", String(choice.minutes === range));
             if (!live) {
+                currentPoints = [];
+                exportButton.disabled = true;
                 charts.replaceChildren();
                 return;
             }
@@ -13234,6 +17343,8 @@ var Amaterasu;
                 ? `Latest live rate: ${historyValue(latestLive.actual_fps, "fps")} · ${historyValue(latestLive.actual_bitrate_kbps / 1000, "Mbit/s")} · host observation ${new Date(latestLive.recorded_at_unix * 1000).toLocaleString()}.${rounded ? " Very large counters are rounded for display." : ""}`
                 : "Latest live rate: waiting for two host counter readings.";
             if (mode === "recorded" && !recorded) {
+                currentPoints = [];
+                exportButton.disabled = true;
                 status.textContent = historyNote || "Recorded history is unavailable. Select Live only to see current observations.";
                 legend.textContent = "";
                 charts.replaceChildren();
@@ -13245,6 +17356,8 @@ var Amaterasu;
             const newest = points.length ? Math.max(...points.map((sample) => sample.recorded_at_unix)) : 0;
             const selectedRange = range;
             const selected = selectedRange === null ? points : points.filter((sample) => sample.recorded_at_unix >= newest - selectedRange * 60);
+            currentPoints = selected;
+            exportButton.disabled = selected.length === 0;
             const recordedCount = points.filter((sample) => sample.chart_source === "recorded").length;
             const liveCount = points.filter((sample) => sample.chart_source === "live").length;
             const description = mode === "combined" ? `${recordedCount} recorded · ${liveCount} live.`
@@ -13258,6 +17371,44 @@ var Amaterasu;
             const chartSource = mode === "combined" ? "combined" : mode;
             charts.replaceChildren(Amaterasu.el("div", "recorded-session-chart-grid", recordedChart("Accepted video rate", "fps", selected, (sample) => sample.actual_fps, chartSource), recordedChart("Accepted audio/video payload rate", "Mbit/s", selected, (sample) => sample.actual_bitrate_kbps / 1000, chartSource), recordedChart("Encoder latency", "ms", selected, (sample) => sample.encode_latency_ms ?? null, chartSource), recordedChart("Observed video sequence gaps", "gaps", selected, (sample) => sample.dropped_frames, chartSource)));
         }
+        function downloadChartCsv() {
+            if (!currentSession || !currentPoints.length)
+                return;
+            const columns = ["session_id", "recorded_at_unix", "observed_at", "source", "frames_sent", "bytes_sent",
+                "dropped_frames", "actual_fps", "actual_bitrate_kbps", "encode_latency_ms"];
+            const rows = currentPoints.map((sample) => {
+                const observedAt = new Date(sample.recorded_at_unix * 1000);
+                return [
+                    sample.session_id,
+                    sample.recorded_at_unix,
+                    Number.isFinite(observedAt.getTime()) ? observedAt.toISOString() : "",
+                    sample.chart_source ?? (mode === "live" ? "live" : "recorded"),
+                    sample.frames_sent,
+                    sample.bytes_sent,
+                    sample.dropped_frames,
+                    sample.actual_fps,
+                    sample.actual_bitrate_kbps,
+                    sample.encode_latency_ms,
+                ];
+            });
+            const formulaLeadingText = /^[\s\u0000-\u001f\u007f-\u009f]*[=+\-@]/u;
+            const unsafeLeadingControl = /^[\t\r\n]/;
+            const csvCell = (value) => {
+                const text = String(value ?? "");
+                const spreadsheetSafeText = typeof value === "string" &&
+                    (formulaLeadingText.test(text) || unsafeLeadingControl.test(text)) ? `'${text}` : text;
+                return `"${spreadsheetSafeText.replaceAll(String.fromCharCode(34), String.fromCharCode(34, 34))}"`;
+            };
+            const csv = [columns, ...rows].map((row) => row.map(csvCell).join(",")).join("\r\n") + "\r\n";
+            const objectUrl = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" }));
+            const link = document.createElement("a");
+            const safeId = currentSession.session_id.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 80) || "stream";
+            link.href = objectUrl;
+            link.download = `amaterasu-stream-${safeId}.csv`;
+            link.click();
+            window.setTimeout(() => URL.revokeObjectURL(objectUrl), 0);
+            exportStatus.textContent = `Downloaded ${currentPoints.length} chart samples as CSV.`;
+        }
         for (const [nextMode, label] of [["combined", "History + live"], ["live", "Live only"], ["recorded", "Recorded only"]]) {
             const node = Amaterasu.button(label, () => { mode = nextMode; draw(); }, "recorded-range-button");
             sourceChoices.push({ mode: nextMode, node });
@@ -13268,8 +17419,9 @@ var Amaterasu;
             choices.push({ minutes, node });
             controls.append(node);
         }
-        const element = Amaterasu.el("article", "live-session-card", heading, Amaterasu.el("p", "muted", "Host-side accepted media and observed sequence gaps; client delivery is not confirmed."), liveSummary, sourceControls, controls, status, legend, charts);
+        const element = Amaterasu.el("article", "live-session-card", heading, Amaterasu.el("p", "muted", "Host-side accepted media and observed sequence gaps; client delivery is not confirmed."), liveSummary, sourceControls, controls, status, legend, charts, exportButton, exportStatus);
         return { element, update(session, nextLive, nextRecorded, nextNote, nextRounded, nextRetention, nextMaximum) {
+                currentSession = session;
                 live = nextLive;
                 recorded = nextRecorded;
                 historyNote = nextNote;
@@ -13639,9 +17791,9 @@ var Amaterasu;
                 ? "Scanning local libraries"
                 : "Latest provider scan");
             const available = snapshots.filter((snapshot) => snapshot.status === "fulfilled").length;
-            const status = Amaterasu.el("section", "overview-status", Amaterasu.el("div", "overview-status-icon", available === snapshots.length ? "✓" : "!"), Amaterasu.el("div", "overview-status-copy", Amaterasu.el("p", "overview-status-label", "SERVICE ACCESS"), Amaterasu.el("h2", "", available === snapshots.length ? "Services responding" : "Some information is unavailable"), Amaterasu.el("p", "muted", available === snapshots.length
-                ? "Catalog, session coordination, applications, and Steam responded to the latest refresh."
-                : "Some service requests could not be completed. Check service access below for details.")));
+            const status = Amaterasu.el("section", "overview-status", Amaterasu.el("div", "overview-status-icon", available === snapshots.length ? "✓" : "!"), Amaterasu.el("div", "overview-status-copy", Amaterasu.el("p", "overview-status-label", "MANAGEMENT SERVICE ACCESS"), Amaterasu.el("h2", "", available === snapshots.length ? "Management services responding" : "Some information is unavailable"), Amaterasu.el("p", "muted", available === snapshots.length
+                ? "Catalog, session coordination, applications, and Steam responded to the latest refresh. This does not indicate stream readiness."
+                : "Some management requests could not be completed. Check service access below for details.")));
             const quickActions = Amaterasu.el("div", "quick-actions");
             for (const [page, label, detail, scope] of [
                 ["host", "Host & devices", "Review pairing and host services", "configuration.read"],
@@ -13664,6 +17816,9 @@ var Amaterasu;
                     ? Amaterasu.messageOf(snapshot.reason)
                     : pagesTextMessage("Responded to the latest refresh"),
             ]);
+            status.setAttribute("role", "status");
+            status.setAttribute("aria-live", "polite");
+            status.setAttribute("aria-atomic", "true");
             const details = Amaterasu.el("div", "overview-details", Amaterasu.panel("Service access", Amaterasu.table(["Service", "Status", "Details"], serviceRows)));
             if (quickActions.hasChildNodes())
                 details.append(Amaterasu.panel("Quick actions", quickActions));
@@ -13678,6 +17833,9 @@ var Amaterasu;
             return () => { };
         }
         const summary = Amaterasu.el("strong", "", "Loading host stream activity…");
+        summary.setAttribute("role", "status");
+        summary.setAttribute("aria-live", "polite");
+        summary.setAttribute("aria-atomic", "true");
         const launchStatus = Amaterasu.el("p", "muted");
         const observation = Amaterasu.el("p", "muted");
         const icon = Amaterasu.el("div", "overview-status-icon", "↗");
@@ -16057,6 +20215,7 @@ var Amaterasu;
                         context.notify(acknowledged ? "Session revoked." : "That session had already ended.");
                     });
                 }, "quiet danger-text");
+                revoke.setAttribute("aria-label", `Revoke management session for ${session.subject}, refresh expires ${new Date(session.refreshExpiresAt * 1000).toLocaleString()}`);
                 return Amaterasu.el("section", "browser-session-card", title, details, revoke);
             });
             sessionsArea.replaceChildren(...cards);
@@ -16080,6 +20239,1529 @@ var Amaterasu;
         void load();
     }
     Amaterasu.renderMaintenance = renderMaintenance;
+})(Amaterasu || (Amaterasu = {}));
+var Amaterasu;
+(function (Amaterasu) {
+    let nextExtensionUiDescriptionId = 0;
+    let nextExtensionUiFieldId = 0;
+    function extensionUiTextForLocale(value, locale) {
+        if (typeof value === "string")
+            return Amaterasu.translateText(value);
+        if (!value || typeof value.source !== "string" || !value.source.trim())
+            throw new Error("Invalid plugin UI text.");
+        const translations = value.translations ?? {};
+        if (Object.values(translations).some((translation) => typeof translation !== "string" || !translation.trim()))
+            throw new Error("Invalid plugin UI translations.");
+        return translations[locale] ?? translations[locale.split("-")[0] ?? locale] ?? Amaterasu.translateText(value.source);
+    }
+    function extensionUiValidateLabel(value) {
+        if (typeof value === "string") {
+            if (!value.trim())
+                throw new Error("Plugin UI labels cannot be empty.");
+            return;
+        }
+        extensionUiTextForLocale(value, "en");
+    }
+    function extensionUiTextNode(value) {
+        extensionUiValidateLabel(value);
+        if (typeof value === "string")
+            return Amaterasu.localizedTextNode(value);
+        return Amaterasu.localeFormattedTextNode((locale) => extensionUiTextForLocale(value, locale));
+    }
+    function extensionUiSetPlaceholder(control, value) {
+        if (typeof value === "string")
+            Amaterasu.setLocalizedAttribute(control, "placeholder", value);
+        else
+            Amaterasu.setLocalizedAttributeFormatter(control, "placeholder", (locale) => extensionUiTextForLocale(value, locale));
+    }
+    function extensionUiLabel(text) {
+        extensionUiValidateLabel(text);
+        return Amaterasu.el("span", "field-label", extensionUiTextNode(text));
+    }
+    function extensionUiControlLabel(text, control) {
+        extensionUiValidateLabel(text);
+        const label = Amaterasu.el("label", "field-label", extensionUiTextNode(text));
+        const id = `amaterasu-plugin-ui-control-${++nextExtensionUiFieldId}`;
+        control.id = id;
+        label.htmlFor = id;
+        return label;
+    }
+    function extensionUiReadOnlyKeyMutation(event) {
+        if (event.ctrlKey || event.metaKey || event.altKey)
+            return false;
+        return event.key.length === 1 || ["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Home", "End", "PageUp", "PageDown", "Enter", " ", "Spacebar", "Backspace", "Delete"].includes(event.key);
+    }
+    function extensionUiChoices(choices, selected) {
+        if (!Array.isArray(choices) || choices.length < 1 || choices.length > 64 ||
+            choices.some((choice) => !choice || typeof choice.value !== "string" || !choice.value || choice.value.length > 128) ||
+            new Set(choices.map((choice) => choice.value)).size !== choices.length ||
+            !choices.some((choice) => choice.value === selected))
+            throw new Error("Invalid plugin UI choices or value.");
+        for (const choice of choices)
+            extensionUiValidateLabel(choice.label);
+    }
+    function validateExtensionUiFieldOptions(options) {
+        for (const name of ["disabled", "busy", "readOnly", "required"]) {
+            const value = options[name];
+            if (value !== undefined && typeof value !== "boolean")
+                throw new Error(`Invalid plugin UI ${name} state.`);
+        }
+        if (options.onChange !== undefined && typeof options.onChange !== "function")
+            throw new Error("Invalid plugin UI change callback.");
+    }
+    function extensionUiControl(element, read, write, controller, parentSignal, release = () => { }, updateChoices, updateState) {
+        let disposed = false;
+        const dispose = () => {
+            if (disposed)
+                return;
+            disposed = true;
+            controller.abort();
+            release();
+            parentSignal.removeEventListener("abort", dispose);
+        };
+        if (parentSignal.aborted)
+            dispose();
+        else
+            parentSignal.addEventListener("abort", dispose, { once: true });
+        const control = {
+            element,
+            value: read,
+            setValue: (value) => { if (!disposed)
+                write(value); },
+            setState: (patch) => { if (!disposed)
+                updateState?.(patch); },
+            dispose,
+        };
+        if (updateChoices) {
+            control.setChoices = (choices, value) => { if (!disposed)
+                updateChoices(choices, value); };
+        }
+        return Object.freeze(control);
+    }
+    function extensionUiFieldState(element, controls, state, applyControlState, supportsValidity = true, hasIntrinsicBusy = () => false, hasIntrinsicInvalid = () => false) {
+        const createDescription = (kind, text, id) => {
+            const description = Amaterasu.el("small", `plugin-control-${kind}`, extensionUiTextNode(text));
+            description.id = id ?? `amaterasu-plugin-ui-description-${++nextExtensionUiDescriptionId}`;
+            if (kind === "error")
+                description.setAttribute("role", "alert");
+            return description;
+        };
+        let activeControls = [...controls];
+        let helpNode = state.help === undefined ? null : createDescription("help", state.help);
+        let errorNode = state.error === undefined ? null : createDescription("error", state.error);
+        const sync = () => {
+            applyControlState(state);
+            const descriptionIds = [helpNode?.id, errorNode?.id].filter((id) => !!id).join(" ");
+            for (const control of activeControls) {
+                if (descriptionIds)
+                    control.setAttribute("aria-describedby", descriptionIds);
+                else
+                    control.removeAttribute("aria-describedby");
+                if (state.busy || hasIntrinsicBusy())
+                    control.setAttribute("aria-busy", "true");
+                else
+                    control.removeAttribute("aria-busy");
+                if (supportsValidity && (state.error !== undefined || hasIntrinsicInvalid()))
+                    control.setAttribute("aria-invalid", "true");
+                else
+                    control.removeAttribute("aria-invalid");
+                if (supportsValidity && state.required)
+                    control.setAttribute("aria-required", "true");
+                else
+                    control.removeAttribute("aria-required");
+            }
+            if (supportsValidity && element.getAttribute("role") === "radiogroup") {
+                if (state.error !== undefined)
+                    element.setAttribute("aria-invalid", "true");
+                else
+                    element.removeAttribute("aria-invalid");
+                if (state.required)
+                    element.setAttribute("aria-required", "true");
+                else
+                    element.removeAttribute("aria-required");
+            }
+        };
+        if (helpNode)
+            element.append(helpNode);
+        if (errorNode)
+            element.append(errorNode);
+        sync();
+        const updateState = ((patch) => {
+            if (!patch || typeof patch !== "object" || Array.isArray(patch))
+                throw new Error("Invalid plugin UI state patch.");
+            const allowed = ["disabled", "busy", "readOnly", "required", "help", "error"];
+            if (Object.keys(patch).some((key) => !allowed.includes(key)))
+                throw new Error("Unknown plugin UI state option.");
+            const next = { ...state };
+            for (const key of ["disabled", "busy", "readOnly", "required"]) {
+                const value = patch[key];
+                if (value !== undefined) {
+                    if (typeof value !== "boolean")
+                        throw new Error(`Invalid plugin UI ${key} state.`);
+                    next[key] = value;
+                }
+            }
+            const hasHelp = Object.prototype.hasOwnProperty.call(patch, "help") && patch.help !== undefined;
+            const hasError = Object.prototype.hasOwnProperty.call(patch, "error") && patch.error !== undefined;
+            let nextHelpNode = helpNode;
+            let nextErrorNode = errorNode;
+            if (hasHelp) {
+                const help = patch.help;
+                if (help === null) {
+                    next.help = undefined;
+                    nextHelpNode = null;
+                }
+                else if (help !== undefined) {
+                    next.help = help;
+                    nextHelpNode = createDescription("help", help, helpNode?.id);
+                }
+            }
+            if (hasError) {
+                const error = patch.error;
+                if (error === null) {
+                    next.error = undefined;
+                    nextErrorNode = null;
+                }
+                else if (error !== undefined) {
+                    next.error = error;
+                    nextErrorNode = createDescription("error", error, errorNode?.id);
+                }
+            }
+            const commitDescription = (current, prepared) => {
+                if (current && prepared) {
+                    current.replaceChildren(...Array.from(prepared.childNodes));
+                    return current;
+                }
+                current?.remove();
+                if (prepared)
+                    element.append(prepared);
+                return prepared;
+            };
+            if (hasHelp)
+                helpNode = commitDescription(helpNode, nextHelpNode);
+            if (hasError)
+                errorNode = commitDescription(errorNode, nextErrorNode);
+            Object.assign(state, next);
+            sync();
+        });
+        updateState.refreshControls = (nextControls) => { activeControls = [...nextControls]; sync(); };
+        return updateState;
+    }
+    function createExtensionUiV1(signal) {
+        if (!signal || typeof signal.addEventListener !== "function")
+            throw new Error("Plugin UI requires a lifecycle signal.");
+        const makeController = () => {
+            if (signal.aborted)
+                throw new Error("Plugin page is no longer active.");
+            return new AbortController();
+        };
+        const ui = {
+            version: 1,
+            toggle(options) {
+                if (!options || typeof options.label !== "string" && typeof options.label !== "object" || typeof options.value !== "boolean")
+                    throw new Error("Invalid plugin toggle.");
+                validateExtensionUiFieldOptions(options);
+                const controller = makeController();
+                const checkbox = Amaterasu.input("", "", "checkbox");
+                checkbox.checked = options.value;
+                let currentValue = options.value;
+                const state = {
+                    disabled: options.disabled === true, busy: options.busy === true, readOnly: options.readOnly === true, required: options.required === true,
+                    help: options.help, error: options.error,
+                };
+                checkbox.addEventListener("click", (event) => {
+                    if (state.readOnly) {
+                        event.preventDefault();
+                        event.stopImmediatePropagation();
+                    }
+                }, { capture: true, signal: controller.signal });
+                checkbox.addEventListener("change", (event) => {
+                    if (state.disabled || state.readOnly) {
+                        checkbox.checked = currentValue;
+                        event.preventDefault();
+                        event.stopImmediatePropagation();
+                        return;
+                    }
+                    currentValue = checkbox.checked;
+                    options.onChange?.(currentValue);
+                }, { signal: controller.signal });
+                const element = Amaterasu.el("div", "field plugin-control plugin-toggle", extensionUiControlLabel(options.label, checkbox), checkbox);
+                const setState = extensionUiFieldState(element, [checkbox], state, (next) => {
+                    checkbox.disabled = next.disabled;
+                    checkbox.required = next.required;
+                    if (next.readOnly)
+                        checkbox.setAttribute("aria-readonly", "true");
+                    else
+                        checkbox.removeAttribute("aria-readonly");
+                });
+                return extensionUiControl(element, () => checkbox.checked, (value) => {
+                    if (typeof value !== "boolean")
+                        throw new Error("Toggle value must be boolean.");
+                    currentValue = value;
+                    checkbox.checked = value;
+                }, controller, signal, undefined, undefined, setState);
+            },
+            select(options) {
+                if (!options || typeof options.label !== "string" && typeof options.label !== "object")
+                    throw new Error("Invalid plugin select.");
+                validateExtensionUiFieldOptions(options);
+                extensionUiChoices(options.choices, options.value);
+                const controller = makeController();
+                const select = Amaterasu.el("select", "");
+                let choices = [...options.choices];
+                let currentValue = options.value;
+                const state = {
+                    disabled: options.disabled === true, busy: options.busy === true, readOnly: options.readOnly === true, required: options.required === true,
+                    help: options.help, error: options.error,
+                };
+                const makeChoiceOptions = (nextChoices) => nextChoices.map((choice) => {
+                    const option = Amaterasu.el("option", "", extensionUiTextNode(choice.label));
+                    option.value = choice.value;
+                    return option;
+                });
+                select.replaceChildren(...makeChoiceOptions(choices));
+                select.value = currentValue;
+                select.addEventListener("click", (event) => {
+                    if (state.readOnly) {
+                        event.preventDefault();
+                        event.stopImmediatePropagation();
+                    }
+                }, { capture: true, signal: controller.signal });
+                select.addEventListener("keydown", (event) => {
+                    if (state.readOnly && extensionUiReadOnlyKeyMutation(event)) {
+                        event.preventDefault();
+                        event.stopImmediatePropagation();
+                    }
+                }, { capture: true, signal: controller.signal });
+                select.addEventListener("change", (event) => {
+                    if (state.disabled || state.readOnly) {
+                        select.value = currentValue;
+                        event.preventDefault();
+                        event.stopImmediatePropagation();
+                        return;
+                    }
+                    currentValue = select.value;
+                    options.onChange?.(currentValue);
+                }, { signal: controller.signal });
+                const element = Amaterasu.el("div", "field plugin-control", extensionUiControlLabel(options.label, select), select);
+                const setState = extensionUiFieldState(element, [select], state, (next) => {
+                    select.disabled = next.disabled;
+                    select.required = next.required;
+                    if (next.readOnly)
+                        select.setAttribute("aria-readonly", "true");
+                    else
+                        select.removeAttribute("aria-readonly");
+                });
+                const setChoices = (nextChoices, value) => {
+                    const nextValue = value ?? currentValue;
+                    extensionUiChoices(nextChoices, nextValue);
+                    const preparedChoices = [...nextChoices];
+                    const preparedOptions = makeChoiceOptions(preparedChoices);
+                    select.replaceChildren(...preparedOptions);
+                    select.value = nextValue;
+                    choices = preparedChoices;
+                    currentValue = nextValue;
+                };
+                return extensionUiControl(element, () => select.value, (value) => {
+                    if (!choices.some((choice) => choice.value === value))
+                        throw new Error("Unsupported select value.");
+                    currentValue = value;
+                    select.value = value;
+                }, controller, signal, () => { }, setChoices, setState);
+            },
+            radioGroup(options) {
+                if (!options || typeof options.label !== "string" && typeof options.label !== "object")
+                    throw new Error("Invalid plugin radio group.");
+                validateExtensionUiFieldOptions(options);
+                extensionUiChoices(options.choices, options.value);
+                const controller = makeController();
+                const state = {
+                    disabled: options.disabled === true, busy: options.busy === true, readOnly: options.readOnly === true, required: options.required === true,
+                    help: options.help, error: options.error,
+                };
+                const group = Amaterasu.radioGroup(extensionUiTextNode(options.label), options.choices.map((choice) => ({ value: choice.value, label: extensionUiTextNode(choice.label) })), options.value, (value) => options.onChange?.(value), controller.signal, { disabled: state.disabled, readOnly: state.readOnly, required: state.required });
+                const setState = extensionUiFieldState(group.node, [...group.controls, group.node], state, (next) => {
+                    group.setBehavior({ disabled: next.disabled, readOnly: next.readOnly, required: next.required });
+                });
+                const setChoices = (nextChoices, value) => {
+                    const selected = value ?? group.value();
+                    extensionUiChoices(nextChoices, selected);
+                    const localized = nextChoices.map((choice) => ({ value: choice.value, label: extensionUiTextNode(choice.label) }));
+                    group.setChoices(localized, selected);
+                    setState.refreshControls([...group.controls, group.node]);
+                };
+                return extensionUiControl(group.node, group.value, group.setValue, controller, signal, group.dispose, setChoices, setState);
+            },
+            textField(options) {
+                if (!options || typeof options.label !== "string" && typeof options.label !== "object" || typeof options.value !== "string")
+                    throw new Error("Invalid plugin text field.");
+                validateExtensionUiFieldOptions(options);
+                if (options.maxLength !== undefined && (!Number.isSafeInteger(options.maxLength) || options.maxLength < 1 || options.maxLength > 65536))
+                    throw new Error("Invalid plugin text field maximum length.");
+                if (options.maxLength !== undefined && options.value.length > options.maxLength)
+                    throw new Error("Plugin text field value exceeds its maximum length.");
+                const controller = makeController();
+                const textInput = Amaterasu.input("", options.value, "text");
+                if (options.placeholder !== undefined)
+                    extensionUiSetPlaceholder(textInput, options.placeholder);
+                if (options.maxLength !== undefined)
+                    textInput.maxLength = options.maxLength;
+                let currentValue = options.value;
+                const state = {
+                    disabled: options.disabled === true, busy: options.busy === true, readOnly: options.readOnly === true, required: options.required === true,
+                    help: options.help, error: options.error,
+                };
+                textInput.addEventListener("input", (event) => {
+                    if (state.disabled || state.readOnly) {
+                        textInput.value = currentValue;
+                        event.preventDefault();
+                        event.stopImmediatePropagation();
+                        return;
+                    }
+                    if (options.maxLength !== undefined && textInput.value.length > options.maxLength) {
+                        textInput.value = currentValue;
+                        textInput.setAttribute("aria-invalid", "true");
+                        return;
+                    }
+                    currentValue = textInput.value;
+                    if (state.error === undefined)
+                        textInput.removeAttribute("aria-invalid");
+                    options.onChange?.(currentValue);
+                }, { capture: true, signal: controller.signal });
+                const element = Amaterasu.el("div", "field plugin-control", extensionUiControlLabel(options.label, textInput), textInput);
+                const setState = extensionUiFieldState(element, [textInput], state, (next) => {
+                    textInput.disabled = next.disabled;
+                    textInput.readOnly = next.readOnly;
+                    textInput.required = next.required;
+                    if (next.readOnly)
+                        textInput.setAttribute("aria-readonly", "true");
+                    else
+                        textInput.removeAttribute("aria-readonly");
+                });
+                return extensionUiControl(element, () => textInput.value, (value) => {
+                    if (typeof value !== "string")
+                        throw new Error("Text field value must be a string.");
+                    if (options.maxLength !== undefined && value.length > options.maxLength)
+                        throw new Error("Text field value exceeds its maximum length.");
+                    currentValue = value;
+                    textInput.value = value;
+                    if (state.error === undefined)
+                        textInput.removeAttribute("aria-invalid");
+                }, controller, signal, undefined, undefined, setState);
+            },
+            numberField(options) {
+                if (!options || typeof options.label !== "string" && typeof options.label !== "object" || typeof options.value !== "number")
+                    throw new Error("Invalid plugin number field.");
+                validateExtensionUiFieldOptions(options);
+                if (options.minimum !== undefined && !Number.isFinite(options.minimum) ||
+                    options.maximum !== undefined && !Number.isFinite(options.maximum) ||
+                    options.minimum !== undefined && options.maximum !== undefined && options.minimum > options.maximum ||
+                    options.step !== undefined && options.step !== "any" && (!Number.isFinite(options.step) || options.step <= 0) ||
+                    !Amaterasu.isValidNumberControlValue(options.value, options.minimum, options.maximum, options.step ?? "any"))
+                    throw new Error("Invalid plugin number field limits, step, or value.");
+                const controller = makeController();
+                const numberInput = Amaterasu.input("", String(options.value), "number");
+                if (options.minimum !== undefined)
+                    numberInput.min = String(options.minimum);
+                if (options.maximum !== undefined)
+                    numberInput.max = String(options.maximum);
+                numberInput.step = String(options.step ?? "any");
+                if (options.placeholder !== undefined)
+                    extensionUiSetPlaceholder(numberInput, options.placeholder);
+                let currentValue = options.value;
+                const state = {
+                    disabled: options.disabled === true, busy: options.busy === true, readOnly: options.readOnly === true, required: options.required === true,
+                    help: options.help, error: options.error,
+                };
+                const readValue = () => {
+                    const rawValue = numberInput.value;
+                    const parsed = Number(rawValue);
+                    if (!rawValue.trim() || !numberInput.validity.valid ||
+                        !Amaterasu.isValidNumberControlValue(parsed, options.minimum, options.maximum, options.step ?? "any"))
+                        throw new Error("Enter a valid number within the plugin field limits.");
+                    return parsed;
+                };
+                numberInput.addEventListener("input", (event) => {
+                    if (state.disabled || state.readOnly) {
+                        numberInput.value = String(currentValue);
+                        event.preventDefault();
+                        event.stopImmediatePropagation();
+                        return;
+                    }
+                    let nextValue;
+                    try {
+                        nextValue = readValue();
+                    }
+                    catch {
+                        numberInput.setAttribute("aria-invalid", "true");
+                        return;
+                    }
+                    currentValue = nextValue;
+                    if (state.error === undefined)
+                        numberInput.removeAttribute("aria-invalid");
+                    options.onChange?.(currentValue);
+                }, { capture: true, signal: controller.signal });
+                const element = Amaterasu.el("div", "field plugin-control", extensionUiControlLabel(options.label, numberInput), numberInput);
+                const setState = extensionUiFieldState(element, [numberInput], state, (next) => {
+                    numberInput.disabled = next.disabled;
+                    numberInput.readOnly = next.readOnly;
+                    numberInput.required = next.required;
+                    if (next.readOnly)
+                        numberInput.setAttribute("aria-readonly", "true");
+                    else
+                        numberInput.removeAttribute("aria-readonly");
+                }, true, undefined, () => {
+                    try {
+                        readValue();
+                        return false;
+                    }
+                    catch {
+                        return true;
+                    }
+                });
+                return extensionUiControl(element, readValue, (value) => {
+                    if (typeof value !== "number" || !Amaterasu.isValidNumberControlValue(value, options.minimum, options.maximum, options.step ?? "any"))
+                        throw new Error("Number field value must be finite and within its limits and step.");
+                    numberInput.value = String(value);
+                    if (Number(numberInput.value) !== value)
+                        throw new Error("Number field value cannot be represented by the input.");
+                    currentValue = value;
+                    if (state.error === undefined)
+                        numberInput.removeAttribute("aria-invalid");
+                }, controller, signal, undefined, undefined, setState);
+            },
+            button(options) {
+                if (!options || typeof options.label !== "string" && typeof options.label !== "object" || typeof options.onClick !== "function" ||
+                    options.variant !== undefined && !["primary", "secondary", "danger"].includes(options.variant))
+                    throw new Error("Invalid plugin action button.");
+                validateExtensionUiFieldOptions(options);
+                extensionUiValidateLabel(options.label);
+                const controller = makeController();
+                const button = Amaterasu.el("button", `button ${options.variant ?? "secondary"} plugin-action-button`, extensionUiTextNode(options.label));
+                button.type = "button";
+                const state = {
+                    disabled: options.disabled === true, busy: options.busy === true, readOnly: false, required: false,
+                    help: options.help, error: options.error,
+                };
+                const element = Amaterasu.el("div", "field plugin-control plugin-action", button);
+                let pendingActions = 0;
+                let disposed = false;
+                const setFieldState = extensionUiFieldState(element, [button], state, (next) => {
+                    button.disabled = next.disabled || next.busy || pendingActions > 0;
+                }, false, () => pendingActions > 0);
+                const updateState = (patch) => {
+                    if (!controller.signal.aborted) {
+                        if (Object.keys(patch).some((key) => !["disabled", "busy", "help", "error"].includes(key)))
+                            throw new Error("Unsupported plugin action button state.");
+                        setFieldState(patch);
+                    }
+                };
+                const settleAction = (restoreFocus) => {
+                    pendingActions = Math.max(0, pendingActions - 1);
+                    if (!disposed) {
+                        setFieldState({});
+                        if (restoreFocus && !button.disabled && document.activeElement === document.body)
+                            button.focus();
+                    }
+                };
+                button.addEventListener("click", (event) => {
+                    if (state.disabled || state.busy || pendingActions > 0)
+                        return;
+                    const restoreFocus = document.activeElement === button;
+                    pendingActions++;
+                    setFieldState({});
+                    try {
+                        const result = options.onClick(event);
+                        if (result && typeof result.then === "function") {
+                            void Promise.resolve(result).then(() => settleAction(restoreFocus), (error) => { settleAction(restoreFocus); throw error; });
+                        }
+                        else
+                            settleAction(restoreFocus);
+                    }
+                    catch (error) {
+                        settleAction(restoreFocus);
+                        throw error;
+                    }
+                }, { signal: controller.signal });
+                const dispose = () => {
+                    if (disposed)
+                        return;
+                    disposed = true;
+                    controller.abort();
+                    signal.removeEventListener("abort", dispose);
+                };
+                if (signal.aborted)
+                    dispose();
+                else
+                    signal.addEventListener("abort", dispose, { once: true });
+                return Object.freeze({
+                    element,
+                    busy: () => state.busy || pendingActions > 0,
+                    setState: (patch) => { if (!disposed)
+                        updateState(patch); },
+                    dispose,
+                });
+            },
+            slider(options) {
+                if (!options || typeof options.label !== "string" && typeof options.label !== "object")
+                    throw new Error("Invalid plugin slider.");
+                validateExtensionUiFieldOptions(options);
+                const controller = makeController();
+                const state = {
+                    disabled: options.disabled === true, busy: options.busy === true, readOnly: options.readOnly === true, required: options.required === true,
+                    help: options.help, error: options.error,
+                };
+                const label = extensionUiLabel(options.label);
+                const slider = Amaterasu.boundedSlider(options.minimum, options.maximum, options.value, typeof options.label === "string" ? options.label : options.label.source, false, "plugin-slider-inputs", {
+                    step: options.step ?? "any",
+                    onChange: options.onChange,
+                    signal: controller.signal,
+                    accessibleLabel: label,
+                    disabled: state.disabled,
+                    readOnly: state.readOnly,
+                    required: state.required,
+                });
+                const element = Amaterasu.el("div", "field plugin-control plugin-slider", label, slider.node);
+                const setState = extensionUiFieldState(element, [slider.range, slider.number], state, (next) => {
+                    slider.setBehavior({ disabled: next.disabled, readOnly: next.readOnly, required: next.required });
+                });
+                return extensionUiControl(element, slider.value, slider.setValue, controller, signal, slider.dispose, undefined, setState);
+            },
+        };
+        return Object.freeze(ui);
+    }
+    Amaterasu.createExtensionUiV1 = createExtensionUiV1;
+})(Amaterasu || (Amaterasu = {}));
+var Amaterasu;
+(function (Amaterasu) {
+    let nextExtensionUiLayoutId = 0;
+    const EXTENSION_UI_TABLE_MAX_COLUMNS = 32;
+    const EXTENSION_UI_TABLE_MAX_ROWS = 1000;
+    function extensionUiLayoutLifecycle(signal) {
+        if (!signal || typeof signal.addEventListener !== "function" || typeof signal.removeEventListener !== "function")
+            throw new Error("Plugin UI requires a lifecycle signal.");
+        if (signal.aborted)
+            throw new Error("Plugin page is no longer active.");
+    }
+    function extensionUiLayoutText(value, locale) {
+        if (typeof value === "string")
+            return Amaterasu.translateText(value);
+        if (!value || typeof value !== "object" || Array.isArray(value) || typeof value.source !== "string" || !value.source.trim())
+            throw new Error("Invalid plugin UI text.");
+        const translations = value.translations ?? {};
+        if (!translations || typeof translations !== "object" || Array.isArray(translations) ||
+            Object.values(translations).some((translation) => typeof translation !== "string" || !translation.trim()))
+            throw new Error("Invalid plugin UI translations.");
+        return translations[locale] ?? translations[locale.split("-")[0] ?? locale] ?? Amaterasu.translateText(value.source);
+    }
+    function extensionUiLayoutTextNode(value) {
+        if (typeof value === "string")
+            return Amaterasu.localizedTextNode(value);
+        extensionUiLayoutText(value, Amaterasu.activeIntlLocale());
+        return Amaterasu.localeFormattedTextNode((locale) => extensionUiLayoutText(value, locale));
+    }
+    function extensionUiLayoutRequiredText(value, description) {
+        if (typeof value === "string") {
+            if (!value.trim())
+                throw new Error(`Invalid plugin UI ${description}.`);
+            return;
+        }
+        extensionUiLayoutText(value, Amaterasu.activeIntlLocale());
+    }
+    function extensionUiLayoutNode(value) {
+        if (!value || typeof value !== "object" || typeof value.nodeType !== "number")
+            return false;
+        const supportedNodeTypes = [Node.ELEMENT_NODE, Node.TEXT_NODE, Node.COMMENT_NODE, Node.DOCUMENT_FRAGMENT_NODE];
+        return supportedNodeTypes.includes(value.nodeType);
+    }
+    function extensionUiLayoutSetLabelAttribute(element, label) {
+        if (typeof label === "string")
+            Amaterasu.setLocalizedAttribute(element, "aria-label", label);
+        else
+            Amaterasu.setLocalizedAttributeFormatter(element, "aria-label", (locale) => extensionUiLayoutText(label, locale));
+    }
+    function createExtensionUiCard(signal, options) {
+        extensionUiLayoutLifecycle(signal);
+        if (!options || typeof options !== "object" || Array.isArray(options))
+            throw new Error("Invalid plugin UI card.");
+        extensionUiLayoutRequiredText(options.label, "card label");
+        const id = `amaterasu-plugin-card-${++nextExtensionUiLayoutId}`;
+        const heading = Amaterasu.el("h2", "", extensionUiLayoutTextNode(options.label));
+        heading.id = `${id}-heading`;
+        const content = Amaterasu.el("div", "plugin-ui-card-content");
+        const element = Amaterasu.el("section", "panel plugin-ui-card", heading, content);
+        element.setAttribute("aria-labelledby", heading.id);
+        let disposed = false;
+        const dispose = () => {
+            if (disposed)
+                return;
+            disposed = true;
+            content.replaceChildren();
+            element.remove();
+            signal.removeEventListener("abort", dispose);
+        };
+        const card = Object.freeze({
+            element,
+            content,
+            append: (child) => {
+                if (disposed || signal.aborted)
+                    return;
+                if (!extensionUiLayoutNode(child))
+                    throw new Error("Plugin UI card children must be DOM nodes.");
+                content.append(child);
+            },
+            dispose,
+        });
+        signal.addEventListener("abort", dispose, { once: true });
+        return card;
+    }
+    function validateExtensionUiTableRows(rows, columnCount) {
+        if (!Array.isArray(rows) || rows.length > EXTENSION_UI_TABLE_MAX_ROWS ||
+            rows.some((row) => !Array.isArray(row) || row.length !== columnCount))
+            throw new Error("Invalid plugin UI table rows.");
+        for (const row of rows) {
+            for (const value of row) {
+                if (typeof value !== "string")
+                    extensionUiLayoutText(value, Amaterasu.activeIntlLocale());
+            }
+        }
+    }
+    function createExtensionUiTable(signal, options) {
+        extensionUiLayoutLifecycle(signal);
+        if (!options || typeof options !== "object" || Array.isArray(options))
+            throw new Error("Invalid plugin UI table.");
+        extensionUiLayoutRequiredText(options.caption, "table caption");
+        if (!Array.isArray(options.columns) || options.columns.length < 1 || options.columns.length > EXTENSION_UI_TABLE_MAX_COLUMNS)
+            throw new Error("Invalid plugin UI table columns.");
+        for (const column of options.columns) {
+            if (!column || typeof column !== "object" || Array.isArray(column))
+                throw new Error("Invalid plugin UI table column.");
+            extensionUiLayoutRequiredText(column.header, "table header");
+        }
+        const columnCount = options.columns.length;
+        const initialRows = options.rows === undefined ? [] : options.rows;
+        validateExtensionUiTableRows(initialRows, columnCount);
+        const region = Amaterasu.el("div", "table-scroll plugin-ui-table-scroll");
+        region.setAttribute("role", "region");
+        region.tabIndex = 0;
+        extensionUiLayoutSetLabelAttribute(region, options.caption);
+        const table = Amaterasu.el("table", "plugin-ui-table");
+        table.append(Amaterasu.el("caption", "", extensionUiLayoutTextNode(options.caption)));
+        const head = Amaterasu.el("thead", "");
+        const headerRow = Amaterasu.el("tr", "");
+        for (const column of options.columns) {
+            const header = Amaterasu.el("th", "", extensionUiLayoutTextNode(column.header));
+            header.setAttribute("scope", "col");
+            headerRow.append(header);
+        }
+        head.append(headerRow);
+        const body = Amaterasu.el("tbody", "");
+        table.append(head, body);
+        region.append(table);
+        let disposed = false;
+        const renderRows = (rows) => {
+            const preparedRows = rows.map((row) => {
+                const tr = Amaterasu.el("tr", "");
+                for (const value of row)
+                    tr.append(Amaterasu.el("td", "", extensionUiLayoutTextNode(value)));
+                return tr;
+            });
+            body.replaceChildren(...preparedRows);
+        };
+        renderRows(initialRows);
+        const dispose = () => {
+            if (disposed)
+                return;
+            disposed = true;
+            table.replaceChildren();
+            region.remove();
+            signal.removeEventListener("abort", dispose);
+        };
+        const component = Object.freeze({
+            element: region,
+            setRows: (rows) => {
+                if (disposed || signal.aborted)
+                    return;
+                validateExtensionUiTableRows(rows, columnCount);
+                renderRows(rows);
+            },
+            dispose,
+        });
+        signal.addEventListener("abort", dispose, { once: true });
+        return component;
+    }
+    function createExtensionUiLayoutV1(signal) {
+        extensionUiLayoutLifecycle(signal);
+        return Object.freeze({
+            version: 1,
+            card: (options) => createExtensionUiCard(signal, options),
+            table: (options) => createExtensionUiTable(signal, options),
+        });
+    }
+    Amaterasu.createExtensionUiLayoutV1 = createExtensionUiLayoutV1;
+})(Amaterasu || (Amaterasu = {}));
+var Amaterasu;
+(function (Amaterasu) {
+    let nextExtensionUiTabsId = 0;
+    function validateExtensionUiTabText(value) {
+        if (typeof value === "string") {
+            if (!value.trim())
+                throw new Error("Plugin tab labels cannot be empty.");
+            return;
+        }
+        if (!value || typeof value !== "object" || typeof value.source !== "string" || !value.source.trim())
+            throw new Error("Invalid plugin tab label.");
+        const translations = value.translations ?? {};
+        if (!translations || typeof translations !== "object" || Array.isArray(translations) ||
+            Object.values(translations).some((translation) => typeof translation !== "string" || !translation.trim()))
+            throw new Error("Invalid plugin tab translations.");
+    }
+    function extensionUiTabsText(value) {
+        validateExtensionUiTabText(value);
+        if (typeof value === "string")
+            return Amaterasu.localizedTextNode(value);
+        const translations = value.translations ?? {};
+        return Amaterasu.localeFormattedTextNode((locale) => translations[locale] ?? translations[locale.split("-")[0] ?? locale] ?? Amaterasu.translateText(value.source));
+    }
+    function validateExtensionUiTabs(tabs) {
+        if (!Array.isArray(tabs) || tabs.length < 1 || tabs.length > 64)
+            throw new Error("Plugin tabs must contain between one and 64 items.");
+        const ids = new Set();
+        const contents = new Set();
+        for (const tab of tabs) {
+            if (!tab || typeof tab !== "object" || typeof tab.id !== "string" ||
+                !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(tab.id) || ids.has(tab.id) ||
+                typeof tab.disabled !== "undefined" && typeof tab.disabled !== "boolean" ||
+                !tab.content || typeof tab.content !== "object" || tab.content.nodeType !== 1 ||
+                typeof tab.content.nodeName !== "string" || contents.has(tab.content))
+                throw new Error("Invalid plugin tab item.");
+            validateExtensionUiTabText(tab.label);
+            ids.add(tab.id);
+            contents.add(tab.content);
+        }
+    }
+    function createExtensionUiTabsV1(signal) {
+        if (!signal || typeof signal.addEventListener !== "function" || typeof signal.removeEventListener !== "function")
+            throw new Error("Plugin tabs require a lifecycle signal.");
+        if (signal.aborted)
+            throw new Error("Plugin page is no longer active.");
+        const makeController = () => {
+            if (signal.aborted)
+                throw new Error("Plugin page is no longer active.");
+            return new AbortController();
+        };
+        const tabs = {
+            tabs(options) {
+                if (!options || typeof options !== "object" || Array.isArray(options))
+                    throw new Error("Invalid plugin tabs options.");
+                if (typeof options.onChange !== "undefined" && typeof options.onChange !== "function")
+                    throw new Error("Invalid plugin tab change callback.");
+                validateExtensionUiTabText(options.label);
+                validateExtensionUiTabs(options.tabs);
+                const controller = makeController();
+                const prefix = `amaterasu-plugin-tabs-${++nextExtensionUiTabsId}`;
+                const labelId = `${prefix}-label`;
+                const label = Amaterasu.el("span", "field-label plugin-tabs-label", extensionUiTabsText(options.label));
+                label.id = labelId;
+                const tablist = Amaterasu.el("div", "plugin-tablist");
+                tablist.setAttribute("role", "tablist");
+                tablist.setAttribute("aria-labelledby", labelId);
+                const panels = Amaterasu.el("div", "plugin-tab-panels");
+                const element = Amaterasu.el("div", "field plugin-tabs", label, tablist, panels);
+                let entries = [];
+                let activeId = null;
+                let disposed = false;
+                const enabledEntry = (id) => id === null ? undefined : entries.find((entry) => entry.id === id && !entry.disabled);
+                const firstEnabled = () => entries.find((entry) => !entry.disabled);
+                const updateSelection = () => {
+                    for (const entry of entries) {
+                        const selected = entry.id === activeId;
+                        entry.button.disabled = entry.disabled;
+                        entry.button.setAttribute("aria-selected", String(selected));
+                        entry.button.tabIndex = selected ? 0 : -1;
+                        entry.panel.hidden = !selected;
+                    }
+                };
+                const makeEntry = (tab) => {
+                    const encodedId = encodeURIComponent(tab.id);
+                    const button = Amaterasu.el("button", "plugin-tab", extensionUiTabsText(tab.label));
+                    button.type = "button";
+                    button.id = `${prefix}-tab-${encodedId}`;
+                    button.setAttribute("role", "tab");
+                    button.setAttribute("data-tab-id", tab.id);
+                    button.setAttribute("aria-controls", `${prefix}-panel-${encodedId}`);
+                    const panel = Amaterasu.el("div", "plugin-tabpanel", tab.content);
+                    panel.id = `${prefix}-panel-${encodedId}`;
+                    panel.setAttribute("role", "tabpanel");
+                    panel.setAttribute("aria-labelledby", button.id);
+                    panel.tabIndex = 0;
+                    return { id: tab.id, disabled: tab.disabled === true, button, panel };
+                };
+                const chooseNextActive = (requested, nextTabs) => {
+                    if (requested !== undefined) {
+                        const tab = nextTabs.find((candidate) => candidate.id === requested);
+                        if (!tab || tab.disabled === true)
+                            throw new Error("Plugin tab selection must name an enabled tab.");
+                        return tab.id;
+                    }
+                    const retained = nextTabs.find((tab) => tab.id === activeId && tab.disabled !== true);
+                    return retained?.id ?? nextTabs.find((tab) => tab.disabled !== true)?.id ?? null;
+                };
+                const commitTabs = (nextTabs, requested) => {
+                    validateExtensionUiTabs(nextTabs);
+                    const focusedElement = document.activeElement instanceof HTMLElement && element.contains(document.activeElement)
+                        ? document.activeElement
+                        : null;
+                    const focusedTabId = focusedElement
+                        ? entries.find((entry) => entry.button === focusedElement)?.id ?? null
+                        : null;
+                    const focusedPanelId = focusedElement
+                        ? entries.find((entry) => entry.panel.contains(focusedElement))?.id ?? null
+                        : null;
+                    const nextActiveId = chooseNextActive(requested, nextTabs);
+                    const currentById = new Map(entries.map((entry) => [entry.id, entry]));
+                    const nextEntries = nextTabs.map((tab) => {
+                        const existing = currentById.get(tab.id);
+                        if (!existing)
+                            return makeEntry(tab);
+                        return { ...existing, disabled: tab.disabled === true };
+                    });
+                    const nextIds = new Set(nextEntries.map((entry) => entry.id));
+                    for (const entry of entries) {
+                        if (!nextIds.has(entry.id)) {
+                            entry.button.remove();
+                            entry.panel.remove();
+                        }
+                    }
+                    for (let index = 0; index < nextEntries.length; index++) {
+                        const entry = nextEntries[index];
+                        const tab = nextTabs[index];
+                        entry.button.replaceChildren(extensionUiTabsText(tab.label));
+                        entry.button.disabled = entry.disabled;
+                        if (entry.panel.childNodes.length !== 1 || entry.panel.firstElementChild !== tab.content)
+                            entry.panel.replaceChildren(tab.content);
+                        if (tablist.children[index] !== entry.button)
+                            tablist.insertBefore(entry.button, tablist.children[index] ?? null);
+                        if (panels.children[index] !== entry.panel)
+                            panels.insertBefore(entry.panel, panels.children[index] ?? null);
+                    }
+                    entries = nextEntries;
+                    activeId = nextActiveId;
+                    updateSelection();
+                    if (focusedElement && document.activeElement === document.body) {
+                        const panelFocusStillVisible = focusedElement.isConnected && focusedPanelId !== null &&
+                            focusedPanelId === activeId && entries.some((entry) => entry.id === focusedPanelId && entry.panel.contains(focusedElement));
+                        if (panelFocusStillVisible)
+                            focusedElement.focus();
+                        else {
+                            const focusedTab = focusedElement.isConnected && focusedTabId !== null
+                                ? entries.find((entry) => entry.id === focusedTabId && !entry.disabled)
+                                : undefined;
+                            (focusedTab ?? enabledEntry(activeId))?.button.focus();
+                        }
+                    }
+                };
+                const activate = (id, focus, notify) => {
+                    const entry = entries.find((candidate) => candidate.id === id);
+                    if (!entry)
+                        throw new Error("Unknown plugin tab.");
+                    if (entry.disabled)
+                        throw new Error("Cannot select a disabled plugin tab.");
+                    const previousActiveId = activeId;
+                    const changed = previousActiveId !== id;
+                    const focusedPanelId = document.activeElement instanceof HTMLElement && element.contains(document.activeElement)
+                        ? entries.find((candidate) => candidate.panel.contains(document.activeElement))?.id ?? null
+                        : null;
+                    activeId = id;
+                    updateSelection();
+                    if (focus || changed && focusedPanelId !== null && focusedPanelId === previousActiveId)
+                        entry.button.focus();
+                    if (changed && notify)
+                        options.onChange?.(id);
+                };
+                const moveFocus = (id) => {
+                    const entry = entries.find((candidate) => candidate.id === id);
+                    if (!entry || entry.disabled)
+                        return;
+                    activate(id, true, true);
+                };
+                const onClick = (event) => {
+                    const target = event.target instanceof Element ? event.target.closest('[role="tab"]') : null;
+                    if (!target || !tablist.contains(target))
+                        return;
+                    const id = target.getAttribute("data-tab-id");
+                    if (id !== null) {
+                        const entry = entries.find((candidate) => candidate.id === id);
+                        if (entry && !entry.disabled)
+                            activate(id, false, true);
+                    }
+                };
+                const onKeyDown = (event) => {
+                    const target = event.target instanceof Element ? event.target.closest('[role="tab"]') : null;
+                    if (!target || !tablist.contains(target))
+                        return;
+                    const id = target.getAttribute("data-tab-id");
+                    if (id === null)
+                        return;
+                    const enabled = entries.filter((entry) => !entry.disabled);
+                    if (enabled.length < 1)
+                        return;
+                    const index = enabled.findIndex((entry) => entry.id === id);
+                    if (index < 0)
+                        return;
+                    let next;
+                    const rtl = getComputedStyle(tablist).direction === "rtl";
+                    if (event.key === "Home")
+                        next = enabled[0];
+                    else if (event.key === "End")
+                        next = enabled.at(-1);
+                    else if (event.key === "ArrowRight")
+                        next = enabled[(index + (rtl ? -1 : 1) + enabled.length) % enabled.length];
+                    else if (event.key === "ArrowLeft")
+                        next = enabled[(index + (rtl ? 1 : -1) + enabled.length) % enabled.length];
+                    else
+                        return;
+                    event.preventDefault();
+                    if (next)
+                        moveFocus(next.id);
+                };
+                tablist.addEventListener("click", onClick, { signal: controller.signal });
+                tablist.addEventListener("keydown", onKeyDown, { signal: controller.signal });
+                const setTabs = (nextTabs, requested) => {
+                    if (!disposed)
+                        commitTabs(nextTabs, requested);
+                };
+                const setDisabled = (id, disabled) => {
+                    if (disposed)
+                        return;
+                    if (typeof disabled !== "boolean")
+                        throw new Error("Plugin tab disabled state must be boolean.");
+                    const entry = entries.find((candidate) => candidate.id === id);
+                    if (!entry)
+                        throw new Error("Unknown plugin tab.");
+                    if (entry.disabled === disabled)
+                        return;
+                    const focused = document.activeElement === entry.button || entry.panel.contains(document.activeElement);
+                    entry.disabled = disabled;
+                    entry.button.disabled = disabled;
+                    if (disabled && activeId === id)
+                        activeId = firstEnabled()?.id ?? null;
+                    else if (!disabled && activeId === null)
+                        activeId = id;
+                    updateSelection();
+                    if (focused)
+                        enabledEntry(activeId)?.button.focus();
+                };
+                const select = (id) => {
+                    if (!disposed)
+                        activate(id, false, false);
+                };
+                const dispose = () => {
+                    if (disposed)
+                        return;
+                    disposed = true;
+                    controller.abort();
+                    signal.removeEventListener("abort", dispose);
+                };
+                commitTabs(options.tabs, options.activeId);
+                if (signal.aborted)
+                    dispose();
+                else
+                    signal.addEventListener("abort", dispose, { once: true });
+                return Object.freeze({
+                    element,
+                    active: () => activeId,
+                    select,
+                    setTabs,
+                    setDisabled,
+                    dispose,
+                });
+            },
+        };
+        return Object.freeze(tabs);
+    }
+    Amaterasu.createExtensionUiTabsV1 = createExtensionUiTabsV1;
+})(Amaterasu || (Amaterasu = {}));
+var Amaterasu;
+(function (Amaterasu) {
+    let nextExtensionUiFeedbackId = 0;
+    function feedbackTextNode(value) {
+        if (typeof value === "string")
+            return Amaterasu.localizedTextNode(value);
+        if (!value || typeof value.source !== "string" || !value.source.trim())
+            throw new Error("Invalid plugin UI text.");
+        const translations = value.translations ?? {};
+        if (!translations || typeof translations !== "object" || Array.isArray(translations) ||
+            Object.values(translations).some((translation) => typeof translation !== "string" || !translation.trim()))
+            throw new Error("Invalid plugin UI translations.");
+        return Amaterasu.localeFormattedTextNode((locale) => translations[locale] ?? translations[locale.split("-")[0] ?? locale] ?? Amaterasu.translateText(value.source));
+    }
+    function validateFeedbackMessage(message) {
+        if (typeof message === "string")
+            return;
+        if (!message || typeof message !== "object" || typeof message.source !== "string" || !message.source.trim())
+            throw new Error("Invalid plugin UI text.");
+        const translations = message.translations ?? {};
+        if (!translations || typeof translations !== "object" || Array.isArray(translations) ||
+            Object.values(translations).some((translation) => typeof translation !== "string" || !translation.trim()))
+            throw new Error("Invalid plugin UI translations.");
+    }
+    function feedbackHandle(element, signal, methods) {
+        let disposed = false;
+        const dispose = () => {
+            if (disposed)
+                return;
+            disposed = true;
+            signal.removeEventListener("abort", dispose);
+        };
+        if (signal.aborted)
+            dispose();
+        else
+            signal.addEventListener("abort", dispose, { once: true });
+        return Object.freeze({ element, ...methods, dispose });
+    }
+    function feedbackLifecycle(signal) {
+        if (!signal || typeof signal.addEventListener !== "function" || typeof signal.removeEventListener !== "function")
+            throw new Error("Plugin UI requires a lifecycle signal.");
+        if (signal.aborted)
+            throw new Error("Plugin page is no longer active.");
+    }
+    function feedbackSetMessage(element, message) {
+        validateFeedbackMessage(message);
+        element.replaceChildren(feedbackTextNode(message));
+    }
+    function createExtensionUiFeedbackV1(signal) {
+        feedbackLifecycle(signal);
+        const makeElement = (className) => Amaterasu.el("div", `plugin-feedback ${className}`);
+        const feedback = {
+            version: 1,
+            status(options) {
+                feedbackLifecycle(signal);
+                if (!options || typeof options !== "object" || Array.isArray(options))
+                    throw new Error("Invalid plugin status feedback.");
+                validateFeedbackMessage(options.message);
+                if (options.busy !== undefined && typeof options.busy !== "boolean")
+                    throw new Error("Invalid plugin status busy state.");
+                const element = makeElement("plugin-feedback-status");
+                element.setAttribute("role", "status");
+                element.setAttribute("aria-live", "polite");
+                element.setAttribute("aria-atomic", "true");
+                element.setAttribute("aria-busy", String(options.busy === true));
+                feedbackSetMessage(element, options.message);
+                let disposed = false;
+                const handle = feedbackHandle(element, signal, {
+                    setMessage(message) {
+                        if (disposed || signal.aborted)
+                            return;
+                        feedbackSetMessage(element, message);
+                    },
+                    setBusy(busy) {
+                        if (disposed || signal.aborted)
+                            return;
+                        if (typeof busy !== "boolean")
+                            throw new Error("Invalid plugin status busy state.");
+                        element.setAttribute("aria-busy", String(busy));
+                    },
+                });
+                const originalDispose = handle.dispose;
+                return Object.freeze({ ...handle, dispose() { disposed = true; originalDispose(); } });
+            },
+            alert(options) {
+                feedbackLifecycle(signal);
+                if (!options || typeof options !== "object" || Array.isArray(options))
+                    throw new Error("Invalid plugin alert feedback.");
+                validateFeedbackMessage(options.message);
+                const severity = options.severity === undefined ? "info" : options.severity;
+                if (!["info", "success", "warning", "error"].includes(severity))
+                    throw new Error("Invalid plugin alert severity.");
+                const element = makeElement("plugin-feedback-alert");
+                element.setAttribute("role", "alert");
+                element.setAttribute("aria-live", "assertive");
+                element.setAttribute("aria-atomic", "true");
+                element.setAttribute("data-severity", severity);
+                feedbackSetMessage(element, options.message);
+                let disposed = false;
+                const handle = feedbackHandle(element, signal, {
+                    setMessage(message) {
+                        if (disposed || signal.aborted)
+                            return;
+                        feedbackSetMessage(element, message);
+                    },
+                    setSeverity(nextSeverity) {
+                        if (disposed || signal.aborted)
+                            return;
+                        if (!["info", "success", "warning", "error"].includes(nextSeverity))
+                            throw new Error("Invalid plugin alert severity.");
+                        element.setAttribute("data-severity", nextSeverity);
+                    },
+                });
+                const originalDispose = handle.dispose;
+                return Object.freeze({ ...handle, dispose() { disposed = true; originalDispose(); } });
+            },
+            progress(options) {
+                feedbackLifecycle(signal);
+                if (!options || typeof options !== "object" || Array.isArray(options))
+                    throw new Error("Invalid plugin progress feedback.");
+                validateFeedbackMessage(options.label);
+                if (options.message !== undefined)
+                    validateFeedbackMessage(options.message);
+                const maximum = options.maximum === undefined ? 100 : options.maximum;
+                if (typeof maximum !== "number" || !Number.isFinite(maximum) || maximum <= 0)
+                    throw new Error("Invalid plugin progress maximum.");
+                const initialValue = options.value === undefined ? null : options.value;
+                if (initialValue !== null && (typeof initialValue !== "number" || !Number.isFinite(initialValue)))
+                    throw new Error("Invalid plugin progress value.");
+                const clampedValue = initialValue === null ? null : Math.min(maximum, Math.max(0, initialValue));
+                const element = makeElement("plugin-feedback-progress");
+                const label = Amaterasu.el("label", "plugin-feedback-label", feedbackTextNode(options.label));
+                const progress = Amaterasu.el("progress", "plugin-feedback-progressbar");
+                const instanceId = ++nextExtensionUiFeedbackId;
+                const progressId = `amaterasu-plugin-feedback-progress-${instanceId}`;
+                const descriptionId = `amaterasu-plugin-feedback-description-${instanceId}`;
+                progress.id = progressId;
+                label.htmlFor = progressId;
+                progress.max = maximum;
+                progress.setAttribute("max", String(maximum));
+                const syncValue = (value) => {
+                    if (value === null) {
+                        progress.removeAttribute("value");
+                    }
+                    else {
+                        progress.value = value;
+                        progress.setAttribute("value", String(value));
+                    }
+                };
+                syncValue(clampedValue);
+                const content = [label, progress];
+                let messageNode = options.message === undefined ? null : Amaterasu.el("small", "plugin-feedback-message", feedbackTextNode(options.message));
+                if (messageNode) {
+                    messageNode.id = descriptionId;
+                    progress.setAttribute("aria-describedby", messageNode.id);
+                    content.push(messageNode);
+                }
+                element.replaceChildren(...content);
+                let currentValue = clampedValue;
+                let disposed = false;
+                const handle = feedbackHandle(element, signal, {
+                    value: () => currentValue,
+                    setValue(value) {
+                        if (disposed || signal.aborted)
+                            return;
+                        if (value !== null && (typeof value !== "number" || !Number.isFinite(value)))
+                            throw new Error("Invalid plugin progress value.");
+                        currentValue = value === null ? null : Math.min(maximum, Math.max(0, value));
+                        syncValue(currentValue);
+                    },
+                    setMessage(message) {
+                        if (disposed || signal.aborted)
+                            return;
+                        if (message !== null)
+                            validateFeedbackMessage(message);
+                        if (message === null) {
+                            messageNode?.remove();
+                            messageNode = null;
+                            progress.removeAttribute("aria-describedby");
+                        }
+                        else if (messageNode) {
+                            messageNode.replaceChildren(feedbackTextNode(message));
+                        }
+                        else {
+                            messageNode = Amaterasu.el("small", "plugin-feedback-message", feedbackTextNode(message));
+                            messageNode.id = descriptionId;
+                            progress.setAttribute("aria-describedby", messageNode.id);
+                            element.append(messageNode);
+                        }
+                    },
+                });
+                const originalDispose = handle.dispose;
+                return Object.freeze({ ...handle, dispose() { disposed = true; originalDispose(); } });
+            },
+        };
+        return Object.freeze(feedback);
+    }
+    Amaterasu.createExtensionUiFeedbackV1 = createExtensionUiFeedbackV1;
+    function createExtensionUiWithFeedbackV1(signal) {
+        const ui = Amaterasu.createExtensionUiV1(signal);
+        const feedback = createExtensionUiFeedbackV1(signal);
+        const layout = Amaterasu.createExtensionUiLayoutV1(signal);
+        return Object.freeze({ ...ui, ...feedback, ...layout, version: 1 });
+    }
+    Amaterasu.createExtensionUiWithFeedbackV1 = createExtensionUiWithFeedbackV1;
+})(Amaterasu || (Amaterasu = {}));
+var Amaterasu;
+(function (Amaterasu) {
+    let nextExtensionUiDialogId = 0;
+    const extensionUiDialogCloseFromParent = new WeakMap();
+    function extensionUiDialogTextNode(value) {
+        if (typeof value === "string") {
+            if (!value.trim())
+                throw new Error("Invalid plugin dialog text.");
+            return Amaterasu.localizedTextNode(value);
+        }
+        if (!value || typeof value !== "object" || typeof value.source !== "string" || !value.source.trim())
+            throw new Error("Invalid plugin dialog text.");
+        const translations = value.translations ?? {};
+        if (!translations || typeof translations !== "object" || Array.isArray(translations) ||
+            Object.values(translations).some((translation) => typeof translation !== "string" || !translation.trim()))
+            throw new Error("Invalid plugin dialog translations.");
+        return Amaterasu.localeFormattedTextNode((locale) => translations[locale] ?? translations[locale.split("-")[0] ?? locale] ?? Amaterasu.translateText(value.source));
+    }
+    function extensionUiDialogContent(content) {
+        if (content === undefined)
+            return [];
+        const values = Array.isArray(content) ? [...content] : [content];
+        return values.map((value) => {
+            if (typeof value === "string")
+                return document.createTextNode(value);
+            if (!value || typeof value !== "object" || value.ownerDocument !== document ||
+                ![1, 3, 11].includes(value.nodeType))
+                throw new Error("Dialog content must be text or a node owned by this document.");
+            return value;
+        });
+    }
+    function createExtensionUiDialogsV1(signal) {
+        if (!signal || typeof signal.addEventListener !== "function" || typeof signal.removeEventListener !== "function")
+            throw new Error("Plugin UI requires a lifecycle signal.");
+        if (signal.aborted)
+            throw new Error("Plugin page is no longer active.");
+        const dialogs = {
+            dialog(options) {
+                if (signal.aborted)
+                    throw new Error("Plugin page is no longer active.");
+                if (!options || typeof options !== "object" || Array.isArray(options))
+                    throw new Error("Invalid plugin dialog.");
+                if (options.onClose !== undefined && typeof options.onClose !== "function")
+                    throw new Error("Invalid plugin dialog close callback.");
+                const titleNode = extensionUiDialogTextNode(options.title);
+                const descriptionNode = options.description === undefined
+                    ? null : extensionUiDialogTextNode(options.description);
+                const cancelLabel = extensionUiDialogTextNode(options.cancelLabel ?? "Cancel");
+                const contentNodes = extensionUiDialogContent(options.content);
+                const initialFocus = options.initialFocus;
+                if (initialFocus !== undefined && (!initialFocus || typeof initialFocus.focus !== "function" ||
+                    initialFocus.ownerDocument !== document || !contentNodes.some((node) => node === initialFocus ||
+                    ((node.nodeType === 1 || node.nodeType === 11) && node.contains(initialFocus)))))
+                    throw new Error("Dialog initial focus must be inside its content.");
+                const instanceId = ++nextExtensionUiDialogId;
+                const titleId = `amaterasu-plugin-dialog-title-${instanceId}`;
+                const descriptionId = `amaterasu-plugin-dialog-description-${instanceId}`;
+                const element = document.createElement("dialog");
+                element.className = "plugin-dialog";
+                element.setAttribute("aria-modal", "true");
+                element.setAttribute("aria-labelledby", titleId);
+                const title = document.createElement("h2");
+                title.id = titleId;
+                title.append(titleNode);
+                element.append(title);
+                if (descriptionNode !== null) {
+                    const description = document.createElement("p");
+                    description.className = "plugin-dialog-description";
+                    description.id = descriptionId;
+                    description.append(descriptionNode);
+                    element.setAttribute("aria-describedby", descriptionId);
+                    element.append(description);
+                }
+                const body = document.createElement("div");
+                body.className = "plugin-dialog-content";
+                body.append(...contentNodes);
+                element.append(body);
+                const actions = document.createElement("div");
+                actions.className = "actions plugin-dialog-actions";
+                const cancelButton = document.createElement("button");
+                cancelButton.type = "button";
+                cancelButton.className = "button secondary";
+                cancelButton.append(cancelLabel);
+                actions.append(cancelButton);
+                element.append(actions);
+                const controller = new AbortController();
+                const nativeClose = element.close.bind(element);
+                let disposed = false;
+                let opener = null;
+                let pendingCloseReason = null;
+                let closeEventPending = false;
+                let suppressFocusReturn = false;
+                const restoreFocus = () => {
+                    const target = opener;
+                    opener = null;
+                    if (!signal.aborted && target?.isConnected)
+                        target.focus();
+                };
+                const closeNestedDialogs = () => {
+                    const nestedDialogs = Array.from(element.querySelectorAll("dialog")).reverse();
+                    for (const nested of nestedDialogs) {
+                        const closeOwned = extensionUiDialogCloseFromParent.get(nested);
+                        if (closeOwned)
+                            closeOwned();
+                        else if (nested.open)
+                            nested.close();
+                    }
+                };
+                const closeDialog = (reason, returnValue) => {
+                    if (disposed || signal.aborted || !element.open)
+                        return;
+                    pendingCloseReason = reason;
+                    closeEventPending = true;
+                    element.close(returnValue ?? reason);
+                };
+                const closeFromParent = () => {
+                    if (disposed || signal.aborted)
+                        return;
+                    if (element.open) {
+                        suppressFocusReturn = true;
+                        closeDialog("close");
+                    }
+                    else if (closeEventPending) {
+                        suppressFocusReturn = true;
+                    }
+                };
+                const onCancel = (event) => {
+                    event.preventDefault();
+                    closeDialog("cancel");
+                };
+                const onKeyDown = (event) => {
+                    if (event.key !== "Tab" || disposed || signal.aborted)
+                        return;
+                    const focusable = Array.from(element.querySelectorAll("a[href],area[href],button:not(:disabled),input:not(:disabled):not([type=hidden]),select:not(:disabled),textarea:not(:disabled),iframe,[tabindex]:not([tabindex='-1']),[contenteditable='true']")).filter((control) => !control.hidden && control.getAttribute("aria-hidden") !== "true" && control.tabIndex >= 0 && control.getClientRects().length > 0);
+                    const first = focusable[0];
+                    const last = focusable.at(-1);
+                    const active = document.activeElement;
+                    if (!first || !last) {
+                        event.preventDefault();
+                        cancelButton.focus();
+                    }
+                    else if (event.shiftKey && (active === first || !element.contains(active))) {
+                        event.preventDefault();
+                        last.focus();
+                    }
+                    else if (!event.shiftKey && (active === last || !element.contains(active))) {
+                        event.preventDefault();
+                        first.focus();
+                    }
+                };
+                const onClose = () => {
+                    const reason = pendingCloseReason ?? (element.returnValue === "cancel" ? "cancel" : "close");
+                    pendingCloseReason = null;
+                    closeEventPending = false;
+                    const shouldRestoreFocus = !suppressFocusReturn;
+                    suppressFocusReturn = false;
+                    if (disposed || signal.aborted)
+                        return;
+                    if (shouldRestoreFocus)
+                        restoreFocus();
+                    else
+                        opener = null;
+                    options.onClose?.(reason);
+                };
+                const onDialogFormSubmit = (event) => {
+                    const form = event.target;
+                    if (form?.tagName !== "FORM" || form.closest("dialog") !== element)
+                        return;
+                    const submitter = event.submitter;
+                    const method = submitter?.hasAttribute("formmethod")
+                        ? submitter.formMethod.toLowerCase() : form.method.toLowerCase();
+                    if (method !== "dialog")
+                        return;
+                    pendingCloseReason = "close";
+                    closeEventPending = true;
+                    queueMicrotask(() => {
+                        if (disposed || signal.aborted)
+                            return;
+                        if (element.open) {
+                            pendingCloseReason = null;
+                            closeEventPending = false;
+                        }
+                        else {
+                            closeNestedDialogs();
+                        }
+                    });
+                };
+                const onHostAbort = () => {
+                    if (disposed)
+                        return;
+                    disposed = true;
+                    try {
+                        if (element.open)
+                            element.close("dispose");
+                    }
+                    finally {
+                        opener = null;
+                        controller.abort();
+                        element.remove();
+                    }
+                };
+                element.close = ((returnValue) => {
+                    if (element.open)
+                        closeNestedDialogs();
+                    if (element.open && !disposed && !signal.aborted) {
+                        closeEventPending = true;
+                        if (pendingCloseReason === null)
+                            pendingCloseReason = returnValue === "cancel" ? "cancel" : "close";
+                    }
+                    nativeClose(returnValue);
+                });
+                extensionUiDialogCloseFromParent.set(element, closeFromParent);
+                cancelButton.addEventListener("click", () => closeDialog("cancel"), { signal: controller.signal });
+                element.addEventListener("cancel", onCancel, { signal: controller.signal });
+                element.addEventListener("keydown", onKeyDown, { signal: controller.signal });
+                element.addEventListener("submit", onDialogFormSubmit, { capture: true, signal: controller.signal });
+                element.addEventListener("close", onClose, { signal: controller.signal });
+                signal.addEventListener("abort", onHostAbort, { once: true });
+                const handle = {
+                    element,
+                    open() {
+                        if (disposed || signal.aborted || element.open || closeEventPending)
+                            return;
+                        if (!element.isConnected)
+                            throw new Error("Append the dialog element before opening it.");
+                        const active = document.activeElement;
+                        opener = active && typeof active.focus === "function" ? active : null;
+                        try {
+                            element.showModal();
+                        }
+                        catch (error) {
+                            opener = null;
+                            throw error;
+                        }
+                        (initialFocus ?? cancelButton).focus();
+                    },
+                    close() { closeDialog("close"); },
+                    dispose() {
+                        if (disposed)
+                            return;
+                        const wasOpen = element.open;
+                        const pendingReason = closeEventPending ? pendingCloseReason : null;
+                        disposed = true;
+                        try {
+                            if (wasOpen)
+                                element.close("dispose");
+                            if (!signal.aborted && (wasOpen || closeEventPending)) {
+                                restoreFocus();
+                                options.onClose?.(wasOpen ? "dispose" : pendingReason ?? "dispose");
+                            }
+                        }
+                        finally {
+                            pendingCloseReason = null;
+                            closeEventPending = false;
+                            opener = null;
+                            controller.abort();
+                            signal.removeEventListener("abort", onHostAbort);
+                            extensionUiDialogCloseFromParent.delete(element);
+                            element.remove();
+                        }
+                    },
+                };
+                return Object.freeze(handle);
+            },
+        };
+        return Object.freeze(dialogs);
+    }
+    Amaterasu.createExtensionUiDialogsV1 = createExtensionUiDialogsV1;
+    function createExtensionUiWithDialogsV1(signal) {
+        const ui = Amaterasu.createExtensionUiWithFeedbackV1(signal);
+        const dialogs = createExtensionUiDialogsV1(signal);
+        return Object.freeze({ ...ui, ...dialogs, version: 1 });
+    }
+    Amaterasu.createExtensionUiWithDialogsV1 = createExtensionUiWithDialogsV1;
 })(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
 (function (Amaterasu) {
@@ -16198,6 +21880,11 @@ var Amaterasu;
             const sdk = Object.freeze({
                 version: 1,
                 signal: controller.signal,
+                features: Object.freeze(["ui.controls/1", "ui.forms/1", "ui.forms/2", "ui.controls/2", "ui.feedback/1", "ui.layout/1", "ui.tabs/1", "ui.dialog/1"]),
+                ui: Object.freeze({
+                    ...Amaterasu.createExtensionUiWithDialogsV1(controller.signal),
+                    ...Amaterasu.createExtensionUiTabsV1(controller.signal),
+                }),
                 call: (method, payload = {}) => {
                     if (controller.signal.aborted || !aliases.has(method))
                         return Promise.reject(new Error("Extension method is unavailable."));
@@ -16224,36 +21911,27 @@ var Amaterasu;
         if ((definition.type !== "integer" && definition.type !== "decimal") ||
             typeof min !== "number" || !Number.isFinite(min) ||
             typeof max !== "number" || !Number.isFinite(max) || min >= max ||
-            (definition.type === "integer" && (!Number.isSafeInteger(min) || !Number.isSafeInteger(max))))
+            (definition.type === "integer" && (!Number.isSafeInteger(min) || !Number.isSafeInteger(max))) ||
+            typeof value !== "number")
             throw new Error("Invalid slider setting.");
-        const number = Amaterasu.input("", String(value), "number");
-        const slider = Amaterasu.input("", "", "range");
-        for (const control of [number, slider]) {
-            control.min = String(min);
-            control.max = String(max);
-            control.step = definition.type === "integer" ? "1" : "any";
-        }
-        slider.value = String(value);
-        slider.setAttribute("aria-label", `${label} slider`);
-        number.setAttribute("aria-label", `${label} value`);
-        const validNumber = () => {
-            const parsed = Number(number.value);
-            return number.value !== "" && number.validity.valid && Number.isFinite(parsed) &&
-                parsed >= min && parsed <= max && (definition.type !== "integer" || Number.isSafeInteger(parsed));
-        };
-        slider.addEventListener("input", () => { number.value = slider.value; });
-        number.addEventListener("input", () => { if (validNumber())
-            slider.value = number.value; });
-        return {
-            node: Amaterasu.el("div", "extension-slider", slider, number),
-            value: () => {
-                if (!validNumber())
-                    throw new Error(`Enter a valid number from ${min} to ${max}.`);
-                return Number(number.value);
-            },
-        };
+        const slider = Amaterasu.boundedSlider(min, max, value, label, definition.type === "integer", "extension-slider");
+        return { node: slider.node, value: slider.value };
     }
     Amaterasu.extensionSliderEditor = extensionSliderEditor;
+    function extensionRadioGroupEditor(definition, value, label, choiceLabels = {}) {
+        if (definition.type !== "enum" || !Array.isArray(definition.options) ||
+            typeof value !== "string" || !definition.options.includes(value))
+            throw new Error("Invalid radio group setting.");
+        const choices = definition.options.map((option) => ({
+            value: option,
+            label: typeof Amaterasu.literalText === "function"
+                ? Amaterasu.literalText(choiceLabels[option] ?? option)
+                : choiceLabels[option] ?? option,
+        }));
+        const control = Amaterasu.radioGroup(label, choices, value);
+        return { node: control.node, value: control.value };
+    }
+    Amaterasu.extensionRadioGroupEditor = extensionRadioGroupEditor;
     function extensionFieldEditor(definition, value, choiceLabels = {}) {
         switch (definition.type) {
             case "nullable": {
@@ -16718,11 +22396,11 @@ var Amaterasu;
                             throw new Error("Missing effective extension setting.");
                         const isOverride = Object.hasOwn(document.values, option.id);
                         const editorValue = isOverride ? document.values[option.id] : effective.value;
-                        const isSlider = option.presentation === "slider";
                         const editor = option.presentation === "keybinding"
                             ? Amaterasu.extensionKeybindingSettingEditor(option.definition, editorValue)
-                            : isSlider ? Amaterasu.extensionSliderEditor(option.definition, editorValue, option.label)
-                                : Amaterasu.extensionFieldEditor(option.definition, editorValue, option.choice_labels);
+                            : option.presentation === "slider" ? Amaterasu.extensionSliderEditor(option.definition, editorValue, option.label)
+                                : option.presentation === "radio_group" ? Amaterasu.extensionRadioGroupEditor(option.definition, editorValue, option.label, option.choice_labels)
+                                    : Amaterasu.extensionFieldEditor(option.definition, editorValue, option.choice_labels);
                         const inherit = scope.kind === "host" ? null : Amaterasu.input("", "", "checkbox");
                         if (inherit) {
                             inherit.checked = !isOverride;
@@ -16916,7 +22594,8 @@ var Amaterasu;
                         const editor = option.presentation === "keybinding"
                             ? Amaterasu.extensionKeybindingSettingEditor(option.definition, value)
                             : option.presentation === "slider" ? Amaterasu.extensionSliderEditor(option.definition, value, option.label)
-                                : Amaterasu.extensionFieldEditor(option.definition, value, option.choice_labels);
+                                : option.presentation === "radio_group" ? Amaterasu.extensionRadioGroupEditor(option.definition, value, option.label, option.choice_labels)
+                                    : Amaterasu.extensionFieldEditor(option.definition, value, option.choice_labels);
                         const controls = editor.node.matches("input,select,textarea") ? [editor.node] : Array.from(editor.node.querySelectorAll("input,select,textarea"));
                         if (controls.length === 1)
                             controls[0].setAttribute("aria-label", option.label);
@@ -17320,6 +22999,9 @@ var Amaterasu;
             setupPassword.required = true;
             setupPassword.autocomplete = "new-password";
             const setupStatus = Amaterasu.el("div");
+            setupStatus.setAttribute("role", "status");
+            setupStatus.setAttribute("aria-live", "polite");
+            setupStatus.setAttribute("aria-atomic", "true");
             const setupSubmit = Amaterasu.el("button", "button primary", "Create administrator");
             setupSubmit.type = "submit";
             const setupForm = Amaterasu.el("form", "settings-form", Amaterasu.field("Code shown on the host", setupCode), Amaterasu.field("Username", setupUsername), Amaterasu.field("Password", setupPassword), setupSubmit, setupStatus);

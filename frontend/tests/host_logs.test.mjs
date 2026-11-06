@@ -5,11 +5,11 @@ import vm from "node:vm";
 import ts from "typescript";
 
 class Element {
-  constructor(tagName) { this.tagName = tagName; this.children = []; this.listeners = new Map(); this.isConnected = false; }
+  constructor(tagName) { this.tagName = tagName; this.children = []; this.listeners = new Map(); this.attributes = {}; this.isConnected = false; }
   setConnected(value) { this.isConnected = value; for (const child of this.children) child?.setConnected?.(value); }
   append(...children) { for (const child of children) { if (child == null) continue; this.children.push(child); child?.setConnected?.(this.isConnected); } }
   replaceChildren(...children) { for (const child of this.children) child?.setConnected?.(false); this.children = []; this.append(...children); }
-  setAttribute() {}
+  setAttribute(name, value) { this.attributes[name] = String(value); }
   addEventListener(event, callback) { this.listeners.set(event, callback); }
   click() { this.listeners.get("click")?.(); }
   get textContent() { return this.children.map((child) => typeof child === "string" ? child : child?.textContent ?? "").join(""); }
@@ -25,10 +25,10 @@ const window = {setTimeout(callback, delay) { const id = nextTimer++; timers.set
   clearTimeout(id) { timers.delete(id); }};
 let downloadedBlob;
 const blobUrls = {createObjectURL(blob) { downloadedBlob = blob; return "blob:fixture"; }, revokeObjectURL() {}};
-const sandbox = vm.createContext({ document, window, TextDecoder, Uint8Array, atob, Blob, URL:blobUrls, Error });
+const sandbox = vm.createContext({ document, window, navigator:{}, TextDecoder, Uint8Array, atob, Blob, URL:blobUrls, Error });
 for (const source of ["src/ui.ts", "src/host_logs.ts"]) {
   vm.runInContext(ts.transpile(readFileSync(source, "utf8"), { target: ts.ScriptTarget.ES2022 }), sandbox);
-  if (source === "src/ui.ts") vm.runInContext("Object.assign(globalThis, Amaterasu); globalThis.literalText = (value) => value; globalThis.messageOf = (error) => error.message", sandbox);
+  if (source === "src/ui.ts") vm.runInContext("Object.assign(globalThis, Amaterasu); globalThis.literalText = (value) => value; globalThis.localizedMessage = (value) => value; globalThis.setLocalizedTextContent = (target,value) => target.textContent = value; globalThis.messageOf = (error) => error.message", sandbox);
 }
 const { renderHostLogs } = sandbox.Amaterasu;
 const descendants = (element) => [element, ...element.children.flatMap((child) => child instanceof Element ? descendants(child) : [])];
@@ -62,6 +62,9 @@ test("host logs read every chunk, preserve UTF-8 and search the full snapshot", 
   const target = new Element("div"); target.setConnected(true);
   renderHostLogs({api}, target);
   await wait(() => target.textContent.includes("older log segments were discarded"));
+  const followStatus = find(target, (element) => element.textContent === "Following");
+  assert.equal(followStatus.attributes.role, "status");
+  assert.equal(followStatus.attributes["aria-live"], "polite");
   assert.ok(calls.filter((call) => call.route === "host-logs/read").length > 1);
   assert.ok(calls.some((call) => call.route === "host-logs/close"));
   const search = find(target, (element) => element.name === "host_log_search");
@@ -257,4 +260,62 @@ test("cancelling a pending support export closes its eventual handle without dow
   await wait(()=>target.textContent.includes("Support bundle cancelled"));
   assert.equal(downloadedBlob,undefined);
   assert.equal(closed.filter((value)=>value===id).length,2);
+});
+
+test("copy copies every rendered preview line and search context without changing follow state", async () => {
+  const text = `${Array.from({length:399}, (_, index) => `line ${index}`).join("\n")}\nneedle tail`;
+  const bytes = Buffer.from(text);
+  const api = { async post(route, payload = {}) {
+    if (route === "host-logs/open") return {ok:true,snapshot:id,length:bytes.length,earlier_segments_discarded:0};
+    if (route === "host-logs/close") return {ok:true};
+    const data = bytes.subarray(payload.offset, Math.min(payload.offset + payload.limit, bytes.length));
+    const next_offset = payload.offset + data.length;
+    return {ok:true,snapshot:id,offset:payload.offset,next_offset,length:bytes.length,data:data.toString("base64"),eof:next_offset === bytes.length};
+  } };
+  const copied = [];
+  sandbox.navigator.clipboard = {async writeText(value) { copied.push(value); }};
+  const target = new Element("div"); target.setConnected(true);
+  renderHostLogs({api}, target);
+  await wait(() => target.textContent.includes("Snapshot loaded"));
+  const output = find(target, (element) => element.className === "host-log-output");
+  const copy = find(target, (element) => element.tagName === "button" && element.textContent === "Copy rendered log preview");
+  const copyStatus = find(target, (element) => element.attributes["aria-live"] === "polite" && element.tagName === "p");
+  const pause = find(target, (element) => element.tagName === "button" && element.textContent === "Pause");
+  assert.equal(copyStatus.attributes.role, "status");
+  assert.equal(copy.disabled, false);
+  pause.click();
+  assert.match(target.textContent, /Paused/);
+  assert.equal(output.textContent.split("\n").length, 300);
+  copy.click();
+  await wait(() => copyStatus.textContent.includes("copied to the clipboard"));
+  assert.equal(copied[0], output.textContent);
+  assert.match(copied[0], /needle tail/);
+  assert.match(target.textContent, /Paused/);
+
+  const search = find(target, (element) => element.name === "host_log_search");
+  search.value = "needle"; search.listeners.get("input")();
+  assert.match(output.textContent, /line 398\nneedle tail/);
+  copy.click();
+  await wait(() => copied.length === 2);
+  assert.equal(copied[1], output.textContent);
+  assert.match(target.textContent, /Paused/);
+});
+
+test("copy reports clipboard failures through an accessible status message", async () => {
+  const bytes = Buffer.from("one visible line");
+  const api = { async post(route) {
+    if (route === "host-logs/open") return {ok:true,snapshot:id,length:bytes.length,earlier_segments_discarded:0};
+    if (route === "host-logs/close") return {ok:true};
+    return {ok:true,snapshot:id,offset:0,next_offset:bytes.length,length:bytes.length,data:bytes.toString("base64"),eof:true};
+  } };
+  sandbox.navigator.clipboard = {async writeText() { throw new Error("permission denied"); }};
+  const target = new Element("div"); target.setConnected(true);
+  renderHostLogs({api}, target);
+  await wait(() => target.textContent.includes("Snapshot loaded"));
+  const copy = find(target, (element) => element.tagName === "button" && element.textContent === "Copy rendered log preview");
+  const status = find(target, (element) => element.tagName === "p" && element.attributes.role === "status");
+  copy.click();
+  await wait(() => status.textContent.includes("Could not copy the rendered log preview"));
+  assert.equal(status.attributes["aria-live"], "polite");
+  assert.equal(copy.disabled, false);
 });

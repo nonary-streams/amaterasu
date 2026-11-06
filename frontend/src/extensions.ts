@@ -15,6 +15,8 @@ namespace Amaterasu {
   interface ExtensionPageSdk {
     readonly version: 1;
     readonly signal: AbortSignal;
+    readonly features?: readonly string[];
+    readonly ui?: ExtensionUiWithDialogsV1 & ExtensionUiTabsV1;
     call(method: string, payload?: Payload): Promise<unknown>;
   }
   interface ExtensionRegistry {
@@ -124,6 +126,11 @@ namespace Amaterasu {
       const sdk: ExtensionPageSdk = Object.freeze({
         version: 1 as const,
         signal: controller.signal,
+        features: Object.freeze(["ui.controls/1", "ui.forms/1", "ui.forms/2", "ui.controls/2", "ui.feedback/1", "ui.layout/1", "ui.tabs/1", "ui.dialog/1"]),
+        ui: Object.freeze({
+          ...createExtensionUiWithDialogsV1(controller.signal),
+          ...createExtensionUiTabsV1(controller.signal),
+        }),
         call: (method: string, payload: Payload = {}) => {
           if (controller.signal.aborted || !aliases.has(method)) return Promise.reject(new Error("Extension method is unavailable."));
           return this.api.post<{ result: unknown }>("extensions/call", { id, digest: descriptor.digest, method, payload })

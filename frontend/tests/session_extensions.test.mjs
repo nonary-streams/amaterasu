@@ -42,6 +42,11 @@ function fixture(scope, write = true, values = { enabled: false }, provider) {
       editors.push(editor);
       return editor;
     },
+    extensionRadioGroupEditor: (definition, initial, label, choiceLabels) => {
+      const editor = { node: element("radio-group"), initial, definition, label, choiceLabels, value: () => initial };
+      editors.push(editor);
+      return editor;
+    },
     runAction: (_button, _status, work) => {
       const promise = work().catch(error => errors.push(error));
       pending.push(promise);
@@ -159,6 +164,21 @@ test("live and unknown policy guidance does not claim runtime application", asyn
   assert.ok(unknown.nodes.some(node => node.tag === "small" && node.children[0] === "Application timing is not available."));
 });
 
+
+test("radio-group descriptor presentations use the enum control and preserve its wire value", async () => {
+  const env = fixture({ kind: "application", id: "game" });
+  env.descriptor.options[0].presentation = "radio_group";
+  env.descriptor.options[0].definition = { type: "enum", default: "steady", options: ["steady", "responsive"] };
+  await settle();
+  assert.equal(env.editors.length, 1);
+  assert.equal(env.editors[0].node.tag, "radio-group");
+  assert.equal(env.editors[0].label, "Enabled");
+  env.editors[0].value = () => "responsive";
+  env.nodes.find(node => node.tag === "form").listeners.submit({ preventDefault() {} });
+  await Promise.all(env.pending);
+  assert.equal(env.calls.find(([route]) => route.endsWith("/settings_update"))[1].values.enabled, "responsive");
+  assert.deepEqual(env.errors, []);
+});
 
 test("a future presentation hint falls back to its typed editor and saves edits", async () => {
   const env = fixture({ kind: "application", id: "game" }, true, {});
