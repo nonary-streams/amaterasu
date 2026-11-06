@@ -16,6 +16,7 @@ pub mod operation_api;
 pub mod processing;
 pub mod requests;
 pub mod retained_options;
+pub mod session_presentation;
 pub mod threading;
 pub mod transport;
 pub mod video;
