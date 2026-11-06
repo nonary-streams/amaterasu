@@ -1,6 +1,6 @@
 use crate::model::{
     MAX_BUFFER_BYTES, MAX_LEDGER, MAX_STREAMS, Operation, ResourceCaptureClock, SourceMode,
-    validate_operation_id,
+    resource::ResourceMode, validate_operation_id,
 };
 use amaterasu_media::{
     MEDIA_BACKEND_ERROR, MEDIA_BUSY, MEDIA_CLOSED, MEDIA_PENDING, MEDIA_UNSUPPORTED, PIXEL_NV12,
@@ -34,6 +34,7 @@ pub struct Delivery {
     pub pixels: Arc<[u8]>,
     pub identity: FrameIdentity,
     pub clock_epoch: Option<[u8; 16]>,
+    pub resource: Option<ResourceMode>,
     pacing: Arc<Mutex<Pacing>>,
 }
 
@@ -67,7 +68,7 @@ struct Stream {
     pixel_mode: SourceMode,
     pixels: Arc<[u8]>,
     resource_clock: Option<ResourceCaptureClock>,
-    selected: bool,
+    resource: Option<ResourceMode>,
     abandoned: bool,
     pacing: Arc<Mutex<Pacing>>,
 }
@@ -273,7 +274,7 @@ impl Controller {
             pixel_mode: mode,
             pixels,
             resource_clock,
-            selected: false,
+            resource: None,
             abandoned: false,
             pacing: Arc::new(Mutex::new(Pacing {
                 origin_us: now_us,
@@ -320,16 +321,14 @@ impl Controller {
         else {
             return MEDIA_CLOSED;
         };
-        let format = match offer {
-            1 => PIXEL_NV12,
-            2 => PIXEL_P010,
-            _ => return MEDIA_UNSUPPORTED,
+        let Some(resource) = ResourceMode::find(offer) else {
+            return MEDIA_UNSUPPORTED;
         };
         if generation != id {
             return MEDIA_UNSUPPORTED;
         }
         let mode = SourceMode {
-            format,
+            format: resource.format,
             ..stream.mode
         };
         let Ok(length) = mode.buffer_length() else {
@@ -345,7 +344,9 @@ impl Controller {
         if pacing.reading {
             return MEDIA_BUSY;
         }
-        if stream.pixel_mode != mode {
+        if stream.pixel_mode != mode
+            || stream.resource.is_some_and(|mode| mode.full_range) != resource.full_range
+        {
             // Both the previous and candidate allocation must fit while a
             // selection transaction is prepared; no live frame is overwritten.
             if self
@@ -355,7 +356,7 @@ impl Controller {
             {
                 return MEDIA_BUSY;
             }
-            let pixels: Arc<[u8]> = match mode.pixels() {
+            let pixels: Arc<[u8]> = match mode.pixels_with_range(resource.full_range) {
                 Ok(pixels) => pixels.into(),
                 Err(_) => return MEDIA_BACKEND_ERROR,
             };
@@ -364,7 +365,7 @@ impl Controller {
             stream.pixel_mode = mode;
             pacing.pending = None;
         }
-        stream.selected = true;
+        stream.resource = Some(resource);
         STATUS_OK
     }
 
@@ -376,7 +377,7 @@ impl Controller {
         resource: bool,
     ) -> Result<Delivery, Status> {
         let stream = self.stream(caller, id)?;
-        if resource && !stream.selected {
+        if resource && stream.resource.is_none() {
             return Err(MEDIA_UNSUPPORTED);
         }
         let mut pacing = stream.pacing.try_lock().map_err(|error| match error {
@@ -424,6 +425,7 @@ impl Controller {
             mode: stream.pixel_mode,
             pixels: stream.pixels.clone(),
             identity,
+            resource: stream.resource,
             clock_epoch: stream
                 .resource_clock
                 .as_ref()

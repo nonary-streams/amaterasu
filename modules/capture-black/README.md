@@ -2,7 +2,7 @@
 
 `amaterasu.capture-black/1` is an explicitly selected capture provider for streams
 that need input/control without reading a desktop. It uses the public version 1.8
-Capture SDK contract and exposes borrowed NV12 or P010 CPU resources. It creates no
+Capture SDK contract and exposes borrowed NV12, P010, or packed SDR RGB resources. It creates no
 threads, operating-system displays, audio routes or input devices.
 
 Trusted startup composition enables it with `{"enabled":true}` and maps the
@@ -30,6 +30,15 @@ bit depth, so an eight-bit preference can become P010 after ten-bit SDR is
 negotiated. Selection waits for an in-flight callback and atomically replaces
 only this stream's storage. Source tests do not certify hardware encoding or
 client HDR presentation.
+
+Standard CPU schema-v2 offers carry complete source color intent. Separate P010
+offers generate limited-range SDR Y=64, full-range SDR Y=0, or BT.2020/PQ HDR
+limited-range Y=64; UV remains 512. Every frame echoes the selected known tuple.
+Packed BGRA8 produces `[0,0,0,255]` with BT.709/sRGB/full metadata so the existing
+SDR conversion path can generate other encoded matrices/ranges honestly. Legacy
+v1 NV12/P010 offers retain their original IDs and unknown color state. Selecting
+a different range waits for the old borrow and rebuilds actual neutral code
+values without changing another stream or relabeling limited-range pixels.
 
 There are at most 32 active streams, 256 MiB of shared pixel storage, and 4096
 active or recently retired operation records. Closed operations remain

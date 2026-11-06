@@ -1,6 +1,7 @@
 use amaterasu_media::{CaptureGeometry, DesktopRect, PIXEL_NV12, PIXEL_P010, frame_size};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+pub mod resource;
 
 pub const SERVICE: &str = "amaterasu.capture-black/1";
 pub const MAX_STREAMS: usize = 32;
@@ -114,14 +115,18 @@ impl SourceMode {
     }
 
     pub fn stride(self) -> u32 {
-        if self.format == PIXEL_P010 {
-            self.width.saturating_mul(2)
-        } else {
-            self.width
+        match self.format {
+            PIXEL_P010 => self.width.saturating_mul(2),
+            amaterasu_media::PIXEL_BGRA8 => self.width.saturating_mul(4),
+            _ => self.width,
         }
     }
 
     pub fn pixels(self) -> Result<Box<[u8]>, &'static str> {
+        self.pixels_with_range(false)
+    }
+
+    pub fn pixels_with_range(self, full: bool) -> Result<Box<[u8]>, &'static str> {
         let length = self.buffer_length()?;
         let luma_length = self.width as usize * self.height as usize;
         let mut bytes = Vec::new();
@@ -129,14 +134,22 @@ impl SourceMode {
             .try_reserve_exact(length)
             .map_err(|_| "resource_exhausted")?;
         if self.format == PIXEL_P010 {
-            for (samples, code) in [(luma_length, 64u16), (luma_length / 2, 512u16)] {
+            for (samples, code) in [
+                (luma_length, if full { 0u16 } else { 64u16 }),
+                (luma_length / 2, 512u16),
+            ] {
                 for _ in 0..samples {
                     bytes.extend_from_slice(&(code << 6).to_le_bytes());
                 }
             }
+        } else if self.format == amaterasu_media::PIXEL_BGRA8 {
+            bytes.resize(length, 0);
+            for pixel in bytes.as_chunks_mut::<4>().0 {
+                pixel[3] = 255;
+            }
         } else {
             bytes.resize(length, 128);
-            bytes[..luma_length].fill(16);
+            bytes[..luma_length].fill(if full { 0 } else { 16 });
         }
         Ok(bytes.into_boxed_slice())
     }

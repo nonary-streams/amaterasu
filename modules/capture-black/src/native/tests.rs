@@ -174,9 +174,113 @@ unsafe extern "C" fn inspect_offer(
     );
     assert!(matches!(
         caps.format,
-        PIXEL_NV12 | amaterasu_media::PIXEL_P010
+        PIXEL_NV12 | amaterasu_media::PIXEL_P010 | amaterasu_media::PIXEL_BGRA8
     ));
+    let selected = crate::model::resource::ResourceMode::find(offer.id).unwrap();
+    assert_eq!(offer.resource.version, selected.schema());
+    if let Some(expected) = selected.color {
+        assert_eq!(
+            offer.resource.size,
+            size_of::<CpuResourceCapabilitiesV2>() as u32
+        );
+        let actual = unsafe { &*offer.resource.data.cast::<CpuResourceCapabilitiesV2>() };
+        assert_eq!(
+            (
+                actual.color.primaries,
+                actual.color.transfer,
+                actual.color.matrix,
+                actual.color.range
+            ),
+            (
+                expected.primaries,
+                expected.transfer,
+                expected.matrix,
+                expected.range
+            )
+        );
+    }
     STATUS_OK
+}
+
+unsafe extern "C" fn inspect_known_black(
+    context: *mut c_void,
+    resource: *const CaptureResourceFrame,
+) -> Status {
+    let expected = unsafe { &*context.cast::<crate::model::resource::ResourceMode>() };
+    let resource = unsafe { &*resource };
+    assert_eq!(resource.offer_id, expected.id);
+    assert_eq!(resource.resource.version, 2);
+    let color = expected.color.unwrap();
+    assert_eq!(
+        (
+            resource.color.primaries,
+            resource.color.transfer,
+            resource.color.matrix,
+            resource.color.range
+        ),
+        (color.primaries, color.transfer, color.matrix, color.range)
+    );
+    let cpu = unsafe { &*resource.resource.data.cast::<CpuFrame>() };
+    assert_eq!(cpu.format, expected.format);
+    let bytes = unsafe { cpu.bytes() }.unwrap();
+    let luma = (cpu.width * cpu.height) as usize;
+    match cpu.format {
+        amaterasu_media::PIXEL_P010 => {
+            assert!(
+                bytes[..luma * 2]
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .all(|sample| u16::from_le_bytes(*sample)
+                        == if expected.full_range { 0 } else { 64 << 6 })
+            );
+            assert!(
+                bytes[luma * 2..]
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .all(|sample| u16::from_le_bytes(*sample) == 512 << 6)
+            );
+        }
+        amaterasu_media::PIXEL_NV12 => {
+            assert!(bytes[..luma].iter().all(|value| *value == 16));
+            assert!(bytes[luma..].iter().all(|value| *value == 128));
+        }
+        amaterasu_media::PIXEL_BGRA8 => assert!(
+            bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|pixel| *pixel == [0, 0, 0, 255])
+        ),
+        _ => panic!("unsupported generated format"),
+    }
+    STATUS_OK
+}
+
+#[test]
+fn explicit_color_offers_deliver_real_sdr_full_limited_and_hdr_black_codes() {
+    for expected in crate::model::resource::MODES
+        .into_iter()
+        .filter(|mode| mode.color.is_some())
+    {
+        let (_controller, factory, id) = setup();
+        let owner = OwnedBinding::new(&factory, "video");
+        let api = owner.api();
+        let context = api.base.base.base.context;
+        assert_eq!(
+            unsafe { (api.select_resource)(context, id, id, expected.id) },
+            STATUS_OK
+        );
+        let sink = CaptureResourceFrameSink {
+            context: std::ptr::from_ref(&expected).cast_mut().cast(),
+            write: inspect_known_black,
+        };
+        assert_eq!(
+            unsafe { (api.read_resource_frame)(context, id, sink) },
+            STATUS_OK
+        );
+    }
 }
 
 #[test]
@@ -260,7 +364,7 @@ fn generic_cpu_offer_requires_exact_stream_generation_then_preserves_clock_and_p
         STATUS_OK
     );
     assert_eq!(generation, id);
-    assert_eq!(offers.calls, 2);
+    assert_eq!(offers.calls, 7);
     assert_eq!(
         unsafe { (api.select_resource)(context, id, generation + 1, 1) },
         MEDIA_UNSUPPORTED

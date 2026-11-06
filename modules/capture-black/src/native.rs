@@ -5,11 +5,11 @@ use amaterasu_media::{
     CAPTURE_FRAME_FRESH, CAPTURE_RESOURCE_INTERFACE_MINOR, CaptureApiV1_6, CaptureApiV1_7,
     CaptureApiV1_8, CaptureEventSink, CaptureFrameV1_3, CaptureGeometry, CaptureResourceFrame,
     CaptureResourceFrameSink, CaptureResourceOffer, CaptureResourceOfferSink, CpuFrame,
-    CpuResourceCapabilities, DmaBufFrameSink, DmaBufLeaseSink, FRAME_ACCESS_CPU,
-    FRAME_CLOCK_HOST_MONOTONIC, FRAME_OWNERSHIP_BORROWED, FRAME_RESOURCE_CPU, FRAME_SYNC_NONE,
-    FrameClockMetadata, FrameDescriptor, FrameSink, FreshFrameSinkV1_2, FreshFrameSinkV1_3,
-    INTERFACE_MAJOR, MEDIA_BACKEND_ERROR, MEDIA_BUSY, MEDIA_UNSUPPORTED, PresentationStatus,
-    host_monotonic_micros,
+    CpuResourceCapabilities, CpuResourceCapabilitiesV2, DmaBufFrameSink, DmaBufLeaseSink,
+    FRAME_ACCESS_CPU, FRAME_CLOCK_HOST_MONOTONIC, FRAME_OWNERSHIP_BORROWED, FRAME_RESOURCE_CPU,
+    FRAME_SYNC_NONE, FrameClockMetadata, FrameDescriptor, FrameSink, FreshFrameSinkV1_2,
+    FreshFrameSinkV1_3, INTERFACE_MAJOR, MEDIA_BACKEND_ERROR, MEDIA_BUSY, MEDIA_UNSUPPORTED,
+    PresentationStatus, host_monotonic_micros,
 };
 use amaterasu_module_sdk::abi::{
     AbiHeader, BorrowedBytes, NativeInterface, NativeInterfaceQuery, NativeServiceFactory,
@@ -292,35 +292,42 @@ unsafe extern "C" fn enumerate_resources(
                 Err(status) => return status,
             }
         };
-        for (id, format) in [
-            (1, amaterasu_media::PIXEL_NV12),
-            (2, amaterasu_media::PIXEL_P010),
-        ] {
-            if (crate::model::SourceMode { format, ..mode })
-                .buffer_length()
-                .is_err()
+        for resource in crate::model::resource::MODES {
+            if (crate::model::SourceMode {
+                format: resource.format,
+                ..mode
+            })
+            .buffer_length()
+            .is_err()
             {
                 continue;
             }
-            let capabilities = CpuResourceCapabilities {
-                format,
-                min_width: mode.width,
-                max_width: mode.width,
-                min_height: mode.height,
-                max_height: mode.height,
+            let capabilities = CpuResourceCapabilitiesV2 {
+                base: CpuResourceCapabilities {
+                    format: resource.format,
+                    min_width: mode.width,
+                    max_width: mode.width,
+                    min_height: mode.height,
+                    max_height: mode.height,
+                },
+                color: resource.color.unwrap_or_default(),
             };
             let offer = CaptureResourceOffer {
-                id,
+                id: resource.id,
                 ownership: FRAME_OWNERSHIP_BORROWED,
                 accessibility: FRAME_ACCESS_CPU,
                 reserved: 0,
                 resource: FrameDescriptor {
                     kind: FRAME_RESOURCE_CPU,
-                    version: 1,
-                    size: size_of::<CpuResourceCapabilities>() as u32,
+                    version: resource.schema(),
+                    size: if resource.color.is_some() {
+                        size_of::<CpuResourceCapabilitiesV2>()
+                    } else {
+                        size_of::<CpuResourceCapabilities>()
+                    } as u32,
                     reserved: 0,
                     namespace: [0; 16],
-                    data: (&capabilities as *const CpuResourceCapabilities).cast(),
+                    data: (&capabilities as *const CpuResourceCapabilitiesV2).cast(),
                 },
                 acquire_sync: none_descriptor(),
                 completion_sync: none_descriptor(),
@@ -365,6 +372,9 @@ unsafe extern "C" fn read_resource_frame(
 ) -> Status {
     guarded(|| {
         deliver(context, stream, true, |delivery, frame| {
+            let selected = delivery
+                .resource
+                .expect("resource delivery requires selection");
             let clock = delivery
                 .clock_epoch
                 .map_or_else(FrameClockMetadata::default, |epoch_id| FrameClockMetadata {
@@ -376,11 +386,7 @@ unsafe extern "C" fn read_resource_frame(
                 });
             let offered = CaptureResourceFrame {
                 offer_generation: stream,
-                offer_id: if frame.format == amaterasu_media::PIXEL_P010 {
-                    2
-                } else {
-                    1
-                },
+                offer_id: selected.id,
                 timestamp_us: frame.timestamp_us,
                 capture_pacing_timestamp_us: frame.timestamp_us,
                 sequence: frame.sequence,
@@ -388,14 +394,12 @@ unsafe extern "C" fn read_resource_frame(
                 height: frame.height,
                 freshness: CAPTURE_FRAME_FRESH,
                 reserved: 0,
-                // The CPU bridge has no color-conversion contract. Generated
-                // neutral codes are limited-range; encoded color is negotiated upstream.
-                color: Default::default(),
+                color: selected.color.unwrap_or_default(),
                 clock,
                 pacing_clock: clock,
                 resource: FrameDescriptor {
                     kind: FRAME_RESOURCE_CPU,
-                    version: 1,
+                    version: selected.schema(),
                     size: size_of::<CpuFrame>() as u32,
                     reserved: 0,
                     namespace: [0; 16],

@@ -157,7 +157,7 @@ fn admission_and_lookup_are_owner_scoped_and_retries_preserve_stream_identity() 
     assert!(controller.mode("other", id).is_err());
     assert_eq!(controller.close("other", id, 1_000_003), Err("not_found"));
     assert_eq!(controller.select("first", id, id + 1, 1), MEDIA_UNSUPPORTED);
-    assert_eq!(controller.select("first", id, id, 3), MEDIA_UNSUPPORTED);
+    assert_eq!(controller.select("first", id, id, 8), MEDIA_UNSUPPORTED);
     assert_eq!(controller.select("first", id, id, 1), STATUS_OK);
     let conflict = controller.handle(
         "first",
@@ -215,6 +215,32 @@ fn rejected_delivery_retries_exact_identity_and_cadence_does_not_accumulate_a_qu
     let next = controller.prepare("owner", id, 2_016_666, false).unwrap();
     assert_eq!(next.identity.sequence, 62);
     next.finish(STATUS_OK);
+}
+
+#[test]
+fn range_selection_waits_for_the_old_borrow_then_rebuilds_real_neutral_codes() {
+    let mut controller = Controller::new(true);
+    let id = open(&mut controller, "video", "range", 1_000_000);
+    assert_eq!(controller.select("video", id, id, 4), STATUS_OK);
+    let old = controller.prepare("video", id, 1_000_000, true).unwrap();
+    assert_eq!(
+        u16::from_le_bytes(old.pixels[..2].try_into().unwrap()),
+        64 << 6
+    );
+    assert_eq!(controller.select("video", id, id, 5), MEDIA_BUSY);
+    old.finish(STATUS_OK);
+    assert_eq!(controller.select("video", id, id, 5), STATUS_OK);
+    let full = controller.prepare("video", id, 1_016_667, true).unwrap();
+    assert_eq!(u16::from_le_bytes(full.pixels[..2].try_into().unwrap()), 0);
+    assert_eq!(full.resource.unwrap().id, 5);
+    full.finish(STATUS_OK);
+    assert_eq!(controller.select("video", id, id, 6), STATUS_OK);
+    let hdr = controller.prepare("video", id, 1_033_334, true).unwrap();
+    assert_eq!(
+        u16::from_le_bytes(hdr.pixels[..2].try_into().unwrap()),
+        64 << 6
+    );
+    assert_eq!(hdr.resource.unwrap().id, 6);
 }
 
 #[test]
