@@ -9,9 +9,11 @@ use crate::{
 };
 use amaterasu_media::{AUDIO_SILENT, AUDIO_TIMESTAMP_ESTIMATED, PCM_F32};
 use cleanup_journal::{
-    CleanupJournal, CleanupState, RouteIntent, RouteRestoreAction, SinkCleanupAction, SinkIntent,
-    SinkObservation, can_add_sink_intent, can_start_sink_load, deactivate_prior_process_sinks,
-    has_unquiesced_sink_load, route_restore_action, sink_cleanup_action, sink_cleanup_requested,
+    CleanupJournal, CleanupState, RouteIntent, RouteRestoreAction, ServerIdentity,
+    SinkCleanupAction, SinkIntent, SinkObservation, can_add_sink_intent, can_start_sink_load,
+    deactivate_prior_process_sinks, has_unquiesced_sink_load, route_restore_action,
+    sink_cleanup_action, sink_cleanup_action_on_server, sink_cleanup_requested,
+    validate_sink_intent_replacement,
 };
 use cleanup_retry::{SinkCleanupCoordinator, UnloadEvidence};
 use std::{
@@ -176,6 +178,20 @@ struct PaServerInfo {
     channel_map: PaChannelMap,
 }
 
+#[allow(
+    dead_code,
+    reason = "fields preserve the installed libpulse C ABI layout"
+)]
+#[repr(C)]
+struct PaModuleInfo {
+    index: u32,
+    name: *const c_char,
+    argument: *const c_char,
+    n_used: u32,
+    auto_unload: c_int,
+    proplist: *mut PaProplist,
+}
+
 #[link(name = "pulse")]
 unsafe extern "C" {
     fn pa_mainloop_new() -> *mut PaMainloop;
@@ -194,6 +210,14 @@ unsafe extern "C" {
     fn pa_context_disconnect(context: *mut PaContext);
     fn pa_context_get_state(context: *const PaContext) -> c_int;
     fn pa_context_errno(context: *const PaContext) -> c_int;
+    fn pa_context_get_server(context: *const PaContext) -> *const c_char;
+    fn pa_context_get_module_info_list(
+        context: *mut PaContext,
+        callback: Option<
+            unsafe extern "C" fn(*mut PaContext, *const PaModuleInfo, c_int, *mut c_void),
+        >,
+        userdata: *mut c_void,
+    ) -> *mut PaOperation;
     fn pa_context_get_server_info(
         context: *mut PaContext,
         callback: Option<unsafe extern "C" fn(*mut PaContext, *const PaServerInfo, *mut c_void)>,
@@ -268,6 +292,23 @@ struct ServerInfoResult {
     completed: bool,
     failed: bool,
     default_sink: Option<String>,
+    instance_cookie: Option<u32>,
+}
+
+struct ModulePresenceResult {
+    target_index: u32,
+    present: bool,
+    completed: bool,
+    failed: bool,
+}
+
+impl ModulePresenceResult {
+    fn presence(&self) -> AudioResult<bool> {
+        if self.failed || !self.completed {
+            return Err("audio_module_inventory_unavailable");
+        }
+        Ok(self.present)
+    }
 }
 
 struct PendingServerInfoQuery {
@@ -761,6 +802,44 @@ impl PulseClient {
         Ok(result)
     }
 
+    fn server_identity(&mut self) -> AudioResult<ServerIdentity> {
+        // SAFETY: libpulse returns the resolved server string owned by this
+        // connected context. Copy it before any callback or context teardown.
+        let address = unsafe { c_string(pa_context_get_server(self.context)) }
+            .filter(|address| !address.is_empty() && address.len() <= 1024)
+            .ok_or("audio_server_identity_unavailable")?;
+        let instance_cookie = self
+            .server_info()?
+            .instance_cookie
+            .ok_or("audio_server_identity_unavailable")?;
+        // pa_server_info.cookie identifies a server instance, not the separate
+        // authentication cookie. Match both it and the resolved endpoint before
+        // interpreting a persisted module index on another connection.
+        Ok(ServerIdentity {
+            address,
+            instance_cookie,
+        })
+    }
+
+    fn module_index_present(&mut self, target_index: u32) -> AudioResult<bool> {
+        let mut result = Box::new(ModulePresenceResult {
+            target_index,
+            present: false,
+            completed: false,
+            failed: false,
+        });
+        // SAFETY: this client owns the operation; heap callback state is kept
+        // until successful completion or retained through canceled teardown.
+        let operation = unsafe {
+            pa_context_get_module_info_list(
+                self.context,
+                Some(module_info_callback),
+                (&mut *result as *mut ModulePresenceResult).cast(),
+            )
+        };
+        self.wait_operation(operation, result)?.presence()
+    }
+
     fn sinks(&mut self) -> AudioResult<Vec<Sink>> {
         self.sinks_with_timeout(CONTROL_TIMEOUT)
     }
@@ -985,6 +1064,8 @@ unsafe extern "C" fn server_info_callback(
         }
         // SAFETY: libpulse keeps the info and its string fields live for this callback.
         result.default_sink = unsafe { c_string((*info).default_sink_name) };
+        // SAFETY: the server info is live for this callback; copy the scalar.
+        result.instance_cookie = Some(unsafe { (*info).cookie });
     }));
 }
 
@@ -1011,6 +1092,28 @@ unsafe extern "C" fn sink_info_callback(
         } else {
             result.failed = true;
         }
+    }));
+}
+
+unsafe extern "C" fn module_info_callback(
+    _context: *mut PaContext,
+    info: *const PaModuleInfo,
+    end_of_list: c_int,
+    userdata: *mut c_void,
+) {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        if userdata.is_null() {
+            return;
+        }
+        // SAFETY: userdata is the boxed query result kept alive by PulseClient.
+        let result = unsafe { &mut *userdata.cast::<ModulePresenceResult>() };
+        if info.is_null() {
+            result.completed = end_of_list > 0;
+            result.failed |= end_of_list < 0;
+            return;
+        }
+        // SAFETY: the native module descriptor remains live for the callback.
+        result.present |= unsafe { (*info).index == result.target_index };
     }));
 }
 
@@ -1198,13 +1301,13 @@ pub(super) struct ManagedVirtualSink {
 
 impl ManagedVirtualSink {
     fn ensure(&self, client: &mut PulseClient) -> AudioResult<()> {
-        if read_cleanup_state()?
-            .sinks
-            .get(&self.name)
-            .is_some_and(|intent| intent.module_index.is_none() && !intent.load_quiesced)
-        {
+        let state = read_cleanup_state()?;
+        let existing = state.sinks.get(&self.name);
+        if existing.is_some_and(|intent| intent.module_index.is_none() && !intent.load_quiesced) {
             return Err("audio_sink_load_pending");
         }
+        let server_identity = client.server_identity()?;
+        validate_sink_intent_replacement(existing, &self.owner_token, Some(&server_identity))?;
         let sinks = client.sinks()?;
         if sinks.iter().any(|sink| {
             sink.endpoint.id == self.name
@@ -1215,7 +1318,14 @@ impl ManagedVirtualSink {
         if sinks.iter().any(|sink| sink.endpoint.id == self.name) {
             return Err("virtual_sink_name_conflict");
         }
-        persist_sink_intent(&self.name, &self.owner_token, None, false, true)?;
+        persist_sink_intent(
+            &self.name,
+            &self.owner_token,
+            Some(&server_identity),
+            None,
+            false,
+            true,
+        )?;
         let index = match client.load_null_sink(&self.name, self.channels, &self.owner_token) {
             Ok(index) => index,
             Err(error) => {
@@ -1226,9 +1336,14 @@ impl ManagedVirtualSink {
                 return Err(error);
             }
         };
-        if let Err(error) =
-            persist_sink_intent(&self.name, &self.owner_token, Some(index), true, false)
-        {
+        if let Err(error) = persist_sink_intent(
+            &self.name,
+            &self.owner_token,
+            Some(&server_identity),
+            Some(index),
+            true,
+            false,
+        ) {
             let _ = request_sink_cleanup(&self.name, &self.owner_token);
             retry_virtual_sink_cleanups_with_client(client, Some(&self.name));
             return Err(error);
@@ -1305,6 +1420,7 @@ fn update_cleanup_state(update: impl FnOnce(&mut CleanupState)) -> AudioResult<(
 fn persist_sink_intent(
     name: &str,
     owner_token: &str,
+    server_identity: Option<&ServerIdentity>,
     module_index: Option<u32>,
     lease_active: bool,
     cleanup_requested: bool,
@@ -1320,6 +1436,7 @@ fn persist_sink_intent(
         .as_mut()
         .ok_or("audio_cleanup_journal_unavailable")?
         .update(|state| {
+            validate_sink_intent_replacement(state.sinks.get(name), owner_token, server_identity)?;
             if !can_add_sink_intent(state, name) {
                 return Err("audio_cleanup_journal_capacity_reached");
             }
@@ -1327,6 +1444,7 @@ fn persist_sink_intent(
                 name.to_owned(),
                 SinkIntent {
                     owner_token: owner_token.to_owned(),
+                    server_identity: server_identity.cloned(),
                     module_index,
                     lease_active,
                     cleanup_requested,
@@ -1398,6 +1516,7 @@ fn record_sink_unload_evidence(
     name: &str,
     owner_token: &str,
     module_index: u32,
+    server_identity: Option<&ServerIdentity>,
     evidence: UnloadEvidence,
 ) -> AudioResult<()> {
     let _guard = cleanup_journal_lock()
@@ -1410,7 +1529,7 @@ fn record_sink_unload_evidence(
     journal
         .as_mut()
         .ok_or("audio_cleanup_journal_unavailable")?
-        .record_unload(name, owner_token, module_index, evidence)
+        .record_unload(name, owner_token, module_index, server_identity, evidence)
 }
 
 fn remove_sink_intent(name: &str, owner_token: &str) -> AudioResult<()> {
@@ -1571,6 +1690,46 @@ fn retry_deferred_sink_cleanup() -> AudioResult<()> {
         .retry_pending()
 }
 
+fn reconcile_absent_sink_module(
+    client: &mut PulseClient,
+    name: &str,
+    intent: &SinkIntent,
+) -> AudioResult<()> {
+    let Some(expected_server) = intent.server_identity.as_ref() else {
+        return Ok(());
+    };
+    let Some(module_index) = intent
+        .module_index
+        .filter(|_| intent.load_quiesced && sink_cleanup_requested(intent))
+    else {
+        return Ok(());
+    };
+    let current_server = client.server_identity()?;
+    if &current_server != expected_server || client.module_index_present(module_index)? {
+        return Ok(());
+    }
+    // A complete module inventory plus this sink readback proves physical
+    // retirement. A lost unload reply alone is not completion, and a query on
+    // a different server cannot interpret this saved native module index.
+    if client.sinks()?.iter().any(|sink| sink.endpoint.id == name) {
+        return Ok(());
+    }
+    let observation = SinkObservation::SinkAndModuleAbsent {
+        server_identity: &current_server,
+        module_index,
+    };
+    if sink_cleanup_action(intent, observation) != SinkCleanupAction::ClearConfirmedAbsent {
+        return Ok(());
+    }
+    update_cleanup_state(|state| {
+        // Do not retire a changed owner, module, server, or reacquired lease
+        // using a proof collected for the previous intent.
+        if state.sinks.get(name) == Some(intent) {
+            state.sinks.remove(name);
+        }
+    })
+}
+
 fn retry_virtual_sink_cleanups_with_client(client: &mut PulseClient, name_filter: Option<&str>) {
     if retry_deferred_sink_cleanup().is_err() {
         return;
@@ -1604,8 +1763,17 @@ fn retry_virtual_sink_cleanups_with_client(client: &mut PulseClient, name_filter
                 None => SinkObservation::Foreign,
             }
         });
-        match sink_cleanup_action(&intent, observation) {
-            SinkCleanupAction::KeepTombstone => continue,
+        let current_server = intent
+            .server_identity
+            .as_ref()
+            .and_then(|_| client.server_identity().ok());
+        match sink_cleanup_action_on_server(&intent, current_server.as_ref(), observation) {
+            SinkCleanupAction::KeepTombstone => {
+                if observation == SinkObservation::Absent {
+                    let _ = reconcile_absent_sink_module(client, &name, &intent);
+                }
+                continue;
+            }
             SinkCleanupAction::ClearConfirmedAbsent => {
                 let _ = remove_sink_intent(&name, &intent.owner_token);
                 continue;
@@ -1615,6 +1783,7 @@ fn retry_virtual_sink_cleanups_with_client(client: &mut PulseClient, name_filter
                     && persist_sink_intent(
                         &name,
                         &intent.owner_token,
+                        intent.server_identity.as_ref(),
                         Some(module_index),
                         false,
                         true,
@@ -1632,6 +1801,7 @@ fn retry_virtual_sink_cleanups_with_client(client: &mut PulseClient, name_filter
                             &name,
                             &intent.owner_token,
                             module_index,
+                            intent.server_identity.as_ref(),
                             UnloadEvidence::Quiesced,
                         );
                     } else {
@@ -1641,6 +1811,7 @@ fn retry_virtual_sink_cleanups_with_client(client: &mut PulseClient, name_filter
                     &name,
                     &intent.owner_token,
                     module_index,
+                    intent.server_identity.as_ref(),
                     UnloadEvidence::Confirmed,
                 )
                 .is_err()
@@ -1736,7 +1907,8 @@ fn managed_virtual_sink(
     if client.sinks()?.iter().any(|sink| sink.endpoint.id == name) {
         return Err("virtual_sink_name_conflict");
     }
-    persist_sink_intent(&name, &token, None, false, true)?;
+    let server_identity = client.server_identity()?;
+    persist_sink_intent(&name, &token, Some(&server_identity), None, false, true)?;
     let index = match client.load_null_sink(&name, channels, &token) {
         Ok(index) => index,
         Err(error) => {
@@ -1747,7 +1919,14 @@ fn managed_virtual_sink(
             return Err(error);
         }
     };
-    if let Err(error) = persist_sink_intent(&name, &token, Some(index), true, false) {
+    if let Err(error) = persist_sink_intent(
+        &name,
+        &token,
+        Some(&server_identity),
+        Some(index),
+        true,
+        false,
+    ) {
         let _ = request_sink_cleanup(&name, &token);
         retry_virtual_sink_cleanups_with_client(client, Some(&name));
         return Err(error);
@@ -2818,6 +2997,73 @@ mod tests {
     }
 
     #[test]
+    fn module_inventory_requires_successful_end_of_list_and_preserves_present_indexes() {
+        let mut result = ModulePresenceResult {
+            target_index: 71,
+            present: false,
+            completed: false,
+            failed: false,
+        };
+        assert!(
+            result.presence().is_err(),
+            "partial inventory cannot prove absence"
+        );
+        let module = PaModuleInfo {
+            index: 71,
+            name: ptr::null(),
+            argument: ptr::null(),
+            n_used: 0,
+            auto_unload: 0,
+            proplist: ptr::null_mut(),
+        };
+        // SAFETY: callback descriptor and output state are live test allocations.
+        unsafe {
+            module_info_callback(
+                ptr::null_mut(),
+                &module,
+                0,
+                (&mut result as *mut ModulePresenceResult).cast(),
+            );
+        }
+        assert!(result.presence().is_err());
+        // A matching index may be a foreign/reused module; either way it forbids
+        // declaring absence. The inventory does not authorize unloading it.
+        unsafe {
+            module_info_callback(
+                ptr::null_mut(),
+                ptr::null(),
+                1,
+                (&mut result as *mut ModulePresenceResult).cast(),
+            );
+        }
+        assert_eq!(result.presence(), Ok(true));
+        result.present = false;
+        result.completed = false;
+        unsafe {
+            module_info_callback(
+                ptr::null_mut(),
+                ptr::null(),
+                -1,
+                (&mut result as *mut ModulePresenceResult).cast(),
+            );
+        }
+        assert!(
+            result.presence().is_err(),
+            "failed inventory cannot prove absence"
+        );
+        result.failed = false;
+        unsafe {
+            module_info_callback(
+                ptr::null_mut(),
+                ptr::null(),
+                1,
+                (&mut result as *mut ModulePresenceResult).cast(),
+            );
+        }
+        assert_eq!(result.presence(), Ok(false));
+    }
+
+    #[test]
     fn context_connect_wait_accepts_every_documented_transition_state() {
         for state in [
             PA_CONTEXT_UNCONNECTED,
@@ -3478,6 +3724,8 @@ mod abi_size_tests {
 
     #[test]
     fn pulse_wire_structs_match_x86_64_header_layout() {
+        assert_eq!(size_of::<PaModuleInfo>(), 40);
+        assert_eq!(std::mem::offset_of!(PaModuleInfo, proplist), 32);
         assert_eq!(size_of::<PaSampleSpec>(), 12);
         assert_eq!(size_of::<PaChannelMap>(), 132);
         assert_eq!(size_of::<PaCVolume>(), 132);

@@ -1,5 +1,5 @@
 //! Retains exact-owner cleanup evidence until the durable journal accepts it.
-use super::cleanup_journal::{CleanupJournal, CleanupState, MAX_SINK_INTENTS};
+use super::cleanup_journal::{CleanupJournal, CleanupState, MAX_SINK_INTENTS, ServerIdentity};
 use crate::model::AudioResult;
 use std::collections::BTreeMap;
 
@@ -28,7 +28,7 @@ pub(super) enum UnloadEvidence {
 struct PendingCleanup {
     owner_token: String,
     retirement_requested: bool,
-    unload: Option<(u32, UnloadEvidence)>,
+    unload: Option<(u32, Option<ServerIdentity>, UnloadEvidence)>,
 }
 
 pub(super) struct SinkCleanupCoordinator<S = CleanupJournal> {
@@ -71,8 +71,9 @@ impl<S: CleanupStore> SinkCleanupCoordinator<S> {
                 intent.lease_active = false;
                 intent.cleanup_requested = true;
             }
-            if let Some((module_index, evidence)) = pending.unload
-                && intent.module_index == Some(module_index)
+            if let Some((module_index, server_identity, evidence)) = &pending.unload
+                && intent.module_index == Some(*module_index)
+                && &intent.server_identity == server_identity
             {
                 match evidence {
                     UnloadEvidence::Confirmed => intent.unload_confirmed = true,
@@ -127,25 +128,31 @@ impl<S: CleanupStore> SinkCleanupCoordinator<S> {
         name: &str,
         owner_token: &str,
         module_index: u32,
+        server_identity: Option<&ServerIdentity>,
         evidence: UnloadEvidence,
     ) -> AudioResult<()> {
         let pending = self.pending_for(name, owner_token)?;
         if pending
             .unload
-            .is_some_and(|(expected, _)| expected != module_index)
+            .as_ref()
+            .is_some_and(|(expected, expected_server, _)| {
+                *expected != module_index || expected_server.as_ref() != server_identity
+            })
         {
             return Err("audio_cleanup_journal_conflict");
         }
         // Evidence comes only from the unload callback or an ordered round trip
         // on that command's original client. A replacement connection or an
         // absent observation cannot manufacture it.
-        pending.unload = Some((module_index, evidence));
+        pending.unload = Some((module_index, server_identity.cloned(), evidence));
         self.update(|state| {
             state
                 .sinks
                 .get(name)
                 .filter(|intent| {
-                    intent.owner_token == owner_token && intent.module_index == Some(module_index)
+                    intent.owner_token == owner_token
+                        && intent.module_index == Some(module_index)
+                        && intent.server_identity.as_ref() == server_identity
                 })
                 .ok_or("audio_cleanup_journal_conflict")?;
             Ok(())
@@ -232,7 +239,7 @@ mod tests {
             intent.unload_submitted = true;
             let mut coordinator = coordinator(intent);
             assert_eq!(
-                coordinator.record_unload("owned-sink", "owner-1", 71, evidence),
+                coordinator.record_unload("owned-sink", "owner-1", 71, None, evidence),
                 Err("audio_cleanup_journal_unavailable")
             );
             assert!(
@@ -288,7 +295,7 @@ mod tests {
             let mut coordinator = coordinator(intent);
             assert!(
                 coordinator
-                    .record_unload("owned-sink", "owner-1", 71, UnloadEvidence::Confirmed)
+                    .record_unload("owned-sink", "owner-1", 71, None, UnloadEvidence::Confirmed)
                     .is_err()
             );
             // Model another native owner, or a new native module instance with
@@ -366,5 +373,40 @@ mod tests {
             &original.read().unwrap().sinks["owned-sink"]
         ));
         assert!(replacement.read().unwrap().sinks["owned-sink"].lease_active);
+    }
+    #[test]
+    fn deferred_unload_evidence_does_not_cross_server_identity() {
+        let server = ServerIdentity {
+            address: "unix:/private/pulse/native".into(),
+            instance_cookie: 19,
+        };
+        let mut intent = owned_intent();
+        intent.server_identity = Some(server.clone());
+        let mut coordinator = coordinator(intent);
+        assert!(
+            coordinator
+                .record_unload(
+                    "owned-sink",
+                    "owner-1",
+                    71,
+                    Some(&server),
+                    UnloadEvidence::Confirmed
+                )
+                .is_err()
+        );
+        coordinator
+            .store
+            .durable
+            .borrow_mut()
+            .sinks
+            .get_mut("owned-sink")
+            .unwrap()
+            .server_identity
+            .as_mut()
+            .unwrap()
+            .instance_cookie += 1;
+        coordinator.retry_pending().unwrap();
+        assert!(!coordinator.read().unwrap().sinks["owned-sink"].unload_confirmed);
+        assert!(!coordinator.has_deferred_cleanup());
     }
 }

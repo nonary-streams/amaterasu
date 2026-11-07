@@ -30,9 +30,16 @@ pub(super) struct CleanupState {
     pub(super) route: Option<RouteIntent>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ServerIdentity {
+    pub(super) address: String,
+    pub(super) instance_cookie: u32,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct SinkIntent {
     pub(super) owner_token: String,
+    pub(super) server_identity: Option<ServerIdentity>,
     pub(super) module_index: Option<u32>,
     pub(super) lease_active: bool,
     pub(super) cleanup_requested: bool,
@@ -190,6 +197,10 @@ fn encode_state(state: &CleanupState) -> Result<Vec<u8>, &'static str> {
                 json!({
                     "owner_token": intent.owner_token,
                     "module_index": intent.module_index,
+                    "server_identity": intent.server_identity.as_ref().map(|identity| json!({
+                        "address": identity.address,
+                        "instance_cookie": identity.instance_cookie,
+                    })),
                     "lease_active": intent.lease_active,
                     "cleanup_requested": intent.cleanup_requested,
                     "load_quiesced": intent.load_quiesced,
@@ -244,7 +255,11 @@ fn decode_state(bytes: &[u8]) -> Result<CleanupState, &'static str> {
         }
         let item = value
             .as_object()
-            .filter(|object| object.len() == 6 || object.len() == 8)
+            .filter(|object| match object.len() {
+                6 | 8 => !object.contains_key("server_identity"),
+                9 => object.contains_key("server_identity"),
+                _ => false,
+            })
             .ok_or("audio_cleanup_journal_corrupt")?;
         let owner_token = item
             .get("owner_token")
@@ -261,6 +276,30 @@ fn decode_state(bytes: &[u8]) -> Result<CleanupState, &'static str> {
                     .ok_or("audio_cleanup_journal_corrupt")?,
             ),
             None => return Err("audio_cleanup_journal_corrupt"),
+        };
+        let server_identity = match item.get("server_identity") {
+            None | Some(Value::Null) => None,
+            Some(value) => {
+                let identity = value
+                    .as_object()
+                    .filter(|identity| identity.len() == 2)
+                    .ok_or("audio_cleanup_journal_corrupt")?;
+                let address = identity
+                    .get("address")
+                    .and_then(Value::as_str)
+                    .filter(|address| !address.is_empty() && address.len() <= 1024)
+                    .ok_or("audio_cleanup_journal_corrupt")?
+                    .to_owned();
+                let instance_cookie = identity
+                    .get("instance_cookie")
+                    .and_then(Value::as_u64)
+                    .and_then(|cookie| u32::try_from(cookie).ok())
+                    .ok_or("audio_cleanup_journal_corrupt")?;
+                Some(ServerIdentity {
+                    address,
+                    instance_cookie,
+                })
+            }
         };
         let unload_submitted = item
             .get("unload_submitted")
@@ -284,6 +323,7 @@ fn decode_state(bytes: &[u8]) -> Result<CleanupState, &'static str> {
             name.clone(),
             SinkIntent {
                 owner_token,
+                server_identity,
                 module_index,
                 lease_active,
                 cleanup_requested,
@@ -646,6 +686,292 @@ mod tests {
     }
 
     #[test]
+    fn crashed_unload_retires_only_after_same_server_native_module_absence() {
+        let server_identity = ServerIdentity {
+            address: "unix:/private/pulse/native".into(),
+            instance_cookie: 19,
+        };
+        let intent = SinkIntent {
+            owner_token: "owner-1".into(),
+            server_identity: Some(server_identity.clone()),
+            module_index: Some(71),
+            lease_active: false,
+            cleanup_requested: true,
+            load_quiesced: true,
+            unload_submitted: true,
+            ..SinkIntent::default()
+        };
+        // A crash loses the successful callback before the journal records it.
+        assert_eq!(
+            sink_cleanup_action(&intent, SinkObservation::Absent),
+            SinkCleanupAction::KeepTombstone
+        );
+        assert_eq!(
+            sink_cleanup_action(
+                &intent,
+                SinkObservation::SinkAndModuleAbsent {
+                    server_identity: &server_identity,
+                    module_index: 71
+                }
+            ),
+            SinkCleanupAction::ClearConfirmedAbsent
+        );
+    }
+
+    #[test]
+    fn native_absence_proof_refuses_wrong_server_index_or_unfinished_load() {
+        let server = ServerIdentity {
+            address: "unix:/private/pulse/native".into(),
+            instance_cookie: 19,
+        };
+        let known = SinkIntent {
+            owner_token: "owner-1".into(),
+            server_identity: Some(server.clone()),
+            module_index: Some(71),
+            load_quiesced: true,
+            cleanup_requested: true,
+            unload_submitted: true,
+            ..SinkIntent::default()
+        };
+        for changed_server in [
+            ServerIdentity {
+                instance_cookie: 20,
+                ..server.clone()
+            },
+            ServerIdentity {
+                address: "unix:/another/pulse/native".into(),
+                ..server.clone()
+            },
+        ] {
+            assert_eq!(
+                sink_cleanup_action(
+                    &known,
+                    SinkObservation::SinkAndModuleAbsent {
+                        server_identity: &changed_server,
+                        module_index: 71
+                    }
+                ),
+                SinkCleanupAction::KeepTombstone
+            );
+        }
+        assert_eq!(
+            sink_cleanup_action(
+                &known,
+                SinkObservation::SinkAndModuleAbsent {
+                    server_identity: &server,
+                    module_index: 72
+                }
+            ),
+            SinkCleanupAction::KeepTombstone
+        );
+        for unsafe_intent in [
+            SinkIntent {
+                server_identity: None,
+                ..known.clone()
+            },
+            SinkIntent {
+                module_index: None,
+                ..known.clone()
+            },
+            SinkIntent {
+                load_quiesced: false,
+                ..known.clone()
+            },
+            SinkIntent {
+                lease_active: true,
+                ..known.clone()
+            },
+            SinkIntent {
+                cleanup_requested: false,
+                ..known.clone()
+            },
+        ] {
+            assert_eq!(
+                sink_cleanup_action(
+                    &unsafe_intent,
+                    SinkObservation::SinkAndModuleAbsent {
+                        server_identity: &server,
+                        module_index: 71
+                    }
+                ),
+                SinkCleanupAction::KeepTombstone
+            );
+        }
+        assert_eq!(
+            sink_cleanup_action(&known, SinkObservation::Foreign),
+            SinkCleanupAction::KeepTombstone
+        );
+        assert_eq!(
+            sink_cleanup_action(
+                &known,
+                SinkObservation::Owned {
+                    owner_token: "foreign-owner",
+                    module_index: 71
+                }
+            ),
+            SinkCleanupAction::KeepTombstone
+        );
+    }
+
+    #[test]
+    fn server_identity_roundtrips_and_legacy_journals_remain_without_identity() {
+        let server = ServerIdentity {
+            address: "unix:/private/pulse/native".into(),
+            instance_cookie: 19,
+        };
+        let state = CleanupState {
+            sinks: BTreeMap::from([(
+                "owned-sink".into(),
+                SinkIntent {
+                    owner_token: "owner-1".into(),
+                    server_identity: Some(server),
+                    module_index: Some(71),
+                    load_quiesced: true,
+                    cleanup_requested: true,
+                    unload_submitted: true,
+                    ..SinkIntent::default()
+                },
+            )]),
+            route: None,
+        };
+        let encoded = encode_state(&state).unwrap();
+        assert_eq!(decode_state(&encoded).unwrap(), state);
+        let mut legacy: Value = serde_json::from_slice(&encoded).unwrap();
+        legacy["sinks"]["owned-sink"]
+            .as_object_mut()
+            .unwrap()
+            .remove("server_identity");
+        let decoded = decode_state(&serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert!(decoded.sinks["owned-sink"].server_identity.is_none());
+        assert_eq!(
+            sink_cleanup_action(&decoded.sinks["owned-sink"], SinkObservation::Absent),
+            SinkCleanupAction::KeepTombstone
+        );
+        for invalid_identity in [
+            json!({"address":"", "instance_cookie":19}),
+            json!({"address":"x".repeat(1025), "instance_cookie":19}),
+            json!({"address":"unix:/private/pulse/native", "instance_cookie":u64::from(u32::MAX)+1}),
+            json!({"address":"unix:/private/pulse/native"}),
+        ] {
+            legacy["sinks"]["owned-sink"]["server_identity"] = invalid_identity;
+            assert!(decode_state(&serde_json::to_vec(&legacy).unwrap()).is_err());
+        }
+    }
+
+    #[test]
+    fn every_identity_bearing_absence_path_requires_the_original_server() {
+        let server = ServerIdentity {
+            address: "unix:/private/pulse/native".into(),
+            instance_cookie: 19,
+        };
+        let known = SinkIntent {
+            owner_token: "owner-1".into(),
+            server_identity: Some(server.clone()),
+            module_index: Some(71),
+            load_quiesced: true,
+            cleanup_requested: true,
+            ..SinkIntent::default()
+        };
+        for intent in [
+            known.clone(),
+            SinkIntent {
+                unload_submitted: true,
+                unload_confirmed: true,
+                ..known.clone()
+            },
+        ] {
+            assert_eq!(
+                sink_cleanup_action(&intent, SinkObservation::Absent),
+                SinkCleanupAction::ClearConfirmedAbsent
+            );
+            for other_server in [
+                ServerIdentity {
+                    instance_cookie: 20,
+                    ..server.clone()
+                },
+                ServerIdentity {
+                    address: "unix:/another/pulse/native".into(),
+                    ..server.clone()
+                },
+            ] {
+                assert_eq!(
+                    sink_cleanup_action_on_server(
+                        &intent,
+                        Some(&other_server),
+                        SinkObservation::Absent
+                    ),
+                    SinkCleanupAction::KeepTombstone
+                );
+                assert_eq!(
+                    sink_cleanup_action_on_server(
+                        &intent,
+                        Some(&other_server),
+                        SinkObservation::Owned {
+                            owner_token: "owner-1",
+                            module_index: 71
+                        }
+                    ),
+                    SinkCleanupAction::KeepTombstone
+                );
+            }
+            assert_eq!(
+                sink_cleanup_action_on_server(&intent, None, SinkObservation::Absent),
+                SinkCleanupAction::KeepTombstone
+            );
+            assert_eq!(
+                sink_cleanup_action_on_server(&intent, Some(&server), SinkObservation::Absent),
+                SinkCleanupAction::ClearConfirmedAbsent
+            );
+        }
+    }
+
+    #[test]
+    fn reconnect_cannot_replace_outstanding_sink_identity_on_another_server() {
+        let server = ServerIdentity {
+            address: "unix:/private/pulse/native".into(),
+            instance_cookie: 19,
+        };
+        let existing = SinkIntent {
+            owner_token: "owner-1".into(),
+            server_identity: Some(server.clone()),
+            module_index: Some(71),
+            load_quiesced: true,
+            lease_active: true,
+            ..SinkIntent::default()
+        };
+        for reconnect_server in [
+            ServerIdentity {
+                instance_cookie: 20,
+                ..server.clone()
+            },
+            ServerIdentity {
+                address: "unix:/another/pulse/native".into(),
+                ..server.clone()
+            },
+        ] {
+            assert_eq!(
+                validate_sink_intent_replacement(
+                    Some(&existing),
+                    "owner-1",
+                    Some(&reconnect_server)
+                ),
+                Err("audio_cleanup_journal_conflict")
+            );
+        }
+        assert!(validate_sink_intent_replacement(Some(&existing), "owner-1", None).is_err());
+        assert!(
+            validate_sink_intent_replacement(Some(&existing), "foreign-owner", Some(&server))
+                .is_err()
+        );
+        assert!(
+            validate_sink_intent_replacement(Some(&existing), "owner-1", Some(&server)).is_ok()
+        );
+        assert!(validate_sink_intent_replacement(None, "owner-1", Some(&server)).is_ok());
+        assert_eq!(existing.server_identity, Some(server));
+        assert_eq!(existing.module_index, Some(71));
+    }
+
+    #[test]
     fn route_restore_is_only_authorized_while_current_default_is_our_target() {
         let route = RouteIntent {
             target_sink: "amaterasu-stream".into(),
@@ -740,6 +1066,13 @@ pub(super) enum RouteRestoreAction {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SinkObservation<'a> {
     Absent,
+    /// A complete native inventory on the identified server found neither the
+    /// owned sink nor its known module. This is resource evidence, not an
+    /// acknowledgment of any command sent on a previous connection.
+    SinkAndModuleAbsent {
+        server_identity: &'a ServerIdentity,
+        module_index: u32,
+    },
     Foreign,
     Owned {
         owner_token: &'a str,
@@ -752,6 +1085,25 @@ pub(super) enum SinkCleanupAction {
     KeepTombstone,
     ClearConfirmedAbsent,
     Unload(u32),
+}
+
+pub(super) fn validate_sink_intent_replacement(
+    existing: Option<&SinkIntent>,
+    owner_token: &str,
+    server_identity: Option<&ServerIdentity>,
+) -> Result<(), &'static str> {
+    if let Some(existing) = existing
+        && (existing.owner_token != owner_token
+            || existing
+                .server_identity
+                .as_ref()
+                .is_some_and(|expected| server_identity != Some(expected)))
+    {
+        // Reconnecting to another server cannot replace an outstanding native
+        // allocation's ownership merely because that server lacks its sink.
+        return Err("audio_cleanup_journal_conflict");
+    }
+    Ok(())
 }
 
 pub(super) fn can_add_sink_intent(state: &CleanupState, name: &str) -> bool {
@@ -822,11 +1174,40 @@ pub(super) fn sink_matches_intent(token: &str, intent: &SinkIntent, _module_inde
     token == intent.owner_token
 }
 
+pub(super) fn sink_cleanup_action_on_server(
+    intent: &SinkIntent,
+    server_identity: Option<&ServerIdentity>,
+    observation: SinkObservation<'_>,
+) -> SinkCleanupAction {
+    if intent
+        .server_identity
+        .as_ref()
+        .is_some_and(|expected| server_identity != Some(expected))
+    {
+        return SinkCleanupAction::KeepTombstone;
+    }
+    sink_cleanup_action(intent, observation)
+}
+
 pub(super) fn sink_cleanup_action(
     intent: &SinkIntent,
     observation: SinkObservation<'_>,
 ) -> SinkCleanupAction {
     match observation {
+        SinkObservation::SinkAndModuleAbsent {
+            server_identity,
+            module_index,
+        } if intent.server_identity.as_ref() == Some(server_identity)
+            && intent.module_index == Some(module_index)
+            && intent.load_quiesced
+            && sink_cleanup_requested(intent) =>
+        {
+            // The original load is complete, so it cannot create a resource
+            // after this observation. The same server instance has neither the
+            // sink nor its module: no unload callback is needed to prove that
+            // this exact native allocation has retired.
+            SinkCleanupAction::ClearConfirmedAbsent
+        }
         SinkObservation::Absent
             if intent.module_index.is_some()
                 && (!intent.unload_submitted
@@ -838,7 +1219,9 @@ pub(super) fn sink_cleanup_action(
         SinkObservation::Absent if intent.module_index.is_none() && intent.load_quiesced => {
             SinkCleanupAction::ClearConfirmedAbsent
         }
-        SinkObservation::Absent | SinkObservation::Foreign => SinkCleanupAction::KeepTombstone,
+        SinkObservation::Absent
+        | SinkObservation::Foreign
+        | SinkObservation::SinkAndModuleAbsent { .. } => SinkCleanupAction::KeepTombstone,
         SinkObservation::Owned {
             owner_token,
             module_index,
