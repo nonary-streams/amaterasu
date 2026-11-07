@@ -2234,6 +2234,61 @@ fn raw_preparation_commands_execute_and_undo_through_the_existing_lifecycle() {
 }
 
 #[test]
+fn cleanup_only_hooks_execute_once_in_reverse_order_with_prepared_undo() {
+    let directory = test_directory("cleanup-only-order");
+    let trace = directory.join("events");
+    let output = directory.join("output");
+    let mut manager = ProcessManager::default();
+    let mut request = launch("cleanup-only-order", "sleep");
+    request["output"] = json!(output);
+    request["environment"]["AMATERASU_RAW_PREPARATION_TEST_EXE"] =
+        json!(std::env::current_exe().unwrap().to_string_lossy());
+    request["preparation"] = json!([
+        {"undo":raw_test_command("--exact tests::controlled_child --ignored -- --application-output=undo-only-first")},
+        {
+            "run":lifecycle_command(&trace, "prepare", "trace"),
+            "undo":lifecycle_command(&trace, "undo-prepared", "trace"),
+        },
+        {"undo":raw_test_command("--exact tests::controlled_child --ignored -- --application-output=undo-only-last")},
+    ]);
+    let started = manager.handle("alice", request);
+    let id = started["process"]["process_id"].as_u64().unwrap();
+    let running = wait_for_state(&mut manager, "alice", id, "running");
+    assert_eq!(running["process"]["preparation"]["completed"], 1);
+    assert_eq!(running["process"]["cleanup"]["remaining"], 3);
+    assert_eq!(trace_events(&trace), ["prepare"]);
+    assert!(
+        !std::fs::read_to_string(&output)
+            .unwrap()
+            .contains("OUT-undo-")
+    );
+
+    manager.handle("alice", json!({"action":"terminate","process_id":id}));
+    let cancelled = wait_for_state(&mut manager, "alice", id, "cancelled");
+    assert_eq!(cancelled["process"]["cleanup"]["state"], "complete");
+    assert_eq!(cancelled["process"]["cleanup"]["remaining"], 0);
+    assert_eq!(trace_events(&trace), ["prepare", "undo-prepared"]);
+    let contents = std::fs::read_to_string(&output).unwrap();
+    let markers = [
+        "OUT-undo-only-last",
+        "OUT-undo-prepared",
+        "OUT-undo-only-first",
+    ];
+    let positions = markers.map(|marker| {
+        assert_eq!(contents.matches(marker).count(), 1, "{contents}");
+        contents.find(marker).unwrap()
+    });
+    assert!(
+        positions.windows(2).all(|pair| pair[0] < pair[1]),
+        "{contents}"
+    );
+
+    manager.handle("alice", json!({"action":"terminate","process_id":id}));
+    assert_eq!(std::fs::read_to_string(&output).unwrap(), contents);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn malformed_later_raw_preparation_rejects_before_any_step_runs() {
     let directory = test_directory("invalid-raw-preparation");
     let trace = directory.join("events");

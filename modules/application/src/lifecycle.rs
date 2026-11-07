@@ -903,6 +903,12 @@ impl ApplicationLifecycle {
             }
             let index = self.next_preparation;
             let Some(command) = self.steps[index].run_command() else {
+                // A reached cleanup-only hook is an explicit end action even
+                // though this step has no preparation process to start.
+                if self.steps[index].undo_command().is_some() {
+                    self.pending_undo.push(index);
+                    self.cleanup.remaining = self.pending_undo.len();
+                }
                 self.next_preparation += 1;
                 continue;
             };
@@ -1186,6 +1192,75 @@ mod undo_retry_tests {
             run: command.clone(),
             undo: Some(command),
         })
+    }
+
+    fn cleanup_only_step(index: usize) -> PreparationStep {
+        let PreparationStep::Structured(step) = preparation_step(index) else {
+            unreachable!();
+        };
+        PreparationStep::Raw(RawPreparationStep {
+            do_command: String::new(),
+            undo: step.run.executable,
+            elevated: false,
+        })
+    }
+
+    #[test]
+    fn cleanup_only_steps_are_owed_in_reverse_order_when_reached() {
+        let empty = PreparationStep::Raw(RawPreparationStep {
+            do_command: String::new(),
+            undo: String::new(),
+            elevated: false,
+        });
+        let mut lifecycle =
+            ApplicationLifecycle::new(vec![cleanup_only_step(0), empty, cleanup_only_step(2)])
+                .unwrap();
+        lifecycle.tick(Instant::now());
+        assert!(lifecycle.is_ready());
+        assert_eq!(lifecycle.preparation.completed, 0);
+        assert_eq!(lifecycle.pending_undo, [0, 2]);
+        assert_eq!(lifecycle.cleanup.remaining, 2);
+
+        lifecycle.begin_cleanup();
+        lifecycle.tick(Instant::now());
+        lifecycle.tick(Instant::now());
+        lifecycle.tick(Instant::now());
+        assert!(lifecycle.cleanup_failed());
+        assert_eq!(lifecycle.attempted_undo, [2, 0]);
+        assert_eq!(
+            lifecycle
+                .cleanup
+                .failures
+                .iter()
+                .map(|failure| failure.step)
+                .collect::<Vec<_>>(),
+            [2, 0],
+        );
+        assert!(
+            lifecycle
+                .cleanup
+                .failures
+                .iter()
+                .all(|failure| matches!(failure.kind, CommandFailureKind::SpawnFailed))
+        );
+    }
+
+    #[test]
+    fn cleanup_only_steps_after_a_failed_preparation_are_not_owed() {
+        let mut lifecycle = ApplicationLifecycle::new(vec![
+            cleanup_only_step(0),
+            preparation_step(1),
+            cleanup_only_step(2),
+        ])
+        .unwrap();
+        lifecycle.tick(Instant::now());
+        assert!(lifecycle.preparation_failed());
+        assert_eq!(lifecycle.preparation.failure.as_ref().unwrap().step, 1);
+        assert_eq!(lifecycle.pending_undo, [0]);
+        lifecycle.tick(Instant::now());
+        lifecycle.tick(Instant::now());
+        assert!(lifecycle.cleanup_failed());
+        assert_eq!(lifecycle.attempted_undo, [0]);
     }
 
     #[test]
