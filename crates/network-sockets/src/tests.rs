@@ -248,6 +248,70 @@ fn tcp_listener_connection_peek_and_shutdown_use_the_same_contract() {
     );
 }
 #[test]
+fn connected_tcp_reads_and_peeks_remain_nonblocking_with_an_idle_peer() {
+    for peek in [false, true] {
+        let factory = Factory::new();
+        let provider = Bound::new(&factory);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = 0;
+        assert_eq!(
+            unsafe {
+                (provider.api().tcp_connect)(
+                    provider.context(),
+                    to_address(listener.local_addr().unwrap()),
+                    1_000,
+                    &mut client,
+                )
+            },
+            STATUS_OK
+        );
+        listener.set_nonblocking(true).unwrap();
+        let accept_deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let peer = loop {
+            match listener.accept() {
+                Ok((peer, _)) => break peer,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    assert!(std::time::Instant::now() < accept_deadline);
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("loopback accept failed: {error}"),
+            }
+        };
+        let (release, released) = std::sync::mpsc::sync_channel(1);
+        let holding_peer = std::thread::spawn(move || {
+            let _ = released.recv_timeout(Duration::from_millis(500));
+            drop(peer);
+        });
+        let mut output = [0; 1];
+        let mut count = usize::MAX;
+        let started = std::time::Instant::now();
+        let operation = if peek {
+            provider.api().peek
+        } else {
+            provider.api().read
+        };
+        // SAFETY: the live binding and writable buffers outlive this callback.
+        let status = unsafe {
+            operation(
+                provider.context(),
+                client,
+                output.as_mut_ptr(),
+                output.len(),
+                &mut count,
+            )
+        };
+        let elapsed = started.elapsed();
+        let _ = release.send(());
+        holding_peer.join().unwrap();
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "idle TCP operation blocked"
+        );
+        assert_eq!(status, net::WOULD_BLOCK);
+    }
+}
+
+#[test]
 fn address_value_conversion_preserves_ipv6_scope_and_rejects_noncanonical_ipv4() {
     let scoped = SocketAddr::V6(SocketAddrV6::new("fe80::1".parse().unwrap(), 42, 7, 19));
     assert_eq!(from_address(to_address(scoped)).unwrap(), scoped);

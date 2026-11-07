@@ -508,6 +508,7 @@ unsafe extern "C" fn tcp_connect(
         let socket =
             TcpStream::connect_timeout(&address, Duration::from_millis(u64::from(timeout_ms)))
                 .map_err(io_status)?;
+        socket.set_nonblocking(true).map_err(io_status)?;
         let id = insert(binding, SocketResource::Tcp(socket), permit)?;
         unsafe { output(out, id) }
     })
