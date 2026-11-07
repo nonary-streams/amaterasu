@@ -1,4 +1,32 @@
 //! One resource-owning thread per stream; only owned CPU frames cross channels.
+#[cfg(windows)]
+pub(crate) fn thread_finished<T>(
+    thread: &std::thread::JoinHandle<T>,
+) -> crate::model::CaptureResult<bool> {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows::Win32::System::Threading::WaitForSingleObject;
+
+    // SAFETY: the JoinHandle owns a live thread handle during this zero-time
+    // wait. The kernel signals it only after thread-local teardown completes.
+    match unsafe { WaitForSingleObject(HANDLE(thread.as_raw_handle()), 0) } {
+        WAIT_OBJECT_0 => Ok(true),
+        WAIT_TIMEOUT => Ok(false),
+        _ => Err(crate::model::CaptureError::new(
+            "retirement_uncertain",
+            "could not observe WGC thread retirement",
+        )),
+    }
+}
+
+#[cfg(not(windows))]
+pub(crate) fn thread_finished<T>(
+    thread: &std::thread::JoinHandle<T>,
+) -> crate::model::CaptureResult<bool> {
+    // WGC is unsupported on this platform; this branch serves portable tests.
+    Ok(thread.is_finished())
+}
+
 #[cfg(any(windows, test))]
 mod implementation {
     use crate::backend::CaptureSession;
@@ -63,7 +91,7 @@ mod implementation {
                     drive_source(source, request_receiver, reply_sender, &source_stopped);
                 })
                 .map_err(|error| CaptureError::new("backend_error", error.to_string()))?;
-            let worker = Self {
+            let mut worker = Self {
                 requests: Some(requests),
                 replies,
                 thread: Some(thread),
@@ -71,7 +99,26 @@ mod implementation {
                 waiting: false,
                 shutdown_failure: None,
             };
-            let metadata = ready.recv().map_err(|_| worker_ended())??;
+            let metadata = match ready.recv() {
+                Ok(result) => result?,
+                Err(_) => {
+                    // Initialization can panic after creating native objects.
+                    // The opening thread owns this join and propagates the
+                    // uncertainty; it must not claim cleanup succeeded.
+                    let panicked = worker
+                        .thread
+                        .take()
+                        .is_some_and(|thread| thread.join().is_err());
+                    return Err(if panicked {
+                        CaptureError::new(
+                            "retirement_uncertain",
+                            "WGC initialization worker panicked",
+                        )
+                    } else {
+                        worker_ended()
+                    });
+                }
+            };
             Ok((worker, metadata))
         }
     }
@@ -110,12 +157,15 @@ mod implementation {
             if let Some(message) = &self.shutdown_failure {
                 return Err(CaptureError::new("backend_error", message.clone()));
             }
-            if self
-                .thread
-                .as_ref()
-                .is_some_and(|thread| !thread.is_finished())
-            {
-                return Ok(false);
+            if let Some(thread) = &self.thread {
+                match super::thread_finished(thread) {
+                    Ok(false) => return Ok(false),
+                    Ok(true) => (),
+                    Err(error) => {
+                        self.shutdown_failure = Some(error.message.clone());
+                        return Err(error);
+                    }
+                }
             }
             if let Some(thread) = self.thread.take()
                 && thread.join().is_err()
@@ -362,6 +412,14 @@ mod tests {
         });
         assert!(matches!(result, Err(error) if error.code == "unsupported_platform"));
         assert_eq!(trace.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn panicking_worker_initialization_preserves_retirement_uncertainty() {
+        let result = Worker::start(|| -> CaptureResult<ThreadBoundSource> {
+            panic!("native initialization failed unexpectedly")
+        });
+        assert!(matches!(result, Err(error) if error.code == "retirement_uncertain"));
     }
 
     struct FailingSource {

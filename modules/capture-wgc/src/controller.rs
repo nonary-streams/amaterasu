@@ -8,11 +8,16 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::JoinHandle;
 use std::time::Instant;
 
 #[cfg(test)]
 #[path = "shutdown_tests.rs"]
 mod shutdown_tests;
+
+#[cfg(test)]
+#[path = "controller_async_tests.rs"]
+mod controller_async_tests;
 
 struct Stream {
     capture_format: crate::format::CaptureFormat,
@@ -28,6 +33,7 @@ struct Stream {
     next_sequence: u64,
     last_timestamp_us: u64,
     close_receipt: Option<CloseReceipt>,
+    unpublished: bool,
 }
 
 #[derive(Clone)]
@@ -60,13 +66,40 @@ impl Stream {
 }
 
 pub struct Controller<B: Backend> {
-    backend: B,
+    backend: Arc<B>,
     enabled: bool,
     streams: BTreeMap<u64, Stream>,
+    opening: BTreeMap<u64, Opening>,
+    startup_retirement_uncertain: bool,
     opened_stream: Option<u64>,
 }
 
+pub(crate) enum OpenStart {
+    Ready(Value),
+    Pending(u64),
+}
+
+struct Opening {
+    owner: String,
+    output: String,
+    operation_id: Option<String>,
+    constant_rate: bool,
+    capture_format: crate::format::CaptureFormat,
+    cancelled: bool,
+    worker: JoinHandle<CaptureResult<PreparedCapture>>,
+}
+
+struct PreparedCapture {
+    session: Box<dyn CaptureSession>,
+    geometry: Option<CaptureGeometry>,
+    touch_surface: Option<TouchSurface>,
+    failure: Option<CaptureError>,
+}
+
 impl<B: Backend> Controller<B> {
+    pub(crate) fn backend(&self) -> Arc<B> {
+        Arc::clone(&self.backend)
+    }
     pub(crate) fn source_preflight(
         &self,
         caller: &str,
@@ -76,24 +109,29 @@ impl<B: Backend> Controller<B> {
         amaterasu_module_sdk::abi::Status,
     > {
         crate::preflight::query(
-            &self.backend,
-            self.enabled,
-            self.streams.len() < MAX_STREAMS,
+            self.backend.as_ref(),
+            self.enabled && !self.startup_retirement_uncertain,
+            self.streams.len() + self.opening.len() < MAX_STREAMS,
             caller,
             request,
         )
     }
     pub fn new(backend: B, enabled: bool) -> Self {
         Self {
-            backend,
+            backend: Arc::new(backend),
             enabled,
             streams: BTreeMap::new(),
+            opening: BTreeMap::new(),
+            startup_retirement_uncertain: false,
             opened_stream: None,
         }
     }
 
     pub fn shutdown(&mut self) {
         self.stop_admission();
+        for opening in self.opening.values_mut() {
+            opening.cancelled = true;
+        }
         self.streams.clear();
     }
 
@@ -103,18 +141,233 @@ impl<B: Backend> Controller<B> {
 
     pub fn quiesce(&mut self) -> CaptureResult<bool> {
         self.stop_admission();
+        let openings: Vec<_> = self.opening.keys().copied().collect();
+        for id in openings {
+            self.cancel_open(id);
+            let _ = self.poll_open(id, false);
+        }
         for stream in self.streams.values_mut() {
             mark_closing(stream);
         }
         if let Some((_, failure)) = self.poll_closing().into_iter().next() {
             return Err(failure);
         }
-        Ok(self.streams.is_empty())
+        if self.startup_retirement_uncertain {
+            return Err(CaptureError::new(
+                "cleanup_failed",
+                "capture startup retirement cannot be proven",
+            ));
+        }
+        Ok(self.opening.is_empty() && self.streams.is_empty())
+    }
+
+    pub(crate) fn begin_open(
+        &mut self,
+        caller: &str,
+        output: String,
+        operation_id: Option<String>,
+        constant_rate: bool,
+        source_format: Option<amaterasu_module_sdk::capture::SourceFormat>,
+    ) -> CaptureResult<OpenStart> {
+        let capture_format = crate::format::CaptureFormat::requested(source_format.as_ref())?;
+        if !self.enabled {
+            return Err(CaptureError::new(
+                "capture_disabled",
+                "capture requires enabled startup policy",
+            ));
+        }
+        if self.startup_retirement_uncertain {
+            return Err(CaptureError::new(
+                "cleanup_failed",
+                "capture startup retirement cannot be proven",
+            ));
+        }
+        if let Some(operation_id) = &operation_id {
+            validate_operation_id(operation_id)?;
+            if let Some((id, stream)) = self.find_operation(caller, operation_id) {
+                if stream.output != output
+                    || stream.constant_rate != constant_rate
+                    || stream.capture_format != capture_format
+                {
+                    return Err(CaptureError::new(
+                        "operation_conflict",
+                        "operation ID already selected a different output or delivery mode",
+                    ));
+                }
+                if stream.close_receipt.is_some() {
+                    return Err(CaptureError::new(
+                        "cleanup_pending",
+                        "the operation's capture stream is still retiring",
+                    ));
+                }
+                return Ok(OpenStart::Ready(open_reply(
+                    id,
+                    &stream.output,
+                    stream.geometry,
+                    stream.touch_surface,
+                    stream.constant_rate,
+                )));
+            }
+            if let Some(existing) = self
+                .opening
+                .values()
+                .find(|job| job.owner == caller && job.operation_id.as_ref() == Some(operation_id))
+            {
+                if existing.output != output
+                    || existing.constant_rate != constant_rate
+                    || existing.capture_format != capture_format
+                {
+                    return Err(CaptureError::new(
+                        "operation_conflict",
+                        "operation ID already selected a different output or delivery mode",
+                    ));
+                }
+                return Err(CaptureError::new(
+                    "cleanup_pending",
+                    "the operation's capture stream is still opening",
+                ));
+            }
+        }
+        if self.streams.len() + self.opening.len() >= MAX_STREAMS {
+            return Err(CaptureError::new(
+                "resource_exhausted",
+                "at most four capture streams may be open",
+            ));
+        }
+        let id = self.next_stream_id()?;
+        let backend = Arc::clone(&self.backend);
+        let worker_output = output.clone();
+        let worker = std::thread::Builder::new()
+            .name("wgc-open".into())
+            .spawn(move || prepare_capture(backend.as_ref(), &worker_output, capture_format))
+            .map_err(|error| {
+                CaptureError::new(
+                    "capture_unavailable",
+                    format!("unable to start capture worker: {error}"),
+                )
+            })?;
+        self.opening.insert(
+            id,
+            Opening {
+                owner: caller.into(),
+                output,
+                operation_id,
+                constant_rate,
+                capture_format,
+                cancelled: false,
+                worker,
+            },
+        );
+        Ok(OpenStart::Pending(id))
+    }
+
+    pub(crate) fn operation_pending(&self, caller: &str, operation_id: &str) -> bool {
+        self.opening
+            .values()
+            .any(|job| job.owner == caller && job.operation_id.as_deref() == Some(operation_id))
+            || self
+                .find_operation(caller, operation_id)
+                .is_some_and(|(_, stream)| stream.unpublished && stream.close_receipt.is_some())
+    }
+
+    pub(crate) fn cancel_open(&mut self, id: u64) {
+        if let Some(job) = self.opening.get_mut(&id) {
+            job.cancelled = true;
+        }
+    }
+
+    pub(crate) fn poll_open(
+        &mut self,
+        id: u64,
+        commit_allowed: bool,
+    ) -> Option<(Value, Option<u64>)> {
+        let Some(job) = self.opening.get(&id) else {
+            return Some((
+                CaptureError::new("cancelled", "capture startup no longer exists").payload(),
+                None,
+            ));
+        };
+        match crate::worker::thread_finished(&job.worker) {
+            Ok(false) => return None,
+            Ok(true) => (),
+            Err(error) => {
+                self.startup_retirement_uncertain = true;
+                return Some((error.payload(), None));
+            }
+        }
+        let job = self.opening.remove(&id).expect("finished opening");
+        let prepared = match job.worker.join() {
+            Ok(Ok(prepared)) => prepared,
+            Ok(Err(error)) => {
+                if error.code == "retirement_uncertain" {
+                    self.startup_retirement_uncertain = true;
+                }
+                return Some((error.payload(), None));
+            }
+            Err(_) => {
+                self.startup_retirement_uncertain = true;
+                return Some((
+                    CaptureError::new("capture_unavailable", "capture startup worker panicked")
+                        .payload(),
+                    None,
+                ));
+            }
+        };
+        let reply = open_reply(
+            id,
+            &job.output,
+            prepared.geometry,
+            prepared.touch_surface,
+            job.constant_rate,
+        );
+        let cancelled = job.cancelled
+            || !commit_allowed
+            || !self.enabled
+            || self.startup_retirement_uncertain
+            || prepared.failure.is_some();
+        let failure = prepared.failure;
+        let mut stream = Stream {
+            capture_format: job.capture_format,
+            owner: job.owner,
+            output: job.output,
+            session: prepared.session,
+            geometry: prepared.geometry,
+            touch_surface: prepared.touch_surface,
+            operation_id: job.operation_id,
+            constant_rate: job.constant_rate,
+            opened_at: Instant::now(),
+            last_frame: None,
+            next_sequence: 0,
+            last_timestamp_us: 0,
+            close_receipt: None,
+            unpublished: cancelled,
+        };
+        if cancelled {
+            mark_closing(&mut stream);
+        }
+        self.streams.insert(id, stream);
+        if let Some(error) = failure {
+            Some((error.payload(), None))
+        } else if cancelled {
+            Some((
+                CaptureError::new("cancelled", "capture startup was cancelled").payload(),
+                None,
+            ))
+        } else {
+            Some((reply, Some(id)))
+        }
     }
 
     pub(crate) fn begin_close(&mut self, caller: &str, id: u64) -> CaptureResult<CloseReceipt> {
         self.authorize_owner(caller, id)?;
         let stream = self.streams.get_mut(&id).expect("authorized stream");
+        Ok(mark_closing(stream))
+    }
+
+    pub(crate) fn abandon_open(&mut self, caller: &str, id: u64) -> CaptureResult<CloseReceipt> {
+        self.authorize_owner(caller, id)?;
+        let stream = self.streams.get_mut(&id).expect("authorized stream");
+        stream.unpublished = true;
         Ok(mark_closing(stream))
     }
 
@@ -143,6 +396,7 @@ impl<B: Backend> Controller<B> {
         failures
     }
 
+    #[cfg(test)]
     pub fn take_opened_stream(&mut self) -> Option<u64> {
         self.opened_stream.take()
     }
@@ -193,8 +447,33 @@ impl<B: Backend> Controller<B> {
                 "capture requires enabled startup policy",
             ));
         }
+        if self.startup_retirement_uncertain {
+            return Err(CaptureError::new(
+                "cleanup_failed",
+                "capture startup retirement cannot be proven",
+            ));
+        }
         if let Some(operation_id) = &operation_id {
             validate_operation_id(operation_id)?;
+            if let Some(existing) = self
+                .opening
+                .values()
+                .find(|job| job.owner == caller && job.operation_id.as_ref() == Some(operation_id))
+            {
+                if existing.output != output
+                    || existing.constant_rate != constant_rate
+                    || existing.capture_format != capture_format
+                {
+                    return Err(CaptureError::new(
+                        "operation_conflict",
+                        "operation ID already selected a different output or delivery mode",
+                    ));
+                }
+                return Err(CaptureError::new(
+                    "cleanup_pending",
+                    "the operation's capture stream is still opening",
+                ));
+            }
             if let Some((stream_id, existing)) = self.find_operation(caller, operation_id) {
                 if existing.close_receipt.is_some() {
                     return Err(CaptureError::new(
@@ -220,7 +499,7 @@ impl<B: Backend> Controller<B> {
                 ));
             }
         }
-        if self.streams.len() >= MAX_STREAMS {
+        if self.streams.len() + self.opening.len() >= MAX_STREAMS {
             return Err(CaptureError::new(
                 "resource_exhausted",
                 "at most four capture streams may be open",
@@ -228,26 +507,15 @@ impl<B: Backend> Controller<B> {
         }
         let id = self.next_stream_id()?;
         guard()?;
-        let mut session = self.backend.open_with_format(output, capture_format)?;
-        let geometry = initial_geometry(&mut *session)?;
-        if capture_format.color_proof {
-            session.validate_source()?;
-            let info = session.source_info()?.ok_or_else(|| {
-                CaptureError::new(
-                    "unsupported_format",
-                    "native source format proof unavailable",
-                )
-            })?;
-            if info.encoding != capture_format.encoding() || info.desktop_hdr != capture_format.hdr
-            {
-                return Err(CaptureError::new(
-                    "unsupported_format",
-                    "native source format does not match requested representation",
-                ));
-            }
-            capture_format.validate_dimensions(info.width, info.height)?;
+        let PreparedCapture {
+            session,
+            geometry,
+            touch_surface,
+            failure,
+        } = prepare_capture(self.backend.as_ref(), output, capture_format)?;
+        if let Some(error) = failure {
+            return Err(error);
         }
-        let touch_surface = initial_touch_surface(&mut *session, geometry)?;
         // Opening may block in a driver. Recheck before retaining resources.
         guard()?;
         self.streams.insert(
@@ -266,6 +534,7 @@ impl<B: Backend> Controller<B> {
                 next_sequence: 0,
                 last_timestamp_us: 0,
                 close_receipt: None,
+                unpublished: false,
             },
         );
         self.opened_stream = Some(id);
@@ -308,7 +577,7 @@ impl<B: Backend> Controller<B> {
         getrandom::fill(&mut random)
             .map_err(|error| CaptureError::new("entropy_error", error.to_string()))?;
         let id = u64::from_le_bytes(random);
-        if self.streams.contains_key(&id) {
+        if self.streams.contains_key(&id) || self.opening.contains_key(&id) {
             return Err(CaptureError::new(
                 "entropy_error",
                 "capture stream ID collision; retry open",
@@ -328,6 +597,18 @@ impl<B: Backend> Controller<B> {
 
     fn lookup(&self, caller: &str, operation_id: &str) -> CaptureResult<Value> {
         validate_operation_id(operation_id)?;
+        if self.startup_retirement_uncertain {
+            return Err(CaptureError::new(
+                "cleanup_failed",
+                "capture startup retirement cannot be proven",
+            ));
+        }
+        if self.operation_pending(caller, operation_id) {
+            return Err(CaptureError::new(
+                "cleanup_pending",
+                "the operation's capture stream is still opening or retiring",
+            ));
+        }
         self.find_operation(caller, operation_id)
             .map(|(id, stream)| {
                 open_reply(
@@ -587,6 +868,57 @@ impl<B: Backend> Controller<B> {
     }
 }
 
+impl<B: Backend> Drop for Controller<B> {
+    fn drop(&mut self) {
+        // A startup worker executes provider code and can own native resources.
+        // Never detach it when the controller is destroyed, even if a driver is
+        // stalled; normal quiescence polls first and keeps this barrier off ticks.
+        for (_, job) in std::mem::take(&mut self.opening) {
+            let _ = job.worker.join();
+        }
+    }
+}
+
+fn prepare_capture<B: Backend>(
+    backend: &B,
+    output: &str,
+    capture_format: crate::format::CaptureFormat,
+) -> CaptureResult<PreparedCapture> {
+    let mut session = backend.open_with_format(output, capture_format)?;
+    let result = (|| {
+        let geometry = initial_geometry(&mut *session)?;
+        if capture_format.color_proof {
+            session.validate_source()?;
+            let info = session.source_info()?.ok_or_else(|| {
+                CaptureError::new(
+                    "unsupported_format",
+                    "native source format proof unavailable",
+                )
+            })?;
+            if info.encoding != capture_format.encoding() || info.desktop_hdr != capture_format.hdr
+            {
+                return Err(CaptureError::new(
+                    "unsupported_format",
+                    "native source format does not match requested representation",
+                ));
+            }
+            capture_format.validate_dimensions(info.width, info.height)?;
+        }
+        let touch_surface = initial_touch_surface(&mut *session, geometry)?;
+        Ok((geometry, touch_surface))
+    })();
+    let (geometry, touch_surface, failure) = match result {
+        Ok((geometry, touch_surface)) => (geometry, touch_surface, None),
+        Err(error) => (None, None, Some(error)),
+    };
+    Ok(PreparedCapture {
+        session,
+        geometry,
+        touch_surface,
+        failure,
+    })
+}
+
 fn mark_closing(stream: &mut Stream) -> CloseReceipt {
     stream.last_frame = None;
     stream
@@ -647,7 +979,7 @@ fn validate_operation_id(operation_id: &str) -> CaptureResult<()> {
     Ok(())
 }
 
-fn enumeration_reply(
+pub(crate) fn enumeration_reply(
     mut outputs: Vec<crate::model::Output>,
     offset: Option<usize>,
     limit: Option<usize>,

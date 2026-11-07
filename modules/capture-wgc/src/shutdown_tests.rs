@@ -6,6 +6,9 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+#[path = "commands_queue_tests.rs"]
+mod commands_queue_tests;
+
 struct OwnedSession(Arc<AtomicUsize>);
 
 impl CaptureSession for OwnedSession {
@@ -45,8 +48,13 @@ fn module_with_session(session: Box<dyn CaptureSession>) -> CaptureModule {
             next_sequence: 0,
             last_timestamp_us: 0,
             close_receipt: None,
+            unpublished: false,
         },
     );
+    module_with_controller(controller)
+}
+
+fn module_with_controller(controller: Controller<NativeBackend>) -> CaptureModule {
     let controller = Arc::new(Mutex::new(controller));
     let factory = amaterasu_module_sdk::capture::CpuSourceFactory::new(Arc::new(
         crate::resource::Provider::new(controller.clone()),
@@ -71,7 +79,11 @@ fn module_with_session(session: Box<dyn CaptureSession>) -> CaptureModule {
         runtime,
         controller,
         shutdown_requested: false,
+        quiescing: false,
         pending_closes: Vec::new(),
+        pending_opens: Vec::new(),
+        pending_lookups: Vec::new(),
+        pending_commands: Vec::new(),
         _factory: factory,
         _preflight_factory: preflight_factory,
     }
@@ -295,11 +307,36 @@ struct Broker {
     completion_attempts: Vec<u64>,
     completion_failures: usize,
     activity_failures: usize,
+    activity_script: std::collections::BTreeMap<u64, std::collections::VecDeque<crate::Response>>,
+    expire_on_complete: std::collections::BTreeSet<u64>,
     session_drops: Option<Arc<AtomicUsize>>,
     retirement_counts_at_completion: Vec<usize>,
 }
 
 impl Broker {
+    fn open(&mut self, request: u64, caller: &str, operation_id: &str) {
+        self.active.insert(request);
+        self.requests.push_back(crate::Response::Request {
+            id: request,
+            caller: caller.into(),
+            initiator: caller.into(),
+            service: crate::SERVICE.into(),
+            payload: json!({"action":"open", "output":"fixture-monitor", "operation_id":operation_id}),
+            remaining_ms: 30_000,
+        });
+    }
+
+    fn lookup(&mut self, request: u64, caller: &str, operation_id: &str) {
+        self.active.insert(request);
+        self.requests.push_back(crate::Response::Request {
+            id: request,
+            caller: caller.into(),
+            initiator: caller.into(),
+            service: crate::SERVICE.into(),
+            payload: json!({"action":"lookup", "operation_id":operation_id}),
+            remaining_ms: 30_000,
+        });
+    }
     fn close(&mut self, request: u64, caller: &str, stream: u64) {
         self.active.insert(request);
         self.requests.push_back(crate::Response::Request {
@@ -335,11 +372,31 @@ unsafe extern "C" fn broker_runtime(
                 message: "activity is unknown".into(),
             }
         }
-        crate::Command::CheckRequest { request } if broker.active.contains(&request) => {
-            crate::Response::Ok
+        crate::Command::CheckRequest { request } => {
+            if let Some(response) = broker
+                .activity_script
+                .get_mut(&request)
+                .and_then(|script| script.pop_front())
+            {
+                if matches!(&response, crate::Response::Error { code, .. } if code == "request_ended" || code == "not_found")
+                {
+                    broker.active.remove(&request);
+                }
+                response
+            } else if broker.active.contains(&request) {
+                crate::Response::Ok
+            } else {
+                crate::Response::Error {
+                    code: "request_ended".into(),
+                    message: "fixture request is no longer active".into(),
+                }
+            }
         }
         crate::Command::Complete { request, payload } => {
             broker.completion_attempts.push(request);
+            if broker.expire_on_complete.remove(&request) {
+                broker.active.remove(&request);
+            }
             if broker.completion_failures != 0 {
                 broker.completion_failures -= 1;
                 crate::Response::Error {
@@ -360,10 +417,6 @@ unsafe extern "C" fn broker_runtime(
                 }
             }
         }
-        crate::Command::CheckRequest { .. } => crate::Response::Error {
-            code: "request_ended".into(),
-            message: "fixture request is no longer active".into(),
-        },
         _ => panic!("unexpected capture broker command"),
     };
     // SAFETY: RuntimeClient provides this live reply sink for the current call.
@@ -418,6 +471,445 @@ fn bind_broker(module: &mut CaptureModule, broker: &mut Mutex<Broker>) {
             invoke: broker_runtime,
         })
     };
+}
+
+#[cfg(not(windows))]
+#[test]
+fn cancelled_broker_open_retains_startup_and_lookup_until_native_retirement() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let (entered, started) = mpsc::channel();
+    let (release, gate) = mpsc::channel();
+    let gate = Mutex::new(gate);
+    let drops = Arc::new(AtomicUsize::new(0));
+    let opened_drops = drops.clone();
+    let backend = NativeBackend::with_opener(move |_| {
+        entered.send(()).unwrap();
+        gate.lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        Ok(Box::new(OwnedSession(opened_drops.clone())))
+    });
+    let mut module = module_with_controller(Controller::new(backend, true));
+    let mut broker = Mutex::new(Broker::default());
+    bind_broker(&mut module, &mut broker);
+    broker.lock().unwrap().open(40, "video", "starting");
+    let before = Instant::now();
+    module.tick().unwrap();
+    assert!(before.elapsed() < Duration::from_secs(1));
+    started.recv_timeout(Duration::from_secs(1)).unwrap();
+    {
+        let mut broker = broker.lock().unwrap();
+        broker.active.remove(&40);
+        broker.lookup(41, "video", "starting");
+    }
+    module.tick().unwrap();
+    assert!(
+        broker.lock().unwrap().completed.is_empty(),
+        "lookup must not prove absence during native startup"
+    );
+    let before = Instant::now();
+    assert!(!module.quiesce().unwrap());
+    assert!(before.elapsed() < Duration::from_secs(1));
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    release.send(()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !module.quiesce().unwrap() {
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    let broker = broker.lock().unwrap();
+    assert_eq!(broker.completed.len(), 1);
+    assert_eq!(broker.completed[0].0, 41);
+    assert_eq!(broker.completed[0].1["error"]["code"], "not_found");
+}
+
+#[cfg(not(windows))]
+#[test]
+fn broker_open_replay_inherits_startup_when_original_waiter_ends() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+    let (entered, started) = mpsc::channel();
+    let (release, gate) = mpsc::channel();
+    let gate = Mutex::new(gate);
+    let opens = Arc::new(AtomicUsize::new(0));
+    let opened_count = opens.clone();
+    let drops = Arc::new(AtomicUsize::new(0));
+    let opened_drops = drops.clone();
+    let backend = NativeBackend::with_opener(move |_| {
+        opened_count.fetch_add(1, Ordering::SeqCst);
+        entered.send(()).unwrap();
+        gate.lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        Ok(Box::new(OwnedSession(opened_drops.clone())))
+    });
+    let mut module = module_with_controller(Controller::new(backend, true));
+    let mut broker = Mutex::new(Broker::default());
+    bind_broker(&mut module, &mut broker);
+    broker.lock().unwrap().open(50, "video", "replayed");
+    module.tick().unwrap();
+    started.recv_timeout(Duration::from_secs(1)).unwrap();
+    broker.lock().unwrap().open(51, "video", "replayed");
+    module.tick().unwrap();
+    broker.lock().unwrap().active.remove(&50);
+    module.tick().unwrap();
+    release.send(()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while broker.lock().unwrap().completed.is_empty() {
+        module.tick().unwrap();
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    let broker = broker.lock().unwrap();
+    assert_eq!(broker.completed.len(), 1);
+    assert_eq!(broker.completed[0].0, 51);
+    assert_eq!(broker.completed[0].1["ok"], true);
+    assert_eq!(opens.load(Ordering::SeqCst), 1);
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+}
+
+#[cfg(not(windows))]
+#[test]
+fn replay_inherits_when_original_expires_between_activity_checks() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+    let (entered, started) = mpsc::channel();
+    let (release, gate) = mpsc::channel();
+    let gate = Mutex::new(gate);
+    let opens = Arc::new(AtomicUsize::new(0));
+    let opened_count = opens.clone();
+    let drops = Arc::new(AtomicUsize::new(0));
+    let opened_drops = drops.clone();
+    let backend = NativeBackend::with_opener(move |_| {
+        opened_count.fetch_add(1, Ordering::SeqCst);
+        entered.send(()).unwrap();
+        gate.lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        Ok(Box::new(OwnedSession(opened_drops.clone())))
+    });
+    let mut module = module_with_controller(Controller::new(backend, true));
+    let mut broker = Mutex::new(Broker::default());
+    bind_broker(&mut module, &mut broker);
+    broker.lock().unwrap().open(150, "video", "race");
+    module.tick().unwrap();
+    started.recv_timeout(Duration::from_secs(1)).unwrap();
+    broker.lock().unwrap().open(151, "video", "race");
+    module.tick().unwrap();
+    // The retry may already have been processed before its owner expires.
+    module.pending_opens.reverse();
+    broker.lock().unwrap().activity_script.insert(
+        150,
+        [
+            crate::Response::Ok,
+            crate::Response::Error {
+                code: "request_ended".into(),
+                message: "expired between checks".into(),
+            },
+        ]
+        .into(),
+    );
+    module.poll_open_requests().unwrap();
+    module.poll_open_requests().unwrap();
+    release.send(()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while broker.lock().unwrap().completed.is_empty() {
+        module.tick().unwrap();
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    let broker = broker.lock().unwrap();
+    assert_eq!(broker.completed[0].0, 151);
+    assert_eq!(broker.completed[0].1["ok"], true);
+    assert_eq!(opens.load(Ordering::SeqCst), 1);
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+}
+
+#[cfg(not(windows))]
+#[test]
+fn replay_inherits_result_when_original_expires_during_completion() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+    let (entered, started) = mpsc::channel();
+    let (release, gate) = mpsc::channel();
+    let gate = Mutex::new(gate);
+    let opens = Arc::new(AtomicUsize::new(0));
+    let opened_count = opens.clone();
+    let drops = Arc::new(AtomicUsize::new(0));
+    let opened_drops = drops.clone();
+    let backend = NativeBackend::with_opener(move |_| {
+        opened_count.fetch_add(1, Ordering::SeqCst);
+        entered.send(()).unwrap();
+        gate.lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        Ok(Box::new(OwnedSession(opened_drops.clone())))
+    });
+    let mut module = module_with_controller(Controller::new(backend, true));
+    let mut broker = Mutex::new(Broker::default());
+    bind_broker(&mut module, &mut broker);
+    broker.lock().unwrap().open(160, "video", "completion-race");
+    module.tick().unwrap();
+    started.recv_timeout(Duration::from_secs(1)).unwrap();
+    broker.lock().unwrap().open(161, "video", "completion-race");
+    module.tick().unwrap();
+    broker.lock().unwrap().expire_on_complete.insert(160);
+    release.send(()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !module
+        .controller
+        .lock()
+        .unwrap()
+        .opening
+        .values()
+        .next()
+        .unwrap()
+        .worker
+        .is_finished()
+    {
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    broker.lock().unwrap().activity_script.insert(
+        161,
+        [crate::Response::Error {
+            code: "fixture_check_failed".into(),
+            message: "replay activity is unknown".into(),
+        }]
+        .into(),
+    );
+    assert!(module.poll_open_requests().is_err());
+    assert!(broker.lock().unwrap().completed.is_empty());
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    while broker.lock().unwrap().completed.is_empty() {
+        module.tick().unwrap();
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    let broker = broker.lock().unwrap();
+    assert!(broker.completion_attempts.contains(&160));
+    assert_eq!(broker.completed[0].0, 161);
+    assert_eq!(broker.completed[0].1["ok"], true);
+    assert_eq!(opens.load(Ordering::SeqCst), 1);
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+}
+
+#[cfg(not(windows))]
+#[test]
+fn unknown_replay_activity_retains_original_startup_until_resolved() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+    let (entered, started) = mpsc::channel();
+    let (release, gate) = mpsc::channel();
+    let gate = Mutex::new(gate);
+    let opens = Arc::new(AtomicUsize::new(0));
+    let opened_count = opens.clone();
+    let drops = Arc::new(AtomicUsize::new(0));
+    let opened_drops = drops.clone();
+    let backend = NativeBackend::with_opener(move |_| {
+        opened_count.fetch_add(1, Ordering::SeqCst);
+        entered.send(()).unwrap();
+        gate.lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        Ok(Box::new(OwnedSession(opened_drops.clone())))
+    });
+    let mut module = module_with_controller(Controller::new(backend, true));
+    let mut broker = Mutex::new(Broker::default());
+    bind_broker(&mut module, &mut broker);
+    broker.lock().unwrap().open(170, "video", "unknown-retry");
+    module.tick().unwrap();
+    started.recv_timeout(Duration::from_secs(1)).unwrap();
+    broker.lock().unwrap().open(171, "video", "unknown-retry");
+    module.tick().unwrap();
+    {
+        let mut broker = broker.lock().unwrap();
+        broker.active.remove(&170);
+        broker.activity_script.insert(
+            171,
+            [crate::Response::Error {
+                code: "fixture_check_failed".into(),
+                message: "replay activity is unknown".into(),
+            }]
+            .into(),
+        );
+    }
+    assert!(module.poll_open_requests().is_err());
+    assert_eq!(opens.load(Ordering::SeqCst), 1);
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    module.poll_open_requests().unwrap();
+    release.send(()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while broker.lock().unwrap().completed.is_empty() {
+        module.tick().unwrap();
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    let broker = broker.lock().unwrap();
+    assert_eq!(broker.completed[0].0, 171);
+    assert_eq!(broker.completed[0].1["ok"], true);
+    assert_eq!(opens.load(Ordering::SeqCst), 1);
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+}
+
+#[cfg(not(windows))]
+#[test]
+fn earlier_replay_cannot_publish_while_original_completion_is_uncertain() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+    let (entered, started) = mpsc::channel();
+    let (release, gate) = mpsc::channel();
+    let gate = Mutex::new(gate);
+    let opens = Arc::new(AtomicUsize::new(0));
+    let opened_count = opens.clone();
+    let drops = Arc::new(AtomicUsize::new(0));
+    let opened_drops = drops.clone();
+    let backend = NativeBackend::with_opener(move |_| {
+        opened_count.fetch_add(1, Ordering::SeqCst);
+        entered.send(()).unwrap();
+        gate.lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        Ok(Box::new(OwnedSession(opened_drops.clone())))
+    });
+    let mut module = module_with_controller(Controller::new(backend, true));
+    let mut broker = Mutex::new(Broker::default());
+    bind_broker(&mut module, &mut broker);
+    broker
+        .lock()
+        .unwrap()
+        .open(180, "video", "uncertain-completion");
+    module.tick().unwrap();
+    started.recv_timeout(Duration::from_secs(1)).unwrap();
+    broker
+        .lock()
+        .unwrap()
+        .open(181, "video", "uncertain-completion");
+    module.tick().unwrap();
+    release.send(()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !module
+        .controller
+        .lock()
+        .unwrap()
+        .opening
+        .values()
+        .next()
+        .unwrap()
+        .worker
+        .is_finished()
+    {
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    broker.lock().unwrap().completion_failures = 1;
+    assert!(module.poll_open_requests().is_err());
+    module.pending_opens.reverse();
+    broker.lock().unwrap().activity_script.insert(
+        180,
+        [crate::Response::Error {
+            code: "fixture_check_failed".into(),
+            message: "original activity is unknown".into(),
+        }]
+        .into(),
+    );
+    assert!(module.poll_open_requests().is_err());
+    assert!(broker.lock().unwrap().completed.is_empty());
+    while broker.lock().unwrap().completed.len() < 2 {
+        module.poll_open_requests().unwrap();
+        assert!(Instant::now() < deadline);
+    }
+    let broker = broker.lock().unwrap();
+    assert_eq!(
+        broker.completed[0].1["stream"],
+        broker.completed[1].1["stream"]
+    );
+    assert_eq!(opens.load(Ordering::SeqCst), 1);
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+}
+
+#[cfg(not(windows))]
+#[test]
+fn queued_open_blocks_lookup_absence_until_admission_and_retirement() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+    let (entered, started) = mpsc::channel();
+    let (release, gate) = mpsc::channel();
+    let gate = Mutex::new(gate);
+    let drops = Arc::new(AtomicUsize::new(0));
+    let opened_drops = drops.clone();
+    let backend = NativeBackend::with_opener(move |_| {
+        entered.send(()).unwrap();
+        gate.lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        Ok(Box::new(OwnedSession(opened_drops.clone())))
+    });
+    let mut module = module_with_controller(Controller::new(backend, true));
+    let mut broker = Mutex::new(Broker::default());
+    bind_broker(&mut module, &mut broker);
+    let (release_controller, held) = hold_controller(&module);
+    {
+        let mut broker = broker.lock().unwrap();
+        broker.open(60, "video", "queued");
+        broker.lookup(61, "video", "queued");
+    }
+    module.tick().unwrap();
+    assert!(broker.lock().unwrap().completed.is_empty());
+    release_controller.send(()).unwrap();
+    held.join().unwrap();
+    module.tick().unwrap();
+    started.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(broker.lock().unwrap().completed.is_empty());
+    broker.lock().unwrap().active.remove(&60);
+    module.tick().unwrap();
+    release.send(()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while broker.lock().unwrap().completed.is_empty() {
+        module.tick().unwrap();
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    let broker = broker.lock().unwrap();
+    assert_eq!(broker.completed[0].0, 61);
+    assert_eq!(broker.completed[0].1["error"]["code"], "not_found");
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+}
+
+#[cfg(not(windows))]
+#[test]
+fn broker_lookup_after_startup_panic_never_claims_capture_absent() {
+    use std::time::Duration;
+    let backend = NativeBackend::with_opener(|_| panic!("fixture native startup panic"));
+    let mut module = module_with_controller(Controller::new(backend, true));
+    let mut broker = Mutex::new(Broker::default());
+    bind_broker(&mut module, &mut broker);
+    {
+        let mut broker = broker.lock().unwrap();
+        broker.open(70, "video", "uncertain");
+        broker.lookup(71, "video", "uncertain");
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while broker.lock().unwrap().completed.len() < 2 {
+        module.tick().unwrap();
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    let broker = broker.lock().unwrap();
+    let lookup = &broker.completed.iter().find(|(id, _)| *id == 71).unwrap().1;
+    assert_eq!(lookup["error"]["code"], "cleanup_failed");
+    drop(broker);
+    assert!(module.quiesce().is_err());
 }
 
 #[test]

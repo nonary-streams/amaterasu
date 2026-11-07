@@ -41,7 +41,7 @@ pub trait CaptureSession: Send {
     }
 }
 
-pub trait Backend: Send {
+pub trait Backend: Send + Sync + 'static {
     fn supported(&self) -> bool;
     fn enumerate(&self) -> CaptureResult<Vec<Output>>;
     fn open(&self, output: &str) -> CaptureResult<Box<dyn CaptureSession>>;
@@ -82,13 +82,31 @@ mod windows;
 #[cfg(windows)]
 pub use windows::WindowsBackend as NativeBackend;
 
+#[cfg(all(not(windows), test))]
+type TestOpener = dyn Fn(&str) -> CaptureResult<Box<dyn CaptureSession>> + Send + Sync;
+
 #[cfg(not(windows))]
-pub struct NativeBackend;
+pub struct NativeBackend {
+    #[cfg(test)]
+    opener: Option<std::sync::Arc<TestOpener>>,
+}
 
 #[cfg(not(windows))]
 impl NativeBackend {
     pub fn new(_: Option<bool>) -> Self {
-        Self
+        Self {
+            #[cfg(test)]
+            opener: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn with_opener(
+        opener: impl Fn(&str) -> CaptureResult<Box<dyn CaptureSession>> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            opener: Some(std::sync::Arc::new(opener)),
+        }
     }
 }
 #[cfg(not(windows))]
@@ -101,7 +119,12 @@ impl Backend for NativeBackend {
         Err(unsupported())
     }
 
-    fn open(&self, _: &str) -> CaptureResult<Box<dyn CaptureSession>> {
+    fn open(&self, output: &str) -> CaptureResult<Box<dyn CaptureSession>> {
+        #[cfg(test)]
+        if let Some(opener) = &self.opener {
+            return opener(output);
+        }
+        let _ = output;
         Err(unsupported())
     }
 }

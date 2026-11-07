@@ -1,10 +1,12 @@
 //! Windows Graphics Capture with caller-owned streams and synchronous CPU frames.
 mod backend;
+mod commands;
 mod controller;
 mod format;
 mod model;
 #[cfg(test)]
 mod native;
+mod opening;
 mod preflight;
 mod resource;
 #[cfg(any(windows, test))]
@@ -45,7 +47,11 @@ struct CaptureModule {
     runtime: RuntimeClient,
     controller: SharedController,
     shutdown_requested: bool,
+    quiescing: bool,
     pending_closes: Vec<PendingClose>,
+    pending_opens: Vec<opening::PendingOpen>,
+    pending_lookups: Vec<opening::PendingLookup>,
+    pending_commands: Vec<commands::PendingCommand>,
     _preflight_factory: Box<
         amaterasu_module_sdk::capture::SourcePreflightFactory<preflight::Provider<NativeBackend>>,
     >,
@@ -92,7 +98,11 @@ impl ManagedModule for CaptureModule {
             runtime,
             controller,
             shutdown_requested: false,
+            quiescing: false,
             pending_closes: Vec::new(),
+            pending_opens: Vec::new(),
+            pending_lookups: Vec::new(),
+            pending_commands: Vec::new(),
             _factory: factory,
             _preflight_factory: preflight_factory,
         })
@@ -106,7 +116,16 @@ impl ManagedModule for CaptureModule {
 
     fn quiesce(&mut self) -> ModuleResult<bool> {
         self.shutdown_requested = true;
+        self.quiescing = true;
+        let open_failure = self.poll_open_requests().err();
+        let command_failure = self.poll_commands(true).err();
         let mut failure = self.poll_pending_closes().err();
+        if let Some(error) = open_failure {
+            failure.get_or_insert(error);
+        }
+        if let Some(error) = command_failure {
+            failure.get_or_insert(error);
+        }
         let retired = match self.controller.try_lock() {
             Ok(mut controller) => controller
                 .quiesce()
@@ -127,29 +146,69 @@ impl ManagedModule for CaptureModule {
         if let Some(error) = failure {
             return Err(error);
         }
-        Ok(retired && self.pending_closes.is_empty())
+        Ok(retired
+            && self.pending_closes.is_empty()
+            && self.pending_opens.is_empty()
+            && self.pending_lookups.is_empty()
+            && self.pending_commands.is_empty())
     }
 
     fn tick(&mut self) -> ModuleResult<()> {
-        self.stop_admission_when_available()?;
-        self.poll_pending_closes()?;
+        let mut failure = self.stop_admission_when_available().err();
+        let opens_ready = retain_failure(&mut failure, self.poll_open_requests());
+        let commands_ready = retain_failure(&mut failure, self.poll_commands(self.quiescing));
+        let closes_ready = retain_failure(&mut failure, self.poll_pending_closes());
         for _ in 0..8 {
-            let (id, caller, service, payload) = match self.runtime.send(Command::Poll {})? {
-                Response::Pending => break,
-                Response::Request {
+            let (id, caller, service, payload) = match self.runtime.send(Command::Poll {}) {
+                Ok(Response::Pending) => break,
+                Ok(Response::Request {
                     id,
                     caller,
                     service,
                     payload,
                     ..
-                } => (id, caller, service, payload),
-                response => return Err(format!("capture poll failed: {response:?}")),
+                }) => (id, caller, service, payload),
+                response => {
+                    failure.get_or_insert_with(|| format!("capture poll failed: {response:?}"));
+                    break;
+                }
             };
-            let mut opened_stream = None;
             let reply = if service != SERVICE {
                 CaptureError::new("invalid_service", "unsupported capture service").payload()
             } else {
                 match serde_json::from_value::<Operation>(payload) {
+                    Ok(Operation::Open {
+                        output,
+                        operation_id,
+                        constant_rate,
+                        source_format,
+                    }) => {
+                        if self.pending_opens.len() < opening::MAX_PENDING_REQUESTS {
+                            self.pending_opens.push(opening::PendingOpen::new(
+                                id,
+                                caller,
+                                output,
+                                operation_id,
+                                constant_rate,
+                                source_format,
+                            ));
+                            continue;
+                        }
+                        CaptureError::new("resource_exhausted", "capture open waiters are full")
+                            .payload()
+                    }
+                    Ok(Operation::Lookup { operation_id }) => {
+                        if self.pending_lookups.len() < opening::MAX_PENDING_REQUESTS {
+                            self.pending_lookups.push(opening::PendingLookup::new(
+                                id,
+                                caller,
+                                operation_id,
+                            ));
+                            continue;
+                        }
+                        CaptureError::new("resource_exhausted", "capture lookup waiters are full")
+                            .payload()
+                    }
                     Ok(Operation::Close { stream }) => {
                         if self.pending_closes.len() < MAX_PENDING_CLOSES {
                             self.pending_closes.push(PendingClose {
@@ -165,26 +224,20 @@ impl ManagedModule for CaptureModule {
                         CaptureError::new("resource_exhausted", "capture close waiters are full")
                             .payload()
                     }
-                    Ok(operation) => {
-                        let mut controller = self
-                            .controller
-                            .lock()
-                            .map_err(|_| "capture controller poisoned")?;
-                        if self.shutdown_requested {
-                            controller.stop_admission();
+                    Ok(operation @ (Operation::Status | Operation::Enumerate { .. })) => {
+                        if self.quiescing {
+                            CaptureError::new("capture_disabled", "capture is quiescing").payload()
+                        } else if self.pending_commands.len() < commands::MAX_PENDING_COMMANDS {
+                            self.pending_commands
+                                .push(commands::PendingCommand::new(id, caller, operation));
+                            continue;
+                        } else {
+                            CaptureError::new(
+                                "resource_exhausted",
+                                "capture command waiters are full",
+                            )
+                            .payload()
                         }
-                        let reply = controller.handle(&caller, operation, &mut || match self
-                            .runtime
-                            .send(Command::CheckRequest { request: id })
-                        {
-                            Ok(Response::Ok) => Ok(()),
-                            response => Err(CaptureError::new(
-                                "cancelled",
-                                format!("request is no longer active: {response:?}"),
-                            )),
-                        });
-                        opened_stream = controller.take_opened_stream();
-                        reply
                     }
                     Err(error) => CaptureError::new("invalid_request", error.to_string()).payload(),
                 }
@@ -195,26 +248,58 @@ impl ManagedModule for CaptureModule {
             }) {
                 Ok(Response::Ok) => (),
                 result => {
-                    if let Some(stream) = opened_stream {
-                        let _ = self
-                            .controller
-                            .lock()
-                            .map_err(|_| "capture controller poisoned")?
-                            .close(&caller, stream);
-                    }
                     if !matches!(result, Ok(Response::Error { ref code, .. }) if code == "request_ended" || code == "not_found")
                     {
-                        return Err(format!("capture completion failed: {result:?}"));
+                        failure.get_or_insert_with(|| {
+                            format!("capture completion failed: {result:?}")
+                        });
                     }
                 }
             }
         }
-        self.poll_pending_closes()?;
-        Ok(())
+        if opens_ready {
+            retain_failure(&mut failure, self.poll_open_requests());
+        }
+        if commands_ready {
+            retain_failure(&mut failure, self.poll_commands(self.quiescing));
+        }
+        if closes_ready {
+            retain_failure(&mut failure, self.poll_pending_closes());
+        }
+        failure.map_or(Ok(()), Err)
+    }
+}
+
+fn retain_failure(failure: &mut Option<String>, result: ModuleResult<()>) -> bool {
+    match result {
+        Ok(()) => true,
+        Err(error) => {
+            failure.get_or_insert(error);
+            false
+        }
     }
 }
 
 impl CaptureModule {
+    fn poll_commands(&mut self, quiescing: bool) -> ModuleResult<()> {
+        commands::poll_requests(
+            &self.runtime,
+            &self.controller,
+            quiescing,
+            &mut self.pending_commands,
+        )
+    }
+
+    fn poll_open_requests(&mut self) -> ModuleResult<()> {
+        opening::poll_requests(
+            &self.runtime,
+            &self.controller,
+            self.shutdown_requested,
+            &mut self.pending_opens,
+            &mut self.pending_lookups,
+        )
+    }
+
     fn poll_pending_closes(&mut self) -> ModuleResult<()> {
         let activity_failure = self.check_close_waiters();
         let retirement_failure = self.poll_close_jobs();
