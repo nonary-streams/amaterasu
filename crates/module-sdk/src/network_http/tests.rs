@@ -1,5 +1,5 @@
-//! Independent in-memory provider: the HTTP adapter must not open an OS socket
-//! or ask the system resolver to reach this deliberately nonexistent hostname.
+//! Replacement-provider fixtures never resolve their virtual host through the
+//! OS. Native-provider fixtures use only loopback addresses and ephemeral ports.
 use super::*;
 use crate::abi::{
     AbiHeader, BorrowedBytes, NativeInterface, STATUS_INVALID_ARGUMENT, STATUS_OK, Status,
@@ -7,6 +7,102 @@ use crate::abi::{
 use crate::network::abi::*;
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
+
+#[cfg(feature = "network-test-support")]
+fn loopback_http_peer(
+    response_delay: Option<Duration>,
+) -> (
+    std::net::SocketAddr,
+    std::sync::mpsc::SyncSender<()>,
+    std::thread::JoinHandle<std::io::Result<()>>,
+) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let (release, released) = std::sync::mpsc::sync_channel(1);
+    let worker = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut peer = loop {
+            match listener.accept() {
+                Ok((peer, _)) => break peer,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return Err(io::ErrorKind::TimedOut.into());
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        peer.set_read_timeout(Some(Duration::from_secs(1)))?;
+        peer.set_write_timeout(Some(Duration::from_secs(1)))?;
+        let mut request = Vec::new();
+        let mut buffer = [0; 1024];
+        while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+            let count = peer.read(&mut buffer)?;
+            if count == 0 || request.len() + count > 16 * 1024 {
+                return Err(io::ErrorKind::InvalidData.into());
+            }
+            request.extend_from_slice(&buffer[..count]);
+        }
+        if let Some(delay) = response_delay {
+            std::thread::sleep(delay);
+            peer.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")?;
+        } else {
+            let _ = released.recv_timeout(Duration::from_millis(500));
+        }
+        Ok(())
+    });
+    (address, release, worker)
+}
+
+#[cfg(feature = "network-test-support")]
+#[test]
+fn native_http_waits_for_a_delayed_response_within_its_deadline() {
+    let (address, _release, peer) = loopback_http_peer(Some(Duration::from_millis(50)));
+    let client = agent(
+        Config::builder()
+            .proxy(None)
+            .timeout_global(Some(Duration::from_secs(1)))
+            .build(),
+        Network::test_provider(),
+    );
+    let result = client
+        .get(format!("http://{address}/delayed"))
+        .call()
+        .map(|mut response| response.body_mut().read_to_string());
+    let peer_result = peer.join().unwrap();
+    assert_eq!(result.unwrap().unwrap(), "ok");
+    peer_result.unwrap();
+}
+
+#[cfg(feature = "network-test-support")]
+#[test]
+fn native_http_idle_peer_expires_at_the_configured_deadline() {
+    let (address, release, peer) = loopback_http_peer(None);
+    let client = agent(
+        Config::builder()
+            .proxy(None)
+            .timeout_global(Some(Duration::from_millis(80)))
+            .build(),
+        Network::test_provider(),
+    );
+    let started = Instant::now();
+    let result = client.get(format!("http://{address}/idle")).call();
+    let elapsed = started.elapsed();
+    let _ = release.send(());
+    peer.join().unwrap().unwrap();
+    assert!(matches!(result, Err(Error::Timeout(_))));
+    assert!(
+        elapsed >= Duration::from_millis(40),
+        "idle HTTP timed out before its wait budget"
+    );
+    assert!(
+        elapsed < Duration::from_millis(400),
+        "idle HTTP exceeded its wait budget"
+    );
+}
 
 #[derive(Default)]
 struct Observed {

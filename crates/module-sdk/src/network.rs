@@ -232,6 +232,9 @@ impl Network {
         })?;
         TcpListener::new(self.clone(), id)
     }
+    /// Connects within `timeout` and returns a blocking stream. This connection
+    /// budget does not set IO timeouts: set read/write timeouts for blocking IO,
+    /// or explicitly enable nonblocking mode before using a polling loop.
     pub fn connect_tcp(&self, address: SocketAddr, timeout: Duration) -> io::Result<TcpStream> {
         self.require(abi::TCP)?;
         let mut id = 0;

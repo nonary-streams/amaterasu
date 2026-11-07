@@ -83,6 +83,9 @@ fn tcp_wrappers_support_tls_style_read_write_and_cloned_listener_ownership() {
     let mut bytes = [0; 7];
     accepted.read_exact(&mut bytes).unwrap();
     assert_eq!(&bytes, b"request");
+    // The outbound Read must wait for bytes rather than expose WouldBlock just
+    // because its peer has not produced the TLS-style reply yet.
+    std::thread::sleep(Duration::from_millis(50));
     accepted.write_all(b"reply").unwrap();
     worker.join().unwrap();
 }

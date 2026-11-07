@@ -117,6 +117,8 @@ pub struct NetworkApi {
     pub interfaces:
         unsafe extern "C" fn(*mut c_void, *mut InterfaceAddress, usize, *mut usize) -> Status,
     pub tcp_listen: unsafe extern "C" fn(*mut c_void, Address, ListenOptions, *mut u64) -> Status,
+    /// Returns a blocking outbound stream. The timeout bounds connection setup;
+    /// consumers set read/write timeouts or explicitly enable NONBLOCKING for IO.
     pub tcp_connect: unsafe extern "C" fn(*mut c_void, Address, u32, *mut u64) -> Status,
     pub udp_bind: unsafe extern "C" fn(*mut c_void, Address, *mut u64) -> Status,
     /// Accepted streams are nonblocking regardless of listener mode.

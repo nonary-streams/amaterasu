@@ -248,7 +248,7 @@ fn tcp_listener_connection_peek_and_shutdown_use_the_same_contract() {
     );
 }
 #[test]
-fn connected_tcp_reads_and_peeks_remain_nonblocking_with_an_idle_peer() {
+fn explicitly_nonblocking_connected_tcp_reads_and_peeks_do_not_wait_for_an_idle_peer() {
     for peek in [false, true] {
         let factory = Factory::new();
         let provider = Bound::new(&factory);
@@ -263,6 +263,11 @@ fn connected_tcp_reads_and_peeks_remain_nonblocking_with_an_idle_peer() {
                     &mut client,
                 )
             },
+            STATUS_OK
+        );
+        // Outbound streams start blocking; a polling consumer selects its mode.
+        assert_eq!(
+            unsafe { (provider.api().set_option)(provider.context(), client, net::NONBLOCKING, 1) },
             STATUS_OK
         );
         listener.set_nonblocking(true).unwrap();
