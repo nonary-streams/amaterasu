@@ -1699,3 +1699,123 @@ fn cleanup_retries_preserve_another_streams_admitted_broker_call() {
         assert_eq!(controller.records[&application].state, State::Stopping);
     }
 }
+
+#[test]
+fn application_launch_join_binds_the_fresh_borrowed_reservation_before_rtsp() {
+    let now = Instant::now();
+    let mut controller = auxiliary_controller();
+    controller.set_session_lifecycle_required(true);
+    controller.set_session_lifecycle_capture_mode(
+        amaterasu_module_sdk::extension_api::CaptureBindingMode::External,
+    );
+    controller.set_global_display_policy(7, json!({}));
+    let original = borrowed_source("application-source");
+    let mut broker = SharedSessionBroker::default();
+    assert!(
+        controller
+            .launch_application_with_source(10, request(1), peer(1), original.clone(), now)
+            .is_none()
+    );
+    assert_eq!(
+        borrowed_ready(&mut controller, &mut broker, now).1.status,
+        200
+    );
+    controller.reply_delivered(10, now);
+    let joining = borrowed_source("joining-reservation");
+    let join_commands = broker.broker.commands.len();
+    assert!(
+        controller
+            .launch_application_with_source(11, request(2), peer(2), joining.clone(), now)
+            .is_none()
+    );
+    assert_eq!(
+        borrowed_ready(&mut controller, &mut broker, now).1.status,
+        200
+    );
+    controller.reply_delivered(11, now);
+    let root = controller
+        .records
+        .values()
+        .find(|record| record.application_session.is_none())
+        .unwrap();
+    let joined = controller
+        .records
+        .values()
+        .find(|record| record.application_session.is_some())
+        .unwrap();
+    assert_eq!(joined.shared_capture.as_ref(), Some(&joining));
+    assert_eq!(root.application_source.as_ref().unwrap().source, original);
+    assert_eq!(
+        joined.presentation_client_id.as_deref(),
+        Some(fingerprint(peer(2).certificate()).as_str())
+    );
+    let commands = &broker.broker.commands[join_commands..];
+    let bind = commands
+        .iter()
+        .position(|command| {
+            matches!(command,
+        Command::CallApi {method, payload, ..} if method == "bind_transport"
+            && payload["reservation_id"] == joining.reservation_id
+            && payload["transport_id"] == joined.rtsp_operation
+            && payload["client_id"] == fingerprint(peer(2).certificate()))
+        })
+        .unwrap();
+    let verify = commands
+        .iter()
+        .position(|command| {
+            matches!(command,
+        Command::CallApi {method, payload, ..} if method == "verify_source"
+            && payload["source"]["reservation_id"] == joining.reservation_id)
+        })
+        .unwrap();
+    let open = commands.iter().position(|command| matches!(command,
+        Command::Request {service, payload, ..} if service == "amaterasu.rtsp/1" && payload["action"] == "open"
+            && payload["borrowed_capture"]["reservation_id"] == joining.reservation_id)).unwrap();
+    assert!(bind < verify && verify < open);
+    assert!(!commands.iter().any(|command| matches!(command,
+        Command::CallApi {method, ..} if method == "bind_application")));
+}
+
+#[test]
+fn application_launch_join_rejects_a_changed_borrowed_source_before_effects() {
+    let now = Instant::now();
+    let mut controller = auxiliary_controller();
+    controller.set_session_lifecycle_required(true);
+    controller.set_session_lifecycle_capture_mode(
+        amaterasu_module_sdk::extension_api::CaptureBindingMode::External,
+    );
+    controller.set_global_display_policy(7, json!({}));
+    let mut broker = SharedSessionBroker::default();
+    assert!(
+        controller
+            .launch_application_with_source(
+                10,
+                request(1),
+                peer(1),
+                borrowed_source("application-source"),
+                now
+            )
+            .is_none()
+    );
+    assert_eq!(
+        borrowed_ready(&mut controller, &mut broker, now).1.status,
+        200
+    );
+    controller.reply_delivered(10, now);
+    let mut changed = borrowed_source("joining-reservation");
+    changed.generation += 1;
+    let commands = broker.broker.commands.len();
+    assert_eq!(
+        controller
+            .launch_application_with_source(11, request(2), peer(2), changed, now)
+            .unwrap()
+            .status,
+        409
+    );
+    assert_eq!(controller.records.len(), 1);
+    assert_eq!(broker.broker.commands.len(), commands);
+    assert_eq!(
+        controller.records.values().next().unwrap().state,
+        State::Ready
+    );
+}

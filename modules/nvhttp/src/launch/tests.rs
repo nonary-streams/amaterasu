@@ -5499,3 +5499,100 @@ fn cooperative_shutdown_runs_owned_application_cleanup_before_reporting_ready() 
     assert!(controller.quiesce(now+Duration::from_secs(15)));
     assert!(broker.actions().contains(&("amaterasu.launch/1", "stop")));
 }
+
+#[test]
+fn cooperative_shutdown_reconciles_only_retired_history_once_with_a_fixed_deadline() {
+    for recovered in [false, true] {
+        let now = Instant::now();
+        let mut controller = Controller::new(Some(config())).unwrap();
+        let mut broker = Broker::default();
+        launch_ready(&mut controller, &mut broker, now);
+        broker.history_release_unavailable = true;
+        assert!(controller.cancel(20, &peer(1), now).is_none());
+        assert_eq!(
+            poll_until_reply(&mut controller, &mut broker, now).1.status,
+            503
+        );
+        let application = *controller.records.keys().next().unwrap();
+        let record = &controller.records[&application];
+        assert_eq!(record.state, State::CleanupFailed);
+        assert!(!record.rtsp_requested);
+        assert!(!record.application_requested);
+        assert!(record.history_release_required);
+        broker.history_release_unavailable = !recovered;
+        let shutdown_at = now + Duration::from_secs(3_600);
+        assert!(!controller.quiesce(shutdown_at));
+        let deadline = controller.records[&application].deadline;
+        for tick in 0..128 {
+            let time = shutdown_at + Duration::from_millis(tick * 100);
+            controller.poll(time, &mut |command| broker.send(command));
+            controller.quiesce(time);
+            assert_eq!(controller.records[&application].deadline, deadline);
+        }
+        assert_eq!(
+            controller.quiesce(shutdown_at + Duration::from_secs(60)),
+            recovered
+        );
+        assert_eq!(broker.history_reserved, !recovered);
+        let releases: Vec<_> = broker
+            .commands
+            .iter()
+            .filter_map(|command| match command {
+                Command::Request {
+                    service, payload, ..
+                } if service == "amaterasu.stream-session/1"
+                    && payload["action"] == "release_history_activity" =>
+                {
+                    Some(payload)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(releases.len(), 2);
+        assert_eq!(releases[0], releases[1]);
+        assert_eq!(
+            broker
+                .actions()
+                .iter()
+                .filter(|action| **action == ("amaterasu.launch/1", "stop"))
+                .count(),
+            1
+        );
+        assert_eq!(controller.records[&application].deadline, deadline);
+    }
+}
+
+#[test]
+fn cooperative_shutdown_preserves_a_genuine_application_cleanup_failure_fence() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut broker = Broker::default();
+    launch_ready(&mut controller, &mut broker, now);
+    broker.application_terminal_stop_state = Some("cleanup_failed");
+    assert!(controller.cancel(20, &peer(1), now).is_none());
+    assert_eq!(
+        poll_until_reply(&mut controller, &mut broker, now).1.status,
+        503
+    );
+    let application = *controller.records.keys().next().unwrap();
+    let deadline = controller.records[&application].deadline;
+    assert!(controller.records[&application].application_cleanup_blocked);
+    for tick in 0..128 {
+        let time = now + Duration::from_millis(tick * 100);
+        assert!(!controller.quiesce(time));
+        controller.poll(time, &mut |command| broker.send(command));
+    }
+    let record = &controller.records[&application];
+    assert_eq!(record.state, State::CleanupFailed);
+    assert!(record.application_requested);
+    assert!(record.application_cleanup_blocked);
+    assert_eq!(record.deadline, deadline);
+    assert_eq!(
+        broker
+            .actions()
+            .iter()
+            .filter(|action| **action == ("amaterasu.launch/1", "stop"))
+            .count(),
+        1
+    );
+}

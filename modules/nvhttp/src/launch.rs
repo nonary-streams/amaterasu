@@ -697,6 +697,8 @@ struct LaunchSource {
 
 pub struct Controller {
     package_activation_pending: bool,
+    quiesce_history_deadline: Option<Instant>,
+    quiesce_history_retries: BTreeSet<u64>,
     logger: Option<LogEmitter>,
     config: Option<StreamingConfig>,
     session_lifecycle_required: bool,
@@ -753,6 +755,8 @@ impl Controller {
         getrandom::fill(&mut nonce).map_err(|_| "random_unavailable")?;
         Ok(Self {
             package_activation_pending: false,
+            quiesce_history_deadline: None,
+            quiesce_history_retries: BTreeSet::new(),
             logger: None,
             config,
             session_lifecycle_required: false,
@@ -1291,6 +1295,11 @@ impl Controller {
             return Some(private_error(503, "another stream is active"));
         }
         if auxiliary.is_none() && self.shared_application(request.app_id).is_some() {
+            if let Some(source) = shared_capture {
+                return self.resume_with_source_for_route(
+                    connection, request, &peer, source, response, now,
+                );
+            }
             return self.join_or_resume(connection, request, peer, response, now);
         }
         if auxiliary.is_none()
@@ -1851,8 +1860,19 @@ impl Controller {
     pub fn quiesce(&mut self, now: Instant) -> bool {
         self.pending_resume = None;
         self.pending_auxiliary.clear();
+        let history_deadline = *self
+            .quiesce_history_deadline
+            .get_or_insert(now + DEFAULT_CLEANUP_BUDGET);
         for record in self.records.values_mut() {
-            if !record.state.terminal()
+            if record.only_history_cleanup_remaining()
+                && now < history_deadline
+                && self.quiesce_history_retries.insert(record.id)
+            {
+                record.state = State::Stopping;
+                record.stage = Stage::ReleaseHistory;
+                record.cleanup_error = None;
+                record.deadline = history_deadline;
+            } else if !record.state.terminal()
                 && !matches!(record.state, State::Stopping | State::CleanupFailed)
             {
                 if record.application_session.is_none() {

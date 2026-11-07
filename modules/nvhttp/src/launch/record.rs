@@ -481,6 +481,28 @@ impl Record {
         self.cleanup_error = Some(error);
     }
 
+    /// History release is idempotent for the frozen activity identity. No
+    /// provider mutation may be retried here while resource ownership remains.
+    pub fn only_history_cleanup_remaining(&self) -> bool {
+        self.state == State::CleanupFailed
+            && self.history_release_required
+            && matches!(
+                self.cleanup_error,
+                Some("history_release_unconfirmed" | "history_release_unavailable")
+            )
+            && !self.rtsp_requested
+            && self.rtsp_ticket.is_none()
+            && !self.application_requested
+            && self.application_launch.is_none()
+            && !self.rtsp_cleanup_blocked
+            && !self.application_cleanup_blocked
+            && self.uncertain.is_empty()
+            && self.rtsp_reconcile.is_none()
+            && self.application_reconcile.is_none()
+            && (self.lifecycle_end_complete
+                || (self.lifecycle_session_target.is_none() && !self.lifecycle_prepare_dispatched))
+    }
+
     pub fn finish_cleanup(&mut self) {
         debug_assert!(self.uncertain.is_empty());
         self.state = if self.failure.is_some() {
