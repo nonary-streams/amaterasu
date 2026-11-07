@@ -355,8 +355,15 @@ impl Controller {
         {
             record.transport_only_cleanup = record.application_session.is_some();
             if record.state == State::CleanupFailed {
-                if let Some(pending) = record.retry_cleanup(now) {
-                    record.uncertain.push_front(pending);
+                match record.retry_cleanup(now) {
+                    Ok(Some(pending)) => record.uncertain.push_front(pending),
+                    Ok(None) => {}
+                    Err(code) => {
+                        if let Some(connection) = record.cancel_connection.take() {
+                            self.management_replies
+                                .push((connection, private_error(503, code)));
+                        }
+                    }
                 }
             } else if record.state != State::Stopping {
                 record.request_cleanup(None, now);

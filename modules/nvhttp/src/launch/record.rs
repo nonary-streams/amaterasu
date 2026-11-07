@@ -65,6 +65,14 @@ pub enum Stage {
     Terminal,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApplicationRetirementState {
+    Unreported,
+    Pending,
+    Failed,
+    Verified,
+}
+
 pub struct Record {
     pub id: u64,
     /// Joining transports borrow the application/session retained by this root.
@@ -103,7 +111,9 @@ pub struct Record {
     pub lifecycle_session_target: Option<amaterasu_module_sdk::extension_api::LifecycleTarget>,
     pub lifecycle_end_fenced: bool,
     pub lifecycle_end_complete: bool,
-    pub lifecycle_application_retired: bool,
+    pub lifecycle_application_retirement: ApplicationRetirementState,
+    /// Changes only when an explicit cleanup retry follows a terminal proof failure.
+    pub lifecycle_application_retirement_attempt: u32,
     pub lifecycle_retirement_launch: Option<u64>,
     pub lifecycle_application_bound: bool,
     pub lifecycle_binding_pending: bool,
@@ -318,7 +328,8 @@ impl Record {
             lifecycle_session_target: None,
             lifecycle_end_fenced: false,
             lifecycle_end_complete: false,
-            lifecycle_application_retired: false,
+            lifecycle_application_retirement: ApplicationRetirementState::Unreported,
+            lifecycle_application_retirement_attempt: 0,
             lifecycle_retirement_launch: None,
             lifecycle_application_bound: false,
             lifecycle_binding_pending: false,
@@ -438,6 +449,24 @@ impl Record {
         &self.rtsp_operation
     }
 
+    pub fn application_retirement_verified(&self) -> bool {
+        self.lifecycle_application_retirement == ApplicationRetirementState::Verified
+    }
+
+    pub fn application_retirement_operation(&self) -> String {
+        let original = format!("{}-lifecycle-app-retired", self.application_operation);
+        if self.lifecycle_application_retirement_attempt == 0 {
+            original
+        } else {
+            // An epoch-qualified application ID already makes the original
+            // retirement ID 128 bytes. Keep every subsequent ID bounded too.
+            format!(
+                "{}-retire-{:08x}",
+                self.application_operation, self.lifecycle_application_retirement_attempt
+            )
+        }
+    }
+
     pub fn request_cleanup(&mut self, failure: Option<&'static str>, now: Instant) {
         if let Some(failure) = failure {
             self.failure.get_or_insert(failure);
@@ -519,10 +548,18 @@ impl Record {
         self.monitor_application_next = !self.monitor_application_next;
     }
 
-    pub fn retry_cleanup(&mut self, now: Instant) -> Option<(Phase, Call)> {
+    pub fn retry_cleanup(&mut self, now: Instant) -> Result<Option<(Phase, Call)>, &'static str> {
         if self.lifecycle_prepare_dispatched && self.lifecycle_session_target.is_none() {
             self.fail_cleanup("lifecycle_retirement_unavailable");
-            return None;
+            return Err("lifecycle_retirement_unavailable");
+        }
+        if self.lifecycle_application_retirement == ApplicationRetirementState::Failed {
+            let Some(attempt) = self.lifecycle_application_retirement_attempt.checked_add(1) else {
+                self.fail_cleanup("application_retirement_attempts_exhausted");
+                return Err("application_retirement_attempts_exhausted");
+            };
+            self.lifecycle_application_retirement_attempt = attempt;
+            self.lifecycle_application_retirement = ApplicationRetirementState::Unreported;
         }
         self.state = State::Stopping;
         self.stage = Stage::Cleanup;
@@ -532,9 +569,9 @@ impl Record {
         self.deadline = self.cleanup_deadline(now);
         self.next_cleanup_poll = now;
         self.retrying_uncertainty = true;
-        self.uncertain.pop_front().map(|(phase, mut call)| {
+        Ok(self.uncertain.pop_front().map(|(phase, mut call)| {
             call.retry_settlement();
             (phase, call)
-        })
+        }))
     }
 }

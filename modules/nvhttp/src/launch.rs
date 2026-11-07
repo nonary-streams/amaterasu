@@ -19,6 +19,7 @@ mod tests {
     include!("launch/audio_tests.rs");
     include!("launch/display_mutation_tests.rs");
     include!("launch/lifecycle_tests.rs");
+    include!("launch/retirement_tests.rs");
     include!("launch/shared_session_tests.rs");
     include!("launch/auxiliary_tests.rs");
 }
@@ -1085,8 +1086,10 @@ impl Controller {
         }
         let already_stopping = record.state == State::Stopping;
         if record.state == State::CleanupFailed {
-            if let Some(pending) = record.retry_cleanup(now) {
-                record.uncertain.push_front(pending);
+            match record.retry_cleanup(now) {
+                Ok(Some(pending)) => record.uncertain.push_front(pending),
+                Ok(None) => {}
+                Err(code) => return json!({"ok":false,"code":code}),
             }
         } else if record.state != State::Stopping {
             record.request_cleanup(None, now);
@@ -1451,7 +1454,13 @@ impl Controller {
             record.transport_only_cleanup = false;
         }
         let retry = if record.state == State::CleanupFailed {
-            record.retry_cleanup(now)
+            match record.retry_cleanup(now) {
+                Ok(pending) => pending,
+                Err(code) => {
+                    record.cancel_connection = None;
+                    return Some(private_error(503, code));
+                }
+            }
         } else {
             record.request_cleanup(None, now);
             None

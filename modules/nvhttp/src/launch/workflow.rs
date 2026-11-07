@@ -3,7 +3,7 @@ use super::{
     MAX_APPLICATION_CLEANUP_BUDGET_MS, MONITOR_INTERVAL, Send, StreamingConfig, app_id,
     call::{Call, Outcome},
     capture_sink_without_routing, key_hex, private_error,
-    record::{Record, Stage, State},
+    record::{ApplicationRetirementState, Record, Stage, State},
     success_reply,
 };
 use crate::encoder_snapshot::{
@@ -42,6 +42,7 @@ pub enum Phase {
     LookupApplicationBinding,
     EndLifecycle,
     ReportApplicationRetired,
+    LookupApplicationRetirement,
     AwaitLifecycleEnd,
     VerifyPaused,
     VerifyResumeSession,
@@ -92,6 +93,7 @@ impl Phase {
             | Self::LookupApplicationBinding
             | Self::EndLifecycle
             | Self::ReportApplicationRetired
+            | Self::LookupApplicationRetirement
             | Self::AwaitLifecycleEnd => {
                 !matches!(payload["status"].as_str(), Some("pending" | "succeeded"))
             }
@@ -135,6 +137,7 @@ mod phase_logging_tests {
             Phase::LookupApplicationBinding,
             Phase::EndLifecycle,
             Phase::ReportApplicationRetired,
+            Phase::LookupApplicationRetirement,
             Phase::AwaitLifecycleEnd,
         ] {
             assert!(!phase.response_reported_failure(&json!({"status":"pending"})));
@@ -294,6 +297,7 @@ impl Controller {
                         | Phase::LookupApplicationBinding
                         | Phase::EndLifecycle
                         | Phase::ReportApplicationRetired
+                        | Phase::LookupApplicationRetirement
                         | Phase::AwaitLifecycleEnd
                         | Phase::VerifyPaused
                         | Phase::VerifyResumeSession
@@ -344,6 +348,7 @@ impl Controller {
                     | Phase::LookupApplicationBinding
                     | Phase::EndLifecycle
                     | Phase::ReportApplicationRetired
+                    | Phase::LookupApplicationRetirement
                     | Phase::AwaitLifecycleEnd
                     | Phase::VerifyPaused
                     | Phase::VerifyResumeSession
@@ -628,9 +633,19 @@ impl Controller {
                 json!({"operation":"end_session", "operation_id":format!("{}-lifecycle-end",record.application_operation), "target":record.lifecycle_session_target}),
                 5_000,
             ),
-            Phase::ReportApplicationRetired => (
+            Phase::ReportApplicationRetired => {
+                // The call may lose its reply after admission. Reconcile this
+                // exact proof operation before considering another attempt.
+                record.lifecycle_application_retirement = ApplicationRetirementState::Pending;
+                (
+                    SESSION_LIFECYCLE_SERVICE,
+                    json!({"operation":"application_retired", "operation_id":record.application_retirement_operation(), "target":record.lifecycle_session_target, "retired":true, "retirement_receipt":{"service":LAUNCH_SERVICE,"launch_id":record.lifecycle_retirement_launch,"operation_id":record.application_operation}}),
+                    5_000,
+                )
+            }
+            Phase::LookupApplicationRetirement => (
                 SESSION_LIFECYCLE_SERVICE,
-                json!({"operation":"application_retired", "operation_id":format!("{}-lifecycle-app-retired",record.application_operation), "target":record.lifecycle_session_target, "retired":true, "retirement_receipt":{"service":LAUNCH_SERVICE,"launch_id":record.lifecycle_retirement_launch,"operation_id":record.application_operation}}),
+                json!({"operation":"lookup", "operation_id":record.application_retirement_operation()}),
                 5_000,
             ),
             Phase::AwaitLifecycleEnd => (
@@ -1195,6 +1210,8 @@ impl Controller {
             }
             Phase::EndLifecycle => {
                 if payload["target"] == json!(record.lifecycle_session_target)
+                    && payload["operation_id"]
+                        == format!("{}-lifecycle-end", record.application_operation)
                     && (payload["status"] == "succeeded"
                         || (payload["status"] == "pending" && payload["fenced"] == true))
                 {
@@ -1223,21 +1240,16 @@ impl Controller {
                     reply_failure(record, replies);
                 }
             }
-            Phase::ReportApplicationRetired => {
-                if payload["target"] == json!(record.lifecycle_session_target)
-                    && matches!(payload["status"].as_str(), Some("pending" | "succeeded"))
-                {
-                    record.lifecycle_application_retired = true;
-                    record.next_cleanup_poll = now + CLEANUP_POLL_INTERVAL;
-                } else {
-                    record.fail_cleanup("lifecycle_application_retirement_unconfirmed");
-                    reply_failure(record, replies);
-                }
+            Phase::ReportApplicationRetired | Phase::LookupApplicationRetirement => {
+                observe_application_retirement(record, job.phase, &payload, now, replies);
             }
             Phase::AwaitLifecycleEnd => {
-                if payload["status"] == "succeeded" {
+                let exact_receipt = payload["operation_id"]
+                    == format!("{}-lifecycle-end", record.application_operation)
+                    && payload["target"] == json!(record.lifecycle_session_target);
+                if exact_receipt && payload["status"] == "succeeded" {
                     record.lifecycle_end_complete = true;
-                } else if payload["status"] == "pending" {
+                } else if exact_receipt && payload["status"] == "pending" {
                     record.next_cleanup_poll = now + CLEANUP_POLL_INTERVAL;
                 } else {
                     record.fail_cleanup("lifecycle_end_unconfirmed");
@@ -1779,7 +1791,14 @@ impl Controller {
             | Phase::LookupApplicationBinding
             | Phase::EndLifecycle
             | Phase::ReportApplicationRetired
+            | Phase::LookupApplicationRetirement
             | Phase::AwaitLifecycleEnd => {
+                if job.phase == Phase::ReportApplicationRetired {
+                    // A broker rejection proves this particular request was
+                    // not admitted; retry may reuse its exact proof identity.
+                    record.lifecycle_application_retirement =
+                        ApplicationRetirementState::Unreported;
+                }
                 record.fail_cleanup("lifecycle_retirement_unconfirmed");
                 reply_failure(record, replies);
             }
@@ -1908,10 +1927,15 @@ impl Controller {
             | Phase::BindApplication
             | Phase::LookupApplicationBinding
             | Phase::EndLifecycle
-            | Phase::ReportApplicationRetired
             | Phase::AwaitLifecycleEnd => {
                 record.fail_cleanup("lifecycle_prepare_unconfirmed");
                 reply_failure(record, replies);
+            }
+            Phase::ReportApplicationRetired | Phase::LookupApplicationRetirement => {
+                // Broker ownership has settled, but its reply did not prove
+                // retirement. Read back this same proof without replaying
+                // native cleanup or extending the cleanup deadline.
+                record.next_cleanup_poll = now + CLEANUP_POLL_INTERVAL;
             }
             Phase::ReserveHistory => {
                 if record.cleanup_error == Some("broker_settlement_unconfirmed") {
@@ -2062,6 +2086,47 @@ impl Controller {
     }
 }
 
+fn observe_application_retirement(
+    record: &mut Record,
+    phase: Phase,
+    payload: &Value,
+    now: Instant,
+    replies: &mut Vec<(u64, Reply)>,
+) {
+    let exact_operation = payload["operation_id"] == record.application_retirement_operation();
+    let exact_target = payload["target"] == json!(record.lifecycle_session_target);
+    match payload["status"].as_str() {
+        Some("pending" | "succeeded") if exact_operation && exact_target => {
+            record.lifecycle_application_retirement = if payload["status"] == "succeeded" {
+                ApplicationRetirementState::Verified
+            } else {
+                ApplicationRetirementState::Pending
+            };
+            record.next_cleanup_poll = now + CLEANUP_POLL_INTERVAL;
+            return;
+        }
+        Some("recovery_required" | "rejected")
+            if exact_operation && (payload.get("target").is_none() || exact_target) =>
+        {
+            // This is a completed read-only verification, not failed native
+            // teardown. Only an explicit retry may request a fresh proof.
+            record.lifecycle_application_retirement = ApplicationRetirementState::Failed;
+        }
+        Some("not_found")
+            if phase == Phase::LookupApplicationRetirement
+                && (payload.get("operation_id").is_none() || exact_operation)
+                && (payload.get("target").is_none() || exact_target) =>
+        {
+            // No retained receipt was found. Preserve the operation identity
+            // so an explicit retry resubmits only the original request.
+            record.lifecycle_application_retirement = ApplicationRetirementState::Unreported;
+        }
+        _ => {}
+    }
+    record.fail_cleanup("lifecycle_application_retirement_unconfirmed");
+    reply_failure(record, replies);
+}
+
 pub(super) fn lifecycle_session_is_paused(record: &Record, payload: &Value) -> bool {
     lifecycle_session_has_phase(record, payload, &["paused"])
 }
@@ -2141,6 +2206,7 @@ impl Phase {
             Self::LookupApplicationBinding => "lookup-application-binding",
             Self::EndLifecycle => "end-lifecycle",
             Self::ReportApplicationRetired => "report-application-retired",
+            Self::LookupApplicationRetirement => "lookup-application-retirement",
             Self::AwaitLifecycleEnd => "await-lifecycle-end",
             Self::VerifyPaused => "verify-paused",
             Self::VerifyResumeSession => "verify-resume-session",
@@ -2240,7 +2306,10 @@ fn needs_work(record: &Record, now: Instant) -> bool {
     }
     if record.stage == Stage::Cleanup
         && record.lifecycle_end_fenced
-        && record.lifecycle_application_retired
+        && matches!(
+            record.lifecycle_application_retirement,
+            ApplicationRetirementState::Pending | ApplicationRetirementState::Verified
+        )
         && !record.lifecycle_end_complete
         && now < record.next_cleanup_poll
     {
@@ -2347,8 +2416,14 @@ pub(super) fn next_phase(record: &Record) -> Phase {
             return Phase::EndLifecycle;
         }
         if !record.rtsp_requested && !record.application_requested {
-            if !record.lifecycle_application_retired {
-                return Phase::ReportApplicationRetired;
+            if !record.application_retirement_verified() {
+                return if record.lifecycle_application_retirement
+                    == ApplicationRetirementState::Unreported
+                {
+                    Phase::ReportApplicationRetired
+                } else {
+                    Phase::LookupApplicationRetirement
+                };
             }
             if !record.lifecycle_end_complete {
                 return Phase::AwaitLifecycleEnd;
