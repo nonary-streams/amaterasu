@@ -196,3 +196,165 @@ fn startup_rejects_an_unavailable_selected_network_provider() {
     assert_eq!(host.typed_network_binds, 1);
     assert!(host.responses.is_empty());
 }
+
+#[test]
+fn shutdown_announcement_seals_admission_without_releasing_owned_control() {
+    let mut host = Host {
+        typed_network_binds: 0,
+        responses: VecDeque::new(),
+        completed: Vec::new(),
+    };
+    let mut module = start(&mut host);
+    let Response::Request { payload, .. } = open_request() else {
+        unreachable!();
+    };
+    let opened = module.dispatch("alice", SERVICE, payload).unwrap();
+    let stream = opened.created.unwrap();
+    let local = opened.payload["local"].as_str().unwrap();
+
+    module.prepare_shutdown(20_000).unwrap();
+    assert!(UdpSocket::bind(local).is_err());
+    assert_eq!(
+        module
+            .dispatch(
+                "alice",
+                SERVICE,
+                json!({"action": "lookup", "operation_id": "first"}),
+            )
+            .unwrap()
+            .payload["stream"],
+        stream
+    );
+    assert_eq!(
+        module
+            .dispatch(
+                "alice",
+                SERVICE,
+                json!({
+                    "action": "open",
+                    "peer_ip": "127.0.0.1",
+                    "connect_data": 17,
+                    "key_hex": "101112131415161718191a1b1c1d1e1f",
+                    "operation_id": "second"
+                }),
+            )
+            .err(),
+        Some("shutting_down")
+    );
+    module
+        .dispatch(
+            "alice",
+            SERVICE,
+            json!({"action": "close", "stream": stream}),
+        )
+        .unwrap();
+    assert!(UdpSocket::bind(local).is_ok());
+}
+
+#[test]
+fn quiesce_releases_control_sockets_before_reporting_ready() {
+    let mut host = Host {
+        typed_network_binds: 0,
+        responses: VecDeque::new(),
+        completed: Vec::new(),
+    };
+    let mut module = start(&mut host);
+    let Response::Request { payload, .. } = open_request() else {
+        unreachable!();
+    };
+    let opened = module.dispatch("alice", SERVICE, payload).unwrap();
+    let local = opened.payload["local"].as_str().unwrap();
+    let retained = module.controller.clone();
+    assert!(UdpSocket::bind(local).is_err());
+
+    assert!(module.quiesce().unwrap());
+    assert!(module.quiesce().unwrap());
+    assert!(UdpSocket::bind(local).is_ok());
+    assert_eq!(
+        retained
+            .lock()
+            .unwrap()
+            .handle("alice", Operation::Status { stream: None })
+            .unwrap()
+            .payload["streams"],
+        json!([])
+    );
+
+    host.responses
+        .extend([open_request(), Response::Ok, Response::Ok]);
+    module.tick().unwrap();
+    assert_eq!(host.completed[0]["ok"], false);
+    assert_eq!(host.completed[0]["code"], "shutting_down");
+    assert!(host.responses.is_empty());
+    assert!(UdpSocket::bind(local).is_ok());
+}
+
+#[test]
+fn quiesce_closes_sockets_even_after_controller_poisoning() {
+    let mut host = Host {
+        typed_network_binds: 0,
+        responses: VecDeque::new(),
+        completed: Vec::new(),
+    };
+    let mut module = start(&mut host);
+    let Response::Request { payload, .. } = open_request() else {
+        unreachable!();
+    };
+    let opened = module.dispatch("alice", SERVICE, payload).unwrap();
+    let local = opened.payload["local"].as_str().unwrap();
+    let retained = module.controller.clone();
+    let _ = std::panic::catch_unwind(|| {
+        let _lock = retained.lock().unwrap();
+        panic!("simulated controller failure");
+    });
+
+    module.prepare_shutdown(20_000).unwrap();
+    assert!(UdpSocket::bind(local).is_err());
+    assert!(module.quiesce().unwrap());
+    assert!(UdpSocket::bind(local).is_ok());
+}
+
+#[test]
+fn shutdown_defers_retirement_without_blocking_on_a_native_call() {
+    let mut host = Host {
+        typed_network_binds: 0,
+        responses: VecDeque::new(),
+        completed: Vec::new(),
+    };
+    let mut module = start(&mut host);
+    let Response::Request { payload, .. } = open_request() else {
+        unreachable!();
+    };
+    let opened = module.dispatch("alice", SERVICE, payload).unwrap();
+    let stream = opened.created.unwrap();
+    let local = opened.payload["local"].as_str().unwrap();
+    let retained = module.controller.clone();
+    // An active native receive holds this same lock while its synchronous sink
+    // borrows plaintext. The host must keep progressing other modules meanwhile.
+    let native_call = retained.lock().unwrap();
+    module.prepare_shutdown(20_000).unwrap();
+    assert!(!module.quiesce().unwrap());
+    host.responses.extend([
+        Response::Request {
+            id: 2,
+            caller: "alice".into(),
+            initiator: "untrusted-initiator".into(),
+            service: SERVICE.into(),
+            remaining_ms: 1000,
+            payload: json!({"action": "close", "stream": stream}),
+        },
+        Response::Ok,
+        Response::Ok,
+    ]);
+    module.tick().unwrap();
+    assert_eq!(host.responses.len(), 3);
+    assert!(host.completed.is_empty());
+    assert!(UdpSocket::bind(local).is_err());
+
+    drop(native_call);
+    module.tick().unwrap();
+    assert!(host.responses.is_empty());
+    assert_eq!(host.completed, [json!({"ok": true})]);
+    assert!(module.quiesce().unwrap());
+    assert!(UdpSocket::bind(local).is_ok());
+}

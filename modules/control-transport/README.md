@@ -59,6 +59,14 @@ caller. Unknown or foreign IDs produce an empty status list. `close {stream}`
 aborts an owned connection and releases its socket; unknown or foreign IDs return
 `stream_not_found`. Close does not wait for a peer's disconnect acknowledgement.
 
+Host shutdown seals new opens while declared consumers finish using existing
+streams. Dependency-ordered quiescence then releases every owned socket before
+reporting ready, including after controller poisoning. An in-flight synchronous
+native callback delays that retirement without blocking the host's drain loop;
+normal JSON operations stay queued until the controller is available. Existing
+close, lookup and status operations remain available during the announcement
+phase.
+
 Four streams may exist globally, two per caller. Nonzero IDs use OS randomness;
 callers must preserve full 64-bit integer precision. The provider retains at most
 1024 issued IDs, 128 idempotency records and 128 historical keys per lifetime.

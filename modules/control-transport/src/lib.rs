@@ -10,7 +10,7 @@ use amaterasu_module_sdk::{
 use controller::{Controller, Reply};
 use model::{Operation, Settings};
 use serde_json::json;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, TryLockError};
 
 const SERVICE: &str = "amaterasu.control-transport/1";
 
@@ -18,6 +18,7 @@ struct ControlTransport {
     runtime: RuntimeClient,
     controller: native::Shared,
     _factory: Box<native::Factory>,
+    shutdown_announced: bool,
 }
 
 impl ManagedModule for ControlTransport {
@@ -29,10 +30,12 @@ impl ManagedModule for ControlTransport {
         let _priority = amaterasu_module_sdk::threading::ScopedThreadPriority::best_effort(
             amaterasu_module_sdk::threading::ThreadPriority::Critical,
         );
-        self.controller
-            .lock()
-            .map_err(|_| "control state unavailable")?
-            .tick();
+        let mut controller = match self.controller.try_lock() {
+            Ok(controller) => controller,
+            Err(TryLockError::WouldBlock) => return Ok(()),
+            Err(TryLockError::Poisoned(_)) => return Err("control state unavailable".into()),
+        };
+        controller.tick();
         match self.runtime.send(Command::Poll {})? {
             Response::Pending => Ok(()),
             Response::Request {
@@ -48,7 +51,13 @@ impl ManagedModule for ControlTransport {
                 ) {
                     return Ok(());
                 }
-                let reply = self.dispatch(&caller, &service, payload);
+                let reply = Self::dispatch_locked(
+                    &mut controller,
+                    self.shutdown_announced,
+                    &caller,
+                    &service,
+                    payload,
+                );
                 let Reply { payload, created } = reply.unwrap_or_else(|code| Reply {
                     payload: json!({"ok": false, "code": code}),
                     created: None,
@@ -62,12 +71,30 @@ impl ManagedModule for ControlTransport {
                 ) && let Some(stream) = created
                 {
                     // A cancelled/lost open response must not leave hidden sockets.
-                    let _ = self.cleanup_controller().close(&caller, stream);
+                    let _ = controller.close(&caller, stream);
                 }
                 Ok(())
             }
             _ => Err("control transport poll failed".into()),
         }
+    }
+
+    fn prepare_shutdown(&mut self, _remaining_ms: u64) -> ModuleResult<()> {
+        // Consumers still own their existing streams until dependency-ordered
+        // quiescence. Only seal new admission during this announcement.
+        self.shutdown_announced = true;
+        Ok(())
+    }
+
+    fn quiesce(&mut self) -> ModuleResult<bool> {
+        self.shutdown_announced = true;
+        let mut controller = match self.controller.try_lock() {
+            Ok(controller) => controller,
+            Err(TryLockError::WouldBlock) => return Ok(false),
+            Err(TryLockError::Poisoned(error)) => error.into_inner(),
+        };
+        controller.shutdown();
+        Ok(true)
     }
 }
 
@@ -79,8 +106,29 @@ impl ControlTransport {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    #[cfg(test)]
     fn dispatch(
         &self,
+        owner: &str,
+        service: &str,
+        payload: serde_json::Value,
+    ) -> model::ControlResult<Reply> {
+        let mut controller = self
+            .controller
+            .lock()
+            .map_err(|_| "control_state_unavailable")?;
+        Self::dispatch_locked(
+            &mut controller,
+            self.shutdown_announced,
+            owner,
+            service,
+            payload,
+        )
+    }
+
+    fn dispatch_locked(
+        controller: &mut Controller,
+        shutdown_announced: bool,
         owner: &str,
         service: &str,
         payload: serde_json::Value,
@@ -90,10 +138,10 @@ impl ControlTransport {
         }
         let operation: Operation =
             serde_json::from_value(payload).map_err(|_| "invalid_request")?;
-        self.controller
-            .lock()
-            .map_err(|_| "control_state_unavailable")?
-            .handle(owner, operation)
+        if shutdown_announced && matches!(operation, Operation::Open(_)) {
+            return Err("shutting_down");
+        }
+        controller.handle(owner, operation)
     }
 }
 
@@ -126,6 +174,7 @@ impl ControlTransport {
             runtime,
             controller,
             _factory: factory,
+            shutdown_announced: false,
         })
     }
 }
