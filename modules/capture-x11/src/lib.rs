@@ -26,6 +26,7 @@ struct CaptureModule {
     runtime: RuntimeClient,
     controller: SharedController,
     _factory: Box<native::Factory<NativeBackend>>,
+    shutting_down: bool,
 }
 
 impl ManagedModule for CaptureModule {
@@ -56,7 +57,27 @@ impl ManagedModule for CaptureModule {
             runtime,
             controller,
             _factory: factory,
+            shutting_down: false,
         })
+    }
+
+    fn prepare_shutdown(&mut self, _remaining_ms: u64) -> ModuleResult<()> {
+        self.shutting_down = true;
+        Ok(())
+    }
+
+    fn quiesce(&mut self) -> ModuleResult<bool> {
+        self.shutting_down = true;
+        match self.controller.try_lock() {
+            Ok(mut controller) => {
+                controller.shutdown();
+                Ok(true)
+            }
+            Err(std::sync::TryLockError::WouldBlock) => Ok(false),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                Err("X11 capture controller poisoned during shutdown".into())
+            }
+        }
     }
 
     fn tick(&mut self) -> ModuleResult<()> {
@@ -83,6 +104,10 @@ impl ManagedModule for CaptureModule {
                 CaptureError::new("invalid_service", "unsupported capture service").payload()
             } else {
                 match serde_json::from_value::<Operation>(payload) {
+                    Ok(Operation::Open { .. }) if self.shutting_down => {
+                        CaptureError::new("capture_shutdown", "X11 capture is shutting down")
+                            .payload()
+                    }
                     Ok(operation) => {
                         let mut controller = self
                             .controller

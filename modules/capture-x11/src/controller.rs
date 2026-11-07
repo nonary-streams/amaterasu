@@ -59,6 +59,16 @@ impl<B: Backend> Controller<B> {
         self.opened_stream.take()
     }
 
+    #[cfg(test)]
+    pub fn with_backend<C: Backend>(self, backend: C) -> Controller<C> {
+        Controller {
+            backend,
+            enabled: self.enabled,
+            streams: self.streams,
+            opened_stream: self.opened_stream,
+        }
+    }
+
     pub fn shutdown(&mut self) {
         self.enabled = false;
         self.streams.clear();

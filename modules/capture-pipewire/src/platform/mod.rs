@@ -105,6 +105,14 @@ pub struct NativeBackend {
 }
 
 impl NativeBackend {
+    #[cfg(test)]
+    pub fn unavailable_for_test() -> Self {
+        Self {
+            availability: Availability::unsupported("isolated_test_backend"),
+            store: None,
+        }
+    }
+
     pub fn new() -> Self {
         let mut probe = Probe::default();
         // SAFETY: private adapter writes only this live, fixed-layout probe slot.

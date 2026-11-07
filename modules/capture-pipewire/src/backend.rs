@@ -68,6 +68,11 @@ pub struct NativeBackend;
 
 #[cfg(not(amaterasu_pipewire))]
 impl NativeBackend {
+    #[cfg(test)]
+    pub fn unavailable_for_test() -> Self {
+        Self
+    }
+
     pub fn new() -> Self {
         Self
     }

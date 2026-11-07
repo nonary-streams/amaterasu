@@ -164,3 +164,12 @@ these workers, and all workers join before module unload.
 The ordinary portal path, saved grants and explicit user selection remain
 independent. Named capture remains a CPU BGRA path; this feature does not provide
 private DRM DMA-BUF / encoder zero-copy transport.
+
+Host shutdown first rejects new source selections and opens while existing
+consumers retain their sources. Once consumers drain, module quiescence closes
+all source leases and joins their native workers before reporting ready. Pending
+open requests retain broker ownership until their shutdown replies settle.
+GLib event dispatch checks cancellation between callbacks, including when events
+remain continuously ready. Native destruction still joins synchronously; these
+ownership checks do not make every compositor, PipeWire, or driver call
+interruptible. Isolated shutdown tests do not replace native desktop qualification.

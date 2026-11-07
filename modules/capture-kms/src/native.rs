@@ -69,6 +69,77 @@ mod tests {
     use std::ffi::CString;
     use std::ptr;
 
+    #[repr(C)]
+    #[derive(Default, Debug)]
+    struct CleanupObservation {
+        make_current_calls: u32,
+        texture_deletions: u32,
+        framebuffer_deletions: u32,
+        wrong_context_deletions: u32,
+        image_deletions: u32,
+        plane_queries: u32,
+        texture_after: u32,
+        framebuffer_after: u32,
+    }
+
+    unsafe extern "C" {
+        fn am_kms_test_image_cleanup(
+            make_current_succeeds: u32,
+            has_context: u32,
+            output: *mut CleanupObservation,
+        );
+        fn am_kms_test_read_without_current_context(output: *mut CleanupObservation) -> i32;
+    }
+
+    #[test]
+    fn failed_context_binding_never_deletes_another_contexts_gl_objects() {
+        let mut observed = CleanupObservation::default();
+        // SAFETY: the adapter fixture writes this fixed-layout result and mocks
+        // every reached platform call, using no native device or EGL context.
+        unsafe { am_kms_test_image_cleanup(0, 1, &mut observed) };
+        assert_eq!(observed.make_current_calls, 1);
+        assert_eq!(observed.texture_deletions, 0, "{observed:?}");
+        assert_eq!(observed.framebuffer_deletions, 0, "{observed:?}");
+        assert_eq!(observed.wrong_context_deletions, 0);
+        assert_eq!(observed.image_deletions, 1);
+        assert_eq!((observed.texture_after, observed.framebuffer_after), (0, 0));
+    }
+
+    #[test]
+    fn successful_context_binding_deletes_only_owned_gl_objects() {
+        let mut observed = CleanupObservation::default();
+        // SAFETY: this is the same isolated fixed-layout mock adapter fixture.
+        unsafe { am_kms_test_image_cleanup(1, 1, &mut observed) };
+        assert_eq!(observed.make_current_calls, 1);
+        assert_eq!(observed.texture_deletions, 1);
+        assert_eq!(observed.framebuffer_deletions, 1);
+        assert_eq!(observed.wrong_context_deletions, 0);
+        assert_eq!(observed.image_deletions, 1);
+    }
+
+    #[test]
+    fn partial_initialization_without_a_context_skips_gl_deletion() {
+        let mut observed = CleanupObservation::default();
+        // SAFETY: this fixture never opens or uses a platform resource.
+        unsafe { am_kms_test_image_cleanup(0, 0, &mut observed) };
+        assert_eq!(observed.make_current_calls, 0);
+        assert_eq!(observed.texture_deletions, 0);
+        assert_eq!(observed.framebuffer_deletions, 0);
+        assert_eq!(observed.image_deletions, 1);
+    }
+
+    #[test]
+    fn read_checks_its_context_before_refreshing_native_framebuffer_ownership() {
+        let mut observed = CleanupObservation::default();
+        // SAFETY: DRM and EGL entry points reached by this call are mocks. The
+        // fixture lends its own initialized frame bytes for the entire call.
+        let result = unsafe { am_kms_test_read_without_current_context(&mut observed) };
+        assert_eq!(result, 9, "{observed:?}");
+        assert_eq!(observed.make_current_calls, 1);
+        assert_eq!(observed.plane_queries, 0, "{observed:?}");
+        assert_eq!(observed.wrong_context_deletions, 0);
+    }
+
     #[test]
     fn native_abi_rejects_null_output_records_before_device_access() {
         // SAFETY: a null pointer is deliberately supplied to exercise the C

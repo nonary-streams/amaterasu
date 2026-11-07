@@ -3,7 +3,12 @@ use std::{env, process::Command};
 fn main() {
     println!("cargo:rustc-check-cfg=cfg(amaterasu_pipewire)");
     println!("cargo:rustc-check-cfg=cfg(amaterasu_kwin)");
-    for file in ["src/platform/adapter.c", "src/platform/adapter.h"] {
+    for file in [
+        "src/platform/adapter.c",
+        "src/platform/adapter.h",
+        "src/platform/dispatch.h",
+        "src/platform/dispatch_tests.c",
+    ] {
         println!("cargo:rerun-if-changed={file}");
     }
     for variable in [
@@ -41,7 +46,12 @@ fn main() {
     if env::var_os("CARGO_FEATURE_LINUX_KWIN_SCREENCAST").is_some() {
         configure_kwin(&mut build);
     }
-    build.file("src/platform/adapter.c").flag("-std=c11");
+    build
+        .file("src/platform/adapter.c")
+        // This separate archive object is referenced only by Rust unit tests;
+        // ordinary native-library linking does not pull the fixture into use.
+        .file("src/platform/dispatch_tests.c")
+        .flag("-std=c11");
     for flag in String::from_utf8(output.stdout)
         .expect("pkg-config UTF-8 flags")
         .split_whitespace()

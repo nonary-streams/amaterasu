@@ -23,3 +23,9 @@ access-lost result. The provider has no fallback to PipeWire or another display
 server. Real-window pixel and throughput qualification requires a live X11 or
 Xwayland session with an authorized `DISPLAY` and remains a separate native
 platform gate.
+
+Host shutdown rejects new opens while existing consumers finish. Module
+quiescence then closes every owned XCB session before reporting ready; a busy
+controller remains pending and a poisoned controller reports an error. Native
+session destruction remains synchronous, and isolated ownership tests do not
+prove that every X server or driver operation is interruptible.

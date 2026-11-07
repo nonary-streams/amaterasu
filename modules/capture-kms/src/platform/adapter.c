@@ -791,14 +791,14 @@ static void clear_imported_image(struct am_kms_session *session) {
     if (session == NULL) {
         return;
     }
-    if (session->display != EGL_NO_DISPLAY && session->context != EGL_NO_CONTEXT &&
-        session->surface != EGL_NO_SURFACE) {
-        (void)eglMakeCurrent(session->display, session->surface, session->surface,
-                             session->context);
-    }
     bool gl_context_ready = session->display != EGL_NO_DISPLAY &&
                             session->context != EGL_NO_CONTEXT &&
-                            session->surface != EGL_NO_SURFACE;
+                            session->surface != EGL_NO_SURFACE &&
+                            eglMakeCurrent(session->display, session->surface,
+                                           session->surface, session->context) == EGL_TRUE;
+    /* A failed bind leaves the previous context current. Never apply this
+     * session's GL object names to that unrelated context; destroying this
+     * session's EGL context below releases its remaining GL objects instead. */
     if (gl_context_ready && session->framebuffer_object != 0) {
         glDeleteFramebuffers(1, &session->framebuffer_object);
     }
@@ -1092,13 +1092,13 @@ int am_kms_read(struct am_kms_session *session, uint8_t *destination,
         expected_length > AM_KMS_MAX_FRAME_BYTES || length != expected_length) {
         return AM_KMS_INVALID_ARGUMENT;
     }
-    int result = refresh_image(session);
-    if (result != AM_KMS_OK) {
-        return result;
-    }
     if (eglMakeCurrent(session->display, session->surface, session->surface,
                        session->context) != EGL_TRUE) {
         return AM_KMS_EGL_UNAVAILABLE;
+    }
+    int result = refresh_image(session);
+    if (result != AM_KMS_OK) {
+        return result;
     }
     size_t pixel_count = (size_t)session->output.width * session->output.height;
     uint8_t *rgba = malloc(pixel_count * 4U);

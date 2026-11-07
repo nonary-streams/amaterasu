@@ -45,6 +45,7 @@ struct CaptureModule {
     _preflight_factory: Box<SourcePreflightFactory<PipewirePreflight>>,
     epoch: Instant,
     pending_opens: Vec<PendingOpen>,
+    shutting_down: bool,
 }
 struct PendingOpen {
     request: u64,
@@ -93,7 +94,29 @@ impl ManagedModule for CaptureModule {
             _preflight_factory: preflight_factory,
             epoch: Instant::now(),
             pending_opens: Vec::new(),
+            shutting_down: false,
         })
+    }
+
+    fn prepare_shutdown(&mut self, _remaining_ms: u64) -> ModuleResult<()> {
+        self.shutting_down = true;
+        Ok(())
+    }
+
+    fn quiesce(&mut self) -> ModuleResult<bool> {
+        self.shutting_down = true;
+        match self.controller.try_lock() {
+            Ok(mut controller) => {
+                // Native SourceSession destruction cancels and joins its worker.
+                // Its callback storage must remain owned until that join returns.
+                controller.shutdown();
+                Ok(self.pending_opens.is_empty())
+            }
+            Err(std::sync::TryLockError::WouldBlock) => Ok(false),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                Err("PipeWire capture controller poisoned during shutdown".into())
+            }
+        }
     }
 
     fn tick(&mut self) -> ModuleResult<()> {
@@ -169,11 +192,18 @@ impl CaptureModule {
         operation: Operation,
         now: u64,
     ) -> ModuleResult<()> {
-        let reply = self
-            .controller
-            .lock()
-            .map_err(|_| "PipeWire controller poisoned")?
-            .handle(&caller, operation.clone(), now);
+        let reply = if self.shutting_down
+            && matches!(
+                operation,
+                Operation::Open { .. } | Operation::SelectSource { .. }
+            ) {
+            Err("capture_shutdown")
+        } else {
+            self.controller
+                .lock()
+                .map_err(|_| "PipeWire controller poisoned")?
+                .handle(&caller, operation.clone(), now)
+        };
         if matches!(
             reply,
             Err("source_restore_pending" | "named_source_pending")

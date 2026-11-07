@@ -82,6 +82,23 @@ pub struct Controller<B: Backend> {
 }
 
 impl<B: Backend> Controller<B> {
+    #[cfg(test)]
+    fn with_backend<C: Backend>(self, backend: C) -> Controller<C> {
+        Controller {
+            backend,
+            direct: self.direct,
+            settings: self.settings,
+            selection: self.selection,
+            selections: self.selections,
+            last_selection: self.last_selection,
+            lease: self.lease,
+            closed: self.closed,
+            opened: self.opened,
+            frames_copied: self.frames_copied,
+            frames_accepted: self.frames_accepted,
+        }
+    }
+
     pub fn new(backend: B, settings: Settings) -> Self {
         Self {
             backend,

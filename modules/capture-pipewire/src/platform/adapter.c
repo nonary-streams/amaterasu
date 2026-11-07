@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "adapter.h"
+#include "dispatch.h"
 #include "kwin.h"
 #include <gio/gio.h>
 #include <gio/gunixfdlist.h>
@@ -169,7 +170,7 @@ static GVariant *portal_request(struct am_pw_session *session, const char *metho
         } else {
             while (!response.received && !atomic_load(&session->stopped)
                 && g_get_monotonic_time() < deadline) {
-                while (g_main_context_iteration(session->main_context, FALSE)) {}
+                am_pw_dispatch_pending(session->main_context, &session->stopped);
                 if (!response.received) g_usleep(10000);
             }
         }
@@ -516,7 +517,7 @@ static gpointer worker(gpointer data) {
     if (selected && !atomic_load(&session->stopped)) {
         if (!connect_pipewire(session, remote)) fail(session, 4);
         else while (!atomic_load(&session->stopped)) {
-            while (g_main_context_iteration(session->main_context, FALSE)) {}
+            am_pw_dispatch_pending(session->main_context, &session->stopped);
 #ifdef AMATERASU_KWIN
             if (session->kwin) {
                 if (am_kwin_poll(session->kwin) < 0) { fail(session, 8); break; }

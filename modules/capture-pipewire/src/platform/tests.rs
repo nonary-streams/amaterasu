@@ -8,6 +8,21 @@ use std::{
     time::{Duration, Instant},
 };
 
+unsafe extern "C" {
+    fn am_pw_test_dispatch_pending(stop_mode: u32) -> u32;
+}
+
+#[test]
+fn continuously_ready_dispatch_observes_stop_between_callbacks() {
+    // SAFETY: fixture owns a private GLib context and a finite synthetic source;
+    // it never opens a bus, portal, PipeWire remote, or native display.
+    unsafe {
+        assert_eq!(am_pw_test_dispatch_pending(1), 1);
+        assert_eq!(am_pw_test_dispatch_pending(2), 0);
+        assert_eq!(am_pw_test_dispatch_pending(0), 4);
+    }
+}
+
 #[test]
 #[ignore = "uses the current desktop and an existing remembered monitor authorization"]
 fn restores_remembered_monitor_with_real_frames() {

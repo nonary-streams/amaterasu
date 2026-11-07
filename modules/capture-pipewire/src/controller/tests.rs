@@ -61,6 +61,164 @@ pub fn open(
         .unwrap()
 }
 
+fn module(controller: Controller<FakeBackend>) -> crate::CaptureModule {
+    use amaterasu_module_sdk::{RuntimeClient, abi::*, capture::SourcePreflightFactory};
+    use std::{ffi::c_void, sync::Mutex, time::Instant};
+
+    unsafe extern "C" fn unused_host(
+        _context: *mut c_void,
+        _request: BorrowedBytes,
+        _reply: ReplySink,
+    ) -> Status {
+        STATUS_INTERNAL_ERROR
+    }
+
+    let controller = Arc::new(Mutex::new(
+        controller.with_backend(crate::backend::NativeBackend::unavailable_for_test()),
+    ));
+    let factory = crate::native::Factory::new(controller.clone());
+    // SAFETY: the retained factory remains live through the preflight wrapper;
+    // this fixture opens no portal, PipeWire, or compositor connection.
+    let preflight_factory = unsafe {
+        SourcePreflightFactory::new(
+            &factory.api,
+            Arc::new(crate::PipewirePreflight(controller.clone())),
+        )
+    };
+    // SAFETY: the stateless endpoint stays live for this fixture. Quiescence
+    // cannot dispatch requests or touch native services through it.
+    let runtime = unsafe {
+        RuntimeClient::from_endpoint(HostApi {
+            header: AbiHeader::of::<HostApi>(),
+            context: std::ptr::null_mut(),
+            invoke: unused_host,
+        })
+    };
+    crate::CaptureModule {
+        runtime,
+        controller,
+        _factory: factory,
+        _preflight_factory: preflight_factory,
+        epoch: Instant::now(),
+        pending_opens: Vec::new(),
+        shutting_down: false,
+    }
+}
+
+#[test]
+fn module_quiescence_releases_capture_before_reporting_ready() {
+    use amaterasu_module_sdk::{ManagedModule, abi::STATUS_OK};
+
+    let (mut controller, driver) = setup(settings());
+    let output = ready(&mut controller, &driver);
+    let reply = open(&mut controller, &output, "amaterasu.video", "one");
+    let stream = reply.payload["stream"].as_u64().unwrap();
+    let mut module = module(controller);
+
+    assert_eq!(driver.drops.load(Ordering::SeqCst), 0);
+    let reader = module
+        .controller
+        .lock()
+        .unwrap()
+        .reader("amaterasu.video", stream)
+        .unwrap();
+    let frame = reader.mailbox.claim().unwrap().unwrap();
+    module.prepare_shutdown(20_000).unwrap();
+    assert_eq!(driver.drops.load(Ordering::SeqCst), 0);
+    assert!(!reader.admission.is_closed());
+    let shared = module.controller.clone();
+    let held = shared.lock().unwrap();
+    assert_eq!(module.quiesce(), Ok(false));
+    drop(held);
+    assert_eq!(module.quiesce(), Ok(true));
+    assert_eq!(driver.drops.load(Ordering::SeqCst), 1);
+    assert!(reader.admission.is_closed());
+    assert_eq!(frame.frame.bytes, vec![100; 16]);
+    frame.finish(STATUS_OK);
+    assert_eq!(module.quiesce(), Ok(true));
+    assert_eq!(driver.drops.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn module_shutdown_settles_pending_opens_and_rejects_new_sources() {
+    use amaterasu_module_sdk::{ManagedModule, RuntimeClient, abi::*};
+    use std::ffi::c_void;
+    unsafe extern "C" fn shutdown_host(
+        context: *mut c_void,
+        request: BorrowedBytes,
+        reply: ReplySink,
+    ) -> Status {
+        // SAFETY: this fixture retains the command bytes and exclusive response
+        // vector for each synchronous runtime call.
+        let Ok(bytes) = (unsafe { request.read() }) else {
+            return STATUS_INVALID_ARGUMENT;
+        };
+        let Ok(command) = serde_json::from_slice::<crate::Command>(bytes) else {
+            return STATUS_INVALID_ARGUMENT;
+        };
+        let response = match command {
+            crate::Command::CheckRequest { .. } => crate::Response::Ok,
+            crate::Command::Poll {} => crate::Response::Pending,
+            crate::Command::Complete { request, payload } => {
+                // SAFETY: the fixture's uniquely borrowed vector outlives the
+                // runtime and is accessed only by this synchronous callback.
+                unsafe { &mut *context.cast::<Vec<Value>>() }
+                    .push(json!({"request":request,"payload":payload}));
+                crate::Response::Ok
+            }
+            _ => return STATUS_INVALID_ARGUMENT,
+        };
+        let bytes = serde_json::to_vec(&response).unwrap();
+        // SAFETY: the callback borrows this serialized response until it returns.
+        unsafe { reply.send(&bytes) };
+        STATUS_OK
+    }
+
+    let mut completed = Vec::<Value>::new();
+    let (mut controller, _) = setup(settings());
+    controller.shutdown();
+    let mut module = module(controller);
+    module.prepare_shutdown(20_000).unwrap();
+    // SAFETY: the private response vector and stateless function remain live
+    // until the module is explicitly destroyed below.
+    module.runtime = unsafe {
+        RuntimeClient::from_endpoint(HostApi {
+            header: AbiHeader::of::<HostApi>(),
+            context: (&mut completed as *mut Vec<Value>).cast(),
+            invoke: shutdown_host,
+        })
+    };
+    module.pending_opens.push(crate::PendingOpen {
+        request: 17,
+        caller: "amaterasu.video".into(),
+        operation: Operation::Open {
+            output: "portal:closed-source".into(),
+            operation_id: Some("late-open".into()),
+            constant_rate: None,
+        },
+    });
+    assert_eq!(module.quiesce(), Ok(false));
+    module.tick().unwrap();
+    assert_eq!(completed.len(), 1);
+    assert_eq!(completed[0]["request"], 17);
+    assert_eq!(completed[0]["payload"]["error"]["code"], "capture_shutdown");
+    module
+        .dispatch(
+            18,
+            "administrator".into(),
+            Operation::SelectSource {
+                source_type: SourceType::Monitor,
+                operation_id: "late-selection".into(),
+            },
+            3,
+        )
+        .unwrap();
+    assert_eq!(completed[1]["request"], 18);
+    assert_eq!(completed[1]["payload"]["error"]["code"], "capture_shutdown");
+    assert_eq!(module.quiesce(), Ok(true));
+    drop(module);
+}
+
 #[test]
 fn unsupported_constant_rate_does_not_allocate_or_replay_a_lease() {
     let (mut controller, driver) = setup(settings());

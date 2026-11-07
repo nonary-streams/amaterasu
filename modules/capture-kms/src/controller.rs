@@ -60,6 +60,16 @@ impl<B: Backend> Controller<B> {
         self.opened_stream.take()
     }
 
+    #[cfg(test)]
+    fn with_backend<C: Backend>(self, backend: C) -> Controller<C> {
+        Controller {
+            backend,
+            enabled: self.enabled,
+            streams: self.streams,
+            opened_stream: self.opened_stream,
+        }
+    }
+
     pub fn shutdown(&mut self) {
         self.enabled = false;
         self.streams.clear();
@@ -418,6 +428,69 @@ mod tests {
 
     fn request(controller: &mut Controller<MetadataBackend>, operation: Operation) -> Value {
         controller.handle("console.one", operation, &mut || Ok(()))
+    }
+
+    #[test]
+    fn module_quiescence_releases_capture_before_reporting_ready() {
+        use amaterasu_module_sdk::{ManagedModule, RuntimeClient, abi::*};
+        use std::{ffi::c_void, sync::Mutex};
+
+        unsafe extern "C" fn unused_host(
+            _context: *mut c_void,
+            _request: BorrowedBytes,
+            _reply: ReplySink,
+        ) -> Status {
+            STATUS_INTERNAL_ERROR
+        }
+
+        let (mut controller, _, dropped) = controller(true);
+        let reply = request(
+            &mut controller,
+            Operation::Open {
+                output: output().id,
+                operation_id: Some("shutdown".into()),
+            },
+        );
+        let stream = reply["stream"].as_u64().unwrap();
+        let controller = Arc::new(Mutex::new(
+            controller.with_backend(crate::backend::NativeBackend::new()),
+        ));
+        let factory = crate::native::Factory::new(controller.clone());
+        // SAFETY: the stateless endpoint stays live through this fixture.
+        // Shutdown must not dispatch requests or touch a real DRM device.
+        let runtime = unsafe {
+            RuntimeClient::from_endpoint(HostApi {
+                header: AbiHeader::of::<HostApi>(),
+                context: std::ptr::null_mut(),
+                invoke: unused_host,
+            })
+        };
+        let mut module = crate::CaptureModule {
+            runtime,
+            controller,
+            _factory: factory,
+            shutting_down: false,
+        };
+
+        module.prepare_shutdown(20_000).unwrap();
+        assert_eq!(dropped.load(Ordering::SeqCst), 0);
+        assert!(
+            module
+                .controller
+                .lock()
+                .unwrap()
+                .geometry("console.one", stream)
+                .is_ok()
+        );
+        let shared = module.controller.clone();
+        let held = shared.lock().unwrap();
+        assert_eq!(module.quiesce(), Ok(false));
+        assert_eq!(dropped.load(Ordering::SeqCst), 0);
+        drop(held);
+        assert_eq!(module.quiesce(), Ok(true));
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        assert_eq!(module.quiesce(), Ok(true));
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
     }
 
     #[test]

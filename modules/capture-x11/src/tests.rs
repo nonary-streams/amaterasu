@@ -121,6 +121,84 @@ fn open(controller: &mut Controller<FakeBackend>, caller: &str, operation_id: &s
     reply["stream"].as_u64().unwrap()
 }
 
+fn module(controller: Controller<FakeBackend>) -> super::CaptureModule {
+    use amaterasu_module_sdk::{RuntimeClient, abi::*};
+    use std::{ffi::c_void, sync::Mutex};
+
+    unsafe extern "C" fn unused_host(
+        _context: *mut c_void,
+        _request: BorrowedBytes,
+        _reply: ReplySink,
+    ) -> Status {
+        STATUS_INTERNAL_ERROR
+    }
+
+    let controller = Arc::new(Mutex::new(
+        controller.with_backend(super::backend::NativeBackend::new()),
+    ));
+    let factory = super::native::Factory::new(controller.clone());
+    // SAFETY: the stateless endpoint remains valid for this fixture. Shutdown
+    // must not dispatch runtime operations or open any native display.
+    let runtime = unsafe {
+        RuntimeClient::from_endpoint(HostApi {
+            header: AbiHeader::of::<HostApi>(),
+            context: std::ptr::null_mut(),
+            invoke: unused_host,
+        })
+    };
+    super::CaptureModule {
+        runtime,
+        controller,
+        _factory: factory,
+        shutting_down: false,
+    }
+}
+
+#[test]
+fn module_quiescence_releases_capture_before_reporting_ready() {
+    use amaterasu_module_sdk::ManagedModule;
+
+    let (mut controller, opened, dropped) = controller(true);
+    open(&mut controller, "console.one", "one");
+    open(&mut controller, "console.two", "two");
+    let mut module = module(controller);
+
+    assert_eq!(opened.load(Ordering::SeqCst), 2);
+    assert_eq!(dropped.load(Ordering::SeqCst), 0);
+    assert_eq!(module.quiesce(), Ok(true));
+    assert_eq!(dropped.load(Ordering::SeqCst), 2);
+    assert_eq!(module.quiesce(), Ok(true));
+    assert_eq!(dropped.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn shutdown_announcement_preserves_capture_until_consumers_drain() {
+    use amaterasu_module_sdk::ManagedModule;
+
+    let (mut controller, _, dropped) = controller(true);
+    let stream = open(&mut controller, "console.one", "one");
+    let mut module = module(controller);
+
+    module.prepare_shutdown(20_000).unwrap();
+    assert_eq!(dropped.load(Ordering::SeqCst), 0);
+    assert!(
+        module
+            .controller
+            .lock()
+            .unwrap()
+            .read("console.one", stream)
+            .is_ok()
+    );
+
+    let shared = module.controller.clone();
+    let held = shared.lock().unwrap();
+    assert_eq!(module.quiesce(), Ok(false));
+    assert_eq!(dropped.load(Ordering::SeqCst), 0);
+    drop(held);
+    assert_eq!(module.quiesce(), Ok(true));
+    assert_eq!(dropped.load(Ordering::SeqCst), 1);
+}
+
 #[test]
 fn stream_leases_are_caller_scoped_for_read_lookup_and_close() {
     let (mut controller, opened, _) = controller(true);

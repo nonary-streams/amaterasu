@@ -2,7 +2,11 @@ use std::{env, process::Command};
 
 fn main() {
     println!("cargo:rustc-check-cfg=cfg(amaterasu_kms)");
-    for path in ["src/platform/adapter.c", "src/platform/adapter.h"] {
+    for path in [
+        "src/platform/adapter.c",
+        "src/platform/adapter.h",
+        "src/platform/cleanup_tests.c",
+    ] {
         println!("cargo:rerun-if-changed={path}");
     }
     for variable in [
@@ -31,7 +35,10 @@ fn main() {
         return;
     }
     let mut build = cc::Build::new();
-    build.file("src/platform/adapter.c").flag("-std=c11");
+    build
+        .file("src/platform/adapter.c")
+        .file("src/platform/cleanup_tests.c")
+        .flag("-std=c11");
     for flag in String::from_utf8(output.stdout)
         .expect("pkg-config output is UTF-8")
         .split_whitespace()
