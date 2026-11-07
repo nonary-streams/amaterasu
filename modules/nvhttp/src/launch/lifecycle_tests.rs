@@ -242,6 +242,35 @@ fn unavailable_extension_lifecycle_refuses_before_application_or_rtsp() {
 }
 
 #[test]
+fn failed_lifecycle_with_confirmed_cleanup_allows_another_launch() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    controller.set_session_lifecycle_required(true);
+    controller.set_global_display_policy(7, json!({}));
+    let mut broker = Broker::default();
+    broker.lifecycle_replies.push_back(json!({"status":"pending"}));
+    broker.lifecycle_replies.push_back(json!({"status":"failed", "cleanup_completed":true,
+        "reason":"processing_output_range_mismatch",
+        "target":{"kind":"session","host_epoch":"epoch","session_id":"session","generation":1}}));
+    assert!(controller.launch(10, request(1), peer(1), now).is_none());
+    let reply = (0..100).find_map(|tick| {
+        controller
+            .poll(now + Duration::from_millis(tick * 100), &mut |command| broker.send(command))
+            .into_iter()
+            .next()
+    }).expect("failed launch reply").1;
+    assert_eq!(reply.status, 503);
+    for tick in 0..100 {
+        controller.poll(now + Duration::from_secs(2) + Duration::from_millis(tick * 100), &mut |command| broker.send(command));
+        if !controller.busy() { break; }
+    }
+    assert!(!controller.busy());
+    assert!(!broker.actions().contains(&("amaterasu.launch/1", "launch_export")));
+    assert!(!broker.actions().contains(&("amaterasu.rtsp/1", "open")));
+    assert!(controller.launch(11, request(2), peer(1), now + Duration::from_secs(20)).is_none());
+}
+
+#[test]
 fn pending_extension_lifecycle_deadline_keeps_session_fenced() {
     let now = Instant::now();
     let mut controller = Controller::new(Some(config())).unwrap();

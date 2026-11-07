@@ -59,6 +59,8 @@ const REGISTRY_SERVICE: &str = "amaterasu.extension-registry/1";
 struct Metadata {
     descriptor: ExtensionDescriptor,
     methods: Vec<ApiMethod>,
+    #[serde(default)]
+    migrations: Vec<Value>,
 }
 
 pub(super) fn install(
@@ -195,7 +197,7 @@ fn configure(
         );
         descriptors.push(
             json!({"descriptor":metadata.descriptor,"descriptor_sha256":digest,
-            "grants":grants,"approved_methods":metadata.methods,"migrations":[]}),
+            "grants":grants,"approved_methods":metadata.methods,"migrations":metadata.migrations}),
         );
         policy.settings.insert(
             provider.clone(),
@@ -355,7 +357,7 @@ fn append_extension(
         })
         .collect();
     let descriptor = json!({"descriptor":metadata.descriptor,"descriptor_sha256":digest,
-        "grants":grants,"approved_methods":metadata.methods,"migrations":[]});
+        "grants":grants,"approved_methods":metadata.methods,"migrations":metadata.migrations});
     let registry = policy
         .settings
         .get_mut(REGISTRY)
@@ -570,6 +572,14 @@ mod append_tests {
         assert_eq!(
             policy.settings[REGISTRY]["descriptors"][1]["descriptor"]["provider"],
             PROVIDER
+        );
+        assert_eq!(
+            policy.settings[REGISTRY]["descriptors"][1]["migrations"][0]["from_schema_revision"],
+            1
+        );
+        assert_eq!(
+            policy.settings[REGISTRY]["descriptors"][1]["migrations"][1]["from_schema_revision"],
+            2
         );
         assert_eq!(policy.settings[COORDINATOR]["journal_path"], "/unchanged");
         assert_eq!(

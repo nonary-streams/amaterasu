@@ -47,7 +47,8 @@ async function fixture({ deferred = false, fail = false, canWrite = true } = {})
 test('RTX plugin owns controls matching its native descriptor and saves slider edits', async () => {
   const env = await fixture();
   for (const option of descriptor.options.filter(option => option.allowed_scopes.includes('application'))) {
-    const control = env.controls.find(control => control.options.label === option.label);
+    const label = option.id === 'rtx_hdr_enable' ? 'Override RTX HDR in global mode' : option.label;
+    const control = env.controls.find(control => control.options.label === label);
     assert.ok(control, option.id);
     if (option.definition.type === 'integer') {
       assert.equal(control.options.minimum, option.definition.minimum);
@@ -61,6 +62,16 @@ test('RTX plugin owns controls matching its native descriptor and saves slider e
   assert.deepEqual(env.updates, [{ expected: 7, values: { rtx_hdr_peak_brightness: 1400 } }]);
   assert.equal(env.dirty(), false);
   assert.equal(env.busy(), false);
+});
+
+test('an application can override the global RTX enable setting', async () => {
+  const env = await fixture();
+  env.controls.find(control => control.options.label === 'Override RTX HDR in global mode').edit(false);
+  await env.flush();
+  assert.deepEqual(env.values(), { rtx_hdr_enable: false });
+  env.controls.find(control => control.options.label === 'Use inherited override rtx hdr in global mode').edit(true);
+  await env.flush();
+  assert.deepEqual(env.values(), {});
 });
 
 test('edits made during an RTX save are serialized with the next revision', async () => {
@@ -80,15 +91,15 @@ test('edits made during an RTX save are serialized with the next revision', asyn
 
 test('RTX enable toggle saves both directions through the same scoped settings API', async () => {
   const env = await fixture();
-  const enable = env.controls.find(control => control.options.label === 'Enable RTX HDR');
-  assert.equal(descriptor.options.find(option => option.id === 'rtx_hdr_enable').apply_policy, 'live_action');
+  const enable = env.controls.find(control => control.options.label === 'Enable RTX HDR for this application');
+  assert.equal(descriptor.options.find(option => option.id === 'rtx_hdr_application_enable').apply_policy, 'next_stream');
   enable.edit(true);
   await env.flush();
   enable.edit(false);
   await env.flush();
   assert.deepEqual(env.updates, [
-    { expected: 7, values: { rtx_hdr_enable: true } },
-    { expected: 8, values: { rtx_hdr_enable: false } },
+    { expected: 7, values: { rtx_hdr_application_enable: true } },
+    { expected: 8, values: { rtx_hdr_application_enable: false } },
   ]);
   assert.equal(env.dirty(), false);
 });

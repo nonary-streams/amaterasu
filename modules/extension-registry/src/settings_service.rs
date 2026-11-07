@@ -462,10 +462,14 @@ impl SettingsService {
                             ));
                             continue;
                         }
+                        // A trusted migration may share the same scope set across
+                        // old fields; explicit entries always take precedence.
+                        let old_allowed =
+                            settings::expand_migration_scopes(&plan.old_fields, &plan.old_allowed);
                         let migration = settings::Migration {
                             old_fields: &plan.old_fields,
                             new_fields: &pending.fields,
-                            old_allowed: &plan.old_allowed,
+                            old_allowed: &old_allowed,
                             new_allowed: &pending.allowed,
                             expected_revision: *expected_revision,
                             new_schema_revision: pending.schema_revision,
