@@ -143,8 +143,15 @@ impl Coordinator {
             || next.receipts.values().any(|receipt| {
                 receipt.work.as_ref().is_some_and(|work| {
                     work.target == target
-                        && !rejected_read_only_release(work)
-                        && !restartable_undispatched_release(receipt, work, caller, capture_retired)
+                        && (work.provider_graph != stream.provider_graph
+                            || (!rejected_read_only_release(work)
+                                && !restartable_undispatched_release(
+                                    receipt,
+                                    work,
+                                    caller,
+                                    capture_retired,
+                                    session,
+                                )))
                 })
             })
         {
@@ -174,6 +181,7 @@ impl Coordinator {
                                 work,
                                 caller,
                                 capture_retired,
+                                session,
                             )
                     })
                     .map(|_| key.clone())
@@ -217,7 +225,9 @@ impl Coordinator {
         {
             return Err("shared_source_recovery_context_changed".into());
         }
-        work.reason = Some(ReleaseReason::Pause);
+        if work.reason != Some(ReleaseReason::End) {
+            work.reason = Some(ReleaseReason::Pause);
+        }
         let stream = next
             .sessions
             .get_mut(id)
@@ -258,14 +268,19 @@ impl Coordinator {
             serde_json::from_value(payload.get("target").cloned().ok_or("target_required")?)
                 .map_err(|_| "invalid_target")?;
         let (epoch, session_id, stream, generation) = super::operations::target_parts(&target)?;
-        if stream.is_some() || epoch != next.host_epoch {
+        if stream.is_some()
+            || (epoch != next.host_epoch && payload["expected_host_epoch"] != next.host_epoch)
+        {
             return Err("stale_recovery_target".into());
         }
         let session = next.sessions.get(session_id).ok_or("unknown_session")?;
         if session.owner.caller != caller || session.owner.initiator != initiator {
             return Err("permission_denied".into());
         }
-        if session.generation != generation || session.phase != SessionPhase::RecoveryRequired {
+        if session.generation != generation
+            || !(session.phase == SessionPhase::RecoveryRequired
+                || (epoch != next.host_epoch && session.phase == SessionPhase::Paused))
+        {
             return Err("session_not_recoverable".into());
         }
         let original = payload
@@ -290,6 +305,15 @@ impl Coordinator {
             return Err("unknown_or_ambiguous_original_operation".into());
         }
         let original_key = &matches[0];
+        if epoch != next.host_epoch {
+            return self.recover_undispatched_session_release(
+                caller,
+                initiator,
+                payload,
+                key,
+                original_key,
+            );
+        }
         let receipt = next
             .receipts
             .get_mut(original_key)
@@ -377,9 +401,14 @@ fn restartable_undispatched_release(
     work: &Work,
     caller: &str,
     capture_retired: bool,
+    session: &SessionRecord,
 ) -> bool {
-    receipt.caller == caller
-        && receipt.initiator == caller
+    let capture_owned = receipt.caller == caller && receipt.initiator == caller;
+    let ended_by_owner = work.reason == Some(ReleaseReason::End)
+        && receipt.request["operation"] == "pause_stream"
+        && receipt.caller == session.owner.caller
+        && receipt.initiator == session.owner.initiator;
+    (capture_owned || ended_by_owner)
         && (receipt.request["operation"] == "pause_stream"
             || (capture_retired && receipt.request["operation"] == "retire_stream"))
         && receipt.request["target"] == json!(work.target)

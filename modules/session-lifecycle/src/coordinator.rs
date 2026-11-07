@@ -63,6 +63,7 @@ mod security;
 mod session_closed_history;
 mod session_closure;
 mod session_prepare_evidence;
+mod session_recovery;
 #[allow(dead_code)]
 mod session_release;
 mod settings_scope;

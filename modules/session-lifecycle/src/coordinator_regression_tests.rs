@@ -54,6 +54,7 @@ struct Harness {
     cleanup_deferred: bool,
     registry_settings: Option<(u64, Value)>,
     external: bool,
+    retirement_result: Option<Value>,
 }
 
 impl Harness {
@@ -336,6 +337,7 @@ impl Harness {
             cleanup_deferred: false,
             registry_settings,
             external,
+            retirement_result: None,
         };
         harness.start();
         harness
@@ -981,7 +983,8 @@ impl Harness {
                         json!({"status":"retired","token":payload["token"],"target":payload["target"]})
                     }
                     Some("verify_retirement") => {
-                        json!({"ok":true,"retired":true,"owner":payload["owner"],"launch_id":payload["launch_id"],"operation_id":payload["operation_id"]})
+                        self.events.push(("launch".into(), payload.clone()));
+                        self.retirement_result.clone().unwrap_or_else(|| json!({"ok":true,"retired":true,"owner":payload["owner"],"launch_id":payload["launch_id"],"operation_id":payload["operation_id"]}))
                     }
                     _ => panic!("unexpected {principal} request: {payload}"),
                 };
@@ -2361,3 +2364,6 @@ fn shared_external_deferred_restoration_never_certifies_resource_release() {
         );
     }
 }
+
+#[path = "coordinator/session_recovery_tests.rs"]
+mod session_recovery_tests;

@@ -101,6 +101,55 @@ pub(super) struct ApplicationJob {
     query_id: String,
     deadline: Instant,
     no_launch: bool,
+    recovery: Option<SessionRecoveryApplication>,
+}
+
+struct SessionRecoveryApplication {
+    original_key: String,
+    transition_id: String,
+    authorized_epoch: String,
+}
+
+impl ApplicationJob {
+    pub(super) fn for_session_recovery(
+        key: String,
+        target: LifecycleTarget,
+        session: &SessionRecord,
+        original_key: String,
+        transition_id: String,
+        authorized_epoch: String,
+    ) -> ModuleResult<Self> {
+        let no_launch = session.application.is_none();
+        let binding = session
+            .application
+            .clone()
+            .or_else(|| {
+                session
+                    .application_operation_id
+                    .as_ref()
+                    .map(|operation_id| ApplicationBinding {
+                        launch_id: 0,
+                        operation_id: operation_id.clone(),
+                        owner: session.owner.caller.clone(),
+                    })
+            })
+            .ok_or("application_retirement_unconfirmed")?;
+        Ok(Self {
+            key,
+            target,
+            binding,
+            no_launch,
+            request: None,
+            result: None,
+            query_id: identifier()?,
+            deadline: Instant::now() + Duration::from_secs(5),
+            recovery: Some(SessionRecoveryApplication {
+                original_key,
+                transition_id,
+                authorized_epoch,
+            }),
+        })
+    }
 }
 
 impl Coordinator {
@@ -189,6 +238,7 @@ impl Coordinator {
                     query_id: identifier()?,
                     deadline: Instant::now() + Duration::from_secs(5),
                     no_launch,
+                    recovery: None,
                 };
                 let response =
                     json!({"status":"pending","operation_id":operation_id,"target":target});
@@ -307,10 +357,28 @@ impl Coordinator {
         result: Option<(u64, Value)>,
     ) -> ModuleResult<()> {
         let mut next = self.shared.borrow().value.clone();
-        let (_, session_id, stream, generation) = super::operations::target_parts(&job.target)?;
+        let (target_epoch, session_id, stream, generation) =
+            super::operations::target_parts(&job.target)?;
         if stream.is_some() {
             return Err("session_target_required".into());
         }
+        let recovery_authorized = job.recovery.as_ref().is_some_and(|context| {
+            context.authorized_epoch == next.host_epoch
+                && next
+                    .receipts
+                    .get(&context.original_key)
+                    .is_some_and(|receipt| {
+                        receipt.response["status"] == "pending"
+                            && receipt.work.as_ref().is_some_and(|work| {
+                                work.target == job.target
+                                    && work.transition_id == context.transition_id
+                                    && work.phase == LifecyclePhase::SessionRelease
+                                    && work.waiting_retirement
+                                    && work.recovery_authorized_epoch.as_deref()
+                                        == Some(next.host_epoch.as_str())
+                            })
+                    })
+        });
         let session = next.sessions.get_mut(session_id).ok_or("unknown_session")?;
         let valid = job.request.is_some_and(|id| id > 0)
             && result.as_ref().is_some_and(|(result_id, r)| {
@@ -325,7 +393,8 @@ impl Coordinator {
                     }
                     && r["operation_id"] == job.binding.operation_id
             })
-            && session.host_epoch == next.host_epoch
+            && session.host_epoch == target_epoch
+            && (target_epoch == next.host_epoch || recovery_authorized)
             && session.generation == generation
             && session.phase == SessionPhase::Ending
             && if job.no_launch {
@@ -353,6 +422,44 @@ impl Coordinator {
                 return Err("invalid_application_retirement_proof".into());
             }
         }
+        if valid && recovery_authorized {
+            let context = job.recovery.as_ref().expect("validated recovery context");
+            let original_operation =
+                next.receipts[&context.original_key].request["operation_id"].clone();
+            let owner = next.sessions[session_id].owner.clone();
+            // Old verification requests cannot authorize native work. Once a
+            // fresh exact owner query proves retirement, replace their pending
+            // readback with an explicit supersession, preserving each identity.
+            for (key, receipt) in &mut next.receipts {
+                if key != &job.key
+                    && receipt.caller == owner.caller
+                    && receipt.initiator == owner.initiator
+                    && receipt.work.is_none()
+                    && receipt.wait_target.is_none()
+                    && receipt.request["target"] == json!(job.target)
+                    && receipt.response["status"] == "recovery_required"
+                    && (receipt.request["operation"] == "application_retired"
+                        || (receipt.request["operation"] == "recover_session"
+                            && receipt.request["original_operation_id"] == original_operation))
+                {
+                    receipt.response["status"] = json!("rejected");
+                    receipt.response["reason"] = json!("superseded_by_verified_retirement");
+                }
+            }
+        }
+        if !valid && recovery_authorized {
+            let context = job.recovery.as_ref().expect("validated recovery context");
+            next.sessions
+                .get_mut(session_id)
+                .expect("validated session")
+                .phase = SessionPhase::RecoveryRequired;
+            let original = next
+                .receipts
+                .get_mut(&context.original_key)
+                .expect("validated original");
+            original.response["status"] = json!("recovery_required");
+            original.response["reason"] = json!("application_retirement_unconfirmed");
+        }
         let receipt = next
             .receipts
             .get_mut(&job.key)
@@ -360,8 +467,15 @@ impl Coordinator {
         receipt.response = if valid {
             json!({"status":"succeeded","operation_id":receipt.request["operation_id"],"target":job.target})
         } else {
-            json!({"status":"recovery_required","operation_id":receipt.request["operation_id"],"reason":"application_retirement_unconfirmed"})
+            json!({"status":if job.recovery.is_some() {"rejected"} else {"recovery_required"},
+                "operation_id":receipt.request["operation_id"],"reason":"application_retirement_unconfirmed"})
         };
+        if job.recovery.is_some() {
+            receipt.response["target"] = json!(job.target);
+            if valid {
+                receipt.response["reconciliation_started"] = json!(true);
+            }
+        }
         save(&self.shared, next)
     }
 }

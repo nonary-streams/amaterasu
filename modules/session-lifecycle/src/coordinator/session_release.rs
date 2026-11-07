@@ -716,6 +716,30 @@ fn valid_owner_completion(journal: &Journal, proof: &SessionReleaseProof) -> boo
         })
 }
 
+/// Recovery-fenced roots remain unavailable to prepare/control. A current owner
+/// recovery may consume their exact historical lineage only for final release.
+pub(super) fn root_available_for_release(
+    journal: &Journal,
+    work: &Work,
+    root: &composition::StoredOutput,
+) -> bool {
+    if root.state == composition::OutputState::Retained {
+        return true;
+    }
+    root.state == composition::OutputState::RecoveryRequired
+        && work.phase == LifecyclePhase::SessionRelease
+        && root.output.origin == work.target
+        && work.recovery_authorized_epoch.as_deref() == Some(journal.host_epoch.as_str())
+        && operations::target_parts(&work.target).is_ok_and(|(epoch, id, stream, _)| {
+            epoch != journal.host_epoch
+                && stream.is_none()
+                && journal.sessions.get(id).is_some_and(|session| {
+                    session.phase == SessionPhase::Ending
+                        && application::valid_retirement_proof(session, &work.target)
+                })
+        })
+}
+
 pub(super) fn validate_session_release_preflight(
     journal: &Journal,
     work: &Work,
@@ -746,13 +770,20 @@ pub(super) fn validate_session_release_preflight(
     let mut roots = journal.composition.records().filter(|record| {
         record.output.origin == work.target
             && record.output.producer == *owner
-            && record.state == composition::OutputState::Retained
+            && root_available_for_release(journal, work, record)
     });
     let root = roots.next().ok_or("session_root_missing_or_ambiguous")?;
     if roots.next().is_some() || !valid_root_provenance(journal, root) {
         return Err("session_root_missing_or_ambiguous".into());
     }
-    resource_generation::current_root_generation(journal, root)?;
+    if root.state == composition::OutputState::RecoveryRequired {
+        let generation = resource_generation::historical_generation(journal, root)?;
+        if session.resource_generations.get(owner) != Some(&generation) {
+            return Err("resource_generation_stale".into());
+        }
+    } else {
+        resource_generation::current_root_generation(journal, root)?;
+    }
     if graph.order.len() == 2 {
         if !session_prepare_evidence::all_dependent_session_prepares_noop(
             journal,
@@ -872,7 +903,7 @@ pub(super) fn record_session_release_proof(
         .find(|record| {
             record.output.origin == work.target
                 && record.output.producer == provider
-                && record.state == composition::OutputState::Retained
+                && root_available_for_release(journal, work, record)
         })
         .ok_or("session_root_missing")?
         .clone();

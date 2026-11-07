@@ -1844,7 +1844,11 @@ impl Coordinator {
                     let mut roots = shared.value.composition.records().filter(|record| {
                         record.output.origin == work.target
                             && record.output.producer == *provider
-                            && record.state == composition::OutputState::Retained
+                            && super::session_release::root_available_for_release(
+                                &shared.value,
+                                &work,
+                                record,
+                            )
                     });
                     let root = roots.next().ok_or("session_root_missing")?;
                     if roots.next().is_some() {

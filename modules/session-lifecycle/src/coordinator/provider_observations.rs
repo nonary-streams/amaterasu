@@ -994,7 +994,19 @@ impl Coordinator {
             (None, None) => {}
         }
         let session = next.sessions.get(session_id).ok_or("unknown_session")?;
-        if epoch != next.host_epoch || epoch != session.host_epoch {
+        let recovered_release = nested
+            .is_some_and(|(request, _)| request.phase == LifecyclePhase::SessionRelease)
+            && application::valid_retirement_proof(session, &target)
+            && next.receipts.values().any(|receipt| {
+                receipt.response["status"] == "pending"
+                    && receipt.work.as_ref().is_some_and(|work| {
+                        work.target == target
+                            && work.phase == LifecyclePhase::SessionRelease
+                            && work.recovery_authorized_epoch.as_deref()
+                                == Some(next.host_epoch.as_str())
+                    })
+            });
+        if epoch != session.host_epoch || (epoch != next.host_epoch && !recovered_release) {
             return Err("stale_host_epoch".into());
         }
         if let Some(stream_id) = stream_id {
