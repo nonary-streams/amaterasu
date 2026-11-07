@@ -1021,11 +1021,11 @@ mod tests {
         };
         assert_eq!(
             route_restore_action(&assignment_fenced_without_apply, Some("user-default")),
-            RouteRestoreAction::Release
+            RouteRestoreAction::KeepTombstone
         );
         assert_eq!(
             route_restore_action(&assignment_fenced_without_apply, Some("new-user-choice")),
-            RouteRestoreAction::Release
+            RouteRestoreAction::KeepTombstone
         );
         let uncertain_restore = RouteIntent {
             restoration_submitted: true,
@@ -1034,15 +1034,15 @@ mod tests {
         };
         assert_eq!(
             route_restore_action(&uncertain_restore, Some("new-user-choice")),
-            RouteRestoreAction::Release
+            RouteRestoreAction::KeepTombstone
         );
         assert_eq!(
             route_restore_action(&uncertain_restore, Some("amaterasu-stream")),
-            RouteRestoreAction::RestoreOriginal
+            RouteRestoreAction::KeepTombstone
         );
         assert_eq!(
             route_restore_action(&uncertain_restore, Some("user-default")),
-            RouteRestoreAction::RestoreOriginal
+            RouteRestoreAction::KeepTombstone
         );
         let restoration_fenced = RouteIntent {
             restoration_quiesced: true,
@@ -1050,8 +1050,98 @@ mod tests {
         };
         assert_eq!(
             route_restore_action(&restoration_fenced, Some("new-user-choice")),
+            RouteRestoreAction::KeepTombstone
+        );
+    }
+
+    #[test]
+    fn delayed_route_commands_keep_their_persisted_owner_after_an_unproven_fence() {
+        struct Server {
+            default: &'static str,
+            pending: Option<&'static str>,
+        }
+
+        impl Server {
+            fn submit_without_reply(&mut self, target: &'static str) {
+                assert!(self.pending.replace(target).is_none());
+            }
+
+            fn finish_prior_command(&mut self) -> &'static str {
+                self.default = self.pending.take().expect("a command is still pending");
+                self.default
+            }
+        }
+
+        let root = temporary_root("late-route-commands");
+        let journal = CleanupJournal::open(&root).unwrap();
+        let mut state = CleanupState {
+            route: Some(RouteIntent {
+                target_sink: "stream".into(),
+                original_sink: "headset".into(),
+                ..RouteIntent::default()
+            }),
+            ..CleanupState::default()
+        };
+        let mut server = Server {
+            default: "headset",
+            pending: None,
+        };
+        journal.write(&state).unwrap();
+        server.submit_without_reply("stream");
+        server.default = "user-choice";
+        // PipeWire can answer an ordered server query before publishing the
+        // preceding route metadata. A fence alone is therefore insufficient.
+        state.route.as_mut().unwrap().assignment_quiesced = true;
+        journal.write(&state).unwrap();
+
+        // Neither a different current default nor a restarted journal proves
+        // that the earlier connection's queued assignment cannot still run.
+        state = journal.read().unwrap();
+        assert_eq!(
+            route_restore_action(state.route.as_ref().unwrap(), Some(server.default)),
+            RouteRestoreAction::KeepTombstone
+        );
+        assert!(validate_route_intent_replacement(state.route.as_ref()).is_err());
+        let assignment_reply = server.finish_prior_command();
+        assert_eq!(server.default, "stream");
+        assert_eq!(
+            route_restore_action(state.route.as_ref().unwrap(), Some(server.default)),
+            RouteRestoreAction::KeepTombstone
+        );
+
+        // A successful assignment followed by an unacknowledged restoration
+        // has the same hazard. A fresh read of the user's choice is no fence.
+        assert_eq!(assignment_reply, "stream");
+        let route = state.route.as_mut().unwrap();
+        route.assignment_confirmed = true;
+        route.restoration_submitted = true;
+        journal.write(&state).unwrap();
+        server.submit_without_reply("headset");
+        server.default = "user-choice";
+        state = CleanupJournal::open(&root).unwrap().read().unwrap();
+        assert_eq!(
+            route_restore_action(state.route.as_ref().unwrap(), Some(server.default)),
+            RouteRestoreAction::KeepTombstone
+        );
+        assert!(validate_route_intent_replacement(state.route.as_ref()).is_err());
+        state.route.as_mut().unwrap().restoration_quiesced = true;
+        assert_eq!(
+            route_restore_action(state.route.as_ref().unwrap(), Some(server.default)),
+            RouteRestoreAction::KeepTombstone
+        );
+        assert_eq!(server.finish_prior_command(), "headset");
+        let route = state.route.as_mut().unwrap();
+        route.restoration_confirmed = true;
+        assert_eq!(server.default, "headset");
+        server.default = "user-choice";
+        assert_eq!(
+            route_restore_action(state.route.as_ref().unwrap(), Some(server.default)),
             RouteRestoreAction::Release
         );
+        state.route = None;
+        journal.write(&state).unwrap();
+        assert!(validate_route_intent_replacement(journal.read().unwrap().route.as_ref()).is_ok());
+        fs::remove_dir_all(root).unwrap();
     }
 }
 
@@ -1121,50 +1211,46 @@ pub(super) fn can_start_sink_load(state: &CleanupState, name: &str) -> bool {
     can_add_sink_intent(state, name) && !has_unquiesced_sink_load(state)
 }
 
+/// A route is global to the Pulse server. Even an apparently superseded
+/// intent must be reconciled before another assignment can own its journal
+/// slot: an older, unfenced command may still change the default later.
+pub(super) fn validate_route_intent_replacement(
+    existing: Option<&RouteIntent>,
+) -> Result<(), &'static str> {
+    if existing.is_some() {
+        Err("audio_route_restore_pending")
+    } else {
+        Ok(())
+    }
+}
+
 pub(super) fn route_restore_action(
     intent: &RouteIntent,
     current_default: Option<&str>,
 ) -> RouteRestoreAction {
+    // PipeWire can fence a request before its route metadata is published.
+    // A fence or a fresh read is not a successful callback.
+    if !intent.assignment_confirmed {
+        return RouteRestoreAction::KeepTombstone;
+    }
+    if intent.restoration_submitted && !intent.restoration_confirmed {
+        return RouteRestoreAction::KeepTombstone;
+    }
     if intent.target_sink == intent.original_sink {
         return RouteRestoreAction::Release;
     }
-    if !intent.assignment_confirmed {
-        return match current_default {
-            None => RouteRestoreAction::Wait,
-            Some(current) if intent.assignment_quiesced && current != intent.target_sink => {
-                RouteRestoreAction::Release
-            }
-            // A timed-out assignment that is quiesced but currently points at
-            // the target is ambiguous: the user may have selected that target.
-            // Never restore the original route without a successful callback.
-            Some(_) => RouteRestoreAction::KeepTombstone,
-        };
-    }
     match current_default {
         None => RouteRestoreAction::Wait,
-        // Restoration is best effort. A lost callback must allow another
-        // attempt while our target is selected, rather than permanently
-        // preventing cleanup. Reassert the original on an uncertain restore
-        // too: PipeWire may expose it as a fallback while its configured
-        // default still names the now-removed virtual sink.
         Some(current)
             if current == intent.original_sink
                 && intent.restoration_submitted
-                && !intent.restoration_confirmed
-                && !intent.restoration_quiesced =>
-        {
-            RouteRestoreAction::RestoreOriginal
-        }
-        Some(current)
-            if current == intent.original_sink
-                && intent.restoration_submitted
-                && (intent.restoration_confirmed || intent.restoration_quiesced) =>
+                && intent.restoration_confirmed =>
         {
             RouteRestoreAction::Release
         }
         Some(current) if current == intent.target_sink => RouteRestoreAction::RestoreOriginal,
-        // A later user choice supersedes our cleanup, even when the previous
-        // restore was unacknowledged. Never retry over that choice.
+        // A later user choice supersedes our settled cleanup. Never retry over
+        // that choice.
         Some(_) => RouteRestoreAction::Release,
     }
 }

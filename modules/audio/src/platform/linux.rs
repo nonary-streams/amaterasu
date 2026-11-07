@@ -1301,6 +1301,13 @@ pub(super) struct ManagedVirtualSink {
 
 impl ManagedVirtualSink {
     fn ensure(&self, client: &mut PulseClient) -> AudioResult<()> {
+        let _cleanup_guard = virtual_sink_cleanup_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.ensure_locked(client)
+    }
+
+    fn ensure_locked(&self, client: &mut PulseClient) -> AudioResult<()> {
         let state = read_cleanup_state()?;
         let existing = state.sinks.get(&self.name);
         if existing.is_some_and(|intent| intent.module_index.is_none() && !intent.load_quiesced) {
@@ -1358,21 +1365,25 @@ impl ManagedVirtualSink {
 
 impl Drop for ManagedVirtualSink {
     fn drop(&mut self) {
+        let _cleanup_guard = virtual_sink_cleanup_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if self
             .module_index
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_none()
+            .is_some()
         {
-            return;
+            let _ = request_sink_cleanup(&self.name, &self.owner_token);
+            if let Ok(mut client) = PulseClient::connect() {
+                retry_virtual_sink_cleanups_with_client(&mut client, Some(&self.name));
+            }
         }
-        let _ = request_sink_cleanup(&self.name, &self.owner_token);
-        let _cleanup_guard = virtual_sink_cleanup_lock()
+        let registry = VIRTUAL_SINKS.get_or_init(|| Mutex::new(SharedSinkRegistry::default()));
+        registry
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Ok(mut client) = PulseClient::connect() {
-            retry_virtual_sink_cleanups_with_client(&mut client, Some(&self.name));
-        }
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove_if_owner(self.channels, self as *const Self);
     }
 }
 
@@ -1545,7 +1556,13 @@ fn remove_sink_intent(name: &str, owner_token: &str) -> AudioResult<()> {
 }
 
 fn persist_route_intent(target_sink: &str, original_sink: &str) -> AudioResult<()> {
+    let mut conflict = None;
     update_cleanup_state(|state| {
+        if let Err(error) = cleanup_journal::validate_route_intent_replacement(state.route.as_ref())
+        {
+            conflict = Some(error);
+            return;
+        }
         state.route = Some(RouteIntent {
             target_sink: target_sink.to_owned(),
             original_sink: original_sink.to_owned(),
@@ -1555,7 +1572,8 @@ fn persist_route_intent(target_sink: &str, original_sink: &str) -> AudioResult<(
             restoration_confirmed: false,
             restoration_quiesced: false,
         });
-    })
+    })?;
+    conflict.map_or(Ok(()), Err)
 }
 
 fn mark_route_assignment_quiesced(target_sink: &str) -> AudioResult<()> {
@@ -1864,9 +1882,113 @@ pub fn virtual_sink_cleanup_pending() -> bool {
     })
 }
 
-static VIRTUAL_SINKS: OnceLock<Mutex<BTreeMap<String, Weak<ManagedVirtualSink>>>> = OnceLock::new();
+enum SharedSinkLookup<T> {
+    Vacant,
+    Active(Arc<T>),
+    Retiring,
+}
+
+struct SharedSinkRegistry<T> {
+    entries: BTreeMap<u32, Weak<T>>,
+}
+
+impl<T> Default for SharedSinkRegistry<T> {
+    fn default() -> Self {
+        Self {
+            entries: BTreeMap::new(),
+        }
+    }
+}
+
+impl<T> SharedSinkRegistry<T> {
+    fn lookup(&self, channels: u32) -> SharedSinkLookup<T> {
+        match self.entries.get(&channels) {
+            None => SharedSinkLookup::Vacant,
+            Some(owner) => owner
+                .upgrade()
+                .map_or(SharedSinkLookup::Retiring, SharedSinkLookup::Active),
+        }
+    }
+
+    fn insert(&mut self, channels: u32, owner: &Arc<T>) {
+        self.entries.insert(channels, Arc::downgrade(owner));
+    }
+
+    fn remove_if_owner(&mut self, channels: u32, owner: *const T) {
+        if self
+            .entries
+            .get(&channels)
+            .is_some_and(|entry| entry.as_ptr() == owner)
+        {
+            self.entries.remove(&channels);
+        }
+    }
+}
+
+static VIRTUAL_SINKS: OnceLock<Mutex<SharedSinkRegistry<ManagedVirtualSink>>> = OnceLock::new();
+
+trait SharedSinkOperations<T> {
+    fn ensure(&mut self, sink: &T) -> AudioResult<()>;
+    fn create(&mut self, channels: u32) -> AudioResult<Arc<T>>;
+}
+
+fn acquire_shared_sink<T>(
+    cleanup: &Mutex<()>,
+    registry: &Mutex<SharedSinkRegistry<T>>,
+    channels: u32,
+    operations: &mut impl SharedSinkOperations<T>,
+) -> AudioResult<Arc<T>> {
+    let cleanup_guard = cleanup
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut registry = registry
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match registry.lookup(channels) {
+        SharedSinkLookup::Active(existing) => {
+            let ensure_result = operations.ensure(&existing);
+            // If ensure fails, dropping the acquired last strong reference
+            // can run its destructor, which takes these same locks.
+            drop(registry);
+            drop(cleanup_guard);
+            ensure_result?;
+            Ok(existing)
+        }
+        SharedSinkLookup::Retiring => Err("audio_sink_retirement_pending"),
+        SharedSinkLookup::Vacant => {
+            let lease = operations.create(channels)?;
+            registry.insert(channels, &lease);
+            Ok(lease)
+        }
+    }
+}
+
+struct PulseSinkOperations<'a>(&'a mut PulseClient);
+
+impl SharedSinkOperations<ManagedVirtualSink> for PulseSinkOperations<'_> {
+    fn ensure(&mut self, sink: &ManagedVirtualSink) -> AudioResult<()> {
+        sink.ensure_locked(self.0)
+    }
+
+    fn create(&mut self, channels: u32) -> AudioResult<Arc<ManagedVirtualSink>> {
+        create_managed_virtual_sink(self.0, channels)
+    }
+}
 
 fn managed_virtual_sink(
+    client: &mut PulseClient,
+    channels: u32,
+) -> AudioResult<Arc<ManagedVirtualSink>> {
+    null_sink_layout(channels)?;
+    acquire_shared_sink(
+        virtual_sink_cleanup_lock(),
+        VIRTUAL_SINKS.get_or_init(|| Mutex::new(SharedSinkRegistry::default())),
+        channels,
+        &mut PulseSinkOperations(client),
+    )
+}
+
+fn create_managed_virtual_sink(
     client: &mut PulseClient,
     channels: u32,
 ) -> AudioResult<Arc<ManagedVirtualSink>> {
@@ -1878,9 +2000,6 @@ fn managed_virtual_sink(
         std::process::id(),
         channels
     );
-    let cleanup_guard = virtual_sink_cleanup_lock()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     retry_virtual_sink_cleanups_with_client(client, Some(&name));
     if read_cleanup_state()?.sinks.contains_key(&name) {
         return Err("virtual_sink_cleanup_pending");
@@ -1892,18 +2011,6 @@ fn managed_virtual_sink(
         }
         return Err("audio_cleanup_journal_capacity_reached");
     }
-    let registry = VIRTUAL_SINKS.get_or_init(|| Mutex::new(BTreeMap::new()));
-    let mut registry = registry
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(existing) = registry.get(&name).and_then(Weak::upgrade) {
-        let ensure_result = existing.ensure(client);
-        drop(registry);
-        drop(cleanup_guard);
-        ensure_result?;
-        return Ok(existing);
-    }
-
     if client.sinks()?.iter().any(|sink| sink.endpoint.id == name) {
         return Err("virtual_sink_name_conflict");
     }
@@ -1940,9 +2047,6 @@ fn managed_virtual_sink(
     });
     // The generated null-sink map is fixed by its requested channel layout.
     debug_assert_eq!(layout.positions.len(), channels as usize);
-    registry.insert(name, Arc::downgrade(&lease));
-    drop(registry);
-    drop(cleanup_guard);
     Ok(lease)
 }
 
@@ -1987,6 +2091,31 @@ struct RouteRegistry {
 }
 
 impl RouteRegistry {
+    fn join_active_route(&mut self, endpoint: &str) -> AudioResult<bool> {
+        let Some(active) = self.active.as_mut() else {
+            return Ok(false);
+        };
+        if active.endpoint != endpoint {
+            return Err("audio_route_conflict");
+        }
+        active.references = active
+            .references
+            .checked_add(1)
+            .ok_or("audio_route_conflict")?;
+        Ok(true)
+    }
+
+    fn release_route(&mut self, endpoint: &str) -> bool {
+        let Some(active) = self.active.as_mut() else {
+            return false;
+        };
+        if active.endpoint != endpoint || active.references == 0 {
+            return false;
+        }
+        active.references -= 1;
+        active.references == 0
+    }
+
     fn restore_pending(&self) -> bool {
         self.active
             .as_ref()
@@ -1995,9 +2124,9 @@ impl RouteRegistry {
 
     fn abandon_idle_restore(&mut self) {
         if self.restore_pending() {
-            // Keep the durable intent until a new assignment replaces it.
-            // Failed cleanup is diagnostic state, not an admission lock.
-            eprintln!("Amaterasu audio route restore remains pending; allowing a new stream");
+            // Keep the durable intent; it prevents a new route mutation until
+            // reconciliation can prove the old operation has settled.
+            eprintln!("Amaterasu audio route restore remains pending");
             self.active = None;
         }
     }
@@ -2055,64 +2184,122 @@ fn wait_for_route_readback(
 fn acquire_route(
     client: &mut PulseClient,
     endpoint: &str,
-    current_default: Option<&str>,
     capture_only: bool,
     explicit_route: bool,
     virtual_route: bool,
 ) -> AudioResult<Option<Arc<RouteLease>>> {
-    let plan = route_plan(
-        endpoint,
-        current_default,
-        capture_only,
-        explicit_route,
-        virtual_route,
-    );
-    if plan == RoutePlan::Skip {
+    if capture_only || (!explicit_route && !virtual_route) {
         return Ok(None);
     }
     let mut registry = route_registry()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    retry_route_restore(client, &mut registry);
+    if acquire_route_with(client, &mut registry, endpoint, virtual_route)? {
+        Ok(Some(Arc::new(RouteLease {
+            endpoint: endpoint.to_owned(),
+        })))
+    } else {
+        Ok(None)
+    }
+}
+
+trait RouteOperations {
+    fn retry_restore(&mut self, registry: &mut RouteRegistry);
+    fn reconcile_persisted(&mut self);
+    fn pending_route(&mut self) -> AudioResult<Option<RouteIntent>>;
+    fn default_sink(&mut self) -> AudioResult<Option<String>>;
+    fn persist_intent(&mut self, endpoint: &str, original: &str) -> AudioResult<()>;
+    fn assign(&mut self, endpoint: &str) -> AudioResult<()>;
+    fn fence_assignment(&mut self) -> AudioResult<()>;
+    fn mark_assignment_fenced(&mut self, endpoint: &str) -> AudioResult<()>;
+    fn confirm_assignment(&mut self, endpoint: &str) -> AudioResult<()>;
+    fn wait_for_assignment(&mut self, endpoint: &str, original: &str) -> bool;
+}
+
+impl RouteOperations for PulseClient {
+    fn retry_restore(&mut self, registry: &mut RouteRegistry) {
+        retry_route_restore(self, registry);
+    }
+
+    fn reconcile_persisted(&mut self) {
+        let _ = reconcile_persisted_route(self);
+    }
+
+    fn pending_route(&mut self) -> AudioResult<Option<RouteIntent>> {
+        Ok(read_cleanup_state()?.route)
+    }
+
+    fn default_sink(&mut self) -> AudioResult<Option<String>> {
+        PulseClient::default_sink(self)
+    }
+
+    fn persist_intent(&mut self, endpoint: &str, original: &str) -> AudioResult<()> {
+        persist_route_intent(endpoint, original)
+    }
+
+    fn assign(&mut self, endpoint: &str) -> AudioResult<()> {
+        self.set_default_sink(endpoint)
+    }
+
+    fn fence_assignment(&mut self) -> AudioResult<()> {
+        self.quiesce_prior_commands()
+    }
+
+    fn mark_assignment_fenced(&mut self, endpoint: &str) -> AudioResult<()> {
+        mark_route_assignment_quiesced(endpoint)
+    }
+
+    fn confirm_assignment(&mut self, endpoint: &str) -> AudioResult<()> {
+        confirm_route_intent(endpoint)
+    }
+
+    fn wait_for_assignment(&mut self, endpoint: &str, original: &str) -> bool {
+        wait_for_route_readback(endpoint, original, Duration::from_millis(250), |timeout| {
+            self.default_sink_with_timeout(timeout)
+        })
+    }
+}
+
+fn acquire_route_with(
+    client: &mut impl RouteOperations,
+    registry: &mut RouteRegistry,
+    endpoint: &str,
+    virtual_route: bool,
+) -> AudioResult<bool> {
+    client.retry_restore(registry);
     registry.abandon_idle_restore();
 
     if registry.active.is_none() {
-        let _ = reconcile_persisted_route(client);
-        if read_cleanup_state()?.route.is_some() {
-            eprintln!("Amaterasu audio route recovery remains pending; allowing a new stream");
+        client.reconcile_persisted();
+        if client.pending_route()?.is_some() {
+            eprintln!("Amaterasu audio route recovery remains pending");
+            // Even a no-write open depends on the selected default remaining
+            // stable. A prior unresolved command may still change it later.
+            return Err("audio_route_restore_pending");
         }
     }
 
-    if let Some(active) = &mut registry.active {
-        if active.endpoint != endpoint {
-            return Err("audio_route_conflict");
-        }
-        active.references = active
-            .references
-            .checked_add(1)
-            .ok_or("audio_route_conflict")?;
-        return Ok(Some(Arc::new(RouteLease {
-            endpoint: endpoint.to_owned(),
-        })));
+    if registry.join_active_route(endpoint)? {
+        return Ok(true);
     }
 
     // Recovery above can change the default. Do not use the caller's snapshot
     // as the original for this stream or reject its successful restoration.
     let observed_default = client.default_sink()?;
-    let pending_route = read_cleanup_state()?.route;
+    let pending_route = client.pending_route()?;
     let original = replacement_route_original(pending_route.as_ref(), observed_default.as_deref());
     let plan = route_plan(
         endpoint,
         observed_default.as_deref(),
-        capture_only,
-        explicit_route,
+        false,
+        true,
         virtual_route,
     );
     let needs_assignment = plan == RoutePlan::Assign;
     if needs_assignment && original.is_none() {
         // PulseAudio has no API to restore an unset default sink. Keep capture
         // available without claiming ownership of a route we cannot restore.
-        return Ok(None);
+        return Ok(false);
     }
     if needs_assignment {
         let original_sink = original.as_deref().ok_or("audio_route_failed")?;
@@ -2121,33 +2308,31 @@ fn acquire_route(
         }
         // Durable intent precedes the global route mutation. If the callback
         // is lost, a restart can check the target before attempting restore.
-        persist_route_intent(endpoint, original_sink)?;
-        record_pending_route(&mut registry, endpoint, original.clone());
-        if client.set_default_sink(endpoint).is_err() {
+        client.persist_intent(endpoint, original_sink)?;
+        record_pending_route(registry, endpoint, original.clone());
+        if client.assign(endpoint).is_err() {
             eprintln!("Amaterasu audio route assignment was not acknowledged");
-            if client.quiesce_prior_commands().is_ok() {
-                let _ = mark_route_assignment_quiesced(endpoint);
+            if client.fence_assignment().is_ok() {
+                let _ = client.mark_assignment_fenced(endpoint);
             }
-            retry_route_restore(client, &mut registry);
+            client.retry_restore(registry);
             return Err("audio_route_failed");
         }
-        if confirm_route_intent(endpoint).is_err() {
-            retry_route_restore(client, &mut registry);
+        if client.confirm_assignment(endpoint).is_err() {
+            client.retry_restore(registry);
             return Err("audio_cleanup_journal_unavailable");
         }
         if let Some(active) = registry.active.as_mut() {
             active.assignment_confirmed = true;
         }
-        if !wait_for_route_readback(
+        if !client.wait_for_assignment(
             endpoint,
             observed_default
                 .as_deref()
                 .expect("assignment requires a previous route"),
-            Duration::from_millis(250),
-            |timeout| client.default_sink_with_timeout(timeout),
         ) {
             eprintln!("Amaterasu audio route assignment acknowledged but readback differs");
-            retry_route_restore(client, &mut registry);
+            client.retry_restore(registry);
             return Err("audio_route_failed");
         }
         let Some(active) = registry.active.as_mut() else {
@@ -2155,7 +2340,7 @@ fn acquire_route(
         };
         active.references = 1;
     } else if !virtual_route {
-        return Ok(None);
+        return Ok(false);
     } else {
         registry.active = Some(ActiveRoute {
             endpoint: endpoint.to_owned(),
@@ -2164,9 +2349,7 @@ fn acquire_route(
             assignment_confirmed: true,
         });
     }
-    Ok(Some(Arc::new(RouteLease {
-        endpoint: endpoint.to_owned(),
-    })))
+    Ok(true)
 }
 
 impl Drop for RouteLease {
@@ -2175,14 +2358,7 @@ impl Drop for RouteLease {
         let mut registry = registry
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(active) = &mut registry.active else {
-            return;
-        };
-        if active.endpoint != self.endpoint || active.references == 0 {
-            return;
-        }
-        active.references -= 1;
-        if active.references == 0
+        if registry.release_route(&self.endpoint)
             && let Ok(mut client) = PulseClient::connect_with_timeout(ROUTE_RESTORE_TIMEOUT)
         {
             retry_route_restore(&mut client, &mut registry);
@@ -2198,13 +2374,22 @@ fn retry_route_restore(client: &mut PulseClient, registry: &mut RouteRegistry) {
     else {
         return;
     };
-    let intent = match read_cleanup_state().ok().and_then(|state| state.route) {
+    let Ok(state) = read_cleanup_state() else {
+        return;
+    };
+    let intent = match state.route {
         Some(intent) => intent,
         None => {
             let Some(original_sink) = active.original.clone() else {
                 registry.active = None;
                 return;
             };
+            if original_sink == active.endpoint {
+                // Tracking an already-selected virtual endpoint made no
+                // global write and has no durable mutation to reconcile.
+                registry.active = None;
+                return;
+            }
             RouteIntent {
                 target_sink: active.endpoint.clone(),
                 original_sink,
@@ -2531,7 +2716,6 @@ impl Capture {
         let route_lease = acquire_route(
             &mut client,
             &selected.endpoint.id,
-            default_sink.as_deref(),
             effective_capture_only,
             explicit_route,
             is_virtual,
@@ -3508,8 +3692,314 @@ mod tests {
         assert_eq!(registry.active.as_ref().unwrap().references, 1);
     }
 
+    #[derive(Default)]
+    struct FakeRouteOperations {
+        current: Option<String>,
+        intent: Option<RouteIntent>,
+        assignments: Vec<String>,
+        lose_assignment_reply: bool,
+    }
+
+    impl RouteOperations for FakeRouteOperations {
+        fn retry_restore(&mut self, registry: &mut RouteRegistry) {
+            if !registry.restore_pending() {
+                return;
+            }
+            if let Some(intent) = &self.intent {
+                match route_restore_action(intent, self.current.as_deref()) {
+                    RouteRestoreAction::Wait | RouteRestoreAction::KeepTombstone => return,
+                    RouteRestoreAction::RestoreOriginal => {
+                        self.current = Some(intent.original_sink.clone());
+                    }
+                    RouteRestoreAction::Release => {}
+                }
+            }
+            self.intent = None;
+            registry.active = None;
+        }
+        fn reconcile_persisted(&mut self) {}
+        fn pending_route(&mut self) -> AudioResult<Option<RouteIntent>> {
+            Ok(self.intent.clone())
+        }
+        fn default_sink(&mut self) -> AudioResult<Option<String>> {
+            Ok(self.current.clone())
+        }
+        fn persist_intent(&mut self, endpoint: &str, original: &str) -> AudioResult<()> {
+            cleanup_journal::validate_route_intent_replacement(self.intent.as_ref())?;
+            self.intent = Some(RouteIntent {
+                target_sink: endpoint.into(),
+                original_sink: original.into(),
+                ..RouteIntent::default()
+            });
+            Ok(())
+        }
+        fn assign(&mut self, endpoint: &str) -> AudioResult<()> {
+            self.assignments.push(endpoint.into());
+            if self.lose_assignment_reply {
+                return Err("audio_operation_timeout");
+            }
+            self.current = Some(endpoint.into());
+            Ok(())
+        }
+        fn fence_assignment(&mut self) -> AudioResult<()> {
+            if self.lose_assignment_reply {
+                Err("audio_operation_timeout")
+            } else {
+                Ok(())
+            }
+        }
+        fn mark_assignment_fenced(&mut self, _: &str) -> AudioResult<()> {
+            Ok(())
+        }
+        fn confirm_assignment(&mut self, _: &str) -> AudioResult<()> {
+            self.intent.as_mut().unwrap().assignment_confirmed = true;
+            Ok(())
+        }
+        fn wait_for_assignment(&mut self, endpoint: &str, _: &str) -> bool {
+            self.current.as_deref() == Some(endpoint)
+        }
+    }
+
     #[test]
-    fn failed_restore_does_not_reserve_the_next_stream_route() {
+    fn delayed_unfenced_assignment_cannot_be_replaced_by_a_new_route() {
+        let mut registry = RouteRegistry::default();
+        let mut client = FakeRouteOperations {
+            current: Some("headset".into()),
+            lose_assignment_reply: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            acquire_route_with(&mut client, &mut registry, "old", false),
+            Err("audio_route_failed")
+        );
+        assert_eq!(
+            acquire_route_with(&mut client, &mut registry, "new", false),
+            Err("audio_route_restore_pending")
+        );
+        assert_eq!(client.assignments, ["old"]);
+        let intent = client.intent.as_ref().unwrap();
+        assert_eq!(intent.target_sink, "old");
+        assert_eq!(intent.original_sink, "headset");
+        // The old command can still take effect after the new open was denied;
+        // its exact identity remains available for recovery.
+        client.current = Some("old".into());
+        client.reconcile_persisted();
+        assert_eq!(client.intent.as_ref().unwrap().target_sink, "old");
+    }
+
+    #[test]
+    fn pending_prior_route_blocks_successor_even_when_already_default() {
+        for restoration_pending in [false, true] {
+            for virtual_route in [false, true] {
+                let old_intent = RouteIntent {
+                    target_sink: "old-stream".into(),
+                    original_sink: "headset".into(),
+                    assignment_confirmed: restoration_pending,
+                    restoration_submitted: restoration_pending,
+                    ..RouteIntent::default()
+                };
+                let mut client = FakeRouteOperations {
+                    current: Some("headset".into()),
+                    intent: Some(old_intent.clone()),
+                    ..Default::default()
+                };
+                let mut registry = RouteRegistry::default();
+
+                assert_eq!(
+                    acquire_route_with(&mut client, &mut registry, "headset", virtual_route),
+                    Err("audio_route_restore_pending")
+                );
+                assert!(registry.active.is_none());
+                assert!(client.assignments.is_empty());
+                assert_eq!(client.intent, Some(old_intent.clone()));
+
+                // The old command can still change the selected default after
+                // the denied open; its ownership must remain in the journal.
+                client.current = Some("old-stream".into());
+                assert_eq!(client.intent, Some(old_intent));
+            }
+        }
+    }
+
+    #[test]
+    fn matching_explicit_route_keeps_the_original_until_both_owners_release() {
+        for first_owner in [0, 1] {
+            let mut registry = RouteRegistry::default();
+            let mut client = FakeRouteOperations {
+                current: Some("headset".into()),
+                ..Default::default()
+            };
+            assert!(acquire_route_with(&mut client, &mut registry, "speakers", false).unwrap());
+            assert_eq!(client.current.as_deref(), Some("speakers"));
+            assert!(acquire_route_with(&mut client, &mut registry, "speakers", false).unwrap());
+            assert_eq!(client.assignments, ["speakers"]);
+            assert_eq!(
+                acquire_route_with(&mut client, &mut registry, "other", false),
+                Err("audio_route_conflict")
+            );
+            assert_eq!(client.intent.as_ref().unwrap().original_sink, "headset");
+            assert_eq!(registry.active.as_ref().unwrap().references, 2);
+            assert!(
+                !registry.release_route("speakers"),
+                "first owner {first_owner}"
+            );
+            assert_eq!(
+                registry.active.as_ref().unwrap().original.as_deref(),
+                Some("headset")
+            );
+            assert!(
+                registry.release_route("speakers"),
+                "second owner after {first_owner}"
+            );
+            client.retry_restore(&mut registry);
+            assert_eq!(client.current.as_deref(), Some("headset"));
+            assert!(client.intent.is_none());
+            assert!(!registry.release_route("speakers"));
+        }
+    }
+
+    #[test]
+    fn managed_sink_registry_shares_layout_and_fences_a_retiring_owner() {
+        for first_owner in [0, 1] {
+            let mut registry = SharedSinkRegistry::default();
+            let first = Arc::new("sink-a");
+            registry.insert(2, &first);
+            let second = match registry.lookup(2) {
+                SharedSinkLookup::Active(sink) => sink,
+                _ => panic!("same-layout stream must reuse its sink"),
+            };
+            assert!(Arc::ptr_eq(&first, &second));
+            assert!(matches!(registry.lookup(6), SharedSinkLookup::Vacant));
+            let old_identity = Arc::as_ptr(&first);
+            let mut owners = [Some(first), Some(second)];
+            drop(owners[first_owner].take());
+            assert!(matches!(registry.lookup(2), SharedSinkLookup::Active(_)));
+            drop(owners[1 - first_owner].take());
+            // Weak upgrade fails as soon as destruction starts, before the
+            // destructor has finished native cleanup and removed its entry.
+            assert!(matches!(registry.lookup(2), SharedSinkLookup::Retiring));
+            let unrelated = Arc::new("other");
+            registry.remove_if_owner(2, Arc::as_ptr(&unrelated));
+            assert!(matches!(registry.lookup(2), SharedSinkLookup::Retiring));
+            registry.remove_if_owner(2, old_identity);
+            assert!(matches!(registry.lookup(2), SharedSinkLookup::Vacant));
+        }
+    }
+
+    struct FakeManagedSink {
+        channels: u32,
+        cleanup: Arc<Mutex<()>>,
+        registry: Arc<Mutex<SharedSinkRegistry<FakeManagedSink>>>,
+        retired: Arc<AtomicU64>,
+    }
+
+    impl Drop for FakeManagedSink {
+        fn drop(&mut self) {
+            let _guard = self.cleanup.lock().unwrap();
+            self.retired.fetch_add(1, Ordering::SeqCst);
+            self.registry
+                .lock()
+                .unwrap()
+                .remove_if_owner(self.channels, self);
+        }
+    }
+
+    struct FakeSinkOperations {
+        cleanup: Arc<Mutex<()>>,
+        registry: Arc<Mutex<SharedSinkRegistry<FakeManagedSink>>>,
+        created: Arc<AtomicU64>,
+        retired: Arc<AtomicU64>,
+        ensure_gate: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>,
+    }
+
+    impl SharedSinkOperations<FakeManagedSink> for FakeSinkOperations {
+        fn ensure(&mut self, _: &FakeManagedSink) -> AudioResult<()> {
+            if let Some((started, resume)) = self.ensure_gate.take() {
+                started.send(()).unwrap();
+                resume.recv().unwrap();
+                return Err("test_ensure_failed");
+            }
+            Ok(())
+        }
+
+        fn create(&mut self, channels: u32) -> AudioResult<Arc<FakeManagedSink>> {
+            self.created.fetch_add(1, Ordering::SeqCst);
+            Ok(Arc::new(FakeManagedSink {
+                channels,
+                cleanup: self.cleanup.clone(),
+                registry: self.registry.clone(),
+                retired: self.retired.clone(),
+            }))
+        }
+    }
+
+    #[test]
+    fn managed_sink_acquisition_shares_one_creation_and_retires_after_last_close() {
+        for first_owner in [0, 1] {
+            let cleanup = Arc::new(Mutex::new(()));
+            let registry = Arc::new(Mutex::new(SharedSinkRegistry::default()));
+            let created = Arc::new(AtomicU64::new(0));
+            let retired = Arc::new(AtomicU64::new(0));
+            let mut operations = FakeSinkOperations {
+                cleanup: cleanup.clone(),
+                registry: registry.clone(),
+                created: created.clone(),
+                retired: retired.clone(),
+                ensure_gate: None,
+            };
+            let first = acquire_shared_sink(&cleanup, &registry, 2, &mut operations).unwrap();
+            let second = acquire_shared_sink(&cleanup, &registry, 2, &mut operations).unwrap();
+            assert!(Arc::ptr_eq(&first, &second));
+            assert_eq!(created.load(Ordering::SeqCst), 1);
+            let mut owners = [Some(first), Some(second)];
+            drop(owners[first_owner].take());
+            assert_eq!(retired.load(Ordering::SeqCst), 0);
+            drop(owners[1 - first_owner].take());
+            assert_eq!(retired.load(Ordering::SeqCst), 1);
+            assert!(matches!(
+                registry.lock().unwrap().lookup(2),
+                SharedSinkLookup::Vacant
+            ));
+        }
+    }
+
+    #[test]
+    fn failed_shared_sink_ensure_drops_last_owner_after_unlocking() {
+        let cleanup = Arc::new(Mutex::new(()));
+        let registry = Arc::new(Mutex::new(SharedSinkRegistry::default()));
+        let created = Arc::new(AtomicU64::new(0));
+        let retired = Arc::new(AtomicU64::new(0));
+        let mut operations = FakeSinkOperations {
+            cleanup: cleanup.clone(),
+            registry: registry.clone(),
+            created,
+            retired: retired.clone(),
+            ensure_gate: None,
+        };
+        let first = acquire_shared_sink(&cleanup, &registry, 2, &mut operations).unwrap();
+        let (started, ready) = mpsc::channel();
+        let (resume, wait) = mpsc::channel();
+        operations.ensure_gate = Some((started, wait));
+        let cleanup_worker = cleanup.clone();
+        let registry_worker = registry.clone();
+        let (done, completion) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let result = acquire_shared_sink(&cleanup_worker, &registry_worker, 2, &mut operations);
+            done.send(result.err()).unwrap();
+        });
+        ready.recv_timeout(Duration::from_secs(1)).unwrap();
+        drop(first);
+        resume.send(()).unwrap();
+        assert_eq!(
+            completion.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Some("test_ensure_failed")
+        );
+        worker.join().unwrap();
+        assert_eq!(retired.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn abandoning_idle_registry_entry_preserves_a_live_route_owner() {
         let mut registry = RouteRegistry::default();
         record_pending_route(&mut registry, "old-stream", Some("headset".into()));
         registry.abandon_idle_restore();
@@ -3543,7 +4033,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires the user Pulse server; temporarily routes audio to private sinks and restores the original default"]
-    fn pending_restore_recovers_and_two_successive_streams_capture_and_clean_up() {
+    fn settled_restore_recovers_and_two_successive_streams_capture_and_clean_up() {
         use std::os::unix::fs::PermissionsExt;
 
         let mut client = PulseClient::connect().expect("user Pulse server is available");
@@ -3579,31 +4069,14 @@ mod tests {
                     original_sink: original.clone(),
                     assignment_confirmed: true,
                     restoration_submitted: true,
+                    restoration_confirmed: true,
                     ..RouteIntent::default()
                 }),
                 ..CleanupState::default()
             })
             .unwrap();
         startup(&state_root).unwrap();
-        assert!(!route_restore_pending(), "uncertain restore is reconciled");
-        // An unacknowledged assignment remains unresolved by design. Its
-        // cleanup must still allow a subsequent stream to acquire a route.
-        journal
-            .write(&CleanupState {
-                route: Some(RouteIntent {
-                    target_sink: "amaterasu-obsolete-recovery-probe".into(),
-                    original_sink: original.clone(),
-                    ..RouteIntent::default()
-                }),
-                ..CleanupState::default()
-            })
-            .unwrap();
-        assert!(route_restore_pending());
-        record_pending_route(
-            &mut route_registry().lock().unwrap(),
-            "amaterasu-obsolete-recovery-probe",
-            Some(original.clone()),
-        );
+        assert!(!route_restore_pending(), "settled restore is reconciled");
         for _ in 0..2 {
             let mut capture = Capture::open("", None, None, None, false, false).unwrap();
             let endpoint = capture.endpoint().to_owned();

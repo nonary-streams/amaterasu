@@ -309,6 +309,14 @@ and background cleanup retries failed route restoration and owned sink unloads.
 Shutdown makes one final bounded pass; failed or indeterminate operations remain
 journaled for the next startup. Cleanup validates the sink's ownership token before
 unloading its module so an unrelated sink reusing a name or module index is retained.
+An outstanding route assignment or restoration prevents a replacement route
+write until the prior intent is reconciled. A Pulse reply or an ordered server
+query alone does not prove PipeWire has published its configured route metadata;
+the effective-default readback used here is not a proof of configured metadata
+settlement. The current implementation does not retain the original Pulse
+connection after a failed fence, so an unacknowledged command remains pending
+and may not be settled automatically after disconnect or restart. Exact native
+configured-route settlement and live PipeWire qualification remain outstanding.
 
 The Windows audio policy/capture behavior and audio capture contract in pinned
 Vibeshine commit `457237db7e57f9c4be21c35bb07e28d1c100eb7d` were used as
