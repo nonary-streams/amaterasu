@@ -486,6 +486,7 @@ fn frozen_action_lineage_survives_restart_and_rejects_tampering() {
             settings_snapshot::FrozenSettings {
                 settings: json!({}),
                 revision: "rev".into(),
+                contract: None,
             },
         )]
         .into(),

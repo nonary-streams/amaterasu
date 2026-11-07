@@ -1228,6 +1228,7 @@ pub(in crate::coordinator) mod tests {
                 settings_snapshot::FrozenSettings {
                     settings: json!({}),
                     revision: "revision".into(),
+                    contract: None,
                 },
             );
         let key = receipt_key("transport", "client", "end");
@@ -1434,6 +1435,7 @@ pub(in crate::coordinator) mod tests {
                 settings_snapshot::FrozenSettings {
                     settings: json!({}),
                     revision: "revision".into(),
+                    contract: None,
                 },
             );
         let key = receipt_key("transport", "client", "end");
@@ -1762,6 +1764,7 @@ pub(in crate::coordinator) mod tests {
                 settings_snapshot::FrozenSettings {
                     settings: json!({}),
                     revision: "revision".into(),
+                    contract: None,
                 },
             );
         }

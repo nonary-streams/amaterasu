@@ -657,21 +657,27 @@ impl Coordinator {
             let mut next = self.shared.borrow().value.clone();
             let snapshots = frozen_settings_mut(&mut next, &work.target)?;
             for (provider, state) in &work.states {
-                snapshots.insert(
-                    provider.clone(),
+                snapshots.entry(provider.clone()).or_insert(
                     super::settings_snapshot::FrozenSettings {
                         settings: state.participant.settings.clone(),
                         revision: state.participant.settings_revision.clone(),
+                        contract: Some(
+                            super::settings_snapshot::FrozenParticipantContract::from_participant(
+                                &state.participant,
+                            )?,
+                        ),
                     },
                 );
             }
-            for participant in &self.settings.participants {
-                snapshots
-                    .entry(participant.provider.clone())
-                    .or_insert_with(|| super::settings_snapshot::FrozenSettings {
-                        settings: participant.settings.clone(),
-                        revision: participant.settings_revision.clone(),
-                    });
+            // Historical values and contracts may come only from retained
+            // preparation evidence, never today's installed policy defaults.
+            if self
+                .settings
+                .participants
+                .iter()
+                .any(|participant| !snapshots.contains_key(&participant.provider))
+            {
+                return Err("settings_snapshot_missing".into());
             }
             save(&self.shared, next)?;
             return Ok(true);

@@ -1,6 +1,82 @@
 //! Explicit, owner-authenticated reconciliation of persisted callback receipts.
 use super::*;
 
+/// Historical release may reuse frozen values only while the installed provider
+/// contracts still identify the participants that admitted those resources.
+pub(super) fn validate_recovery_provider_contracts(
+    journal: &Journal,
+    settings: &LifecycleSettings,
+    session: &SessionRecord,
+    target: &LifecycleTarget,
+    retained_graph: Option<&ProviderGraph>,
+    snapshots: &BTreeMap<String, settings_snapshot::FrozenSettings>,
+) -> ModuleResult<()> {
+    let installed_graph = ProviderGraph {
+        order: settings.resolved_participants()?,
+        dependencies: settings
+            .participants
+            .iter()
+            .map(|participant| (participant.provider.clone(), participant.depends_on.clone()))
+            .collect(),
+    };
+    if retained_graph != Some(&installed_graph) {
+        return Err("recovery_provider_graph_changed".into());
+    }
+    if installed_graph.order.iter().any(|provider| {
+        snapshots
+            .get(provider)
+            .is_none_or(|snapshot| snapshot.revision.is_empty() || !snapshot.settings.is_object())
+    }) {
+        return Err("recovery_settings_snapshot_missing".into());
+    }
+    let preparation_phase = match target {
+        LifecycleTarget::Session { .. } => LifecyclePhase::SessionPrepare,
+        LifecycleTarget::Stream { .. } => LifecyclePhase::StreamPrepare,
+        _ => return Err("invalid_recovery_target".into()),
+    };
+    for participant in &settings.participants {
+        let snapshot = &snapshots[&participant.provider];
+        if let Some(contract) = &snapshot.contract
+            && !contract.matches_participant(participant)
+        {
+            return Err("recovery_provider_contract_changed".into());
+        }
+        // Older snapshots may use their exact retained prepare admission as
+        // contract evidence. Other streams and release plans cannot establish
+        // which participant originally admitted this target's resources.
+        let mut original_found = false;
+        for admission_id in &session.admission_ids {
+            if session.admission_targets.get(admission_id) != Some(target)
+                || session.admission_phases.get(admission_id) != Some(&preparation_phase)
+            {
+                continue;
+            }
+            let Some(admission) = journal
+                .authority
+                .admissions
+                .get(admission_id)
+                .or_else(|| journal.authority.settled.get(admission_id))
+            else {
+                continue;
+            };
+            if admission.provider != participant.provider {
+                continue;
+            }
+            let contract = settings_snapshot::FrozenParticipantContract::from_participant(
+                &admission.selection.participant,
+            )?;
+            if !contract.matches_participant(participant) {
+                return Err("recovery_provider_contract_changed".into());
+            }
+            original_found = true;
+        }
+        if snapshot.contract.is_none() && !original_found {
+            return Err("recovery_contract_snapshot_missing".into());
+        }
+    }
+    Ok(())
+}
+
 impl Coordinator {
     /// Resolve an exact retained admission for a native-retired consumer. This
     /// read-only query cannot retire resources, adopt capture or revive an epoch.
@@ -164,6 +240,14 @@ impl Coordinator {
         {
             return Err("native_retirement_unconfirmed".into());
         }
+        validate_recovery_provider_contracts(
+            &next,
+            &self.settings,
+            session,
+            &target,
+            stream.provider_graph.as_ref(),
+            &stream.provider_settings,
+        )?;
         // A settled ResourcePlan rejection has no admitted effect. Preserve its
         // rejection receipt while allowing a fresh cleanup attempt; unknown or
         // effectful callbacks remain fenced by the check above.

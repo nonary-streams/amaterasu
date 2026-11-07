@@ -110,48 +110,14 @@ fn release_preflight(
     {
         return Err("session_release_not_recoverable".into());
     }
-    let installed_graph = ProviderGraph {
-        order: settings.resolved_participants()?,
-        dependencies: settings
-            .participants
-            .iter()
-            .map(|participant| (participant.provider.clone(), participant.depends_on.clone()))
-            .collect(),
-    };
-    if session.provider_graph.as_ref() != Some(&installed_graph) {
-        return Err("recovery_provider_graph_changed".into());
-    }
-    if installed_graph.order.iter().any(|provider| {
-        session
-            .provider_settings
-            .get(provider)
-            .is_none_or(|snapshot| snapshot.revision.is_empty() || !snapshot.settings.is_object())
-    }) {
-        return Err("recovery_settings_snapshot_missing".into());
-    }
-    for admission_id in &session.admission_ids {
-        if let Some(admission) = journal
-            .authority
-            .admissions
-            .get(admission_id)
-            .or_else(|| journal.authority.settled.get(admission_id))
-        {
-            let original = &admission.selection.participant;
-            let mut selected = settings
-                .participants
-                .iter()
-                .find(|participant| participant.provider == original.provider)
-                .ok_or("recovery_provider_contract_changed")?
-                .clone();
-            // Values are frozen separately; the method contract, dependency
-            // shape and granted provider capabilities must retain their identity.
-            selected.settings = original.settings.clone();
-            selected.settings_revision = original.settings_revision.clone();
-            if selected != *original {
-                return Err("recovery_provider_contract_changed".into());
-            }
-        }
-    }
+    recovery::validate_recovery_provider_contracts(
+        journal,
+        settings,
+        session,
+        &work.target,
+        session.provider_graph.as_ref(),
+        &session.provider_settings,
+    )?;
     if journal.inputs.has_unresolved_session(epoch, id)
         || journal.actions.has_unresolved_session(epoch, id)
         || journal.receipts.iter().any(|(key, receipt)| {
@@ -279,7 +245,8 @@ mod tests {
         let method = |name| json!({"service":"provider/1","method":name,"interface_major":1,"interface_minor":0,"schema_revision":1});
         let participant = json!({"provider":"provider","plan_method":method("plan"),"callback_method":method("callback"),
             "status_method":method("status"),"capabilities":[],"cleanup_methods":[],"settings_revision":"current","settings":{"value":"new"}});
-        let settings = serde_json::from_value(json!({"participants":[participant]})).unwrap();
+        let settings: LifecycleSettings =
+            serde_json::from_value(json!({"participants":[participant]})).unwrap();
         let target =
             json!({"kind":"session","host_epoch":"old","session_id":"session","generation":1});
         let graph = json!({"order":["provider"],"dependencies":{"provider":[]}});
@@ -290,9 +257,21 @@ mod tests {
         let work = json!({"phase":"session.release","target":target,"reason":"end","intent":null,"video":null,
             "transition_id":"transition","providers":["provider"],"provider_graph":graph,"index":0,"states":{},
             "candidate":null,"waiting_retirement":true});
-        let journal = serde_json::from_value(json!({"version":3,"host_epoch":"current","sessions":{"session":session},
+        let mut journal:Journal = serde_json::from_value(json!({"version":3,"host_epoch":"current","sessions":{"session":session},
             "receipts":{"end":{"caller":"owner","initiator":"owner","request":{"operation":"end_session","operation_id":"end","target":target},
                 "response":{"status":"recovery_required"},"work":work}}})).unwrap();
+        let contract = settings_snapshot::FrozenParticipantContract::from_participant(
+            &settings.participants[0],
+        )
+        .unwrap();
+        journal
+            .sessions
+            .get_mut("session")
+            .unwrap()
+            .provider_settings
+            .get_mut("provider")
+            .unwrap()
+            .contract = Some(contract);
         (journal, settings)
     }
 
@@ -315,6 +294,55 @@ mod tests {
         assert_eq!(
             release_preflight(&journal, &settings, "end").unwrap_err(),
             "recovery_provider_graph_changed"
+        );
+    }
+
+    #[test]
+    fn matching_snapshot_cannot_override_a_conflicting_exact_prepare_contract() {
+        let (mut journal, settings) = fixture();
+        let target = journal.receipts["end"]
+            .work
+            .as_ref()
+            .unwrap()
+            .target
+            .clone();
+        let mut original = settings.participants[0].clone();
+        original
+            .capabilities
+            .insert("historical_capability/1".into());
+        let approvals: Vec<_> = [
+            &original.plan_method,
+            &original.callback_method,
+            &original.status_method,
+        ]
+        .into_iter()
+        .map(|method| {
+            json!({"method":method,
+                "broker_approval":{"provider":original.provider,"method":method}})
+        })
+        .collect();
+        let admission = serde_json::from_value(json!({"provider":original.provider,
+            "selection":{"participant":original,"approvals":approvals,"capabilities":original.capabilities,
+                "cleanup_methods":[],"authorized_borrowers":[]},
+            "plan":{"plan_id":"original-plan","revision":1,"resources":[],"mutation_domains":[],
+                "required_capabilities":[],"constraints":{},"obligations":[],"affected_consumers":[],
+                "consumer_change":"live","candidate_constraint":null,"allowed_degradation":[]},
+            "rights":[]})).unwrap();
+        journal
+            .authority
+            .settled
+            .insert("original-admission".into(), admission);
+        let session = journal.sessions.get_mut("session").unwrap();
+        session.admission_ids.insert("original-admission".into());
+        session
+            .admission_targets
+            .insert("original-admission".into(), target);
+        session
+            .admission_phases
+            .insert("original-admission".into(), LifecyclePhase::SessionPrepare);
+        assert_eq!(
+            release_preflight(&journal, &settings, "end").unwrap_err(),
+            "recovery_provider_contract_changed"
         );
     }
 

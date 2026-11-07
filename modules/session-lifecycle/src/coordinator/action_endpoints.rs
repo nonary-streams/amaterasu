@@ -2430,6 +2430,7 @@ mod tests {
                     super::super::settings_snapshot::FrozenSettings {
                         settings: json!({}),
                         revision: "rev".into(),
+                        contract: None,
                     },
                 )]
                 .into(),
@@ -2766,6 +2767,7 @@ mod tests {
                     super::super::settings_snapshot::FrozenSettings {
                         settings: json!({}),
                         revision: "stream-rev".into(),
+                        contract: None,
                     },
                 )]
                 .into(),
@@ -2810,6 +2812,7 @@ mod tests {
                     super::super::settings_snapshot::FrozenSettings {
                         settings: json!({}),
                         revision: "session-rev".into(),
+                        contract: None,
                     },
                 )]
                 .into(),

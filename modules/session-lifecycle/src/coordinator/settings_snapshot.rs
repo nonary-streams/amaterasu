@@ -3,6 +3,7 @@ use crate::adapter::ParticipantSettings;
 use amaterasu_module_sdk::{Command, ModuleResult, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 const MAX_PROVIDERS: usize = 32;
@@ -100,6 +101,40 @@ impl SnapshotScopes {
 pub struct FrozenSettings {
     pub settings: Value,
     pub revision: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) contract: Option<FrozenParticipantContract>,
+}
+
+/// Version 1 binds the complete installed participant contract. Settings values
+/// and their revision are frozen separately, so normalize only those two fields.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(super) struct FrozenParticipantContract {
+    pub(super) version: u32,
+    pub(super) digest: String,
+}
+
+impl FrozenParticipantContract {
+    pub(super) fn from_participant(participant: &ParticipantSettings) -> ModuleResult<Self> {
+        let mut normalized = participant.clone();
+        normalized.settings = json!({});
+        normalized.settings_revision.clear();
+        let bytes = serde_json::to_vec(&normalized).map_err(|_| "invalid_provider_contract")?;
+        Ok(Self {
+            version: 1,
+            digest: format!("{:x}", Sha256::digest(bytes)),
+        })
+    }
+
+    pub(super) fn matches_participant(&self, participant: &ParticipantSettings) -> bool {
+        self.version == 1
+            && self.digest.len() == 64
+            && self
+                .digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            && Self::from_participant(participant).is_ok_and(|current| current == *self)
+    }
 }
 
 #[derive(Debug)]
@@ -159,15 +194,16 @@ impl SettingsSnapshotJob {
             participants
                 .iter()
                 .map(|p| {
-                    (
+                    Ok((
                         p.provider.clone(),
                         FrozenSettings {
                             settings: p.settings.clone(),
                             revision: p.settings_revision.clone(),
+                            contract: Some(FrozenParticipantContract::from_participant(p)?),
                         },
-                    )
+                    ))
                 })
-                .collect()
+                .collect::<ModuleResult<BTreeMap<_, _>>>()?
         } else {
             BTreeMap::new()
         };
@@ -291,6 +327,12 @@ impl SettingsSnapshotJob {
                 live_options,
                 descriptor_revision,
             } => {
+                // The registry supplies values, never the installed method or
+                // capability identity that will govern later native cleanup.
+                let mut snapshot = snapshot.clone();
+                snapshot.contract = Some(FrozenParticipantContract::from_participant(
+                    &self.participants[self.index],
+                )?);
                 match send(Command::ReleaseResult { request: *request })? {
                     Response::Ok => {}
                     _ => return Err("settings registry result release failed".into()),
@@ -303,10 +345,8 @@ impl SettingsSnapshotJob {
                     self.participants[self.index].provider.clone(),
                     live_options.clone(),
                 );
-                self.snapshots.insert(
-                    self.participants[self.index].provider.clone(),
-                    snapshot.clone(),
-                );
+                self.snapshots
+                    .insert(self.participants[self.index].provider.clone(), snapshot);
                 self.index += 1;
                 self.stage = Stage::Submit;
             }
@@ -371,6 +411,7 @@ fn parse_registry_response(
     let snapshot = FrozenSettings {
         settings: Value::Object(values),
         revision: format!("registry-{revision}"),
+        contract: None,
     };
     if !valid_snapshot(&snapshot.settings, &snapshot.revision) {
         return Err("invalid effective settings".into());
@@ -405,6 +446,144 @@ mod tests {
         Response::Result {
             payload: json!({"ok":true,"status":"ok","revision":revision,"values":{},"effective":{"x":{"value":value,"source":{"kind":"host"}}}}),
         }
+    }
+
+    #[test]
+    fn direct_settings_freeze_selected_participant_contract_identity() {
+        let participant = participant("provider");
+        let mut job =
+            SettingsSnapshotJob::new(None, &[participant], SnapshotScopes::default()).unwrap();
+        let snapshots = job
+            .advance(&mut |_| panic!("direct snapshot needs no broker"))
+            .unwrap()
+            .unwrap();
+        let snapshot = serde_json::to_value(&snapshots["provider"]).unwrap();
+        assert_eq!(snapshot["contract"]["version"], 1);
+        assert_eq!(snapshot["contract"]["digest"].as_str().unwrap().len(), 64);
+    }
+
+    #[test]
+    fn registry_settings_cannot_supply_the_selected_contract_identity() {
+        let participant = participant("provider");
+        let mut direct = SettingsSnapshotJob::new(
+            None,
+            std::slice::from_ref(&participant),
+            SnapshotScopes::default(),
+        )
+        .unwrap();
+        let expected =
+            serde_json::to_value(direct.advance(&mut |_| unreachable!()).unwrap().unwrap())
+                .unwrap();
+        let mut registry = SettingsSnapshotJob::new(
+            Some("registry/1"),
+            &[participant],
+            SnapshotScopes::default(),
+        )
+        .unwrap();
+        let mut send = |command| match command {
+            Command::Request { .. } => Ok(Response::Accepted { id: 8 }),
+            Command::TakeResult { request: 8 } => Ok(Response::Result {
+                payload: json!({"ok":true,"status":"ok","revision":9,
+                    "effective":{"x":{"value":2}},
+                    "contract":{"version":1,"digest":"a".repeat(64)}}),
+            }),
+            Command::ReleaseResult { request: 8 } => Ok(Response::Ok),
+            _ => panic!("unexpected registry command"),
+        };
+        assert!(registry.advance(&mut send).unwrap().is_none());
+        assert!(registry.advance(&mut send).unwrap().is_none());
+        let snapshots = registry.advance(&mut send).unwrap().unwrap();
+        let snapshot = serde_json::to_value(&snapshots["provider"]).unwrap();
+        assert_eq!(snapshot["contract"]["version"], 1);
+        assert_eq!(snapshot["contract"], expected["provider"]["contract"]);
+        assert_ne!(snapshot["contract"]["digest"], "a".repeat(64));
+        assert_eq!(snapshot["settings"]["x"], 2);
+    }
+
+    #[test]
+    fn contract_identity_covers_all_participant_fields_except_frozen_values() {
+        let original = participant("provider");
+        let identity = FrozenParticipantContract::from_participant(&original).unwrap();
+        assert!(serde_json::to_vec(&identity).unwrap().len() <= 100);
+        let mut values = original.clone();
+        values.settings = json!({"different":"values"});
+        values.settings_revision = "different-revision".into();
+        assert!(identity.matches_participant(&values));
+        for field in [
+            "provider",
+            "version",
+            "dependencies",
+            "plan_service",
+            "plan_method",
+            "interface_major",
+            "interface_minor",
+            "schema_revision",
+            "callback",
+            "status",
+            "binding_validation",
+            "capabilities",
+            "cleanup_methods",
+        ] {
+            let mut changed = original.clone();
+            match field {
+                "provider" => changed.provider = "replacement".into(),
+                "version" => changed.contract_version += 1,
+                "dependencies" => changed.depends_on.push("dependency".into()),
+                "plan_service" => changed.plan_method.service = "replacement/1".into(),
+                "plan_method" => changed.plan_method.method = "replacement".into(),
+                "interface_major" => changed.plan_method.interface_major += 1,
+                "interface_minor" => changed.plan_method.interface_minor += 1,
+                "schema_revision" => changed.plan_method.schema_revision += 1,
+                "callback" => changed.callback_method.method = "replacement".into(),
+                "status" => changed.status_method.method = "replacement".into(),
+                "binding_validation" => {
+                    changed.binding_validate_method = Some(changed.plan_method.clone())
+                }
+                "capabilities" => {
+                    changed.capabilities.insert("new-capability".into());
+                }
+                "cleanup_methods" => changed.cleanup_methods.push(
+                    serde_json::from_value(serde_json::to_value(&changed.callback_method).unwrap())
+                        .unwrap(),
+                ),
+                _ => unreachable!(),
+            }
+            assert!(!identity.matches_participant(&changed), "changed {field}");
+        }
+    }
+
+    #[test]
+    fn malformed_or_unknown_contract_identity_never_matches_a_participant() {
+        let participant = participant("provider");
+        let identity = FrozenParticipantContract::from_participant(&participant).unwrap();
+        assert!(identity.matches_participant(&participant));
+        for version in [0, 2, u32::MAX] {
+            let mut unknown = identity.clone();
+            unknown.version = version;
+            assert!(!unknown.matches_participant(&participant));
+        }
+        for digest in [
+            String::new(),
+            "a".repeat(63),
+            "a".repeat(65),
+            "g".repeat(64),
+            "A".repeat(64),
+        ] {
+            let mut malformed = identity.clone();
+            malformed.digest = digest;
+            assert!(!malformed.matches_participant(&participant));
+        }
+        let legacy: FrozenSettings = serde_json::from_value(json!({
+            "settings":{"x":1}, "revision":"legacy"
+        }))
+        .unwrap();
+        assert!(legacy.contract.is_none());
+        assert!(
+            serde_json::from_value::<FrozenParticipantContract>(json!({
+                "version":1,"digest":identity.digest,"replacement":true
+            }))
+            .is_err()
+        );
     }
 
     #[test]

@@ -2097,6 +2097,276 @@ fn replacement_external_client_joins_retained_source_after_original_transport_re
 }
 
 #[test]
+fn restarted_external_stream_rejects_changed_frozen_provider_contracts() {
+    let mut accepted_changes = Vec::new();
+    for change in ["callback", "plan", "status", "capabilities", "dependencies"] {
+        let harness = Harness::with_processing_mode(true, None, false, true);
+        let (mut harness, _, source) = prepare_shared_source(harness);
+        harness.coordinator.take();
+        let participant = &mut harness.settings.participants[1];
+        match change {
+            "callback" => participant.callback_method.method = "lifecycle_status".into(),
+            "plan" => participant.plan_method.method = "lifecycle_status".into(),
+            "status" => participant.status_method.method = "lifecycle_callback".into(),
+            "capabilities" => {
+                participant.capabilities.insert("changed_contract/1".into());
+            }
+            "dependencies" => participant.depends_on.clear(),
+            _ => unreachable!(),
+        }
+        harness.start();
+        let journal_before = std::fs::read(harness.root.join("journal.json")).unwrap();
+        let events_before = harness.events.len();
+        let result = harness.call(
+            "capture",
+            json!({"operation":"retire_stream",
+            "operation_id":format!("changed-contract-{change}"),"restart_recovery":true,
+            "target":source["target"],
+            "retirement_receipt":{"service":"video/1","operation_id":"exact-native-owner",
+                "response":{"code":"not_found"}}}),
+        );
+        if result["status"] != "rejected" {
+            accepted_changes.push((change, result));
+            continue;
+        }
+        assert_eq!(
+            result["reason"],
+            if change == "dependencies" {
+                "recovery_provider_graph_changed"
+            } else {
+                "recovery_provider_contract_changed"
+            },
+            "{change}: {result}"
+        );
+        assert_eq!(
+            std::fs::read(harness.root.join("journal.json")).unwrap(),
+            journal_before,
+            "rejection must preserve original recovery evidence for {change}"
+        );
+        assert_eq!(
+            harness.events.len(),
+            events_before,
+            "contract mismatch must reject before release dispatch for {change}"
+        );
+        assert!(harness.native_live);
+    }
+    assert!(
+        accepted_changes.is_empty(),
+        "changed frozen contracts were admitted: {accepted_changes:?}"
+    );
+}
+
+#[test]
+fn restarted_external_stream_requires_its_exact_frozen_contract_or_legacy_prepare() {
+    for scenario in [
+        "legacy-retained",
+        "legacy-changed",
+        "legacy-missing",
+        "legacy-unrelated",
+        "malformed",
+        "unknown-version",
+    ] {
+        let harness = Harness::with_processing_mode(true, None, false, true);
+        let (mut harness, session, source) = prepare_shared_source(harness);
+        let joined = if matches!(
+            scenario,
+            "legacy-retained" | "legacy-changed" | "legacy-unrelated"
+        ) {
+            harness
+                .settings
+                .operation_grants
+                .get_mut("capture")
+                .unwrap()
+                .insert("ack_stream".into());
+            harness
+                .coordinator
+                .as_mut()
+                .unwrap()
+                .configure_for_test(harness.settings.clone());
+            activate_external_consumer(&mut harness, &source["target"], "legacy-source");
+            Some(join_external_consumer(
+                &mut harness,
+                &session,
+                "legacy-joined",
+                "joined-client",
+            ))
+        } else {
+            None
+        };
+        let target = if matches!(scenario, "legacy-retained" | "legacy-changed") {
+            joined.as_ref().unwrap()["target"].clone()
+        } else {
+            source["target"].clone()
+        };
+        harness.coordinator.take();
+        // This isolated fixture models journals written before contract identity
+        // was persisted, or a malformed identity that must never use fallback.
+        let journal_path = harness.root.join("journal.json");
+        let mut document: Value =
+            serde_json::from_slice(&std::fs::read(&journal_path).unwrap()).unwrap();
+        let snapshots = document["sessions"][target["session_id"].as_str().unwrap()]["streams"]
+            [target["stream_id"].as_str().unwrap()]["provider_settings"]
+            .as_object_mut()
+            .unwrap();
+        for snapshot in snapshots.values_mut() {
+            if scenario == "malformed" {
+                snapshot["contract"] = json!({"version":1,"digest":"invalid-digest"});
+            } else if scenario == "unknown-version" {
+                snapshot["contract"] = json!({"version":99,"digest":"0".repeat(64)});
+            } else {
+                snapshot.as_object_mut().unwrap().remove("contract");
+            }
+        }
+        std::fs::write(&journal_path, serde_json::to_vec(&document).unwrap()).unwrap();
+        if scenario == "legacy-changed" {
+            harness.settings.participants[0]
+                .capabilities
+                .insert("changed_contract/1".into());
+        }
+        harness.start();
+        let journal_before = std::fs::read(&journal_path).unwrap();
+        let events_before = harness.events.len();
+        let operation = format!("contract-proof-{scenario}");
+        let result = harness.call(
+            "capture",
+            json!({"operation":"retire_stream",
+            "operation_id":operation,"restart_recovery":true,"target":target,
+            "retirement_receipt":{"service":"video/1","operation_id":"exact-native-owner",
+                "response":{"code":"not_found"}}}),
+        );
+        if scenario == "legacy-retained" {
+            assert_eq!(result["status"], "pending", "{scenario}: {result}");
+            let mut result = result;
+            for _ in 0..400 {
+                result = harness.call(
+                    "capture",
+                    json!({"operation":"lookup","operation_id":operation}),
+                );
+                if result["status"] != "pending" {
+                    break;
+                }
+            }
+            assert_eq!(result["status"], "succeeded", "{result}");
+            assert_eq!(result["shared_retained"], true);
+            assert!(
+                harness.native_live,
+                "legacy proof cannot release the retained source"
+            );
+        } else {
+            assert_eq!(result["status"], "rejected", "{scenario}: {result}");
+            assert_eq!(
+                result["reason"],
+                if matches!(scenario, "legacy-missing" | "legacy-unrelated") {
+                    "recovery_contract_snapshot_missing"
+                } else {
+                    "recovery_provider_contract_changed"
+                },
+                "{scenario}: {result}"
+            );
+            assert_eq!(
+                std::fs::read(&journal_path).unwrap(),
+                journal_before,
+                "rejection preserves original evidence for {scenario}"
+            );
+            assert_eq!(
+                harness.events.len(),
+                events_before,
+                "rejection precedes provider dispatch for {scenario}"
+            );
+            assert!(harness.native_live);
+        }
+    }
+}
+
+#[test]
+fn restarted_external_stream_releases_with_original_settings_after_current_values_change() {
+    let mut harness = Harness::with_processing_mode(true, None, false, true);
+    for participant in &mut harness.settings.participants {
+        participant.settings = json!({"policy":"original"});
+        participant.settings_revision = "original-revision".into();
+    }
+    let (mut harness, session, source) = prepare_shared_source(harness);
+    harness
+        .settings
+        .operation_grants
+        .get_mut("capture")
+        .unwrap()
+        .insert("ack_stream".into());
+    harness
+        .coordinator
+        .as_mut()
+        .unwrap()
+        .configure_for_test(harness.settings.clone());
+    activate_external_consumer(&mut harness, &source["target"], "settings-source");
+    let joined = join_external_consumer(&mut harness, &session, "settings-joined", "joined-client");
+    harness.coordinator.take();
+    for participant in &mut harness.settings.participants {
+        participant.settings = json!({"policy":"replacement"});
+        participant.settings_revision = "replacement-revision".into();
+    }
+    harness.start();
+    let retire = |harness: &mut Harness, target: &Value, operation: &str| {
+        let result = harness.call(
+            "capture",
+            json!({"operation":"retire_stream",
+            "operation_id":operation,"restart_recovery":true,"target":target,
+            "retirement_receipt":{"service":"video/1","operation_id":format!("native-{operation}"),
+                "response":{"code":"not_found"}}}),
+        );
+        assert_eq!(result["status"], "pending", "{result}");
+        let mut result = result;
+        for _ in 0..400 {
+            result = harness.call(
+                "capture",
+                json!({"operation":"lookup","operation_id":operation}),
+            );
+            if result["status"] != "pending" {
+                break;
+            }
+        }
+        assert_eq!(result["status"], "succeeded", "{result}");
+        result
+    };
+    let joined_result = retire(
+        &mut harness,
+        &joined["target"],
+        "frozen-settings-joined-release",
+    );
+    assert_eq!(joined_result["shared_retained"], true);
+    assert!(harness.native_live);
+    let result = retire(
+        &mut harness,
+        &source["target"],
+        "frozen-settings-source-release",
+    );
+    assert_eq!(result["resources_released"], true);
+    assert!(!harness.native_live);
+    let released: Vec<_> = harness
+        .events
+        .iter()
+        .filter(|(_, payload)| {
+            payload["arguments"]["phase"] == "stream.release"
+                && payload["arguments"]["intent"] != "join"
+        })
+        .collect();
+    assert_eq!(
+        released.len(),
+        4,
+        "both original providers plan and release"
+    );
+    for (_, payload) in released {
+        assert_eq!(
+            payload["arguments"]["settings"],
+            json!({"policy":"original"})
+        );
+        assert_eq!(
+            payload["arguments"]["settings_revision"],
+            "original-revision"
+        );
+    }
+}
+
+#[test]
 fn restarted_external_shared_source_retires_consumers_before_original_policy() {
     for (source_first, source_retired_before_restart) in
         [(false, false), (true, false), (true, true)]
