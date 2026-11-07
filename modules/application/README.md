@@ -322,8 +322,16 @@ with `wait_all: true` remains running while a non-zombie group member exists;
 with `wait_all: false`, the remaining group receives the same graceful-then-force
 cleanup. Linux and macOS inspect group members while excluding the deliberately
 unreaped root and other zombies. The root is deliberately left unreaped
-(`waitid(WNOWAIT)`) until the final group signal, so its PID/PGID cannot be
-recycled into an unrelated group. Natural root exit starts cleanup on the next
+(`waitid(WNOWAIT)`) until the final group signal and a complete member inspection
+finds no live descendants, so its PID/PGID cannot be recycled into an unrelated
+group. Signal acceptance alone does not start undo or release native ownership;
+an incomplete or malformed group observation retains the root for retry.
+Linux also requires procfs to use the current PID namespace and the completed
+scan to include the held leader in its expected group; an ancestor namespace
+mount, missing leader, or inconsistent process identity cannot prove retirement.
+Other Unix platforms cannot establish native group retirement using the current
+numeric probe and return an unsupported containment error rather than releasing
+the root reservation. Natural root exit starts cleanup on the next
 poll when the group is done or `wait_all` is disabled. The record remains
 `running` during graceful cleanup and reports the root's
 exit status afterward. The host must preserve exclusive wait ownership: it must

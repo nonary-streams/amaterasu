@@ -4,7 +4,7 @@ use std::process::{Child, Command, ExitStatus};
 
 pub(crate) struct ContainedChild {
     child: Child,
-    group_finished: bool,
+    force_requested: bool,
 }
 
 impl ContainedChild {
@@ -13,7 +13,7 @@ impl ContainedChild {
         let child = command.process_group(0).spawn()?;
         Ok(Self {
             child,
-            group_finished: false,
+            force_requested: false,
         })
     }
 
@@ -82,9 +82,9 @@ impl ContainedChild {
     }
 
     pub fn force_stop(&mut self) -> io::Result<()> {
-        if !self.group_finished {
+        if !self.force_requested {
             let _ = self.signal(libc::SIGKILL)?;
-            self.group_finished = true;
+            self.force_requested = true;
         }
         Ok(())
     }
@@ -118,8 +118,36 @@ impl ContainedChild {
     }
 
     pub fn try_reap(&mut self) -> io::Result<Option<ExitStatus>> {
-        // Only final group signaling permits releasing the PID reservation.
-        if !self.group_finished {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            self.try_reap_with_group_observation(Self::group_running)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            // kill(PGID, 0) cannot distinguish our reserved zombie leader from
+            // live descendants. Reaping it would discard the only PGID reuse
+            // protection before native tree retirement could be established.
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "confirmed process-group retirement requires Linux or macOS member inspection",
+            ))
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", test))]
+    fn try_reap_with_group_observation(
+        &mut self,
+        group_running: impl FnOnce(&Self) -> io::Result<bool>,
+    ) -> io::Result<Option<ExitStatus>> {
+        // Signal acceptance does not prove that every group member has exited.
+        // Keep the leader wait-owned until a complete native group inspection
+        // confirms retirement, so neither cleanup nor PGID reuse can race it.
+        if !self.force_requested {
+            return Ok(None);
+        }
+        // WNOWAIT validates exclusive ownership before inspecting the numeric
+        // group. ECHILD must not fall back to Child's cached root exit status.
+        if !self.exited()? || group_running(self)? {
             return Ok(None);
         }
         self.child.try_wait()
@@ -177,51 +205,171 @@ impl DetachedChild {
 
 #[cfg(target_os = "linux")]
 fn linux_group_has_live_members(group_id: u32) -> io::Result<bool> {
-    const MAX_PROCESS_SCAN: usize = 131_072;
-
-    let processes = std::fs::read_dir("/proc")?;
-    for (index, entry) in processes.enumerate() {
-        if index >= MAX_PROCESS_SCAN {
-            return Err(io::Error::other("procfs process scan exceeded its bound"));
-        }
+    let self_stat = std::fs::read_to_string("/proc/self/stat")?;
+    let self_status = std::fs::read_to_string("/proc/self/status")?;
+    let processes = std::fs::read_dir("/proc")?.map(|entry| {
         let entry = entry?;
-        if entry
+        let Some(process_id) = entry
             .file_name()
             .to_str()
             .and_then(|name| name.parse::<u32>().ok())
-            .is_none()
-        {
-            continue;
-        }
-        let stat = match std::fs::read_to_string(entry.path().join("stat")) {
-            Ok(stat) => stat,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            // An unreadable process could be a live group member. Keep the
-            // stream alive until the configured timeout forces group cleanup.
-            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return Ok(true),
-            Err(error) => return Err(error),
+        else {
+            return Ok(None);
         };
-        if linux_stat_is_live_group_member(&stat, group_id) {
-            return Ok(true);
+        match std::fs::read_to_string(entry.path().join("stat")) {
+            Ok(stat) => Ok(Some((process_id, stat))),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            // An unreadable process could be a live group member. Keep native
+            // ownership until a complete observation can confirm retirement.
+            Err(error) => Err(error),
         }
-    }
-    Ok(false)
+    });
+    linux_group_has_live_members_from_stats(
+        group_id,
+        std::process::id(),
+        &self_stat,
+        &self_status,
+        processes,
+    )
 }
 
 #[cfg(target_os = "linux")]
-fn linux_stat_is_live_group_member(stat: &str, group_id: u32) -> bool {
-    let Some(command_end) = stat.rfind(')') else {
-        return false;
+fn linux_group_has_live_members_from_stats(
+    group_id: u32,
+    current_process_id: u32,
+    self_stat: &str,
+    self_status: &str,
+    processes: impl IntoIterator<Item = io::Result<Option<(u32, String)>>>,
+) -> io::Result<bool> {
+    const MAX_PROCESS_SCAN: usize = 131_072;
+
+    linux_validate_proc_pid_view(current_process_id, self_stat, self_status)?;
+    let mut leader_seen = false;
+    for (index, entry) in processes.into_iter().enumerate() {
+        if index >= MAX_PROCESS_SCAN {
+            return Err(io::Error::other("procfs process scan exceeded its bound"));
+        }
+        let Some((process_id, stat)) = entry? else {
+            continue;
+        };
+        let process = LinuxProcessStat::parse(&stat)?;
+        if process.process_id != process_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "procfs stat does not match its process directory",
+            ));
+        }
+        if process_id == group_id {
+            if process.process_group != group_id {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "procfs leader does not match the owned process group",
+                ));
+            }
+            leader_seen = true;
+        }
+        if process.is_live_group_member(group_id) {
+            return Ok(true);
+        }
+    }
+    // WNOWAIT still owns the unreaped group leader. A scan that omits it is
+    // partial or uses another PID view and cannot establish group absence.
+    if leader_seen {
+        Ok(false)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "procfs scan omitted the owned process-group leader",
+        ))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_validate_proc_pid_view(
+    current_process_id: u32,
+    self_stat: &str,
+    self_status: &str,
+) -> io::Result<()> {
+    let invalid_view = || {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "procfs PID namespace does not match the current process",
+        )
     };
-    let mut fields = stat[command_end + 1..].split_whitespace();
-    let Some(state) = fields.next() else {
-        return false;
-    };
-    let _parent_process = fields.next();
-    let Some(process_group) = fields.next().and_then(|field| field.parse::<u32>().ok()) else {
-        return false;
-    };
-    process_group == group_id && !matches!(state, "Z" | "X")
+    if LinuxProcessStat::parse(self_stat)?.process_id != current_process_id {
+        return Err(invalid_view());
+    }
+    // NStgid starts with the PID namespace owning the procfs mount and lists
+    // inner namespace identities afterward. Numeric coincidences across two
+    // namespaces do not establish that group IDs use our signal/wait view.
+    let mut namespace_fields = self_status
+        .lines()
+        .filter_map(|line| line.strip_prefix("NStgid:"));
+    let mut namespace_ids = namespace_fields
+        .next()
+        .ok_or_else(invalid_view)?
+        .split_whitespace();
+    let namespace_pid = namespace_ids
+        .next()
+        .and_then(|pid| pid.parse::<u32>().ok())
+        .ok_or_else(invalid_view)?;
+    if namespace_fields.next().is_some()
+        || namespace_ids.next().is_some()
+        || namespace_pid != current_process_id
+    {
+        return Err(invalid_view());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct LinuxProcessStat {
+    process_id: u32,
+    process_group: u32,
+    live: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxProcessStat {
+    fn parse(stat: &str) -> io::Result<Self> {
+        let malformed = || {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "malformed procfs process identity",
+            )
+        };
+        let command_start = stat.find('(').ok_or_else(malformed)?;
+        let command_end = stat
+            .rfind(')')
+            .filter(|end| *end > command_start)
+            .ok_or_else(malformed)?;
+        let process_id = stat[..command_start]
+            .trim()
+            .parse::<u32>()
+            .ok()
+            .filter(|process_id| *process_id != 0)
+            .ok_or_else(malformed)?;
+        let mut fields = stat[command_end + 1..].split_whitespace();
+        let state = fields.next().ok_or_else(malformed)?;
+        let _parent_process = fields
+            .next()
+            .and_then(|field| field.parse::<u32>().ok())
+            .ok_or_else(malformed)?;
+        let process_group = fields
+            .next()
+            .and_then(|field| field.parse::<u32>().ok())
+            .ok_or_else(malformed)?;
+        Ok(Self {
+            process_id,
+            process_group,
+            live: !matches!(state, "Z" | "X" | "x"),
+        })
+    }
+
+    fn is_live_group_member(&self, group_id: u32) -> bool {
+        self.process_group == group_id && self.live
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -288,3 +436,7 @@ fn siginfo_status(info: &libc::siginfo_t) -> i32 {
     // SAFETY: callers only inspect siginfo_t after waitid initialized its result.
     unsafe { info.si_status() }
 }
+
+#[cfg(test)]
+#[path = "unix_tests.rs"]
+mod tests;
