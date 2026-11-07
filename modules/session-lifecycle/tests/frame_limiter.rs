@@ -134,6 +134,34 @@ impl Drop for NativeModule {
     }
 }
 
+fn fresh_proton_environment(tool: &std::path::Path, runtime_root: &std::path::Path) -> Value {
+    let output = std::process::Command::new("python3")
+        .args([
+            "-I",
+            "-c",
+            r#"
+import importlib.util, json, sys, types
+spec = importlib.util.spec_from_file_location("limiter_fixture", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+environment = {"XDG_RUNTIME_DIR": sys.argv[2], "SteamAppId": "42"}
+applied = module.apply({"g_session": types.SimpleNamespace(env=environment)})
+print(json.dumps({"applied": applied, "environment": environment}))
+"#,
+        ])
+        .arg(tool.join("_amaterasu_frame_limiter_v1.py"))
+        .arg(runtime_root)
+        .env("TMPDIR", runtime_root)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
 #[test]
 #[ignore = "requires the explicitly built frame-limiter cdylib; runs only in disposable directories"]
 fn native_limiter_prepares_through_unchanged_coordinator_and_broker() {
@@ -183,6 +211,7 @@ fn native_limiter_prepares_through_unchanged_coordinator_and_broker() {
                     if overlay_available { "1" } else { "0" },
                 )
                 .env("XDG_DATA_HOME", &runtime)
+                .env("XDG_STATE_HOME", &runtime)
                 .status()
                 .unwrap();
             succeeded &= status.success();
@@ -218,7 +247,8 @@ fn native_limiter_prepares_through_unchanged_coordinator_and_broker() {
     )
     .unwrap();
     let module_settings = json!({"lifecycle_coordinator":{"principal":COORDINATOR,"service":LIFECYCLE},
-        "proton_runtime_directory":root,"proton_steam_roots":[steam],"mangohud_search_paths":[search]});
+        "proton_runtime_directory":root,"proton_state_directory":root,
+        "proton_steam_roots":[steam],"mangohud_search_paths":[search]});
     // Discover the actual registered schemas from the module, without effects.
     let probe = NativeModule::load(&library, module_settings.clone(), None);
     let methods = probe.endpoint.methods.clone();
@@ -478,7 +508,13 @@ fn native_limiter_prepares_through_unchanged_coordinator_and_broker() {
             &std::fs::read(root.join("amaterasu/frame-limiter/active.json")).unwrap(),
         )
         .unwrap();
-        assert_eq!(policy["policies"][0]["limit_millihz"], refresh);
+        assert!(
+            policy["policies"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|policy| policy["limit_millihz"] == 59940)
+        );
         if let Some(order) = std::env::var_os("AMATERASU_LIMITER_TEST_JOIN") {
             let source_first = order == "source-first";
             id += 1;
@@ -581,15 +617,15 @@ fn native_limiter_prepares_through_unchanged_coordinator_and_broker() {
                 assert_eq!(retired["consumer_retired"], true);
                 assert_eq!(retired["shared_retained"], index == 0);
                 assert_eq!(retired["resources_released"], index == 1);
-                assert_eq!(
+                assert!(
                     root.join("amaterasu/frame-limiter/active.json").exists(),
-                    index == 0,
-                    "first consumer must keep policy; last restores it"
+                    "the application root keeps policy after either client departs"
                 );
+                assert_eq!(fresh_proton_environment(&tool, &root)["applied"], true);
             }
             break;
         }
-        if cycle == 0 {
+        if cycle == 0 && std::env::var_os("AMATERASU_LIMITER_TEST_RESTART").is_some() {
             module.restart();
             let deadline = Instant::now() + Duration::from_secs(5);
             while root.join("amaterasu/frame-limiter/active.json").exists() {
@@ -671,7 +707,15 @@ fn native_limiter_prepares_through_unchanged_coordinator_and_broker() {
             }
             assert!(Instant::now() < deadline, "pause still pending: {status}");
         }
-        assert!(!root.join("amaterasu/frame-limiter/active.json").exists());
+        assert!(root.join("amaterasu/frame-limiter/active.json").exists());
+        let fresh = fresh_proton_environment(&tool, &root);
+        assert_eq!(
+            fresh["applied"], true,
+            "a paused application lost its launch policy"
+        );
+        if effective_provider != "mangohud" {
+            assert_eq!(fresh["environment"]["VKD3D_FRAME_RATE"], "59.94");
+        }
     }
     id += 1;
     let ending = call(
@@ -758,6 +802,7 @@ fn native_limiter_shared_external_clients_preserve_policy_until_last_retirement(
             .env("AMATERASU_FRAME_LIMITER_LIBRARY", &library)
             .env("AMATERASU_LIMITER_TEST_CHILD", &directory)
             .env("XDG_DATA_HOME", &directory)
+            .env("XDG_STATE_HOME", &directory)
             .env("AMATERASU_LIMITER_TEST_AUTOMATIC", "0")
             .env("AMATERASU_LIMITER_TEST_OVERLAY", "0")
             .env("AMATERASU_LIMITER_TEST_JOIN", order)
