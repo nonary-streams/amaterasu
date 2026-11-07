@@ -1322,6 +1322,7 @@ struct Broker {
     application_state: &'static str,
     application_cleanup_budget: Value,
     application_stop_pending: bool,
+    application_stop_on_stream_end: bool,
     application_terminal_stop_state: Option<&'static str>,
     held_application_stop_request: Option<u64>,
     application_stop_expired: bool,
@@ -1410,6 +1411,7 @@ impl Default for Broker {
             application_state: "active",
             application_cleanup_budget: json!(20_000),
             application_stop_pending: false,
+            application_stop_on_stream_end: false,
             application_terminal_stop_state: None,
             held_application_stop_request: None,
             application_stop_expired: false,
@@ -1777,6 +1779,7 @@ impl Broker {
                     "app_id":payload["app_id"],
                     "catalog_revision":1,
                     "cleanup_budget_ms":self.application_cleanup_budget,
+                    "stop_on_stream_end":self.application_stop_on_stream_end,
                     "config_overrides":launch["launch"]["config_overrides"].as_object()
                         .map(|overrides| json!(overrides)).unwrap_or_else(|| json!({})),
                     "application_display_settings":self.application_display_settings,
@@ -1819,6 +1822,7 @@ impl Broker {
                 },
                 "catalog_revision": self.application_catalog_revision,
                 "cleanup_budget_ms":self.application_cleanup_budget,
+                "stop_on_stream_end":self.application_stop_on_stream_end,
             });
             launch["executable_path"] = json!(self.application_executable_path);
             if self.application_fec_percentage.is_some()
@@ -5361,25 +5365,43 @@ fn steam_lifetime_policy_closes_the_application_on_authenticated_disconnect() {
         poll_until_reply(&mut controller, &mut broker, now);
         let record = controller.records.values_mut().next().unwrap();
         record.lifecycle_required = true;
-        record.lifecycle_session_target = serde_json::from_value(json!({"kind":"session","host_epoch":"epoch","session_id":"session","generation":1})).ok();
+        record.lifecycle_session_target = serde_json::from_value(
+            json!({"kind":"session","host_epoch":"epoch","session_id":"session","generation":1}),
+        )
+        .ok();
         let lifecycle_target = record.lifecycle_session_target.clone();
         record.stop_on_stream_end = close_application;
+        record.lifecycle_application_bound = true;
         let id = record.id;
         let ticket = record.rtsp_ticket.unwrap();
-        let mut payload = broker.response("amaterasu.rtsp/1", &json!({"action":"status","ticket":ticket}));
+        let mut payload = broker.response(
+            "amaterasu.rtsp/1",
+            &json!({"action":"status","ticket":ticket}),
+        );
         payload["lifecycle_session_target"] = json!(lifecycle_target);
         payload["state"] = json!("closed");
         payload["authenticated_disconnect_reason"] = json!("peer_disconnected");
         payload["lifecycle_retired"] = json!(true);
         payload["lifecycle_intent"] = json!("initial");
-        let job = workflow::Job {record:id, phase:workflow::Phase::MonitorRtsp,
-            call:call::Call::new("unused",json!({}),"unused".into(),1000), deadline:now+Duration::from_secs(5)};
+        let job = workflow::Job {
+            record: id,
+            phase: workflow::Phase::MonitorRtsp,
+            call: call::Call::new("unused", json!({}), "unused".into(), 1000),
+            deadline: now + Duration::from_secs(5),
+        };
         controller.consume(&job, payload, now, &mut Vec::new());
         let record = &controller.records[&id];
         if close_application {
             assert_eq!(record.state, State::Stopping);
             assert_eq!(record.stage, Stage::Cleanup);
-        } else { assert!(matches!(record.stage, Stage::VerifyPaused | Stage::ReleasePausedHistory)); }
+            assert!(record.owns_application_cleanup());
+            assert_eq!(workflow::next_phase(record), workflow::Phase::EndLifecycle);
+        } else {
+            assert!(matches!(
+                record.stage,
+                Stage::VerifyPaused | Stage::ReleasePausedHistory
+            ));
+        }
     }
 }
 

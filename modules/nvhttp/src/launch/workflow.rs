@@ -1612,7 +1612,6 @@ impl Controller {
                     Ok((_, _, "ready" | "arming" | "playing", true)) => record.monitored(now),
                     Ok((_, _, "closed" | "failed", true))
                         if record.lifecycle_required
-                            && !record.stop_on_stream_end
                             && rtsp_stream_consumers_retired(record, &payload) =>
                     {
                         if payload["state"] == "failed" {
@@ -1627,17 +1626,21 @@ impl Controller {
                         record.rtsp_requested = false;
                         record.rtsp_ticket = None;
                         record.rtsp_url = None;
-                        record.transport_only_cleanup = true;
-                        if record.application_session.is_some() {
-                            record.request_transport_cleanup(None, now);
+                        if record.stop_on_stream_end {
+                            record.request_cleanup(None, now);
                         } else {
-                            record.stage = if record.history_release_required {
-                                Stage::ReleasePausedHistory
+                            record.transport_only_cleanup = true;
+                            if record.application_session.is_some() {
+                                record.request_transport_cleanup(None, now);
                             } else {
-                                Stage::VerifyPaused
-                            };
+                                record.stage = if record.history_release_required {
+                                    Stage::ReleasePausedHistory
+                                } else {
+                                    Stage::VerifyPaused
+                                };
+                            }
+                            record.deadline = now + INITIAL_DEADLINE;
                         }
-                        record.deadline = now + INITIAL_DEADLINE;
                     }
                     Ok(_) => {
                         log_monitor_problem(logger.as_ref(), job.phase, "unhealthy");

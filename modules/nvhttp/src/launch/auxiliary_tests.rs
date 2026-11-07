@@ -1631,3 +1631,71 @@ fn revocation_while_transport_binding_is_pending_prevents_retry_and_stream_effec
             .all(|record| record.state.terminal())
     );
 }
+
+#[test]
+fn cleanup_retries_preserve_another_streams_admitted_broker_call() {
+    for management in [false, true] {
+        let now = Instant::now();
+        let mut controller = auxiliary_controller();
+        let mut broker = Broker::default();
+        launch_ready(&mut controller, &mut broker, now);
+        broker.fail_rtsp_settlement = true;
+        assert!(controller.cancel(20, &peer(1), now).is_none());
+        let (_, failed) = poll_until_reply(&mut controller, &mut broker, now);
+        assert_eq!(failed.status, 503);
+        let application = *controller.records.keys().next().unwrap();
+        assert_eq!(controller.records[&application].state, State::CleanupFailed);
+        assert!(!controller.records[&application].uncertain.is_empty());
+        broker.fail_rtsp_settlement = false;
+
+        assert!(
+            controller
+                .launch_auxiliary(
+                    30,
+                    request(2),
+                    peer(2),
+                    auxiliary_plan(2, CaptureSource::SyntheticBlack),
+                    now,
+                )
+                .is_none()
+        );
+        let auxiliary = *controller.records.keys().last().unwrap();
+        controller.poll(now, &mut |command| presentation_send(&mut broker, command));
+        controller.poll(now, &mut |command| presentation_send(&mut broker, command));
+        assert_eq!(controller.job.as_ref().unwrap().record, auxiliary);
+        let admitted_request = broker.next;
+        assert!(broker.results.contains_key(&admitted_request));
+        let retry_commands = broker.commands.len();
+
+        if management {
+            let status = controller.management_status(None);
+            assert_eq!(
+                controller.management_stop(
+                    status["launch"]["reference"].as_str().unwrap(),
+                    status["launch"]["revision"].as_str().unwrap(),
+                    now,
+                )["accepted"],
+                true
+            );
+        } else {
+            assert!(controller.cancel(21, &peer(1), now).is_none());
+        }
+        assert_eq!(
+            controller.job.as_ref().unwrap().record,
+            auxiliary,
+            "a cleanup retry must retain the other stream's accepted request",
+        );
+        controller.poll(now, &mut |command| presentation_send(&mut broker, command));
+        let commands = &broker.commands[retry_commands..];
+        assert!(commands.iter().any(|command| matches!(command,
+            Command::TakeResult { request } if *request == admitted_request)));
+        assert!(commands.iter().any(|command| matches!(command,
+            Command::ReleaseResult { request } if *request == admitted_request)));
+        assert_eq!(
+            controller.job.as_ref().unwrap().record,
+            application,
+            "the queued cleanup retry runs after the existing request settles"
+        );
+        assert_eq!(controller.records[&application].state, State::Stopping);
+    }
+}

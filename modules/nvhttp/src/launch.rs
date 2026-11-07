@@ -1081,13 +1081,8 @@ impl Controller {
         }
         let already_stopping = record.state == State::Stopping;
         if record.state == State::CleanupFailed {
-            if let Some((phase, call)) = record.retry_cleanup(now) {
-                self.job = Some(Job {
-                    record: id,
-                    phase,
-                    call,
-                    deadline: record.deadline,
-                });
+            if let Some(pending) = record.retry_cleanup(now) {
+                record.uncertain.push_front(pending);
             }
         } else if record.state != State::Stopping {
             record.request_cleanup(None, now);
@@ -1452,13 +1447,8 @@ impl Controller {
             record.request_cleanup(None, now);
             None
         };
-        if let Some((phase, call)) = retry {
-            self.job = Some(Job {
-                record: record.id,
-                phase,
-                call,
-                deadline: record.deadline,
-            });
+        if let Some(pending) = retry {
+            record.uncertain.push_front(pending);
         }
         if let Some(job) = self.job.as_mut().filter(|job| job.record == record.id) {
             job.call.cancel();

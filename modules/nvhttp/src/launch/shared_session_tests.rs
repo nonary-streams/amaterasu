@@ -80,11 +80,18 @@ impl SharedSessionBroker {
 }
 
 fn one_client_application() -> (Controller, SharedSessionBroker, Instant) {
+    one_client_application_with_lifetime(false)
+}
+
+fn one_client_application_with_lifetime(
+    stop_on_stream_end: bool,
+) -> (Controller, SharedSessionBroker, Instant) {
     let now = Instant::now();
     let mut controller = Controller::new(Some(config())).unwrap();
     controller.set_global_display_policy(7, json!({}));
     controller.set_session_lifecycle_required(true);
     let mut broker = SharedSessionBroker::default();
+    broker.broker.application_stop_on_stream_end = stop_on_stream_end;
     assert!(controller.launch(10, request(1), peer(1), now).is_none());
     let (_, first) = broker.reply(&mut controller, now);
     assert_eq!(first.status, 200, "{}", String::from_utf8_lossy(&first.body));
@@ -294,4 +301,100 @@ fn a_joined_client_can_confirm_application_exit_after_the_source_monitor_is_fenc
     assert_eq!(controller.current_game(&peer(2)), 0);
     assert!(broker.broker.commands.iter().any(|command| matches!(command, Command::Request {service,payload,..}
         if service=="amaterasu.session-lifecycle/1" && payload["operation"]=="end_session")));
+}
+
+#[test]
+fn stream_end_lifetime_policy_retires_the_owned_application() {
+    for joined_client in [false, true] {
+        let (mut controller, mut broker, now) = one_client_application_with_lifetime(true);
+        if joined_client {
+            assert!(controller.resume(11, request(2), &peer(2), now).is_none());
+            assert_eq!(broker.reply(&mut controller, now).1.status, 200);
+            controller.reply_delivered(11, now);
+        }
+        broker.transports.get_mut(&71).unwrap()["state"] = json!("closed");
+        for tick in 1..=100 {
+            controller.poll(now + Duration::from_millis(tick * 100), &mut |command| {
+                broker.send(command)
+            });
+            if controller
+                .records
+                .values()
+                .all(|record| record.state.terminal())
+            {
+                break;
+            }
+        }
+        assert!(broker.broker.application_stopped);
+        assert!(
+            controller
+                .records
+                .values()
+                .all(|record| record.state.terminal())
+        );
+        assert!(
+            broker
+                .transports
+                .values()
+                .all(|transport| transport["state"] == "closed")
+        );
+        assert_eq!(controller.current_game(&peer(1)), 0);
+        let operations: Vec<_> = broker
+            .broker
+            .commands
+            .iter()
+            .filter_map(|command| match command {
+                Command::Request {
+                    service, payload, ..
+                } if service == "amaterasu.session-lifecycle/1" => payload["operation"].as_str(),
+                _ => None,
+            })
+            .collect();
+        assert!(operations.contains(&"end_session"));
+        assert!(operations.contains(&"application_retired"));
+        if joined_client {
+            let close_joined = broker.broker.commands.iter().position(|command| matches!(command,
+                Command::Request {service, payload, ..}
+                if service == "amaterasu.rtsp/1" && payload["action"] == "close" && payload["ticket"] == 72)).unwrap();
+            let stop_application = broker
+                .broker
+                .commands
+                .iter()
+                .position(|command| {
+                    matches!(command,
+                Command::Request {service, payload, ..}
+                if service == "amaterasu.launch/1" && payload["action"] == "stop")
+                })
+                .unwrap();
+            assert!(close_joined < stop_application);
+        }
+    }
+}
+
+#[test]
+fn joined_transport_never_owns_application_cleanup_with_stream_end_policy() {
+    let (mut controller, mut broker, now) = one_client_application_with_lifetime(true);
+    assert!(controller.resume(11, request(2), &peer(2), now).is_none());
+    assert_eq!(broker.reply(&mut controller, now).1.status, 200);
+    controller.reply_delivered(11, now);
+    broker.transports.get_mut(&72).unwrap()["state"] = json!("closed");
+    for tick in 1..=100 {
+        controller.poll(now + Duration::from_millis(tick * 100), &mut |command| {
+            broker.send(command)
+        });
+    }
+    let application = controller
+        .records
+        .values()
+        .find(|record| record.application_session.is_none())
+        .unwrap();
+    let joined = controller
+        .records
+        .values()
+        .find(|record| record.application_session.is_some())
+        .unwrap();
+    assert_eq!(application.state, State::Ready);
+    assert!(joined.state.terminal());
+    assert!(!broker.broker.application_stopped);
+    assert_eq!(controller.current_game(&peer(1)), 1);
 }
