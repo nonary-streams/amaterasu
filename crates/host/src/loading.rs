@@ -1,17 +1,18 @@
 //! Library ownership stays here; policy and feature behavior stay in managed libraries.
 use amaterasu_abi::{
     AbiHeader, BorrowedBytes, HostApi, ModuleApi, ModuleEntry, ModuleQuiesceApi,
-    ModuleQuiesceEntry, RuntimeApi, RuntimeEntry, RuntimeWaitApi, RuntimeWaitEntry, STATUS_OK,
-    Status,
+    ModuleQuiesceEntry, ModuleShutdownApi, ModuleShutdownEntry, RuntimeApi, RuntimeEntry,
+    RuntimeWaitApi, RuntimeWaitEntry, STATUS_OK, Status,
 };
 use amaterasu_contracts::{
-    Command, HOST_LIFECYCLE_CONTROL_PRINCIPAL, HOST_LOG_SERVICE, HostLifecycleAction, HostLogEvent,
-    Response,
+    Command, HOST_LIFECYCLE_CONTROL_PRINCIPAL, HOST_LOG_SERVICE, HOST_MODULE_SHUTDOWN_TIMEOUT_MS,
+    HostLifecycleAction, HostLogEvent, Response,
 };
 use amaterasu_logging::{HostLogService, LoggerError, ProductLogger};
 use amaterasu_package::{PackageResult, VerifiedPackage, ordered_components};
 use libloading::Library;
 use serde_json::json;
+use std::collections::BTreeSet;
 use std::ffi::c_void;
 use std::mem::MaybeUninit;
 use std::path::Path;
@@ -117,6 +118,9 @@ pub struct LoadedComponents {
     // Fields drop in declaration order: modules must stop before their runtime disappears.
     modules: Vec<FeatureLibrary>,
     quiesced: bool,
+    quiesce_attempted: bool,
+    shutdown_deadline: Option<std::time::Instant>,
+    shutdown_prepare_error: Option<String>,
     product_logger: Option<ProductLogger>,
     host_log_service: Option<HostLogService>,
     host_logs_enabled: bool,
@@ -128,7 +132,11 @@ pub struct LoadedComponents {
 
 impl Drop for LoadedComponents {
     fn drop(&mut self) {
-        if let Err(error) = self.quiesce(std::time::Duration::from_secs(20)) {
+        if !self.quiesce_attempted
+            && let Err(error) = self.quiesce(std::time::Duration::from_millis(
+                HOST_MODULE_SHUTDOWN_TIMEOUT_MS,
+            ))
+        {
             eprintln!("cooperative module shutdown incomplete: {error}");
         }
         while let Some(module) = self.modules.pop() {
@@ -215,7 +223,12 @@ impl LoadedComponents {
                 .filter(|component| !component.runtime),
             |runtime, component| {
                 let endpoint = runtime.endpoint(&component.id)?;
-                FeatureLibrary::load(&directory.join(&component.file), &component.id, &endpoint)
+                FeatureLibrary::load(
+                    &directory.join(&component.file),
+                    &component.id,
+                    component.requires.keys().cloned().collect(),
+                    &endpoint,
+                )
             },
             progress,
         )
@@ -235,6 +248,9 @@ impl LoadedComponents {
         let mut loaded = Self {
             modules: Vec::new(),
             quiesced: false,
+            quiesce_attempted: false,
+            shutdown_deadline: None,
+            shutdown_prepare_error: None,
             product_logger,
             host_log_service: None,
             host_logs_enabled,
@@ -256,22 +272,115 @@ impl LoadedComponents {
         if self.quiesced {
             return Ok(());
         }
-        let deadline = std::time::Instant::now() + budget;
+        let deadline = self.prepare_shutdown(budget)?;
+        // The verified manifest supplies this acyclic graph. Providers keep
+        // receiving ticks, but must not begin their own shutdown until every
+        // loaded consumer has released its dependency on them.
+        let dependents: Vec<Vec<usize>> = self
+            .modules
+            .iter()
+            .map(|provider| {
+                self.modules
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, consumer)| {
+                        consumer
+                            .dependencies
+                            .contains(&provider.id)
+                            .then_some(index)
+                    })
+                    .collect()
+            })
+            .collect();
+        let mut progress_error = None;
         loop {
             let mut ready = true;
-            for module in self.modules.iter_mut().rev() {
-                ready &= module.quiesce()?;
+            let mut poll_error = None;
+            let mut drained = vec![false; self.modules.len()];
+            for index in (0..self.modules.len()).rev() {
+                if dependents[index].iter().any(|consumer| !drained[*consumer]) {
+                    ready = false;
+                    continue;
+                }
+                match self.modules[index].quiesce() {
+                    Ok(module_ready) => {
+                        drained[index] = module_ready;
+                        ready &= module_ready;
+                    }
+                    Err(error) => {
+                        ready = false;
+                        poll_error.get_or_insert(error);
+                    }
+                }
             }
             if ready {
+                if let Some(error) = &self.shutdown_prepare_error {
+                    return Err(error.clone());
+                }
                 self.quiesced = true;
                 return Ok(());
             }
             if std::time::Instant::now() >= deadline {
-                return Err("module drain deadline elapsed".into());
+                let failure = poll_error
+                    .or(progress_error)
+                    .or_else(|| self.shutdown_prepare_error.clone());
+                return Err(match failure {
+                    Some(error) => format!("module drain deadline elapsed: {error}"),
+                    None => "module drain deadline elapsed".into(),
+                });
             }
-            self.tick()?;
+            // Quiesce is a repeated progress poll. A failed participant must
+            // not prevent independent consumers from draining their effects,
+            // or stop their providers from processing already-owned cleanup.
+            progress_error = self.tick_during_shutdown().err().or(poll_error);
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
+    }
+
+    fn prepare_shutdown(
+        &mut self,
+        budget: std::time::Duration,
+    ) -> PackageResult<std::time::Instant> {
+        if let Some(deadline) = self.shutdown_deadline {
+            return Ok(deadline);
+        }
+        let deadline = std::time::Instant::now()
+            .checked_add(budget)
+            .ok_or("module shutdown budget is too large")?;
+        self.shutdown_deadline = Some(deadline);
+        self.quiesce_attempted = true;
+        // Announce to all participants before even the first consumer starts
+        // draining. This bounds provider work performed on that consumer's
+        // behalf without starting provider cleanup ahead of the dependency gate.
+        for module in self.modules.iter_mut().rev() {
+            let remaining_ms = deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64;
+            if let Err(error) = module.prepare_shutdown(remaining_ms) {
+                self.shutdown_prepare_error.get_or_insert(error);
+            }
+        }
+        Ok(deadline)
+    }
+
+    /// Explicit stop paths observe drain failure before acknowledging shutdown.
+    /// Drop still destroys every owned module, but never starts a second drain
+    /// budget after this attempt has already expired.
+    pub(crate) fn shutdown(mut self, budget: std::time::Duration) -> PackageResult<()> {
+        self.quiesce(budget)
+    }
+
+    fn tick_during_shutdown(&mut self) -> PackageResult<()> {
+        let mut failure = None;
+        for module in &mut self.modules {
+            if let Err(error) = module.tick() {
+                failure.get_or_insert(error);
+            }
+        }
+        self.drain_log_events();
+        self.service_host_logs();
+        failure.map_or(Ok(()), Err)
     }
 
     pub fn observe_work(&self) -> PackageResult<u64> {
@@ -697,14 +806,22 @@ impl Drop for RuntimeLibrary {
 
 struct FeatureLibrary {
     id: String,
+    dependencies: BTreeSet<String>,
     api: ModuleApi,
     quiesce_api: Option<ModuleQuiesceApi>,
+    shutdown_api: Option<ModuleShutdownApi>,
+    shutdown_prepared: bool,
     instance: *mut c_void,
     _library: Library,
 }
 
 impl FeatureLibrary {
-    fn load(path: &Path, id: &str, endpoint: &HostApi) -> PackageResult<Self> {
+    fn load(
+        path: &Path,
+        id: &str,
+        dependencies: BTreeSet<String>,
+        endpoint: &HostApi,
+    ) -> PackageResult<Self> {
         let library = open_verified_library(path)?;
         // SAFETY: the verified native component promises this symbol and C table layout.
         let api = unsafe {
@@ -721,6 +838,14 @@ impl FeatureLibrary {
                 Err(_) => None,
             }
         };
+        // SAFETY: the optional contract has its own versioned symbol and its
+        // complete table header is validated before any callback is copied.
+        let shutdown_api = unsafe {
+            match library.get::<ModuleShutdownEntry>(b"amaterasu_module_shutdown_v1\0") {
+                Ok(entry) => Some(read_api_table(entry())?),
+                Err(_) => None,
+            }
+        };
         let mut instance = std::ptr::null_mut();
         // SAFETY: the module borrows the table during creation and copies it if needed later.
         let status = unsafe { (api.create)(endpoint, &mut instance) };
@@ -730,11 +855,30 @@ impl FeatureLibrary {
         }
         Ok(Self {
             id: id.to_owned(),
+            dependencies,
             api,
             quiesce_api,
+            shutdown_api,
+            shutdown_prepared: false,
             instance,
             _library: library,
         })
+    }
+
+    fn prepare_shutdown(&mut self, remaining_ms: u64) -> PackageResult<()> {
+        if self.shutdown_prepared {
+            return Ok(());
+        }
+        self.shutdown_prepared = true;
+        let Some(api) = self.shutdown_api else {
+            // Legacy modules still follow their original quiescence contract;
+            // absence never substitutes for an affirmative readiness poll.
+            return Ok(());
+        };
+        // SAFETY: the host serializes this one announcement with lifecycle
+        // calls and retains the module instance and library through destruction.
+        let status = unsafe { (api.prepare)(self.instance, remaining_ms) };
+        require_success(status, &format!("prepare shutdown {}", self.id))
     }
 
     fn quiesce(&mut self) -> PackageResult<bool> {

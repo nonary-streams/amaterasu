@@ -8,6 +8,9 @@ use std::path::Path;
 
 use crate::loading::LoadedComponents;
 
+const COMPONENT_SHUTDOWN_BUDGET: std::time::Duration =
+    std::time::Duration::from_millis(amaterasu_contracts::HOST_MODULE_SHUTDOWN_TIMEOUT_MS);
+
 pub fn run(root: &Path, digest: &str, input: Option<&str>) -> PackageResult<()> {
     let mut startup_progress = send_startup_progress;
     let state_root = development_state_root(root)?;
@@ -25,9 +28,8 @@ pub fn run(root: &Path, digest: &str, input: Option<&str>) -> PackageResult<()> 
             serde_json::to_string(&response).map_err(|error| error.to_string())?
         ))?;
     }
-    // Destruction is included in the supervisor deadline as well as startup and dispatch.
-    drop(components);
-    Ok(())
+    // Cleanup is included in the supervisor deadline as well as startup and dispatch.
+    components.shutdown(COMPONENT_SHUTDOWN_BUDGET)
 }
 
 fn execute_input(
@@ -240,7 +242,9 @@ pub fn serve(root: &Path, digest: &str) -> PackageResult<()> {
                     crate::timing::remaining_tick_interval(tick_started.elapsed()),
                 )?;
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return components.shutdown(COMPONENT_SHUTDOWN_BUDGET);
+            }
         }
     }
 }
@@ -254,6 +258,9 @@ pub fn serve_interactive(
     state_root: &Path,
     seed: Option<&Path>,
 ) -> PackageResult<()> {
+    #[cfg(windows)]
+    let mut shutdown = crate::worker_shutdown::WorkerShutdown::from_reader(std::io::stdin())
+        .map_err(|error| format!("interactive shutdown monitor failed: {error}"))?;
     // Its stdout is a single inherited, write-only pipe to the Session 0
     // supervisor. It carries the exact bounded startup proof and is not a
     // console or a capability channel.
@@ -269,10 +276,18 @@ pub fn serve_interactive(
     }
     let mut startup_progress = |_| Ok(());
     let mut components = load_components(root, digest, state_root, &mut startup_progress)?;
+    #[cfg(windows)]
+    if shutdown.is_requested().map_err(|error| error.to_string())? {
+        return components.shutdown(COMPONENT_SHUTDOWN_BUDGET);
+    }
     components.tick()?;
     components.health()?;
     send_line("READY")?;
     loop {
+        #[cfg(windows)]
+        if shutdown.is_requested().map_err(|error| error.to_string())? {
+            return components.shutdown(COMPONENT_SHUTDOWN_BUDGET);
+        }
         let observed_work = components.observe_work()?;
         let tick_started = std::time::Instant::now();
         components.tick()?;
@@ -331,15 +346,19 @@ fn finish_lifecycle_action(
     components: LoadedComponents,
     action: HostLifecycleAction,
 ) -> PackageResult<()> {
-    lifecycle_action_after_cleanup(action, move || drop(components), send_host_action)
+    lifecycle_action_after_cleanup(
+        action,
+        move || components.shutdown(COMPONENT_SHUTDOWN_BUDGET),
+        send_host_action,
+    )
 }
 
 fn lifecycle_action_after_cleanup(
     action: HostLifecycleAction,
-    cleanup: impl FnOnce(),
+    cleanup: impl FnOnce() -> PackageResult<()>,
     emit: impl FnOnce(HostLifecycleAction) -> PackageResult<()>,
 ) -> PackageResult<()> {
-    cleanup();
+    cleanup()?;
     emit(action)
 }
 
@@ -364,7 +383,10 @@ mod tests {
         let events = std::cell::RefCell::new(Vec::new());
         lifecycle_action_after_cleanup(
             HostLifecycleAction::Restart,
-            || events.borrow_mut().push("cleanup"),
+            || {
+                events.borrow_mut().push("cleanup");
+                Ok(())
+            },
             |action| {
                 assert_eq!(action, HostLifecycleAction::Restart);
                 events.borrow_mut().push("action acknowledged");
@@ -373,5 +395,21 @@ mod tests {
         )
         .unwrap();
         assert_eq!(events.into_inner(), ["cleanup", "action acknowledged"]);
+    }
+
+    #[test]
+    fn lifecycle_action_is_not_acknowledged_when_cleanup_fails() {
+        let acknowledged = std::cell::Cell::new(false);
+        let result = lifecycle_action_after_cleanup(
+            HostLifecycleAction::Quit,
+            || Err("native cleanup did not retire".into()),
+            |_| {
+                acknowledged.set(true);
+                Ok(())
+            },
+        );
+
+        assert!(!acknowledged.get());
+        assert_eq!(result.unwrap_err(), "native cleanup did not retire");
     }
 }

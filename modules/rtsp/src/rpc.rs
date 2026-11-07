@@ -9,12 +9,20 @@ pub enum Outcome {
     Uncertain,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Admission {
+    Unsubmitted,
+    Rejected,
+    Possible,
+}
+
 pub struct Call {
     command: Command,
     request: Option<u64>,
     cancelling: bool,
     failures: u8,
     result: Option<Value>,
+    admission: Admission,
 }
 
 impl Call {
@@ -40,6 +48,7 @@ impl Call {
             cancelling: false,
             failures: 0,
             result: None,
+            admission: Admission::Unsubmitted,
         }
     }
 
@@ -53,7 +62,20 @@ impl Call {
         self.failures = 0;
     }
 
+    /// Local proof about this exact call, never an inference from cancellation.
+    /// A conflict or any ambiguous submit permanently prevents this proof.
+    pub fn observed_result(&self) -> Option<&Value> {
+        self.result.as_ref()
+    }
+
+    pub fn proven_not_dispatched(&self) -> bool {
+        matches!(self.admission, Admission::Unsubmitted | Admission::Rejected)
+    }
+
     pub fn poll(&mut self, runtime: &RuntimeClient) -> Outcome {
+        if self.cancelling && self.proven_not_dispatched() {
+            return Outcome::SettledFailure;
+        }
         if self.failures >= 3 {
             return Outcome::Uncertain;
         }
@@ -61,13 +83,29 @@ impl Call {
             return match runtime.send_ephemeral(self.command.clone()) {
                 Ok(Response::Accepted { id }) => {
                     self.request = Some(id);
+                    self.admission = Admission::Possible;
                     self.failures = 0;
                     Outcome::Waiting
                 }
-                Ok(Response::Error { .. }) => Outcome::SettledFailure,
+                Ok(Response::Error { code, .. }) => {
+                    self.admission = if self.admission == Admission::Unsubmitted
+                        && matches!(
+                            code.as_str(),
+                            "permission_denied"
+                                | "invalid_request"
+                                | "unavailable"
+                                | "resource_exhausted"
+                        ) {
+                        Admission::Rejected
+                    } else {
+                        Admission::Possible
+                    };
+                    Outcome::SettledFailure
+                }
                 _ => {
                     // The command may have reached the broker. Resubmit this exact
                     // operation only to recover its request ID, then settle it.
+                    self.admission = Admission::Possible;
                     self.cancelling = true;
                     self.failures += 1;
                     Outcome::Waiting
@@ -82,7 +120,10 @@ impl Call {
             return Outcome::Waiting;
         }
         if self.result.is_none() {
-            match runtime.send_ephemeral(Command::TakeResult { request }) {
+            // Keep the payload before releasing its broker record. The SDK's
+            // ephemeral helper releases first and can hide a known result when
+            // only that bookkeeping operation fails.
+            match runtime.send(Command::TakeResult { request }) {
                 Ok(Response::Pending) => return Outcome::Waiting,
                 Ok(Response::Result { payload }) => self.result = Some(payload),
                 _ => {
@@ -103,13 +144,15 @@ impl Call {
         }
     }
 
-    pub fn shutdown(&mut self, runtime: &RuntimeClient) {
+    pub fn shutdown(&mut self, runtime: &RuntimeClient) -> Outcome {
         self.cancel();
         for _ in 0..4 {
-            if !matches!(self.poll(runtime), Outcome::Waiting) {
-                break;
+            let outcome = self.poll(runtime);
+            if !matches!(outcome, Outcome::Waiting) {
+                return outcome;
             }
         }
+        Outcome::Uncertain
     }
 }
 
@@ -152,11 +195,15 @@ mod tests {
         commands: Vec<Command>,
         lose_first_admission: bool,
         fail_settlement: bool,
+        admission_rejection: Option<&'static str>,
     }
 
     impl Endpoint {
         fn dispatch(&self, command: &Command) -> Response {
             match command {
+                Command::Request { .. } if self.admission_rejection.is_some() => {
+                    Response::error(self.admission_rejection.unwrap(), "not admitted")
+                }
                 Command::Request { .. } => Response::Accepted { id: 41 },
                 Command::Cancel { .. } | Command::ReleaseResult { .. } if self.fail_settlement => {
                     Response::error("unavailable", "deliberate settlement failure")
@@ -201,6 +248,56 @@ mod tests {
         };
         // SAFETY: callers keep endpoint alive and use the client synchronously.
         unsafe { RuntimeClient::from_endpoint(api) }
+    }
+
+    #[test]
+    fn cancelled_unsubmitted_call_never_dispatches_a_request() {
+        let mut endpoint = Endpoint::default();
+        let runtime = client(&mut endpoint);
+        let mut call = Call::new(json!({"action":"prepare"}), "unsubmitted".into(), None);
+        call.cancel();
+        assert!(matches!(call.poll(&runtime), Outcome::SettledFailure));
+        assert!(endpoint.commands.is_empty());
+    }
+
+    #[test]
+    fn first_admission_rejection_proves_no_dispatch_only_for_known_pre_enqueue_errors() {
+        for code in [
+            "permission_denied",
+            "invalid_request",
+            "unavailable",
+            "resource_exhausted",
+            "conflict",
+            "unexpected",
+        ] {
+            let mut endpoint = Endpoint {
+                admission_rejection: Some(code),
+                ..Endpoint::default()
+            };
+            let runtime = client(&mut endpoint);
+            let mut call = Call::new(json!({"action":"prepare"}), "rejected".into(), None);
+            assert!(matches!(call.poll(&runtime), Outcome::SettledFailure));
+            assert_eq!(
+                call.proven_not_dispatched(),
+                !matches!(code, "conflict" | "unexpected")
+            );
+        }
+    }
+
+    #[test]
+    fn rejection_after_lost_admission_cannot_prove_no_dispatch() {
+        let mut endpoint = Endpoint {
+            lose_first_admission: true,
+            admission_rejection: Some("unavailable"),
+            ..Endpoint::default()
+        };
+        let runtime = client(&mut endpoint);
+        let mut call = Call::new(json!({"action":"prepare"}), "lost".into(), None);
+        assert!(matches!(call.poll(&runtime), Outcome::Waiting));
+        assert!(!call.proven_not_dispatched());
+        call.cancel();
+        assert!(matches!(call.poll(&runtime), Outcome::SettledFailure));
+        assert!(!call.proven_not_dispatched());
     }
 
     #[test]

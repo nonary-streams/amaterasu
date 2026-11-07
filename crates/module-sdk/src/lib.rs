@@ -363,7 +363,17 @@ pub trait ManagedModule: Sized {
     fn start(runtime: RuntimeClient) -> ModuleResult<Self>;
     fn tick(&mut self) -> ModuleResult<()>;
 
+    /// Announce host shutdown once, before any consumer begins quiescing.
+    /// Record the remaining host budget and stop admitting external work only.
+    /// Keep serving declared consumers and retain owned resources until quiesce;
+    /// this bounded, nonblocking announcement must not begin provider cleanup.
+    fn prepare_shutdown(&mut self, _remaining_ms: u64) -> ModuleResult<()> {
+        Ok(())
+    }
+
     /// Begin or poll shutdown while dependencies continue receiving ticks.
+    /// The host begins this after declared consumers have drained, and begins
+    /// dependency shutdown only after this module reports ready.
     /// Stop admitting new work, release owned effects, then return true. A false
     /// result keeps the instance and all providers alive for another host tick.
     fn quiesce(&mut self) -> ModuleResult<bool> {
@@ -387,6 +397,14 @@ macro_rules! export_module {
                 tick: $crate::exports::tick::<$module>,
                 health: $crate::exports::health::<$module>,
                 destroy: $crate::exports::destroy::<$module>,
+            };
+            &API
+        }
+        #[unsafe(no_mangle)]
+        pub extern "C" fn amaterasu_module_shutdown_v1() -> *const $crate::abi::ModuleShutdownApi {
+            static API: $crate::abi::ModuleShutdownApi = $crate::abi::ModuleShutdownApi {
+                header: $crate::abi::AbiHeader::of::<$crate::abi::ModuleShutdownApi>(),
+                prepare: $crate::exports::prepare_shutdown::<$module>,
             };
             &API
         }

@@ -195,3 +195,132 @@ fn shutdown_budget_tracks_only_owed_undo_and_covers_the_longest_raw_waits() {
         (Duration::from_secs(300) + containment_budget) * 7 + containment_budget
     );
 }
+
+#[test]
+fn announced_deadline_caps_an_active_command_without_starting_cleanup() {
+    let step = PreparationStep::Raw(RawPreparationStep {
+        do_command: String::new(),
+        undo: sleeping_command(),
+        elevated: false,
+    });
+    let mut lifecycle = undo_lifecycle(300, step);
+    let now = Instant::now();
+    lifecycle.start_next_undo(now);
+    let deadline = now + Duration::from_secs(20);
+    lifecycle.prepare_shutdown(deadline);
+    assert!(lifecycle.phase == Phase::Cleaning);
+    assert!(lifecycle.active.as_ref().unwrap().task.outcome.is_none());
+    assert_eq!(
+        lifecycle.active.as_ref().unwrap().task.stop_requested_at,
+        None
+    );
+    let execution_deadline = deadline - COMMAND_STOP_GRACE - COMMAND_REAP_TIMEOUT;
+    assert_eq!(
+        lifecycle.active.as_ref().unwrap().task.execution_deadline,
+        Some(execution_deadline)
+    );
+    lifecycle.prepare_shutdown(deadline + Duration::from_secs(100));
+    assert_eq!(
+        lifecycle.active.as_ref().unwrap().task.execution_deadline,
+        Some(execution_deadline)
+    );
+}
+
+#[test]
+fn an_expired_announced_deadline_does_not_start_an_owed_undo() {
+    let step = PreparationStep::Raw(RawPreparationStep {
+        do_command: String::new(),
+        undo: std::env::temp_dir()
+            .join("amaterasu-never-start-expired-undo")
+            .to_string_lossy()
+            .into_owned(),
+        elevated: false,
+    });
+    let mut lifecycle = ApplicationLifecycle::new(vec![step]).unwrap();
+    lifecycle.tick(Instant::now());
+    let now = Instant::now();
+    lifecycle.prepare_shutdown(now);
+    lifecycle.begin_cleanup();
+    lifecycle.tick(now);
+    assert!(lifecycle.cleanup_failed());
+    assert_eq!(lifecycle.pending_undo, [0]);
+    assert!(!lifecycle.has_active_command());
+    assert!(matches!(
+        lifecycle.cleanup.failures[0].kind,
+        CommandFailureKind::TimedOut
+    ));
+}
+
+#[test]
+fn announcement_and_ordinary_ticks_leave_forward_preparation_untouched_until_cleanup() {
+    let mut lifecycle = OwnedLifecycle(
+        ApplicationLifecycle::new_with_context(
+            vec![PreparationStep::Raw(RawPreparationStep {
+                do_command: sleeping_command(),
+                undo: String::new(),
+                elevated: false,
+            })],
+            BTreeMap::from([("AMATERASU_TEST_CHILD".into(), "sleep".into())]),
+            None,
+            300,
+        )
+        .unwrap(),
+    );
+    let now = Instant::now();
+    lifecycle.start_next_preparation(now);
+    lifecycle.prepare_shutdown(now + Duration::from_secs(20));
+    lifecycle.tick(now + Duration::from_secs(30));
+    assert!(lifecycle.phase == Phase::Preparing);
+    let task = &lifecycle.active.as_ref().unwrap().task;
+    assert_eq!(task.execution_deadline, None);
+    assert_eq!(task.stop_requested_at, None);
+    assert!(task.outcome.is_none());
+    lifecycle.begin_cleanup();
+    let task = &lifecycle.active.as_ref().unwrap().task;
+    assert!(task.execution_deadline.unwrap() <= now + Duration::from_secs(20));
+    assert!(matches!(
+        task.outcome.as_ref().unwrap().kind,
+        CommandFailureKind::Cancelled
+    ));
+}
+
+#[test]
+fn later_announcements_preserve_shorter_execution_and_existing_stop_windows() {
+    let step = PreparationStep::Raw(RawPreparationStep {
+        do_command: String::new(),
+        undo: sleeping_command(),
+        elevated: false,
+    });
+    let mut lifecycle = undo_lifecycle(300, step);
+    let now = Instant::now();
+    lifecycle.start_next_undo(now);
+    let original_execution = now + Duration::from_secs(1);
+    let original_stop = now - Duration::from_millis(100);
+    let task = &mut lifecycle.active.as_mut().unwrap().task;
+    task.execution_deadline = Some(original_execution);
+    task.stop_requested_at = Some(original_stop);
+    task.cancel();
+    lifecycle.prepare_shutdown(now + Duration::from_secs(20));
+    lifecycle.prepare_shutdown(now + Duration::from_secs(300));
+    let task = &lifecycle.active.as_ref().unwrap().task;
+    assert_eq!(task.execution_deadline, Some(original_execution));
+    assert_eq!(task.stop_requested_at, Some(original_stop));
+}
+
+#[test]
+fn a_future_undo_uses_the_original_announced_execution_cutoff() {
+    let step = PreparationStep::Raw(RawPreparationStep {
+        do_command: String::new(),
+        undo: sleeping_command(),
+        elevated: false,
+    });
+    let mut lifecycle = undo_lifecycle(300, step);
+    let now = Instant::now();
+    let deadline = now + Duration::from_secs(20);
+    lifecycle.prepare_shutdown(deadline);
+    lifecycle.start_next_undo(now + Duration::from_secs(5));
+    assert_eq!(
+        lifecycle.active.as_ref().unwrap().task.execution_deadline,
+        Some(deadline - COMMAND_STOP_GRACE - COMMAND_REAP_TIMEOUT)
+    );
+}

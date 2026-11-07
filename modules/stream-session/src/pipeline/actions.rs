@@ -40,6 +40,10 @@ impl Pipeline {
                 | Operation::Start { .. }
                 | Operation::StartWhenAuthenticated { .. }
         );
+        if opens_session && self.shutdown_admission_closed() {
+            rpc::complete(send, request, error("host_stopping"));
+            return;
+        }
         if opens_session
             && (!self.journal.loaded
                 || self.journal.failed
@@ -73,6 +77,10 @@ impl Pipeline {
             } => {
                 if input.owner != "amaterasu.nvhttp" || !self.settings.enabled {
                     rpc::complete(send, input.request, error("permission_denied"));
+                } else if self.shutdown_admission_closed()
+                    && !self.history_activities.contains(&activity_id)
+                {
+                    rpc::complete(send, input.request, error("host_stopping"));
                 } else if self.package_barrier_pending
                     && !self.history_activities.contains(&activity_id)
                 {
@@ -394,60 +402,13 @@ impl Pipeline {
             rpc::complete(send, request, record.response());
             return;
         }
-        let retrying_cleanup = record.state == State::CleanupFailed;
-        let mut job = Job::new(
-            session,
+        let mut job = stop_job(
+            record,
             Some(request),
-            if record.input_lookup_required
-                || (record.input_attempted && record.input_lease.is_none())
-            {
-                Step::FindInput
-            } else if record.input_lease.is_some() {
-                Step::ReleaseInput
-            } else {
-                Step::DrainVideo
-            },
-            now + self.settings.drain_timeout_ms,
+            now,
+            self.settings.drain_timeout_ms,
+            persist_lifecycle_identity,
         );
-        record.outcome = State::Stopped;
-        record.history.stopping("stop_requested");
-        record.state = State::Stopping;
-        record.cleanup_error = None;
-        input::queue_rumble_zeros(record, now);
-        if retrying_cleanup
-            || record
-                .start
-                .as_ref()
-                .is_some_and(|start| start.lifecycle_target.is_some())
-        {
-            if !record.rumble_pending.is_empty() {
-                record.rumble_stop_unconfirmed = true;
-                record.rumble_pending.clear();
-                record.rumble_active_until.clear();
-            }
-            record.plane = None;
-        }
-        if !record.rumble_pending.is_empty() {
-            job.step = Step::RumbleDrain;
-        }
-        if let Some(plane) = record.plane.as_mut() {
-            plane.stop();
-        } else {
-            job.cleanup = true;
-            job.deadline = now + 15000;
-            if !persist_lifecycle_identity {
-                job.settle_uncertain(record);
-            }
-            if job.pending.is_none() {
-                if let Some(step) = job.next_cleanup(record) {
-                    job.step = step;
-                } else {
-                    // A previous cleanup attempt may already have retired every
-                    // resource. Let the driver confirm journal retirement.
-                    job.step = Step::WaitDrain;
-                }
-            }
-        }
         if persist_lifecycle_identity {
             let document = match self.journal.with_record(record) {
                 Ok(document) => document,
@@ -714,4 +675,68 @@ fn validate_start_configuration(
         return Err("start_conflict");
     }
     Ok(())
+}
+
+/// Build the ordinary owned stop workflow without dispatching provider work.
+pub(super) fn stop_job(
+    record: &mut Record,
+    request: Option<u64>,
+    now: u64,
+    drain_timeout_ms: u64,
+    persist_lifecycle_identity: bool,
+) -> Job {
+    let retrying_cleanup = record.state == State::CleanupFailed;
+    let mut job = Job::new(
+        record.id,
+        request,
+        if record.input_lookup_required || (record.input_attempted && record.input_lease.is_none())
+        {
+            Step::FindInput
+        } else if record.input_lease.is_some() {
+            Step::ReleaseInput
+        } else {
+            Step::DrainVideo
+        },
+        now + drain_timeout_ms,
+    );
+    record.outcome = State::Stopped;
+    record.history.stopping("stop_requested");
+    record.state = State::Stopping;
+    record.cleanup_error = None;
+    input::queue_rumble_zeros(record, now);
+    if retrying_cleanup
+        || record
+            .start
+            .as_ref()
+            .is_some_and(|start| start.lifecycle_target.is_some())
+    {
+        if !record.rumble_pending.is_empty() {
+            record.rumble_stop_unconfirmed = true;
+            record.rumble_pending.clear();
+            record.rumble_active_until.clear();
+        }
+        record.plane = None;
+    }
+    if !record.rumble_pending.is_empty() {
+        job.step = Step::RumbleDrain;
+    }
+    if let Some(plane) = record.plane.as_mut() {
+        plane.stop();
+    } else {
+        job.cleanup = true;
+        job.deadline = now + 15000;
+        if !persist_lifecycle_identity {
+            job.settle_uncertain(record);
+        }
+        if job.pending.is_none() {
+            if let Some(step) = job.next_cleanup(record) {
+                job.step = step;
+            } else {
+                // A previous cleanup attempt may already have retired every
+                // resource. Let the driver confirm journal retirement.
+                job.step = Step::WaitDrain;
+            }
+        }
+    }
+    job
 }

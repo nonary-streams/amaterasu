@@ -438,6 +438,7 @@ impl Pipeline {
             && record.restart_lifecycle_preparation.is_none()
             && !record.shared_capture_attached
             && record.uncertain.is_none()
+            && record.journal_uncertain.is_none()
             && !record.input_attempted
             && record.input_lease.is_none()
             && !record.virtual_display_attempted

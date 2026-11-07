@@ -19,6 +19,19 @@ impl Pipeline {
         initiator: &str,
     ) -> Result<Operation, &'static str> {
         let operation = crate::library::decode(service, payload, caller, initiator)?;
+        if (self.quiescing || self.shutdown_deadline.is_some())
+            && matches!(
+                operation,
+                Operation::LaunchLibrary { .. }
+                    | Operation::PreflightExport { .. }
+                    | Operation::Launch { .. }
+                    | Operation::LaunchExport { .. }
+                    | Operation::PrepareDisplayAdmission { .. }
+                    | Operation::VerifyDisplayAdmission { .. }
+            )
+        {
+            return Err("shutting_down");
+        }
         if self.application_retirement_observers.contains_key(caller)
             && !matches!(operation, Operation::ApplicationRetirementStatus { .. })
         {
@@ -129,6 +142,7 @@ impl Pipeline {
         }
         job.begin_cleanup(record, outcome, None);
         job.request = Some(request);
+        self.bound_cleanup_deadline(job);
         Ok(None)
     }
 }

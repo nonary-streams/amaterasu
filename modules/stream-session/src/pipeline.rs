@@ -7,6 +7,7 @@ mod host_metrics_activity;
 mod input;
 mod journal;
 mod lifecycle;
+mod quiescence;
 mod record;
 mod responses;
 mod rpc;
@@ -96,6 +97,8 @@ pub struct Pipeline {
     package_barrier_registered: bool,
     package_barrier_pending: bool,
     package_barrier_next_poll: u64,
+    shutdown_deadline: Option<u64>,
+    shutdown_announced_deadline: Option<u64>,
 }
 
 impl Pipeline {
@@ -122,6 +125,8 @@ impl Pipeline {
             package_barrier_registered: false,
             package_barrier_pending: false,
             package_barrier_next_poll: 0,
+            shutdown_deadline: None,
+            shutdown_announced_deadline: None,
         })
     }
 
@@ -220,6 +225,12 @@ impl Pipeline {
             if let Some(pending) = record.uncertain.as_mut() {
                 settled &= pending.shutdown(send);
             }
+            if let Some(pending) = record.journal_uncertain.as_mut() {
+                settled &= pending.shutdown(send);
+            }
+            for pending in &mut record.shutdown_observations {
+                settled &= pending.shutdown(send);
+            }
             let display_request_uncertain = record.uncertain.is_some()
                 && matches!(
                     record.uncertain_step,
@@ -237,6 +248,11 @@ impl Pipeline {
                 );
             if display_request_uncertain {
                 settled = false;
+            } else if self.shutdown_announced_deadline.is_some() || self.shutdown_deadline.is_some()
+            {
+                // Cooperative shutdown already had its bounded provider tick
+                // window. Never begin a fresh native teardown in Drop afterward.
+                settled &= !record.display_attempted && !record.virtual_display_attempted;
             } else {
                 settled &= display::shutdown(record, send);
                 settled &= if record.config.virtual_display_intent.is_some() {
@@ -270,13 +286,19 @@ impl Pipeline {
                 record.state.terminal()
                     && !record.history.has_work()
                     && record.uncertain.is_none()
+                    && record.journal_uncertain.is_none()
+                    && record.shutdown_observations.is_empty()
                     && record.plane.is_none()
                     && !record.audio_recovery_needed
             })
     }
 
+    pub(super) fn elapsed_millis(&self) -> u64 {
+        self.started.elapsed().as_millis().min(u64::MAX as u128) as u64
+    }
+
     pub fn tick(&mut self, runtime: &RuntimeClient) -> ModuleResult<()> {
-        let now = self.started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        let now = self.elapsed_millis();
         let poll_barrier = self.package_barrier_registered && now >= self.package_barrier_next_poll;
         if poll_barrier {
             match runtime.send(Command::HostPackageBarrierPending {})? {
@@ -328,6 +350,7 @@ impl Pipeline {
             self.start_next_recovery(now);
         }
         self.pump(now);
+        self.progress_shutdown_observations(now, send);
         self.history_activities.progress(now, &self.records, send);
         if let Some(job) = self.job.as_mut()
             && job.step == Step::WaitDrain

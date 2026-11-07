@@ -6,6 +6,7 @@ mod history;
 mod host_audio;
 mod input;
 mod providers;
+mod quiescence;
 mod restart;
 mod shared_capture;
 mod virtual_display;

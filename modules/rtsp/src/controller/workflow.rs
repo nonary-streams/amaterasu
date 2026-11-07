@@ -16,12 +16,23 @@ impl Controller {
         {
             record.close(Some("request_cancelled"));
             job.call.cancel();
-            job.deadline = now.saturating_add(CLEANUP_BUDGET_MS);
+            job.deadline = self.cleanup_deadline(now);
         }
         if now >= job.deadline && record.state != State::Closing {
             record.close(Some("operation_deadline"));
             job.call.cancel();
-            job.deadline = now.saturating_add(CLEANUP_BUDGET_MS);
+            job.deadline = self.cleanup_deadline(now);
+        }
+        if self
+            .shutdown_deadline
+            .is_some_and(|deadline| now >= deadline)
+            && (matches!(record.state, State::Closing | State::CleanupFailed)
+                || matches!(job.phase, Phase::Stop | Phase::Find))
+        {
+            job.call.cancel();
+            self.retain_uncertain(&mut record, job, "cleanup_deadline", runtime);
+            self.records.insert(record.id, record);
+            return;
         }
         let outcome = job.call.poll(runtime);
         match outcome {
@@ -55,7 +66,13 @@ impl Controller {
         match job.phase {
             Phase::Prepare => {
                 record.close(Some("dependency_unavailable"));
-                self.schedule_lookup(record, job.caller, now);
+                if job.call.proven_not_dispatched() {
+                    record.needs_lookup = false;
+                    self.schedule_cleanup(record, job.caller, now);
+                    complete_caller(record, job.caller, runtime);
+                } else {
+                    self.schedule_lookup(record, job.caller, now);
+                }
             }
             Phase::LifecyclePrepare | Phase::LifecycleLookup => {
                 record.close(Some("dependency_unavailable"));
@@ -67,14 +84,17 @@ impl Controller {
                         "dependency_unavailable",
                     );
                 }
-                if job.phase == Phase::LifecyclePrepare {
+                if job.phase == Phase::LifecyclePrepare && job.call.proven_not_dispatched() {
+                    record.lifecycle_prepare_outstanding = false;
+                    self.schedule_stop(record, job.caller, now);
+                } else if job.phase == Phase::LifecyclePrepare {
                     // Broker settlement cannot roll back a committed coordinator
                     // transition. Recover its exact admission before cleanup.
                     self.schedule_lifecycle_lookup(
                         record,
                         job.caller,
                         None,
-                        now.saturating_add(CLEANUP_BUDGET_MS),
+                        self.cleanup_deadline(now),
                     );
                 } else {
                     record.state = State::CleanupFailed;
@@ -135,121 +155,49 @@ impl Controller {
         runtime: &RuntimeClient,
     ) {
         let network = job.network.filter(|_| record.state == State::Arming);
-        let operation = format!("{}-lifecycle-prepare", record.operation());
-        if payload["operation_id"] != operation {
-            self.reject_lifecycle_preparation(record, network, job.caller, runtime);
-            return;
-        }
-        if payload["status"] == "pending" {
-            self.schedule_lifecycle_lookup(record, job.caller, network, job.deadline);
-            return;
-        }
-        if payload["status"] == "rejected" {
-            record.lifecycle_prepare_outstanding = false;
-            if let Some((connection, action_ticket)) = network {
-                self.fail_network_action(
-                    record,
-                    connection,
-                    action_ticket,
-                    "lifecycle_prepare_rejected",
-                );
-            } else {
-                record.close(Some("lifecycle_prepare_rejected"));
+        match super::preparation::apply_response(record, payload) {
+            super::preparation::PreparationResolution::Pending => {
+                self.schedule_lifecycle_lookup(record, job.caller, network, job.deadline);
             }
-            self.schedule_stop(record, job.caller, now);
-            return;
-        }
-        let target: Option<amaterasu_extension_api::LifecycleTarget> =
-            serde_json::from_value(payload["target"].clone()).ok();
-        let candidate: Option<amaterasu_extension_api::CaptureBinding> =
-            serde_json::from_value(payload["candidate"].clone()).ok();
-        let valid_target = match (&record.config.lifecycle_session_target, &target) {
-            (
-                Some(amaterasu_extension_api::LifecycleTarget::Session {
-                    host_epoch: expected_epoch,
-                    session_id: expected_session,
-                    ..
-                }),
-                Some(amaterasu_extension_api::LifecycleTarget::Stream {
-                    host_epoch,
-                    session_id,
-                    stream_id,
-                    generation,
-                }),
-            ) => {
-                host_epoch == expected_epoch
-                    && session_id == expected_session
-                    && !stream_id.is_empty()
-                    && *generation > 0
-            }
-            _ => false,
-        };
-        let returned_mode = serde_json::from_value::<amaterasu_extension_api::CaptureBindingMode>(
-            payload
-                .get("capture_binding_mode")
-                .cloned()
-                .unwrap_or(json!("managed")),
-        )
-        .ok();
-        let valid_candidate = if record.config.lifecycle_capture_mode.is_external() {
-            payload["candidate"].is_null()
-                && payload["required_consumers"] == json!(["capture"])
-                && (record.config.lifecycle_intent.as_deref() != Some("join")
-                    || target.as_ref().is_some_and(|target| {
-                        super::lifecycle_binding::valid_external_join(target, payload)
-                    }))
-        } else if record.config.lifecycle_intent.as_deref() == Some("join") {
-            candidate
-                .as_ref()
-                .zip(target.as_ref())
-                .is_some_and(|(binding, target)| {
-                    super::lifecycle_binding::valid_join_binding(binding, target, payload)
-                })
-        } else {
-            candidate
-            .as_ref()
-            .zip(record.negotiated_video)
-            .zip(record.negotiated_video_stream_format)
-            .is_some_and(|((binding, video), format)| {
-                matches!(&target, Some(amaterasu_extension_api::LifecycleTarget::Stream { generation, .. }) if binding.generation == *generation)
-                    && binding.geometry_revision > 0
-                    && binding.plan_revision > 0
-                    && binding.mode.width == video.width
-                    && binding.mode.height == video.height
-                    && binding.mode.refresh_millihz == video.fps * 1000
-                    && binding.mode.hdr
-                        == (format.dynamic_range == amaterasu_module_sdk::DynamicRange::Hdr)
-            })
-        };
-        if payload["status"] != "succeeded"
-            || !valid_target
-            || !valid_candidate
-            || returned_mode != Some(record.config.lifecycle_capture_mode)
-        {
-            self.reject_lifecycle_preparation(record, network, job.caller, runtime);
-            return;
-        }
-        let source =
-            match preparation_source(record, &payload["target"], payload.get("shared_source")) {
-                Some(source) => source,
-                None => {
-                    self.reject_lifecycle_preparation(record, network, job.caller, runtime);
-                    return;
+            super::preparation::PreparationResolution::Rejected => {
+                if let Some((connection, action_ticket)) = network {
+                    self.fail_network_action(
+                        record,
+                        connection,
+                        action_ticket,
+                        "lifecycle_prepare_rejected",
+                    );
+                } else {
+                    record.close(Some("lifecycle_prepare_rejected"));
                 }
-            };
-        record.lifecycle_target = Some(payload["target"].clone());
-        record.lifecycle_candidate = Some(payload["candidate"].clone());
-        record.lifecycle_source_target = Some(source);
-        record.lifecycle_prepare_outstanding = false;
-        if let Some((connection, action_ticket)) = network {
-            let Some(start) = record.authenticated_lifecycle_start_payload() else {
-                self.fail_network_action(record, connection, action_ticket, "negotiation_failed");
-                return;
-            };
-            self.schedule_actual_arm(record, start, connection, action_ticket, job.deadline);
-        } else {
-            record.close(Some("network_disconnected"));
-            self.schedule_stop(record, job.caller, now);
+                self.schedule_stop(record, job.caller, now);
+            }
+            super::preparation::PreparationResolution::Admitted => {
+                if let Some((connection, action_ticket)) = network {
+                    let Some(start) = record.authenticated_lifecycle_start_payload() else {
+                        self.fail_network_action(
+                            record,
+                            connection,
+                            action_ticket,
+                            "negotiation_failed",
+                        );
+                        return;
+                    };
+                    self.schedule_actual_arm(
+                        record,
+                        start,
+                        connection,
+                        action_ticket,
+                        job.deadline,
+                    );
+                } else {
+                    record.close(Some("network_disconnected"));
+                    self.schedule_stop(record, job.caller, now);
+                }
+            }
+            super::preparation::PreparationResolution::Unconfirmed => {
+                self.reject_lifecycle_preparation(record, network, job.caller, runtime);
+            }
         }
     }
 
@@ -698,15 +646,10 @@ impl Controller {
                 call,
                 caller,
                 network: None,
-                deadline: now.saturating_add(CLEANUP_BUDGET_MS),
+                deadline: self.cleanup_deadline(now),
             });
         } else if record.session.is_some() && record.lifecycle_prepare_outstanding {
-            self.schedule_lifecycle_lookup(
-                record,
-                caller,
-                None,
-                now.saturating_add(CLEANUP_BUDGET_MS),
-            );
+            self.schedule_lifecycle_lookup(record, caller, None, self.cleanup_deadline(now));
         } else if record.session.is_some() {
             self.schedule_stop(record, caller, now);
         } else if record.needs_lookup {
@@ -725,6 +668,11 @@ impl Controller {
         network: Option<(u64, u64)>,
         deadline: u64,
     ) {
+        let deadline = if matches!(record.state, State::Closing | State::CleanupFailed) {
+            self.cap_cleanup_deadline(deadline)
+        } else {
+            deadline
+        };
         let call = Call::for_service(
             "amaterasu.session-lifecycle/1",
             json!({"operation":"lookup", "operation_id":format!("{}-lifecycle-prepare", record.operation())}),
@@ -753,7 +701,7 @@ impl Controller {
             call,
             caller,
             network: None,
-            deadline: now.saturating_add(CLEANUP_BUDGET_MS),
+            deadline: self.cleanup_deadline(now),
         });
     }
 
@@ -764,7 +712,7 @@ impl Controller {
             call: self.stop_call(record),
             caller,
             network: None,
-            deadline: now.saturating_add(CLEANUP_BUDGET_MS),
+            deadline: self.cleanup_deadline(now),
         });
     }
 
@@ -790,6 +738,11 @@ impl Controller {
         network: Option<(u64, u64)>,
         deadline: u64,
     ) {
+        let deadline = if matches!(record.state, State::Closing | State::CleanupFailed) {
+            self.cap_cleanup_deadline(deadline)
+        } else {
+            deadline
+        };
         let call = Call::new(
             json!({"action":"status","session":record.session}),
             self.operation_id(record, "status"),
@@ -803,6 +756,15 @@ impl Controller {
             network,
             deadline,
         });
+    }
+
+    pub(super) fn cleanup_deadline(&self, now: u64) -> u64 {
+        self.cap_cleanup_deadline(now.saturating_add(CLEANUP_BUDGET_MS))
+    }
+
+    fn cap_cleanup_deadline(&self, deadline: u64) -> u64 {
+        self.shutdown_deadline
+            .map_or(deadline, |announced| deadline.min(announced))
     }
 
     pub(super) fn stop_call(&mut self, record: &Record) -> Call {

@@ -61,6 +61,7 @@ pub(super) struct Tracker {
     started_at: Instant,
     associated: bool,
     stopping_at: Option<Instant>,
+    shutdown_deadline: Option<Instant>,
 }
 
 impl Tracker {
@@ -86,6 +87,7 @@ impl Tracker {
             started_at: Instant::now(),
             associated: false,
             stopping_at: None,
+            shutdown_deadline: None,
         })
     }
 
@@ -117,6 +119,20 @@ impl Tracker {
         self.associated
     }
 
+    pub(super) fn prepare_shutdown(&mut self, deadline: Instant) {
+        let deadline = self
+            .shutdown_deadline
+            .map_or(deadline, |current| current.min(deadline));
+        self.shutdown_deadline = Some(deadline);
+        if let Some(stopping_at) = &mut self.stopping_at {
+            *stopping_at = (*stopping_at).min(
+                deadline
+                    .checked_sub(STOP_CONFIRMATION_TIMEOUT)
+                    .unwrap_or(deadline),
+            );
+        }
+    }
+
     pub(super) fn is_stopping(&self) -> bool {
         self.stopping_at.is_some()
     }
@@ -132,7 +148,20 @@ impl Tracker {
         mut scan: impl FnMut() -> Option<BTreeMap<u32, Process>>,
         mut close: impl FnMut(&TrackedProcess, &[u8]),
     ) -> SteamStopProgress {
-        self.stopping_at = Some(now + grace);
+        let requested = match self.shutdown_deadline {
+            Some(deadline) => (now + grace).min(
+                deadline
+                    .checked_sub(STOP_CONFIRMATION_TIMEOUT)
+                    .unwrap_or(deadline),
+            ),
+            None => now + grace,
+        };
+        self.stopping_at = Some(if self.shutdown_deadline.is_some() {
+            self.stopping_at
+                .map_or(requested, |current| current.min(requested))
+        } else {
+            requested
+        });
         let Some(processes) = scan() else {
             return SteamStopProgress::Failed("steam_process_scan_failed");
         };
@@ -145,6 +174,29 @@ impl Tracker {
             close(&process, &self.user_sid);
         }
         SteamStopProgress::Pending
+    }
+
+    pub(super) fn force_shutdown(&mut self) {
+        self.force_shutdown_with(scan_processes, terminate_validated_process);
+    }
+
+    fn force_shutdown_with(
+        &mut self,
+        mut scan: impl FnMut() -> Option<BTreeMap<u32, Process>>,
+        mut terminate: impl FnMut(&TrackedProcess, &[u8]),
+    ) {
+        let Some(snapshot) = scan() else {
+            return;
+        };
+        // Retained exact identities are the only destructor authority.
+        self.tracked.retain(|pid, tracked| {
+            snapshot.get(pid).is_some_and(|process| {
+                process_may_still_be_tracked(tracked, process, &self.user_sid)
+            })
+        });
+        for process in self.tracked_descendant_first(&snapshot) {
+            terminate(&process, &self.user_sid);
+        }
     }
 
     pub(super) fn advance_stop(&mut self, now: Instant) -> SteamStopProgress {
@@ -736,6 +788,7 @@ mod tests {
             started_at: Instant::now(),
             associated: false,
             stopping_at: None,
+            shutdown_deadline: None,
         }
     }
 
@@ -744,6 +797,57 @@ mod tests {
             20,
             process(20, 1, Some(r"C:\games\title\game.exe"), Some(CURRENT_SID)),
         )])
+    }
+
+    #[test]
+    fn final_shutdown_does_not_associate_a_later_independent_launch() {
+        let mut tracker = tracker();
+        tracker.refresh_tracking(&owned_game());
+        assert_eq!(
+            tracker.request_stop_with(
+                Instant::now(),
+                Duration::ZERO,
+                || Some(BTreeMap::new()),
+                |_, _| {}
+            ),
+            SteamStopProgress::Complete
+        );
+        let later = BTreeMap::from([(
+            99,
+            process(99, 1, Some(r"C:\games\title\game.exe"), Some(CURRENT_SID)),
+        )]);
+        tracker.force_shutdown_with(
+            || Some(later.clone()),
+            |_, _| panic!("a later independent launch is not owned"),
+        );
+        assert!(tracker.tracked.is_empty());
+        assert!(!tracker.is_stopping());
+    }
+
+    #[test]
+    fn final_shutdown_revalidates_only_retained_identities_without_renewing_time() {
+        let mut tracker = tracker();
+        let mut processes = owned_game();
+        tracker.refresh_tracking(&processes);
+        let tracked = tracker.tracked.clone();
+        let deadline = Instant::now() - Duration::from_secs(20);
+        tracker.stopping_at = Some(deadline);
+        processes.insert(
+            21,
+            process(21, 20, Some(r"C:\tools\new-child.exe"), Some(CURRENT_SID)),
+        );
+        processes.insert(
+            99,
+            process(99, 1, Some(r"C:\games\title\game.exe"), Some(CURRENT_SID)),
+        );
+        let mut signaled = Vec::new();
+        tracker.force_shutdown_with(
+            || Some(processes.clone()),
+            |process, _| signaled.push(process.identity),
+        );
+        assert_eq!(signaled, [tracked.get(&20).unwrap().identity]);
+        assert_eq!(tracker.tracked, tracked);
+        assert_eq!(tracker.stopping_at, Some(deadline));
     }
 
     #[test]

@@ -354,26 +354,38 @@ Repeated termination of a terminal record succeeds. Background ticks never sleep
 for a running preparation/undo command. They perform at most a bounded spawn,
 observation, or containment action and retain child ownership between ticks.
 Containment errors and the bounded reap deadline become `cleanup_failed` instead
-of discarding the child; an explicit terminate retries. Manager shutdown requests
-all stops and advances owed undo against one shared deadline covering each
-record's configured application exit timeout, a 2-second root reap deadline,
-and every currently owed undo's execution and containment budget. Successful
-undos no longer contribute to that budget; prepare-only leases contribute their
-own owed work. If a long lifecycle command outlasts that deadline, shutdown
-returns an error while the live manager still retains ownership for retry. Drop
-first attempts normal cleanup, then cancels remaining lifecycle commands and
-makes a final bounded containment attempt. Drop cannot report failure, and
-persistent OS errors, uninterruptible kernel operations, or host death prevent an
-absolute no-orphan guarantee. Windows closes private jobs on host death; Unix
-host death can bypass cleanup. There is no durable watcher or restart
-reconciliation.
+of discarding the child; an explicit terminate retries. Ordinary application Stop
+honors its configured exit timeout, including up to 300 seconds, followed by
+bounded confirmation. Direct manager shutdown uses one shared budget for the
+application and currently owed undo commands.
 
-The installed host's worker shutdown deadline is currently five seconds after
-EOF. Direct manager shutdown budgets do not extend that external deadline.
-Long undo commands must be settled through the nonblocking launch/stop lifecycle
-before host unload; host-EOF shutdown qualification for those waits remains
-pending. Windows SYSTEM/UAC, associations, and Windows native execution remain
-separate platform qualification gates on the current Linux host.
+For cooperative host shutdown, the host first announces its remaining shared
+budget. The application retains the earliest absolute deadline and closes new
+launch and preparation admission. Existing status, lookup, termination, and
+idempotent replay remain available. Announcement does not start cleanup or
+shorten a forward preparation command while consumers still drain. Once cleanup
+is authorized, native process, Steam, and active/future undo deadlines are capped
+by that retained deadline, reserving bounded force and reap/confirmation time.
+Application quiesce advances cleanup without sleeping. An exhausted execution
+budget starts no additional undo commands; owed work and uncertain native
+identities remain failed or pending rather than becoming cleanup complete.
+
+After announcement or a shutdown attempt, Drop performs only one exact native
+containment attempt and grants no new wait budget or undo execution. Standalone
+owners that omit explicit shutdown have a five-second fallback. Drop cannot
+report failure, and persistent OS errors, uninterruptible kernel operations, or
+host death prevent an absolute no-orphan guarantee. Windows closes private jobs
+on host death; Unix host death can bypass cleanup. There is no durable watcher
+or restart reconciliation for these process identities.
+
+Current source coordinates a 20-second module deadline inside a 25-second worker
+window and a 30-second Linux user-service stop timeout. Installed host EOF/runtime
+behavior has not been qualified here. Windows SCM now requests cooperative
+worker cleanup through a private EOF-only pipe and waits for a clean process
+exit before replacement; timeout containment remains a failure. Windows
+compilation, native SCM stop/session-switch behavior,
+SYSTEM/UAC, and associations remain separate platform qualification gates on the
+current Linux host.
 
 Platform references: [POSIX waitid](https://www.man7.org/linux/man-pages/man3/waitid.3p.html),
 [Windows job objects](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects),

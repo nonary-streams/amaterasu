@@ -62,6 +62,8 @@ impl Controller {
             } => {
                 if caller != "amaterasu.nvhttp" {
                     rpc::complete(runtime, request, error("permission_denied"));
+                } else if self.quiescence.is_some() || self.shutdown_deadline.is_some() {
+                    rpc::complete(runtime, request, error("module_quiescing"));
                 } else {
                     let payload = self
                         .configure_network_policy(port, address_family, bind_address, now)
@@ -108,6 +110,10 @@ impl Controller {
         runtime: &RuntimeClient,
         verified: bool,
     ) {
+        if self.quiescence.is_some() || self.shutdown_deadline.is_some() {
+            rpc::complete(runtime, input.request, error("module_quiescing"));
+            return;
+        }
         let OpenRequest {
             request,
             caller,

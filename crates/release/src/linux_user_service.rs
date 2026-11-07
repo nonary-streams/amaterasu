@@ -1282,7 +1282,7 @@ mod tests {
         assert!(unit.contains(&format!("HostExecutableSha256={}", "b".repeat(64))));
         assert!(unit.contains("WantedBy=graphical-session.target"));
         assert!(unit.contains("Restart=on-failure\nRestartSec=5s"));
-        assert!(unit.contains("KillMode=mixed\nTimeoutStopSec=20s"));
+        assert!(unit.contains("KillMode=mixed\nTimeoutStopSec=30s"));
         assert!(!unit.contains("User=root"));
         assert!(!unit.contains("sudo"));
     }

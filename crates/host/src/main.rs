@@ -27,6 +27,8 @@ mod web_recovery;
 #[cfg(windows)]
 mod windows_service;
 mod worker;
+#[cfg(any(windows, test))]
+mod worker_shutdown;
 
 use amaterasu_package::PackageResult;
 use std::path::Path;

@@ -43,6 +43,17 @@ impl ManagedModule for LaunchModule {
         }
         Ok(Self { runtime, pipeline })
     }
+    fn prepare_shutdown(&mut self, remaining_ms: u64) -> ModuleResult<()> {
+        // Consumers drain first. Gate admission now, then retain the host's
+        // deadline so our later provider cleanup cannot renew the host budget.
+        self.pipeline.prepare_shutdown(remaining_ms);
+        Ok(())
+    }
+    fn quiesce(&mut self) -> ModuleResult<bool> {
+        // Direct SDK launches also own process and session cleanup. The host
+        // keeps our provider dependencies ticking until this drain completes.
+        Ok(self.pipeline.quiesce())
+    }
     fn tick(&mut self) -> ModuleResult<()> {
         self.pipeline
             .tick(|command| self.runtime.send_ephemeral(command))

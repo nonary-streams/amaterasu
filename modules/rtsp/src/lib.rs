@@ -56,6 +56,17 @@ impl ManagedModule for RtspModule {
         let now = self.started.elapsed().as_millis().min(u64::MAX as u128) as u64;
         self.controller.tick(&self.runtime, now)
     }
+
+    fn prepare_shutdown(&mut self, remaining_ms: u64) -> ModuleResult<()> {
+        let now = self.started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        self.controller.prepare_shutdown(now, remaining_ms);
+        Ok(())
+    }
+
+    fn quiesce(&mut self) -> ModuleResult<bool> {
+        let now = self.started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        Ok(self.controller.quiesce(&self.runtime, now))
+    }
 }
 
 impl Drop for RtspModule {

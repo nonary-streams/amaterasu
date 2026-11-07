@@ -126,6 +126,20 @@ impl SteamProcessTracker {
         }
     }
 
+    pub(crate) fn prepare_shutdown(&mut self, deadline: Instant) {
+        #[cfg(any(target_os = "linux", windows))]
+        self.inner.prepare_shutdown(deadline);
+        #[cfg(not(any(target_os = "linux", windows)))]
+        let _ = deadline;
+    }
+
+    /// Last destructor attempt: signal only freshly validated identities and
+    /// retain the original clock and unconfirmed obligation.
+    pub(crate) fn force_shutdown(&mut self) {
+        #[cfg(any(target_os = "linux", windows))]
+        self.inner.force_shutdown();
+    }
+
     pub(crate) fn stop_budget(grace: Duration) -> Duration {
         grace + STOP_CONFIRMATION_TIMEOUT
     }
@@ -211,6 +225,7 @@ mod linux {
         scan_failed: bool,
         associated: bool,
         stopping_at: Option<Instant>,
+        shutdown_deadline: Option<Instant>,
     }
 
     impl Tracker {
@@ -247,6 +262,7 @@ mod linux {
                 scan_failed: false,
                 associated: false,
                 stopping_at: None,
+                shutdown_deadline: None,
             })
         }
 
@@ -286,6 +302,20 @@ mod linux {
             self.associated
         }
 
+        pub(super) fn prepare_shutdown(&mut self, deadline: Instant) {
+            let deadline = self
+                .shutdown_deadline
+                .map_or(deadline, |current| current.min(deadline));
+            self.shutdown_deadline = Some(deadline);
+            if let Some(stopping_at) = &mut self.stopping_at {
+                *stopping_at = (*stopping_at).min(
+                    deadline
+                        .checked_sub(STOP_CONFIRMATION_TIMEOUT)
+                        .unwrap_or(deadline),
+                );
+            }
+        }
+
         pub(super) fn is_stopping(&self) -> bool {
             self.stopping_at.is_some()
         }
@@ -311,7 +341,20 @@ mod linux {
         ) -> SteamStopProgress {
             // Retain the stop obligation even when its first snapshot fails, so
             // an explicit cleanup retry returns to this tracker.
-            self.stopping_at = Some(now + grace);
+            let requested = match self.shutdown_deadline {
+                Some(deadline) => (now + grace).min(
+                    deadline
+                        .checked_sub(STOP_CONFIRMATION_TIMEOUT)
+                        .unwrap_or(deadline),
+                ),
+                None => now + grace,
+            };
+            self.stopping_at = Some(if self.shutdown_deadline.is_some() {
+                self.stopping_at
+                    .map_or(requested, |current| current.min(requested))
+            } else {
+                requested
+            });
             let Some(processes) = scan() else {
                 return SteamStopProgress::Failed("steam_process_scan_failed");
             };
@@ -324,6 +367,46 @@ mod linux {
                 signal(identity, libc::SIGTERM, self.user_id);
             }
             SteamStopProgress::Pending
+        }
+
+        pub(super) fn force_shutdown(&mut self) {
+            let install_root = self.install_root.clone();
+            self.force_shutdown_with(
+                || scan_processes(&install_root),
+                |identity, signal, user_id| {
+                    let _ = signal_identity(identity, signal, user_id);
+                },
+            );
+        }
+
+        fn force_shutdown_with(
+            &mut self,
+            mut scan: impl FnMut() -> Option<ProcessSnapshot>,
+            mut signal: impl FnMut(Identity, i32, u32),
+        ) {
+            let Some(snapshot) = scan() else {
+                return;
+            };
+            // Destruction may revalidate old ownership, never discover a new launch.
+            let by_pid = snapshot
+                .processes
+                .iter()
+                .map(|process| (process.identity.pid, process))
+                .collect::<BTreeMap<_, _>>();
+            self.tracked.retain(|pid, identity| {
+                snapshot
+                    .indeterminate_pids
+                    .get(pid)
+                    .is_some_and(|observed| observed.is_none_or(|observed| observed == *identity))
+                    || by_pid.get(pid).is_some_and(|process| {
+                        process.identity == *identity
+                            && process.user_id == self.user_id
+                            && (process.executable.is_none() || !protected_runtime(process))
+                    })
+            });
+            for identity in self.tracked_descendant_first(&snapshot.processes) {
+                signal(identity, libc::SIGKILL, self.user_id);
+            }
         }
 
         pub(super) fn advance_stop(&mut self, now: Instant) -> SteamStopProgress {
@@ -764,6 +847,7 @@ mod linux {
                 scan_failed: false,
                 associated: false,
                 stopping_at: None,
+                shutdown_deadline: None,
             }
         }
 
@@ -903,6 +987,86 @@ mod linux {
 
             let wrong_user = synthetic_process(12, 1, "/games/title/game", 1001);
             assert!(!signal_target_is_current(expected, &wrong_user, 1000));
+        }
+
+        #[test]
+        fn final_shutdown_does_not_associate_a_later_independent_launch() {
+            let mut tracker = tracker();
+            let now = Instant::now();
+            let old = synthetic_process(12, 1, "/games/title/game", 1000);
+            tracker.refresh_tracking(std::slice::from_ref(&old));
+            assert_eq!(
+                tracker.request_stop_with(
+                    now,
+                    Duration::ZERO,
+                    || Some(ProcessSnapshot::default()),
+                    |_, _, _| {}
+                ),
+                SteamStopProgress::Complete
+            );
+            let later = synthetic_process(99, 1, "/games/title/game", 1000);
+            tracker.force_shutdown_with(
+                || Some(vec![later.clone()].into()),
+                |_, _, _| panic!("a later independent launch is not owned"),
+            );
+            assert!(tracker.tracked.is_empty());
+            assert!(!tracker.is_stopping());
+        }
+
+        #[test]
+        fn final_shutdown_revalidates_only_retained_identities_without_renewing_time() {
+            let mut tracker = tracker();
+            let old = synthetic_process(12, 1, "/games/title/game", 1000);
+            tracker.refresh_tracking(std::slice::from_ref(&old));
+            let deadline = Instant::now() - Duration::from_secs(20);
+            tracker.stopping_at = Some(deadline);
+            let processes = vec![
+                old.clone(),
+                synthetic_process(13, 12, "/usr/bin/new-child", 1000),
+                synthetic_process(99, 1, "/games/title/game", 1000),
+            ];
+            let mut signaled = Vec::new();
+            tracker.force_shutdown_with(
+                || Some(processes.clone().into()),
+                |identity, signal, _| signaled.push((identity, signal)),
+            );
+            assert_eq!(signaled, [(old.identity, libc::SIGKILL)]);
+            assert_eq!(tracker.tracked, BTreeMap::from([(12, old.identity)]));
+            assert_eq!(tracker.stopping_at, Some(deadline));
+        }
+
+        #[test]
+        fn announced_host_deadline_caps_current_and_future_steam_attempts() {
+            let mut tracker = tracker();
+            let game = synthetic_process(12, 1, "/games/title/game", 1000);
+            let now = Instant::now();
+            tracker.request_stop_with(
+                now,
+                Duration::from_secs(300),
+                || Some(vec![game.clone()].into()),
+                |_, _, _| {},
+            );
+            let host_deadline = now + Duration::from_secs(20);
+            tracker.prepare_shutdown(host_deadline);
+            assert_eq!(
+                tracker.stopping_at,
+                Some(host_deadline - STOP_CONFIRMATION_TIMEOUT)
+            );
+            tracker.prepare_shutdown(host_deadline + Duration::from_secs(100));
+            assert_eq!(
+                tracker.stopping_at,
+                Some(host_deadline - STOP_CONFIRMATION_TIMEOUT)
+            );
+            tracker.request_stop_with(
+                now + Duration::from_secs(5),
+                Duration::from_secs(300),
+                || Some(vec![game.clone()].into()),
+                |_, _, _| {},
+            );
+            assert_eq!(
+                tracker.stopping_at,
+                Some(host_deadline - STOP_CONFIRMATION_TIMEOUT)
+            );
         }
 
         #[test]

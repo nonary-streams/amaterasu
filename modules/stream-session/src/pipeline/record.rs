@@ -118,6 +118,10 @@ pub(super) struct Record {
     pub attempted: BTreeSet<Resource>,
     pub uncertain: Option<rpc::Pending>,
     pub uncertain_step: Option<Step>,
+    pub journal_uncertain: Option<rpc::Pending>,
+    /// At most one read-only observation can be in flight when shutdown begins.
+    /// Its broker bookkeeping cannot keep native resources alive after teardown.
+    pub shutdown_observations: Vec<rpc::Pending>,
     pub plane: Option<Box<dyn Drive>>,
     pub audio_recovery_needed: bool,
     pub prepared_until: u64,
@@ -262,6 +266,8 @@ impl Record {
             attempted: BTreeSet::new(),
             uncertain: None,
             uncertain_step: None,
+            journal_uncertain: None,
+            shutdown_observations: Vec::new(),
             plane: None,
             audio_recovery_needed: false,
             prepared_until: 0,

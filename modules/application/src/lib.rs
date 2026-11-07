@@ -30,6 +30,22 @@ impl ManagedModule for ApplicationModule {
         })
     }
 
+    fn prepare_shutdown(&mut self, remaining_ms: u64) -> ModuleResult<()> {
+        let deadline = std::time::Instant::now()
+            .checked_add(std::time::Duration::from_millis(remaining_ms))
+            .ok_or_else(|| {
+                "application shutdown deadline exceeds monotonic clock bounds".to_owned()
+            })?;
+        self.processes.prepare_shutdown_until(deadline);
+        Ok(())
+    }
+
+    fn quiesce(&mut self) -> ModuleResult<bool> {
+        self.processes
+            .poll_shutdown(std::time::Instant::now())
+            .map_err(str::to_owned)
+    }
+
     fn tick(&mut self) -> ModuleResult<()> {
         self.processes.reap_exited().map_err(str::to_owned)?;
         match self.runtime.send(Command::Poll {})? {

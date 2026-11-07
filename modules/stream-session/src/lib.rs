@@ -55,6 +55,17 @@ impl ManagedModule for StreamSession {
     fn tick(&mut self) -> ModuleResult<()> {
         self.pipeline.tick(&self.runtime)
     }
+
+    fn prepare_shutdown(&mut self, remaining_ms: u64) -> ModuleResult<()> {
+        let now = self.pipeline.elapsed_millis();
+        self.pipeline.prepare_shutdown(now, remaining_ms);
+        Ok(())
+    }
+
+    fn quiesce(&mut self) -> ModuleResult<bool> {
+        let now = self.pipeline.elapsed_millis();
+        Ok(self.pipeline.quiesce(now))
+    }
 }
 impl Drop for StreamSession {
     fn drop(&mut self) {

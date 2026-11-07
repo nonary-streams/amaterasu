@@ -1,5 +1,9 @@
 //! Development console supervision. Never replays a dispatched command.
-use amaterasu_contracts::{Command as ControlCommand, HostLifecycleAction, Response};
+#[cfg(target_os = "linux")]
+use amaterasu_contracts::HOST_MODULE_SHUTDOWN_TIMEOUT_MS;
+use amaterasu_contracts::{
+    Command as ControlCommand, HOST_WORKER_SHUTDOWN_TIMEOUT_MS, HostLifecycleAction, Response,
+};
 use amaterasu_package::{
     ActivationState, BootstrapConfig, PackageResult, RootLock, VerificationPolicy,
     package_directory, read_json, unix_timestamp, verify_package, write_json_atomically,
@@ -19,7 +23,7 @@ use std::time::{Duration, Instant};
 
 const LIVENESS_TIMEOUT: Duration = Duration::from_secs(5);
 // The worker may spend up to 20 seconds quiescing components before teardown.
-const WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(25);
+const WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(HOST_WORKER_SHUTDOWN_TIMEOUT_MS);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(35);
 const SERVICE_READY_FILE: &str = "service-ready.json";
 const OPERATIONAL_TIMEOUT: Duration = Duration::from_secs(10);
@@ -556,7 +560,9 @@ fn run_linux_user_service_inner(
                 {
                     let (request, _) = pending_activation.take().expect("checked pending request");
                     input.revoke();
-                    if let Err(error) = components.quiesce(Duration::from_secs(20)) {
+                    if let Err(error) =
+                        components.shutdown(Duration::from_millis(HOST_MODULE_SHUTDOWN_TIMEOUT_MS))
+                    {
                         let _ = crate::package_activation::write_status(
                             &state_root,
                             &request.manifest_digest,
@@ -566,7 +572,6 @@ fn run_linux_user_service_inner(
                             "cannot retire the running package for activation: {error}"
                         ));
                     }
-                    drop(components);
                     return Ok(Some(LinuxUserAction::Activate(request)));
                 }
                 if pending_activation.is_none()
@@ -577,7 +582,7 @@ fn run_linux_user_service_inner(
                 }
                 if let Some(action) = components.take_host_lifecycle_action()? {
                     input.revoke();
-                    drop(components);
+                    components.shutdown(Duration::from_millis(HOST_MODULE_SHUTDOWN_TIMEOUT_MS))?;
                     return Ok(Some(LinuxUserAction::Lifecycle(action)));
                 }
                 input.refresh(root, &digest, pid, starttime)?;
@@ -586,7 +591,7 @@ fn run_linux_user_service_inner(
                 ));
             }
             input.revoke();
-            drop(components);
+            components.shutdown(Duration::from_millis(HOST_MODULE_SHUTDOWN_TIMEOUT_MS))?;
             Ok(None)
         })();
         input.revoke();
@@ -764,43 +769,10 @@ pub(crate) fn run_managed_service(
 }
 
 #[cfg(windows)]
-pub(crate) fn run_interactive_service(
-    root: &Path,
-    mut stop_requested: impl FnMut() -> bool,
-    mut session_changed: impl FnMut() -> bool,
-    on_started: impl FnOnce(),
-) -> PackageResult<()> {
-    let _lock = RootLock::acquire(root)?;
-    let digest = crate::supervisor::select_active(root)?;
-    let mut supervisor = crate::interactive_worker::Supervisor::new(root, &digest)?;
-    if !supervisor.has_ready_worker()? {
-        // SCM may keep the service alive while no user is signed in, but that
-        // is not an install-time readiness condition: no stream-capable
-        // worker exists yet. Leaving the marker absent makes the MSI health
-        // gate fail closed and restore a predecessor rather than claim success.
-        return Err("no active interactive worker is ready".into());
-    }
-    publish_service_readiness(root, &digest)?;
-    on_started();
-    while !stop_requested() {
-        if supervisor.refresh(session_changed())? == Some(HostLifecycleAction::Quit) {
-            break;
-        }
-        if !supervisor.has_ready_worker()? {
-            remove_service_readiness(root);
-        } else if !root
-            .join(SERVICE_READY_FILE)
-            .try_exists()
-            .map_err(|error| error.to_string())?
-        {
-            publish_service_readiness(root, &digest)?;
-        }
-        std::thread::sleep(Duration::from_millis(250));
-    }
-    let result = supervisor.shutdown();
-    remove_service_readiness(root);
-    result
-}
+#[path = "service/windows.rs"]
+mod windows;
+#[cfg(windows)]
+pub(crate) use windows::run_interactive_service;
 
 fn publish_service_readiness(root: &Path, digest: &str) -> PackageResult<()> {
     if digest.len() != 64
@@ -967,7 +939,7 @@ impl Worker {
         &mut self,
         action: HostLifecycleAction,
     ) -> PackageResult<HostLifecycleAction> {
-        let deadline = Instant::now() + Duration::from_secs(25);
+        let deadline = Instant::now() + WORKER_SHUTDOWN_TIMEOUT;
         loop {
             if let Some(status) = self.child.try_wait().map_err(|error| error.to_string())? {
                 return crate::protocol::acknowledge_host_action(action, status.success());

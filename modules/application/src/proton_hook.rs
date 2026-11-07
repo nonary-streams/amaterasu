@@ -26,6 +26,10 @@ const SERVER_READY_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) struct ProtonHookManager {
     #[cfg(target_os = "linux")]
     active: BTreeMap<String, ActiveHook>,
+    #[cfg(target_os = "linux")]
+    retiring: Vec<Child>,
+    #[cfg(target_os = "linux")]
+    shutting_down: bool,
     #[cfg(all(test, target_os = "linux"))]
     root_override: Option<Vec<PathBuf>>,
 }
@@ -51,6 +55,9 @@ impl ProtonHookManager {
     pub(crate) fn acquire(&mut self, spec: &LaunchSpec) -> Result<Option<String>, &'static str> {
         #[cfg(target_os = "linux")]
         {
+            if self.shutting_down {
+                return Err("host_stopping");
+            }
             let Some(app_id) = spec.steam_id.as_deref() else {
                 return Ok(None);
             };
@@ -93,7 +100,14 @@ impl ProtonHookManager {
             if active.references == 0
                 && let Some(mut active) = self.active.remove(_app_id)
             {
-                stop_server(active.server.take());
+                if self.shutting_down {
+                    if let Some(child) = retire_server(active.server.take()) {
+                        self.retiring.push(child);
+                    }
+                } else {
+                    // Preserve ordinary Stop's existing same-app restart ordering.
+                    stop_server(active.server.take());
+                }
             }
         }
     }
@@ -109,7 +123,45 @@ impl ProtonHookManager {
             {
                 active.server = None;
             }
-            let _ = ensure_server(app_id, active);
+            if !self.shutting_down {
+                let _ = ensure_server(app_id, active);
+            }
+        }
+        #[cfg(target_os = "linux")]
+        self.retiring
+            .retain_mut(|child| !matches!(child.try_wait(), Ok(Some(_))));
+    }
+
+    /// Close helper restart admission without stopping the current consumer's hook.
+    pub(crate) fn prepare_shutdown(&mut self) {
+        #[cfg(target_os = "linux")]
+        {
+            self.shutting_down = true;
+        }
+    }
+
+    pub(crate) fn shutdown_complete(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            self.active.is_empty() && self.retiring.is_empty()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            true
+        }
+    }
+
+    pub(crate) fn force_shutdown(&mut self) {
+        #[cfg(target_os = "linux")]
+        {
+            for (_, mut active) in std::mem::take(&mut self.active) {
+                if let Some(child) = retire_server(active.server.take()) {
+                    self.retiring.push(child);
+                }
+            }
+            for child in &mut self.retiring {
+                let _ = retire_child(child);
+            }
         }
     }
 
@@ -117,6 +169,8 @@ impl ProtonHookManager {
     fn with_roots(roots: Vec<PathBuf>) -> Self {
         Self {
             active: BTreeMap::new(),
+            retiring: Vec::new(),
+            shutting_down: false,
             root_override: Some(roots),
         }
     }
@@ -138,12 +192,7 @@ impl ProtonHookManager {
 
 impl Drop for ProtonHookManager {
     fn drop(&mut self) {
-        #[cfg(target_os = "linux")]
-        {
-            for (_, mut active) in std::mem::take(&mut self.active) {
-                stop_server(active.server.take());
-            }
-        }
+        self.force_shutdown();
     }
 }
 
@@ -211,6 +260,44 @@ fn stop_server(server: Option<HookServer>) {
     if let Some(mut server) = server {
         drop(server._keepalive);
         terminate_server(&mut server.child);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn retire_server(server: Option<HookServer>) -> Option<Child> {
+    let mut server = server?;
+    drop(server._keepalive);
+    if retire_child(&mut server.child) {
+        None
+    } else {
+        Some(server.child)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn retire_child(child: &mut Child) -> bool {
+    retire_child_with(
+        child,
+        |child| child.try_wait().map(|status| status.is_some()),
+        Child::kill,
+    )
+}
+
+/// Only an observed live, still-owned child authorizes a final signal. A failed
+/// wait retains unresolved ownership and cannot authorize numeric-PID signaling.
+#[cfg(target_os = "linux")]
+fn retire_child_with<T>(
+    child: &mut T,
+    mut observe: impl FnMut(&mut T) -> std::io::Result<bool>,
+    mut signal: impl FnMut(&mut T) -> std::io::Result<()>,
+) -> bool {
+    match observe(child) {
+        Ok(true) => true,
+        Err(_) => false,
+        Ok(false) => {
+            let _ = signal(child);
+            matches!(observe(child), Ok(true))
+        }
     }
 }
 
@@ -413,6 +500,119 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(25));
         }
+    }
+
+    struct HelperProbe {
+        observations: std::collections::VecDeque<std::io::Result<bool>>,
+        signals: usize,
+    }
+
+    fn retire_probe(probe: &mut HelperProbe) -> bool {
+        retire_child_with(
+            probe,
+            |probe| {
+                probe
+                    .observations
+                    .pop_front()
+                    .expect("unexpected extra wait")
+            },
+            |probe| {
+                probe.signals += 1;
+                Ok(())
+            },
+        )
+    }
+
+    #[test]
+    fn failed_helper_waits_retain_ownership_without_signaling() {
+        for error in [
+            std::io::Error::from_raw_os_error(libc::ECHILD),
+            std::io::Error::other("unreadable child status"),
+        ] {
+            let mut probe = HelperProbe {
+                observations: std::collections::VecDeque::from([Err(error)]),
+                signals: 0,
+            };
+            assert!(!retire_probe(&mut probe));
+            assert_eq!(probe.signals, 0);
+        }
+    }
+
+    #[test]
+    fn helper_retirement_requires_observed_exit_after_the_signal() {
+        let mut probe = HelperProbe {
+            observations: std::collections::VecDeque::from([Ok(false), Ok(false)]),
+            signals: 0,
+        };
+        assert!(!retire_probe(&mut probe));
+        assert_eq!(probe.signals, 1);
+        probe.observations.push_back(Ok(true));
+        assert!(retire_probe(&mut probe));
+        assert_eq!(probe.signals, 1);
+    }
+
+    #[test]
+    fn shutdown_retires_helper_handles_without_restart_or_blocking_wait() {
+        let app_id = format!("{}", 3_500_000_000u64 + std::process::id() as u64);
+        let mut manager = ProtonHookManager::with_roots(Vec::new());
+        manager.acquire(&launch_spec(&app_id, true)).unwrap();
+        let pid = manager
+            .active
+            .get(&app_id)
+            .unwrap()
+            .server
+            .as_ref()
+            .unwrap()
+            .child
+            .id();
+        manager.prepare_shutdown();
+        assert_eq!(
+            manager
+                .active
+                .get(&app_id)
+                .unwrap()
+                .server
+                .as_ref()
+                .unwrap()
+                .child
+                .id(),
+            pid
+        );
+        assert!(!manager.shutdown_complete());
+        manager.release(&app_id);
+        assert!(manager.active.is_empty());
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !manager.shutdown_complete() {
+            manager.reap();
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert!(manager.acquire(&launch_spec(&app_id, true)).is_err());
+    }
+
+    #[test]
+    fn announced_shutdown_does_not_restart_an_exited_owned_helper() {
+        let app_id = format!("{}", 3_600_000_000u64 + std::process::id() as u64);
+        let mut manager = ProtonHookManager::with_roots(Vec::new());
+        manager.acquire(&launch_spec(&app_id, true)).unwrap();
+        manager.prepare_shutdown();
+        let server = manager
+            .active
+            .get_mut(&app_id)
+            .unwrap()
+            .server
+            .as_mut()
+            .unwrap();
+        server.child.kill().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !matches!(server.child.try_wait(), Ok(Some(_))) {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        manager.reap();
+        assert!(manager.active.get(&app_id).unwrap().server.is_none());
+        manager.release(&app_id);
+        assert!(manager.shutdown_complete());
     }
 
     #[cfg(target_os = "linux")]

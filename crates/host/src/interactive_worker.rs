@@ -5,7 +5,10 @@
 //! duplicated with the rights needed for process creation. No token, user
 //! environment, or service handle is passed to the worker after launch.
 
-use amaterasu_contracts::HostLifecycleAction;
+use crate::worker_shutdown::StartupFailure;
+use amaterasu_contracts::{
+    HOST_SERVICE_STOP_TIMEOUT_MS, HOST_WORKER_SHUTDOWN_TIMEOUT_MS, HostLifecycleAction,
+};
 use amaterasu_package::PackageResult;
 use amaterasu_package::playnite_extension::{
     PlayniteExtensionInstall, PlayniteExtensionReceipt, finalize_playnite_extension,
@@ -19,6 +22,12 @@ const WTS_ACTIVE: i32 = 0;
 const INVALID_SESSION_ID: u32 = u32::MAX;
 const WAIT_OBJECT_0: u32 = 0;
 const WAIT_TIMEOUT: u32 = 258;
+const ERROR_PROCESS_ABORTED: u32 = 1067;
+const WORKER_SHUTDOWN_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_millis(HOST_WORKER_SHUTDOWN_TIMEOUT_MS);
+const CONTAINMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(
+    HOST_SERVICE_STOP_TIMEOUT_MS.saturating_sub(HOST_WORKER_SHUTDOWN_TIMEOUT_MS),
+);
 const HOST_ACTION_EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const MAX_WORKER_PROTOCOL_BUFFER: usize = 128;
 const TOKEN_ASSIGN_PRIMARY: u32 = 0x0001;
@@ -255,7 +264,7 @@ pub(crate) struct Supervisor<'a> {
 
 impl<'a> Supervisor<'a> {
     pub(crate) fn new(root: &'a Path, digest: &'a str) -> PackageResult<Self> {
-        let mut supervisor = Self {
+        Ok(Self {
             root,
             digest,
             companion_policy: crate::input_companion::CompanionPolicy::load(root, digest)?,
@@ -264,9 +273,7 @@ impl<'a> Supervisor<'a> {
             restart_budget: crate::protocol::RestartBudget::default(),
             restart_pending: false,
             observed_session: None,
-        };
-        supervisor.refresh(true)?;
-        Ok(supervisor)
+        })
     }
 
     /// Stops a worker as soon as its user session is no longer active. Polling
@@ -274,13 +281,19 @@ impl<'a> Supervisor<'a> {
     pub(crate) fn refresh(
         &mut self,
         session_changed: bool,
+        stop_requested: &mut impl FnMut() -> bool,
+        mut on_worker_stopping: impl FnMut(),
     ) -> PackageResult<Option<HostLifecycleAction>> {
+        if stop_requested() {
+            return Ok(None);
+        }
         if crate::input_companion::CompanionPolicy::load(self.root, self.digest)?
             != self.companion_policy
         {
-            self.worker = None;
-            return Err(
-                "input companion policy changed; restart the service to reauthorize".into(),
+            on_worker_stopping();
+            return crate::worker_shutdown::finish_with_cleanup(
+                Err("input companion policy changed; restart the service to reauthorize".into()),
+                || self.stop_worker(),
             );
         }
         let active = active_user_session()?;
@@ -291,7 +304,8 @@ impl<'a> Supervisor<'a> {
             .as_ref()
             .is_some_and(|worker| active != Some(worker.session_id))
         {
-            self.worker = None;
+            on_worker_stopping();
+            self.stop_worker()?;
             self.failed_starts = 0;
             self.restart_pending = false;
         }
@@ -303,17 +317,20 @@ impl<'a> Supervisor<'a> {
             (None, false)
         };
         if let Some(action) = action {
+            on_worker_stopping();
             self.worker = None;
             match action {
                 HostLifecycleAction::Quit => return Ok(Some(action)),
                 HostLifecycleAction::Restart => self.schedule_restart()?,
             }
         } else if exited {
+            on_worker_stopping();
             self.worker = None;
             self.failed_starts += 1;
             self.schedule_restart()?;
         }
-        if self.worker.is_none()
+        if !stop_requested()
+            && self.worker.is_none()
             && let Some(session_id) = active
             && (session_changed
                 || session_changed_by_polling
@@ -325,13 +342,17 @@ impl<'a> Supervisor<'a> {
                 self.digest,
                 session_id,
                 self.companion_policy.as_ref(),
+                stop_requested,
             ) {
-                Ok(worker) => {
+                Ok(Some(worker)) => {
                     self.worker = Some(worker);
                     self.failed_starts = 0;
                     self.restart_pending = false;
                 }
-                Err(_) => {
+                Ok(None) => return Ok(None),
+                Err(error) => {
+                    let error = error.into_retryable(stop_requested())?;
+                    eprintln!("Interactive worker startup failed: {error}");
                     self.failed_starts += 1;
                     self.restart_pending = true;
                 }
@@ -370,9 +391,15 @@ impl<'a> Supervisor<'a> {
             .map(|ready| ready.unwrap_or(false))
     }
 
+    fn stop_worker(&mut self) -> PackageResult<()> {
+        self.worker
+            .take()
+            .map(|mut worker| worker.shutdown())
+            .unwrap_or(Ok(()))
+    }
+
     pub(crate) fn shutdown(mut self) -> PackageResult<()> {
-        self.worker = None;
-        Ok(())
+        self.stop_worker()
     }
 }
 
@@ -383,6 +410,8 @@ struct Worker {
     creation_time: u64,
     session_id: u32,
     readiness: ReadinessPipe,
+    shutdown: ShutdownPipe,
+    shutdown_deadline: Option<std::time::Instant>,
 }
 
 impl Worker {
@@ -391,7 +420,11 @@ impl Worker {
         digest: &str,
         session_id: u32,
         companion_policy: Option<&crate::input_companion::CompanionPolicy>,
-    ) -> PackageResult<Self> {
+        stop_requested: &mut impl FnMut() -> bool,
+    ) -> Result<Option<Self>, StartupFailure> {
+        if stop_requested() {
+            return Ok(None);
+        }
         let user_token = UserToken::for_session(session_id)?;
         let prepared = crate::state_root::prepare(root, digest, user_token.handle)?;
         let primary_token = user_token.duplicate_primary()?;
@@ -406,6 +439,7 @@ impl Worker {
         };
         let null_device = InheritableNull::open()?;
         let mut readiness = ReadinessPipe::open()?;
+        let mut shutdown = ShutdownPipe::open()?;
         let application_name = wide_os(executable.as_os_str())?;
         let mut arguments = vec![
             executable.as_os_str(),
@@ -419,7 +453,11 @@ impl Worker {
         }
         let mut command_line = command_line(&arguments)?;
         let mut desktop: Vec<u16> = "winsta0\\default".encode_utf16().chain(Some(0)).collect();
-        let allowed_handles = [null_device.handle, readiness.write_handle()];
+        let allowed_handles = [
+            null_device.handle,
+            readiness.write_handle(),
+            shutdown.read_handle(),
+        ];
         let attributes = StartupAttributeList::only_handles(&allowed_handles)?;
         let startup = StartupInfoExW {
             startup: StartupInfoW {
@@ -438,7 +476,7 @@ impl Worker {
                 show_window: 0,
                 reserved2_count: 0,
                 reserved2: std::ptr::null_mut(),
-                standard_input: null_device.handle,
+                standard_input: shutdown.read_handle(),
                 standard_output: readiness.write_handle(),
                 standard_error: null_device.handle,
             },
@@ -454,8 +492,12 @@ impl Worker {
         // command_line is mutable as required by CreateProcessAsUserW. Scoped
         // token, environment, desktop, and standard-handle storage remain live
         // for the call. The explicit attribute list restricts inheritance to
-        // the NUL device and one write-only readiness pipe; no other SYSTEM
-        // handle can reach the interactive user process.
+        // the NUL device, one write-only readiness pipe, and one read-only
+        // shutdown pipe. Neither of the service-owned opposite endpoints can
+        // reach the interactive user process.
+        if stop_requested() {
+            return Ok(None);
+        }
         let created = unsafe {
             CreateProcessAsUserW(
                 primary_token.handle,
@@ -478,6 +520,7 @@ impl Worker {
         // handle. The retained process handle has the worker's full lifetime.
         unsafe { CloseHandle(process.thread) };
         readiness.close_write();
+        shutdown.close_read();
         let mut created = FileTime { low: 0, high: 0 };
         let mut exited = FileTime { low: 0, high: 0 };
         let mut kernel = FileTime { low: 0, high: 0 };
@@ -499,27 +542,73 @@ impl Worker {
             creation_time: (u64::from(created.high) << 32) | u64::from(created.low),
             session_id,
             readiness,
+            shutdown,
+            shutdown_deadline: None,
         };
         if !times_ok || worker.creation_time == 0 {
-            drop(worker);
-            return Err("interactive worker creation identity is unavailable".into());
+            return Err(StartupFailure::after_cleanup(
+                "interactive worker creation identity is unavailable".into(),
+                worker.shutdown(),
+            ));
         }
         if let Some(policy) = companion_policy
             && let Err(error) = policy.authorize(worker.process_id, worker.creation_time)
         {
-            drop(worker);
-            return Err(error);
+            return Err(StartupFailure::after_cleanup(error, worker.shutdown()));
         }
-        if let Err(error) = worker.readiness.wait_for_ready(worker.process) {
-            drop(worker);
-            return Err(error);
+        match worker
+            .readiness
+            .wait_for_ready(worker.process, stop_requested)
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                worker.shutdown().map_err(StartupFailure::CleanupFailed)?;
+                return Ok(None);
+            }
+            Err(error) => {
+                return Err(StartupFailure::after_cleanup(error, worker.shutdown()));
+            }
         }
         if let Some(install) = extension_install
             && let Err(error) = install.finalize()
         {
             eprintln!("Playnite extension installation could not finalize: {error}");
         }
-        Ok(worker)
+        Ok(Some(worker))
+    }
+
+    fn shutdown(&mut self) -> PackageResult<()> {
+        let deadline = *self
+            .shutdown_deadline
+            .get_or_insert_with(|| std::time::Instant::now() + WORKER_SHUTDOWN_TIMEOUT);
+        self.shutdown.request_stop()?;
+        loop {
+            // SAFETY: Worker owns the retained process handle until Drop.
+            match unsafe { WaitForSingleObject(self.process, 20) } {
+                WAIT_OBJECT_0 => {
+                    let mut exit_code = u32::MAX;
+                    // SAFETY: this process handle and output slot remain live
+                    // throughout the synchronous status query.
+                    if unsafe { GetExitCodeProcess(self.process, &mut exit_code) } == 0 {
+                        return Err("interactive worker shutdown exit status is unavailable".into());
+                    }
+                    return if exit_code == 0 {
+                        Ok(())
+                    } else {
+                        Err(format!(
+                            "interactive worker shutdown failed with exit code {exit_code}"
+                        ))
+                    };
+                }
+                WAIT_TIMEOUT if std::time::Instant::now() < deadline => {
+                    // A faulty module must not block its own teardown by filling
+                    // stdout. Drain bounded chunks without accepting new actions.
+                    self.readiness.discard_available()?;
+                }
+                WAIT_TIMEOUT => return Err("interactive worker shutdown deadline elapsed".into()),
+                _ => return Err("interactive worker shutdown status is unavailable".into()),
+            }
+        }
     }
 
     fn has_exited(&self) -> PackageResult<bool> {
@@ -567,10 +656,83 @@ impl Worker {
     }
 }
 
+/// The service alone owns the writer. Closing it requests cooperative stop;
+/// the user worker receives only an inherited read endpoint as stdin.
+struct ShutdownPipe {
+    read: *mut c_void,
+    write: *mut c_void,
+}
+
+impl ShutdownPipe {
+    fn open() -> PackageResult<Self> {
+        let mut attributes = SecurityAttributes {
+            length: std::mem::size_of::<SecurityAttributes>() as u32,
+            security_descriptor: std::ptr::null_mut(),
+            inherit_handle: 1,
+        };
+        let mut pipe = Self {
+            read: std::ptr::null_mut(),
+            write: std::ptr::null_mut(),
+        };
+        // SAFETY: the wrapper owns any returned endpoints; output slots and
+        // the security attributes remain writable throughout the call.
+        if unsafe { CreatePipe(&mut pipe.read, &mut pipe.write, &mut attributes, 0) } == 0
+            || pipe.read.is_null()
+            || pipe.write.is_null()
+        {
+            return Err("interactive worker shutdown pipe could not be created".into());
+        }
+        // SAFETY: only the service writer is made noninheritable; the explicit
+        // startup handle list allows only the worker's read endpoint through.
+        if unsafe { SetHandleInformation(pipe.write, HANDLE_FLAG_INHERIT, 0) } == 0 {
+            return Err("interactive worker shutdown pipe could not be secured".into());
+        }
+        Ok(pipe)
+    }
+
+    fn read_handle(&self) -> *mut c_void {
+        self.read
+    }
+
+    fn close_read(&mut self) {
+        if !self.read.is_null() {
+            // SAFETY: this closes the parent's duplicate after process launch;
+            // the child owns its independently inherited read endpoint.
+            unsafe { CloseHandle(self.read) };
+            self.read = std::ptr::null_mut();
+        }
+    }
+
+    fn request_stop(&mut self) -> PackageResult<()> {
+        if !self.write.is_null() {
+            // SAFETY: this wrapper owns the sole writer. The child cannot keep
+            // a duplicate alive because that endpoint was never inherited.
+            if unsafe { CloseHandle(self.write) } == 0 {
+                return Err("interactive worker shutdown request could not be delivered".into());
+            }
+            self.write = std::ptr::null_mut();
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ShutdownPipe {
+    fn drop(&mut self) {
+        for handle in [&mut self.read, &mut self.write] {
+            if !(*handle).is_null() {
+                // SAFETY: the wrapper owns these remaining parent endpoints.
+                unsafe { CloseHandle(*handle) };
+                *handle = std::ptr::null_mut();
+            }
+        }
+    }
+}
+
 /// One inherited write handle carries a bounded, one-way startup proof from
 /// the unprivileged worker to its Session 0 parent. The parent end is marked
 /// non-inheritable before CreateProcessAsUserW, so the user process cannot
-/// receive or retain any service-owned handles besides its own stdout pipe.
+/// receive either service-owned control endpoint. Its separate stdin pipe
+/// accepts only EOF and cannot carry console commands or privileged handles.
 struct ReadinessPipe {
     read: *mut c_void,
     write: *mut c_void,
@@ -628,15 +790,22 @@ impl ReadinessPipe {
         }
     }
 
-    fn wait_for_ready(&mut self, process: *mut c_void) -> PackageResult<()> {
+    fn wait_for_ready(
+        &mut self,
+        process: *mut c_void,
+        stop_requested: &mut impl FnMut() -> bool,
+    ) -> PackageResult<bool> {
         let deadline = std::time::Instant::now() + STARTUP_READY_TIMEOUT;
         while std::time::Instant::now() < deadline {
+            if stop_requested() {
+                return Ok(false);
+            }
             if unsafe { WaitForSingleObject(process, 0) } == WAIT_OBJECT_0 {
                 return Err("interactive worker exited before readiness".into());
             }
             self.read_available()?;
             if self.ready {
-                return Ok(());
+                return Ok(true);
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
@@ -646,6 +815,49 @@ impl ReadinessPipe {
     fn take_host_action(&mut self) -> PackageResult<Option<HostLifecycleAction>> {
         self.read_available()?;
         Ok(self.action.take())
+    }
+
+    fn discard_available(&mut self) -> PackageResult<()> {
+        let mut available = 0;
+        // SAFETY: the retained read endpoint belongs to this wrapper. This
+        // queries its buffered-byte count without exposing caller memory.
+        if unsafe {
+            PeekNamedPipe(
+                self.read,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                &mut available,
+                std::ptr::null_mut(),
+            )
+        } == 0
+        {
+            // Closing stdout is normal during process exit. The process wait
+            // and exit code remain the authoritative shutdown acknowledgment.
+            return Ok(());
+        }
+        let count = available.min(MAX_WORKER_PROTOCOL_BUFFER as u32);
+        if count == 0 {
+            return Ok(());
+        }
+        let mut buffer = [0_u8; MAX_WORKER_PROTOCOL_BUFFER];
+        let mut read = 0;
+        // SAFETY: count is bounded by buffer, and PeekNamedPipe established
+        // these bytes are available to this sole reader without blocking.
+        if unsafe {
+            ReadFile(
+                self.read,
+                buffer.as_mut_ptr().cast(),
+                count,
+                &mut read,
+                std::ptr::null_mut(),
+            )
+        } == 0
+        {
+            return Err("interactive worker shutdown output could not be drained".into());
+        }
+        self.buffer.clear();
+        Ok(())
     }
 
     fn read_available(&mut self) -> PackageResult<()> {
@@ -792,11 +1004,20 @@ impl Drop for Worker {
         if !self.process.is_null() {
             // SAFETY: the supervisor owns this worker handle. Terminate only
             // when it is still running; an action worker has already exited
-            // cleanly and needs only its retained handle closed.
+            // cleanly and needs only its retained handle closed. An explicit
+            // stop already consumed its worker budget, so containment receives
+            // only the remaining service allowance, never a renewed deadline.
+            let containment_wait = crate::worker_shutdown::remaining_containment(
+                self.shutdown_deadline,
+                std::time::Instant::now(),
+                CONTAINMENT_TIMEOUT,
+            )
+            .as_millis()
+            .min(u128::from(u32::MAX)) as u32;
             unsafe {
                 if WaitForSingleObject(self.process, 0) == WAIT_TIMEOUT {
-                    let _ = TerminateProcess(self.process, 0);
-                    let _ = WaitForSingleObject(self.process, 5_000);
+                    let _ = TerminateProcess(self.process, ERROR_PROCESS_ABORTED);
+                    let _ = WaitForSingleObject(self.process, containment_wait);
                 }
                 let _ = CloseHandle(self.process);
             }

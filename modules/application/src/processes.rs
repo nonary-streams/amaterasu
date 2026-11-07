@@ -1,3 +1,5 @@
+mod shutdown;
+
 use crate::command_paths::resolve_command_executable;
 use crate::commands::{DetachedCommandRequest, prepare_detached_requests};
 use crate::containment::{ContainedChild, DetachedChild};
@@ -150,6 +152,8 @@ struct ProcessRecord {
     #[serde(skip)]
     stop_deadline: Option<Instant>,
     #[serde(skip)]
+    shutdown_deadline: Option<Instant>,
+    #[serde(skip)]
     completion: Option<Completion>,
     #[serde(skip)]
     application_started_at: Option<Instant>,
@@ -203,6 +207,7 @@ impl ProcessRecord {
             detached_requests,
             child: None,
             stop_deadline: None,
+            shutdown_deadline: None,
             completion: None,
             application_started_at: None,
             auto_detached: false,
@@ -384,7 +389,13 @@ impl ProcessRecord {
         } else {
             Duration::ZERO
         };
-        self.stop_deadline = Some(now + grace);
+        let requested_deadline = now + grace;
+        self.stop_deadline = Some(
+            self.shutdown_deadline
+                .map_or(requested_deadline, |deadline| {
+                    requested_deadline.min(deadline.checked_sub(REAP_TIMEOUT).unwrap_or(deadline))
+                }),
+        );
         self.completion = Some(completion);
         self.state = ProcessState::Stopping;
         Ok(())
@@ -551,7 +562,10 @@ impl ProcessRecord {
     }
 
     fn advance(&mut self) -> Result<(), &'static str> {
-        let now = Instant::now();
+        self.advance_at(Instant::now())
+    }
+
+    fn advance_at(&mut self, now: Instant) -> Result<(), &'static str> {
         self.reap_detached_commands();
         match self.state {
             ProcessState::Preparing => self.advance_preparation(now),
@@ -677,10 +691,16 @@ impl ProcessRecord {
     fn begin_steam_stop(&mut self, now: Instant) {
         self.completion.get_or_insert(Completion::Cancelled);
         let grace = Duration::from_secs(self.spec.exit_timeout_seconds);
+        let shutdown_deadline = self.shutdown_deadline;
         let progress = self
             .steam_tracker
             .as_mut()
             .map_or(SteamStopProgress::Complete, |tracker| {
+                // Preparation may create this tracker after the host announced
+                // its deadline. Every stop/retry inherits that retained bound.
+                if let Some(deadline) = shutdown_deadline {
+                    tracker.prepare_shutdown(deadline);
+                }
                 tracker.request_stop(now, grace)
             });
         self.apply_steam_stop_progress(progress);
@@ -714,9 +734,36 @@ impl ProcessRecord {
         self.spec.steam_id.is_some() || self.spec.steam_install_dir.is_some()
     }
 
-    fn abort_active_lifecycle_command(&mut self) {
+    fn prepare_shutdown_until(&mut self, deadline: Instant) {
+        let deadline = self
+            .shutdown_deadline
+            .map_or(deadline, |current| current.min(deadline));
+        self.shutdown_deadline = Some(deadline);
+        if let Some(stop_deadline) = &mut self.stop_deadline {
+            *stop_deadline =
+                (*stop_deadline).min(deadline.checked_sub(REAP_TIMEOUT).unwrap_or(deadline));
+        }
+        if let Some(tracker) = &mut self.steam_tracker {
+            tracker.prepare_shutdown(deadline);
+        }
         if let Some(lifecycle) = &mut self.lifecycle {
-            lifecycle.abort_active_command();
+            lifecycle.prepare_shutdown(deadline);
+        }
+    }
+
+    fn force_shutdown(&mut self) {
+        if let Some(child) = &mut self.child
+            && child.force_stop().is_ok()
+        {
+            let _ = child.try_reap();
+        }
+        if !self.is_terminal()
+            && let Some(tracker) = &mut self.steam_tracker
+        {
+            tracker.force_shutdown();
+        }
+        if let Some(lifecycle) = &mut self.lifecycle {
+            lifecycle.force_shutdown();
         }
     }
 
@@ -841,12 +888,12 @@ impl PreparationLease {
             && (self.lifecycle.is_cleanup_complete() || self.lifecycle.cleanup_failed())
     }
 
-    fn prepare_shutdown(&mut self) {
+    fn prepare_shutdown(&mut self, now: Instant) {
         if !self.stopping {
-            self.begin_stop();
-        } else {
-            self.advance();
+            self.stopping = true;
+            self.lifecycle.begin_cleanup();
         }
+        self.lifecycle.tick(now);
     }
 }
 
@@ -857,6 +904,9 @@ pub struct ProcessManager {
     preparations: BTreeMap<(String, String), PreparationLease>,
     proton_hooks: ProtonHookManager,
     next_id: u64,
+    shutdown_deadline: Option<Instant>,
+    shutdown_started: bool,
+    shutdown_error: Option<&'static str>,
 }
 
 impl ProcessManager {
@@ -1058,8 +1108,13 @@ impl ProcessManager {
             if record.spec != spec || record.detached_requests != detached_requests {
                 return Err("operation_conflict");
             }
-            record.advance()?;
+            if self.shutdown_deadline.is_none() {
+                record.advance()?;
+            }
             return Ok(json!({"ok":true,"process":record}));
+        }
+        if self.shutdown_deadline.is_some() {
+            return Err("host_stopping");
         }
         if self.records.len() >= 128
             || self
@@ -1093,8 +1148,13 @@ impl ProcessManager {
             if lease.spec != spec {
                 return Err("operation_conflict");
             }
-            lease.advance();
+            if self.shutdown_deadline.is_none() {
+                lease.advance();
+            }
             return Ok(lease.response());
+        }
+        if self.shutdown_deadline.is_some() {
+            return Err("host_stopping");
         }
         check_output_support(spec.output.as_deref(), false)?;
         if self
@@ -1217,94 +1277,6 @@ impl ProcessManager {
         failure.map_or(Ok(()), Err)
     }
 
-    /// Stop every owned child against one shared deadline. Active preparation is
-    /// cancelled, owed undo is allowed to finish, and cleanup failures stay retryable.
-    pub fn shutdown(&mut self) -> Result<(), &'static str> {
-        let deadline = Instant::now() + self.shutdown_budget();
-        let mut failure = None;
-        loop {
-            let mut release_hooks = Vec::new();
-            for record in self.records.values_mut() {
-                if let Err(error) = record.prepare_shutdown() {
-                    failure = Some(error);
-                }
-                if let Err(error) = record.advance() {
-                    failure = Some(error);
-                }
-                if record.is_terminal()
-                    && let Some(app_id) = record.steam_proton_hook_app_id.take()
-                {
-                    release_hooks.push(app_id);
-                }
-            }
-            for app_id in release_hooks {
-                self.proton_hooks.release(&app_id);
-            }
-            for lease in self.preparations.values_mut() {
-                lease.prepare_shutdown();
-            }
-            if self
-                .records
-                .values()
-                .all(ProcessRecord::settled_for_shutdown)
-                && self
-                    .preparations
-                    .values()
-                    .all(PreparationLease::settled_for_shutdown)
-            {
-                let cleanup_failed = self
-                    .records
-                    .values()
-                    .any(|record| matches!(record.state, ProcessState::CleanupFailed { .. }))
-                    || self
-                        .preparations
-                        .values()
-                        .any(|lease| lease.lifecycle.cleanup_failed());
-                return if cleanup_failed {
-                    Err(failure.unwrap_or("process_cleanup_failed"))
-                } else {
-                    Ok(())
-                };
-            }
-            if Instant::now() >= deadline {
-                return Err(failure.unwrap_or("process_wait_timeout"));
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-    }
-
-    /// Cancel lifecycle commands only after graceful shutdown has exhausted its
-    /// shared deadline, then make a final bounded attempt to settle every owned
-    /// child before the manager itself is dropped.
-    fn force_settle_owned_children(&mut self) {
-        let deadline = Instant::now() + self.shutdown_budget();
-        loop {
-            for record in self.records.values_mut() {
-                let _ = record.prepare_shutdown();
-                record.abort_active_lifecycle_command();
-                let _ = record.advance();
-            }
-            for lease in self.preparations.values_mut() {
-                lease.prepare_shutdown();
-                lease.lifecycle.abort_active_command();
-                lease.advance();
-            }
-            if self
-                .records
-                .values()
-                .all(ProcessRecord::settled_for_shutdown)
-                && self
-                    .preparations
-                    .values()
-                    .all(PreparationLease::settled_for_shutdown)
-                || Instant::now() >= deadline
-            {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-    }
-
     fn shutdown_budget(&self) -> Duration {
         let process_budget = self
             .records
@@ -1340,14 +1312,6 @@ impl ProcessManager {
             .max()
             .unwrap_or(REAP_TIMEOUT);
         process_budget.max(preparation_budget)
-    }
-}
-
-impl Drop for ProcessManager {
-    fn drop(&mut self) {
-        if self.shutdown().is_err() {
-            self.force_settle_owned_children();
-        }
     }
 }
 

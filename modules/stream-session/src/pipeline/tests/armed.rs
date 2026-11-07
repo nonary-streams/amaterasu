@@ -896,7 +896,7 @@ fn autonomous_capture_failure_uses_existing_confirmed_cleanup() {
     );
 }
 
-fn prepared_lifecycle_for_cleanup(external: bool) -> (Harness, u64, Value) {
+pub(super) fn prepared_lifecycle_for_cleanup(external: bool) -> (Harness, u64, Value) {
     let mut host = Harness::new();
     host.pipeline
         .settings

@@ -15,8 +15,9 @@ pub fn render_service_unit(
     let executable = systemd_quote(executable)?;
     let root = systemd_quote(root)?;
     Ok(format!(
-        "[Unit]\nDescription=Amaterasu LinuxSession ({})\n# HostExecutableSha256={host_executable_digest}\nAfter=graphical-session.target\nPartOf=graphical-session.target\nStartLimitIntervalSec=0\n\n[Service]\nType=simple\nExecStart={executable} service-user {root} {digest}\nRestart=on-failure\nRestartSec=5s\nKillSignal=SIGTERM\nKillMode=mixed\nTimeoutStopSec=20s\n\n[Install]\nWantedBy=graphical-session.target\n",
+        "[Unit]\nDescription=Amaterasu LinuxSession ({})\n# HostExecutableSha256={host_executable_digest}\nAfter=graphical-session.target\nPartOf=graphical-session.target\nStartLimitIntervalSec=0\n\n[Service]\nType=simple\nExecStart={executable} service-user {root} {digest}\nRestart=on-failure\nRestartSec=5s\nKillSignal=SIGTERM\nKillMode=mixed\nTimeoutStopSec={stop_seconds}s\n\n[Install]\nWantedBy=graphical-session.target\n",
         &digest[..12],
+        stop_seconds = amaterasu_contracts::HOST_SERVICE_STOP_TIMEOUT_MS / 1_000,
     ))
 }
 
@@ -42,4 +43,40 @@ pub fn systemd_quote(path: &Path) -> PackageResult<String> {
 
 pub fn valid_digest(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+#[cfg(test)]
+mod shutdown_budget_tests {
+    use super::*;
+    use amaterasu_contracts::{
+        HOST_MODULE_SHUTDOWN_TIMEOUT_MS, HOST_SERVICE_STOP_TIMEOUT_MS,
+        HOST_WORKER_SHUTDOWN_TIMEOUT_MS,
+    };
+
+    #[test]
+    fn service_deadline_outlasts_worker_and_module_drain() {
+        let unit = render_service_unit(
+            Path::new("/test/amaterasu"),
+            Path::new("/test/root"),
+            &"a".repeat(64),
+            &"b".repeat(64),
+        )
+        .unwrap();
+        let timeout = unit
+            .lines()
+            .find_map(|line| line.strip_prefix("TimeoutStopSec="))
+            .unwrap()
+            .strip_suffix('s')
+            .unwrap()
+            .parse::<u64>()
+            .unwrap()
+            * 1_000;
+        let budgets = [
+            HOST_MODULE_SHUTDOWN_TIMEOUT_MS,
+            HOST_WORKER_SHUTDOWN_TIMEOUT_MS,
+            timeout,
+        ];
+        assert!(budgets.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(timeout, HOST_SERVICE_STOP_TIMEOUT_MS);
+    }
 }

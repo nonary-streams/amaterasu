@@ -64,6 +64,16 @@ impl Controller {
             self.records.insert(ticket, record);
             return;
         }
+        if record.state == State::Ready
+            && self.shutdown_deadline.is_some()
+            && request.method == amaterasu_gamestream::rtsp::Method::Play
+        {
+            // Existing prepared ownership remains available until DAG-ordered
+            // quiescence. The shutdown announcement admits no new native start.
+            self.reply_status(connection, request.cseq, 503);
+            self.records.insert(ticket, record);
+            return;
+        }
         if record.state == State::Ready && now >= record.expires {
             self.reply_status(connection, request.cseq, 454);
             record.close(Some("prepare_expired"));
@@ -140,7 +150,7 @@ impl Controller {
                     call,
                     caller: None,
                     network: Some((connection, action_ticket)),
-                    deadline: now.saturating_add(CLEANUP_BUDGET_MS),
+                    deadline: self.cleanup_deadline(now),
                 });
             }
             Err(error) => {

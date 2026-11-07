@@ -53,12 +53,24 @@ typedef struct {
 } AmaterasuModuleApi;
 
 /* Optional amaterasu_module_quiesce_v1() export, using the ModuleApi instance.
- * poll is bounded/nonblocking and writes ready=0 or 1. All modules continue to
- * receive ticks until every participant is ready, before reverse-order destroy. */
+ * poll is bounded/nonblocking and writes ready=0 or 1. Declared consumers drain
+ * before their providers begin quiescing. All modules continue to receive ticks
+ * until every participant is ready, before reverse-order destroy. */
 typedef struct {
     AmaterasuAbiHeader header;
     AmaterasuStatus (*poll)(void *instance, uint8_t *ready);
 } AmaterasuModuleQuiesceApi;
+
+/* Optional amaterasu_module_shutdown_v1() export, using the ModuleApi instance.
+ * The host announces once to every module before any quiescence poll. prepare
+ * is bounded/nonblocking and receives the remaining shared budget in milliseconds;
+ * retain an absolute deadline rather than renewing a per-module timeout. Close
+ * admission only: keep serving owned work and defer provider cleanup until poll.
+ * Announcement alone never establishes readiness for destruction. */
+typedef struct {
+    AmaterasuAbiHeader header;
+    AmaterasuStatus (*prepare)(void *instance, uint64_t remaining_ms);
+} AmaterasuModuleShutdownApi;
 
 typedef struct {
     AmaterasuAbiHeader header;
@@ -104,6 +116,8 @@ typedef struct {
 } AmaterasuNativeServiceFactory;
 
 const AmaterasuModuleApi *amaterasu_module_v1(void);
+const AmaterasuModuleQuiesceApi *amaterasu_module_quiesce_v1(void);
+const AmaterasuModuleShutdownApi *amaterasu_module_shutdown_v1(void);
 const AmaterasuRuntimeApi *amaterasu_runtime_v1(void);
 const AmaterasuRuntimeWaitApi *amaterasu_runtime_wait_v1(void);
 

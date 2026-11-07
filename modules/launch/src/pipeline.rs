@@ -85,6 +85,8 @@ pub struct Pipeline {
     provider_routes: BTreeMap<String, ProviderRoute>,
     library_routes: BTreeMap<String, crate::library::Route>,
     prepared_context_service: Option<String>,
+    quiescing: bool,
+    shutdown_deadline: Option<Instant>,
 }
 impl Pipeline {
     pub fn new(environment: BTreeMap<String, String>) -> Result<Self, &'static str> {
@@ -100,6 +102,8 @@ impl Pipeline {
             provider_routes: BTreeMap::new(),
             library_routes: BTreeMap::new(),
             prepared_context_service: None,
+            quiescing: false,
+            shutdown_deadline: None,
         })
     }
     pub fn set_retirement_observers(&mut self, observers: BTreeSet<String>) {
@@ -166,8 +170,86 @@ impl Pipeline {
         serde_json::json!({"ok":true,"retired":true,"owner":owner,
             "launch_id":record.launch_id,"operation_id":operation_id})
     }
+    pub fn prepare_shutdown(&mut self, remaining_ms: u64) {
+        let now = Instant::now();
+        let deadline = now
+            .checked_add(Duration::from_millis(remaining_ms))
+            .unwrap_or(now);
+        self.shutdown_deadline = Some(
+            self.shutdown_deadline
+                .map_or(deadline, |current| current.min(deadline)),
+        );
+    }
+
+    pub fn quiesce(&mut self) -> bool {
+        self.quiescing = true;
+        self.schedule_shutdown_cleanup();
+        self.job.is_none()
+            && self.records.values.values().all(|record| {
+                record.state.terminal()
+                    && record.cleanup_error.is_none()
+                    && record.outstanding_request.is_none()
+            })
+    }
+
+    fn schedule_shutdown_cleanup(&mut self) {
+        if !self.quiescing {
+            return;
+        }
+        let mut job = match self.job.take() {
+            Some(mut job) if job.cleanup => {
+                // Polling shutdown cannot restart an undo or extend its deadline.
+                self.bound_cleanup_deadline(&mut job);
+                self.job = Some(job);
+                return;
+            }
+            Some(job) => job,
+            None => {
+                let Some(record) = self.records.values.values().find(|record| {
+                    !record.state.terminal() && record.state != State::CleanupFailed
+                }) else {
+                    return;
+                };
+                Workflow::monitor(record.launch_id, false)
+            }
+        };
+        let record = self
+            .records
+            .values
+            .get_mut(&job.launch_id)
+            .expect("shutdown workflow record");
+        record.display_admission = None;
+        if let Some(pending) = job.pending.take() {
+            // A submitted mutation may have committed even without its reply.
+            // Settle exactly that broker entry before cleanup performs lookup.
+            record.outstanding_request = Some(pending);
+        }
+        let starting = record.state == State::Starting;
+        job.begin_cleanup(
+            record,
+            if starting {
+                Outcome::Cancelled
+            } else {
+                Outcome::Completed
+            },
+            starting.then_some("shutdown_requested"),
+        );
+        self.bound_cleanup_deadline(&mut job);
+        self.job = Some(job);
+    }
+
+    fn bound_cleanup_deadline(&self, job: &mut Workflow) {
+        if job.cleanup
+            && let Some(deadline) = self.shutdown_deadline
+        {
+            job.deadline = job.deadline.min(deadline);
+        }
+    }
+
     pub fn tick(&mut self, mut send: impl FnMut(Command) -> Transport) -> ModuleResult<()> {
+        self.schedule_shutdown_cleanup();
         if let Some(mut job) = self.job.take() {
+            self.bound_cleanup_deadline(&mut job);
             if !job.cleanup && job.request.is_none() {
                 let has_readback = match self.poll_detached_readback(&mut job, &mut send) {
                     Ok(has_readback) => has_readback,
@@ -196,6 +278,19 @@ impl Pipeline {
                 return Err(error);
             }
             if let Some(request) = job.pending.take() {
+                if job.cleanup && Instant::now() >= job.deadline {
+                    self.records
+                        .values
+                        .get_mut(&job.launch_id)
+                        .expect("workflow record")
+                        .outstanding_request = Some(request);
+                    if self.settle_outstanding(job.launch_id, &mut send) {
+                        self.dependency_failed(&mut job, "deadline_exceeded", &mut send)?;
+                    } else {
+                        self.cleanup_failed(&job, "request_cancellation_unconfirmed", &mut send)?;
+                    }
+                    return Ok(());
+                }
                 match send(Command::TakeResult { request }) {
                     Ok(Response::Pending) => {
                         job.pending = Some(request);
@@ -456,6 +551,7 @@ impl Pipeline {
                 }
                 job.begin_cleanup(record, outcome, None);
                 job.request = Some(id);
+                self.bound_cleanup_deadline(job);
             }
             Ok(
                 operation @ (Operation::PrepareDisplayAdmission { .. }
@@ -940,6 +1036,7 @@ impl Pipeline {
                     outcome,
                     None,
                 );
+                self.bound_cleanup_deadline(&mut job);
                 self.job = Some(job);
                 Ok(())
             }
@@ -1020,6 +1117,7 @@ impl Pipeline {
         job: &mut Workflow,
         send: &mut impl FnMut(Command) -> Transport,
     ) -> ModuleResult<()> {
+        self.bound_cleanup_deadline(job);
         if !self.settle_outstanding(job.launch_id, send) {
             return self.cleanup_failed(job, "request_cancellation_unconfirmed", send);
         }
@@ -1991,6 +2089,7 @@ impl Pipeline {
         }
     }
     fn retain(&mut self, job: &mut Workflow) -> ModuleResult<()> {
+        self.bound_cleanup_deadline(job);
         self.job = Some(job.clone());
         Ok(())
     }

@@ -99,6 +99,13 @@ confirmed. Unknown outcomes and managed-capture markers remain fenced.
 
 The optional SDK `amaterasu_module_quiesce_v1` contract keeps all providers ticking
 while consumers drain their owned work. NVHTTP stops admitting client work and
-runs stream, application, and lifecycle cleanup before reporting ready. The host
-bounds this drain to twenty seconds before reverse-order destruction; its worker
-supervisor allows twenty-five seconds. Timeout paths retain recovery evidence.
+runs stream, application, and lifecycle cleanup before reporting ready. RTSP and
+stream-session also quiesce their independently owned SDK streams. Stream-session
+rejects new preparation/start work while retaining status and stop operations,
+uses the normal drain/retirement workflow, and keeps pending ownership writes
+intact before cancelling dependent startup work. Its streams share one fixed
+fifteen-second budget; failed cleanup remains fenced instead of being replayed
+implicitly. Readiness requires native resources, lifecycle journals and owned
+activity reservations to retire. The host bounds its drain to twenty seconds
+before reverse-order destruction; its worker supervisor allows twenty-five
+seconds. Timeout paths retain recovery evidence.

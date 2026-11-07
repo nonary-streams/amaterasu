@@ -4532,3 +4532,5 @@ fn generic_provider_invalid_stop_fence_retains_lease_and_allows_owner_retry() {
     assert_eq!(stopped["launch"]["state"], "stopped", "{stopped}");
     assert!(harness.sessions[0].lease.is_none());
 }
+
+mod shutdown;

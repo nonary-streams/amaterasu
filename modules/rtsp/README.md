@@ -234,3 +234,29 @@ and source class. A nondefault borrowed route requires the context's explicit
 source mode to match its frozen retained geometry and range. Missing context
 preserves the legacy default route; unknown source mode or depth does not imply
 eight-bit capture. Changing the context after admission fails before capture.
+
+RTSP closes new Open and PLAY startup admissions when the host announces shutdown,
+stores the original absolute deadline, and preserves existing transport and native
+ownership until its dependent consumers drain. Cooperative module quiescence then
+revokes pending RTSP connections and drains existing stream ownership
+through the ordinary asynchronous cleanup workflow while providers still tick.
+Every following lookup and stop shares the first cleanup deadline. A failed
+cleanup or unresolved broker call keeps quiescence incomplete; repeated polls do
+not reopen an undo attempt or grant another cleanup budget. Drop does not restart
+cleanup after a host shutdown announcement or cooperative quiescence has begun.
+
+The synchronous fallback shutdown also uses one aggregate cleanup deadline.
+Interrupted lifecycle preparation is recovered by an exact authenticated lookup
+and the same target, capture binding, and shared source validation used for live
+startup before a cleanup-only Stop is sent. A known coordinator result is retained
+before broker result release, so bookkeeping failures cannot discard its target.
+Read-only observation settlement is retained separately from native retirement.
+
+Canceling a broker call before its first submission sends no request. Only that
+local proof, or a first explicit pre-enqueue broker rejection, allows an
+unsubmitted lifecycle preparation to be classified as not admitted. An admission
+conflict, a lost admission response, or a later rejection preserves uncertainty.
+A never-submitted lookup says nothing about its original preparation. In
+particular, an accepted call canceled before provider delivery cannot currently
+be distinguished from a committed call using Cancel/Release acknowledgments;
+plain same-epoch lookup absence remains fail-closed.

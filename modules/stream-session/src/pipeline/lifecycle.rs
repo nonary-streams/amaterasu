@@ -11,6 +11,50 @@ impl Pipeline {
         send: &mut Send<'_>,
         factory: &mut Factory<'_>,
     ) -> bool {
+        let shutdown_deadline = self.shutdown_deadline.or_else(|| {
+            (job.cleanup || record.state == State::Stopping)
+                .then_some(self.shutdown_announced_deadline)
+                .flatten()
+        });
+        if let Some(deadline) = shutdown_deadline {
+            job.deadline = job.deadline.min(deadline);
+            if now >= job.deadline && job.step == Step::PersistJournal {
+                // Ownership persistence may already have committed. Retain its
+                // exact broker identity for reconciliation; shutdown expiry must
+                // not cancel the write or continue into unjournaled effects.
+                record.journal_uncertain = job.pending.take();
+                self.journal.failed = true;
+                self.recovery_blocked = true;
+                record.cleanup_error = Some("lifecycle_journal_write_unconfirmed");
+                record.state = State::CleanupFailed;
+                self.reply(record, job, send);
+                // Keep this separately from any uncertain dependent operation,
+                // while releasing the workflow so status/stop remain available.
+                return false;
+            }
+        }
+        if let Some(deadline) = self.shutdown_deadline
+            && now >= job.deadline
+            && !job.cleanup
+            && record.state == State::Active
+            && job.step == Step::ObserveActiveBinding
+        {
+            // This is only the Video provider's caller-owned status read. It
+            // cannot allocate, extend a lease or mutate lifecycle state. Keep
+            // its exact settlement separate so healthy native teardown proceeds.
+            if let Some(mut pending) = job.pending.take() {
+                pending.cancel();
+                record.shutdown_observations.push(pending);
+            }
+            *job = super::actions::stop_job(
+                record,
+                job.request,
+                now,
+                self.settings.drain_timeout_ms,
+                false,
+            );
+            job.deadline = job.deadline.min(deadline);
+        }
         if !job.cleanup && record.state == State::Stopping && record.outcome == State::Failed {
             job.fail(record, record.error.unwrap_or("media_failed"), now);
         }

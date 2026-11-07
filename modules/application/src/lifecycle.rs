@@ -510,6 +510,7 @@ struct CommandTask {
     force_requested: bool,
     observed_exit: bool,
     outcome: Option<CommandFailure>,
+    shutdown_deadline: Option<Instant>,
 }
 
 struct TaskSpawnError {
@@ -585,6 +586,7 @@ impl CommandTask {
                 force_requested: false,
                 observed_exit: false,
                 outcome: None,
+                shutdown_deadline: None,
             }),
             Err(failure) => Err(TaskSpawnError {
                 task: failure.child.map(|child| {
@@ -595,10 +597,35 @@ impl CommandTask {
                         force_requested: false,
                         observed_exit: true,
                         outcome: Some(CommandFailure::spawn(&failure.error)),
+                        shutdown_deadline: None,
                     })
                 }),
                 error: failure.error,
             }),
+        }
+    }
+
+    fn prepare_shutdown(&mut self, deadline: Instant) {
+        let deadline = self
+            .shutdown_deadline
+            .map_or(deadline, |current| current.min(deadline));
+        self.shutdown_deadline = Some(deadline);
+        let execution_deadline = deadline
+            .checked_sub(COMMAND_STOP_GRACE + COMMAND_REAP_TIMEOUT)
+            .unwrap_or(deadline);
+        self.execution_deadline = Some(
+            self.execution_deadline
+                .map_or(execution_deadline, |current| {
+                    current.min(execution_deadline)
+                }),
+        );
+    }
+
+    fn force_shutdown(&mut self) {
+        self.cancel();
+        if self.child.force_stop().is_ok() {
+            self.force_requested = true;
+            let _ = self.child.try_reap();
         }
     }
 
@@ -611,6 +638,24 @@ impl CommandTask {
     /// Perform at most one observation or signal for this tick. The owned child
     /// remains in this task until both the root and its contained tree settle.
     fn poll(&mut self, now: Instant) -> CommandPoll {
+        if !self.force_requested
+            && self.shutdown_deadline.is_some_and(|deadline| {
+                now >= deadline
+                    .checked_sub(COMMAND_REAP_TIMEOUT)
+                    .unwrap_or(deadline)
+            })
+        {
+            self.outcome
+                .get_or_insert_with(|| CommandFailure::new(CommandFailureKind::TimedOut));
+            match self.child.force_stop() {
+                Ok(()) => {
+                    self.force_requested = true;
+                    self.stop_requested_at.get_or_insert(now);
+                    return CommandPoll::Running;
+                }
+                Err(error) => return CommandPoll::Blocked(CommandFailure::containment(&error)),
+            }
+        }
         if !self.observed_exit && self.outcome.is_none() {
             match self.child.exited() {
                 Ok(true) => self.observed_exit = true,
@@ -664,8 +709,11 @@ impl CommandTask {
                 CommandPoll::Finished(result)
             }
             Ok(None)
-                if now.saturating_duration_since(stop_requested_at)
-                    >= COMMAND_STOP_GRACE + COMMAND_REAP_TIMEOUT =>
+                if self
+                    .shutdown_deadline
+                    .is_some_and(|deadline| now >= deadline)
+                    || now.saturating_duration_since(stop_requested_at)
+                        >= COMMAND_STOP_GRACE + COMMAND_REAP_TIMEOUT =>
             {
                 CommandPoll::Blocked(CommandFailure::new(CommandFailureKind::ContainmentFailed))
             }
@@ -786,6 +834,8 @@ pub(crate) struct ApplicationLifecycle {
     active: Option<ActiveCommand>,
     #[serde(skip)]
     phase: Phase,
+    #[serde(skip)]
+    shutdown_deadline: Option<Instant>,
 }
 
 impl ApplicationLifecycle {
@@ -838,7 +888,43 @@ impl ApplicationLifecycle {
             attempted_undo: Vec::new(),
             active: None,
             phase: Phase::Preparing,
+            shutdown_deadline: None,
         }
+    }
+
+    pub(crate) fn prepare_shutdown(&mut self, deadline: Instant) {
+        let deadline = self
+            .shutdown_deadline
+            .map_or(deadline, |current| current.min(deadline));
+        self.shutdown_deadline = Some(deadline);
+        if matches!(self.phase, Phase::Cleaning | Phase::CleanupFailed)
+            && let Some(active) = &mut self.active
+        {
+            active.task.prepare_shutdown(deadline);
+        }
+    }
+
+    pub(crate) fn force_shutdown(&mut self) {
+        if let Some(active) = &mut self.active {
+            active.task.force_shutdown();
+        }
+    }
+
+    fn execution_budget_expired(&self, now: Instant) -> bool {
+        self.shutdown_deadline.is_some_and(|deadline| {
+            now >= deadline
+                .checked_sub(COMMAND_STOP_GRACE + COMMAND_REAP_TIMEOUT)
+                .unwrap_or(deadline)
+        })
+    }
+
+    fn retain_command(&mut self, purpose: CommandPurpose, mut task: CommandTask) {
+        if matches!(self.phase, Phase::Cleaning | Phase::CleanupFailed)
+            && let Some(deadline) = self.shutdown_deadline
+        {
+            task.prepare_shutdown(deadline);
+        }
+        self.active = Some(ActiveCommand { purpose, task });
     }
 
     pub(crate) fn is_ready(&self) -> bool {
@@ -927,10 +1013,7 @@ impl ApplicationLifecycle {
                     // later times out or exits unsuccessfully, so its undo is owed.
                     self.pending_undo.push(index);
                     self.cleanup.remaining = self.pending_undo.len();
-                    self.active = Some(ActiveCommand {
-                        purpose: CommandPurpose::Preparation(index),
-                        task,
-                    });
+                    self.retain_command(CommandPurpose::Preparation(index), task);
                 }
                 Err(failure) => {
                     let command_failure = CommandFailure::spawn(&failure.error);
@@ -942,10 +1025,7 @@ impl ApplicationLifecycle {
                     if let Some(task) = failure.task {
                         self.pending_undo.push(index);
                         self.cleanup.remaining = self.pending_undo.len();
-                        self.active = Some(ActiveCommand {
-                            purpose: CommandPurpose::Preparation(index),
-                            task: *task,
-                        });
+                        self.retain_command(CommandPurpose::Preparation(index), *task);
                     }
                     self.begin_cleanup();
                 }
@@ -969,6 +1049,12 @@ impl ApplicationLifecycle {
             self.complete_undo(index);
             return;
         };
+        if self.execution_budget_expired(now) {
+            self.record_undo_failure(index, CommandFailure::new(CommandFailureKind::TimedOut));
+            self.cleanup.state = CleanupState::Failed;
+            self.phase = Phase::CleanupFailed;
+            return;
+        }
         match CommandTask::spawn(
             command,
             &self.environment,
@@ -978,10 +1064,7 @@ impl ApplicationLifecycle {
             now,
         ) {
             Ok(task) => {
-                self.active = Some(ActiveCommand {
-                    purpose: CommandPurpose::Undo(index),
-                    task,
-                });
+                self.retain_command(CommandPurpose::Undo(index), task);
             }
             Err(failure) => {
                 let command_failure = CommandFailure::spawn(&failure.error);
@@ -991,10 +1074,7 @@ impl ApplicationLifecycle {
                 }
                 self.record_undo_failure(index, command_failure);
                 if let Some(task) = failure.task {
-                    self.active = Some(ActiveCommand {
-                        purpose: CommandPurpose::UndoRetry(index),
-                        task: *task,
-                    });
+                    self.retain_command(CommandPurpose::UndoRetry(index), *task);
                     self.cleanup.state = CleanupState::Failed;
                     self.phase = Phase::CleanupFailed;
                 }
@@ -1112,6 +1192,11 @@ impl ApplicationLifecycle {
         self.cleanup.state = CleanupState::Pending;
         self.cleanup.remaining = self.pending_undo.len();
         self.phase = Phase::Cleaning;
+        if let Some(deadline) = self.shutdown_deadline
+            && let Some(active) = &mut self.active
+        {
+            active.task.prepare_shutdown(deadline);
+        }
     }
 
     pub(crate) fn retry_cleanup(&mut self) {
@@ -1123,6 +1208,7 @@ impl ApplicationLifecycle {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn abort_active_command(&mut self) {
         if self.phase == Phase::Preparing {
             self.begin_cleanup();

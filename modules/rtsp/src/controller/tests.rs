@@ -25,6 +25,9 @@ struct Endpoint {
     verifier_reply: Option<Value>,
     deny_launch: bool,
     deny_settlement: bool,
+    deny_settlement_requests: BTreeSet<u64>,
+    lifecycle_results: VecDeque<Option<Value>>,
+    lifecycle_requests: BTreeMap<u64, Option<Value>>,
     recovery_results: VecDeque<Option<Value>>,
     recovery_requests: BTreeMap<u64, Option<Value>>,
     next_recovery_request: u64,
@@ -33,12 +36,23 @@ struct Endpoint {
 impl Endpoint {
     fn dispatch(&mut self, command: &Command) -> Response {
         match command {
+            Command::Poll {} => Response::Pending,
             Command::CheckRequest { .. } if self.active_request => Response::Ok,
             Command::CheckRequest { .. } => Response::error("request_ended", "cancelled"),
             Command::Request { service, .. }
                 if self.deny_launch && service == "amaterasu.launch/1" =>
             {
                 Response::error("permission_denied", "no Launch grant")
+            }
+            Command::Request { service, .. }
+                if service == "amaterasu.session-lifecycle/1"
+                    && !self.lifecycle_results.is_empty() =>
+            {
+                self.next_recovery_request += 1;
+                let id = 900 + self.next_recovery_request;
+                self.lifecycle_requests
+                    .insert(id, self.lifecycle_results.pop_front().expect("nonempty"));
+                Response::Accepted { id }
             }
             Command::Request { service, .. }
                 if service == "amaterasu.stream-session/1" && !self.recovery_results.is_empty() =>
@@ -50,6 +64,16 @@ impl Endpoint {
                 Response::Accepted { id }
             }
             Command::Request { .. } => Response::Accepted { id: 71 },
+            Command::TakeResult { request }
+                if let Some(Some(payload)) = self.lifecycle_requests.get(request) =>
+            {
+                Response::Result {
+                    payload: payload.clone(),
+                }
+            }
+            Command::TakeResult { request } if self.lifecycle_requests.contains_key(request) => {
+                Response::Pending
+            }
             Command::TakeResult { request }
                 if let Some(Some(payload)) = self.recovery_requests.get(request) =>
             {
@@ -67,7 +91,9 @@ impl Endpoint {
                 self.completions.push((*request, payload.clone()));
                 Response::Ok
             }
-            Command::Cancel { .. } | Command::ReleaseResult { .. } if self.deny_settlement => {
+            Command::Cancel { request } | Command::ReleaseResult { request }
+                if self.deny_settlement || self.deny_settlement_requests.contains(request) =>
+            {
                 Response::error("unavailable", "deliberate settlement failure")
             }
             _ => Response::Ok,
@@ -490,6 +516,7 @@ fn startup_reconciliation_clean_status_admits_new_launch_without_stop() {
     let mut controller = Controller::new(settings).unwrap();
     startup_recovery_pending(&mut controller, 45_000);
     let mut endpoint = Endpoint {
+        active_request: true,
         recovery_results: VecDeque::from([Some(listed_stream_sessions(json!([]), 0))]),
         ..Endpoint::default()
     };
@@ -1362,12 +1389,15 @@ fn cancelled_parent_reaches_cleanup_failed_when_settlement_stays_unavailable() {
         deadline: 5_000,
     });
     let mut endpoint = Endpoint {
+        active_request: true,
         deny_settlement: true,
         ..Endpoint::default()
     };
     let runtime = client(&mut endpoint);
 
-    for now in 0..5 {
+    controller.advance_job(&runtime, 0);
+    endpoint.active_request = false;
+    for now in 1..5 {
         controller.advance_job(&runtime, now);
     }
 
@@ -3140,4 +3170,334 @@ fn disconnect_during_lifecycle_lookup_retries_the_exact_preparation_before_clean
             && payload["action"] == "stop" && payload["lifecycle_configuration"]["lifecycle_target"]["stream_id"] == "stream")));
     assert!(!endpoint.commands.iter().any(|command| matches!(command,
         Command::Request { payload, .. } if payload["action"] == "start_when_authenticated")));
+}
+
+#[test]
+fn shutdown_during_lifecycle_prepare_resolves_admission_before_native_cleanup() {
+    for (external, joining) in [(false, false), (true, false), (false, true), (true, true)] {
+        for during_lookup in [false, true] {
+            let (mut record, reply) = lifecycle_cleanup_fixture(external, joining);
+            let mut controller = Controller::new(Settings::default()).unwrap();
+            let start = record.authenticated_start_payload(23).unwrap();
+            controller.schedule_arm(&mut record, start, 8, 9, 0);
+            controller.records.insert(record.id, record);
+            let lifecycle_results = if during_lookup {
+                VecDeque::from([
+                    Some(
+                        json!({"status":"pending","operation_id":"rtsp-0000000000000005-lifecycle-prepare"}),
+                    ),
+                    None,
+                    Some(
+                        json!({"status":"pending","operation_id":"rtsp-0000000000000005-lifecycle-prepare"}),
+                    ),
+                    Some(reply.clone()),
+                ])
+            } else {
+                VecDeque::from([None, Some(reply.clone())])
+            };
+            let mut terminal = json!({"ok":true,"session":23,"state":"stopped","cleanup_error":null,
+                "lifecycle_target":reply["target"],"lifecycle_retired":!joining});
+            if joining {
+                terminal["lifecycle_consumer_retired"] = json!(true);
+                terminal["lifecycle_resources_released"] = json!(false);
+                terminal["lifecycle_shared_retained"] = json!(true);
+                terminal["lifecycle_shared_source"] = reply["shared_source"].clone();
+            }
+            let mut endpoint = Endpoint {
+                lifecycle_results,
+                recovery_results: VecDeque::from([Some(terminal)]),
+                ..Endpoint::default()
+            };
+            let runtime = client(&mut endpoint);
+            for now in 1..=if during_lookup { 3 } else { 1 } {
+                controller.advance_job(&runtime, now);
+            }
+            controller.shutdown(&runtime);
+            assert!(endpoint.commands.iter().any(|command| matches!(command,
+                Command::Request { service, payload, .. } if service == "amaterasu.session-lifecycle/1"
+                    && payload["operation"] == "lookup" && payload["operation_id"] == "rtsp-0000000000000005-lifecycle-prepare")));
+            let stop = endpoint
+                .commands
+                .iter()
+                .find_map(|command| match command {
+                    Command::Request { payload, .. } if payload["action"] == "stop" => {
+                        Some(payload)
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(
+                stop["lifecycle_configuration"]["lifecycle_target"],
+                reply["target"]
+            );
+            assert_eq!(
+                stop["lifecycle_configuration"]["lifecycle_candidate"],
+                reply["candidate"]
+            );
+            assert_eq!(
+                stop["lifecycle_configuration"]["lifecycle_shared_source"],
+                reply["shared_source"]
+            );
+            assert_eq!(
+                stop["lifecycle_configuration"]["lifecycle_capture_mode"],
+                if external { "external" } else { "managed" }
+            );
+            assert!(controller.records[&5].cleanup_confirmed);
+            assert!(!controller.records[&5].lifecycle_prepare_outstanding);
+            assert!(!endpoint.commands.iter().any(|command| matches!(command,
+                Command::Request { payload, .. } if payload["action"] == "start_when_authenticated")));
+        }
+    }
+}
+
+#[test]
+fn shutdown_before_lifecycle_prepare_submission_never_admits_a_coordinator_operation() {
+    let (mut record, _) = lifecycle_cleanup_fixture(false, false);
+    let mut controller = Controller::new(Settings::default()).unwrap();
+    let start = record.authenticated_start_payload(23).unwrap();
+    controller.schedule_arm(&mut record, start, 8, 9, 0);
+    controller.records.insert(record.id, record);
+    let mut endpoint = Endpoint {
+        recovery_results: VecDeque::from([Some(
+            json!({"ok":true,"session":23,"state":"stopped","cleanup_error":null}),
+        )]),
+        ..Endpoint::default()
+    };
+    let runtime = client(&mut endpoint);
+    controller.shutdown(&runtime);
+    assert!(!endpoint.commands.iter().any(|command| matches!(command,
+        Command::Request { service, .. } if service == "amaterasu.session-lifecycle/1")));
+    assert!(controller.records[&5].cleanup_confirmed);
+    assert!(!controller.records[&5].lifecycle_prepare_outstanding);
+}
+
+#[test]
+fn cancelled_unsubmitted_lifecycle_prepare_stops_only_the_prepared_native_session() {
+    let (mut record, _) = lifecycle_cleanup_fixture(false, false);
+    let mut controller = Controller::new(Settings::default()).unwrap();
+    let start = record.authenticated_start_payload(23).unwrap();
+    controller.schedule_arm(&mut record, start, 8, 9, 0);
+    controller.records.insert(record.id, record);
+    let mut endpoint = Endpoint {
+        recovery_results: VecDeque::from([Some(
+            json!({"ok":true,"session":23,"state":"stopped","cleanup_error":null}),
+        )]),
+        ..Endpoint::default()
+    };
+    let runtime = client(&mut endpoint);
+    controller.disconnected(8, Some(5), "peer_disconnected");
+    for now in 1..=3 {
+        controller.advance_job(&runtime, now);
+    }
+    assert!(!endpoint.commands.iter().any(|command| matches!(command,
+        Command::Request { service, .. } if service == "amaterasu.session-lifecycle/1")));
+    assert!(controller.records[&5].cleanup_confirmed);
+    assert!(!controller.records[&5].lifecycle_prepare_outstanding);
+}
+
+#[test]
+fn undispatched_lifecycle_lookup_cannot_clear_the_original_preparation() {
+    let (mut record, reply) = lifecycle_cleanup_fixture(false, false);
+    record.state = State::Closing;
+    record.lifecycle_prepare_outstanding = true;
+    let mut controller = Controller::new(Settings::default()).unwrap();
+    controller.schedule_cleanup(&mut record, None, 0);
+    controller.records.insert(record.id, record);
+    let mut endpoint = Endpoint {
+        lifecycle_results: VecDeque::from([Some(reply.clone())]),
+        recovery_results: VecDeque::from([Some(
+            json!({"ok":true,"session":23,"state":"stopped","cleanup_error":null,
+            "lifecycle_target":reply["target"],"lifecycle_retired":true}),
+        )]),
+        ..Endpoint::default()
+    };
+    let runtime = client(&mut endpoint);
+    controller.shutdown(&runtime);
+    assert_eq!(
+        controller.records[&5].lifecycle_target.as_ref(),
+        Some(&reply["target"])
+    );
+    assert!(controller.records[&5].cleanup_confirmed);
+}
+
+#[test]
+fn shutdown_with_no_remaining_budget_never_admits_new_work() {
+    let mut endpoint = Endpoint::default();
+    let runtime = client(&mut endpoint);
+    let response = shutdown_request(
+        &runtime,
+        "amaterasu.session-lifecycle/1",
+        json!({"operation":"lookup","operation_id":"exact"}),
+        "shutdown-expired".into(),
+        Instant::now(),
+    );
+    assert!(response.is_err());
+    assert!(endpoint.commands.is_empty());
+}
+
+#[test]
+fn shutdown_status_bookkeeping_failure_does_not_block_native_stop() {
+    let mut controller = Controller::new(Settings::default()).unwrap();
+    let record = record(State::Playing);
+    controller.job = Some(Job {
+        ticket: record.id,
+        phase: Phase::Status,
+        call: Call::new(
+            json!({"action":"status","session":23}),
+            "read-only-status".into(),
+            None,
+        ),
+        caller: None,
+        network: None,
+        deadline: 5_000,
+    });
+    controller.records.insert(record.id, record);
+    let mut endpoint = Endpoint {
+        deny_settlement_requests: BTreeSet::from([71]),
+        recovery_results: VecDeque::from([Some(
+            json!({"ok":true,"session":23,"state":"stopped","cleanup_error":null}),
+        )]),
+        ..Endpoint::default()
+    };
+    // Admit only the read-only observation before assigning the stop result.
+    let terminal = endpoint.recovery_results.pop_front().unwrap();
+    let runtime = client(&mut endpoint);
+    controller.advance_job(&runtime, 1);
+    endpoint.recovery_results.push_back(terminal);
+    controller.shutdown(&runtime);
+    assert!(controller.records[&5].cleanup_confirmed);
+    assert_eq!(controller.shutdown_settlement.len(), 1);
+    assert!(endpoint.commands.iter().any(|command| matches!(command,
+        Command::Request { payload, .. } if payload["action"] == "stop" && payload["session"] == 23)));
+}
+
+#[test]
+fn shutdown_preserves_a_known_lifecycle_result_when_only_result_release_fails() {
+    let (mut record, reply) = lifecycle_cleanup_fixture(false, false);
+    let mut controller = Controller::new(Settings::default()).unwrap();
+    let start = record.authenticated_start_payload(23).unwrap();
+    controller.schedule_arm(&mut record, start, 8, 9, 0);
+    controller.records.insert(record.id, record);
+    let mut endpoint = Endpoint {
+        verifier_reply: Some(reply.clone()),
+        deny_settlement_requests: BTreeSet::from([71]),
+        ..Endpoint::default()
+    };
+    let runtime = client(&mut endpoint);
+    controller.advance_job(&runtime, 1);
+    controller.advance_job(&runtime, 2);
+    assert!(
+        controller
+            .job
+            .as_ref()
+            .unwrap()
+            .call
+            .observed_result()
+            .is_some()
+    );
+    endpoint.recovery_results.push_back(Some(
+        json!({"ok":true,"session":23,"state":"stopped","cleanup_error":null,
+        "lifecycle_target":reply["target"],"lifecycle_retired":true}),
+    ));
+    controller.shutdown(&runtime);
+    assert!(controller.records[&5].cleanup_confirmed);
+    assert!(!controller.records[&5].lifecycle_prepare_outstanding);
+    assert_eq!(controller.shutdown_settlement.len(), 1);
+    let stop = endpoint
+        .commands
+        .iter()
+        .find_map(|command| match command {
+            Command::Request { payload, .. } if payload["action"] == "stop" => Some(payload),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        stop["lifecycle_configuration"]["lifecycle_target"],
+        reply["target"]
+    );
+}
+
+#[test]
+fn shutdown_records_share_the_original_aggregate_deadline() {
+    let (mut pending, _) = lifecycle_cleanup_fixture(false, false);
+    pending.state = State::Closing;
+    pending.lifecycle_prepare_outstanding = true;
+    let mut second = record(State::Playing);
+    second.id = 6;
+    second.session = Some(24);
+    let mut controller = Controller::new(Settings::default()).unwrap();
+    controller.records.insert(pending.id, pending);
+    controller.records.insert(second.id, second);
+    let mut endpoint = Endpoint {
+        verifier_reply: Some(
+            json!({"status":"pending","operation_id":"rtsp-0000000000000005-lifecycle-prepare"}),
+        ),
+        ..Endpoint::default()
+    };
+    let runtime = client(&mut endpoint);
+    let started = Instant::now();
+    controller.stop_owned_sessions_on_shutdown(&runtime, started + Duration::from_millis(15));
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert!(!endpoint.commands.iter().any(|command| matches!(command,
+        Command::Request { payload, .. } if payload["action"] == "stop" && payload["session"] == 24)));
+    assert!(!controller.records[&5].cleanup_confirmed);
+    assert!(!controller.records[&6].cleanup_confirmed);
+}
+
+#[test]
+fn shutdown_announcement_rejects_new_play_without_releasing_prepared_ownership() {
+    let (mut record, announce) = announced_profile_record();
+    assert!(record.accept_announce(&announce));
+    let mut controller = Controller::new(Settings::default()).unwrap();
+    controller.records.insert(record.id, record);
+    controller.prepare_shutdown(10, 1_000);
+    controller.handle_network(77, 5, request(Method::Play, "/", 7, true), 11);
+    let record = &controller.records[&5];
+    assert_eq!(record.state, State::Ready);
+    assert!(record.failure.is_none());
+    assert!(!record.lifecycle_prepare_outstanding);
+    assert!(controller.job.is_none());
+}
+
+#[test]
+fn owner_close_before_rtsp_quiescence_uses_the_announced_shutdown_deadline() {
+    let mut controller = Controller::new(Settings::default()).unwrap();
+    controller.records.insert(5, record(State::Playing));
+    let mut endpoint = Endpoint {
+        active_request: true,
+        recovery_results: VecDeque::from([None]),
+        ..Endpoint::default()
+    };
+    let runtime = client(&mut endpoint);
+    controller.prepare_shutdown(100, 10);
+    controller.close(9, "caller", 5, 109, &runtime);
+    assert_eq!(controller.job.as_ref().unwrap().deadline, 110);
+    controller.tick(&runtime, 109).unwrap();
+    controller.tick(&runtime, 110).unwrap();
+    for now in [400, 401, 1_500, 1_501] {
+        controller.tick(&runtime, now).unwrap();
+    }
+    assert!(!controller.records[&5].cleanup_confirmed);
+    assert_eq!(
+        endpoint
+            .commands
+            .iter()
+            .filter(|command| matches!(command, Command::Request { .. }))
+            .count(),
+        1,
+        "owner cleanup must not admit more work after the original shutdown bound"
+    );
+}
+
+#[test]
+fn shutdown_announcement_does_not_replace_an_existing_forward_start_deadline() {
+    let (mut record, _) = lifecycle_cleanup_fixture(false, false);
+    let mut controller = Controller::new(Settings::default()).unwrap();
+    let start = record.authenticated_start_payload(23).unwrap();
+    controller.schedule_arm(&mut record, start, 8, 9, 0);
+    let original_deadline = controller.job.as_ref().unwrap().deadline;
+    controller.records.insert(record.id, record);
+    controller.prepare_shutdown(100, 10);
+    assert_eq!(controller.job.as_ref().unwrap().deadline, original_deadline);
+    assert_eq!(controller.records[&5].state, State::Arming);
 }

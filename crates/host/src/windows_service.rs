@@ -186,7 +186,11 @@ fn report_status(
         win32_exit_code,
         service_specific_exit_code: u32::from(win32_exit_code != 0),
         check_point: 0,
-        wait_hint: 5_000,
+        wait_hint: if state == SERVICE_STOP_PENDING {
+            amaterasu_contracts::HOST_SERVICE_STOP_TIMEOUT_MS as u32
+        } else {
+            5_000
+        },
     };
     // SAFETY: `status` remains valid for the synchronous API call and the
     // handle came from RegisterServiceCtrlHandlerExW in this service process.

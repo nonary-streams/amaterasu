@@ -9,6 +9,13 @@ use std::collections::{BTreeMap, BTreeSet};
 /// it may request that the trusted host restart or stop the selected runtime.
 pub const HOST_LIFECYCLE_SERVICE: &str = "amaterasu.host-lifecycle/1";
 
+/// One module-drain budget announced before consumers begin shutdown.
+pub const HOST_MODULE_SHUTDOWN_TIMEOUT_MS: u64 = 20_000;
+/// Allows the worker drain and a bounded process-exit tail before containment.
+pub const HOST_WORKER_SHUTDOWN_TIMEOUT_MS: u64 = 25_000;
+/// The service manager must outlast the worker's own shutdown allowance.
+pub const HOST_SERVICE_STOP_TIMEOUT_MS: u64 = 30_000;
+
 /// Explicit host grant to request a signed package trial.
 pub const HOST_PACKAGE_ACTIVATION_SERVICE: &str = "amaterasu.host-package-activation/1";
 

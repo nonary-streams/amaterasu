@@ -5,6 +5,10 @@ mod lifecycle_binding;
 mod network;
 #[cfg(test)]
 mod ownership_tests;
+mod preparation;
+mod quiescence;
+#[cfg(test)]
+mod quiescence_tests;
 mod record;
 mod recovery_status;
 mod retirement;
@@ -175,6 +179,9 @@ pub struct Controller {
     records: BTreeMap<u64, Record>,
     pending_network: VecDeque<PendingNetwork>,
     job: Option<Job>,
+    quiescence: Option<quiescence::Quiescence>,
+    shutdown_deadline: Option<u64>,
+    shutdown_settlement: Vec<Call>,
     display_admission: Option<DisplayAdmission>,
     display_cleanup: Vec<DisplayCleanup>,
     startup_recovery: StartupRecovery,
@@ -236,6 +243,9 @@ impl Controller {
             records: BTreeMap::new(),
             pending_network: VecDeque::new(),
             job: None,
+            quiescence: None,
+            shutdown_deadline: None,
+            shutdown_settlement: Vec::new(),
             display_admission: None,
             display_cleanup: Vec::new(),
             startup_recovery,
@@ -247,7 +257,12 @@ impl Controller {
     }
 
     pub fn tick(&mut self, runtime: &RuntimeClient, now: u64) -> ModuleResult<()> {
+        if self.quiescence.is_some() {
+            return self.tick_quiescing(runtime, now);
+        }
+        self.cap_announced_cleanup_deadline();
         self.poll_transport(now);
+        self.cap_announced_cleanup_deadline();
         self.advance_startup_recovery(runtime, now);
         self.advance_job(runtime, now);
         self.advance_display_admission(runtime, now);
@@ -261,6 +276,7 @@ impl Controller {
         if self.job.is_none() && self.display_admission.is_none() {
             self.poll_caller(runtime, now)?;
         }
+        self.cap_announced_cleanup_deadline();
         self.reconcile_network_port(now);
         Ok(())
     }
@@ -268,12 +284,30 @@ impl Controller {
     /// Revoke RTSP tickets and make bounded, owner-scoped stop attempts for every
     /// known stream-session before this module unloads.
     pub fn shutdown(&mut self, runtime: &RuntimeClient) {
+        if self.quiescence.is_some() || self.shutdown_deadline.is_some() {
+            return;
+        }
         let cleanup_deadline = Instant::now() + ORDERLY_SESSION_CLEANUP_BUDGET;
+        self.shutdown_settlement.retain_mut(|call| {
+            !matches!(
+                call.shutdown(runtime),
+                Outcome::SettledFailure | Outcome::Result(_)
+            )
+        });
         if let Some(call) = self.startup_recovery.call.as_mut() {
             call.shutdown(runtime);
         }
-        if let Some(job) = self.job.as_mut() {
-            job.call.shutdown(runtime);
+        if let Some(mut job) = self.job.take() {
+            let outcome = job.call.shutdown(runtime);
+            if let Some(record) = self.records.get_mut(&job.ticket) {
+                apply_observed_shutdown_result(record, job.phase, &job.call);
+                if matches!(outcome, Outcome::SettledFailure) {
+                    apply_undispatched_shutdown_proof(record, job.phase, &job.call);
+                } else {
+                    record.uncertain_phase = Some(job.phase);
+                    record.uncertain = Some(job.call);
+                }
+            }
         }
         if let Some(admission) = self.display_admission.as_mut() {
             admission.call.shutdown(runtime);
@@ -282,8 +316,15 @@ impl Controller {
             cleanup.call.shutdown(runtime);
         }
         for record in self.records.values_mut() {
-            if let Some(call) = record.uncertain.as_mut() {
-                call.shutdown(runtime);
+            if let Some(mut call) = record.uncertain.take() {
+                let phase = record.uncertain_phase.take().unwrap_or(Phase::Prepare);
+                apply_observed_shutdown_result(record, phase, &call);
+                if matches!(call.shutdown(runtime), Outcome::SettledFailure) {
+                    apply_undispatched_shutdown_proof(record, phase, &call);
+                } else {
+                    record.uncertain_phase = Some(phase);
+                    record.uncertain = Some(call);
+                }
             }
         }
         self.stop_owned_sessions_on_shutdown(runtime, cleanup_deadline);
@@ -312,9 +353,29 @@ impl Controller {
         record: &mut Record,
         deadline: Instant,
     ) {
+        if record.uncertain.is_some() {
+            let read_only = matches!(
+                record.uncertain_phase,
+                Some(Phase::Status | Phase::Find | Phase::LifecycleLookup)
+            );
+            let observed = record
+                .uncertain
+                .as_ref()
+                .is_some_and(|call| call.observed_result().is_some());
+            if (read_only || observed) && self.shutdown_settlement.len() < MAX_RECORDS {
+                self.shutdown_settlement
+                    .push(record.uncertain.take().expect("retained call"));
+                record.uncertain_phase = None;
+            } else {
+                record.state = State::CleanupFailed;
+                record.cleanup_error = Some("shutdown_settlement_unconfirmed");
+                return;
+            }
+        }
         if record.session.is_none() && record.needs_lookup {
             let lookup = shutdown_request(
                 runtime,
+                "amaterasu.stream-session/1",
                 json!({"action":"lookup","operation_id":record.operation()}),
                 format!("{}-module-shutdown-lookup", record.operation()),
                 deadline,
@@ -333,12 +394,22 @@ impl Controller {
                     record.cleanup_error = Some("shutdown_lookup_not_found");
                     return;
                 }
-                _ => {
+                Err(failure) => {
+                    retain_shutdown_failure(record, Phase::Find, failure);
+                    return;
+                }
+                Ok(_) => {
                     record.state = State::CleanupFailed;
                     record.cleanup_error = Some("shutdown_lookup_unconfirmed");
                     return;
                 }
             }
+        }
+
+        if record.lifecycle_prepare_outstanding
+            && !self.resolve_lifecycle_on_shutdown(runtime, record, deadline)
+        {
+            return;
         }
 
         let Some(_) = record.session else {
@@ -349,6 +420,7 @@ impl Controller {
         };
         let stop = shutdown_request(
             runtime,
+            "amaterasu.stream-session/1",
             record.stop_payload(),
             format!("{}-module-shutdown-stop", record.operation()),
             deadline,
@@ -363,11 +435,50 @@ impl Controller {
                 record.state = State::CleanupFailed;
                 record.cleanup_error = Some("shutdown_stop_rejected");
             }
-            Err(code) => {
-                record.state = State::CleanupFailed;
-                record.cleanup_error = Some(code);
+            Err(failure) => retain_shutdown_failure(record, Phase::Stop, failure),
+        }
+    }
+
+    fn resolve_lifecycle_on_shutdown(
+        &mut self,
+        runtime: &RuntimeClient,
+        record: &mut Record,
+        deadline: Instant,
+    ) -> bool {
+        while Instant::now() < deadline {
+            let operation_id = self.operation_id(record, "shutdown-lifecycle-lookup");
+            let response = shutdown_request(
+                runtime,
+                "amaterasu.session-lifecycle/1",
+                json!({"operation":"lookup", "operation_id":format!("{}-lifecycle-prepare", record.operation())}),
+                operation_id,
+                deadline,
+            );
+            match response {
+                Ok(payload) => match preparation::apply_response(record, &payload) {
+                    preparation::PreparationResolution::Admitted
+                    | preparation::PreparationResolution::Rejected => return true,
+                    preparation::PreparationResolution::Pending => {
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        if !remaining.is_zero() {
+                            thread::sleep(ORDERLY_SESSION_POLL_INTERVAL.min(remaining));
+                        }
+                    }
+                    preparation::PreparationResolution::Unconfirmed => {
+                        record.state = State::CleanupFailed;
+                        record.cleanup_error = Some("shutdown_lifecycle_unconfirmed");
+                        return false;
+                    }
+                },
+                Err(failure) => {
+                    retain_shutdown_failure(record, Phase::LifecycleLookup, failure);
+                    return false;
+                }
             }
         }
+        record.state = State::CleanupFailed;
+        record.cleanup_error = Some("shutdown_lifecycle_deadline");
+        false
     }
 
     fn advance_startup_recovery(&mut self, runtime: &RuntimeClient, now: u64) {
@@ -891,50 +1002,69 @@ fn authenticated_disconnect_reason(record: &Record, payload: &Value) -> Option<&
     }
 }
 
+struct ShutdownFailure {
+    code: &'static str,
+    call: Box<Call>,
+}
+
+fn apply_observed_shutdown_result(record: &mut Record, phase: Phase, call: &Call) {
+    if matches!(phase, Phase::LifecyclePrepare | Phase::LifecycleLookup)
+        && let Some(payload) = call.observed_result()
+    {
+        preparation::apply_response(record, payload);
+    }
+}
+
+fn apply_undispatched_shutdown_proof(record: &mut Record, phase: Phase, call: &Call) {
+    if !call.proven_not_dispatched() {
+        return;
+    }
+    match phase {
+        Phase::LifecyclePrepare => record.lifecycle_prepare_outstanding = false,
+        Phase::Prepare => record.needs_lookup = false,
+        _ => {}
+    }
+}
+
+fn retain_shutdown_failure(record: &mut Record, phase: Phase, failure: ShutdownFailure) {
+    record.state = State::CleanupFailed;
+    record.cleanup_error = Some(failure.code);
+    record.uncertain_phase = Some(phase);
+    record.uncertain = Some(*failure.call);
+}
+
 fn shutdown_request(
     runtime: &RuntimeClient,
+    service: &str,
     payload: Value,
     operation_id: String,
     deadline: Instant,
-) -> Result<Value, &'static str> {
-    let command = Command::Request {
-        service: "amaterasu.stream-session/1".into(),
-        payload,
-        operation_id,
-        parent: None,
-        timeout_ms: CLEANUP_BUDGET_MS,
-    };
-    let id = match runtime.send_ephemeral(command) {
-        Ok(Response::Accepted { id }) => id,
-        Ok(Response::Error { .. }) => return Err("shutdown_request_unavailable"),
-        _ => return Err("shutdown_request_unconfirmed"),
-    };
-
+) -> Result<Value, ShutdownFailure> {
+    let mut call = Call::for_service(service, payload, operation_id, None);
+    let mut code = "shutdown_request_unconfirmed";
     while Instant::now() < deadline {
-        match runtime.send_ephemeral(Command::TakeResult { request: id }) {
-            Ok(Response::Result { payload }) => {
-                let released = match runtime.send_ephemeral(Command::ReleaseResult { request: id })
-                {
-                    Ok(Response::Ok) => true,
-                    Ok(Response::Error { code, .. }) if code == "not_found" => true,
-                    _ => false,
-                };
-                return if released {
-                    Ok(payload)
-                } else {
-                    Err("shutdown_result_release_failed")
-                };
+        match call.poll(runtime) {
+            Outcome::Result(payload) => return Ok(payload),
+            Outcome::SettledFailure => {
+                code = "shutdown_request_unavailable";
+                break;
             }
-            Ok(Response::Pending) => {
+            Outcome::Uncertain => break,
+            Outcome::Waiting => {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if !remaining.is_zero() {
                     thread::sleep(ORDERLY_SESSION_POLL_INTERVAL.min(remaining));
                 }
             }
-            _ => return Err("shutdown_request_unconfirmed"),
         }
     }
-    Err("shutdown_request_unconfirmed")
+    // Retain exact call identity even if cancellation/release cannot be settled.
+    // Canceling an unsubmitted call cannot admit work after the shared deadline.
+    call.shutdown(runtime);
+    Err(ShutdownFailure {
+        code,
+        call: Box::new(call),
+    })
 }
 
 fn stream_state(payload: &Value) -> Option<&'static str> {

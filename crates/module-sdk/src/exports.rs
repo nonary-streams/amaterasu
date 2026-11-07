@@ -64,6 +64,21 @@ pub unsafe extern "C" fn health<M: ManagedModule>(instance: *mut c_void) -> Stat
 }
 
 /// # Safety
+/// `instance` must refer to a live M created by this library, exclusively borrowed.
+/// The host announces shutdown before beginning any module's quiesce operation.
+pub unsafe extern "C" fn prepare_shutdown<M: ManagedModule>(
+    instance: *mut c_void,
+    remaining_ms: u64,
+) -> Status {
+    if instance.is_null() {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    // SAFETY: the host serializes lifecycle calls and lends the live module for
+    // this bounded announcement; allocation ownership remains with the library.
+    contain_failure(|| unsafe { &mut *instance.cast::<M>() }.prepare_shutdown(remaining_ms))
+}
+
+/// # Safety
 /// `instance` is a live, exclusively borrowed M; `ready` is writable for this call.
 pub unsafe extern "C" fn quiesce<M: ManagedModule>(
     instance: *mut c_void,
@@ -94,3 +109,6 @@ pub unsafe extern "C" fn destroy<M: ManagedModule>(instance: *mut c_void) {
         Ok(())
     });
 }
+
+#[cfg(test)]
+mod tests;
