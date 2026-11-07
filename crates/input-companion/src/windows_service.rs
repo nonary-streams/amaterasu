@@ -2,6 +2,7 @@
 //! This module is not selected by the ordinary Amaterasu worker by default.
 use crate::windows_identity::{inspect_process, opening_process, pipe_peer, service_process_id};
 use crate::windows_pipe::{Pipe, PipeKind};
+use crate::worker_client::{REPLY_TIMEOUT, WorkerClient, WorkerTransport};
 use crate::{
     GrantRegistry, InputEvent, InputPacket, InputResult, InputSession, PermitLedger,
     ProcessIdentity, VhfDeviceSink, WindowsVhfTransport,
@@ -383,98 +384,52 @@ pub fn authorize_worker(
 }
 
 pub struct WindowsInputClient {
-    pipe: Pipe,
-    token: String,
-    generation: u64,
-    next_sequence: u64,
-    closed: bool,
+    connection: WorkerClient<Pipe>,
 }
 
 impl WindowsInputClient {
     pub fn connect() -> InputResult<Self> {
-        let mut pipe = Pipe::connect(PipeKind::Worker)?;
-        pipe.write_line(
-            &serde_json::to_vec(&Request::WorkerStart)
-                .map_err(|_| crate::InputError::InvalidEvent)?,
-        )?;
-        let reply = pipe
-            .read_line(Instant::now() + Duration::from_secs(2))?
-            .ok_or(crate::InputError::Device)?;
-        let Reply::Granted { generation, token } =
-            serde_json::from_slice(&reply).map_err(|_| crate::InputError::Device)?
-        else {
-            return Err(crate::InputError::PermissionDenied);
-        };
-        if generation == 0 || token.len() != 32 {
-            return Err(crate::InputError::Device);
-        }
         Ok(Self {
-            pipe,
-            token,
-            generation,
-            next_sequence: 1,
-            closed: false,
+            connection: WorkerClient::connect(Pipe::connect(PipeKind::Worker)?, REPLY_TIMEOUT)?,
         })
     }
 
+    pub fn connect_with_deadline(deadline: Instant) -> InputResult<Self> {
+        if Instant::now() >= deadline {
+            return Err(crate::InputError::Device);
+        }
+        Ok(Self {
+            connection: WorkerClient::connect_with_deadline(
+                Pipe::connect(PipeKind::Worker)?,
+                REPLY_TIMEOUT,
+                Some(deadline),
+            )?,
+        })
+    }
+
+    pub fn restrict_deadline(&mut self, deadline: Instant) {
+        self.connection.restrict_deadline(deadline);
+    }
+
     pub fn send(&mut self, event: InputEvent) -> InputResult<()> {
-        if self.closed {
-            return Err(crate::InputError::Closed);
-        }
-        let packet = InputPacket {
-            version: crate::PROTOCOL_VERSION,
-            generation: self.generation,
-            sequence: self.next_sequence,
-            lease_token: self.token.clone(),
-            event,
-        };
-        self.next_sequence = self
-            .next_sequence
-            .checked_add(1)
-            .ok_or(crate::InputError::InvalidSequence)?;
-        let bytes = serde_json::to_vec(&Request::WorkerEvent { packet })
-            .map_err(|_| crate::InputError::InvalidEvent)?;
-        self.pipe.write_line(&bytes)?;
-        let response = self
-            .pipe
-            .read_line(Instant::now() + Duration::from_secs(2))?
-            .ok_or(crate::InputError::Device)?;
-        match serde_json::from_slice::<Reply>(&response) {
-            Ok(Reply::Ok) => Ok(()),
-            _ => Err(crate::InputError::PermissionDenied),
-        }
+        self.connection.send(event)
     }
 
     pub fn close(&mut self) -> InputResult<()> {
-        if self.closed {
-            return Ok(());
-        }
-        let bytes = serde_json::to_vec(&Request::WorkerClose)
-            .map_err(|_| crate::InputError::InvalidEvent)?;
-        self.pipe.write_line(&bytes)?;
-        let response = self
-            .pipe
-            .read_line(Instant::now() + Duration::from_secs(2))?
-            .ok_or(crate::InputError::Device)?;
-        match serde_json::from_slice::<Reply>(&response) {
-            Ok(Reply::Ok) => {
-                self.closed = true;
-                Ok(())
-            }
-            _ => Err(crate::InputError::Device),
-        }
+        self.connection.close()
     }
 }
 
-impl Drop for WindowsInputClient {
-    fn drop(&mut self) {
-        // Closing the pipe is authoritative; the server revokes and destroys
-        // the child independently even if this best-effort message is lost.
-        if !self.closed
-            && let Ok(bytes) = serde_json::to_vec(&Request::WorkerClose)
-        {
-            let _ = self.pipe.write_line(&bytes);
+impl WorkerTransport for Pipe {
+    fn write_frame(&mut self, frame: &[u8], deadline: Instant) -> InputResult<()> {
+        if Instant::now() >= deadline {
+            return Err(crate::InputError::Device);
         }
+        self.write_line_before(frame, deadline)
+    }
+
+    fn read_frame(&mut self, deadline: Instant) -> InputResult<Option<Vec<u8>>> {
+        self.read_line(deadline)
     }
 }
 

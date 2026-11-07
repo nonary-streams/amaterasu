@@ -69,6 +69,21 @@ pub trait Backend {
     /// device so late output cannot cross a lease boundary.
     fn set_feedback_queue(&mut self, _queue: FeedbackQueue) {}
     fn set_feedback_generation(&mut self, _generation: u64) {}
+    /// Cap subsequent native transport waits without beginning teardown.
+    /// Repeated announcements must retain the earliest absolute deadline.
+    fn restrict_shutdown_deadline(&mut self, _deadline: std::time::Instant) {}
+    /// A successful stop independently proves every accepted input effect has
+    /// retired, even if individual key/contact release reports were rejected.
+    /// Owned device destruction and acknowledged companion revocation provide
+    /// this proof; global OS injection alone does not.
+    fn stop_retires_inputs(&self) -> bool {
+        false
+    }
+    /// Whether successful stop independently retires all owned pen/touch and
+    /// controller-touch contacts, including failed terminal reports.
+    fn stop_retires_contacts(&self) -> bool {
+        false
+    }
     /// Releases and removes owned virtual controller slots without stopping
     /// keyboard or pointer injection for the current lease.
     fn disable_controller_input(&mut self) -> InputResult<()> {

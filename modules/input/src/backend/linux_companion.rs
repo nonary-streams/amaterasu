@@ -8,6 +8,7 @@ use crate::model::{
 use amaterasu_input_companion::{InputEvent, LinuxInputClient};
 use std::collections::HashMap;
 use std::path::Path;
+use std::time::Instant;
 
 const MAX_COMPANION_SCROLL_DELTA: i32 = 12_000;
 
@@ -183,6 +184,7 @@ pub struct LinuxCompanionBackend {
     profile: GamepadProfile,
     touch_as_mouse: SingleTouchAsMouse,
     active_gamepad_slots: u16,
+    shutdown_deadline: Option<Instant>,
 }
 
 impl LinuxCompanionBackend {
@@ -195,6 +197,7 @@ impl LinuxCompanionBackend {
             profile: GamepadProfile::Auto,
             touch_as_mouse: SingleTouchAsMouse::default(),
             active_gamepad_slots: 0,
+            shutdown_deadline: None,
         }
     }
 
@@ -340,8 +343,13 @@ impl Backend for LinuxCompanionBackend {
                 "input companion lease is active",
             ));
         }
-        self.client =
-            Some(LinuxInputClient::connect(Path::new(&self.socket_path)).map_err(companion_error)?);
+        let client = match self.shutdown_deadline {
+            Some(deadline) => {
+                LinuxInputClient::connect_with_deadline(Path::new(&self.socket_path), deadline)
+            }
+            None => LinuxInputClient::connect(Path::new(&self.socket_path)),
+        };
+        self.client = Some(client.map_err(companion_error)?);
         self.held_virtual_keycodes.clear();
         self.touch_as_mouse.reset();
         self.active_gamepad_slots = 0;
@@ -445,14 +453,37 @@ impl Backend for LinuxCompanionBackend {
         self.poll_feedback()
     }
 
+    fn restrict_shutdown_deadline(&mut self, deadline: Instant) {
+        let deadline = self
+            .shutdown_deadline
+            .map_or(deadline, |prior| prior.min(deadline));
+        self.shutdown_deadline = Some(deadline);
+        if let Some(client) = self.client.as_mut() {
+            client.restrict_deadline(deadline);
+        }
+    }
+
+    fn stop_retires_inputs(&self) -> bool {
+        true
+    }
+
+    fn stop_retires_contacts(&self) -> bool {
+        true
+    }
+
     fn stop(&mut self) -> InputResult<()> {
-        let Some(mut client) = self.client.take() else {
+        let Some(client) = self.client.as_mut() else {
             return Ok(());
         };
+        // A closed socket only requests server-side revocation. Retain the
+        // exact lease until the companion acknowledges completed cleanup; an
+        // uncertain close must not make a later stop report success.
+        client.close().map_err(companion_error)?;
+        self.client = None;
         self.held_virtual_keycodes.clear();
         self.touch_as_mouse.reset();
         self.active_gamepad_slots = 0;
-        client.close().map_err(companion_error)
+        Ok(())
     }
 }
 
@@ -526,6 +557,132 @@ mod tests {
     };
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
+
+    struct CompanionSocketFixture {
+        directory: std::path::PathBuf,
+        socket: std::path::PathBuf,
+        worker: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl CompanionSocketFixture {
+        fn close_replies(replies: &'static [&'static str]) -> Self {
+            use std::io::{BufRead, BufReader, Write};
+            use std::os::unix::net::UnixListener;
+
+            let mut suffix = [0_u8; 8];
+            getrandom::fill(&mut suffix).unwrap();
+            let directory = std::env::temp_dir().join(format!(
+                "amaterasu-input-close-{}-{}",
+                std::process::id(),
+                u64::from_ne_bytes(suffix),
+            ));
+            std::fs::create_dir(&directory).unwrap();
+            let socket = directory.join("input.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let worker = std::thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut request = String::new();
+                reader.read_line(&mut request).unwrap();
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&request).unwrap(),
+                    serde_json::json!({"kind": "worker_start"}),
+                );
+                writeln!(
+                    reader.get_mut(),
+                    "{}",
+                    serde_json::json!({
+                        "kind": "granted",
+                        "generation": 1,
+                        "token": "b".repeat(32),
+                        "gamepad": true,
+                    }),
+                )
+                .unwrap();
+                for reply in replies {
+                    request.clear();
+                    if reader.read_line(&mut request).unwrap_or(0) == 0 {
+                        return;
+                    }
+                    assert_eq!(
+                        serde_json::from_str::<serde_json::Value>(&request).unwrap(),
+                        serde_json::json!({"kind": "worker_close"}),
+                    );
+                    if writeln!(reader.get_mut(), "{reply}").is_err() {
+                        return;
+                    }
+                }
+            });
+            Self {
+                directory,
+                socket,
+                worker: Some(worker),
+            }
+        }
+
+        fn backend(&self) -> LinuxCompanionBackend {
+            let mut backend = LinuxCompanionBackend::new(self.socket.display().to_string());
+            backend.start().unwrap();
+            backend
+        }
+    }
+
+    impl Drop for CompanionSocketFixture {
+        fn drop(&mut self) {
+            self.worker.take().unwrap().join().unwrap();
+            std::fs::remove_file(&self.socket).unwrap();
+            std::fs::remove_dir(&self.directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn rejected_companion_close_keeps_exact_lease_until_acknowledged_retry() {
+        let fixture =
+            CompanionSocketFixture::close_replies(&[r#"{"kind":"denied"}"#, r#"{"kind":"ok"}"#]);
+        let mut backend = fixture.backend();
+        backend.held_virtual_keycodes.insert(0x41, 30);
+        backend.touch_as_mouse.active_pointer = Some(4);
+        backend.active_gamepad_slots = 1 << 2;
+
+        assert_eq!(backend.stop().unwrap_err().code, "companion_unavailable");
+        assert!(backend.client.is_some());
+        assert_eq!(backend.held_virtual_keycodes.get(&0x41), Some(&30));
+        assert_eq!(backend.touch_as_mouse.active_pointer, Some(4));
+        assert_eq!(backend.active_gamepad_slots, 1 << 2);
+        assert_eq!(backend.start().unwrap_err().code, "backend_busy");
+
+        backend.stop().unwrap();
+        assert!(backend.client.is_none());
+        assert!(backend.held_virtual_keycodes.is_empty());
+        assert_eq!(backend.touch_as_mouse.active_pointer, None);
+        assert_eq!(backend.active_gamepad_slots, 0);
+        backend.stop().unwrap();
+    }
+
+    #[test]
+    fn disconnected_companion_does_not_turn_unconfirmed_cleanup_into_success() {
+        let fixture = CompanionSocketFixture::close_replies(&[]);
+        let mut backend = fixture.backend();
+        assert_eq!(backend.stop().unwrap_err().code, "companion_unavailable");
+        assert_eq!(backend.stop().unwrap_err().code, "companion_unavailable");
+        assert!(backend.client.is_some());
+        assert_eq!(backend.start().unwrap_err().code, "backend_busy");
+    }
+
+    #[test]
+    fn shutdown_deadline_does_not_renew_the_companion_close_wait() {
+        let fixture = CompanionSocketFixture::close_replies(&[r#"{"kind":"ok"}"#]);
+        let mut backend = fixture.backend();
+        let expired = Instant::now();
+        backend.restrict_shutdown_deadline(expired);
+        backend.restrict_shutdown_deadline(expired + Duration::from_secs(30));
+
+        assert_eq!(backend.stop().unwrap_err().code, "companion_unavailable");
+        assert!(backend.client.is_some());
+    }
 
     fn touch(pointer_id: u32, phase: PenTouchPhase, x: u16, y: u16) -> Event {
         Event::PenTouch {

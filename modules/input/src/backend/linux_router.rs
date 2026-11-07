@@ -161,6 +161,18 @@ impl Backend for LinuxBackendRouter {
         self.companion.set_feedback_queue(queue.clone());
         self.native.set_feedback_queue(queue);
     }
+    fn restrict_shutdown_deadline(&mut self, deadline: Instant) {
+        self.companion.restrict_shutdown_deadline(deadline);
+        self.native.restrict_shutdown_deadline(deadline);
+    }
+    fn stop_retires_inputs(&self) -> bool {
+        // Both routes own the kernel keyboard/pointer devices, and stop also
+        // waits for independently routed native pen/touch devices to retire.
+        true
+    }
+    fn stop_retires_contacts(&self) -> bool {
+        true
+    }
     fn supported_gamepad_profiles(&self) -> &'static [&'static str] {
         GamepadProfile::implemented_profiles()
     }

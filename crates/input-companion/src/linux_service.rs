@@ -8,7 +8,7 @@
 //! the host process.
 use crate::{
     DeviceSink, GamepadFeedback, GrantRegistry, InputError, InputEvent, InputPacket, InputResult,
-    InputSession, MouseButton, PROTOCOL_VERSION, PermitLedger, ProcessIdentity,
+    InputSession, MouseButton, PermitLedger, ProcessIdentity,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
@@ -425,139 +425,6 @@ fn listener_exit_diagnostic(result: std::thread::Result<InputResult<()>>) -> Opt
         Ok(Ok(())) => None,
         Ok(Err(error)) => Some(format!("input companion listener ended: {error:?}")),
         Err(_) => Some("input companion listener thread panicked".into()),
-    }
-}
-
-/// Worker-side client. Dropping its socket is authoritative and causes the
-/// server to revoke the lease and release every held key/button.
-pub struct LinuxInputClient {
-    stream: BufReader<UnixStream>,
-    token: String,
-    generation: u64,
-    next_sequence: u64,
-    gamepad_enabled: bool,
-    closed: bool,
-}
-
-impl LinuxInputClient {
-    pub fn connect(socket_path: &Path) -> InputResult<Self> {
-        let stream = UnixStream::connect(socket_path).map_err(system_error)?;
-        stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .map_err(system_error)?;
-        stream
-            .set_write_timeout(Some(Duration::from_secs(2)))
-            .map_err(system_error)?;
-        let mut client = Self {
-            stream: BufReader::new(stream),
-            token: String::new(),
-            generation: 0,
-            next_sequence: 1,
-            gamepad_enabled: false,
-            closed: false,
-        };
-        client.write_request(&Request::Start)?;
-        let reply = client.read_reply()?;
-        let Reply::Granted {
-            generation,
-            token,
-            gamepad,
-        } = reply
-        else {
-            return Err(InputError::PermissionDenied);
-        };
-        if generation == 0
-            || token.len() != 32
-            || !token.bytes().all(|byte| byte.is_ascii_hexdigit())
-        {
-            return Err(InputError::InvalidGrant);
-        }
-        client.generation = generation;
-        client.token = token;
-        client.gamepad_enabled = gamepad;
-        Ok(client)
-    }
-
-    /// Reports the separate gamepad bit returned for this authenticated lease.
-    pub fn gamepad_enabled(&self) -> bool {
-        self.gamepad_enabled
-    }
-
-    pub fn send(&mut self, event: InputEvent) -> InputResult<()> {
-        if self.closed {
-            return Err(InputError::Closed);
-        }
-        let packet = InputPacket {
-            version: PROTOCOL_VERSION,
-            generation: self.generation,
-            sequence: self.next_sequence,
-            lease_token: self.token.clone(),
-            event,
-        };
-        self.next_sequence = self
-            .next_sequence
-            .checked_add(1)
-            .ok_or(InputError::InvalidSequence)?;
-        self.write_request(&Request::Event { packet })?;
-        match self.read_reply()? {
-            Reply::Ok => Ok(()),
-            _ => Err(InputError::PermissionDenied),
-        }
-    }
-
-    /// Polls one local rumble event from a session-owned gamepad. This stays
-    /// separate from the Moonlight protocol until a host feedback route exists.
-    pub fn poll_gamepad_feedback(&mut self) -> InputResult<Option<GamepadFeedback>> {
-        if self.closed {
-            return Err(InputError::Closed);
-        }
-        self.write_request(&Request::FeedbackPoll {
-            generation: self.generation,
-            token: self.token.clone(),
-        })?;
-        match self.read_reply()? {
-            Reply::Feedback { event } => Ok(event),
-            _ => Err(InputError::PermissionDenied),
-        }
-    }
-
-    pub fn close(&mut self) -> InputResult<()> {
-        if self.closed {
-            return Ok(());
-        }
-        self.write_request(&Request::Close)?;
-        match self.read_reply()? {
-            Reply::Ok => {
-                self.closed = true;
-                Ok(())
-            }
-            _ => Err(InputError::Device),
-        }
-    }
-
-    fn write_request(&mut self, request: &Request) -> InputResult<()> {
-        let bytes = serde_json::to_vec(request).map_err(|_| InputError::InvalidEvent)?;
-        if bytes.len() > MAX_FRAME_BYTES {
-            return Err(InputError::InvalidEvent);
-        }
-        let stream = self.stream.get_mut();
-        stream.write_all(&bytes).map_err(system_error)?;
-        stream.write_all(b"\n").map_err(system_error)
-    }
-
-    fn read_reply(&mut self) -> InputResult<Reply> {
-        let frame = read_frame(&mut self.stream)?.ok_or(InputError::Closed)?;
-        serde_json::from_slice(&frame).map_err(|_| InputError::InvalidEvent)
-    }
-}
-
-impl Drop for LinuxInputClient {
-    fn drop(&mut self) {
-        if !self.closed {
-            let _ = self.write_request(&Request::Close);
-            // Socket close remains authoritative even if the best-effort frame
-            // cannot be sent or acknowledged.
-        }
     }
 }
 
@@ -1911,7 +1778,7 @@ mod tests {
             serde_json::json!({
                 "kind": "worker_event",
                 "packet": {
-                    "version": PROTOCOL_VERSION,
+                    "version": crate::PROTOCOL_VERSION,
                     "generation": 1,
                     "sequence": 1,
                     "lease_token": "0123456789abcdef0123456789abcdef",

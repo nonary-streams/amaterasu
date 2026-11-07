@@ -44,6 +44,28 @@ from any context. Explicit client overrides remain scoped to their own lease.
 Unbound legacy acquisitions remain exclusive across the provider.
 The versioned Input SDK request/response contract is unchanged.
 
+## Shutdown and cleanup acknowledgement
+
+Host shutdown closes new acquisition and settings-update admission first, while
+declared consumers may continue using their existing leases. Dependency-ordered
+quiescence then rejects deferred input delivery, settles admitted broker jobs,
+and retires every controller context before reporting ready. Failed native
+release remains owned for retry; one context cannot hide another context's
+cleanup. The earliest announced host deadline also bounds subsequent companion
+transport waits and cannot be renewed by repeated shutdown calls.
+
+Binding revocation begins native release immediately, independently of the
+response queue or its deadline. Individual failed release reports do not prevent
+independent device teardown. Successful destruction of owned devices or an
+acknowledged companion revocation proves those devices' input has retired;
+Windows global injection still requires its exact key and contact releases.
+
+Companion clients retain the exact connection after a failed Close and refuse
+replacement until retirement is acknowledged. The installed v1 wire format is
+unchanged: each connection permits one outstanding request, and a timeout retains
+that operation. A later Close must settle the prior reply before sending its own
+request, so a delayed input acknowledgement cannot be mistaken for cleanup proof.
+
 ## Durable input policy
 
 The input module loads the caller-scoped product document `product/amaterasu.input`

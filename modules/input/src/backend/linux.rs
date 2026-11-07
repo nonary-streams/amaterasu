@@ -1497,6 +1497,14 @@ impl Backend for LinuxBackend {
         }
         result
     }
+    fn stop_retires_inputs(&self) -> bool {
+        true
+    }
+
+    fn stop_retires_contacts(&self) -> bool {
+        true
+    }
+
     fn stop(&mut self) -> InputResult<()> {
         let pen_touch_result = self.pen_touch.stop();
         let gamepad_result = self.gamepads.stop();
@@ -2870,7 +2878,7 @@ mod tests {
     }
 
     #[test]
-    fn controller_cleanup_releases_all_keys_after_uncertain_keyboard_destroy_retry() {
+    fn owned_stop_retires_all_keys_after_uncertain_keyboard_destroy_retry() {
         let adapter = FakeAdapterGuard::install();
         let _guard = FakeAdapterGuard;
         let mut controller = Controller::new(LinuxBackend::new("/missing/uinput".into()), true);
@@ -2899,17 +2907,13 @@ mod tests {
             vec![moonlight_key(0x43, KeyState::Down)],
         );
         assert_eq!(failure["error"]["code"], "injection_failed");
-        assert_eq!(failure["cleanup_required"], true);
+        // The first exact-device destroy failed during terminal reports, but
+        // its retry and the independent native stop retired both owned devices.
+        // No new keyboard is needed to prove every uncertain press is gone.
+        assert_eq!(failure["cleanup_required"], false);
+        assert!(!controller.has_live_state());
         assert_eq!(adapter.borrow().next_id, 2);
         assert!(adapter.borrow().fail_create);
-        let released = controller.handle(
-            "owner",
-            Operation::Release { lease },
-            std::time::Instant::now(),
-            &mut || Ok(()),
-        );
-        assert_eq!(released["ok"], true);
-        assert_eq!(released["released"], true);
         assert!(!controller.cleanup_required());
         assert_eq!(adapter.borrow().destroys, [1, 1, 2]);
         assert_eq!(adapter.borrow().next_id, 2);

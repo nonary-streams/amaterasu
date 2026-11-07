@@ -35,6 +35,7 @@ pub(crate) struct Controllers<B: Backend> {
     factory: Box<dyn FnMut() -> ModuleResult<B>>,
     enabled: bool,
     policy: Option<InputPolicy>,
+    shutdown_deadline: Option<Instant>,
 }
 
 impl<B: Backend> Controllers<B> {
@@ -51,6 +52,7 @@ impl<B: Backend> Controllers<B> {
             factory: Box::new(factory),
             enabled,
             policy: None,
+            shutdown_deadline: None,
         }
     }
 
@@ -155,6 +157,9 @@ impl<B: Backend> Controllers<B> {
         let backend =
             (self.factory)().map_err(|error| InputError::new("backend_unavailable", error))?;
         let mut controller = Controller::new(backend, self.enabled);
+        if let Some(deadline) = self.shutdown_deadline {
+            controller.restrict_shutdown_deadline(deadline);
+        }
         if let Some(policy) = &self.policy {
             policy.apply_to_controller(&mut controller);
         }
@@ -240,6 +245,27 @@ impl<B: Backend> Controllers<B> {
             .is_some_and(|key| !self.contexts.contains_key(key))
         {
             self.selected = None;
+        }
+    }
+
+    pub(crate) fn quiesce_all(&mut self, now: Instant) -> bool {
+        let mut ready = self.defaults.quiesce(now);
+        for context in self.contexts.values_mut() {
+            // Continue independent contexts even when another native release
+            // fails. A single selected context cannot establish global drain.
+            ready &= context.controller.quiesce(now);
+        }
+        ready
+    }
+
+    pub(crate) fn restrict_shutdown_deadline(&mut self, deadline: Instant) {
+        let deadline = self
+            .shutdown_deadline
+            .map_or(deadline, |prior| prior.min(deadline));
+        self.shutdown_deadline = Some(deadline);
+        self.defaults.restrict_shutdown_deadline(deadline);
+        for context in self.contexts.values_mut() {
+            context.controller.restrict_shutdown_deadline(deadline);
         }
     }
 }
@@ -495,6 +521,62 @@ mod tests {
             true
         );
         assert_eq!(trace.borrow().stopped, vec![1]);
+    }
+
+    #[test]
+    fn shutdown_releases_independent_contexts_and_retries_only_failed_native_ownership() {
+        let now = Instant::now();
+        let (mut pool, trace) = pool();
+        let first = acquire(&mut pool, "one", json!({}), now)["lease"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let second = acquire(&mut pool, "two", json!({}), now)["lease"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        batch(&mut pool, &first, vec![key(KeyState::Down)], now);
+        batch(&mut pool, &second, vec![key(KeyState::Down)], now);
+        trace.borrow_mut().fail_key_release.insert(1);
+        trace.borrow_mut().fail_stop.insert(1);
+
+        assert!(!pool.quiesce_all(now));
+        assert!(pool.contexts["one"].controller.has_live_state());
+        assert!(!pool.contexts["two"].controller.has_live_state());
+        assert_eq!(trace.borrow().stopped, vec![1, 2]);
+        let attempted_events = trace.borrow().events.len();
+        assert!(!pool.quiesce_all(now + Duration::from_millis(50)));
+        assert_eq!(trace.borrow().events.len(), attempted_events);
+
+        trace.borrow_mut().fail_key_release.clear();
+        trace.borrow_mut().fail_stop.clear();
+        assert!(pool.quiesce_all(now + Duration::from_millis(100)));
+        assert_eq!(trace.borrow().stopped, vec![1, 2, 1]);
+        assert!(pool.quiesce_all(now + Duration::from_secs(1)));
+        assert_eq!(trace.borrow().stopped, vec![1, 2, 1]);
+    }
+
+    #[test]
+    fn shutdown_retires_a_direct_legacy_lease_and_its_pressed_keys() {
+        let now = Instant::now();
+        let (mut pool, trace) = pool();
+        let operation: Operation = serde_json::from_value(json!({
+            "action":"acquire","operation_id":"legacy"
+        }))
+        .unwrap();
+        let lease = pool.handle(OWNER, operation, now, &mut || Ok(()))["lease"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        batch(&mut pool, &lease, vec![key(KeyState::Down)], now);
+
+        assert!(pool.quiesce_all(now));
+        assert_eq!(
+            trace.borrow().events,
+            vec![(0, key(KeyState::Down)), (0, key(KeyState::Up))]
+        );
+        assert_eq!(trace.borrow().stopped, vec![0]);
+        assert!(!pool.has_live_state());
     }
 
     #[test]

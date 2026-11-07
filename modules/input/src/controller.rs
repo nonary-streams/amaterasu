@@ -772,6 +772,25 @@ impl<B: Backend> Controller<B> {
         self.lease.is_some() || self.cleanup_required()
     }
 
+    pub(crate) fn restrict_shutdown_deadline(&mut self, deadline: Instant) {
+        self.backend.restrict_shutdown_deadline(deadline);
+    }
+
+    pub(crate) fn quiesce(&mut self, now: Instant) -> bool {
+        if self
+            .lease
+            .as_ref()
+            .is_some_and(|lease| !lease.cleanup_required)
+        {
+            let _ = self.finish_lease(now, "shutdown");
+        } else {
+            // Failed releases keep their ownership and ordinary retry delay.
+            // Repeated host polls neither replay presses nor reset that delay.
+            self.expire(now);
+        }
+        !self.has_live_state()
+    }
+
     pub fn cleanup_required(&self) -> bool {
         self.startup_cleanup_pending
             || self.controller_cleanup_pending
@@ -1965,22 +1984,39 @@ impl<B: Backend> Controller<B> {
                 }
             }
         }
-        if let Some(error) = self.cancel_pen_touch_contacts() {
-            failure = Some(error);
-        }
+        let mut contact_failure = self.cancel_pen_touch_contacts();
         if let Some(error) = self.cancel_controller_touch_contacts() {
+            contact_failure = Some(error);
+        }
+        if self.lease.is_some() {
+            let stop_retires_inputs = self.backend.stop_retires_inputs();
+            let stop_retires_contacts = self.backend.stop_retires_contacts();
+            match self.backend.stop() {
+                Ok(()) if stop_retires_inputs => {
+                    // Destroying the exact owned devices or acknowledging the
+                    // exact companion revocation independently retires presses
+                    // whose individual terminal report could not be delivered.
+                    self.pressed.clear();
+                    self.pen_touch_contacts.clear();
+                    self.controller_touch_contacts.clear();
+                    failure = None;
+                    contact_failure = None;
+                }
+                Ok(()) if stop_retires_contacts => {
+                    // Windows synthetic contact/controller devices are owned
+                    // even when keyboard and mouse presses use global OS input.
+                    self.pen_touch_contacts.clear();
+                    self.controller_touch_contacts.clear();
+                    contact_failure = None;
+                }
+                Ok(()) => {}
+                Err(error) => failure = Some(error),
+            }
+        }
+        if let Some(error) = contact_failure {
             failure = Some(error);
         }
         if let Some(error) = failure {
-            if let Some(lease) = &mut self.lease {
-                lease.cleanup_required = true;
-            }
-            self.retry_at = now + Duration::from_millis(100);
-            return Err(InputError::new("release_failed", error.message));
-        }
-        if self.lease.is_some()
-            && let Err(error) = self.backend.stop()
-        {
             if let Some(lease) = &mut self.lease {
                 lease.cleanup_required = true;
             }

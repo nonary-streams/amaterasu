@@ -23,6 +23,7 @@ mod shortcut_store;
 pub use model::{Key as ShortcutKey, KeyState as ShortcutKeyState};
 mod product_settings;
 mod session_binding;
+mod shutdown;
 
 use amaterasu_input_policy::KeyBindings;
 use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};
@@ -81,8 +82,10 @@ struct InputModule {
     input_boot_epoch: String,
     shortcut_cache: shortcut_cache::ShortcutCache,
     pending_revoke: Option<(QueuedRequest, session_binding::RevokeRequest)>,
+    shutdown: shutdown::Shutdown,
 }
 
+#[derive(Clone)]
 struct QueuedRequest {
     id: u64,
     caller: String,
@@ -233,7 +236,17 @@ impl ManagedModule for InputModule {
             acquire_job: None,
             activation_job: None,
             pending_revoke: None,
+            shutdown: shutdown::Shutdown::default(),
         })
+    }
+    fn prepare_shutdown(&mut self, remaining_ms: u64) -> ModuleResult<()> {
+        self.shutdown.announce(Instant::now(), remaining_ms);
+        self.controller
+            .restrict_shutdown_deadline(self.shutdown.deadline());
+        Ok(())
+    }
+    fn quiesce(&mut self) -> ModuleResult<bool> {
+        self.quiesce_input(Instant::now())
     }
     fn tick(&mut self) -> ModuleResult<()> {
         let _priority = amaterasu_module_sdk::threading::ScopedThreadPriority::best_effort(
@@ -241,6 +254,7 @@ impl ManagedModule for InputModule {
         );
         self.controller.expire_all(Instant::now());
         self.controller.select_default();
+        self.settle_shutdown_rejection()?;
         let runtime = &self.runtime;
         self.product_settings
             .advance(&mut |command| runtime.send(command), &mut self.controller)?;
@@ -290,6 +304,9 @@ impl InputModule {
             payload,
             deadline: Instant::now() + Duration::from_millis(remaining_ms),
         };
+        if self.reject_shutdown_request(&request)? {
+            return Ok(());
+        }
         // Fence immediately, even when a previously admitted batch is draining.
         if request.service == SERVICE
             && request.payload.get("action").and_then(Value::as_str) == Some("revoke_binding")
@@ -349,22 +366,31 @@ impl InputModule {
             } else {
                 false
             };
-            if let Err(code) = self.bindings.revoke(
+            let (owner, lease) = match self.bindings.revoke(
                 &request.caller,
                 &revoke.operation_id,
                 &revoke.token,
                 revoke.target.clone(),
             ) {
-                return self.complete(
-                    request.id,
-                    InputError::new(code, "binding revocation rejected").payload(),
-                    &request.caller,
-                    false,
-                );
-            }
+                Ok(binding) => binding,
+                Err(code) => {
+                    return self.complete(
+                        request.id,
+                        InputError::new(code, "binding revocation rejected").payload(),
+                        &request.caller,
+                        false,
+                    );
+                }
+            };
             self.shortcut_cache.invalidate(&revoke.token);
             self.controller.select_binding(&revoke.token);
             self.controller.set_consumed_held(true);
+            if let Some(lease) = lease {
+                // Native revocation must not depend on the response request
+                // outliving settings or shortcut work. Failed release stays
+                // owned by this exact controller for the normal tick retry.
+                let _ = self.controller.cancel_bound_lease(&owner, &lease);
+            }
             if transferred {
                 self.shortcut_job
                     .as_mut()
@@ -436,6 +462,9 @@ impl InputModule {
     }
 
     fn dispatch(&mut self, request: QueuedRequest) -> ModuleResult<()> {
+        if self.reject_shutdown_request(&request)? {
+            return Ok(());
+        }
         self.controller
             .select_request(&request.caller, &request.payload);
         if request.service != SERVICE {
@@ -1058,7 +1087,19 @@ impl InputModule {
         let Some((request, revoke)) = self.pending_revoke.take() else {
             return Ok(());
         };
-        self.complete(request.id, serde_json::json!({"ok":true,"status":"retired","token":revoke.token,"target":revoke.target}), &request.caller, false)
+        let reply = serde_json::json!({
+            "ok": true,
+            "status": "retired",
+            "token": revoke.token,
+            "target": revoke.target,
+        });
+        if let Err(error) = self.complete(request.id, reply, &request.caller, false) {
+            // Native retirement has completed; retain only the exact response
+            // obligation when its broker acknowledgement is uncertain.
+            self.pending_revoke = Some((request, revoke));
+            return Err(error);
+        }
+        Ok(())
     }
 
     fn advance_activation(&mut self) -> ModuleResult<()> {

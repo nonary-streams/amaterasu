@@ -6,6 +6,8 @@ mod model;
 mod permit;
 mod session;
 mod vhf;
+#[cfg(any(target_os = "linux", windows))]
+mod worker_client;
 
 pub use model::{
     GamepadFeedback, InputEvent, InputPacket, MouseButton, PROTOCOL_VERSION, PeerIdentity,
@@ -15,14 +17,20 @@ pub use session::{DeviceSink, GrantRegistry, InputGrant, InputSession};
 pub use vhf::{VhfDeviceSink, VhfTransport};
 
 #[cfg(target_os = "linux")]
+mod linux_client;
+#[cfg(target_os = "linux")]
 mod linux_service;
 #[cfg(target_os = "linux")]
-pub use linux_service::{LinuxInputClient, LinuxInputService};
+pub use linux_client::LinuxInputClient;
+#[cfg(target_os = "linux")]
+pub use linux_service::LinuxInputService;
 
 #[cfg(windows)]
 mod windows_identity;
 #[cfg(windows)]
 mod windows_pipe;
+#[cfg(any(windows, test))]
+mod windows_pipe_state;
 #[cfg(windows)]
 mod windows_service;
 #[cfg(windows)]

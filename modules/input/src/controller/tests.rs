@@ -18,6 +18,8 @@ struct FakeBackend {
     fail_next: bool,
     fail_release: bool,
     fail_stop: bool,
+    stop_retires_inputs: bool,
+    stop_retires_contacts: bool,
     fail_start_once: bool,
     native_resource_owned: bool,
     native_resource_trace: Option<Rc<std::cell::Cell<bool>>>,
@@ -48,6 +50,12 @@ struct FakeBackend {
     pen_touch_advances: usize,
 }
 impl Backend for FakeBackend {
+    fn stop_retires_inputs(&self) -> bool {
+        self.stop_retires_inputs
+    }
+    fn stop_retires_contacts(&self) -> bool {
+        self.stop_retires_contacts
+    }
     fn poll_gamepad_feedback(
         &mut self,
     ) -> InputResult<Option<amaterasu_input_companion::GamepadFeedback>> {
@@ -2119,6 +2127,120 @@ fn failed_controller_slot_removal_retries_without_blocking_keyboard_or_mouse() {
 }
 
 #[test]
+fn whole_lease_shutdown_supersedes_pending_controller_only_cleanup_and_key_repeat() {
+    let now = Instant::now();
+    let mut controller = Controller::new(
+        FakeBackend {
+            fail_controller_disable: true,
+            controller_input_supported: true,
+            ..Default::default()
+        },
+        true,
+    );
+    controller.set_key_repeat_policy(1, 25.0);
+    let lease = acquire(&mut controller, now);
+    assert_eq!(
+        batch(&mut controller, &lease, vec![key(30, KeyState::Down)])["ok"],
+        true
+    );
+    assert!(controller.repeating_key.is_some());
+    assert!(controller.set_controller_enabled(false, now).is_err());
+    assert!(controller.controller_cleanup_pending);
+    assert!(!controller.lease.as_ref().unwrap().cleanup_required);
+
+    assert!(controller.quiesce(now));
+    assert!(controller.repeating_key.is_none());
+    assert!(controller.pressed.is_empty());
+    assert_eq!(controller.backend.stops, 1);
+    let delivered = controller.backend.trace.borrow().len();
+    controller.expire(now + Duration::from_secs(1));
+    assert_eq!(controller.backend.trace.borrow().len(), delivered);
+}
+
+#[test]
+fn owned_device_retirement_can_prove_cleanup_after_rejected_individual_key_release() {
+    let now = Instant::now();
+    let mut controller = Controller::new(
+        FakeBackend {
+            fail_release: true,
+            stop_retires_inputs: true,
+            ..Default::default()
+        },
+        true,
+    );
+    let lease = acquire(&mut controller, now);
+    assert_eq!(
+        batch(&mut controller, &lease, vec![key(30, KeyState::Down)])["ok"],
+        true
+    );
+
+    assert!(controller.quiesce(now));
+    assert_eq!(controller.backend.stops, 1);
+    assert!(controller.pressed.is_empty());
+    assert!(controller.lease.is_none());
+}
+
+#[test]
+fn global_injection_obligations_survive_independent_native_stop() {
+    let now = Instant::now();
+    let mut controller = Controller::new(
+        FakeBackend {
+            fail_release: true,
+            ..Default::default()
+        },
+        true,
+    );
+    let lease = acquire(&mut controller, now);
+    assert_eq!(
+        batch(&mut controller, &lease, vec![key(30, KeyState::Down)])["ok"],
+        true
+    );
+
+    assert!(!controller.quiesce(now));
+    assert_eq!(controller.backend.stops, 1);
+    assert_eq!(controller.pressed.len(), 1);
+    assert!(controller.lease.as_ref().unwrap().cleanup_required);
+    controller.backend.fail_release = false;
+    assert!(controller.quiesce(now + Duration::from_millis(100)));
+    assert!(controller.pressed.is_empty());
+}
+
+#[test]
+fn owned_contact_retirement_does_not_clear_unreleased_global_keys() {
+    let now = Instant::now();
+    let mut controller = Controller::new(
+        FakeBackend {
+            fail_release: true,
+            supports_pen_touch: true,
+            stop_retires_contacts: true,
+            failed_pen_touch_events: vec![(7, PenTouchPhase::Cancel)],
+            ..Default::default()
+        },
+        true,
+    );
+    let lease = acquire(&mut controller, now);
+    assert_eq!(
+        batch(
+            &mut controller,
+            &lease,
+            vec![
+                key(30, KeyState::Down),
+                pen_touch(7, PenTouchDevice::Touch, PenTouchPhase::Down, 100, 200),
+            ]
+        )["ok"],
+        true
+    );
+    assert_eq!(controller.pen_touch_contacts.len(), 1);
+
+    assert!(!controller.quiesce(now));
+    assert!(controller.pen_touch_contacts.is_empty());
+    assert_eq!(controller.pressed.len(), 1);
+    assert!(controller.lease.as_ref().unwrap().cleanup_required);
+    controller.backend.fail_release = false;
+    assert!(controller.quiesce(now + Duration::from_millis(100)));
+}
+
+#[test]
 fn pen_touch_refresh_continues_while_controller_removal_retries() {
     let mut controller = Controller::new(
         FakeBackend {
@@ -2365,7 +2487,7 @@ fn failed_releases_remain_tracked_block_new_leases_and_retry() {
     assert_eq!(result["error"]["code"], "release_failed");
     assert_eq!(result["cleanup_required"], true);
     assert_eq!(controller.pressed.len(), 1);
-    assert_eq!(controller.backend.stops, 0);
+    assert_eq!(controller.backend.stops, 1);
     let busy = controller.handle(
         "other",
         Operation::Acquire {
@@ -2404,7 +2526,7 @@ fn failed_releases_remain_tracked_block_new_leases_and_retry() {
     controller.expire(now + Duration::from_millis(101));
     assert!(controller.pressed.is_empty());
     assert!(controller.lease.is_none());
-    assert_eq!(controller.backend.stops, 1);
+    assert_eq!(controller.backend.stops, 2);
 }
 #[test]
 fn original_modifier_release_failure_preserves_owner_until_recovery() {

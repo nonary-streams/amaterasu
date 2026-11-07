@@ -12,6 +12,7 @@ use crate::model::{
 use amaterasu_input_companion::WindowsInputClient;
 use amaterasu_input_policy::{KeyBindings, host_modifier_identity};
 use std::collections::HashMap;
+use std::time::Instant;
 use windows_gamepad::WindowsGamepads;
 use windows_pen_touch::WindowsPenTouch;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
@@ -24,6 +25,7 @@ pub struct WindowsBackend {
     keybindings: KeyBindings,
     held_key_plans: HeldKeyPlans<KeyboardPlan>,
     companion_key_plans: HashMap<u8, KeyboardPlan>,
+    shutdown_deadline: Option<Instant>,
     gamepads: WindowsGamepads,
     pen_touch: WindowsPenTouch,
 }
@@ -42,6 +44,7 @@ impl WindowsBackend {
             keybindings: KeyBindings::default(),
             held_key_plans: HeldKeyPlans::new(),
             companion_key_plans: HashMap::new(),
+            shutdown_deadline: None,
             gamepads: WindowsGamepads::new(),
             pen_touch: WindowsPenTouch::new(),
         }
@@ -248,7 +251,17 @@ impl Backend for WindowsBackend {
 
     fn start(&mut self) -> InputResult<()> {
         if self.vhf_companion {
-            self.companion = Some(WindowsInputClient::connect().map_err(companion_error)?);
+            if self.companion.is_some() {
+                return Err(InputError::new(
+                    "backend_busy",
+                    "input companion lease is active",
+                ));
+            }
+            let client = match self.shutdown_deadline {
+                Some(deadline) => WindowsInputClient::connect_with_deadline(deadline),
+                None => WindowsInputClient::connect(),
+            };
+            self.companion = Some(client.map_err(companion_error)?);
             self.companion_key_plans.clear();
             return Ok(());
         }
@@ -365,19 +378,43 @@ impl Backend for WindowsBackend {
         self.gamepads.disable()
     }
 
+    fn restrict_shutdown_deadline(&mut self, deadline: Instant) {
+        let deadline = self
+            .shutdown_deadline
+            .map_or(deadline, |prior| prior.min(deadline));
+        self.shutdown_deadline = Some(deadline);
+        if let Some(client) = self.companion.as_mut() {
+            client.restrict_deadline(deadline);
+        }
+    }
+
+    fn stop_retires_inputs(&self) -> bool {
+        // The VHF child owns every injected input. SendInput keyboard/mouse
+        // state belongs to the desktop and still needs explicit terminal events.
+        self.vhf_companion
+    }
+
+    fn stop_retires_contacts(&self) -> bool {
+        // Both Windows routes own their contact devices even when keyboard
+        // and mouse events use the desktop's global SendInput state.
+        true
+    }
+
     fn stop(&mut self) -> InputResult<()> {
         if self.vhf_companion {
-            self.companion_key_plans.clear();
-            if let Some(mut companion) = self.companion.take() {
-                // The server destroys its child on disconnect. Discard the
-                // terminal pipe even if its close acknowledgement is lost.
+            if let Some(companion) = self.companion.as_mut() {
+                // Pipe closure requests server cleanup but cannot acknowledge
+                // it. Keep the exact child lease owned after a failed close.
                 companion.close().map_err(companion_error)?;
             }
+            self.companion = None;
+            self.companion_key_plans.clear();
             return Ok(());
         }
         let gamepad_result = self.gamepads.stop();
         let pen_touch_result = self.pen_touch.stop();
-        self.held_key_plans.clear();
+        // SendInput keys remain global host state after native device teardown.
+        // A failed key-up must retain its original plan for the owner's retry.
         gamepad_result?;
         pen_touch_result
     }
@@ -1229,6 +1266,11 @@ mod tests {
             ))
         });
         assert!(up_result.is_err());
+        assert_eq!(backend.held_key_plans.get(&0x41), Some(&plan));
+
+        // Independent controller/contact teardown does not retire globally
+        // injected SendInput keys. Keep the exact plan through stop as well.
+        backend.stop().unwrap();
         assert_eq!(backend.held_key_plans.get(&0x41), Some(&plan));
 
         backend
