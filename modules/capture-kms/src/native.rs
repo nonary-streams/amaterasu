@@ -80,6 +80,16 @@ mod tests {
         plane_queries: u32,
         texture_after: u32,
         framebuffer_after: u32,
+        unbind_calls: u32,
+        foreign_context_unbinds: u32,
+        surface_destructions: u32,
+        context_destructions: u32,
+        display_terminations: u32,
+        current_context_after: u32,
+        selected_api_after: u32,
+        vg_context_after: u32,
+        foreign_display_terminations: u32,
+        api_bind_calls: u32,
     }
 
     unsafe extern "C" {
@@ -89,6 +99,105 @@ mod tests {
             output: *mut CleanupObservation,
         );
         fn am_kms_test_read_without_current_context(output: *mut CleanupObservation) -> i32;
+        fn am_kms_test_full_cleanup(
+            make_current_succeeds: u32,
+            initially_owned: u32,
+            selected_vg: u32,
+            output: *mut CleanupObservation,
+        );
+        fn am_kms_test_api_cleanup(scenario: u32, output: *mut CleanupObservation);
+    }
+
+    #[test]
+    fn failed_teardown_bind_does_not_explicitly_unbind_foreign_context() {
+        let mut observed = CleanupObservation::default();
+        // SAFETY: every platform operation reached by this fixture is mocked.
+        unsafe { am_kms_test_full_cleanup(0, 0, 0, &mut observed) };
+        assert_eq!(observed.unbind_calls, 0, "{observed:?}");
+        assert_eq!(observed.foreign_context_unbinds, 0, "{observed:?}");
+        assert_eq!(observed.foreign_display_terminations, 1, "{observed:?}");
+        assert_eq!(observed.texture_deletions, 0, "{observed:?}");
+        assert_eq!(observed.framebuffer_deletions, 0, "{observed:?}");
+        assert_eq!(observed.image_deletions, 1);
+        assert_eq!(observed.surface_destructions, 1);
+        assert_eq!(observed.context_destructions, 1);
+        assert_eq!(observed.display_terminations, 1);
+    }
+
+    #[test]
+    fn full_cleanup_unbinds_its_own_context_even_if_rebinding_fails() {
+        let mut observed = CleanupObservation::default();
+        // SAFETY: this fixture owns its fake handles and mocks platform calls.
+        unsafe { am_kms_test_full_cleanup(0, 1, 0, &mut observed) };
+        assert_eq!(observed.unbind_calls, 1, "{observed:?}");
+        assert_eq!(observed.current_context_after, 0, "{observed:?}");
+        assert_eq!(observed.context_destructions, 1);
+    }
+
+    #[test]
+    fn full_cleanup_unbinds_context_after_successful_binding() {
+        let mut observed = CleanupObservation::default();
+        // SAFETY: this fixture owns its fake handles and mocks platform calls.
+        unsafe { am_kms_test_full_cleanup(1, 0, 0, &mut observed) };
+        assert_eq!(observed.unbind_calls, 1, "{observed:?}");
+        assert_eq!(observed.foreign_context_unbinds, 0);
+        assert_eq!(observed.texture_deletions, 1);
+        assert_eq!(observed.framebuffer_deletions, 1);
+        assert_eq!(observed.current_context_after, 0, "{observed:?}");
+        assert_eq!(observed.context_destructions, 1);
+    }
+
+    #[test]
+    fn full_cleanup_unbinds_own_gl_context_with_openvg_selected() {
+        const EGL_OPENVG_API: u32 = 0x30a1;
+        let mut observed = CleanupObservation::default();
+        // SAFETY: the fixture tracks separate fake GL and OpenVG contexts.
+        unsafe { am_kms_test_full_cleanup(1, 0, 1, &mut observed) };
+        assert_eq!(observed.unbind_calls, 1, "{observed:?}");
+        assert_eq!(observed.foreign_context_unbinds, 0, "{observed:?}");
+        assert_eq!(observed.current_context_after, 0, "{observed:?}");
+        assert_eq!(observed.vg_context_after, 6, "{observed:?}");
+        assert_eq!(observed.selected_api_after, EGL_OPENVG_API, "{observed:?}");
+    }
+
+    #[test]
+    fn partial_initialization_does_not_change_the_callers_api() {
+        let mut observed = CleanupObservation::default();
+        // SAFETY: the fixture uses fake EGL handles and mock entry points.
+        unsafe { am_kms_test_api_cleanup(0, &mut observed) };
+        assert_eq!(observed.api_bind_calls, 0, "{observed:?}");
+        assert_eq!(observed.selected_api_after, 0x30a1, "{observed:?}");
+    }
+
+    #[test]
+    fn failed_api_switch_does_not_unbind_foreign_context() {
+        let mut observed = CleanupObservation::default();
+        // SAFETY: the fixture uses fake EGL handles and mock entry points.
+        unsafe { am_kms_test_api_cleanup(1, &mut observed) };
+        assert_eq!(observed.api_bind_calls, 1, "{observed:?}");
+        assert_eq!(observed.unbind_calls, 0, "{observed:?}");
+        assert_eq!(observed.selected_api_after, 0x30a1, "{observed:?}");
+        assert_eq!(observed.vg_context_after, 6, "{observed:?}");
+    }
+
+    #[test]
+    fn failed_api_restoration_does_not_claim_the_original_api_was_restored() {
+        let mut observed = CleanupObservation::default();
+        // SAFETY: the fixture uses fake EGL handles and mock entry points.
+        unsafe { am_kms_test_api_cleanup(2, &mut observed) };
+        assert_eq!(observed.api_bind_calls, 2, "{observed:?}");
+        assert_eq!(observed.selected_api_after, 0x30a0, "{observed:?}");
+        assert_eq!(observed.vg_context_after, 6, "{observed:?}");
+    }
+
+    #[test]
+    fn no_selected_api_is_not_replaced_or_unbound() {
+        let mut observed = CleanupObservation::default();
+        // SAFETY: the fixture uses fake EGL handles and mock entry points.
+        unsafe { am_kms_test_api_cleanup(3, &mut observed) };
+        assert_eq!(observed.api_bind_calls, 0, "{observed:?}");
+        assert_eq!(observed.unbind_calls, 0, "{observed:?}");
+        assert_eq!(observed.selected_api_after, 0x3038, "{observed:?}");
     }
 
     #[test]

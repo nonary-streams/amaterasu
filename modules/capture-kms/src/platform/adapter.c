@@ -955,9 +955,27 @@ static void destroy_egl(struct am_kms_session *session) {
         return;
     }
     clear_imported_image(session);
+    /* The current-context queries and null-context unbind use the selected
+     * client API. Inspect the GLES binding without unbinding an OpenVG context. */
     if (session->display != EGL_NO_DISPLAY && session->context != EGL_NO_CONTEXT) {
-        (void)eglMakeCurrent(session->display, EGL_NO_SURFACE, EGL_NO_SURFACE,
-                             EGL_NO_CONTEXT);
+        EGLenum previous_api = eglQueryAPI();
+        bool switched_api = false;
+        bool can_inspect_gl = previous_api == EGL_OPENGL_ES_API;
+        if (!can_inspect_gl && previous_api != EGL_NONE &&
+            eglBindAPI(EGL_OPENGL_ES_API) == EGL_TRUE) {
+            switched_api = true;
+            can_inspect_gl = true;
+        }
+        /* A failed bind in clear_imported_image leaves the prior GL context
+         * current. Only unbind when it is this session's context. */
+        if (can_inspect_gl && eglGetCurrentDisplay() == session->display &&
+            eglGetCurrentContext() == session->context) {
+            (void)eglMakeCurrent(session->display, EGL_NO_SURFACE, EGL_NO_SURFACE,
+                                 EGL_NO_CONTEXT);
+        }
+        if (switched_api) {
+            (void)eglBindAPI(previous_api);
+        }
     }
     if (session->display != EGL_NO_DISPLAY && session->surface != EGL_NO_SURFACE) {
         (void)eglDestroySurface(session->display, session->surface);
