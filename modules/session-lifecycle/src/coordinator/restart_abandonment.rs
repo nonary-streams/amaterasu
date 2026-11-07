@@ -442,6 +442,45 @@ pub(super) mod tests {
                 "method":"lifecycle_callback","interface_major":1,"interface_minor":0,"schema_revision":1}})
     }
 
+    /// The startup sweep must find stranded sessions even when retained
+    /// history makes an unscoped snapshot exceed the broker result limit.
+    #[test]
+    fn restart_stranded_listing_is_owner_scoped_and_bounded() {
+        let (mut coordinator, _root) = open_coordinator("amaterasu-stranded-listing");
+        for id in 0..70 {
+            insert_stranded(&coordinator, &format!("stranded-{id}"));
+        }
+        let mut journal = coordinator.shared.borrow().value.clone();
+        let mut foreign = journal.sessions["stranded-0"].clone();
+        foreign.id = "foreign".into();
+        foreign.owner.caller = "other".into();
+        foreign.owner.initiator = "other".into();
+        journal.sessions.insert("foreign".into(), foreign);
+        let mut current = journal.sessions["stranded-1"].clone();
+        current.id = "current".into();
+        current.host_epoch = journal.host_epoch.clone();
+        journal.sessions.insert("current".into(), current);
+        save(&coordinator.shared, journal).unwrap();
+
+        let listing = coordinator.handle(
+            OWNER,
+            OWNER,
+            json!({"operation":"snapshot","restart_stranded":true}),
+        );
+        assert_eq!(listing["status"], "ok", "{listing}");
+        assert_eq!(listing["truncated"], true);
+        let sessions = listing["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 64);
+        assert!(sessions.iter().all(|session| {
+            session["host_epoch"] == OLD_EPOCH
+                && session["session_id"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("stranded-")
+        }));
+        assert!(serde_json::to_vec(&listing).unwrap().len() <= 16_384);
+    }
+
     #[test]
     fn only_the_owner_abandons_an_old_epoch_undispatched_release() {
         let (mut coordinator, path) = open_coordinator("restart-abandon-owner");

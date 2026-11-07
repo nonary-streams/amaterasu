@@ -137,6 +137,9 @@ fn required_reprepare(
 impl Coordinator {
     pub(super) fn snapshot(&self, caller: &str, initiator: &str, payload: &Value) -> Value {
         let journal = &self.shared.borrow().value;
+        if payload["restart_stranded"] == true {
+            return restart_stranded_sessions(journal, caller, initiator);
+        }
         let target = match payload.get("target").filter(|value| !value.is_null()) {
             Some(value) => match serde_json::from_value::<LifecycleTarget>(value.clone()) {
                 Ok(target) => Some(target),
@@ -783,6 +786,29 @@ impl Coordinator {
         save(&self.shared, next)?;
         Ok(response)
     }
+}
+
+/// Sessions the caller owns that a host restart left `recovery_required`, in a
+/// compact form that stays within the broker result limit however much
+/// history the journal retains. A truncated listing is completed by asking
+/// again after the listed sessions leave the journal.
+fn restart_stranded_sessions(journal: &Journal, caller: &str, initiator: &str) -> Value {
+    const MAX_LISTED: usize = 64;
+    let mut stranded = journal.sessions.values().filter(|session| {
+        allowed(session, caller, initiator)
+            && session.phase == SessionPhase::RecoveryRequired
+            && session.host_epoch != journal.host_epoch
+    });
+    let sessions: Vec<_> = stranded
+        .by_ref()
+        .take(MAX_LISTED)
+        .map(|session| {
+            json!({"session_id":session.id,"host_epoch":session.host_epoch,
+                "generation":session.generation,"phase":session.phase})
+        })
+        .collect();
+    json!({"status":"ok","host_epoch":journal.host_epoch,"sessions":sessions,
+        "truncated":stranded.next().is_some()})
 }
 
 #[cfg(test)]
