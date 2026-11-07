@@ -81,6 +81,20 @@ pub(crate) fn finish_with_cleanup<T>(
     }
 }
 
+/// Read readiness only after the process wait observes the worker running.
+pub(crate) fn readiness_after_process_wait(
+    wait_result: u32,
+    read_ready: impl FnOnce() -> Result<bool, String>,
+) -> Result<bool, String> {
+    const WAIT_OBJECT_0: u32 = 0;
+    const WAIT_TIMEOUT: u32 = 258;
+    match wait_result {
+        WAIT_TIMEOUT => read_ready(),
+        WAIT_OBJECT_0 => Err("interactive worker exited before readiness".into()),
+        _ => Err("interactive worker readiness process status is unavailable".into()),
+    }
+}
+
 /// Charge forced containment to the existing service shutdown allowance.
 pub(crate) fn remaining_containment(
     shutdown_deadline: Option<Instant>,
@@ -144,6 +158,35 @@ mod tests {
     use std::io::Cursor;
     use std::sync::mpsc::Sender;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn readiness_requires_a_running_process_before_reading_ready() {
+        assert_eq!(readiness_after_process_wait(258, || Ok(true)), Ok(true));
+        assert_eq!(readiness_after_process_wait(258, || Ok(false)), Ok(false));
+        assert_eq!(
+            readiness_after_process_wait(258, || Err("pipe failed".to_owned())),
+            Err("pipe failed".to_owned())
+        );
+        for (result, message) in [
+            (0, "interactive worker exited before readiness"),
+            (
+                u32::MAX,
+                "interactive worker readiness process status is unavailable",
+            ),
+            (
+                1,
+                "interactive worker readiness process status is unavailable",
+            ),
+        ] {
+            let mut read = false;
+            let observed = readiness_after_process_wait(result, || {
+                read = true;
+                Ok(true)
+            });
+            assert_eq!(observed, Err(message.to_owned()));
+            assert!(!read, "a READY record must not override an uncertain wait");
+        }
+    }
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(2);
 

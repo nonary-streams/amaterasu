@@ -800,11 +800,14 @@ impl ReadinessPipe {
             if stop_requested() {
                 return Ok(false);
             }
-            if unsafe { WaitForSingleObject(process, 0) } == WAIT_OBJECT_0 {
-                return Err("interactive worker exited before readiness".into());
-            }
-            self.read_available()?;
-            if self.ready {
+            // SAFETY: the caller retains this exact process handle while the
+            // readiness pipe is polled.
+            let wait_result = unsafe { WaitForSingleObject(process, 0) };
+            let ready = crate::worker_shutdown::readiness_after_process_wait(wait_result, || {
+                self.read_available()?;
+                Ok(self.ready)
+            })?;
+            if ready {
                 return Ok(true);
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
