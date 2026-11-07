@@ -265,6 +265,7 @@ impl Controller {
         }
         self.cap_announced_cleanup_deadline();
         self.poll_transport(now);
+        self.advance_shutdown_settlement(runtime);
         self.cap_announced_cleanup_deadline();
         self.advance_startup_recovery(runtime, now);
         self.advance_job(runtime, now);
@@ -359,7 +360,7 @@ impl Controller {
         if record.uncertain.is_some() {
             let read_only = matches!(
                 record.uncertain_phase,
-                Some(Phase::Status | Phase::Find | Phase::LifecycleLookup)
+                Some(Phase::Observe | Phase::Status | Phase::Find | Phase::LifecycleLookup)
             );
             let observed = record
                 .uncertain

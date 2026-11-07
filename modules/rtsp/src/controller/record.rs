@@ -281,6 +281,7 @@ pub(super) enum Phase {
     LifecycleLookup,
     Arm,
     Stop,
+    Observe,
     Status,
 }
 

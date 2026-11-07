@@ -56,9 +56,10 @@ impl Controller {
 
     fn begin_quiescence(&mut self, runtime: &RuntimeClient) {
         if self.shutdown_settlement.len() < MAX_RECORDS
-            && self.job.as_ref().is_some_and(|job| {
-                job.phase == Phase::Status && job.caller.is_none() && job.network.is_none()
-            })
+            && self
+                .job
+                .as_ref()
+                .is_some_and(|job| job.phase == Phase::Observe)
         {
             let mut job = self.job.take().expect("background status job");
             job.call.cancel();
@@ -136,17 +137,7 @@ impl Controller {
         self.advance_job(runtime, now);
         self.close_quiescing_records();
         self.advance_display_cleanup(runtime);
-        self.shutdown_settlement
-            .retain_mut(|call| match call.poll(runtime) {
-                Outcome::SettledFailure | Outcome::Result(_) => false,
-                Outcome::Waiting => true,
-                Outcome::Uncertain => {
-                    // Retrying metadata settlement does not repeat a failed undo.
-                    // The aggregate quiescence deadline bounds these attempts.
-                    call.retry_settlement();
-                    true
-                }
-            });
+        self.advance_shutdown_settlement(runtime);
         if self.job.is_none()
             && let Some(ticket) = self
                 .records
@@ -170,11 +161,25 @@ impl Controller {
         Ok(())
     }
 
+    pub(super) fn advance_shutdown_settlement(&mut self, runtime: &RuntimeClient) {
+        self.shutdown_settlement
+            .retain_mut(|call| match call.poll(runtime) {
+                Outcome::SettledFailure | Outcome::Result(_) => false,
+                Outcome::Waiting => true,
+                Outcome::Uncertain => {
+                    // Retrying metadata settlement does not repeat a failed undo.
+                    // Quiescence applies its aggregate deadline separately.
+                    call.retry_settlement();
+                    true
+                }
+            });
+    }
+
     fn close_quiescing_records(&mut self) {
-        let observed = self.job.as_ref().and_then(|job| {
-            (job.phase == Phase::Status && job.caller.is_none() && job.network.is_none())
-                .then_some(job.ticket)
-        });
+        let observed = self
+            .job
+            .as_ref()
+            .and_then(|job| (job.phase == Phase::Observe).then_some(job.ticket));
         for record in self.records.values_mut() {
             if record.state.terminal() || record.state == State::CleanupFailed {
                 continue;

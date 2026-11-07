@@ -8,6 +8,17 @@ impl Controller {
         let Some(mut record) = self.records.remove(&job.ticket) else {
             return;
         };
+        if job.phase == Phase::Observe
+            && record.state == State::Closing
+            && self.shutdown_settlement.len() < MAX_RECORDS
+        {
+            // Status is read-only: preserve its exact cancellation/release
+            // ownership while allowing native cleanup to proceed independently.
+            job.call.cancel();
+            self.shutdown_settlement.push(job.call);
+            self.records.insert(record.id, record);
+            return;
+        }
         if job.phase == Phase::Prepare
             && record.state != State::Closing
             && job
@@ -118,7 +129,7 @@ impl Controller {
             Phase::Stop => {
                 self.schedule_status_until(record, job.caller, job.network, job.deadline)
             }
-            Phase::Find | Phase::Status => {
+            Phase::Find | Phase::Observe | Phase::Status => {
                 record.state = State::CleanupFailed;
                 record.cleanup_error = Some("dependency_unavailable");
                 complete_caller(record, job.caller, runtime);
@@ -142,7 +153,9 @@ impl Controller {
             }
             Phase::Arm => self.armed(record, job, &payload, now),
             Phase::Stop => self.stopped(record, job, &payload, runtime),
-            Phase::Status => self.status_result(record, job, &payload, now, runtime),
+            Phase::Observe | Phase::Status => {
+                self.status_result(record, job, &payload, now, runtime)
+            }
         }
     }
 
@@ -619,6 +632,13 @@ impl Controller {
             self.records.insert(ticket, record);
             return;
         }
+        // Each detached observation belongs to a distinct record that has
+        // left Playing, and RTSP records remain resident for this runtime.
+        // Thus a full ledger cannot coexist with another Playing record.
+        // Preserve this reservation invariant if record reclamation is added.
+        if self.shutdown_settlement.len() >= MAX_RECORDS {
+            return;
+        }
         let eligible =
             |record: &&Record| record.state == State::Playing && now >= record.next_status;
         let next = self
@@ -729,6 +749,9 @@ impl Controller {
             PREPARE_BUDGET_MS
         });
         self.schedule_status_until(record, caller, network, deadline);
+        if let Some(job) = self.job.as_mut() {
+            job.phase = Phase::Observe;
+        }
     }
 
     pub(super) fn schedule_status_until(

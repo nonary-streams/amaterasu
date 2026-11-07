@@ -264,6 +264,10 @@ and the same target, capture binding, and shared source validation used for live
 startup before a cleanup-only Stop is sent. A known coordinator result is retained
 before broker result release, so bookkeeping failures cannot discard its target.
 Read-only observation settlement is retained separately from native retirement.
+The same separation applies during normal operation: a disconnect can start its
+owned Stop while an earlier periodic status observation is still being settled.
+Observations after a submitted Stop continue polling that cleanup instead of
+submitting another Stop. Pending observation settlement is bounded and retried.
 
 Canceling a broker call before its first submission sends no request. Only that
 local proof, or a first explicit pre-enqueue broker rejection, allows an

@@ -3605,6 +3605,127 @@ fn cancelled_unsubmitted_lifecycle_prepare_stops_only_the_prepared_native_sessio
 }
 
 #[test]
+fn disconnect_does_not_wait_for_an_inflight_background_status_before_stop() {
+    for status in [
+        None,
+        Some(json!({"ok":true,"session":23,"state":"active","cleanup_error":null})),
+    ] {
+        let mut controller = Controller::new(Settings::default()).unwrap();
+        let mut other = record(State::Playing);
+        let record = record(State::Playing);
+        controller.schedule_status(&record, None, None, 0);
+        controller.records.insert(record.id, record);
+        other.id = 6;
+        other.session = Some(24);
+        controller.records.insert(other.id, other);
+        let mut endpoint = Endpoint {
+            recovery_results: VecDeque::from([
+                status,
+                Some(json!({"ok":true,"session":23,"state":"stopped","cleanup_error":null})),
+            ]),
+            deny_settlement_requests: BTreeSet::from([701]),
+            ..Endpoint::default()
+        };
+        let runtime = client(&mut endpoint);
+        controller.advance_job(&runtime, 1);
+        assert!(endpoint.recovery_requests.contains_key(&701));
+        controller.advance_job(&runtime, 2);
+        controller.disconnected(8, Some(5), "peer_disconnected");
+        for now in 3..=15 {
+            controller.advance_shutdown_settlement(&runtime);
+            controller.advance_job(&runtime, now);
+            if controller.job.is_none() {
+                controller.schedule_background(now);
+            }
+        }
+        assert!(endpoint.commands.iter().any(|command| matches!(command,
+        Command::Request { payload, .. } if payload["action"] == "stop" && payload["session"] == 23)),
+        "a pending read-only observation must not delay Stop");
+        assert!(controller.records[&5].cleanup_confirmed);
+        assert_eq!(controller.records[&6].state, State::Playing);
+        assert_eq!(controller.shutdown_settlement.len(), 1);
+        endpoint.deny_settlement_requests.clear();
+        controller.advance_shutdown_settlement(&runtime);
+        assert!(controller.shutdown_settlement.is_empty());
+    }
+}
+
+#[test]
+fn post_stop_status_polls_without_submitting_another_stop() {
+    let mut controller = Controller::new(Settings::default()).unwrap();
+    let record = record(State::Closing);
+    controller.schedule_stop(&record, None, 0);
+    controller.records.insert(record.id, record);
+    let active = json!({"ok":true,"session":23,"state":"active","cleanup_error":null});
+    let mut endpoint = Endpoint {
+        recovery_results: VecDeque::from([
+            Some(active.clone()),
+            Some(active),
+            Some(json!({"ok":true,"session":23,"state":"stopped","cleanup_error":null})),
+        ]),
+        ..Endpoint::default()
+    };
+    let runtime = client(&mut endpoint);
+    for now in 1..=15 {
+        controller.advance_job(&runtime, now);
+    }
+    let stops = endpoint
+        .commands
+        .iter()
+        .filter(|command| {
+            matches!(command,
+        Command::Request { payload, .. } if payload["action"] == "stop" && payload["session"] == 23)
+        })
+        .count();
+    assert_eq!(stops, 1);
+    assert!(controller.records[&5].cleanup_confirmed);
+}
+
+#[test]
+fn detached_observation_capacity_leaves_room_for_every_playing_record() {
+    let mut controller = Controller::new(Settings::default()).unwrap();
+    let mut endpoint = Endpoint::default();
+    let runtime = client(&mut endpoint);
+    for index in 0..MAX_RECORDS {
+        let mut record = record(State::Playing);
+        record.id = index as u64 + 1;
+        record.session = Some(index as u64 + 1);
+        record.next_status = 0;
+        let ticket = record.id;
+        controller.records.insert(ticket, record);
+        endpoint.recovery_results.push_back(None);
+        endpoint
+            .recovery_results
+            .push_back(Some(json!({"ok":true,"session":ticket,
+            "state":"stopped","cleanup_error":null})));
+        controller.schedule_background(1);
+        assert!(
+            controller
+                .job
+                .as_ref()
+                .is_some_and(|job| job.phase == Phase::Observe)
+        );
+        controller.advance_job(&runtime, 2);
+        let request = 701 + 2 * index as u64;
+        endpoint.deny_settlement_requests.insert(request);
+        controller.disconnected(8, Some(ticket), "peer_disconnected");
+        controller.advance_job(&runtime, 3);
+        assert_eq!(controller.shutdown_settlement.len(), index + 1);
+        controller.schedule_background(4);
+        controller.advance_job(&runtime, 5);
+        controller.advance_job(&runtime, 6);
+        assert!(controller.records[&ticket].cleanup_confirmed);
+    }
+    assert_eq!(controller.shutdown_settlement.len(), MAX_RECORDS);
+    assert!(
+        controller
+            .records
+            .values()
+            .all(|record| record.state != State::Playing)
+    );
+}
+
+#[test]
 fn undispatched_lifecycle_lookup_cannot_clear_the_original_preparation() {
     let (mut record, reply) = lifecycle_cleanup_fixture(false, false);
     record.state = State::Closing;
