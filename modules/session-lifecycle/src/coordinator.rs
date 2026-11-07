@@ -44,6 +44,7 @@ mod finalize_result_verify;
 #[allow(dead_code)] // Finalization selection remains gated until composition sequencing is wired.
 mod finalize_selection;
 mod frozen_settings_read;
+mod input_retirement;
 mod join;
 mod live_settings_read;
 mod observation_scheduler;
@@ -1137,6 +1138,8 @@ pub struct Coordinator {
     settlement_drivers: BTreeMap<String, settlement_dispatch::SettlementDispatch>,
     validations: BTreeMap<String, security::ValidationJob>,
     revocations: BTreeMap<String, security::RevocationJob>,
+    input_retirement_jobs: BTreeMap<String, input_retirement::AcknowledgementJob>,
+    input_retirement_cursor: usize,
     application_jobs: BTreeMap<String, application::ApplicationJob>,
     application_cursor: usize,
     ephemeral: BTreeMap<String, (Receipt, Instant)>,
@@ -1223,6 +1226,8 @@ impl Coordinator {
             settlement_drivers: BTreeMap::new(),
             validations: BTreeMap::new(),
             revocations: BTreeMap::new(),
+            input_retirement_jobs: BTreeMap::new(),
+            input_retirement_cursor: 0,
             application_jobs: BTreeMap::new(),
             application_cursor: 0,
             ephemeral: BTreeMap::new(),

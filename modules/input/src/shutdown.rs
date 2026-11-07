@@ -42,6 +42,7 @@ impl Shutdown {
                         | "poll_gamepad_feedback"
                         | "release"
                         | "revoke_binding"
+                        | "acknowledge_binding_retirement"
                 )
             )
         } else {
@@ -91,6 +92,7 @@ impl InputModule {
             .restrict_shutdown_deadline(self.shutdown.deadline());
         self.shutdown.quiescing = true;
         let _ = self.settle_shutdown_rejection();
+        let _ = self.advance_retirement_acknowledgement();
         // Reject deferred acquisitions and input delivery even if a settings or
         // shortcut operation currently prevents the ordinary queue from draining.
         // Already admitted asynchronous jobs retain their exact broker/state
@@ -114,6 +116,7 @@ impl InputModule {
             || self.activation_job.is_some()
             || self.shortcut_job.is_some()
             || self.pending_revoke.is_some()
+            || self.pending_retirement_acknowledgement.is_some()
             || self.product_settings.busy()
             || self.shutdown.rejected.is_some()
             || !self.queued.is_empty();

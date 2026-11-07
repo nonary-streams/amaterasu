@@ -9,6 +9,12 @@
 use serde::Serialize;
 use serde_json::Value;
 
+mod retirement;
+pub use retirement::{
+    INPUT_BINDING_RETIREMENT_VERSION, InputBindingRetirement, binding_retirement_acknowledged,
+    binding_retirement_from_reply,
+};
+
 pub const INPUT_SERVICE: &str = "amaterasu.input/1";
 pub const MAX_BATCH_EVENTS: usize = 64;
 pub const MAX_LEASE_BYTES: usize = 128;
@@ -164,6 +170,11 @@ fn valid_batch_error_code(code: &str) -> bool {
 #[derive(Debug, Serialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum InputRequest<'a> {
+    /// Release retained bookkeeping only after the coordinator has durably
+    /// recorded this exact provider retirement receipt. This is not cleanup.
+    AcknowledgeBindingRetirement {
+        receipt: &'a InputBindingRetirement,
+    },
     Lookup {
         operation_id: &'a str,
     },

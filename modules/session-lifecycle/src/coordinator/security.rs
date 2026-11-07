@@ -641,6 +641,7 @@ impl Coordinator {
         &mut self,
         send: &mut dyn FnMut(Command) -> ModuleResult<Response>,
     ) -> ModuleResult<()> {
+        self.advance_input_retirement_acknowledgements(send)?;
         self.advance_revocations(send)?;
         let keys: Vec<_> = self.validations.keys().take(8).cloned().collect();
         for key in keys {
@@ -909,21 +910,40 @@ impl Coordinator {
                     result: None,
                     operation_id: identifier()?,
                 });
-            if let Some(result) = job.result.take() {
+            if let Some(result) = job.result.clone() {
                 if let Some(id) = job.request
-                    && !matches!(
-                        send(Command::ReleaseResult { request: id }),
-                        Ok(Response::Ok)
-                    )
+                    && !super::input_retirement::result_released(send(Command::ReleaseResult {
+                        request: id,
+                    }))
                 {
-                    job.result = Some(result);
                     continue;
                 }
+                job.request = None;
                 if result["status"] == "retired"
                     && result["token"] == token
                     && result["target"] == json!(target)
                 {
                     let mut next = self.shared.borrow().value.clone();
+                    let receipt = match super::input_retirement::receipt_from_result(
+                        &next,
+                        &result,
+                        &token,
+                        &target,
+                        &job.operation_id,
+                    ) {
+                        Ok(receipt) => receipt,
+                        Err(_) => {
+                            // A mismatched provider receipt fences only this
+                            // binding. Other native cleanup must keep advancing.
+                            self.fail_revocation(&token)?;
+                            continue;
+                        }
+                    };
+                    if let Some(receipt) = receipt {
+                        next.inputs
+                            .record_retirement(receipt)
+                            .map_err(|_| "input_retirement_receipt_rejected")?;
+                    }
                     if let Some(stream) = next
                         .sessions
                         .get_mut(&binding.session_id)
@@ -1077,6 +1097,11 @@ impl Coordinator {
                 } else {
                     Err("operation_id_conflict".into())
                 };
+            }
+            if next.input_bindings.len() + next.inputs.pending_retirements().count()
+                >= crate::input_authority::MAX_RETAINED_INPUT_BINDINGS
+            {
+                return Err("input_retirement_ack_pending".into());
             }
             let target: LifecycleTarget =
                 serde_json::from_value(payload["target"].clone()).map_err(|_| "invalid_target")?;

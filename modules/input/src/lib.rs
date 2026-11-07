@@ -82,6 +82,7 @@ struct InputModule {
     input_boot_epoch: String,
     shortcut_cache: shortcut_cache::ShortcutCache,
     pending_revoke: Option<(QueuedRequest, session_binding::RevokeRequest)>,
+    pending_retirement_acknowledgement: Option<session_binding::PendingRetirementAcknowledgement>,
     shutdown: shutdown::Shutdown,
 }
 
@@ -236,6 +237,7 @@ impl ManagedModule for InputModule {
             acquire_job: None,
             activation_job: None,
             pending_revoke: None,
+            pending_retirement_acknowledgement: None,
             shutdown: shutdown::Shutdown::default(),
         })
     }
@@ -254,6 +256,7 @@ impl ManagedModule for InputModule {
         );
         self.controller.expire_all(Instant::now());
         self.controller.select_default();
+        self.advance_retirement_acknowledgement()?;
         self.settle_shutdown_rejection()?;
         let runtime = &self.runtime;
         self.product_settings
@@ -410,10 +413,17 @@ impl InputModule {
             self.queued.push_front(request);
             return self.drain_queued();
         }
+        if request.service == SERVICE
+            && request.payload["action"] == "acknowledge_binding_retirement"
+            && self.pending_retirement_acknowledgement.is_none()
+        {
+            return self.dispatch(request);
+        }
         let defer = ((self.shortcut_job.is_some()
             || self.acquire_job.is_some()
             || self.activation_job.is_some()
-            || self.pending_revoke.is_some())
+            || self.pending_revoke.is_some()
+            || self.pending_retirement_acknowledgement.is_some())
             && !is_read_only_input(&request.payload))
             || should_defer_settings_request(
                 &self.product_settings,
@@ -443,6 +453,7 @@ impl InputModule {
             && self.acquire_job.is_none()
             && self.activation_job.is_none()
             && self.pending_revoke.is_none()
+            && self.pending_retirement_acknowledgement.is_none()
         {
             let Some(request) = self.queued.pop_front() else {
                 break;
@@ -474,6 +485,9 @@ impl InputModule {
                 &request.caller,
                 false,
             );
+        }
+        if request.payload["action"] == "acknowledge_binding_retirement" {
+            return self.acknowledge_binding_retirement(request);
         }
         if request.payload.get("action").and_then(Value::as_str) == Some("confirm_delivery") {
             let proof: Result<DeliveryProofRequest, _> =
@@ -1080,18 +1094,29 @@ impl InputModule {
     fn advance_revoke(&mut self) -> ModuleResult<()> {
         if let Some((_, revoke)) = &self.pending_revoke {
             self.controller.select_binding(&revoke.token);
-        }
-        if self.controller.cleanup_required() {
-            return Ok(());
+            if self.controller.binding_has_live_state(&revoke.token) {
+                return Ok(());
+            }
         }
         let Some((request, revoke)) = self.pending_revoke.take() else {
             return Ok(());
+        };
+        let receipt = match self
+            .bindings
+            .record_retirement(&revoke, &self.input_boot_epoch)
+        {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                self.pending_revoke = Some((request, revoke));
+                return Err(error.into());
+            }
         };
         let reply = serde_json::json!({
             "ok": true,
             "status": "retired",
             "token": revoke.token,
             "target": revoke.target,
+            "retirement_receipt": receipt,
         });
         if let Err(error) = self.complete(request.id, reply, &request.caller, false) {
             // Native retirement has completed; retain only the exact response

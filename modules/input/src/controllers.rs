@@ -191,6 +191,41 @@ impl<B: Backend> Controllers<B> {
         }
     }
 
+    pub(crate) fn binding_has_live_state(&self, binding: &str) -> bool {
+        self.contexts
+            .get(binding)
+            .is_some_and(|context| context.controller.has_live_state())
+    }
+
+    /// Release only the exact idle context after lifecycle durably acknowledges
+    /// its native retirement. Other contexts and the default lease stay owned.
+    pub(crate) fn retire_binding_context(
+        &mut self,
+        binding: &str,
+        owner: &str,
+        lease: Option<&str>,
+    ) -> InputResult<()> {
+        if let Some(context) = self.contexts.get(binding) {
+            if context.owner != owner || context.lease.as_deref() != lease {
+                return Err(InputError::new(
+                    "operation_conflict",
+                    "input context identity differs",
+                ));
+            }
+            if context.controller.has_live_state() {
+                return Err(InputError::new(
+                    "cleanup_required",
+                    "input context has unresolved native ownership",
+                ));
+            }
+        }
+        self.contexts.remove(binding);
+        if self.selected.as_deref() == Some(binding) {
+            self.selected = None;
+        }
+        Ok(())
+    }
+
     pub(crate) fn consumed_held(&self) -> bool {
         self.selected
             .as_ref()

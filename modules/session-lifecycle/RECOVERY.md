@@ -76,6 +76,33 @@ The callback-status recovery path is unchanged: its current-epoch session target
 and retained provider receipt identify the original callback; it never replays an
 unknown effect.
 
+## Input retirement bookkeeping
+
+An input provider may attach a version 1 `retirement_receipt` to its existing
+exact `retired` reply. The SDK binds this receipt to the input token, stream
+target, revoke operation and provider boot epoch. The coordinator first saves
+native retirement and the pending receipt in the same journal transaction, then
+uses the public Input SDK's `acknowledge_binding_retirement` request. Only an
+exact acknowledgement permits removing that stored receipt. The input provider
+can then recycle the exact retired binding and idle context; this metadata
+exchange cannot prove native cleanup or authorize input.
+
+Pending acknowledgements survive coordinator restart. Result-release uncertainty
+and failed journal writes retain the exact proof or acknowledgement for retry.
+The combined live-binding and pending-acknowledgement budget is 128; unavailable
+acknowledgement capacity stops new input admission rather than evicting history.
+Malformed version 1 metadata fences its exact stream for recovery without
+blocking unrelated retirement work. Providers that omit the optional receipt,
+or advertise an unknown receipt version, keep their existing retirement protocol
+and receive no acknowledgement request. New input providers remain compatible
+with older consumers, which retain their old bounded-history behavior.
+
+An empty pending book leaves the journal representation unchanged. A nonempty
+`inputs.retirement_receipts` field requires this coordinator version; an older
+strict reader may reject it. Do not discard these records to downgrade. This
+change preserves restart ownership after the native proof transaction succeeds;
+it does not recover a revoke operation whose identity was lost before that save.
+
 ## Behavioral reference
 
 Vibeshine `43cf27252a205221a295126a5fcd9ad87ba9c914` separates transport teardown

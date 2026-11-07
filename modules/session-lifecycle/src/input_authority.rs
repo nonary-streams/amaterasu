@@ -6,10 +6,12 @@
 //! all calls with quiescence. Clone, mutate, and persist this state atomically
 //! with the canonical stream before exposing any result or dispatching effects.
 use crate::action_authority::ActionTarget;
+use amaterasu_module_sdk::input::InputBindingRetirement;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 const MAX_BINDINGS: usize = 64;
+pub(crate) const MAX_RETAINED_INPUT_BINDINGS: usize = 128;
 const MAX_RESERVATIONS: usize = 256;
 // Terminal replies are retained without eviction; admission reserves capacity.
 const MAX_RESERVATION_RECEIPTS: usize = 4096;
@@ -128,6 +130,10 @@ pub struct InputAuthority {
     // Historical receipts are never authority to reserve or dispatch again.
     #[serde(default)]
     terminal_receipts: BTreeMap<String, Reservation>,
+    /// Native retirement is already proved. These metadata receipts survive
+    /// restart until the selected input provider acknowledges forgetting them.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    retirement_receipts: BTreeMap<String, InputBindingRetirement>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -150,6 +156,12 @@ pub enum ReservationResult {
 impl InputAuthority {
     pub fn validate(&self) -> bool {
         self.bindings.len() <= MAX_BINDINGS
+            && self.retirement_receipts.len() <= MAX_RETAINED_INPUT_BINDINGS
+            && self.retirement_receipts.iter().all(|(token, receipt)| {
+                token == &receipt.token
+                    && receipt.validate().is_ok()
+                    && !self.bindings.contains_key(token)
+            })
             && self.reservations.len() <= MAX_RESERVATIONS
             && self.reservations.len() + self.terminal_receipts.len() <= MAX_RESERVATION_RECEIPTS
             && self.terminal_receipts.iter().all(|(key, receipt)| {
@@ -200,6 +212,7 @@ impl InputAuthority {
         }
         let token = unique_id(|id| {
             self.bindings.contains_key(id)
+                || self.retirement_receipts.contains_key(id)
                 || self
                     .reservations
                     .values()
@@ -208,6 +221,44 @@ impl InputAuthority {
         })?;
         self.bindings.insert(token.clone(), active.clone());
         Ok(token)
+    }
+
+    pub(crate) fn record_retirement(
+        &mut self,
+        receipt: InputBindingRetirement,
+    ) -> Result<(), Error> {
+        receipt.validate().map_err(|_| Error::Invalid)?;
+        if self.bindings.contains_key(&receipt.token) {
+            return Err(Error::Unauthorized);
+        }
+        if let Some(previous) = self.retirement_receipts.get(&receipt.token) {
+            return if previous == &receipt {
+                Ok(())
+            } else {
+                Err(Error::Conflict)
+            };
+        }
+        if self.retirement_receipts.len() >= MAX_RETAINED_INPUT_BINDINGS {
+            return Err(Error::Capacity);
+        }
+        self.retirement_receipts
+            .insert(receipt.token.clone(), receipt);
+        Ok(())
+    }
+
+    pub(crate) fn pending_retirements(&self) -> impl Iterator<Item = &InputBindingRetirement> {
+        self.retirement_receipts.values()
+    }
+
+    pub(crate) fn acknowledge_retirement(
+        &mut self,
+        receipt: &InputBindingRetirement,
+    ) -> Result<(), Error> {
+        if self.retirement_receipts.get(&receipt.token) != Some(receipt) {
+            return Err(Error::Conflict);
+        }
+        self.retirement_receipts.remove(&receipt.token);
+        Ok(())
     }
 
     /// The coordinator must independently resolve `active` for every call.
@@ -627,6 +678,8 @@ impl InputAuthority {
     /// Prior tokens cannot cross a host epoch and running effects become unknown.
     pub fn recover_after_restart(&mut self) {
         self.bindings.clear();
+        // Already-proved native retirement is not a new input authority and
+        // must not be discarded with the previous epoch's live bindings.
         for r in self.reservations.values_mut() {
             if r.outcome == Outcome::Running {
                 r.outcome = Outcome::RecoveryRequired;
@@ -1333,5 +1386,65 @@ mod tests {
             Err(Error::Unauthorized)
         );
         assert!(book.validate());
+    }
+}
+
+#[cfg(test)]
+mod retirement_tests {
+    use super::*;
+    use amaterasu_extension_api::LifecycleTarget;
+    use amaterasu_module_sdk::input::INPUT_BINDING_RETIREMENT_VERSION;
+
+    fn receipt(index: usize) -> InputBindingRetirement {
+        InputBindingRetirement {
+            version: INPUT_BINDING_RETIREMENT_VERSION,
+            token: format!("binding-{index}"),
+            target: LifecycleTarget::Stream {
+                host_epoch: "host".into(),
+                session_id: "session".into(),
+                stream_id: format!("stream-{index}"),
+                generation: 1,
+            },
+            revoke_operation_id: format!("revoke-{index}"),
+            input_boot_epoch: "provider-boot".into(),
+        }
+    }
+
+    #[test]
+    fn native_retirement_metadata_is_bounded_and_never_evicted_on_restart() {
+        let mut authority = InputAuthority::default();
+        assert!(
+            serde_json::to_value(&authority)
+                .unwrap()
+                .get("retirement_receipts")
+                .is_none()
+        );
+        for index in 0..MAX_RETAINED_INPUT_BINDINGS {
+            authority.record_retirement(receipt(index)).unwrap();
+        }
+        assert_eq!(
+            authority.record_retirement(receipt(MAX_RETAINED_INPUT_BINDINGS)),
+            Err(Error::Capacity)
+        );
+        authority.recover_after_restart();
+        assert_eq!(
+            authority.pending_retirements().count(),
+            MAX_RETAINED_INPUT_BINDINGS
+        );
+        assert!(authority.validate());
+        let mut wrong = receipt(0);
+        wrong.input_boot_epoch = "another-provider".into();
+        assert_eq!(
+            authority.acknowledge_retirement(&wrong),
+            Err(Error::Conflict)
+        );
+        authority.acknowledge_retirement(&receipt(0)).unwrap();
+        authority
+            .record_retirement(receipt(MAX_RETAINED_INPUT_BINDINGS))
+            .unwrap();
+        assert_eq!(
+            authority.pending_retirements().count(),
+            MAX_RETAINED_INPUT_BINDINGS
+        );
     }
 }

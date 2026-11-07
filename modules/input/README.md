@@ -28,7 +28,8 @@ device sets, held keys, scroll/repeat state, scoped policy and controller feedba
 Up to eight input contexts may be live. Completing or revoking one binding only
 retires its exact lease; it does not cancel another stream owned by the same
 broker caller. Retired contexts remain available for bounded operation lookup
-for five minutes, with at most 128 retained contexts. Unconfirmed native cleanup
+for five minutes or until the coordinator acknowledges their exact retirement,
+with at most 128 retained contexts. Unconfirmed native cleanup
 remains owned and cannot be reclaimed as an idle context.
 
 Every context uses the same trusted startup backend selection. The Linux
@@ -42,7 +43,8 @@ multi-client hardware qualification.
 Global settings updates apply across the contexts and report outstanding cleanup
 from any context. Explicit client overrides remain scoped to their own lease.
 Unbound legacy acquisitions remain exclusive across the provider.
-The versioned Input SDK request/response contract is unchanged.
+The versioned Input SDK retains the existing lease operations and provides the
+optional retirement acknowledgement described below.
 
 ## Shutdown and cleanup acknowledgement
 
@@ -59,6 +61,23 @@ response queue or its deadline. Individual failed release reports do not prevent
 independent device teardown. Successful destruction of owned devices or an
 acknowledged companion revocation proves those devices' input has retired;
 Windows global injection still requires its exact key and contact releases.
+
+After exact native retirement, `revoke_binding` optionally returns a version 1
+`retirement_receipt` identifying its token, stream target, revoke operation and
+input-provider boot epoch. The lifecycle coordinator first saves this native
+proof durably, then uses the Input SDK's `acknowledge_binding_retirement` request.
+Only that authenticated acknowledgement releases the matching retired binding
+record and idle controller context; pending native ownership or admitted work
+prevents release. This keeps the 128-record registry bounded without exhausting
+it permanently after 128 completed lifetimes. An uncertain acknowledgement reply
+remains owned for settlement, including during shutdown.
+
+Acknowledgement is bookkeeping, never independent proof of native retirement.
+Repeating it after the matching record is gone performs no native action, even
+after a provider restart. Old acquire requests still need a fresh validation of
+their original lifecycle token before creating devices, so acknowledged and
+fenced tokens cannot reactivate a retired stream. Independently built providers
+that omit the optional receipt retain the original retirement protocol.
 
 Companion clients retain the exact connection after a failed Close and refuse
 replacement until retirement is acknowledged. The installed v1 wire format is

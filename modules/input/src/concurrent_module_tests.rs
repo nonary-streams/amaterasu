@@ -16,6 +16,7 @@ struct Host {
     completed: BTreeMap<u64, Value>,
     lose_completions: BTreeSet<u64>,
     fail_completions: BTreeSet<u64>,
+    retired_bindings: BTreeSet<String>,
 }
 impl Host {
     fn call(&mut self, command: Command) -> Response {
@@ -46,6 +47,11 @@ impl Host {
                     };
                 }
                 let token = self.requests[&request]["token"].as_str().unwrap();
+                if self.retired_bindings.contains(token) {
+                    return Response::Result {
+                        payload: json!({"status":"rejected","reason":"binding_revoked"}),
+                    };
+                }
                 Response::Result {
                     payload: json!({"status":"succeeded","target":target(token),"geometry_revision":1,"batch_epoch":format!("batch-{token}"),"active":true}),
                 }
@@ -137,6 +143,222 @@ impl Harness {
         self.dispatch(id, "amaterasu.session-lifecycle", json!({"action":"binding_status","operation_id":format!("status-{binding}"),"token":binding,"target":target(binding)}));
         self.host.lock().unwrap().completed[&id].clone()
     }
+
+    fn retirement_receipt(&self, binding: &str) -> Value {
+        json!({
+            "version":1,
+            "token":binding,
+            "target":target(binding),
+            "revoke_operation_id":format!("revoke-{binding}"),
+            "input_boot_epoch":self.module.input_boot_epoch,
+        })
+    }
+
+    fn revoke(&mut self, id: u64, binding: &str) -> Value {
+        self.dispatch(
+            id,
+            "amaterasu.session-lifecycle",
+            json!({
+                "action":"revoke_binding",
+                "operation_id":format!("revoke-{binding}"),
+                "token":binding,
+                "target":target(binding),
+            }),
+        );
+        self.host.lock().unwrap().completed[&id].clone()
+    }
+
+    fn acknowledge_retirement(&mut self, id: u64, receipt: Value) -> Value {
+        self.dispatch(
+            id,
+            "amaterasu.session-lifecycle",
+            json!({
+                "action":"acknowledge_binding_retirement","receipt":receipt,
+            }),
+        );
+        self.host.lock().unwrap().completed[&id].clone()
+    }
+}
+
+#[test]
+fn durable_retirement_acknowledgements_allow_more_than_128_native_context_lifetimes() {
+    let mut host = Harness::new();
+    let mut acknowledged = true;
+    for index in 0..128 {
+        let binding = format!("completed-{index}");
+        let id = 10_000 * (index + 1);
+        assert_eq!(host.acquire(id, &binding)["ok"], true);
+        assert_eq!(host.revoke(id + 1, &binding)["status"], "retired");
+        host.host
+            .lock()
+            .unwrap()
+            .retired_bindings
+            .insert(binding.clone());
+        let receipt = host.retirement_receipt(&binding);
+        acknowledged &= host.acknowledge_retirement(id + 2, receipt)["status"] == "acknowledged";
+    }
+    let next = host.acquire(2_000_000, "fresh-after-128");
+    assert_eq!(
+        next["ok"], true,
+        "fresh binding rejected after exact retired acknowledgements: {next}"
+    );
+    assert!(acknowledged);
+}
+
+#[test]
+fn acknowledged_retirement_fences_old_acquire_and_preserves_an_unrelated_live_context() {
+    let mut host = Harness::new();
+    let acquired = host.acquire(10, "old");
+    assert_eq!(acquired["ok"], true);
+    assert_eq!(host.acquire(20, "unrelated")["ok"], true);
+    let retired = host.revoke(30, "old");
+    let receipt = host.retirement_receipt("old");
+    assert_eq!(retired["retirement_receipt"], receipt);
+    host.host
+        .lock()
+        .unwrap()
+        .retired_bindings
+        .insert("old".into());
+    assert_eq!(
+        host.acknowledge_retirement(40, receipt.clone())["status"],
+        "acknowledged"
+    );
+    assert_eq!(
+        host.acknowledge_retirement(41, receipt)["status"],
+        "acknowledged"
+    );
+    host.dispatch(
+        42,
+        OWNER,
+        json!({
+            "action":"batch","lease":acquired["lease"],"input_binding":"old",
+            "operation_id":"batch-old:1","events":[model::Event::Relative {dx:1,dy:2}],
+        }),
+    );
+    assert_eq!(host.host.lock().unwrap().completed[&42]["ok"], false);
+    host.module
+        .accept_request(
+            43,
+            "amaterasu.session-lifecycle".into(),
+            SERVICE.into(),
+            json!({
+                "action":"revoke_binding","operation_id":"revoke-old",
+                "token":"old","target":target("old"),
+            }),
+            5_000,
+        )
+        .unwrap();
+    let repeated_revoke = host.host.lock().unwrap().completed[&43].clone();
+    assert_eq!(repeated_revoke["ok"], false);
+    assert!(repeated_revoke.get("retirement_receipt").is_none());
+    assert_eq!(host.status(50, "unrelated")["status"], "bound");
+    assert_eq!(host.acquire(60, "old")["ok"], false);
+    assert_ne!(host.status(70, "old")["status"], "bound");
+    assert_eq!(host.status(71, "unrelated")["status"], "bound");
+}
+
+#[test]
+fn retirement_acknowledgement_cannot_release_live_or_mismatched_ownership() {
+    let mut host = Harness::new();
+    assert_eq!(host.acquire(10, "one")["ok"], true);
+    let receipt = host.retirement_receipt("one");
+    assert_eq!(
+        host.acknowledge_retirement(20, receipt.clone())["ok"],
+        false
+    );
+    assert_eq!(host.status(30, "one")["status"], "bound");
+    assert_eq!(host.revoke(40, "one")["status"], "retired");
+    for (index, field, replacement) in [
+        (0, "input_boot_epoch", json!("other-provider-boot")),
+        (1, "revoke_operation_id", json!("other-revocation")),
+        (2, "target", target("other-target")),
+        (3, "version", json!(2)),
+    ] {
+        let mut wrong = receipt.clone();
+        wrong[field] = replacement;
+        assert_eq!(host.acknowledge_retirement(50 + index, wrong)["ok"], false);
+    }
+    host.dispatch(
+        60,
+        OWNER,
+        json!({"action":"acknowledge_binding_retirement","receipt":receipt}),
+    );
+    assert_eq!(host.host.lock().unwrap().completed[&60]["ok"], false);
+    assert_eq!(
+        host.acknowledge_retirement(70, receipt)["status"],
+        "acknowledged"
+    );
+}
+
+#[test]
+fn retirement_acknowledgement_waits_for_matching_admitted_work() {
+    let mut host = Harness::new();
+    host.dispatch(
+        10,
+        OWNER,
+        json!({
+            "action":"acquire","operation_id":"pending-acquire",
+            "lifecycle_binding_token":"pending",
+        }),
+    );
+    assert!(host.module.acquire_job.is_some());
+    assert_eq!(host.revoke(20, "pending")["status"], "retired");
+    let receipt = host.retirement_receipt("pending");
+    let blocked = host.acknowledge_retirement(30, receipt.clone());
+    assert_eq!(blocked["error"]["code"], "binding_retirement_busy");
+    assert!(host.module.acquire_job.is_some());
+
+    host.module.advance_acquire().unwrap();
+    assert!(host.module.acquire_job.is_none());
+    assert_eq!(
+        host.acknowledge_retirement(40, receipt)["status"],
+        "acknowledged"
+    );
+}
+
+#[test]
+fn uncertain_retirement_ack_reply_is_retained_through_quiescence_without_replaying_release() {
+    let mut host = Harness::new();
+    assert_eq!(host.acquire(10, "one")["ok"], true);
+    assert_eq!(host.revoke(20, "one")["status"], "retired");
+    let receipt = host.retirement_receipt("one");
+    host.host.lock().unwrap().fail_completions.insert(30);
+    let request = QueuedRequest {
+        id: 30,
+        caller: "amaterasu.session-lifecycle".into(),
+        service: SERVICE.into(),
+        payload: json!({"action":"acknowledge_binding_retirement","receipt":receipt}),
+        deadline: Instant::now() + Duration::from_secs(5),
+    };
+    assert!(host.module.dispatch(request).is_err());
+    assert!(host.module.pending_retirement_acknowledgement.is_some());
+    assert!(!host.module.controller.binding_has_live_state("one"));
+    assert!(!host.module.quiesce().unwrap());
+    host.host.lock().unwrap().fail_completions.remove(&30);
+    assert!(host.module.quiesce().unwrap());
+    assert!(host.module.pending_retirement_acknowledgement.is_none());
+    assert_eq!(host.host.lock().unwrap().completed[&30]["receipt"], receipt);
+    assert_eq!(
+        host.acknowledge_retirement(40, receipt)["status"],
+        "acknowledged"
+    );
+}
+
+#[test]
+fn unknown_retirement_ack_after_restart_is_metadata_only_and_remains_available_during_shutdown() {
+    let mut host = Harness::new();
+    assert_eq!(host.acquire(10, "unrelated")["ok"], true);
+    let mut receipt = host.retirement_receipt("unknown-old-token");
+    receipt["input_boot_epoch"] = json!("previous-provider-boot");
+    let reply = host.acknowledge_retirement(20, receipt.clone());
+    assert_eq!(reply["status"], "acknowledged");
+    assert!(reply.get("retirement_receipt").is_none());
+    assert_eq!(host.status(30, "unrelated")["status"], "bound");
+    assert!(host.module.quiesce().unwrap());
+    assert_eq!(
+        host.acknowledge_retirement(40, receipt)["status"],
+        "acknowledged"
+    );
 }
 
 #[test]

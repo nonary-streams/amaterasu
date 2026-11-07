@@ -1,6 +1,7 @@
 //! Lifecycle-issued input bindings. Tokens identify selected resources; only
 //! broker-attested lifecycle responses grant a lease or revoke its admission.
 use amaterasu_extension_api::LifecycleTarget;
+use amaterasu_module_sdk::input::{INPUT_BINDING_RETIREMENT_VERSION, InputBindingRetirement};
 use amaterasu_module_sdk::{Command, ModuleResult, Response};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -46,6 +47,7 @@ struct Binding {
     next_sequence: u64,
     revoked: bool,
     revoke_id: Option<String>,
+    retired: bool,
 }
 #[derive(Default)]
 pub(crate) struct Bindings {
@@ -94,6 +96,7 @@ impl Bindings {
                 next_sequence: 1,
                 revoked: false,
                 revoke_id: None,
+                retired: false,
             },
         );
         Ok(())
@@ -282,6 +285,162 @@ impl Bindings {
         entry.revoked = true;
         entry.revoke_id = Some(operation_id.into());
         Ok((entry.owner.clone(), entry.lease.clone()))
+    }
+
+    pub fn record_retirement(
+        &mut self,
+        revoke: &RevokeRequest,
+        input_boot_epoch: &str,
+    ) -> Result<InputBindingRetirement, &'static str> {
+        let entry = self
+            .entries
+            .get_mut(&revoke.token)
+            .ok_or("binding_unknown")?;
+        if !entry.revoked
+            || entry.revoke_id.as_deref() != Some(&revoke.operation_id)
+            || entry.target.as_ref() != Some(&revoke.target)
+        {
+            return Err("binding_retirement_mismatch");
+        }
+        let receipt = InputBindingRetirement {
+            version: INPUT_BINDING_RETIREMENT_VERSION,
+            token: revoke.token.clone(),
+            target: revoke.target.clone(),
+            revoke_operation_id: revoke.operation_id.clone(),
+            input_boot_epoch: input_boot_epoch.to_owned(),
+        };
+        receipt.validate()?;
+        entry.retired = true;
+        Ok(receipt)
+    }
+
+    fn retirement_owner(
+        &self,
+        receipt: &InputBindingRetirement,
+        input_boot_epoch: &str,
+    ) -> Result<Option<(String, Option<String>)>, &'static str> {
+        let Some(entry) = self.entries.get(&receipt.token) else {
+            // Absence can acknowledge bookkeeping only. It never supplies a
+            // native retirement receipt, including after provider restart.
+            return Ok(None);
+        };
+        if receipt.input_boot_epoch != input_boot_epoch
+            || !entry.retired
+            || !entry.revoked
+            || entry.revoke_id.as_deref() != Some(&receipt.revoke_operation_id)
+            || entry.target.as_ref() != Some(&receipt.target)
+        {
+            return Err("binding_retirement_mismatch");
+        }
+        Ok(Some((entry.owner.clone(), entry.lease.clone())))
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AcknowledgeRetirement {
+    action: String,
+    receipt: InputBindingRetirement,
+}
+
+pub(super) struct PendingRetirementAcknowledgement {
+    request: super::QueuedRequest,
+    reply: Value,
+}
+
+impl super::InputModule {
+    pub(super) fn acknowledge_binding_retirement(
+        &mut self,
+        request: super::QueuedRequest,
+    ) -> ModuleResult<()> {
+        if self.pending_retirement_acknowledgement.is_some() {
+            return self.complete(
+                request.id,
+                super::InputError::new("binding_retirement_busy", "an acknowledgement is settling")
+                    .payload(),
+                &request.caller,
+                false,
+            );
+        }
+        let response = self.release_retired_binding(&request);
+        let reply = match response {
+            Ok(receipt) => json!({"ok":true,"status":"acknowledged","receipt":receipt}),
+            Err(code) => {
+                super::InputError::new(code, "input retirement acknowledgement rejected").payload()
+            }
+        };
+        self.pending_retirement_acknowledgement =
+            Some(PendingRetirementAcknowledgement { request, reply });
+        self.advance_retirement_acknowledgement()
+    }
+
+    fn release_retired_binding(
+        &mut self,
+        request: &super::QueuedRequest,
+    ) -> Result<InputBindingRetirement, &'static str> {
+        if request.caller != LIFECYCLE_PRINCIPAL {
+            return Err("permission_denied");
+        }
+        let acknowledgement: AcknowledgeRetirement =
+            serde_json::from_value(request.payload.clone()).map_err(|_| "invalid_request")?;
+        if acknowledgement.action != "acknowledge_binding_retirement" {
+            return Err("invalid_request");
+        }
+        let receipt = acknowledgement.receipt;
+        receipt.validate()?;
+        if self.binding_retirement_work_pending(&receipt.token) {
+            return Err("binding_retirement_busy");
+        }
+        if let Some((owner, lease)) = self
+            .bindings
+            .retirement_owner(&receipt, &self.input_boot_epoch)?
+        {
+            self.controller
+                .retire_binding_context(&receipt.token, &owner, lease.as_deref())
+                .map_err(|_| "binding_retirement_busy")?;
+            self.bindings.entries.remove(&receipt.token);
+            self.shortcut_cache.invalidate(&receipt.token);
+        }
+        Ok(receipt)
+    }
+
+    fn binding_retirement_work_pending(&self, token: &str) -> bool {
+        self.acquire_job
+            .as_ref()
+            .is_some_and(|job| job.token == token)
+            || self
+                .activation_job
+                .as_ref()
+                .is_some_and(|(request, _)| request.payload["input_binding"] == token)
+            || self
+                .shortcut_job
+                .as_ref()
+                .is_some_and(|(_, job)| job.binding_identity().1 == token)
+            || self
+                .pending_revoke
+                .as_ref()
+                .is_some_and(|(_, revoke)| revoke.token == token)
+            || self.queued.iter().any(|request| {
+                ["input_binding", "lifecycle_binding_token", "token"]
+                    .into_iter()
+                    .any(|field| request.payload[field] == token)
+            })
+    }
+
+    pub(super) fn advance_retirement_acknowledgement(&mut self) -> ModuleResult<()> {
+        let Some(pending) = self.pending_retirement_acknowledgement.take() else {
+            return Ok(());
+        };
+        if let Err(error) = self.complete(
+            pending.request.id,
+            pending.reply.clone(),
+            &pending.request.caller,
+            false,
+        ) {
+            self.pending_retirement_acknowledgement = Some(pending);
+            return Err(error);
+        }
+        Ok(())
     }
 }
 
