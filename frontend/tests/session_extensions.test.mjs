@@ -81,20 +81,36 @@ function fixture(scope, write = true, values = { enabled: false }, provider, ful
   return { area, calls, nodes, editors, pending, errors, notifications, descriptor };
 }
 
-test("application cards expose inherited plugin controls before an override exists", async () => {
+test("application cards use global values without inheritance switches and save only edits", async () => {
   const env = fixture({ kind: "application", id: "app-0000000000000001" }, true, {}, undefined, true);
   await settle();
   assert.equal(env.editors.length, 1, "application controls render immediately, host-only options stay hidden");
-  const inherit = env.nodes.find(node => node.tag === "label" && node.children.includes(" Use inherited value")).children[0];
-  assert.equal(inherit.checked, true);
+  assert.equal(env.nodes.some(node => node.tag === "label" && node.children.includes(" Use inherited value")), false);
+  const form = env.nodes.find(node => node.tag === "form");
+  form.listeners.submit({ preventDefault() {} });
+  await Promise.all(env.pending);
+  assert.equal(env.calls.some(([route]) => route.endsWith("/settings_update")), false);
   env.editors[0].value = () => true;
   env.editors[0].node.listeners.input();
-  assert.equal(inherit.checked, false);
-  env.nodes.find(node => node.tag === "form").listeners.submit({ preventDefault() {} });
+  form.listeners.submit({ preventDefault() {} });
   await Promise.all(env.pending);
   assert.deepEqual(env.calls.find(([route]) => route.endsWith("/settings_update"))[1].values, { enabled: true });
   assert.deepEqual(env.errors, []);
 });
+
+for (const expanded of [undefined, false, true]) {
+  test(`generated application sections honor default_expanded=${expanded} without creating overrides`, async () => {
+    const env = fixture({ kind: "application", id: "app-0000000000000001" }, true, {}, undefined, true);
+    if (expanded !== undefined) env.descriptor.default_expanded = expanded;
+    await settle();
+    const section = env.nodes.find(node => node.className === "application-plugin-section");
+    assert.equal(section.tag, "details");
+    assert.equal(section.open, expanded === true);
+    assert.equal(env.calls.some(([route]) => route.endsWith("/settings_update")), false);
+    section.open = !section.open;
+    assert.equal(env.calls.some(([route]) => route.endsWith("/settings_update")), false);
+  });
+}
 
 for (const scope of [{ kind: "application", id: "game" }, { kind: "paired_client", id: "client" }]) {
   test(`${scope.kind} settings use the generic scope and preserve explicit false`, async () => {

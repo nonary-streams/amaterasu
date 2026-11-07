@@ -38,6 +38,9 @@ pub struct Manifest {
     /// UI ownership can be declared independently of registry-backed settings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settings_owner: Option<String>,
+    /// Initial disclosure state of the plugin's application settings section.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub default_expanded: bool,
     #[serde(default)]
     pub methods: Vec<MethodDeclaration>,
     pub files: BTreeMap<String, Asset>,
@@ -190,6 +193,7 @@ pub fn prepare_extension(
         placements: default_placements(),
         settings_provider: None,
         settings_owner: None,
+        default_expanded: false,
         methods: Vec::new(),
         files,
     };
@@ -388,6 +392,24 @@ mod tests {
             "files":{"main.js":{"sha256":"a".repeat(64),"size":1}}});
         let mut manifest: Manifest = serde_json::from_value(legacy).unwrap();
         assert_eq!(manifest.placements, ["page"]);
+        assert!(!manifest.default_expanded);
+        assert!(
+            serde_json::to_value(&manifest)
+                .unwrap()
+                .get("default_expanded")
+                .is_none()
+        );
+        manifest.default_expanded = true;
+        let expanded = serde_json::to_value(&manifest).unwrap();
+        assert_eq!(expanded["default_expanded"], true);
+        assert!(
+            serde_json::from_value::<Manifest>(expanded.clone())
+                .unwrap()
+                .default_expanded
+        );
+        let mut invalid = expanded;
+        invalid["default_expanded"] = serde_json::json!("true");
+        assert!(serde_json::from_value::<Manifest>(invalid).is_err());
         manifest.placements = vec!["application".into()];
         manifest.settings_provider = Some("amaterasu.rtx-hdr".into());
         assert!(validate_manifest(&manifest, 0).is_ok());

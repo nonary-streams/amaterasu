@@ -295,7 +295,7 @@ A selected plugin can own its settings UI by adding a `settings_provider` to
 its signed application configuration:
 
 ```json
-{"placements": ["application"], "settings_provider": "amaterasu.rtx-hdr", "methods": []}
+{"placements": ["application"], "settings_provider": "amaterasu.rtx-hdr", "default_expanded": true, "methods": []}
 ```
 
 This advertises `ui.application-settings/1` and supplies `sdk.settings`, with
@@ -312,6 +312,15 @@ or automatic saving. `read()` returns the existing settings document containing
 omitting a key restores inheritance. It does not itself prove live application.
 The RTX HDR plugin's `ui/application.js` uses this helper and serializes debounced
 slider saves while preserving edits made during a pending request.
+
+Its application panel starts expanded and shows one enable switch selected by
+the effective host `rtx_hdr_scope`, plus the four picture controls. Debanding,
+SDR fallback brightness, and fullscreen/foreground restrictions live under a
+closed **Advanced** section. Untouched controls display effective global values
+without separate inheritance switches; editing a field creates an application
+override while preserving all other sparse values, including an inactive mode's
+saved enable setting. Generated application settings use the same edit-to-override
+behavior.
 
 Saving during a stream uses the same settings contract as saving while idle.
 For options declared `live_action`, the active consumer reads the latest scoped
@@ -333,6 +342,22 @@ The host places plugin-owned cards in the dedicated **Plugin settings** area and
 suppresses the generic form for a provider with a selected custom UI. Providers
 without custom UI retain the generated settings card as a fallback. Plugins
 without settings can attach sections by omitting `settings_provider`.
+
+Application sections are collapsible. Set the optional Boolean
+`default_expanded` in the signed UI configuration to show the section's controls
+immediately, as RTX HDR does. Omit it or set it to `false` to start closed.
+Users can still open or close each section; opening does not create overrides,
+save values, or grant API access. Custom controls mount once even while closed,
+so collapsing a section preserves its draft and does not cancel a pending save.
+
+Providers without a custom web UI can set the same `default_expanded` field on
+their Module SDK `extension_api::ExtensionDescriptor` to control their generated
+application settings section. The native descriptor and signed UI configuration
+are independent: declare the hint in both if you distribute both surfaces.
+An absent native field deserializes as `false` and is omitted when serialized,
+preserving existing descriptor wire representations. The hint does not change
+the settings schema revision. Older hosts need an update before accepting a
+manifest or descriptor containing the new field.
 
 The [application section example](../examples/web-extension/application.js)
 uses the existing greeting provider and declares no settings overrides. Package

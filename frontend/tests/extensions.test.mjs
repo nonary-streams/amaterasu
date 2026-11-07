@@ -4,6 +4,16 @@ import test from "node:test";
 import vm from "node:vm";
 import ts from "typescript";
 
+test("signed UI expansion hints preserve legacy discovery and reject non-booleans", async () => {
+  for (const expanded of [undefined, false, true, "true", 1, null]) {
+    const entry = { ...valid, ...(expanded === undefined ? {} : { default_expanded: expanded }) };
+    const env = setup([entry]);
+    const descriptors = await env.pages.discover();
+    assert.equal(descriptors.length, expanded === undefined || typeof expanded === "boolean" ? 1 : 0);
+    if (descriptors.length) assert.equal(descriptors[0].default_expanded, expanded);
+  }
+});
+
 function setup(entries, { applicationOnly = false, deferLoad = false, write = true } = {}) {
   class Script { remove() {} }
   let currentScript = null;

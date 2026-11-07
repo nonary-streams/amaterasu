@@ -20121,6 +20121,7 @@ var Amaterasu;
             typeof record.name === "string" && !!record.name.trim() && record.name.length <= 128 &&
             typeof record.digest === "string" && /^[a-f0-9]{64}$/.test(record.digest) &&
             record.sdk_version === 1 && typeof record.entrypoint === "string" &&
+            (record.default_expanded === undefined || typeof record.default_expanded === "boolean") &&
             (record.placements === undefined || (Array.isArray(record.placements) && record.placements.length > 0 && record.placements.length <= 4 &&
                 new Set(record.placements).size === record.placements.length && record.placements.every((place) => place === "page" || place === "application" || place === "overview" || place === "settings"))) &&
             (record.settings_provider == null || (typeof record.settings_provider === "string" && /^[a-z0-9._-]{1,128}$/.test(record.settings_provider) &&
@@ -20786,6 +20787,11 @@ var Amaterasu;
         }
     }
     Amaterasu.claimModuleSettings = claimModuleSettings;
+    function applicationPluginSection(title, defaultExpanded, content) {
+        const section = Amaterasu.el("details", "application-plugin-section", Amaterasu.el("summary", "application-plugin-summary", Amaterasu.literalText(title)), Amaterasu.el("div", "application-plugin-content", content));
+        section.open = defaultExpanded;
+        return section;
+    }
     function sessionExtensionApplyPolicyHelp(policy) {
         switch (policy) {
             case "next_session": return "Requires a new application session.";
@@ -20990,8 +20996,7 @@ var Amaterasu;
             renderFallback(new Set(sections.flatMap((entry) => entry.settings_provider ? [entry.settings_provider] : [])));
             for (const descriptor of sections) {
                 const container = Amaterasu.el("div");
-                const section = Amaterasu.panel(Amaterasu.literalText(descriptor.name), container);
-                section.classList.add("application-plugin-section");
+                const section = applicationPluginSection(descriptor.name, descriptor.default_expanded === true, container);
                 custom.append(section);
                 const mount = pages.mountApplication(descriptor.id, container, application);
                 mounts.add(mount);
@@ -21150,20 +21155,16 @@ var Amaterasu;
                         if (controls.length === 1)
                             controls[0].setAttribute("aria-label", option.label);
                         const row = Amaterasu.el("fieldset", "session-extension-option catalog-plugin-override-row", Amaterasu.el("legend", "field-label", Amaterasu.literalText(option.label)), editor.node);
-                        const inherit = showAllOptions ? Amaterasu.input("", "", "checkbox") : undefined;
-                        if (inherit) {
-                            inherit.checked = inherited;
-                            row.append(Amaterasu.el("label", "session-extension-inherit", inherit, " Use inherited value"));
-                            const edited = () => { inherit.checked = false; };
-                            editor.node.addEventListener("input", edited);
-                            editor.node.addEventListener("change", edited);
-                        }
+                        const entry = { editor, overridden: !inherited };
+                        const edited = () => { entry.overridden = true; };
+                        editor.node.addEventListener("input", edited);
+                        editor.node.addEventListener("change", edited);
                         if (option.help)
                             row.append(Amaterasu.el("small", "muted", Amaterasu.literalText(option.help)));
                         row.append(Amaterasu.el("small", "muted", sessionExtensionApplyPolicyHelp(option.apply_policy)));
                         if (!showAllOptions)
                             row.append(Amaterasu.button("Remove override", () => { entries.delete(option.id); row.remove(); refreshChoices(); }));
-                        entries.set(option.id, { editor, inherit });
+                        entries.set(option.id, entry);
                         rows.append(row);
                     };
                     const add = Amaterasu.button("Add override", () => {
@@ -21216,7 +21217,7 @@ var Amaterasu;
                         const result = { ...document.values };
                         for (const option of options) {
                             const entry = entries.get(option.id);
-                            if (entry && !entry.inherit?.checked)
+                            if (entry?.overridden)
                                 result[option.id] = entry.editor.value();
                             else
                                 delete result[option.id];
@@ -21283,7 +21284,9 @@ var Amaterasu;
                             }
                         });
                     });
-                    return Amaterasu.panel(Amaterasu.literalText(descriptor.display_name || descriptor.provider), form);
+                    return showAllOptions
+                        ? applicationPluginSection(descriptor.display_name || descriptor.provider, descriptor.default_expanded === true, form)
+                        : Amaterasu.panel(Amaterasu.literalText(descriptor.display_name || descriptor.provider), form);
                 });
                 if (sharedChoices)
                     sharedChoices.list.append(...sharedGroups);

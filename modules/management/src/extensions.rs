@@ -76,7 +76,7 @@ impl Extensions {
         let extensions: Vec<Value> = self.entries.iter().filter_map(|entry| {
             let bundle = self.selected(entry)?;
             let methods: Vec<Value> = bundle.manifest.methods.iter().filter(|method| approved(entry, method) && permits(auth, method)).map(|method| json!({"alias":method.alias,"scope":method.scope,"min_role":method.min_role})).collect();
-            Some(json!({"id":bundle.manifest.id,"name":bundle.manifest.name,"digest":bundle.digest,"sdk_version":bundle.manifest.sdk_version,"entrypoint":bundle.manifest.entrypoint,"placements":bundle.manifest.placements,"settings_provider":bundle.manifest.settings_provider,"settings_owner":bundle.manifest.settings_owner,"methods":methods}))
+            Some(json!({"id":bundle.manifest.id,"name":bundle.manifest.name,"digest":bundle.digest,"sdk_version":bundle.manifest.sdk_version,"entrypoint":bundle.manifest.entrypoint,"placements":bundle.manifest.placements,"settings_provider":bundle.manifest.settings_provider,"settings_owner":bundle.manifest.settings_owner,"default_expanded":bundle.manifest.default_expanded,"methods":methods}))
         }).collect();
         json!({"ok":true,"extensions":extensions})
     }
@@ -307,6 +307,7 @@ mod tests {
         manifest.methods.push(method());
         manifest.placements = vec!["application".into()];
         manifest.settings_provider = Some("example.provider".into());
+        manifest.default_expanded = true;
         let signer = SigningKey::from_bytes(&[42; 32]);
         let fingerprint = sha256(signer.verifying_key().as_bytes());
         let keys = BTreeMap::from([(
@@ -382,6 +383,10 @@ mod tests {
         .unwrap();
         let auth = json!({"ok":true,"kind":"administrator_session","role":"operator","scopes":["catalog.read"]});
         assert_eq!(extensions.list(&auth)["extensions"][0]["id"], "hello");
+        assert_eq!(
+            extensions.list(&auth)["extensions"][0]["default_expanded"],
+            true
+        );
         assert_eq!(
             extensions.list(&auth)["extensions"][0]["placements"],
             json!(["application"])

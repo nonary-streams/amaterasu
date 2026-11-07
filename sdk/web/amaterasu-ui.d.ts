@@ -272,6 +272,8 @@ declare namespace AmaterasuPluginUi {
       placements?: ("page" | "application" | "overview" | "settings")[];
       settings_provider?: string | null;
       settings_owner?: string | null;
+      /** Initial application section state; users can still collapse or expand it. */
+      default_expanded?: boolean;
       methods: ExtensionMethod[];
     }
 
@@ -306,6 +308,7 @@ declare namespace AmaterasuPluginUi {
   interface ExtensionSettingsDescriptor {
       provider: string;
       display_name?: string | null;
+      default_expanded?: boolean;
       options: {
         id: string; label: string; help: string; definition: ExtensionFieldDefinition;
         choice_labels?: Record<string,string>; presentation?: string | null;

@@ -1696,6 +1696,25 @@ input[type="checkbox"], input[type="radio"] { min-height: 0; }
 .catalog-plugin-overrides-actions { display: flex; flex-wrap: wrap; gap: .75rem; margin-top: 1rem; }
 .catalog-plugin-overrides-fields:disabled { opacity: .7; }
 
+.application-plugin-settings, .application-plugin-sections { display: grid; gap: 16px; }
+.application-plugin-sections:not(:empty) { margin-top: 16px; }
+.application-plugin-section { min-width: 0; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); overflow: hidden; }
+.application-plugin-summary { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 18px 20px; cursor: pointer; list-style: none; font-size: 16px; font-weight: 600; }
+.application-plugin-summary::-webkit-details-marker { display: none; }
+.application-plugin-summary::after { content: ""; width: 8px; height: 8px; flex-shrink: 0; border-right: 2px solid var(--muted); border-bottom: 2px solid var(--muted); transform: rotate(45deg); transition: transform .15s; }
+.application-plugin-section[open] > .application-plugin-summary { border-bottom: 1px solid var(--line); }
+.application-plugin-section[open] > .application-plugin-summary::after { transform: rotate(225deg); }
+.application-plugin-summary:hover { background: color-mix(in srgb, var(--accent) 5%, transparent); }
+.application-plugin-summary:focus-visible { outline-offset: -4px; }
+.application-plugin-content { padding: 20px; min-width: 0; }
+@media (max-width: 640px) {
+  .application-plugin-summary { padding: 16px; }
+  .application-plugin-content { padding: 14px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .application-plugin-summary::after { transition: none; }
+}
+
 /* Reusable web-extension controls and feedback inherit the active host semantic theme. */
 .plugin-feedback { color: var(--fg); }
 .plugin-feedback-status { color: var(--secondary); }
@@ -1709,8 +1728,16 @@ input[type="checkbox"], input[type="radio"] { min-height: 0; }
 .plugin-feedback-message { color: var(--secondary); }
 .plugin-control { width: min(100%, 520px); }
 .plugin-control > select { min-height: 40px; width: 100%; }
-.plugin-toggle { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
-.plugin-toggle input[type="checkbox"] { width: 20px; height: 20px; accent-color: var(--accent); }
+.plugin-toggle { display: flex; flex-direction: row; align-items: center; justify-content: space-between; gap: 16px; }
+.plugin-toggle input[type="checkbox"] { appearance: none; position: relative; align-self: center; flex-shrink: 0; width: 36px; height: 20px; margin: 0; padding: 0; border: 1px solid var(--muted); border-radius: 999px; background: var(--line); cursor: pointer; }
+.plugin-toggle input[type="checkbox"]::before { content: ""; position: absolute; top: 3px; left: 3px; width: 12px; height: 12px; border-radius: 50%; background: var(--fg); }
+.plugin-toggle input[type="checkbox"]:checked { border-color: var(--accent); background: var(--accent); }
+.plugin-toggle input[type="checkbox"]:checked::before { transform: translateX(16px); background: var(--on-accent); }
+.plugin-toggle input[type="checkbox"]:disabled { cursor: not-allowed; opacity: .5; }
+@media (forced-colors: active) {
+  .plugin-toggle input[type="checkbox"] { appearance: auto; }
+  .plugin-toggle input[type="checkbox"]::before { display: none; }
+}
 .radio-group { display: grid; gap: 6px; width: min(100%, 420px); min-width: 0; margin: 0; padding: 0; border: 0; }
 .radio-group-label { display: block; margin-bottom: 2px; font-weight: 600; }
 .radio-option { display: flex; align-items: center; gap: 10px; min-height: 40px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); color: var(--fg); }

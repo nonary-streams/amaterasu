@@ -9,6 +9,8 @@ namespace Amaterasu {
     placements?: ("page" | "application" | "overview" | "settings")[];
     settings_provider?: string | null;
     settings_owner?: string | null;
+    /** Initial application section state; users can still collapse or expand it. */
+    default_expanded?: boolean;
     methods: ExtensionMethod[];
   }
   interface ExtensionPage {
@@ -37,6 +39,7 @@ namespace Amaterasu {
   export interface ExtensionSettingsDescriptor {
     provider: string;
     display_name?: string | null;
+    default_expanded?: boolean;
     options: {
       id: string; label: string; help: string; definition: ExtensionFieldDefinition;
       choice_labels?: Record<string,string>; presentation?: string | null;
@@ -95,6 +98,7 @@ namespace Amaterasu {
       typeof record.name === "string" && !!record.name.trim() && record.name.length <= 128 &&
       typeof record.digest === "string" && /^[a-f0-9]{64}$/.test(record.digest) &&
       record.sdk_version === 1 && typeof record.entrypoint === "string" &&
+      (record.default_expanded === undefined || typeof record.default_expanded === "boolean") &&
       (record.placements === undefined || (Array.isArray(record.placements) && record.placements.length > 0 && record.placements.length <= 4 &&
         new Set(record.placements).size === record.placements.length && record.placements.every((place: unknown) => place === "page" || place === "application" || place === "overview" || place === "settings"))) &&
       (record.settings_provider == null || (typeof record.settings_provider === "string" && /^[a-z0-9._-]{1,128}$/.test(record.settings_provider) &&

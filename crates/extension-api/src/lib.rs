@@ -714,6 +714,10 @@ pub struct ExtensionDescriptor {
     pub provider: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
+    /// Initial disclosure state for generated application settings. This is
+    /// presentation only: opening a section never creates settings overrides.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub default_expanded: bool,
     pub revision: u64,
     pub options: Vec<OptionDescriptor>,
     pub actions: Vec<ActionDescriptor>,
@@ -1921,6 +1925,7 @@ mod tests {
         let mut descriptor = ExtensionDescriptor {
             provider: "example.provider".into(),
             display_name: None,
+            default_expanded: false,
             revision: 1,
             options: vec![option],
             actions: vec![],
@@ -1928,6 +1933,23 @@ mod tests {
             settings_validate: method,
         };
         assert!(validate_descriptor(&descriptor).is_ok());
+        let legacy = serde_json::to_value(&descriptor).unwrap();
+        assert!(legacy.get("default_expanded").is_none());
+        assert!(
+            !serde_json::from_value::<ExtensionDescriptor>(legacy)
+                .unwrap()
+                .default_expanded
+        );
+        descriptor.default_expanded = true;
+        let expanded = serde_json::to_value(&descriptor).unwrap();
+        assert!(
+            serde_json::from_value::<ExtensionDescriptor>(expanded.clone())
+                .unwrap()
+                .default_expanded
+        );
+        let mut invalid = expanded;
+        invalid["default_expanded"] = json!("true");
+        assert!(serde_json::from_value::<ExtensionDescriptor>(invalid).is_err());
         assert_eq!(
             serde_json::to_value(&descriptor.options[0]).unwrap()["presentation"],
             json!("slider")
@@ -1971,6 +1993,7 @@ mod tests {
         let mut descriptor = ExtensionDescriptor {
             provider: "example.provider".into(),
             display_name: None,
+            default_expanded: false,
             revision: 1,
             options: vec![option],
             actions: vec![],
@@ -2045,6 +2068,7 @@ mod tests {
         let mut descriptor = ExtensionDescriptor {
             provider: "example.provider".into(),
             display_name: None,
+            default_expanded: false,
             revision: 1,
             options: vec![],
             actions: vec![ActionDescriptor {

@@ -22,8 +22,17 @@ namespace Amaterasu {
   interface SessionExtensionDescriptor {
     provider: string;
     display_name?: string | null;
+    default_expanded?: boolean;
     options: SessionExtensionOption[];
     actions: SessionExtensionAction[];
+  }
+
+  function applicationPluginSection(title: string, defaultExpanded: boolean, content: HTMLElement): HTMLDetailsElement {
+    const section = el("details", "application-plugin-section",
+      el("summary", "application-plugin-summary", literalText(title)),
+      el("div", "application-plugin-content", content));
+    section.open = defaultExpanded;
+    return section;
   }
   interface SessionExtensionSettings {
     revision: number;
@@ -212,8 +221,7 @@ namespace Amaterasu {
       renderFallback(new Set(sections.flatMap((entry) => entry.settings_provider ? [entry.settings_provider] : [])));
       for (const descriptor of sections) {
         const container = el("div");
-        const section = panel(literalText(descriptor.name), container);
-        section.classList.add("application-plugin-section");
+        const section = applicationPluginSection(descriptor.name, descriptor.default_expanded === true, container);
         custom.append(section);
         const mount = pages.mountApplication(descriptor.id, container, application);
         mounts.add(mount);
@@ -301,7 +309,7 @@ namespace Amaterasu {
           let effectiveAvailable = true;
           let baseline = JSON.stringify(document.values);
           const options = descriptor.options.filter((option) => Array.isArray(option.allowed_scopes) && option.allowed_scopes.includes("application"));
-          const entries = new Map<string, { editor: ExtensionFieldEditor; inherit?: HTMLInputElement }>();
+          const entries = new Map<string, { editor: ExtensionFieldEditor; overridden: boolean }>();
           const form = el("form", "settings-form catalog-plugin-overrides-form");
           const fields = el("fieldset", "catalog-plugin-overrides-fields");
           fields.disabled = !context.api.allows("configuration.write");
@@ -359,18 +367,14 @@ namespace Amaterasu {
             const controls = editor.node.matches("input,select,textarea") ? [editor.node] : Array.from(editor.node.querySelectorAll("input,select,textarea"));
             if (controls.length === 1) controls[0]!.setAttribute("aria-label", option.label);
             const row = el("fieldset", "session-extension-option catalog-plugin-override-row", el("legend", "field-label", literalText(option.label)), editor.node);
-            const inherit = showAllOptions ? input("", "", "checkbox") : undefined;
-            if (inherit) {
-              inherit.checked = inherited;
-              row.append(el("label", "session-extension-inherit", inherit, " Use inherited value"));
-              const edited = () => { inherit.checked = false; };
-              editor.node.addEventListener("input", edited);
-              editor.node.addEventListener("change", edited);
-            }
+            const entry = { editor, overridden: !inherited };
+            const edited = () => { entry.overridden = true; };
+            editor.node.addEventListener("input", edited);
+            editor.node.addEventListener("change", edited);
             if (option.help) row.append(el("small", "muted", literalText(option.help)));
             row.append(el("small", "muted", sessionExtensionApplyPolicyHelp(option.apply_policy)));
             if (!showAllOptions) row.append(button("Remove override", () => { entries.delete(option.id); row.remove(); refreshChoices(); }));
-            entries.set(option.id, { editor, inherit });
+            entries.set(option.id, entry);
             rows.append(row);
           };
           const add = button("Add override", () => {
@@ -419,7 +423,7 @@ namespace Amaterasu {
             const result: Payload = { ...document.values };
             for (const option of options) {
               const entry = entries.get(option.id);
-              if (entry && !entry.inherit?.checked) result[option.id] = entry.editor.value();
+              if (entry?.overridden) result[option.id] = entry.editor.value();
               else delete result[option.id];
             }
             return result;
@@ -472,7 +476,9 @@ namespace Amaterasu {
               }
             });
           });
-          return panel(literalText(descriptor.display_name || descriptor.provider), form);
+          return showAllOptions
+            ? applicationPluginSection(descriptor.display_name || descriptor.provider, descriptor.default_expanded === true, form)
+            : panel(literalText(descriptor.display_name || descriptor.provider), form);
         });
         if (sharedChoices) sharedChoices.list.append(...sharedGroups);
         if (showAllOptions && !panels.length) { area.replaceChildren(); return; }

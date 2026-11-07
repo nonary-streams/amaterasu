@@ -60,6 +60,8 @@ fn apply_ui_configuration(manifest: &mut extension::Manifest, bytes: &[u8]) -> R
         settings_provider: Option<String>,
         #[serde(default)]
         settings_owner: Option<String>,
+        #[serde(default)]
+        default_expanded: bool,
     }
     let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
     if value.is_array() {
@@ -70,6 +72,39 @@ fn apply_ui_configuration(manifest: &mut extension::Manifest, bytes: &[u8]) -> R
         manifest.placements = config.placements;
         manifest.settings_provider = config.settings_provider;
         manifest.settings_owner = config.settings_owner;
+        manifest.default_expanded = config.default_expanded;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn packaging_preserves_expansion_hint_and_legacy_defaults() {
+        let mut manifest: extension::Manifest = serde_json::from_value(serde_json::json!({
+            "schema":1,"project":"amaterasu.web.extension","id":"example","name":"Example",
+            "sequence":1,"expires_unix":100,"sdk_version":1,"entrypoint":"main.js",
+            "files":{"main.js":{"sha256":"a".repeat(64),"size":1}}
+        }))
+        .unwrap();
+        apply_ui_configuration(
+            &mut manifest,
+            br#"{"placements":["application"],"default_expanded":true}"#,
+        )
+        .unwrap();
+        assert!(manifest.default_expanded);
+        apply_ui_configuration(&mut manifest, br#"{"placements":["application"]}"#).unwrap();
+        assert!(!manifest.default_expanded);
+        assert!(
+            apply_ui_configuration(
+                &mut manifest,
+                br#"{"placements":["application"],"default_expanded":"true"}"#,
+            )
+            .is_err()
+        );
+        apply_ui_configuration(&mut manifest, b"[]").unwrap();
+        assert!(!manifest.default_expanded);
+    }
 }
