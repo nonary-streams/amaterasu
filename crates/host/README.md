@@ -65,9 +65,19 @@ not survive a worker restart; durable data remains the responsibility of its
 own module. Native module faults may leave external effects; host supervision is
 not transactional rollback or a native-code sandbox.
 
-EOF/shutdown destroys modules in reverse load order and then their runtime. A
-hung teardown is killed after the deadline and exits with an error. The
-development console still rejects production roots, but the Windows SCM path
+EOF/shutdown first announces one shared deadline, then drains consumers before
+their declared providers while providers continue ticking. A completed drain
+destroys modules in reverse load order and their runtime last. If any drain or
+shutdown announcement fails, the host retains the complete graph, including
+instances, library handles, runtime endpoints and host services, until process
+exit. It invokes no module destructor for that graph, rejects further graph use
+or native loading, and reports failure without a successful shutdown or restart
+acknowledgment. Supervisors retire the failed worker process before starting a
+replacement. This containment does not prove external effects were retired;
+durable cleanup state still requires reconciliation. Standalone SDK embeddings
+must uphold their own native lifetime and destruction obligations.
+
+The development console still rejects production roots, but the Windows SCM path
 loads a signed production set in the active WTS user session. Before that worker
 starts, SCM derives a SID-specific state root from its token, validates that no
 reparse point is involved, and grants exactly that SID plus LocalSystem and

@@ -111,7 +111,7 @@ fn probe_with_recovery(
     recovery_budget: std::time::Duration,
 ) -> PackageResult<()> {
     let root = crate::service::validate_user_service_root(root)?;
-    let _lock = amaterasu_package::RootLock::acquire(&root)?;
+    let _lock = crate::loading::ProcessRootLock::new(amaterasu_package::RootLock::acquire(&root)?);
     let state_root = crate::service::validate_user_state_root(&root.join("data/state"))?;
     prepare_trial(&root, request, |path, verified, bootstrap| {
         let mut package = amaterasu_package::verify_package(

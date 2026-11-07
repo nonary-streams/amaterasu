@@ -14,10 +14,14 @@ use libloading::Library;
 use serde_json::json;
 use std::collections::BTreeSet;
 use std::ffi::c_void;
-use std::mem::MaybeUninit;
+use std::mem::{ManuallyDrop, MaybeUninit};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 
 pub(crate) mod management_tls;
+#[cfg(test)]
+mod process_lock_tests;
 #[cfg(test)]
 mod teardown_tests;
 
@@ -114,13 +118,71 @@ fn inject_running_package_digest(
     Ok(())
 }
 
-pub struct LoadedComponents {
+#[derive(Default)]
+struct NativeProcessState {
+    quarantined: AtomicBool,
+}
+
+impl NativeProcessState {
+    fn require_usable(&self) -> PackageResult<()> {
+        if self.quarantined.load(Ordering::Acquire) {
+            Err("native graph quarantined after incomplete shutdown; this process must exit".into())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn quarantine(&self) {
+        self.quarantined.store(true, Ordering::Release);
+    }
+}
+
+fn native_process_state() -> Arc<NativeProcessState> {
+    static PROCESS: OnceLock<Arc<NativeProcessState>> = OnceLock::new();
+    PROCESS.get_or_init(Default::default).clone()
+}
+
+/// A failed native drain is fatal to this process, including activation trials.
+/// Loading a replacement cannot make the retained graph safe to destroy.
+pub(crate) fn require_process_usable() -> PackageResult<()> {
+    native_process_state().require_usable()
+}
+
+/// Keep the existing root admission lock until actual process exit if native
+/// work cannot retire. Error logging and stack unwinding must not admit another
+/// host while a quarantined graph still owns native resources.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) struct ProcessRootLock {
+    lock: Option<amaterasu_package::RootLock>,
+    process: Arc<NativeProcessState>,
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl ProcessRootLock {
+    pub(crate) fn new(lock: amaterasu_package::RootLock) -> Self {
+        Self {
+            lock: Some(lock),
+            process: native_process_state(),
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl Drop for ProcessRootLock {
+    fn drop(&mut self) {
+        if self.process.require_usable().is_err()
+            && let Some(lock) = self.lock.take()
+        {
+            // Retain only this exact acquired lock. The OS releases its file
+            // handle on process exit; no native cleanup or extra wait runs here.
+            std::mem::forget(lock);
+        }
+    }
+}
+
+struct LoadedGraph {
     // Fields drop in declaration order: modules must stop before their runtime disappears.
     modules: Vec<FeatureLibrary>,
-    quiesced: bool,
-    quiesce_attempted: bool,
-    shutdown_deadline: Option<std::time::Instant>,
-    shutdown_prepare_error: Option<String>,
     product_logger: Option<ProductLogger>,
     host_log_service: Option<HostLogService>,
     host_logs_enabled: bool,
@@ -128,6 +190,26 @@ pub struct LoadedComponents {
     log_loss: LogLoss,
     lifecycle_endpoint: HostApi,
     runtime: RuntimeLibrary,
+}
+
+impl Drop for LoadedGraph {
+    fn drop(&mut self) {
+        while let Some(module) = self.modules.pop() {
+            drop(module);
+        }
+    }
+}
+
+pub struct LoadedComponents {
+    // Keep the entire graph allocation stable. Failed shutdown intentionally
+    // retains instances, endpoint state, host services and every library handle
+    // until process exit; returning from Drop must not auto-destroy any field.
+    graph: ManuallyDrop<Box<LoadedGraph>>,
+    process: Arc<NativeProcessState>,
+    quiesced: bool,
+    quiesce_attempted: bool,
+    shutdown_deadline: Option<std::time::Instant>,
+    shutdown_prepare_error: Option<String>,
 }
 
 impl Drop for LoadedComponents {
@@ -139,8 +221,14 @@ impl Drop for LoadedComponents {
         {
             eprintln!("cooperative module shutdown incomplete: {error}");
         }
-        while let Some(module) = self.modules.pop() {
-            drop(module);
+        if self.quiesced {
+            // SAFETY: this is the graph's only destruction path. Every module
+            // reported safe to destroy; LoadedGraph drops consumers first and
+            // retains all provider libraries and the runtime until they end.
+            unsafe { ManuallyDrop::drop(&mut self.graph) };
+        } else {
+            self.process.quarantine();
+            eprintln!("native graph retained after incomplete shutdown; host process must exit");
         }
     }
 }
@@ -154,6 +242,7 @@ impl LoadedComponents {
         product_logger: Option<ProductLogger>,
         progress: &mut dyn FnMut(usize) -> PackageResult<()>,
     ) -> PackageResult<Self> {
+        require_process_usable()?;
         crate::privilege::require_user_process()?;
         let runtime_component = package
             .manifest
@@ -243,44 +332,59 @@ impl LoadedComponents {
         mut load: impl FnMut(&mut RuntimeLibrary, Component) -> PackageResult<FeatureLibrary>,
         progress: &mut dyn FnMut(usize) -> PackageResult<()>,
     ) -> PackageResult<Self> {
+        let process = runtime.process.clone();
+        process.require_usable()?;
         // Own partial initialization immediately so every error path stops consumers
         // before their native providers, including progress and endpoint failures.
         let mut loaded = Self {
-            modules: Vec::new(),
+            graph: ManuallyDrop::new(Box::new(LoadedGraph {
+                modules: Vec::new(),
+                product_logger,
+                host_log_service: None,
+                host_logs_enabled,
+                pending_log_policy: None,
+                log_loss: LogLoss::default(),
+                lifecycle_endpoint,
+                runtime,
+            })),
+            process,
             quiesced: false,
             quiesce_attempted: false,
             shutdown_deadline: None,
             shutdown_prepare_error: None,
-            product_logger,
-            host_log_service: None,
-            host_logs_enabled,
-            pending_log_policy: None,
-            log_loss: LogLoss::default(),
-            lifecycle_endpoint,
-            runtime,
         };
         progress(1)?;
         for (index, component) in components.into_iter().enumerate() {
-            let module = load(&mut loaded.runtime, component)?;
-            loaded.modules.push(module);
+            let module = load(&mut loaded.graph.runtime, component)?;
+            loaded.graph.modules.push(module);
             progress(index + 2)?;
         }
         Ok(loaded)
     }
 
     pub(crate) fn quiesce(&mut self, budget: std::time::Duration) -> PackageResult<()> {
+        self.process.require_usable()?;
         if self.quiesced {
             return Ok(());
         }
-        let deadline = self.prepare_shutdown(budget)?;
+        self.quiesce_attempted = true;
+        let deadline = match self.prepare_shutdown(budget) {
+            Ok(deadline) => deadline,
+            Err(error) => {
+                self.process.quarantine();
+                return Err(error);
+            }
+        };
         // The verified manifest supplies this acyclic graph. Providers keep
         // receiving ticks, but must not begin their own shutdown until every
         // loaded consumer has released its dependency on them.
         let dependents: Vec<Vec<usize>> = self
+            .graph
             .modules
             .iter()
             .map(|provider| {
-                self.modules
+                self.graph
+                    .modules
                     .iter()
                     .enumerate()
                     .filter_map(|(index, consumer)| {
@@ -296,13 +400,13 @@ impl LoadedComponents {
         loop {
             let mut ready = true;
             let mut poll_error = None;
-            let mut drained = vec![false; self.modules.len()];
-            for index in (0..self.modules.len()).rev() {
+            let mut drained = vec![false; self.graph.modules.len()];
+            for index in (0..self.graph.modules.len()).rev() {
                 if dependents[index].iter().any(|consumer| !drained[*consumer]) {
                     ready = false;
                     continue;
                 }
-                match self.modules[index].quiesce() {
+                match self.graph.modules[index].quiesce() {
                     Ok(module_ready) => {
                         drained[index] = module_ready;
                         ready &= module_ready;
@@ -315,12 +419,14 @@ impl LoadedComponents {
             }
             if ready {
                 if let Some(error) = &self.shutdown_prepare_error {
+                    self.process.quarantine();
                     return Err(error.clone());
                 }
                 self.quiesced = true;
                 return Ok(());
             }
             if std::time::Instant::now() >= deadline {
+                self.process.quarantine();
                 let failure = poll_error
                     .or(progress_error)
                     .or_else(|| self.shutdown_prepare_error.clone());
@@ -352,7 +458,7 @@ impl LoadedComponents {
         // Announce to all participants before even the first consumer starts
         // draining. This bounds provider work performed on that consumer's
         // behalf without starting provider cleanup ahead of the dependency gate.
-        for module in self.modules.iter_mut().rev() {
+        for module in self.graph.modules.iter_mut().rev() {
             let remaining_ms = deadline
                 .saturating_duration_since(std::time::Instant::now())
                 .as_millis()
@@ -365,15 +471,15 @@ impl LoadedComponents {
     }
 
     /// Explicit stop paths observe drain failure before acknowledging shutdown.
-    /// Drop still destroys every owned module, but never starts a second drain
-    /// budget after this attempt has already expired.
+    /// Failed drains retain the complete native graph until process exit. Drop
+    /// never destroys an unready module or starts a second drain budget.
     pub(crate) fn shutdown(mut self, budget: std::time::Duration) -> PackageResult<()> {
         self.quiesce(budget)
     }
 
     fn tick_during_shutdown(&mut self) -> PackageResult<()> {
         let mut failure = None;
-        for module in &mut self.modules {
+        for module in &mut self.graph.modules {
             if let Err(error) = module.tick() {
                 failure.get_or_insert(error);
             }
@@ -384,32 +490,35 @@ impl LoadedComponents {
     }
 
     pub fn observe_work(&self) -> PackageResult<u64> {
-        let Some(api) = self.runtime.wait_api else {
+        self.process.require_usable()?;
+        let Some(api) = self.graph.runtime.wait_api else {
             return Ok(0);
         };
         let mut observed = 0;
         // SAFETY: runtime and output remain live for this serialized call.
         require_success(
-            unsafe { (api.observe)(self.runtime.instance, &mut observed) },
+            unsafe { (api.observe)(self.graph.runtime.instance, &mut observed) },
             "observe runtime work",
         )?;
         Ok(observed)
     }
     pub fn wait_for_work(&self, observed: u64, timeout: std::time::Duration) -> PackageResult<()> {
-        let Some(api) = self.runtime.wait_api else {
+        self.process.require_usable()?;
+        let Some(api) = self.graph.runtime.wait_api else {
             std::thread::sleep(timeout);
             return Ok(());
         };
         let micros = timeout.as_micros().min(1_000_000) as u64;
         // SAFETY: the selected runtime is retained until the bounded wait returns.
         require_success(
-            unsafe { (api.wait)(self.runtime.instance, observed, micros) },
+            unsafe { (api.wait)(self.graph.runtime.instance, observed, micros) },
             "wait for runtime work",
         )
     }
 
     pub fn tick(&mut self) -> PackageResult<()> {
-        for module in &mut self.modules {
+        self.process.require_usable()?;
+        for module in &mut self.graph.modules {
             module.tick()?;
         }
         self.drain_log_events();
@@ -426,7 +535,7 @@ impl LoadedComponents {
         };
         // SAFETY: the reserved endpoint belongs to this live runtime; the ABI
         // copies its bounded response before returning.
-        let Ok(output) = (unsafe { self.lifecycle_endpoint.call(&input) }) else {
+        let Ok(output) = (unsafe { self.graph.lifecycle_endpoint.call(&input) }) else {
             return;
         };
         let Ok(Response::LogEvents {
@@ -436,11 +545,12 @@ impl LoadedComponents {
         else {
             return;
         };
-        let Some(logger) = &self.product_logger else {
+        let graph = &mut **self.graph;
+        let Some(logger) = &graph.product_logger else {
             return;
         };
-        self.log_loss.record_broker(dropped_records);
-        let mut pending_policy = self.pending_log_policy.take();
+        graph.log_loss.record_broker(dropped_records);
+        let mut pending_policy = graph.pending_log_policy.take();
         if let Some(HostLogEvent::Policy {
             revision,
             minimum_level,
@@ -472,7 +582,7 @@ impl LoadedComponents {
                     message,
                 } => {
                     if policy_queue_blocked || logger.emit(level, &target, &message).is_err() {
-                        self.log_loss.record_host();
+                        graph.log_loss.record_host();
                     }
                 }
                 HostLogEvent::Policy {
@@ -512,20 +622,22 @@ impl LoadedComponents {
             }
         }
         if !policy_queue_blocked {
-            self.log_loss
+            graph
+                .log_loss
                 .report(|message| logger.emit(3, "amaterasu.host::logging", message));
         }
-        self.pending_log_policy = pending_policy;
+        graph.pending_log_policy = pending_policy;
     }
 
     /// Route a bounded number of host-log requests without performing disk I/O
     /// on the host tick. RequestRouter enforces ownership and deadlines.
     fn service_host_logs(&mut self) {
-        if !self.host_logs_enabled {
+        if !self.graph.host_logs_enabled {
             return;
         }
         for _ in 0..4 {
             let result = self
+                .graph
                 .host_log_service
                 .as_ref()
                 .and_then(|service| service.try_complete().ok())
@@ -553,13 +665,15 @@ impl LoadedComponents {
                 });
                 continue;
             }
-            if self.host_log_service.is_none() {
-                self.host_log_service = self
+            if self.graph.host_log_service.is_none() {
+                self.graph.host_log_service = self
+                    .graph
                     .product_logger
                     .as_ref()
                     .and_then(|logger| HostLogService::start(logger.clone()).ok());
             }
             let submitted = self
+                .graph
                 .host_log_service
                 .as_ref()
                 .is_some_and(|handler| handler.submit(id, payload).is_ok());
@@ -576,29 +690,32 @@ impl LoadedComponents {
         let input = serde_json::to_vec(&command).ok()?;
         // SAFETY: the private endpoint belongs to the live runtime and copies
         // its bounded response before returning; LoadedComponents owns both.
-        let output = unsafe { self.lifecycle_endpoint.call(&input) }.ok()?;
+        let output = unsafe { self.graph.lifecycle_endpoint.call(&input) }.ok()?;
         serde_json::from_slice(&output).ok()
     }
 
     pub fn health(&self) -> PackageResult<()> {
-        for module in &self.modules {
+        self.process.require_usable()?;
+        for module in &self.graph.modules {
             module.health()?;
         }
         Ok(())
     }
 
     pub fn console_endpoint(&mut self) -> PackageResult<HostApi> {
-        self.runtime.endpoint("amaterasu.console")
+        self.process.require_usable()?;
+        self.graph.runtime.endpoint("amaterasu.console")
     }
 
     #[cfg(target_os = "linux")]
     pub fn take_host_package_activation(
         &self,
     ) -> PackageResult<Option<amaterasu_contracts::HostPackageActivation>> {
+        self.process.require_usable()?;
         let input = serde_json::to_vec(&Command::HostPackageActivationDrain {})
             .map_err(|error| error.to_string())?;
         // SAFETY: the private host endpoint belongs to this live runtime.
-        let output = unsafe { self.lifecycle_endpoint.call(&input) }
+        let output = unsafe { self.graph.lifecycle_endpoint.call(&input) }
             .map_err(|status| format!("host activation endpoint returned status {status}"))?;
         match serde_json::from_slice(&output).map_err(|error| error.to_string())? {
             Response::HostPackageActivation { request } => Ok(request.map(|value| *value)),
@@ -608,11 +725,12 @@ impl LoadedComponents {
     }
 
     pub fn take_host_lifecycle_action(&self) -> PackageResult<Option<HostLifecycleAction>> {
+        self.process.require_usable()?;
         let input = serde_json::to_vec(&Command::HostLifecycleDrain {})
             .map_err(|error| error.to_string())?;
         // SAFETY: the private endpoint belongs to this live runtime and is used
         // only while LoadedComponents keeps the runtime alive.
-        let output = unsafe { self.lifecycle_endpoint.call(&input) }
+        let output = unsafe { self.graph.lifecycle_endpoint.call(&input) }
             .map_err(|status| format!("host lifecycle endpoint returned status {status}"))?;
         match serde_json::from_slice(&output).map_err(|error| error.to_string())? {
             Response::HostLifecycle { action } => Ok(action),
@@ -737,6 +855,7 @@ fn same_path(left: &str, right: &str) -> bool {
 }
 
 struct RuntimeLibrary {
+    process: Arc<NativeProcessState>,
     api: RuntimeApi,
     wait_api: Option<RuntimeWaitApi>,
     instance: *mut c_void,
@@ -770,6 +889,7 @@ impl RuntimeLibrary {
             return Err("runtime returned a null instance".into());
         }
         Ok(Self {
+            process: native_process_state(),
             api,
             wait_api,
             instance,

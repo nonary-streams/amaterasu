@@ -477,7 +477,7 @@ enum LinuxUserAction {
 
 #[cfg(target_os = "linux")]
 fn run_linux_user_service(root: &Path, expected_digest: &str) -> PackageResult<()> {
-    let _lock = RootLock::acquire(root)?;
+    let _lock = crate::loading::ProcessRootLock::new(RootLock::acquire(root)?);
     let mut trial_pending =
         match crate::package_activation::startup_transition(root, expected_digest)? {
             crate::package_activation::StartupTransition::None => false,
@@ -493,6 +493,13 @@ fn run_linux_user_service(root: &Path, expected_digest: &str) -> PackageResult<(
             }
         };
     let result = run_linux_user_service_inner(root, expected_digest, &mut trial_pending);
+    if let Err(error) = &result
+        && let Err(quarantine) = crate::loading::require_process_usable()
+    {
+        // Recovery can load another graph. An unretired trial must instead
+        // retain its journal for recovery by a fresh worker process.
+        return Err(format!("{error}; {quarantine}"));
+    }
     if result.is_err() && trial_pending {
         let recovered = crate::package_activation::recover(root, expected_digest);
         if let Ok(state) = validate_user_state_root(&root.join("data/state")) {
@@ -614,6 +621,12 @@ fn run_linux_user_service_inner(
                         );
                     }
                     Err(error) => {
+                        // A failed trial may retain an unretired native graph.
+                        // Exit this worker rather than reloading the active
+                        // package alongside that graph, even without a journal.
+                        if let Err(quarantine) = crate::loading::require_process_usable() {
+                            break Err(format!("package activation failed: {error}; {quarantine}"));
+                        }
                         let _ = crate::package_activation::write_status(
                             &state_root,
                             &request.manifest_digest,
