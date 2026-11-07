@@ -20,6 +20,9 @@ const CALL_DEADLINE: Duration = Duration::from_secs(5);
 const UNAVAILABLE_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_SNAPSHOT_ATTEMPTS: u8 = 6;
 const MAX_CANDIDATES: usize = 128;
+/// A truncated listing is resumed only after progress, and at most this often,
+/// so sessions the coordinator keeps refusing cannot loop the sweep.
+const MAX_LISTING_ROUNDS: u8 = 8;
 
 /// Fixed, identity-free events for the controller's log.
 pub(super) type SweepEvent = (LogLevel, &'static str);
@@ -50,14 +53,25 @@ enum Step {
         current_epoch: String,
         remaining: VecDeque<StrandedSession>,
         active: Option<ActiveCall>,
+        listing_truncated: bool,
+        abandoned_any: bool,
     },
     Idle,
+}
+
+/// One pass over a stranded-session listing.
+struct Abandoning {
+    current_epoch: String,
+    remaining: VecDeque<StrandedSession>,
+    listing_truncated: bool,
+    abandoned_any: bool,
 }
 
 pub(super) struct RestartSweep {
     step: Step,
     snapshot_operation_prefix: String,
     snapshot_sequence: u64,
+    listing_rounds: u8,
 }
 
 impl RestartSweep {
@@ -66,6 +80,7 @@ impl RestartSweep {
             step: Step::Disabled,
             snapshot_operation_prefix,
             snapshot_sequence: 0,
+            listing_rounds: 0,
         }
     }
 
@@ -79,6 +94,7 @@ impl RestartSweep {
     /// Run one more sweep after lifecycle capacity refused a preparation.
     pub(super) fn request_retry(&mut self) {
         if matches!(self.step, Step::Idle) {
+            self.listing_rounds = 0;
             self.step = awaiting_snapshot();
         }
     }
@@ -112,7 +128,19 @@ impl RestartSweep {
                 current_epoch,
                 remaining,
                 active,
-            } => self.poll_abandoning(current_epoch, remaining, active, now, send),
+                listing_truncated,
+                abandoned_any,
+            } => self.poll_abandoning(
+                Abandoning {
+                    current_epoch,
+                    remaining,
+                    listing_truncated,
+                    abandoned_any,
+                },
+                active,
+                now,
+                send,
+            ),
         }
     }
 
@@ -136,7 +164,9 @@ impl RestartSweep {
         ActiveCall {
             call: Call::new(
                 LIFECYCLE_SERVICE,
-                json!({"operation":"snapshot"}),
+                // The full snapshot is bounded and refuses retained history
+                // past the broker limit; this listing stays small.
+                json!({"operation":"snapshot","restart_stranded":true}),
                 operation_id,
                 CALL_TIMEOUT_MS,
             ),
@@ -164,10 +194,13 @@ impl RestartSweep {
                 if stranded.is_empty() {
                     return Some((LogLevel::Debug, "restart_sweep none_stranded"));
                 }
+                self.listing_rounds = self.listing_rounds.saturating_add(1);
                 self.step = Step::Abandoning {
                     current_epoch,
                     remaining: stranded.into(),
                     active: None,
+                    listing_truncated: payload["truncated"] == true,
+                    abandoned_any: false,
                 };
                 Some((LogLevel::Info, "restart_sweep abandoning_stranded_sessions"))
             }
@@ -187,8 +220,7 @@ impl RestartSweep {
 
     fn poll_abandoning(
         &mut self,
-        current_epoch: String,
-        mut remaining: VecDeque<StrandedSession>,
+        mut round: Abandoning,
         active: Option<ActiveCall>,
         now: Instant,
         send: &mut Send<'_>,
@@ -196,16 +228,17 @@ impl RestartSweep {
         let mut active = match active {
             Some(active) => active,
             None => {
-                let Some(session) = remaining.pop_front() else {
-                    return Some((LogLevel::Info, "restart_sweep complete"));
+                let Some(session) = round.remaining.pop_front() else {
+                    return Some(self.finish_round(&round));
                 };
-                abandon_call(&current_epoch, &session, now)
+                abandon_call(&round.current_epoch, &session, now)
             }
         };
         let (active, event) = match poll_call(&mut active, now, send) {
             Outcome::Waiting => (Some(active), None),
             Outcome::Result(payload) => {
                 active.call.release_result(send);
+                round.abandoned_any |= abandonment_accepted(&payload);
                 (None, Some(abandonment_event(&payload)))
             }
             Outcome::Rejected | Outcome::Settled | Outcome::Uncertain => (
@@ -214,11 +247,25 @@ impl RestartSweep {
             ),
         };
         self.step = Step::Abandoning {
-            current_epoch,
-            remaining,
+            current_epoch: round.current_epoch,
+            remaining: round.remaining,
             active,
+            listing_truncated: round.listing_truncated,
+            abandoned_any: round.abandoned_any,
         };
         event
+    }
+
+    /// Ask for the rest of a truncated listing once this round made progress.
+    fn finish_round(&mut self, round: &Abandoning) -> SweepEvent {
+        if round.listing_truncated
+            && round.abandoned_any
+            && self.listing_rounds < MAX_LISTING_ROUNDS
+        {
+            self.step = awaiting_snapshot();
+            return (LogLevel::Info, "restart_sweep listing_continues");
+        }
+        (LogLevel::Info, "restart_sweep complete")
     }
 }
 
@@ -299,10 +346,15 @@ fn abandonment_operation_id(current_epoch: &str, session: &StrandedSession) -> S
     format!("nvhttp-restart-abandon-{digest}")
 }
 
+fn abandonment_accepted(payload: &Value) -> bool {
+    matches!(payload["status"].as_str(), Some("pending" | "succeeded"))
+}
+
 fn abandonment_event(payload: &Value) -> SweepEvent {
-    match payload["status"].as_str() {
-        Some("pending" | "succeeded") => (LogLevel::Info, "restart_sweep session_abandoned"),
-        _ => (LogLevel::Warning, "restart_sweep abandonment_refused"),
+    if abandonment_accepted(payload) {
+        (LogLevel::Info, "restart_sweep session_abandoned")
+    } else {
+        (LogLevel::Warning, "restart_sweep abandonment_refused")
     }
 }
 

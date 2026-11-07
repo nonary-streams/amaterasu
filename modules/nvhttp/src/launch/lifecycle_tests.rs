@@ -848,6 +848,7 @@ fn long_stream_monitoring_retires_results_before_real_broker_capacity_is_exhaust
 struct RestartSweepBroker {
     launch: Broker,
     hold_snapshots: bool,
+    refuse_abandonment: bool,
     snapshot_reply: Value,
     lifecycle_operations: Vec<Value>,
     sweep_results: BTreeMap<u64, Value>,
@@ -866,7 +867,11 @@ impl RestartSweepBroker {
                 let result = match payload["operation"].as_str() {
                     Some("snapshot") => self.snapshot_reply.clone(),
                     Some("recover_session") if payload["restart_abandonment"] == true => {
-                        json!({"status":"pending","operation_id":payload["operation_id"]})
+                        if self.refuse_abandonment {
+                            json!({"status":"rejected","reason":"release_work_unavailable"})
+                        } else {
+                            json!({"status":"pending","operation_id":payload["operation_id"]})
+                        }
                     }
                     _ => return self.launch.send(command),
                 };
@@ -922,6 +927,10 @@ fn restart_sweep_abandons_stranded_sessions_without_reporting_retirement() {
         controller.poll(now + Duration::from_millis(tick * 10), &mut |command| broker.send(command));
     }
     assert_eq!(broker.operations(), ["snapshot", "recover_session"]);
+    assert_eq!(
+        broker.lifecycle_operations[0]["restart_stranded"], true,
+        "the bounded stranded listing, not the full snapshot, is requested"
+    );
     let abandon = broker.lifecycle_operations[1].clone();
     assert_eq!(abandon["restart_abandonment"], true, "only the abandonment mode is sent");
     assert_eq!(
@@ -942,6 +951,31 @@ fn restart_sweep_abandons_stranded_sessions_without_reporting_retirement() {
         ["snapshot", "recover_session", "snapshot", "recover_session"]
     );
     assert_eq!(broker.lifecycle_operations[3]["operation_id"], operation_id);
+}
+
+/// A truncated listing is continued only after a round made progress, so
+/// sessions the coordinator keeps refusing cannot loop the sweep.
+#[test]
+fn truncated_stranded_listing_continues_only_after_progress() {
+    for (refuse, expected_snapshots) in [(false, 8), (true, 1)] {
+        let now = Instant::now();
+        let mut controller = Controller::new(Some(config())).unwrap();
+        controller.set_session_lifecycle_required(true);
+        controller.enable_restart_abandonment_sweep();
+        let mut snapshot = stranded_snapshot();
+        snapshot["truncated"] = json!(true);
+        let mut broker = RestartSweepBroker {
+            snapshot_reply: snapshot,
+            refuse_abandonment: refuse,
+            ..Default::default()
+        };
+        for tick in 0..400 {
+            controller.poll(now + Duration::from_millis(tick * 10), &mut |command| broker.send(command));
+        }
+        let snapshots = broker.operations().iter().filter(|operation| **operation == "snapshot").count();
+        assert_eq!(snapshots, expected_snapshots, "refuse={refuse}");
+        assert!(!controller.busy());
+    }
 }
 
 #[test]
