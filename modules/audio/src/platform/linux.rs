@@ -1,5 +1,6 @@
 //! PulseAudio capture for Linux, including PipeWire's Pulse compatibility server.
 mod cleanup_journal;
+mod cleanup_retry;
 
 use super::RecoveryConfig;
 use crate::{
@@ -12,6 +13,7 @@ use cleanup_journal::{
     SinkObservation, can_add_sink_intent, can_start_sink_load, deactivate_prior_process_sinks,
     has_unquiesced_sink_load, route_restore_action, sink_cleanup_action, sink_cleanup_requested,
 };
+use cleanup_retry::{SinkCleanupCoordinator, UnloadEvidence};
 use std::{
     any::Any,
     collections::{BTreeMap, VecDeque},
@@ -64,7 +66,7 @@ const STARTUP_OPEN_TOTAL_TIMEOUT: Duration = Duration::from_secs(4);
 const MAX_CAPTURE_CHUNK: usize = 1024 * 1024;
 static NEXT_MANAGED_SINK: AtomicU64 = AtomicU64::new(1);
 static NEXT_SINK_CLEANUP_SLOT: AtomicU64 = AtomicU64::new(0);
-static CLEANUP_JOURNAL: OnceLock<Mutex<Option<CleanupJournal>>> = OnceLock::new();
+static CLEANUP_JOURNAL: OnceLock<Mutex<Option<SinkCleanupCoordinator>>> = OnceLock::new();
 static CLEANUP_JOURNAL_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[repr(C)]
@@ -1287,16 +1289,17 @@ fn update_cleanup_state(update: impl FnOnce(&mut CleanupState)) -> AudioResult<(
     let _guard = cleanup_journal_lock()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let journal = CLEANUP_JOURNAL
+    let mut journal = CLEANUP_JOURNAL
         .get_or_init(|| Mutex::new(None))
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let journal = journal
-        .as_ref()
+        .as_mut()
         .ok_or("audio_cleanup_journal_unavailable")?;
-    let mut state = journal.read()?;
-    update(&mut state);
-    journal.write(&state)
+    journal.update(|state| {
+        update(state);
+        Ok(())
+    })
 }
 
 fn persist_sink_intent(
@@ -1309,31 +1312,32 @@ fn persist_sink_intent(
     let _guard = cleanup_journal_lock()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let journal = CLEANUP_JOURNAL
+    let mut journal = CLEANUP_JOURNAL
         .get_or_init(|| Mutex::new(None))
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let journal = journal
-        .as_ref()
-        .ok_or("audio_cleanup_journal_unavailable")?;
-    let mut state = journal.read()?;
-    if !can_add_sink_intent(&state, name) {
-        return Err("audio_cleanup_journal_capacity_reached");
-    }
-    state.sinks.insert(
-        name.to_owned(),
-        SinkIntent {
-            owner_token: owner_token.to_owned(),
-            module_index,
-            lease_active,
-            cleanup_requested,
-            load_quiesced: module_index.is_some(),
-            unload_submitted: false,
-            unload_confirmed: false,
-            unload_quiesced: false,
-        },
-    );
-    journal.write(&state)
+    journal
+        .as_mut()
+        .ok_or("audio_cleanup_journal_unavailable")?
+        .update(|state| {
+            if !can_add_sink_intent(state, name) {
+                return Err("audio_cleanup_journal_capacity_reached");
+            }
+            state.sinks.insert(
+                name.to_owned(),
+                SinkIntent {
+                    owner_token: owner_token.to_owned(),
+                    module_index,
+                    lease_active,
+                    cleanup_requested,
+                    load_quiesced: module_index.is_some(),
+                    unload_submitted: false,
+                    unload_confirmed: false,
+                    unload_quiesced: false,
+                },
+            );
+            Ok(())
+        })
 }
 
 fn mark_sink_load_quiesced(name: &str, owner_token: &str) -> AudioResult<()> {
@@ -1356,16 +1360,17 @@ fn mark_sink_load_quiesced(name: &str, owner_token: &str) -> AudioResult<()> {
 }
 
 fn request_sink_cleanup(name: &str, owner_token: &str) -> AudioResult<()> {
-    update_cleanup_state(|state| {
-        if let Some(intent) = state
-            .sinks
-            .get_mut(name)
-            .filter(|intent| intent.owner_token == owner_token)
-        {
-            intent.lease_active = false;
-            intent.cleanup_requested = true;
-        }
-    })
+    let _guard = cleanup_journal_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut journal = CLEANUP_JOURNAL
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    journal
+        .as_mut()
+        .ok_or("audio_cleanup_journal_unavailable")?
+        .request_retirement(name, owner_token)
 }
 
 fn mark_sink_unload_submitted(name: &str, owner_token: &str) -> AudioResult<()> {
@@ -1389,42 +1394,23 @@ fn mark_sink_unload_submitted(name: &str, owner_token: &str) -> AudioResult<()> 
     }
 }
 
-fn mark_sink_unload_quiesced(name: &str, owner_token: &str) -> AudioResult<()> {
-    let mut found = false;
-    update_cleanup_state(|state| {
-        if let Some(intent) = state
-            .sinks
-            .get_mut(name)
-            .filter(|intent| intent.owner_token == owner_token)
-        {
-            found = true;
-            intent.unload_quiesced = true;
-        }
-    })?;
-    if found {
-        Ok(())
-    } else {
-        Err("audio_cleanup_journal_conflict")
-    }
-}
-
-fn mark_sink_unload_confirmed(name: &str, owner_token: &str) -> AudioResult<()> {
-    let mut found = false;
-    update_cleanup_state(|state| {
-        if let Some(intent) = state
-            .sinks
-            .get_mut(name)
-            .filter(|intent| intent.owner_token == owner_token)
-        {
-            found = true;
-            intent.unload_confirmed = true;
-        }
-    })?;
-    if found {
-        Ok(())
-    } else {
-        Err("audio_cleanup_journal_conflict")
-    }
+fn record_sink_unload_evidence(
+    name: &str,
+    owner_token: &str,
+    module_index: u32,
+    evidence: UnloadEvidence,
+) -> AudioResult<()> {
+    let _guard = cleanup_journal_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut journal = CLEANUP_JOURNAL
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    journal
+        .as_mut()
+        .ok_or("audio_cleanup_journal_unavailable")?
+        .record_unload(name, owner_token, module_index, evidence)
 }
 
 fn remove_sink_intent(name: &str, owner_token: &str) -> AudioResult<()> {
@@ -1571,7 +1557,24 @@ fn owns_virtual_sink_module(sinks: &[Sink], sink_name: &str, module_index: u32) 
         .any(|sink| sink.endpoint.id == sink_name && sink.owner_module == module_index)
 }
 
+fn retry_deferred_sink_cleanup() -> AudioResult<()> {
+    let _guard = cleanup_journal_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut journal = CLEANUP_JOURNAL
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    journal
+        .as_mut()
+        .ok_or("audio_cleanup_journal_unavailable")?
+        .retry_pending()
+}
+
 fn retry_virtual_sink_cleanups_with_client(client: &mut PulseClient, name_filter: Option<&str>) {
+    if retry_deferred_sink_cleanup().is_err() {
+        return;
+    }
     let Ok(state) = read_cleanup_state() else {
         return;
     };
@@ -1625,11 +1628,23 @@ fn retry_virtual_sink_cleanups_with_client(client: &mut PulseClient, name_filter
                 }
                 if client.unload_module(module_index).is_err() {
                     if client.quiesce_prior_commands().is_ok() {
-                        let _ = mark_sink_unload_quiesced(&name, &intent.owner_token);
+                        let _ = record_sink_unload_evidence(
+                            &name,
+                            &intent.owner_token,
+                            module_index,
+                            UnloadEvidence::Quiesced,
+                        );
                     } else {
                         continue;
                     }
-                } else if mark_sink_unload_confirmed(&name, &intent.owner_token).is_err() {
+                } else if record_sink_unload_evidence(
+                    &name,
+                    &intent.owner_token,
+                    module_index,
+                    UnloadEvidence::Confirmed,
+                )
+                .is_err()
+                {
                     continue;
                 }
             }
@@ -1653,6 +1668,9 @@ fn retry_virtual_sink_cleanups() {
     let _cleanup_guard = virtual_sink_cleanup_lock()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if retry_deferred_sink_cleanup().is_err() {
+        return;
+    }
     let Ok(mut client) = PulseClient::connect() else {
         return;
     };
@@ -1660,7 +1678,19 @@ fn retry_virtual_sink_cleanups() {
 }
 
 pub fn virtual_sink_cleanup_pending() -> bool {
-    read_cleanup_state().is_ok_and(|state| state.sinks.values().any(sink_cleanup_requested))
+    let _guard = cleanup_journal_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let journal = CLEANUP_JOURNAL
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    journal.as_ref().is_some_and(|journal| {
+        journal.has_deferred_cleanup()
+            || journal
+                .read()
+                .is_ok_and(|state| state.sinks.values().any(sink_cleanup_requested))
+    })
 }
 
 static VIRTUAL_SINKS: OnceLock<Mutex<BTreeMap<String, Weak<ManagedVirtualSink>>>> = OnceLock::new();
@@ -2625,7 +2655,13 @@ pub fn startup(state_root: &Path) -> AudioResult<()> {
             .get_or_init(|| Mutex::new(None))
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *configured = Some(journal);
+        // Deferred evidence belongs to the journal that admitted its sink.
+        // Persist it before reconfiguration; never move it to another root or
+        // discard it because the module is starting again in this process.
+        if let Some(previous) = configured.as_mut() {
+            previous.retry_pending()?;
+        }
+        *configured = Some(SinkCleanupCoordinator::new(journal));
     }
     if let Ok(mut client) = PulseClient::connect() {
         let _ = reconcile_persisted_route(&mut client);
