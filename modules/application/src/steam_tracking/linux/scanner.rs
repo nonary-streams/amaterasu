@@ -1,11 +1,11 @@
 //! Bounded, read-only process snapshots off the managed-module tick.
-use super::{Process, scan_processes};
+use super::{ProcessSnapshot, scan_processes};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 
 pub(super) struct ProcessScanner {
     requests: SyncSender<()>,
-    results: Receiver<Option<Vec<Process>>>,
+    results: Receiver<Option<ProcessSnapshot>>,
     pending: bool,
 }
 
@@ -15,7 +15,7 @@ impl ProcessScanner {
     }
 
     fn with_reader(
-        mut read: impl FnMut() -> Option<Vec<Process>> + Send + 'static,
+        mut read: impl FnMut() -> Option<ProcessSnapshot> + Send + 'static,
     ) -> Option<Self> {
         let (requests, incoming) = mpsc::sync_channel(1);
         let (outgoing, results) = mpsc::sync_channel(1);
@@ -46,7 +46,7 @@ impl ProcessScanner {
         self.pending
     }
 
-    pub(super) fn poll(&mut self) -> Option<Option<Vec<Process>>> {
+    pub(super) fn poll(&mut self) -> Option<Option<ProcessSnapshot>> {
         match self.results.try_recv() {
             Ok(result) => {
                 self.pending = false;
@@ -86,7 +86,7 @@ mod tests {
             let _ = &guard;
             started.send(()).unwrap();
             blocked.recv().unwrap();
-            Some(Vec::new())
+            Some(ProcessSnapshot::default())
         })
         .unwrap();
         scanner.request();
@@ -107,7 +107,7 @@ mod tests {
         let mut scanner = ProcessScanner::with_reader(move || {
             started.send(()).unwrap();
             blocked.recv().unwrap();
-            Some(Vec::new())
+            Some(ProcessSnapshot::default())
         })
         .unwrap();
         assert!(scanner.request());
@@ -118,7 +118,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
             if let Some(snapshot) = scanner.poll() {
-                assert!(snapshot.unwrap().is_empty());
+                assert!(snapshot.unwrap().processes.is_empty());
                 break;
             }
             assert!(Instant::now() < deadline);

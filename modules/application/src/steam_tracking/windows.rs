@@ -1,4 +1,4 @@
-use super::SteamGameLiveness;
+use super::{STOP_CONFIRMATION_TIMEOUT, STOP_GRACE, SteamGameLiveness, SteamStopProgress};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
@@ -27,8 +27,6 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 const MAX_PROCESS_COUNT: usize = 131_072;
 const MAX_TOKEN_INFORMATION_BYTES: u32 = 64 * 1024;
 const GAME_ASSOCIATION_WINDOW: Duration = Duration::from_secs(15);
-const STOP_GRACE: Duration = Duration::from_secs(2);
-const STOP_SCAN_FAILURE_GRACE: Duration = Duration::from_secs(10);
 const PROCESS_IMAGE_BUFFER_UNITS: usize = 32_768;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -121,64 +119,91 @@ impl Tracker {
         self.stopping_at.is_some()
     }
 
-    pub(super) fn request_stop(&mut self, now: Instant) -> bool {
-        let Some(processes) = scan_processes() else {
-            return false;
-        };
-        self.refresh_tracking(&processes);
-        if self.tracked.is_empty() {
-            return false;
-        }
-
-        for process in self.tracked_descendant_first() {
-            request_graceful_close(&process, &self.user_sid);
-        }
-        self.stopping_at = Some(now + STOP_GRACE);
-        true
+    pub(super) fn request_stop(&mut self, now: Instant) -> SteamStopProgress {
+        self.request_stop_with(now, scan_processes, request_graceful_close)
     }
 
-    pub(super) fn advance_stop(&mut self, now: Instant) -> bool {
-        let Some(processes) = scan_processes() else {
-            let finished = self
-                .stopping_at
-                .is_some_and(|deadline| now >= deadline + STOP_SCAN_FAILURE_GRACE);
-            if finished {
-                self.stopping_at = None;
-                self.tracked.clear();
-            }
-            return !finished;
+    fn request_stop_with(
+        &mut self,
+        now: Instant,
+        mut scan: impl FnMut() -> Option<BTreeMap<u32, Process>>,
+        mut close: impl FnMut(&TrackedProcess, &[u8]),
+    ) -> SteamStopProgress {
+        self.stopping_at = Some(now + STOP_GRACE);
+        let Some(processes) = scan() else {
+            return SteamStopProgress::Failed("steam_process_scan_failed");
         };
-
         self.refresh_tracking(&processes);
         if self.tracked.is_empty() {
             self.stopping_at = None;
-            return false;
+            return SteamStopProgress::Complete;
         }
+        for process in self.tracked_descendant_first(&processes) {
+            close(&process, &self.user_sid);
+        }
+        SteamStopProgress::Pending
+    }
 
-        let Some(deadline) = self.stopping_at else {
-            return true;
+    pub(super) fn advance_stop(&mut self, now: Instant) -> SteamStopProgress {
+        self.advance_stop_with(now, scan_processes, terminate_validated_process)
+    }
+
+    fn advance_stop_with(
+        &mut self,
+        now: Instant,
+        mut scan: impl FnMut() -> Option<BTreeMap<u32, Process>>,
+        mut terminate: impl FnMut(&TrackedProcess, &[u8]),
+    ) -> SteamStopProgress {
+        let Some(processes) = scan() else {
+            return if self
+                .stopping_at
+                .is_some_and(|deadline| now >= deadline + STOP_CONFIRMATION_TIMEOUT)
+            {
+                SteamStopProgress::Failed("steam_process_scan_failed")
+            } else {
+                SteamStopProgress::Pending
+            };
         };
-        if now >= deadline + STOP_SCAN_FAILURE_GRACE {
-            self.tracked.clear();
+        self.refresh_tracking(&processes);
+        if self.tracked.is_empty() {
             self.stopping_at = None;
-            return false;
+            return SteamStopProgress::Complete;
+        }
+        let Some(deadline) = self.stopping_at else {
+            return SteamStopProgress::Pending;
+        };
+        if now >= deadline + STOP_CONFIRMATION_TIMEOUT {
+            let error = if self.tracked.iter().any(|(pid, tracked)| {
+                processes.get(pid).is_some_and(|process| {
+                    !process_matches_tracked(tracked, process, &self.user_sid)
+                })
+            }) {
+                "steam_process_scan_failed"
+            } else {
+                "steam_process_stop_timed_out"
+            };
+            return SteamStopProgress::Failed(error);
         }
         if now >= deadline {
-            for process in self.tracked_descendant_first() {
-                terminate_validated_process(&process, &self.user_sid);
+            for process in self.tracked_descendant_first(&processes) {
+                terminate(&process, &self.user_sid);
             }
-            if let Some(processes) = scan_processes() {
+            if let Some(processes) = scan() {
                 self.refresh_tracking(&processes);
+                if self.tracked.is_empty() {
+                    self.stopping_at = None;
+                    return SteamStopProgress::Complete;
+                }
             }
         }
-        !self.tracked.is_empty()
+        SteamStopProgress::Pending
     }
 
     fn refresh_tracking(&mut self, processes: &BTreeMap<u32, Process>) {
         self.tracked.retain(|pid, tracked| {
-            processes
-                .get(pid)
-                .is_some_and(|process| process_matches_tracked(tracked, process, &self.user_sid))
+            processes.get(pid).is_some_and(|process| {
+                process_may_still_be_tracked(tracked, process, &self.user_sid)
+            })
         });
 
         for process in processes.values() {
@@ -220,7 +245,14 @@ impl Tracker {
                         && is_new_process(&self.baseline, identity)
                         && !protected_runtime(image)
                         && !self.tracked.contains_key(&identity.pid)
-                        && self.tracked.contains_key(&process.parent_id))
+                        && self
+                            .tracked
+                            .get(&process.parent_id)
+                            .is_some_and(|tracked_parent| {
+                                processes.get(&process.parent_id).is_some_and(|parent| {
+                                    process_matches_tracked(tracked_parent, parent, &self.user_sid)
+                                })
+                            }))
                     .then(|| TrackedProcess {
                         identity,
                         parent_id: process.parent_id,
@@ -241,7 +273,7 @@ impl Tracker {
         }
     }
 
-    fn tracked_descendant_first(&self) -> Vec<TrackedProcess> {
+    fn tracked_descendant_first(&self, snapshot: &BTreeMap<u32, Process>) -> Vec<TrackedProcess> {
         let depth = |process: &TrackedProcess| {
             let mut parent_id = process.parent_id;
             let mut visited = BTreeSet::new();
@@ -255,7 +287,16 @@ impl Tracker {
             }
             depth
         };
-        let mut processes = self.tracked.values().cloned().collect::<Vec<_>>();
+        let mut processes = self
+            .tracked
+            .values()
+            .filter(|tracked| {
+                snapshot.get(&tracked.identity.pid).is_some_and(|process| {
+                    process_matches_tracked(tracked, process, &self.user_sid)
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
         processes.sort_by_key(|process| {
             (
                 std::cmp::Reverse(depth(process)),
@@ -347,6 +388,27 @@ fn protected_runtime(image: &Path) -> bool {
     ) || name.starts_with("steam-runtime-")
 }
 
+/// Missing metadata cannot prove that a previously owned process retired.
+fn process_may_still_be_tracked(
+    tracked: &TrackedProcess,
+    process: &Process,
+    current_user_sid: &[u8],
+) -> bool {
+    tracked.user_sid == current_user_sid
+        && !protected_runtime(&tracked.image)
+        && process
+            .identity
+            .is_none_or(|identity| identity == tracked.identity)
+        && process
+            .user_sid
+            .as_deref()
+            .is_none_or(|sid| sid == tracked.user_sid.as_slice())
+        && process
+            .image
+            .as_deref()
+            .is_none_or(|image| paths_equal(image, &tracked.image))
+}
+
 fn process_matches_tracked(
     tracked: &TrackedProcess,
     process: &Process,
@@ -363,6 +425,10 @@ fn process_matches_tracked(
 }
 
 fn scan_processes() -> Option<BTreeMap<u32, Process>> {
+    #[cfg(test)]
+    if super::FAIL_NEXT_PROCESS_SCAN.replace(false) {
+        return None;
+    }
     let snapshot = OwnedHandle::new(unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) })?;
     let mut entry = PROCESSENTRY32W {
         dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
@@ -668,6 +734,206 @@ mod tests {
             associated: false,
             stopping_at: None,
         }
+    }
+
+    fn owned_game() -> BTreeMap<u32, Process> {
+        BTreeMap::from([(
+            20,
+            process(20, 1, Some(r"C:\games\title\game.exe"), Some(CURRENT_SID)),
+        )])
+    }
+
+    #[test]
+    fn stop_keeps_live_identities_after_the_confirmation_deadline() {
+        let mut tracker = tracker();
+        let processes = owned_game();
+        tracker.refresh_tracking(&processes);
+        let tracked = tracker.tracked.clone();
+        let deadline = Instant::now();
+        tracker.stopping_at = Some(deadline);
+        assert_eq!(
+            tracker.advance_stop_with(
+                deadline + STOP_CONFIRMATION_TIMEOUT,
+                || Some(processes.clone()),
+                |_, _| panic!("the expired attempt must not signal"),
+            ),
+            SteamStopProgress::Failed("steam_process_stop_timed_out"),
+        );
+        assert_eq!(tracker.tracked, tracked);
+        assert!(tracker.is_stopping());
+    }
+
+    #[test]
+    fn stop_cannot_confirm_retirement_without_a_snapshot() {
+        let mut tracker = tracker();
+        tracker.refresh_tracking(&owned_game());
+        let tracked = tracker.tracked.clone();
+        let deadline = Instant::now();
+        tracker.stopping_at = Some(deadline);
+        assert_eq!(
+            tracker.advance_stop_with(
+                deadline + STOP_CONFIRMATION_TIMEOUT,
+                || None,
+                |_, _| panic!("unreadable snapshots must never authorize signals"),
+            ),
+            SteamStopProgress::Failed("steam_process_scan_failed"),
+        );
+        assert_eq!(tracker.tracked, tracked);
+        assert!(tracker.is_stopping());
+    }
+
+    #[test]
+    fn stop_scan_failure_retains_a_retryable_attempt() {
+        let mut tracker = tracker();
+        tracker.refresh_tracking(&owned_game());
+        let tracked = tracker.tracked.clone();
+        assert_eq!(
+            tracker.request_stop_with(
+                Instant::now(),
+                || None,
+                |_, _| panic!("unreadable snapshots must never authorize signals"),
+            ),
+            SteamStopProgress::Failed("steam_process_scan_failed"),
+        );
+        assert_eq!(tracker.tracked, tracked);
+        assert!(tracker.is_stopping());
+    }
+
+    #[test]
+    fn stop_preserves_unreadable_owned_processes_without_signaling_them() {
+        for missing_field in ["identity", "user", "image", "all"] {
+            let mut tracker = tracker();
+            let mut snapshot = owned_game();
+            tracker.refresh_tracking(&snapshot);
+            let tracked = tracker.tracked.clone();
+            let game = snapshot.get_mut(&20).unwrap();
+            if matches!(missing_field, "identity" | "all") {
+                game.identity = None;
+            }
+            if matches!(missing_field, "user" | "all") {
+                game.user_sid = None;
+            }
+            if matches!(missing_field, "image" | "all") {
+                game.image = None;
+            }
+            snapshot.insert(
+                21,
+                process(
+                    21,
+                    20,
+                    Some(r"C:\tools\unverified-child.exe"),
+                    Some(CURRENT_SID),
+                ),
+            );
+            let now = Instant::now();
+            assert_eq!(
+                tracker.request_stop_with(
+                    now,
+                    || Some(snapshot.clone()),
+                    |_, _| panic!("unreadable ownership cannot authorize a signal or a descendant"),
+                ),
+                SteamStopProgress::Pending,
+            );
+            assert_eq!(tracker.tracked, tracked);
+            assert_eq!(
+                tracker.advance_stop_with(
+                    now + STOP_GRACE + STOP_CONFIRMATION_TIMEOUT,
+                    || Some(snapshot.clone()),
+                    |_, _| panic!("the expired attempt must not signal"),
+                ),
+                SteamStopProgress::Failed("steam_process_scan_failed"),
+            );
+            assert_eq!(tracker.tracked, tracked);
+            assert!(tracker.is_stopping());
+            assert_eq!(
+                tracker.request_stop_with(
+                    now + STOP_GRACE + STOP_CONFIRMATION_TIMEOUT,
+                    || Some(BTreeMap::new()),
+                    |_, _| panic!("confirmed absence must not signal"),
+                ),
+                SteamStopProgress::Complete,
+            );
+        }
+    }
+
+    #[test]
+    fn a_readable_reused_identity_retires_the_old_process_despite_unreadable_user() {
+        let mut tracker = tracker();
+        tracker.refresh_tracking(&owned_game());
+        let mut reused = process(20, 1, None, None);
+        reused.identity.as_mut().unwrap().creation_time += 1;
+        assert_eq!(
+            tracker.request_stop_with(
+                Instant::now(),
+                || Some(BTreeMap::from([(20, reused.clone())])),
+                |_, _| panic!("a reused PID must not be signaled"),
+            ),
+            SteamStopProgress::Complete,
+        );
+        assert!(tracker.tracked.is_empty());
+    }
+
+    #[test]
+    fn stop_waits_for_an_observed_exit_after_termination() {
+        let mut tracker = tracker();
+        let now = Instant::now();
+        let processes = owned_game();
+        assert_eq!(
+            tracker.request_stop_with(now, || Some(processes.clone()), |_, _| {}),
+            SteamStopProgress::Pending,
+        );
+        let tracked = tracker.tracked.clone();
+        let mut snapshots = [Some(processes), None].into_iter();
+        let mut terminated = Vec::new();
+        assert_eq!(
+            tracker.advance_stop_with(
+                now + STOP_GRACE,
+                || snapshots.next().unwrap(),
+                |process, _| terminated.push(process.identity),
+            ),
+            SteamStopProgress::Pending,
+        );
+        assert_eq!(terminated, [tracked.get(&20).unwrap().identity]);
+        assert_eq!(tracker.tracked, tracked);
+        assert!(tracker.is_stopping());
+        assert_eq!(
+            tracker.advance_stop_with(
+                now + STOP_GRACE + Duration::from_millis(1),
+                || Some(BTreeMap::new()),
+                |_, _| panic!("an empty snapshot must not authorize signals"),
+            ),
+            SteamStopProgress::Complete,
+        );
+        assert!(!tracker.is_stopping());
+    }
+
+    #[test]
+    fn stop_retry_revalidates_retained_identities_before_signaling() {
+        let mut tracker = tracker();
+        let processes = owned_game();
+        tracker.refresh_tracking(&processes);
+        let now = Instant::now();
+        tracker.stopping_at = Some(now);
+        assert_eq!(
+            tracker.advance_stop_with(
+                now + STOP_CONFIRMATION_TIMEOUT,
+                || Some(processes.clone()),
+                |_, _| panic!("the expired attempt must not signal"),
+            ),
+            SteamStopProgress::Failed("steam_process_stop_timed_out"),
+        );
+        let mut reused = process(20, 1, Some(r"C:\tools\unrelated.exe"), Some(CURRENT_SID));
+        reused.identity.as_mut().unwrap().creation_time += 1;
+        assert_eq!(
+            tracker.request_stop_with(
+                now + STOP_CONFIRMATION_TIMEOUT,
+                || Some(BTreeMap::from([(20, reused.clone())])),
+                |_, _| panic!("a reused PID must not receive a retry signal"),
+            ),
+            SteamStopProgress::Complete,
+        );
+        assert!(tracker.tracked.is_empty());
+        assert!(!tracker.is_stopping());
     }
 
     #[test]

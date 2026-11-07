@@ -7,7 +7,7 @@ use crate::protocol::{
     Action, LaunchSpec, MAX_EXIT_TIMEOUT_SECONDS, PreparationSpec, ProcessState, TerminalOutcome,
 };
 use crate::proton_hook::ProtonHookManager;
-use crate::steam_tracking::{SteamGameLiveness, SteamProcessTracker};
+use crate::steam_tracking::{SteamGameLiveness, SteamProcessTracker, SteamStopProgress};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -564,19 +564,12 @@ impl ProcessRecord {
                     .as_ref()
                     .is_some_and(SteamProcessTracker::is_stopping) =>
             {
-                if !self
+                let progress = self
                     .steam_tracker
                     .as_mut()
                     .expect("stopping Steam tracker exists")
-                    .advance_stop(now)
-                {
-                    self.steam_game_liveness = Some(SteamGameLiveness::Unknown);
-                    let completion = self
-                        .completion
-                        .take()
-                        .expect("stopping Steam process has an outcome");
-                    self.complete_or_clean(completion);
-                }
+                    .advance_stop(now);
+                self.apply_steam_stop_progress(progress);
             }
             ProcessState::Stopping => self.advance_lifecycle_cleanup(now),
             ProcessState::CleanupFailed { .. }
@@ -643,23 +636,14 @@ impl ProcessRecord {
                     .begin_cleanup();
                 self.state = ProcessState::Stopping;
             }
-            ProcessState::Running => {
-                let now = Instant::now();
-                let tracking = self
+            ProcessState::Running => self.begin_steam_stop(Instant::now()),
+            ProcessState::CleanupFailed { .. }
+                if self
                     .steam_tracker
-                    .as_mut()
-                    .is_some_and(|tracker| tracker.request_stop(now));
-                if tracking {
-                    self.completion = Some(Completion::Cancelled);
-                    self.steam_game_liveness = Some(SteamGameLiveness::Stopping);
-                    self.state = ProcessState::Stopping;
-                } else {
-                    // The Steam launcher is intentionally outside the managed
-                    // job/group. Without attributed game PIDs, release the lease
-                    // without signaling the Steam client or an unrelated process.
-                    self.steam_game_liveness = Some(SteamGameLiveness::Unknown);
-                    self.complete_or_clean(Completion::Cancelled);
-                }
+                    .as_ref()
+                    .is_some_and(SteamProcessTracker::is_stopping) =>
+            {
+                self.begin_steam_stop(Instant::now());
             }
             ProcessState::CleanupFailed { .. } if self.child.is_some() => {
                 if self.stop_deadline.is_some() {
@@ -690,6 +674,41 @@ impl ProcessRecord {
         Ok(())
     }
 
+    fn begin_steam_stop(&mut self, now: Instant) {
+        self.completion.get_or_insert(Completion::Cancelled);
+        let progress = self
+            .steam_tracker
+            .as_mut()
+            .map_or(SteamStopProgress::Complete, |tracker| {
+                tracker.request_stop(now)
+            });
+        self.apply_steam_stop_progress(progress);
+    }
+
+    fn apply_steam_stop_progress(&mut self, progress: SteamStopProgress) {
+        match progress {
+            SteamStopProgress::Pending => {
+                self.cleanup_error = None;
+                self.steam_game_liveness = Some(SteamGameLiveness::Stopping);
+                self.state = ProcessState::Stopping;
+            }
+            SteamStopProgress::Complete => {
+                // The launcher remains outside the managed group. Only a
+                // confirmed empty tracker releases an attributed game lease.
+                self.steam_game_liveness = Some(SteamGameLiveness::Unknown);
+                let completion = self
+                    .completion
+                    .take()
+                    .expect("stopping Steam process has an outcome");
+                self.complete_or_clean(completion);
+            }
+            SteamStopProgress::Failed(error) => {
+                self.steam_game_liveness = Some(SteamGameLiveness::Stopping);
+                self.mark_cleanup_failed(error);
+            }
+        }
+    }
+
     fn is_steam_metadata_launch(&self) -> bool {
         self.spec.steam_id.is_some() || self.spec.steam_install_dir.is_some()
     }
@@ -702,6 +721,10 @@ impl ProcessRecord {
 
     fn owns_active_child(&self) -> bool {
         self.child.is_some()
+            || self
+                .steam_tracker
+                .as_ref()
+                .is_some_and(SteamProcessTracker::is_stopping)
             || self
                 .lifecycle
                 .as_ref()
@@ -1286,12 +1309,17 @@ impl ProcessManager {
             .records
             .values()
             .map(|record| {
-                Duration::from_secs(
+                let process_stop_budget = Duration::from_secs(
                     record
                         .spec
                         .exit_timeout_seconds
                         .min(MAX_EXIT_TIMEOUT_SECONDS),
-                ) + REAP_TIMEOUT
+                ) + REAP_TIMEOUT;
+                let steam_stop_budget = record
+                    .steam_tracker
+                    .as_ref()
+                    .map_or(Duration::ZERO, |_| SteamProcessTracker::stop_budget());
+                process_stop_budget.max(steam_stop_budget)
                     + record
                         .lifecycle
                         .as_ref()
@@ -1358,6 +1386,75 @@ mod failed_preparation_shutdown_tests {
 
 fn error(code: &str) -> Value {
     json!({"ok":false,"code":code})
+}
+
+#[cfg(all(test, any(target_os = "linux", windows)))]
+mod steam_cleanup_tests {
+    use super::*;
+
+    #[test]
+    fn failed_steam_scan_retries_the_tracker_before_optional_lifecycle_cleanup() {
+        for with_lifecycle in [false, true] {
+            let directory = std::env::temp_dir().join(format!(
+                "amaterasu-steam-cleanup-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos(),
+            ));
+            std::fs::create_dir(&directory).unwrap();
+            let mut manager = ProcessManager::default();
+            let response = manager.handle(
+                "alice",
+                json!({
+                    "action":"launch",
+                    "operation_id":"steam-cleanup-retry",
+                    "executable":directory.join("missing-launcher"),
+                    "preparation":if with_lifecycle { vec![json!({})] } else { Vec::new() },
+                }),
+            );
+            let process_id = response["process"]["process_id"].as_u64().unwrap();
+            let mut record = manager.records.remove(&process_id).unwrap();
+            record.spec.steam_install_dir = Some(directory.to_string_lossy().into_owned());
+            record.state = ProcessState::Running;
+            record.steam_tracker =
+                SteamProcessTracker::begin(directory.to_str().unwrap(), Some("42"));
+            assert!(record.steam_tracker.is_some());
+            std::fs::remove_dir(&directory).unwrap();
+            if let Some(lifecycle) = &mut record.lifecycle {
+                lifecycle.tick(Instant::now());
+            }
+            let lifecycle_before = serde_json::to_value(&record.lifecycle).unwrap();
+
+            for _ in 0..2 {
+                crate::steam_tracking::fail_next_process_scan();
+                record.request_termination().unwrap();
+                assert_eq!(
+                    record.state,
+                    ProcessState::CleanupFailed {
+                        outcome: TerminalOutcome::Cancelled
+                    }
+                );
+                assert_eq!(record.cleanup_error, Some("steam_process_scan_failed"));
+                assert!(record.steam_tracker.as_ref().unwrap().is_stopping());
+                assert!(record.owns_active_child());
+                assert!(!record.settled_for_shutdown());
+                assert_eq!(
+                    serde_json::to_value(&record.lifecycle).unwrap(),
+                    lifecycle_before
+                );
+            }
+
+            // A successful retry confirms this empty install tree before undo.
+            record.request_termination().unwrap();
+            record.advance().unwrap();
+            assert_eq!(record.state, ProcessState::Cancelled);
+            assert_eq!(record.cleanup_error, None);
+            assert!(!record.steam_tracker.as_ref().unwrap().is_stopping());
+            assert!(record.settled_for_shutdown());
+        }
+    }
 }
 
 #[cfg(test)]
