@@ -265,6 +265,9 @@ impl ManagedModule for NvhttpModule {
             let mut launches = launch::Controller::new(settings.streaming.clone())?;
             launches.set_logger(log_emitter);
             launches.set_session_lifecycle_required(settings.session_lifecycle_required);
+            if settings.session_lifecycle_required {
+                launches.enable_restart_abandonment_sweep();
+            }
             launches.set_session_lifecycle_capture_mode(settings.session_lifecycle_capture_mode);
             if let Some(composition) = runtime.processing_composition()? {
                 launches.select_processing_services(&composition)?;

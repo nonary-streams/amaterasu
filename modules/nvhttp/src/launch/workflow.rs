@@ -1242,6 +1242,10 @@ impl Controller {
                 }
             }
             Phase::PrepareLifecycle | Phase::LookupLifecycle => {
+                if payload["reason"] == "session_capacity_exhausted" {
+                    // Sessions stranded by a restart may hold that capacity.
+                    self.restart_sweep.request_retry();
+                }
                 if payload["operation_id"] != format!("{}-lifecycle", record.application_operation)
                 {
                     record.fail_cleanup("lifecycle_prepare_unconfirmed");

@@ -396,6 +396,27 @@ resource identity under fresh owner authorization. It never replays an unknown
 preparation. Missing receipts, uncertain native effects, or unconfirmed retirement
 remain `recovery_required`; that state is not successful restoration.
 
+Owner abandonment after restart covers an owner that kept its application
+records only in memory and so can never report an earlier application retired.
+Its `snapshot` lists each session's `host_epoch`, so the owner can find them.
+The owner sends `abandon_restarted_session` with a current-epoch session target.
+It is accepted only for that owner's `recovery_required` session from an older
+epoch when every stream is retired, no input, action, shared-source or
+composition state remains, every retained admission is settled and owned by the
+session, and the only retained work is the undispatched `end_session` release.
+Otherwise it is refused, with `restart_effect_unknown` for dispatched, blocked
+or uncertain release work. On acceptance the old end receipt is rejected as
+`superseded_by_restart_abandonment`, and the frozen release graph runs its
+normal provider cleanup under recovery authorization. The application is
+recorded as `untracked_after_restart`: `application_retired` stays false, no
+retirement proof is created, and closed-session certificates still require one.
+A released session ends with `application: "untracked_after_restart"`; rejected,
+deferred or uncertain cleanup returns it to `recovery_required`. Abandonment
+lets bounded retention reclaim the session. It is not successful restoration and
+does not prove that the application stopped. NVHTTP sweeps for such sessions at
+startup and after a `session_capacity_exhausted` refusal; it never reports them
+retired.
+
 The `lookup_control_baseline` operation lets only the selected
 virtual-screen owner read an owner-acknowledged original configure settlement
 while its baseline remains pinned. The request contains `operation`,

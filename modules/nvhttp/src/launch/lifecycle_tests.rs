@@ -841,3 +841,152 @@ fn long_stream_monitoring_retires_results_before_real_broker_capacity_is_exhaust
         Response::Accepted { .. }
     ));
 }
+
+/// Answers the restart sweep's lifecycle calls itself and forwards every
+/// other command, including launch lifecycle calls, to the launch fixture.
+#[derive(Default)]
+struct RestartSweepBroker {
+    launch: Broker,
+    hold_snapshots: bool,
+    snapshot_reply: Value,
+    lifecycle_operations: Vec<Value>,
+    sweep_results: BTreeMap<u64, Value>,
+    next: u64,
+}
+
+impl RestartSweepBroker {
+    const FIRST_SWEEP_REQUEST: u64 = 1_000_000;
+
+    fn send(&mut self, command: Command) -> Transport {
+        match &command {
+            Command::Request { service, payload, .. }
+                if service == "amaterasu.session-lifecycle/1" =>
+            {
+                self.lifecycle_operations.push(payload.clone());
+                let result = match payload["operation"].as_str() {
+                    Some("snapshot") => self.snapshot_reply.clone(),
+                    Some("abandon_restarted_session") => {
+                        json!({"status":"pending","operation_id":payload["operation_id"]})
+                    }
+                    _ => return self.launch.send(command),
+                };
+                self.next += 1;
+                let id = Self::FIRST_SWEEP_REQUEST + self.next;
+                self.sweep_results.insert(id, result);
+                Ok(Response::Accepted { id })
+            }
+            Command::TakeResult { request } if self.sweep_results.contains_key(request) => {
+                let result = &self.sweep_results[request];
+                if self.hold_snapshots && result.get("sessions").is_some() {
+                    Ok(Response::Pending)
+                } else {
+                    Ok(Response::Result { payload: result.clone() })
+                }
+            }
+            Command::ReleaseResult { request } | Command::Cancel { request }
+                if self.sweep_results.contains_key(request) =>
+            {
+                Ok(Response::Ok)
+            }
+            _ => self.launch.send(command),
+        }
+    }
+
+    fn operations(&self) -> Vec<&str> {
+        self.lifecycle_operations
+            .iter()
+            .map(|payload| payload["operation"].as_str().unwrap_or_default())
+            .collect()
+    }
+}
+
+fn stranded_snapshot() -> Value {
+    json!({"status":"ok","host_epoch":"current","sessions":[
+        {"session_id":"stranded","host_epoch":"previous","generation":1,"phase":"recovery_required","streams":[]},
+        {"session_id":"ended","host_epoch":"previous","generation":1,"phase":"ended","streams":[]},
+        {"session_id":"live","host_epoch":"current","generation":1,"phase":"recovery_required","streams":[]}
+    ]})
+}
+
+#[test]
+fn restart_sweep_abandons_stranded_sessions_without_reporting_retirement() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    controller.set_session_lifecycle_required(true);
+    controller.enable_restart_abandonment_sweep();
+    let mut broker = RestartSweepBroker {
+        snapshot_reply: stranded_snapshot(),
+        ..Default::default()
+    };
+    for tick in 0..16 {
+        controller.poll(now + Duration::from_millis(tick * 10), &mut |command| broker.send(command));
+    }
+    assert_eq!(broker.operations(), ["snapshot", "abandon_restarted_session"]);
+    let abandon = broker.lifecycle_operations[1].clone();
+    assert_eq!(
+        abandon["target"],
+        json!({"kind":"session","host_epoch":"current","session_id":"stranded","generation":1})
+    );
+    let operation_id = abandon["operation_id"].clone();
+    assert!(operation_id.as_str().unwrap().starts_with("nvhttp-restart-abandon-"));
+    assert!(!controller.busy());
+
+    // A later sweep in the same epoch replays the same coordinator receipt.
+    controller.restart_sweep.request_retry();
+    for tick in 0..16 {
+        controller.poll(now + Duration::from_millis(tick * 10), &mut |command| broker.send(command));
+    }
+    assert_eq!(
+        broker.operations(),
+        ["snapshot", "abandon_restarted_session", "snapshot", "abandon_restarted_session"]
+    );
+    assert_eq!(broker.lifecycle_operations[3]["operation_id"], operation_id);
+}
+
+#[test]
+fn launches_proceed_during_the_sweep_and_capacity_refusal_sweeps_again() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    controller.set_session_lifecycle_required(true);
+    controller.set_global_display_policy(7, json!({}));
+    controller.enable_restart_abandonment_sweep();
+    let mut broker = RestartSweepBroker {
+        hold_snapshots: true,
+        snapshot_reply: json!({"status":"ok","host_epoch":"current","sessions":[]}),
+        ..Default::default()
+    };
+    broker.launch.lifecycle_replies.push_back(json!({"status":"succeeded",
+        "target":{"kind":"session","host_epoch":"current","session_id":"session","generation":1}}));
+    assert!(controller.launch(10, request(1), peer(1), now).is_none());
+    for tick in 0..100 {
+        controller.poll(now + Duration::from_millis(tick * 10), &mut |command| broker.send(command));
+        if broker.launch.actions().contains(&("amaterasu.launch/1", "launch_export")) {
+            break;
+        }
+    }
+    assert!(broker.launch.actions().contains(&("amaterasu.launch/1", "launch_export")));
+    assert_eq!(broker.operations(), ["snapshot", "prepare"], "sweep is still pending");
+
+    let later = now + Duration::from_secs(60);
+    let mut controller = Controller::new(Some(config())).unwrap();
+    controller.set_session_lifecycle_required(true);
+    controller.set_global_display_policy(7, json!({}));
+    controller.enable_restart_abandonment_sweep();
+    let mut broker = RestartSweepBroker {
+        snapshot_reply: json!({"status":"ok","host_epoch":"current","sessions":[]}),
+        ..Default::default()
+    };
+    broker.launch.lifecycle_replies.push_back(
+        json!({"status":"rejected","reason":"session_capacity_exhausted"}),
+    );
+    for tick in 0..4 {
+        controller.poll(later + Duration::from_millis(tick), &mut |command| broker.send(command));
+    }
+    assert_eq!(broker.operations(), ["snapshot"]);
+    assert!(controller.launch(11, request(2), peer(1), later).is_none());
+    for tick in 0..100 {
+        controller.poll(later + Duration::from_millis(tick * 10), &mut |command| broker.send(command));
+    }
+    assert_eq!(broker.operations(), ["snapshot", "prepare", "snapshot"]);
+    assert!(!broker.operations().contains(&"application_retired"));
+}

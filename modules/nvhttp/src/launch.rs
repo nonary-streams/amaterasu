@@ -10,6 +10,7 @@ mod auxiliary;
 mod call;
 mod cleanup_recovery;
 mod record;
+mod restart_sweep;
 mod resume_snapshot;
 mod shared_session;
 mod workflow;
@@ -756,6 +757,7 @@ pub struct Controller {
     pending_auxiliary: BTreeMap<String, auxiliary::PendingAuxiliary>,
     borrowed_capture_verification: bool,
     pending_presentation_observations: Vec<amaterasu_module_sdk::session_presentation::Observation>,
+    restart_sweep: restart_sweep::RestartSweep,
 }
 
 impl Controller {
@@ -816,6 +818,7 @@ impl Controller {
             pending_auxiliary: BTreeMap::new(),
             borrowed_capture_verification: false,
             pending_presentation_observations: Vec::new(),
+            restart_sweep: restart_sweep::RestartSweep::disabled(format!("nvhttp-{}", hex(&nonce))),
         })
     }
 
@@ -867,6 +870,21 @@ impl Controller {
 
     pub fn set_session_lifecycle_required(&mut self, required: bool) {
         self.session_lifecycle_required = required;
+    }
+
+    /// Abandon lifecycle sessions that an earlier host epoch left in recovery.
+    /// Their launch records did not survive the restart, so this owner can
+    /// never report those applications retired.
+    pub fn enable_restart_abandonment_sweep(&mut self) {
+        self.restart_sweep.enable();
+    }
+
+    fn advance_restart_sweep(&mut self, now: Instant, send: &mut Send<'_>) {
+        if let Some((level, event)) = self.restart_sweep.poll(now, send)
+            && let Some(logger) = &self.logger
+        {
+            let _ = logger.emit(level, "launch", event);
+        }
     }
 
     pub fn set_session_lifecycle_capture_mode(
@@ -1758,6 +1776,7 @@ impl Controller {
         mut allowed: impl FnMut(&[u8], crate::wire::Permission) -> bool,
     ) -> Vec<(u64, Reply)> {
         let mut replies = std::mem::take(&mut self.management_replies);
+        self.advance_restart_sweep(now, send);
         self.synchronize_application_cleanup(now);
         if let Some(mut job) = self.job.take() {
             self.advance(&mut job, now, send, &mut replies);
@@ -2028,6 +2047,7 @@ impl Controller {
         if let Some(job) = self.job.as_mut() {
             job.call.shutdown(send);
         }
+        self.restart_sweep.shutdown(send);
         for record in self.records.values_mut() {
             for (_, call) in &mut record.uncertain {
                 call.shutdown(send);
