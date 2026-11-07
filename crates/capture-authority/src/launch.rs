@@ -1,7 +1,12 @@
 //! Root-only launch and lifetime ownership for an approved worker.
 use crate::{AUTHORITY_CHANNEL_FD, ApprovalRecord, ApprovalStore, AuthorityResult, files};
 use amaterasu_package::{BootstrapConfig, VerificationPolicy, package_directory, verify_package};
-use amaterasu_vkms_frame_helper::channel::{ChannelShutdown, SeqpacketChannel};
+use amaterasu_vkms_frame_helper::{
+    channel::{ChannelShutdown, SeqpacketChannel},
+    process::retire_child,
+};
+mod sessions;
+use sessions::{SessionOwner, SessionRegistry};
 use std::{
     fs::File,
     io,
@@ -10,7 +15,7 @@ use std::{
         unix::{fs::MetadataExt, process::CommandExt},
     },
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    process::{Child, Command, ExitStatus, Stdio},
     thread::{self, JoinHandle},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -51,30 +56,48 @@ pub fn run(options: LaunchOptions) -> AuthorityResult<()> {
         .set_receive_timeout(Some(POLL_INTERVAL))
         .map_err(|e| e.to_string())?;
     set_send_timeout(&control)?;
-    let mut worker = Worker(spawn_worker(
+    let mut worker = Worker::new(spawn_worker(
         executable,
         worker_control,
         &options,
         &approval,
     )?);
-    let mut sessions: Vec<(ChannelShutdown, JoinHandle<AuthorityResult<()>>)> = Vec::new();
+    let mut sessions = SessionRegistry::default();
     let result = serve_control(
         &control,
         &store,
         &options,
         &approval,
         &helper_path,
-        &mut worker.0,
+        &mut worker,
         &mut sessions,
     );
-    for (shutdown, _) in &sessions {
-        shutdown.shutdown();
-    }
-    for (_, thread) in sessions {
-        let _ = thread.join();
-    }
-    result
+    finish_supervision(result, &mut sessions, || worker.retire())
 }
+
+fn finish_supervision(
+    result: AuthorityResult<()>,
+    sessions: &mut SessionRegistry,
+    retire_worker: impl FnOnce() -> AuthorityResult<()>,
+) -> AuthorityResult<()> {
+    let session_result = sessions.drain();
+    let worker_result = retire_worker();
+    // The three subsystems have independent cleanup obligations. Preserve all
+    // outcome classes while retaining only one bounded session-error receipt.
+    let errors: Vec<_> = [result, session_result, worker_result]
+        .into_iter()
+        .filter_map(Result::err)
+        .collect();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+#[cfg(test)]
+#[path = "launch/supervision_tests.rs"]
+mod supervision_tests;
 
 fn verify_installation(
     options: &LaunchOptions,
@@ -149,8 +172,8 @@ fn serve_control(
     options: &LaunchOptions,
     approval: &ApprovalRecord,
     helper_path: &Path,
-    worker: &mut Child,
-    sessions: &mut Vec<(ChannelShutdown, JoinHandle<AuthorityResult<()>>)>,
+    worker: &mut Worker,
+    sessions: &mut SessionRegistry,
 ) -> AuthorityResult<()> {
     let mut buffer = [0; 9];
     loop {
@@ -164,16 +187,9 @@ fn serve_control(
                 Err(format!("approved worker exited: {status}"))
             };
         }
-        // Reap completed sessions so repeated probes do not exhaust the bound.
-        let mut index = 0;
-        while index < sessions.len() {
-            if sessions[index].1.is_finished() {
-                let (_, finished) = sessions.swap_remove(index);
-                let _ = finished.join();
-            } else {
-                index += 1;
-            }
-        }
+        // A failed session stays confined during service, but its error is
+        // retained for the supervisor's final outcome instead of discarded.
+        sessions.reap_finished();
         let received = match control.receive(&mut buffer) {
             Ok(received) => received,
             Err(error)
@@ -227,6 +243,9 @@ fn serve_control(
                 retirement,
             )
         });
+        // Own the thread before any fallible transport/allocation step. This
+        // guard also covers failed SCM_RIGHTS handoff and unwinding.
+        sessions.insert(SessionOwner::new(shutdown, handle))?;
         let mut descriptors = vec![client.as_fd()];
         let ready = if let Some(receipt) = &worker_retirement {
             descriptors.push(receipt.as_fd());
@@ -235,11 +254,8 @@ fn serve_control(
             SESSION_READY
         };
         if let Err(error) = control.send(ready, &descriptors) {
-            shutdown.shutdown();
-            let _ = handle.join();
             return Err(error.to_string());
         }
-        sessions.push((shutdown, handle));
     }
 }
 
@@ -357,13 +373,76 @@ mod precheck_tests {
     }
 }
 
-struct Worker(Child);
+#[derive(Default)]
+struct WorkerState {
+    identity_lost: bool,
+    retirement: Option<AuthorityResult<()>>,
+}
+
+impl WorkerState {
+    fn observe<T>(&mut self, result: io::Result<T>) -> io::Result<T> {
+        if result
+            .as_ref()
+            .is_err_and(|error| error.raw_os_error() == Some(libc::ECHILD))
+        {
+            self.identity_lost = true;
+        }
+        result
+    }
+}
+
+struct Worker {
+    child: Child,
+    state: WorkerState,
+}
+
+impl Worker {
+    fn new(child: Child) -> Self {
+        Self {
+            child,
+            state: WorkerState::default(),
+        }
+    }
+
+    fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        if self.state.identity_lost {
+            return Err(io::Error::from_raw_os_error(libc::ECHILD));
+        }
+        let result = self.state.observe(self.child.try_wait());
+        if let Err(error) = &result {
+            eprintln!("approved worker exit observation failed; owner remains retained: {error}");
+        }
+        result
+    }
+
+    fn retire(&mut self) -> AuthorityResult<()> {
+        if let Some(result) = &self.state.retirement {
+            return result.clone();
+        }
+        if self.state.identity_lost {
+            eprintln!(
+                "approved worker retirement failed: child identity was lost; retaining the unresolved owner without signaling its reusable PID"
+            );
+            // Dedicated privileged supervisor containment, never a host tick.
+            // Neither an ECHILD error nor a timeout is positive retirement proof.
+            loop {
+                thread::park_timeout(Duration::from_secs(1));
+            }
+        }
+        let result = retire_child(&mut self.child, Duration::ZERO, |error| {
+            eprintln!("approved worker retirement failed; owner remains retained: {error}");
+        })
+        .map_err(|error| format!("approved worker retirement failed: {error}"));
+        self.state.retirement = Some(result.clone());
+        result
+    }
+}
+
 impl Drop for Worker {
     fn drop(&mut self) {
-        if matches!(self.0.try_wait(), Ok(None)) {
-            let _ = self.0.kill();
+        if let Err(error) = self.retire() {
+            eprintln!("{error}");
         }
-        let _ = self.0.wait();
     }
 }
 

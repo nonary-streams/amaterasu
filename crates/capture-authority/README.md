@@ -67,3 +67,21 @@ and `driver-read-leases` feature configurations; the retirement envelope does no
 change frame protocol 1 or experimental frame protocol 4. This source validation
 does not qualify an installed authority, driver or real client stream. The new
 capture client requires an authority binary supporting the version-two handshake.
+
+## Supervisor ownership
+
+The privileged supervisor owns every session thread immediately after spawn,
+including failed descriptor handoffs and unwinding. It signals all sessions
+before joining any one, retains one bounded session-error outcome during service,
+and joins every independent worker even after another result is an error or a
+panic. Per-session failures remain confined while service continues; the final
+supervisor result preserves the recorded failure. Session ownership is never
+detached to make shutdown appear complete.
+
+Authorized-worker retirement uses the same verified child reaper. The supervisor
+reports real reap/termination failures while retaining the child and continues
+containment until exit proof is available. If an earlier worker observation loses
+child identity with ECHILD, it logs the unresolved failure and retains the owner
+without signaling or waiting on the reusable numeric PID. This state cannot
+return successful shutdown. These waits occur only in the dedicated privileged
+supervisor, never the host's plugin tick.
