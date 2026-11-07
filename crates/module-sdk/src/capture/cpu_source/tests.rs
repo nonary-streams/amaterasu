@@ -1,15 +1,26 @@
 use super::*;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{
+    Weak,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+};
 struct Provider {
     open: AtomicBool,
     generation: AtomicU64,
     reads: AtomicU64,
     failures: AtomicU64,
+    descriptions: AtomicU64,
+    describe_errors: Mutex<BTreeMap<u64, Status>>,
+    last_pixels: Mutex<Weak<Vec<u8>>>,
+    generation_after_read: AtomicU64,
 }
 impl CpuSourceProvider for Provider {
     fn describe(&self, caller: &str, stream: u64) -> Result<CpuSourceDescription, Status> {
         if caller != "video" || stream != 7 || !self.open.load(Ordering::SeqCst) {
             return Err(MEDIA_CLOSED);
+        }
+        let call = self.descriptions.fetch_add(1, Ordering::SeqCst) + 1;
+        if let Some(status) = self.describe_errors.lock().unwrap().remove(&call) {
+            return Err(status);
         }
         Ok(CpuSourceDescription {
             generation: self.generation.load(Ordering::SeqCst),
@@ -37,13 +48,19 @@ impl CpuSourceProvider for Provider {
     ) -> Result<Option<CpuSourcePresentation>, Status> {
         self.describe(caller, stream)?;
         self.reads.fetch_add(1, Ordering::SeqCst);
+        let bytes = Arc::new(vec![0; 12]);
+        *self.last_pixels.lock().unwrap() = Arc::downgrade(&bytes);
+        let generation = self.generation_after_read.swap(0, Ordering::SeqCst);
+        if generation != 0 {
+            self.generation.store(generation, Ordering::SeqCst);
+        }
         Ok(Some(CpuSourcePresentation {
             width: 2,
             height: 2,
             stride: 4,
             pixel_format: format.pixel_format,
             color: format.color,
-            bytes: Arc::new(vec![0; 12]),
+            bytes,
             timestamp_us: 123,
             capture_pacing_timestamp_us: 120,
             sequence: 8,
@@ -63,7 +80,23 @@ fn provider() -> Arc<Provider> {
         generation: AtomicU64::new(1),
         reads: AtomicU64::new(0),
         failures: AtomicU64::new(0),
+        descriptions: AtomicU64::new(0),
+        describe_errors: Mutex::new(BTreeMap::new()),
+        last_pixels: Mutex::new(Weak::new()),
+        generation_after_read: AtomicU64::new(0),
     })
+}
+
+fn fail_describe_after(provider: &Provider, offset: u64, status: Status) {
+    let call = provider.descriptions.load(Ordering::SeqCst) + offset;
+    assert!(
+        provider
+            .describe_errors
+            .lock()
+            .unwrap()
+            .insert(call, status)
+            .is_none()
+    );
 }
 unsafe fn bind_table(factory: &CpuSourceFactory<Provider>, caller: &str) -> *const CaptureApiV1_10 {
     let query = NativeInterfaceQuery {
@@ -217,5 +250,143 @@ fn bindings_use_authenticated_owner_and_do_not_invent_legacy_eight_bit_hdr() {
             Err(MEDIA_UNSUPPORTED)
         ));
         api.base.base.base.base.release.unwrap()(c);
+    }
+}
+
+#[test]
+fn transient_post_offer_description_errors_propagate_and_retry() {
+    let provider = provider();
+    let factory = CpuSourceFactory::new(provider.clone());
+    // SAFETY: the binding, sink context and output live for each synchronous call.
+    unsafe {
+        let table = bind_table(&factory, "video");
+        let api = &*table;
+        let context = api.base.base.base.base.context;
+        for status in [MEDIA_BUSY, MEDIA_PENDING, MEDIA_CLOSED, MEDIA_BACKEND_ERROR] {
+            fail_describe_after(&provider, 2, status);
+            let mut generation = 99;
+            let mut offers = Vec::<(u64, u32, [u32; 6])>::new();
+            let sink = CaptureResourceOfferSink {
+                context: (&mut offers as *mut Vec<_>).cast(),
+                write: offer_sink,
+            };
+            assert_eq!(
+                (api.base.enumerate_resources)(context, 7, sink, &mut generation),
+                status
+            );
+            assert_eq!(generation, 99);
+            assert_eq!(offers.len(), 1); // Provisional output is invalid on error.
+            offers.clear();
+            assert_eq!(
+                (api.base.enumerate_resources)(context, 7, sink, &mut generation),
+                STATUS_OK
+            );
+            assert_eq!(generation, 1);
+            assert_eq!(offers.len(), 1);
+        }
+        api.base.base.base.base.release.unwrap()(context);
+    }
+}
+
+#[test]
+fn changed_description_invalidates_provisional_offers() {
+    struct ChangingOffer<'a> {
+        provider: &'a Provider,
+        offers: Vec<(u64, u32, [u32; 6])>,
+    }
+    unsafe extern "C" fn change_generation(
+        context: *mut c_void,
+        offer: *const CaptureResourceOffer,
+    ) -> Status {
+        // SAFETY: the test supplies a live ChangingOffer for the callback.
+        let state = unsafe { &mut *context.cast::<ChangingOffer<'_>>() };
+        // SAFETY: forward the synchronous borrowed offer to the ordinary sink.
+        let status = unsafe { offer_sink((&mut state.offers as *mut Vec<_>).cast(), offer) };
+        state.provider.generation.store(2, Ordering::SeqCst);
+        status
+    }
+    let provider = provider();
+    let factory = CpuSourceFactory::new(provider.clone());
+    // SAFETY: binding, sink context and output remain live until release.
+    unsafe {
+        let table = bind_table(&factory, "video");
+        let api = &*table;
+        let context = api.base.base.base.base.context;
+        let mut state = ChangingOffer {
+            provider: &provider,
+            offers: Vec::new(),
+        };
+        let mut generation = 99;
+        assert_eq!(
+            (api.base.enumerate_resources)(
+                context,
+                7,
+                CaptureResourceOfferSink {
+                    context: (&mut state as *mut ChangingOffer<'_>).cast(),
+                    write: change_generation,
+                },
+                &mut generation,
+            ),
+            MEDIA_UNSUPPORTED
+        );
+        assert_eq!(generation, 99);
+        assert_eq!(state.offers.len(), 1);
+        state.offers.clear();
+        assert_eq!(
+            (api.base.enumerate_resources)(
+                context,
+                7,
+                CaptureResourceOfferSink {
+                    context: (&mut state.offers as *mut Vec<_>).cast(),
+                    write: offer_sink,
+                },
+                &mut generation,
+            ),
+            STATUS_OK
+        );
+        assert_eq!(generation, 2);
+        assert_eq!(
+            (api.base.select_resource)(context, 7, generation, 1),
+            STATUS_OK
+        );
+        api.base.base.base.base.release.unwrap()(context);
+    }
+}
+
+#[test]
+fn post_read_description_errors_never_deliver_or_retain_a_frame() {
+    let provider = provider();
+    let factory = CpuSourceFactory::new(provider.clone());
+    // SAFETY: the binding and callback contexts live through each call.
+    unsafe {
+        let table = bind_table(&factory, "video");
+        let api = &*table;
+        let context = api.base.base.base.base.context;
+        assert_eq!((api.base.select_resource)(context, 7, 1, 1), STATUS_OK);
+        let mut copied = Vec::<u8>::new();
+        let sink = CaptureResourceFrameSink {
+            context: (&mut copied as *mut Vec<u8>).cast(),
+            write: frame_sink,
+        };
+        for status in [MEDIA_BUSY, MEDIA_PENDING, MEDIA_CLOSED, MEDIA_BACKEND_ERROR] {
+            // One describe precedes read, one authenticates the fake read, and
+            // the third revalidates the borrowed presentation before delivery.
+            fail_describe_after(&provider, 3, status);
+            assert_eq!((api.base.read_resource_frame)(context, 7, sink), status);
+            assert!(copied.is_empty());
+            assert!(provider.last_pixels.lock().unwrap().upgrade().is_none());
+            assert_eq!((api.base.read_resource_frame)(context, 7, sink), MEDIA_BUSY);
+            assert_eq!(copied.len(), 12);
+            copied.clear();
+        }
+        provider.generation_after_read.store(2, Ordering::SeqCst);
+        assert_eq!(
+            (api.base.read_resource_frame)(context, 7, sink),
+            MEDIA_UNSUPPORTED
+        );
+        assert!(copied.is_empty());
+        assert!(provider.last_pixels.lock().unwrap().upgrade().is_none());
+        assert_eq!(provider.failures.load(Ordering::SeqCst), 0);
+        api.base.base.base.base.release.unwrap()(context);
     }
 }

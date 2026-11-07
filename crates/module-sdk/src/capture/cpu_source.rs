@@ -490,7 +490,11 @@ unsafe extern "C" fn enumerate<P: CpuSourceProvider>(
                 return status;
             }
         }
-        if !matches!(b.describe(s),Ok(ref current) if same_description(&d,current)) {
+        let current = match b.describe(s) {
+            Ok(current) => current,
+            Err(status) => return status,
+        };
+        if !same_description(&d, &current) {
             return MEDIA_UNSUPPORTED;
         }
         // SAFETY: output is caller-owned, writable and aligned.
