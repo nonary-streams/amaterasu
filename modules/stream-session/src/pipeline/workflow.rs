@@ -150,6 +150,22 @@ impl Job {
         self.deadline = now.saturating_add(15000);
     }
 
+    /// Settle the retained broker operation using the step that submitted it.
+    /// Journal adoption leaves this operation on the record until its new
+    /// lifecycle cleanup identity has been durably recorded.
+    pub fn settle_uncertain(&mut self, record: &mut Record) {
+        let Some(mut pending) = record.uncertain.take() else {
+            return;
+        };
+        if let Some(step) = record.uncertain_step.take() {
+            self.step = step;
+        }
+        pending.retry();
+        pending.cancel();
+        self.pending = Some(pending);
+        self.settling_allocation = true;
+    }
+
     pub fn next_cleanup(&mut self, record: &Record) -> Option<Step> {
         if record.restart_lifecycle_preparation.is_some() {
             return (!self.lifecycle_retire_tried).then_some(Step::ResolveLifecyclePreparation);

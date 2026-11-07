@@ -441,6 +441,9 @@ impl Pipeline {
             job.journal_payload = None;
             job.journal_operation_id = None;
             job.step = job.journal_resume.take().unwrap_or(Step::WaitDrain);
+            if job.cleanup {
+                job.settle_uncertain(record);
+            }
             return true;
         }
         if job.cleanup {

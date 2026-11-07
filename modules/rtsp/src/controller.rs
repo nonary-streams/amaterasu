@@ -341,7 +341,7 @@ impl Controller {
             }
         }
 
-        let Some(session) = record.session else {
+        let Some(_) = record.session else {
             record.cleanup_confirmed =
                 record.lifecycle_target.is_none() && !record.lifecycle_prepare_outstanding;
             finish_record(record);
@@ -349,7 +349,7 @@ impl Controller {
         };
         let stop = shutdown_request(
             runtime,
-            json!({"action":"stop","session":session}),
+            record.stop_payload(),
             format!("{}-module-shutdown-stop", record.operation()),
             deadline,
         );

@@ -386,6 +386,12 @@ impl LifecycleJournal {
             .is_some_and(|entry| *entry == Entry::from_record(record))
     }
 
+    pub fn matches_lifecycle_identity(&self, record: &Record) -> bool {
+        self.document.entries.get(&record.id).is_some_and(|entry| {
+            entry.lifecycle_recovery == Entry::from_record(record).lifecycle_recovery
+        })
+    }
+
     pub fn with_record(&self, record: &Record) -> Result<Document, &'static str> {
         let mut next = self.document.clone();
         next.entries.insert(record.id, Entry::from_record(record));

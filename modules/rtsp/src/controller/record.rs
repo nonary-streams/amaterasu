@@ -156,6 +156,30 @@ impl Record {
         Some(payload)
     }
 
+    /// Preserve the same validated binding for startup and cleanup-only adoption.
+    /// Cleanup never dispatches this payload as a start operation.
+    pub(super) fn authenticated_lifecycle_start_payload(&self) -> Option<Value> {
+        let target = self.lifecycle_target.as_ref()?;
+        let mut payload = self.authenticated_start_payload(self.session?)?;
+        payload["configuration"]["lifecycle_target"] = target.clone();
+        payload["configuration"]["lifecycle_candidate"] = self.lifecycle_candidate.clone()?;
+        if self.config.lifecycle_intent.as_deref() == Some("join") {
+            payload["configuration"]["lifecycle_shared_source"] =
+                json!(self.lifecycle_source_target.as_ref()?);
+        }
+        payload["configuration"]["lifecycle_capture_mode"] =
+            json!(self.config.lifecycle_capture_mode);
+        Some(payload)
+    }
+
+    pub(super) fn stop_payload(&self) -> Value {
+        let mut payload = json!({"action":"stop","session":self.session});
+        if let Some(start) = self.authenticated_lifecycle_start_payload() {
+            payload["lifecycle_configuration"] = start["configuration"].clone();
+        }
+        payload
+    }
+
     pub fn operation(&self) -> String {
         format!("rtsp-{:016x}", self.id)
     }

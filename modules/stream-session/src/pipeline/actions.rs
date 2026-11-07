@@ -123,9 +123,11 @@ impl Pipeline {
                 StartMode::WhenAuthenticated,
                 send,
             ),
-            Operation::Stop { session } | Operation::Close { session } => {
-                self.stop(input, session, send)
-            }
+            Operation::Stop {
+                session,
+                lifecycle_configuration,
+            } => self.stop(input, session, lifecycle_configuration, send),
+            Operation::Close { session } => self.stop(input, session, None, send),
             Operation::Status { session } => self.status(input, session, send),
             Operation::ManagementStopStream { session_id } => {
                 self.management_stop_stream(input, &session_id, send)
@@ -281,128 +283,8 @@ impl Pipeline {
             rpc::complete(send, request, error("session_not_found"));
             return;
         };
-        if record.processing_plan_provider.is_some()
-            && (configuration.lifecycle_target.is_none()
-                || (configuration.lifecycle_capture_mode.is_managed()
-                    && configuration.lifecycle_candidate.is_none()))
-        {
-            rpc::complete(send, request, error("processing_lifecycle_required"));
-            return;
-        }
-        match (
-            &record.config.lifecycle_session_target,
-            &configuration.lifecycle_target,
-            &configuration.lifecycle_candidate,
-        ) {
-            (None, None, None)
-                if configuration.lifecycle_capture_mode.is_managed()
-                    && record.config.lifecycle_capture_mode.is_managed() => {}
-            (
-                Some(amaterasu_extension_api::LifecycleTarget::Session {
-                    host_epoch,
-                    session_id,
-                    ..
-                }),
-                Some(amaterasu_extension_api::LifecycleTarget::Stream {
-                    host_epoch: stream_epoch,
-                    session_id: stream_session,
-                    stream_id,
-                    generation,
-                }),
-                None,
-            ) if owner == "amaterasu.rtsp"
-                && configuration.lifecycle_capture_mode.is_external()
-                && record.config.lifecycle_capture_mode.is_external()
-                && host_epoch == stream_epoch
-                && session_id == stream_session
-                && valid_name(stream_id)
-                && *generation > 0 => {}
-            (
-                Some(amaterasu_extension_api::LifecycleTarget::Session {
-                    host_epoch,
-                    session_id,
-                    ..
-                }),
-                Some(amaterasu_extension_api::LifecycleTarget::Stream {
-                    host_epoch: stream_epoch,
-                    session_id: stream_session,
-                    stream_id,
-                    generation,
-                }),
-                Some(candidate),
-            ) if owner == "amaterasu.rtsp"
-                && configuration.lifecycle_capture_mode.is_managed()
-                && record.config.lifecycle_capture_mode.is_managed()
-                && host_epoch == stream_epoch
-                && session_id == stream_session
-                && valid_name(stream_id)
-                && *generation > 0
-                && candidate.generation == *generation
-                && amaterasu_extension_api::validate_capture_binding(candidate).is_ok()
-                && candidate.capture_provider == "amaterasu.capture-pipewire/1"
-                && candidate.selector_schema == "amaterasu.kwin-wl-output/1"
-                && candidate
-                    .selector
-                    .as_object()
-                    .is_some_and(|object| object.len() == 1)
-                && candidate.selector["output"].as_str().is_some_and(|output| {
-                    output.starts_with("kwin:Virtual-") && valid_name(output)
-                })
-                && !candidate.mode.hdr
-                && configuration.source_id.is_none()
-                && configuration.capture_provider == crate::model::CaptureProvider::PipeWire => {}
-            _ => {
-                rpc::complete(send, request, error("invalid_lifecycle_identity"));
-                return;
-            }
-        }
-        if let Err(code) = configuration.configuration.normalize_codec() {
+        if let Err(code) = validate_start_configuration(&owner, record, &mut configuration) {
             rpc::complete(send, request, error(code));
-            return;
-        }
-        if let Err(code) = configuration.validate(record.config.stream_audio) {
-            rpc::complete(send, request, error(code));
-            return;
-        }
-        if configuration.source_capture_context != record.config.source_capture_context {
-            rpc::complete(send, request, error("source_capture_context_changed"));
-            return;
-        }
-        if let Some(source) = &record.config.borrowed_capture
-            && (configuration.output != source.output || configuration.source_id.is_some())
-        {
-            rpc::complete(send, request, error("borrowed_capture_changed"));
-            return;
-        }
-        if let Err(code) = super::shared_capture::validate_start(record, &configuration) {
-            rpc::complete(send, request, error(code));
-            return;
-        }
-        if configuration.source_id.is_some()
-            && (record.config.display_request.is_some()
-                || record.config.virtual_display_intent.is_some())
-        {
-            rpc::complete(send, request, error("source_mode_display_incompatible"));
-            return;
-        }
-        if !configuration.matches_prepared_audio(&record.config) {
-            rpc::complete(send, request, error("audio_configuration_mismatch"));
-            return;
-        }
-        if !configuration.matches_prepared_codec(&record.config) {
-            rpc::complete(send, request, error("video_codec_mismatch"));
-            return;
-        }
-        if !configuration.matches_prepared_encryption(&record.config) {
-            rpc::complete(send, request, error("encryption_configuration_mismatch"));
-            return;
-        }
-        if record
-            .start
-            .as_ref()
-            .is_some_and(|existing| existing != &configuration)
-        {
-            rpc::complete(send, request, error("start_conflict"));
             return;
         }
         if record.state == State::Active
@@ -450,7 +332,13 @@ impl Pipeline {
         }
     }
 
-    fn stop(&mut self, input: Incoming, session: u64, send: &mut Send<'_>) {
+    fn stop(
+        &mut self,
+        input: Incoming,
+        session: u64,
+        lifecycle_configuration: Option<Box<StartConfig>>,
+        send: &mut Send<'_>,
+    ) {
         let Incoming {
             request,
             owner,
@@ -469,7 +357,40 @@ impl Pipeline {
             rpc::complete(send, request, response);
             return;
         };
-        if record.state.terminal() {
+        let mut adopted_lifecycle = false;
+        if let Some(mut configuration) = lifecycle_configuration {
+            if owner != "amaterasu.rtsp" || configuration.lifecycle_target.is_none() {
+                rpc::complete(send, request, error("permission_denied"));
+                return;
+            }
+            if let Err(code) = validate_start_configuration(&owner, record, &mut configuration) {
+                rpc::complete(send, request, error(code));
+                return;
+            }
+            if record.start.is_none() {
+                // Accept cleanup ownership without arming or opening capture.
+                // The journal must commit before any lifecycle mutation below.
+                record.start = Some(*configuration);
+                adopted_lifecycle = true;
+            }
+        }
+        if record.state.terminal() && !adopted_lifecycle {
+            rpc::complete(send, request, record.response());
+            return;
+        }
+        let persist_lifecycle_identity = record
+            .start
+            .as_ref()
+            .is_some_and(|start| start.lifecycle_target.is_some())
+            && !self.journal.matches_lifecycle_identity(record);
+        if persist_lifecycle_identity && self.journal.failed {
+            // A failed or unconfirmed write requires authoritative journal
+            // reconciliation. A retry must not fence a target held only in RAM,
+            // or race a late write using a new operation identity.
+            record.state = State::CleanupFailed;
+            record
+                .cleanup_error
+                .get_or_insert("lifecycle_journal_write_unconfirmed");
             rpc::complete(send, request, record.response());
             return;
         }
@@ -514,23 +435,35 @@ impl Pipeline {
         } else {
             job.cleanup = true;
             job.deadline = now + 15000;
-            if let Some(mut pending) = record.uncertain.take() {
-                if let Some(step) = record.uncertain_step.take() {
+            if !persist_lifecycle_identity {
+                job.settle_uncertain(record);
+            }
+            if job.pending.is_none() {
+                if let Some(step) = job.next_cleanup(record) {
                     job.step = step;
+                } else {
+                    // A previous cleanup attempt may already have retired every
+                    // resource. Let the driver confirm journal retirement.
+                    job.step = Step::WaitDrain;
                 }
-                pending.retry();
-                pending.cancel();
-                job.pending = Some(pending);
-                job.settling_allocation = true;
             }
-            if let Some(step) = job.next_cleanup(record) {
-                job.step = step;
-            } else {
-                // A previous cleanup attempt may already have retired every
-                // resource. Let the cleanup driver confirm journal retirement
-                // instead of dispatching the initial drain step again.
-                job.step = Step::WaitDrain;
-            }
+        }
+        if persist_lifecycle_identity {
+            let document = match self.journal.with_record(record) {
+                Ok(document) => document,
+                Err(_) => {
+                    self.journal.failed = true;
+                    record.state = State::CleanupFailed;
+                    record.cleanup_error = Some("lifecycle_journal_write_failed");
+                    rpc::complete(send, request, record.response());
+                    return;
+                }
+            };
+            job.journal_resume = Some(job.step);
+            job.journal_payload = Some(self.journal.set_payload(&document));
+            job.journal_document = Some(document);
+            job.journal_operation_id = Some(self.journal.op_id(self.sequence.saturating_add(1)));
+            job.step = Step::PersistJournal;
         }
         self.job = Some(job);
     }
@@ -592,7 +525,7 @@ impl Pipeline {
         // This explicit management operation authorizes stopping a particular
         // visible stream. Cleanup retains that stream's original transport owner.
         input.owner = record.owner.clone();
-        self.stop(input, id, send);
+        self.stop(input, id, None, send);
     }
 
     fn management_live_sessions(&mut self, input: Incoming, send: &mut Send<'_>) {
@@ -662,4 +595,123 @@ fn unix_time_millis() -> i64 {
         Ok(duration) => i64::try_from(duration.as_millis()).unwrap_or(i64::MAX),
         Err(error) => -i64::try_from(error.duration().as_millis()).unwrap_or(i64::MAX),
     }
+}
+
+/// Startup and cleanup adoption share the same owner, frozen configuration and
+/// coordinator binding checks. Validation alone never opens native resources.
+fn validate_start_configuration(
+    owner: &str,
+    record: &Record,
+    configuration: &mut StartConfig,
+) -> Result<(), &'static str> {
+    if configuration.client_feature_flags.is_some() && owner != "amaterasu.rtsp" {
+        return Err("permission_denied");
+    }
+    if record.processing_plan_provider.is_some()
+        && (configuration.lifecycle_target.is_none()
+            || (configuration.lifecycle_capture_mode.is_managed()
+                && configuration.lifecycle_candidate.is_none()))
+    {
+        return Err("processing_lifecycle_required");
+    }
+    match (
+        &record.config.lifecycle_session_target,
+        &configuration.lifecycle_target,
+        &configuration.lifecycle_candidate,
+    ) {
+        (None, None, None)
+            if configuration.lifecycle_capture_mode.is_managed()
+                && record.config.lifecycle_capture_mode.is_managed() => {}
+        (
+            Some(amaterasu_extension_api::LifecycleTarget::Session {
+                host_epoch,
+                session_id,
+                ..
+            }),
+            Some(amaterasu_extension_api::LifecycleTarget::Stream {
+                host_epoch: stream_epoch,
+                session_id: stream_session,
+                stream_id,
+                generation,
+            }),
+            None,
+        ) if owner == "amaterasu.rtsp"
+            && configuration.lifecycle_capture_mode.is_external()
+            && record.config.lifecycle_capture_mode.is_external()
+            && host_epoch == stream_epoch
+            && session_id == stream_session
+            && valid_name(stream_id)
+            && *generation > 0 => {}
+        (
+            Some(amaterasu_extension_api::LifecycleTarget::Session {
+                host_epoch,
+                session_id,
+                ..
+            }),
+            Some(amaterasu_extension_api::LifecycleTarget::Stream {
+                host_epoch: stream_epoch,
+                session_id: stream_session,
+                stream_id,
+                generation,
+            }),
+            Some(candidate),
+        ) if owner == "amaterasu.rtsp"
+            && configuration.lifecycle_capture_mode.is_managed()
+            && record.config.lifecycle_capture_mode.is_managed()
+            && host_epoch == stream_epoch
+            && session_id == stream_session
+            && valid_name(stream_id)
+            && *generation > 0
+            && candidate.generation == *generation
+            && amaterasu_extension_api::validate_capture_binding(candidate).is_ok()
+            && candidate.capture_provider == "amaterasu.capture-pipewire/1"
+            && candidate.selector_schema == "amaterasu.kwin-wl-output/1"
+            && candidate
+                .selector
+                .as_object()
+                .is_some_and(|object| object.len() == 1)
+            && candidate.selector["output"].as_str().is_some_and(|output| {
+                output.starts_with("kwin:Virtual-") && valid_name(output)
+            })
+            && !candidate.mode.hdr
+            && configuration.source_id.is_none()
+            && configuration.capture_provider == crate::model::CaptureProvider::PipeWire => {}
+        _ => {
+            return Err("invalid_lifecycle_identity");
+        }
+    }
+    configuration.configuration.normalize_codec()?;
+    configuration.validate(record.config.stream_audio)?;
+    if configuration.source_capture_context != record.config.source_capture_context {
+        return Err("source_capture_context_changed");
+    }
+    if let Some(source) = &record.config.borrowed_capture
+        && (configuration.output != source.output || configuration.source_id.is_some())
+    {
+        return Err("borrowed_capture_changed");
+    }
+    super::shared_capture::validate_start(record, configuration)?;
+    if configuration.source_id.is_some()
+        && (record.config.display_request.is_some()
+            || record.config.virtual_display_intent.is_some())
+    {
+        return Err("source_mode_display_incompatible");
+    }
+    if !configuration.matches_prepared_audio(&record.config) {
+        return Err("audio_configuration_mismatch");
+    }
+    if !configuration.matches_prepared_codec(&record.config) {
+        return Err("video_codec_mismatch");
+    }
+    if !configuration.matches_prepared_encryption(&record.config) {
+        return Err("encryption_configuration_mismatch");
+    }
+    if record
+        .start
+        .as_ref()
+        .is_some_and(|existing| existing != configuration)
+    {
+        return Err("start_conflict");
+    }
+    Ok(())
 }

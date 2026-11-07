@@ -1277,6 +1277,10 @@ pub enum Operation {
     },
     Stop {
         session: u64,
+        /// An admitted RTSP lifecycle may finish preparing after the transport
+        /// disconnects, before native startup has received its binding.
+        #[serde(default)]
+        lifecycle_configuration: Option<Box<StartConfig>>,
     },
     Close {
         session: u64,

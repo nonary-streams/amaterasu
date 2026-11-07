@@ -64,6 +64,27 @@ pixels. The pointer is centered on the owned output after an authorized mouse
 lease is acquired; later topology updates refresh absolute pointer mapping before
 control packets are translated. Geometry is not inferred from client resolution.
 
+## Lifecycle cleanup before startup
+
+The version 1 `stop` operation accepts an optional `lifecycle_configuration`
+containing the same configuration as `start_when_authenticated`. An RTSP adapter
+uses it when its exact coordinator preparation succeeds after the transport has
+closed, before the native stream has received the admitted binding. Only the
+existing stream owner `amaterasu.rtsp` can supply this field. The parent session,
+capture mode, candidate, shared source and prepared media configuration undergo
+the same validation as startup; a different already accepted configuration is
+rejected.
+
+Accepting this field transfers cleanup ownership only. It does not arm, signal
+readiness or open capture. Stream-session persists the admitted lifecycle identity
+before ordinary fencing, native-resource lookup and retirement. A previously
+terminal pre-start record can accept this late identity for cleanup. Unresolved
+broker work is settled using its original operation and step after the journal
+commits. Stop responses use the existing exact lifecycle retirement proof; unknown
+preparation results never become successful cleanup evidence. Replacement
+stream-session providers implementing this v1 extension must preserve these
+semantics and accept the unchanged RTSP adapter's cleanup-only configuration.
+
 ## Interrupted external-capture cleanup
 
 A restart first reconciles every recorded native resource using its original

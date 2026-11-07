@@ -895,3 +895,134 @@ fn autonomous_capture_failure_uses_existing_confirmed_cleanup() {
         Some("unsupported_audio_format")
     );
 }
+
+fn prepared_lifecycle_for_cleanup(external: bool) -> (Harness, u64, Value) {
+    let mut host = Harness::new();
+    host.pipeline
+        .settings
+        .allowed_principals
+        .push("amaterasu.rtsp".into());
+    host.broker.lifecycle_success = true;
+    host.broker.authenticated = false;
+    let mut request = prepare();
+    request["lifecycle_session_target"] =
+        json!({"kind":"session","host_epoch":"epoch","session_id":"session","generation":1});
+    if external {
+        request["lifecycle_capture_mode"] = json!("external");
+    }
+    let id = host.response_from(1, "amaterasu.rtsp", request)["session"]
+        .as_u64()
+        .unwrap();
+    let mut configuration = start(id)["configuration"].clone();
+    configuration["lifecycle_target"] = json!({"kind":"stream","host_epoch":"epoch","session_id":"session","stream_id":"stream","generation":1});
+    if external {
+        configuration["lifecycle_capture_mode"] = json!("external");
+    } else {
+        configuration["capture_provider"] = json!("pipewire");
+        configuration["lifecycle_candidate"] = json!({"capture_provider":"amaterasu.capture-pipewire/1","selector_schema":"amaterasu.kwin-wl-output/1","selector":{"output":"kwin:Virtual-12"},"resource":{"provider":"provider","resource_id":"r","incarnation":"i","revision":1,"execution_domain":"seat","mutation_domain":null},"mode":{"width":1280,"height":720,"refresh_millihz":60000,"hdr":false},"plan_revision":1,"geometry_revision":1,"generation":1});
+    }
+    (host, id, configuration)
+}
+
+#[test]
+fn stop_retires_a_prepared_lifecycle_without_starting_native_capture() {
+    for external in [false, true] {
+        for already_stopped in [false, true] {
+            let (mut host, id, configuration) = prepared_lifecycle_for_cleanup(external);
+            if already_stopped {
+                assert_eq!(
+                    host.response_from(2, "amaterasu.rtsp", json!({"action":"stop","session":id}))
+                        ["state"],
+                    "stopped"
+                );
+            }
+            let mut wrong_configuration = configuration.clone();
+            wrong_configuration["lifecycle_target"]["session_id"] = json!("another-session");
+            assert_eq!(host.response_from(3, "amaterasu.rtsp", json!({"action":"stop","session":id,"lifecycle_configuration":wrong_configuration}))["code"], "invalid_lifecycle_identity");
+            let stopped = host.response_from(
+                4,
+                "amaterasu.rtsp",
+                json!({"action":"stop","session":id,"lifecycle_configuration":configuration}),
+            );
+            assert_eq!(
+                stopped["state"], "stopped",
+                "external={external} already_stopped={already_stopped}: {stopped}"
+            );
+            assert_eq!(stopped["lifecycle_retired"], true, "{stopped}");
+            let pause = host
+                .broker
+                .calls
+                .iter()
+                .position(|call| call.payload["operation"] == "pause_stream")
+                .unwrap();
+            let journal = host.broker.calls.iter().position(|call| call.service == "amaterasu.state/1" && call.payload["action"] == "set" && call.payload["value"]["entries"][id.to_string()]["lifecycle_recovery"]["stream_target"] == configuration["lifecycle_target"]).unwrap();
+            assert!(
+                journal < pause,
+                "admitted target must be durable before fencing"
+            );
+            assert!(
+                host.broker
+                    .calls
+                    .iter()
+                    .any(|call| call.payload["operation"] == "retire_stream")
+            );
+            assert!(
+                !host
+                    .broker
+                    .calls
+                    .iter()
+                    .any(|call| call.payload["action"] == "open"
+                        && matches!(
+                            call.service.as_str(),
+                            "amaterasu.video/1" | "amaterasu.audio/1"
+                        ))
+            );
+            assert!(
+                host.broker.state_value.as_ref().unwrap()["entries"]
+                    .as_object()
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+}
+
+#[test]
+fn cleanup_binding_adoption_waits_for_durable_journal_confirmation() {
+    let (mut host, id, configuration) = prepared_lifecycle_for_cleanup(false);
+    host.broker.state_fail_set = true;
+    let stopped = host.response_from(
+        2,
+        "amaterasu.rtsp",
+        json!({"action":"stop","session":id,"lifecycle_configuration":configuration}),
+    );
+    assert_eq!(stopped["state"], "cleanup_failed", "{stopped}");
+    assert_eq!(stopped["cleanup_error"], "lifecycle_journal_write_failed");
+    let writes = host
+        .broker
+        .calls
+        .iter()
+        .filter(|call| call.service == "amaterasu.state/1" && call.payload["action"] == "set")
+        .count();
+    host.broker.state_fail_set = false;
+    let retried = host.response_from(3, "amaterasu.rtsp", json!({"action":"stop","session":id}));
+    assert_eq!(retried["state"], "cleanup_failed", "{retried}");
+    assert_eq!(
+        host.broker
+            .calls
+            .iter()
+            .filter(|call| call.service == "amaterasu.state/1" && call.payload["action"] == "set")
+            .count(),
+        writes,
+        "unconfirmed journal must be reconciled before another operation can race it"
+    );
+    assert!(!host.broker.calls.iter().any(|call| matches!(
+        call.payload["operation"].as_str(),
+        Some("pause_stream" | "retire_stream")
+    )));
+    assert!(
+        host.broker.state_value.as_ref().unwrap()["entries"][id.to_string()]["lifecycle_recovery"]
+            ["stream_target"]
+            .is_null()
+    );
+}

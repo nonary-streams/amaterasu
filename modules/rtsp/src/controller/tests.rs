@@ -2919,3 +2919,225 @@ fn absent_stream_session_cannot_confirm_unresolved_lifecycle_retirement() {
         );
     }
 }
+
+fn lifecycle_cleanup_fixture(external: bool, joining: bool) -> (Record, Value) {
+    let (mut record, announce) = announced_profile_record();
+    assert!(record.accept_announce(&announce));
+    record.config.lifecycle_session_target = serde_json::from_value(json!({
+        "kind":"session","host_epoch":"epoch","session_id":"session","generation":1
+    }))
+    .ok();
+    record.config.lifecycle_settings_revision = Some("7".into());
+    record.config.lifecycle_intent = Some(if joining { "join" } else { "initial" }.into());
+    record.lifecycle_input_required = Some(false);
+    let target = json!({"kind":"stream","host_epoch":"epoch","session_id":"session","stream_id":"stream","generation":1});
+    let candidate = json!({"capture_provider":"amaterasu.capture-pipewire/1","selector_schema":"amaterasu.kwin-wl-output/1","selector":{"output":"kwin:Virtual-12"},
+        "resource":{"provider":"provider","resource_id":"output","incarnation":"one","revision":1,"execution_domain":"desktop","mutation_domain":null,"mutation_domains":["desktop"]},
+        "mode":{"width":announce.video.width,"height":announce.video.height,"refresh_millihz":announce.video.fps * 1000,"hdr":false},
+        "plan_revision":1,"geometry_revision":1,"generation":1,"fallback":"forbidden"});
+    let mut reply = json!({"status":"succeeded",
+        "operation_id":"rtsp-0000000000000005-lifecycle-prepare","target":target,"candidate":candidate});
+    if external {
+        record.config.lifecycle_capture_mode =
+            amaterasu_extension_api::CaptureBindingMode::External;
+        reply["capture_binding_mode"] = json!("external");
+        reply["candidate"] = Value::Null;
+        reply["required_consumers"] = json!(["capture"]);
+    }
+    if joining {
+        let source = json!({"kind":"stream","host_epoch":"epoch","session_id":"session","stream_id":"source","generation":3});
+        let mut binding = reply["candidate"].clone();
+        if !external {
+            binding["generation"] = json!(3);
+        }
+        reply["shared_source"] = source.clone();
+        reply["join_context"] = json!({"source":source,"source_transition":"source-prepare",
+            "capture_binding_mode":record.config.lifecycle_capture_mode,
+            "binding_owner":if external { Value::Null } else { json!("provider") },"binding":binding});
+    }
+    (record, reply)
+}
+
+#[test]
+fn disconnect_during_lifecycle_prepare_resolves_admission_before_owned_cleanup() {
+    for (external, joining) in [(false, false), (true, false), (false, true), (true, true)] {
+        let (mut record, reply) = lifecycle_cleanup_fixture(external, joining);
+        let mut controller = Controller::new(Settings::default()).unwrap();
+        let start = record.authenticated_start_payload(23).unwrap();
+        controller.schedule_arm(&mut record, start, 8, 9, 0);
+        controller.records.insert(record.id, record);
+        let mut endpoint = Endpoint::default();
+        let runtime = client(&mut endpoint);
+
+        controller.advance_job(&runtime, 1);
+        controller.disconnected(8, Some(5), "peer_disconnected");
+        controller.advance_job(&runtime, 2);
+        controller.advance_job(&runtime, 3);
+        assert!(endpoint.commands.iter().any(|command| matches!(command,
+            Command::Request { service, payload, .. } if service == "amaterasu.session-lifecycle/1"
+                && payload["operation"] == "lookup"
+                && payload["operation_id"] == "rtsp-0000000000000005-lifecycle-prepare")));
+        assert!(
+            endpoint
+                .commands
+                .iter()
+                .any(|command| matches!(command, Command::Cancel { .. }))
+        );
+        assert!(!endpoint.commands.iter().any(|command| matches!(command,
+            Command::Request { payload, .. } if payload["action"] == "stop")));
+
+        endpoint.verifier_reply = Some(reply.clone());
+        controller.advance_job(&runtime, 4);
+        controller.advance_job(&runtime, 5);
+        let stop = endpoint
+            .commands
+            .iter()
+            .find_map(|command| match command {
+                Command::Request {
+                    service, payload, ..
+                } if service == "amaterasu.stream-session/1" && payload["action"] == "stop" => {
+                    Some(payload)
+                }
+                _ => None,
+            })
+            .expect("owned stream-session stop after exact preparation resolution");
+        assert_eq!(
+            stop["lifecycle_configuration"]["lifecycle_target"],
+            reply["target"]
+        );
+        assert_eq!(
+            stop["lifecycle_configuration"]["lifecycle_candidate"],
+            reply["candidate"]
+        );
+        assert_eq!(
+            stop["lifecycle_configuration"]["lifecycle_shared_source"],
+            reply["shared_source"]
+        );
+        assert_eq!(
+            stop["lifecycle_configuration"]["lifecycle_capture_mode"],
+            if external { "external" } else { "managed" }
+        );
+        assert!(!endpoint.commands.iter().any(|command| matches!(command,
+            Command::Request { payload, .. } if payload["action"] == "start_when_authenticated")));
+
+        let mut terminal = json!({"ok":true,"session":23,"state":"stopped","cleanup_error":null,
+            "lifecycle_target":reply["target"],"lifecycle_retired":!joining});
+        if joining {
+            terminal["lifecycle_consumer_retired"] = json!(true);
+            terminal["lifecycle_resources_released"] = json!(false);
+            terminal["lifecycle_shared_retained"] = json!(true);
+            terminal["lifecycle_shared_source"] = reply["shared_source"].clone();
+        }
+        endpoint.verifier_reply = Some(terminal);
+        controller.advance_job(&runtime, 6);
+        let record = &controller.records[&5];
+        assert!(record.state.terminal());
+        assert!(record.cleanup_confirmed);
+        assert!(!record.lifecycle_prepare_outstanding);
+        assert_eq!(record.lifecycle_target.as_ref(), Some(&reply["target"]));
+    }
+}
+
+#[test]
+fn lifecycle_prepare_deadline_and_late_success_preserve_cleanup_only_admission() {
+    for late_success in [false, true] {
+        let (mut record, reply) = lifecycle_cleanup_fixture(false, false);
+        let mut controller = Controller::new(Settings::default()).unwrap();
+        let start = record.authenticated_start_payload(23).unwrap();
+        controller.schedule_arm(&mut record, start, 8, 9, 0);
+        let deadline = record.expires;
+        controller.records.insert(record.id, record);
+        let mut endpoint = Endpoint::default();
+        let runtime = client(&mut endpoint);
+        controller.advance_job(&runtime, 1);
+        if late_success {
+            // The coordinator reply may be available after the transport has
+            // already committed to closing. It remains cleanup evidence.
+            let mut record = controller.records.remove(&5).unwrap();
+            record.close(Some("network_disconnected"));
+            let mut job = controller.job.take().unwrap();
+            job.network = None;
+            controller.consume_result(&mut record, job, reply, 2, &runtime);
+            controller.records.insert(5, record);
+        } else {
+            controller.advance_job(&runtime, deadline);
+            controller.advance_job(&runtime, deadline + 1);
+            assert!(
+                controller
+                    .job
+                    .as_ref()
+                    .is_some_and(|job| job.phase == Phase::LifecycleLookup)
+            );
+            endpoint.verifier_reply = Some(reply);
+            controller.advance_job(&runtime, deadline + 2);
+        }
+        controller.advance_job(&runtime, deadline + 3);
+        assert!(endpoint.commands.iter().any(|command| matches!(command,
+            Command::Request { service, payload, .. } if service == "amaterasu.stream-session/1"
+                && payload["action"] == "stop" && payload["lifecycle_configuration"]["lifecycle_target"]["stream_id"] == "stream")));
+        assert!(!endpoint.commands.iter().any(|command| matches!(command,
+            Command::Request { payload, .. } if payload["action"] == "start_when_authenticated")));
+    }
+}
+
+#[test]
+fn missing_or_foreign_lifecycle_lookup_cannot_confirm_cleanup() {
+    for reply in [
+        json!({"status":"not_found"}),
+        json!({"status":"rejected","operation_id":"foreign-operation"}),
+    ] {
+        let (mut record, _) = lifecycle_cleanup_fixture(false, false);
+        record.state = State::Closing;
+        record.lifecycle_prepare_outstanding = true;
+        let mut controller = Controller::new(Settings::default()).unwrap();
+        controller.schedule_cleanup(&mut record, None, 0);
+        controller.records.insert(record.id, record);
+        let mut endpoint = Endpoint {
+            verifier_reply: Some(reply),
+            ..Endpoint::default()
+        };
+        let runtime = client(&mut endpoint);
+        controller.advance_job(&runtime, 1);
+        controller.advance_job(&runtime, 2);
+        let record = &controller.records[&5];
+        assert_eq!(record.state, State::CleanupFailed);
+        assert!(record.lifecycle_prepare_outstanding);
+        assert!(!record.cleanup_confirmed);
+        assert!(!endpoint.commands.iter().any(|command| matches!(command,
+            Command::Request { payload, .. } if payload["action"] == "stop")));
+    }
+}
+
+#[test]
+fn disconnect_during_lifecycle_lookup_retries_the_exact_preparation_before_cleanup() {
+    let (mut record, reply) = lifecycle_cleanup_fixture(false, false);
+    let mut controller = Controller::new(Settings::default()).unwrap();
+    let start = record.authenticated_start_payload(23).unwrap();
+    controller.schedule_arm(&mut record, start, 8, 9, 0);
+    controller.records.insert(record.id, record);
+    let mut endpoint = Endpoint {
+        verifier_reply: Some(
+            json!({"status":"pending","operation_id":"rtsp-0000000000000005-lifecycle-prepare"}),
+        ),
+        ..Endpoint::default()
+    };
+    let runtime = client(&mut endpoint);
+    for now in 1..=3 {
+        controller.advance_job(&runtime, now);
+    }
+    controller.disconnected(8, Some(5), "peer_disconnected");
+    controller.advance_job(&runtime, 4);
+    assert_eq!(controller.records[&5].state, State::CleanupFailed);
+    controller.schedule_background(5);
+    controller.schedule_background(5 + CLEANUP_RETRY_DELAYS_MS[0]);
+    endpoint.verifier_reply = Some(reply);
+    for now in 256..=258 {
+        controller.advance_job(&runtime, now);
+    }
+    assert!(!controller.records[&5].lifecycle_prepare_outstanding);
+    assert!(endpoint.commands.iter().any(|command| matches!(command,
+        Command::Request { service, payload, .. } if service == "amaterasu.stream-session/1"
+            && payload["action"] == "stop" && payload["lifecycle_configuration"]["lifecycle_target"]["stream_id"] == "stream")));
+    assert!(!endpoint.commands.iter().any(|command| matches!(command,
+        Command::Request { payload, .. } if payload["action"] == "start_when_authenticated")));
+}
