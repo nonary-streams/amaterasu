@@ -511,6 +511,12 @@ struct CommandTask {
     observed_exit: bool,
     outcome: Option<CommandFailure>,
     shutdown_deadline: Option<Instant>,
+    #[cfg(test)]
+    fail_next_exit_observation: bool,
+    #[cfg(test)]
+    fail_next_reap_observation: bool,
+    #[cfg(test)]
+    fail_next_stop_observation: bool,
 }
 
 struct TaskSpawnError {
@@ -587,6 +593,12 @@ impl CommandTask {
                 observed_exit: false,
                 outcome: None,
                 shutdown_deadline: None,
+                #[cfg(test)]
+                fail_next_exit_observation: false,
+                #[cfg(test)]
+                fail_next_reap_observation: false,
+                #[cfg(test)]
+                fail_next_stop_observation: false,
             }),
             Err(failure) => Err(TaskSpawnError {
                 task: failure.child.map(|child| {
@@ -598,6 +610,12 @@ impl CommandTask {
                         observed_exit: true,
                         outcome: Some(CommandFailure::spawn(&failure.error)),
                         shutdown_deadline: None,
+                        #[cfg(test)]
+                        fail_next_exit_observation: false,
+                        #[cfg(test)]
+                        fail_next_reap_observation: false,
+                        #[cfg(test)]
+                        fail_next_stop_observation: false,
                     })
                 }),
                 error: failure.error,
@@ -635,6 +653,30 @@ impl CommandTask {
         }
     }
 
+    fn observe_exit(&mut self) -> std::io::Result<bool> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_exit_observation) {
+            return Err(std::io::Error::other("injected exit observation failure"));
+        }
+        self.child.exited()
+    }
+
+    fn observe_retirement(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_reap_observation) {
+            return Err(std::io::Error::other("injected group observation failure"));
+        }
+        self.child.try_reap()
+    }
+
+    fn request_stop(&mut self) -> std::io::Result<bool> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_stop_observation) {
+            return Err(std::io::Error::other("injected stop observation failure"));
+        }
+        self.child.request_stop()
+    }
+
     /// Perform at most one observation or signal for this tick. The owned child
     /// remains in this task until both the root and its contained tree settle.
     fn poll(&mut self, now: Instant) -> CommandPoll {
@@ -645,8 +687,15 @@ impl CommandTask {
                     .unwrap_or(deadline)
             })
         {
-            self.outcome
-                .get_or_insert_with(|| CommandFailure::new(CommandFailureKind::TimedOut));
+            if !self.observed_exit && self.outcome.is_none() {
+                match self.observe_exit() {
+                    Ok(true) => self.observed_exit = true,
+                    Ok(false) => {
+                        self.outcome = Some(CommandFailure::new(CommandFailureKind::TimedOut));
+                    }
+                    Err(error) => return CommandPoll::Blocked(CommandFailure::containment(&error)),
+                }
+            }
             match self.child.force_stop() {
                 Ok(()) => {
                     self.force_requested = true;
@@ -657,7 +706,7 @@ impl CommandTask {
             }
         }
         if !self.observed_exit && self.outcome.is_none() {
-            match self.child.exited() {
+            match self.observe_exit() {
                 Ok(true) => self.observed_exit = true,
                 Ok(false)
                     if self
@@ -673,7 +722,7 @@ impl CommandTask {
             }
         }
         if self.stop_requested_at.is_none() {
-            match self.child.request_stop() {
+            match self.request_stop() {
                 Ok(_) => self.stop_requested_at = Some(now),
                 Err(error) => {
                     return CommandPoll::Blocked(CommandFailure::containment(&error));
@@ -694,7 +743,7 @@ impl CommandTask {
             }
             return CommandPoll::Running;
         }
-        match self.child.try_reap() {
+        match self.observe_retirement() {
             Ok(Some(status)) => {
                 let result = self.outcome.take().map_or_else(
                     || {
@@ -960,7 +1009,9 @@ impl ApplicationLifecycle {
                         return;
                     }
                     CommandPurpose::Undo(index) | CommandPurpose::UndoRetry(index) => {
-                        active.task.cancel();
+                        // Keep the exact command and its native identity. A
+                        // transient observation error does not prove that a
+                        // running undo should be cancelled or repeated.
                         active.purpose = CommandPurpose::UndoRetry(index);
                         self.active = Some(active);
                         self.record_undo_failure(index, failure);
@@ -1184,7 +1235,9 @@ impl ApplicationLifecycle {
                     .at("preparation", self.next_preparation),
             );
         }
-        if let Some(active) = &mut self.active {
+        if let Some(active) = &mut self.active
+            && matches!(active.purpose, CommandPurpose::Preparation(_))
+        {
             active.task.cancel();
         }
         self.cleanup.failures.clear();

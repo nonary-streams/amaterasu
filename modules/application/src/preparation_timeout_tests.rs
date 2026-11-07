@@ -75,6 +75,231 @@ fn settle_cancelled_command(lifecycle: &mut ApplicationLifecycle, now: Instant) 
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn successful_undo_is_not_reexecuted_after_group_observation_failure() {
+    let trace = std::env::temp_dir().join(format!(
+        "amaterasu-undo-group-observation-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&trace);
+    let command: ConfiguredCommand = serde_json::from_value(json!({
+        "executable": std::env::current_exe().unwrap(),
+        "args": ["--exact", "tests::controlled_child", "--ignored"],
+        "environment": {
+            "AMATERASU_TEST_CHILD": "trace",
+            "AMATERASU_TEST_TRACE": trace,
+            "AMATERASU_TEST_EVENT": "undo"
+        },
+        "timeout_ms": 5000
+    }))
+    .unwrap();
+    let step = PreparationStep::Structured(StructuredPreparationStep {
+        run: command.clone(),
+        undo: Some(command),
+    });
+    let mut lifecycle = undo_lifecycle(30, step);
+    let start = Instant::now();
+    lifecycle.start_next_undo(start);
+    lifecycle
+        .active
+        .as_mut()
+        .unwrap()
+        .task
+        .fail_next_reap_observation = true;
+    let deadline = start + Duration::from_secs(5);
+    while !lifecycle.cleanup_failed() {
+        lifecycle.tick(start + Duration::from_secs(2) + start.elapsed());
+        assert!(
+            Instant::now() < deadline,
+            "expected group observation failure"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(lifecycle.active.as_ref().unwrap().task.observed_exit);
+    assert_eq!(std::fs::read_to_string(&trace).unwrap(), "undo\n");
+
+    while !lifecycle.is_cleanup_complete() {
+        if lifecycle.cleanup_failed() {
+            lifecycle.retry_cleanup();
+        }
+        lifecycle.tick(start + Duration::from_secs(2) + start.elapsed());
+        assert!(Instant::now() < deadline, "cleanup did not complete");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(std::fs::read_to_string(&trace).unwrap(), "undo\n");
+    std::fs::remove_file(trace).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn successful_undo_is_not_reexecuted_after_exit_observation_failure() {
+    let trace = std::env::temp_dir().join(format!(
+        "amaterasu-undo-exit-observation-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&trace);
+    let command: ConfiguredCommand = serde_json::from_value(json!({
+        "executable": std::env::current_exe().unwrap(),
+        "args": ["--exact", "tests::controlled_child", "--ignored"],
+        "environment": {
+            "AMATERASU_TEST_CHILD": "trace",
+            "AMATERASU_TEST_TRACE": trace,
+            "AMATERASU_TEST_EVENT": "undo"
+        },
+        "timeout_ms": 5000
+    }))
+    .unwrap();
+    let step = PreparationStep::Structured(StructuredPreparationStep {
+        run: command.clone(),
+        undo: Some(command),
+    });
+    let mut lifecycle = undo_lifecycle(30, step);
+    let start = Instant::now();
+    let deadline = start + Duration::from_secs(5);
+    lifecycle.start_next_undo(start);
+    // WNOWAIT checks the real child's exit without consuming the identity that
+    // the lifecycle must retain through process-group retirement.
+    while !lifecycle
+        .active
+        .as_mut()
+        .unwrap()
+        .task
+        .child
+        .exited()
+        .unwrap()
+    {
+        assert!(Instant::now() < deadline, "undo child did not exit");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    lifecycle
+        .active
+        .as_mut()
+        .unwrap()
+        .task
+        .fail_next_exit_observation = true;
+    lifecycle.tick(start + Duration::from_secs(2));
+    assert!(lifecycle.cleanup_failed());
+    assert!(!lifecycle.active.as_ref().unwrap().task.observed_exit);
+    // Resume at the shutdown force cutoff: an already exited child must be
+    // observed before assigning a timeout to the command.
+    lifecycle.prepare_shutdown(start + Duration::from_secs(4));
+    while !lifecycle.is_cleanup_complete() {
+        if lifecycle.cleanup_failed() {
+            lifecycle.retry_cleanup();
+        }
+        lifecycle.tick(start + Duration::from_secs(2) + start.elapsed());
+        assert!(Instant::now() < deadline, "cleanup did not complete");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(std::fs::read_to_string(&trace).unwrap(), "undo\n");
+    std::fs::remove_file(trace).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn successful_undo_keeps_its_exit_across_shutdown_force_cutoff() {
+    let trace = std::env::temp_dir().join(format!(
+        "amaterasu-undo-stop-observation-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&trace);
+    let command: ConfiguredCommand = serde_json::from_value(json!({
+        "executable": std::env::current_exe().unwrap(),
+        "args": ["--exact", "tests::controlled_child", "--ignored"],
+        "environment": {
+            "AMATERASU_TEST_CHILD": "trace",
+            "AMATERASU_TEST_TRACE": trace,
+            "AMATERASU_TEST_EVENT": "undo"
+        },
+        "timeout_ms": 5000
+    }))
+    .unwrap();
+    let step = PreparationStep::Structured(StructuredPreparationStep {
+        run: command.clone(),
+        undo: Some(command),
+    });
+    let mut lifecycle = undo_lifecycle(30, step);
+    let start = Instant::now();
+    let deadline = start + Duration::from_secs(5);
+    lifecycle.start_next_undo(start);
+    lifecycle
+        .active
+        .as_mut()
+        .unwrap()
+        .task
+        .fail_next_stop_observation = true;
+    while !lifecycle.cleanup_failed() {
+        lifecycle.tick(start + start.elapsed());
+        assert!(
+            Instant::now() < deadline,
+            "expected stop observation failure"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(lifecycle.active.as_ref().unwrap().task.observed_exit);
+    lifecycle.prepare_shutdown(start + Duration::from_secs(4));
+    while !lifecycle.is_cleanup_complete() {
+        if lifecycle.cleanup_failed() {
+            lifecycle.retry_cleanup();
+        }
+        lifecycle.tick(start + Duration::from_secs(2) + start.elapsed());
+        assert!(Instant::now() < deadline, "cleanup did not complete");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(std::fs::read_to_string(&trace).unwrap(), "undo\n");
+    std::fs::remove_file(trace).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn observation_failure_keeps_a_running_undo_until_it_finishes() {
+    let trace = std::env::temp_dir().join(format!("amaterasu-undo-running-{}", std::process::id()));
+    let release = trace.with_extension("release");
+    let _ = std::fs::remove_file(&trace);
+    let _ = std::fs::remove_file(&release);
+    let command: ConfiguredCommand = serde_json::from_value(json!({
+        "executable": "/bin/sh",
+        "args": ["-c", "printf 'undo\\n' >> \"$1\"; while [ ! -e \"$2\" ]; do /bin/sleep 0.01; done", "test-undo", trace, release],
+        "environment": {},
+        "timeout_ms": 5000
+    })).unwrap();
+    let step = PreparationStep::Structured(StructuredPreparationStep {
+        run: command.clone(),
+        undo: Some(command),
+    });
+    let mut lifecycle = undo_lifecycle(30, step);
+    let start = Instant::now();
+    let deadline = start + Duration::from_secs(5);
+    lifecycle.start_next_undo(start);
+    while !trace.exists() {
+        assert!(Instant::now() < deadline, "undo did not start");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    lifecycle
+        .active
+        .as_mut()
+        .unwrap()
+        .task
+        .fail_next_exit_observation = true;
+    lifecycle.tick(start);
+    assert!(lifecycle.cleanup_failed());
+    lifecycle.tick(start);
+    assert!(lifecycle.active.as_ref().unwrap().task.outcome.is_none());
+    std::fs::write(&release, b"continue").unwrap();
+    while !lifecycle.is_cleanup_complete() {
+        if lifecycle.cleanup_failed() {
+            lifecycle.retry_cleanup();
+        }
+        lifecycle.tick(start + Duration::from_secs(2) + start.elapsed());
+        assert!(Instant::now() < deadline, "cleanup did not complete");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(std::fs::read_to_string(&trace).unwrap(), "undo\n");
+    std::fs::remove_file(trace).unwrap();
+    std::fs::remove_file(release).unwrap();
+}
+
 #[test]
 fn raw_undo_uses_the_exit_policy_minimum_and_remains_owned_at_timeout() {
     for exit_timeout_seconds in [0, 10, 16, 300] {
