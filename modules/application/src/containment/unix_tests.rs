@@ -135,16 +135,82 @@ fn malformed_process_stat_cannot_prove_group_retirement() {
 #[test]
 #[cfg(target_os = "linux")]
 fn group_retirement_distinguishes_live_members_from_exited_and_other_groups() {
-    let live_member = |stat| {
-        LinuxProcessStat::parse(stat)
-            .unwrap()
-            .is_live_group_member(42)
+    let scan = |stat| {
+        scan_group(
+            "9 (self) S 1 7",
+            "NStgid:\t9\n",
+            &[(42, "42 (leader) Z 1 42"), (123, stat)],
+        )
+        .unwrap()
     };
-    assert!(live_member("123 (command with ) spaces) S 1 42"));
-    assert!(!live_member("123 (command) Z 1 42"));
-    assert!(!live_member("123 (command) X 1 42"));
-    assert!(!live_member("123 (command) x 1 42"));
-    assert!(!live_member("123 (command) S 1 99"));
+    assert!(scan("123 (command with ) spaces) S 1 42"));
+    assert!(!scan("123 (command) Z 1 42"));
+    assert!(!scan("123 (command) X 1 42"));
+    assert!(!scan("123 (command) x 1 42"));
+    assert!(!scan("123 (command) S 1 99"));
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn zombie_group_leader_with_live_sibling_is_not_retired() {
+    let processes = [
+        (42, "42 (held leader) Z 1 42"),
+        (43, "43 (descendant) Z 1 42"),
+    ];
+    let scan = |sibling_live: bool| {
+        linux_group_has_live_members_from_stats(
+            42,
+            9,
+            "9 (self) S 1 7",
+            "NStgid:\t9\n",
+            processes
+                .iter()
+                .map(|(pid, stat)| Ok(Some((*pid, (*stat).to_owned())))),
+            |pid| Ok(pid != 43 || !sibling_live),
+        )
+    };
+    assert!(scan(true).unwrap());
+    assert!(!scan(false).unwrap());
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn failed_pidfd_observation_cannot_prove_retirement() {
+    let entries = [
+        Ok(Some((42, "42 (held leader) Z 1 42".to_owned()))),
+        Ok(Some((43, "43 (descendant) Z 1 42".to_owned()))),
+    ];
+    let error = linux_group_has_live_members_from_stats(
+        42,
+        9,
+        "9 (self) S 1 7",
+        "NStgid:\t9\n",
+        entries,
+        |pid| {
+            if pid == 42 {
+                Ok(true)
+            } else {
+                Err(io::Error::from_raw_os_error(libc::ENOSYS))
+            }
+        },
+    )
+    .expect_err("unavailable pidfd observation cannot prove group retirement");
+    assert_eq!(error.raw_os_error(), Some(libc::ENOSYS));
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn invalid_pidfd_poll_events_cannot_prove_retirement() {
+    assert!(linux_pidfd_revents(libc::POLLIN).unwrap());
+    assert!(linux_pidfd_revents(libc::POLLHUP).unwrap());
+    for event in [
+        0,
+        libc::POLLERR,
+        libc::POLLNVAL,
+        libc::POLLIN | libc::POLLERR,
+    ] {
+        assert!(linux_pidfd_revents(event).is_err());
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -157,6 +223,7 @@ fn scan_group(self_stat: &str, self_status: &str, processes: &[(u32, &str)]) -> 
         processes
             .iter()
             .map(|(process_id, stat)| Ok(Some((*process_id, (*stat).to_owned())))),
+        |_| Ok(true),
     )
 }
 
@@ -249,7 +316,14 @@ fn complete_local_proc_view_can_distinguish_retired_and_live_groups() {
 fn vanished_proc_stat_is_skipped_but_cannot_replace_the_held_leader() {
     let read = |pid, result| linux_process_stat_from_read(pid, result);
     let scan = |entries: Vec<io::Result<Option<(u32, String)>>>| {
-        linux_group_has_live_members_from_stats(42, 9, "9 (self) S 1 7", "NStgid:\t9\n", entries)
+        linux_group_has_live_members_from_stats(
+            42,
+            9,
+            "9 (self) S 1 7",
+            "NStgid:\t9\n",
+            entries,
+            |_| Ok(true),
+        )
     };
     let leader = || read(42, Ok("42 (held leader) Z 1 42".to_owned()));
     for errno in [libc::ENOENT, libc::ESRCH] {

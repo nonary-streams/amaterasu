@@ -2,6 +2,14 @@ use std::io;
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, ExitStatus};
 
+#[cfg(target_os = "linux")]
+#[path = "unix_proc_view.rs"]
+mod unix_proc_view;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "unix_pidfd_tests.rs"]
+mod pidfd_tests;
+
 pub(crate) struct ContainedChild {
     child: Child,
     force_requested: bool,
@@ -205,29 +213,25 @@ impl DetachedChild {
 
 #[cfg(target_os = "linux")]
 fn linux_group_has_live_members(group_id: u32) -> io::Result<bool> {
-    let self_stat = std::fs::read_to_string("/proc/self/stat")?;
-    let self_status = std::fs::read_to_string("/proc/self/status")?;
-    let processes = std::fs::read_dir("/proc")?.map(|entry| {
-        let entry = entry?;
-        let Some(process_id) = entry
-            .file_name()
-            .to_str()
-            .and_then(|name| name.parse::<u32>().ok())
-        else {
-            return Ok(None);
-        };
-        linux_process_stat_from_read(
-            process_id,
-            std::fs::read_to_string(entry.path().join("stat")),
-        )
-    });
-    linux_group_has_live_members_from_stats(
+    let view = unix_proc_view::ProcView::open()?;
+    let self_stat = view.self_stat()?;
+    let self_status = view.self_status()?;
+    let processes = view
+        .process_ids()?
+        .into_iter()
+        .map(|process_id| linux_process_stat_from_read(process_id, view.process_stat(process_id)));
+    let live = linux_group_has_live_members_from_stats(
         group_id,
         std::process::id(),
         &self_stat,
         &self_status,
         processes,
-    )
+        linux_process_has_exited,
+    )?;
+    // A scan may establish absence only while its descriptor-rooted proc view
+    // remains the same unrestricted mount. A changed view is inconclusive.
+    view.finish()?;
+    Ok(live)
 }
 
 #[cfg(target_os = "linux")]
@@ -259,6 +263,7 @@ fn linux_group_has_live_members_from_stats(
     self_stat: &str,
     self_status: &str,
     processes: impl IntoIterator<Item = io::Result<Option<(u32, String)>>>,
+    mut process_has_exited: impl FnMut(u32) -> io::Result<bool>,
 ) -> io::Result<bool> {
     const MAX_PROCESS_SCAN: usize = 131_072;
 
@@ -287,8 +292,13 @@ fn linux_group_has_live_members_from_stats(
             }
             leader_seen = true;
         }
-        if process.is_live_group_member(group_id) {
-            return Ok(true);
+        if process.process_group == group_id {
+            // A zombie thread-group leader can still have a running sibling.
+            // pidfd readiness reports exit of the entire group, including an
+            // execing sibling that replaces its leader during observation.
+            if process.live || !process_has_exited(process_id)? {
+                return Ok(true);
+            }
         }
     }
     // WNOWAIT still owns the unreaped group leader. A scan that omits it is
@@ -385,10 +395,51 @@ impl LinuxProcessStat {
             live: !matches!(state, "Z" | "X" | "x"),
         })
     }
+}
 
-    fn is_live_group_member(&self, group_id: u32) -> bool {
-        self.process_group == group_id && self.live
+#[cfg(target_os = "linux")]
+fn linux_process_has_exited(process_id: u32) -> io::Result<bool> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    // pidfd_open needs no parentage and pins the observed process identity.
+    // A PID can be reused only after the previously observed process has gone.
+    // SAFETY: pidfd_open takes a numeric PID and zero flags; it retains no pointers.
+    let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, process_id, 0) };
+    if descriptor < 0 {
+        let error = io::Error::last_os_error();
+        return if error.raw_os_error() == Some(libc::ESRCH) {
+            Ok(true)
+        } else {
+            Err(error)
+        };
     }
+    // SAFETY: pidfd_open returned a new owned file descriptor on success.
+    let descriptor = unsafe { OwnedFd::from_raw_fd(descriptor as i32) };
+    let mut event = libc::pollfd {
+        fd: descriptor.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: event is valid writable storage for one pollfd; timeout is zero.
+    let result = unsafe { libc::poll(&mut event, 1, 0) };
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if result == 0 {
+        return Ok(false);
+    }
+    linux_pidfd_revents(event.revents)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_pidfd_revents(revents: i16) -> io::Result<bool> {
+    if revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+        return Err(io::Error::other("pidfd process-exit observation failed"));
+    }
+    if revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+        return Ok(true);
+    }
+    Err(io::Error::other("pidfd process-exit observation failed"))
 }
 
 #[cfg(target_os = "macos")]
