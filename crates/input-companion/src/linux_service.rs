@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -28,6 +28,8 @@ use std::time::{Duration, Instant};
 
 const MAX_CONNECTIONS: usize = 8;
 const MAX_FRAME_BYTES: usize = 64 * 1024;
+const IO_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const FRAME_DEADLINE: Duration = Duration::from_secs(2);
 const MAX_SCROLL_DELTA: i32 = 12_000;
 const EV_SYN: u16 = 0;
 const EV_KEY: u16 = 1;
@@ -442,7 +444,10 @@ fn serve(
             let mut active_workers = Vec::with_capacity(workers.len());
             for worker in workers.drain(..) {
                 if worker.is_finished() {
-                    let _ = worker.join();
+                    if worker.join().is_err() {
+                        cleanup_failed.store(true, Ordering::Release);
+                        stop.store(true, Ordering::Release);
+                    }
                 } else {
                     active_workers.push(worker);
                 }
@@ -456,12 +461,15 @@ fn serve(
                     let path = uinput_path.to_path_buf();
                     let count = Arc::clone(&count);
                     workers.push(std::thread::spawn(move || {
-                        if let Err(error) =
-                            serve_worker(stream, &path, ledger, stop, cleanup_failed)
-                        {
-                            eprintln!("input companion worker ended: {error:?}");
-                        }
-                        count.fetch_sub(1, Ordering::AcqRel);
+                        run_guarded_worker(&count, &stop, &cleanup_failed, || {
+                            serve_worker(
+                                stream,
+                                &path,
+                                ledger,
+                                Arc::clone(&stop),
+                                Arc::clone(&cleanup_failed),
+                            )
+                        });
                     }));
                 }
                 Ok((_stream, _)) => {
@@ -476,13 +484,42 @@ fn serve(
         Ok(())
     })();
     stop.store(true, Ordering::Release);
-    for worker in workers {
-        worker.join().map_err(|_| InputError::Device)?;
-    }
+    join_workers(workers)?;
     if cleanup_failed.load(Ordering::Acquire) {
         return Err(InputError::Device);
     }
     result
+}
+
+fn run_guarded_worker(
+    count: &AtomicUsize,
+    stop: &AtomicBool,
+    cleanup_failed: &AtomicBool,
+    worker: impl FnOnce() -> InputResult<()>,
+) {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(worker));
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => eprintln!("input companion worker ended: {error:?}"),
+        Err(_) => {
+            cleanup_failed.store(true, Ordering::Release);
+            stop.store(true, Ordering::Release);
+            eprintln!("input companion worker panicked; cleanup is unconfirmed");
+        }
+    }
+    count.fetch_sub(1, Ordering::AcqRel);
+}
+
+fn join_workers(workers: Vec<JoinHandle<()>>) -> InputResult<()> {
+    let mut failed = false;
+    for worker in workers {
+        failed |= worker.join().is_err();
+    }
+    if failed {
+        Err(InputError::Device)
+    } else {
+        Ok(())
+    }
 }
 
 fn serve_worker(
@@ -498,18 +535,16 @@ fn serve_worker(
         .map_err(|_| InputError::Closed)?
         .may_open(&process, Instant::now())
     {
-        write_reply_to(&stream, &Reply::Denied)?;
+        write_reply_to(&stream, &Reply::Denied, &stop)?;
         return Err(InputError::PermissionDenied);
     }
     let mut reader = BufReader::new(stream);
-    let Some(frame) = read_frame_timeout(&mut reader, Duration::from_secs(2))? else {
-        return Err(InputError::Closed);
-    };
+    let frame = read_start_frame(&mut reader, &stop, Instant::now() + FRAME_DEADLINE)?;
     if !matches!(
         serde_json::from_slice::<Request>(&frame),
         Ok(Request::Start)
     ) {
-        write_reply_to(reader.get_ref(), &Reply::Denied)?;
+        write_reply_to(reader.get_ref(), &Reply::Denied, &stop)?;
         return Err(InputError::PermissionDenied);
     }
     let lease = ledger
@@ -528,11 +563,11 @@ fn serve_worker(
                 .lock()
                 .map_err(|_| InputError::Closed)?
                 .release_lease(&process, generation, &token);
-            write_reply_to(reader.get_ref(), &Reply::Denied)?;
+            write_reply_to(reader.get_ref(), &Reply::Denied, &stop)?;
             return Err(error);
         }
     };
-    let mut session = match InputSession::connect(&lease.peer, lease.grant, sink, Instant::now()) {
+    let session = match InputSession::connect(&lease.peer, lease.grant, sink, Instant::now()) {
         Ok(session) => session,
         Err(error) => {
             ledger
@@ -542,36 +577,86 @@ fn serve_worker(
             return Err(error);
         }
     };
-    if let Err(error) = write_reply_to(
-        reader.get_ref(),
-        &Reply::Granted {
-            generation: lease.generation,
-            token: lease.token,
-            gamepad,
-        },
-    ) {
-        let cleanup = session.revoke();
-        if session.cleanup_required() {
-            cleanup_failed.store(true, Ordering::Release);
-            stop.store(true, Ordering::Release);
-        } else {
-            ledger
-                .lock()
-                .map_err(|_| InputError::Closed)?
-                .release_lease(&process, generation, &token);
-        }
-        cleanup?;
-        return Err(error);
-    }
-    let result = run_worker(
+    serve_session(
         &mut reader,
         &process,
         generation,
-        &token,
+        token,
+        gamepad,
         &ledger,
-        &mut session,
+        session,
         &stop,
-    );
+        &cleanup_failed,
+    )
+}
+
+fn read_start_frame(
+    reader: &mut BufReader<UnixStream>,
+    stop: &AtomicBool,
+    deadline: Instant,
+) -> InputResult<Vec<u8>> {
+    let mut frames = FrameReader::new();
+    loop {
+        if stop.load(Ordering::Acquire) {
+            return Err(InputError::Closed);
+        }
+        if Instant::now() >= deadline {
+            return Err(InputError::Expired);
+        }
+        let frame = frames.read(reader, stop)?;
+        if stop.load(Ordering::Acquire) {
+            return Err(InputError::Closed);
+        }
+        if Instant::now() >= deadline {
+            return Err(InputError::Expired);
+        }
+        if let Some(frame) = frame {
+            return Ok(frame);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn serve_session<S: DeviceSink>(
+    reader: &mut BufReader<UnixStream>,
+    process: &ProcessIdentity,
+    generation: u64,
+    token: String,
+    gamepad: bool,
+    ledger: &Arc<Mutex<PermitLedger>>,
+    mut session: InputSession<S>,
+    stop: &AtomicBool,
+    cleanup_failed: &AtomicBool,
+) -> InputResult<()> {
+    let authorized = !stop.load(Ordering::Acquire)
+        && inspect_process(process.process_id).is_ok_and(|current| &current == process)
+        && ledger.lock().is_ok_and(|ledger| {
+            ledger.is_current_lease(process, generation, &token, Instant::now())
+        });
+    let result = if authorized {
+        write_reply_to(
+            reader.get_ref(),
+            &Reply::Granted {
+                generation,
+                token: token.clone(),
+                gamepad,
+            },
+            stop,
+        )
+        .and_then(|()| {
+            run_worker(
+                reader,
+                process,
+                generation,
+                &token,
+                ledger,
+                &mut session,
+                stop,
+            )
+        })
+    } else {
+        Err(InputError::PermissionDenied)
+    };
     let cleanup = session.revoke();
     if session.cleanup_required() {
         cleanup_failed.store(true, Ordering::Release);
@@ -580,7 +665,7 @@ fn serve_worker(
         ledger
             .lock()
             .map_err(|_| InputError::Closed)?
-            .release_lease(&process, generation, &token);
+            .release_lease(process, generation, &token);
     }
     cleanup?;
     result
@@ -597,8 +682,9 @@ fn run_worker<S: DeviceSink>(
 ) -> InputResult<()> {
     reader
         .get_ref()
-        .set_read_timeout(Some(Duration::from_millis(50)))
+        .set_read_timeout(Some(IO_POLL_INTERVAL))
         .map_err(system_error)?;
+    let mut frames = FrameReader::new();
     while !stop.load(Ordering::Acquire) {
         if &inspect_process(process.process_id)? != process
             || !ledger
@@ -606,7 +692,7 @@ fn run_worker<S: DeviceSink>(
                 .map_err(|_| InputError::Closed)?
                 .is_current_lease(process, worker_generation, worker_token, Instant::now())
         {
-            write_reply_to(reader.get_ref(), &Reply::Denied)?;
+            write_reply_to(reader.get_ref(), &Reply::Denied, stop)?;
             break;
         }
         let now = Instant::now();
@@ -614,13 +700,16 @@ fn run_worker<S: DeviceSink>(
         if session.poll_expiry(now)? {
             break;
         }
-        let Some(frame) = read_frame(reader)? else {
+        let Some(frame) = frames.read(reader, stop)? else {
             continue;
         };
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
         // SO_PEERCRED is pinned to the connection. Re-inspecting PID starttime
         // for every frame rejects PID reuse and dead/disconnected workers.
         if &peer_process(reader.get_ref())? != process {
-            write_reply_to(reader.get_ref(), &Reply::Denied)?;
+            write_reply_to(reader.get_ref(), &Reply::Denied, stop)?;
             break;
         }
         match serde_json::from_slice::<Request>(&frame) {
@@ -635,7 +724,7 @@ fn run_worker<S: DeviceSink>(
                     Instant::now(),
                 ) {
                     drop(permit);
-                    write_reply_to(reader.get_ref(), &Reply::Denied)?;
+                    write_reply_to(reader.get_ref(), &Reply::Denied, stop)?;
                     break;
                 }
                 let accepted = session.submit(&packet, Instant::now()).is_ok();
@@ -643,6 +732,7 @@ fn run_worker<S: DeviceSink>(
                 write_reply_to(
                     reader.get_ref(),
                     if accepted { &Reply::Ok } else { &Reply::Denied },
+                    stop,
                 )?;
                 if !accepted {
                     break;
@@ -650,7 +740,7 @@ fn run_worker<S: DeviceSink>(
             }
             Ok(Request::Close) => {
                 session.revoke()?;
-                write_reply_to(reader.get_ref(), &Reply::Ok)?;
+                write_reply_to(reader.get_ref(), &Reply::Ok, stop)?;
                 break;
             }
             Ok(Request::FeedbackPoll { generation, token }) => {
@@ -662,15 +752,15 @@ fn run_worker<S: DeviceSink>(
                     Instant::now(),
                 ) {
                     drop(permit);
-                    write_reply_to(reader.get_ref(), &Reply::Denied)?;
+                    write_reply_to(reader.get_ref(), &Reply::Denied, stop)?;
                     break;
                 }
                 let event = session.poll_gamepad_feedback(generation, &token)?;
                 drop(permit);
-                write_reply_to(reader.get_ref(), &Reply::Feedback { event })?;
+                write_reply_to(reader.get_ref(), &Reply::Feedback { event }, stop)?;
             }
             _ => {
-                write_reply_to(reader.get_ref(), &Reply::Denied)?;
+                write_reply_to(reader.get_ref(), &Reply::Denied, stop)?;
                 break;
             }
         }
@@ -1665,46 +1755,137 @@ fn validate_uinput_access(path: &Path) -> InputResult<()> {
     Ok(())
 }
 
-fn read_frame(reader: &mut BufReader<UnixStream>) -> InputResult<Option<Vec<u8>>> {
-    read_frame_timeout(reader, Duration::from_millis(50))
+struct FrameReader {
+    partial: Vec<u8>,
+    deadline: Option<Instant>,
 }
 
-fn read_frame_timeout(
-    reader: &mut BufReader<UnixStream>,
-    timeout: Duration,
-) -> InputResult<Option<Vec<u8>>> {
-    reader
-        .get_ref()
-        .set_read_timeout(Some(timeout))
-        .map_err(system_error)?;
-    let mut frame = Vec::new();
-    match reader.read_until(b'\n', &mut frame) {
-        Ok(0) => Err(InputError::Closed),
-        Ok(length) if length <= MAX_FRAME_BYTES && frame.last() == Some(&b'\n') => {
-            frame.pop();
-            Ok(Some(frame))
+impl FrameReader {
+    fn new() -> Self {
+        Self {
+            partial: Vec::new(),
+            deadline: None,
         }
-        Ok(_) => Err(InputError::InvalidEvent),
-        Err(error)
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-            ) && frame.is_empty() =>
+    }
+
+    // Consume at most one buffered chunk per turn, so a continuously writing
+    // peer cannot suppress permit, process, and shutdown checks.
+    fn read(
+        &mut self,
+        reader: &mut BufReader<UnixStream>,
+        stop: &AtomicBool,
+    ) -> InputResult<Option<Vec<u8>>> {
+        if stop.load(Ordering::Acquire) {
+            return Err(InputError::Closed);
+        }
+        if self
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
         {
-            Ok(None)
+            return Err(InputError::Expired);
         }
-        Err(error) => Err(system_error(error)),
+        reader
+            .get_ref()
+            .set_read_timeout(Some(IO_POLL_INTERVAL))
+            .map_err(system_error)?;
+        let available = match reader.fill_buf() {
+            Ok([]) => return Err(InputError::Closed),
+            Ok(bytes) => bytes,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(system_error(error)),
+        };
+        if stop.load(Ordering::Acquire) {
+            return Err(InputError::Closed);
+        }
+        if self
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return Err(InputError::Expired);
+        }
+        self.deadline
+            .get_or_insert_with(|| Instant::now() + FRAME_DEADLINE);
+        let length = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |index| index + 1);
+        if self.partial.len() + length > MAX_FRAME_BYTES {
+            return Err(InputError::InvalidEvent);
+        }
+        let complete = available[length - 1] == b'\n';
+        self.partial.extend_from_slice(&available[..length]);
+        reader.consume(length);
+        if complete {
+            self.partial.pop();
+            self.deadline = None;
+            return Ok(Some(std::mem::take(&mut self.partial)));
+        }
+        Ok(None)
     }
 }
 
-fn write_reply_to(stream: &UnixStream, reply: &Reply) -> InputResult<()> {
-    let bytes = serde_json::to_vec(reply).map_err(|_| InputError::InvalidEvent)?;
-    if bytes.len() > MAX_FRAME_BYTES {
+fn write_reply_to(stream: &UnixStream, reply: &Reply, stop: &AtomicBool) -> InputResult<()> {
+    let mut bytes = serde_json::to_vec(reply).map_err(|_| InputError::InvalidEvent)?;
+    if bytes.len() + 1 > MAX_FRAME_BYTES {
         return Err(InputError::InvalidEvent);
     }
-    let mut writer = stream;
-    writer.write_all(&bytes).map_err(system_error)?;
-    writer.write_all(b"\n").map_err(system_error)
+    bytes.push(b'\n');
+    let deadline = Instant::now() + IO_POLL_INTERVAL;
+    let mut written = 0;
+    while written < bytes.len() {
+        if stop.load(Ordering::Acquire) {
+            return Err(InputError::Closed);
+        }
+        if Instant::now() >= deadline {
+            return Err(InputError::Expired);
+        }
+        // SAFETY: the borrowed slice remains valid for this synchronous send;
+        // DONTWAIT bounds it and NOSIGNAL prevents a disconnected peer's SIGPIPE.
+        let result = unsafe {
+            libc::send(
+                stream.as_raw_fd(),
+                bytes[written..].as_ptr().cast(),
+                bytes.len() - written,
+                libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+            )
+        };
+        if result > 0 {
+            written += result as usize;
+            continue;
+        }
+        if result == 0 {
+            return Err(InputError::Closed);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        if error.kind() != std::io::ErrorKind::WouldBlock {
+            return Err(system_error(error));
+        }
+        let mut descriptor = libc::pollfd {
+            fd: stream.as_raw_fd(),
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        let millis = deadline
+            .saturating_duration_since(Instant::now())
+            .as_millis()
+            .clamp(1, 10) as i32;
+        // SAFETY: descriptor is initialized and lives through this bounded poll.
+        let result = unsafe { libc::poll(&mut descriptor, 1, millis) };
+        if result < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return Err(system_error(std::io::Error::last_os_error()));
+        }
+    }
+    Ok(())
 }
 
 fn set_bit(fd: RawFd, request: libc::Ioctl, bit: u32) -> InputResult<()> {
@@ -1758,6 +1939,7 @@ fn button_code(button: MouseButton) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
     use std::sync::atomic::AtomicUsize;
 
     fn socket_test_directory() -> PathBuf {
@@ -1805,6 +1987,69 @@ mod tests {
             listener_exit_diagnostic(Ok(Err(InputError::Device))).as_deref(),
             Some("input companion listener ended: Device")
         );
+    }
+
+    #[test]
+    fn worker_panic_fences_service_and_all_worker_handles_are_joined() {
+        let count = AtomicUsize::new(1);
+        let stop = AtomicBool::new(false);
+        let failed = AtomicBool::new(false);
+        run_guarded_worker(&count, &stop, &failed, || {
+            panic!("synthetic worker failure")
+        });
+        assert_eq!(count.load(Ordering::Acquire), 0);
+        assert!(stop.load(Ordering::Acquire));
+        assert!(failed.load(Ordering::Acquire));
+
+        let retired = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&retired);
+        let first = std::thread::spawn(|| panic!("synthetic join failure"));
+        while !first.is_finished() {
+            std::thread::yield_now();
+        }
+        let (release, wait_for_release) = std::sync::mpsc::channel();
+        let (started, second_started) = std::sync::mpsc::channel();
+        let second = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            wait_for_release.recv().unwrap();
+            observed.store(true, Ordering::Release);
+        });
+        second_started.recv().unwrap();
+        let (joined, join_result) = std::sync::mpsc::channel();
+        let joiner =
+            std::thread::spawn(move || joined.send(join_workers(vec![first, second])).unwrap());
+        let early = join_result.recv_timeout(Duration::from_millis(50));
+        release.send(()).unwrap();
+        let final_result = match early {
+            Ok(result) => result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => join_result.recv().unwrap(),
+            Err(error) => panic!("joiner disappeared: {error}"),
+        };
+        joiner.join().unwrap();
+        assert!(matches!(
+            early,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert_eq!(final_result, Err(InputError::Device));
+        assert!(retired.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn start_frame_arriving_after_absolute_deadline_is_rejected() {
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let deadline = Instant::now() + Duration::from_millis(30);
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(
+                deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(1),
+            );
+            client.write_all(b"{\"kind\":\"worker_start\"}\n").unwrap();
+        });
+        let mut reader = BufReader::new(server);
+        assert_eq!(
+            read_start_frame(&mut reader, &AtomicBool::new(false), deadline),
+            Err(InputError::Expired)
+        );
+        writer.join().unwrap();
     }
 
     #[test]
@@ -1986,9 +2231,274 @@ mod tests {
         let mut reader = BufReader::new(server);
 
         assert_eq!(
-            read_frame_timeout(&mut reader, Duration::from_millis(50)),
+            FrameReader::new().read(&mut reader, &AtomicBool::new(false)),
             Err(InputError::Closed)
         );
+    }
+
+    #[test]
+    fn partial_frames_survive_poll_timeouts_and_stop_is_checked() {
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let mut reader = BufReader::new(server);
+        let stop = AtomicBool::new(false);
+        let mut frames = FrameReader::new();
+        client.write_all(b"{\"kind\":").unwrap();
+        assert_eq!(frames.read(&mut reader, &stop), Ok(None));
+        assert_eq!(frames.read(&mut reader, &stop), Ok(None));
+        client.write_all(b"\"worker_close\"}\nnext\n").unwrap();
+        assert_eq!(
+            frames.read(&mut reader, &stop),
+            Ok(Some(b"{\"kind\":\"worker_close\"}".to_vec()))
+        );
+        assert_eq!(frames.read(&mut reader, &stop), Ok(Some(b"next".to_vec())));
+        client.write_all(b"partial").unwrap();
+        assert_eq!(frames.read(&mut reader, &stop), Ok(None));
+        stop.store(true, Ordering::Release);
+        assert_eq!(frames.read(&mut reader, &stop), Err(InputError::Closed));
+    }
+
+    #[test]
+    fn partial_frames_obey_absolute_deadline_and_storage_limit() {
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let mut reader = BufReader::new(server);
+        let stop = AtomicBool::new(false);
+        let mut frames = FrameReader::new();
+        client.write_all(b"partial").unwrap();
+        assert_eq!(frames.read(&mut reader, &stop), Ok(None));
+        frames.deadline = Some(Instant::now());
+        client.write_all(b"more").unwrap();
+        assert_eq!(frames.read(&mut reader, &stop), Err(InputError::Expired));
+
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let mut reader = BufReader::new(server);
+        let writer = std::thread::spawn(move || client.write_all(&vec![b'x'; MAX_FRAME_BYTES + 1]));
+        let mut frames = FrameReader::new();
+        loop {
+            match frames.read(&mut reader, &stop) {
+                Ok(None) => assert!(frames.partial.len() <= MAX_FRAME_BYTES),
+                result => {
+                    assert_eq!(result, Err(InputError::InvalidEvent));
+                    break;
+                }
+            }
+        }
+        drop(reader);
+        let _ = writer.join().unwrap();
+    }
+
+    #[derive(Default)]
+    struct ObservedDevice {
+        events: Vec<InputEvent>,
+        releases: usize,
+    }
+
+    struct TestSink(Arc<Mutex<ObservedDevice>>);
+    impl DeviceSink for TestSink {
+        fn submit(&mut self, event: &InputEvent) -> InputResult<()> {
+            self.0.lock().unwrap().events.push(event.clone());
+            Ok(())
+        }
+        fn release_all(&mut self) -> InputResult<()> {
+            self.0.lock().unwrap().releases += 1;
+            Ok(())
+        }
+    }
+
+    fn fill_socket(stream: &UnixStream) {
+        let bytes = [b'x'; 4096];
+        loop {
+            // SAFETY: the slice is valid for this nonblocking send.
+            let result = unsafe {
+                libc::send(
+                    stream.as_raw_fd(),
+                    bytes.as_ptr().cast(),
+                    bytes.len(),
+                    libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+                )
+            };
+            if result < 0 {
+                assert_eq!(
+                    std::io::Error::last_os_error().kind(),
+                    std::io::ErrorKind::WouldBlock
+                );
+                break;
+            }
+            assert!(result > 0);
+        }
+    }
+
+    type SessionFixture = (
+        ProcessIdentity,
+        Arc<Mutex<PermitLedger>>,
+        u64,
+        String,
+        InputSession<TestSink>,
+        Arc<Mutex<ObservedDevice>>,
+    );
+
+    fn session_fixture(stream: &UnixStream) -> SessionFixture {
+        let process = peer_process(stream).unwrap();
+        let now = Instant::now();
+        let mut ledger = PermitLedger::new(GrantRegistry::independent_devices());
+        ledger
+            .refresh_from_host_with_gamepad(process.clone(), "a".repeat(64), true, true, true, now)
+            .unwrap();
+        let lease = ledger.claim(&process, now).unwrap();
+        let device = Arc::new(Mutex::new(ObservedDevice::default()));
+        let mut session =
+            InputSession::connect(&lease.peer, lease.grant, TestSink(Arc::clone(&device)), now)
+                .unwrap();
+        session
+            .submit(
+                &InputPacket {
+                    version: crate::PROTOCOL_VERSION,
+                    generation: lease.generation,
+                    sequence: 1,
+                    lease_token: lease.token.clone(),
+                    event: InputEvent::EvdevKey {
+                        code: 30,
+                        pressed: true,
+                    },
+                },
+                now,
+            )
+            .unwrap();
+        (
+            process,
+            Arc::new(Mutex::new(ledger)),
+            lease.generation,
+            lease.token,
+            session,
+            device,
+        )
+    }
+
+    #[test]
+    fn blocked_grant_reply_retires_owned_device_and_lease() {
+        let (server, _client) = UnixStream::pair().unwrap();
+        let (process, ledger, generation, token, session, device) = session_fixture(&server);
+        fill_socket(&server);
+        let mut reader = BufReader::new(server);
+        let stop = AtomicBool::new(false);
+        let failed = AtomicBool::new(false);
+        let result = serve_session(
+            &mut reader,
+            &process,
+            generation,
+            token.clone(),
+            true,
+            &ledger,
+            session,
+            &stop,
+            &failed,
+        );
+        assert_eq!(result, Err(InputError::Expired));
+        assert!(!failed.load(Ordering::Acquire));
+        assert!(!ledger.lock().unwrap().is_current_lease(
+            &process,
+            generation,
+            &token,
+            Instant::now()
+        ));
+        let device = device.lock().unwrap();
+        assert_eq!(device.releases, 1);
+        assert!(device.events.contains(&InputEvent::EvdevKey {
+            code: 30,
+            pressed: false
+        }));
+    }
+
+    #[test]
+    fn revoked_permit_before_grant_retires_device_without_acknowledging() {
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let (process, ledger, generation, token, session, device) = session_fixture(&server);
+        ledger.lock().unwrap().revoke(&process);
+        let mut reader = BufReader::new(server);
+        let stop = AtomicBool::new(false);
+        let failed = AtomicBool::new(false);
+        assert_eq!(
+            serve_session(
+                &mut reader,
+                &process,
+                generation,
+                token,
+                true,
+                &ledger,
+                session,
+                &stop,
+                &failed
+            ),
+            Err(InputError::PermissionDenied)
+        );
+        client.set_nonblocking(true).unwrap();
+        let mut byte = [0];
+        assert_eq!(
+            client.read(&mut byte).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert_eq!(device.lock().unwrap().releases, 1);
+    }
+
+    #[test]
+    fn unread_worker_reply_retires_held_input() {
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let (process, ledger, generation, token, session, device) = session_fixture(&server);
+        let filler = server.try_clone().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let failed = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let worker_failed = Arc::clone(&failed);
+        let worker_ledger = Arc::clone(&ledger);
+        let worker_process = process.clone();
+        let worker_token = token.clone();
+        let worker = std::thread::spawn(move || {
+            serve_session(
+                &mut BufReader::new(server),
+                &worker_process,
+                generation,
+                worker_token,
+                true,
+                &worker_ledger,
+                session,
+                &worker_stop,
+                &worker_failed,
+            )
+        });
+        let mut grant = Vec::new();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        while grant.last() != Some(&b'\n') {
+            let mut byte = [0];
+            client.read_exact(&mut byte).unwrap();
+            grant.push(byte[0]);
+        }
+        assert!(matches!(
+            serde_json::from_slice::<Reply>(&grant),
+            Ok(Reply::Granted { .. })
+        ));
+        fill_socket(&filler);
+        let request = serde_json::to_vec(&Request::FeedbackPoll {
+            generation,
+            token: token.clone(),
+        })
+        .unwrap();
+        client.write_all(&request).unwrap();
+        client.write_all(b"\n").unwrap();
+        assert_eq!(worker.join().unwrap(), Err(InputError::Expired));
+        assert!(!failed.load(Ordering::Acquire));
+        assert!(!ledger.lock().unwrap().is_current_lease(
+            &process,
+            generation,
+            &token,
+            Instant::now()
+        ));
+        let device = device.lock().unwrap();
+        assert_eq!(device.releases, 1);
+        assert!(device.events.contains(&InputEvent::EvdevKey {
+            code: 30,
+            pressed: false
+        }));
     }
 
     #[test]
