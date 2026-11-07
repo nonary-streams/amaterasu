@@ -9,6 +9,7 @@ struct Harness {
     results: BTreeMap<u64, Value>,
     callbacks: Vec<(String, String)>,
     uncertain_phase: String,
+    unavailable_approval: Option<(String, String)>,
 }
 
 impl Harness {
@@ -41,6 +42,7 @@ impl Harness {
             results: BTreeMap::new(),
             callbacks: vec![],
             uncertain_phase: uncertain_phase.into(),
+            unavailable_approval: None,
         }
     }
 
@@ -51,6 +53,7 @@ impl Harness {
             results,
             callbacks,
             uncertain_phase,
+            unavailable_approval,
             ..
         } = self;
         let mut send = |command| -> ModuleResult<Response> {
@@ -62,6 +65,16 @@ impl Harness {
                     min_minor,
                 } => {
                     let provider = service.strip_suffix("/1").unwrap();
+                    if unavailable_approval.as_ref().is_some_and(
+                        |(missing_provider, missing_method)| {
+                            missing_provider == provider && missing_method == &method
+                        },
+                    ) {
+                        return Ok(Response::Error {
+                            code: "not_found".into(),
+                            message: "selected provider method is not registered".into(),
+                        });
+                    }
                     Ok(Response::Result {
                         payload: json!({"provider":provider,"method":{"service":service,"method":method,"interface_major":interface_major,"interface_minor":min_minor}}),
                     })
@@ -310,6 +323,145 @@ fn missing_dependent_provider_blocks_prerequisite_but_not_independent() {
         .map(|(provider, _)| provider.as_str())
         .collect();
     assert_eq!(releases, ["c"]);
+}
+
+#[test]
+fn unavailable_configured_provider_does_not_starve_independent_cleanup() {
+    for missing_method in ["plan", "callback"] {
+        let mut h = Harness::new("none");
+        // Put an independent provider after the unavailable one in discovery order.
+        h.coordinator.settings.participants = vec![
+            participant("a", &[]),
+            participant("b", &["a"]),
+            participant("c", &[]),
+        ];
+        let started = h.coordinator.handle(
+            "caller",
+            "initiator",
+            json!({"operation":"prepare","operation_id":"prepare"}),
+        );
+        assert_eq!(h.run("prepare")["status"], "succeeded");
+        h.coordinator
+            .shared
+            .borrow_mut()
+            .value
+            .sessions
+            .get_mut(started["session_id"].as_str().unwrap())
+            .unwrap()
+            .application_retired = true;
+        // Re-discover the unchanged installed selection while b is unavailable.
+        h.coordinator.selections.clear();
+        h.coordinator.approval_cursor = 0;
+        h.unavailable_approval = Some(("b".into(), missing_method.into()));
+        h.coordinator.handle(
+            "caller",
+            "initiator",
+            json!({
+                "operation":"end_session","operation_id":"end","target":started["target"]
+            }),
+        );
+        let ended = h.run("end");
+        assert_eq!(ended["status"], "recovery_required", "{ended}");
+        let releases: Vec<_> = h
+            .callbacks
+            .iter()
+            .filter(|(_, phase)| phase == "session.release")
+            .map(|(provider, _)| provider.as_str())
+            .collect();
+        assert_eq!(releases, ["c"], "missing {missing_method}");
+    }
+}
+
+#[test]
+fn preparation_waits_for_all_methods_and_retries_unavailable_approval() {
+    let mut h = Harness::new("none");
+    h.unavailable_approval = Some(("b".into(), "callback".into()));
+    h.coordinator.handle(
+        "caller",
+        "initiator",
+        json!({
+            "operation":"prepare","operation_id":"prepare"
+        }),
+    );
+    for _ in 0..40 {
+        h.tick();
+    }
+    assert!(
+        h.callbacks.is_empty(),
+        "partial approval must not admit preparation"
+    );
+    assert_eq!(
+        h.coordinator.handle(
+            "caller",
+            "initiator",
+            json!({
+                "operation":"lookup","operation_id":"prepare"
+            })
+        )["status"],
+        "pending"
+    );
+    h.unavailable_approval = None;
+    assert_eq!(h.run("prepare")["status"], "succeeded");
+    assert!(
+        h.coordinator
+            .selections
+            .values()
+            .all(|selection| selection.approvals.len() == 3)
+    );
+}
+
+#[test]
+fn approval_rediscovery_preserves_retained_admission_order() {
+    let mut h = Harness::new("none");
+    h.coordinator.handle(
+        "caller",
+        "initiator",
+        json!({
+            "operation":"prepare","operation_id":"prepare"
+        }),
+    );
+    let mut admitted = None;
+    for _ in 0..100 {
+        h.tick();
+        admitted = h
+            .coordinator
+            .shared
+            .borrow()
+            .value
+            .authority
+            .admissions
+            .values()
+            .find(|admission| admission.provider == "b")
+            .cloned();
+        if admitted.is_some() {
+            break;
+        }
+    }
+    let admitted = admitted.expect("b must have a durably admitted plan");
+    h.coordinator.selections.clear();
+    h.coordinator.approval_cursor = 0;
+    h.unavailable_approval = Some(("b".into(), "plan".into()));
+    for _ in 0..40 {
+        h.tick();
+    }
+    assert_eq!(h.coordinator.selections["b"].approvals.len(), 2);
+    assert!(
+        h.coordinator
+            .shared
+            .borrow()
+            .value
+            .authority
+            .admissions
+            .values()
+            .any(|current| current.selection == admitted.selection)
+    );
+    h.unavailable_approval = None;
+    h.tick();
+    assert_eq!(
+        h.coordinator.selections["b"].approvals, admitted.selection.approvals,
+        "discovery timing must not change the exact retained admission identity"
+    );
+    assert_eq!(h.run("prepare")["status"], "succeeded");
 }
 
 #[test]

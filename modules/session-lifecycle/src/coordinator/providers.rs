@@ -1,4 +1,5 @@
 use super::*;
+use crate::adapter::{MethodSettings, ParticipantSettings};
 use crate::prepare_authority::{AuthorityJournal, CoordinatorPrepareAuthority, MethodApproval};
 use crate::prepare_driver::{PrepareAuthority, PrepareJournal, PreparePhase};
 use amaterasu_extension_api::{ProviderOperation, ProviderRequest, ProviderResponse};
@@ -717,10 +718,9 @@ impl Coordinator {
         Ok(true)
     }
 
-    pub(super) fn refresh_approvals(
-        &mut self,
-        send: &mut dyn FnMut(Command) -> ModuleResult<Response>,
-    ) -> ModuleResult<()> {
+    fn required_approval_methods(
+        &self,
+    ) -> ModuleResult<Vec<(ParticipantSettings, MethodSettings)>> {
         let mut methods: Vec<_> = self
             .settings
             .participants
@@ -747,7 +747,7 @@ impl Coordinator {
                     .iter()
                     .find(|p| p.provider == owner)
                     .ok_or("policy_owner_unavailable")?;
-                let selected = crate::adapter::MethodSettings {
+                let selected = MethodSettings {
                     service: method.service.clone(),
                     method: method.method.clone(),
                     interface_major: method.interface_major,
@@ -790,10 +790,65 @@ impl Coordinator {
                 },
             )?;
         }
-        if self.approval_cursor >= methods.len() {
+        Ok(methods)
+    }
+
+    fn method_approval_available(
+        &self,
+        participant: &ParticipantSettings,
+        method: &MethodSettings,
+    ) -> bool {
+        self.selections
+            .get(&participant.provider)
+            .is_some_and(|selection| {
+                selection
+                    .approvals
+                    .iter()
+                    .any(|approval| approval.method == *method)
+            })
+    }
+
+    fn provider_approvals_complete(&self, provider: &str) -> bool {
+        let Some(selection) = self.selections.get(provider) else {
+            return false;
+        };
+        let participant = &selection.participant;
+        [
+            &participant.plan_method,
+            &participant.callback_method,
+            &participant.status_method,
+        ]
+        .into_iter()
+        .chain(participant.binding_validate_method.as_ref())
+        .all(|method| self.method_approval_available(participant, method))
+    }
+
+    pub(super) fn refresh_approvals(
+        &mut self,
+        send: &mut dyn FnMut(Command) -> ModuleResult<Response>,
+    ) -> ModuleResult<()> {
+        let methods = self.required_approval_methods()?;
+        if methods
+            .iter()
+            .all(|(participant, method)| self.method_approval_available(participant, method))
+        {
             return Ok(());
         }
-        let (participant, method) = &methods[self.approval_cursor];
+        // Discovery is fair across providers and methods. An unavailable method
+        // cannot prevent the independent cleanup branches from being approved.
+        let mut selected = None;
+        for _ in 0..methods.len() {
+            let index = self.approval_cursor % methods.len();
+            self.approval_cursor = self.approval_cursor.saturating_add(1);
+            let (participant, method) = &methods[index];
+            if !self.method_approval_available(participant, method) {
+                selected = Some((participant, method));
+                break;
+            }
+        }
+        let Some((participant, method)) = selected else {
+            return Ok(());
+        };
         let response = send(Command::QueryApiApproval {
             service: method.service.clone(),
             method: method.method.clone(),
@@ -826,7 +881,17 @@ impl Coordinator {
                 method: method.clone(),
                 broker_approval: payload,
             });
-            self.approval_cursor += 1;
+            // Admissions persist this exact sequence. Keep installed method
+            // order stable even when a method registers later than its peers.
+            selection.approvals.sort_by_key(|approval| {
+                methods
+                    .iter()
+                    .position(|(owner, method)| {
+                        owner.provider == selection.participant.provider
+                            && *method == approval.method
+                    })
+                    .unwrap_or(usize::MAX)
+            });
         }
         Ok(())
     }
@@ -847,7 +912,14 @@ impl Coordinator {
         let journal = &self.shared.borrow().value;
         let (_, session_id, _, _) = super::operations::target_parts(&work.target)?;
         let session = journal.sessions.get(session_id).ok_or("unknown_session")?;
-        let mut selections: Vec<_> = self.selections.values().cloned().collect();
+        // Partially discovered providers are not valid authority selections.
+        // Cleanup may still use the independently approved providers.
+        let mut selections: Vec<_> = self
+            .selections
+            .values()
+            .filter(|selection| self.provider_approvals_complete(&selection.participant.provider))
+            .cloned()
+            .collect();
         for selected in &mut selections {
             if let Some(snapshot) =
                 frozen_settings(journal, &work.target)?.get(&selected.participant.provider)
@@ -1311,9 +1383,16 @@ impl Coordinator {
                 self.processing_jobs.remove(&key);
             }
         }
-        if self.selections.len() != self.settings.participants.len() {
-            return Ok(());
-        }
+        let methods = self.required_approval_methods()?;
+        let approvals_complete = methods
+            .iter()
+            .all(|(participant, method)| self.method_approval_available(participant, method));
+        let discovery_complete = self.approval_cursor >= methods.len();
+        let lifecycle_approvals_complete = self
+            .settings
+            .participants
+            .iter()
+            .all(|participant| self.provider_approvals_complete(&participant.provider));
         let mut keys: Vec<_> = self
             .shared
             .borrow()
@@ -1339,6 +1418,18 @@ impl Coordinator {
             else {
                 continue;
             };
+            let cleanup = matches!(
+                work.phase,
+                LifecyclePhase::StreamRelease | LifecyclePhase::SessionRelease
+            );
+            // New preparation requires the entire selected graph. Give startup
+            // discovery one complete sweep before fencing unavailable cleanup
+            // branches; independent approved branches can then still retire.
+            if (!cleanup && !approvals_complete)
+                || (cleanup && !lifecycle_approvals_complete && !discovery_complete)
+            {
+                continue;
+            }
             if work.waiting_retirement {
                 if !self.retirement_ready(&work)? {
                     continue;
@@ -1489,6 +1580,10 @@ impl Coordinator {
                 && !work.states.contains_key(provider)
             {
                 self.fail_work(&key, "restart_requires_cleanup")?;
+                continue;
+            }
+            if cleanup && !self.provider_approvals_complete(provider) {
+                self.cleanup_failure(&key, "provider_approval_unavailable")?;
                 continue;
             }
             // Unsupported v2 phases must be rejected before settings discovery or
@@ -3600,7 +3695,7 @@ mod output_finish_tests {
         let target =
             json!({"kind":"session","host_epoch":epoch,"session_id":"session","generation":1});
         let method = json!({"service":"screen/2","method":"callback","interface_major":2,"interface_minor":1,"schema_revision":1});
-        let participant: crate::adapter::ParticipantSettings = serde_json::from_value(json!({"provider":"screen","depends_on":[],"plan_method":method,"callback_method":method,"status_method":method,"capabilities":[],"cleanup_methods":[],"settings_revision":"revision","settings":{}})).unwrap();
+        let participant: ParticipantSettings = serde_json::from_value(json!({"provider":"screen","depends_on":[],"plan_method":method,"callback_method":method,"status_method":method,"capabilities":[],"cleanup_methods":[],"settings_revision":"revision","settings":{}})).unwrap();
         let approval: MethodApproval = serde_json::from_value(
             json!({"method":method,"broker_approval":{"provider":"screen","method":method}}),
         )
