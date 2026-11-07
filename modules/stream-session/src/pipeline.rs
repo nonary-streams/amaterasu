@@ -285,6 +285,7 @@ impl Pipeline {
             && self.records.values().all(|record| {
                 record.state.terminal()
                     && !record.history.has_work()
+                    && !record.host_metrics.has_work()
                     && record.uncertain.is_none()
                     && record.journal_uncertain.is_none()
                     && record.shutdown_observations.is_empty()

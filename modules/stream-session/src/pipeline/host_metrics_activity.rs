@@ -40,6 +40,10 @@ impl HostMetricsActivity {
         }
     }
 
+    pub fn has_work(&self) -> bool {
+        !matches!(self.phase, Phase::Idle | Phase::Complete)
+    }
+
     pub fn progress(&mut self, record_id: u64, now: u64, send: &mut rpc::Send<'_>) {
         let phase = std::mem::replace(&mut self.phase, Phase::Complete);
         self.phase = match phase {
@@ -72,7 +76,7 @@ impl HostMetricsActivity {
             Phase::Ending(mut pending) => match pending.poll(send, now) {
                 rpc::Progress::Result(response) => {
                     if pending.release_result(send) {
-                        if response["ok"] == true {
+                        if response["ok"] == true && response["active"] == false {
                             Phase::Complete
                         } else {
                             pending.retry();
@@ -95,6 +99,10 @@ impl HostMetricsActivity {
 
     pub fn shutdown(&mut self, record_id: u64, now: u64, send: &mut rpc::Send<'_>) -> bool {
         self.teardown_confirmed(record_id);
+        if matches!(&self.phase, Phase::Beginning(pending) if !pending.was_sent()) {
+            self.phase = Phase::Complete;
+            return true;
+        }
         for turn in 0..16 {
             self.progress(record_id, now.saturating_add(turn), send);
             if matches!(self.phase, Phase::Complete | Phase::Idle) {
@@ -114,7 +122,9 @@ impl HostMetricsActivity {
             }
         }
         match &mut self.phase {
-            Phase::Ending(pending) => pending.shutdown(send),
+            // Broker settlement alone does not prove the provider removed the
+            // activity; only progress observing a successful End does that.
+            Phase::Ending(_) => false,
             Phase::Idle | Phase::Beginning(_) | Phase::Active | Phase::Complete => false,
         }
     }
@@ -206,5 +216,90 @@ mod tests {
         let mut activity = HostMetricsActivity::new(9);
         activity.teardown_confirmed(9);
         assert!(activity.shutdown(9, 0, &mut |_| Ok(Response::Ok)));
+    }
+
+    #[test]
+    fn shutdown_does_not_report_a_pending_end_as_retired() {
+        let mut activity = HostMetricsActivity::new(13);
+        activity.phase = Phase::Ending(activity_request(&activity.session_id, 13, false));
+        let mut send = |command| match command {
+            Command::Request { .. } => Ok(Response::Accepted { id: 7 }),
+            Command::TakeResult { request: 7 } => Ok(Response::Pending),
+            other => panic!("unexpected shutdown command: {other:?}"),
+        };
+        assert!(!activity.shutdown(13, 0, &mut send));
+        assert!(matches!(activity.phase, Phase::Ending(_)));
+    }
+
+    #[test]
+    fn end_requires_an_explicit_inactive_acknowledgement() {
+        let mut activity = HostMetricsActivity::new(14);
+        activity.phase = Phase::Ending(activity_request(&activity.session_id, 14, false));
+        let mut send = |command| match command {
+            Command::Request { .. } => Ok(Response::Accepted { id: 7 }),
+            Command::TakeResult { .. } => Ok(Response::Result {
+                payload: json!({"ok":true,"active":true}),
+            }),
+            Command::ReleaseResult { .. } => Ok(Response::Ok),
+            other => panic!("unexpected command: {other:?}"),
+        };
+        activity.progress(14, 1, &mut send);
+        activity.progress(14, 2, &mut send);
+        assert!(activity.has_work());
+        assert!(matches!(activity.phase, Phase::Ending(_)));
+    }
+
+    #[test]
+    fn ambiguous_begin_survives_retry_then_rejection_until_exact_end() {
+        let mut activity = HostMetricsActivity::new(11);
+        activity.activated(11);
+        activity.teardown_confirmed(11);
+        let mut admissions = 0;
+        let mut actions = Vec::new();
+        let mut send = |command: Command| -> ModuleResult<Response> {
+            match command {
+                Command::Request { payload, .. } => {
+                    let action = payload["action"].as_str().unwrap().to_owned();
+                    actions.push(action.clone());
+                    if action == "stream_activity_begin" {
+                        admissions += 1;
+                        match admissions {
+                            1..=3 => Err("admission response lost".into()),
+                            4 => Ok(Response::Error {
+                                code: "unavailable".into(),
+                                message: String::new(),
+                            }),
+                            _ => Ok(Response::Accepted { id: 1 }),
+                        }
+                    } else {
+                        Ok(Response::Accepted { id: 2 })
+                    }
+                }
+                Command::TakeResult { request } => Ok(Response::Result {
+                    payload: json!({"ok":true,"active":request == 1}),
+                }),
+                Command::ReleaseResult { .. } => Ok(Response::Ok),
+                other => panic!("unexpected command: {other:?}"),
+            }
+        };
+        for now in 1..=5 {
+            activity.progress(11, now, &mut send);
+        }
+        assert!(matches!(activity.phase, Phase::Beginning(_)));
+        for now in 6..=12 {
+            activity.progress(11, now, &mut send);
+        }
+        assert!(matches!(activity.phase, Phase::Complete));
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| *action == "stream_activity_end")
+                .count(),
+            1
+        );
+        assert_eq!(
+            actions.last().map(String::as_str),
+            Some("stream_activity_end")
+        );
     }
 }

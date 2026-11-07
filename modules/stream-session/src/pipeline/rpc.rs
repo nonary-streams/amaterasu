@@ -15,6 +15,7 @@ pub(super) struct Pending {
     attempts: u8,
     settling: bool,
     first_sent_at: Option<u64>,
+    uncertain_admission: bool,
     admission_rejected: bool,
     retry_uncertain_admission: bool,
 }
@@ -41,6 +42,7 @@ impl Pending {
             attempts: 0,
             settling: false,
             first_sent_at: None,
+            uncertain_admission: false,
             admission_rejected: false,
             retry_uncertain_admission: false,
         }
@@ -80,26 +82,14 @@ impl Pending {
     }
 
     pub fn shutdown(&mut self, send: &mut Send<'_>) -> bool {
+        if self.retry_uncertain_admission {
+            return self.shutdown_idempotent(send);
+        }
         self.cancel();
         if self.request.is_none() {
-            if self.first_sent_at.is_none() {
-                return true;
-            }
-            // Reuse the exact operation ID to recover a lost admission before
-            // attempting cancellation and release during unload.
-            for _ in 0..4 {
-                match send(self.command.clone()) {
-                    Ok(Response::Accepted { id }) => {
-                        self.request = Some(id);
-                        break;
-                    }
-                    Ok(Response::Error { .. }) => return true,
-                    _ => {}
-                }
-            }
-            if self.request.is_none() {
-                return false;
-            }
+            // Without a clock, shutdown cannot prove that replay still falls
+            // inside the broker's retained-operation window.
+            return self.first_sent_at.is_none() || self.admission_rejected;
         }
         for _ in 0..4 {
             match self.poll(send, u64::MAX) {
@@ -114,6 +104,27 @@ impl Pending {
             }
         }
         false
+    }
+
+    /// Cancellation of broker bookkeeping does not fence an already delivered
+    /// provider operation. Wait for its terminal result before allowing an
+    /// idempotent activity to be retried or its matching end to proceed.
+    fn shutdown_idempotent(&mut self, send: &mut Send<'_>) -> bool {
+        if self.request.is_none() && (self.first_sent_at.is_none() || self.admission_rejected) {
+            return true;
+        }
+        let Some(request) = self.request else {
+            // Shutdown has no current monotonic timestamp, so it cannot prove
+            // a lost admission is still inside the broker replay horizon.
+            return false;
+        };
+        if self.completed.is_none() {
+            match send(Command::TakeResult { request }) {
+                Ok(Response::Result { payload }) => self.completed = Some(payload),
+                _ => return false,
+            }
+        }
+        self.release_result(send)
     }
 
     pub fn retry(&mut self) {
@@ -132,8 +143,8 @@ impl Pending {
         self.admission_rejected
     }
 
-    /// Releases a result already retrieved by `poll`. Result ownership belongs
-    /// to the caller once `Progress::Result` is returned.
+    /// Releases a retained result; a lost response can be retried with the same
+    /// request ID. A `not_found` response confirms that tracking is gone.
     pub fn release_result(&mut self, send: &mut Send<'_>) -> bool {
         let Some(request) = self.request else {
             return true;
@@ -171,17 +182,20 @@ impl Pending {
             return match send(self.command.clone()) {
                 Ok(Response::Accepted { id }) => {
                     self.request = Some(id);
+                    self.admission_rejected = false;
                     self.attempts = 0;
                     Progress::Waiting
                 }
-                Ok(Response::Error { .. }) => {
+                Ok(Response::Error { code, .. }) => {
                     // An earlier lost admission may already have reached the
                     // provider; only the first explicit rejection proves no
                     // request was admitted.
-                    self.admission_rejected = self.attempts == 0;
+                    self.admission_rejected = !self.uncertain_admission && code != "conflict";
+                    self.uncertain_admission |= code == "conflict";
                     Progress::Failed
                 }
                 _ => {
+                    self.uncertain_admission = true;
                     if !self.retry_uncertain_admission {
                         self.settling = true;
                     }
@@ -202,6 +216,10 @@ impl Pending {
             Ok(Response::Result { payload }) => {
                 self.completed = Some(payload.clone());
                 Progress::Result(payload)
+            }
+            _ if self.retry_uncertain_admission => {
+                self.attempts += 1;
+                Progress::Waiting
             }
             _ => {
                 self.settling = true;
@@ -263,5 +281,106 @@ mod tests {
         let mut rejected = Pending::new("service", json!({}), "other".into(), None);
         assert!(matches!(rejected.poll(&mut send, 1), Progress::Failed));
         assert!(rejected.admission_rejected());
+    }
+
+    #[test]
+    fn retry_does_not_forget_a_lost_admission_before_rejection() {
+        let mut pending = Pending::new("service", json!({}), "operation".into(), None)
+            .retry_uncertain_admission();
+        for now in 1..=3 {
+            assert!(matches!(
+                pending.poll(&mut |_| Err("lost".into()), now),
+                Progress::Waiting
+            ));
+        }
+        assert!(matches!(
+            pending.poll(&mut |_| unreachable!(), 4),
+            Progress::Unresolved
+        ));
+        pending.retry();
+        assert!(matches!(
+            pending.poll(
+                &mut |_| Ok(Response::Error {
+                    code: "unavailable".into(),
+                    message: String::new(),
+                }),
+                5
+            ),
+            Progress::Failed
+        ));
+        assert!(!pending.admission_rejected());
+        assert!(!pending.shutdown(&mut |_| Ok(Response::Error {
+            code: "unavailable".into(),
+            message: String::new(),
+        })));
+    }
+
+    #[test]
+    fn conflicting_operation_is_not_proof_of_absent_admission() {
+        let mut pending = Pending::new("service", json!({}), "operation".into(), None);
+        assert!(matches!(
+            pending.poll(
+                &mut |_| Ok(Response::Error {
+                    code: "conflict".into(),
+                    message: String::new(),
+                }),
+                1
+            ),
+            Progress::Failed
+        ));
+        assert!(!pending.admission_rejected());
+    }
+
+    #[test]
+    fn shutdown_waits_for_delivered_activity_to_finish_before_settlement() {
+        let mut pending = Pending::new("service", json!({}), "operation".into(), None)
+            .retry_uncertain_admission();
+        assert!(matches!(
+            pending.poll(&mut |_| Ok(Response::Accepted { id: 7 }), 1),
+            Progress::Waiting
+        ));
+        assert!(!pending.shutdown(&mut |command| match command {
+            Command::TakeResult { request: 7 } => Ok(Response::Pending),
+            other => panic!("must not cancel in-flight provider operation: {other:?}"),
+        }));
+        assert!(pending.shutdown(&mut |command| match command {
+            Command::TakeResult { request: 7 } => Ok(Response::Result {
+                payload: json!({"ok":true})
+            }),
+            Command::ReleaseResult { request: 7 } => Ok(Response::Ok),
+            other => panic!("unexpected command: {other:?}"),
+        }));
+    }
+
+    #[test]
+    fn shutdown_never_replays_an_unknown_admission_without_a_clock() {
+        let mut pending = Pending::new("service", json!({}), "operation".into(), None);
+        assert!(matches!(
+            pending.poll(&mut |_| Err("lost".into()), 1),
+            Progress::Waiting
+        ));
+        assert!(!pending.shutdown(&mut |_| panic!("must not reissue an unknown admission")));
+    }
+
+    #[test]
+    fn accepted_retry_clears_prior_rejection_before_shutdown() {
+        let mut pending = Pending::new("service", json!({}), "operation".into(), None)
+            .retry_uncertain_admission();
+        assert!(matches!(
+            pending.poll(
+                &mut |_| Ok(Response::Error {
+                    code: "unavailable".into(),
+                    message: String::new()
+                }),
+                1
+            ),
+            Progress::Failed
+        ));
+        pending.retry();
+        assert!(matches!(
+            pending.poll(&mut |_| Ok(Response::Accepted { id: 7 }), 2),
+            Progress::Waiting
+        ));
+        assert!(!pending.shutdown(&mut |_| Ok(Response::Pending)));
     }
 }

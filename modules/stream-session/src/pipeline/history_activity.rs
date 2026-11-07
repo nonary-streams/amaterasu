@@ -12,7 +12,6 @@ enum Phase {
     Ending(rpc::Pending),
     Ended,
     Unavailable,
-    CleanupExpired,
 }
 
 struct Reservation {
@@ -83,7 +82,7 @@ impl HistoryActivities {
                         reply("reserved", false, &activity_id, &rtsp_operation_id),
                     );
                 }
-                Phase::Ending(_) | Phase::Ended | Phase::CleanupExpired => {
+                Phase::Ending(_) | Phase::Ended => {
                     rpc::complete(send, request, super::error("history_activity_ended"));
                 }
             }
@@ -162,13 +161,6 @@ impl HistoryActivities {
                     send,
                     request,
                     reply("released", false, activity_id, rtsp_operation_id),
-                );
-            }
-            Phase::CleanupExpired => {
-                rpc::complete(
-                    send,
-                    request,
-                    super::error("history_activity_end_unconfirmed"),
                 );
             }
             Phase::Reserved => {
@@ -264,18 +256,12 @@ impl HistoryActivities {
                         super::error("history_activity_end_unconfirmed"),
                     );
                 }
-                if let Phase::Ending(pending) = &mut entry.phase
-                    && pending.shutdown(send)
-                {
-                    entry.phase = Phase::CleanupExpired;
-                    entry.terminal_at.get_or_insert(now);
-                }
-                continue;
+                // Keep the exact End until its provider response proves the
+                // activity retired; broker cancellation is not that proof.
             }
             if now < entry.retry_at {
                 continue;
             }
-            let is_beginning = matches!(entry.phase, Phase::Beginning(_));
             let result = match &mut entry.phase {
                 Phase::Beginning(pending) | Phase::Ending(pending) => {
                     match pending.poll(send, now) {
@@ -284,14 +270,14 @@ impl HistoryActivities {
                         }
                         rpc::Progress::Failed if pending.admission_rejected() => Some(Value::Null),
                         rpc::Progress::Failed => {
-                            *pending = activity_request(activity_id, is_beginning);
+                            // Preserve the original admission uncertainty; a
+                            // later rejection cannot disprove the first send.
+                            pending.retry();
                             entry.retry_at = now.saturating_add(1_000);
                             None
                         }
                         rpc::Progress::Unresolved => {
-                            if pending.shutdown(send) {
-                                *pending = activity_request(activity_id, is_beginning);
-                            }
+                            pending.retry();
                             entry.retry_at = now.saturating_add(1_000);
                             None
                         }
@@ -402,14 +388,12 @@ impl HistoryActivities {
         });
     }
 
-    pub(super) fn shutdown(&mut self, send: &mut rpc::Send<'_>) -> bool {
-        let mut settled = true;
-        for entry in self.entries.values_mut() {
-            if let Phase::Beginning(pending) | Phase::Ending(pending) = &mut entry.phase {
-                settled &= pending.shutdown(send);
-            }
-        }
-        settled
+    pub(super) fn shutdown(&mut self, _send: &mut rpc::Send<'_>) -> bool {
+        self.entries.values().all(|entry| match &entry.phase {
+            Phase::Ended | Phase::Unavailable => true,
+            Phase::Beginning(pending) => !pending.was_sent(),
+            Phase::Reserved | Phase::Ending(_) => false,
+        })
     }
 }
 
@@ -434,4 +418,137 @@ fn activity_request(activity_id: &str, beginning: bool) -> rpc::Pending {
         None,
     )
     .retry_uncertain_admission()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use amaterasu_module_sdk::{Command, ModuleResult, Response};
+
+    #[test]
+    fn repeated_rejections_do_not_clear_an_uncertain_begin() {
+        let mut activities = HistoryActivities::default();
+        let mut sends = 0;
+        let mut send = |command: Command| -> ModuleResult<Response> {
+            match command {
+                Command::Request { .. } => {
+                    sends += 1;
+                    if sends == 1 {
+                        Err("lost admission".into())
+                    } else {
+                        Ok(Response::Error {
+                            code: "unavailable".into(),
+                            message: String::new(),
+                        })
+                    }
+                }
+                Command::Complete { .. } => Ok(Response::Ok),
+                other => panic!("unexpected command: {other:?}"),
+            }
+        };
+        activities.reserve(3, "activity".into(), "rtsp".into(), 0, &mut send);
+        for now in [0, 1, 1_001, 2_001, 3_001] {
+            activities.progress(now, &BTreeMap::new(), &mut send);
+        }
+        assert!(sends >= 3);
+        assert!(activities.has_active_reservations());
+        assert!(matches!(
+            activities.entries["activity"].phase,
+            Phase::Beginning(_)
+        ));
+    }
+
+    #[test]
+    fn expired_failed_end_retains_activity_ownership() {
+        let mut activities = HistoryActivities::default();
+        activities.entries.insert(
+            "activity".into(),
+            Reservation {
+                rtsp_operation_id: "rtsp".into(),
+                phase: Phase::Ending(activity_request("activity", false)),
+                began_at: 0,
+                terminal_at: None,
+                retry_at: 0,
+                callers: Vec::new(),
+                release_callers: Vec::new(),
+                release_requested: true,
+                release_requested_at: Some(0),
+                completed_at: None,
+            },
+        );
+        let mut send = |command| match command {
+            Command::Request { .. } => Ok(Response::Accepted { id: 7 }),
+            Command::TakeResult { .. } => Ok(Response::Result {
+                payload: json!({"ok":false}),
+            }),
+            Command::ReleaseResult { .. } => Ok(Response::Ok),
+            other => panic!("unexpected command: {other:?}"),
+        };
+        for now in [600_001, 600_002, 601_003, 601_004, 901_005] {
+            activities.progress(now, &BTreeMap::new(), &mut send);
+        }
+        assert!(activities.has_active_reservations());
+        assert!(activities.contains("activity"));
+    }
+
+    #[test]
+    fn ambiguous_begin_survives_retry_rejection_until_end() {
+        let mut activities = HistoryActivities::default();
+        let mut admissions = 0;
+        let mut actions = Vec::new();
+        let mut send = |command: Command| -> ModuleResult<Response> {
+            match command {
+                Command::Request { payload, .. } => {
+                    let action = payload["action"].as_str().unwrap().to_owned();
+                    actions.push(action.clone());
+                    if action == "stream_activity_begin" {
+                        admissions += 1;
+                        match admissions {
+                            1..=3 => Err("lost admission".into()),
+                            4..=7 => Ok(Response::Error {
+                                code: "unavailable".into(),
+                                message: String::new(),
+                            }),
+                            _ => Ok(Response::Accepted { id: 1 }),
+                        }
+                    } else {
+                        Ok(Response::Accepted { id: 2 })
+                    }
+                }
+                Command::TakeResult { request } => Ok(Response::Result {
+                    payload: if request == 1 {
+                        json!({"ok":true,"reserved":true})
+                    } else {
+                        json!({"ok":true,"ended":true})
+                    },
+                }),
+                Command::Cancel { .. }
+                | Command::ReleaseResult { .. }
+                | Command::Complete { .. } => Ok(Response::Ok),
+                other => panic!("unexpected command: {other:?}"),
+            }
+        };
+        let records = BTreeMap::new();
+        activities.reserve(3, "activity".into(), "rtsp".into(), 0, &mut send);
+        activities.release(4, "activity", "rtsp", 0, &records, &mut send);
+        for now in 0..=4 {
+            activities.progress(now, &records, &mut send);
+        }
+        assert!(activities.has_active_reservations());
+        for now in (1..=15).map(|n| n * 1_000) {
+            activities.progress(now, &records, &mut send);
+        }
+        assert!(!activities.has_active_reservations());
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| *action == "stream_activity_end")
+                .count(),
+            1
+        );
+        assert_eq!(
+            actions.last().map(String::as_str),
+            Some("stream_activity_end")
+        );
+    }
 }

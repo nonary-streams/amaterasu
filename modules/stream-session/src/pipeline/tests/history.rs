@@ -342,10 +342,16 @@ fn abandoned_uncertain_begin_is_ended_after_late_completion() {
         json!({"action":"reserve_history_activity",
         "activity_id":activity,"rtsp_operation_id":activity}),
     );
-    for _ in 0..5 {
+    for _ in 0..3 {
         host.tick();
     }
     assert!(host.broker.history_activities.contains(activity));
+    // Keep the already committed Begin result unavailable until the caller's
+    // reservation wait expires, then allow its exact retained result through.
+    host.broker.history_pending_polls = 100;
+    for _ in 0..2 {
+        host.tick();
+    }
     host.now += 10_001;
     host.tick();
     assert_eq!(host.broker.replies.remove(&1).unwrap()["reserved"], false);
@@ -355,6 +361,7 @@ fn abandoned_uncertain_begin_is_ended_after_late_completion() {
         json!({"action":"release_history_activity",
         "activity_id":activity,"rtsp_operation_id":activity}),
     );
+    host.broker.history_pending_polls = 0;
     for _ in 0..8 {
         host.now += 1_001;
         host.tick();
@@ -541,7 +548,6 @@ fn expired_end_does_not_strand_waiting_release_caller() {
     host.tick();
     host.tick();
     assert_eq!(host.broker.history_requests.len(), 1);
-    host.broker.fail_cancel = true;
     host.now += 600_001;
     host.tick();
     assert_eq!(
@@ -549,9 +555,18 @@ fn expired_end_does_not_strand_waiting_release_caller() {
         "history_activity_end_unconfirmed"
     );
     assert_eq!(host.broker.history_requests.len(), 1);
-    host.broker.fail_cancel = false;
-    host.tick();
+    // A broker cancellation does not prove the provider completed End.
+    // Keep the same pending request until its real successful result arrives.
+    assert!(host.pipeline.history_activities.has_active_reservations());
+    host.broker.history_pending_polls = 0;
+    for _ in 0..10 {
+        host.tick();
+        if host.broker.history_requests.is_empty() {
+            break;
+        }
+    }
     assert!(host.broker.history_requests.is_empty());
+    assert!(host.broker.history_activities.is_empty());
 }
 
 fn prepare_and_start(host: &mut Harness) -> u64 {
@@ -1088,21 +1103,31 @@ fn failed_result_release_retries_the_same_history_operation_without_replaying_mu
 }
 
 #[test]
-fn shutdown_recovers_a_lost_history_admission_then_cancels_and_releases_it() {
+fn shutdown_retains_a_lost_history_admission_without_replaying_it() {
     let mut host = Harness::new();
     host.broker.history_available = true;
     host.broker.fault = Some((HISTORY_SERVICE.into(), Fault::Admission));
     let _session = prepare_and_start(&mut host);
     host.tick();
     assert_eq!(host.broker.history_requests.len(), 1);
+    let requests = host.broker.history_requests.clone();
+    let command_count = host.broker.commands.len();
 
     let settled = {
         let (pipeline, broker) = (&mut host.pipeline, &mut host.broker);
         pipeline.shutdown_with(&mut |command| broker.send(command))
     };
 
-    assert!(settled);
-    assert!(host.broker.history_requests.is_empty());
+    // Shutdown has no timestamp proving the operation remains replayable.
+    // Retain the same uncertainty instead of reissuing or cancelling it.
+    assert!(!settled);
+    assert_eq!(host.broker.history_requests, requests);
+    assert!(
+        !host.broker.commands[command_count..].iter().any(|command| {
+            matches!(command, Command::Request {service,..} if service == HISTORY_SERVICE)
+                || matches!(command, Command::Cancel {request} if requests.contains(request))
+        })
+    );
     assert_eq!(host.broker.history_calls(), 1);
 }
 
