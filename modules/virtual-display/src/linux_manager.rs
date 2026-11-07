@@ -297,6 +297,7 @@ pub struct Manager {
     receiver: Option<Receiver<Event>>,
     worker: Option<JoinHandle<()>>,
     cleanup_pending: std::collections::BTreeSet<(String, String)>,
+    recovery_pending: std::collections::BTreeSet<(String, String)>,
     observer: Option<observer::Observer>,
     borrows: BTreeMap<String, Borrow>,
     reconfigurations: BTreeMap<(String, String), Reconfiguration>,
@@ -326,6 +327,7 @@ impl Manager {
             receiver: None,
             worker: None,
             cleanup_pending: Default::default(),
+            recovery_pending: Default::default(),
             observer: None,
             borrows: BTreeMap::new(),
             reconfigurations: BTreeMap::new(),
@@ -427,6 +429,7 @@ impl Manager {
                             self.parked.insert(record.key(), record.output);
                             continue;
                         }
+                        self.recovery_pending.insert(record.key());
                         self.monitors.insert(
                             record.key(),
                             Monitor {
@@ -437,7 +440,7 @@ impl Manager {
                                 specification: record.specification,
                                 state: "cleanup_failed",
                                 output: Some(record.output),
-                                error: Some("restart_cleanup_failed".into()),
+                                error: self.recovery_error.clone(),
                                 references: record.references,
                                 layout: self.settings.virtual_display_layout,
                                 scale: self.settings.dd_virtual_display_scale,
@@ -474,6 +477,7 @@ impl Manager {
                     self.cleanup_pending.remove(&key);
                     match result {
                         Ok(parked_output) => {
+                            self.recovery_pending.remove(&key);
                             self.monitors.remove(&key);
                             if let Some(output) = parked_output {
                                 self.parked.insert(key.clone(), output);
@@ -487,6 +491,9 @@ impl Manager {
                             }
                         }
                         Err(error) => {
+                            if self.recovery_pending.contains(&key) {
+                                self.recovery_error = Some(error.clone());
+                            }
                             if let Some(monitor) = self.monitors.get_mut(&key) {
                                 monitor.state = "cleanup_failed";
                                 monitor.error = Some(error);
@@ -944,6 +951,47 @@ impl Manager {
         }
     }
 
+    fn recovery_references_pending(&self) -> bool {
+        self.recovery_pending.iter().any(|key| {
+            self.monitors.get(key).is_some_and(|monitor| {
+                monitor
+                    .references
+                    .as_ref()
+                    .is_some_and(|references| !references.is_empty())
+            })
+        })
+    }
+
+    fn enqueue_recovery_cleanup(&mut self) -> Result<(), &'static str> {
+        // At most eight recovered records exist. An authenticated removal opens
+        // one attempt per exact record; failed native cleanup is never replayed
+        // by tick or by merely observing recovery status.
+        let keys: Vec<_> = self
+            .recovery_pending
+            .iter()
+            .filter(|key| !self.cleanup_pending.contains(*key))
+            .cloned()
+            .collect();
+        if self
+            .topology_revision
+            .checked_add(keys.len() as u64)
+            .is_none()
+        {
+            return Err("topology_revision_exhausted");
+        }
+        for key in keys {
+            if !self.enqueue(Work::Remove { key: key.clone() }) {
+                return Err("busy");
+            }
+            self.topology_revision += 1;
+            self.pending_mutations += 1;
+            self.cleanup_pending.insert(key.clone());
+            self.monitors.get_mut(&key).unwrap().state = "removing";
+            self.recovery_error = Some("restart_cleanup_pending".into());
+        }
+        Ok(())
+    }
+
     fn remove(&mut self, caller: &str, identity: &str, reference_id: Option<&str>) -> Value {
         if self
             .monitors
@@ -1010,7 +1058,15 @@ impl Manager {
         {
             return failure("journal_unavailable");
         }
-        if !self.cleanup_pending.contains(&key) {
+        if self.recovery_pending.contains(&key) {
+            if self.recovery_references_pending() {
+                return json!({"ok":true,"removed":false,"identity":identity,
+                    "reference_owned":false,"cleanup_deferred":true});
+            }
+            if let Err(code) = self.enqueue_recovery_cleanup() {
+                return failure(code);
+            }
+        } else if !self.cleanup_pending.contains(&key) {
             if !self.enqueue(Work::Remove { key: key.clone() }) {
                 return failure("busy");
             }

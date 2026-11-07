@@ -1256,6 +1256,7 @@ fn parked_status_is_explicit_and_does_not_claim_connector_removal() {
         receiver: Some(receiver),
         worker: None,
         cleanup_pending: std::collections::BTreeSet::from([key.clone()]),
+        recovery_pending: Default::default(),
         observer: None,
         borrows: Default::default(),
         reconfigurations: Default::default(),
@@ -1338,6 +1339,7 @@ fn manager_releases_parks_and_reuses_output_through_public_operations() {
         receiver: Some(receiver),
         worker: Some(worker),
         cleanup_pending: Default::default(),
+        recovery_pending: Default::default(),
         observer: None,
         borrows: Default::default(),
         reconfigurations: Default::default(),
@@ -1405,7 +1407,7 @@ fn manager_releases_parks_and_reuses_output_through_public_operations() {
     fs::remove_dir_all(root).unwrap();
 }
 
-fn manager_for_failed_creation(
+fn manager_with_fake_worker(
     controller: Controller<FakeBroker, FakeCompositor, FakeConnectors>,
 ) -> super::super::Manager {
     let (sender, jobs) = std::sync::mpsc::sync_channel(16);
@@ -1434,6 +1436,7 @@ fn manager_for_failed_creation(
         receiver: Some(receiver),
         worker: Some(worker),
         cleanup_pending: Default::default(),
+        recovery_pending: Default::default(),
         observer: None,
         borrows: Default::default(),
         reconfigurations: Default::default(),
@@ -1442,11 +1445,13 @@ fn manager_for_failed_creation(
         pending_mutations: 0,
         stopped,
     };
-    wait_for_failed_creation_manager(&mut manager, |manager| manager.ready);
+    wait_for_fake_worker(&mut manager, |manager| {
+        manager.ready || manager.recovery_error.is_some()
+    });
     manager
 }
 
-fn wait_for_failed_creation_manager(
+fn wait_for_fake_worker(
     manager: &mut super::super::Manager,
     settled: impl Fn(&super::super::Manager) -> bool,
 ) {
@@ -1476,7 +1481,7 @@ fn admit_failed_creation(manager: &mut super::super::Manager) {
         expected_topology_domain_id: None,
     };
     assert_eq!(manager.admit("session", operation).0["ok"], true);
-    wait_for_failed_creation_manager(manager, |manager| manager.pending_mutations == 0);
+    wait_for_fake_worker(manager, |manager| manager.pending_mutations == 0);
     assert_eq!(
         manager.monitors[&("session".into(), FIRST.into())].state,
         "cleanup_failed"
@@ -1486,7 +1491,7 @@ fn admit_failed_creation(manager: &mut super::super::Manager) {
 fn remove_failed_creation(manager: &mut super::super::Manager) {
     let response = manager.remove("session", FIRST, Some("failed-stream"));
     assert_eq!(response["ok"], true, "{response}");
-    wait_for_failed_creation_manager(manager, |manager| manager.pending_mutations == 0);
+    wait_for_fake_worker(manager, |manager| manager.pending_mutations == 0);
     assert!(manager.monitors.is_empty());
     assert_eq!(
         manager.remove("session", FIRST, Some("failed-stream"))["removed"],
@@ -1499,7 +1504,7 @@ fn manager_failed_creation_before_journaling_releases_its_admission() {
     let (root, controller) = fixture();
     *controller.connectors.0.lock().unwrap() = Err("DRM sysfs is unavailable".into());
     let broker = controller.broker.clone();
-    let mut manager = manager_for_failed_creation(controller);
+    let mut manager = manager_with_fake_worker(controller);
     admit_failed_creation(&mut manager);
     assert!(broker.effects.lock().unwrap().is_empty());
     assert!(!root.join("connectors.json").exists());
@@ -1516,7 +1521,7 @@ fn manager_failed_creation_after_successful_rollback_releases_its_admission() {
     let (root, mut controller) = fixture();
     controller.compositor.fail = true;
     let broker = controller.broker.clone();
-    let mut manager = manager_for_failed_creation(controller);
+    let mut manager = manager_with_fake_worker(controller);
     admit_failed_creation(&mut manager);
     assert!(!broker.connected("Virtual-2").unwrap());
     let document: serde_json::Value =
@@ -1536,7 +1541,7 @@ fn manager_failed_creation_with_unconfirmed_journal_write_retains_its_obligation
     // A failed atomic replacement gives the actor no successful durable write
     // acknowledgement. The creation must not be classified as proven retired.
     fs::create_dir(root.join("connectors.json")).unwrap();
-    let mut manager = manager_for_failed_creation(controller);
+    let mut manager = manager_with_fake_worker(controller);
     admit_failed_creation(&mut manager);
     assert_eq!(
         manager.remove("session", FIRST, Some("failed-stream"))["code"],
@@ -1556,7 +1561,7 @@ fn manager_failed_creation_keeps_parked_connector_visible_after_reference_releas
         controller.compositor.guard_available = guard_available;
         controller.compositor.fail_restore = fail_restore;
         let broker = controller.broker.clone();
-        let mut manager = manager_for_failed_creation(controller);
+        let mut manager = manager_with_fake_worker(controller);
         admit_failed_creation(&mut manager);
         assert!(broker.connected("Virtual-2").unwrap());
         assert!(
@@ -1567,7 +1572,7 @@ fn manager_failed_creation_keeps_parked_connector_visible_after_reference_releas
 
         let response = manager.remove("session", FIRST, Some("failed-stream"));
         assert_eq!(response["ok"], true, "{response}");
-        wait_for_failed_creation_manager(&mut manager, |manager| manager.pending_mutations == 0);
+        wait_for_fake_worker(&mut manager, |manager| manager.pending_mutations == 0);
         let status = manager.status("session", Some(FIRST.into()), Some("failed-stream".into()));
         assert_eq!(status["parked"], true, "{status}");
         assert_eq!(status["reference_owned"], false);
@@ -1595,13 +1600,13 @@ fn manager_failed_creation_with_uncertain_rollback_retains_native_cleanup() {
     controller.compositor.fail = true;
     let broker = controller.broker.clone();
     *broker.reject_removal.lock().unwrap() = true;
-    let mut manager = manager_for_failed_creation(controller);
+    let mut manager = manager_with_fake_worker(controller);
     admit_failed_creation(&mut manager);
     assert!(broker.connected("Virtual-2").unwrap());
 
     let response = manager.remove("session", FIRST, Some("failed-stream"));
     assert_eq!(response["ok"], true, "{response}");
-    wait_for_failed_creation_manager(&mut manager, |manager| manager.pending_mutations == 0);
+    wait_for_fake_worker(&mut manager, |manager| manager.pending_mutations == 0);
     assert_eq!(
         manager.monitors[&("session".into(), FIRST.into())].state,
         "cleanup_failed"
@@ -1654,6 +1659,7 @@ fn linux_shared_references_persist_and_release_only_the_last_connector_owner() {
         receiver: Some(receiver),
         worker: Some(worker),
         cleanup_pending: Default::default(),
+        recovery_pending: Default::default(),
         observer: None,
         borrows: Default::default(),
         reconfigurations: Default::default(),
@@ -1904,7 +1910,7 @@ fn linux_shared_references_persist_and_release_only_the_last_connector_owner() {
 }
 
 #[test]
-fn reference_ownership_survives_journal_reload_and_restart_cleanup() {
+fn restart_preserves_unreleased_references_without_native_cleanup() {
     let (root, mut controller) = fixture();
     let record = controller
         .create_with_references(
@@ -1919,21 +1925,265 @@ fn reference_ownership_survives_journal_reload_and_restart_cleanup() {
         )
         .unwrap();
     let broker = controller.broker.clone();
+    let effects = broker.effects.lock().unwrap().clone();
     drop(controller);
-    let journal = Journal::open(&root).unwrap();
-    assert_eq!(journal.records[0].references, record.references);
     let mut restarted = Controller {
-        journal,
+        journal: Journal::open(&root).unwrap(),
         broker,
         compositor: FakeCompositor::new(),
         connectors: FakeConnectors::named(1..=8),
         layout: VirtualDisplayLayout::Extended,
         stopped: Default::default(),
     };
-    // Linux restart reconciles stale connectors; references never revive a stream.
-    assert!(restarted.recover().is_none());
-    assert!(!restarted.broker.connected(&record.output).unwrap());
+    let recovery = restarted.recover();
+    assert!(
+        restarted.broker.connected(&record.output).unwrap(),
+        "restart disconnected a connector with unreleased capture references"
+    );
+    assert_eq!(*restarted.broker.effects.lock().unwrap(), effects);
+    assert_eq!(recovery.as_deref(), Some("reference_retirement_required"));
+    assert!(restarted.compositor.restored.is_empty());
+    assert_eq!(restarted.journal.records.len(), 1);
+    assert_eq!(restarted.journal.records[0].references, record.references);
+    assert!(!restarted.journal.records[0].parked);
     drop(restarted);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn restart_waits_for_each_owner_reference_before_removal_or_parking() {
+    for guard_available in [false, true] {
+        let (root, mut controller) = fixture();
+        let record = controller
+            .create_with_references(
+                "session".into(),
+                specification(FIRST),
+                ScaleSetting::Automatic,
+                Some(std::collections::BTreeSet::from([
+                    "stream-a".into(),
+                    "stream-b".into(),
+                ])),
+                VirtualDisplayLayout::Extended,
+            )
+            .unwrap();
+        let broker = controller.broker.clone();
+        let effects = broker.effects.lock().unwrap().clone();
+        drop(controller);
+        let mut compositor = FakeCompositor::new();
+        compositor.guard_available = guard_available;
+        let restarted = Controller {
+            journal: Journal::open(&root).unwrap(),
+            broker: broker.clone(),
+            compositor,
+            connectors: FakeConnectors::named(1..=8),
+            layout: VirtualDisplayLayout::Extended,
+            stopped: Default::default(),
+        };
+        let mut manager = manager_with_fake_worker(restarted);
+        let status = manager.status("session", Some(FIRST.into()), Some("stream-a".into()));
+        assert_eq!(status["reference_owned"], true);
+        assert_eq!(status["recovery_ready"], false);
+        assert_eq!(status["recovery_error"], "reference_retirement_required");
+        assert_eq!(
+            manager.remove("other", FIRST, Some("stream-a"))["removed"],
+            true
+        );
+        assert_eq!(
+            manager.remove("session", FIRST, Some("unknown-reference"))["reference_released"],
+            false
+        );
+        assert_eq!(*broker.effects.lock().unwrap(), effects);
+
+        let first_release = manager.remove("session", FIRST, Some("stream-a"));
+        assert_eq!(first_release["reference_released"], true);
+        assert_eq!(first_release["removed"], false);
+        assert_eq!(manager.pending_mutations, 0);
+        assert_eq!(*broker.effects.lock().unwrap(), effects);
+        let status = manager.status("session", Some(FIRST.into()), Some("stream-b".into()));
+        assert_eq!(status["reference_owned"], true);
+        assert_eq!(status["recovery_ready"], false);
+        let document: serde_json::Value =
+            serde_json::from_slice(&fs::read(root.join("connectors.json")).unwrap()).unwrap();
+        assert_eq!(
+            document["records"][0]["references"],
+            serde_json::json!(["stream-b"])
+        );
+
+        let final_release = manager.remove("session", FIRST, Some("stream-b"));
+        assert_eq!(final_release["ok"], true, "{final_release}");
+        wait_for_fake_worker(&mut manager, |manager| manager.pending_mutations == 0);
+        let status = manager.status("session", Some(FIRST.into()), Some("stream-b".into()));
+        assert_eq!(status["reference_owned"], false);
+        assert_eq!(status["recovery_ready"], true);
+        assert_eq!(status["parked"], !guard_available);
+        assert_eq!(broker.connected(&record.output).unwrap(), !guard_available);
+        let after_cleanup = broker.effects.lock().unwrap().clone();
+        let removal = manager.remove("session", FIRST, Some("stream-b"));
+        assert_eq!(removal["removed"], guard_available);
+        assert_eq!(*broker.effects.lock().unwrap(), after_cleanup);
+        assert!(broker.connected("Virtual-1").unwrap());
+        drop(manager);
+        let journal = Journal::open(&root).unwrap();
+        if guard_available {
+            assert!(journal.records.is_empty());
+        } else {
+            assert_eq!(journal.records.len(), 1);
+            assert!(journal.records[0].parked);
+            assert!(journal.records[0].references.as_ref().unwrap().is_empty());
+        }
+        drop(journal);
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn restart_defers_all_recovered_connectors_until_every_identity_releases_capture() {
+    for (guard_available, first_already_released) in [(false, false), (true, true)] {
+        let (root, mut controller) = fixture();
+        let first_references = if first_already_released {
+            Default::default()
+        } else {
+            std::collections::BTreeSet::from(["stream-a".into()])
+        };
+        let first = controller
+            .create_with_references(
+                "session".into(),
+                specification(FIRST),
+                ScaleSetting::Automatic,
+                Some(first_references),
+                VirtualDisplayLayout::Extended,
+            )
+            .unwrap();
+        let second = controller
+            .create_with_references(
+                "other-session".into(),
+                specification(SECOND),
+                ScaleSetting::Automatic,
+                Some(std::collections::BTreeSet::from(["stream-b".into()])),
+                VirtualDisplayLayout::Extended,
+            )
+            .unwrap();
+        let broker = controller.broker.clone();
+        let effects = broker.effects.lock().unwrap().clone();
+        drop(controller);
+        let mut compositor = FakeCompositor::new();
+        compositor.guard_available = guard_available;
+        let restarted = Controller {
+            journal: Journal::open(&root).unwrap(),
+            broker: broker.clone(),
+            compositor,
+            connectors: FakeConnectors::named(1..=8),
+            layout: VirtualDisplayLayout::Extended,
+            stopped: Default::default(),
+        };
+        let mut manager = manager_with_fake_worker(restarted);
+        assert_eq!(*broker.effects.lock().unwrap(), effects);
+        let release = manager.remove("session", FIRST, Some("stream-a"));
+        assert_eq!(release["ok"], true, "{release}");
+        assert_eq!(release["cleanup_deferred"], true);
+        assert_eq!(release["reference_owned"], false);
+        assert_eq!(manager.pending_mutations, 0);
+        assert_eq!(*broker.effects.lock().unwrap(), effects);
+        assert!(broker.connected(&first.output).unwrap());
+        assert!(broker.connected(&second.output).unwrap());
+        let status = manager.status(
+            "other-session",
+            Some(SECOND.into()),
+            Some("stream-b".into()),
+        );
+        assert_eq!(status["reference_owned"], true);
+        assert_eq!(status["recovery_ready"], false);
+
+        let release = manager.remove("other-session", SECOND, Some("stream-b"));
+        assert_eq!(release["ok"], true, "{release}");
+        assert_eq!(manager.pending_mutations, 2);
+        wait_for_fake_worker(&mut manager, |manager| manager.pending_mutations == 0);
+        assert!(manager.recovery_pending.is_empty());
+        assert_eq!(
+            manager.status("session", None, None)["recovery_ready"],
+            true
+        );
+        assert_eq!(broker.connected(&first.output).unwrap(), !guard_available);
+        assert_eq!(broker.connected(&second.output).unwrap(), !guard_available);
+        assert_eq!(
+            manager.status("session", Some(FIRST.into()), None)["parked"],
+            !guard_available
+        );
+        assert_eq!(
+            manager.status("other-session", Some(SECOND.into()), None)["parked"],
+            !guard_available
+        );
+        assert!(broker.connected("Virtual-1").unwrap());
+        drop(manager);
+        let journal = Journal::open(&root).unwrap();
+        assert_eq!(journal.records.len(), if guard_available { 0 } else { 2 });
+        assert!(
+            journal
+                .records
+                .iter()
+                .all(|record| record.parked && record.references.as_ref().unwrap().is_empty())
+        );
+        drop(journal);
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn restart_cleanup_failure_retries_only_after_an_explicit_owner_request() {
+    let (root, mut controller) = fixture();
+    let record = controller
+        .create_with_references(
+            "session".into(),
+            specification(FIRST),
+            ScaleSetting::Automatic,
+            Some(std::collections::BTreeSet::from(["stream-a".into()])),
+            VirtualDisplayLayout::Extended,
+        )
+        .unwrap();
+    let broker = controller.broker.clone();
+    drop(controller);
+    *broker.reject_removal.lock().unwrap() = true;
+    let restarted = Controller {
+        journal: Journal::open(&root).unwrap(),
+        broker: broker.clone(),
+        compositor: FakeCompositor::new(),
+        connectors: FakeConnectors::named(1..=8),
+        layout: VirtualDisplayLayout::Extended,
+        stopped: Default::default(),
+    };
+    let mut manager = manager_with_fake_worker(restarted);
+    assert_eq!(
+        manager.remove("session", FIRST, Some("stream-a"))["ok"],
+        true
+    );
+    wait_for_fake_worker(&mut manager, |manager| manager.pending_mutations == 0);
+    assert!(broker.connected(&record.output).unwrap());
+    assert_eq!(
+        manager.status("session", None, None)["recovery_ready"],
+        false
+    );
+    let effects = broker.effects.lock().unwrap().clone();
+    for _ in 0..16 {
+        manager.tick();
+        assert_eq!(
+            manager.status("session", None, None)["recovery_ready"],
+            false
+        );
+    }
+    assert_eq!(*broker.effects.lock().unwrap(), effects);
+
+    *broker.reject_removal.lock().unwrap() = false;
+    assert_eq!(
+        manager.remove("session", FIRST, Some("stream-a"))["ok"],
+        true
+    );
+    wait_for_fake_worker(&mut manager, |manager| manager.pending_mutations == 0);
+    assert!(!broker.connected(&record.output).unwrap());
+    assert_eq!(
+        manager.status("session", None, None)["recovery_ready"],
+        true
+    );
+    drop(manager);
     fs::remove_dir_all(root).unwrap();
 }
 

@@ -290,6 +290,17 @@ impl<B: Broker, C: Compositor, I: ConnectorInventory> Controller<B, C, I> {
         Ok(false)
     }
     fn recover(&mut self) -> Option<String> {
+        // Provider restart invalidates its borrows, not its consumers' durable
+        // references. A saved layout can affect every output, so preserve the
+        // entire desktop until each owning caller explicitly releases capture.
+        if self.journal.records.iter().any(|record| {
+            record
+                .references
+                .as_ref()
+                .is_some_and(|references| !references.is_empty())
+        }) {
+            return Some("reference_retirement_required".into());
+        }
         let keys: Vec<_> = self.journal.records.iter().map(Record::key).collect();
         let mut failure = None;
         for key in keys {

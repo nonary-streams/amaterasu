@@ -128,7 +128,16 @@ provider borrow exists; legacy reconfigure continues to require one reference.
 `$XDG_STATE_HOME/amaterasu/virtual-display-linux` (default
 `~/.local/state/amaterasu/virtual-display-linux`) is locked against other
 Amaterasu hosts and synced before connect. Startup reconciles interrupted owned
-connectors before admitting new ones. Failed cleanup retains ownership intent.
+connectors before admitting new ones. Persisted nonempty stable references fence
+all startup topology changes with `reference_retirement_required`: provider restart
+invalidates borrows but does not prove that capture consumers have stopped. Each
+original caller must release its exact references after retiring capture. Releases
+are persisted individually; only after every recovered reference has been released
+does the provider enqueue one cleanup attempt per recovered connector, at most
+eight. Status polling never retries failed native cleanup; an explicit owning
+`remove` opens another bounded attempt. Readiness returns only after those records
+are removed or safely parked. Legacy records without reference metadata retain
+their existing best-effort startup cleanup behavior. Failed cleanup retains ownership intent.
 When the final reference is released, Linux restores the saved layout before
 disconnecting. If restoration fails or there is no distinct active Wayland
 output to guard the disconnect, an independently observed owned output can be
