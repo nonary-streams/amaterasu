@@ -216,13 +216,10 @@ fn linux_group_has_live_members(group_id: u32) -> io::Result<bool> {
         else {
             return Ok(None);
         };
-        match std::fs::read_to_string(entry.path().join("stat")) {
-            Ok(stat) => Ok(Some((process_id, stat))),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-            // An unreadable process could be a live group member. Keep native
-            // ownership until a complete observation can confirm retirement.
-            Err(error) => Err(error),
-        }
+        linux_process_stat_from_read(
+            process_id,
+            std::fs::read_to_string(entry.path().join("stat")),
+        )
     });
     linux_group_has_live_members_from_stats(
         group_id,
@@ -231,6 +228,28 @@ fn linux_group_has_live_members(group_id: u32) -> io::Result<bool> {
         &self_status,
         processes,
     )
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_stat_from_read(
+    process_id: u32,
+    result: io::Result<String>,
+) -> io::Result<Option<(u32, String)>> {
+    match result {
+        Ok(stat) => Ok(Some((process_id, stat))),
+        // procfs may report ESRCH if the task exits after the stat file was
+        // opened but before it was read. It is as absent as an ENOENT entry;
+        // the scan still requires the wait-owned group leader to be present.
+        Err(error)
+            if error.kind() == io::ErrorKind::NotFound
+                || error.raw_os_error() == Some(libc::ESRCH) =>
+        {
+            Ok(None)
+        }
+        // An unreadable process could be a live group member. Keep native
+        // ownership until a complete observation can confirm retirement.
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(target_os = "linux")]

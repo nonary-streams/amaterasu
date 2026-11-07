@@ -245,6 +245,40 @@ fn complete_local_proc_view_can_distinguish_retired_and_live_groups() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
+fn vanished_proc_stat_is_skipped_but_cannot_replace_the_held_leader() {
+    let read = |pid, result| linux_process_stat_from_read(pid, result);
+    let scan = |entries: Vec<io::Result<Option<(u32, String)>>>| {
+        linux_group_has_live_members_from_stats(42, 9, "9 (self) S 1 7", "NStgid:\t9\n", entries)
+    };
+    let leader = || read(42, Ok("42 (held leader) Z 1 42".to_owned()));
+    for errno in [libc::ENOENT, libc::ESRCH] {
+        assert!(
+            !scan(vec![
+                leader(),
+                read(43, Err(io::Error::from_raw_os_error(errno)))
+            ])
+            .expect("a process that vanished during stat cannot remain a live group member")
+        );
+        assert_eq!(
+            scan(vec![read(42, Err(io::Error::from_raw_os_error(errno)))])
+                .expect_err("a missing owned leader cannot prove group retirement")
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+    assert_eq!(
+        scan(vec![
+            leader(),
+            read(43, Err(io::Error::from_raw_os_error(libc::EACCES)))
+        ])
+        .expect_err("an unreadable process may be a live group member")
+        .kind(),
+        io::ErrorKind::PermissionDenied
+    );
+}
+
+#[test]
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn unsupported_unix_retirement_does_not_release_the_root_reservation() {
     let mut root = ExitedRoot::spawn();
