@@ -47,11 +47,12 @@ const MAX_CLEANUP_RETRIES: u8 = 2;
 const CLEANUP_RETRY_DELAYS_MS: [u64; 2] = [250, 1_000];
 const STATUS_INTERVAL_MS: u64 = 250;
 const MAX_RECORDS: usize = 128;
+const MAX_STARTUP_RECOVERY_SESSIONS: usize = 32;
 const MAX_PENDING_NETWORK: usize = 16;
 const MAX_DISPLAY_CLEANUP: usize = 16;
 const STARTUP_RECONCILIATION_TIMEOUT_MS: u64 = 45_000;
-// Leave five seconds for service-manager shutdown overhead (the user service
-// uses TimeoutStopSec=20s); both live RTSP records share this aggregate budget.
+// Legacy synchronous unload shares one bounded budget across all known streams.
+// The managed host instead announces its cooperative shutdown deadline.
 const ORDERLY_SESSION_CLEANUP_BUDGET: Duration = Duration::from_secs(15);
 const ORDERLY_SESSION_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
@@ -104,6 +105,7 @@ struct StartupRecovery {
     phase: RecoveryPhase,
     call: Option<Call>,
     stale_sessions: VecDeque<u64>,
+    attempted_sessions: BTreeSet<u64>,
     current_session: Option<u64>,
     error: Option<&'static str>,
 }
@@ -118,6 +120,7 @@ impl StartupRecovery {
             phase: RecoveryPhase::List,
             call: None,
             stale_sessions: VecDeque::new(),
+            attempted_sessions: BTreeSet::new(),
             current_session: None,
             error: None,
         }
@@ -490,7 +493,13 @@ impl Controller {
             if let Some(call) = recovery.call.as_mut() {
                 match call.poll(runtime) {
                     Outcome::SettledFailure | Outcome::Result(_) => recovery.call = None,
-                    Outcome::Waiting | Outcome::Uncertain => {}
+                    Outcome::Waiting => {}
+                    Outcome::Uncertain => {
+                        // Retry only settlement of this retained broker identity.
+                        // A transient outage must not permanently exhaust the
+                        // local poll allowance and prevent explicit recovery.
+                        call.retry_settlement();
+                    }
                 }
             }
             return;
@@ -515,7 +524,11 @@ impl Controller {
                 }
                 RecoveryPhase::Stop => {
                     let Some(session) = recovery.stale_sessions.pop_front() else {
-                        recovery.phase = RecoveryPhase::Complete;
+                        // The Stop replies prove these exact owners retired,
+                        // but only a fresh global snapshot proves the durable
+                        // startup journal finished reconciling.
+                        recovery.phase = RecoveryPhase::List;
+                        recovery.retry_status_at = now;
                         return;
                     };
                     recovery.current_session = Some(session);
@@ -562,21 +575,7 @@ impl Controller {
             Outcome::Result(payload) => {
                 recovery.call = None;
                 let result = match phase {
-                    RecoveryPhase::List => match payload["startup_reconciled"].as_bool() {
-                        Some(false) if payload["ok"] == true => {
-                            recovery.retry_status_at = now.saturating_add(STATUS_INTERVAL_MS);
-                            Ok(())
-                        }
-                        Some(true) => recovery_list(&payload).map(|sessions| {
-                            recovery.stale_sessions = sessions;
-                            recovery.phase = if recovery.stale_sessions.is_empty() {
-                                RecoveryPhase::Complete
-                            } else {
-                                RecoveryPhase::Stop
-                            };
-                        }),
-                        _ => Err("startup_reconciliation_response_invalid"),
-                    },
+                    RecoveryPhase::List => accept_recovery_list(recovery, &payload, now),
                     RecoveryPhase::Stop => {
                         let Some(session) = recovery.current_session else {
                             recovery.error = Some("startup_reconciliation_state_invalid");
@@ -844,6 +843,56 @@ impl Controller {
     }
 }
 
+fn accept_recovery_list(
+    recovery: &mut StartupRecovery,
+    payload: &Value,
+    now: u64,
+) -> Result<(), &'static str> {
+    let reconciled = payload["startup_reconciled"]
+        .as_bool()
+        .ok_or("startup_reconciliation_response_invalid")?;
+    // Validate the complete owner-scoped page before choosing any mutations.
+    let mut stale_sessions = recovery_list(payload)?;
+    if stale_sessions
+        .iter()
+        .any(|session| recovery.attempted_sessions.contains(session))
+    {
+        // A successful Stop followed by a live observation is not permission to
+        // replay cleanup or report retirement. An explicit reconciliation pass
+        // may retry after the conflicting state has been investigated.
+        return Err("startup_reconciliation_cleanup_unconfirmed");
+    }
+    if !reconciled {
+        // Stream-session still drives ordinary interrupted workflows itself.
+        // Only its failed journal owners need this bounded owner Stop; waiting
+        // for the global barrier first would prevent those owners ever retrying.
+        stale_sessions.retain(|session| {
+            payload["sessions"]
+                .as_array()
+                .expect("validated recovery page")
+                .iter()
+                .any(|entry| entry["session"] == *session && entry["state"] == "cleanup_failed")
+        });
+    }
+    if stale_sessions.is_empty() {
+        if reconciled {
+            recovery.phase = RecoveryPhase::Complete;
+        } else {
+            recovery.retry_status_at = now.saturating_add(STATUS_INTERVAL_MS);
+        }
+        return Ok(());
+    }
+    if recovery.attempted_sessions.len() + stale_sessions.len() > MAX_STARTUP_RECOVERY_SESSIONS {
+        return Err("startup_reconciliation_capacity_exhausted");
+    }
+    recovery
+        .attempted_sessions
+        .extend(stale_sessions.iter().copied());
+    recovery.stale_sessions = stale_sessions;
+    recovery.phase = RecoveryPhase::Stop;
+    Ok(())
+}
+
 fn recovery_list(payload: &Value) -> Result<VecDeque<u64>, &'static str> {
     let sessions = payload["sessions"]
         .as_array()
@@ -855,9 +904,9 @@ fn recovery_list(payload: &Value) -> Result<VecDeque<u64>, &'static str> {
         .as_bool()
         .ok_or("startup_reconciliation_response_invalid")?;
     if payload["ok"] != true
-        || sessions.len() > 32
+        || sessions.len() > MAX_STARTUP_RECOVERY_SESSIONS
         || total < sessions.len() as u64
-        || (truncated && sessions.len() != 32)
+        || (truncated && sessions.len() != MAX_STARTUP_RECOVERY_SESSIONS)
         || (!truncated && total != sessions.len() as u64)
     {
         return Err("startup_reconciliation_response_invalid");
@@ -865,7 +914,7 @@ fn recovery_list(payload: &Value) -> Result<VecDeque<u64>, &'static str> {
 
     // Stream-session status is broker-scoped to this RTSP module principal and
     // places all nonterminal records before retained terminal history. Its live
-    // live record limit is at most 32, so this page includes every orphan.
+    // record limit is at most 32, so this page includes every orphan.
     let mut stale = VecDeque::new();
     let mut seen = BTreeSet::new();
     for session in sessions {

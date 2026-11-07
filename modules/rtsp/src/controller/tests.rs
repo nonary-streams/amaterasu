@@ -349,6 +349,299 @@ fn retirement_fences_wait_for_the_native_journal_reconciliation_proof() {
 }
 
 #[test]
+fn startup_reconciliation_retries_exact_failed_journal_owners_before_global_proof() {
+    let mut controller = Controller::new(Settings {
+        allowed_principals: vec!["amaterasu.nvhttp".into()],
+        ..Settings::default()
+    })
+    .unwrap();
+    startup_recovery_pending(&mut controller, 45_000);
+    let mut blocked = listed_stream_sessions(
+        json!([
+            {"session":23,"state":"cleanup_failed","cleanup_error":"component_cleanup_failed"},
+            {"session":24,"state":"stopping","cleanup_error":null}
+        ]),
+        2,
+    );
+    blocked["startup_reconciled"] = json!(false);
+    let mut still_recovering = listed_stream_sessions(
+        json!([
+            {"session":23,"state":"stopped","cleanup_error":null},
+            {"session":24,"state":"stopping","cleanup_error":null}
+        ]),
+        2,
+    );
+    still_recovering["startup_reconciled"] = json!(false);
+    let mut endpoint = Endpoint {
+        recovery_results: VecDeque::from([
+            Some(blocked),
+            Some(json!({"ok":true,"session":23,"state":"stopped","cleanup_error":null})),
+            Some(still_recovering),
+        ]),
+        ..Endpoint::default()
+    };
+    let runtime = client(&mut endpoint);
+
+    for now in 0..8 {
+        controller.advance_startup_recovery(&runtime, now);
+    }
+
+    let stops: Vec<_> = endpoint
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            Command::Request {
+                service, payload, ..
+            } if service == "amaterasu.stream-session/1" && payload["action"] == "stop" => {
+                Some(payload)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(stops.len(), 1, "retry only an exact failed journal owner");
+    assert_eq!(stops[0]["session"], 23);
+    assert!(stops[0].get("owner").is_none(), "broker supplies the owner");
+    assert!(!controller.startup_recovery.ready());
+    controller.retirement_status(
+        1,
+        "amaterasu.nvhttp",
+        Some("old-operation"),
+        Some(&"0".repeat(32)),
+        &runtime,
+    );
+    assert_eq!(endpoint.completions.last().unwrap().1["retired"], false);
+    controller.open(
+        OpenRequest {
+            request: 2,
+            caller: "amaterasu.nvhttp".into(),
+            config: open(),
+            deadline: 5000,
+            display_preflight_deadline: None,
+        },
+        8,
+        &runtime,
+        false,
+    );
+    assert_eq!(
+        endpoint.completions.last().unwrap().1["code"],
+        "startup_reconciliation_pending"
+    );
+
+    endpoint
+        .recovery_results
+        .push_back(Some(listed_stream_sessions(
+            json!([
+                {"session":23,"state":"stopped","cleanup_error":null},
+                {"session":24,"state":"stopped","cleanup_error":null}
+            ]),
+            2,
+        )));
+    controller.advance_startup_recovery(&runtime, 257);
+    controller.advance_startup_recovery(&runtime, 258);
+    assert!(controller.startup_recovery.ready());
+}
+
+#[test]
+fn startup_reconciliation_failed_owner_retry_stays_blocked() {
+    let mut controller = Controller::new(Settings::default()).unwrap();
+    startup_recovery_pending(&mut controller, 45_000);
+    let mut blocked = listed_stream_sessions(
+        json!([
+            {"session":23,"state":"cleanup_failed","cleanup_error":"component_cleanup_failed"}
+        ]),
+        1,
+    );
+    blocked["startup_reconciled"] = json!(false);
+    let mut endpoint = Endpoint {
+        recovery_results: VecDeque::from([
+            Some(blocked),
+            Some(
+                json!({"ok":true,"session":23,"state":"cleanup_failed","cleanup_error":"component_cleanup_failed"}),
+            ),
+        ]),
+        ..Endpoint::default()
+    };
+    let runtime = client(&mut endpoint);
+    for now in 0..8 {
+        controller.advance_startup_recovery(&runtime, now);
+    }
+    assert!(controller.startup_recovery.blocked());
+    assert_eq!(
+        controller.startup_recovery.error,
+        Some("startup_reconciliation_cleanup_failed")
+    );
+    assert!(!controller.startup_recovery.ready());
+    assert_eq!(
+        endpoint
+            .commands
+            .iter()
+            .filter(|command| matches!(command,
+        Command::Request { payload,.. } if payload["action"] == "stop"))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn startup_reconciliation_validates_the_complete_unreconciled_page_before_retry() {
+    let malformed = [
+        json!([
+            {"session":23,"state":"cleanup_failed","cleanup_error":"cleanup_failed"},
+            {"session":23,"state":"stopping","cleanup_error":null}
+        ]),
+        json!([
+            {"session":23,"state":"cleanup_failed","cleanup_error":"cleanup_failed"},
+            {"session":0,"state":"stopping","cleanup_error":null}
+        ]),
+        json!([
+            {"session":23,"state":"cleanup_failed","cleanup_error":"cleanup_failed"},
+            {"session":24,"state":"unknown","cleanup_error":null}
+        ]),
+    ];
+    for sessions in malformed {
+        let mut controller = Controller::new(Settings::default()).unwrap();
+        startup_recovery_pending(&mut controller, 45_000);
+        let mut page = listed_stream_sessions(sessions, 2);
+        page["startup_reconciled"] = json!(false);
+        let mut endpoint = Endpoint {
+            recovery_results: VecDeque::from([Some(page)]),
+            ..Endpoint::default()
+        };
+        let runtime = client(&mut endpoint);
+        controller.advance_startup_recovery(&runtime, 0);
+        controller.advance_startup_recovery(&runtime, 1);
+        assert!(controller.startup_recovery.blocked());
+        assert!(!endpoint.commands.iter().any(|command| matches!(command,
+            Command::Request {payload,..} if payload["action"] == "stop")));
+    }
+}
+
+#[test]
+fn startup_reconciliation_does_not_repeat_a_successful_stop_for_a_still_live_owner() {
+    for reconciled in [false, true] {
+        let mut controller = Controller::new(Settings {
+            allowed_principals: vec!["amaterasu.nvhttp".into()],
+            ..Settings::default()
+        })
+        .unwrap();
+        startup_recovery_pending(&mut controller, 45_000);
+        let mut page = listed_stream_sessions(
+            json!([
+                {"session":23,"state":"cleanup_failed","cleanup_error":"component_cleanup_failed"}
+            ]),
+            1,
+        );
+        page["startup_reconciled"] = json!(false);
+        let mut contradictory = page.clone();
+        contradictory["startup_reconciled"] = json!(reconciled);
+        let mut endpoint = Endpoint {
+            recovery_results: VecDeque::from([
+                Some(page.clone()),
+                Some(json!({"ok":true,"session":23,"state":"stopped","cleanup_error":null})),
+                Some(contradictory),
+            ]),
+            ..Endpoint::default()
+        };
+        let runtime = client(&mut endpoint);
+        for now in 0..10 {
+            controller.advance_startup_recovery(&runtime, now);
+        }
+        assert!(controller.startup_recovery.blocked());
+        assert_eq!(
+            controller.startup_recovery.error,
+            Some("startup_reconciliation_cleanup_unconfirmed")
+        );
+        assert_eq!(
+            endpoint
+                .commands
+                .iter()
+                .filter(|command| matches!(command,
+            Command::Request {payload,..} if payload["action"] == "stop"))
+                .count(),
+            1
+        );
+        controller.reconcile_startup(1, "amaterasu.nvhttp", 100, &runtime);
+        assert_eq!(controller.startup_recovery.phase, RecoveryPhase::List);
+        assert!(controller.startup_recovery.attempted_sessions.is_empty());
+        endpoint.recovery_results.extend([
+            Some(page),
+            Some(json!({"ok":true,"session":23,"state":"stopped","cleanup_error":null})),
+            Some(listed_stream_sessions(json!([]), 0)),
+        ]);
+        for now in 101..110 {
+            controller.advance_startup_recovery(&runtime, now);
+        }
+        assert!(controller.startup_recovery.ready());
+        assert_eq!(
+            endpoint
+                .commands
+                .iter()
+                .filter(|command| matches!(command,
+            Command::Request {payload,..} if payload["action"] == "stop"))
+                .count(),
+            2
+        );
+    }
+}
+
+#[test]
+fn startup_reconciliation_blocked_settlement_recovers_after_repeated_transport_failures() {
+    let mut controller = Controller::new(Settings {
+        allowed_principals: vec!["amaterasu.nvhttp".into()],
+        retirement_status_principals: vec!["observer".into()],
+        retirement_status_owners: BTreeMap::from([("observer".into(), "amaterasu.nvhttp".into())]),
+        ..Settings::default()
+    })
+    .unwrap();
+    startup_recovery_pending(&mut controller, 45_000);
+    let mut endpoint = Endpoint {
+        deny_settlement: true,
+        recovery_results: VecDeque::from([Some(listed_stream_sessions(json!([]), 0))]),
+        ..Endpoint::default()
+    };
+    let runtime = client(&mut endpoint);
+    for now in 0..12 {
+        controller.advance_startup_recovery(&runtime, now);
+    }
+    assert!(controller.startup_recovery.blocked());
+    assert!(controller.startup_recovery.call.is_some());
+    endpoint.deny_settlement = false;
+    for now in 12..17 {
+        controller.advance_startup_recovery(&runtime, now);
+    }
+    assert!(
+        controller.startup_recovery.call.is_none(),
+        "settle the same request when transport recovers"
+    );
+    assert!(
+        controller.startup_recovery.blocked(),
+        "settlement alone never proves startup cleanup"
+    );
+    assert_eq!(
+        endpoint
+            .commands
+            .iter()
+            .filter(|command| matches!(command, Command::Request { .. }))
+            .count(),
+        1
+    );
+    assert!(
+        endpoint
+            .commands
+            .iter()
+            .any(|command| matches!(command, Command::ReleaseResult { request: 701 }))
+    );
+    controller.reconcile_startup(1, "observer", 17, &runtime);
+    assert_eq!(
+        endpoint.completions.last().unwrap().1["code"],
+        "permission_denied"
+    );
+    assert!(controller.startup_recovery.blocked());
+    controller.reconcile_startup(2, "amaterasu.nvhttp", 17, &runtime);
+    assert_eq!(controller.startup_recovery.phase, RecoveryPhase::List);
+}
+
+#[test]
 fn stale_epoch_admission_and_blocked_reconciliation_cannot_simulate_retirement() {
     let mut controller = Controller::new(Settings {
         allowed_principals: vec!["caller".into()],
@@ -476,12 +769,18 @@ fn startup_reconciliation_stops_only_sessions_in_rtsp_scoped_status_and_waits_te
             )),
             Some(json!({"ok":true,"session":23,"state":"stopping","cleanup_error":null})),
             Some(json!({"ok":true,"session":23,"state":"stopped","cleanup_error":null})),
+            Some(listed_stream_sessions(
+                json!([
+                    {"session":23,"state":"stopped","cleanup_error":null}
+                ]),
+                1,
+            )),
         ]),
         ..Endpoint::default()
     };
     let runtime = client(&mut endpoint);
 
-    for now in [0, 1, 2, 3, 253, 254, 255] {
+    for now in [0, 1, 2, 3, 253, 254, 255, 256, 257] {
         controller.advance_startup_recovery(&runtime, now);
     }
 
@@ -502,6 +801,8 @@ fn startup_reconciliation_stops_only_sessions_in_rtsp_scoped_status_and_waits_te
     assert_eq!(actions[1]["session"], 23);
     assert_eq!(actions[2]["action"], "status");
     assert_eq!(actions[2]["session"], 23);
+    assert_eq!(actions[3]["action"], "status");
+    assert!(actions[3]["session"].is_null());
     assert!(!actions.iter().any(|action| action["session"] == 24));
 }
 
@@ -567,6 +868,12 @@ fn restart_reconciliation_stops_old_lease_before_fresh_resume_open() {
                 1,
             )),
             Some(json!({"ok":true,"session":23,"state":"stopped","cleanup_error":null})),
+            Some(listed_stream_sessions(
+                json!([
+                    {"session":23,"state":"stopped","cleanup_error":null}
+                ]),
+                1,
+            )),
             Some(json!({
                 "ok":true,
                 "session":24,
@@ -603,7 +910,7 @@ fn restart_reconciliation_stops_old_lease_before_fresh_resume_open() {
     assert!(!endpoint.commands.iter().any(|command| matches!(command,
         Command::Request { payload, .. } if payload["action"] == "prepare")));
 
-    for now in [1, 2, 3, 4, 5] {
+    for now in [1, 2, 3, 4, 5, 6, 7] {
         controller.advance_startup_recovery(&runtime, now);
     }
     assert!(controller.startup_recovery.ready());
@@ -616,11 +923,11 @@ fn restart_reconciliation_stops_old_lease_before_fresh_resume_open() {
             deadline: 10_000,
             display_preflight_deadline: None,
         },
-        6,
+        8,
         &runtime,
         false,
     );
-    for now in 7..11 {
+    for now in 9..13 {
         controller.advance_job(&runtime, now);
     }
 
@@ -639,11 +946,13 @@ fn restart_reconciliation_stops_old_lease_before_fresh_resume_open() {
             _ => None,
         })
         .collect();
-    assert_eq!(requests.len(), 3);
+    assert_eq!(requests.len(), 4);
     assert_eq!(requests[0].0["action"], "status");
     assert_eq!(requests[1].0["action"], "stop");
     assert_eq!(requests[1].0["session"], 23);
-    assert_eq!(requests[2].0["action"], "prepare");
+    assert_eq!(requests[2].0["action"], "status");
+    assert!(requests[2].0["session"].is_null());
+    assert_eq!(requests[3].0["action"], "prepare");
     let new_ticket = controller
         .records
         .values()
@@ -651,10 +960,10 @@ fn restart_reconciliation_stops_old_lease_before_fresh_resume_open() {
         .expect("fresh resume ticket")
         .id;
     assert_eq!(
-        requests[2].0["operation_id"],
+        requests[3].0["operation_id"],
         format!("rtsp-{new_ticket:016x}")
     );
-    assert_ne!(requests[1].1, requests[2].1);
+    assert_ne!(requests[1].1, requests[3].1);
     assert!(controller.records.values().any(|record| {
         record.config.operation_id == "nvhttp-resume-fresh"
             && record.session == Some(24)

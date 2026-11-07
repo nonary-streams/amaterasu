@@ -210,6 +210,19 @@ ones. Observation-only principals cannot call this operation. After a failed
 startup pass has settled, a normal owner may call `reconcile_startup` to retry
 its native reconciliation; this never marks cleanup successful by itself.
 
+Startup reconciliation validates the complete broker-scoped stream-session
+snapshot before stopping an exact owner. While the downstream startup journal
+is still unresolved, it retries only records explicitly marked `cleanup_failed`;
+ordinary interrupted workflows keep their existing automatic cleanup owner.
+Each owner is attempted at most once in a bounded reconciliation pass. Failed
+cleanup or a later contradictory live observation blocks the pass until an
+authorized owner requests another reconciliation. Successful Stops are followed
+by a fresh global snapshot: admission and epoch retirement remain fenced until
+the durable startup barrier is reconciled and no owned live record remains.
+Retained broker settlement continues using its exact request identity after
+transient transport failures; settling that bookkeeping alone leaves the pass
+blocked and requires an explicit reconciliation retry.
+
 Signed startup `max_live_tickets` and downstream `max_live_sessions` are bounded
 from 1 to 32 and default to 2. Configured media endpoints reserve three UDP
 ports per concurrent ticket, starting at the usual video/control/audio offsets
