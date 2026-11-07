@@ -270,7 +270,10 @@ fn owner_release_receipt(receipt: &Receipt, work: &Work, session: &SessionRecord
     let request_matches = match receipt.request["operation"].as_str() {
         Some("end_session") => receipt.request["target"] == json!(target),
         // An abandonment interrupted by another restart names its own epoch.
-        Some("abandon_restarted_session") => session.application_disposition.is_some(),
+        Some("recover_session") => {
+            receipt.request["restart_abandonment"] == true
+                && session.application_disposition.is_some()
+        }
         _ => false,
     };
     receipt.caller == session.owner.caller
@@ -394,7 +397,7 @@ pub(super) mod tests {
 
     pub(in crate::coordinator) fn abandon_request(coordinator: &Coordinator, id: &str) -> Value {
         let epoch = coordinator.shared.borrow().value.host_epoch.clone();
-        json!({"operation":"abandon_restarted_session","operation_id":format!("{id}-abandon"),
+        json!({"operation":"recover_session","restart_abandonment":true,"operation_id":format!("{id}-abandon"),
             "target":{"kind":"session","host_epoch":epoch,"session_id":id,"generation":1}})
     }
 

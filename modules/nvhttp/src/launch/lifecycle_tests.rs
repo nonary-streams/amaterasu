@@ -865,7 +865,7 @@ impl RestartSweepBroker {
                 self.lifecycle_operations.push(payload.clone());
                 let result = match payload["operation"].as_str() {
                     Some("snapshot") => self.snapshot_reply.clone(),
-                    Some("abandon_restarted_session") => {
+                    Some("recover_session") if payload["restart_abandonment"] == true => {
                         json!({"status":"pending","operation_id":payload["operation_id"]})
                     }
                     _ => return self.launch.send(command),
@@ -921,8 +921,9 @@ fn restart_sweep_abandons_stranded_sessions_without_reporting_retirement() {
     for tick in 0..16 {
         controller.poll(now + Duration::from_millis(tick * 10), &mut |command| broker.send(command));
     }
-    assert_eq!(broker.operations(), ["snapshot", "abandon_restarted_session"]);
+    assert_eq!(broker.operations(), ["snapshot", "recover_session"]);
     let abandon = broker.lifecycle_operations[1].clone();
+    assert_eq!(abandon["restart_abandonment"], true, "only the abandonment mode is sent");
     assert_eq!(
         abandon["target"],
         json!({"kind":"session","host_epoch":"current","session_id":"stranded","generation":1})
@@ -938,7 +939,7 @@ fn restart_sweep_abandons_stranded_sessions_without_reporting_retirement() {
     }
     assert_eq!(
         broker.operations(),
-        ["snapshot", "abandon_restarted_session", "snapshot", "abandon_restarted_session"]
+        ["snapshot", "recover_session", "snapshot", "recover_session"]
     );
     assert_eq!(broker.lifecycle_operations[3]["operation_id"], operation_id);
 }

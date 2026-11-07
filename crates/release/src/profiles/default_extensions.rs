@@ -96,7 +96,6 @@ fn configure(
                 "lookup",
                 "snapshot",
                 "recover_session",
-                "abandon_restarted_session",
             ],
         ),
         (

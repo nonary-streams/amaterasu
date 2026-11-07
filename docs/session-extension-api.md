@@ -399,7 +399,8 @@ remain `recovery_required`; that state is not successful restoration.
 Owner abandonment after restart covers an owner that kept its application
 records only in memory and so can never report an earlier application retired.
 Its `snapshot` lists each session's `host_epoch`, so the owner can find them.
-The owner sends `abandon_restarted_session` with a current-epoch session target.
+The owner sends `recover_session` with `restart_abandonment: true` and a
+current-epoch session target, so no grant beyond `recover_session` is needed.
 It is accepted only for that owner's `recovery_required` session from an older
 epoch when every stream is retired, no input, action, shared-source or
 composition state remains, every retained admission is settled and owned by the

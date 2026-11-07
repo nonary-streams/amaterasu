@@ -2747,10 +2747,7 @@ fn restart_before_application_retired(session_release_deferred: bool) -> (Harnes
     let mut harness = Harness::with_processing_mode(true, None, false, true);
     harness.policy_obligations = true;
     harness.policy_session_release_deferred = session_release_deferred;
-    for (caller, operation) in [
-        ("transport", "abandon_restarted_session"),
-        ("capture", "ack_stream"),
-    ] {
+    for (caller, operation) in [("transport", "recover_session"), ("capture", "ack_stream")] {
         harness
             .settings
             .operation_grants
@@ -2818,7 +2815,7 @@ fn abandon(harness: &mut Harness, session: &Value) -> Value {
     assert_ne!(snapshot["host_epoch"], session["host_epoch"]);
     let mut target = session.clone();
     target["host_epoch"] = snapshot["host_epoch"].clone();
-    let request = json!({"operation":"abandon_restarted_session",
+    let request = json!({"operation":"recover_session","restart_abandonment":true,
         "operation_id":"stranded.abandon","target":target});
     let started = harness.call("transport", request.clone());
     assert_eq!(started["status"], "pending", "{started}");
@@ -2890,7 +2887,7 @@ fn deferred_abandoned_release_stays_fenced_for_recovery() {
     target["host_epoch"] = journal["host_epoch"].clone();
     let retry = harness.call(
         "transport",
-        json!({"operation":"abandon_restarted_session",
+        json!({"operation":"recover_session","restart_abandonment":true,
         "operation_id":"stranded.abandon-again","target":target}),
     );
     // The deferred release admission is still unsettled; nothing is replayed.

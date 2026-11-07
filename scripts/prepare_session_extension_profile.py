@@ -33,7 +33,7 @@ CONSOLE = "amaterasu.console"
 # These are operation grants, not a native-code sandbox or user role grants.
 OPERATIONS = {
     LAUNCH: ["read_prepared_plans"],
-    NVHTTP: ["prepare", "bind_application", "application_retired", "end_session", "lookup", "snapshot", "recover_session", "abandon_restarted_session"],
+    NVHTTP: ["prepare", "bind_application", "application_retired", "end_session", "lookup", "snapshot", "recover_session"],
     RTSP: ["prepare_stream", "resume_stream", "lookup", "snapshot"],
     STREAM: ["validate_candidate", "ack_binding", "start_stream", "pause_stream", "retire_stream", "resolve_stream_preparation", "binding_validate", "capture_invalidated", "resource_invalidated", "issue_input_binding", "lookup"],
     INPUT: ["validate_input_binding", "reserve_input_action", "finish_input_action", "lookup_input_action"],

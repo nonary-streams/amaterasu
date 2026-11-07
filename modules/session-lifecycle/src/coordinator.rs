@@ -1451,12 +1451,14 @@ impl Coordinator {
                 return rejection("capacity_exhausted");
             }
         }
-        let result = if operation == "recover_session" {
+        // Restart abandonment is a recovery mode, so it needs no grant beyond
+        // the owner's existing `recover_session`.
+        let result = if operation == "recover_session" && payload["restart_abandonment"] == true {
+            self.abandon_restarted_session(caller, initiator, payload, key)
+        } else if operation == "recover_session" {
             self.recover_session(caller, initiator, payload, key)
         } else if operation == "retire_stream" && payload["restart_recovery"] == true {
             self.retire_restarted_stream(caller, initiator, payload, key)
-        } else if operation == "abandon_restarted_session" {
-            self.abandon_restarted_session(caller, initiator, payload, key)
         } else if operation == "refresh_provider_observations" {
             self.refresh_provider_observations(caller, initiator, payload, key)
         } else {

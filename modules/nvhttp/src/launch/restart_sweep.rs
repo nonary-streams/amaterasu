@@ -272,7 +272,7 @@ fn stranded_sessions(payload: &Value) -> Option<(String, Vec<StrandedSession>)> 
 /// the same epoch replays the coordinator's receipt instead of acting twice.
 fn abandon_call(current_epoch: &str, session: &StrandedSession, now: Instant) -> ActiveCall {
     let operation_id = abandonment_operation_id(current_epoch, session);
-    let payload = json!({"operation":"abandon_restarted_session","operation_id":operation_id,
+    let payload = json!({"operation":"recover_session","restart_abandonment":true,"operation_id":operation_id,
         "target":{"kind":"session","host_epoch":current_epoch,
             "session_id":session.session_id,"generation":session.generation}});
     ActiveCall {
