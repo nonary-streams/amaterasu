@@ -1549,8 +1549,10 @@ impl Pipeline {
                         ApplicationState::Preparing | ApplicationState::Running
                     )
                     && let Some(request) = job.request.take()
+                    && completion_rejected(send, request, record.response())
                 {
-                    complete(send, request, record.response())?;
+                    job.begin_cleanup(record, Outcome::Cancelled, Some("request_cancelled"));
+                    return self.retain(job);
                 }
                 match state {
                     ApplicationState::Preparing | ApplicationState::Stopping => {
@@ -1588,6 +1590,18 @@ impl Pipeline {
                 };
                 record.provider_ticket = evidence.ticket;
                 use crate::provider_evidence::State as ProviderState;
+                if job.step == Step::StartProvider
+                    && record.return_on_admission
+                    && matches!(
+                        evidence.state,
+                        ProviderState::Starting | ProviderState::Running
+                    )
+                    && let Some(request) = job.request.take()
+                    && completion_rejected(send, request, record.response())
+                {
+                    job.begin_cleanup(record, Outcome::Cancelled, Some("request_cancelled"));
+                    return self.retain(job);
+                }
                 match evidence.state {
                     ProviderState::Starting if job.step == Step::StartProvider => {
                         job.step = Step::MonitorProvider;
@@ -1596,11 +1610,6 @@ impl Pipeline {
                     ProviderState::Running
                         if job.step == Step::StartProvider || record.state == State::Starting =>
                     {
-                        if record.return_on_admission
-                            && let Some(request) = job.request.take()
-                        {
-                            complete(send, request, record.response())?;
-                        }
                         job.step = Step::Activate;
                     }
                     ProviderState::Running => return Ok(()),
@@ -1635,8 +1644,10 @@ impl Pipeline {
                         responses::ProviderState::Starting | responses::ProviderState::Running
                     )
                     && let Some(request) = job.request.take()
+                    && completion_rejected(send, request, record.response())
                 {
-                    complete(send, request, record.response())?;
+                    job.begin_cleanup(record, Outcome::Cancelled, Some("request_cancelled"));
+                    return self.retain(job);
                 }
                 match provider.state {
                     responses::ProviderState::Starting => job.step = Step::AwaitPlayniteStart,
@@ -1968,16 +1979,11 @@ impl Pipeline {
             }
             None => return Err("missing launch request".into()),
         };
-        let active = matches!(send(Command::CheckRequest { request }), Ok(Response::Ok));
-        let delivered = active
-            && matches!(
-                send(Command::Complete {
-                    request,
-                    payload: self.records.values[&job.launch_id].response(),
-                }),
-                Ok(Response::Ok)
-            );
-        if delivered {
+        if !completion_rejected(
+            send,
+            request,
+            self.records.values[&job.launch_id].response(),
+        ) {
             return Ok(());
         }
         job.begin_cleanup(
@@ -2104,6 +2110,20 @@ fn complete(
         Response::Error { code, .. } if code == "request_ended" || code == "not_found" => Ok(()),
         _ => Err("launch completion failed".into()),
     }
+}
+
+/// Submit a completion exactly once. Only a definite rejection proves that the
+/// caller did not receive it; transport failure may follow successful delivery.
+/// In that case the workflow remains owned and can be stopped by operation ID.
+fn completion_rejected(
+    send: &mut impl FnMut(Command) -> Transport,
+    request: u64,
+    payload: Value,
+) -> bool {
+    matches!(
+        send(Command::Complete { request, payload }),
+        Ok(Response::Error { .. })
+    )
 }
 
 /// Active records whose process or provider can end on its own.
