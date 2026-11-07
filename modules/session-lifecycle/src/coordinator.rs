@@ -57,12 +57,12 @@ mod provider_observations;
 mod providers;
 mod recovery;
 mod refresh_receipt;
-mod revocation_schedule;
-#[cfg(test)]
-mod revocation_schedule_tests;
 #[allow(dead_code)] // Generation lookup is gated on authenticated endpoints.
 mod resource_generation;
 mod retention;
+mod revocation_schedule;
+#[cfg(test)]
+mod revocation_schedule_tests;
 mod security;
 mod session_closed_history;
 mod session_closure;
