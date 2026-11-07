@@ -81,6 +81,10 @@ pub struct Record {
     pub application_owner_client_id: String,
     pub presentation_client_id: Option<String>,
     pub transport_only_cleanup: bool,
+    /// Apply the application lifetime policy only after this transport has
+    /// supplied an exact retirement receipt.
+    pub stop_application_after_stream_retirement: bool,
+    pub rtsp_closing_deadline: Option<Instant>,
     pub desktop: bool,
     pub auxiliary: Option<super::auxiliary::AuxiliaryRecord>,
     pub shared_capture: Option<amaterasu_module_sdk::session_presentation::SharedCapture>,
@@ -294,6 +298,8 @@ impl Record {
             application_owner_client_id,
             presentation_client_id: None,
             transport_only_cleanup: false,
+            stop_application_after_stream_retirement: false,
+            rtsp_closing_deadline: None,
             encoder_snapshot: None,
             video_codec_offer: CodecOffer {
                 codecs: vec![amaterasu_media::VideoCodec::H264],
@@ -492,6 +498,18 @@ impl Record {
     pub fn request_transport_cleanup(&mut self, failure: Option<&'static str>, now: Instant) {
         self.request_cleanup(failure, now);
         self.transport_only_cleanup = true;
+    }
+
+    /// A failed monitor does not prove that the stream has retired. Keep the
+    /// application alive until the exact RTSP cleanup receipt is available.
+    pub fn request_monitored_transport_cleanup(
+        &mut self,
+        failure: Option<&'static str>,
+        now: Instant,
+    ) {
+        self.stop_application_after_stream_retirement =
+            self.application_session.is_none() && self.stop_on_stream_end;
+        self.request_transport_cleanup(failure, now);
     }
 
     pub fn cleanup_deadline(&self, now: Instant) -> Instant {

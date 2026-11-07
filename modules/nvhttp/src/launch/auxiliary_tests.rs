@@ -604,6 +604,134 @@ fn auxiliary_borrowed_application_verifies_and_binds_source_before_required_life
 }
 
 #[test]
+fn resumed_source_keeps_disconnect_witness_with_its_exact_transport() {
+    let now = Instant::now();
+    let mut controller = auxiliary_controller();
+    controller.set_session_lifecycle_required(true);
+    controller.set_session_lifecycle_capture_mode(
+        amaterasu_module_sdk::extension_api::CaptureBindingMode::External,
+    );
+    controller.set_global_display_policy(7, json!({}));
+    let mut broker = SharedSessionBroker::default();
+    assert!(
+        controller
+            .launch_application_with_source(
+                10,
+                request(1),
+                peer(1),
+                borrowed_source("application-source"),
+                now,
+            )
+            .is_none()
+    );
+    assert_eq!(
+        borrowed_ready(&mut controller, &mut broker, now).1.status,
+        200
+    );
+    controller.reply_delivered(10, now);
+    controller.take_auxiliary_events();
+
+    let pause = |controller: &mut Controller,
+                 broker: &mut SharedSessionBroker,
+                 ticket: u64,
+                 start: Instant,
+                 reason: Option<&str>| {
+        let transport = broker.transports.get_mut(&ticket).unwrap();
+        transport["state"] = json!("closed");
+        transport["authenticated_disconnect_reason"] = json!(reason);
+        for tick in 1..=150 {
+            controller.poll(start + Duration::from_millis(tick * 50), &mut |command| {
+                borrowed_send(broker, command)
+            });
+            if controller.records[&1].state == State::Paused {
+                return start + Duration::from_millis(tick * 50);
+            }
+        }
+        panic!(
+            "transport did not retire: {:?}",
+            controller.records[&1].cleanup_error
+        );
+    };
+    let resume_ready =
+        |controller: &mut Controller, broker: &mut SharedSessionBroker, start: Instant| {
+            for tick in 0..300 {
+                let at = start + Duration::from_millis(tick * 10);
+                if let Some((_, reply)) = controller
+                    .poll(at, &mut |command| borrowed_send(broker, command))
+                    .into_iter()
+                    .next()
+                {
+                    assert_eq!(
+                        reply.status, 200,
+                        "failure={:?}",
+                        controller.records[&1].failure
+                    );
+                    return at;
+                }
+            }
+            panic!(
+                "resume did not complete: {:?}",
+                controller.records[&1].cleanup_error
+            );
+        };
+    let second_at = pause(&mut controller, &mut broker, 71, now, None);
+    assert!(
+        controller
+            .resume_with_source_for_route(
+                11,
+                request(2),
+                &peer(1),
+                borrowed_source("second"),
+                StreamResponse::Resume,
+                second_at,
+            )
+            .is_none()
+    );
+    let second_at = resume_ready(&mut controller, &mut broker, second_at);
+    controller.reply_delivered(11, second_at);
+    let started = controller.take_auxiliary_events();
+    assert!(started.iter().any(
+        |event| event.reservation_id == "second" && event.event == SessionEvent::StreamStarted
+    ));
+    let second_operation = controller.records[&1].rtsp_operation.clone();
+    let third_at = pause(
+        &mut controller,
+        &mut broker,
+        72,
+        second_at,
+        Some("peer_disconnected"),
+    );
+    assert!(controller.records[&1].authenticated_client_disconnected);
+
+    assert!(
+        controller
+            .resume_with_source_for_route(
+                12,
+                request(3),
+                &peer(1),
+                borrowed_source("third"),
+                StreamResponse::Resume,
+                third_at,
+            )
+            .is_none()
+    );
+    assert!(!controller.records[&1].authenticated_client_disconnected);
+    let previous = controller.take_auxiliary_events();
+    assert_eq!(previous.len(), 1);
+    assert_eq!(previous[0].reservation_id, "second");
+    assert_eq!(previous[0].transport_id, second_operation);
+    assert_eq!(previous[0].event, SessionEvent::ClientDisconnected);
+    let third_at = resume_ready(&mut controller, &mut broker, third_at);
+    controller.reply_delivered(12, third_at);
+    controller.take_auxiliary_events();
+    pause(&mut controller, &mut broker, 73, third_at, None);
+    let last = controller.take_auxiliary_events();
+    assert_eq!(last.len(), 1);
+    assert_eq!(last[0].reservation_id, "third");
+    assert_eq!(last[0].event, SessionEvent::StreamEnded);
+}
+
+#[test]
 fn auxiliary_unknown_route_is_rejected_before_any_stream_admission() {
     let now = Instant::now();
     let mut controller = auxiliary_controller();

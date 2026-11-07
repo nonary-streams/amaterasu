@@ -74,6 +74,49 @@ impl Record {
 }
 
 impl Controller {
+    /// Preserve an unreported transport observation before reusing its record
+    /// for a new RTSP operation. The application source hold has its own
+    /// lifetime and remains owned until the application itself ends.
+    pub(super) fn queue_previous_source_retirement(&mut self, root: u64) -> Result<(), ()> {
+        let record = &self.records[&root];
+        let Some(source) = record.shared_capture.as_ref() else {
+            return Ok(());
+        };
+        if record.rtsp_requested
+            || record.source_ended_reported
+            || record
+                .application_source
+                .as_ref()
+                .is_some_and(|hold| hold.source.reservation_id == source.reservation_id)
+        {
+            return Ok(());
+        }
+        if self.pending_presentation_observations.len() >= super::MAX_RECORDS {
+            return Err(());
+        }
+        let observation = Observation {
+            client_id: fingerprint(record.peer.certificate()),
+            session_id: source.session_id.clone(),
+            generation: source.generation,
+            reservation_id: source.reservation_id.clone(),
+            transport_id: record.rtsp_operation.clone(),
+            transport_epoch: record.rtsp_runtime_epoch.clone(),
+            event: if !record.source_started_reported {
+                SessionEvent::FailedStart
+            } else if record.authenticated_client_disconnected {
+                SessionEvent::ClientDisconnected
+            } else {
+                SessionEvent::StreamEnded
+            },
+        };
+        self.records
+            .get_mut(&root)
+            .expect("retained root")
+            .source_ended_reported = true;
+        self.pending_presentation_observations.push(observation);
+        Ok(())
+    }
+
     /// Recovery workers may fence only operations no longer represented by
     /// this controller, including uncertain cleanup and pending admissions.
     pub fn owns_transport_operation(&self, operation_id: &str, runtime_epoch: &str) -> bool {
@@ -412,41 +455,6 @@ impl Controller {
                 409,
                 "borrowed capture source generation changed",
             ));
-        }
-        if self.pending_presentation_observations.len() >= super::MAX_RECORDS {
-            return Some(private_error(503, "source observation capacity exhausted"));
-        }
-        // Retire the previous transport's exact source hold before replacing
-        // its in-memory reservation on a paused application root.
-        let previous_retirement = self.records.get_mut(&root).and_then(|record| {
-            if record.rtsp_requested || record.source_ended_reported {
-                return None;
-            }
-            let previous = record.shared_capture.as_ref()?;
-            if record
-                .application_source
-                .as_ref()
-                .is_some_and(|hold| hold.source.reservation_id == previous.reservation_id)
-            {
-                return None;
-            }
-            record.source_ended_reported = true;
-            Some(Observation {
-                client_id: fingerprint(record.peer.certificate()),
-                session_id: previous.session_id.clone(),
-                generation: previous.generation,
-                reservation_id: previous.reservation_id.clone(),
-                transport_id: record.rtsp_operation.clone(),
-                transport_epoch: record.rtsp_runtime_epoch.clone(),
-                event: if record.source_started_reported {
-                    SessionEvent::StreamEnded
-                } else {
-                    SessionEvent::FailedStart
-                },
-            })
-        });
-        if let Some(observation) = previous_retirement {
-            self.pending_presentation_observations.push(observation);
         }
         // The fresh reservation is frozen on the candidate created by the
         // ordinary resume admission. Native stream effects follow verification.

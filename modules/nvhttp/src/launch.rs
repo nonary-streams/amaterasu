@@ -1566,17 +1566,28 @@ impl Controller {
                 Err(_) => return Some(private_error(503, "resume capacity exhausted")),
             };
             let operation = operation_id(&self.nonce, id, "rtsp");
-            let record = self
+            let root = self
                 .records
-                .values_mut()
+                .values()
                 .find(|record| {
                     record.lifecycle_required
                         && record.state == State::Paused
                         && record.request.app_id == request.app_id
                         && record.application_session.is_none()
                 })
+                .expect("retained session remains available")
+                .id;
+            if self.queue_previous_source_retirement(root).is_err() {
+                return Some(private_error(503, "source observation capacity exhausted"));
+            }
+            let record = self
+                .records
+                .get_mut(&root)
                 .expect("retained session remains available");
             record.rtsp_operation = operation;
+            record.authenticated_client_disconnected = false;
+            record.rtsp_closing_deadline = None;
+            record.stop_application_after_stream_retirement = false;
             record.revoked = false;
             record.failure = None;
             record.resumed = true;
