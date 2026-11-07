@@ -106,6 +106,7 @@ pub struct CpuResourceProcessingSession {
     stream: u64,
     source: SourceFormat,
     target: CpuProcessingTarget,
+    output: Option<(u64, CpuProcessingOffer)>,
     selected: Option<Selection>,
     active: bool,
     retired: bool,
@@ -157,6 +158,7 @@ impl CpuResourceProcessingSession {
             stream,
             source,
             target,
+            output: None,
             selected: None,
             active: false,
             retired: false,
@@ -181,6 +183,7 @@ impl CpuResourceProcessingSession {
             unsafe { (processor.base.cancel)(processor.base.base.context, self.stream) };
             self.active = false;
         }
+        self.output = None;
         self.selected = None;
         self.retired = true;
     }
@@ -243,30 +246,39 @@ impl CpuResourceProcessingSession {
     unsafe fn negotiate(&mut self, capture: &CaptureApiV1_8) -> Result<(), ConnectionError> {
         let processor = unsafe { &*self.processor };
         let context = processor.base.base.context;
-        let (generation, outputs) = enumerate(|sink, generation| unsafe {
-            (processor.enumerate_outputs)(context, self.stream, sink, generation)
-        })?;
-        // Ordered target formats preserve the consumer's explicit precision
-        // preference; no output format or color is inferred from the input.
-        let output = self
-            .target
-            .formats
-            .iter()
-            .find_map(|format| {
-                outputs.iter().find(|offer| {
-                    offer.capabilities.base.format == format.pixel_format
-                        && tuple(offer.capabilities.color) == tuple(format.color)
-                        && target_matches(offer.capabilities, &self.target)
+        let (generation, output) = if let Some(output) = self.output {
+            output
+        } else {
+            let (generation, outputs) = enumerate(|sink, generation| unsafe {
+                (processor.enumerate_outputs)(context, self.stream, sink, generation)
+            })?;
+            // Ordered target formats preserve the consumer's explicit precision
+            // preference; no output format or color is inferred from the input.
+            let output = self
+                .target
+                .formats
+                .iter()
+                .find_map(|format| {
+                    outputs.iter().find(|offer| {
+                        offer.capabilities.base.format == format.pixel_format
+                            && tuple(offer.capabilities.color) == tuple(format.color)
+                            && target_matches(offer.capabilities, &self.target)
+                    })
                 })
-            })
-            .copied()
-            .ok_or(ConnectionError::NoCompatibleOffer)?;
-        self.active = true;
-        let status =
-            unsafe { (processor.select_output)(context, self.stream, generation, output.id) };
-        if status != STATUS_OK {
-            return Err(ConnectionError::Native(status));
-        }
+                .copied()
+                .ok_or(ConnectionError::NoCompatibleOffer)?;
+            self.active = true;
+            let status =
+                unsafe { (processor.select_output)(context, self.stream, generation, output.id) };
+            if status != STATUS_OK {
+                // The ABI does not promise that an unsuccessful output selection
+                // had no effect. Retire this exact stream before any retry.
+                self.cancel();
+                return Err(ConnectionError::Native(status));
+            }
+            self.output = Some((generation, output));
+            (generation, output)
+        };
         let (input_generation, inputs) = enumerate(|sink, generation| unsafe {
             (processor.base.enumerate_resources)(context, self.stream, sink, generation)
         })?;
@@ -300,6 +312,10 @@ impl CpuResourceProcessingSession {
                     continue;
                 }
                 if status != STATUS_OK {
+                    // Only UNSUPPORTED guarantees that the previous input
+                    // configuration was left unchanged. A transient result can
+                    // still have acquired work that cancellation must retire.
+                    self.cancel();
                     return Err(ConnectionError::Native(status));
                 }
                 let status = unsafe {

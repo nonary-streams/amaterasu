@@ -9,6 +9,7 @@ use std::sync::{
 #[derive(Default)]
 struct Counts {
     reads: AtomicUsize,
+    configurations: AtomicUsize,
     processes: AtomicUsize,
     cancels: AtomicUsize,
     shutdowns: AtomicUsize,
@@ -123,6 +124,7 @@ impl CpuResourceProcessor for Planar {
         input: CpuResourceCapabilitiesV2,
         output: CpuResourceCapabilitiesV2,
     ) -> Result<(), Status> {
+        self.counts.configurations.fetch_add(1, Ordering::SeqCst);
         assert_eq!(input.color.transfer, FRAME_TRANSFER_PQ);
         assert_eq!(output.color.transfer, FRAME_TRANSFER_BT709);
         Ok(())
@@ -683,6 +685,195 @@ fn malformed_source_clock_envelopes_fail_before_processing_but_unknown_domain_is
             counts.processes.load(Ordering::SeqCst),
             usize::from(accepted)
         );
+        drop(session);
+        assert_eq!(counts.cancels.load(Ordering::SeqCst), 1);
+    }
+}
+
+type SelectProcessorOutput = unsafe extern "C" fn(*mut std::ffi::c_void, u64, u64, u64) -> Status;
+type ConfigureProcessorInput = unsafe extern "C" fn(
+    *mut std::ffi::c_void,
+    u64,
+    u64,
+    u64,
+    u64,
+    *const CaptureResourceOffer,
+) -> Status;
+thread_local! {
+    static ORIGINAL_PROCESSOR_SELECT: std::cell::Cell<Option<SelectProcessorOutput>> = const { std::cell::Cell::new(None) };
+    static ORIGINAL_PROCESSOR_CONFIGURE: std::cell::Cell<Option<ConfigureProcessorInput>> = const { std::cell::Cell::new(None) };
+    static UNCERTAIN_PROCESSOR_STATUS: std::cell::Cell<Status> = const { std::cell::Cell::new(MEDIA_BUSY) };
+    static UNCERTAIN_PROCESSOR_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+unsafe extern "C" fn select_then_report_uncertain(
+    context: *mut std::ffi::c_void,
+    stream: u64,
+    generation: u64,
+    id: u64,
+) -> Status {
+    UNCERTAIN_PROCESSOR_CALLS.set(UNCERTAIN_PROCESSOR_CALLS.get() + 1);
+    assert_eq!(
+        unsafe { ORIGINAL_PROCESSOR_SELECT.get().unwrap()(context, stream, generation, id) },
+        STATUS_OK
+    );
+    UNCERTAIN_PROCESSOR_STATUS.get()
+}
+unsafe extern "C" fn configure_then_report_uncertain(
+    context: *mut std::ffi::c_void,
+    stream: u64,
+    generation: u64,
+    id: u64,
+    source_generation: u64,
+    source: *const CaptureResourceOffer,
+) -> Status {
+    UNCERTAIN_PROCESSOR_CALLS.set(UNCERTAIN_PROCESSOR_CALLS.get() + 1);
+    assert_eq!(
+        unsafe {
+            ORIGINAL_PROCESSOR_CONFIGURE.get().unwrap()(
+                context,
+                stream,
+                generation,
+                id,
+                source_generation,
+                source,
+            )
+        },
+        STATUS_OK
+    );
+    UNCERTAIN_PROCESSOR_STATUS.get()
+}
+
+#[test]
+fn uncertain_processor_selection_or_configuration_is_cancelled_before_retry() {
+    for select in [true, false] {
+        for status in [MEDIA_BUSY, MEDIA_PENDING] {
+            let counts = Arc::new(Counts::default());
+            let source = CpuSourceFactory::new(Arc::new(Source(counts.clone())));
+            let source = Native::capture(&source.api);
+            let processor = Native(
+                into_resource_processor_binding(Planar {
+                    counts: counts.clone(),
+                    unsupported: false,
+                    wrong_sequence: false,
+                })
+                .cast(),
+            );
+            // SAFETY: this borrowed table copy keeps the original binding live;
+            // its wrappers perform the real effect before returning uncertainty.
+            let mut table =
+                unsafe { std::ptr::read(processor.table::<FrameResourceProcessorApi>()) };
+            ORIGINAL_PROCESSOR_SELECT.set(Some(table.select_output));
+            ORIGINAL_PROCESSOR_CONFIGURE.set(Some(table.base.configure));
+            UNCERTAIN_PROCESSOR_STATUS.set(status);
+            UNCERTAIN_PROCESSOR_CALLS.set(0);
+            if select {
+                table.select_output = select_then_report_uncertain;
+            } else {
+                table.base.configure = configure_then_report_uncertain;
+            }
+            let mut session = unsafe {
+                CpuResourceProcessingSession::new(
+                    &table,
+                    1,
+                    2,
+                    SourceFormat {
+                        bit_depth: 10,
+                        dynamic_range: DynamicRange::Hdr,
+                    },
+                    target(),
+                )
+            }
+            .unwrap();
+            assert!(
+                matches!(unsafe { session.forward(source.table(), |_| STATUS_OK) }, Err(ConnectionError::Native(actual)) if actual == status)
+            );
+            assert!(session.is_retired());
+            assert_eq!(counts.cancels.load(Ordering::SeqCst), 1);
+            assert!(matches!(
+                unsafe { session.forward(source.table(), |_| STATUS_OK) },
+                Err(ConnectionError::Stale)
+            ));
+            assert_eq!(UNCERTAIN_PROCESSOR_CALLS.get(), 1);
+            assert_eq!(counts.reads.load(Ordering::SeqCst), 0);
+            drop(session);
+            assert_eq!(counts.cancels.load(Ordering::SeqCst), 1);
+        }
+    }
+}
+
+type SelectCaptureResource = unsafe extern "C" fn(*mut std::ffi::c_void, u64, u64, u64) -> Status;
+thread_local! {
+    static ORIGINAL_CAPTURE_SELECT: std::cell::Cell<Option<SelectCaptureResource>> = const { std::cell::Cell::new(None) };
+    static CAPTURE_SELECT_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+unsafe extern "C" fn transient_capture_select(
+    context: *mut std::ffi::c_void,
+    stream: u64,
+    generation: u64,
+    id: u64,
+) -> Status {
+    let attempts = CAPTURE_SELECT_ATTEMPTS.get();
+    CAPTURE_SELECT_ATTEMPTS.set(attempts + 1);
+    if attempts == 0 {
+        UNCERTAIN_PROCESSOR_STATUS.get()
+    } else {
+        unsafe { ORIGINAL_CAPTURE_SELECT.get().unwrap()(context, stream, generation, id) }
+    }
+}
+
+#[test]
+fn transient_capture_selection_keeps_processor_owned_until_retry_or_drop() {
+    for (status, retry) in [
+        (MEDIA_BUSY, false),
+        (MEDIA_BUSY, true),
+        (MEDIA_PENDING, false),
+        (MEDIA_PENDING, true),
+    ] {
+        let counts = Arc::new(Counts::default());
+        let source = CpuSourceFactory::new(Arc::new(Source(counts.clone())));
+        let source = Native::capture(&source.api);
+        // SAFETY: the original capture binding remains live for this table copy.
+        let mut capture = unsafe { std::ptr::read(source.table::<CaptureApiV1_8>()) };
+        ORIGINAL_CAPTURE_SELECT.set(Some(capture.select_resource));
+        CAPTURE_SELECT_ATTEMPTS.set(0);
+        UNCERTAIN_PROCESSOR_STATUS.set(status);
+        capture.select_resource = transient_capture_select;
+        let processor = Native(
+            into_resource_processor_binding(Planar {
+                counts: counts.clone(),
+                unsupported: false,
+                wrong_sequence: false,
+            })
+            .cast(),
+        );
+        let mut session = unsafe {
+            CpuResourceProcessingSession::new(
+                processor.table(),
+                1,
+                2,
+                SourceFormat {
+                    bit_depth: 10,
+                    dynamic_range: DynamicRange::Hdr,
+                },
+                target(),
+            )
+        }
+        .unwrap();
+        assert!(
+            matches!(unsafe { session.forward(&capture, |_| STATUS_OK) }, Err(ConnectionError::Native(actual)) if actual == status)
+        );
+        assert!(!session.is_retired());
+        assert_eq!(counts.cancels.load(Ordering::SeqCst), 0);
+        assert_eq!(counts.reads.load(Ordering::SeqCst), 0);
+        assert_eq!(counts.configurations.load(Ordering::SeqCst), 1);
+        if retry {
+            assert_eq!(
+                unsafe { session.forward(&capture, |_| STATUS_OK) }.unwrap(),
+                STATUS_OK
+            );
+            assert_eq!(counts.reads.load(Ordering::SeqCst), 1);
+            assert_eq!(counts.configurations.load(Ordering::SeqCst), 2);
+        }
         drop(session);
         assert_eq!(counts.cancels.load(Ordering::SeqCst), 1);
     }
