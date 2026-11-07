@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod capacity_tests;
 mod shutdown;
 
 use crate::command_paths::resolve_command_executable;
@@ -19,6 +21,8 @@ use std::time::{Duration, Instant};
 
 const REAP_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_PAYLOAD_BYTES: usize = 16_384;
+const MAX_RECORDS: usize = 128;
+const MAX_CALLER_RECORDS: usize = 32;
 
 fn spawn_detached_commands_with(
     spec: &LaunchSpec,
@@ -1116,16 +1120,7 @@ impl ProcessManager {
         if self.shutdown_deadline.is_some() {
             return Err("host_stopping");
         }
-        if self.records.len() >= 128
-            || self
-                .records
-                .values()
-                .filter(|record| record.owner == caller)
-                .count()
-                >= 32
-        {
-            return Err("process_limit");
-        }
+        self.ensure_capacity(caller)?;
         let process_id = self.next_id.checked_add(1).ok_or("process_limit")?;
         let proton_hook_app_id = self.proton_hooks.acquire(&spec)?;
         let mut record =
@@ -1164,7 +1159,16 @@ impl ProcessManager {
         {
             return Err("operation_conflict");
         }
-        if self.records.len() + self.preparations.len() >= 128
+        self.ensure_capacity(caller)?;
+        let mut lease = PreparationLease::new(caller, operation_id, spec);
+        lease.advance();
+        let response = lease.response();
+        self.preparations.insert(key, lease);
+        Ok(response)
+    }
+
+    fn ensure_capacity(&self, caller: &str) -> Result<(), &'static str> {
+        if self.records.len() + self.preparations.len() >= MAX_RECORDS
             || self
                 .records
                 .values()
@@ -1175,15 +1179,11 @@ impl ProcessManager {
                     .values()
                     .filter(|lease| lease.owner == caller)
                     .count()
-                >= 32
+                >= MAX_CALLER_RECORDS
         {
             return Err("process_limit");
         }
-        let mut lease = PreparationLease::new(caller, operation_id, spec);
-        lease.advance();
-        let response = lease.response();
-        self.preparations.insert(key, lease);
-        Ok(response)
+        Ok(())
     }
 
     fn preparation_action(
