@@ -72,7 +72,13 @@ pub struct Controller<B: Backend> {
     opening: BTreeMap<u64, Opening>,
     startup_retirement_uncertain: bool,
     opened_stream: Option<u64>,
+    #[cfg(test)]
+    opening_observer: Option<Box<OpeningObserver>>,
 }
+
+#[cfg(test)]
+type OpeningObserver =
+    dyn FnMut(&JoinHandle<CaptureResult<PreparedCapture>>) -> CaptureResult<bool> + Send;
 
 pub(crate) enum OpenStart {
     Ready(Value),
@@ -124,7 +130,25 @@ impl<B: Backend> Controller<B> {
             opening: BTreeMap::new(),
             startup_retirement_uncertain: false,
             opened_stream: None,
+            #[cfg(test)]
+            opening_observer: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_opening_observation(&mut self) {
+        let mut failed = false;
+        self.opening_observer = Some(Box::new(move |worker| {
+            if !failed {
+                failed = true;
+                Err(CaptureError::new(
+                    "wait_failed",
+                    "injected observation failure",
+                ))
+            } else {
+                crate::worker::thread_finished(worker)
+            }
+        }));
     }
 
     pub fn shutdown(&mut self) {
@@ -142,9 +166,12 @@ impl<B: Backend> Controller<B> {
     pub fn quiesce(&mut self) -> CaptureResult<bool> {
         self.stop_admission();
         let openings: Vec<_> = self.opening.keys().copied().collect();
+        let mut observation_failure = None;
         for id in openings {
             self.cancel_open(id);
-            let _ = self.poll_open(id, false);
+            if let Err(error) = self.poll_open(id, false) {
+                observation_failure.get_or_insert(error);
+            }
         }
         for stream in self.streams.values_mut() {
             mark_closing(stream);
@@ -157,6 +184,9 @@ impl<B: Backend> Controller<B> {
                 "cleanup_failed",
                 "capture startup retirement cannot be proven",
             ));
+        }
+        if let Some(error) = observation_failure {
+            return Err(error);
         }
         Ok(self.opening.is_empty() && self.streams.is_empty())
     }
@@ -280,20 +310,23 @@ impl<B: Backend> Controller<B> {
         &mut self,
         id: u64,
         commit_allowed: bool,
-    ) -> Option<(Value, Option<u64>)> {
+    ) -> CaptureResult<Option<(Value, Option<u64>)>> {
         let Some(job) = self.opening.get(&id) else {
-            return Some((
+            return Ok(Some((
                 CaptureError::new("cancelled", "capture startup no longer exists").payload(),
                 None,
-            ));
+            )));
         };
-        match crate::worker::thread_finished(&job.worker) {
-            Ok(false) => return None,
-            Ok(true) => (),
-            Err(error) => {
-                self.startup_retirement_uncertain = true;
-                return Some((error.payload(), None));
-            }
+        #[cfg(test)]
+        let observed = if let Some(observer) = &mut self.opening_observer {
+            observer(&job.worker)
+        } else {
+            crate::worker::thread_finished(&job.worker)
+        };
+        #[cfg(not(test))]
+        let observed = crate::worker::thread_finished(&job.worker);
+        if !observed? {
+            return Ok(None);
         }
         let job = self.opening.remove(&id).expect("finished opening");
         let prepared = match job.worker.join() {
@@ -302,15 +335,15 @@ impl<B: Backend> Controller<B> {
                 if error.code == "retirement_uncertain" {
                     self.startup_retirement_uncertain = true;
                 }
-                return Some((error.payload(), None));
+                return Ok(Some((error.payload(), None)));
             }
             Err(_) => {
                 self.startup_retirement_uncertain = true;
-                return Some((
+                return Ok(Some((
                     CaptureError::new("capture_unavailable", "capture startup worker panicked")
                         .payload(),
                     None,
-                ));
+                )));
             }
         };
         let reply = open_reply(
@@ -347,14 +380,14 @@ impl<B: Backend> Controller<B> {
         }
         self.streams.insert(id, stream);
         if let Some(error) = failure {
-            Some((error.payload(), None))
+            Ok(Some((error.payload(), None)))
         } else if cancelled {
-            Some((
+            Ok(Some((
                 CaptureError::new("cancelled", "capture startup was cancelled").payload(),
                 None,
-            ))
+            )))
         } else {
-            Some((reply, Some(id)))
+            Ok(Some((reply, Some(id))))
         }
     }
 

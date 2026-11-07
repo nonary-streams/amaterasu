@@ -13,7 +13,9 @@ mod resource;
 mod staging;
 mod worker;
 
-use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};
+use amaterasu_module_sdk::{
+    Command, LogLevel, ManagedModule, ModuleResult, Response, RuntimeClient,
+};
 use backend::NativeBackend;
 use controller::{CloseReceipt, Controller};
 use model::{CaptureError, Operation};
@@ -23,6 +25,7 @@ use std::sync::{Arc, Mutex};
 
 const SERVICE: &str = "amaterasu.capture-wgc/1";
 const MAX_PENDING_CLOSES: usize = 32;
+const MAX_PENDING_REPLIES: usize = 32;
 type SharedController = Arc<Mutex<Controller<NativeBackend>>>;
 
 struct PendingClose {
@@ -32,6 +35,11 @@ struct PendingClose {
     receipt: Option<CloseReceipt>,
     reply: Option<Value>,
     admitted: bool,
+}
+
+struct PendingReply {
+    request: u64,
+    payload: Value,
 }
 
 #[derive(Deserialize)]
@@ -52,6 +60,8 @@ struct CaptureModule {
     pending_opens: Vec<opening::PendingOpen>,
     pending_lookups: Vec<opening::PendingLookup>,
     pending_commands: Vec<commands::PendingCommand>,
+    pending_replies: Vec<PendingReply>,
+    poll_diagnostic_reported: bool,
     _preflight_factory: Box<
         amaterasu_module_sdk::capture::SourcePreflightFactory<preflight::Provider<NativeBackend>>,
     >,
@@ -103,6 +113,8 @@ impl ManagedModule for CaptureModule {
             pending_opens: Vec::new(),
             pending_lookups: Vec::new(),
             pending_commands: Vec::new(),
+            pending_replies: Vec::new(),
+            poll_diagnostic_reported: false,
             _factory: factory,
             _preflight_factory: preflight_factory,
         })
@@ -120,6 +132,9 @@ impl ManagedModule for CaptureModule {
         let open_failure = self.poll_open_requests().err();
         let command_failure = self.poll_commands(true).err();
         let mut failure = self.poll_pending_closes().err();
+        if let Err(error) = self.poll_pending_replies() {
+            failure.get_or_insert(error);
+        }
         if let Some(error) = open_failure {
             failure.get_or_insert(error);
         }
@@ -150,7 +165,8 @@ impl ManagedModule for CaptureModule {
             && self.pending_closes.is_empty()
             && self.pending_opens.is_empty()
             && self.pending_lookups.is_empty()
-            && self.pending_commands.is_empty())
+            && self.pending_commands.is_empty()
+            && self.pending_replies.is_empty())
     }
 
     fn tick(&mut self) -> ModuleResult<()> {
@@ -158,7 +174,13 @@ impl ManagedModule for CaptureModule {
         let opens_ready = retain_failure(&mut failure, self.poll_open_requests());
         let commands_ready = retain_failure(&mut failure, self.poll_commands(self.quiescing));
         let closes_ready = retain_failure(&mut failure, self.poll_pending_closes());
+        let replies_ready = retain_failure(&mut failure, self.poll_pending_replies());
         for _ in 0..8 {
+            // Every immediate reply needs a slot before we take ownership of
+            // another broker request. An unknown Complete may have delivered.
+            if self.pending_replies.len() == MAX_PENDING_REPLIES {
+                break;
+            }
             let (id, caller, service, payload) = match self.runtime.send(Command::Poll {}) {
                 Ok(Response::Pending) => break,
                 Ok(Response::Request {
@@ -242,20 +264,10 @@ impl ManagedModule for CaptureModule {
                     Err(error) => CaptureError::new("invalid_request", error.to_string()).payload(),
                 }
             };
-            match self.runtime.send(Command::Complete {
+            self.pending_replies.push(PendingReply {
                 request: id,
                 payload: reply,
-            }) {
-                Ok(Response::Ok) => (),
-                result => {
-                    if !matches!(result, Ok(Response::Error { ref code, .. }) if code == "request_ended" || code == "not_found")
-                    {
-                        failure.get_or_insert_with(|| {
-                            format!("capture completion failed: {result:?}")
-                        });
-                    }
-                }
-            }
+            });
         }
         if opens_ready {
             retain_failure(&mut failure, self.poll_open_requests());
@@ -266,7 +278,28 @@ impl ManagedModule for CaptureModule {
         if closes_ready {
             retain_failure(&mut failure, self.poll_pending_closes());
         }
-        failure.map_or(Ok(()), Err)
+        if replies_ready {
+            retain_failure(&mut failure, self.poll_pending_replies());
+        }
+        // Observation errors leave their exact owned work in the queues for
+        // the next host tick. Poison is an invariant failure, even when an
+        // earlier broker failure would otherwise mask it.
+        if self.controller.is_poisoned() {
+            return Err("capture controller poisoned".into());
+        }
+        if failure.is_some() {
+            if !self.poll_diagnostic_reported {
+                let _ = self.runtime.log(
+                    LogLevel::Warning,
+                    "capture.wgc",
+                    "Capture broker or worker observation failed; owned work is retained for retry.",
+                );
+                self.poll_diagnostic_reported = true;
+            }
+        } else {
+            self.poll_diagnostic_reported = false;
+        }
+        Ok(())
     }
 }
 
@@ -281,6 +314,28 @@ fn retain_failure(failure: &mut Option<String>, result: ModuleResult<()>) -> boo
 }
 
 impl CaptureModule {
+    fn poll_pending_replies(&mut self) -> ModuleResult<()> {
+        let mut failure = None;
+        self.pending_replies.retain(|reply| {
+            match self.runtime.send(Command::Complete {
+                request: reply.request,
+                payload: reply.payload.clone(),
+            }) {
+                Ok(Response::Ok) => false,
+                Ok(Response::Error { code, .. })
+                    if code == "request_ended" || code == "not_found" =>
+                {
+                    false
+                }
+                _ => {
+                    failure.get_or_insert("capture reply completion is uncertain".to_owned());
+                    true
+                }
+            }
+        });
+        failure.map_or(Ok(()), Err)
+    }
+
     fn poll_commands(&mut self, quiescing: bool) -> ModuleResult<()> {
         commands::poll_requests(
             &self.runtime,

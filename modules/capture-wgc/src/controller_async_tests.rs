@@ -84,6 +84,42 @@ fn cancelled_startup_keeps_ownership_until_worker_and_session_retire() {
 }
 
 #[test]
+fn transient_startup_observation_failure_retries_the_same_owned_worker_on_quiesce() {
+    let (entered, observed) = mpsc::channel();
+    let (release, gate) = mpsc::channel();
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let mut controller = Controller::new(
+        HeldBackend {
+            entered,
+            gate: Mutex::new(gate),
+            dropped: dropped.clone(),
+            retired: Arc::new(AtomicBool::new(true)),
+        },
+        true,
+    );
+    let OpenStart::Pending(token) = controller
+        .begin_open("video", "display".into(), Some("op".into()), false, None)
+        .unwrap()
+    else {
+        panic!("expected pending open")
+    };
+    observed.recv_timeout(Duration::from_secs(1)).unwrap();
+    controller.fail_next_opening_observation();
+    assert_eq!(controller.quiesce().unwrap_err().code, "wait_failed");
+    assert!(controller.opening.contains_key(&token));
+    assert!(controller.operation_pending("video", "op"));
+    assert!(!controller.startup_retirement_uncertain);
+    assert_eq!(dropped.load(Ordering::SeqCst), 0);
+    release.send(()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !controller.quiesce().unwrap() {
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    assert_eq!(dropped.load(Ordering::SeqCst), 1);
+}
+
+#[test]
 fn operation_reservation_survives_cancel_until_actual_capture_retirement() {
     let (entered, observed) = mpsc::channel();
     let (release, gate) = mpsc::channel();
@@ -130,7 +166,7 @@ fn operation_reservation_survives_cancel_until_actual_capture_retirement() {
     release.send(()).unwrap();
     let until = Instant::now() + Duration::from_secs(2);
     let (reply, committed) = loop {
-        if let Some(completed) = controller.poll_open(token, true) {
+        if let Some(completed) = controller.poll_open(token, true).unwrap() {
             break completed;
         }
         assert!(Instant::now() < until);
@@ -176,7 +212,7 @@ fn successful_startup_is_owned_and_replay_returns_the_same_stream() {
     release.send(()).unwrap();
     let until = Instant::now() + Duration::from_secs(2);
     let (reply, stream) = loop {
-        if let Some(completed) = controller.poll_open(token, true) {
+        if let Some(completed) = controller.poll_open(token, true).unwrap() {
             break completed;
         }
         assert!(Instant::now() < until);
@@ -299,7 +335,7 @@ fn nested_worker_retirement_uncertainty_is_not_mistaken_for_absence() {
     };
     let until = Instant::now() + Duration::from_secs(2);
     let (reply, _) = loop {
-        if let Some(completed) = controller.poll_open(token, true) {
+        if let Some(completed) = controller.poll_open(token, true).unwrap() {
             break completed;
         }
         assert!(Instant::now() < until);
@@ -324,7 +360,7 @@ fn startup_panic_permanently_prevents_false_quiescence() {
     };
     let until = Instant::now() + Duration::from_secs(2);
     loop {
-        if let Some((reply, _)) = controller.poll_open(token, true) {
+        if let Some((reply, _)) = controller.poll_open(token, true).unwrap() {
             assert_eq!(reply["error"]["code"], "capture_unavailable");
             break;
         }
@@ -398,7 +434,7 @@ fn failed_initialization_retains_session_and_operation_until_real_retirement() {
     };
     let until = Instant::now() + Duration::from_secs(2);
     let (reply, stream) = loop {
-        if let Some(completed) = controller.poll_open(token, true) {
+        if let Some(completed) = controller.poll_open(token, true).unwrap() {
             break completed;
         }
         assert!(Instant::now() < until);

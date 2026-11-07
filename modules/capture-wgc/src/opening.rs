@@ -21,6 +21,7 @@ pub(crate) struct PendingOpen {
     reply: Option<Value>,
     stream: Option<u64>,
     completion_uncertain: bool,
+    observation_failure_logged: bool,
 }
 
 impl PendingOpen {
@@ -43,6 +44,7 @@ impl PendingOpen {
             reply: None,
             stream: None,
             completion_uncertain: false,
+            observation_failure_logged: false,
         }
     }
 }
@@ -118,6 +120,7 @@ fn transfer_to_replay<'a>(
                 candidate.reply = owner.reply.take();
                 candidate.stream = owner.stream.take();
                 candidate.completion_uncertain = owner.completion_uncertain;
+                candidate.observation_failure_logged = owner.observation_failure_logged;
                 return Transfer::Transferred;
             }
             Activity::Ended => (),
@@ -215,10 +218,13 @@ pub(crate) fn poll_requests<B: Backend>(
             let mut startup_retiring = false;
             if let Some(token) = pending.token {
                 controller.cancel_open(token);
-                if controller.poll_open(token, false).is_none() {
-                    startup_retiring = true;
-                } else {
-                    pending.token = None;
+                match controller.poll_open(token, false) {
+                    Ok(None) => startup_retiring = true,
+                    Ok(Some(_)) => pending.token = None,
+                    Err(_) => {
+                        startup_retiring = true;
+                        log_observation_failure(runtime, &mut pending);
+                    }
                 }
             }
             // A completion whose outcome was unknown may have delivered this
@@ -273,10 +279,14 @@ pub(crate) fn poll_requests<B: Backend>(
         }
         if pending.reply.is_none() {
             if let Some(token) = pending.token {
-                if let Some((reply, stream)) = controller.poll_open(token, true) {
-                    pending.token = None;
-                    pending.reply = Some(reply);
-                    pending.stream = stream;
+                match controller.poll_open(token, true) {
+                    Ok(Some((reply, stream))) => {
+                        pending.token = None;
+                        pending.reply = Some(reply);
+                        pending.stream = stream;
+                    }
+                    Ok(None) => (),
+                    Err(_) => log_observation_failure(runtime, &mut pending),
                 }
             } else {
                 match controller.begin_open(
@@ -426,6 +436,17 @@ pub(crate) fn poll_requests<B: Backend>(
     failure.map_or(Ok(()), Err)
 }
 
+fn log_observation_failure(runtime: &RuntimeClient, pending: &mut PendingOpen) {
+    if !pending.observation_failure_logged {
+        pending.observation_failure_logged = true;
+        let _ = runtime.log(
+            amaterasu_module_sdk::LogLevel::Warning,
+            "capture.wgc",
+            "Unable to observe capture startup worker; retaining ownership and retrying",
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -433,6 +454,99 @@ mod tests {
         AbiHeader, BorrowedBytes, HostApi, ReplySink, STATUS_OK, Status,
     };
     use std::ffi::c_void;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    #[derive(Default)]
+    struct Endpoint {
+        completions: Vec<(u64, Value)>,
+        warnings: usize,
+    }
+
+    unsafe extern "C" fn active_request(
+        context: *mut c_void,
+        input: BorrowedBytes,
+        sink: ReplySink,
+    ) -> Status {
+        // SAFETY: the test keeps the endpoint and borrowed input alive for this call.
+        let endpoint = unsafe { &*context.cast::<Mutex<Endpoint>>() };
+        let command: Command = serde_json::from_slice(unsafe { input.read().unwrap() }).unwrap();
+        let mut endpoint = endpoint.lock().unwrap();
+        match command {
+            Command::CheckRequest { .. } => (),
+            Command::Complete { request, payload } => endpoint.completions.push((request, payload)),
+            Command::Log { .. } => endpoint.warnings += 1,
+            other => panic!("unexpected command: {other:?}"),
+        }
+        // SAFETY: the host supplies a valid synchronous reply sink.
+        unsafe { sink.send(&serde_json::to_vec(&Response::Ok).unwrap()) };
+        STATUS_OK
+    }
+
+    struct Session;
+
+    impl crate::backend::CaptureSession for Session {
+        fn read(&mut self, _: u32) -> crate::model::CaptureResult<Option<crate::model::Frame>> {
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn transient_open_observation_retains_owner_and_coalesced_replay() {
+        let mut endpoint = Box::new(Mutex::new(Endpoint::default()));
+        // SAFETY: the endpoint remains allocated until all polling is complete.
+        let runtime = unsafe {
+            RuntimeClient::from_endpoint(HostApi {
+                header: AbiHeader::of::<HostApi>(),
+                context: std::ptr::from_mut(endpoint.as_mut()).cast(),
+                invoke: active_request,
+            })
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let backend_calls = calls.clone();
+        let backend = crate::NativeBackend::with_opener(move |_| {
+            backend_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(Session))
+        });
+        let mut controller = Controller::new(backend, true);
+        controller.fail_next_opening_observation();
+        let controller = Arc::new(Mutex::new(controller));
+        let make_open = |request| {
+            PendingOpen::new(
+                request,
+                "video".into(),
+                "display".into(),
+                Some("op".into()),
+                false,
+                None,
+            )
+        };
+        let mut opens = vec![make_open(1), make_open(2)];
+        let mut lookups = Vec::new();
+        poll_requests(&runtime, &controller, false, &mut opens, &mut lookups).unwrap();
+        let token = opens[0].token.expect("first request owns the startup");
+        poll_requests(&runtime, &controller, false, &mut opens, &mut lookups).unwrap();
+        assert_eq!(opens.len(), 2);
+        assert_eq!(opens[0].token, Some(token));
+        assert!(endpoint.lock().unwrap().completions.is_empty());
+        assert_eq!(endpoint.lock().unwrap().warnings, 1);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !opens.is_empty() {
+            poll_requests(&runtime, &controller, false, &mut opens, &mut lookups).unwrap();
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        let endpoint = endpoint.lock().unwrap();
+        assert_eq!(endpoint.completions.len(), 2);
+        assert!(
+            endpoint
+                .completions
+                .iter()
+                .all(|(_, payload)| payload["stream"] == token)
+        );
+        assert_eq!(endpoint.warnings, 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
 
     unsafe extern "C" fn ended_request(
         _: *mut c_void,

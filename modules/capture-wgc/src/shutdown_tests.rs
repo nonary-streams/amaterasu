@@ -9,6 +9,10 @@ use std::sync::{Arc, Mutex};
 #[path = "commands_queue_tests.rs"]
 mod commands_queue_tests;
 
+#[cfg(not(windows))]
+#[path = "opening_real_broker_tests.rs"]
+mod opening_real_broker_tests;
+
 struct OwnedSession(Arc<AtomicUsize>);
 
 impl CaptureSession for OwnedSession {
@@ -84,6 +88,8 @@ fn module_with_controller(controller: Controller<NativeBackend>) -> CaptureModul
         pending_opens: Vec::new(),
         pending_lookups: Vec::new(),
         pending_commands: Vec::new(),
+        pending_replies: Vec::new(),
+        poll_diagnostic_reported: false,
         _factory: factory,
         _preflight_factory: preflight_factory,
     }
@@ -306,6 +312,9 @@ struct Broker {
     completed: Vec<(u64, serde_json::Value)>,
     completion_attempts: Vec<u64>,
     completion_failures: usize,
+    accepted_completion_failures: usize,
+    poll_failures: usize,
+    diagnostics: Vec<String>,
     activity_failures: usize,
     activity_script: std::collections::BTreeMap<u64, std::collections::VecDeque<crate::Response>>,
     expire_on_complete: std::collections::BTreeSet<u64>,
@@ -361,6 +370,13 @@ unsafe extern "C" fn broker_runtime(
     let command: crate::Command = serde_json::from_slice(unsafe { input.read().unwrap() }).unwrap();
     let mut broker = broker.lock().unwrap();
     let response = match command {
+        crate::Command::Poll {} if broker.poll_failures != 0 => {
+            broker.poll_failures -= 1;
+            crate::Response::Error {
+                code: "fixture_poll_failed".into(),
+                message: "sensitive data".into(),
+            }
+        }
         crate::Command::Poll {} => broker
             .requests
             .pop_front()
@@ -403,6 +419,13 @@ unsafe extern "C" fn broker_runtime(
                     code: "fixture_completion_failed".into(),
                     message: "retry this exact completion".into(),
                 }
+            } else if broker.accepted_completion_failures != 0 && broker.active.remove(&request) {
+                broker.accepted_completion_failures -= 1;
+                broker.completed.push((request, payload));
+                crate::Response::Error {
+                    code: "fixture_lost_reply".into(),
+                    message: "sensitive data".into(),
+                }
             } else if broker.active.remove(&request) {
                 if let Some(drops) = &broker.session_drops {
                     let retired = drops.load(Ordering::SeqCst);
@@ -416,6 +439,10 @@ unsafe extern "C" fn broker_runtime(
                     message: "fixture request is no longer active".into(),
                 }
             }
+        }
+        crate::Command::Log { message, .. } => {
+            broker.diagnostics.push(message);
+            crate::Response::Ok
         }
         _ => panic!("unexpected capture broker command"),
     };
@@ -1122,7 +1149,7 @@ fn failed_activity_check_does_not_admit_native_cleanup() {
     bind_broker(&mut module, &mut broker);
     broker.lock().unwrap().activity_failures = 1;
     broker.lock().unwrap().close(41, "video", 1);
-    assert!(module.tick().unwrap_err().contains("activity check failed"));
+    module.tick().unwrap();
     assert_eq!(polls.load(Ordering::SeqCst), 0);
     assert_eq!(drops.load(Ordering::SeqCst), 0);
     assert!(!module.pending_closes[0].admitted);
@@ -1183,7 +1210,7 @@ fn completion_retry_keeps_the_retired_receipt_without_restarting_cleanup() {
     module.tick().unwrap();
     ready.store(true, Ordering::SeqCst);
     broker.lock().unwrap().completion_failures = 1;
-    assert!(module.tick().unwrap_err().contains("completion failed"));
+    module.tick().unwrap();
     let retired_polls = polls.load(Ordering::SeqCst);
     assert_eq!(drops.load(Ordering::SeqCst), 1);
     assert_eq!(module.pending_closes.len(), 1);
@@ -1192,6 +1219,99 @@ fn completion_retry_keeps_the_retired_receipt_without_restarting_cleanup() {
     assert_eq!(broker.lock().unwrap().completion_attempts, [41, 41]);
     assert_eq!(broker.lock().unwrap().completed, [(41, json!({"ok":true}))]);
     assert!(module.pending_closes.is_empty());
+}
+
+#[test]
+fn uncertain_rejection_completion_is_retained_and_retried_after_delivery() {
+    let mut module = module_with_controller(Controller::new(NativeBackend::new(None), true));
+    let mut broker = Box::new(Mutex::new(Broker::default()));
+    bind_broker(&mut module, &mut broker);
+    {
+        let mut broker = broker.lock().unwrap();
+        broker.active.insert(42);
+        broker.accepted_completion_failures = 1;
+        broker.requests.push_back(crate::Response::Request {
+            id: 42,
+            caller: "video".into(),
+            initiator: "video".into(),
+            service: crate::SERVICE.into(),
+            payload: json!({"action":"invalid"}),
+            remaining_ms: 30_000,
+        });
+    }
+    module.tick().unwrap();
+    assert_eq!(broker.lock().unwrap().completed.len(), 1);
+    broker.lock().unwrap().completion_failures = 1;
+    assert!(module.quiesce().is_err());
+    assert_eq!(module.pending_replies.len(), 1);
+    module.tick().unwrap();
+    assert!(module.quiesce().unwrap());
+    let broker = broker.lock().unwrap();
+    assert_eq!(broker.completion_attempts, [42, 42, 42]);
+    assert_eq!(broker.completed.len(), 1);
+}
+
+#[test]
+fn poll_failures_are_nonfatal_and_diagnostics_are_bounded_and_redacted() {
+    let mut module = module_with_controller(Controller::new(NativeBackend::new(None), true));
+    let mut broker = Box::new(Mutex::new(Broker::default()));
+    bind_broker(&mut module, &mut broker);
+    broker.lock().unwrap().poll_failures = 3;
+    for _ in 0..3 {
+        module.tick().unwrap();
+    }
+    let broker = broker.lock().unwrap();
+    assert_eq!(broker.diagnostics.len(), 1);
+    assert!(!broker.diagnostics[0].contains("sensitive data"));
+}
+
+#[test]
+fn uncertain_immediate_replies_apply_bounded_backpressure_and_recover() {
+    let mut module = module_with_controller(Controller::new(NativeBackend::new(None), true));
+    let mut broker = Box::new(Mutex::new(Broker::default()));
+    bind_broker(&mut module, &mut broker);
+    {
+        let mut broker = broker.lock().unwrap();
+        broker.completion_failures = 10_000;
+        for id in 0..40 {
+            broker.active.insert(id);
+            broker.requests.push_back(crate::Response::Request {
+                id,
+                caller: "video".into(),
+                initiator: "video".into(),
+                service: crate::SERVICE.into(),
+                payload: json!({"action":"invalid"}),
+                remaining_ms: 30_000,
+            });
+        }
+    }
+    for _ in 0..5 {
+        module.tick().unwrap();
+    }
+    assert_eq!(module.pending_replies.len(), crate::MAX_PENDING_REPLIES);
+    assert_eq!(broker.lock().unwrap().requests.len(), 8);
+    assert!(module.quiesce().is_err());
+    broker.lock().unwrap().completion_failures = 0;
+    module.tick().unwrap();
+    assert!(module.quiesce().unwrap());
+    let broker = broker.lock().unwrap();
+    assert!(broker.requests.is_empty());
+    assert_eq!(broker.completed.len(), 40);
+}
+
+#[test]
+fn poisoned_controller_remains_fatal_even_with_a_broker_failure() {
+    let mut module = module_with_controller(Controller::new(NativeBackend::new(None), true));
+    let mut broker = Box::new(Mutex::new(Broker::default()));
+    bind_broker(&mut module, &mut broker);
+    broker.lock().unwrap().poll_failures = 1;
+    let controller = module.controller.clone();
+    let _ = std::thread::spawn(move || {
+        let _guard = controller.lock().unwrap();
+        panic!("poison fixture");
+    })
+    .join();
+    assert_eq!(module.tick().unwrap_err(), "capture controller poisoned");
 }
 
 #[test]

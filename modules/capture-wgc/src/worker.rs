@@ -121,6 +121,34 @@ mod implementation {
             };
             Ok((worker, metadata))
         }
+
+        pub(super) fn quiesce_with(
+            &mut self,
+            observe: impl FnOnce(&JoinHandle<()>) -> CaptureResult<bool>,
+        ) -> CaptureResult<bool> {
+            self.stopped.store(true, Ordering::Release);
+            self.requests.take();
+            if let Some(message) = &self.shutdown_failure {
+                return Err(CaptureError::new("backend_error", message.clone()));
+            }
+            if let Some(thread) = &self.thread {
+                match observe(thread) {
+                    Ok(false) => return Ok(false),
+                    Ok(true) => (),
+                    // Observation failure does not consume the owned handle.
+                    // A later call can retry the same retirement proof.
+                    Err(error) => return Err(error),
+                }
+            }
+            if let Some(thread) = self.thread.take()
+                && thread.join().is_err()
+            {
+                let message = "WGC worker panicked while retiring its capture source";
+                self.shutdown_failure = Some(message.into());
+                return Err(CaptureError::new("backend_error", message));
+            }
+            Ok(true)
+        }
     }
 
     pub(super) fn drive_source<S: FrameSource>(
@@ -152,29 +180,7 @@ mod implementation {
             // Disconnect an idle worker immediately. An in-flight source poll
             // still owns its resources and is retained until its destructor
             // and thread have completed; never detach module-owned code.
-            self.stopped.store(true, Ordering::Release);
-            self.requests.take();
-            if let Some(message) = &self.shutdown_failure {
-                return Err(CaptureError::new("backend_error", message.clone()));
-            }
-            if let Some(thread) = &self.thread {
-                match super::thread_finished(thread) {
-                    Ok(false) => return Ok(false),
-                    Ok(true) => (),
-                    Err(error) => {
-                        self.shutdown_failure = Some(error.message.clone());
-                        return Err(error);
-                    }
-                }
-            }
-            if let Some(thread) = self.thread.take()
-                && thread.join().is_err()
-            {
-                let message = "WGC worker panicked while retiring its capture source";
-                self.shutdown_failure = Some(message.into());
-                return Err(CaptureError::new("backend_error", message));
-            }
-            Ok(true)
+            self.quiesce_with(super::thread_finished)
         }
 
         fn read(&mut self, wait_ms: u32) -> CaptureResult<Option<Frame>> {
@@ -314,6 +320,47 @@ mod tests {
         );
         assert_ne!(trace[0].1, thread::current().id());
         assert!(trace.iter().all(|(_, owner)| *owner == trace[0].1));
+    }
+
+    #[test]
+    fn transient_thread_observation_error_can_retry_owned_retirement() {
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let source_trace = trace.clone();
+        let (_gate, receiver) = mpsc::channel();
+        let mut worker = Worker::start(move || {
+            Ok(ThreadBoundSource {
+                trace: source_trace,
+                gate: receiver,
+                _thread_bound: Rc::new(()),
+            })
+        })
+        .unwrap();
+        let error = worker
+            .quiesce_with(|_| {
+                Err(CaptureError::new(
+                    "retirement_uncertain",
+                    "temporary wait observation failure",
+                ))
+            })
+            .unwrap_err();
+        assert_eq!(error.code, "retirement_uncertain");
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !worker
+            .quiesce()
+            .expect("same thread handle can be observed again")
+        {
+            assert!(std::time::Instant::now() < deadline);
+            thread::yield_now();
+        }
+        assert_eq!(
+            trace
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(action, _)| action == "drop")
+                .count(),
+            1
+        );
     }
 
     #[test]

@@ -207,8 +207,10 @@ dependencies = [
 name = "amaterasu-capture-wgc"
 version = "0.1.0"
 dependencies = [
+ "amaterasu-contracts",
  "amaterasu-media",
  "amaterasu-module-sdk",
+ "amaterasu-runtime",
  "amaterasu-windows-capture-geometry",
  "getrandom 0.3.4",
  "serde",

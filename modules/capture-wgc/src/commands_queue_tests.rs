@@ -231,7 +231,7 @@ fn read_waiter_failure_does_not_starve_an_owned_close() {
         });
         broker.close(41, "video", 1);
     }
-    assert!(module.tick().unwrap_err().contains("activity check failed"));
+    module.tick().unwrap();
     assert_eq!(drops.load(Ordering::SeqCst), 1);
     assert!(
         broker
@@ -280,7 +280,7 @@ fn failed_existing_read_waiter_does_not_block_new_close() {
         broker.activity_failures = 1;
         broker.close(41, "video", 1);
     }
-    assert!(module.tick().unwrap_err().contains("activity check failed"));
+    module.tick().unwrap();
     assert_eq!(drops.load(Ordering::SeqCst), 1);
     assert_eq!(module.pending_commands.len(), 1);
     assert!(
