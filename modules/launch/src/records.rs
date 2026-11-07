@@ -206,8 +206,7 @@ impl Records {
                             .preflight_deadline
                             .is_some_and(|deadline| Instant::now() < deadline)))
         });
-        let tracked = operation_id.starts_with("ale1:");
-        if tracked {
+        let tracked_key = if operation_id.starts_with("ale1:") {
             if !self.current_epoch_operation(&operation_id) {
                 return Err("stale_operation_epoch");
             }
@@ -223,13 +222,15 @@ impl Records {
             {
                 return Err("operation_unconfirmed");
             }
-            if !self.admitted_operations.contains(&key) {
-                if self.admitted_operations.len() + self.retired_operations.len() >= 4096 {
-                    return Err("operation_limit");
-                }
-                self.admitted_operations.insert(key);
+            if !self.admitted_operations.contains(&key)
+                && self.admitted_operations.len() + self.retired_operations.len() >= 4096
+            {
+                return Err("operation_limit");
             }
-        }
+            Some(key)
+        } else {
+            None
+        };
         let GlobalPreparation {
             structured_steps: global_preparation,
             legacy_commands: legacy_global_preparation,
@@ -280,6 +281,11 @@ impl Records {
         let resource = catalog_principal
             .as_deref()
             .map(|owner| lease_resource(owner, &app_id));
+        // Reserve the replay fence only when the corresponding record can be
+        // installed. Rejected admissions have made no effects and may retry.
+        if let Some(tracked_key) = tracked_key {
+            self.admitted_operations.insert(tracked_key);
+        }
         self.values.insert(
             id,
             Record {
@@ -530,3 +536,7 @@ fn lease_resource(owner: &str, app_id: &str) -> String {
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
+
+#[cfg(test)]
+#[path = "records_tests.rs"]
+mod tests;
