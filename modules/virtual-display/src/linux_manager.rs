@@ -132,6 +132,7 @@ struct Monitor {
     retained_mode: Option<crate::retained_mode::Change>,
     retained_mode_pending: bool,
     retained_mode_durable: bool,
+    creation_cleanup_complete: bool,
     state: &'static str,
     output: Option<String>,
     error: Option<String>,
@@ -248,6 +249,14 @@ enum Work {
         key: (String, String),
     },
 }
+#[derive(Debug)]
+struct CreationFailure {
+    error: String,
+    /// Proven by the creation worker: no journal write was attempted, or exact
+    /// native removal and deletion of the ownership journal both succeeded.
+    cleanup_complete: bool,
+}
+
 enum Event {
     RetainedMode {
         key: (String, String),
@@ -268,12 +277,13 @@ enum Event {
     },
     Created {
         key: (String, String),
-        result: Result<Record, String>,
+        result: Result<Record, CreationFailure>,
         parked: BTreeMap<(String, String), String>,
     },
     Removed {
         key: (String, String),
-        result: Result<bool, String>,
+        /// The worker reports the durable parked output, or exact retirement.
+        result: Result<Option<String>, String>,
     },
 }
 
@@ -423,6 +433,7 @@ impl Manager {
                                 retained_mode: record.retained_mode,
                                 retained_mode_pending: false,
                                 retained_mode_durable: true,
+                                creation_cleanup_complete: false,
                                 specification: record.specification,
                                 state: "cleanup_failed",
                                 output: Some(record.output),
@@ -447,8 +458,9 @@ impl Manager {
                                 monitor.output = Some(record.output);
                                 monitor.state = "ready";
                             }
-                            Err(error) => {
-                                monitor.error = Some(error);
+                            Err(failure) => {
+                                monitor.error = Some(failure.error);
+                                monitor.creation_cleanup_complete = failure.cleanup_complete;
                                 monitor.state = "cleanup_failed";
                             }
                         }
@@ -461,11 +473,9 @@ impl Manager {
                     self.pending_mutations = self.pending_mutations.saturating_sub(1);
                     self.cleanup_pending.remove(&key);
                     match result {
-                        Ok(parked) => {
-                            let monitor = self.monitors.remove(&key);
-                            if parked
-                                && let Some(output) = monitor.and_then(|monitor| monitor.output)
-                            {
+                        Ok(parked_output) => {
+                            self.monitors.remove(&key);
+                            if let Some(output) = parked_output {
                                 self.parked.insert(key.clone(), output);
                             } else {
                                 self.parked.remove(&key);
@@ -807,6 +817,7 @@ impl Manager {
                     retained_mode: None,
                     retained_mode_pending: false,
                     retained_mode_durable: false,
+                    creation_cleanup_complete: false,
                     specification,
                     state: "creating",
                     output: None,
@@ -917,6 +928,22 @@ impl Manager {
             .references = Some(references);
         true
     }
+    fn release_creation_references(
+        &mut self,
+        key: &(String, String),
+        references: BTreeSet<String>,
+    ) -> bool {
+        if self.monitors[key].creation_cleanup_complete {
+            // These references belong only to a failed admission. The worker
+            // explicitly proved its native cleanup; an absent journal on its
+            // own never permits dropping an ordinary monitor's references.
+            self.monitors.get_mut(key).unwrap().references = Some(references);
+            true
+        } else {
+            self.persist_references(key, references)
+        }
+    }
+
     fn remove(&mut self, caller: &str, identity: &str, reference_id: Option<&str>) -> Value {
         if self
             .monitors
@@ -972,14 +999,14 @@ impl Manager {
             let mut references = references.clone();
             let released = references.remove(reference);
             let last = references.is_empty();
-            if !self.persist_references(&key, references) {
+            if !self.release_creation_references(&key, references) {
                 return failure("journal_unavailable");
             }
             if !last {
                 return json!({"ok":true,"removed":false,"identity":identity,"reference_released":released,"reference_owned":false});
             }
         } else if self.monitors[&key].references.is_some()
-            && !self.persist_references(&key, BTreeSet::new())
+            && !self.release_creation_references(&key, BTreeSet::new())
         {
             return failure("journal_unavailable");
         }
@@ -1747,6 +1774,7 @@ mod owner_target_tests {
                 retained_mode: None,
                 retained_mode_pending: false,
                 retained_mode_durable: false,
+                creation_cleanup_complete: false,
                 specification: Specification {
                     hdr_enabled: false,
                     identity: identity.into(),

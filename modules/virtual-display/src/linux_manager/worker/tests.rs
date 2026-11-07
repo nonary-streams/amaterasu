@@ -1239,6 +1239,7 @@ fn parked_status_is_explicit_and_does_not_claim_connector_removal() {
                 retained_mode: None,
                 retained_mode_pending: false,
                 retained_mode_durable: false,
+                creation_cleanup_complete: false,
                 specification: specification(FIRST),
                 state: "removing",
                 output: Some("Virtual-2".into()),
@@ -1266,7 +1267,7 @@ fn parked_status_is_explicit_and_does_not_claim_connector_removal() {
     sender
         .send(Event::Removed {
             key,
-            result: Ok(true),
+            result: Ok(Some("Virtual-2".into())),
         })
         .unwrap();
     manager.tick();
@@ -1286,6 +1287,7 @@ fn parked_status_is_explicit_and_does_not_claim_connector_removal() {
             retained_mode: None,
             retained_mode_pending: false,
             retained_mode_durable: false,
+            creation_cleanup_complete: false,
             specification: specification(FIRST),
             state: "creating",
             output: None,
@@ -1400,6 +1402,224 @@ fn manager_releases_parks_and_reuses_output_through_public_operations() {
         serde_json::json!([])
     );
     drop(manager);
+    fs::remove_dir_all(root).unwrap();
+}
+
+fn manager_for_failed_creation(
+    controller: Controller<FakeBroker, FakeCompositor, FakeConnectors>,
+) -> super::super::Manager {
+    let (sender, jobs) = std::sync::mpsc::sync_channel(16);
+    let (events, receiver) = std::sync::mpsc::sync_channel(16);
+    let stopped = controller.stopped.clone();
+    let worker_stopped = stopped.clone();
+    let worker = std::thread::spawn(move || {
+        run(
+            controller.journal,
+            controller.broker,
+            controller.compositor,
+            controller.connectors,
+            controller.layout,
+            jobs,
+            events,
+            worker_stopped,
+        );
+    });
+    let mut manager = super::super::Manager {
+        settings: serde_json::from_value(serde_json::json!({"enabled":true})).unwrap(),
+        monitors: Default::default(),
+        parked: Default::default(),
+        ready: false,
+        recovery_error: None,
+        sender: Some(sender),
+        receiver: Some(receiver),
+        worker: Some(worker),
+        cleanup_pending: Default::default(),
+        observer: None,
+        borrows: Default::default(),
+        reconfigurations: Default::default(),
+        domain_id: "failed-creation-test".into(),
+        topology_revision: 0,
+        pending_mutations: 0,
+        stopped,
+    };
+    wait_for_failed_creation_manager(&mut manager, |manager| manager.ready);
+    manager
+}
+
+fn wait_for_failed_creation_manager(
+    manager: &mut super::super::Manager,
+    settled: impl Fn(&super::super::Manager) -> bool,
+) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        manager.tick();
+        if settled(manager) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    panic!("fake display worker did not settle");
+}
+
+fn admit_failed_creation(manager: &mut super::super::Manager) {
+    let operation = crate::model::Operation::Create {
+        hdr_enabled: false,
+        identity: FIRST.into(),
+        width: 1920,
+        height: 1080,
+        refresh_millihz: 60000,
+        name: "Amaterasu".into(),
+        reference_id: Some("failed-stream".into()),
+        dd_virtual_display_scale: None,
+        virtual_display_layout: None,
+        expected_topology_revision: None,
+        expected_topology_domain_id: None,
+    };
+    assert_eq!(manager.admit("session", operation).0["ok"], true);
+    wait_for_failed_creation_manager(manager, |manager| manager.pending_mutations == 0);
+    assert_eq!(
+        manager.monitors[&("session".into(), FIRST.into())].state,
+        "cleanup_failed"
+    );
+}
+
+fn remove_failed_creation(manager: &mut super::super::Manager) {
+    let response = manager.remove("session", FIRST, Some("failed-stream"));
+    assert_eq!(response["ok"], true, "{response}");
+    wait_for_failed_creation_manager(manager, |manager| manager.pending_mutations == 0);
+    assert!(manager.monitors.is_empty());
+    assert_eq!(
+        manager.remove("session", FIRST, Some("failed-stream"))["removed"],
+        true
+    );
+}
+
+#[test]
+fn manager_failed_creation_before_journaling_releases_its_admission() {
+    let (root, controller) = fixture();
+    *controller.connectors.0.lock().unwrap() = Err("DRM sysfs is unavailable".into());
+    let broker = controller.broker.clone();
+    let mut manager = manager_for_failed_creation(controller);
+    admit_failed_creation(&mut manager);
+    assert!(broker.effects.lock().unwrap().is_empty());
+    assert!(!root.join("connectors.json").exists());
+
+    remove_failed_creation(&mut manager);
+    assert!(broker.effects.lock().unwrap().is_empty());
+    assert!(broker.connected("Virtual-1").unwrap());
+    drop(manager);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn manager_failed_creation_after_successful_rollback_releases_its_admission() {
+    let (root, mut controller) = fixture();
+    controller.compositor.fail = true;
+    let broker = controller.broker.clone();
+    let mut manager = manager_for_failed_creation(controller);
+    admit_failed_creation(&mut manager);
+    assert!(!broker.connected("Virtual-2").unwrap());
+    let document: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("connectors.json")).unwrap()).unwrap();
+    assert_eq!(document["records"], serde_json::json!([]));
+
+    remove_failed_creation(&mut manager);
+    assert!(broker.connected("Virtual-1").unwrap());
+    drop(manager);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn manager_failed_creation_with_unconfirmed_journal_write_retains_its_obligation() {
+    let (root, controller) = fixture();
+    let broker = controller.broker.clone();
+    // A failed atomic replacement gives the actor no successful durable write
+    // acknowledgement. The creation must not be classified as proven retired.
+    fs::create_dir(root.join("connectors.json")).unwrap();
+    let mut manager = manager_for_failed_creation(controller);
+    admit_failed_creation(&mut manager);
+    assert_eq!(
+        manager.remove("session", FIRST, Some("failed-stream"))["code"],
+        "journal_unavailable"
+    );
+    assert_eq!(manager.monitors.len(), 1);
+    assert!(broker.effects.lock().unwrap().is_empty());
+    drop(manager);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn manager_failed_creation_keeps_parked_connector_visible_after_reference_release() {
+    for (guard_available, fail_restore) in [(false, false), (true, true)] {
+        let (root, mut controller) = fixture();
+        controller.compositor.fail = true;
+        controller.compositor.guard_available = guard_available;
+        controller.compositor.fail_restore = fail_restore;
+        let broker = controller.broker.clone();
+        let mut manager = manager_for_failed_creation(controller);
+        admit_failed_creation(&mut manager);
+        assert!(broker.connected("Virtual-2").unwrap());
+        assert!(
+            manager.monitors[&("session".into(), FIRST.into())]
+                .output
+                .is_none()
+        );
+
+        let response = manager.remove("session", FIRST, Some("failed-stream"));
+        assert_eq!(response["ok"], true, "{response}");
+        wait_for_failed_creation_manager(&mut manager, |manager| manager.pending_mutations == 0);
+        let status = manager.status("session", Some(FIRST.into()), Some("failed-stream".into()));
+        assert_eq!(status["parked"], true, "{status}");
+        assert_eq!(status["reference_owned"], false);
+        assert_eq!(status["parked_outputs"][0]["output"], "Virtual-2");
+        let removal = manager.remove("session", FIRST, Some("failed-stream"));
+        assert_eq!(removal["parked"], true);
+        assert_eq!(removal["removed"], false);
+        assert!(broker.connected("Virtual-2").unwrap());
+        assert!(broker.connected("Virtual-1").unwrap());
+
+        drop(manager);
+        let journal = Journal::open(&root).unwrap();
+        assert_eq!(journal.records.len(), 1);
+        assert!(journal.records[0].parked);
+        assert_eq!(journal.records[0].output, "Virtual-2");
+        assert!(journal.records[0].references.as_ref().unwrap().is_empty());
+        drop(journal);
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn manager_failed_creation_with_uncertain_rollback_retains_native_cleanup() {
+    let (root, mut controller) = fixture();
+    controller.compositor.fail = true;
+    let broker = controller.broker.clone();
+    *broker.reject_removal.lock().unwrap() = true;
+    let mut manager = manager_for_failed_creation(controller);
+    admit_failed_creation(&mut manager);
+    assert!(broker.connected("Virtual-2").unwrap());
+
+    let response = manager.remove("session", FIRST, Some("failed-stream"));
+    assert_eq!(response["ok"], true, "{response}");
+    wait_for_failed_creation_manager(&mut manager, |manager| manager.pending_mutations == 0);
+    assert_eq!(
+        manager.monitors[&("session".into(), FIRST.into())].state,
+        "cleanup_failed"
+    );
+    assert!(broker.connected("Virtual-2").unwrap());
+    let document: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("connectors.json")).unwrap()).unwrap();
+    assert_eq!(document["records"].as_array().unwrap().len(), 1);
+    assert_eq!(document["records"][0]["references"], serde_json::json!([]));
+
+    *broker.reject_removal.lock().unwrap() = false;
+    remove_failed_creation(&mut manager);
+    assert!(!broker.connected("Virtual-2").unwrap());
+    assert!(broker.connected("Virtual-1").unwrap());
+    drop(manager);
+    let journal = Journal::open(&root).unwrap();
+    assert!(journal.records.is_empty());
+    drop(journal);
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -1594,6 +1814,7 @@ fn linux_shared_references_persist_and_release_only_the_last_connector_owner() {
             retained_mode: None,
             retained_mode_pending: false,
             retained_mode_durable: false,
+            creation_cleanup_complete: false,
             specification: specification(SECOND),
             state: "ready",
             output: Some("Virtual-3".into()),
@@ -1661,6 +1882,7 @@ fn linux_shared_references_persist_and_release_only_the_last_connector_owner() {
         retained_mode: None,
         retained_mode_pending: false,
         retained_mode_durable: false,
+        creation_cleanup_complete: false,
         specification: specification(FIRST),
         state: "ready",
         output: Some("Virtual-2".into()),

@@ -1,6 +1,6 @@
 //! Serialized native effects run outside the host's input/media tick.
 use super::{
-    Event, Record, Work,
+    CreationFailure, Event, Record, Work,
     compositor::{Compositor, Placement},
     connectors::ConnectorInventory,
     journal::Journal,
@@ -40,6 +40,12 @@ struct Controller<B: Broker, C: Compositor, I: ConnectorInventory> {
     layout: VirtualDisplayLayout,
     stopped: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
+struct PreparedCreation {
+    record: Record,
+    parked_key: Option<(String, String)>,
+    placement: Placement,
+}
+
 impl<B: Broker, C: Compositor, I: ConnectorInventory> Controller<B, C, I> {
     fn retained_mode(
         &mut self,
@@ -301,15 +307,15 @@ impl<B: Broker, C: Compositor, I: ConnectorInventory> Controller<B, C, I> {
         scale: ScaleSetting,
     ) -> Result<Record, String> {
         self.create_with_references(owner, specification, scale, None, self.layout)
+            .map_err(|failure| failure.error)
     }
-    fn create_with_references(
+    fn prepare_creation(
         &mut self,
         owner: String,
         specification: Specification,
-        scale: ScaleSetting,
         references: Option<std::collections::BTreeSet<String>>,
         layout: VirtualDisplayLayout,
-    ) -> Result<Record, String> {
+    ) -> Result<PreparedCreation, String> {
         if self.stopped.load(std::sync::atomic::Ordering::Acquire) {
             return Err("display manager stopping".into());
         }
@@ -321,7 +327,6 @@ impl<B: Broker, C: Compositor, I: ConnectorInventory> Controller<B, C, I> {
             .iter()
             .find(|record| record.parked)
             .cloned();
-        let reused_parked = parked.is_some();
         if parked
             .as_ref()
             .is_some_and(|record| record.setup_layouts.len() >= 4)
@@ -377,12 +382,45 @@ impl<B: Broker, C: Compositor, I: ConnectorInventory> Controller<B, C, I> {
             record.setup_layouts.push(current);
         }
         let placement = self.placement(&record.output, layout);
-        if let Some(previous) = parked {
-            self.journal
-                .replace_parked(&previous.key(), record.clone())?;
+        Ok(PreparedCreation {
+            record,
+            parked_key: parked.as_ref().map(Record::key),
+            placement,
+        })
+    }
+
+    fn create_with_references(
+        &mut self,
+        owner: String,
+        specification: Specification,
+        scale: ScaleSetting,
+        references: Option<std::collections::BTreeSet<String>>,
+        layout: VirtualDisplayLayout,
+    ) -> Result<Record, CreationFailure> {
+        // Selection and snapshotting do not mutate the journal or connector.
+        // Failures here leave only the caller's in-memory admission to release.
+        let PreparedCreation {
+            mut record,
+            parked_key,
+            placement,
+        } = self
+            .prepare_creation(owner, specification, references, layout)
+            .map_err(|error| CreationFailure {
+                error,
+                cleanup_complete: true,
+            })?;
+        let reused_parked = parked_key.is_some();
+        let persisted = if let Some(previous) = parked_key {
+            self.journal.replace_parked(&previous, record.clone())
         } else {
-            self.journal.insert(record.clone())?;
-        }
+            self.journal.insert(record.clone())
+        };
+        persisted.map_err(|error| CreationFailure {
+            error,
+            // Atomic replacement may have happened before a sync error. Keep
+            // this ownership obligation unresolved rather than infer absence.
+            cleanup_complete: false,
+        })?;
         let result = (|| {
             // Even an already connected parked output must be checked by the
             // broker: status alone does not prove that this UID still owns it.
@@ -421,10 +459,13 @@ impl<B: Broker, C: Compositor, I: ConnectorInventory> Controller<B, C, I> {
             }
             Ok(record.clone())
         })();
-        if result.is_err() {
-            let _ = self.remove(&record.key());
-        }
-        result
+        result.map_err(|error| CreationFailure {
+            error,
+            // A failed or parked cleanup retains its ownership record. Only
+            // exact native retirement plus successful journal deletion proves
+            // this failed creation no longer owns a resource.
+            cleanup_complete: matches!(self.remove(&record.key()), Ok(false)),
+        })
     }
 }
 #[allow(clippy::too_many_arguments)]
@@ -538,7 +579,21 @@ pub(super) fn run<B: Broker, C: Compositor, I: ConnectorInventory>(
                 continue;
             }
             Work::Remove { key } => {
-                let result = controller.remove(&key);
+                let result = controller.remove(&key).and_then(|parked| {
+                    if !parked {
+                        return Ok(None);
+                    }
+                    // A creation may have failed before its output was returned
+                    // to the manager. Report parking from the durable owner,
+                    // independent of that incomplete admission metadata.
+                    controller
+                        .journal
+                        .records
+                        .iter()
+                        .find(|record| record.key() == key && record.parked)
+                        .map(|record| Some(record.output.clone()))
+                        .ok_or_else(|| "parked display ownership record missing".into())
+                });
                 Event::Removed { key, result }
             }
         };
