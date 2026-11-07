@@ -486,6 +486,17 @@ fn session_extensions(action: &str, object: &Object) -> Result<(), &'static str>
             fields(object, &["provider"], &[])?;
             text(object, "provider")?;
         }
+        "settings_migrate" => {
+            fields(object, &["provider", "expected_revision"], &[])?;
+            text(object, "provider")?;
+            if object
+                .get("expected_revision")
+                .and_then(Value::as_u64)
+                .is_none()
+            {
+                return Err(INVALID);
+            }
+        }
         "settings_get" | "settings_update" => {
             if action == "settings_get" {
                 fields(object, &["provider", "scope"], &[])?;

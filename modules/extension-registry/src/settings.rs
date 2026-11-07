@@ -271,6 +271,21 @@ pub struct Migration<'a> {
     pub replacements: &'a BTreeMap<Scope, Values>,
 }
 
+pub fn expand_migration_scopes(
+    fields: &Fields,
+    allowed: &BTreeMap<String, BTreeSet<String>>,
+) -> BTreeMap<String, BTreeSet<String>> {
+    let mut expanded = allowed.clone();
+    if let Some(defaults) = expanded.remove("*") {
+        for name in fields.keys() {
+            expanded
+                .entry(name.clone())
+                .or_insert_with(|| defaults.clone());
+        }
+    }
+    expanded
+}
+
 pub fn migrate(current: &Document, migration: Migration<'_>) -> Result<Document, String> {
     let Migration {
         old_fields,
@@ -354,6 +369,96 @@ pub fn migrate(current: &Document, migration: Migration<'_>) -> Result<Document,
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn migration_scope_defaults_respect_explicit_restrictions() {
+        let (fields, _, _) = fixture();
+        let allowed = BTreeMap::from([
+            ("*".into(), ["host".into(), "application".into()].into()),
+            ("enabled".into(), ["host".into()].into()),
+        ]);
+        let expanded = expand_migration_scopes(&fields, &allowed);
+        assert_eq!(expanded["enabled"], ["host".into()].into());
+        assert_eq!(
+            expanded["count"],
+            ["host".into(), "application".into()].into()
+        );
+        assert!(!expanded.contains_key("*"));
+    }
+
+    #[test]
+    fn rtx_hdr_migration_preserves_older_host_settings_and_defaults_to_opt_in() {
+        let metadata: Value =
+            serde_json::from_str(include_str!("../../rtx-hdr/metadata/linux.json")).unwrap();
+        let descriptor = &metadata["descriptor"]["options"];
+        let fields: Fields = descriptor
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|option| {
+                (
+                    option["id"].as_str().unwrap().to_owned(),
+                    serde_json::from_value(option["definition"].clone()).unwrap(),
+                )
+            })
+            .collect();
+        let allowed: BTreeMap<String, BTreeSet<String>> = descriptor
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|option| {
+                (
+                    option["id"].as_str().unwrap().to_owned(),
+                    serde_json::from_value(option["allowed_scopes"].clone()).unwrap(),
+                )
+            })
+            .collect();
+        for plan in metadata["migrations"].as_array().unwrap() {
+            let old_fields: Fields = serde_json::from_value(plan["old_fields"].clone()).unwrap();
+            let old_allowed: BTreeMap<String, BTreeSet<String>> =
+                serde_json::from_value(plan["old_allowed"].clone()).unwrap();
+            let current = Document {
+                revision: 3,
+                schema_revision: plan["from_schema_revision"].as_u64().unwrap(),
+                layers: vec![Layer {
+                    scope: Scope::Host,
+                    values: [
+                        ("rtx_hdr_enable".into(), json!(true)),
+                        ("rtx_hdr_peak_brightness".into(), json!(1424)),
+                    ]
+                    .into(),
+                }],
+            };
+            let updated = migrate(
+                &current,
+                Migration {
+                    old_fields: &old_fields,
+                    new_fields: &fields,
+                    old_allowed: &old_allowed,
+                    new_allowed: &allowed,
+                    expected_revision: 3,
+                    new_schema_revision: 3,
+                    renames: &BTreeMap::new(),
+                    removed: &BTreeSet::new(),
+                    replacements: &BTreeMap::new(),
+                },
+            )
+            .unwrap();
+            let effective = resolve(
+                &fields,
+                &allowed,
+                &updated,
+                Some("app-0000000000000001"),
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(effective["rtx_hdr_enable"].value, true);
+            assert_eq!(effective["rtx_hdr_peak_brightness"].value, 1424);
+            assert_eq!(effective["rtx_hdr_scope"].value, "application");
+            assert_eq!(effective["rtx_hdr_application_enable"].value, false);
+        }
+    }
 
     fn fixture() -> (Fields, BTreeMap<String, BTreeSet<String>>, Document) {
         let fields = serde_json::from_value(json!({

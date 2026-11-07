@@ -46,13 +46,16 @@ pub fn resolve(path: &str) -> Option<Route> {
                 "describe" => "describe",
                 "settings_get" => "settings_get",
                 "settings_update" => "settings_update",
+                "settings_migrate" => "settings_migrate",
                 _ => return None,
             },
-            Some(if action == "settings_update" {
-                "configuration.write"
-            } else {
-                "configuration.read"
-            }),
+            Some(
+                if matches!(action, "settings_update" | "settings_migrate") {
+                    "configuration.write"
+                } else {
+                    "configuration.read"
+                },
+            ),
         ),
         ("auth", "enroll") => ("amaterasu.authentication/1", "enroll_first_admin", None),
         ("auth", "change_password") => (
@@ -553,6 +556,19 @@ mod tests {
 
     #[test]
     fn session_extension_settings_accept_host_and_canonical_application_scopes() {
+        let migrate = resolve("/v1/session-extensions/settings_migrate").unwrap();
+        assert_eq!(migrate.scope, Some("configuration.write"));
+        assert_eq!(
+            payload(migrate, br#"{"provider":"example","expected_revision":3}"#).unwrap()["operation"],
+            "settings_migrate"
+        );
+        assert!(
+            payload(
+                migrate,
+                br#"{"provider":"example","expected_revision":3,"values":{}}"#
+            )
+            .is_err()
+        );
         let list = resolve("/v1/session-extensions/list").unwrap();
         let next = br#"{"after":"example","limit":32,"revision":7}"#;
         assert_eq!(payload(list, next).unwrap()["revision"], 7);

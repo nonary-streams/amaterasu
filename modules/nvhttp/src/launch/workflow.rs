@@ -874,6 +874,21 @@ impl Controller {
                 } else if payload["status"] == "pending" {
                     record.lifecycle_prepare_pending = true;
                     record.next_monitor = now + CLEANUP_POLL_INTERVAL;
+                } else if payload["status"] == "failed"
+                    && payload["cleanup_completed"] == true
+                    && lifecycle_session_target(&payload).is_some()
+                {
+                    // The lifecycle authority has confirmed that preparation
+                    // failed and all its effects were retired. No application
+                    // or RTSP admission has occurred at this point.
+                    record.lifecycle_prepare_dispatched = false;
+                    record.lifecycle_prepare_pending = false;
+                    let reason = if payload["reason"] == "processing_output_range_mismatch" {
+                        "processing_output_range_mismatch"
+                    } else {
+                        "lifecycle_prepare_failed"
+                    };
+                    fail_record(record, reason, now);
                 } else if payload["status"] == "succeeded"
                     && let Some(target) = lifecycle_session_target(&payload)
                     && serde_json::from_value::<
@@ -4189,7 +4204,12 @@ fn take_call(job: &mut Job) -> Call {
 
 fn reply_failure(record: &mut Record, replies: &mut Vec<(u64, Reply)>) {
     if let Some(connection) = record.launch_connection.take() {
-        replies.push((connection, private_error(503, "stream launch failed")));
+        let message = if record.failure == Some("processing_output_range_mismatch") {
+            "stream format is incompatible with the selected video processing"
+        } else {
+            "stream launch failed"
+        };
+        replies.push((connection, private_error(503, message)));
     }
     if record.state == State::CleanupFailed
         && let Some(connection) = record.cancel_connection.take()
