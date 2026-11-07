@@ -139,6 +139,10 @@ struct WindowsSession {
 }
 
 impl CaptureSession for WindowsSession {
+    fn quiesce(&mut self) -> CaptureResult<bool> {
+        self.worker.quiesce()
+    }
+
     fn source_info(&mut self) -> CaptureResult<Option<SourceInfo>> {
         self.validate_source()?;
         Ok(Some(self.source_info))

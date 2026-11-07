@@ -3,6 +3,8 @@
 mod implementation {
     use crate::backend::CaptureSession;
     use crate::model::{CaptureError, CaptureResult, Frame};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError};
     use std::thread::{self, JoinHandle};
     use std::time::Duration;
@@ -15,7 +17,9 @@ mod implementation {
         requests: Option<SyncSender<()>>,
         replies: Receiver<CaptureResult<Option<Frame>>>,
         thread: Option<JoinHandle<()>>,
+        stopped: Arc<AtomicBool>,
         waiting: bool,
+        shutdown_failure: Option<String>,
     }
 
     impl Worker {
@@ -38,13 +42,15 @@ mod implementation {
             let (requests, request_receiver) = mpsc::sync_channel(1);
             let (reply_sender, replies) = mpsc::sync_channel(1);
             let (ready_sender, ready) = mpsc::sync_channel(1);
+            let stopped = Arc::new(AtomicBool::new(false));
+            let source_stopped = stopped.clone();
             let thread = thread::Builder::new()
                 .name("amaterasu-wgc".into())
                 .spawn(move || {
                     amaterasu_module_sdk::threading::configure_worker_priority(
                         amaterasu_module_sdk::threading::ThreadPriority::Critical,
                     );
-                    let (mut source, metadata) = match initialize() {
+                    let (source, metadata) = match initialize() {
                         Ok(value) => value,
                         Err(error) => {
                             let _ = ready_sender.send(Err(error));
@@ -54,30 +60,73 @@ mod implementation {
                     if ready_sender.send(Ok(metadata)).is_err() {
                         return;
                     }
-                    while request_receiver.recv().is_ok() {
-                        let result = source.poll();
-                        let terminal = result.as_ref().is_err_and(|error| {
-                            error.code == "access_lost" || error.code == "device_lost"
-                        });
-                        if reply_sender.try_send(result).is_err() || terminal {
-                            break;
-                        }
-                    }
-                    // Source drops here, on its creation thread, before join.
+                    drive_source(source, request_receiver, reply_sender, &source_stopped);
                 })
                 .map_err(|error| CaptureError::new("backend_error", error.to_string()))?;
             let worker = Self {
                 requests: Some(requests),
                 replies,
                 thread: Some(thread),
+                stopped,
                 waiting: false,
+                shutdown_failure: None,
             };
             let metadata = ready.recv().map_err(|_| worker_ended())??;
             Ok((worker, metadata))
         }
     }
 
+    pub(super) fn drive_source<S: FrameSource>(
+        mut source: S,
+        requests: Receiver<()>,
+        replies: SyncSender<CaptureResult<Option<Frame>>>,
+        stopped: &AtomicBool,
+    ) {
+        while requests.recv().is_ok() {
+            // A disconnected channel still yields its buffered request. Check
+            // cancellation at dispatch so shutdown does not start that native
+            // poll; a poll already admitted by this check must finish normally.
+            if stopped.load(Ordering::Acquire) {
+                break;
+            }
+            let result = source.poll();
+            let terminal = result
+                .as_ref()
+                .is_err_and(|error| error.code == "access_lost" || error.code == "device_lost");
+            if replies.try_send(result).is_err() || terminal {
+                break;
+            }
+        }
+        // Source drops here, on its creation thread, before join.
+    }
+
     impl CaptureSession for Worker {
+        fn quiesce(&mut self) -> CaptureResult<bool> {
+            // Disconnect an idle worker immediately. An in-flight source poll
+            // still owns its resources and is retained until its destructor
+            // and thread have completed; never detach module-owned code.
+            self.stopped.store(true, Ordering::Release);
+            self.requests.take();
+            if let Some(message) = &self.shutdown_failure {
+                return Err(CaptureError::new("backend_error", message.clone()));
+            }
+            if self
+                .thread
+                .as_ref()
+                .is_some_and(|thread| !thread.is_finished())
+            {
+                return Ok(false);
+            }
+            if let Some(thread) = self.thread.take()
+                && thread.join().is_err()
+            {
+                let message = "WGC worker panicked while retiring its capture source";
+                self.shutdown_failure = Some(message.into());
+                return Err(CaptureError::new("backend_error", message));
+            }
+            Ok(true)
+        }
+
         fn read(&mut self, wait_ms: u32) -> CaptureResult<Option<Frame>> {
             if !self.waiting {
                 self.requests
@@ -111,6 +160,7 @@ mod implementation {
         fn drop(&mut self) {
             // Disconnect before joining, so an idle worker wakes. Joining is
             // mandatory: no worker code may outlive module library unloading.
+            self.stopped.store(true, Ordering::Release);
             self.requests.take();
             if let Some(thread) = self.thread.take() {
                 let _ = thread.join();
@@ -135,7 +185,7 @@ mod tests {
     use crate::backend::CaptureSession;
     use crate::model::{CaptureError, CaptureResult, Frame};
     use std::rc::Rc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, mpsc};
     use std::thread::{self, ThreadId};
     use std::time::Duration;
@@ -175,6 +225,45 @@ mod tests {
                 .unwrap()
                 .push(("drop".into(), thread::current().id()));
         }
+    }
+
+    #[test]
+    fn shutdown_cancels_a_queued_poll_before_driving_the_source() {
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let worker_trace = trace.clone();
+        let (requests, queued) = mpsc::sync_channel(1);
+        requests.send(()).unwrap();
+        // The queue can still contain a read if this owner thread has not
+        // been scheduled yet. Shutdown sets its gate before disconnecting.
+        let stopped = AtomicBool::new(true);
+        drop(requests);
+        let (replies, _results) = mpsc::sync_channel(1);
+        let (gate, gate_receiver) = mpsc::channel();
+        gate.send(()).unwrap();
+        let worker = thread::spawn(move || {
+            worker_trace
+                .lock()
+                .unwrap()
+                .push(("open".into(), thread::current().id()));
+            let source = ThreadBoundSource {
+                trace: worker_trace,
+                gate: gate_receiver,
+                _thread_bound: Rc::new(()),
+            };
+            super::implementation::drive_source(source, queued, replies, &stopped);
+        });
+        worker.join().unwrap();
+        let trace = trace.lock().unwrap();
+        assert_eq!(
+            trace
+                .iter()
+                .map(|(operation, _)| operation.as_str())
+                .collect::<Vec<_>>(),
+            ["open", "drop"],
+            "shutdown must retire the source without dispatching buffered native work",
+        );
+        assert_ne!(trace[0].1, thread::current().id());
+        assert!(trace.iter().all(|(_, owner)| *owner == trace[0].1));
     }
 
     #[test]

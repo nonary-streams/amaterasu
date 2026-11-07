@@ -31,6 +31,7 @@ struct Settings {
 struct CaptureModule {
     runtime: RuntimeClient,
     controller: SharedController,
+    shutdown_requested: bool,
     _preflight_factory: Box<
         amaterasu_module_sdk::capture::SourcePreflightFactory<preflight::Provider<NativeBackend>>,
     >,
@@ -70,12 +71,32 @@ impl ManagedModule for CaptureModule {
         Ok(Self {
             runtime,
             controller,
+            shutdown_requested: false,
             _factory: factory,
             _preflight_factory: preflight_factory,
         })
     }
 
+    fn prepare_shutdown(&mut self, _remaining_ms: u64) -> ModuleResult<()> {
+        self.shutdown_requested = true;
+        self.stop_admission_when_available()?;
+        Ok(())
+    }
+
+    fn quiesce(&mut self) -> ModuleResult<bool> {
+        self.shutdown_requested = true;
+        match self.controller.try_lock() {
+            Ok(mut controller) => {
+                controller.shutdown();
+                Ok(true)
+            }
+            Err(std::sync::TryLockError::WouldBlock) => Ok(false),
+            Err(_) => Err("capture controller poisoned".into()),
+        }
+    }
+
     fn tick(&mut self) -> ModuleResult<()> {
+        self.stop_admission_when_available()?;
         for _ in 0..8 {
             let (id, caller, service, payload) = match self.runtime.send(Command::Poll {})? {
                 Response::Pending => break,
@@ -98,6 +119,9 @@ impl ManagedModule for CaptureModule {
                             .controller
                             .lock()
                             .map_err(|_| "capture controller poisoned")?;
+                        if self.shutdown_requested {
+                            controller.stop_admission();
+                        }
                         let reply = controller.handle(&caller, operation, &mut || match self
                             .runtime
                             .send(Command::CheckRequest { request: id })
@@ -132,6 +156,21 @@ impl ManagedModule for CaptureModule {
                         return Err(format!("capture completion failed: {result:?}"));
                     }
                 }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl CaptureModule {
+    fn stop_admission_when_available(&self) -> ModuleResult<()> {
+        if self.shutdown_requested {
+            match self.controller.try_lock() {
+                Ok(mut controller) => controller.stop_admission(),
+                // A native read already owns this mutex. The module flag
+                // rejects Open when its control request is processed later.
+                Err(std::sync::TryLockError::WouldBlock) => (),
+                Err(_) => return Err("capture controller poisoned".into()),
             }
         }
         Ok(())

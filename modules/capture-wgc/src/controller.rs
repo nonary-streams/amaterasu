@@ -6,7 +6,13 @@ use amaterasu_media::CaptureGeometry;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
+
+#[cfg(test)]
+#[path = "shutdown_tests.rs"]
+mod shutdown_tests;
 
 struct Stream {
     capture_format: crate::format::CaptureFormat,
@@ -21,6 +27,16 @@ struct Stream {
     last_frame: Option<Frame>,
     next_sequence: u64,
     last_timestamp_us: u64,
+    close_receipt: Option<CloseReceipt>,
+}
+
+#[derive(Clone)]
+pub(crate) struct CloseReceipt(Arc<AtomicBool>);
+
+impl CloseReceipt {
+    pub(crate) fn retired(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
 }
 
 impl Stream {
@@ -77,8 +93,54 @@ impl<B: Backend> Controller<B> {
     }
 
     pub fn shutdown(&mut self) {
-        self.enabled = false;
+        self.stop_admission();
         self.streams.clear();
+    }
+
+    pub fn stop_admission(&mut self) {
+        self.enabled = false;
+    }
+
+    pub fn quiesce(&mut self) -> CaptureResult<bool> {
+        self.stop_admission();
+        for stream in self.streams.values_mut() {
+            mark_closing(stream);
+        }
+        if let Some((_, failure)) = self.poll_closing().into_iter().next() {
+            return Err(failure);
+        }
+        Ok(self.streams.is_empty())
+    }
+
+    pub(crate) fn begin_close(&mut self, caller: &str, id: u64) -> CaptureResult<CloseReceipt> {
+        self.authorize_owner(caller, id)?;
+        let stream = self.streams.get_mut(&id).expect("authorized stream");
+        Ok(mark_closing(stream))
+    }
+
+    pub(crate) fn poll_closing(&mut self) -> Vec<(u64, CaptureError)> {
+        let mut failures = Vec::new();
+        let mut retired = Vec::new();
+        // Poll every owned source so one pending or failed worker does not
+        // prevent independent streams from retiring on the same host tick.
+        for (&id, stream) in &mut self.streams {
+            let Some(receipt) = &stream.close_receipt else {
+                continue;
+            };
+            match stream.session.quiesce() {
+                Ok(true) => retired.push((id, receipt.clone())),
+                Ok(false) => (),
+                Err(error) => failures.push((id, error)),
+            }
+        }
+        for (id, receipt) in retired {
+            let stream = self.streams.remove(&id).expect("retiring stream");
+            // A joined worker alone is insufficient: destroy its complete
+            // session before any broker waiter can report successful Close.
+            drop(stream);
+            receipt.0.store(true, Ordering::Release);
+        }
+        failures
     }
 
     pub fn take_opened_stream(&mut self) -> Option<u64> {
@@ -134,6 +196,12 @@ impl<B: Backend> Controller<B> {
         if let Some(operation_id) = &operation_id {
             validate_operation_id(operation_id)?;
             if let Some((stream_id, existing)) = self.find_operation(caller, operation_id) {
+                if existing.close_receipt.is_some() {
+                    return Err(CaptureError::new(
+                        "cleanup_pending",
+                        "the operation's capture stream is still retiring",
+                    ));
+                }
                 if existing.output != output
                     || existing.constant_rate != constant_rate
                     || existing.capture_format != capture_format
@@ -197,6 +265,7 @@ impl<B: Backend> Controller<B> {
                 last_frame: None,
                 next_sequence: 0,
                 last_timestamp_us: 0,
+                close_receipt: None,
             },
         );
         self.opened_stream = Some(id);
@@ -318,18 +387,48 @@ impl<B: Backend> Controller<B> {
             .as_ref()
             .is_err_and(|error: &CaptureError| matches!(error.code, "access_lost" | "device_lost"))
         {
-            self.streams.remove(&id);
+            let _ = self.close(caller, id);
         }
         result
     }
 
     pub fn close(&mut self, caller: &str, id: u64) -> CaptureResult<()> {
-        self.authorize(caller, id)?;
-        self.streams.remove(&id);
-        Ok(())
+        let receipt = self.begin_close(caller, id)?;
+        if let Some((_, failure)) = self
+            .poll_closing()
+            .into_iter()
+            .find(|(stream, _)| *stream == id)
+        {
+            return Err(failure);
+        }
+        if receipt.retired() {
+            Ok(())
+        } else {
+            Err(CaptureError::new(
+                "cleanup_pending",
+                "capture worker is still retiring",
+            ))
+        }
     }
 
     fn authorize(&self, caller: &str, id: u64) -> CaptureResult<()> {
+        self.authorize_owner(caller, id)?;
+        if self
+            .streams
+            .get(&id)
+            .expect("authorized stream")
+            .close_receipt
+            .is_some()
+        {
+            return Err(CaptureError::new(
+                "access_lost",
+                "capture stream is retiring",
+            ));
+        }
+        Ok(())
+    }
+
+    fn authorize_owner(&self, caller: &str, id: u64) -> CaptureResult<()> {
         match self.streams.get(&id) {
             Some(stream) if stream.owner == caller => Ok(()),
             _ => Err(CaptureError::new(
@@ -447,7 +546,7 @@ impl<B: Backend> Controller<B> {
             .as_ref()
             .is_err_and(|error| error.code == "access_lost" || error.code == "device_lost")
         {
-            self.streams.remove(&id);
+            let _ = self.close(caller, id);
         }
         result
     }
@@ -478,7 +577,7 @@ impl<B: Backend> Controller<B> {
         };
         if geometry_lost {
             stream.last_frame = None;
-            self.streams.remove(&id);
+            let _ = self.close(caller, id);
             return Err(CaptureError::new(
                 "access_lost",
                 "capture desktop geometry changed or became unavailable; enumerate and reopen",
@@ -486,6 +585,14 @@ impl<B: Backend> Controller<B> {
         }
         current
     }
+}
+
+fn mark_closing(stream: &mut Stream) -> CloseReceipt {
+    stream.last_frame = None;
+    stream
+        .close_receipt
+        .get_or_insert_with(|| CloseReceipt(Arc::new(AtomicBool::new(false))))
+        .clone()
 }
 
 fn initial_geometry(session: &mut dyn CaptureSession) -> CaptureResult<Option<CaptureGeometry>> {

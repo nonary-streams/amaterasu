@@ -18,6 +18,12 @@ impl TouchSurface {
 
 pub trait CaptureSession: Send {
     fn read(&mut self, wait_ms: u32) -> CaptureResult<Option<Frame>>;
+    /// Stop requesting frames and poll resource retirement without waiting for
+    /// a worker. True permits the controller to destroy the session; worker
+    /// implementations must join their thread before reporting completion.
+    fn quiesce(&mut self) -> CaptureResult<bool> {
+        Ok(true)
+    }
     fn source_info(&mut self) -> CaptureResult<Option<crate::format::SourceInfo>> {
         Ok(None)
     }

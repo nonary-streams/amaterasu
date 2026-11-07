@@ -8,6 +8,10 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
+#[cfg(test)]
+#[path = "shutdown_tests.rs"]
+mod shutdown_tests;
+
 struct Stream {
     owner: String,
     output: String,
@@ -52,8 +56,12 @@ impl<B: Backend> Controller<B> {
     }
 
     pub fn shutdown(&mut self) {
-        self.enabled = false;
+        self.stop_admission();
         self.streams.clear();
+    }
+
+    pub fn stop_admission(&mut self) {
+        self.enabled = false;
     }
 
     pub fn take_opened_stream(&mut self) -> Option<u64> {

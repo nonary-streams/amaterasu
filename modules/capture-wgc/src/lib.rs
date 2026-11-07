@@ -13,13 +13,24 @@ mod worker;
 
 use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};
 use backend::NativeBackend;
-use controller::Controller;
+use controller::{CloseReceipt, Controller};
 use model::{CaptureError, Operation};
 use serde::Deserialize;
+use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
 
 const SERVICE: &str = "amaterasu.capture-wgc/1";
+const MAX_PENDING_CLOSES: usize = 32;
 type SharedController = Arc<Mutex<Controller<NativeBackend>>>;
+
+struct PendingClose {
+    request: Option<u64>,
+    caller: String,
+    stream: u64,
+    receipt: Option<CloseReceipt>,
+    reply: Option<Value>,
+    admitted: bool,
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -33,6 +44,8 @@ struct Settings {
 struct CaptureModule {
     runtime: RuntimeClient,
     controller: SharedController,
+    shutdown_requested: bool,
+    pending_closes: Vec<PendingClose>,
     _preflight_factory: Box<
         amaterasu_module_sdk::capture::SourcePreflightFactory<preflight::Provider<NativeBackend>>,
     >,
@@ -78,12 +91,48 @@ impl ManagedModule for CaptureModule {
         Ok(Self {
             runtime,
             controller,
+            shutdown_requested: false,
+            pending_closes: Vec::new(),
             _factory: factory,
             _preflight_factory: preflight_factory,
         })
     }
 
+    fn prepare_shutdown(&mut self, _remaining_ms: u64) -> ModuleResult<()> {
+        self.shutdown_requested = true;
+        self.stop_admission_when_available()?;
+        Ok(())
+    }
+
+    fn quiesce(&mut self) -> ModuleResult<bool> {
+        self.shutdown_requested = true;
+        let mut failure = self.poll_pending_closes().err();
+        let retired = match self.controller.try_lock() {
+            Ok(mut controller) => controller
+                .quiesce()
+                .map_err(|error| format!("{}: {}", error.code, error.message)),
+            Err(std::sync::TryLockError::WouldBlock) => Ok(false),
+            Err(_) => Err("capture controller poisoned".into()),
+        };
+        let retired = match retired {
+            Ok(retired) => retired,
+            Err(error) => {
+                failure.get_or_insert(error);
+                false
+            }
+        };
+        if retired && let Err(error) = self.poll_pending_closes() {
+            failure.get_or_insert(error);
+        }
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        Ok(retired && self.pending_closes.is_empty())
+    }
+
     fn tick(&mut self) -> ModuleResult<()> {
+        self.stop_admission_when_available()?;
+        self.poll_pending_closes()?;
         for _ in 0..8 {
             let (id, caller, service, payload) = match self.runtime.send(Command::Poll {})? {
                 Response::Pending => break,
@@ -101,11 +150,29 @@ impl ManagedModule for CaptureModule {
                 CaptureError::new("invalid_service", "unsupported capture service").payload()
             } else {
                 match serde_json::from_value::<Operation>(payload) {
+                    Ok(Operation::Close { stream }) => {
+                        if self.pending_closes.len() < MAX_PENDING_CLOSES {
+                            self.pending_closes.push(PendingClose {
+                                request: Some(id),
+                                caller,
+                                stream,
+                                receipt: None,
+                                reply: None,
+                                admitted: false,
+                            });
+                            continue;
+                        }
+                        CaptureError::new("resource_exhausted", "capture close waiters are full")
+                            .payload()
+                    }
                     Ok(operation) => {
                         let mut controller = self
                             .controller
                             .lock()
                             .map_err(|_| "capture controller poisoned")?;
+                        if self.shutdown_requested {
+                            controller.stop_admission();
+                        }
                         let reply = controller.handle(&caller, operation, &mut || match self
                             .runtime
                             .send(Command::CheckRequest { request: id })
@@ -140,6 +207,138 @@ impl ManagedModule for CaptureModule {
                         return Err(format!("capture completion failed: {result:?}"));
                     }
                 }
+            }
+        }
+        self.poll_pending_closes()?;
+        Ok(())
+    }
+}
+
+impl CaptureModule {
+    fn poll_pending_closes(&mut self) -> ModuleResult<()> {
+        let activity_failure = self.check_close_waiters();
+        let retirement_failure = self.poll_close_jobs();
+        let completion_failure = self.complete_close_waiters();
+        activity_failure
+            .or(retirement_failure)
+            .or(completion_failure)
+            .map_or(Ok(()), Err)
+    }
+
+    fn check_close_waiters(&mut self) -> Option<String> {
+        let mut failure = None;
+        // Cancellation retires a broker waiter, never a source whose cleanup
+        // has started. Its receipt remains attached to the owned stream.
+        self.pending_closes.retain_mut(|pending| {
+            if pending.reply.is_some() {
+                return true;
+            }
+            let Some(request) = pending.request else {
+                return true;
+            };
+            match self.runtime.send(Command::CheckRequest { request }) {
+                Ok(Response::Ok) => {
+                    pending.admitted = true;
+                    true
+                }
+                Ok(Response::Error { code, .. })
+                    if code == "request_ended" || code == "not_found" =>
+                {
+                    if pending.admitted && pending.receipt.is_none() {
+                        // Admission can precede acquiring a controller held by
+                        // a native read. Retain that exact cleanup target even
+                        // when the broker waiter goes away before begin_close.
+                        pending.request = None;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                response => {
+                    failure.get_or_insert_with(|| {
+                        format!("capture close activity check failed: {response:?}")
+                    });
+                    true
+                }
+            }
+        });
+        failure
+    }
+
+    fn poll_close_jobs(&mut self) -> Option<String> {
+        match self.controller.try_lock() {
+            Ok(mut controller) => {
+                for pending in &mut self.pending_closes {
+                    if pending.admitted && pending.receipt.is_none() && pending.reply.is_none() {
+                        match controller.begin_close(&pending.caller, pending.stream) {
+                            Ok(receipt) => pending.receipt = Some(receipt),
+                            Err(error) => pending.reply = Some(error.payload()),
+                        }
+                    }
+                }
+                let errors = controller.poll_closing();
+                for pending in &mut self.pending_closes {
+                    if pending.reply.is_some() {
+                        continue;
+                    }
+                    if pending.receipt.as_ref().is_some_and(CloseReceipt::retired) {
+                        pending.reply = Some(json!({"ok":true}));
+                    } else if pending.receipt.is_some()
+                        && let Some((_, error)) =
+                            errors.iter().find(|(stream, _)| *stream == pending.stream)
+                    {
+                        pending.reply =
+                            Some(CaptureError::new(error.code, error.message.clone()).payload());
+                    }
+                }
+                None
+            }
+            Err(std::sync::TryLockError::WouldBlock) => None,
+            Err(_) => Some("capture controller poisoned".into()),
+        }
+    }
+
+    fn complete_close_waiters(&mut self) -> Option<String> {
+        let mut failure = None;
+        let waiters = std::mem::take(&mut self.pending_closes);
+        for pending in waiters {
+            let Some(request) = pending.request else {
+                if pending.receipt.is_none() && pending.reply.is_none() {
+                    self.pending_closes.push(pending);
+                }
+                // Once begun, the stream owns cleanup without broker metadata.
+                continue;
+            };
+            let Some(reply) = &pending.reply else {
+                self.pending_closes.push(pending);
+                continue;
+            };
+            match self.runtime.send(Command::Complete {
+                request,
+                payload: reply.clone(),
+            }) {
+                Ok(Response::Ok) => (),
+                Ok(Response::Error { code, .. })
+                    if code == "request_ended" || code == "not_found" => {}
+                result => {
+                    failure.get_or_insert_with(|| {
+                        format!("capture close completion failed: {result:?}")
+                    });
+                    self.pending_closes.push(pending);
+                }
+            }
+        }
+        failure
+    }
+
+    fn stop_admission_when_available(&self) -> ModuleResult<()> {
+        if self.shutdown_requested {
+            match self.controller.try_lock() {
+                Ok(mut controller) => controller.stop_admission(),
+                // A native read already owns this mutex. The module flag
+                // rejects Open when its control request is processed later.
+                Err(std::sync::TryLockError::WouldBlock) => (),
+                Err(_) => return Err("capture controller poisoned".into()),
             }
         }
         Ok(())

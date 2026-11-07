@@ -66,7 +66,12 @@ these grants. Linux/macOS implement explicit `unsupported_platform` responses.
 - `{"action":"lookup","operation_id":"start-1"}` recovers that caller's
   same stream/output reply after a lost open result. The mapping ends when the
   stream closes or loses its capture source.
-- `{"action":"close","stream":123}` closes only the caller's stream.
+- `{"action":"close","stream":123}` closes only the caller's stream. Its broker
+  request remains pending until the worker has joined and the complete native
+  session has been destroyed; only then does it return `{"ok":true}`. Other
+  requests continue receiving ticks while the worker retires. Duplicate Close
+  requests share that retirement. There are at most 32 retained Close waiters
+  and queued cleanup targets; additional requests return `resource_exhausted`.
 - `{"action":"status"}` reports `ok`, `enabled`, `native_supported`, and only
   that caller's `streams` (`stream` and `output`). `native_supported` means this
   build includes Windows code, not that this OS/session passed an open test.
@@ -95,11 +100,28 @@ reconnection or output substitution. Caller-scoped lookup cannot recover an ID
 that was already closed, and restart does not preserve streams.
 
 Opening checks runtime request activity before and after resource creation.
-Cancellation drops the new session; losing its completion acknowledgment also
-closes that specific newly created stream. Replay and lookup replies never
+Cancellation retires the new session; losing its completion acknowledgment also
+retires that specific newly created stream. Replay and lookup replies never
 mark existing streams for this cleanup. Module shutdown closes every stream.
 Native binding release releases that binding's context; use `close` to end the
 stream separately.
+
+Once Close has been admitted, cancelling its broker request releases only the
+waiter. The exact caller/stream target remains owned until it can enter cleanup,
+including while a native callback holds the controller. A closing stream rejects
+new reads and replayed opens, retains its owner-scoped operation lookup, and
+counts against stream capacity until destruction finishes. Terminal native
+errors use this same retirement path. `MEDIA_CLOSED` ends frame delivery; a
+successful control Close is the separate proof that native retirement completed.
+
+The host shutdown announcement rejects new opens without retiring captures still
+used by consumers. Once those consumers have quiesced, provider quiescence
+disconnects frame requests and polls each owned worker. It reports ready only
+after every worker has finished destroying its source and has been joined,
+keeping its declared dependencies alive until capture retirement completes.
+A worker panic remains a shutdown error on retries. These transitions are
+covered by portable module and held-worker fixtures; native Windows shutdown
+timing and driver behavior still require Windows qualification.
 
 ## Native frames and lifetimes
 

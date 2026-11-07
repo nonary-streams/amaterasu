@@ -140,6 +140,12 @@ any capture allocation; unavailable targets never select another output.
 
 ## Windows implementation and remaining hardware gates
 
+The host shutdown announcement rejects new opens while preserving existing
+captures for consumers to drain. Provider quiescence then destroys all owned
+duplication sessions before reporting ready, keeping its declared dependencies
+alive until capture retirement. Portable fixtures verify this module lifecycle; COM
+release timing and physical Windows shutdown still require native qualification.
+
 The Windows backend uses official `windows` 0.62 COM wrappers:
 `CreateDXGIFactory1`/adapter-output enumeration, `D3D11CreateDevice` on the chosen
 adapter, `IDXGIOutput1::DuplicateOutput` for legacy BGRA8 and
