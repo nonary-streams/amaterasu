@@ -312,3 +312,141 @@ fn explicitly_rejected_active_completion_retires_launch() {
     assert!(harness.processes[0].child.is_none());
     assert_eq!(effect_count(&harness, Route::Executable), 1);
 }
+
+#[test]
+fn real_broker_distinguishes_first_rejection_from_lost_admission_acknowledgement() {
+    use amaterasu_contracts::{Grants, RuntimeConfig};
+    use amaterasu_runtime::Broker;
+
+    for route in [Route::Executable, Route::Playnite, Route::Generic] {
+        for cancelled in [false, true] {
+            let mut config = RuntimeConfig::default();
+            config.principals.insert(
+                "caller".into(),
+                Grants {
+                    call: ["test.launch/1".into()].into(),
+                    ..Default::default()
+                },
+            );
+            config.principals.insert(
+                "provider".into(),
+                Grants {
+                    provide: ["test.launch/1".into()].into(),
+                    ..Default::default()
+                },
+            );
+            let mut broker = Broker::new(config).unwrap();
+            assert!(matches!(
+                broker.dispatch(
+                    "provider",
+                    Command::Register {
+                        service: "test.launch/1".into()
+                    }
+                ),
+                Response::Ok
+            ));
+            let request_id = match broker.dispatch(
+                "caller",
+                Command::Request {
+                    service: "test.launch/1".into(),
+                    payload: json!({}),
+                    timeout_ms: 30_000,
+                    operation_id: "launch".into(),
+                    parent: None,
+                },
+            ) {
+                Response::Accepted { id } => id,
+                response => panic!("unexpected request response: {response:?}"),
+            };
+            assert!(
+                matches!(broker.dispatch("provider", Command::Poll {}), Response::Request { id, .. } if id == request_id)
+            );
+            if cancelled {
+                assert!(matches!(
+                    broker.dispatch(
+                        "caller",
+                        Command::Cancel {
+                            request: request_id
+                        }
+                    ),
+                    Response::Ok
+                ));
+            }
+
+            let (mut pipeline, mut harness, request) = configured(route);
+            enqueue(&mut harness, request);
+            let mut completions = 0;
+            for _ in 0..150 {
+                pipeline.tick(|command| {
+                    if let Command::Complete { ref payload, .. } = command
+                        && payload["launch"]["state"] == "starting"
+                    {
+                        completions += 1;
+                        let response = broker.dispatch("provider", Command::Complete {
+                            request: request_id,
+                            payload: payload.clone(),
+                        });
+                        if cancelled {
+                            assert!(matches!(response, Response::Error { ref code, .. } if code == "request_ended"));
+                            return Ok(response);
+                        }
+                        assert!(matches!(response, Response::Ok));
+                        // The result is committed, but delivery of its acknowledgement fails.
+                        return Err("injected lost broker acknowledgement".into());
+                    }
+                    harness.send(command)
+                }).unwrap();
+                if completions > 0 && (cancelled && pipeline.job.is_none() || !cancelled) {
+                    break;
+                }
+            }
+            assert_eq!(completions, 1, "{route:?}");
+            assert_eq!(effect_count(&harness, route), 1, "{route:?}");
+            if cancelled {
+                assert!(pipeline.records.values[&1].state == State::Cancelled);
+                assert!(harness.sessions[0].lease.is_none());
+            } else {
+                assert!(
+                    matches!(broker.dispatch("caller", Command::TakeResult { request: request_id }), Response::Result { payload } if payload["launch"]["state"] == "starting")
+                );
+                assert!(pipeline.job.is_some());
+                assert!(harness.sessions[0].lease.is_some());
+                for _ in 0..100 {
+                    if pipeline.job.is_none() {
+                        break;
+                    }
+                    pipeline
+                        .tick(|command| {
+                            if let Command::Complete { ref payload, .. } = command
+                                && payload["launch"]["state"] == "starting"
+                            {
+                                completions += 1;
+                                return Ok(broker.dispatch(
+                                    "provider",
+                                    Command::Complete {
+                                        request: request_id,
+                                        payload: payload.clone(),
+                                    },
+                                ));
+                            }
+                            harness.send(command)
+                        })
+                        .unwrap();
+                }
+                assert_eq!(completions, 1, "{route:?}: admission was retried");
+                let stopped = harness.request_as(
+                    &mut pipeline,
+                    "amaterasu.nvhttp",
+                    "management",
+                    json!({"action":"stop","launch_id":1}),
+                );
+                assert_eq!(
+                    stopped["launch"]["state"], "stopped",
+                    "{route:?}: {stopped}"
+                );
+                assert_eq!(effect_count(&harness, route), 1, "{route:?}");
+                assert!(harness.sessions[0].lease.is_none());
+            }
+        }
+    }
+}

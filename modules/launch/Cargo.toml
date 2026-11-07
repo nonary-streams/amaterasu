@@ -16,5 +16,8 @@ serde_json.workspace = true
 sha2.workspace = true
 getrandom.workspace = true
 
+[dev-dependencies]
+amaterasu-runtime = { path = "../../crates/runtime" }
+
 [lints]
 workspace = true

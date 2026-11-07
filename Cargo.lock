@@ -516,6 +516,7 @@ dependencies = [
  "amaterasu-contracts",
  "amaterasu-input-policy",
  "amaterasu-module-sdk",
+ "amaterasu-runtime",
  "getrandom 0.3.4",
  "serde",
  "serde_json",
