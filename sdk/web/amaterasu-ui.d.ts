@@ -239,6 +239,28 @@ declare namespace AmaterasuPluginUi {
       };
     }
 
+  type ExtensionFieldDefinition = {
+      type: string;
+      default: unknown;
+      inner?: ExtensionFieldDefinition;
+      minimum?: number | null;
+      maximum?: number | null;
+      min_length?: number | null;
+      max_length?: number | null;
+      min_items?: number | null;
+      max_items?: number | null;
+      options?: string[];
+      item?: ExtensionFieldDefinition;
+      fields?: Record<string, ExtensionFieldDefinition>;
+      tag?: string;
+      variants?: Record<string, Record<string, ExtensionFieldDefinition>>;
+    };
+
+  interface ExtensionFieldEditor {
+      node: HTMLElement;
+      value(): unknown;
+    }
+
   interface ExtensionMethod { alias: string }
 
   interface ExtensionDescriptor {
@@ -249,6 +271,7 @@ declare namespace AmaterasuPluginUi {
       entrypoint: string;
       placements?: ("page" | "application" | "overview" | "settings")[];
       settings_provider?: string | null;
+      settings_owner?: string | null;
       methods: ExtensionMethod[];
     }
 
@@ -260,7 +283,7 @@ declare namespace AmaterasuPluginUi {
       mountApplication?(container: HTMLElement, sdk: ExtensionPageSdk): void | (() => void);
     }
 
-  interface ApplicationExtensionContext { readonly id: string; readonly name: string }
+  interface ApplicationExtensionContext { readonly id: string; readonly name: string; readonly onDocumentChange?: () => void }
 
   interface ApplicationSettingsDocument {
       revision: number;
@@ -272,8 +295,22 @@ declare namespace AmaterasuPluginUi {
       readonly version: 1;
       readonly provider: string;
       readonly canWrite: boolean;
+      readonly scope?: ExtensionSettingsScope;
+      describe?(): Promise<ExtensionSettingsDescriptor>;
       read(): Promise<ApplicationSettingsDocument>;
       update(expectedRevision: number, values: Payload): Promise<{ revision: number }>;
+    }
+
+  type ExtensionSettingsScope = { readonly kind: "host" } | { readonly kind: "application"; readonly id: string };
+
+  interface ExtensionSettingsDescriptor {
+      provider: string;
+      display_name?: string | null;
+      options: {
+        id: string; label: string; help: string; definition: ExtensionFieldDefinition;
+        choice_labels?: Record<string,string>; presentation?: string | null;
+        allowed_scopes: string[]; apply_policy: string;
+      }[];
     }
 
   interface ApplicationExtensionMount {
@@ -290,7 +327,7 @@ declare namespace AmaterasuPluginUi {
       readonly ui?: ExtensionUiWithDialogsV1 & ExtensionUiTabsV1 & ExtensionUiChartsV1;
       readonly assets?: { stylesheet(path: string): Promise<void> };
       canCall?(method: string): boolean;
-      readonly application?: ApplicationExtensionContext;
+      readonly application?: Pick<ApplicationExtensionContext, "id" | "name"> & { readonly notifyChanged?: () => void };
       readonly settings?: ApplicationSettingsApi;
       setDirty?(dirty: boolean): void;
       setBusy?(busy: boolean): void;
