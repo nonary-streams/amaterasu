@@ -562,6 +562,7 @@ mod tests {
             settings_revision: "revision".into(),
             application_retired: false,
             application_retirement_proof: None,
+            application_disposition: None,
             streams: Default::default(),
             obligations: vec![],
             required_consumers: None,

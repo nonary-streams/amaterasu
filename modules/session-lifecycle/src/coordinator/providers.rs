@@ -2617,7 +2617,7 @@ impl Coordinator {
             }
             Ok(!inputs.has_unresolved_stream(epoch, id, stream_id))
         } else {
-            Ok(session.application_retired
+            Ok(session.application_retired_or_untracked()
                 && session
                     .streams
                     .values()
@@ -2968,6 +2968,14 @@ impl Coordinator {
                 }
             }
         }
+        // An abandoned session has no retirement proof to fall back on, so
+        // deferred restoration fences it for recovery instead of retiring it.
+        let abandoned_release_deferred = work.phase == LifecyclePhase::SessionRelease
+            && super::restart_abandonment::finish_abandoned_release(
+                session,
+                deferred,
+                &mut response,
+            );
         if let Some(failed) = &work.failed_preparation {
             response["status"] = json!(if failed.uncertain {
                 "recovery_required"
@@ -3001,6 +3009,7 @@ impl Coordinator {
         response["operation_id"] = receipt.request["operation_id"].clone();
         receipt.response = response;
         receipt.work = ((deferred && shared_source_cleanup)
+            || abandoned_release_deferred
             || work
                 .failed_preparation
                 .as_ref()
@@ -3356,6 +3365,7 @@ mod admission_target_tests {
             settings_revision: "revision".into(),
             application_retired: false,
             application_retirement_proof: None,
+            application_disposition: None,
             streams: Default::default(),
             obligations: vec![],
             required_consumers: None,

@@ -55,6 +55,9 @@ struct Harness {
     registry_settings: Option<(u64, Value)>,
     external: bool,
     retirement_result: Option<Value>,
+    /// Simulates a v1 policy provider with session and stream obligations.
+    policy_obligations: bool,
+    policy_session_release_deferred: bool,
 }
 
 impl Harness {
@@ -338,6 +341,8 @@ impl Harness {
             registry_settings,
             external,
             retirement_result: None,
+            policy_obligations: false,
+            policy_session_release_deferred: false,
         };
         harness.start();
         harness
@@ -449,8 +454,11 @@ impl Harness {
                         Response::Ok
                     ));
                 } else if self.external {
-                    let response =
-                        external_policy_response(&payload, "display", self.cleanup_deferred);
+                    let response = if self.policy_obligations {
+                        obligation_policy_response(&payload, self.policy_session_release_deferred)
+                    } else {
+                        external_policy_response(&payload, "display", self.cleanup_deferred)
+                    };
                     if payload["method"] == "lifecycle_callback"
                         && args["phase"] == "stream.prepare"
                     {
@@ -2678,4 +2686,225 @@ fn processing_preflight_allows_sdr_resume_of_retained_sdr_processing_source() {
             .iter()
             .any(|call| { call["arguments"]["phase"] == "stream.prepare" })
     );
+}
+
+/// A v1 policy provider shaped like the frame limiter: each session and stream
+/// target owns one policy resource with one cleanup obligation.
+fn obligation_policy_response(payload: &Value, session_release_deferred: bool) -> Value {
+    let args = &payload["arguments"];
+    let phase = args["phase"].as_str().unwrap_or_default();
+    let scope = args["target"]["stream_id"].as_str().unwrap_or("session");
+    let obligation = json!({"obligation_id":format!("cleanup-{scope}"),"provider":"display",
+        "resource_id":format!("policy-{scope}"),"mutation_domain":null,"depends_on":[],
+        "cleanup_method":{"service":"example.display/1","method":"lifecycle_callback",
+            "interface_major":1,"interface_minor":0,"schema_revision":1},"payload":{}});
+    if payload["method"] == "resource_plan" {
+        return json!({"status":"planned","plan":{"plan_id":format!("policy-{scope}"),"revision":1,
+            "resources":[{"provider":"display","resource_id":format!("policy-{scope}"),"incarnation":null,
+                "expected_revision":null,"execution_domain":"seat","mutation_domains":[],"access":"read"}],
+            "mutation_domains":[],"required_capabilities":[],"constraints":{},"obligations":[obligation],
+            "affected_consumers":[],"consumer_change":"live","candidate_constraint":null,"allowed_degradation":[]}});
+    }
+    let approved = args["approved_plan"]["obligations"].clone();
+    if matches!(phase, "session.prepare" | "stream.prepare") {
+        return json!({"status":"prepared","candidate":null,"obligations":approved});
+    }
+    let state = if session_release_deferred && phase == "session.release" {
+        "deferred_restoration"
+    } else {
+        "released"
+    };
+    let outcomes: Vec<Value> = approved
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|obligation| {
+            json!({"obligation_id":obligation["obligation_id"],"state":state,"reason":null})
+        })
+        .collect();
+    json!({"status":"cleanup","outcomes":outcomes})
+}
+
+fn journal_snapshot(harness: &Harness) -> Value {
+    serde_json::from_slice(&std::fs::read(harness.root.join("journal.json")).unwrap()).unwrap()
+}
+
+fn session_release_callbacks(harness: &Harness) -> usize {
+    harness
+        .events
+        .iter()
+        .filter(|(provider, call)| {
+            provider == "display"
+                && call["method"] == "lifecycle_callback"
+                && call["arguments"]["phase"] == "session.release"
+        })
+        .count()
+}
+
+/// Prepare an application session with a released stream, fence its end, and
+/// restart before the owner can report application retirement.
+fn restart_before_application_retired(session_release_deferred: bool) -> (Harness, Value) {
+    let mut harness = Harness::with_processing_mode(true, None, false, true);
+    harness.policy_obligations = true;
+    harness.policy_session_release_deferred = session_release_deferred;
+    for (caller, operation) in [
+        ("transport", "abandon_restarted_session"),
+        ("capture", "ack_stream"),
+    ] {
+        harness
+            .settings
+            .operation_grants
+            .get_mut(caller)
+            .unwrap()
+            .insert(operation.into());
+    }
+    harness
+        .coordinator
+        .as_mut()
+        .unwrap()
+        .configure_for_test(harness.settings.clone());
+    let started = harness.call(
+        "transport",
+        json!({"operation":"prepare","operation_id":"stranded.session",
+        "application_ref":{"kind":"application","app_id":"app"}}),
+    );
+    assert_eq!(started["status"], "pending", "{started}");
+    let session = wait_shared_operation(&mut harness, "stranded.session")["target"].clone();
+    assert_eq!(
+        harness.call(
+            "transport",
+            json!({"operation":"bind_application","operation_id":"stranded.app",
+        "target":session,"launch_id":42,"application_operation_id":"launch-42"})
+        )["status"],
+        "succeeded"
+    );
+    let started = harness.call("transport",json!({"operation":"prepare_stream","operation_id":"stranded.stream",
+        "target":session,"intent":"initial","requested_video":{"width":1920,"height":1080,"refresh_millihz":60000,"hdr":false},
+        "consumer_requirements":["capture"]}));
+    assert_eq!(started["status"], "pending", "{started}");
+    let stream = wait_shared_operation(&mut harness, "stranded.stream");
+    assert_eq!(stream["status"], "succeeded", "{stream}");
+    activate_external_consumer(&mut harness, &stream["target"], "stranded");
+    let retired = retire_shared_client(&mut harness, &stream["target"], "stranded.close");
+    assert_eq!(retired["status"], "succeeded", "{retired}");
+    let end = harness.call(
+        "transport",
+        json!({"operation":"end_session","operation_id":"stranded.end","target":session}),
+    );
+    assert_eq!(end["status"], "pending", "{end}");
+    for _ in 0..20 {
+        harness.tick();
+    }
+    assert_eq!(session_release_callbacks(&harness), 0);
+    harness.coordinator.take();
+    harness.start();
+    // Like the frame limiter: the stream's obligation was released with its
+    // stream, while the session obligation remains with a settled admission.
+    let journal = journal_snapshot(&harness);
+    let record = &journal["sessions"][session["session_id"].as_str().unwrap()];
+    assert_eq!(record["obligations"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        journal["authority"]["settled"].as_object().unwrap().len(),
+        1
+    );
+    (harness, session)
+}
+
+fn abandon(harness: &mut Harness, session: &Value) -> Value {
+    let snapshot = harness.call("transport", json!({"operation":"snapshot"}));
+    let listed = &snapshot["sessions"][0];
+    assert_eq!(listed["phase"], "recovery_required", "{snapshot}");
+    assert_eq!(listed["host_epoch"], session["host_epoch"]);
+    assert_ne!(snapshot["host_epoch"], session["host_epoch"]);
+    let mut target = session.clone();
+    target["host_epoch"] = snapshot["host_epoch"].clone();
+    let request = json!({"operation":"abandon_restarted_session",
+        "operation_id":"stranded.abandon","target":target});
+    let started = harness.call("transport", request.clone());
+    assert_eq!(started["status"], "pending", "{started}");
+    assert_eq!(started["abandoned_target"], *session);
+    assert_eq!(
+        harness.call("transport", request),
+        started,
+        "idempotent retry"
+    );
+    wait_shared_operation(harness, "stranded.abandon")
+}
+
+#[test]
+fn restarted_session_abandonment_runs_frozen_release_without_claiming_retirement() {
+    let (mut harness, session) = restart_before_application_retired(false);
+    let end = harness.call(
+        "transport",
+        json!({"operation":"lookup","operation_id":"stranded.end"}),
+    );
+    assert_eq!(end["status"], "recovery_required", "{end}");
+    let result = abandon(&mut harness, &session);
+    assert_eq!(result["status"], "succeeded", "{result}");
+    assert_eq!(result["application_retired"], false);
+    assert_eq!(result["application"], "untracked_after_restart");
+    assert_eq!(result["target"], session);
+    for _ in 0..20 {
+        harness.tick();
+    }
+    assert_eq!(session_release_callbacks(&harness), 1);
+    let end = harness.call(
+        "transport",
+        json!({"operation":"lookup","operation_id":"stranded.end"}),
+    );
+    assert_eq!(end["status"], "rejected");
+    assert_eq!(end["reason"], "superseded_by_restart_abandonment");
+    let journal = journal_snapshot(&harness);
+    let record = &journal["sessions"][session["session_id"].as_str().unwrap()];
+    assert_eq!(record["phase"], "ended", "{record}");
+    assert_eq!(record["application_retired"], false);
+    assert_eq!(record["application_retirement_proof"], Value::Null);
+    assert_eq!(
+        record["application_disposition"]["kind"],
+        "untracked_after_restart"
+    );
+    assert_eq!(record["obligations"], json!([]));
+    assert_eq!(journal["authority"]["settled"], json!({}));
+    assert_eq!(journal["authority"]["admissions"], json!({}));
+    harness.coordinator.take();
+    harness.start();
+    let snapshot = harness.call("transport", json!({"operation":"snapshot"}));
+    assert_eq!(snapshot["sessions"][0]["phase"], "ended", "{snapshot}");
+}
+
+#[test]
+fn deferred_abandoned_release_stays_fenced_for_recovery() {
+    let (mut harness, session) = restart_before_application_retired(true);
+    let result = abandon(&mut harness, &session);
+    assert_eq!(result["status"], "recovery_required", "{result}");
+    assert_eq!(result["reason"], "restart_abandonment_restoration_deferred");
+    assert_eq!(result["application_retired"], false);
+    assert_eq!(session_release_callbacks(&harness), 1);
+    let journal = journal_snapshot(&harness);
+    let record = &journal["sessions"][session["session_id"].as_str().unwrap()];
+    assert_eq!(record["phase"], "recovery_required", "{record}");
+    assert_eq!(record["application_retired"], false);
+    assert_ne!(record["obligations"], json!([]));
+    assert_ne!(journal["authority"]["settled"], json!({}));
+    let mut target = session.clone();
+    target["host_epoch"] = journal["host_epoch"].clone();
+    let retry = harness.call(
+        "transport",
+        json!({"operation":"abandon_restarted_session",
+        "operation_id":"stranded.abandon-again","target":target}),
+    );
+    // The deferred release admission is still unsettled; nothing is replayed.
+    assert_eq!(retry["reason"], "live_admission_retained", "{retry}");
+    assert_eq!(session_release_callbacks(&harness), 1);
+    harness.coordinator.take();
+    harness.start();
+    for _ in 0..20 {
+        harness.tick();
+    }
+    let snapshot = harness.call("transport", json!({"operation":"snapshot"}));
+    assert_eq!(
+        snapshot["sessions"][0]["phase"], "recovery_required",
+        "{snapshot}"
+    );
+    assert_eq!(session_release_callbacks(&harness), 1);
 }

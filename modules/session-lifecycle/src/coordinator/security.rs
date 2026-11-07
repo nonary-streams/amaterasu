@@ -414,7 +414,7 @@ impl Coordinator {
                     }),
                 LifecyclePhase::SessionRelease => {
                     session.phase == SessionPhase::Ending
-                        && session.application_retired
+                        && session.application_retired_or_untracked()
                         && session
                             .streams
                             .values()

@@ -159,7 +159,7 @@ impl Coordinator {
             let streams: Vec<_> = session.streams.iter()
                 .filter(|(id, _)| selected_stream.is_none_or(|stream| stream == *id))
                 .map(|(id, stream)| json!({"stream_id":id,"generation":stream.generation,"phase":stream.phase,"candidate":stream.candidate})).collect();
-            json!({"session_id":session.id,"generation":session.generation,"phase":session.phase,"application_ref":session.application_ref,"streams":streams})
+            json!({"session_id":session.id,"host_epoch":session.host_epoch,"generation":session.generation,"phase":session.phase,"application_ref":session.application_ref,"streams":streams})
         }).collect();
         let response = json!({"status":"ok","host_epoch":journal.host_epoch,"sessions":sessions});
         if serde_json::to_vec(&response)
@@ -336,6 +336,7 @@ impl Coordinator {
                         .into(),
                     application_retired: false,
                     application_retirement_proof: None,
+                    application_disposition: None,
                     streams: BTreeMap::new(),
                     obligations: vec![],
                     required_consumers: None,

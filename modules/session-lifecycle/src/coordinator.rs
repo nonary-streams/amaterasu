@@ -61,6 +61,7 @@ mod recovery;
 mod refresh_receipt;
 #[allow(dead_code)] // Generation lookup is gated on authenticated endpoints.
 mod resource_generation;
+mod restart_abandonment;
 mod retention;
 mod revocation_schedule;
 #[cfg(test)]
@@ -444,6 +445,10 @@ struct SessionRecord {
     application_retired: bool,
     #[serde(default)]
     application_retirement_proof: Option<application::ApplicationRetirementProof>,
+    /// Why a session may release without an application retirement proof.
+    /// Present only after owner abandonment of a restart-interrupted session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    application_disposition: Option<restart_abandonment::ApplicationDisposition>,
     streams: BTreeMap<String, StreamRecord>,
     #[serde(default)]
     obligations: Vec<amaterasu_extension_api::ResourceObligation>,
@@ -473,6 +478,15 @@ struct SessionRecord {
     resource_generations: BTreeMap<String, u64>,
     #[serde(default)]
     processing_decision: Option<processing_preflight::ProcessingDecision>,
+}
+
+impl SessionRecord {
+    /// Session release requires the application to be either proven retired or
+    /// durably recorded as untracked after a restart. Only the former is a
+    /// retirement; closed-session certificates still require its proof.
+    fn application_retired_or_untracked(&self) -> bool {
+        self.application_retired || self.application_disposition.is_some()
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -696,6 +710,10 @@ fn validate_journal(journal: &Journal) -> io::Result<()> {
                         };
                         !application::valid_retirement_proof(session, &target)
                     })
+                || session
+                    .application_disposition
+                    .as_ref()
+                    .is_some_and(|disposition| !disposition.valid_for(session, &journal.host_epoch))
                 || session.resource_generations.len() > 32
                 || session
                     .resource_generations
@@ -1437,6 +1455,8 @@ impl Coordinator {
             self.recover_session(caller, initiator, payload, key)
         } else if operation == "retire_stream" && payload["restart_recovery"] == true {
             self.retire_restarted_stream(caller, initiator, payload, key)
+        } else if operation == "abandon_restarted_session" {
+            self.abandon_restarted_session(caller, initiator, payload, key)
         } else if operation == "refresh_provider_observations" {
             self.refresh_provider_observations(caller, initiator, payload, key)
         } else {

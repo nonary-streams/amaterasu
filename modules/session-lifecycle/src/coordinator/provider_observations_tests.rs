@@ -36,6 +36,7 @@ fn session(epoch: &str, id: &str) -> SessionRecord {
         settings_revision: "initial".into(),
         application_retired: false,
         application_retirement_proof: None,
+        application_disposition: None,
         streams: BTreeMap::new(),
         obligations: vec![],
         required_consumers: None,

@@ -442,6 +442,7 @@ impl EndedSessionCertificate {
             settings_revision: "certificate".into(),
             application_retired: true,
             application_retirement_proof: Some(self.application_proof.clone()),
+            application_disposition: None,
             streams: BTreeMap::new(),
             obligations: vec![],
             required_consumers: None,

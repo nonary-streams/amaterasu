@@ -269,7 +269,11 @@ fn matches_target(target: &LifecycleTarget, session_id: &str, stream_id: Option<
         LifecycleTarget::Validation { .. } => false,
     }
 }
-fn has_composition_output(journal: &Journal, session_id: &str, stream_id: Option<&str>) -> bool {
+pub(super) fn has_composition_output(
+    journal: &Journal,
+    session_id: &str,
+    stream_id: Option<&str>,
+) -> bool {
     journal
         .composition
         .records()
@@ -473,7 +477,7 @@ pub(super) fn compact(journal: &mut Journal) {
             .filter(|(id, epoch)| {
                 let session = &journal.sessions[id];
                 session.phase == SessionPhase::Ended
-                    && session.application_retired
+                    && session.application_retired_or_untracked()
                     && session.obligations.is_empty()
                     && session.streams.is_empty()
                     && !journal.inputs.has_unresolved_session(epoch, id)
@@ -1017,6 +1021,64 @@ mod tests {
             )["reason"],
             "retention_capacity_exhausted"
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn untracked_ended_sessions_compact_but_unaccounted_applications_do_not() {
+        let mut journal = journal();
+        let sessions = 2 * (KEEP_ENDED_SESSIONS + 8);
+        for id in 0..sessions {
+            insert_ended(&mut journal, id, "succeeded");
+            let session = journal.sessions.get_mut(&format!("session-{id}")).unwrap();
+            session.application_retired = false;
+            session.host_epoch = "old-epoch".into();
+            if id % 2 == 0 {
+                session.application_disposition = Some(
+                    super::super::restart_abandonment::ApplicationDisposition::UntrackedAfterRestart {
+                        abandoned_epoch: "old-epoch".into(),
+                        recorded_epoch: "epoch".into(),
+                        application_operation_id: None,
+                    },
+                );
+            }
+        }
+        compact(&mut journal);
+        let (untracked, unaccounted): (Vec<_>, Vec<_>) = journal
+            .sessions
+            .values()
+            .partition(|session| session.application_disposition.is_some());
+        assert_eq!(untracked.len(), KEEP_ENDED_SESSIONS);
+        // Without a retirement or a recorded disposition, nothing is compacted.
+        assert_eq!(unaccounted.len(), sessions / 2);
+    }
+
+    #[test]
+    fn abandoned_stranded_sessions_free_capacity_for_new_preparation() {
+        use super::super::restart_abandonment::tests as stranded;
+        let (mut coordinator, root) = stranded::open_coordinator("amaterasu-retention-stranded");
+        for id in 0..MAX_SESSIONS {
+            stranded::insert_stranded(&coordinator, &format!("stranded-{id}"));
+        }
+        let prepare = json!({"operation":"prepare","operation_id":"new","application_ref":{"kind":"desktop"}});
+        assert_eq!(
+            coordinator.handle(stranded::OWNER, stranded::OWNER, prepare.clone())["reason"],
+            "session_capacity_exhausted"
+        );
+        for id in 0..=KEEP_ENDED_SESSIONS {
+            let request = stranded::abandon_request(&coordinator, &format!("stranded-{id}"));
+            let response = coordinator.handle(stranded::OWNER, stranded::OWNER, request);
+            assert_eq!(response["status"], "pending", "{response}");
+        }
+        for _ in 0..KEEP_ENDED_SESSIONS {
+            coordinator
+                .advance(&mut |_| panic!("an empty release graph must not dispatch a provider"))
+                .unwrap();
+        }
+        assert!(coordinator.shared.borrow().value.sessions.len() < MAX_SESSIONS);
+        let created = coordinator.handle(stranded::OWNER, stranded::OWNER, prepare);
+        assert_eq!(created["status"], "pending", "{created}");
+        drop(coordinator);
         std::fs::remove_dir_all(root).unwrap();
     }
 
