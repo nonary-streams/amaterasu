@@ -1,5 +1,6 @@
 //! Bounded, read-only process snapshots off the managed-module tick.
 use super::{Process, scan_processes};
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 
 pub(super) struct ProcessScanner {
@@ -9,8 +10,8 @@ pub(super) struct ProcessScanner {
 }
 
 impl ProcessScanner {
-    pub(super) fn start() -> Option<Self> {
-        Self::with_reader(scan_processes)
+    pub(super) fn start(install_root: PathBuf) -> Option<Self> {
+        Self::with_reader(move || scan_processes(&install_root))
     }
 
     fn with_reader(

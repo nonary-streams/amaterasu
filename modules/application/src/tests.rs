@@ -280,6 +280,38 @@ fn steam_install_tree_association_tracks_and_stops_only_the_new_game_process() {
     let _ = std::fs::remove_dir_all(install_directory);
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn steam_proton_process_in_install_root_is_stopped() {
+    let install_directory = test_directory("steam-root-cwd");
+    let mut request = launch("steam-root-cwd", "sleep");
+    request["steam_id"] = json!("42");
+    request["steam_install_dir"] = json!(install_directory);
+    request["cwd"] = json!(install_directory);
+    request["environment"]["SteamAppId"] = json!("42");
+
+    let mut manager = ProcessManager::default();
+    let launched = manager.handle("alice", request);
+    let id = launched["process"]["process_id"].as_u64().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let observed = status(&mut manager, "alice", id);
+        if observed["process"]["steam_game_liveness"] == "associated" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "game was not associated: {observed}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let stopping = manager.handle("alice", json!({"action":"terminate","process_id":id}));
+    assert_eq!(stopping["process"]["state"], "stopping", "{stopping}");
+    wait_for_state(&mut manager, "alice", id, "cancelled");
+    manager.shutdown().unwrap();
+    std::fs::remove_dir_all(install_directory).unwrap();
+}
+
 #[cfg(windows)]
 #[test]
 fn steam_install_tree_association_stops_only_the_verified_game_process() {

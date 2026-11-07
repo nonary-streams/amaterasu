@@ -276,7 +276,9 @@ impl ProcessRecord {
                 .spec
                 .steam_install_dir
                 .as_deref()
-                .and_then(SteamProcessTracker::begin);
+                .and_then(|directory| {
+                    SteamProcessTracker::begin(directory, self.spec.steam_id.as_deref())
+                });
             self.steam_game_liveness = Some(if self.steam_tracker.is_some() {
                 SteamGameLiveness::Searching
             } else {

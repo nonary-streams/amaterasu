@@ -21,18 +21,19 @@ pub(crate) struct SteamProcessTracker {
 }
 
 impl SteamProcessTracker {
-    pub(crate) fn begin(install_directory: &str) -> Option<Self> {
+    pub(crate) fn begin(install_directory: &str, steam_id: Option<&str>) -> Option<Self> {
         #[cfg(target_os = "linux")]
         {
-            linux::Tracker::begin(install_directory).map(|inner| Self { inner })
+            linux::Tracker::begin(install_directory, steam_id).map(|inner| Self { inner })
         }
         #[cfg(windows)]
         {
+            let _ = steam_id;
             windows::Tracker::begin(install_directory).map(|inner| Self { inner })
         }
         #[cfg(not(any(target_os = "linux", windows)))]
         {
-            let _ = install_directory;
+            let _ = (install_directory, steam_id);
             None
         }
     }
@@ -131,7 +132,7 @@ mod linux {
     use std::collections::{BTreeMap, BTreeSet};
     use std::ffi::c_void;
     use std::fs;
-    use std::io;
+    use std::io::{self, Read};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::path::{Path, PathBuf};
     use std::time::Duration;
@@ -154,10 +155,12 @@ mod linux {
         parent_id: u32,
         executable: Option<PathBuf>,
         working_directory: Option<PathBuf>,
+        steam_app_id: Option<String>,
     }
 
     pub(super) struct Tracker {
         install_root: PathBuf,
+        steam_id: Option<String>,
         user_id: u32,
         baseline: BTreeMap<u32, u64>,
         tracked: BTreeMap<u32, Identity>,
@@ -170,25 +173,26 @@ mod linux {
     }
 
     impl Tracker {
-        pub(super) fn begin(install_directory: &str) -> Option<Self> {
+        pub(super) fn begin(install_directory: &str, steam_id: Option<&str>) -> Option<Self> {
             let install_root = Path::new(install_directory).canonicalize().ok()?;
             if !install_root.is_dir() || install_root == Path::new("/") {
                 return None;
             }
             let user_id = effective_user_id();
-            let baseline = scan_processes()?
+            let baseline = scan_processes(&install_root)?
                 .into_iter()
                 .filter(|process| process.user_id == user_id)
                 .map(|process| (process.identity.pid, process.identity.start_ticks))
                 .collect();
             Some(Self {
+                scanner: ProcessScanner::start(install_root.clone())?,
                 install_root,
+                steam_id: steam_id.map(str::to_owned),
                 user_id,
                 baseline,
                 tracked: BTreeMap::new(),
                 started_at: Instant::now(),
                 next_scan_at: Instant::now(),
-                scanner: ProcessScanner::start()?,
                 scan_failed: false,
                 associated: false,
                 stopping_at: None,
@@ -236,7 +240,7 @@ mod linux {
         }
 
         pub(super) fn request_stop(&mut self, now: Instant) -> bool {
-            let Some(processes) = scan_processes() else {
+            let Some(processes) = scan_processes(&self.install_root) else {
                 return false;
             };
             self.refresh_tracking(&processes);
@@ -251,7 +255,7 @@ mod linux {
         }
 
         pub(super) fn advance_stop(&mut self, now: Instant) -> bool {
-            let Some(processes) = scan_processes() else {
+            let Some(processes) = scan_processes(&self.install_root) else {
                 // An unreadable process table cannot justify another signal.
                 let finished = self
                     .stopping_at
@@ -285,7 +289,7 @@ mod linux {
         }
 
         fn refresh_tracking_from_scan(&mut self) {
-            if let Some(processes) = scan_processes() {
+            if let Some(processes) = scan_processes(&self.install_root) {
                 self.refresh_tracking(&processes);
             }
         }
@@ -312,7 +316,12 @@ mod linux {
                     process.user_id == user_id
                         && is_new_process(baseline, process.identity)
                         && !protected_runtime(process)
-                        && has_install_tree_evidence(process, install_root, None)
+                        && has_install_tree_evidence(
+                            process,
+                            install_root,
+                            self.steam_id.as_deref(),
+                            None,
+                        )
                 })
                 .map(|process| process.identity)
                 .collect::<Vec<_>>();
@@ -377,7 +386,7 @@ mod linux {
             .is_none_or(|start_ticks| *start_ticks != identity.start_ticks)
     }
 
-    fn scan_processes() -> Option<Vec<Process>> {
+    fn scan_processes(install_root: &Path) -> Option<Vec<Process>> {
         let directory = fs::read_dir("/proc").ok()?;
         let user_id = effective_user_id();
         let mut processes = Vec::new();
@@ -405,15 +414,40 @@ mod linux {
             }
             let executable = fs::read_link(process_directory.join("exe")).ok();
             let working_directory = fs::read_link(process_directory.join("cwd")).ok();
+            let steam_app_id = (working_directory.as_deref() == Some(install_root))
+                .then(|| read_steam_app_id(&process_directory))
+                .flatten();
             processes.push(Process {
                 identity: Identity { pid, start_ticks },
                 user_id: process_user,
                 parent_id,
                 executable,
                 working_directory,
+                steam_app_id,
             });
         }
         Some(processes)
+    }
+
+    fn read_steam_app_id(directory: &Path) -> Option<String> {
+        const MAX_ENVIRONMENT_BYTES: u64 = 128 * 1024;
+        let mut bytes = Vec::new();
+        fs::File::open(directory.join("environ"))
+            .ok()?
+            .take(MAX_ENVIRONMENT_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .ok()?;
+        if bytes.len() as u64 > MAX_ENVIRONMENT_BYTES {
+            return None;
+        }
+        let mut ids = bytes
+            .split(|byte| *byte == 0)
+            .filter_map(|entry| entry.strip_prefix(b"SteamAppId="));
+        let id = std::str::from_utf8(ids.next()?).ok()?;
+        if ids.next().is_some() || id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        Some(id.to_owned())
     }
 
     fn read_identity(directory: &Path, pid: u32) -> Option<(u32, u64)> {
@@ -441,6 +475,7 @@ mod linux {
     fn has_install_tree_evidence(
         process: &Process,
         install_root: &Path,
+        steam_id: Option<&str>,
         command_line_path: Option<&Path>,
     ) -> bool {
         // Arguments are user-controlled text and never establish root ownership;
@@ -450,6 +485,9 @@ mod linux {
             |candidate: &Path| candidate != install_root && candidate.starts_with(install_root);
         process.executable.as_deref().is_some_and(inside)
             || process.working_directory.as_deref().is_some_and(inside)
+            || (process.working_directory.as_deref() == Some(install_root)
+                && steam_id.is_some()
+                && process.steam_app_id.as_deref() == steam_id)
     }
 
     fn protected_runtime(process: &Process) -> bool {
@@ -538,6 +576,7 @@ mod linux {
             parent_id,
             executable: fs::read_link(directory.join("exe")).ok(),
             working_directory: fs::read_link(directory.join("cwd")).ok(),
+            steam_app_id: None,
         })
     }
 
@@ -559,18 +598,20 @@ mod linux {
                 parent_id,
                 executable: Some(PathBuf::from(path)),
                 working_directory: None,
+                steam_app_id: None,
             }
         }
 
         fn tracker() -> Tracker {
             Tracker {
                 install_root: PathBuf::from("/games/title"),
+                steam_id: Some("42".into()),
                 user_id: 1000,
                 baseline: BTreeMap::from([(10, 100), (11, 200)]),
                 tracked: BTreeMap::new(),
                 started_at: Instant::now(),
                 next_scan_at: Instant::now(),
-                scanner: ProcessScanner::start().unwrap(),
+                scanner: ProcessScanner::start(PathBuf::from("/games/title")).unwrap(),
                 scan_failed: false,
                 associated: false,
                 stopping_at: None,
@@ -592,6 +633,7 @@ mod linux {
             assert!(!has_install_tree_evidence(
                 &process,
                 &tracker.install_root,
+                Some("42"),
                 Some(Path::new("/games/title/game")),
             ));
             tracker.refresh_tracking(&[process]);
@@ -605,14 +647,30 @@ mod linux {
             assert!(!has_install_tree_evidence(
                 &process,
                 Path::new("/games/title"),
+                Some("42"),
                 None,
             ));
             process.working_directory = Some(PathBuf::from("/games/title/game"));
             assert!(has_install_tree_evidence(
                 &process,
                 Path::new("/games/title"),
+                Some("42"),
                 None,
             ));
+        }
+
+        #[test]
+        fn root_cwd_requires_the_matching_steam_app_id() {
+            let mut tracker = tracker();
+            let mut game = synthetic_process(12, 1, "/proton/wine64-preloader", 1000);
+            game.working_directory = Some(PathBuf::from("/games/title"));
+            game.steam_app_id = Some("43".into());
+            tracker.refresh_tracking(&[game.clone()]);
+            assert!(tracker.tracked.is_empty());
+
+            game.steam_app_id = Some("42".into());
+            tracker.refresh_tracking(&[game]);
+            assert!(tracker.tracked.contains_key(&12));
         }
 
         #[test]
@@ -700,8 +758,8 @@ mod linux {
 
         #[test]
         fn missing_or_root_install_directory_disables_process_tracking() {
-            assert!(Tracker::begin("/path/that/does/not/exist").is_none());
-            assert!(Tracker::begin("/").is_none());
+            assert!(Tracker::begin("/path/that/does/not/exist", Some("42")).is_none());
+            assert!(Tracker::begin("/", Some("42")).is_none());
         }
     }
 }
