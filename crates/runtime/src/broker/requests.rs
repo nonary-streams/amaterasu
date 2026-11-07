@@ -355,6 +355,9 @@ impl RequestRouter {
                 now,
             );
         }
+        // Hook cancellation releases its participant immediately. End delegated
+        // work while the parent's terminal record still identifies its children.
+        self.cancel_orphaned_delegations(now);
         Response::Ok
     }
 

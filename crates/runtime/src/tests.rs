@@ -1668,6 +1668,188 @@ fn delegated_retries_survive_parent_completion_and_children_cancel() {
 }
 
 #[test]
+fn cancelling_a_hook_cancels_delegated_children_before_releasing_the_participant() {
+    for cleanup in [false, true] {
+        let mut configuration = RuntimeConfig::default();
+        for principal in ["owner", "participant", "leaf"] {
+            configuration.principals.insert(
+                principal.into(),
+                Grants {
+                    call: names(&["work/1"]),
+                    provide: names(&["work/1"]),
+                    hook: names(&["prepare/1"]),
+                    ..Default::default()
+                },
+            );
+        }
+        configuration.hooks.insert(
+            "prepare/1".into(),
+            HookSpec {
+                owner: "owner".into(),
+                participants: vec!["participant".into()],
+                timeout_ms: 30_000,
+            },
+        );
+        let mut broker = Broker::new(configuration).unwrap();
+        let now = Instant::now();
+        broker.dispatch_at(
+            "leaf",
+            Command::Register {
+                service: "work/1".into(),
+            },
+            now,
+        );
+        broker.dispatch_at(
+            "participant",
+            Command::RegisterHook {
+                hook: "prepare/1".into(),
+            },
+            now,
+        );
+        let invocation = accepted_id(broker.dispatch_at(
+            "owner",
+            Command::RunHookOperation {
+                hook: "prepare/1".into(),
+                payload: json!({}),
+                operation_id: "cancel.delegated.hook".into(),
+                cleanup,
+            },
+            now,
+        ));
+        assert!(matches!(
+            broker.dispatch_at("owner", Command::HookResult { invocation }, now),
+            Response::Pending
+        ));
+        let Response::Request {
+            id: participant, ..
+        } = broker.dispatch_at("participant", Command::Poll {}, now)
+        else {
+            panic!("hook participant was not delivered");
+        };
+        let delegated = |operation: &str, parent| Command::Request {
+            service: "work/1".into(),
+            payload: json!({}),
+            timeout_ms: 30_000,
+            operation_id: operation.into(),
+            parent: Some(parent),
+        };
+        let child =
+            accepted_id(broker.dispatch_at("participant", delegated("child", participant), now));
+        assert!(matches!(
+            broker.dispatch_at("leaf", Command::Poll {}, now),
+            Response::Request { id, .. } if id == child
+        ));
+        let grandchild =
+            accepted_id(broker.dispatch_at("leaf", delegated("grandchild", child), now));
+        let unrelated_parent = accepted_id(broker.dispatch_at(
+            "owner",
+            Command::Request {
+                service: "work/1".into(),
+                payload: json!({}),
+                timeout_ms: 30_000,
+                operation_id: "unrelated-parent".into(),
+                parent: None,
+            },
+            now,
+        ));
+        assert!(matches!(
+            broker.dispatch_at("leaf", Command::Poll {}, now),
+            Response::Request { id, .. } if id == grandchild
+        ));
+        assert!(matches!(
+            broker.dispatch_at("leaf", Command::Poll {}, now),
+            Response::Request { id, .. } if id == unrelated_parent
+        ));
+        let unrelated_child = accepted_id(broker.dispatch_at(
+            "leaf",
+            delegated("unrelated-child", unrelated_parent),
+            now,
+        ));
+        let queued_child =
+            accepted_id(broker.dispatch_at("leaf", delegated("queued-child", child), now));
+
+        assert!(matches!(
+            broker.dispatch_at("owner", Command::CancelHook { invocation }, now),
+            Response::Ok
+        ));
+        assert_error_code(
+            broker.dispatch_at("leaf", Command::CheckRequest { request: child }, now),
+            "request_ended",
+        );
+        assert_error_code(
+            broker.dispatch_at("participant", Command::TakeResult { request: child }, now),
+            "cancelled",
+        );
+        assert_error_code(
+            broker.dispatch_at(
+                "leaf",
+                Command::TakeResult {
+                    request: grandchild,
+                },
+                now,
+            ),
+            "cancelled",
+        );
+        assert_error_code(
+            broker.dispatch_at(
+                "leaf",
+                Command::TakeResult {
+                    request: queued_child,
+                },
+                now,
+            ),
+            "cancelled",
+        );
+        assert!(matches!(
+            broker.dispatch_at(
+                "leaf",
+                Command::CheckRequest {
+                    request: unrelated_parent
+                },
+                now
+            ),
+            Response::Ok
+        ));
+        assert!(matches!(
+            broker.dispatch_at("leaf", Command::Poll {}, now),
+            Response::Request { id, .. } if id == unrelated_child
+        ));
+        assert!(matches!(
+            broker.dispatch_at(
+                "leaf",
+                Command::CheckRequest {
+                    request: unrelated_child
+                },
+                now
+            ),
+            Response::Ok
+        ));
+        assert!(matches!(
+            broker.dispatch_at("leaf", Command::Poll {}, now),
+            Response::Pending
+        ));
+        assert_error_code(
+            broker.dispatch_at("participant", delegated("late-child", participant), now),
+            "permission_denied",
+        );
+        for (caller, request) in [
+            ("participant", child),
+            ("leaf", grandchild),
+            ("leaf", queued_child),
+        ] {
+            assert!(matches!(
+                broker.dispatch_at(caller, Command::ReleaseResult { request }, now),
+                Response::Ok
+            ));
+            assert_error_code(
+                broker.dispatch_at(caller, Command::TakeResult { request }, now),
+                "not_found",
+            );
+        }
+    }
+}
+
+#[test]
 fn hook_operations_do_not_conflict_with_caller_operation_identifiers() {
     let mut broker = test_broker();
     broker.dispatch(
