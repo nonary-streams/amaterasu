@@ -13,7 +13,8 @@ pub(crate) enum SteamGameLiveness {
     Stopping,
 }
 
-const STOP_GRACE: Duration = Duration::from_secs(2);
+#[cfg(all(test, any(target_os = "linux", windows)))]
+const TEST_STOP_GRACE: Duration = Duration::from_secs(2);
 const STOP_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Retirement requires a successful snapshot proving no attributed game remains.
@@ -92,18 +93,18 @@ impl SteamProcessTracker {
 
     /// Begin stopping the currently associated game tree. The Steam client and
     /// its runtime processes are excluded and never receive signals.
-    pub(crate) fn request_stop(&mut self, now: Instant) -> SteamStopProgress {
+    pub(crate) fn request_stop(&mut self, now: Instant, grace: Duration) -> SteamStopProgress {
         #[cfg(target_os = "linux")]
         {
-            self.inner.request_stop(now)
+            self.inner.request_stop(now, grace)
         }
         #[cfg(windows)]
         {
-            self.inner.request_stop(now)
+            self.inner.request_stop(now, grace)
         }
         #[cfg(not(any(target_os = "linux", windows)))]
         {
-            let _ = now;
+            let _ = (now, grace);
             SteamStopProgress::Complete
         }
     }
@@ -125,8 +126,8 @@ impl SteamProcessTracker {
         }
     }
 
-    pub(crate) fn stop_budget() -> Duration {
-        STOP_GRACE + STOP_CONFIRMATION_TIMEOUT
+    pub(crate) fn stop_budget(grace: Duration) -> Duration {
+        grace + STOP_CONFIRMATION_TIMEOUT
     }
 
     pub(crate) fn is_stopping(&self) -> bool {
@@ -152,9 +153,9 @@ mod windows;
 #[cfg(target_os = "linux")]
 mod linux {
     mod scanner;
-    use super::{
-        Instant, STOP_CONFIRMATION_TIMEOUT, STOP_GRACE, SteamGameLiveness, SteamStopProgress,
-    };
+    #[cfg(test)]
+    use super::TEST_STOP_GRACE;
+    use super::{Instant, STOP_CONFIRMATION_TIMEOUT, SteamGameLiveness, SteamStopProgress};
     use scanner::ProcessScanner;
     use std::collections::{BTreeMap, BTreeSet};
     use std::ffi::c_void;
@@ -289,10 +290,11 @@ mod linux {
             self.stopping_at.is_some()
         }
 
-        pub(super) fn request_stop(&mut self, now: Instant) -> SteamStopProgress {
+        pub(super) fn request_stop(&mut self, now: Instant, grace: Duration) -> SteamStopProgress {
             let install_root = self.install_root.clone();
             self.request_stop_with(
                 now,
+                grace,
                 || scan_processes(&install_root),
                 |identity, signal, user_id| {
                     let _ = signal_identity(identity, signal, user_id);
@@ -303,12 +305,13 @@ mod linux {
         fn request_stop_with(
             &mut self,
             now: Instant,
+            grace: Duration,
             mut scan: impl FnMut() -> Option<ProcessSnapshot>,
             mut signal: impl FnMut(Identity, i32, u32),
         ) -> SteamStopProgress {
             // Retain the stop obligation even when its first snapshot fails, so
             // an explicit cleanup retry returns to this tracker.
-            self.stopping_at = Some(now + STOP_GRACE);
+            self.stopping_at = Some(now + grace);
             let Some(processes) = scan() else {
                 return SteamStopProgress::Failed("steam_process_scan_failed");
             };
@@ -903,6 +906,67 @@ mod linux {
         }
 
         #[test]
+        fn configured_steam_grace_controls_force_and_confirmation_deadlines() {
+            for seconds in [0, 1, 30, 300] {
+                let mut tracker = tracker();
+                let game = synthetic_process(12, 1, "/games/title/game", 1000);
+                let now = Instant::now();
+                let grace = Duration::from_secs(seconds);
+                let mut signals = Vec::new();
+                assert_eq!(
+                    tracker.request_stop_with(
+                        now,
+                        grace,
+                        || Some(vec![game.clone()].into()),
+                        |_, signal, _| signals.push(signal),
+                    ),
+                    SteamStopProgress::Pending,
+                );
+                assert_eq!(tracker.stopping_at, Some(now + grace));
+                assert_eq!(signals, [libc::SIGTERM]);
+                signals.clear();
+                if !grace.is_zero() {
+                    assert_eq!(
+                        tracker.advance_stop_with(
+                            now + grace - Duration::from_millis(1),
+                            || Some(vec![game.clone()].into()),
+                            |_, signal, _| signals.push(signal),
+                        ),
+                        SteamStopProgress::Pending,
+                    );
+                    assert!(signals.is_empty());
+                }
+                assert_eq!(
+                    tracker.advance_stop_with(
+                        now + grace,
+                        || Some(vec![game.clone()].into()),
+                        |_, signal, _| signals.push(signal),
+                    ),
+                    SteamStopProgress::Pending,
+                );
+                assert_eq!(signals, [libc::SIGKILL]);
+                assert_eq!(
+                    tracker.advance_stop_with(
+                        now + grace + STOP_CONFIRMATION_TIMEOUT,
+                        || Some(vec![game.clone()].into()),
+                        |_, _, _| panic!("the expired attempt must not signal"),
+                    ),
+                    SteamStopProgress::Failed("steam_process_stop_timed_out"),
+                );
+                assert_eq!(tracker.tracked.get(&12), Some(&game.identity));
+                // Retrying the retained obligation uses the same configured grace.
+                let retry_at = now + grace + STOP_CONFIRMATION_TIMEOUT;
+                tracker.request_stop_with(
+                    retry_at,
+                    grace,
+                    || Some(vec![game.clone()].into()),
+                    |_, _, _| {},
+                );
+                assert_eq!(tracker.stopping_at, Some(retry_at + grace));
+            }
+        }
+
+        #[test]
         fn stop_keeps_live_identities_after_the_confirmation_deadline() {
             let mut tracker = tracker();
             let game = synthetic_process(12, 1, "/games/title/game", 1000);
@@ -949,6 +1013,7 @@ mod linux {
             tracker.refresh_tracking(std::slice::from_ref(&game));
             let pending = tracker.request_stop_with(
                 Instant::now(),
+                TEST_STOP_GRACE,
                 || None,
                 |_, _, _| panic!("unreadable snapshots must never authorize signals"),
             );
@@ -999,6 +1064,7 @@ mod linux {
                 assert_eq!(
                     tracker.request_stop_with(
                         deadline + STOP_CONFIRMATION_TIMEOUT,
+                        TEST_STOP_GRACE,
                         || Some(ProcessSnapshot::default()),
                         |_, _, _| panic!("confirmed absence must not signal"),
                     ),
@@ -1017,6 +1083,7 @@ mod linux {
             assert_eq!(
                 tracker.request_stop_with(
                     now,
+                    TEST_STOP_GRACE,
                     || Some(vec![game.clone()].into()),
                     |_, _, _| panic!("an unreadable executable must not authorize signals"),
                 ),
@@ -1032,6 +1099,7 @@ mod linux {
             assert_eq!(
                 tracker.request_stop_with(
                     Instant::now(),
+                    TEST_STOP_GRACE,
                     || Some(ProcessSnapshot {
                         processes: Vec::new(),
                         indeterminate_pids: BTreeMap::from([(
@@ -1109,6 +1177,7 @@ mod linux {
             assert_eq!(
                 tracker.request_stop_with(
                     now,
+                    TEST_STOP_GRACE,
                     || Some(processes.clone().into()),
                     |identity, signal, user_id| signals.push((identity.pid, signal, user_id)),
                 ),
@@ -1123,7 +1192,7 @@ mod linux {
             let mut snapshots = [Some(processes.into()), None].into_iter();
             assert_eq!(
                 tracker.advance_stop_with(
-                    now + STOP_GRACE,
+                    now + TEST_STOP_GRACE,
                     || snapshots.next().unwrap(),
                     |identity, signal, user_id| signals.push((identity.pid, signal, user_id)),
                 ),
@@ -1139,7 +1208,7 @@ mod linux {
 
             assert_eq!(
                 tracker.advance_stop_with(
-                    now + STOP_GRACE + Duration::from_millis(1),
+                    now + TEST_STOP_GRACE + Duration::from_millis(1),
                     || Some(ProcessSnapshot::default()),
                     |_, _, _| panic!("an empty snapshot must not authorize signals"),
                 ),
@@ -1173,6 +1242,7 @@ mod linux {
             assert_eq!(
                 tracker.request_stop_with(
                     now + STOP_CONFIRMATION_TIMEOUT,
+                    TEST_STOP_GRACE,
                     || Some(vec![reused.clone()].into()),
                     |_, _, _| panic!("a reused PID must not receive a retry signal"),
                 ),

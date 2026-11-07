@@ -676,11 +676,12 @@ impl ProcessRecord {
 
     fn begin_steam_stop(&mut self, now: Instant) {
         self.completion.get_or_insert(Completion::Cancelled);
+        let grace = Duration::from_secs(self.spec.exit_timeout_seconds);
         let progress = self
             .steam_tracker
             .as_mut()
             .map_or(SteamStopProgress::Complete, |tracker| {
-                tracker.request_stop(now)
+                tracker.request_stop(now, grace)
             });
         self.apply_steam_stop_progress(progress);
     }
@@ -1315,10 +1316,15 @@ impl ProcessManager {
                         .exit_timeout_seconds
                         .min(MAX_EXIT_TIMEOUT_SECONDS),
                 ) + REAP_TIMEOUT;
-                let steam_stop_budget = record
-                    .steam_tracker
-                    .as_ref()
-                    .map_or(Duration::ZERO, |_| SteamProcessTracker::stop_budget());
+                let steam_stop_budget =
+                    record.steam_tracker.as_ref().map_or(Duration::ZERO, |_| {
+                        SteamProcessTracker::stop_budget(Duration::from_secs(
+                            record
+                                .spec
+                                .exit_timeout_seconds
+                                .min(MAX_EXIT_TIMEOUT_SECONDS),
+                        ))
+                    });
                 process_stop_budget.max(steam_stop_budget)
                     + record
                         .lifecycle
@@ -1391,6 +1397,41 @@ fn error(code: &str) -> Value {
 #[cfg(all(test, any(target_os = "linux", windows)))]
 mod steam_cleanup_tests {
     use super::*;
+
+    #[test]
+    fn configured_steam_grace_is_included_once_in_the_shared_shutdown_budget() {
+        let directory = std::env::temp_dir().join(format!(
+            "amaterasu-steam-budget-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let mut manager = ProcessManager::default();
+        let response = manager.handle(
+            "alice",
+            json!({
+                "action":"launch", "operation_id":"steam-budget",
+                "executable":directory.join("missing-launcher"),
+            }),
+        );
+        let id = response["process"]["process_id"].as_u64().unwrap();
+        manager.records.get_mut(&id).unwrap().steam_tracker =
+            SteamProcessTracker::begin(directory.to_str().unwrap(), Some("42"));
+        assert!(manager.records.get(&id).unwrap().steam_tracker.is_some());
+        std::fs::remove_dir(&directory).unwrap();
+        for seconds in [0, 1, 30, 300] {
+            manager
+                .records
+                .get_mut(&id)
+                .unwrap()
+                .spec
+                .exit_timeout_seconds = seconds;
+            assert_eq!(manager.shutdown_budget(), Duration::from_secs(seconds + 10));
+        }
+    }
 
     #[test]
     fn failed_steam_scan_retries_the_tracker_before_optional_lifecycle_cleanup() {
