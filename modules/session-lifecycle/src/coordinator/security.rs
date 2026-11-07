@@ -868,16 +868,11 @@ impl Coordinator {
         &mut self,
         send: &mut dyn FnMut(Command) -> ModuleResult<Response>,
     ) -> ModuleResult<()> {
-        let tokens: Vec<_> = self
-            .shared
-            .borrow()
-            .value
-            .revoked_inputs
-            .iter()
-            .take(8)
-            .cloned()
-            .collect();
+        let tokens = self
+            .revocation_schedule
+            .select(&self.shared.borrow().value.revoked_inputs);
         for token in tokens {
+            self.revocation_schedule.mark_attempt(&token);
             let binding = self
                 .shared
                 .borrow()

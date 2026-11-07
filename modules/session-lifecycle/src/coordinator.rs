@@ -57,6 +57,9 @@ mod provider_observations;
 mod providers;
 mod recovery;
 mod refresh_receipt;
+mod revocation_schedule;
+#[cfg(test)]
+mod revocation_schedule_tests;
 #[allow(dead_code)] // Generation lookup is gated on authenticated endpoints.
 mod resource_generation;
 mod retention;
@@ -1138,6 +1141,7 @@ pub struct Coordinator {
     settlement_drivers: BTreeMap<String, settlement_dispatch::SettlementDispatch>,
     validations: BTreeMap<String, security::ValidationJob>,
     revocations: BTreeMap<String, security::RevocationJob>,
+    revocation_schedule: revocation_schedule::RevocationSchedule,
     input_retirement_jobs: BTreeMap<String, input_retirement::AcknowledgementJob>,
     input_retirement_cursor: usize,
     application_jobs: BTreeMap<String, application::ApplicationJob>,
@@ -1226,6 +1230,7 @@ impl Coordinator {
             settlement_drivers: BTreeMap::new(),
             validations: BTreeMap::new(),
             revocations: BTreeMap::new(),
+            revocation_schedule: revocation_schedule::RevocationSchedule::default(),
             input_retirement_jobs: BTreeMap::new(),
             input_retirement_cursor: 0,
             application_jobs: BTreeMap::new(),
