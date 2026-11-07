@@ -16,6 +16,10 @@ use std::{
 };
 
 const OPEN_SESSION: &[u8] = b"AMACA001";
+const OPEN_RETIRING_SESSION: &[u8] = b"AMACA002";
+const PRECHECK_RETIREMENT: &[u8] = b"AMACAP02";
+const RETIREMENT_SUPPORTED: &[u8] = b"AMACP2OK";
+const RETIRING_SESSION_READY: &[u8] = b"AMACAOK2";
 const PRECHECK: &[u8] = b"AMACAP01";
 const PRECHECK_READY: &[u8] = b"AMACAPOK";
 const SESSION_READY: &[u8] = b"AMACAOK1";
@@ -202,6 +206,14 @@ fn serve_control(
         };
         let (server, client) = SeqpacketChannel::pair().map_err(|e| e.to_string())?;
         let shutdown = server.shutdown_handle().map_err(|e| e.to_string())?;
+        // A v2 client has a separate receipt endpoint. Interrupting frame I/O
+        // cannot fabricate EOF or discard the authority's retirement proof.
+        let (retirement, worker_retirement) = if &buffer[..received.len] == OPEN_RETIRING_SESSION {
+            let (server, client) = SeqpacketChannel::pair().map_err(|error| error.to_string())?;
+            (Some(server), Some(client))
+        } else {
+            (None, None)
+        };
         let session_store = store.try_clone()?;
         let session_approval = approval.clone();
         let session_id = options.approval_id.clone();
@@ -212,9 +224,17 @@ fn serve_control(
                 session_approval,
                 session_store,
                 session_id,
+                retirement,
             )
         });
-        if let Err(error) = control.send(SESSION_READY, &[client.as_fd()]) {
+        let mut descriptors = vec![client.as_fd()];
+        let ready = if let Some(receipt) = &worker_retirement {
+            descriptors.push(receipt.as_fd());
+            RETIRING_SESSION_READY
+        } else {
+            SESSION_READY
+        };
+        if let Err(error) = control.send(ready, &descriptors) {
             shutdown.shutdown();
             let _ = handle.join();
             return Err(error.to_string());
@@ -232,14 +252,21 @@ fn prepare_control_request(
     active_sessions: usize,
     verify: impl FnOnce() -> AuthorityResult<File>,
 ) -> AuthorityResult<Option<File>> {
-    if bytes == PRECHECK {
+    if bytes == PRECHECK || bytes == PRECHECK_RETIREMENT {
         drop(verify()?);
         control
-            .send(PRECHECK_READY, &[])
+            .send(
+                if bytes == PRECHECK {
+                    PRECHECK_READY
+                } else {
+                    RETIREMENT_SUPPORTED
+                },
+                &[],
+            )
             .map_err(|error| error.to_string())?;
         return Ok(None);
     }
-    if bytes != OPEN_SESSION {
+    if bytes != OPEN_SESSION && bytes != OPEN_RETIRING_SESSION {
         return Err("malformed authority control request".into());
     }
     if active_sessions >= MAX_SESSIONS {
@@ -279,6 +306,32 @@ mod precheck_tests {
         let reply = client.receive(&mut bytes).unwrap();
         assert_eq!(&bytes[..reply.len], PRECHECK_READY);
         assert!(!reply.truncated && !reply.descriptors_truncated && reply.descriptors.is_empty());
+    }
+    #[test]
+    fn v2_capability_precheck_does_not_allocate_and_v1_open_is_preserved() {
+        let (client, server) = SeqpacketChannel::pair().unwrap();
+        let verified = std::cell::Cell::new(0);
+        assert!(
+            prepare_control_request(&server, PRECHECK_RETIREMENT, MAX_SESSIONS, || {
+                verified.set(verified.get() + 1);
+                File::open("/dev/null").map_err(|error| error.to_string())
+            })
+            .unwrap()
+            .is_none()
+        );
+        let mut bytes = [0; 9];
+        let received = client.receive(&mut bytes).unwrap();
+        assert_eq!(&bytes[..received.len], RETIREMENT_SUPPORTED);
+        assert!(received.descriptors.is_empty());
+        assert_eq!(verified.get(), 1);
+        for opcode in [OPEN_SESSION, OPEN_RETIRING_SESSION] {
+            assert!(
+                prepare_control_request(&server, opcode, 0, || File::open("/dev/null")
+                    .map_err(|error| error.to_string()))
+                .unwrap()
+                .is_some()
+            );
+        }
     }
     #[test]
     fn revoked_precheck_and_unknown_requests_cannot_reach_session_creation() {

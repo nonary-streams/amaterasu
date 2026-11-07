@@ -5,7 +5,9 @@
 use crate::{ApprovalRecord, ApprovalStore};
 use amaterasu_vkms_frame_helper::{
     HELPER_SOCKET_FD,
+    authority::{AUTHORITY_RETIREMENT_FAILED, AUTHORITY_SESSION_RETIRED},
     channel::{Received, SeqpacketChannel},
+    process::retire_child,
     protocol::{self, Reply, Request, RequestRecord, ResponseRecord},
 };
 use std::{
@@ -32,19 +34,151 @@ pub fn serve_session(
     approval: ApprovalRecord,
     store: ApprovalStore,
     approval_id: String,
+    retirement: Option<SeqpacketChannel>,
 ) -> Result<(), String> {
-    require_current_approval(&store, &approval_id, &approval)?;
-    let helper = HelperSession::spawn(helper_executable)?;
-    proxy_session(
+    serve_and_retire(
         &client,
-        &helper.channel,
+        helper_executable,
         &approval,
-        ProtectedApproval {
-            store: &store,
-            identifier: &approval_id,
-            approval: &approval,
-        },
+        &store,
+        &approval_id,
+        retirement.as_ref(),
     )
+}
+
+fn serve_and_retire(
+    client: &SeqpacketChannel,
+    helper_executable: File,
+    approval: &ApprovalRecord,
+    store: &ApprovalStore,
+    approval_id: &str,
+    retirement: Option<&SeqpacketChannel>,
+) -> Result<(), String> {
+    let Some(mut helper) = start_session(
+        client,
+        retirement,
+        || require_current_approval(store, approval_id, approval),
+        || HelperSession::spawn(helper_executable),
+    )?
+    else {
+        return Ok(());
+    };
+    let result = proxy_session(
+        client,
+        helper
+            .channel
+            .as_ref()
+            .expect("channel lives until retirement"),
+        approval,
+        ProtectedApproval {
+            store,
+            identifier: approval_id,
+            approval,
+        },
+    );
+    finish_retirement(retirement, || {
+        let cleanup = helper.retire(retirement);
+        drop(helper);
+        cleanup
+    })?;
+    result
+}
+
+fn start_session<T>(
+    client: &SeqpacketChannel,
+    retirement: Option<&SeqpacketChannel>,
+    authorization: impl Fn() -> Result<(), String>,
+    spawn: impl FnOnce() -> Result<T, String>,
+) -> Result<Option<T>, String> {
+    let admission = authorization().and_then(|()| {
+        if retirement.is_some() {
+            // The client registers its receipt before HELLO. Lost OPEN2 replies
+            // cannot allocate native helpers without an observed lifecycle owner.
+            let requested = await_initial_hello(client, &authorization)?;
+            if !requested {
+                return Ok(false);
+            }
+            authorization()?;
+        }
+        Ok(true)
+    });
+    match admission {
+        Ok(true) => match spawn() {
+            Ok(helper) => Ok(Some(helper)),
+            Err(error) => {
+                send_retirement(retirement, true)?;
+                Err(error)
+            }
+        },
+        Ok(false) => {
+            send_retirement(retirement, true)?;
+            Ok(None)
+        }
+        Err(error) => {
+            send_retirement(retirement, true)?;
+            Err(error)
+        }
+    }
+}
+
+fn send_retirement(receipt: Option<&SeqpacketChannel>, retired: bool) -> Result<(), String> {
+    if let Some(receipt) = receipt {
+        set_send_timeout(receipt)?;
+        receipt
+            .send(
+                if retired {
+                    AUTHORITY_SESSION_RETIRED
+                } else {
+                    AUTHORITY_RETIREMENT_FAILED
+                },
+                &[],
+            )
+            .map_err(|error| format!("capture retirement receipt failed: {error}"))?;
+    }
+    Ok(())
+}
+
+fn finish_retirement(
+    receipt: Option<&SeqpacketChannel>,
+    retire: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    match retire() {
+        Ok(()) => send_retirement(receipt, true),
+        Err(error) => {
+            let _ = send_retirement(receipt, false);
+            Err(error)
+        }
+    }
+}
+
+/// Readiness alone is not allocation authority. Only an exact first HELLO can
+/// create the helper, and the record remains queued for normal proxy validation.
+fn await_initial_hello(
+    client: &SeqpacketChannel,
+    authorization: impl Fn() -> Result<(), String>,
+) -> Result<bool, String> {
+    let mut buffer = [0; protocol::REQUEST_LEN + 1];
+    loop {
+        authorization()?;
+        if client.peer_closed().map_err(|error| error.to_string())? {
+            return Ok(false);
+        }
+        match client.peek_nonblocking(&mut buffer) {
+            Err(error) if is_timeout(&error) => std::thread::sleep(Duration::from_millis(2)),
+            Err(error) => return Err(error.to_string()),
+            Ok(received) if received.is_end_of_stream() => return Ok(false),
+            Ok(received) => {
+                validate_transport(&received, false)?;
+                let request = protocol::decode_request(&buffer[..received.len])
+                    .map_err(|_| "capture authority requires an initial HELLO")?;
+                if request.request_id != 1 || !matches!(request.request, Request::Hello) {
+                    return Err("capture authority requires an initial HELLO".into());
+                }
+                authorization()?;
+                return Ok(true);
+            }
+        }
+    }
 }
 
 trait SessionAuthorization {
@@ -206,6 +340,9 @@ fn proxy_session(
         let deadline = Instant::now() + response_timeout(&request.request);
         let response = loop {
             authorization.check()?;
+            if client.peer_closed().map_err(|error| error.to_string())? {
+                return Ok(());
+            }
             match helper.receive(&mut response_buffer) {
                 Ok(received) => break received,
                 Err(error) if is_timeout(&error) && Instant::now() < deadline => {}
@@ -277,7 +414,7 @@ fn response_timeout(request: &Request) -> Duration {
 }
 
 struct HelperSession {
-    channel: SeqpacketChannel,
+    channel: Option<SeqpacketChannel>,
     child: Child,
 }
 
@@ -317,19 +454,28 @@ impl HelperSession {
             });
         }
         let child = command.spawn().map_err(|error| error.to_string())?;
-        Ok(Self { channel, child })
+        Ok(Self {
+            channel: Some(channel),
+            child,
+        })
+    }
+
+    fn retire(&mut self, receipt: Option<&SeqpacketChannel>) -> Result<(), String> {
+        drop(self.channel.take());
+        // Dedicated session thread owns the child throughout retries. A failed
+        // kill/wait publishes failure immediately and can never publish success.
+        retire_child(&mut self.child, Duration::ZERO, |_| {
+            let _ = send_retirement(receipt, false);
+        })
+        .map_err(|error| format!("capture helper retirement failed: {error}"))
     }
 }
 
 impl Drop for HelperSession {
     fn drop(&mut self) {
-        if let Ok(shutdown) = self.channel.shutdown_handle() {
-            shutdown.shutdown();
+        if let Err(error) = self.retire(None) {
+            eprintln!("{error}");
         }
-        // Never leave a privileged process alive after the session is revoked,
-        // its worker exits, or either side violates the protocol.
-        let _ = self.child.kill();
-        let _ = self.child.wait();
     }
 }
 

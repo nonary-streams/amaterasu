@@ -289,3 +289,150 @@ fn attached_request_descriptors_never_reach_the_helper() {
     let mut buffer = [0; protocol::REQUEST_LEN + 1];
     assert!(helper.receive(&mut buffer).unwrap().is_end_of_stream());
 }
+
+#[test]
+fn closing_worker_interrupts_an_outstanding_helper_response() {
+    let (worker, proxy_client) = SeqpacketChannel::pair().unwrap();
+    let (proxy_helper, helper) = SeqpacketChannel::pair().unwrap();
+    let (finished, completion) = mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let result = proxy_session(&proxy_client, &proxy_helper, &approval(), || Ok(()));
+        finished.send(result).unwrap();
+    });
+    worker.send(&request(1, Request::Hello), &[]).unwrap();
+    helper.receive(&mut [0; protocol::REQUEST_LEN + 1]).unwrap();
+    worker.shutdown_handle().unwrap().shutdown();
+    let timely = completion.recv_timeout(Duration::from_millis(250));
+    // Release the fixture even when the assertion will fail.
+    drop(helper);
+    server.join().unwrap();
+    assert!(
+        timely.is_ok(),
+        "worker closure was ignored while awaiting helper reply"
+    );
+}
+
+#[test]
+fn independent_retirement_receipt_is_sent_only_after_reaper_finishes() {
+    let (receipt, authority) = SeqpacketChannel::pair().unwrap();
+    let (entered, began) = mpsc::channel();
+    let (release, held) = mpsc::channel();
+    let thread = std::thread::spawn(move || {
+        finish_retirement(Some(&authority), || {
+            entered.send(()).unwrap();
+            held.recv().unwrap();
+            Ok(())
+        })
+    });
+    began.recv().unwrap();
+    assert!(
+        receipt.receive_nonblocking(&mut [0; 9]).is_err(),
+        "held reaper must not acknowledge retirement"
+    );
+    release.send(()).unwrap();
+    thread.join().unwrap().unwrap();
+    let mut bytes = [0; 9];
+    let response = receipt.receive(&mut bytes).unwrap();
+    assert_eq!(&bytes[..response.len], AUTHORITY_SESSION_RETIRED);
+    assert!(response.descriptors.is_empty());
+}
+
+#[test]
+fn failed_reaper_never_sends_retired_receipt() {
+    let (receipt, authority) = SeqpacketChannel::pair().unwrap();
+    assert_eq!(
+        finish_retirement(Some(&authority), || Err("wait failed".into())).unwrap_err(),
+        "wait failed"
+    );
+    let mut bytes = [0; 9];
+    let response = receipt.receive(&mut bytes).unwrap();
+    assert_eq!(&bytes[..response.len], AUTHORITY_RETIREMENT_FAILED);
+    assert!(receipt.receive_nonblocking(&mut bytes).is_err());
+}
+
+#[test]
+fn lost_v2_handoff_never_reaches_helper_allocation() {
+    let (client, authority) = SeqpacketChannel::pair().unwrap();
+    client.shutdown_handle().unwrap().shutdown();
+    assert!(!await_initial_hello(&authority, || Ok(())).unwrap());
+}
+
+#[test]
+fn v2_allocates_only_after_exact_initial_hello_and_rechecks_authority() {
+    let (client, authority) = SeqpacketChannel::pair().unwrap();
+    client.send(&request(1, Request::Hello), &[]).unwrap();
+    let checks = AtomicUsize::new(0);
+    assert!(
+        await_initial_hello(&authority, || {
+            checks.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+        .unwrap()
+    );
+    assert_eq!(checks.load(Ordering::SeqCst), 2);
+    let mut bytes = [0; protocol::REQUEST_LEN + 1];
+    let queued = authority.receive(&mut bytes).unwrap();
+    assert_eq!(&bytes[..queued.len], request(1, Request::Hello));
+    for invalid in [
+        request(2, Request::Hello),
+        request(1, Request::Frame { crtc_id: 1 }),
+        vec![0; protocol::REQUEST_LEN],
+    ] {
+        client.send(&invalid, &[]).unwrap();
+        assert!(await_initial_hello(&authority, || Ok(())).is_err());
+        authority.receive(&mut bytes).unwrap();
+    }
+    client.send(&request(1, Request::Hello), &[]).unwrap();
+    assert!(await_initial_hello(&authority, || Err("revoked".into())).is_err());
+}
+
+#[test]
+fn revocation_at_last_pre_spawn_check_retires_without_creating_a_helper() {
+    let (client, authority) = SeqpacketChannel::pair().unwrap();
+    let (receipt, retirement) = SeqpacketChannel::pair().unwrap();
+    client.send(&request(1, Request::Hello), &[]).unwrap();
+    let checks = AtomicUsize::new(0);
+    let result = start_session(
+        &authority,
+        Some(&retirement),
+        || {
+            if checks.fetch_add(1, Ordering::SeqCst) == 3 {
+                Err("revoked before spawn".into())
+            } else {
+                Ok(())
+            }
+        },
+        || -> Result<(), String> { panic!("revocation must not allocate a native helper") },
+    );
+    assert_eq!(result.unwrap_err(), "revoked before spawn");
+    let mut bytes = [0; 9];
+    let response = receipt.receive(&mut bytes).unwrap();
+    assert_eq!(&bytes[..response.len], AUTHORITY_SESSION_RETIRED);
+}
+
+#[test]
+fn failed_and_lost_handoffs_retire_without_allocating_a_helper() {
+    for malformed in [false, true] {
+        let (client, authority) = SeqpacketChannel::pair().unwrap();
+        let (receipt, retirement) = SeqpacketChannel::pair().unwrap();
+        if malformed {
+            client.send(b"bad HELLO", &[]).unwrap();
+        } else {
+            drop(client);
+        }
+        let result = start_session(
+            &authority,
+            Some(&retirement),
+            || Ok(()),
+            || -> Result<(), String> { panic!("no native allocation without valid HELLO") },
+        );
+        if malformed {
+            assert!(result.is_err());
+        } else {
+            assert!(result.unwrap().is_none());
+        }
+        let mut bytes = [0; 9];
+        let response = receipt.receive(&mut bytes).unwrap();
+        assert_eq!(&bytes[..response.len], AUTHORITY_SESSION_RETIRED);
+    }
+}
