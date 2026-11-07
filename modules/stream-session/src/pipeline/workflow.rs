@@ -220,15 +220,13 @@ impl Job {
             }
             self.tried.insert(resource);
         }
-        if !self.virtual_display_tried
-            && record.virtual_display_attempted
-            && record.config.virtual_display_intent.is_none()
+        // A rejected or unresolved video Close leaves the capture consumer
+        // alive. Keep its display and topology intact until retirement is
+        // confirmed, even if this cleanup pass has already tried that Close.
+        if record.resources.contains_key(&Resource::Video)
+            || record.attempted.contains(&Resource::Video)
         {
-            return Some(if self.virtual_display_removing {
-                Step::FindOwnedVirtualDisplay
-            } else {
-                Step::RemoveOwnedVirtualDisplay
-            });
+            return None;
         }
         if !self.display_tried {
             if record.display_attempted && !record.display_status_verified {
@@ -251,6 +249,16 @@ impl Job {
                 || (record.owns_display_restore && record.display_lease.is_some()))
         {
             return None;
+        }
+        if !self.virtual_display_tried
+            && record.virtual_display_attempted
+            && record.config.virtual_display_intent.is_none()
+        {
+            return Some(if self.virtual_display_removing {
+                Step::FindOwnedVirtualDisplay
+            } else {
+                Step::RemoveOwnedVirtualDisplay
+            });
         }
         if !self.virtual_display_tried {
             if record.virtual_display_attempted && !record.virtual_display_status_verified {

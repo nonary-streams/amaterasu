@@ -1,6 +1,7 @@
 mod armed;
 mod auxiliary;
 mod display;
+mod display_order;
 mod harness;
 mod history;
 mod host_audio;
