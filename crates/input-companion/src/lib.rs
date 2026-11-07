@@ -8,6 +8,8 @@ mod session;
 mod vhf;
 #[cfg(any(target_os = "linux", windows))]
 mod worker_client;
+#[cfg(any(windows, test))]
+mod worker_server;
 
 pub use model::{
     GamepadFeedback, InputEvent, InputPacket, MouseButton, PROTOCOL_VERSION, PeerIdentity,

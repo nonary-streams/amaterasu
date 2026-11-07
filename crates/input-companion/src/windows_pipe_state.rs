@@ -7,6 +7,7 @@ pub(crate) const MAX_FRAME: usize = 4096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum IoKind {
+    Connect,
     Read,
     Write,
 }
@@ -15,6 +16,7 @@ pub(crate) enum IoKind {
 pub(crate) enum IoResult {
     Transferred(usize),
     Aborted,
+    Disconnected,
     Failed,
 }
 
@@ -44,6 +46,10 @@ impl OwnedIo {
             bytes: bytes.into_iter().map(UnsafeCell::new).collect(),
             phase: Phase::NotStarted,
         }
+    }
+
+    pub(crate) fn kind(&self) -> IoKind {
+        self.kind
     }
 
     pub(crate) fn start(&mut self) -> InputResult<()> {
@@ -114,6 +120,11 @@ pub(crate) fn remaining_wait_ms(now: Instant, deadline: Instant) -> Option<u32> 
     )
 }
 
+/// Cancellation checks slice the same budget; no slice starts a fresh timeout.
+pub(crate) fn cancellable_wait_ms(now: Instant, deadline: Instant) -> Option<u32> {
+    remaining_wait_ms(now, deadline).map(|milliseconds| milliseconds.min(10))
+}
+
 pub(crate) fn take_frame(buffered: &mut Vec<u8>) -> InputResult<Option<Vec<u8>>> {
     if let Some(end) = buffered.iter().position(|byte| *byte == b'\n') {
         if end >= MAX_FRAME {
@@ -137,6 +148,7 @@ mod tests {
     #[test]
     fn cancellation_never_releases_a_kernel_borrow_without_completion() {
         let mut operation = OwnedIo::new(IoKind::Write, vec![1, 2, 3]);
+        assert_eq!(operation.kind(), IoKind::Write);
         let borrowed_buffer = operation.buffer();
         operation.start().unwrap();
         assert!(operation.request_cancellation());
@@ -207,6 +219,38 @@ mod tests {
             remaining_wait_ms(now, now + Duration::from_secs(u64::from(u32::MAX))),
             Some(u32::MAX - 1)
         );
+    }
+
+    #[test]
+    fn stop_poll_slices_do_not_renew_the_absolute_operation_deadline() {
+        let now = Instant::now();
+        let deadline = now + Duration::from_millis(25);
+        assert_eq!(cancellable_wait_ms(now, deadline), Some(10));
+        assert_eq!(
+            cancellable_wait_ms(now + Duration::from_millis(10), deadline),
+            Some(10)
+        );
+        assert_eq!(
+            cancellable_wait_ms(now + Duration::from_millis(20), deadline),
+            Some(5)
+        );
+        assert_eq!(cancellable_wait_ms(deadline, deadline), None);
+    }
+
+    #[test]
+    fn cancelled_accept_keeps_ownership_until_the_exact_connect_retires() {
+        let mut operation = OwnedIo::new(IoKind::Connect, Vec::new());
+        operation.start().unwrap();
+        operation.request_cancellation();
+        let mut operation = match operation.into_retired() {
+            Err(operation) => operation,
+            Ok(_) => panic!("an accept cancellation is not retirement"),
+        };
+        operation.complete(IoResult::Disconnected);
+        let retired = operation.into_retired().ok().unwrap();
+        assert_eq!(retired.kind, IoKind::Connect);
+        assert_eq!(retired.result, IoResult::Disconnected);
+        assert!(retired.bytes.is_empty());
     }
 
     #[test]

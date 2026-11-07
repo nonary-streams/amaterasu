@@ -1,13 +1,15 @@
 //! Local, bounded named-pipe frames. The OS process and impersonation checks
 //! in `windows_identity` authorize each request after it has been read.
 use crate::windows_pipe_state::{
-    IoKind, IoResult, MAX_FRAME, OwnedIo, RetiredIo, remaining_wait_ms, take_frame,
+    IoKind, IoResult, MAX_FRAME, OwnedIo, RetiredIo, cancellable_wait_ms, remaining_wait_ms,
+    take_frame,
 };
 use crate::{InputError, InputResult};
 use std::cell::{RefCell, UnsafeCell};
 use std::ffi::c_void;
 use std::ptr::{null, null_mut};
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 use windows_sys::Win32::System::IO::OVERLAPPED;
 
 type Handle = *mut c_void;
@@ -102,14 +104,6 @@ unsafe extern "system" {
         transferred: *mut u32,
         wait: i32,
     ) -> i32;
-    fn PeekNamedPipe(
-        pipe: Handle,
-        buffer: *mut c_void,
-        length: u32,
-        read: *mut u32,
-        available: *mut u32,
-        remaining: *mut u32,
-    ) -> i32;
     fn CloseHandle(handle: Handle) -> i32;
     fn LocalFree(memory: Handle) -> Handle;
     fn GetLastError() -> u32;
@@ -164,6 +158,7 @@ impl PendingIo {
         // The Pipe keeps its handle live through this operation's retirement.
         let completed = unsafe {
             match kind {
+                IoKind::Connect => ConnectNamedPipe(handle, pending.overlapped.get().cast()),
                 IoKind::Read => ReadFile(
                     handle,
                     buffer.cast(),
@@ -180,14 +175,20 @@ impl PendingIo {
                 ),
             }
         };
-        if completed != 0 {
+        if completed != 0 && kind == IoKind::Connect {
+            pending.complete(IoResult::Transferred(0));
+        } else if completed != 0 {
             // Even an immediate asynchronous completion takes its actual byte
             // count from this operation, never a synchronous output parameter.
             pending.poll_completion();
         } else {
             // SAFETY: read immediately after the failed I/O call on this thread.
             let error = unsafe { GetLastError() };
-            if error != ERROR_IO_PENDING {
+            if kind == IoKind::Connect && error == ERROR_PIPE_CONNECTED {
+                // The client connected between instance creation and accept.
+                // No overlapped operation was queued in this documented case.
+                pending.complete(IoResult::Transferred(0));
+            } else if error != ERROR_IO_PENDING {
                 pending.complete(io_failure(error));
             }
         }
@@ -224,7 +225,18 @@ impl PendingIo {
             )
         } != 0
         {
-            self.complete(IoResult::Transferred(transferred as usize));
+            // ConnectNamedPipe's transferred-byte output is undefined. Only
+            // read/write operations may use it as an initialized byte count.
+            let length = if self
+                .operation
+                .as_ref()
+                .is_some_and(|operation| operation.kind() == IoKind::Connect)
+            {
+                0
+            } else {
+                transferred as usize
+            };
+            self.complete(IoResult::Transferred(length));
             return true;
         }
         // SAFETY: this thread has made no intervening Win32 call.
@@ -249,9 +261,20 @@ impl PendingIo {
         }
     }
 
-    fn wait_before(&mut self, deadline: Instant) -> InputResult<bool> {
+    fn wait_until(&mut self, deadline: Instant, stop: Option<&AtomicBool>) -> InputResult<bool> {
         loop {
-            let Some(milliseconds) = remaining_wait_ms(Instant::now(), deadline) else {
+            if stop.is_some_and(|stop| stop.load(Ordering::Acquire)) {
+                self.cancel();
+                self.poll_completion();
+                return Ok(false);
+            }
+            let now = Instant::now();
+            let wait = if stop.is_some() {
+                cancellable_wait_ms(now, deadline)
+            } else {
+                remaining_wait_ms(now, deadline)
+            };
+            let Some(milliseconds) = wait else {
                 self.cancel();
                 self.poll_completion();
                 return Ok(false);
@@ -300,6 +323,8 @@ impl Drop for PendingIo {
 fn io_failure(error: u32) -> IoResult {
     if error == ERROR_OPERATION_ABORTED {
         IoResult::Aborted
+    } else if error == ERROR_NO_DATA {
+        IoResult::Disconnected
     } else {
         IoResult::Failed
     }
@@ -401,6 +426,7 @@ impl Pipe {
             inherit: 0,
         };
         let flags = PIPE_ACCESS_DUPLEX
+            | FILE_FLAG_OVERLAPPED
             | if first {
                 FILE_FLAG_FIRST_PIPE_INSTANCE
             } else {
@@ -429,18 +455,40 @@ impl Pipe {
         })
     }
 
-    pub(crate) fn accept(&self) -> InputResult<bool> {
-        // SAFETY: the handle is a live server pipe instance. The only benign
-        // failures are an already-connected client or one that disconnected
-        // before accept. The latter must not terminate the service.
-        if unsafe { ConnectNamedPipe(self.handle, null_mut()) } == 0 {
-            return match unsafe { GetLastError() } {
-                ERROR_PIPE_CONNECTED => Ok(true),
-                ERROR_NO_DATA => Ok(false),
-                _ => Err(InputError::Device),
-            };
+    pub(crate) fn accept_until(
+        &mut self,
+        deadline: Instant,
+        stop: &AtomicBool,
+    ) -> InputResult<Option<bool>> {
+        if !self.server {
+            return Err(InputError::Device);
         }
-        Ok(true)
+        let mut io = self.io.borrow_mut();
+        if io.failed {
+            return Err(InputError::Device);
+        }
+        if io.operation.is_none() {
+            if stop.load(Ordering::Acquire) || Instant::now() >= deadline {
+                return Ok(None);
+            }
+            io.operation = Some(PendingIo::begin(self.handle, IoKind::Connect, Vec::new())?);
+        }
+        io.operation
+            .as_mut()
+            .expect("owned accept")
+            .wait_until(deadline, Some(stop))?;
+        let Some(completed) = io.take_completed() else {
+            return Ok(None);
+        };
+        match (completed.kind, completed.result) {
+            (IoKind::Connect, IoResult::Transferred(0)) => Ok(Some(true)),
+            (IoKind::Connect, IoResult::Disconnected) => Ok(Some(false)),
+            (IoKind::Connect, IoResult::Aborted) => Ok(None),
+            _ => {
+                io.failed = true;
+                Err(InputError::Device)
+            }
+        }
     }
 
     pub(crate) fn connect(kind: PipeKind) -> InputResult<Self> {
@@ -472,13 +520,10 @@ impl Pipe {
     }
 
     pub(crate) fn write_line(&self, bytes: &[u8]) -> InputResult<()> {
-        if !self.server {
-            let deadline = Instant::now()
-                .checked_add(crate::worker_client::REPLY_TIMEOUT)
-                .ok_or(InputError::Device)?;
-            return self.write_line_before(bytes, deadline);
-        }
-        self.write_server_line(bytes)
+        let deadline = Instant::now()
+            .checked_add(crate::worker_client::REPLY_TIMEOUT)
+            .ok_or(InputError::Device)?;
+        self.write_line_before(bytes, deadline)
     }
 
     fn frame(bytes: &[u8]) -> InputResult<Vec<u8>> {
@@ -492,8 +537,26 @@ impl Pipe {
     }
 
     pub(crate) fn write_line_before(&self, bytes: &[u8], deadline: Instant) -> InputResult<()> {
+        self.write_line_inner(bytes, deadline, None)
+    }
+
+    pub(crate) fn write_line_until(
+        &self,
+        bytes: &[u8],
+        deadline: Instant,
+        stop: &AtomicBool,
+    ) -> InputResult<()> {
+        self.write_line_inner(bytes, deadline, Some(stop))
+    }
+
+    fn write_line_inner(
+        &self,
+        bytes: &[u8],
+        deadline: Instant,
+        stop: Option<&AtomicBool>,
+    ) -> InputResult<()> {
         let frame = Self::frame(bytes)?;
-        if self.server || Instant::now() >= deadline {
+        if stop.is_some_and(|stop| stop.load(Ordering::Acquire)) || Instant::now() >= deadline {
             return Err(InputError::Device);
         }
         let mut io = self.io.borrow_mut();
@@ -509,7 +572,7 @@ impl Pipe {
             .operation
             .as_mut()
             .expect("owned write")
-            .wait_before(deadline);
+            .wait_until(deadline, stop);
         let completed = io.take_completed();
         if completed_before_deadline == Ok(true)
             && completed
@@ -524,31 +587,23 @@ impl Pipe {
         Err(InputError::Device)
     }
 
-    fn write_server_line(&self, bytes: &[u8]) -> InputResult<()> {
-        let frame = Self::frame(bytes)?;
-        let mut written = 0;
-        // SAFETY: only server handles use synchronous I/O; frame remains live
-        // until WriteFile returns. Every overlapped client path uses PendingIo.
-        if unsafe {
-            WriteFile(
-                self.handle,
-                frame.as_ptr().cast(),
-                frame.len() as u32,
-                &mut written,
-                null_mut(),
-            )
-        } == 0
-            || written as usize != frame.len()
-        {
-            return Err(InputError::Device);
-        }
-        Ok(())
+    pub(crate) fn read_line(&mut self, deadline: Instant) -> InputResult<Option<Vec<u8>>> {
+        self.read_line_inner(deadline, None)
     }
 
-    pub(crate) fn read_line(&mut self, deadline: Instant) -> InputResult<Option<Vec<u8>>> {
-        if self.server {
-            return self.read_server_line(deadline);
-        }
+    pub(crate) fn read_line_until(
+        &mut self,
+        deadline: Instant,
+        stop: &AtomicBool,
+    ) -> InputResult<Option<Vec<u8>>> {
+        self.read_line_inner(deadline, Some(stop))
+    }
+
+    fn read_line_inner(
+        &mut self,
+        deadline: Instant,
+        stop: Option<&AtomicBool>,
+    ) -> InputResult<Option<Vec<u8>>> {
         let mut io = self.io.borrow_mut();
         loop {
             if let Some(completed) = io.take_completed() {
@@ -556,6 +611,12 @@ impl Pipe {
             }
             if io.failed {
                 return Err(InputError::Device);
+            }
+            if stop.is_some_and(|stop| stop.load(Ordering::Acquire)) {
+                if let Some(operation) = &mut io.operation {
+                    operation.cancel();
+                }
+                return Ok(None);
             }
             if let Some(frame) = take_frame(&mut io.buffered)? {
                 return Ok(Some(frame));
@@ -578,7 +639,7 @@ impl Pipe {
                 .operation
                 .as_mut()
                 .expect("owned read")
-                .wait_before(deadline)?;
+                .wait_until(deadline, stop)?;
             if let Some(completed) = io.take_completed() {
                 io.retain_read(completed)?;
             }
@@ -587,63 +648,6 @@ impl Pipe {
                 // the next observation of this same outstanding wire request.
                 return Ok(None);
             }
-        }
-    }
-
-    fn read_server_line(&mut self, deadline: Instant) -> InputResult<Option<Vec<u8>>> {
-        loop {
-            if let Some(frame) = take_frame(&mut self.io.get_mut().buffered)? {
-                return Ok(Some(frame));
-            }
-            let mut available = 0;
-            // SAFETY: PeekNamedPipe uses no data buffer and writes one u32.
-            if unsafe {
-                PeekNamedPipe(
-                    self.handle,
-                    null_mut(),
-                    0,
-                    null_mut(),
-                    &mut available,
-                    null_mut(),
-                )
-            } == 0
-            {
-                return Err(InputError::Device);
-            }
-            if available == 0 {
-                if Instant::now() >= deadline {
-                    return Ok(None);
-                }
-                std::thread::sleep(
-                    Duration::from_millis(10)
-                        .min(deadline.saturating_duration_since(Instant::now())),
-                );
-                continue;
-            }
-            let mut buffer = [0u8; 512];
-            let mut read = 0;
-            let amount = available
-                .min(buffer.len() as u32)
-                .min((MAX_FRAME - self.io.get_mut().buffered.len()) as u32);
-            // SAFETY: available bytes were observed immediately before the
-            // synchronous read; the buffer remains live and is bounded.
-            if unsafe {
-                ReadFile(
-                    self.handle,
-                    buffer.as_mut_ptr().cast(),
-                    amount,
-                    &mut read,
-                    null_mut(),
-                )
-            } == 0
-                || read == 0
-            {
-                return Err(InputError::Device);
-            }
-            self.io
-                .get_mut()
-                .buffered
-                .extend_from_slice(&buffer[..read as usize]);
         }
     }
 }
