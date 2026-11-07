@@ -28,6 +28,24 @@ impl ManagedModule for MediaTransportModule {
         Self::start_configured(runtime, None)
     }
 
+    fn prepare_shutdown(&mut self, _remaining_ms: u64) -> ModuleResult<()> {
+        self.controller
+            .lock()
+            .map_err(|_| "transport state unavailable")?
+            .prepare_shutdown();
+        Ok(())
+    }
+
+    fn quiesce(&mut self) -> ModuleResult<bool> {
+        // The host starts provider quiescence only after its consumers drain.
+        // No transport workers outlive this bounded queue/socket destruction.
+        self.controller
+            .lock()
+            .map_err(|_| "transport state unavailable")?
+            .shutdown();
+        Ok(true)
+    }
+
     fn tick(&mut self) -> ModuleResult<()> {
         let _priority = amaterasu_module_sdk::threading::ScopedThreadPriority::best_effort(
             amaterasu_module_sdk::threading::ThreadPriority::High,

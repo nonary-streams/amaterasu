@@ -194,6 +194,11 @@ medium may continue. Native `drain` closes both inputs and returns immediately;
 status reaches `drained` after the local queue empties. Repeated drain is harmless.
 An incomplete audio FEC group emits no extra packets at drain. Close/shutdown
 abort pending queues and release both sockets. There are no detached workers.
+Host shutdown announcement rejects new stream opens while existing consumers
+retain media admission, status, drain, and close until they finish. Once the
+host begins this provider's quiescence, it closes all remaining stream sockets
+and aborts queued datagrams before reporting ready. Repeated polls and later
+ticks cannot admit another stream.
 Bindings must be released before provider unload through signed dependency
 ordering; documented FFI boundaries require live initialized packet allocations
 and prohibit unwinding across the native ABI.

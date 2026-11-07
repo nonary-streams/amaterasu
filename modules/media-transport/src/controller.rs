@@ -22,6 +22,7 @@ pub struct Controller {
     used_keys: Vec<[u8; 16]>,
     used_discoveries: Vec<DiscoveryTokens>,
     tick_cursor: usize,
+    shutting_down: bool,
 }
 
 impl Controller {
@@ -40,6 +41,7 @@ impl Controller {
             used_keys: Vec::new(),
             used_discoveries: Vec::new(),
             tick_cursor: 0,
+            shutting_down: false,
         }
     }
 
@@ -71,6 +73,9 @@ impl Controller {
     }
 
     fn open(&mut self, owner: &str, request: Open) -> TransportResult<(Value, Option<u64>)> {
+        if self.shutting_down {
+            return Err("shutting_down");
+        }
         if !self.settings.enabled {
             return Err("disabled");
         }
@@ -238,7 +243,12 @@ impl Controller {
             .collect()
     }
 
+    pub fn prepare_shutdown(&mut self) {
+        self.shutting_down = true;
+    }
+
     pub fn shutdown(&mut self) {
+        self.prepare_shutdown();
         self.settings.enabled = false;
         self.streams.clear();
     }
