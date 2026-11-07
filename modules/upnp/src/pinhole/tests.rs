@@ -16,6 +16,9 @@ struct FakeControlState {
     missing_refresh_count: usize,
     added_leases: Vec<u32>,
     refreshed_leases: Vec<u32>,
+    fail_status: bool,
+    fail_add_for: Option<PinholeEndpoint>,
+    fail_refresh_for: Option<u16>,
 }
 
 impl Default for FakeControl {
@@ -31,6 +34,9 @@ impl Default for FakeControl {
             missing_refresh_count: 0,
             added_leases: Vec::new(),
             refreshed_leases: Vec::new(),
+            fail_status: false,
+            fail_add_for: None,
+            fail_refresh_for: None,
         })))
     }
 }
@@ -55,7 +61,12 @@ impl FakeControl {
 
 impl Ipv6FirewallControl for FakeControl {
     fn firewall_status(&mut self) -> Result<FirewallStatus, GatewayError> {
-        Ok(self.0.borrow().status)
+        let state = self.0.borrow();
+        if state.fail_status {
+            Err(GatewayError::new("injected firewall status failure"))
+        } else {
+            Ok(state.status)
+        }
     }
 
     fn add_pinhole(
@@ -64,6 +75,9 @@ impl Ipv6FirewallControl for FakeControl {
         lease_duration_seconds: u32,
     ) -> Result<u16, GatewayError> {
         let mut state = self.0.borrow_mut();
+        if state.fail_add_for == Some(endpoint) {
+            return Err(GatewayError::new("injected add failure"));
+        }
         let unique_id = state.next_id;
         state.next_id += 1;
         state.pinholes.insert(unique_id, endpoint);
@@ -78,6 +92,9 @@ impl Ipv6FirewallControl for FakeControl {
     ) -> Result<PinholeRefreshOutcome, GatewayError> {
         let mut state = self.0.borrow_mut();
         state.refreshed_leases.push(lease_duration_seconds);
+        if state.fail_refresh_for == Some(unique_id) {
+            return Err(GatewayError::new("injected refresh failure"));
+        }
         if state.missing_refresh_count > 0 {
             state.missing_refresh_count -= 1;
             state.pinholes.remove(&unique_id);
@@ -199,4 +216,90 @@ fn disallowed_policy_preserves_pending_ownership_when_delete_fails() {
     ));
     assert_eq!(manager.owned_pinholes().count(), 1);
     assert_eq!(manager.reconcile(&[endpoint]).unwrap().removed, 1);
+}
+
+#[test]
+fn firewall_status_failure_does_not_keep_a_removed_listener_exposed() {
+    let control = FakeControl::default();
+    let mut manager = PinholeManager::new(control.clone());
+    let removed = endpoint("2001:db8::10", 47989, Protocol::Tcp);
+    let retained = endpoint("2001:db8::10", 47998, Protocol::Udp);
+    manager.reconcile(&[removed, retained]).unwrap();
+    control.0.borrow_mut().fail_status = true;
+
+    assert!(matches!(
+        manager.reconcile(&[retained]),
+        Err(PinholeError::Status(_))
+    ));
+
+    assert_eq!(
+        manager.owned_pinholes().collect::<Vec<_>>(),
+        vec![(retained, 2)]
+    );
+    assert_eq!(control.pinholes(), BTreeMap::from([(2, retained)]));
+    assert!(control.0.borrow().refreshed_leases.is_empty());
+}
+
+#[test]
+fn failed_addition_does_not_keep_a_removed_listener_exposed() {
+    let control = FakeControl::default();
+    let mut manager = PinholeManager::new(control.clone());
+    let removed = endpoint("2001:db8::10", 47989, Protocol::Tcp);
+    let replacement = endpoint("2001:db8::10", 47998, Protocol::Udp);
+    manager.reconcile(&[removed]).unwrap();
+    control.0.borrow_mut().fail_add_for = Some(replacement);
+
+    assert!(matches!(
+        manager.reconcile(&[replacement]),
+        Err(PinholeError::Add { endpoint, .. }) if endpoint == replacement
+    ));
+
+    assert!(manager.owned_pinholes().next().is_none());
+    assert!(control.pinholes().is_empty());
+}
+
+#[test]
+fn failed_refresh_does_not_keep_a_removed_listener_exposed() {
+    let control = FakeControl::default();
+    let mut manager = PinholeManager::new(control.clone());
+    let removed = endpoint("2001:db8::10", 47989, Protocol::Tcp);
+    let retained = endpoint("2001:db8::10", 47998, Protocol::Udp);
+    manager.reconcile(&[removed, retained]).unwrap();
+    control.0.borrow_mut().fail_refresh_for = Some(2);
+
+    assert!(matches!(
+        manager.reconcile(&[retained]),
+        Err(PinholeError::Refresh { endpoint, .. }) if endpoint == retained
+    ));
+
+    assert_eq!(
+        manager.owned_pinholes().collect::<Vec<_>>(),
+        vec![(retained, 2)]
+    );
+    assert_eq!(control.pinholes(), BTreeMap::from([(2, retained)]));
+}
+
+#[test]
+fn concurrent_refresh_and_cleanup_failures_both_remain_visible_and_retryable() {
+    let control = FakeControl::default();
+    let mut manager = PinholeManager::new(control.clone());
+    let removed = endpoint("2001:db8::10", 47989, Protocol::Tcp);
+    let retained = endpoint("2001:db8::10", 47998, Protocol::Udp);
+    manager.reconcile(&[removed, retained]).unwrap();
+    control.0.borrow_mut().fail_refresh_for = Some(2);
+    control.fail_deletes(1);
+
+    let error = manager.reconcile(&[retained]).unwrap_err().to_string();
+    assert!(error.contains("injected refresh failure"));
+    assert!(error.contains("injected delete failure"));
+    assert_eq!(manager.owned_pinholes().count(), 2);
+    assert_eq!(control.pinholes().len(), 2);
+
+    control.0.borrow_mut().fail_refresh_for = None;
+    assert_eq!(manager.reconcile(&[retained]).unwrap().removed, 1);
+    assert_eq!(
+        manager.owned_pinholes().collect::<Vec<_>>(),
+        vec![(retained, 2)]
+    );
+    assert_eq!(control.pinholes(), BTreeMap::from([(2, retained)]));
 }

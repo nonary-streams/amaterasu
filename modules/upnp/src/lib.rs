@@ -734,7 +734,6 @@ impl<G: Gateway> MappingManager<G> {
         let current_mappings = match self.gateway.find_mappings(key) {
             Ok(mappings) => mappings,
             Err(source) => {
-                self.owned.remove(&key);
                 return vec![MappingFailure {
                     operation: MappingOperation::Inspect,
                     mapping: key,
@@ -822,6 +821,13 @@ impl<G: Gateway> MappingManager<G> {
             } else {
                 None
             };
+            if matches!(restoration, Some(Ok(())))
+                && let Some(previous) = &applied_change.restore_on_rollback
+            {
+                // Acknowledged restoration supersedes the created tuple even if the
+                // following inspection fails. Cleanup must retain that exact tuple.
+                self.owned.insert(key, previous.clone());
+            }
 
             let mut candidates = vec![applied_change.created_mapping.clone()];
             if let Some(previously_owned) = &applied_change.previously_owned {
@@ -906,7 +912,8 @@ impl<G: Gateway> MappingManager<G> {
         let current_mappings = match self.gateway.find_mappings(key) {
             Ok(mappings) => mappings,
             Err(source) => {
-                self.owned.remove(&key);
+                // Inspection failure does not establish absence or changed ownership.
+                // Keep the last acknowledged tuple for a later exact-match cleanup.
                 return Err(source);
             }
         };

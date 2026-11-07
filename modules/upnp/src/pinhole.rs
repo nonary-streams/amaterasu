@@ -90,6 +90,10 @@ pub enum PinholeError {
     Cleanup {
         failures: Vec<(PinholeEndpoint, GatewayError)>,
     },
+    Reconcile {
+        maintenance: Box<PinholeError>,
+        cleanup: Box<PinholeError>,
+    },
     Shutdown {
         failures: Vec<(PinholeEndpoint, GatewayError)>,
     },
@@ -111,9 +115,14 @@ impl fmt::Display for PinholeError {
             ),
             Self::Cleanup { failures } => write!(
                 formatter,
-                "IPv6 pinhole reconcile left {} owned cleanup failure(s)",
-                failures.len()
+                "IPv6 pinhole reconcile left {} owned cleanup failure(s): {}",
+                failures.len(),
+                format_cleanup_failures(failures)
             ),
+            Self::Reconcile {
+                maintenance,
+                cleanup,
+            } => write!(formatter, "{maintenance}; {cleanup}"),
             Self::Shutdown { failures } => write!(
                 formatter,
                 "IPv6 pinhole shutdown left {} owned cleanup failure(s)",
@@ -152,30 +161,51 @@ impl<C: Ipv6FirewallControl> PinholeManager<C> {
     /// separate `firewall_enabled` report bit is informational and does not gate the
     /// operation. Existing owned pinholes are removed when the gateway disallows new
     /// pinholes, and cleanup failures remain recorded for a later retry.
+    /// Pinholes for listeners no longer desired are removed even when firewall status,
+    /// addition, or refresh fails. Those failures do not revoke desired listeners.
     pub fn reconcile(
         &mut self,
         endpoints: &[PinholeEndpoint],
     ) -> Result<PinholeReport, PinholeError> {
-        let status = self
-            .control
-            .firewall_status()
-            .map_err(PinholeError::Status)?;
         let desired: BTreeSet<_> = endpoints
             .iter()
             .copied()
             .filter(|endpoint| valid_endpoint(*endpoint))
             .collect();
-        let mut report = PinholeReport {
-            allowed: status.pinhole_allowed,
-            ..PinholeReport::default()
+        let mut report = PinholeReport::default();
+        let maintenance = self.maintain_desired_pinholes(&desired, &mut report);
+        let retained = if maintenance.is_ok() && !report.allowed {
+            BTreeSet::new()
+        } else {
+            desired
         };
+        let cleanup = self.remove_stale_pinholes(&retained, &mut report);
 
+        match (maintenance, cleanup) {
+            (Ok(()), Ok(())) => Ok(report),
+            (Err(maintenance), Err(cleanup)) => Err(PinholeError::Reconcile {
+                maintenance: Box::new(maintenance),
+                cleanup: Box::new(cleanup),
+            }),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        }
+    }
+
+    fn maintain_desired_pinholes(
+        &mut self,
+        desired: &BTreeSet<PinholeEndpoint>,
+        report: &mut PinholeReport,
+    ) -> Result<(), PinholeError> {
+        let status = self
+            .control
+            .firewall_status()
+            .map_err(PinholeError::Status)?;
+        report.allowed = status.pinhole_allowed;
         if !status.pinhole_allowed {
-            self.remove_stale_pinholes(&BTreeSet::new(), &mut report)?;
-            return Ok(report);
+            return Ok(());
         }
 
-        for endpoint in &desired {
+        for endpoint in desired {
             let Some(unique_id) = self.owned.get(endpoint).copied() else {
                 let unique_id = self
                     .control
@@ -212,8 +242,7 @@ impl<C: Ipv6FirewallControl> PinholeManager<C> {
             }
         }
 
-        self.remove_stale_pinholes(&desired, &mut report)?;
-        Ok(report)
+        Ok(())
     }
 
     /// Deletes owned pinholes. Failed IDs remain recorded for retry.
@@ -267,6 +296,19 @@ impl<C: Ipv6FirewallControl> PinholeManager<C> {
             Err(PinholeError::Cleanup { failures })
         }
     }
+}
+
+fn format_cleanup_failures(failures: &[(PinholeEndpoint, GatewayError)]) -> String {
+    failures
+        .iter()
+        .map(|(endpoint, source)| {
+            format!(
+                "{}:{} {:?}: {source}",
+                endpoint.internal_client, endpoint.internal_port, endpoint.protocol
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 fn valid_endpoint(endpoint: PinholeEndpoint) -> bool {

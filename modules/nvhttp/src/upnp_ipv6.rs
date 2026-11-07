@@ -7,11 +7,14 @@ use amaterasu_upnp::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv6Addr};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::RecvTimeoutError;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crate::upnp::UpnpRuntimeStatus;
+use crate::upnp::{
+    LifecycleCommand, LifecycleReceiver, LifecycleSender, UpnpRuntimeStatus, UpnpStatusMailbox,
+    lifecycle_channel,
+};
 
 const CLEANUP_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_RUNTIME_ERROR_CHARS: usize = 256;
@@ -22,15 +25,10 @@ struct DesiredPinholes {
     endpoints: Vec<amaterasu_upnp::MappingEndpoint>,
 }
 
-enum LifecycleCommand {
-    Configure(DesiredPinholes),
-    Shutdown,
-}
-
 /// Owns the IPv6 pinhole worker and makes orderly cleanup part of module shutdown.
 pub(crate) struct Ipv6PinholeLifecycle {
-    commands: Sender<LifecycleCommand>,
-    statuses: Receiver<UpnpRuntimeStatus>,
+    commands: LifecycleSender<DesiredPinholes>,
+    statuses: UpnpStatusMailbox,
     worker: Option<JoinHandle<()>>,
     last_desired: Option<DesiredPinholes>,
     status: UpnpRuntimeStatus,
@@ -38,11 +36,12 @@ pub(crate) struct Ipv6PinholeLifecycle {
 
 impl Ipv6PinholeLifecycle {
     pub(crate) fn new(network: Option<Network>) -> Self {
-        let (command_tx, command_rx) = mpsc::channel();
-        let (status_tx, status_rx) = mpsc::channel();
+        let (command_tx, command_rx) = lifecycle_channel();
+        let statuses = UpnpStatusMailbox::default();
+        let worker_statuses = statuses.clone();
         let worker = thread::Builder::new()
             .name("amaterasu-upnp-ipv6".into())
-            .spawn(move || run_worker(network, command_rx, status_tx))
+            .spawn(move || run_worker(network, command_rx, worker_statuses))
             .ok();
         let status = if worker.is_some() {
             UpnpRuntimeStatus {
@@ -57,7 +56,7 @@ impl Ipv6PinholeLifecycle {
         };
         Self {
             commands: command_tx,
-            statuses: status_rx,
+            statuses,
             worker,
             last_desired: None,
             status,
@@ -97,11 +96,15 @@ impl Ipv6PinholeLifecycle {
         &self.status
     }
 
+    pub(crate) fn request_shutdown(&self) {
+        let _ = self.commands.send(LifecycleCommand::Shutdown);
+    }
+
     pub(crate) fn shutdown(&mut self) {
         if self.worker.is_none() {
             return;
         }
-        let _ = self.commands.send(LifecycleCommand::Shutdown);
+        self.request_shutdown();
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
@@ -119,8 +122,8 @@ impl Drop for Ipv6PinholeLifecycle {
 
 fn run_worker(
     network: Option<Network>,
-    commands: Receiver<LifecycleCommand>,
-    statuses: Sender<UpnpRuntimeStatus>,
+    commands: LifecycleReceiver<DesiredPinholes>,
+    statuses: UpnpStatusMailbox,
 ) {
     let mut desired = DesiredPinholes::default();
     let mut gateways: BTreeMap<String, Ipv6GatewayOwner<IgdIpv6Firewall>> = BTreeMap::new();

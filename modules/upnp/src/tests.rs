@@ -23,6 +23,9 @@ struct FakeGatewayState {
     add_attempts: usize,
     refresh_attempts: usize,
     refresh_requests: Vec<Mapping>,
+    fail_find_for: Option<MappingKey>,
+    fail_find_after_remove_for: Option<MappingKey>,
+    fail_find_after_add_attempt: Option<usize>,
 }
 
 impl FakeGateway {
@@ -44,6 +47,13 @@ impl FakeGateway {
 
     fn set_refresh_failure(&self, key: Option<MappingKey>) {
         self.0.borrow_mut().fail_refresh_for = key;
+    }
+
+    fn clear_inspection_failure(&self) {
+        let mut state = self.0.borrow_mut();
+        state.fail_find_for = None;
+        state.fail_find_after_remove_for = None;
+        state.fail_find_after_add_attempt = None;
     }
 
     fn mappings(&self) -> BTreeMap<MappingKey, Mapping> {
@@ -86,14 +96,11 @@ impl FakeGateway {
 
 impl Gateway for FakeGateway {
     fn find_mappings(&mut self, key: MappingKey) -> Result<Vec<Mapping>, GatewayError> {
-        Ok(self
-            .0
-            .borrow()
-            .mappings
-            .get(&key)
-            .cloned()
-            .into_iter()
-            .collect())
+        let state = self.0.borrow();
+        if state.fail_find_for == Some(key) {
+            return Err(GatewayError::new("injected inspection failure"));
+        }
+        Ok(state.mappings.get(&key).cloned().into_iter().collect())
     }
 
     fn create_if_absent(&mut self, mapping: &Mapping) -> Result<(), GatewayError> {
@@ -110,12 +117,18 @@ impl Gateway for FakeGateway {
         }
 
         state.mappings.insert(mapping.key(), mapping.clone());
+        if state.fail_find_after_add_attempt == Some(state.add_attempts) {
+            state.fail_find_for = Some(mapping.key());
+        }
         Ok(())
     }
 
     fn remove_if_matches(&mut self, mapping: &Mapping) -> Result<RemovalOutcome, GatewayError> {
         let mut state = self.0.borrow_mut();
         let key = mapping.key();
+        if state.fail_find_after_remove_for == Some(key) {
+            state.fail_find_for = Some(key);
+        }
 
         if state.fail_remove_for == Some(key) {
             return Err(GatewayError::new("injected remove failure"));
@@ -505,6 +518,86 @@ fn later_protocol_retarget_failure_rolls_back_the_earlier_protocol() {
     assert_eq!(fake_gateway.mappings(), previous_mappings);
     assert_eq!(manager.owned_mappings().count(), 2);
     assert_eq!(fake_gateway.add_attempts(), 6);
+}
+
+#[test]
+fn rollback_inspection_failure_retains_a_mapping_whose_removal_failed() {
+    let gateway = FakeGateway::default();
+    let mut manager = manager(gateway.clone());
+    let original = endpoint([192, 168, 1, 10], 47989, true);
+    let replacement = endpoint([192, 168, 1, 10], 48000, true);
+    manager.reconcile(&[original]).unwrap();
+    gateway.set_add_failure(key(48000, Protocol::Udp));
+    gateway.set_remove_failure(Some(key(48000, Protocol::Tcp)));
+    gateway.0.borrow_mut().fail_find_after_remove_for = Some(key(48000, Protocol::Tcp));
+
+    assert!(matches!(
+        manager.reconcile(&[replacement]),
+        Err(UpnpError::AddFailed { rollback_failures, .. })
+            if rollback_failures.iter().any(|failure|
+                failure.operation == super::MappingOperation::Inspect)
+    ));
+    assert_eq!(manager.owned_mappings().count(), 3);
+    assert_eq!(gateway.mappings().len(), 3);
+
+    gateway.clear_inspection_failure();
+    gateway.set_remove_failure(None);
+    assert_eq!(manager.shutdown().unwrap().removed, 3);
+    assert!(gateway.mappings().is_empty());
+}
+
+#[test]
+fn interrupted_retarget_inspection_failure_retains_the_previous_mapping() {
+    let gateway = FakeGateway::default();
+    let mut manager = manager(gateway.clone());
+    manager
+        .reconcile(&[endpoint([192, 168, 1, 10], 47989, true)])
+        .unwrap();
+    let original = gateway.mappings();
+    gateway.set_remove_failure(Some(key(47989, Protocol::Tcp)));
+    gateway.0.borrow_mut().fail_find_after_remove_for = Some(key(47989, Protocol::Tcp));
+
+    assert!(matches!(
+        manager.reconcile(&[endpoint([192, 168, 1, 20], 47989, true)]),
+        Err(UpnpError::ReconcileFailed { rollback_failures, .. })
+            if rollback_failures.iter().any(|failure|
+                failure.operation == super::MappingOperation::Inspect)
+    ));
+    assert_eq!(manager.owned_mappings().count(), 2);
+    assert_eq!(gateway.mappings(), original);
+
+    gateway.clear_inspection_failure();
+    gateway.set_remove_failure(None);
+    assert_eq!(manager.shutdown().unwrap().removed, 2);
+    assert!(gateway.mappings().is_empty());
+}
+
+#[test]
+fn restored_mapping_remains_owned_when_post_restoration_inspection_fails() {
+    let gateway = FakeGateway::default();
+    let mut manager = manager(gateway.clone());
+    manager
+        .reconcile(&[endpoint([192, 168, 1, 10], 47989, true)])
+        .unwrap();
+    let original = gateway.mappings();
+    gateway.set_add_failure_on_attempt(4);
+    gateway.0.borrow_mut().fail_find_after_add_attempt = Some(6);
+
+    assert!(matches!(
+        manager.reconcile(&[endpoint([192, 168, 1, 20], 47989, true)]),
+        Err(UpnpError::AddFailed { rollback_failures, .. })
+            if rollback_failures.iter().any(|failure|
+                failure.operation == super::MappingOperation::Inspect)
+    ));
+    assert_eq!(
+        manager.owned_mappings().cloned().collect::<Vec<_>>(),
+        original.values().cloned().collect::<Vec<_>>()
+    );
+    assert_eq!(gateway.mappings(), original);
+
+    gateway.clear_inspection_failure();
+    assert_eq!(manager.shutdown().unwrap().removed, 2);
+    assert!(gateway.mappings().is_empty());
 }
 
 #[test]

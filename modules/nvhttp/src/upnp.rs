@@ -9,7 +9,10 @@ use amaterasu_upnp::{
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::{
+    Arc, Mutex,
+    mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError},
+};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -159,15 +162,111 @@ impl Default for UpnpRuntimeStatus {
     }
 }
 
-enum LifecycleCommand {
-    Configure(DesiredMappings),
+#[derive(Clone, Default)]
+pub(crate) struct UpnpStatusMailbox(Arc<Mutex<Option<UpnpRuntimeStatus>>>);
+
+impl UpnpStatusMailbox {
+    pub(crate) fn send(&self, status: UpnpRuntimeStatus) -> Result<(), ()> {
+        *self.0.lock().map_err(|_| ())? = Some(status);
+        Ok(())
+    }
+
+    pub(crate) fn try_recv(&self) -> Result<UpnpRuntimeStatus, ()> {
+        self.0.lock().map_err(|_| ())?.take().ok_or(())
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum LifecycleCommand<T> {
+    Configure(T),
     Shutdown,
+}
+
+struct LifecycleMailbox<T> {
+    latest_configuration: Option<T>,
+    shutdown: bool,
+}
+
+pub(crate) struct LifecycleSender<T> {
+    mailbox: Arc<Mutex<LifecycleMailbox<T>>>,
+    wakeup: SyncSender<()>,
+}
+
+pub(crate) struct LifecycleReceiver<T> {
+    mailbox: Arc<Mutex<LifecycleMailbox<T>>>,
+    wakeup: Receiver<()>,
+}
+
+/// Listener changes replace obsolete desired state instead of queuing more router
+/// work. Shutdown has its own sticky flag and always preempts pending changes.
+pub(crate) fn lifecycle_channel<T>() -> (LifecycleSender<T>, LifecycleReceiver<T>) {
+    let mailbox = Arc::new(Mutex::new(LifecycleMailbox {
+        latest_configuration: None,
+        shutdown: false,
+    }));
+    let (wakeup_tx, wakeup_rx) = mpsc::sync_channel(1);
+    (
+        LifecycleSender {
+            mailbox: mailbox.clone(),
+            wakeup: wakeup_tx,
+        },
+        LifecycleReceiver {
+            mailbox,
+            wakeup: wakeup_rx,
+        },
+    )
+}
+
+impl<T> LifecycleSender<T> {
+    pub(crate) fn send(&self, command: LifecycleCommand<T>) -> Result<(), ()> {
+        let mut mailbox = self.mailbox.lock().map_err(|_| ())?;
+        match command {
+            LifecycleCommand::Configure(configuration) if !mailbox.shutdown => {
+                mailbox.latest_configuration = Some(configuration);
+            }
+            LifecycleCommand::Configure(_) => return Err(()),
+            LifecycleCommand::Shutdown => {
+                mailbox.shutdown = true;
+                mailbox.latest_configuration = None;
+            }
+        }
+        match self.wakeup.try_send(()) {
+            Ok(()) | Err(TrySendError::Full(())) => Ok(()),
+            Err(TrySendError::Disconnected(())) => Err(()),
+        }
+    }
+}
+
+impl<T> LifecycleReceiver<T> {
+    pub(crate) fn recv_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<LifecycleCommand<T>, RecvTimeoutError> {
+        let now = Instant::now();
+        let deadline = now.checked_add(timeout).unwrap_or(now);
+        loop {
+            {
+                let mut mailbox = self
+                    .mailbox
+                    .lock()
+                    .map_err(|_| RecvTimeoutError::Disconnected)?;
+                if mailbox.shutdown {
+                    return Ok(LifecycleCommand::Shutdown);
+                }
+                if let Some(configuration) = mailbox.latest_configuration.take() {
+                    return Ok(LifecycleCommand::Configure(configuration));
+                }
+            }
+            self.wakeup
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))?;
+        }
+    }
 }
 
 /// Owns the UPnP worker and guarantees an orderly best-effort cleanup on drop.
 pub(crate) struct UpnpLifecycle {
-    commands: Sender<LifecycleCommand>,
-    statuses: Receiver<UpnpRuntimeStatus>,
+    commands: LifecycleSender<DesiredMappings>,
+    statuses: UpnpStatusMailbox,
     worker: Option<JoinHandle<()>>,
     ipv6_lifecycle: crate::upnp_ipv6::Ipv6PinholeLifecycle,
     last_desired: Option<DesiredMappings>,
@@ -178,12 +277,13 @@ pub(crate) struct UpnpLifecycle {
 
 impl UpnpLifecycle {
     pub(crate) fn new(network: Option<Network>) -> Self {
-        let (command_tx, command_rx) = mpsc::channel();
-        let (status_tx, status_rx) = mpsc::channel();
+        let (command_tx, command_rx) = lifecycle_channel();
+        let statuses = UpnpStatusMailbox::default();
+        let worker_statuses = statuses.clone();
         let worker_network = network.clone();
         let worker = thread::Builder::new()
             .name("amaterasu-upnp".into())
-            .spawn(move || run_worker(worker_network, command_rx, status_tx))
+            .spawn(move || run_worker(worker_network, command_rx, worker_statuses))
             .ok();
         let status = if worker.is_some() {
             UpnpRuntimeStatus::default()
@@ -197,7 +297,7 @@ impl UpnpLifecycle {
         let ipv6_status = ipv6_lifecycle.status().clone();
         Self {
             commands: command_tx,
-            statuses: status_rx,
+            statuses,
             worker,
             ipv6_lifecycle,
             last_desired: None,
@@ -236,8 +336,9 @@ impl UpnpLifecycle {
     }
 
     pub(crate) fn shutdown(&mut self) {
+        let _ = self.commands.send(LifecycleCommand::Shutdown);
+        self.ipv6_lifecycle.request_shutdown();
         if let Some(worker) = self.worker.take() {
-            let _ = self.commands.send(LifecycleCommand::Shutdown);
             let _ = worker.join();
         }
         while let Ok(status) = self.statuses.try_recv() {
@@ -385,8 +486,8 @@ fn append_listener_endpoints(
 
 fn run_worker(
     network: Option<Network>,
-    commands: Receiver<LifecycleCommand>,
-    statuses: Sender<UpnpRuntimeStatus>,
+    commands: LifecycleReceiver<DesiredMappings>,
+    statuses: UpnpStatusMailbox,
 ) {
     let mut desired = DesiredMappings::default();
     let mut gateways: BTreeMap<String, GatewayOwner<IgdGateway>> = BTreeMap::new();
@@ -927,6 +1028,65 @@ mod tests {
 
     fn address(value: &str) -> SocketAddr {
         value.parse().unwrap()
+    }
+
+    #[test]
+    fn lifecycle_commands_coalesce_pending_listener_configurations() {
+        let (commands, worker) = lifecycle_channel();
+        for revision in 0..10_000 {
+            commands
+                .send(LifecycleCommand::Configure(revision))
+                .unwrap();
+        }
+        assert!(matches!(
+            worker.recv_timeout(Duration::ZERO),
+            Ok(LifecycleCommand::Configure(9_999))
+        ));
+        assert!(matches!(
+            worker.recv_timeout(Duration::ZERO),
+            Err(RecvTimeoutError::Timeout)
+        ));
+    }
+
+    #[test]
+    fn lifecycle_shutdown_preempts_pending_listener_configurations() {
+        let (commands, worker) = lifecycle_channel();
+        for revision in 0..10_000 {
+            commands
+                .send(LifecycleCommand::Configure(revision))
+                .unwrap();
+        }
+        commands.send(LifecycleCommand::Shutdown).unwrap();
+        assert!(matches!(
+            worker.recv_timeout(Duration::ZERO),
+            Ok(LifecycleCommand::Shutdown)
+        ));
+        assert!(commands.send(LifecycleCommand::Configure(10_000)).is_err());
+    }
+
+    #[test]
+    fn lifecycle_status_retains_only_the_latest_worker_snapshot() {
+        let statuses = UpnpStatusMailbox::default();
+        for revision in 0..10_000 {
+            statuses
+                .send(UpnpRuntimeStatus {
+                    status: "error".into(),
+                    error: Some(format!("revision {revision}")),
+                })
+                .unwrap();
+        }
+        assert_eq!(
+            statuses.try_recv().unwrap().error.as_deref(),
+            Some("revision 9999")
+        );
+        assert!(statuses.try_recv().is_err());
+    }
+
+    #[test]
+    fn lifecycle_command_sender_detects_a_retired_worker() {
+        let (commands, worker) = lifecycle_channel();
+        drop(worker);
+        assert!(commands.send(LifecycleCommand::Configure(1)).is_err());
     }
 
     #[test]

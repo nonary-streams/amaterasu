@@ -10,8 +10,9 @@ Reconcile creates every replacement before removing stale mappings. If an add
 fails, mappings created during that attempt are rolled back and the old owned
 mappings remain. Existing mappings are never adopted or intentionally replaced.
 Changing an endpoint's IPv4 address while keeping the same external port and
-protocol cannot be staged on IGD, so reconcile reports the existing mapping and
-leaves it intact.
+protocol cannot be staged on IGD. Reconcile retargets that key only when the
+current mapping still exactly matches this manager's recorded ownership. If a
+later replacement fails, it attempts to restore the prior owned mappings.
 
 Call `MappingManager::shutdown` during orderly shutdown. It removes only
 mappings the manager successfully created whose full recorded mapping still
@@ -48,6 +49,15 @@ firewall-enabled bit is informational. The NVHTTP caller runs discovery and
 refresh every 120 seconds and removes owned pinholes during orderly shutdown.
 This exact-ID tracking and cleanup is a stricter lifecycle than the pinned
 implementation, which relies on lease expiry after `AddPinhole`.
+Pinholes for listeners removed from the desired set are cleaned up even if
+firewall status, an addition, or an unrelated refresh fails. Still-desired
+pinholes remain tracked, and simultaneous maintenance and cleanup errors are
+both returned so cleanup can be retried.
+
+IPv6 IDs do not establish gateway incarnation or prove that a router has not
+reused an expired ID. The protocol adapter cannot inspect a pinhole's endpoint
+tuple before refresh or deletion. Router restart and ID reuse remain unqualified;
+the process-local ID record is not durable native retirement proof.
 
 Tests use deterministic fake IPv4/IPv6 gateway controls and local protocol
 fixtures; they do not contact a router or change host firewall state. No physical
