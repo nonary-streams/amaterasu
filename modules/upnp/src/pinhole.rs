@@ -1,8 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::net::Ipv6Addr;
+use std::time::Instant;
 
-use crate::{GatewayError, MAPPING_LEASE_SECONDS, Protocol};
+use crate::{GatewayError, MAPPING_LEASE_SECONDS, OperationDeadline, Protocol};
 
 /// Lease requested for each IPv6 firewall pinhole.
 pub const PINHOLE_LEASE_SECONDS: u32 = MAPPING_LEASE_SECONDS;
@@ -63,6 +64,20 @@ pub trait Ipv6FirewallControl {
     ) -> Result<PinholeRefreshOutcome, GatewayError>;
 
     fn delete_pinhole(&mut self, unique_id: u16) -> Result<PinholeDeleteOutcome, GatewayError>;
+
+    /// Deletes an owned pinhole within one absolute shutdown budget.
+    ///
+    /// Adapters must check this deadline before every protocol effect. The
+    /// default refuses bounded cleanup instead of calling an unbounded adapter.
+    fn delete_pinhole_until(
+        &mut self,
+        _unique_id: u16,
+        _deadline: Instant,
+    ) -> Result<PinholeDeleteOutcome, GatewayError> {
+        Err(GatewayError::new(
+            "firewall adapter does not support bounded pinhole cleanup",
+        ))
+    }
 }
 
 /// Summary of one IPv6 pinhole reconciliation.
@@ -138,6 +153,7 @@ impl std::error::Error for PinholeError {}
 pub struct PinholeManager<C> {
     control: C,
     owned: BTreeMap<PinholeEndpoint, u16>,
+    shutdown_deadline: OperationDeadline,
 }
 
 impl<C: Ipv6FirewallControl> PinholeManager<C> {
@@ -145,6 +161,7 @@ impl<C: Ipv6FirewallControl> PinholeManager<C> {
         Self {
             control,
             owned: BTreeMap::new(),
+            shutdown_deadline: OperationDeadline::default(),
         }
     }
 
@@ -259,6 +276,12 @@ impl<C: Ipv6FirewallControl> PinholeManager<C> {
         Ok(report)
     }
 
+    /// Deletes owned IDs without renewing an earlier shutdown budget.
+    pub fn shutdown_until(&mut self, deadline: Instant) -> Result<PinholeReport, PinholeError> {
+        self.shutdown_deadline.restrict(deadline);
+        self.shutdown()
+    }
+
     pub fn owned_pinholes(&self) -> impl Iterator<Item = (PinholeEndpoint, u16)> + '_ {
         self.owned
             .iter()
@@ -278,7 +301,14 @@ impl<C: Ipv6FirewallControl> PinholeManager<C> {
             .collect();
         let mut failures = Vec::new();
         for (endpoint, unique_id) in stale {
-            match self.control.delete_pinhole(unique_id) {
+            let deletion = match self.shutdown_deadline.deadline() {
+                Some(deadline) if deadline <= Instant::now() => {
+                    Err(GatewayError::new("pinhole shutdown deadline exceeded"))
+                }
+                Some(deadline) => self.control.delete_pinhole_until(unique_id, deadline),
+                None => self.control.delete_pinhole(unique_id),
+            };
+            match deletion {
                 Ok(PinholeDeleteOutcome::Deleted) => {
                     self.owned.remove(&endpoint);
                     report.removed += 1;

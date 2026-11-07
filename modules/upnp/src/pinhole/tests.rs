@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::net::Ipv6Addr;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use super::*;
 
@@ -69,6 +70,17 @@ impl Ipv6FirewallControl for FakeControl {
         }
     }
 
+    fn delete_pinhole_until(
+        &mut self,
+        unique_id: u16,
+        deadline: Instant,
+    ) -> Result<PinholeDeleteOutcome, GatewayError> {
+        if Instant::now() >= deadline {
+            return Err(GatewayError::new("test firewall deadline expired"));
+        }
+        self.delete_pinhole(unique_id)
+    }
+
     fn add_pinhole(
         &mut self,
         endpoint: PinholeEndpoint,
@@ -119,6 +131,33 @@ impl Ipv6FirewallControl for FakeControl {
             PinholeDeleteOutcome::Missing
         })
     }
+}
+
+#[test]
+fn expired_pinhole_shutdown_budget_preserves_exact_ids_and_cannot_be_renewed() {
+    let control = FakeControl::default();
+    let mut manager = PinholeManager::new(control.clone());
+    let endpoint = PinholeEndpoint::new("2001:db8::5".parse().unwrap(), 47998, Protocol::Udp);
+    manager.reconcile(&[endpoint]).unwrap();
+    let before = control.pinholes();
+    assert_eq!(
+        manager.owned_pinholes().collect::<Vec<_>>(),
+        vec![(endpoint, 1)]
+    );
+
+    assert!(manager.shutdown_until(Instant::now()).is_err());
+    assert_eq!(control.pinholes(), before);
+    assert_eq!(
+        manager.owned_pinholes().collect::<Vec<_>>(),
+        vec![(endpoint, 1)]
+    );
+    assert!(
+        manager
+            .shutdown_until(Instant::now() + Duration::from_secs(30))
+            .is_err()
+    );
+    assert!(manager.shutdown().is_err());
+    assert_eq!(control.pinholes(), before);
 }
 
 fn endpoint(address: &str, port: u16, protocol: Protocol) -> PinholeEndpoint {

@@ -219,6 +219,7 @@ fn ipv6_firewall_status_and_pinhole_creation_use_selected_provider_tcp() {
         control_path: "/ipv6/firewall".into(),
         internal_addresses: vec!["2001:db8::9".parse().unwrap()],
         identity: "test".into(),
+        operation_deadline: OperationDeadline::default(),
     };
     let status = firewall.firewall_status().unwrap();
     assert!(status.firewall_enabled && status.pinhole_allowed);
@@ -292,6 +293,7 @@ fn http_total_deadline_stops_a_gateway_that_keeps_trickling_body_bytes() {
         "/description.xml",
         1024,
         started + Duration::from_millis(60),
+        &OperationDeadline::default(),
     );
     assert!(
         result.is_err(),
@@ -341,10 +343,79 @@ fn http_partial_writes_share_one_absolute_deadline() {
             timeouts: RefCell::new(Vec::new()),
         },
         deadline: Instant::now() + Duration::from_millis(45),
+        operation_deadline: OperationDeadline::default(),
     };
     let error = stream.write_all(&[7; 64]).unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     assert!(stream.stream.written > 0 && stream.stream.written < 64);
     let timeouts = stream.stream.timeouts.borrow();
     assert!(timeouts.windows(2).all(|pair| pair[1] < pair[0]));
+}
+
+#[test]
+fn http_partial_writes_observe_a_shared_deadline_restricted_after_the_first_write() {
+    struct RestrictingWriter {
+        operation_deadline: OperationDeadline,
+        written: usize,
+    }
+    impl Read for RestrictingWriter {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            Ok(0)
+        }
+    }
+    impl Write for RestrictingWriter {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            self.operation_deadline.restrict(Instant::now());
+            self.written += 1;
+            Ok(1)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    impl TimedStream for RestrictingWriter {
+        fn read_timeout(&self, _: Duration) -> io::Result<()> {
+            Ok(())
+        }
+        fn write_timeout(&self, _: Duration) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let operation_deadline = OperationDeadline::default();
+    let mut stream = DeadlineIo {
+        stream: RestrictingWriter {
+            operation_deadline: operation_deadline.clone(),
+            written: 0,
+        },
+        deadline: Instant::now() + Duration::from_secs(30),
+        operation_deadline,
+    };
+    let result = stream.write_all(&[7; 64]);
+    assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+    assert_eq!(stream.stream.written, 1);
+}
+
+#[test]
+fn expired_shared_ipv6_cleanup_budget_cannot_open_a_connection_or_be_extended() {
+    let listener = std::net::TcpListener::bind("[::1]:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let SocketAddr::V6(address) = listener.local_addr().unwrap() else {
+        panic!("IPv6 listener required");
+    };
+    let operation_deadline = OperationDeadline::default();
+    operation_deadline.restrict(Instant::now());
+    let mut firewall = IgdIpv6Firewall {
+        network: Network::test_provider(),
+        control_address: address,
+        control_path: "/ipv6/firewall".into(),
+        internal_addresses: vec!["2001:db8::9".parse().unwrap()],
+        identity: "expired-budget-test".into(),
+        operation_deadline,
+    };
+    assert!(
+        firewall
+            .delete_pinhole_until(17, Instant::now() + Duration::from_secs(30))
+            .is_err()
+    );
+    assert!(matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock));
 }

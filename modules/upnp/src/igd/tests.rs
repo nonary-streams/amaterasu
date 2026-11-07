@@ -167,6 +167,7 @@ fn ipv4_mapping_inspection_and_safe_delete_use_selected_provider_tcp() {
         control_path: "/control/mapping".into(),
         service: SERVICES[2].into(),
         internal_address: mapping.internal_address,
+        operation_deadline: OperationDeadline::default(),
     };
     assert_eq!(
         gateway.remove_if_matches(&mapping).unwrap(),
@@ -179,4 +180,104 @@ fn ipv4_mapping_inspection_and_safe_delete_use_selected_provider_tcp() {
     assert!(requests[2].contains("WANIPConnection:2#DeletePortMapping"));
     assert!(requests[2].contains("<NewExternalPort>47998</NewExternalPort>"));
     assert!(requests[2].contains("<NewProtocol>UDP</NewProtocol>"));
+}
+
+#[test]
+fn shutdown_budget_restricted_during_soap_stops_later_scan_and_delete_effects() {
+    use std::io::{Read, Write};
+    use std::sync::mpsc;
+
+    let operation_deadline = OperationDeadline::default();
+    let peer_deadline = operation_deadline.clone();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let (stop, stopped) = mpsc::channel();
+    let peer = std::thread::spawn(move || {
+        let accept_deadline = Instant::now() + Duration::from_secs(2);
+        let mut requests = Vec::new();
+        let responses = [
+            (200, mapping_xml()),
+            (500, "<Envelope><Body><Fault><detail><UPnPError><errorCode>713</errorCode><errorDescription>SpecifiedArrayIndexInvalid</errorDescription></UPnPError></detail></Fault></Body></Envelope>".into()),
+            (200, "<Envelope><Body><DeletePortMappingResponse/></Body></Envelope>".into()),
+        ];
+        for (status, body) in responses {
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if stopped.try_recv().is_ok() || Instant::now() >= accept_deadline {
+                            return requests;
+                        }
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("loopback SOAP peer failed: {error}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let mut bytes = Vec::new();
+            let mut buffer = [0; 2048];
+            loop {
+                let count = stream.read(&mut buffer).unwrap();
+                assert_ne!(count, 0);
+                bytes.extend_from_slice(&buffer[..count]);
+                if let Some(position) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                    let header_end = position + 4;
+                    let headers = std::str::from_utf8(&bytes[..position]).unwrap();
+                    let length = headers
+                        .lines()
+                        .filter_map(|line| line.split_once(':'))
+                        .find_map(|(name, value)| {
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    if bytes.len() >= header_end + length {
+                        break;
+                    }
+                }
+            }
+            requests.push(String::from_utf8(bytes).unwrap());
+            // The first submitted read is allowed to complete. Its adapter must
+            // observe this restriction before any later SOAP connection/effect.
+            peer_deadline.restrict(Instant::now());
+            let response = format!(
+                "HTTP/1.1 {status} Result\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+        requests
+    });
+
+    let mapping =
+        mapping_from_response(&Element::parse(mapping_xml().as_bytes()).unwrap()).unwrap();
+    let gateway = IgdGateway {
+        network: Network::test_provider(),
+        address,
+        root_path: "/root.xml".into(),
+        control_path: "/control/mapping".into(),
+        service: SERVICES[2].into(),
+        internal_address: mapping.internal_address,
+        operation_deadline,
+    };
+    let mut manager = crate::MappingManager::with_owner_id(gateway, "retained-budget-owner");
+    manager.owned.insert(mapping.key(), mapping.clone());
+    let result = manager.shutdown_until(Instant::now() + Duration::from_secs(30));
+    let _ = stop.send(());
+    let requests = peer.join().unwrap();
+
+    assert!(
+        result.is_err(),
+        "an expired scan must not report a successful delete"
+    );
+    assert_eq!(
+        requests.len(),
+        1,
+        "later SOAP steps must not renew a fresh HTTP budget"
+    );
+    assert!(requests[0].contains("#GetGenericPortMappingEntry"));
+    assert_eq!(manager.owned_mappings().collect::<Vec<_>>(), vec![&mapping]);
 }

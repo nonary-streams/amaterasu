@@ -3,8 +3,8 @@ use amaterasu_module_sdk::network::Network;
 use amaterasu_module_sdk::{Command, Response, RuntimeClient};
 use amaterasu_network_policy::GameStreamPorts;
 use amaterasu_upnp::{
-    Gateway, IgdGateway, MappingEndpoint, MappingManager, Protocol, RECOMMENDED_REFRESH_INTERVAL,
-    discover_gateway,
+    Gateway, IgdGateway, MappingEndpoint, MappingManager, OperationDeadline, Protocol,
+    RECOMMENDED_REFRESH_INTERVAL, discover_gateway_with_deadline,
 };
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -21,6 +21,7 @@ const EXPOSURE_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const EXPOSURE_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const CLEANUP_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_RUNTIME_ERROR_CHARS: usize = 256;
+const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ManagementExposureSnapshot {
@@ -105,6 +106,14 @@ impl ManagementExposure {
 
     pub(crate) fn snapshot(&self) -> ManagementExposureSnapshot {
         self.snapshot
+    }
+
+    pub(crate) fn quiesce(&mut self, runtime: &RuntimeClient) -> bool {
+        if let Some(request) = self.pending {
+            self.cancelling = true;
+            self.cancel_pending(runtime, request);
+        }
+        self.pending.is_none()
     }
 
     fn cancel_pending(&mut self, runtime: &RuntimeClient, request: u64) {
@@ -263,11 +272,102 @@ impl<T> LifecycleReceiver<T> {
     }
 }
 
-/// Owns the UPnP worker and guarantees an orderly best-effort cleanup on drop.
+/// A worker returns its exact remaining owners instead of losing them on error.
+pub(crate) struct WorkerCompletion<T> {
+    pub(crate) owners: T,
+    pub(crate) error: Option<String>,
+}
+
+/// Polling never waits for live native work. Failed cleanup keeps both its
+/// evidence and owners until the enclosing module is safely destroyed.
+pub(crate) struct LifecycleWorker<T> {
+    worker: Option<JoinHandle<WorkerCompletion<T>>>,
+    completion: Option<WorkerCompletion<T>>,
+    failure: Option<String>,
+    never_started: bool,
+}
+
+impl<T> LifecycleWorker<T> {
+    pub(crate) fn new(
+        worker: std::io::Result<JoinHandle<WorkerCompletion<T>>>,
+        start_error: &'static str,
+    ) -> Self {
+        match worker {
+            Ok(worker) => Self {
+                worker: Some(worker),
+                completion: None,
+                failure: None,
+                never_started: false,
+            },
+            Err(error) => Self {
+                worker: None,
+                completion: None,
+                failure: Some(format!("{start_error}: {error}")),
+                never_started: true,
+            },
+        }
+    }
+
+    pub(crate) fn poll(&mut self) -> Result<bool, String> {
+        if self.never_started {
+            // A failed spawn drops the unstarted closure synchronously. Feature
+            // health still reports the startup error, but no worker, callback,
+            // mapping or pinhole exists that shutdown must retire.
+            return Ok(true);
+        }
+        if let Some(error) = &self.failure {
+            return Err(error.clone());
+        }
+        if self
+            .worker
+            .as_ref()
+            .is_some_and(|worker| !worker.is_finished())
+        {
+            return Ok(false);
+        }
+        self.finish();
+        if let Some(error) = &self.failure {
+            return Err(error.clone());
+        }
+        match &self.completion {
+            Some(WorkerCompletion {
+                error: Some(error), ..
+            }) => Err(error.clone()),
+            Some(_) => Ok(true),
+            None => Err("UPnP lifecycle worker has no retirement evidence".into()),
+        }
+    }
+
+    pub(crate) fn finish(&mut self) {
+        if let Some(worker) = self.worker.take() {
+            match worker.join() {
+                Ok(completion) => self.completion = Some(completion),
+                Err(_) => {
+                    self.failure = Some("UPnP lifecycle worker panicked during cleanup".into())
+                }
+            }
+        }
+    }
+
+    pub(crate) fn completion(&self) -> Option<&WorkerCompletion<T>> {
+        self.completion.as_ref()
+    }
+}
+
+impl<T> Drop for LifecycleWorker<T> {
+    fn drop(&mut self) {
+        // Module destruction is a mandatory safety barrier: provider callbacks
+        // and network bindings must not outlive the library that owns them.
+        self.finish();
+    }
+}
+
+/// Owns the UPnP workers and polls exact retirement before module readiness.
 pub(crate) struct UpnpLifecycle {
     commands: LifecycleSender<DesiredMappings>,
     statuses: UpnpStatusMailbox,
-    worker: Option<JoinHandle<()>>,
+    worker: LifecycleWorker<BTreeMap<String, GatewayOwner<IgdGateway>>>,
+    deadline: OperationDeadline,
     ipv6_lifecycle: crate::upnp_ipv6::Ipv6PinholeLifecycle,
     last_desired: Option<DesiredMappings>,
     ipv4_status: UpnpRuntimeStatus,
@@ -277,15 +377,18 @@ pub(crate) struct UpnpLifecycle {
 
 impl UpnpLifecycle {
     pub(crate) fn new(network: Option<Network>) -> Self {
+        let deadline = OperationDeadline::default();
         let (command_tx, command_rx) = lifecycle_channel();
         let statuses = UpnpStatusMailbox::default();
         let worker_statuses = statuses.clone();
         let worker_network = network.clone();
+        let worker_deadline = deadline.clone();
         let worker = thread::Builder::new()
             .name("amaterasu-upnp".into())
-            .spawn(move || run_worker(worker_network, command_rx, worker_statuses))
-            .ok();
-        let status = if worker.is_some() {
+            .spawn(move || {
+                run_worker(worker_network, command_rx, worker_statuses, worker_deadline)
+            });
+        let status = if worker.is_ok() {
             UpnpRuntimeStatus::default()
         } else {
             UpnpRuntimeStatus {
@@ -293,12 +396,13 @@ impl UpnpLifecycle {
                 error: Some("UPnP lifecycle worker could not be started".into()),
             }
         };
-        let ipv6_lifecycle = crate::upnp_ipv6::Ipv6PinholeLifecycle::new(network);
+        let ipv6_lifecycle = crate::upnp_ipv6::Ipv6PinholeLifecycle::new(network, deadline.clone());
         let ipv6_status = ipv6_lifecycle.status().clone();
         Self {
             commands: command_tx,
             statuses,
-            worker,
+            worker: LifecycleWorker::new(worker, "UPnP lifecycle worker could not be started"),
+            deadline,
             ipv6_lifecycle,
             last_desired: None,
             ipv4_status: status.clone(),
@@ -335,18 +439,59 @@ impl UpnpLifecycle {
         &self.status
     }
 
-    pub(crate) fn shutdown(&mut self) {
+    pub(crate) fn prepare_shutdown(&self, deadline: Instant) {
+        self.deadline.restrict(deadline);
+    }
+
+    fn request_shutdown(&self) {
+        self.deadline
+            .restrict(Instant::now() + DEFAULT_SHUTDOWN_TIMEOUT);
         let _ = self.commands.send(LifecycleCommand::Shutdown);
         self.ipv6_lifecycle.request_shutdown();
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
+    }
+
+    pub(crate) fn poll_shutdown(&mut self) -> Result<bool, String> {
+        self.request_shutdown();
+        // Poll both families even when one fails, so one stalled router does
+        // not prevent the independent worker from retiring its resources.
+        let ipv4 = self.worker.poll().and_then(|ready| {
+            let retained = self.worker.completion().map_or(0, |completion| {
+                completion
+                    .owners
+                    .values()
+                    .map(|owner| owner.manager.owned_mappings().count())
+                    .sum::<usize>()
+            });
+            if ready && retained > 0 {
+                Err(format!(
+                    "{retained} owned IPv4 mapping(s) remain pending cleanup"
+                ))
+            } else {
+                Ok(ready)
+            }
+        });
+        let ipv6 = self.ipv6_lifecycle.poll_shutdown();
+        self.refresh_status();
+        match (ipv4, ipv6) {
+            (Ok(ipv4), Ok(ipv6)) => Ok(ipv4 && ipv6),
+            (Err(error), Ok(_)) | (Ok(_), Err(error)) => Err(error),
+            (Err(ipv4), Err(ipv6)) => Err(bounded_runtime_error(format!("{ipv4}; {ipv6}"))),
         }
+    }
+
+    fn refresh_status(&mut self) {
         while let Ok(status) = self.statuses.try_recv() {
             self.ipv4_status = status;
         }
-        self.ipv6_lifecycle.shutdown();
         self.ipv6_status = self.ipv6_lifecycle.status().clone();
         self.status = merge_runtime_status(&self.ipv4_status, &self.ipv6_status);
+    }
+
+    pub(crate) fn shutdown(&mut self) {
+        self.request_shutdown();
+        self.worker.finish();
+        self.ipv6_lifecycle.shutdown();
+        self.refresh_status();
     }
 }
 
@@ -488,7 +633,8 @@ fn run_worker(
     network: Option<Network>,
     commands: LifecycleReceiver<DesiredMappings>,
     statuses: UpnpStatusMailbox,
-) {
+    deadline: OperationDeadline,
+) -> WorkerCompletion<BTreeMap<String, GatewayOwner<IgdGateway>>> {
     let mut desired = DesiredMappings::default();
     let mut gateways: BTreeMap<String, GatewayOwner<IgdGateway>> = BTreeMap::new();
     let mut active_gateway: Option<String> = None;
@@ -515,15 +661,20 @@ fn run_worker(
         }
 
         if shutdown {
-            if let Some(error) = shutdown_gateways(&mut gateways) {
+            deadline.restrict(Instant::now() + DEFAULT_SHUTDOWN_TIMEOUT);
+            let error = shutdown_gateways(&mut gateways, &deadline);
+            if let Some(error) = &error {
                 let _ = statuses.send(UpnpRuntimeStatus {
                     status: "error".into(),
-                    error: Some(error),
+                    error: Some(error.clone()),
                 });
             } else {
                 let _ = statuses.send(UpnpRuntimeStatus::default());
             }
-            break;
+            return WorkerCompletion {
+                owners: gateways,
+                error,
+            };
         }
 
         let now = Instant::now();
@@ -552,8 +703,9 @@ fn run_worker(
                         .ok_or_else(|| {
                             amaterasu_upnp::GatewayError::new("UPnP network provider unavailable")
                         })
-                        .and_then(discover_gateway)
-                    {
+                        .and_then(|network| {
+                            discover_gateway_with_deadline(network, deadline.clone())
+                        }) {
                         Ok(gateway) => {
                             last_discovery_error = None;
                             discovery_error = None;
@@ -827,12 +979,33 @@ fn cleanup_inactive_gateways<G: Gateway>(
 
 fn shutdown_gateways<G: Gateway>(
     gateways: &mut BTreeMap<String, GatewayOwner<G>>,
+    deadline: &OperationDeadline,
 ) -> Option<String> {
+    deadline.restrict(Instant::now() + DEFAULT_SHUTDOWN_TIMEOUT);
+    if gateways
+        .values()
+        .all(|owner| owner.manager.owned_mappings().next().is_none())
+    {
+        return None;
+    }
     let mut last_errors = Vec::new();
+    let mut attempts = 0;
     for _ in 0..3 {
+        if deadline.is_expired() {
+            last_errors.push("UPnP shutdown deadline exceeded".into());
+            break;
+        }
+        attempts += 1;
         let mut attempt_errors = Vec::new();
         for owner in gateways.values_mut() {
-            if let Err(error) = owner.manager.shutdown() {
+            if deadline.is_expired() {
+                attempt_errors.push("UPnP shutdown deadline exceeded".into());
+                break;
+            }
+            if let Err(error) = owner
+                .manager
+                .shutdown_until(deadline.deadline().expect("shutdown deadline"))
+            {
                 attempt_errors.push(bounded_runtime_error(error));
             }
         }
@@ -853,8 +1026,13 @@ fn shutdown_gateways<G: Gateway>(
         .first()
         .map(String::as_str)
         .unwrap_or("gateway cleanup did not complete");
+    let attempts = if attempts == 3 {
+        "three shutdown attempts".to_owned()
+    } else {
+        format!("{attempts} shutdown attempt(s) before the deadline expired")
+    };
     Some(bounded_runtime_error(format!(
-        "Could not remove {retained_mappings} owned mapping(s) after three shutdown attempts; leases may remain active for up to 3600 seconds. Last error: {last_error}"
+        "Could not remove {retained_mappings} owned mapping(s) after {attempts}; leases may remain active for up to 3600 seconds. Last error: {last_error}"
     )))
 }
 
@@ -873,6 +1051,7 @@ fn cleanup_status_or(error: Option<String>, fallback: UpnpRuntimeStatus) -> Upnp
 #[cfg(test)]
 mod tests {
     use super::*;
+    use amaterasu_module_sdk::ManagedModule;
     use amaterasu_module_sdk::abi::{self, AbiHeader, BorrowedBytes, HostApi, ReplySink};
     use amaterasu_upnp::{GatewayError, Mapping, MappingKey, RefreshOutcome, RemovalOutcome};
     use std::{
@@ -891,6 +1070,8 @@ mod tests {
     struct FakeCleanupGatewayState {
         mappings: BTreeMap<MappingKey, Mapping>,
         remove_failures_remaining: usize,
+        remove_calls: usize,
+        tighten_deadline_on_remove: Option<OperationDeadline>,
     }
 
     #[derive(Clone)]
@@ -922,6 +1103,10 @@ mod tests {
 
         fn remove_if_matches(&mut self, mapping: &Mapping) -> Result<RemovalOutcome, GatewayError> {
             let mut state = self.state.lock().unwrap();
+            state.remove_calls += 1;
+            if let Some(deadline) = &state.tighten_deadline_on_remove {
+                deadline.restrict(Instant::now());
+            }
             if state.remove_failures_remaining > 0 {
                 state.remove_failures_remaining -= 1;
                 return Err(GatewayError::new("temporary gateway cleanup failure"));
@@ -934,6 +1119,17 @@ mod tests {
             }
             state.mappings.remove(&mapping.key());
             Ok(RemovalOutcome::Removed)
+        }
+
+        fn remove_if_matches_until(
+            &mut self,
+            mapping: &Mapping,
+            deadline: Instant,
+        ) -> Result<RemovalOutcome, GatewayError> {
+            if Instant::now() >= deadline {
+                return Err(GatewayError::new("mock cleanup deadline exceeded"));
+            }
+            self.remove_if_matches(mapping)
         }
 
         fn refresh_if_matches(
@@ -997,6 +1193,11 @@ mod tests {
         let mut state = state.lock().unwrap();
         state.commands.push(command.clone());
         let response = match command {
+            Command::GetSettings {} => Response::Result { payload: json!({}) },
+            Command::Register { .. }
+            | Command::RegisterApi { .. }
+            | Command::Log { .. }
+            | Command::HostPackageBarrierRegister {} => Response::Ok,
             Command::Request { .. } => Response::Accepted { id: 41 },
             Command::TakeResult { request: 41 } => Response::Result {
                 payload: state.result.clone(),
@@ -1087,6 +1288,128 @@ mod tests {
         let (commands, worker) = lifecycle_channel();
         drop(worker);
         assert!(commands.send(LifecycleCommand::Configure(1)).is_err());
+    }
+
+    #[test]
+    fn nvhttp_quiescence_waits_for_the_owned_upnp_worker_without_joining_it() {
+        let state = Arc::new(Mutex::new(ExposureEndpointState::default()));
+        let runtime = exposure_runtime(state.clone());
+        let mut module = crate::NvhttpModule::start(runtime).unwrap();
+        // Retire the idle real workers before installing a held mock at the
+        // same production worker boundary. No discovery or socket is opened.
+        module.upnp_lifecycle.shutdown();
+        let (release, held) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let error = held
+                .recv_timeout(Duration::from_secs(2))
+                .err()
+                .map(|_| "held UPnP worker did not receive its test release".to_owned());
+            WorkerCompletion {
+                owners: BTreeMap::new(),
+                error,
+            }
+        });
+        module.upnp_lifecycle.worker = LifecycleWorker::new(Ok(worker), "test worker");
+
+        let started = Instant::now();
+        let result = module.quiesce();
+        let elapsed = started.elapsed();
+        // Always release the fixture before asserting, including a regression
+        // that incorrectly returns ready, so Drop can still join safely.
+        let _ = release.send(());
+        assert_eq!(result, Ok(false));
+        assert!(elapsed < Duration::from_millis(250));
+
+        let timeout = Instant::now() + Duration::from_secs(2);
+        while !module.quiesce().unwrap() {
+            assert!(Instant::now() < timeout);
+            thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn worker_cleanup_failure_retains_its_exact_returned_owners() {
+        let (release, held) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            held.recv_timeout(Duration::from_secs(2)).unwrap();
+            WorkerCompletion {
+                owners: vec!["gateway:TCP:47989".to_owned()],
+                error: Some("router did not confirm mapping removal".into()),
+            }
+        });
+        let mut worker = LifecycleWorker::new(Ok(worker), "test worker");
+        let pending = worker.poll();
+        release.send(()).unwrap();
+        assert_eq!(pending, Ok(false));
+        worker.finish();
+        assert_eq!(
+            worker.poll(),
+            Err("router did not confirm mapping removal".into())
+        );
+        assert_eq!(worker.completion().unwrap().owners, ["gateway:TCP:47989"]);
+        assert_eq!(
+            worker.poll(),
+            Err("router did not confirm mapping removal".into())
+        );
+        assert_eq!(worker.completion().unwrap().owners, ["gateway:TCP:47989"]);
+    }
+
+    #[test]
+    fn unstarted_worker_is_retired_while_panicked_worker_remains_failed() {
+        let mut unstarted = LifecycleWorker::<Vec<String>>::new(
+            Err(std::io::Error::other("injected thread resource exhaustion")),
+            "UPnP worker failed to start",
+        );
+        assert_eq!(unstarted.poll(), Ok(true));
+        assert!(unstarted.completion().is_none());
+
+        let handle = thread::spawn(|| -> WorkerCompletion<Vec<String>> {
+            panic!("injected worker panic after start")
+        });
+        let mut panicked = LifecycleWorker::new(Ok(handle), "test worker");
+        panicked.finish();
+        assert!(panicked.poll().unwrap_err().contains("panicked"));
+    }
+
+    #[test]
+    fn shutdown_preparation_cannot_renew_the_shared_budget() {
+        let mut lifecycle = UpnpLifecycle::new(None);
+        let deadline = Instant::now();
+        lifecycle.prepare_shutdown(deadline);
+        lifecycle.prepare_shutdown(deadline + Duration::from_secs(30));
+        lifecycle.request_shutdown();
+        assert_eq!(lifecycle.deadline.deadline(), Some(deadline));
+        lifecycle.shutdown();
+    }
+
+    #[test]
+    fn management_exposure_quiescence_keeps_retrying_the_same_pending_request() {
+        let state = Arc::new(Mutex::new(ExposureEndpointState {
+            release_failures_remaining: 1,
+            ..ExposureEndpointState::default()
+        }));
+        let runtime = exposure_runtime(state.clone());
+        let mut exposure = ManagementExposure::default();
+        exposure.tick(&runtime);
+        assert!(!exposure.quiesce(&runtime));
+        assert_eq!(exposure.pending, Some(41));
+        assert!(exposure.quiesce(&runtime));
+        assert!(exposure.pending.is_none());
+        let commands = &state.lock().unwrap().commands;
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| matches!(command, Command::Request { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| matches!(command, Command::ReleaseResult { request: 41 }))
+                .count(),
+            2
+        );
     }
 
     #[test]
@@ -1365,13 +1688,31 @@ mod tests {
         let (owner, state) = owned_fake_gateway(3);
         let mut gateways = BTreeMap::from([("gateway".into(), owner)]);
 
-        let error = shutdown_gateways(&mut gateways).unwrap();
+        let deadline = OperationDeadline::default();
+        deadline.restrict(Instant::now() + DEFAULT_SHUTDOWN_TIMEOUT);
+        let error = shutdown_gateways(&mut gateways, &deadline).unwrap();
 
         assert!(error.contains("three shutdown attempts"));
         assert!(error.contains("3600 seconds"));
         assert!(error.contains("mapping cleanup failure"));
         assert_eq!(state.lock().unwrap().mappings.len(), 1);
         assert_eq!(gateways["gateway"].manager.owned_mappings().count(), 1);
+    }
+
+    #[test]
+    fn shortened_shutdown_budget_stops_later_gateways_and_keeps_exact_mappings() {
+        let deadline = OperationDeadline::default();
+        deadline.restrict(Instant::now() + DEFAULT_SHUTDOWN_TIMEOUT);
+        let (first, first_state) = owned_fake_gateway(usize::MAX);
+        let (second, second_state) = owned_fake_gateway(usize::MAX);
+        first_state.lock().unwrap().tighten_deadline_on_remove = Some(deadline.clone());
+        let mut gateways = BTreeMap::from([("a".into(), first), ("b".into(), second)]);
+
+        assert!(shutdown_gateways(&mut gateways, &deadline).is_some());
+        assert_eq!(first_state.lock().unwrap().remove_calls, 1);
+        assert_eq!(second_state.lock().unwrap().remove_calls, 0);
+        assert_eq!(gateways["a"].manager.owned_mappings().count(), 1);
+        assert_eq!(gateways["b"].manager.owned_mappings().count(), 1);
     }
 
     #[test]

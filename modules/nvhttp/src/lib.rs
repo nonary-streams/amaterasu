@@ -351,6 +351,14 @@ impl ManagedModule for NvhttpModule {
         })
     }
 
+    fn prepare_shutdown(&mut self, remaining_ms: u64) -> ModuleResult<()> {
+        let deadline = Instant::now()
+            .checked_add(Duration::from_millis(remaining_ms))
+            .ok_or("nvhttp shutdown deadline exceeds monotonic clock bounds")?;
+        self.upnp_lifecycle.prepare_shutdown(deadline);
+        Ok(())
+    }
+
     fn quiesce(&mut self) -> ModuleResult<bool> {
         self.log_queue.flush(&self.runtime);
         if !self.quiescing {
@@ -361,7 +369,10 @@ impl ManagedModule for NvhttpModule {
                 }
             }
         }
-        Ok(self.router.as_mut().is_none_or(wire::Router::quiesce))
+        let router_ready = self.router.as_mut().is_none_or(wire::Router::quiesce);
+        let exposure_ready = self.management_exposure.quiesce(&self.runtime);
+        let upnp_ready = self.upnp_lifecycle.poll_shutdown()?;
+        Ok(router_ready && exposure_ready && upnp_ready)
     }
 
     fn tick(&mut self) -> ModuleResult<()> {

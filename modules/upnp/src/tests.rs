@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use super::{
     Gateway, GatewayError, ListenerEndpoint, MAPPING_LEASE_SECONDS, Mapping, MappingEndpoint,
@@ -147,6 +148,17 @@ impl Gateway for FakeGateway {
         }
     }
 
+    fn remove_if_matches_until(
+        &mut self,
+        mapping: &Mapping,
+        deadline: Instant,
+    ) -> Result<RemovalOutcome, GatewayError> {
+        if Instant::now() >= deadline {
+            return Err(GatewayError::new("test gateway deadline expired"));
+        }
+        self.remove_if_matches(mapping)
+    }
+
     fn refresh_if_matches(&mut self, mapping: &Mapping) -> Result<RefreshOutcome, GatewayError> {
         let mut state = self.0.borrow_mut();
         let key = mapping.key();
@@ -165,6 +177,40 @@ impl Gateway for FakeGateway {
             Some(_) => Ok(RefreshOutcome::Changed),
         }
     }
+}
+
+#[test]
+fn expired_mapping_shutdown_budget_preserves_exact_owned_entries_and_cannot_be_renewed() {
+    let gateway = FakeGateway::default();
+    let mut manager = MappingManager::with_owner_id(gateway.clone(), "expired-budget");
+    manager
+        .reconcile(&[ListenerEndpoint::new(
+            "192.168.1.5".parse().unwrap(),
+            47998,
+            true,
+        )])
+        .unwrap();
+    let before = gateway.mappings();
+    assert_eq!(before.len(), 2);
+
+    assert!(manager.shutdown_until(Instant::now()).is_err());
+    assert_eq!(
+        gateway.mappings(),
+        before,
+        "expired cleanup must have no router effect"
+    );
+    assert_eq!(manager.owned_mappings().count(), 2);
+    assert!(
+        manager
+            .shutdown_until(Instant::now() + Duration::from_secs(30))
+            .is_err()
+    );
+    assert!(
+        manager.shutdown().is_err(),
+        "plain retry must not bypass the chosen budget"
+    );
+    assert_eq!(gateway.mappings(), before);
+    assert_eq!(manager.owned_mappings().count(), 2);
 }
 
 fn endpoint(address: [u8; 4], port: u16, active: bool) -> ListenerEndpoint {

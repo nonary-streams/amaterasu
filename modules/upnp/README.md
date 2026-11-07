@@ -39,6 +39,23 @@ must schedule refreshes.
 discovery errors. Mapping, cleanup, and refresh errors are returned to the
 caller.
 
+For host shutdown, construct a shared `OperationDeadline` and pass clones to
+`discover_gateway_with_deadline` and `discover_ipv6_firewalls_with_deadline`.
+Calling `restrict` records the earliest absolute deadline, including while a
+worker is reconciling or refreshing. Both adapters check it before each new
+SOAP connection and each partial HTTP read or write; normal HTTP requests keep
+their three-second cap. A call already submitted to the selected network
+provider retains its previously submitted timeout. A later SOAP action,
+interface search, retry, or gateway must not receive a fresh shutdown budget.
+
+Use `MappingManager::shutdown_until` and `PinholeManager::shutdown_until` with
+that same earliest deadline. Expiration preserves unresolved exact mapping
+values and pinhole IDs and returns an error. Both managers retain the earliest
+shutdown deadline across retries, including a later plain `shutdown` call.
+Replacement gateway adapters implement `Gateway::remove_if_matches_until` or
+`Ipv6FirewallControl::delete_pinhole_until` to honor that absolute budget; their
+default implementations fail closed rather than invoking an unbounded method.
+
 `discover_ipv6_firewalls(&network)` separately searches `ff02::c` from each selected local
 IPv6 interface, retaining that interface scope for the gateway's link-local
 control endpoint. `PinholeManager` uses `WANIPv6FirewallControl`, asks for a

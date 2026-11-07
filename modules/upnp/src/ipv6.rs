@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use xmltree::{Element, XMLNode};
 
 use crate::{
-    GatewayError, Ipv6FirewallControl, PinholeDeleteOutcome, PinholeEndpoint,
+    GatewayError, Ipv6FirewallControl, OperationDeadline, PinholeDeleteOutcome, PinholeEndpoint,
     PinholeRefreshOutcome, Protocol,
 };
 
@@ -37,6 +37,7 @@ pub struct IgdIpv6Firewall {
     control_path: String,
     internal_addresses: Vec<Ipv6Addr>,
     identity: String,
+    operation_deadline: OperationDeadline,
 }
 
 impl IgdIpv6Firewall {
@@ -87,6 +88,17 @@ pub fn ipv6_interface_addresses(
 
 /// Discovers IPv6 IGDs separately with scoped `ff02::c` SSDP searches.
 pub fn discover_ipv6_firewalls(network: &Network) -> Result<Vec<IgdIpv6Firewall>, GatewayError> {
+    discover_ipv6_firewalls_with_deadline(network, OperationDeadline::default())
+}
+
+/// Discovers gateways while honoring a shared shutdown budget, including between interfaces.
+pub fn discover_ipv6_firewalls_with_deadline(
+    network: &Network,
+    operation_deadline: OperationDeadline,
+) -> Result<Vec<IgdIpv6Firewall>, GatewayError> {
+    operation_deadline
+        .remaining(Instant::now() + IPV6_SEARCH_TIMEOUT)
+        .map_err(|error| GatewayError::new(error.to_string()))?;
     let addresses = ipv6_interface_addresses(network)?;
     let mut interface_addresses = std::collections::BTreeMap::<u32, Vec<Ipv6Addr>>::new();
     for entry in addresses {
@@ -117,6 +129,7 @@ pub fn discover_ipv6_firewalls(network: &Network) -> Result<Vec<IgdIpv6Firewall>
             interface_index,
             internal_address,
             &internal_addresses,
+            &operation_deadline,
         ) {
             Ok(Some(firewall))
                 if !discovered
@@ -144,21 +157,34 @@ fn discover_on_interface(
     interface_index: u32,
     internal_address: Ipv6Addr,
     internal_addresses: &[Ipv6Addr],
+    operation_deadline: &OperationDeadline,
 ) -> Result<Option<IgdIpv6Firewall>, GatewayError> {
+    operation_deadline
+        .remaining(Instant::now() + IPV6_SEARCH_TIMEOUT)
+        .map_err(|error| GatewayError::new(error.to_string()))?;
     let socket = create_ssdp_socket(network, interface_index, internal_address)?;
     let request = format!(
         "M-SEARCH * HTTP/1.1\r\nHOST: [FF02::C]:{SSDP_PORT}\r\nMAN: \"ssdp:discover\"\r\nMX: 2\r\nST: {IGD_DEVICE_TYPE}\r\n\r\n"
     );
     let destination = SocketAddr::V6(SocketAddrV6::new(SSDP_GROUP, SSDP_PORT, 0, interface_index));
     socket
-        .send_to(request.as_bytes(), destination)
+        .set_write_timeout(Some(
+            operation_deadline
+                .remaining(Instant::now() + IPV6_SEARCH_TIMEOUT)
+                .map_err(|error| GatewayError::new(error.to_string()))?,
+        ))
+        .and_then(|()| socket.send_to(request.as_bytes(), destination))
         .map_err(|error| GatewayError::new(format!("IPv6 IGD search failed: {error}")))?;
 
     let deadline = Instant::now() + IPV6_SEARCH_TIMEOUT;
     let mut response_buffer = [0u8; MAX_SSDP_RESPONSE_BYTES];
     while Instant::now() < deadline {
         socket
-            .set_read_timeout(Some(deadline.saturating_duration_since(Instant::now())))
+            .set_read_timeout(Some(
+                operation_deadline
+                    .remaining(deadline)
+                    .map_err(|error| GatewayError::new(error.to_string()))?,
+            ))
             .map_err(|error| GatewayError::new(format!("IPv6 IGD search failed: {error}")))?;
         let (read, source) = match socket.recv_from(&mut response_buffer) {
             Ok(response) => response,
@@ -181,10 +207,13 @@ fn discover_on_interface(
             network,
             response,
             source,
-            interface_index,
-            internal_address,
-            internal_addresses,
-            deadline,
+            InterfaceSearch {
+                interface_index,
+                internal_address,
+                internal_addresses,
+                deadline,
+                operation_deadline,
+            },
         )? {
             return Ok(Some(firewall));
         }
@@ -214,15 +243,27 @@ fn create_ssdp_socket(
     Ok(socket)
 }
 
+struct InterfaceSearch<'a> {
+    interface_index: u32,
+    internal_address: Ipv6Addr,
+    internal_addresses: &'a [Ipv6Addr],
+    deadline: Instant,
+    operation_deadline: &'a OperationDeadline,
+}
+
 fn parse_ssdp_response(
     network: &Network,
     response: &[u8],
     source: SocketAddr,
-    interface_index: u32,
-    internal_address: Ipv6Addr,
-    internal_addresses: &[Ipv6Addr],
-    deadline: Instant,
+    search: InterfaceSearch<'_>,
 ) -> Result<Option<IgdIpv6Firewall>, GatewayError> {
+    let InterfaceSearch {
+        interface_index,
+        internal_address,
+        internal_addresses,
+        deadline,
+        operation_deadline,
+    } = search;
     let Some((target, location)) = parse_ssdp_advertisement(response) else {
         return Ok(None);
     };
@@ -242,6 +283,7 @@ fn parse_ssdp_response(
         &device_path,
         MAX_DESCRIPTION_BYTES,
         deadline,
+        operation_deadline,
     )?;
     if description.status != 200 {
         return Ok(None);
@@ -267,6 +309,7 @@ fn parse_ssdp_response(
         control_path,
         internal_addresses: internal_addresses.to_vec(),
         identity,
+        operation_deadline: operation_deadline.clone(),
     }))
 }
 
@@ -411,26 +454,27 @@ pub(crate) struct HttpResponse {
     pub body: Vec<u8>,
 }
 
-pub(crate) fn http_request(
+pub(crate) fn http_post(
     network: &Network,
     address: SocketAddr,
     path: &str,
-    method: &str,
     headers: &[(&str, &str)],
     body: Option<&[u8]>,
     max_body_bytes: usize,
+    operation_deadline: &OperationDeadline,
 ) -> Result<HttpResponse, GatewayError> {
     perform_http(
         network,
         HttpOperation {
             address,
             path,
-            method,
+            method: "POST",
             headers,
             body,
             max_body_bytes,
         },
         Instant::now() + HTTP_TIMEOUT,
+        operation_deadline,
     )
 }
 
@@ -440,6 +484,7 @@ pub(crate) fn http_get_until(
     path: &str,
     max_body_bytes: usize,
     deadline: Instant,
+    operation_deadline: &OperationDeadline,
 ) -> Result<HttpResponse, GatewayError> {
     perform_http(
         network,
@@ -452,6 +497,7 @@ pub(crate) fn http_get_until(
             max_body_bytes,
         },
         deadline,
+        operation_deadline,
     )
 }
 
@@ -462,18 +508,6 @@ struct HttpOperation<'a> {
     headers: &'a [(&'a str, &'a str)],
     body: Option<&'a [u8]>,
     max_body_bytes: usize,
-}
-
-fn remaining(deadline: Instant) -> io::Result<Duration> {
-    deadline
-        .checked_duration_since(Instant::now())
-        .filter(|duration| !duration.is_zero())
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::TimedOut,
-                "IGD HTTP operation deadline exceeded",
-            )
-        })
 }
 
 trait TimedStream: Read + Write {
@@ -491,20 +525,24 @@ impl TimedStream for TcpStream {
 struct DeadlineIo<S> {
     stream: S,
     deadline: Instant,
+    operation_deadline: OperationDeadline,
 }
 impl<S: TimedStream> Read for DeadlineIo<S> {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
-        self.stream.read_timeout(remaining(self.deadline)?)?;
+        self.stream
+            .read_timeout(self.operation_deadline.remaining(self.deadline)?)?;
         self.stream.read(bytes)
     }
 }
 impl<S: TimedStream> Write for DeadlineIo<S> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.stream.write_timeout(remaining(self.deadline)?)?;
+        self.stream
+            .write_timeout(self.operation_deadline.remaining(self.deadline)?)?;
         self.stream.write(bytes)
     }
     fn flush(&mut self) -> io::Result<()> {
-        self.stream.write_timeout(remaining(self.deadline)?)?;
+        self.stream
+            .write_timeout(self.operation_deadline.remaining(self.deadline)?)?;
         self.stream.flush()
     }
 }
@@ -513,6 +551,7 @@ fn perform_http(
     network: &Network,
     operation: HttpOperation<'_>,
     deadline: Instant,
+    operation_deadline: &OperationDeadline,
 ) -> Result<HttpResponse, GatewayError> {
     let HttpOperation {
         address,
@@ -540,11 +579,17 @@ fn perform_http(
         request.push_str(&format!("Content-Length: {}\r\n", body.len()));
     }
     request.push_str("\r\n");
-    let timeout = remaining(deadline).map_err(|error| GatewayError::new(error.to_string()))?;
+    let timeout = operation_deadline
+        .remaining(deadline)
+        .map_err(|error| GatewayError::new(error.to_string()))?;
     let stream = network
         .connect_tcp(address, timeout)
         .map_err(|error| GatewayError::new(format!("IGD HTTP connection failed: {error}")))?;
-    let mut stream = DeadlineIo { stream, deadline };
+    let mut stream = DeadlineIo {
+        stream,
+        deadline,
+        operation_deadline: operation_deadline.clone(),
+    };
     stream
         .write_all(request.as_bytes())
         .and_then(|()| {
@@ -766,6 +811,15 @@ impl Ipv6FirewallControl for IgdIpv6Firewall {
             Err(error) => Err(error),
         }
     }
+
+    fn delete_pinhole_until(
+        &mut self,
+        unique_id: u16,
+        deadline: Instant,
+    ) -> Result<PinholeDeleteOutcome, GatewayError> {
+        self.operation_deadline.restrict(deadline);
+        self.delete_pinhole(unique_id)
+    }
 }
 
 impl IgdIpv6Firewall {
@@ -776,17 +830,17 @@ impl IgdIpv6Firewall {
     ) -> Result<Element, GatewayError> {
         let body = soap_envelope(action, parameters);
         let action_header = format!("\"{IPV6_FIREWALL_SERVICE}#{action}\"");
-        let response = http_request(
+        let response = http_post(
             &self.network,
             SocketAddr::V6(self.control_address),
             &self.control_path,
-            "POST",
             &[
                 ("Content-Type", "text/xml; charset=\"utf-8\""),
                 ("SOAPAction", &action_header),
             ],
             Some(body.as_bytes()),
             MAX_SOAP_RESPONSE_BYTES,
+            &self.operation_deadline,
         )?;
         let root = Element::parse(response.body.as_slice())
             .map_err(|error| GatewayError::new(format!("invalid IPv6 SOAP response: {error}")))?;

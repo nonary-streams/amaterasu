@@ -2,22 +2,23 @@
 
 use amaterasu_module_sdk::network::Network;
 use amaterasu_upnp::{
-    IgdIpv6Firewall, Ipv6FirewallControl, PinholeEndpoint, PinholeManager,
-    RECOMMENDED_REFRESH_INTERVAL, discover_ipv6_firewalls,
+    IgdIpv6Firewall, Ipv6FirewallControl, OperationDeadline, PinholeEndpoint, PinholeManager,
+    RECOMMENDED_REFRESH_INTERVAL, discover_ipv6_firewalls_with_deadline,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv6Addr};
 use std::sync::mpsc::RecvTimeoutError;
-use std::thread::{self, JoinHandle};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::upnp::{
-    LifecycleCommand, LifecycleReceiver, LifecycleSender, UpnpRuntimeStatus, UpnpStatusMailbox,
-    lifecycle_channel,
+    LifecycleCommand, LifecycleReceiver, LifecycleSender, LifecycleWorker, UpnpRuntimeStatus,
+    UpnpStatusMailbox, WorkerCompletion, lifecycle_channel,
 };
 
 const CLEANUP_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_RUNTIME_ERROR_CHARS: usize = 256;
+const DEFAULT_SHUTDOWN_BUDGET: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct DesiredPinholes {
@@ -29,21 +30,22 @@ struct DesiredPinholes {
 pub(crate) struct Ipv6PinholeLifecycle {
     commands: LifecycleSender<DesiredPinholes>,
     statuses: UpnpStatusMailbox,
-    worker: Option<JoinHandle<()>>,
+    worker: LifecycleWorker<BTreeMap<String, Ipv6GatewayOwner<IgdIpv6Firewall>>>,
+    deadline: OperationDeadline,
     last_desired: Option<DesiredPinholes>,
     status: UpnpRuntimeStatus,
 }
 
 impl Ipv6PinholeLifecycle {
-    pub(crate) fn new(network: Option<Network>) -> Self {
+    pub(crate) fn new(network: Option<Network>, deadline: OperationDeadline) -> Self {
         let (command_tx, command_rx) = lifecycle_channel();
         let statuses = UpnpStatusMailbox::default();
         let worker_statuses = statuses.clone();
+        let worker_deadline = deadline.clone();
         let worker = thread::Builder::new()
             .name("amaterasu-upnp-ipv6".into())
-            .spawn(move || run_worker(network, command_rx, worker_statuses))
-            .ok();
-        let status = if worker.is_some() {
+            .spawn(move || run_worker(network, command_rx, worker_statuses, worker_deadline));
+        let status = if worker.is_ok() {
             UpnpRuntimeStatus {
                 status: "disabled".into(),
                 error: None,
@@ -57,7 +59,8 @@ impl Ipv6PinholeLifecycle {
         Self {
             commands: command_tx,
             statuses,
-            worker,
+            worker: LifecycleWorker::new(worker, "IPv6 UPnP lifecycle"),
+            deadline,
             last_desired: None,
             status,
         }
@@ -100,17 +103,41 @@ impl Ipv6PinholeLifecycle {
         let _ = self.commands.send(LifecycleCommand::Shutdown);
     }
 
-    pub(crate) fn shutdown(&mut self) {
-        if self.worker.is_none() {
-            return;
-        }
-        self.request_shutdown();
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
+    pub(crate) fn poll_shutdown(&mut self) -> Result<bool, String> {
+        let outcome = self.worker.poll().and_then(|ready| {
+            if !ready {
+                return Ok(false);
+            }
+            let retained = self
+                .worker
+                .completion()
+                .map_or(0, |completion| owned_pinhole_count(&completion.owners));
+            if retained > 0 {
+                Err(format!(
+                    "{retained} IPv6 pinhole(s) remain pending cleanup after worker retirement"
+                ))
+            } else {
+                Ok(true)
+            }
+        });
         while let Ok(status) = self.statuses.try_recv() {
             self.status = status;
         }
+        if let Err(error) = &outcome {
+            self.status = UpnpRuntimeStatus {
+                status: "error".into(),
+                error: Some(error.clone()),
+            };
+        }
+        outcome
+    }
+
+    pub(crate) fn shutdown(&mut self) {
+        install_default_shutdown_deadline(&self.deadline);
+        self.request_shutdown();
+        // Module destruction is the final safety barrier. A live worker retains
+        // network-provider callbacks and must finish before its code can unload.
+        self.worker.finish();
     }
 }
 
@@ -120,11 +147,18 @@ impl Drop for Ipv6PinholeLifecycle {
     }
 }
 
+fn install_default_shutdown_deadline(deadline: &OperationDeadline) {
+    if deadline.deadline().is_none() {
+        deadline.restrict(Instant::now() + DEFAULT_SHUTDOWN_BUDGET);
+    }
+}
+
 fn run_worker(
     network: Option<Network>,
     commands: LifecycleReceiver<DesiredPinholes>,
     statuses: UpnpStatusMailbox,
-) {
+    deadline: OperationDeadline,
+) -> WorkerCompletion<BTreeMap<String, Ipv6GatewayOwner<IgdIpv6Firewall>>> {
     let mut desired = DesiredPinholes::default();
     let mut gateways: BTreeMap<String, Ipv6GatewayOwner<IgdIpv6Firewall>> = BTreeMap::new();
     let mut active_gateways = BTreeSet::new();
@@ -150,7 +184,8 @@ fn run_worker(
         }
 
         if shutdown {
-            let status = shutdown_gateways(&mut gateways).map_or_else(
+            let error = shutdown_gateways(&mut gateways, &deadline);
+            let status = error.clone().map_or_else(
                 || UpnpRuntimeStatus {
                     status: "disabled".into(),
                     error: None,
@@ -161,7 +196,10 @@ fn run_worker(
                 },
             );
             let _ = statuses.send(status);
-            break;
+            return WorkerCompletion {
+                owners: gateways,
+                error,
+            };
         }
 
         let now = Instant::now();
@@ -192,8 +230,9 @@ fn run_worker(
                                 "IPv6 UPnP network provider unavailable",
                             )
                         })
-                        .and_then(discover_ipv6_firewalls)
-                    {
+                        .and_then(|network| {
+                            discover_ipv6_firewalls_with_deadline(network, deadline.clone())
+                        }) {
                         Ok(discovered) => {
                             if !discovered.is_empty() {
                                 last_discovery_error = None;
@@ -382,17 +421,33 @@ fn next_worker_wakeup(
 fn cleanup_gateways<C: Ipv6FirewallControl>(
     gateways: &mut BTreeMap<String, Ipv6GatewayOwner<C>>,
 ) -> Option<String> {
+    cleanup_gateways_until(gateways, None)
+}
+
+fn cleanup_gateways_until<C: Ipv6FirewallControl>(
+    gateways: &mut BTreeMap<String, Ipv6GatewayOwner<C>>,
+    deadline: Option<&OperationDeadline>,
+) -> Option<String> {
     let mut errors = Vec::new();
     for owner in gateways.values_mut() {
-        if let Err(error) = owner.manager.shutdown() {
+        if owner.manager.owned_pinholes().next().is_none() {
+            continue;
+        }
+        let operation_deadline = deadline.and_then(OperationDeadline::deadline);
+        if operation_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            errors.push("IPv6 UPnP cleanup deadline expired".into());
+            break;
+        }
+        let cleanup = match operation_deadline {
+            Some(deadline) => owner.manager.shutdown_until(deadline),
+            None => owner.manager.shutdown(),
+        };
+        if let Err(error) = cleanup {
             errors.push(bounded_runtime_error(error));
         }
     }
     gateways.retain(|_, owner| owner.manager.owned_pinholes().next().is_some());
-    let retained = gateways
-        .values()
-        .map(|owner| owner.manager.owned_pinholes().count())
-        .sum::<usize>();
+    let retained = owned_pinhole_count(gateways);
     if retained > 0 {
         errors.push(format!("{retained} IPv6 pinhole(s) remain pending cleanup"));
     }
@@ -424,19 +479,30 @@ fn cleanup_inactive_gateways<C: Ipv6FirewallControl>(
 
 fn shutdown_gateways<C: Ipv6FirewallControl>(
     gateways: &mut BTreeMap<String, Ipv6GatewayOwner<C>>,
+    deadline: &OperationDeadline,
 ) -> Option<String> {
-    let mut last_error = cleanup_gateways(gateways)?;
+    install_default_shutdown_deadline(deadline);
+    let mut last_error = cleanup_gateways_until(gateways, Some(deadline))?;
     for _ in 1..3 {
-        last_error = cleanup_gateways(gateways)?;
+        if deadline.is_expired() {
+            break;
+        }
+        last_error = cleanup_gateways_until(gateways, Some(deadline))?;
     }
-    let retained = gateways
-        .values()
-        .map(|owner| owner.manager.owned_pinholes().count())
-        .sum::<usize>();
+    let retained = owned_pinhole_count(gateways);
     Some(bounded_runtime_error(format!(
-        "Could not remove {retained} owned IPv6 pinhole(s) after three shutdown attempts; leases may remain active for up to 3600 seconds. Last error: {}",
+        "Could not remove {retained} owned IPv6 pinhole(s) within the shutdown deadline and at most three shutdown attempts; leases may remain active for up to 3600 seconds. Last error: {}",
         last_error
     )))
+}
+
+fn owned_pinhole_count<C: Ipv6FirewallControl>(
+    gateways: &BTreeMap<String, Ipv6GatewayOwner<C>>,
+) -> usize {
+    gateways
+        .values()
+        .map(|owner| owner.manager.owned_pinholes().count())
+        .sum()
 }
 
 fn cleanup_status_or(error: Option<String>, fallback: UpnpRuntimeStatus) -> UpnpRuntimeStatus {
@@ -508,12 +574,11 @@ mod tests {
         FirewallStatus, GatewayError, Ipv6FirewallControl, MappingEndpoint, PinholeDeleteOutcome,
         PinholeRefreshOutcome, Protocol,
     };
-    use std::cell::RefCell;
     use std::collections::BTreeSet;
-    use std::rc::Rc;
+    use std::sync::{Arc, Condvar, Mutex, mpsc};
 
     #[derive(Clone, Default)]
-    struct FakeFirewall(Rc<RefCell<FakeFirewallState>>);
+    struct FakeFirewall(Arc<Mutex<FakeFirewallState>>);
 
     struct FakeFirewallState {
         next_id: u16,
@@ -521,6 +586,8 @@ mod tests {
         delete_failures: usize,
         delete_attempts: usize,
         pinhole_allowed: bool,
+        cleanup_gate: Option<Arc<CleanupGate>>,
+        expire_after_delete: Option<OperationDeadline>,
     }
 
     impl Default for FakeFirewallState {
@@ -531,25 +598,27 @@ mod tests {
                 delete_failures: 0,
                 delete_attempts: 0,
                 pinhole_allowed: true,
+                cleanup_gate: None,
+                expire_after_delete: None,
             }
         }
     }
 
     impl FakeFirewall {
         fn fail_deletes(&self, count: usize) {
-            self.0.borrow_mut().delete_failures = count;
+            self.0.lock().unwrap().delete_failures = count;
         }
 
         fn allow_pinholes(&self, allowed: bool) {
-            self.0.borrow_mut().pinhole_allowed = allowed;
+            self.0.lock().unwrap().pinhole_allowed = allowed;
         }
 
         fn delete_attempts(&self) -> usize {
-            self.0.borrow().delete_attempts
+            self.0.lock().unwrap().delete_attempts
         }
 
         fn pinhole_count(&self) -> usize {
-            self.0.borrow().owned_ids.len()
+            self.0.lock().unwrap().owned_ids.len()
         }
     }
 
@@ -557,7 +626,7 @@ mod tests {
         fn firewall_status(&mut self) -> Result<FirewallStatus, GatewayError> {
             Ok(FirewallStatus {
                 firewall_enabled: true,
-                pinhole_allowed: self.0.borrow().pinhole_allowed,
+                pinhole_allowed: self.0.lock().unwrap().pinhole_allowed,
             })
         }
 
@@ -566,7 +635,7 @@ mod tests {
             _endpoint: PinholeEndpoint,
             _lease_duration_seconds: u32,
         ) -> Result<u16, GatewayError> {
-            let mut state = self.0.borrow_mut();
+            let mut state = self.0.lock().unwrap();
             state.next_id = state.next_id.saturating_add(1).max(1);
             let unique_id = state.next_id;
             state.owned_ids.insert(unique_id);
@@ -578,7 +647,7 @@ mod tests {
             unique_id: u16,
             _lease_duration_seconds: u32,
         ) -> Result<PinholeRefreshOutcome, GatewayError> {
-            Ok(if self.0.borrow().owned_ids.contains(&unique_id) {
+            Ok(if self.0.lock().unwrap().owned_ids.contains(&unique_id) {
                 PinholeRefreshOutcome::Refreshed
             } else {
                 PinholeRefreshOutcome::Missing
@@ -586,18 +655,211 @@ mod tests {
         }
 
         fn delete_pinhole(&mut self, unique_id: u16) -> Result<PinholeDeleteOutcome, GatewayError> {
-            let mut state = self.0.borrow_mut();
+            let mut state = self.0.lock().unwrap();
             state.delete_attempts += 1;
             if state.delete_failures > 0 {
                 state.delete_failures -= 1;
                 return Err(GatewayError::new("injected pinhole cleanup failure"));
             }
-            Ok(if state.owned_ids.remove(&unique_id) {
+            let outcome = if state.owned_ids.remove(&unique_id) {
                 PinholeDeleteOutcome::Deleted
             } else {
                 PinholeDeleteOutcome::Missing
-            })
+            };
+            if let Some(deadline) = state.expire_after_delete.take() {
+                deadline.restrict(Instant::now());
+            }
+            Ok(outcome)
         }
+
+        fn delete_pinhole_until(
+            &mut self,
+            unique_id: u16,
+            deadline: Instant,
+        ) -> Result<PinholeDeleteOutcome, GatewayError> {
+            let gate = self.0.lock().unwrap().cleanup_gate.clone();
+            if let Some(gate) = gate {
+                let _ = gate.entered.send(());
+                let released = gate.released.lock().unwrap();
+                let (released, _) = gate
+                    .changed
+                    .wait_timeout_while(
+                        released,
+                        deadline.saturating_duration_since(Instant::now()),
+                        |released| !*released,
+                    )
+                    .unwrap();
+                if !*released {
+                    return Err(GatewayError::new("mock IPv6 cleanup deadline expired"));
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(GatewayError::new("mock IPv6 cleanup deadline expired"));
+            }
+            self.delete_pinhole(unique_id)
+        }
+    }
+
+    struct CleanupGate {
+        entered: mpsc::Sender<()>,
+        released: Mutex<bool>,
+        changed: Condvar,
+    }
+
+    fn owned_gateway(control: FakeFirewall) -> Ipv6GatewayOwner<FakeFirewall> {
+        let endpoint = PinholeEndpoint::new("2001:db8::10".parse().unwrap(), 47989, Protocol::Tcp);
+        let mut manager = PinholeManager::new(control);
+        manager.reconcile(&[endpoint]).unwrap();
+        Ipv6GatewayOwner {
+            manager,
+            internal_addresses: vec![endpoint.internal_client],
+        }
+    }
+
+    fn gate_cleanup(control: &FakeFirewall) -> (Arc<CleanupGate>, mpsc::Receiver<()>) {
+        let (entered, receiver) = mpsc::channel();
+        let gate = Arc::new(CleanupGate {
+            entered,
+            released: Mutex::new(false),
+            changed: Condvar::new(),
+        });
+        control.0.lock().unwrap().cleanup_gate = Some(gate.clone());
+        (gate, receiver)
+    }
+
+    #[test]
+    fn slow_pinhole_cleanup_is_polled_without_joining_a_live_worker() {
+        let control = FakeFirewall::default();
+        let owner = owned_gateway(control.clone());
+        let (gate, entered) = gate_cleanup(&control);
+        let deadline = OperationDeadline::default();
+        let worker = thread::spawn(move || {
+            deadline.restrict(Instant::now() + Duration::from_secs(2));
+            let mut gateways = BTreeMap::from([("gateway".to_owned(), owner)]);
+            let error = shutdown_gateways(&mut gateways, &deadline);
+            WorkerCompletion {
+                owners: gateways,
+                error,
+            }
+        });
+        let mut retirement = LifecycleWorker::new(Ok(worker), "test IPv6 worker startup failed");
+        entered.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let poll_started = Instant::now();
+        assert_eq!(retirement.poll(), Ok(false));
+        assert!(poll_started.elapsed() < Duration::from_millis(100));
+        assert_eq!(control.pinhole_count(), 1);
+        assert!(retirement.completion().is_none());
+
+        *gate.released.lock().unwrap() = true;
+        gate.changed.notify_all();
+        let wait_deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if retirement.poll().unwrap() {
+                break;
+            }
+            assert!(
+                Instant::now() < wait_deadline,
+                "cleanup worker failed to retire"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(control.pinhole_count(), 0);
+        assert!(retirement.completion().unwrap().owners.is_empty());
+    }
+
+    #[test]
+    fn shutdown_deadline_is_shared_across_gateways_and_retry_attempts() {
+        let slow_control = FakeFirewall::default();
+        let untouched_control = FakeFirewall::default();
+        let first = owned_gateway(slow_control.clone());
+        let second = owned_gateway(untouched_control.clone());
+        let (_gate, entered) = gate_cleanup(&slow_control);
+        let deadline = OperationDeadline::default();
+        let worker = thread::spawn(move || {
+            deadline.restrict(Instant::now() + Duration::from_millis(40));
+            let mut gateways = BTreeMap::from([
+                ("first-gateway".to_owned(), first),
+                ("second-gateway".to_owned(), second),
+            ]);
+            let error = shutdown_gateways(&mut gateways, &deadline);
+            WorkerCompletion {
+                owners: gateways,
+                error,
+            }
+        });
+        let mut retirement = LifecycleWorker::new(Ok(worker), "test IPv6 worker startup failed");
+        entered.recv_timeout(Duration::from_secs(1)).unwrap();
+        retirement.finish();
+
+        assert!(retirement.poll().unwrap_err().contains("shutdown deadline"));
+        assert_eq!(
+            owned_pinhole_count(&retirement.completion().unwrap().owners),
+            2
+        );
+        assert_eq!(slow_control.pinhole_count(), 1);
+        assert_eq!(untouched_control.pinhole_count(), 1);
+        assert_eq!(untouched_control.delete_attempts(), 0);
+        assert!(entered.try_recv().is_err(), "expired cleanup was retried");
+        // Polling an error preserves the exact managers for subsequent diagnosis.
+        assert!(retirement.poll().is_err());
+        assert_eq!(
+            owned_pinhole_count(&retirement.completion().unwrap().owners),
+            2
+        );
+    }
+
+    #[test]
+    fn expired_shutdown_budget_keeps_owners_without_starting_router_operations() {
+        let control = FakeFirewall::default();
+        let mut gateways = BTreeMap::from([("gateway".to_owned(), owned_gateway(control.clone()))]);
+        let deadline = OperationDeadline::default();
+        let expired = Instant::now();
+        deadline.restrict(expired);
+
+        assert!(shutdown_gateways(&mut gateways, &deadline).is_some());
+        assert_eq!(deadline.deadline(), Some(expired));
+        assert_eq!(control.delete_attempts(), 0);
+        assert_eq!(owned_pinhole_count(&gateways), 1);
+    }
+
+    #[test]
+    fn expired_shutdown_budget_accepts_gateways_without_owned_pinholes() {
+        let control = FakeFirewall::default();
+        control.allow_pinholes(false);
+        let mut gateways = BTreeMap::from([("gateway".to_owned(), owned_gateway(control.clone()))]);
+        let deadline = OperationDeadline::default();
+        deadline.restrict(Instant::now());
+
+        assert_eq!(shutdown_gateways(&mut gateways, &deadline), None);
+        assert!(gateways.is_empty());
+        assert_eq!(control.pinhole_count(), 0);
+        assert_eq!(control.delete_attempts(), 0);
+    }
+
+    #[test]
+    fn last_pinhole_removed_at_deadline_does_not_make_later_empty_gateways_fail() {
+        let control = FakeFirewall::default();
+        let owner = owned_gateway(control.clone());
+        let empty_control = FakeFirewall::default();
+        let empty_owner = Ipv6GatewayOwner {
+            manager: PinholeManager::new(empty_control.clone()),
+            internal_addresses: Vec::new(),
+        };
+        let deadline = OperationDeadline::default();
+        deadline.restrict(Instant::now() + Duration::from_secs(2));
+        control.0.lock().unwrap().expire_after_delete = Some(deadline.clone());
+        let mut gateways = BTreeMap::from([
+            ("first-owned-gateway".to_owned(), owner),
+            ("last-empty-gateway".to_owned(), empty_owner),
+        ]);
+
+        assert_eq!(shutdown_gateways(&mut gateways, &deadline), None);
+        assert!(deadline.is_expired());
+        assert!(gateways.is_empty());
+        assert_eq!(control.pinhole_count(), 0);
+        assert_eq!(control.delete_attempts(), 1);
+        assert_eq!(empty_control.delete_attempts(), 0);
     }
 
     #[test]
@@ -615,14 +877,17 @@ mod tests {
         )]);
         control.fail_deletes(3);
 
-        let error = shutdown_gateways(&mut gateways).unwrap();
+        let error = shutdown_gateways(&mut gateways, &OperationDeadline::default()).unwrap();
 
         assert!(error.contains("three shutdown attempts"));
         assert_eq!(control.delete_attempts(), 3);
         assert_eq!(control.pinhole_count(), 1);
         assert_eq!(gateways["gateway"].manager.owned_pinholes().count(), 1);
 
-        assert_eq!(shutdown_gateways(&mut gateways), None);
+        assert_eq!(
+            shutdown_gateways(&mut gateways, &OperationDeadline::default()),
+            None
+        );
         assert_eq!(control.delete_attempts(), 4);
         assert_eq!(control.pinhole_count(), 0);
         assert!(gateways.is_empty());

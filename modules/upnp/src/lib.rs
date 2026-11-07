@@ -5,14 +5,16 @@
 //! call [`MappingManager::shutdown`] during orderly shutdown to remove mappings that
 //! still match the exact recorded mapping.
 
+mod deadline;
 mod igd;
 mod ipv6;
 mod pinhole;
 
-pub use igd::{IgdGateway, SEARCH_TIMEOUT, discover_gateway};
+pub use deadline::OperationDeadline;
+pub use igd::{IgdGateway, SEARCH_TIMEOUT, discover_gateway, discover_gateway_with_deadline};
 pub use ipv6::{
     IPV6_SEARCH_TIMEOUT, IgdIpv6Firewall, Ipv6InterfaceAddress, discover_ipv6_firewalls,
-    ipv6_interface_addresses,
+    discover_ipv6_firewalls_with_deadline, ipv6_interface_addresses,
 };
 pub use pinhole::{
     FirewallStatus, Ipv6FirewallControl, PINHOLE_LEASE_SECONDS, PinholeDeleteOutcome,
@@ -24,7 +26,7 @@ use std::fmt;
 use std::net::{IpAddr, Ipv4Addr};
 use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(test)]
 mod tests;
@@ -180,6 +182,21 @@ pub trait Gateway {
 
     fn remove_if_matches(&mut self, mapping: &Mapping) -> Result<RemovalOutcome, GatewayError>;
 
+    /// Removes an exact owned mapping within the caller's absolute shutdown budget.
+    ///
+    /// Adapters must check the same deadline before each protocol effect, including
+    /// inspection steps. The default refuses bounded cleanup rather than silently
+    /// invoking an adapter that has not implemented that contract.
+    fn remove_if_matches_until(
+        &mut self,
+        _mapping: &Mapping,
+        _deadline: Instant,
+    ) -> Result<RemovalOutcome, GatewayError> {
+        Err(GatewayError::new(
+            "gateway does not support bounded mapping cleanup",
+        ))
+    }
+
     fn refresh_if_matches(&mut self, mapping: &Mapping) -> Result<RefreshOutcome, GatewayError>;
 }
 
@@ -319,6 +336,7 @@ pub struct MappingManager<G> {
     gateway: G,
     owned: BTreeMap<MappingKey, Mapping>,
     description: String,
+    shutdown_deadline: OperationDeadline,
 }
 
 enum PlannedMappingChange {
@@ -359,6 +377,7 @@ impl<G: Gateway> MappingManager<G> {
             gateway,
             owned: BTreeMap::new(),
             description: format!("Amaterasu UPnP {owner_id}"),
+            shutdown_deadline: OperationDeadline::default(),
         }
     }
 
@@ -561,7 +580,7 @@ impl<G: Gateway> MappingManager<G> {
         let mut cleanup_failures = Vec::new();
         for mapping in stale_mappings {
             let key = mapping.key();
-            match self.gateway.remove_if_matches(&mapping) {
+            match self.remove_owned_mapping(&mapping) {
                 Ok(RemovalOutcome::Removed) => {
                     self.owned.remove(&key);
                     report.removed += 1;
@@ -601,7 +620,7 @@ impl<G: Gateway> MappingManager<G> {
 
         for mapping in owned_mappings {
             let key = mapping.key();
-            match self.gateway.remove_if_matches(&mapping) {
+            match self.remove_owned_mapping(&mapping) {
                 Ok(RemovalOutcome::Removed) => {
                     self.owned.remove(&key);
                     report.removed += 1;
@@ -626,6 +645,22 @@ impl<G: Gateway> MappingManager<G> {
             Ok(report)
         } else {
             Err(UpnpError::ShutdownFailed { failures })
+        }
+    }
+
+    /// Removes owned mappings without renewing an earlier shutdown budget.
+    pub fn shutdown_until(&mut self, deadline: Instant) -> Result<ShutdownReport, UpnpError> {
+        self.shutdown_deadline.restrict(deadline);
+        self.shutdown()
+    }
+
+    fn remove_owned_mapping(&mut self, mapping: &Mapping) -> Result<RemovalOutcome, GatewayError> {
+        match self.shutdown_deadline.deadline() {
+            Some(deadline) if deadline <= Instant::now() => {
+                Err(GatewayError::new("mapping shutdown deadline exceeded"))
+            }
+            Some(deadline) => self.gateway.remove_if_matches_until(mapping, deadline),
+            None => self.gateway.remove_if_matches(mapping),
         }
     }
 

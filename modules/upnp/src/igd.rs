@@ -5,10 +5,12 @@ use std::time::{Duration, Instant};
 use xmltree::{Element, XMLNode};
 
 use crate::ipv6::{
-    find_child_recursive, http_get_until, http_request, soap_error_code, valid_http_path,
-    xml_escape,
+    find_child_recursive, http_get_until, http_post, soap_error_code, valid_http_path, xml_escape,
 };
-use crate::{Gateway, GatewayError, Mapping, MappingKey, Protocol, RefreshOutcome, RemovalOutcome};
+use crate::{
+    Gateway, GatewayError, Mapping, MappingKey, OperationDeadline, Protocol, RefreshOutcome,
+    RemovalOutcome,
+};
 
 /// Upper bound for one IPv4 discovery receive iteration.
 pub const SEARCH_TIMEOUT: Duration = Duration::from_secs(2);
@@ -30,10 +32,22 @@ pub struct IgdGateway {
     control_path: String,
     service: String,
     internal_address: Ipv4Addr,
+    operation_deadline: OperationDeadline,
 }
 
 /// Discovers an IPv4 IGD using the caller's selected network provider.
 pub fn discover_gateway(network: &Network) -> Result<IgdGateway, GatewayError> {
+    discover_gateway_with_deadline(network, OperationDeadline::default())
+}
+
+/// Discovers a gateway while sharing a caller-restrictable shutdown budget.
+pub fn discover_gateway_with_deadline(
+    network: &Network,
+    operation_deadline: OperationDeadline,
+) -> Result<IgdGateway, GatewayError> {
+    operation_deadline
+        .remaining(Instant::now() + SEARCH_TIMEOUT)
+        .map_err(|error| GatewayError::new(error.to_string()))?;
     let socket = network
         .bind_udp(SocketAddr::from(([0, 0, 0, 0], 0)))
         .map_err(|error| GatewayError::new(format!("IGD discovery socket failed: {error}")))?;
@@ -44,16 +58,27 @@ pub fn discover_gateway(network: &Network) -> Result<IgdGateway, GatewayError> {
         "M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nMX: 2\r\nST: {DEVICE_TYPE}\r\n\r\n"
     );
     socket
-        .send_to(
-            request.as_bytes(),
-            SocketAddr::from(([239, 255, 255, 250], 1900)),
-        )
+        .set_write_timeout(Some(
+            operation_deadline
+                .remaining(Instant::now() + SEARCH_TIMEOUT)
+                .map_err(|error| GatewayError::new(error.to_string()))?,
+        ))
+        .and_then(|()| {
+            socket.send_to(
+                request.as_bytes(),
+                SocketAddr::from(([239, 255, 255, 250], 1900)),
+            )
+        })
         .map_err(|error| GatewayError::new(format!("IGD discovery failed: {error}")))?;
     let deadline = Instant::now() + SEARCH_TIMEOUT;
     let mut buffer = [0; 8192];
     while Instant::now() < deadline {
         socket
-            .set_read_timeout(Some(deadline.saturating_duration_since(Instant::now())))
+            .set_read_timeout(Some(
+                operation_deadline
+                    .remaining(deadline)
+                    .map_err(|error| GatewayError::new(error.to_string()))?,
+            ))
             .map_err(|error| GatewayError::new(format!("IGD discovery timeout failed: {error}")))?;
         let (length, source) = match socket.recv_from(&mut buffer) {
             Ok(result) => result,
@@ -80,13 +105,18 @@ pub fn discover_gateway(network: &Network) -> Result<IgdGateway, GatewayError> {
             &root_path,
             MAX_DESCRIPTION_BYTES,
             deadline,
+            &operation_deadline,
         ) {
             Ok(response) if response.status == 200 => response,
             _ => continue,
         };
-        if let Ok(gateway) =
-            IgdGateway::from_description(network.clone(), address, root_path, &description.body)
-        {
+        if let Ok(gateway) = IgdGateway::from_description(
+            network.clone(),
+            address,
+            root_path,
+            &description.body,
+            operation_deadline.clone(),
+        ) {
             return Ok(gateway);
         }
     }
@@ -184,6 +214,7 @@ impl IgdGateway {
         address: SocketAddr,
         root_path: String,
         bytes: &[u8],
+        operation_deadline: OperationDeadline,
     ) -> Result<Self, GatewayError> {
         let root = Element::parse(bytes)
             .map_err(|error| GatewayError::new(format!("invalid IGD description: {error}")))?;
@@ -191,6 +222,9 @@ impl IgdGateway {
             .ok_or_else(|| GatewayError::new("IGD description has no mapping service"))?;
         let (address, control_path) = control_target(&root, address, &root_path, &control)
             .ok_or_else(|| GatewayError::new("IGD description has an invalid control URL"))?;
+        operation_deadline
+            .remaining(Instant::now() + SEARCH_TIMEOUT)
+            .map_err(|error| GatewayError::new(error.to_string()))?;
         let internal_address = local_ipv4_route(&network, address)?;
         Ok(Self {
             network,
@@ -199,6 +233,7 @@ impl IgdGateway {
             control_path,
             service,
             internal_address,
+            operation_deadline,
         })
     }
     /// IPv4 interface selected by the provider route to this gateway.
@@ -215,17 +250,17 @@ impl IgdGateway {
     fn action(&self, action: &str, parameters: &[(&str, String)]) -> Result<Element, GatewayError> {
         let body = soap_envelope(&self.service, action, parameters);
         let header = format!("\"{}#{action}\"", self.service);
-        let response = http_request(
+        let response = http_post(
             &self.network,
             self.address,
             &self.control_path,
-            "POST",
             &[
                 ("Content-Type", "text/xml; charset=\"utf-8\""),
                 ("SOAPAction", &header),
             ],
             Some(body.as_bytes()),
             MAX_SOAP_BYTES,
+            &self.operation_deadline,
         )?;
         let root = Element::parse(response.body.as_slice())
             .map_err(|error| GatewayError::new(format!("invalid IGD SOAP response: {error}")))?;
@@ -332,6 +367,14 @@ impl Gateway for IgdGateway {
             ],
         )?;
         Ok(RemovalOutcome::Removed)
+    }
+    fn remove_if_matches_until(
+        &mut self,
+        mapping: &Mapping,
+        deadline: Instant,
+    ) -> Result<RemovalOutcome, GatewayError> {
+        self.operation_deadline.restrict(deadline);
+        self.remove_if_matches(mapping)
     }
     fn refresh_if_matches(&mut self, mapping: &Mapping) -> Result<RefreshOutcome, GatewayError> {
         let current = self.find_mappings(mapping.key())?;
