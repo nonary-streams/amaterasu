@@ -63,6 +63,29 @@ struct VerifiedDisplay {
 
 #[cfg(any(windows, test))]
 impl Topology {
+    /// Select one exact target from the fully reconciled topology. The caller
+    /// keeps its private target identity inside the provider's matcher.
+    pub(crate) fn select_target(
+        &self,
+        mut matches: impl FnMut(&str) -> bool,
+    ) -> Result<SelectedOutput, GeometryError> {
+        let mut matches = self
+            .displays
+            .iter()
+            .filter(|display| matches(&display.target_id));
+        let display = matches.next().ok_or(GeometryError::TargetChanged)?;
+        if matches.next().is_some() {
+            return Err(unavailable(
+                "exact capture selector matches more than one target",
+            ));
+        }
+        Ok(SelectedOutput {
+            source_name: display.source_name.clone(),
+            monitor_handle: display.monitor_handle,
+            rectangle: display.rectangle,
+        })
+    }
+
     pub(crate) fn reconcile(
         gdi: Vec<DisplaySnapshot>,
         dxgi: Vec<DisplaySnapshot>,
@@ -200,4 +223,15 @@ fn source_key(source_name: &str) -> String {
 #[cfg(any(windows, test))]
 pub(crate) fn unavailable(message: &'static str) -> GeometryError {
     GeometryError::Unavailable(message)
+}
+
+/// CCD encodes an SDR-white multiplier of 80 nits, scaled by 1000.
+#[cfg(any(windows, test))]
+pub(crate) fn reference_white_scale(value: u32) -> Result<f64, GeometryError> {
+    if value == 0 || value > 125_000 {
+        return Err(GeometryError::Unavailable(
+            "native SDR white level is outside representable HDR luminance",
+        ));
+    }
+    Ok(f64::from(value) / 1000.0)
 }

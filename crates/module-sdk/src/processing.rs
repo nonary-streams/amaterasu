@@ -9,6 +9,7 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
 };
 mod consumer;
+pub mod resource;
 pub use consumer::{
     ProcessingOutcome, ScopedGpuFrame, configure_gpu_stream, process_gpu, update_gpu_stream,
 };

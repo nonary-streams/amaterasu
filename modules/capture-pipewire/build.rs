@@ -108,4 +108,5 @@ fn configure_kwin(build: &mut cc::Build) {
     println!("cargo:rerun-if-changed=src/platform/kwin.h");
     println!("cargo:rustc-cfg=amaterasu_kwin");
     println!("cargo:rustc-link-arg-cdylib=-Wl,--undefined=amaterasu_kwin_marker");
+    println!("cargo:rustc-link-arg-cdylib=-Wl,--undefined=amaterasu_kwin_desktop_marker");
 }

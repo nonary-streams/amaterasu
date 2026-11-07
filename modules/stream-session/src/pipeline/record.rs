@@ -420,7 +420,7 @@ impl Record {
     }
 
     pub fn response(&self) -> Value {
-        json!({
+        let mut response = json!({
             "ok": true,
             "session": self.id,
             "lifecycle_session_target": self.config.lifecycle_session_target,
@@ -491,7 +491,20 @@ impl Record {
                 && self.input_controller_supported,
             "input_events_sent": self.input_events_sent,
             "input_batches": self.input_batches,
-        })
+        });
+        if let Some(source) = &self.config.borrowed_capture {
+            response["borrowed_capture"] = json!(source);
+        }
+        if let Some(context) = &self.config.source_capture_context {
+            response["source_capture_context"] = json!(context);
+        }
+        if let Some(reason) = self.authenticated_disconnect_reason
+            && self.control_authenticated
+        {
+            response["authenticated_disconnect"] = json!({"version":1,"session":self.id,
+                "operation_id":self.config.operation_id,"control_authenticated":true,"reason":reason});
+        }
+        response
     }
 
     pub fn open(&self, resource: Resource) -> Value {
@@ -545,6 +558,9 @@ impl Record {
                 if let Some(options) = &start.encoder_options {
                     payload["encoder_options"] = options.clone();
                 }
+                if let Some(context) = &start.source_capture_context {
+                    payload["source_capture_context"] = json!(context);
+                }
                 if let Some(source_id) = start.source_id {
                     payload["source_id"] = json!(source_id);
                 } else {
@@ -568,7 +584,7 @@ impl Record {
                 let mut payload = json!({"action":"open","endpoint":start.audio_endpoint,
                     "capture_sink_without_routing":start.capture_sink_without_routing,
                     "virtual_sink":start.virtual_sink,
-                    "channels":start.channels,
+                    "channels":start.virtual_sink.as_ref().and(start.channels),
                     "host_audio_enabled":start.host_audio_enabled});
                 if self.config.stream_audio {
                     payload["capture_format"] = json!({

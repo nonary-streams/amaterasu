@@ -6,6 +6,8 @@ extern "C" {
 #endif
 #define AMATERASU_PIXEL_BGRA8 1
 #define AMATERASU_PIXEL_NV12 2
+/* P010: little-endian u16 samples, ten-bit codes in bits 15:6, bits 5:0 zero. */
+#define AMATERASU_PIXEL_P010 3
 #define AMATERASU_CODEC_H264 1
 #define AMATERASU_CODEC_HEVC 2
 #define AMATERASU_CODEC_AV1 3
@@ -28,6 +30,7 @@ extern "C" {
 #define AMATERASU_VIDEO_ENCODER_CONTRACT "amaterasu.video-encoder.native/1"
 #define AMATERASU_ENCODER_PROVIDER_CONTRACT "amaterasu.encoder-provider.native/1"
 #define AMATERASU_FRAME_RESOURCE_CONSUMER_CONTRACT "amaterasu.frame-resource-consumer.native/1"
+#define AMATERASU_FRAME_RESOURCE_PROCESSOR_CONTRACT "amaterasu.frame-resource-processor.native/1"
 #define AMATERASU_CPU_FRAME_PROCESSOR_CONTRACT "amaterasu.cpu-frame-processor.native/1"
 #define AMATERASU_GPU_FRAME_PROCESSOR_CONTRACT "amaterasu.gpu-frame-processor.native/1"
 #define AMATERASU_AUDIO_CAPTURE_CONTRACT "amaterasu.audio-capture.native/1"
@@ -86,7 +89,9 @@ typedef struct {
 } AmaterasuAudioEncoderApi;
 
 /* CPU bytes are borrowed only during submit or a synchronous frame callback.
- * NV12 is Y then UV, both with the same stride and even width/height. */
+ * NV12/P010 are contiguous Y then UV with equal byte stride and even dimensions.
+ * P010 stride is even and at least width*2; its low six sample bits are zero.
+ * The pixel format describes storage, not color primaries or transfer. */
 typedef struct {
     uint32_t width, height, format, stride;
     const uint8_t *data;
@@ -418,6 +423,14 @@ typedef struct {
 typedef struct {
     uint32_t version, size, primaries, transfer, matrix, range;
 } AmaterasuFrameColorMetadata;
+/* CPU resource schema v2 offers negotiate explicit known color/range. Each
+ * color tuple has its own offer ID. Frame descriptors also use version=2 with
+ * the unchanged AmaterasuCpuFrame payload; outer frame color must equal the
+ * selected tuple on every presentation. Unknown color is never authoritative. */
+typedef struct {
+    AmaterasuCpuResourceCapabilities base;
+    AmaterasuFrameColorMetadata color;
+} AmaterasuCpuResourceCapabilitiesV2;
 typedef struct {
     uint32_t version, size, domain, reserved;
     uint8_t epoch_id[16];
@@ -674,6 +687,16 @@ typedef struct {
     AmaterasuStatus (*color_provenance)(void *, uint64_t, uint32_t *);
 } AmaterasuCaptureApiV1_10;
 #define AMATERASU_CAPTURE_API_V1_10_SIZE ((uint32_t)sizeof(AmaterasuCaptureApiV1_10))
+/* Optional nonmutating source preflight on the same typed Capture family.
+ * Input/output JSON is bounded to 8192 bytes. A query creates no source, native
+ * resource, display, permission or lease; one reply is synchronously copied.
+ * Ready is an observation, not a guarantee a later capture open will succeed. */
+#define AMATERASU_CAPTURE_SOURCE_PREFLIGHT_INTERFACE_MINOR 11
+typedef struct {
+    AmaterasuCaptureApiV1_10 base;
+    AmaterasuStatus (*source_preflight)(void *, AmaterasuBorrowedBytes, AmaterasuReplySink);
+} AmaterasuCaptureApiV1_11;
+#define AMATERASU_CAPTURE_API_V1_11_SIZE ((uint32_t)sizeof(AmaterasuCaptureApiV1_11))
 typedef struct {
     AmaterasuVideoApiV1_1 base;
     AmaterasuStatus (*hdr_metadata)(void *, uint64_t, AmaterasuHdrMetadata *);

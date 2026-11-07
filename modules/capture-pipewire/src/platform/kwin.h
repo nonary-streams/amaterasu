@@ -12,6 +12,8 @@ int am_kwin_compositor_digest(const char *boot_id, uint32_t pid, uint64_t startt
 /* Connection, Wayland proxies and event callbacks remain on one native worker.
  * The borrowed cancellation flag outlives open/poll and all callbacks. */
 struct am_kwin *am_kwin_open(const char *output,const atomic_bool *stopped,int64_t deadline_us);
+/* Read-only bounded registry/output inspection; never creates a screencast. */
+int am_kwin_preflight(const char *output,int managed,uint32_t width,uint32_t height,uint32_t refresh_millihz);
 int am_kwin_poll(struct am_kwin *connection);
 int am_kwin_snapshot(struct am_kwin *connection,uint32_t *node,uint64_t *serial,struct am_kwin_geometry *geometry);
 void am_kwin_close(struct am_kwin *connection);

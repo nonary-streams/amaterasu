@@ -84,6 +84,7 @@ struct FakeCompositor {
     restored: Vec<bool>,
     mode_journal: Option<PathBuf>,
     setup_journal: Option<PathBuf>,
+    observed_retained_mode: Option<Specification>,
 }
 impl FakeCompositor {
     fn new() -> Self {
@@ -99,10 +100,18 @@ impl FakeCompositor {
             restored: Vec::new(),
             mode_journal: None,
             setup_journal: None,
+            observed_retained_mode: None,
         }
     }
 }
 impl Compositor for FakeCompositor {
+    fn verify_retained_mode(&mut self, _: &str, expected: &Specification) -> Result<(), String> {
+        if self.observed_retained_mode.as_ref() == Some(expected) {
+            Ok(())
+        } else {
+            Err("native retained mode readback differs".into())
+        }
+    }
     fn mode_only_baseline(
         &mut self,
         _: &str,
@@ -1227,6 +1236,9 @@ fn parked_status_is_explicit_and_does_not_claim_connector_removal() {
         monitors: BTreeMap::from([(
             key.clone(),
             Monitor {
+                retained_mode: None,
+                retained_mode_pending: false,
+                retained_mode_durable: false,
                 specification: specification(FIRST),
                 state: "removing",
                 output: Some("Virtual-2".into()),
@@ -1271,6 +1283,9 @@ fn parked_status_is_explicit_and_does_not_claim_connector_removal() {
     manager.monitors.insert(
         ("owner".into(), FIRST.into()),
         Monitor {
+            retained_mode: None,
+            retained_mode_pending: false,
+            retained_mode_durable: false,
             specification: specification(FIRST),
             state: "creating",
             output: None,
@@ -1576,6 +1591,9 @@ fn linux_shared_references_persist_and_release_only_the_last_connector_owner() {
     manager.monitors.insert(
         ("other-owner".into(), SECOND.into()),
         Monitor {
+            retained_mode: None,
+            retained_mode_pending: false,
+            retained_mode_durable: false,
             specification: specification(SECOND),
             state: "ready",
             output: Some("Virtual-3".into()),
@@ -1640,6 +1658,9 @@ fn linux_shared_references_persist_and_release_only_the_last_connector_owner() {
     assert!(manager.monitors.is_empty());
     // A legacy record remains valid without reference metadata.
     let legacy = Monitor {
+        retained_mode: None,
+        retained_mode_pending: false,
+        retained_mode_durable: false,
         specification: specification(FIRST),
         state: "ready",
         output: Some("Virtual-2".into()),
@@ -1691,5 +1712,142 @@ fn reference_ownership_survives_journal_reload_and_restart_cleanup() {
     assert!(restarted.recover().is_none());
     assert!(!restarted.broker.connected(&record.output).unwrap());
     drop(restarted);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn retained_mode_commit_requires_native_readback_and_preserves_connector_and_references() {
+    let (root, mut controller) = fixture();
+    let references =
+        std::collections::BTreeSet::from(["monitor-role".into(), "source-lifetime".into()]);
+    let record = controller
+        .create_with_references(
+            "remote-plugin".into(),
+            specification(FIRST),
+            ScaleSetting::Retain,
+            Some(references.clone()),
+            VirtualDisplayLayout::Extended,
+        )
+        .unwrap();
+    controller.compositor.observed_retained_mode = Some(record.specification.clone());
+    let key = record.key();
+    let mut desired = record.specification.clone();
+    desired.width = 1280;
+    desired.height = 720;
+    desired.refresh_millihz = 120000;
+    desired.hdr_enabled = true;
+    let change = crate::retained_mode::Change {
+        operation_id: "retained-mode-1".into(),
+        reference_id: "monitor-role".into(),
+        expected_reference_ids: references.clone(),
+        expected_revision: 0,
+        old: record.specification.clone(),
+        desired: desired.clone(),
+        completed: false,
+        aborted: false,
+    };
+    let effects = controller.broker.effects.lock().unwrap().clone();
+    let prepared = controller
+        .retained_mode(&key, change.clone(), crate::retained_mode::Step::Prepare)
+        .unwrap();
+    assert_eq!(prepared.output, record.output);
+    assert_eq!(prepared.specification, record.specification);
+    assert_eq!(prepared.references, Some(references.clone()));
+    assert!(!prepared.retained_mode.as_ref().unwrap().completed);
+    assert!(
+        controller
+            .retained_mode(&key, change.clone(), crate::retained_mode::Step::Commit)
+            .is_err()
+    );
+    assert_eq!(
+        controller.journal.records[0].specification,
+        record.specification
+    );
+    assert!(
+        !controller.journal.records[0]
+            .retained_mode
+            .as_ref()
+            .unwrap()
+            .completed
+    );
+    // A separate display provider has now applied the requested mode and color.
+    controller.compositor.observed_retained_mode = Some(desired.clone());
+    let committed = controller
+        .retained_mode(&key, change, crate::retained_mode::Step::Commit)
+        .unwrap();
+    assert_eq!(committed.specification, desired);
+    assert_eq!(committed.output, record.output);
+    assert_eq!(committed.references, Some(references));
+    assert!(committed.retained_mode.as_ref().unwrap().completed);
+    assert_eq!(*controller.broker.effects.lock().unwrap(), effects);
+    assert_eq!(controller.journal.records.len(), 1);
+    let persisted: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("connectors.json")).unwrap()).unwrap();
+    assert_eq!(persisted["records"][0]["specification"]["width"], 1280);
+    assert_eq!(persisted["records"][0]["retained_mode"]["completed"], true);
+    drop(controller);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn retained_mode_abort_is_observed_and_durable_without_changing_the_native_output() {
+    let (root, mut controller) = fixture();
+    let references = std::collections::BTreeSet::from(["retained".into()]);
+    let record = controller
+        .create_with_references(
+            "remote-plugin".into(),
+            specification(FIRST),
+            ScaleSetting::Retain,
+            Some(references.clone()),
+            VirtualDisplayLayout::Extended,
+        )
+        .unwrap();
+    controller.compositor.observed_retained_mode = Some(record.specification.clone());
+    let mut desired = record.specification.clone();
+    desired.width = 1280;
+    desired.height = 720;
+    desired.hdr_enabled = true;
+    let change = crate::retained_mode::Change {
+        operation_id: "rejected-mode".into(),
+        reference_id: "retained".into(),
+        expected_reference_ids: references,
+        expected_revision: 0,
+        old: record.specification.clone(),
+        desired,
+        completed: false,
+        aborted: false,
+    };
+    let key = record.key();
+    controller
+        .retained_mode(&key, change.clone(), crate::retained_mode::Step::Prepare)
+        .unwrap();
+    controller.compositor.observed_retained_mode = None;
+    assert!(
+        controller
+            .retained_mode(&key, change.clone(), crate::retained_mode::Step::Abort)
+            .is_err()
+    );
+    assert!(
+        controller.journal.records[0]
+            .retained_mode
+            .as_ref()
+            .unwrap()
+            .is_pending()
+    );
+    controller.compositor.observed_retained_mode = Some(record.specification.clone());
+    let aborted = controller
+        .retained_mode(&key, change.clone(), crate::retained_mode::Step::Abort)
+        .unwrap();
+    assert_eq!(aborted.specification, record.specification);
+    assert_eq!(aborted.output, record.output);
+    assert_eq!(aborted.retained_mode.as_ref().unwrap().mode_revision(), 1);
+    assert!(aborted.retained_mode.as_ref().unwrap().aborted);
+    assert!(
+        controller
+            .retained_mode(&key, change, crate::retained_mode::Step::Commit)
+            .is_err()
+    );
+    assert_eq!(controller.broker.effects.lock().unwrap().len(), 1);
+    drop(controller);
     fs::remove_dir_all(root).unwrap();
 }

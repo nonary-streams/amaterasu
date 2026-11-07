@@ -107,6 +107,7 @@ fn enumeration_pages_are_bounded_ordered_and_do_not_disturb_capture() {
             output: "output-000".into(),
             operation_id: None,
             constant_rate: true,
+            source_format: None,
         },
         &mut || Ok(()),
     );
@@ -452,6 +453,7 @@ fn touch_surface_is_published_only_when_provider_proves_valid_mapping() {
             output: "fake".into(),
             operation_id: Some("touch".into()),
             constant_rate: false,
+            source_format: None,
         };
         let reply = controller.handle("owner", request(), &mut || Ok(()));
         if let Some(error) = error {
@@ -501,6 +503,7 @@ fn open(controller: &mut Controller<FakeBackend>, owner: &str) -> u64 {
             operation_id: None,
             output: "fake-output".into(),
             constant_rate: false,
+            source_format: None,
         },
         &mut || Ok(()),
     );
@@ -515,6 +518,7 @@ fn open_constant_rate(controller: &mut Controller<FakeBackend>, owner: &str) -> 
             operation_id: None,
             output: "fake-output".into(),
             constant_rate: true,
+            source_format: None,
         },
         &mut || Ok(()),
     );
@@ -555,6 +559,7 @@ fn constant_rate_open_is_opt_in_and_deserializes_explicitly() {
 
 fn frame(timestamp_us: u64, sequence: u64, bytes: &[u8]) -> Frame {
     Frame {
+        encoding: crate::format::SourceEncoding::Bgra8,
         width: 2,
         height: 1,
         stride: 8,
@@ -755,6 +760,7 @@ fn disabled_and_cancelled_opens_do_not_leave_resources() {
             operation_id: None,
             output: "fake".into(),
             constant_rate: false,
+            source_format: None,
         },
         &mut || Ok(()),
     );
@@ -768,6 +774,7 @@ fn disabled_and_cancelled_opens_do_not_leave_resources() {
             operation_id: None,
             output: "fake".into(),
             constant_rate: false,
+            source_format: None,
         },
         &mut || {
             calls += 1;
@@ -797,6 +804,7 @@ fn stream_capacity_owner_close_and_shutdown_are_enforced() {
                 operation_id: None,
                 output: "fake".into(),
                 constant_rate: false,
+                source_format: None,
             },
             &mut || Ok(())
         )["error"]["code"],
@@ -825,6 +833,7 @@ fn row_pitch_copy_excludes_padding_and_checks_bounds() {
 fn native_callback_delivers_pixels_then_reports_pending_and_device_loss() {
     let events = Arc::new(Mutex::new(VecDeque::from([
         Ok(Some(Frame {
+            encoding: crate::format::SourceEncoding::Bgra8,
             width: 2,
             height: 1,
             stride: 8,
@@ -1096,6 +1105,7 @@ fn operation_lookup_recovers_owned_stream_without_marking_replays_as_new() {
         output: "fake".into(),
         operation_id: Some("start-1".into()),
         constant_rate: false,
+        source_format: None,
     };
     let opened = controller.handle("owner", request(), &mut || Ok(()));
     let id = opened["stream"].as_u64().unwrap();
@@ -1119,6 +1129,7 @@ fn operation_lookup_recovers_owned_stream_without_marking_replays_as_new() {
         output: "fake".into(),
         operation_id: Some("start-1".into()),
         constant_rate: true,
+        source_format: None,
     };
     assert_eq!(
         controller.handle("owner", conflict, &mut || Ok(()))["error"]["code"],
@@ -1228,6 +1239,7 @@ fn identical_operation_ids_are_scoped_to_each_owner() {
         output: "fake-output".into(),
         operation_id: Some("shared-operation-name".into()),
         constant_rate: false,
+        source_format: None,
     };
     let first = controller.handle("first", request(), &mut || Ok(()));
     let second = controller.handle("second", request(), &mut || Ok(()));
@@ -1285,6 +1297,7 @@ unsafe extern "C" fn close_during_frame(context: *mut c_void, frame: *const CpuF
 #[test]
 fn callback_can_close_stream_without_invalidating_borrowed_pixels() {
     let events = Arc::new(Mutex::new(VecDeque::from([Ok(Some(Frame {
+        encoding: crate::format::SourceEncoding::Bgra8,
         width: 1,
         height: 1,
         stride: 4,

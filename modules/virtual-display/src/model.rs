@@ -27,6 +27,9 @@ pub struct Settings {
     pub dd_use_sunshine_virtual_display_driver: bool,
     /// None preserves the distinction between an omitted setting and explicit zero.
     pub dd_virtual_display_permanent_count: Option<u8>,
+    /// Trusted startup verifier principals. Public operations cannot update this
+    /// list; an ordinary caller cannot query another principal's target names.
+    pub target_verifiers: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -39,6 +42,7 @@ struct SettingsInput {
     dd_use_sunshine_virtual_display_driver: bool,
     dd_virtual_display_permanent_count: Present<Value>,
     dd_vdd_static_monitor_count: Present<Value>,
+    target_verifiers: Vec<String>,
 }
 
 impl Default for SettingsInput {
@@ -51,6 +55,7 @@ impl Default for SettingsInput {
             dd_use_sunshine_virtual_display_driver: true,
             dd_virtual_display_permanent_count: Present::default(),
             dd_vdd_static_monitor_count: Present::default(),
+            target_verifiers: Vec::new(),
         }
     }
 }
@@ -110,6 +115,20 @@ impl<'de> Deserialize<'de> for Settings {
 
         let scale = crate::scale::ScaleSetting::try_from(input.dd_virtual_display_scale)
             .map_err(|()| D::Error::custom("unsupported dd_virtual_display_scale"))?;
+        if input.target_verifiers.len() > 16
+            || input
+                .target_verifiers
+                .iter()
+                .any(|name| !valid_principal(name))
+            || input
+                .target_verifiers
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                != input.target_verifiers.len()
+        {
+            return Err(D::Error::custom("invalid target verifier principals"));
+        }
         Ok(Self {
             enabled: input.enabled,
             virtual_display_layout: input.virtual_display_layout,
@@ -117,6 +136,7 @@ impl<'de> Deserialize<'de> for Settings {
             dd_activate_virtual_display: input.dd_activate_virtual_display,
             dd_use_sunshine_virtual_display_driver: input.dd_use_sunshine_virtual_display_driver,
             dd_virtual_display_permanent_count: permanent_count,
+            target_verifiers: input.target_verifiers,
         })
     }
 }
@@ -130,6 +150,7 @@ impl Default for Settings {
             dd_activate_virtual_display: false,
             dd_use_sunshine_virtual_display_driver: true,
             dd_virtual_display_permanent_count: None,
+            target_verifiers: Vec::new(),
         }
     }
 }
@@ -178,6 +199,14 @@ pub fn valid_identity(identity: &str) -> bool {
 
 pub fn valid_reference_id(reference_id: &str) -> bool {
     amaterasu_contracts::virtual_display::valid_reference_id(reference_id)
+}
+
+pub fn valid_principal(principal: &str) -> bool {
+    !principal.is_empty()
+        && principal.len() <= 128
+        && principal
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
 }
 
 #[cfg(any(not(amaterasu_libvirtualdisplay), test))]

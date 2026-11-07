@@ -60,6 +60,8 @@ pub enum Operation {
         operation_id: Option<String>,
         #[serde(default)]
         constant_rate: bool,
+        #[serde(default)]
+        source_format: Option<amaterasu_module_sdk::capture::SourceFormat>,
     },
     Lookup {
         operation_id: String,
@@ -71,6 +73,7 @@ pub enum Operation {
 
 #[derive(Clone, Debug)]
 pub struct Frame {
+    pub encoding: crate::format::SourceEncoding,
     pub width: u32,
     pub height: u32,
     pub stride: u32,
@@ -90,7 +93,6 @@ pub struct FrameDelivery {
     pub is_fresh: bool,
 }
 
-#[cfg(any(windows, test))]
 pub fn frame_layout(width: u32, height: u32) -> CaptureResult<(u32, usize)> {
     let stride = width.checked_mul(4).ok_or_else(invalid_frame)?;
     let length = (stride as usize)
@@ -107,7 +109,6 @@ pub fn frame_layout(width: u32, height: u32) -> CaptureResult<(u32, usize)> {
     Ok((stride, length))
 }
 
-#[cfg(any(windows, test))]
 fn invalid_frame() -> CaptureError {
     CaptureError::new(
         "invalid_frame",
@@ -119,7 +120,7 @@ fn invalid_frame() -> CaptureError {
 /// Each of `height` rows at `source + row * row_pitch` must contain at
 /// least `width * 4` initialized readable bytes through this call. Padding
 /// need not be initialized; it is never included in a Rust slice.
-#[cfg(any(windows, test))]
+#[cfg(test)]
 pub unsafe fn copy_bgra_rows(
     width: u32,
     height: u32,
@@ -159,4 +160,56 @@ pub fn mapped_length(height: u32, row_pitch: u32, stride: u32) -> CaptureResult<
         .and_then(|length| length.checked_add(stride as usize))
         .filter(|length| *length <= 2 * amaterasu_media::MAX_FRAME_BYTES)
         .ok_or_else(invalid_frame)
+}
+
+/// Validate packed CPU storage while permitting bounded FP16 source readback.
+/// P010 delivery storage is separately bounded by the public resource adapter.
+pub fn source_frame_layout(
+    width: u32,
+    height: u32,
+    encoding: crate::format::SourceEncoding,
+) -> CaptureResult<(u32, usize)> {
+    let stride = width
+        .checked_mul(encoding.bytes_per_pixel())
+        .ok_or_else(invalid_frame)?;
+    let length = (stride as usize)
+        .checked_mul(height as usize)
+        .ok_or_else(invalid_frame)?;
+    if width == 0
+        || height == 0
+        || width > 8192
+        || height > 8192
+        || length > 2 * amaterasu_media::MAX_FRAME_BYTES
+    {
+        return Err(invalid_frame());
+    }
+    Ok((stride, length))
+}
+
+/// # Safety
+/// `source + row * row_pitch` must hold the complete initialized packed pixel
+/// row for each row through this call. Padding is never borrowed or read.
+#[cfg(any(windows, test))]
+pub unsafe fn copy_source_rows(
+    width: u32,
+    height: u32,
+    row_pitch: u32,
+    source: *const u8,
+    encoding: crate::format::SourceEncoding,
+) -> CaptureResult<Vec<u8>> {
+    let (stride, length) = source_frame_layout(width, height, encoding)?;
+    mapped_length(height, row_pitch, stride)?;
+    if source.is_null() {
+        return Err(invalid_frame());
+    }
+    let mut bytes = vec![0; length];
+    for row in 0..height as usize {
+        // SAFETY: caller supplies initialized pixel bytes, validated offsets
+        // stay within the mapped texture, and row padding is not included.
+        let pixels = unsafe {
+            std::slice::from_raw_parts(source.add(row * row_pitch as usize), stride as usize)
+        };
+        bytes[row * stride as usize..(row + 1) * stride as usize].copy_from_slice(pixels);
+    }
+    Ok(bytes)
 }

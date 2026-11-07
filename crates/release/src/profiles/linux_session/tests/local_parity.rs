@@ -204,6 +204,7 @@ fn profile_uses_real_libraries_and_none_of_the_fixture_or_foreign_platform_compo
     assert_eq!(
         video.native_uses,
         &[
+            "amaterasu.capture-black/1",
             "amaterasu.capture-kms/1",
             "amaterasu.capture-pipewire/1",
             "amaterasu.capture-vkms/1",
@@ -439,7 +440,7 @@ fn linux_session_call_intersections_cover_the_whole_stream_and_launch_chain() {
 }
 
 #[test]
-fn only_the_stream_chain_can_reach_capture_and_virtual_display() {
+fn only_the_approved_stream_and_remote_owners_can_reach_capture_and_virtual_display() {
     let policy = default_policy("chain-only");
     let capture = "amaterasu.capture-kms/1";
     let virtual_display = "amaterasu.virtual-display/1";
@@ -468,7 +469,13 @@ fn only_the_stream_chain_can_reach_capture_and_virtual_display() {
         .collect();
     assert_eq!(
         display_callers,
-        BTreeSet::from([NVHTTP_ID, RTSP_ID, STREAM_SESSION_ID])
+        BTreeSet::from([
+            NVHTTP_ID,
+            RTSP_ID,
+            STREAM_SESSION_ID,
+            "amaterasu.remote-session",
+            "amaterasu.display",
+        ])
     );
     for outsider in [
         "amaterasu.pairing",
@@ -482,7 +489,9 @@ fn only_the_stream_chain_can_reach_capture_and_virtual_display() {
         CONSOLE_ID,
     ] {
         assert!(!policy.principals[outsider].call.contains(capture));
-        assert!(!policy.principals[outsider].call.contains(virtual_display));
+        if outsider != "amaterasu.display" {
+            assert!(!policy.principals[outsider].call.contains(virtual_display));
+        }
     }
     let native_users: BTreeSet<_> = policy
         .principals
@@ -666,6 +675,8 @@ fn nvhttp_chain_grants_match_the_agreed_services_exactly() {
     assert_eq!(
         component(NVHTTP_ID).grants().call,
         expected(&[
+            "nonary.session-presentation/1",
+            "amaterasu.capture-black/1",
             "amaterasu.host-package-barrier/1",
             "amaterasu.configuration/1",
             "amaterasu.session-lifecycle/1",
@@ -699,6 +710,7 @@ fn nvhttp_chain_grants_match_the_agreed_services_exactly() {
     assert_eq!(
         component(RTSP_ID).grants().call,
         expected(&[
+            "amaterasu.capture-black/1",
             "amaterasu.session-lifecycle/1",
             "amaterasu.extension-registry/1",
             "nonary.frame-limiter/1",
@@ -723,6 +735,7 @@ fn nvhttp_chain_grants_match_the_agreed_services_exactly() {
     assert_eq!(
         component(STREAM_SESSION_ID).grants().call,
         expected(&[
+            "amaterasu.capture-black/1",
             "amaterasu.host-package-barrier/1",
             "amaterasu.session-lifecycle/1",
             "amaterasu.extension-registry/1",
@@ -758,6 +771,7 @@ fn nvhttp_chain_grants_match_the_agreed_services_exactly() {
     assert_eq!(
         component(VIDEO_COMPONENT_ID).grants().call,
         expected(&[
+            "amaterasu.capture-black/1",
             "amaterasu.capture-kms/1",
             "amaterasu.capture-pipewire/1",
             "amaterasu.capture-vkms/1",

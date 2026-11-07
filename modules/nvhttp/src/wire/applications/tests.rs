@@ -29,6 +29,8 @@ fn request_context(secure: bool, trusted: bool, certificate: bool) -> RequestCon
         peer_trusted: trusted,
         list_allowed: trusted,
         launch_allowed: trusted,
+        view_allowed: trusted,
+        terminate_allowed: trusted,
         remote: "127.0.0.1".parse().unwrap(),
         peer_certificate: certificate.then(|| vec![1, 2, 3]),
     }

@@ -9,6 +9,7 @@ amaterasu-abi.workspace = true
 amaterasu-contracts.workspace = true
 amaterasu-configuration-schema.workspace = true
 amaterasu-extension-api.workspace = true
+amaterasu-module-sdk.workspace = true
 amaterasu-package.workspace = true
 amaterasu-storage.workspace = true
 serde_json.workspace = true

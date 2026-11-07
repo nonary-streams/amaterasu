@@ -232,6 +232,11 @@ impl Coordinator {
     ) -> ModuleResult<Value> {
         let mut next = self.shared.borrow().value.clone();
         let operation = payload["operation"].as_str().ok_or("invalid_request")?;
+        if !matches!(operation, "prepare" | "prepare_stream" | "resume_stream")
+            && payload.get("borrowed_capture").is_some()
+        {
+            return Err("borrowed_capture_context_is_frozen".into());
+        }
         // A transferred action may mutate a domain shared across sessions. Its
         // domain set is not known until fresh planning, so conservatively fence
         // new preparation until the transfer completes or is reconciled.
@@ -249,6 +254,13 @@ impl Coordinator {
         let mut wait_target = None;
         let mut response;
         if operation == "prepare" {
+            let application_ref = super::borrowed_capture::freeze_application(
+                &self.settings,
+                caller,
+                initiator,
+                &payload,
+                &next,
+            )?;
             let application_operation_id = payload
                 .get("application_operation_id")
                 .map(|value| {
@@ -289,10 +301,7 @@ impl Coordinator {
                         initiator: initiator.into(),
                     },
                     delegates: self.settings.session_delegates.clone(),
-                    application_ref: payload
-                        .get("application_ref")
-                        .cloned()
-                        .unwrap_or(Value::Null),
+                    application_ref,
                     settings_revision: payload
                         .get("settings_revision")
                         .and_then(Value::as_str)
@@ -340,6 +349,12 @@ impl Coordinator {
             response = json!({"status":"succeeded","target":target,"plan_revision":payload.get("plan_revision")});
             match operation {
                 "prepare_stream" | "resume_stream" => {
+                    let borrowed_capture = super::borrowed_capture::stream_source(
+                        &self.settings,
+                        caller,
+                        &payload,
+                        session,
+                    )?;
                     if stream_id.is_some()
                         || !matches!(session.phase, SessionPhase::Ready | SessionPhase::Paused)
                     {
@@ -452,6 +467,7 @@ impl Coordinator {
                     next.sessions.get_mut(&session_id).unwrap().streams.insert(
                         stream_id,
                         StreamRecord {
+                            borrowed_capture,
                             join_context: current.join_context.clone(),
                             provider_graph: current.provider_graph.clone(),
                             generation: 1,

@@ -50,6 +50,7 @@ LIBRARY_PACKAGES = [
     "amaterasu-session-history", "amaterasu-host-metrics", "amaterasu-catalog",
     "amaterasu-application", "amaterasu-steam", "amaterasu-lutris", "amaterasu-authentication",
     "amaterasu-management", "amaterasu-pairing", "amaterasu-nvhttp", "amaterasu-display",
+    "amaterasu-remote-session", "amaterasu-capture-black",
     "amaterasu-launch", "amaterasu-input", "amaterasu-virtual-display", "amaterasu-capture-kms",
     "amaterasu-capture-pipewire",
     "amaterasu-audio", "amaterasu-audio-encode", "amaterasu-encode", "amaterasu-video",

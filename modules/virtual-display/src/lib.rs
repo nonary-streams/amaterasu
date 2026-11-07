@@ -12,6 +12,7 @@ mod manager;
 mod model;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod protocol;
+mod retained_mode;
 mod scale;
 
 use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};

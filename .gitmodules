@@ -16,3 +16,6 @@
 [submodule "modules/frame-limiter"]
 	path = modules/frame-limiter
 	url = https://github.com/nonary-streams/amaterasu-frame-limiter.git
+[submodule "modules/remote-session"]
+	path = modules/remote-session
+	url = https://github.com/nonary-streams/amaterasu-remote-session.git

@@ -1,4 +1,5 @@
 mod direct;
+mod preflight;
 use crate::{
     admission::Admission,
     backend::{Backend, SourceSession},
@@ -244,8 +245,14 @@ impl<B: Backend> Controller<B> {
             return Err("unsupported_constant_rate");
         }
         if output.starts_with("kwin:") {
-            if !self.settings.allow_named_outputs {
+            let name = output.strip_prefix("kwin:").expect("named output prefix");
+            let managed = direct::valid_name(name);
+            if managed && !self.settings.allow_named_outputs && !self.settings.allow_desktop_outputs
+            {
                 return Err("named_capture_disabled");
+            }
+            if !managed && !self.settings.allow_desktop_outputs {
+                return Err("desktop_capture_disabled");
             }
             return self.direct.open(
                 &self.backend,
@@ -554,6 +561,7 @@ impl<B: Backend> Controller<B> {
             "selection_choices":self.choices(),"streams":streams,"geometry_supported":false,
             "opened":self.opened,"closed":self.closed.len(),"active":usize::from(self.lease.is_some()) + self.direct.active_count(),
             "named_outputs_enabled":self.settings.allow_named_outputs,"named_capture_linked":cfg!(amaterasu_kwin),
+            "desktop_outputs_enabled":self.settings.allow_desktop_outputs,
             "frames_copied":self.frames_copied + copied,"frames_accepted":self.frames_accepted + accepted})
     }
 
@@ -600,5 +608,7 @@ fn output_metadata(record: &SelectionRecord) -> Option<Value> {
     )
 }
 
+#[cfg(test)]
+mod preflight_tests;
 #[cfg(test)]
 mod tests;

@@ -90,7 +90,7 @@ feature parity with a deployed streaming host. **Pending** means not implemented
 | Video processing and HDR | Implemented BGRA-to-NV12 conversion, provider selection, force-IDR and graceful video drain; HDR pending | Color conversion, HDR metadata, processing, TrueHDR and SDR fallback |
 | Physical display management | Implemented Windows classic CCD transactions; hardware unqualified | Resolution, refresh, HDR, scaling, rotation and exact topology restoration |
 | Virtual-display adapters | Implemented Sunshine owned temporary-monitor adapter; driver unqualified | Driver protocols, persistent identity, readiness, fallback and cleanup |
-| Remote Monitor | Pending | Per-client retained monitors, isolated capture, layouts and peer-safe teardown |
+| Remote Monitor | Pending | Plugin and public SDK implementation: [remote sessions](remote-session-plugin.md). Native display, client playback, layouts and peer-safe teardown require complete platform qualification. |
 | Display recovery | Implemented durable journal and explicit owner recovery | Crashes, cancellation, stale snapshots, emergency recovery and final-owner release |
 | Audio | Implemented Windows WASAPI and Linux Pulse-compatible monitor capture with Opus delivery; live audio remains unqualified | Sustained client playback, clock synchronization, surround, endpoint roles and recovery under server changes |
 | Keyboard/mouse | Implemented authenticated session dispatch, captured-monitor coordinate validation, expiring input leases, Windows SendInput and Linux uinput backends; hardware unqualified | Native multi-monitor/mixed-DPI qualification, layout-change continuity, layouts/text, desktop ownership and crash-surviving release cleanup |

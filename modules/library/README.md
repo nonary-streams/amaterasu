@@ -3,6 +3,25 @@
 The library forwards client-facing catalog list and resolve requests. Launch
 remains owned by `amaterasu.launch/1`.
 
+## Complete presentation identities
+
+An installed presentation consumer can request
+`{"action":"identity_inventory","limit":32,"cursor":null}`. This returns
+`{ok,revision,entries,next_cursor}`; entries contain `id`, `uuid`, `title`,
+`aliases`, `visible`, `monitor_profile`, and `properties`. IDs and aliases retain
+the canonical `app-` plus sixteen lowercase hexadecimal digits. Hidden entries
+remain in this inventory so a synthetic control or cached tile cannot reuse
+their identities. Ordinary `list` remains a visible `id`/`name` projection.
+
+Each page contains at most 32 ordered entries and fits 12 KiB, so metadata can
+produce a shorter page with a continuation. Preserve the complete cursor and
+restart after a revision conflict. The SDK supplies request/response types and
+whole-page validation. The library removes launch and preparation fields before
+publication, validates bounded properties and continuations, and delegates with
+the original broker parent. Catalog accepts inventory requests only from its
+startup-selected library and configured consumer initiator; payload identities
+never select a catalog owner.
+
 Optional provider discovery is disabled by default. At startup, an installed
 package may supply module settings such as:
 

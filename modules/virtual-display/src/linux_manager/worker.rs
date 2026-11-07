@@ -41,6 +41,78 @@ struct Controller<B: Broker, C: Compositor, I: ConnectorInventory> {
     stopped: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 impl<B: Broker, C: Compositor, I: ConnectorInventory> Controller<B, C, I> {
+    fn retained_mode(
+        &mut self,
+        key: &(String, String),
+        mut change: crate::retained_mode::Change,
+        step: crate::retained_mode::Step,
+    ) -> Result<Record, String> {
+        let mut record = self
+            .journal
+            .records
+            .iter()
+            .find(|record| &record.key() == key)
+            .cloned()
+            .ok_or("missing owned display record")?;
+        if record.parked
+            || !change.references_match(record.references.as_ref())
+            || !self.broker.connected(&record.output)?
+        {
+            return Err("retained mode ownership changed".into());
+        }
+        if step != crate::retained_mode::Step::Prepare {
+            if record.retained_mode.as_ref() != Some(&change)
+                || !change.valid(&record.specification)
+            {
+                return Err("retained mode transaction changed".into());
+            }
+            let expected = if step == crate::retained_mode::Step::Commit {
+                &change.desired
+            } else {
+                &change.old
+            };
+            self.compositor
+                .verify_retained_mode(&record.output, expected)?;
+            if step == crate::retained_mode::Step::Commit {
+                if change.aborted {
+                    return Err("retained mode was aborted".into());
+                }
+                change.completed = true;
+                record.specification = change.desired.clone();
+            } else {
+                if change.completed {
+                    return Err("retained mode already committed".into());
+                }
+                change.aborted = true;
+                record.specification = change.old.clone();
+            }
+        } else {
+            if record.specification != change.old
+                || record
+                    .transition
+                    .as_ref()
+                    .is_some_and(|transition| !transition.completed)
+                || record
+                    .retained_mode
+                    .as_ref()
+                    .is_some_and(|previous| previous.is_pending() && previous != &change)
+            {
+                return Err("retained mode precondition changed".into());
+            }
+            self.compositor
+                .verify_retained_mode(&record.output, &change.old)?;
+            // A completed earlier transaction no longer owns a mutation. The
+            // new durable intent records its own exact observed old/new modes.
+            record.transition = None;
+        }
+        record.retained_mode = Some(change);
+        if !record.valid() {
+            return Err("invalid retained mode intent".into());
+        }
+        self.journal.update(record.clone())?;
+        Ok(record)
+    }
+
     fn park(&mut self, mut record: Record, reason: &str) -> Result<bool, String> {
         if !record
             .references
@@ -50,6 +122,10 @@ impl<B: Broker, C: Compositor, I: ConnectorInventory> Controller<B, C, I> {
                 .transition
                 .as_ref()
                 .is_some_and(|transition| !transition.completed)
+            || record
+                .retained_mode
+                .as_ref()
+                .is_some_and(|change| change.is_pending())
         {
             return Err("cannot park an unresolved display owner".into());
         }
@@ -287,6 +363,7 @@ impl<B: Broker, C: Compositor, I: ConnectorInventory> Controller<B, C, I> {
                 .unwrap_or_default(),
             references,
             transition: None,
+            retained_mode: None,
             parked: false,
             park_reason: None,
         };
@@ -385,6 +462,10 @@ pub(super) fn run<B: Broker, C: Compositor, I: ConnectorInventory>(
             break;
         }
         let event = match work {
+            Work::RetainedMode { key, change, step } => {
+                let result = controller.retained_mode(&key, change, step);
+                Event::RetainedMode { key, result }
+            }
             Work::VerifyModeOnly {
                 key,
                 output,

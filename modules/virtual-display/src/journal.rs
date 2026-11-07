@@ -12,6 +12,10 @@ use std::path::{Path, PathBuf};
 pub struct Record {
     pub owner: String,
     pub specification: Specification,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allocation_specification: Option<Specification>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retained_mode: Option<crate::retained_mode::Change>,
     pub display_id: u64,
     pub lease: u64,
     pub prospective_lease: Option<u64>,
@@ -26,7 +30,7 @@ pub struct Record {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "event", deny_unknown_fields)]
 enum Event {
-    Upsert { record: Record },
+    Upsert { record: Box<Record> },
     Delete { owner: String, identity: String },
 }
 
@@ -99,6 +103,18 @@ impl Journal {
             match event {
                 Event::Upsert { record } => {
                     if record.specification.validate().is_err()
+                        || record
+                            .allocation_specification
+                            .as_ref()
+                            .is_some_and(|allocation| {
+                                allocation.validate().is_err()
+                                    || allocation.identity != record.specification.identity
+                                    || allocation.name != record.specification.name
+                            })
+                        || record
+                            .retained_mode
+                            .as_ref()
+                            .is_some_and(|change| !change.valid(&record.specification))
                         || record.display_id
                             != crate::model::display_id(
                                 &record.owner,
@@ -122,7 +138,7 @@ impl Journal {
                     }
                     records.insert(
                         (record.owner.clone(), record.specification.identity.clone()),
-                        record,
+                        *record,
                     );
                 }
                 Event::Delete { owner, identity } => {
@@ -173,7 +189,7 @@ impl Journal {
             return Err("conflicting virtual display journal records".into());
         }
         self.write(&Event::Upsert {
-            record: record.clone(),
+            record: Box::new(record.clone()),
         })?;
         self.records.insert(
             (record.owner.clone(), record.specification.identity.clone()),
@@ -241,6 +257,8 @@ mod tests {
             name: "Test display".into(),
         };
         let record = Record {
+            allocation_specification: None,
+            retained_mode: None,
             owner: "alice".into(),
             display_id: crate::model::display_id("alice", &specification.identity),
             specification,

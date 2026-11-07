@@ -173,9 +173,13 @@ unsafe extern "C" fn retirement(
     STATUS_OK
 }
 fn fixture() -> (Rc<Fixture>, InputPool<Rc<Fixture>>, CpuPoolSelection) {
+    fixture_format(PIXEL_BGRA8)
+}
+
+fn fixture_format(format: u32) -> (Rc<Fixture>, InputPool<Rc<Fixture>>, CpuPoolSelection) {
     let state = Box::new(UnsafeCell::new(State {
         caps: EncoderInputCpuWritableCapabilities {
-            format: PIXEL_BGRA8,
+            format,
             min_width: 2,
             max_width: 2,
             min_height: 2,
@@ -187,8 +191,8 @@ fn fixture() -> (Rc<Fixture>, InputPool<Rc<Fixture>>, CpuPoolSelection) {
         target: EncoderInputCpuWritableFrame {
             width: 2,
             height: 2,
-            format: PIXEL_BGRA8,
-            stride: 12,
+            format,
+            stride: if format == PIXEL_P010 { 8 } else { 12 },
             data: ptr::null_mut(),
             len: 24,
         },
@@ -224,7 +228,7 @@ fn fixture() -> (Rc<Fixture>, InputPool<Rc<Fixture>>, CpuPoolSelection) {
         dropped: Rc::new(Cell::new(false)),
     });
     let pool = unsafe { InputPool::new(&*fixture.table, fixture.clone(), 1) }.unwrap();
-    let selection = unsafe { super::configure(&pool, 2, 2, PIXEL_BGRA8, 1) }.unwrap();
+    let selection = unsafe { super::configure(&pool, 2, 2, format, 1) }.unwrap();
     (fixture, pool, selection)
 }
 unsafe extern "C" fn retain(_: *mut c_void) -> Status {
@@ -307,6 +311,49 @@ fn copies_rows_and_metadata_and_retires() {
     );
     assert!(none(&submitted.completion_sync));
     finish(pool, selection.generation);
+}
+
+#[test]
+fn p010_copy_preserves_both_planes_with_independent_source_and_target_padding() {
+    let (fixture, pool, selection) = fixture_format(PIXEL_P010);
+    // SAFETY: no callback or lease is active while the test changes its provider fixture.
+    let state = unsafe { &mut *fixture.state.get() };
+    state.caps.format = PIXEL_P010;
+    state.target.format = PIXEL_P010;
+    state.target.stride = 8;
+    state.target.len = 24;
+    state.pixels = vec![0xee; 24];
+    let mut bytes = [0xaa; 18];
+    for row in 0..3 {
+        let code = if row < 2 { 64u16 + row as u16 } else { 512u16 };
+        for column in 0..2 {
+            bytes[row * 6 + column * 2..row * 6 + column * 2 + 2]
+                .copy_from_slice(&(code << 6).to_le_bytes());
+        }
+    }
+    let cpu = CpuFrame {
+        width: 2,
+        height: 2,
+        format: PIXEL_P010,
+        stride: 6,
+        data: bytes.as_ptr(),
+        len: bytes.len(),
+        timestamp_us: 11,
+        sequence: 12,
+    };
+    let frame = capture(&cpu);
+    // SAFETY: provider's input pool and immutable capture pixels remain live for the copy.
+    assert!(unsafe { write(&pool, &selection, &frame, 3, 4, 12) }.is_ok());
+    let state = unsafe { &*fixture.state.get() };
+    for row in 0..3 {
+        assert_eq!(
+            &state.pixels[row * 8..row * 8 + 4],
+            &bytes[row * 6..row * 6 + 4]
+        );
+        assert_eq!(&state.pixels[row * 8 + 4..row * 8 + 8], &[0xee; 4]);
+    }
+    assert_eq!(state.submitted.unwrap().sequence, 12);
+    finish(pool, selection.generation());
 }
 #[test]
 fn busy_rejected_commit_and_failed_abandon_are_safe() {

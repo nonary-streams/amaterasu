@@ -72,6 +72,8 @@ pub struct Broker {
     pub video_close_polls: u8,
     pub video_remaining: u8,
     pub format_rate: u32,
+    pub reported_audio_capture_channels: Option<u32>,
+    pub reported_audio_sink_channels: Option<u32>,
     pub fail_completion: bool,
     pub discovered_video_port: Option<u16>,
     pub discovered_audio_port: Option<u16>,
@@ -1287,16 +1289,27 @@ impl Broker {
                 reply
             }
             "amaterasu.audio/1" => {
-                let channels = allocation.request["capture_format"]["channels"]
-                    .as_u64()
-                    .or_else(|| allocation.request["channels"].as_u64())
+                let channels = self
+                    .reported_audio_capture_channels
+                    .map(u64::from)
+                    .or_else(|| {
+                        allocation.request["capture_format"]["channels"]
+                            .as_u64()
+                            .or_else(|| allocation.request["channels"].as_u64())
+                    })
                     .unwrap_or(2);
                 let mask = match channels {
                     6 => 0x3f,
                     8 => 0x63f,
                     _ => 3,
                 };
-                json!({"ok":true,"stream":id,"endpoint":"resolved-canonical-endpoint","format":{"sample_rate":self.format_rate,"channels":channels,"channel_mask":mask,"format":"f32"}})
+                json!({"ok":true,"stream":id,"endpoint":"resolved-canonical-endpoint",
+                    "requested_endpoint":allocation.request["endpoint"],
+                    "virtual_sink":allocation.request["virtual_sink"],
+                    "channels":self.reported_audio_sink_channels.map(Value::from).unwrap_or_else(||allocation.request["channels"].clone()),
+                    "host_audio_enabled":allocation.request["host_audio_enabled"],
+                    "capture_sink_without_routing":allocation.request["capture_sink_without_routing"],
+                    "format":{"sample_rate":self.format_rate,"channels":channels,"channel_mask":mask,"format":"f32"}})
             }
             _ => panic!("unexpected component"),
         }

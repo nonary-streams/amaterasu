@@ -129,7 +129,313 @@ fn startup_recovery_pending(controller: &mut Controller, deadline: u64) {
 }
 
 fn listed_stream_sessions(sessions: Value, total: usize) -> Value {
-    json!({"ok":true,"sessions":sessions,"total":total,"truncated":false})
+    json!({"ok":true,"sessions":sessions,"total":total,"truncated":false,"startup_reconciled":true})
+}
+
+#[test]
+fn retirement_observations_distinguish_runtime_fences_from_missing_tickets() {
+    let settings = Settings {
+        allowed_principals: vec!["caller".into()],
+        retirement_status_principals: vec!["observer".into()],
+        retirement_status_owners: BTreeMap::from([("observer".into(), "caller".into())]),
+        ..Settings::default()
+    };
+    let mut controller = Controller::new(settings).unwrap();
+    let epoch = controller.runtime_epoch.clone();
+    let old_epoch = "0".repeat(32);
+    assert_ne!(epoch, old_epoch);
+    let mut endpoint = Endpoint::default();
+    let runtime = client(&mut endpoint);
+    controller.retirement_status(1, "observer", Some("persisted-op"), None, &runtime);
+    controller.retirement_status(2, "observer", Some("persisted-op"), Some(&epoch), &runtime);
+    controller.retirement_status(
+        3,
+        "observer",
+        Some("persisted-op"),
+        Some(&old_epoch),
+        &runtime,
+    );
+    assert_eq!(endpoint.completions[0].1["state"], "unknown");
+    assert_eq!(endpoint.completions[0].1["retired"], false);
+    assert!(endpoint.completions[0].1["expected_runtime_epoch"].is_null());
+    assert_eq!(endpoint.completions[1].1["retired"], false);
+    assert_eq!(endpoint.completions[1].1["expected_runtime_epoch"], epoch);
+    assert_eq!(endpoint.completions[2].1["state"], "epoch_fenced");
+    assert_eq!(endpoint.completions[2].1["retired"], true);
+    assert_eq!(
+        endpoint.completions[2].1["expected_runtime_epoch"],
+        old_epoch
+    );
+    assert_eq!(endpoint.completions[2].1["runtime_epoch"], epoch);
+    let mut current = record(State::Ready);
+    current.config.operation_id = "persisted-op".into();
+    controller.records.insert(current.id, current);
+    controller.retirement_status(
+        4,
+        "observer",
+        Some("persisted-op"),
+        Some(&old_epoch),
+        &runtime,
+    );
+    assert_eq!(endpoint.completions[3].1["state"], "active");
+    assert_eq!(endpoint.completions[3].1["retired"], false);
+    let current = controller.records.get_mut(&5).unwrap();
+    current.state = State::Closed;
+    controller.retirement_status(5, "observer", Some("persisted-op"), Some(&epoch), &runtime);
+    assert_eq!(endpoint.completions[4].1["retired"], false);
+    controller.records.get_mut(&5).unwrap().cleanup_confirmed = true;
+    controller.retirement_status(6, "observer", Some("persisted-op"), Some(&epoch), &runtime);
+    assert_eq!(endpoint.completions[5].1["state"], "retired");
+    assert_eq!(endpoint.completions[5].1["retired"], true);
+    controller.retirement_status(7, "foreign", Some("persisted-op"), Some(&epoch), &runtime);
+    assert_eq!(endpoint.completions[6].1["code"], "permission_denied");
+    controller.reconcile_startup(8, "observer", 0, &runtime);
+    assert_eq!(endpoint.completions[7].1["code"], "permission_denied");
+}
+
+#[test]
+fn retirement_observers_are_pinned_to_one_owner_and_epoch_reads_ignore_current_occupancy() {
+    let mut controller = Controller::new(Settings {
+        allowed_principals: vec!["caller".into(), "foreign-owner".into()],
+        retirement_status_owners: BTreeMap::from([
+            ("observer".into(), "caller".into()),
+            ("foreign-observer".into(), "foreign-owner".into()),
+        ]),
+        ..Settings::default()
+    })
+    .unwrap();
+    let epoch = controller.runtime_epoch.clone();
+    let mut owned = record(State::Closed);
+    owned.config.operation_id = "colliding-operation".into();
+    owned.cleanup_confirmed = true;
+    let mut foreign = record(State::Playing);
+    foreign.id = 6;
+    foreign.owner = "foreign-owner".into();
+    foreign.config.operation_id = "colliding-operation".into();
+    controller.records.insert(owned.id, owned);
+    controller.records.insert(foreign.id, foreign);
+    controller.display_cleanup.push(DisplayCleanup {
+        owner: "foreign-owner".into(),
+        operation_id: "foreign-pending".into(),
+        call: Call::new(json!({"action":"verify"}), "foreign-cleanup".into(), None),
+    });
+    let mut endpoint = Endpoint::default();
+    let runtime = client(&mut endpoint);
+    controller.retirement_status(
+        1,
+        "observer",
+        Some("colliding-operation"),
+        Some(&epoch),
+        &runtime,
+    );
+    assert_eq!(endpoint.completions[0].1["retired"], true);
+    assert_eq!(endpoint.completions[0].1["active_operations"], 0);
+    assert_eq!(endpoint.completions[0].1["cleanup_pending"], false);
+    controller.retirement_status(
+        2,
+        "foreign-observer",
+        Some("colliding-operation"),
+        Some(&epoch),
+        &runtime,
+    );
+    assert_eq!(endpoint.completions[1].1["retired"], false);
+    assert_eq!(endpoint.completions[1].1["active_operations"], 1);
+    assert_eq!(endpoint.completions[1].1["cleanup_pending"], true);
+    controller.retirement_status(3, "caller", None, None, &runtime);
+    assert_eq!(endpoint.completions[2].1["active_operations"], 0);
+    assert_eq!(endpoint.completions[2].1["cleanup_pending"], false);
+    controller
+        .retired_operations
+        .insert(("foreign-owner".into(), "foreign-fence".into()));
+    controller.retirement_status(4, "observer", Some("foreign-fence"), Some(&epoch), &runtime);
+    assert_eq!(endpoint.completions[3].1["state"], "unknown");
+    assert_eq!(endpoint.completions[3].1["retired"], false);
+    controller.display_cleanup.push(DisplayCleanup {
+        owner: "caller".into(),
+        operation_id: "colliding-operation".into(),
+        call: Call::new(json!({"action":"verify"}), "owned-cleanup".into(), None),
+    });
+    controller.retirement_status(5, "observer", None, None, &runtime);
+    assert_eq!(endpoint.completions[4].1["startup_reconciled"], true);
+    assert_eq!(endpoint.completions[4].1["state"], "ready");
+    assert_eq!(endpoint.completions[4].1["cleanup_pending"], true);
+    controller.retirement_status(
+        6,
+        "observer",
+        Some("colliding-operation"),
+        Some(&epoch),
+        &runtime,
+    );
+    assert_eq!(endpoint.completions[5].1["retired"], false);
+    assert_eq!(endpoint.completions[5].1["state"], "active");
+    assert!(
+        serde_json::from_value::<Operation>(
+            json!({"action":"retirement_status", "owner":"foreign-owner"})
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn retirement_fences_wait_for_the_native_journal_reconciliation_proof() {
+    let mut controller = Controller::new(Settings {
+        allowed_principals: vec!["caller".into()],
+        ..Settings::default()
+    })
+    .unwrap();
+    startup_recovery_pending(&mut controller, 45_000);
+    let mut pending = listed_stream_sessions(json!([]), 0);
+    pending["startup_reconciled"] = json!(false);
+    let mut endpoint = Endpoint {
+        recovery_results: VecDeque::from([
+            Some(pending),
+            Some(listed_stream_sessions(json!([]), 0)),
+        ]),
+        ..Endpoint::default()
+    };
+    let runtime = client(&mut endpoint);
+    controller.advance_startup_recovery(&runtime, 0);
+    controller.advance_startup_recovery(&runtime, 1);
+    assert!(!controller.startup_recovery.ready());
+    controller.retirement_status(
+        1,
+        "caller",
+        Some("old-operation"),
+        Some(&"0".repeat(32)),
+        &runtime,
+    );
+    assert_eq!(endpoint.completions[0].1["retired"], false);
+    assert_eq!(endpoint.completions[0].1["startup_reconciled"], false);
+    controller.advance_startup_recovery(&runtime, 251);
+    controller.advance_startup_recovery(&runtime, 252);
+    assert!(controller.startup_recovery.ready());
+    controller.retirement_status(
+        2,
+        "caller",
+        Some("old-operation"),
+        Some(&"0".repeat(32)),
+        &runtime,
+    );
+    assert_eq!(endpoint.completions[1].1["retired"], true);
+    let missing = json!({"ok":false,"code":"session_not_found"});
+    assert!(recovery_stop_response(&missing, 23).is_err());
+    assert!(recovery_status_response(&missing, 23).is_err());
+}
+
+#[test]
+fn stale_epoch_admission_and_blocked_reconciliation_cannot_simulate_retirement() {
+    let mut controller = Controller::new(Settings {
+        allowed_principals: vec!["caller".into()],
+        ..Settings::default()
+    })
+    .unwrap();
+    let mut endpoint = Endpoint::default();
+    let runtime = client(&mut endpoint);
+    let mut config = open();
+    config.expected_runtime_epoch = Some("0".repeat(32));
+    controller.open(
+        OpenRequest {
+            request: 1,
+            caller: "caller".into(),
+            config,
+            deadline: 5000,
+            display_preflight_deadline: None,
+        },
+        0,
+        &runtime,
+        false,
+    );
+    assert_eq!(endpoint.completions[0].1["code"], "runtime_epoch_changed");
+    assert!(controller.records.is_empty());
+    assert!(
+        !endpoint
+            .commands
+            .iter()
+            .any(|command| matches!(command, Command::Request { .. }))
+    );
+    controller.startup_recovery.phase = RecoveryPhase::Blocked;
+    controller.startup_recovery.operation_sequence = 17;
+    controller.retirement_status(2, "caller", Some("old-op"), Some(&"0".repeat(32)), &runtime);
+    assert_eq!(endpoint.completions[1].1["retired"], false);
+    controller.reconcile_startup(3, "caller", 1000, &runtime);
+    assert_eq!(controller.startup_recovery.phase, RecoveryPhase::List);
+    assert_eq!(controller.startup_recovery.operation_sequence, 17);
+    assert_eq!(endpoint.completions[2].1["startup_reconciled"], false);
+}
+
+#[test]
+fn exact_operation_retirement_fences_delayed_admission_and_waits_for_native_close() {
+    let mut controller = Controller::new(Settings {
+        allowed_principals: vec!["caller".into()],
+        retirement_status_principals: vec!["observer".into()],
+        retirement_status_owners: BTreeMap::from([("observer".into(), "caller".into())]),
+        ..Settings::default()
+    })
+    .unwrap();
+    let epoch = controller.runtime_epoch.clone();
+    let mut endpoint = Endpoint {
+        verifier_reply: Some(
+            json!({"ok":true,"session":23,"state":"stopped","cleanup_error":null}),
+        ),
+        ..Endpoint::default()
+    };
+    let runtime = client(&mut endpoint);
+    controller.retire_operation(1, "caller", "never-admitted", &epoch, 0, &runtime);
+    assert_eq!(endpoint.completions[0].1["state"], "operation_fenced");
+    assert_eq!(endpoint.completions[0].1["retired"], true);
+    let mut delayed = open();
+    delayed.operation_id = "never-admitted".into();
+    delayed.expected_runtime_epoch = Some(epoch.clone());
+    controller.settings.enabled = true;
+    controller.open(
+        OpenRequest {
+            request: 2,
+            caller: "caller".into(),
+            config: delayed,
+            deadline: 5000,
+            display_preflight_deadline: None,
+        },
+        0,
+        &runtime,
+        false,
+    );
+    assert_eq!(endpoint.completions[1].1["code"], "operation_retired");
+    controller.records.insert(5, record(State::Playing));
+    controller.retire_operation(3, "caller", "caller-operation", &epoch, 0, &runtime);
+    assert_eq!(endpoint.completions[2].1["retired"], false);
+    assert_eq!(endpoint.completions[2].1["active_operations"], 1);
+    for now in 1..8 {
+        controller.advance_job(&runtime, now);
+    }
+    assert!(controller.records[&5].cleanup_confirmed);
+    assert!(endpoint.commands.iter().any(|command|matches!(command,Command::Request{service,payload,..} if service=="amaterasu.stream-session/1" && payload["action"]=="stop" && payload["session"]==23)));
+    controller.retirement_status(
+        4,
+        "observer",
+        Some("caller-operation"),
+        Some(&epoch),
+        &runtime,
+    );
+    assert_eq!(endpoint.completions.last().unwrap().1["retired"], true);
+    assert_eq!(
+        endpoint.completions.last().unwrap().1["active_operations"],
+        0
+    );
+    controller.retire_operation(5, "observer", "foreign", &epoch, 0, &runtime);
+    assert_eq!(
+        endpoint.completions.last().unwrap().1["code"],
+        "permission_denied"
+    );
+    for index in controller.retired_operations.len()..MAX_RECORDS {
+        controller
+            .retired_operations
+            .insert(("caller".into(), format!("fenced-{index}")));
+    }
+    controller.retire_operation(6, "caller", "over-capacity", &epoch, 0, &runtime);
+    assert_eq!(
+        endpoint.completions.last().unwrap().1["code"],
+        "retirement_fence_capacity_exhausted"
+    );
 }
 
 #[test]
@@ -2557,6 +2863,36 @@ fn authenticated_disconnect_requires_exact_clean_lifecycle_retirement() {
     assert_eq!(authenticated_disconnect_reason(&record, &payload), None);
     payload["authenticated_disconnect_reason"] = json!("peer_disconnected");
     payload["state"] = json!("stopped");
+    assert_eq!(authenticated_disconnect_reason(&record, &payload), None);
+}
+
+#[test]
+fn auxiliary_disconnect_requires_an_exact_authenticated_control_retirement_witness() {
+    let record = record(State::Playing);
+    let mut payload = json!({"ok":true,"session":23,"state":"failed","cleanup_error":null,
+        "authenticated_disconnect_reason":"peer_disconnected"});
+    assert_eq!(authenticated_disconnect_reason(&record, &payload), None);
+    payload["authenticated_disconnect"] = json!({"version":1,"session":23,
+        "operation_id":record.operation(),"control_authenticated":true,"reason":"peer_disconnected"});
+    assert_eq!(
+        authenticated_disconnect_reason(&record, &payload),
+        Some("peer_disconnected")
+    );
+    for (field, value) in [
+        ("session", json!(24)),
+        ("operation_id", json!("another-transport")),
+        ("control_authenticated", json!(false)),
+        ("reason", json!("peer_timeout")),
+    ] {
+        let mut forged = payload.clone();
+        forged["authenticated_disconnect"][field] = value;
+        assert_eq!(
+            authenticated_disconnect_reason(&record, &forged),
+            None,
+            "{field}"
+        );
+    }
+    payload["cleanup_error"] = json!("native_retirement_pending");
     assert_eq!(authenticated_disconnect_reason(&record, &payload), None);
 }
 

@@ -257,6 +257,21 @@ pub struct SourceEncoderRegistration {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct SourcePreflightRoute {
+    pub provider: CaptureProvider,
+    #[serde(rename = "class")]
+    pub source_class: amaterasu_module_sdk::capture::SourceClass,
+}
+
+impl Clone for SourcePreflightRoute {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl Copy for SourcePreflightRoute {}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Settings {
     #[serde(default)]
     pub enabled: bool,
@@ -264,6 +279,12 @@ pub struct Settings {
     pub capture_providers: BTreeSet<CaptureProvider>,
     #[serde(default)]
     pub external_capture_providers: BTreeMap<String, ExternalProviderRegistration>,
+    /// Trusted opaque route keys for nonmutating source queries. Requests
+    /// cannot choose a native service or fall back to another provider.
+    #[serde(default)]
+    pub source_preflight_routes: BTreeMap<String, SourcePreflightRoute>,
+    #[serde(default)]
+    pub preflight_only_principals: BTreeSet<String>,
     #[serde(default)]
     pub external_encoder_providers: BTreeMap<String, String>,
     #[serde(default)]
@@ -274,6 +295,9 @@ pub struct Settings {
     pub cpu_processor_service: Option<String>,
     #[serde(default)]
     pub gpu_processor_service: Option<String>,
+    /// Explicit generic resource processor; v1.0 uses signed startup settings.
+    #[serde(default)]
+    pub resource_processor_service: Option<String>,
     /// Keep the selected processor inactive until a stream explicitly selects it.
     #[serde(default)]
     pub gpu_processor_opt_in: bool,
@@ -302,11 +326,14 @@ impl Default for Settings {
             enabled: false,
             capture_providers: default_providers(),
             external_capture_providers: BTreeMap::new(),
+            source_preflight_routes: BTreeMap::new(),
+            preflight_only_principals: BTreeSet::new(),
             external_encoder_providers: BTreeMap::new(),
             external_encoder_consumers: BTreeMap::new(),
             source_encoder_providers: BTreeMap::new(),
             cpu_processor_service: None,
             gpu_processor_service: None,
+            resource_processor_service: None,
             gpu_processor_opt_in: false,
             require_frame_lease: false,
             drain_timeout_ms: default_drain_timeout(),
@@ -335,6 +362,7 @@ impl Settings {
         for service in [
             self.cpu_processor_service.as_deref(),
             self.gpu_processor_service.as_deref(),
+            self.resource_processor_service.as_deref(),
         ]
         .into_iter()
         .flatten()
@@ -360,6 +388,28 @@ impl Settings {
         })
     }
     pub fn validate(&self) -> Result<(), &'static str> {
+        if self.source_preflight_routes.len() > 32
+            || self.source_preflight_routes.iter().any(|(key, provider)| {
+                key.is_empty()
+                    || key.len() > 128
+                    || key.chars().any(char::is_control)
+                    || !self
+                        .resolved_providers()
+                        .iter()
+                        .any(|selected| selected.identity() == provider.provider.identity())
+            })
+        {
+            return Err("invalid_source_preflight_routes");
+        }
+        if self.preflight_only_principals.len() > 32
+            || self.preflight_only_principals.iter().any(|principal| {
+                principal.is_empty()
+                    || principal.len() > 128
+                    || principal.chars().any(char::is_control)
+            })
+        {
+            return Err("invalid_preflight_only_principals");
+        }
         if (self.capture_providers.is_empty()
             && self.external_capture_providers.is_empty()
             && self.source_encoder_providers.is_empty())
@@ -376,7 +426,19 @@ impl Settings {
                 .gpu_processor_service
                 .as_ref()
                 .is_some_and(|service| !valid_external_service(service))
-            || (self.cpu_processor_service.is_some() && self.gpu_processor_service.is_some())
+            || self
+                .resource_processor_service
+                .as_ref()
+                .is_some_and(|service| !valid_external_service(service))
+            || [
+                self.cpu_processor_service.is_some(),
+                self.gpu_processor_service.is_some(),
+                self.resource_processor_service.is_some(),
+            ]
+            .into_iter()
+            .filter(|selected| *selected)
+            .count()
+                > 1
             || self.external_encoder_consumers.len() > 16
             || self
                 .external_encoder_consumers
@@ -458,6 +520,27 @@ impl Settings {
                         .map(CaptureProvider::External)
                     }),
             )
+            .collect()
+    }
+
+    pub fn resolved_source_preflight_routes(&self) -> BTreeMap<String, SourcePreflightRoute> {
+        let providers = self.resolved_providers();
+        self.source_preflight_routes
+            .iter()
+            .filter_map(|(key, route)| {
+                providers
+                    .iter()
+                    .find(|provider| provider.identity() == route.provider.identity())
+                    .map(|provider| {
+                        (
+                            key.clone(),
+                            SourcePreflightRoute {
+                                provider: *provider,
+                                source_class: route.source_class,
+                            },
+                        )
+                    })
+            })
             .collect()
     }
 }
@@ -652,10 +735,6 @@ impl Configuration {
         // used with an explicitly selected processing policy.
         self.gpu_processing.is_none()
             && self.video_stream_format.validate().is_ok()
-            && ((self.video_stream_format.bit_depth == 8
-                && self.video_stream_format.dynamic_range
-                    == amaterasu_module_sdk::DynamicRange::Sdr)
-                || (cfg!(target_os = "linux") && self.video_stream_format.bit_depth == 10))
             && (1..=16384).contains(&self.width)
             && (1..=16384).contains(&self.height)
             && self.width.is_multiple_of(2)
@@ -679,10 +758,6 @@ impl Configuration {
                         == (self.video_stream_format.dynamic_range
                             == amaterasu_module_sdk::DynamicRange::Hdr))
         }) && self.video_stream_format.validate().is_ok()
-            && ((self.video_stream_format.bit_depth == 8
-                && self.video_stream_format.dynamic_range
-                    == amaterasu_module_sdk::DynamicRange::Sdr)
-                || (cfg!(target_os = "linux") && self.video_stream_format.bit_depth == 10))
             && (16..=3840).contains(&self.width)
             && (16..=2160).contains(&self.height)
             && self.width.is_multiple_of(2)
@@ -690,8 +765,6 @@ impl Configuration {
             && (1..=120).contains(&self.fps)
             && (100_000..=100_000_000).contains(&self.bitrate)
             && self.max_reference_frames <= 16
-            && (cfg!(target_os = "linux") || self.codec == VideoCodec::H264)
-            && (!cfg!(windows) || self.color_mode.is_default())
             && self.slices_per_frame >= 1
             && self.amd_av1_latency_mode == AmdAv1LatencyMode::Auto
             && self.nvenc_settings.validate().is_ok()
@@ -709,6 +782,7 @@ fn valid_software_option(value: &Option<String>, maximum: usize) -> bool {
 
 #[derive(Clone, PartialEq)]
 pub struct OpenSpec {
+    pub source_capture_context: Option<amaterasu_module_sdk::capture::SourceCaptureContext>,
     pub packet_boundaries: bool,
     pub operation_id: Option<String>,
     pub provider: CaptureProvider,
@@ -817,6 +891,8 @@ enum OperationInput {
         source_id: Option<u64>,
         #[serde(default)]
         encoder_options: Option<serde_json::Value>,
+        #[serde(default)]
+        source_capture_context: Option<amaterasu_module_sdk::capture::SourceCaptureContext>,
         encoder: EncoderSelection,
         #[serde(default)]
         encoder_provider: Option<String>,
@@ -923,6 +999,7 @@ impl<'de> Deserialize<'de> for Operation {
                 output,
                 source_id,
                 encoder_options,
+                source_capture_context,
                 encoder,
                 encoder_provider,
                 configuration,
@@ -934,6 +1011,7 @@ impl<'de> Deserialize<'de> for Operation {
                     if capture_provider.0.is_some()
                         || capture.0.is_some()
                         || constant_rate.0.is_some()
+                        || source_capture_context.is_some()
                         || !output.is_empty()
                     {
                         return Err(serde::de::Error::custom(
@@ -962,7 +1040,7 @@ impl<'de> Deserialize<'de> for Operation {
                         constant_rate.0.unwrap_or(false),
                     )
                 };
-                if let Some(options) = encoder_options {
+                if encoder_options.is_some() || source_capture_context.is_some() {
                     return Ok(Self::OpenWithOptions {
                         specification: Box::new(OpenSpec {
                             packet_boundaries,
@@ -976,7 +1054,8 @@ impl<'de> Deserialize<'de> for Operation {
                             encoder,
                             encoder_provider,
                             source_id: None,
-                            encoder_options: Some(options),
+                            encoder_options,
+                            source_capture_context,
                             configuration: *configuration,
                         }),
                     });
@@ -1093,7 +1172,7 @@ mod tests {
             assert_eq!(current.codec, media);
             assert!(current.validate());
             current.video_stream_format.bit_depth = 10;
-            assert_eq!(current.validate(), cfg!(target_os = "linux"));
+            assert!(current.validate());
         }
         let mut conflicting: Configuration =
             serde_json::from_value(open_request()["configuration"].clone()).unwrap();
@@ -1102,6 +1181,42 @@ mod tests {
         assert_eq!(
             conflicting.normalize_codec(),
             Err("conflicting_video_codec")
+        );
+    }
+
+    #[test]
+    fn selected_providers_can_accept_ten_bit_sdr_and_hdr_without_host_os_gates() {
+        for codec in [
+            amaterasu_module_sdk::VideoCodec::Hevc,
+            amaterasu_module_sdk::VideoCodec::Av1,
+        ] {
+            for dynamic_range in [
+                amaterasu_module_sdk::DynamicRange::Sdr,
+                amaterasu_module_sdk::DynamicRange::Hdr,
+            ] {
+                let mut configuration: Configuration =
+                    serde_json::from_value(open_request()["configuration"].clone()).unwrap();
+                configuration.video_stream_format = amaterasu_module_sdk::VideoStreamFormat {
+                    codec,
+                    bit_depth: 10,
+                    dynamic_range,
+                };
+                configuration.normalize_codec().unwrap();
+                assert!(configuration.validate());
+                assert!(configuration.validate_source());
+            }
+        }
+        let mut configuration: Configuration =
+            serde_json::from_value(open_request()["configuration"].clone()).unwrap();
+        configuration.color_mode = ColorMode::Bt709Full;
+        assert!(
+            configuration.validate(),
+            "the selected encoder decides color capability"
+        );
+        configuration.video_stream_format.bit_depth = 10;
+        assert!(
+            !configuration.validate(),
+            "invalid H.264 formats remain invalid on every platform"
         );
     }
 
@@ -1480,12 +1595,15 @@ mod tests {
             enabled: true,
             capture_providers: [CaptureProvider::X11].into(),
             external_capture_providers: BTreeMap::new(),
+            source_preflight_routes: BTreeMap::new(),
+            preflight_only_principals: BTreeSet::new(),
             external_encoder_providers: BTreeMap::new(),
             external_encoder_consumers: BTreeMap::new(),
             source_encoder_providers: BTreeMap::new(),
             cpu_processor_service: None,
             gpu_processor_service: None,
             gpu_processor_opt_in: false,
+            resource_processor_service: None,
             require_frame_lease: false,
             drain_timeout_ms: 5000,
         };
@@ -1506,12 +1624,15 @@ mod tests {
             enabled: true,
             capture_providers: [CaptureProvider::Kms].into(),
             external_capture_providers: BTreeMap::new(),
+            source_preflight_routes: BTreeMap::new(),
+            preflight_only_principals: BTreeSet::new(),
             external_encoder_providers: BTreeMap::new(),
             external_encoder_consumers: BTreeMap::new(),
             source_encoder_providers: BTreeMap::new(),
             cpu_processor_service: None,
             gpu_processor_service: None,
             gpu_processor_opt_in: false,
+            resource_processor_service: None,
             require_frame_lease: false,
             drain_timeout_ms: 5000,
         };
@@ -1610,6 +1731,23 @@ mod tests {
                 serde_json::from_value(json!({"gpu_processor_service":service})).unwrap();
             assert_eq!(settings.validate(), Err("invalid_video_settings"));
         }
+        let resource: Settings =
+            serde_json::from_value(json!({"resource_processor_service":"third-party.effects/1"}))
+                .unwrap();
+        assert!(resource.validate().is_ok());
+        for other in ["gpu_processor_service", "cpu_processor_service"] {
+            let mut settings = json!({"resource_processor_service":"third-party.effects/1"});
+            settings[other] = json!("other.effects/1");
+            assert_eq!(
+                serde_json::from_value::<Settings>(settings)
+                    .unwrap()
+                    .validate(),
+                Err("invalid_video_settings")
+            );
+        }
+        let invalid: Settings =
+            serde_json::from_value(json!({"resource_processor_service":"no-version"})).unwrap();
+        assert_eq!(invalid.validate(), Err("invalid_video_settings"));
     }
     #[test]
     fn external_encoder_settings_reject_untrusted_or_duplicate_services() {

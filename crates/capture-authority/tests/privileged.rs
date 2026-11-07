@@ -217,6 +217,7 @@ fn real_broker_scopes_sessions_and_revokes_a_running_unprivileged_worker() {
         done_tx.send(result).unwrap();
     });
     until_exists(&root.0.join("state/ready"));
+    assert!(root.0.join("state/precheck-ready").exists());
     assert!(root.0.join("state/scope-denied").exists());
     assert!(root.0.join("state/replay-denied").exists());
     let worker_pid: i32 = fs::read_to_string(root.0.join("state/ready"))

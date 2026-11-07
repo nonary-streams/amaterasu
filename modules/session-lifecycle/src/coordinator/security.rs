@@ -155,11 +155,16 @@ impl Coordinator {
                 _ => return rejection("invalid_client_context"),
             },
         };
+        let application =
+            match super::borrowed_capture::provider_application(session, &request.target) {
+                Ok(application) => application,
+                Err(reason) => return rejection(&reason),
+            };
         json!(amaterasu_extension_api::ProviderContextResponse {
             status: "succeeded".into(),
             context: amaterasu_extension_api::ProviderContext {
                 target: request.target,
-                application: session.application_ref.clone(),
+                application,
                 requested_video: request.requested_video,
                 client,
             },

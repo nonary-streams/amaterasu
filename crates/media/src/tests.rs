@@ -17,6 +17,8 @@ use amaterasu_abi::STATUS_OK;
 fn frame_shapes_reject_overflow_invalid_planes_and_excessive_memory() {
     assert_eq!(frame_size(1920, 1080, PIXEL_BGRA8, 7680), Ok(8_294_400));
     assert_eq!(frame_size(1920, 1080, PIXEL_NV12, 1920), Ok(3_110_400));
+    assert_eq!(frame_size(1920, 1080, PIXEL_P010, 3840), Ok(6_220_800));
+    assert_eq!(frame_size(1920, 1080, PIXEL_P010, 3848), Ok(6_233_760));
     for shape in [
         (0, 1080, PIXEL_BGRA8, 7680),
         (8193, 1, PIXEL_BGRA8, 32772),
@@ -25,6 +27,12 @@ fn frame_shapes_reject_overflow_invalid_planes_and_excessive_memory() {
         (1920, 1079, PIXEL_NV12, 1920),
         (1920, 1080, 99, 7680),
         (8192, 8192, PIXEL_BGRA8, u32::MAX),
+        (1919, 1080, PIXEL_P010, 3840),
+        (1920, 1079, PIXEL_P010, 3840),
+        (1920, 1080, PIXEL_P010, 3838),
+        (1920, 1080, PIXEL_P010, 3841),
+        (8192, 8192, PIXEL_P010, 16384),
+        (2, 2, PIXEL_P010, u32::MAX),
     ] {
         assert_eq!(
             frame_size(shape.0, shape.1, shape.2, shape.3),

@@ -171,6 +171,10 @@ impl Pipeline {
             rpc::complete(send, request, error("permission_denied"));
             return;
         }
+        if config.borrowed_capture.is_some() && owner != "amaterasu.rtsp" {
+            rpc::complete(send, request, error("permission_denied"));
+            return;
+        }
         if let Some(record) = self.records.values().find(|record| {
             record.owner == owner && record.config.operation_id == config.operation_id
         }) {
@@ -208,7 +212,7 @@ impl Pipeline {
                 .values()
                 .filter(|record| !record.state.terminal())
                 .count()
-                >= 2
+                >= self.settings.max_live_sessions
         {
             rpc::complete(send, request, error("capacity_exceeded"));
             return;
@@ -360,6 +364,16 @@ impl Pipeline {
             rpc::complete(send, request, error(code));
             return;
         }
+        if configuration.source_capture_context != record.config.source_capture_context {
+            rpc::complete(send, request, error("source_capture_context_changed"));
+            return;
+        }
+        if let Some(source) = &record.config.borrowed_capture
+            && (configuration.output != source.output || configuration.source_id.is_some())
+        {
+            rpc::complete(send, request, error("borrowed_capture_changed"));
+            return;
+        }
         if let Err(code) = super::shared_capture::validate_start(record, &configuration) {
             rpc::complete(send, request, error(code));
             return;
@@ -444,12 +458,15 @@ impl Pipeline {
             ..
         } = input;
 
+        let startup_reconciled = self.startup_reconciled();
         let Some(record) = self
             .records
             .get_mut(&session)
             .filter(|record| record.owner == owner)
         else {
-            rpc::complete(send, request, error("session_not_found"));
+            let mut response = error("session_not_found");
+            response["startup_reconciled"] = json!(startup_reconciled);
+            rpc::complete(send, request, response);
             return;
         };
         if record.state.terminal() {
@@ -521,7 +538,7 @@ impl Pipeline {
     fn status(&mut self, input: Incoming, session: Option<u64>, send: &mut Send<'_>) {
         let Incoming { request, owner, .. } = input;
 
-        let reply = if let Some(id) = session {
+        let mut reply = if let Some(id) = session {
             self.records
                 .get(&id)
                 .filter(|record| record.owner == owner)
@@ -537,11 +554,12 @@ impl Pipeline {
                 .iter()
                 .filter(|record| !record.state.terminal())
                 .chain(owned.iter().filter(|record| record.state.terminal()))
-                .take(16)
+                .take(32)
                 .map(|record| record.response())
                 .collect();
-            json!({"ok":true,"enabled":self.settings.enabled,"sessions":visible,"total":owned.len(),"truncated":owned.len()>16})
+            json!({"ok":true,"enabled":self.settings.enabled,"sessions":visible,"total":owned.len(),"truncated":owned.len()>32})
         };
+        reply["startup_reconciled"] = json!(self.startup_reconciled());
         rpc::complete(send, request, reply);
     }
 

@@ -23,6 +23,8 @@ mod capture_events;
 pub use capture_events::*;
 mod frame_resource;
 pub use frame_resource::*;
+mod source_preflight;
+pub use source_preflight::*;
 mod encoder_provider;
 pub use encoder_provider::*;
 mod encoder_input_pool;
@@ -58,6 +60,9 @@ pub const CAPTURE_FRAME_CACHED_REUSE: u32 = 0;
 pub const CAPTURE_FRAME_FRESH: u32 = 1;
 pub const PIXEL_BGRA8: u32 = 1;
 pub const PIXEL_NV12: u32 = 2;
+/// Little-endian 4:2:0 planar Y then interleaved UV. Each ten-bit code occupies
+/// the high ten bits of a u16; the low six bits are zero. Stride is in bytes.
+pub const PIXEL_P010: u32 = 3;
 pub const CODEC_H264: u32 = 1;
 pub const CODEC_HEVC: u32 = 2;
 pub const CODEC_AV1: u32 = 3;
@@ -97,8 +102,9 @@ pub struct CpuProcessorApi {
 
 pub const CPU_PROCESSOR_API_V1_0_SIZE: u32 = size_of::<CpuProcessorApi>() as u32;
 
-/// BGRA uses one plane; NV12 uses contiguous Y then interleaved UV planes with
-/// the same stride. Timestamps are microseconds from the producer's stream epoch.
+/// BGRA uses one plane; NV12 and P010 use contiguous Y then interleaved UV
+/// planes with the same byte stride. P010 stores little-endian high-bit-aligned
+/// ten-bit codes. Timestamps are microseconds from the producer's stream epoch.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct CpuFrame {
@@ -140,6 +146,11 @@ pub fn frame_size(width: u32, height: u32, format: u32, stride: u32) -> Result<u
         PIXEL_BGRA8 => (width.checked_mul(4), Some(height)),
         PIXEL_NV12 if width.is_multiple_of(2) && height.is_multiple_of(2) => {
             (Some(width), height.checked_add(height / 2))
+        }
+        PIXEL_P010
+            if width.is_multiple_of(2) && height.is_multiple_of(2) && stride.is_multiple_of(2) =>
+        {
+            (width.checked_mul(2), height.checked_add(height / 2))
         }
         _ => return Err(STATUS_INVALID_ARGUMENT),
     };

@@ -236,11 +236,24 @@ constructor requires those bindings and owners to remain live.
 For an external provider that implements v1.8, video can select a standard CPU
 resource explicitly using `"frame_transport":"generic_cpu"` in its provider
 registration. Video submits that frame synchronously through the existing CPU
-encoder path. The bridge currently requires unknown color metadata and does not
-use generic source timestamps for pacing. This setting does not provide generic GPU or custom-resource
+encoder path. Legacy v1 planar resources keep their established default-range
+compatibility; v2 offers and frames must carry matching known color tuples.
+P010 preserves genuine ten-bit SDR or HDR input, with separately declared SDR
+ranges. This bridge does not infer a clock domain from source timestamps.
+This setting does not provide generic GPU or custom-resource
 forwarding to encoders; those require a compatible resource consumer and its
 own binding and lifecycle integration. Existing `cpu` and `dmabuf` settings
 continue to use their existing interfaces.
+
+An explicitly selected `resource_processor_service` can negotiate CPU-v2 source
+and output colors independently through the existing generic processor v1.0
+contract and public SDK adapters. This permits an independent provider to
+process Windows-style P010 HDR input into declared SDR output through unchanged
+Video. The stock GPU effects accept DMA-BUF leases; no stock CPU HDR-to-SDR tone
+mapper is selected. Unsupported source/output offers fail without a fallback or
+metadata relabeling. See [CPU resource processing](resource-frame-processing.md)
+for provider APIs, exact typed grants, startup composition and the explicit
+empty per-stream settings limitation.
 
 ## Frame and processor contracts
 

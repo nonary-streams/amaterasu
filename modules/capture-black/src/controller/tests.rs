@@ -1,0 +1,428 @@
+use super::*;
+use crate::model::failure;
+
+#[test]
+fn source_preflight_is_read_only_and_rejects_unsupported_classes_and_modes() {
+    use amaterasu_module_sdk::capture::{
+        SourceClass, SourceMode as RequestedMode, SourcePreflightRequest, SourceReadiness,
+    };
+    let controller = Controller::new(true);
+    let mut request = SourcePreflightRequest {
+        source_class: SourceClass::Synthetic,
+        route: None,
+        mode: RequestedMode {
+            width: 1920,
+            height: 1080,
+            refresh_millihz: 60_000,
+            hdr: true,
+            bit_depth: None,
+        },
+    };
+    let ready = controller.preflight(&request);
+    ready.validate(&request).unwrap();
+    assert!(ready.is_ready());
+    assert!(controller.streams.is_empty());
+    assert!(controller.retired.is_empty());
+    assert_eq!(controller.bytes, 0);
+    assert_eq!(controller.next_id, 0);
+    request.source_class = SourceClass::ManagedOutput;
+    assert_eq!(
+        controller.preflight(&request).state,
+        SourceReadiness::Unsupported
+    );
+    request.source_class = SourceClass::Synthetic;
+    request.mode.width = 1919;
+    assert_eq!(
+        controller.preflight(&request).state,
+        SourceReadiness::Unsupported
+    );
+    request.mode.width = 1920;
+    request.route = Some("unrelated:physical-monitor".into());
+    assert_eq!(
+        controller.preflight(&request).state,
+        SourceReadiness::Unsupported
+    );
+    request.route = None;
+    assert_eq!(
+        Controller::new(false).preflight(&request).state,
+        SourceReadiness::Unavailable
+    );
+}
+
+fn open(controller: &mut Controller, caller: &str, operation_id: &str, now: u64) -> u64 {
+    controller
+        .handle(
+            caller,
+            Operation::Open {
+                output: "black:64x48@60:nv12".into(),
+                operation_id: Some(operation_id.into()),
+                resource_capture_clock: None,
+                resource_callback_contract: None,
+            },
+            now,
+            &mut || Ok(()),
+        )
+        .unwrap()
+        .0["stream"]
+        .as_u64()
+        .unwrap()
+}
+
+#[test]
+fn generated_nv12_black_has_valid_geometry_levels_and_canonical_bounded_output() {
+    let mode = SourceMode::parse("black:1920x1080@120:nv12").unwrap();
+    let pixels = mode.pixels().unwrap();
+    let luma = 1920 * 1080;
+    assert_eq!(pixels.len(), luma * 3 / 2);
+    assert!(pixels[..luma].iter().all(|byte| *byte == 16));
+    assert!(pixels[luma..].iter().all(|byte| *byte == 128));
+    assert_eq!(mode.geometry().output, mode.geometry().virtual_desktop);
+    assert_eq!(mode.output(), "black:1920x1080@120:nv12");
+    for bad in [
+        "desktop",
+        "black:64x48@0:nv12",
+        "black:63x48@60:nv12",
+        "black:8194x48@60:nv12",
+        "black:064x48@60:nv12",
+        "black:64x48@241:nv12",
+        "black:64x48@60:yuv444",
+        "black:64x48@+60:nv12",
+        "black:64x48@60:nv12:extra",
+        "black:64x48@60.0:nv12",
+    ] {
+        assert!(SourceMode::parse(bad).is_err(), "{bad}");
+    }
+}
+
+#[test]
+fn generated_p010_black_has_neutral_ten_bit_codes_without_truncating_to_eight_bits() {
+    let mode = SourceMode::parse("black:1920x1080@60:p010").unwrap();
+    assert_eq!(mode.output(), "black:1920x1080@60:p010");
+    assert_eq!(mode.stride(), 3840);
+    let pixels = mode.pixels().unwrap();
+    assert_eq!(pixels.len(), 1920 * 1080 * 3);
+    let luma_bytes = 1920 * 1080 * 2;
+    assert!(
+        pixels[..luma_bytes]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .all(|sample| u16::from_le_bytes([sample[0], sample[1]]) == 64 << 6)
+    );
+    assert!(
+        pixels[luma_bytes..]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .all(|sample| u16::from_le_bytes([sample[0], sample[1]]) == 512 << 6)
+    );
+    assert!(
+        SourceMode::parse("black:8192x8192@60:p010").is_err(),
+        "per-frame SDK byte bound still applies"
+    );
+}
+
+#[test]
+fn nv12_preference_can_negotiate_p010_after_sdr_ten_bit_is_selected() {
+    let mut controller = Controller::new(true);
+    let id = open(&mut controller, "owner", "sdr-ten-bit", 1_000_000);
+    assert_eq!(controller.mode("owner", id).unwrap().format, PIXEL_NV12);
+    let old = controller.prepare("owner", id, 1_000_000, false).unwrap();
+    assert_eq!(
+        controller.select("owner", id, id, 2),
+        MEDIA_BUSY,
+        "selection cannot replace an in-flight delivery"
+    );
+    drop(old);
+    assert_eq!(controller.select("owner", id, id, 2), STATUS_OK);
+    let p010 = controller.prepare("owner", id, 1_000_000, true).unwrap();
+    assert_eq!(p010.mode.format, PIXEL_P010);
+    assert_eq!(p010.pixels.len(), 64 * 48 * 3);
+    p010.finish(STATUS_OK);
+    assert_eq!(controller.select("owner", id, id, 1), STATUS_OK);
+    let nv12 = controller.prepare("owner", id, 1_016_666, true).unwrap();
+    assert_eq!(nv12.mode.format, PIXEL_NV12);
+    nv12.finish(STATUS_OK);
+    controller.close("owner", id, 1_020_000).unwrap();
+    assert_eq!(controller.bytes, 0);
+}
+
+#[test]
+fn admission_and_lookup_are_owner_scoped_and_retries_preserve_stream_identity() {
+    let mut controller = Controller::new(true);
+    let id = open(&mut controller, "first", "operation", 1_000_000);
+    assert_eq!(open(&mut controller, "first", "operation", 1_000_001), id);
+    let foreign = open(&mut controller, "other", "operation", 1_000_002);
+    assert_ne!(id, foreign);
+    assert!(controller.mode("other", id).is_err());
+    assert_eq!(controller.close("other", id, 1_000_003), Err("not_found"));
+    assert_eq!(controller.select("first", id, id + 1, 1), MEDIA_UNSUPPORTED);
+    assert_eq!(controller.select("first", id, id, 8), MEDIA_UNSUPPORTED);
+    assert_eq!(controller.select("first", id, id, 1), STATUS_OK);
+    let conflict = controller.handle(
+        "first",
+        Operation::Open {
+            output: "black:128x48@60:nv12".into(),
+            operation_id: Some("operation".into()),
+            resource_capture_clock: None,
+            resource_callback_contract: None,
+        },
+        1_000_004,
+        &mut || Ok(()),
+    );
+    assert_eq!(conflict.unwrap_err(), "operation_conflict");
+    controller.close("first", id, 1_000_005).unwrap();
+    controller.close("first", id, 1_000_006).unwrap();
+    assert_eq!(
+        controller
+            .handle(
+                "first",
+                Operation::Open {
+                    output: "black:64x48@60:nv12".into(),
+                    operation_id: Some("operation".into()),
+                    resource_capture_clock: None,
+                    resource_callback_contract: None
+                },
+                1_000_007,
+                &mut || Ok(())
+            )
+            .unwrap_err(),
+        "operation_closed"
+    );
+    assert!(controller.mode("other", foreign).is_ok());
+}
+
+#[test]
+fn rejected_delivery_retries_exact_identity_and_cadence_does_not_accumulate_a_queue() {
+    let mut controller = Controller::new(true);
+    let id = open(&mut controller, "owner", "paced", 1_000_000);
+    let first = controller.prepare("owner", id, 1_000_000, false).unwrap();
+    let identity = first.identity;
+    assert_eq!(identity.sequence, 1);
+    assert_eq!(first.finish(MEDIA_BUSY), MEDIA_BUSY);
+    let retry = controller.prepare("owner", id, 2_000_000, false).unwrap();
+    assert_eq!(retry.identity.sequence, identity.sequence);
+    assert_eq!(retry.identity.timestamp_us, identity.timestamp_us);
+    retry.finish(STATUS_OK);
+    let current = controller.prepare("owner", id, 2_000_000, false).unwrap();
+    assert_eq!(current.identity.sequence, 61);
+    assert_eq!(current.identity.timestamp_us, 2_000_000);
+    current.finish(STATUS_OK);
+    assert!(matches!(
+        controller.prepare("owner", id, 2_000_001, false),
+        Err(MEDIA_PENDING)
+    ));
+    let next = controller.prepare("owner", id, 2_016_666, false).unwrap();
+    assert_eq!(next.identity.sequence, 62);
+    next.finish(STATUS_OK);
+}
+
+#[test]
+fn range_selection_waits_for_the_old_borrow_then_rebuilds_real_neutral_codes() {
+    let mut controller = Controller::new(true);
+    let id = open(&mut controller, "video", "range", 1_000_000);
+    assert_eq!(controller.select("video", id, id, 4), STATUS_OK);
+    let old = controller.prepare("video", id, 1_000_000, true).unwrap();
+    assert_eq!(
+        u16::from_le_bytes(old.pixels[..2].try_into().unwrap()),
+        64 << 6
+    );
+    assert_eq!(controller.select("video", id, id, 5), MEDIA_BUSY);
+    old.finish(STATUS_OK);
+    assert_eq!(controller.select("video", id, id, 5), STATUS_OK);
+    let full = controller.prepare("video", id, 1_016_667, true).unwrap();
+    assert_eq!(u16::from_le_bytes(full.pixels[..2].try_into().unwrap()), 0);
+    assert_eq!(full.resource.unwrap().id, 5);
+    full.finish(STATUS_OK);
+    assert_eq!(controller.select("video", id, id, 6), STATUS_OK);
+    let hdr = controller.prepare("video", id, 1_033_334, true).unwrap();
+    assert_eq!(
+        u16::from_le_bytes(hdr.pixels[..2].try_into().unwrap()),
+        64 << 6
+    );
+    assert_eq!(hdr.resource.unwrap().id, 6);
+}
+
+#[test]
+fn close_and_lost_open_completion_wait_for_inflight_callbacks_then_retire_storage() {
+    let mut controller = Controller::new(true);
+    let id = open(&mut controller, "owner", "lost", 1_000_000);
+    let frame = controller.prepare("owner", id, 1_000_000, false).unwrap();
+    assert_eq!(controller.close("owner", id, 1_000_001), Err("busy"));
+    assert!(matches!(
+        controller.prepare("owner", id, 1_000_002, false),
+        Err(MEDIA_CLOSED)
+    ));
+    controller.rollback_open("owner", Some(id), 1_000_003);
+    assert!(controller.bytes > 0);
+    drop(frame);
+    controller.maintain(1_000_004);
+    assert_eq!(controller.bytes, 0);
+    assert!(controller.streams.is_empty());
+    assert!(controller.retired.contains_key(&id));
+    let next = open(&mut controller, "owner", "next", 1_000_005);
+    assert!(next > id);
+}
+
+#[test]
+fn cancelled_open_rechecks_authority_after_allocating_and_leaves_no_stream() {
+    let mut controller = Controller::new(true);
+    let mut calls = 0;
+    let result = controller.handle(
+        "owner",
+        Operation::Open {
+            output: "black:64x48@60:nv12".into(),
+            operation_id: Some("cancelled".into()),
+            resource_capture_clock: None,
+            resource_callback_contract: None,
+        },
+        1_000_000,
+        &mut || {
+            calls += 1;
+            if calls == 1 {
+                Ok(())
+            } else {
+                Err("request_ended")
+            }
+        },
+    );
+    assert_eq!(result.unwrap_err(), "request_ended");
+    assert_eq!(controller.next_id, 0);
+    assert_eq!(controller.bytes, 0);
+    assert!(controller.streams.is_empty());
+    assert_eq!(failure("request_ended")["ok"], false);
+}
+
+#[test]
+fn stream_and_memory_limits_fail_before_allocation_and_closed_ledger_is_bounded() {
+    let mut controller = Controller::new(true);
+    for index in 0..MAX_STREAMS {
+        open(
+            &mut controller,
+            "owner",
+            &format!("stream-{index}"),
+            1_000_000,
+        );
+    }
+    let result = controller.handle(
+        "owner",
+        Operation::Open {
+            output: "black:64x48@60:nv12".into(),
+            operation_id: Some("overflow".into()),
+            resource_capture_clock: None,
+            resource_callback_contract: None,
+        },
+        1_000_000,
+        &mut || Ok(()),
+    );
+    assert_eq!(result.unwrap_err(), "resource_exhausted");
+    assert_eq!(controller.streams.len(), MAX_STREAMS);
+    controller.shutdown();
+    assert_eq!(controller.bytes, 0);
+    let request = || Operation::Open {
+        output: "black:8192x8192@60:nv12".into(),
+        operation_id: None,
+        resource_capture_clock: None,
+        resource_callback_contract: None,
+    };
+    controller
+        .handle("owner", request(), 2_000_000, &mut || Ok(()))
+        .unwrap();
+    controller
+        .handle("owner", request(), 2_000_000, &mut || Ok(()))
+        .unwrap();
+    assert_eq!(
+        controller
+            .handle("owner", request(), 2_000_000, &mut || Ok(()))
+            .unwrap_err(),
+        "resource_exhausted"
+    );
+    controller.shutdown();
+    for index in 0..MAX_LEDGER {
+        controller.retired.insert(
+            index as u64,
+            Retired {
+                owner: "owner".into(),
+                operation_id: None,
+                retired_at_us: 2_000_000,
+            },
+        );
+    }
+    assert_eq!(
+        controller
+            .handle("owner", request(), 2_000_001, &mut || Ok(()))
+            .unwrap_err(),
+        "resource_exhausted"
+    );
+    controller.maintain(RETIRED_OPERATION_US + 2_000_001);
+    assert!(controller.retired.is_empty());
+}
+
+#[test]
+fn resource_clock_contract_is_explicit_and_conflicting_retry_is_rejected() {
+    let mut controller = Controller::new(true);
+    let request = |epoch: &str, contract: Option<&str>| Operation::Open {
+        output: "black:64x48@60:nv12".into(),
+        operation_id: Some("clock".into()),
+        resource_capture_clock: Some(ResourceCaptureClock {
+            domain: "host_monotonic".into(),
+            epoch_id: epoch.into(),
+        }),
+        resource_callback_contract: contract.map(str::to_owned),
+    };
+    assert_eq!(
+        controller
+            .handle(
+                "owner",
+                request("11111111111111111111111111111111", None),
+                1_000_000,
+                &mut || Ok(())
+            )
+            .unwrap_err(),
+        "invalid_resource_callback_contract"
+    );
+    assert_eq!(
+        controller
+            .handle(
+                "owner",
+                request(
+                    "00000000000000000000000000000000",
+                    Some("cross_service_safe")
+                ),
+                1_000_000,
+                &mut || Ok(())
+            )
+            .unwrap_err(),
+        "invalid_resource_capture_clock"
+    );
+    let (reply, created) = controller
+        .handle(
+            "owner",
+            request(
+                "11111111111111111111111111111111",
+                Some("cross_service_safe"),
+            ),
+            1_000_000,
+            &mut || Ok(()),
+        )
+        .unwrap();
+    assert_eq!(reply["resource_callback_contract"], "cross_service_safe");
+    let id = created.unwrap();
+    let frame = controller.prepare("owner", id, 1_000_000, false).unwrap();
+    assert_eq!(frame.clock_epoch, Some([0x11; 16]));
+    drop(frame);
+    assert_eq!(
+        controller
+            .handle(
+                "owner",
+                request(
+                    "22222222222222222222222222222222",
+                    Some("cross_service_safe")
+                ),
+                1_000_000,
+                &mut || Ok(())
+            )
+            .unwrap_err(),
+        "operation_conflict"
+    );
+}

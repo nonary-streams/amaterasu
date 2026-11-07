@@ -650,6 +650,7 @@ fn permission_api_reads_current_committed_certificate_policy() {
     assert_eq!(check(PERMISSION_LIST), STATUS_OK);
     assert_eq!(check(PERMISSION_VIEW), STATUS_OK);
     assert_eq!(check(PERMISSION_LAUNCH), IDENTITY_FORBIDDEN);
+    assert_eq!(check(PERMISSION_TERMINATE), IDENTITY_FORBIDDEN);
     assert_eq!(check(99), STATUS_INVALID_ARGUMENT);
     assert_eq!(
         unsafe {
@@ -666,6 +667,19 @@ fn permission_api_reads_current_committed_certificate_policy() {
         .publish(2, Snapshot::prepare(&document, time()).unwrap())
         .unwrap();
     assert_eq!(check(PERMISSION_LAUNCH), STATUS_OK);
+    // Launch permission does not implicitly authorize terminating another
+    // client's stream. The live committed termination bit is independent.
+    assert_eq!(check(PERMISSION_TERMINATE), IDENTITY_FORBIDDEN);
+    document.clients[0].permissions.terminate_streams = true;
+    shared
+        .publish(3, Snapshot::prepare(&document, time()).unwrap())
+        .unwrap();
+    assert_eq!(check(PERMISSION_TERMINATE), STATUS_OK);
+    document.clients[0].permissions.terminate_streams = false;
+    shared
+        .publish(4, Snapshot::prepare(&document, time()).unwrap())
+        .unwrap();
+    assert_eq!(check(PERMISSION_TERMINATE), IDENTITY_FORBIDDEN);
     document.clients[0].permissions = crate::protocol::ClientPermissions {
         list_apps: false,
         view_streams: false,
@@ -674,10 +688,12 @@ fn permission_api_reads_current_committed_certificate_policy() {
     };
     document.permission_mode_enabled = false;
     shared
-        .publish(3, Snapshot::prepare(&document, time()).unwrap())
+        .publish(5, Snapshot::prepare(&document, time()).unwrap())
         .unwrap();
     assert_eq!(check(PERMISSION_LAUNCH), STATUS_OK);
+    assert_eq!(check(PERMISSION_TERMINATE), STATUS_OK);
     shared.invalidate();
     assert_eq!(check(PERMISSION_LAUNCH), IDENTITY_UNAVAILABLE);
+    assert_eq!(check(PERMISSION_TERMINATE), IDENTITY_UNAVAILABLE);
     unsafe { (api.v1_0.base.release.unwrap())(context) };
 }

@@ -146,6 +146,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "amaterasu-capture-black"
+version = "0.1.0"
+dependencies = [
+ "amaterasu-media",
+ "amaterasu-module-sdk",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "amaterasu-capture-dxgi"
 version = "0.1.0"
 dependencies = [
@@ -302,6 +312,7 @@ name = "amaterasu-display"
 version = "0.1.0"
 dependencies = [
  "amaterasu-module-sdk",
+ "amaterasu-windows-capture-geometry",
  "getrandom 0.3.4",
  "serde",
  "serde_json",
@@ -623,6 +634,7 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "sha2",
  "ureq",
 ]
 
@@ -746,6 +758,7 @@ dependencies = [
  "amaterasu-configuration-schema",
  "amaterasu-contracts",
  "amaterasu-extension-api",
+ "amaterasu-module-sdk",
  "amaterasu-nvhttp",
  "amaterasu-package",
  "amaterasu-runtime",
@@ -753,6 +766,19 @@ dependencies = [
  "ed25519-dalek",
  "getrandom 0.3.4",
  "libloading",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
+name = "amaterasu-remote-session"
+version = "0.1.0"
+dependencies = [
+ "amaterasu-module-sdk",
+ "amaterasu-runtime",
+ "amaterasu-state",
+ "getrandom 0.3.4",
  "serde",
  "serde_json",
  "sha2",
@@ -961,6 +987,7 @@ dependencies = [
  "amaterasu-contracts",
  "amaterasu-module-sdk",
  "amaterasu-storage",
+ "amaterasu-windows-capture-geometry",
  "cc",
  "getrandom 0.3.4",
  "serde",

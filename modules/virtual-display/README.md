@@ -20,7 +20,9 @@ touching the driver. When the module is enabled, create may manage a temporary
 monitor regardless of `dd_activate_virtual_display`. That setting requests
 stream-time topology activation; this service does not implement that behavior.
 On Windows an explicit create cannot activate topology or make its monitor the
-only active display. Linux owned creation activates only its new output.
+only active display. An `extended` create intent is accepted without changing
+peer outputs; the display coordinator activates it through the Display API.
+Linux owned creation activates only its new output.
 If `dd_use_sunshine_virtual_display_driver` is false, create returns
 `unsupported_driver`; this service has no alternative driver and does not silently
 select Sunshine. Builds without the optional Linux backend return
@@ -36,6 +38,30 @@ caller-specific IDs, `getrandom` supplies lease capabilities, and `windows-sys`
 provides documented Win32 bindings. Native code remains trusted, not sandboxed.
 
 ## API
+
+Windows monitor identity publication and capture readiness are separate. A ready
+monitor can expose its private device path to a trusted display coordinator for
+activation while `capture_output` remains absent. The optional `capture_output`
+is an opaque `exact-target:` selector shared by the DXGI and WGC Capture SDK
+adapters. Its digest does not publish a native target identity or OS handle.
+Publication requires the exact owned target to be active at the requested
+dimensions, rounded millihertz refresh rate and HDR state, agreement across CCD,
+GDI and DXGI enumeration, and unchanged mode/color readback. `ready.capture_error`
+explains missing capture readiness. Capture providers independently resolve the
+selector to one current target and retain its exact physical identity; malformed,
+missing or ambiguous selectors never select the primary output or permit a
+geometry fallback. Windows runtime and driver qualification remain separate from
+the platform-independent contract and state-machine tests.
+
+`verify_owner_target` lets an explicitly trusted display coordinator verify an
+existing caller-owned stable reference without impersonating that caller. Only
+principals listed in the provider's trusted startup `target_verifiers` setting
+may call it; the default is an empty list. The operation matches the exact owner,
+identity and live reference, returning its specification, local target name and
+activation state. It grants no creation or release authority and cannot change
+the verifier policy. The display coordinator must derive `owner` from its
+authenticated inbound broker caller, compare the exact target/specification,
+and preserve peer outputs when composing the requested display.
 
 The optional Linux `linux-libvirtualdisplay` feature directly links the pinned
 `third-party/libvirtualdisplay` CMake driver target. Initialize that submodule
@@ -372,3 +398,28 @@ This domain covers only changes admitted by this provider, not external KScreen
 or broker effects. The independent compositor/output observation and continuing
 validation remain necessary. Windows rejects explicit per-request layout or
 revision with `unsupported_topology_domain`; its prior requests remain valid.
+
+Retained outputs can change their effective mode and HDR state without replacing
+or releasing their allocation. The owning coordinator must retire every capture
+consumer first. `prepare_retained_mode` binds a unique operation ID to the exact
+identity, owning reference, complete expected reference set and observed
+`mode_revision`; unaccounted references and native borrows reject admission.
+The provider syncs its old/new intent before a trusted display coordinator may
+verify it with `verify_retained_mode` and perform `scoped_reconfigure`. Preparation
+keeps the effective specification unchanged and withdraws capture readiness.
+
+`commit_retained_mode` publishes the desired specification only after independent
+native mode, HDR and exact target observation. Windows preserves the driver's
+immutable allocation specification separately from the effective desktop mode.
+Linux serializes preparation and completion through its journal-owning actor and
+reads back the exact KScreen output. Neither operation recreates the connector or
+changes a reference's ownership. An unsupported advertised mode remains a failure.
+
+After a rejected or rolled-back display request, `abort_retained_mode` can unfreeze
+the original source only when the exact old mode and HDR state are independently
+observed. Unknown partial effects remain prepared for reconciliation or explicit
+owned cleanup. Successful commit and observed abort both advance `mode_revision`,
+so a late older operation cannot undo a later transaction. Identical retries are
+idempotent and conflicting payloads cannot reuse an operation ID. Status exposes
+the effective specification, observation revision and retained-mode transaction;
+readiness remains distinct from preparation or local request admission.

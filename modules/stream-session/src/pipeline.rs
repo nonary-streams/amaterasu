@@ -139,6 +139,16 @@ impl Pipeline {
         Self::new(settings)
     }
 
+    fn startup_reconciled(&self) -> bool {
+        self.journal.loaded
+            && !self.journal.failed
+            && self.recovery_initialized
+            && self.recovery_ready
+            && !self.recovery_blocked
+            && self.recovery_queue.is_empty()
+            && self.recovery_ids.is_empty()
+    }
+
     /// Unload cannot drive asynchronous provider cleanup. Release native bindings
     /// and settle broker work; active provider resources require their own unload.
     pub fn shutdown(&mut self, runtime: &RuntimeClient) {
@@ -339,11 +349,17 @@ impl Pipeline {
             self.records.insert(record.id, record);
             if retain {
                 self.job = Some(job);
-            } else if self.recovery_ids.remove(&session) {
-                if self.journal.document.entries.contains_key(&session) {
-                    self.recovery_blocked = true;
+            } else if self.recovery_ids.contains(&session) {
+                if !self.journal.document.entries.contains_key(&session) {
+                    self.recovery_ids.remove(&session);
                 }
+                self.recovery_blocked = self.recovery_ids.iter().any(|id| {
+                    self.records
+                        .get(id)
+                        .is_none_or(|record| record.state == State::CleanupFailed)
+                });
                 self.recovery_ready = self.recovery_queue.is_empty()
+                    && self.recovery_ids.is_empty()
                     && self.journal.document.entries.is_empty()
                     && !self.recovery_blocked;
             }

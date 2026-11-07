@@ -9,6 +9,7 @@ mod default_extensions;
 pub mod linux_session;
 mod operation_apis;
 mod platform_extensions;
+mod remote_sessions;
 
 pub const RUNTIME_ID: &str = "amaterasu.runtime";
 
@@ -1667,25 +1668,27 @@ impl PackageProfile {
                 PLAYNITE,
                 LUTRIS,
                 AUTHENTICATION,
-                platform_extensions::ADMIN,
+                remote_sessions::PLATFORM_MANAGEMENT,
                 PLATFORM_PAIRING,
-                platform_extensions::TRANSPORT,
-                DISPLAY,
+                remote_sessions::PLATFORM_TRANSPORT,
+                remote_sessions::RETAINED_DISPLAY,
                 platform_extensions::EXECUTOR,
                 INPUT,
                 VIRTUAL_DISPLAY,
+                remote_sessions::COMPONENT,
+                remote_sessions::BLACK_CAPTURE,
                 CAPTURE_DXGI,
                 CAPTURE_WGC,
                 CAPTURE_X11,
                 AUDIO,
                 AUDIO_ENCODE,
                 ENCODE,
-                X11_VIDEO,
+                remote_sessions::PLATFORM_VIDEO,
                 MEDIA_TRANSPORT,
                 CONTROL_TRANSPORT,
                 platform_extensions::PROVIDER,
-                platform_extensions::STREAM,
-                platform_extensions::STREAM_CONTROL,
+                remote_sessions::PLATFORM_STREAM,
+                remote_sessions::PLATFORM_STREAM_CONTROL,
             ],
             Self::ExtensionExample => &[
                 RUNTIME,
@@ -1709,25 +1712,27 @@ impl PackageProfile {
                 PLAYNITE,
                 LUTRIS,
                 AUTHENTICATION,
-                platform_extensions::EXAMPLE_ADMIN,
+                remote_sessions::EXAMPLE_MANAGEMENT,
                 PLATFORM_PAIRING,
-                platform_extensions::TRANSPORT,
-                DISPLAY,
+                remote_sessions::PLATFORM_TRANSPORT,
+                remote_sessions::RETAINED_DISPLAY,
                 platform_extensions::EXECUTOR,
                 INPUT,
                 VIRTUAL_DISPLAY,
+                remote_sessions::COMPONENT,
+                remote_sessions::BLACK_CAPTURE,
                 CAPTURE_DXGI,
                 CAPTURE_WGC,
                 CAPTURE_X11,
                 AUDIO,
                 AUDIO_ENCODE,
                 ENCODE,
-                X11_VIDEO,
+                remote_sessions::PLATFORM_VIDEO,
                 MEDIA_TRANSPORT,
                 CONTROL_TRANSPORT,
                 platform_extensions::PROVIDER,
-                platform_extensions::STREAM,
-                platform_extensions::STREAM_CONTROL,
+                remote_sessions::PLATFORM_STREAM,
+                remote_sessions::PLATFORM_STREAM_CONTROL,
             ],
         }
     }
@@ -1915,6 +1920,14 @@ fn development_policy_with_extensions(
             &[platform_extensions::NATIVE_METADATA],
             &journal_directory,
         )?;
+    }
+    if install_extensions {
+        remote_sessions::install(&mut policy)?;
+    } else {
+        // The desktop smoke graph deliberately excludes session extensions.
+        // Do not retain product API approvals for components it will remove.
+        policy.principals.remove(remote_sessions::COMPONENT.id);
+        policy.principals.remove(remote_sessions::BLACK_CAPTURE.id);
     }
     operation_apis::install(&mut policy)?;
     Ok(policy)
@@ -2121,6 +2134,7 @@ pub fn installer_policy(
         &[platform_extensions::WINDOWS_METADATA],
     )
     .expect("bundled default extension metadata must be valid");
+    remote_sessions::install(&mut policy).expect("valid client-session composition");
     operation_apis::install(&mut policy).expect("valid module operation contracts");
     policy
 }

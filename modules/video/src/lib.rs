@@ -6,6 +6,7 @@ mod pipeline;
 mod plane;
 mod queue;
 mod rpc;
+mod source_preflight;
 
 use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};
 use model::{Operation, Settings, error};
@@ -40,6 +41,7 @@ pub struct Video {
     pipeline: Pipeline,
     plane: Box<dyn Plane>,
     _factory: Box<native::Factory>,
+    source_preflight: source_preflight::SourcePreflight,
 }
 
 impl ManagedModule for Video {
@@ -50,6 +52,7 @@ impl ManagedModule for Video {
         let settings: Settings =
             serde_json::from_value(payload).map_err(|_| "invalid video settings")?;
         settings.validate()?;
+        let source_preflight = source_preflight::SourcePreflight::new(&settings);
         let queues = Arc::new(Mutex::new(queue::Queues::default()));
         let plane: Box<dyn Plane> = if settings.enabled {
             Box::new(
@@ -63,6 +66,11 @@ impl ManagedModule for Video {
                     settings.cpu_processor_service.as_deref(),
                     settings.gpu_processor_service.as_deref(),
                 )?
+                .with_resource_processor(&runtime, settings.resource_processor_service.as_deref())?
+                .with_source_preflight_routes(
+                    &runtime,
+                    &settings.resolved_source_preflight_routes(),
+                )
                 .with_required_frame_leases(settings.require_frame_lease)
                 .with_gpu_processor_opt_in(settings.gpu_processor_opt_in),
             )
@@ -88,6 +96,7 @@ impl ManagedModule for Video {
             pipeline,
             plane,
             _factory: factory,
+            source_preflight,
         })
     }
 
@@ -114,6 +123,17 @@ impl ManagedModule for Video {
                     return Ok(());
                 }
                 let mut send = |command| runtime.send_ephemeral(command);
+                if !self.source_preflight.operation_allowed(&caller, &payload) {
+                    rpc::complete(&mut send, id, error("source_preflight_only"));
+                    return Ok(());
+                }
+                if payload["action"] == "preflight_source" {
+                    let response =
+                        self.source_preflight
+                            .handle(runtime, self.plane.as_mut(), id, payload);
+                    rpc::complete(&mut send, id, response);
+                    return Ok(());
+                }
                 match serde_json::from_value::<Operation>(payload) {
                     Ok(operation) => self.pipeline.handle(&caller, id, operation, &mut send),
                     Err(_) => {

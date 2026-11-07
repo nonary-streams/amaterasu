@@ -1,20 +1,37 @@
 //! Capture-only publishing and notifications. No encoding or provider selection
 //! runs on a capture thread. Each channel represents one capture session.
 mod connection;
+mod cpu_source;
+pub mod high_depth;
 mod negotiation;
+mod preflight;
 mod provenance;
 mod publisher;
+mod selector;
+mod source_format;
 mod subscription;
 
 pub use connection::{ConnectionError, ResourceConnection};
+pub use cpu_source::{
+    CpuSourceDescription, CpuSourceFactory, CpuSourceFormat, CpuSourcePresentation,
+    CpuSourceProvider,
+};
 pub use negotiation::{
     Accessibility, DeliveryFormat, DeliveryRequirement, DeliverySelection,
     MAX_DELIVERY_CAPABILITY_BYTES, MAX_DELIVERY_OFFERS, MAX_DELIVERY_REQUIREMENTS,
     NegotiationError, Ownership, ProviderOffer, Schema, select_delivery,
     select_delivery_with_compatibility,
 };
+pub use preflight::{
+    MAX_SOURCE_CAPABILITIES, MAX_SOURCE_PREFLIGHT_BYTES, SourceClass, SourceMode,
+    SourceModeCapabilities, SourcePreflightConnection, SourcePreflightFactory,
+    SourcePreflightProvider, SourcePreflightRequest, SourcePreflightResponse, SourceReadiness,
+    decode_video_source_preflight, source_preflight, source_preflight_payload,
+};
 pub use provenance::color_provenance;
 pub use publisher::{CaptureFrames, CapturePublisher, PublishError, capture_channel};
+pub use selector::{EXACT_TARGET_PREFIX, exact_target_key, exact_target_selector};
+pub use source_format::{SourceCaptureContext, SourceFormat};
 pub use subscription::{CaptureNotice, CaptureNotifications, CaptureSubscription};
 
 #[derive(Clone, Debug, Eq, PartialEq)]

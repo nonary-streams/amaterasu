@@ -32,7 +32,10 @@ impl DirectSources {
         now: u64,
         timeout: u32,
     ) -> CaptureResult<Reply> {
-        let Some(name) = output.strip_prefix("kwin:").filter(|name| valid_name(name)) else {
+        let Some(name) = output
+            .strip_prefix("kwin:")
+            .filter(|name| valid_direct_name(name, true))
+        else {
             return Err("invalid_named_output");
         };
         let operation = operation.ok_or("operation_id_required")?;
@@ -173,11 +176,20 @@ fn response(source: &Source) -> Value {
     response
 }
 
-fn valid_name(name: &str) -> bool {
+pub(super) fn valid_name(name: &str) -> bool {
     name.strip_prefix("Virtual-")
         .filter(|number| !number.starts_with('0') && number.bytes().all(|b| b.is_ascii_digit()))
         .and_then(|number| number.parse::<u32>().ok())
         .is_some_and(|number| number > 0)
+}
+
+pub(super) fn valid_direct_name(name: &str, allow_desktop_outputs: bool) -> bool {
+    valid_name(name)
+        || (allow_desktop_outputs
+            && !name.starts_with("Virtual-")
+            && !name.is_empty()
+            && name.len() <= 127
+            && !name.chars().any(char::is_control))
 }
 
 #[cfg(test)]

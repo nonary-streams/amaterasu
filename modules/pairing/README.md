@@ -10,16 +10,36 @@ No real Moonlight application has yet qualified this module end to end.
 Settings default to empty principal sets:
 
 ```json
-{"administrator_principals":["amaterasu.console"],"transport_principals":["amaterasu.nvhttp"]}
+{"administrator_principals":["amaterasu.console"],"transport_principals":["amaterasu.nvhttp"],"authority_observer_principals":["amaterasu.remote-session"]}
 ```
 
-Both lists allow at most 16 runtime principals. The module needs `provide` for
+Each list allows at most 16 runtime principals. The module needs `provide` for
 `amaterasu.pairing/1` and `call` for `amaterasu.state/1`. Callers need pairing
 call permission. State requests preserve their runtime parent; the current
 runtime delegation policy also requires the initiating caller to have state
 call permission. State itself namespaces data by the immediate provider identity.
 Never grant callers access by trusting a payload caller or client identifier.
 Native modules are trusted code; runtime grants are not a native-code sandbox.
+
+An authority observer may use the public
+`amaterasu_module_sdk::pairing_authority` adapter to request
+`{"action":"client_authorization","certificate_id":"<64 lowercase hex>"}`.
+The response includes the exact queried fingerprint, current `paired` status,
+effective `may_list`, `may_view`, `may_launch`, and `may_terminate` privileges, durable State
+`revision`, and optional `name`. Unknown or expired certificates return
+`paired:false` with every privilege false and no name. Permission mode disabled
+retains legacy full access for a currently paired certificate; enabled mode uses
+the same certificate-bound policy as native identity checks.
+Effective listing includes any of list, view, or launch permission, and effective
+viewing includes view or launch permission. The SDK defaults an absent listing
+bit from older providers to false, without inferring it from another privilege.
+
+The observer list authorizes only this read operation. It does not authorize
+pairing, certificate import, administration, transport verification, or unpairing.
+This observation does not authenticate a connection or prove resource retirement;
+consumers still validate live transport possession and exact cleanup separately.
+Client-supplied IDs and display names are metadata and may be duplicated; the
+authority lookup always uses the committed certificate fingerprint.
 
 An administrator first initializes a persistent RSA-2048 host key, self-signed
 X.509 certificate, and random UUID:

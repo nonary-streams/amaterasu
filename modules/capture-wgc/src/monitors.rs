@@ -1,10 +1,12 @@
 use crate::model::{CaptureError, CaptureResult, Output};
 use windows::Win32::Foundation::{LPARAM, RECT};
-use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, DXGI_ERROR_NOT_FOUND, IDXGIFactory1};
+use windows::Win32::Graphics::Dxgi::{
+    CreateDXGIFactory1, DXGI_ERROR_NOT_FOUND, IDXGIFactory1, IDXGIOutput6,
+};
 use windows::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
 };
-use windows::core::BOOL;
+use windows::core::{BOOL, Interface};
 
 pub struct Monitor {
     pub handle: HMONITOR,
@@ -178,4 +180,62 @@ fn rectangle_extent(start: i32, end: i32) -> CaptureResult<u32> {
         .ok()
         .filter(|extent| *extent != 0)
         .ok_or_else(|| CaptureError::new("backend_error", "GDI returned an invalid monitor span"))
+}
+
+/// Match the exact selected GDI monitor to an attached DXGI Output6 before
+/// trusting its live scan-out transfer function. Desktop HDR flags alone do
+/// not establish the captured texture's pixel encoding.
+pub fn desktop_color(monitor: &Monitor) -> CaptureResult<crate::format::DesktopColor> {
+    let unavailable = || {
+        CaptureError::new(
+            "source_color_unavailable",
+            "exact monitor has no unambiguous DXGI Output6 color observation",
+        )
+    };
+    // SAFETY: bounded read-only COM enumeration; returned values are copied,
+    // and no borrowed native output or OS handle escapes the call.
+    unsafe {
+        let factory: IDXGIFactory1 = CreateDXGIFactory1().map_err(|_| unavailable())?;
+        let mut observed = None;
+        for adapter_index in 0..32 {
+            let adapter = match factory.EnumAdapters1(adapter_index) {
+                Ok(adapter) => adapter,
+                Err(error) if error.code() == DXGI_ERROR_NOT_FOUND => break,
+                Err(_) => return Err(unavailable()),
+            };
+            for output_index in 0..64 {
+                let output = match adapter.EnumOutputs(output_index) {
+                    Ok(output) => output,
+                    Err(error) if error.code() == DXGI_ERROR_NOT_FOUND => break,
+                    Err(_) => return Err(unavailable()),
+                };
+                let description = output.GetDesc().map_err(|_| unavailable())?;
+                if description.Monitor != monitor.handle
+                    || !description.AttachedToDesktop.as_bool()
+                    || !wide_string(&description.DeviceName)
+                        .eq_ignore_ascii_case(&monitor.metadata.device_name)
+                    || description.DesktopCoordinates.left != monitor.metadata.left
+                    || description.DesktopCoordinates.top != monitor.metadata.top
+                    || i64::from(description.DesktopCoordinates.right)
+                        - i64::from(description.DesktopCoordinates.left)
+                        != i64::from(monitor.metadata.width)
+                    || i64::from(description.DesktopCoordinates.bottom)
+                        - i64::from(description.DesktopCoordinates.top)
+                        != i64::from(monitor.metadata.height)
+                {
+                    continue;
+                }
+                if observed.is_some() {
+                    return Err(unavailable());
+                }
+                let output: IDXGIOutput6 = output.cast().map_err(|_| unavailable())?;
+                let color = output.GetDesc1().map_err(|_| unavailable())?;
+                observed = Some(crate::format::DesktopColor {
+                    color_space: color.ColorSpace.0,
+                    bits_per_color: color.BitsPerColor,
+                });
+            }
+        }
+        observed.ok_or_else(unavailable)
+    }
 }

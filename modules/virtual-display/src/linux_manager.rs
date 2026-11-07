@@ -4,6 +4,7 @@ mod connectors;
 mod journal;
 mod layout;
 mod observer;
+mod retained_mode;
 mod worker;
 use crate::{
     model::{
@@ -36,6 +37,8 @@ pub(super) struct Record {
     references: Option<BTreeSet<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     transition: Option<Transition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retained_mode: Option<crate::retained_mode::Change>,
     /// A released connector reserved by the provider for recovery and reuse.
     /// It may remain connected as a desktop anchor or already be disconnected.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -85,6 +88,10 @@ impl Record {
             && self.owner.len() <= 128
             && !self.owner.chars().any(char::is_control)
             && self.specification.validate().is_ok()
+            && self
+                .retained_mode
+                .as_ref()
+                .is_none_or(|change| change.valid(&self.specification))
             && self.transition.as_ref().is_none_or(|transition| {
                 !transition.operation_id.is_empty()
                     && transition.operation_id.len() <= 128
@@ -122,6 +129,9 @@ impl Record {
 #[derive(Clone)]
 struct Monitor {
     specification: Specification,
+    retained_mode: Option<crate::retained_mode::Change>,
+    retained_mode_pending: bool,
+    retained_mode_durable: bool,
     state: &'static str,
     output: Option<String>,
     error: Option<String>,
@@ -131,9 +141,51 @@ struct Monitor {
 }
 impl Monitor {
     fn response(&self, reference_id: Option<&str>) -> Value {
-        json!({"reference_owned":reference_id.is_some_and(|reference|self.references.as_ref().is_some_and(|references|references.contains(reference))),"specification":self.specification,"virtual_display_layout":self.layout,"dd_virtual_display_scale":Manager::scale_value(self.scale),"state":self.state,"output":self.output,"error":self.error,
-            "capture_output":self.output.as_ref().filter(|_|self.state=="ready").map(|output|format!("kwin:{output}")),
-            "ready":self.output.as_ref().filter(|_|self.state=="ready").map(|output|json!({"device_path":output,"active":true}))})
+        let reference_owned = reference_id.is_some_and(|reference| {
+            self.references
+                .as_ref()
+                .is_some_and(|references| references.contains(reference))
+        });
+        let mode_revision = self
+            .retained_mode
+            .as_ref()
+            .map_or(0, |change| change.mode_revision());
+        let retained_mode = self.retained_mode.as_ref().map(|change| {
+            if self.retained_mode_pending || !self.retained_mode_durable {
+                json!({"ok":true,"state":"pending","operation_id":change.operation_id})
+            } else {
+                change.response()
+            }
+        });
+        let capture_output = self
+            .output
+            .as_ref()
+            .filter(|_| {
+                self.state == "ready"
+                    && self
+                        .retained_mode
+                        .as_ref()
+                        .is_none_or(|change| !change.is_pending())
+            })
+            .map(|output| format!("kwin:{output}"));
+        let ready = self
+            .output
+            .as_ref()
+            .filter(|_| self.state == "ready")
+            .map(|output| json!({"device_path":output,"active":true}));
+        json!({
+            "reference_owned": reference_owned,
+            "specification": self.specification,
+            "mode_revision": mode_revision,
+            "retained_mode": retained_mode,
+            "virtual_display_layout": self.layout,
+            "dd_virtual_display_scale": Manager::scale_value(self.scale),
+            "state": self.state,
+            "output": self.output,
+            "error": self.error,
+            "capture_output": capture_output,
+            "ready": ready,
+        })
     }
 }
 pub struct Admission {
@@ -163,6 +215,11 @@ enum Verification {
     },
 }
 enum Work {
+    RetainedMode {
+        key: (String, String),
+        change: crate::retained_mode::Change,
+        step: crate::retained_mode::Step,
+    },
     VerifyModeOnly {
         key: (String, String),
         output: String,
@@ -192,6 +249,10 @@ enum Work {
     },
 }
 enum Event {
+    RetainedMode {
+        key: (String, String),
+        result: Result<Record, String>,
+    },
     ModeOnlyVerified {
         key: (String, String),
         result: Result<Value, String>,
@@ -297,6 +358,20 @@ impl Manager {
             .and_then(|receiver| receiver.try_recv().ok())
         {
             match event {
+                Event::RetainedMode { key, result } => {
+                    if let Some(monitor) = self.monitors.get_mut(&key) {
+                        monitor.retained_mode_pending = false;
+                        match result {
+                            Ok(record) => {
+                                monitor.specification = record.specification;
+                                monitor.retained_mode = record.retained_mode;
+                                monitor.retained_mode_durable = true;
+                                monitor.error = None;
+                            }
+                            Err(error) => monitor.error = Some(error),
+                        }
+                    }
+                }
                 Event::ModeOnlyVerified {
                     key,
                     result,
@@ -345,6 +420,9 @@ impl Manager {
                         self.monitors.insert(
                             record.key(),
                             Monitor {
+                                retained_mode: record.retained_mode,
+                                retained_mode_pending: false,
+                                retained_mode_durable: true,
                                 specification: record.specification,
                                 state: "cleanup_failed",
                                 output: Some(record.output),
@@ -520,6 +598,64 @@ impl Manager {
                 self.release_borrow(caller, &identity, &reference_id, &borrow_id),
                 None,
             ),
+            Operation::VerifyOwnerTarget {
+                owner,
+                identity,
+                reference_id,
+            } => (
+                self.verify_owner_target(caller, &owner, &identity, &reference_id),
+                None,
+            ),
+            Operation::PrepareRetainedMode {
+                operation_id,
+                identity,
+                reference_id,
+                expected_reference_ids,
+                expected_mode_revision,
+                width,
+                height,
+                refresh_millihz,
+                hdr_enabled,
+            } => (
+                self.prepare_retained_mode(
+                    caller,
+                    operation_id,
+                    identity,
+                    reference_id,
+                    expected_reference_ids,
+                    expected_mode_revision,
+                    width,
+                    height,
+                    refresh_millihz,
+                    hdr_enabled,
+                ),
+                None,
+            ),
+            Operation::VerifyRetainedMode {
+                owner,
+                identity,
+                reference_id,
+                operation_id,
+            } => (
+                self.verify_retained_mode(caller, &owner, &identity, &reference_id, &operation_id),
+                None,
+            ),
+            Operation::CommitRetainedMode {
+                operation_id,
+                identity,
+                reference_id,
+            } => (
+                self.commit_retained_mode(caller, &identity, &reference_id, &operation_id),
+                None,
+            ),
+            Operation::AbortRetainedMode {
+                operation_id,
+                identity,
+                reference_id,
+            } => (
+                self.abort_retained_mode(caller, &identity, &reference_id, &operation_id),
+                None,
+            ),
             Operation::Status {
                 identity,
                 reference_id,
@@ -617,6 +753,13 @@ impl Manager {
                             None,
                         );
                     }
+                    if existing
+                        .retained_mode
+                        .as_ref()
+                        .is_some_and(|change| change.is_pending())
+                    {
+                        return (failure("reconfigure_pending"), None);
+                    }
                     if matches!(existing.state, "removing" | "cleanup_failed") {
                         return (failure("cleanup_pending"), None);
                     }
@@ -661,6 +804,9 @@ impl Manager {
                 self.topology_revision += 1;
                 self.pending_mutations += 1;
                 let monitor = Monitor {
+                    retained_mode: None,
+                    retained_mode_pending: false,
+                    retained_mode_durable: false,
                     specification,
                     state: "creating",
                     output: None,
@@ -681,6 +827,55 @@ impl Manager {
                 )
             }
         }
+    }
+
+    fn verify_owner_target(
+        &self,
+        caller: &str,
+        owner: &str,
+        identity: &str,
+        reference_id: &str,
+    ) -> Value {
+        if !self
+            .settings
+            .target_verifiers
+            .iter()
+            .any(|verifier| verifier == caller)
+        {
+            return failure("permission_denied");
+        }
+        if !crate::model::valid_principal(owner)
+            || !valid_identity(identity)
+            || !valid_reference_id(reference_id)
+        {
+            return failure("invalid_request");
+        }
+        let Some(monitor) = self.monitors.get(&(owner.into(), identity.into())) else {
+            return failure("owned_target_unavailable");
+        };
+        if monitor
+            .retained_mode
+            .as_ref()
+            .is_some_and(|change| change.is_pending())
+        {
+            return failure("reconfigure_pending");
+        }
+        if !monitor
+            .references
+            .as_ref()
+            .is_some_and(|references| references.contains(reference_id))
+            || monitor.state != "ready"
+        {
+            return failure("owned_target_unavailable");
+        }
+        let Some(target) = monitor
+            .output
+            .as_deref()
+            .filter(|target| !target.is_empty())
+        else {
+            return failure("owned_target_unavailable");
+        };
+        json!({"ok":true,"owned":true,"target_id":target,"specification":monitor.specification,"active":true})
     }
     pub fn completion_lost(&mut self, admission: Option<Admission>) {
         if let Some(admission) = admission {
@@ -723,6 +918,13 @@ impl Manager {
         true
     }
     fn remove(&mut self, caller: &str, identity: &str, reference_id: Option<&str>) -> Value {
+        if self
+            .monitors
+            .get(&(caller.into(), identity.into()))
+            .is_some_and(|monitor| monitor.retained_mode_pending)
+        {
+            return failure("reconfigure_pending");
+        }
         if self
             .reconfigurations
             .values()
@@ -1278,6 +1480,14 @@ impl Manager {
         let Some(monitor) = self.monitors.get(&key) else {
             return (failure("not_found"), None);
         };
+        if monitor
+            .retained_mode
+            .as_ref()
+            .is_some_and(|change| change.is_pending())
+            || monitor.retained_mode_pending
+        {
+            return (failure("reconfigure_pending"), None);
+        }
         if monitor.state != "ready"
             || !monitor
                 .references
@@ -1515,5 +1725,80 @@ impl Drop for Manager {
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod owner_target_tests {
+    use super::*;
+
+    #[test]
+    fn cross_provider_target_proof_requires_explicit_verifier_and_live_exact_reference() {
+        let mut manager = Manager::start(Settings {
+            target_verifiers: vec!["amaterasu.display".into()],
+            ..Settings::default()
+        })
+        .unwrap();
+        let identity = "00000000-0000-0000-0000-000000000001";
+        let key = ("remote-plugin".into(), identity.into());
+        manager.monitors.insert(
+            key.clone(),
+            Monitor {
+                retained_mode: None,
+                retained_mode_pending: false,
+                retained_mode_durable: false,
+                specification: Specification {
+                    hdr_enabled: false,
+                    identity: identity.into(),
+                    width: 1920,
+                    height: 1080,
+                    refresh_millihz: 60000,
+                    name: "Remote monitor".into(),
+                },
+                state: "ready",
+                output: Some("Virtual-9".into()),
+                error: None,
+                references: Some(["retained".into()].into()),
+                layout: VirtualDisplayLayout::Extended,
+                scale: ScaleSetting::Retain,
+            },
+        );
+        let verified =
+            manager.verify_owner_target("amaterasu.display", "remote-plugin", identity, "retained");
+        assert_eq!(verified["ok"], true);
+        assert_eq!(verified["owned"], true);
+        assert_eq!(verified["target_id"], "Virtual-9");
+        assert_eq!(verified["active"], true);
+        for (caller, owner, reference) in [
+            ("untrusted", "remote-plugin", "retained"),
+            ("remote-plugin", "remote-plugin", "retained"),
+            ("amaterasu.display", "other-plugin", "retained"),
+            ("amaterasu.display", "remote-plugin", "different"),
+        ] {
+            let refused = manager.verify_owner_target(caller, owner, identity, reference);
+            assert_eq!(refused["ok"], false);
+            assert!(refused.get("target_id").is_none());
+        }
+        manager.monitors.get_mut(&key).unwrap().state = "removing";
+        assert_eq!(
+            manager.verify_owner_target("amaterasu.display", "remote-plugin", identity, "retained")
+                ["code"],
+            "owned_target_unavailable"
+        );
+        manager.monitors.get_mut(&key).unwrap().state = "ready";
+        manager
+            .monitors
+            .get_mut(&key)
+            .unwrap()
+            .references
+            .as_mut()
+            .unwrap()
+            .clear();
+        assert_eq!(
+            manager.verify_owner_target("amaterasu.display", "remote-plugin", identity, "retained")
+                ["code"],
+            "owned_target_unavailable"
+        );
+        assert!(manager.sender.is_none());
     }
 }

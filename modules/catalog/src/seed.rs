@@ -52,6 +52,11 @@ impl CatalogPosition {
 pub(crate) fn desktop_entry() -> Entry {
     Entry {
         name: DESKTOP_ENTRY_NAME.into(),
+        uuid: None,
+        id_aliases: Vec::new(),
+        hidden: false,
+        remote_monitor_profile: false,
+        properties: json!({}),
         description: String::new(),
         tags: Vec::new(),
         artwork: None,

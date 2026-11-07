@@ -311,6 +311,12 @@ impl Controller {
             {
                 return Err("lifecycle_identity_unverified");
             }
+            if payload["borrowed_capture"] != json!(record.config.borrowed_capture) {
+                return Err("borrowed_capture_unverified");
+            }
+            if payload["source_capture_context"] != json!(record.config.source_capture_context) {
+                return Err("source_capture_context_unverified");
+            }
             if serde_json::from_value::<amaterasu_extension_api::CaptureBindingMode>(
                 payload
                     .get("lifecycle_capture_mode")

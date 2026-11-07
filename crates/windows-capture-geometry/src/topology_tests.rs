@@ -85,6 +85,41 @@ fn assert_resolve_unavailable(topology: &Topology, selected: &SelectedOutput) {
 }
 
 #[test]
+fn exact_target_selection_never_uses_a_peer_or_ambiguous_match() {
+    let snapshot = snapshots();
+    let expected = selected(&snapshot, 1);
+    let topology = Topology::reconcile(snapshot.gdi, snapshot.dxgi, snapshot.ccd).unwrap();
+    assert_eq!(
+        topology
+            .select_target(|target| target.eq_ignore_ascii_case("ADAPTER-B:TARGET-3"))
+            .unwrap(),
+        expected
+    );
+    assert_eq!(
+        topology.select_target(|_| false),
+        Err(GeometryError::TargetChanged)
+    );
+    assert!(matches!(
+        topology.select_target(|_| true),
+        Err(GeometryError::Unavailable(_))
+    ));
+    let selected = topology
+        .select_target(|target| target == "adapter-b:target-3")
+        .unwrap();
+    assert_eq!(
+        topology
+            .resolve(&selected, Some("adapter-b:target-3"))
+            .unwrap()
+            .target_id,
+        "adapter-b:target-3"
+    );
+    assert_eq!(
+        topology.resolve(&selected, Some("adapter-b:target-8")),
+        Err(GeometryError::TargetChanged)
+    );
+}
+
+#[test]
 fn equal_complete_sets_reconcile_independent_order_case_and_negative_origins() {
     let mut snapshot = snapshots();
     snapshot.dxgi.reverse();
@@ -273,4 +308,13 @@ fn selected_monitor_must_still_match_handle_name_and_rectangle() {
             ..selected
         },
     );
+}
+
+#[test]
+fn reference_white_is_a_native_multiplier_without_an_invented_default() {
+    assert_eq!(super::model::reference_white_scale(1000), Ok(1.0));
+    assert_eq!(super::model::reference_white_scale(2500), Ok(2.5));
+    assert_eq!(super::model::reference_white_scale(125000), Ok(125.0));
+    assert!(super::model::reference_white_scale(0).is_err());
+    assert!(super::model::reference_white_scale(125001).is_err());
 }

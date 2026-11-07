@@ -49,8 +49,10 @@ pub struct EncoderInputCpuWritableFrame {
 pub fn encoder_input_cpu_writable_capabilities_valid(
     caps: &EncoderInputCpuWritableCapabilities,
 ) -> bool {
-    matches!(caps.format, crate::PIXEL_BGRA8 | crate::PIXEL_NV12)
-        && caps.min_width != 0
+    matches!(
+        caps.format,
+        crate::PIXEL_BGRA8 | crate::PIXEL_NV12 | crate::PIXEL_P010
+    ) && caps.min_width != 0
         && caps.min_width <= caps.max_width
         && caps.max_width <= 8192
         && caps.min_height != 0
@@ -275,6 +277,18 @@ mod tests {
         frame.width = 1;
         frame.format = crate::PIXEL_NV12;
         assert!(!encoder_input_cpu_writable_valid(&frame, &nv12));
+        let p010 = EncoderInputCpuWritableCapabilities {
+            format: crate::PIXEL_P010,
+            ..caps
+        };
+        assert!(encoder_input_cpu_writable_capabilities_valid(&p010));
+        frame.width = 2;
+        frame.format = crate::PIXEL_P010;
+        frame.stride = 4;
+        frame.len = 12;
+        assert!(encoder_input_cpu_writable_valid(&frame, &p010));
+        frame.stride = 5;
+        assert!(!encoder_input_cpu_writable_valid(&frame, &p010));
     }
 
     #[test]

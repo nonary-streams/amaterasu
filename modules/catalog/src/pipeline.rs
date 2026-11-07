@@ -215,6 +215,8 @@ struct ProviderFinish {
 enum ScanProjection {
     List,
     ExportList,
+    IdentityInventory,
+    Profiles,
     SteamIds,
 }
 
@@ -235,6 +237,7 @@ pub struct Pipeline {
     library_principal: Option<String>,
     launch_principals: BTreeSet<String>,
     export_principals: BTreeMap<String, String>,
+    profile_principals: BTreeMap<String, String>,
     steam_id_export_principals: BTreeMap<String, String>,
     import_principals: BTreeMap<String, String>,
     provider_launch_principals: BTreeMap<String, String>,
@@ -245,6 +248,10 @@ pub struct Pipeline {
     seed: DesktopSeed,
 }
 impl Pipeline {
+    pub fn with_profile_principals(mut self, principals: BTreeMap<String, String>) -> Self {
+        self.profile_principals = principals;
+        self
+    }
     pub fn with_library_principal(mut self, principal: String) -> Self {
         self.library_principal = Some(principal);
         self
@@ -296,6 +303,23 @@ impl Pipeline {
             ));
         }
         match operation {
+            operation @ (Operation::ProfileList { .. }
+            | Operation::ProfileUpsert { .. }
+            | Operation::ProfileDelete { .. }) => {
+                if initiator != MANAGEMENT_PRINCIPAL {
+                    return Err(error(
+                        "permission_denied",
+                        "profile mutations require the management initiator",
+                    ));
+                }
+                let owner = self.profile_principals.get(caller).ok_or_else(|| {
+                    error(
+                        "permission_denied",
+                        "caller is not an authorized profile coordinator",
+                    )
+                })?;
+                Ok((format!("principal/{owner}"), None, operation))
+            }
             operation @ (Operation::ProviderSnapshotBegin { .. }
             | Operation::ProviderArtworkRefresh { .. }
             | Operation::ProviderSnapshotRevoke { .. }
@@ -319,6 +343,21 @@ impl Pipeline {
                     ));
                 }
                 Ok((format!("principal/{caller}"), None, operation))
+            }
+            operation @ Operation::ExportIdentityInventory { .. } => {
+                if caller != library_principal {
+                    return Err(error(
+                        "permission_denied",
+                        "caller is not the library facade",
+                    ));
+                }
+                let owner = self.export_principals.get(initiator).ok_or_else(|| {
+                    error(
+                        "permission_denied",
+                        "request initiator is not an authorized catalog consumer",
+                    )
+                })?;
+                Ok((format!("principal/{owner}"), None, operation))
             }
             operation @ Operation::ExportList { .. } => {
                 let consumer = if caller == library_principal {
@@ -529,6 +568,8 @@ impl Pipeline {
             | Operation::ResolveExportedLaunch { id }
             | Operation::Update { id, .. }
             | Operation::Delete { id, .. } => Some(id),
+            Operation::ProfileUpsert { id, .. } if !id.is_empty() => Some(id),
+            Operation::ProfileDelete { id, .. } => Some(id),
             _ => None,
         };
         let payload = json!({"action":"collection_get","collection":context.key,"key":key});
@@ -2699,7 +2740,9 @@ impl Pipeline {
                 | Operation::ResolveExportedArtwork { id }
                 | Operation::ResolveExportedLaunch { id }
                 | Operation::Update { id, .. }
-                | Operation::Delete { id, .. } = &operation
+                | Operation::Delete { id, .. }
+                | Operation::ProfileUpsert { id, .. }
+                | Operation::ProfileDelete { id, .. } = &operation
                     && !payload["value"].is_null()
                 {
                     let entry: Entry = match serde_json::from_value(payload["value"].clone()) {
@@ -2732,7 +2775,8 @@ impl Pipeline {
                     );
                 }
                 let public_count = count.saturating_sub(context.provider_count);
-                if matches!(operation, Operation::Create { .. })
+                if (matches!(operation, Operation::Create { .. })
+                    || matches!(&operation,Operation::ProfileUpsert {id,..} if id.is_empty()))
                     && public_count >= MAX_ENTRIES as u64
                 {
                     return complete(
@@ -2756,6 +2800,8 @@ impl Pipeline {
             if matches!(
                 operation,
                 Operation::ExportList { .. }
+                    | Operation::ExportIdentityInventory { .. }
+                    | Operation::ProfileList { .. }
                     | Operation::ExportSteamIds { .. }
                     | Operation::ResolveExported { .. }
                     | Operation::ResolveExportedArtwork { .. }
@@ -2776,6 +2822,8 @@ impl Pipeline {
         if matches!(
             operation,
             Operation::ExportList { .. }
+                | Operation::ExportIdentityInventory { .. }
+                | Operation::ProfileList { .. }
                 | Operation::ExportSteamIds { .. }
                 | Operation::ResolveExported { .. }
                 | Operation::ResolveExportedArtwork { .. }
@@ -2816,6 +2864,20 @@ impl Pipeline {
                 cursor,
                 limit,
                 ScanProjection::ExportList,
+            ),
+            Operation::ExportIdentityInventory { cursor, limit } => (
+                String::new(),
+                String::new(),
+                cursor,
+                limit,
+                ScanProjection::IdentityInventory,
+            ),
+            Operation::ProfileList { cursor, limit } => (
+                String::new(),
+                "remote_monitor_profiles".into(),
+                cursor,
+                limit,
+                ScanProjection::Profiles,
             ),
             Operation::ExportSteamIds { cursor, limit } => (
                 String::new(),
@@ -2918,11 +2980,20 @@ impl Pipeline {
                 return self.scan_launch_markers(context, scan, send);
             }
             operation => {
+                let profile_mutation = matches!(
+                    operation,
+                    Operation::ProfileUpsert { .. } | Operation::ProfileDelete { .. }
+                );
                 return match apply(operation, Some(document)) {
                     Ok(Change::Read(reply)) => complete_selected(send, context, reply),
                     Ok(Change::Write { document, reply }) => {
-                        let id = reply["id"].as_str().expect("mutation ID");
-                        let payload = json!({"action":"collection_commit","collection":context.key,"expected_revision":state_revision,"metadata":{"revision":document.revision,"next_id":document.next_id,"provider_count":context.provider_count},"edits":[{"key":id,"value":document.entries.get(id)}]});
+                        let id = reply["id"].as_str().expect("mutation ID").to_owned();
+                        let reply = if profile_mutation {
+                            crate::profiles::project_reply(reply)
+                        } else {
+                            reply
+                        };
+                        let payload = json!({"action":"collection_commit","collection":context.key,"expected_revision":state_revision,"metadata":{"revision":document.revision,"next_id":document.next_id,"provider_count":context.provider_count},"edits":[{"key":id,"value":document.entries.get(&id)}]});
                         self.submit(context, payload, Stage::Saving(reply), send)
                     }
                     Err(failure) => complete(send, context.request_id, failure),
@@ -3131,8 +3202,28 @@ impl Pipeline {
                 ScanProjection::List if matches_query(&entry, &scan.query) => {
                     Some(project_entry(id, &entry, false))
                 }
-                ScanProjection::ExportList if matches_query(&entry, &scan.query) => {
+                ScanProjection::ExportList
+                    if !entry.hidden && matches_query(&entry, &scan.query) =>
+                {
                     Some(project_entry(id, &entry, true))
+                }
+                ScanProjection::IdentityInventory => match crate::identity::project(id, &entry) {
+                    Ok(projected) => Some(projected),
+                    Err(message) => {
+                        return complete(send, context.request_id, error("invalid_entry", message));
+                    }
+                },
+                ScanProjection::Profiles if entry.remote_monitor_profile => {
+                    match crate::identity::project(id, &entry) {
+                        Ok(projected) => Some(projected),
+                        Err(message) => {
+                            return complete(
+                                send,
+                                context.request_id,
+                                error("invalid_profile", message),
+                            );
+                        }
+                    }
                 }
                 ScanProjection::SteamIds => entry
                     .steam_id
@@ -3185,7 +3276,9 @@ impl Scan {
                     crate::protocol::config_override_capabilities();
                 reply
             }
-            ScanProjection::ExportList => {
+            ScanProjection::ExportList
+            | ScanProjection::IdentityInventory
+            | ScanProjection::Profiles => {
                 json!({"ok":true,"revision":self.revision,"entries":self.entries,"next_cursor":cursor})
             }
         }
@@ -3727,6 +3820,11 @@ fn collection_commit(session: &ProviderSession, edits: Vec<Value>) -> Value {
 fn playnite_fullscreen_entry(config_overrides: ConfigOverrides) -> Entry {
     Entry {
         name: PLAYNITE_FULLSCREEN_NAME.into(),
+        uuid: None,
+        id_aliases: Vec::new(),
+        hidden: false,
+        remote_monitor_profile: false,
+        properties: json!({}),
         description: String::new(),
         tags: Vec::new(),
         artwork: None,

@@ -2412,6 +2412,7 @@ mod tests {
         streams.insert(
             "stream".into(),
             super::super::StreamRecord {
+                borrowed_capture: None,
                 provider_graph: None,
                 generation: 4,
                 phase: StreamPhase::Active,
@@ -2747,6 +2748,7 @@ mod tests {
         streams.insert(
             "stream".into(),
             super::super::StreamRecord {
+                borrowed_capture: None,
                 provider_graph: None,
                 generation: 4,
                 phase: StreamPhase::Active,

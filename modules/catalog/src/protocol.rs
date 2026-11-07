@@ -58,6 +58,25 @@ pub enum Operation {
         cursor: Option<Cursor>,
         limit: Option<usize>,
     },
+    /// Complete occupancy includes hidden rows and retained aliases. Only the
+    /// trusted library facade may delegate this installed-consumer operation.
+    ExportIdentityInventory {
+        cursor: Option<Cursor>,
+        limit: Option<usize>,
+    },
+    ProfileList {
+        cursor: Option<Cursor>,
+        limit: Option<usize>,
+    },
+    ProfileUpsert {
+        id: String,
+        entry: Entry,
+        expected_revision: u64,
+    },
+    ProfileDelete {
+        id: String,
+        expected_revision: u64,
+    },
     /// Export only Steam IDs from the owner selected by steam_id_export_principals.
     ExportSteamIds {
         cursor: Option<Cursor>,
@@ -191,6 +210,21 @@ pub fn apply(operation: Operation, existing: Option<Document>) -> Result<Change,
         }
         Operation::List { cursor, limit } => return page(&document, "", cursor, limit, false),
         Operation::ExportList { cursor, limit } => return page(&document, "", cursor, limit, true),
+        Operation::ExportIdentityInventory { cursor, limit } => {
+            return identity_page(&document, cursor, limit, false);
+        }
+        Operation::ProfileList { cursor, limit } => {
+            return identity_page(&document, cursor, limit, true);
+        }
+        Operation::ProfileUpsert {
+            id,
+            entry,
+            expected_revision,
+        } => return crate::profiles::upsert(document, id, entry, expected_revision),
+        Operation::ProfileDelete {
+            id,
+            expected_revision,
+        } => return crate::profiles::delete(document, id, expected_revision),
         Operation::ExportSteamIds { cursor, limit } => {
             return page_steam_ids(&document, cursor, limit);
         }
@@ -388,10 +422,9 @@ fn page(
     } else {
         ""
     };
-    let mut matching = document
-        .entries
-        .iter()
-        .filter(|(id, entry)| id.as_str() > after && matches_query(entry, query));
+    let mut matching = document.entries.iter().filter(|(id, entry)| {
+        id.as_str() > after && (!export || !entry.hidden) && matches_query(entry, query)
+    });
     let entries: Vec<Value> = matching
         .by_ref()
         .take(limit)
@@ -418,6 +451,72 @@ pub(crate) fn config_override_capabilities() -> Value {
     // Preserve the legacy response envelope. Extension option definitions and
     // platform availability are supplied by the selected providers' descriptors.
     json!({})
+}
+
+fn identity_page(
+    document: &Document,
+    cursor: Option<Cursor>,
+    limit: Option<usize>,
+    profiles_only: bool,
+) -> Result<Change, Value> {
+    let limit = limit.unwrap_or(20);
+    if !(1..=32).contains(&limit) {
+        return Err(error(
+            "invalid_request",
+            "page limit must be between 1 and 32",
+        ));
+    }
+    let after = if let Some(cursor) = &cursor {
+        check_revision(document, cursor.revision)?;
+        let query = if profiles_only {
+            "remote_monitor_profiles"
+        } else {
+            ""
+        };
+        if cursor.query != query || !document.entries.contains_key(&cursor.after) {
+            return Err(error(
+                "invalid_cursor",
+                "cursor does not match the identity inventory",
+            ));
+        }
+        cursor.after.as_str()
+    } else {
+        ""
+    };
+    let mut entries = Vec::new();
+    let mut bytes = 0_usize;
+    let mut more = false;
+    for (id, entry) in document.entries.iter().filter(|(id, entry)| {
+        id.as_str() > after && (!profiles_only || entry.remote_monitor_profile)
+    }) {
+        let row = crate::identity::project(id, entry)
+            .map_err(|message| error("invalid_entry", message))?;
+        let size = serde_json::to_vec(&row)
+            .map_err(|_| error("invalid_entry", "cannot serialize inventory row"))?
+            .len();
+        if entries.len() == limit || bytes + size > 12_000 {
+            more = true;
+            break;
+        }
+        bytes += size;
+        entries.push(row);
+    }
+    let next_cursor = if more {
+        entries.last().map(|entry| Cursor {
+            revision: document.revision,
+            after: entry["id"].as_str().expect("identity ID").into(),
+            query: if profiles_only {
+                "remote_monitor_profiles".into()
+            } else {
+                String::new()
+            },
+        })
+    } else {
+        None
+    };
+    Ok(Change::Read(
+        json!({"ok":true,"revision":document.revision,"entries":entries,"next_cursor":next_cursor}),
+    ))
 }
 
 fn page_steam_ids(

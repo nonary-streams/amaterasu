@@ -43,8 +43,10 @@ pub enum OptionError {
     InvalidCaptureAuthorityCard(String),
     CaptureAuthorityRequirements,
     CaptureAuthorityCardWithoutHelper,
+    CaptureAuthorityPrecheckWithoutHelper,
     ConflictingCaptureHelpers,
     VirtualScreenCaptureRequirements,
+    DesktopOutputCaptureRequirements,
     InvalidLabel(&'static str),
 }
 
@@ -82,6 +84,9 @@ impl fmt::Display for OptionError {
             Self::VirtualScreenCaptureRequirements => formatter.write_str(
                 "--enable-virtual-screen-capture requires --enable-capture, --enable-virtual-display, a --capture-authority-helper or already configured --frame-helper, and the default capture output"
             ),
+            Self::DesktopOutputCaptureRequirements => formatter.write_str(
+                "--enable-desktop-output-capture requires --enable-capture"
+            ),
             Self::InvalidRtxHdrRuntime(value) => write!(
                 formatter,
                 "--rtx-hdr-runtime expects an absolute normal directory path, got {value:?}"
@@ -104,6 +109,7 @@ impl fmt::Display for OptionError {
             Self::CaptureAuthorityCardWithoutHelper => formatter.write_str(
                 "--capture-authority-card requires --capture-authority-helper"
             ),
+            Self::CaptureAuthorityPrecheckWithoutHelper=>formatter.write_str("--capture-authority-precheck requires --capture-authority-helper and a compatible capture artifact"),
             Self::ConflictingCaptureHelpers => formatter.write_str(
                 "--capture-authority-helper and --frame-helper are mutually exclusive"
             ),
@@ -308,6 +314,9 @@ pub struct LinuxSessionOptions {
     /// Enables video processing and explicit KMS capture; portal selection
     /// and a configured frame helper retain their own authorization rules.
     pub enable_capture: bool,
+    /// Allows direct capture of existing physical KWin outputs through the
+    /// selected PipeWire provider. Managed-output permission stays separate.
+    pub enable_desktop_output_capture: bool,
     /// Enables host audio capture.
     pub enable_audio: bool,
     /// Enables the owned virtual display provider.
@@ -329,6 +338,9 @@ pub struct LinuxSessionOptions {
     pub capture_authority_helper: Option<String>,
     /// Exact DRM card included in the package's requested authority.
     pub capture_authority_card: u32,
+    /// Request nonallocating source capability negotiation on a compatible
+    /// artifact; the protected launcher still determines actual support.
+    pub capture_authority_precheck: bool,
 }
 
 impl Default for LinuxSessionOptions {
@@ -341,6 +353,7 @@ impl Default for LinuxSessionOptions {
             capture_output: DEFAULT_CAPTURE_OUTPUT.into(),
             audio_endpoint: DEFAULT_AUDIO_ENDPOINT.into(),
             enable_capture: false,
+            enable_desktop_output_capture: false,
             enable_audio: false,
             enable_virtual_display: false,
             enable_virtual_screen_capture: false,
@@ -350,6 +363,7 @@ impl Default for LinuxSessionOptions {
             rtx_hdr_runtime_directory: None,
             capture_authority_helper: None,
             capture_authority_card: 0,
+            capture_authority_precheck: false,
         }
     }
 }
@@ -408,6 +422,10 @@ impl LinuxSessionOptions {
                     seen.once("--enable-capture")?;
                     options.enable_capture = true;
                 }
+                "--enable-desktop-output-capture" => {
+                    seen.once("--enable-desktop-output-capture")?;
+                    options.enable_desktop_output_capture = true;
+                }
                 "--enable-audio" => {
                     seen.once("--enable-audio")?;
                     options.enable_audio = true;
@@ -435,6 +453,10 @@ impl LinuxSessionOptions {
                     seen.once("--capture-authority-card")?;
                     let card = required_value(&mut arguments, "--capture-authority-card")?;
                     options.capture_authority_card = parse_capture_authority_card(&card)?;
+                }
+                "--capture-authority-precheck" => {
+                    seen.once("--capture-authority-precheck")?;
+                    options.capture_authority_precheck = true;
                 }
                 "--enable-virtual-display" => {
                     seen.once("--enable-virtual-display")?;
@@ -471,6 +493,12 @@ impl LinuxSessionOptions {
 
     /// Reject inconsistent opt-in settings for both parsed and programmatic profiles.
     pub fn validate(&self) -> Result<(), OptionError> {
+        if self.capture_authority_precheck && self.capture_authority_helper.is_none() {
+            return Err(OptionError::CaptureAuthorityPrecheckWithoutHelper);
+        }
+        if self.enable_desktop_output_capture && !self.enable_capture {
+            return Err(OptionError::DesktopOutputCaptureRequirements);
+        }
         if self.capture_authority_helper.is_some() && self.frame_helper.is_some() {
             return Err(OptionError::ConflictingCaptureHelpers);
         }

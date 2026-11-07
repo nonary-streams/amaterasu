@@ -1,14 +1,27 @@
-//! Optional owned-display artifact and KDE registration checks.
+//! Optional owned-display and direct KWin capture artifact/registration checks.
 use amaterasu_package::{ComponentManifest, PackageResult, read_bounded};
 use serde_json::Value;
 use std::{collections::BTreeMap, path::Path};
 pub(crate) const DESKTOP_FILE: &str = "org.amaterasu.StreamingHost.desktop";
 const DRIVER_MARKER: &[u8] = b"AMATERASU_LINUX_VDD=b2946d02a09bc453d9e6d287623390ca1dedf964\0";
 const CAPTURE_MARKER: &[u8] = b"AMATERASU_KWIN_CAPTURE=1\0";
+const DESKTOP_CAPTURE_MARKER: &[u8] = b"AMATERASU_KWIN_DESKTOP_CAPTURE=1\0";
 pub(crate) fn enabled(settings: &BTreeMap<String, Value>) -> bool {
     settings
         .get("amaterasu.capture-pipewire")
-        .is_some_and(|setting| setting["allow_named_outputs"] == true)
+        .is_some_and(|setting| {
+            setting["allow_named_outputs"] == true || setting["allow_desktop_outputs"] == true
+        })
+}
+pub(crate) fn desktop_capture_enabled(settings: &BTreeMap<String, Value>) -> bool {
+    settings
+        .get("amaterasu.capture-pipewire")
+        .is_some_and(|setting| setting["allow_desktop_outputs"] == true)
+}
+pub(crate) fn validate_desktop_capture_artifact(artifact: &[u8]) -> PackageResult<()> {
+    validate_marker(artifact, DESKTOP_CAPTURE_MARKER).map_err(|_| {
+        "desktop output capture requires the linked KWin desktop-capture feature".into()
+    })
 }
 pub(crate) fn validate(
     package: &Path,
@@ -28,6 +41,11 @@ pub(crate) fn validate(
             enabled(settings),
             CAPTURE_MARKER,
         ),
+        (
+            "amaterasu.capture-pipewire",
+            desktop_capture_enabled(settings),
+            DESKTOP_CAPTURE_MARKER,
+        ),
     ] {
         if !setting {
             continue;
@@ -35,11 +53,13 @@ pub(crate) fn validate(
         let component = components
             .iter()
             .find(|entry| entry.id == component)
-            .ok_or("owned display component is absent")?;
-        validate_marker(
-            &read_bounded(&package.join(&component.file), 256 * 1024 * 1024)?,
-            marker,
-        )?;
+            .ok_or("required output-capture or virtual-display component is absent")?;
+        let artifact = read_bounded(&package.join(&component.file), 256 * 1024 * 1024)?;
+        if marker == DESKTOP_CAPTURE_MARKER {
+            validate_desktop_capture_artifact(&artifact)?;
+        } else {
+            validate_marker(&artifact, marker)?;
+        }
     }
     Ok(())
 }
@@ -133,5 +153,28 @@ mod tests {
         assert!(validate_marker(DRIVER_MARKER, DRIVER_MARKER).is_ok());
         assert!(validate_marker(b"unmarked artifact", DRIVER_MARKER).is_err());
         assert!(validate_marker(&[DRIVER_MARKER, DRIVER_MARKER].concat(), DRIVER_MARKER).is_err());
+    }
+    #[test]
+    fn desktop_capture_requires_its_own_artifact_capability_and_scoped_kde_declaration() {
+        let settings = BTreeMap::from([
+            (
+                "amaterasu.capture-pipewire".into(),
+                serde_json::json!({"allow_desktop_outputs":true}),
+            ),
+            (
+                "amaterasu.virtual-display".into(),
+                serde_json::json!({"enabled":false}),
+            ),
+        ]);
+        assert!(enabled(&settings));
+        assert!(desktop_capture_enabled(&settings));
+        assert!(validate_desktop_capture_artifact(CAPTURE_MARKER).is_err());
+        assert!(validate_desktop_capture_artifact(DESKTOP_CAPTURE_MARKER).is_ok());
+        assert!(
+            validate_desktop_capture_artifact(
+                &[DESKTOP_CAPTURE_MARKER, DESKTOP_CAPTURE_MARKER].concat()
+            )
+            .is_err()
+        );
     }
 }

@@ -1,8 +1,12 @@
 //! Windows Graphics Capture with caller-owned streams and synchronous CPU frames.
 mod backend;
 mod controller;
+mod format;
 mod model;
+#[cfg(test)]
 mod native;
+mod preflight;
+mod resource;
 #[cfg(any(windows, test))]
 mod staging;
 mod worker;
@@ -29,7 +33,11 @@ struct Settings {
 struct CaptureModule {
     runtime: RuntimeClient,
     controller: SharedController,
-    _factory: Box<native::Factory<NativeBackend>>,
+    _preflight_factory: Box<
+        amaterasu_module_sdk::capture::SourcePreflightFactory<preflight::Provider<NativeBackend>>,
+    >,
+    _factory:
+        Box<amaterasu_module_sdk::capture::CpuSourceFactory<resource::Provider<NativeBackend>>>,
 }
 
 impl ManagedModule for CaptureModule {
@@ -43,7 +51,18 @@ impl ManagedModule for CaptureModule {
             NativeBackend::new(settings.capture_cursor),
             settings.enabled,
         )));
-        let factory = native::Factory::new(controller.clone());
+        let factory = amaterasu_module_sdk::capture::CpuSourceFactory::new(Arc::new(
+            resource::Provider::new(controller.clone()),
+        ));
+        // SAFETY: the original factory's bind allocates binding metadata only.
+        // Both boxed factories outlive all bindings; the query provider retains
+        // caller-scoped controller state and never opens a capture source.
+        let preflight_factory = unsafe {
+            amaterasu_module_sdk::capture::SourcePreflightFactory::new(
+                &factory.api,
+                Arc::new(preflight::Provider::new(controller.clone())),
+            )
+        };
         runtime.require_success(Command::Register {
             service: SERVICE.into(),
         })?;
@@ -53,13 +72,14 @@ impl ManagedModule for CaptureModule {
             runtime.register_native_typed(
                 SERVICE,
                 amaterasu_module_sdk::media::native_contracts::CAPTURE,
-                &factory.api,
+                &preflight_factory.api,
             )
         }?;
         Ok(Self {
             runtime,
             controller,
             _factory: factory,
+            _preflight_factory: preflight_factory,
         })
     }
 

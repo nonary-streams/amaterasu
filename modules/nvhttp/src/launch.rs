@@ -6,6 +6,7 @@
 use amaterasu_module_sdk::{
     EncoderSelection, NvencSettings, NvencSettingsOverrides, SoftwareEncoderOptions,
 };
+mod auxiliary;
 mod call;
 mod record;
 mod resume_snapshot;
@@ -19,6 +20,7 @@ mod tests {
     include!("launch/display_mutation_tests.rs");
     include!("launch/lifecycle_tests.rs");
     include!("launch/shared_session_tests.rs");
+    include!("launch/auxiliary_tests.rs");
 }
 
 use crate::encoder_snapshot::{
@@ -676,6 +678,21 @@ struct PendingResume {
     request: LaunchRequest,
     peer: PeerIdentity,
     retained: bool,
+    response_kind: StreamResponse,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum StreamResponse {
+    #[default]
+    Launch,
+    Resume,
+}
+
+#[derive(Default)]
+struct LaunchSource {
+    auxiliary: Option<amaterasu_module_sdk::session_presentation::AuxiliaryStreamPlan>,
+    shared_capture: Option<amaterasu_module_sdk::session_presentation::SharedCapture>,
+    response: StreamResponse,
 }
 
 pub struct Controller {
@@ -717,6 +734,14 @@ pub struct Controller {
     nonce: [u8; 16],
     next_id: u64,
     sequence: u64,
+    last_scheduled_record: u64,
+    auxiliary_black_capture_provider: Option<CaptureProvider>,
+    auxiliary_black_capture_route_key: Option<String>,
+    auxiliary_exact_capture_provider: Option<CaptureProvider>,
+    auxiliary_exact_capture_routes: BTreeMap<String, CaptureProvider>,
+    pending_auxiliary: BTreeMap<String, auxiliary::PendingAuxiliary>,
+    borrowed_capture_verification: bool,
+    pending_presentation_observations: Vec<amaterasu_module_sdk::session_presentation::Observation>,
 }
 
 impl Controller {
@@ -764,6 +789,14 @@ impl Controller {
             nonce,
             next_id: 0,
             sequence: 0,
+            last_scheduled_record: 0,
+            auxiliary_black_capture_provider: None,
+            auxiliary_black_capture_route_key: Some("synthetic_black".into()),
+            auxiliary_exact_capture_provider: None,
+            auxiliary_exact_capture_routes: BTreeMap::new(),
+            pending_auxiliary: BTreeMap::new(),
+            borrowed_capture_verification: false,
+            pending_presentation_observations: Vec::new(),
         })
     }
 
@@ -1072,39 +1105,94 @@ impl Controller {
         peer: PeerIdentity,
         now: Instant,
     ) -> Option<Reply> {
+        self.launch_for_route(connection, request, peer, StreamResponse::Launch, now)
+    }
+
+    pub(crate) fn launch_for_route(
+        &mut self,
+        connection: u64,
+        request: LaunchRequest,
+        peer: PeerIdentity,
+        response: StreamResponse,
+        now: Instant,
+    ) -> Option<Reply> {
+        self.launch_with_source(
+            connection,
+            request,
+            peer,
+            LaunchSource {
+                response,
+                ..LaunchSource::default()
+            },
+            now,
+        )
+    }
+
+    fn validate_stream_request(
+        &self,
+        request: &LaunchRequest,
+        peer: &PeerIdentity,
+        auxiliary_audio: Option<bool>,
+    ) -> Result<(), Reply> {
+        if self.package_activation_pending {
+            return Err(private_error(503, "plugin activation is pending"));
+        }
+        let Some(config) = &self.config else {
+            return Err(private_error(503, "streaming is disabled"));
+        };
+        if !self.output_settings_ready {
+            return Err(private_error(503, "stream settings are loading"));
+        }
+        if !peer.paired() {
+            return Err(private_error(401, "authenticated paired TLS is required"));
+        }
+        let desktop = auxiliary_audio.is_some() || request.app_id == DESKTOP_APP_ID;
+        if (request.app_id == 0 && auxiliary_audio.is_none())
+            || request.app_id > i32::MAX as u32
+            || (desktop && auxiliary_audio.is_none() && !config.desktop.enabled)
+            || !config.profile.accepts(request)
+            || !matches!(request.audio_channels, 2 | 6 | 8)
+            || (auxiliary_audio.unwrap_or(true)
+                && ((request.audio_channels == 6 && config.profile.audio_bitrate < 256_000)
+                    || (request.audio_channels == 8 && config.profile.audio_bitrate < 512_000)))
+            || request
+                .device_name
+                .as_deref()
+                .is_some_and(|name| !valid_device_name(name))
+        {
+            return Err(private_error(400, "unsupported streaming request"));
+        }
+        Ok(())
+    }
+
+    fn launch_with_source(
+        &mut self,
+        connection: u64,
+        request: LaunchRequest,
+        peer: PeerIdentity,
+        source: LaunchSource,
+        now: Instant,
+    ) -> Option<Reply> {
+        let LaunchSource {
+            auxiliary,
+            shared_capture,
+            response,
+        } = source;
         if peer.paired() {
             self.prune_finished_transports();
             if self.retired_stream_key(&request) {
                 return Some(private_error(409, "launch key was already used"));
             }
         }
-        if self.package_activation_pending {
-            return Some(private_error(503, "plugin activation is pending"));
+        if let Err(reply) = self.validate_stream_request(
+            &request,
+            &peer,
+            auxiliary.as_ref().map(|plan| plan.stream_audio),
+        ) {
+            return Some(reply);
         }
-        let Some(config) = &self.config else {
-            return Some(private_error(503, "streaming is disabled"));
-        };
-        if !self.output_settings_ready {
-            return Some(private_error(503, "stream settings are loading"));
-        }
-        if !peer.paired() {
-            return Some(private_error(401, "authenticated paired TLS is required"));
-        }
-        let desktop = request.app_id == DESKTOP_APP_ID;
-        if request.app_id == 0
-            || request.app_id > i32::MAX as u32
-            || (desktop && !config.desktop.enabled)
-            || !config.profile.accepts(&request)
-            || !matches!(request.audio_channels, 2 | 6 | 8)
-            || (request.audio_channels == 6 && config.profile.audio_bitrate < 256_000)
-            || (request.audio_channels == 8 && config.profile.audio_bitrate < 512_000)
-            || request
-                .device_name
-                .as_deref()
-                .is_some_and(|name| !valid_device_name(name))
-        {
-            return Some(private_error(400, "unsupported streaming request"));
-        }
+        let config = self.config.as_ref().expect("validated streaming config");
+        let desktop = auxiliary.is_some() || request.app_id == DESKTOP_APP_ID;
         let device_name = request
             .device_name
             .as_deref()
@@ -1114,11 +1202,21 @@ impl Controller {
         let global_fec_percentage = self
             .global_fec_percentage
             .unwrap_or(config.profile.fec_percentage);
-        let global_stream_audio = self.global_stream_audio;
+        let global_stream_audio = auxiliary
+            .as_ref()
+            .map_or(self.global_stream_audio, |plan| plan.stream_audio);
         let global_video_encryption_policy = self.global_video_encryption_policy;
         let global_audio_sink_capture_only = self.global_audio_sink_capture_only;
-        let global_preparation = self.global_preparation.clone();
-        let legacy_global_preparation = self.legacy_global_preparation.clone();
+        let global_preparation = if auxiliary.is_some() {
+            Vec::new()
+        } else {
+            self.global_preparation.clone()
+        };
+        let legacy_global_preparation = if auxiliary.is_some() {
+            Vec::new()
+        } else {
+            self.legacy_global_preparation.clone()
+        };
         let global_ping_timeout_ms = self.global_ping_timeout_ms;
         let global_video_max_batch_size_kb = self.global_video_max_batch_size_kb;
         let global_max_bitrate_kbps = self.global_max_bitrate_kbps;
@@ -1142,20 +1240,46 @@ impl Controller {
         let global_capture_mode = self.configured_capture;
         let selected_capture_mode = peer.client_capture.unwrap_or(global_capture_mode);
         let requested_capture_output = capture_output.clone();
-        let (capture_provider, constant_rate, capture_output) = resolve_capture_route(
-            selected_capture_mode,
-            bootstrap_capture_provider.clone(),
-            &capture_output,
-        );
+        let source_capture_context =
+            match self.presentation_source_context(auxiliary.as_ref(), shared_capture.as_ref()) {
+                Ok(context) => context,
+                Err(code) => return Some(private_error(503, code)),
+            };
+        let (capture_provider, constant_rate, capture_output) = match auxiliary
+            .as_ref()
+            .map(|plan| &plan.capture)
+            .or_else(|| shared_capture.as_ref().map(|source| &source.capture))
+        {
+            Some(source) => match self.presentation_capture_route(source, &request) {
+                Ok(route) => route,
+                Err(code) => return Some(private_error(503, code)),
+            },
+            None => resolve_capture_route(
+                selected_capture_mode,
+                bootstrap_capture_provider.clone(),
+                &capture_output,
+            ),
+        };
 
         if let Some(record) = self
             .records
             .values_mut()
             .find(|record| record.request.remote_input_key == request.remote_input_key)
         {
-            if record.peer == peer && record.request == request {
+            if record.peer == peer
+                && record.request == request
+                && auxiliary::same_auxiliary_source(
+                    record.auxiliary.as_ref().map(|auxiliary| &auxiliary.plan),
+                    auxiliary.as_ref(),
+                )
+                && auxiliary::same_shared_source(
+                    record.shared_capture.as_ref(),
+                    shared_capture.as_ref(),
+                )
+            {
                 if matches!(record.state, State::Ready) {
                     record.launch_connection = Some(connection);
+                    record.response_kind = response;
                     return Some(success_reply(record));
                 }
                 if !record.state.terminal() {
@@ -1171,10 +1295,15 @@ impl Controller {
         if self.records.len() >= MAX_RECORDS {
             return Some(private_error(503, "another stream is active"));
         }
-        if self.shared_application(request.app_id).is_some() {
-            return self.join_or_resume(connection, request, peer, now);
+        if auxiliary.is_none() && self.shared_application(request.app_id).is_some() {
+            return self.join_or_resume(connection, request, peer, response, now);
         }
-        if self.records.values().any(|record| !record.state.terminal()) {
+        if auxiliary.is_none()
+            && self
+                .records
+                .values()
+                .any(|record| record.auxiliary.is_none() && !record.state.terminal())
+        {
             return Some(private_error(503, "another application is active"));
         }
         let video_codec_offer = match self.codec_offer(config, &request) {
@@ -1223,9 +1352,11 @@ impl Controller {
             now + INITIAL_DEADLINE,
         );
         record.requested_capture_output = requested_capture_output;
-        record.lifecycle_required = self.session_lifecycle_required;
+        record.lifecycle_required = self.session_lifecycle_required && auxiliary.is_none();
         record.lifecycle_capture_mode = self.session_lifecycle_capture_mode;
         record.desktop = desktop;
+        record.response_kind = response;
+        record.source_capture_context = source_capture_context;
         record.video_codec_offer = video_codec_offer;
         record.encoder_snapshot = self.encoder_snapshot.clone();
         record.global_display_revision = self.global_display_revision;
@@ -1246,6 +1377,24 @@ impl Controller {
         record.effective_qp = record.peer.client_qp.unwrap_or(record.global_qp);
         record.selected_encoder = startup_encoder;
         record.global_display_policy = self.global_display_policy.clone();
+        record.auxiliary = auxiliary.map(auxiliary::AuxiliaryRecord::new);
+        record.shared_capture = shared_capture;
+        if record.shared_capture.is_some() || record.auxiliary.is_some() {
+            record.presentation_client_id = Some(fingerprint(record.peer.certificate()));
+        }
+        record.application_source = record
+            .shared_capture
+            .clone()
+            .map(|source| auxiliary::ApplicationSourceHold::new(source, &record));
+        if record.shared_capture.is_some() || record.auxiliary.is_some() {
+            record.stage = Stage::ReadRtspRuntimeEpoch;
+            record.next_monitor = now;
+        }
+        if record.auxiliary.is_some() {
+            record.capture_sink_without_routing = true;
+            record.global_configured_virtual_sink = None;
+            record.global_display_policy = json!({});
+        }
         self.records.insert(id, record);
         None
     }
@@ -1324,6 +1473,20 @@ impl Controller {
         peer: &PeerIdentity,
         now: Instant,
     ) -> Option<Reply> {
+        self.resume_for_route(connection, request, peer, StreamResponse::Resume, now)
+    }
+
+    pub(crate) fn resume_for_route(
+        &mut self,
+        connection: u64,
+        mut request: LaunchRequest,
+        peer: &PeerIdentity,
+        response: StreamResponse,
+        now: Instant,
+    ) -> Option<Reply> {
+        if request.app_id == 0 {
+            request.app_id = self.current_game(peer);
+        }
         if peer.paired() {
             self.prune_finished_transports();
             if self.retired_stream_key(&request) {
@@ -1334,7 +1497,7 @@ impl Controller {
             .shared_application(request.app_id)
             .is_some_and(|root| self.application_has_live_stream(root))
         {
-            return self.join_stream(connection, request, peer.clone(), now);
+            return self.join_stream(connection, request, peer.clone(), response, now);
         }
         if self.package_activation_pending {
             return Some(private_error(503, "plugin activation is pending"));
@@ -1409,6 +1572,7 @@ impl Controller {
             record.revoked = false;
             record.failure = None;
             record.resumed = true;
+            record.response_kind = response;
             record.adopted = false;
             record.resume_abandoned = false;
             record.launch_connection = Some(connection);
@@ -1421,6 +1585,7 @@ impl Controller {
                 request,
                 peer: peer.clone(),
                 retained: true,
+                response_kind: response,
             });
             return None;
         }
@@ -1439,6 +1604,7 @@ impl Controller {
             request,
             peer: peer.clone(),
             retained: false,
+            response_kind: response,
         });
         None
     }
@@ -1451,6 +1617,7 @@ impl Controller {
             .values()
             .find(|record| {
                 (!record.revoked || record.state == State::Paused)
+                    && record.auxiliary.is_none()
                     && matches!(record.state, State::Ready | State::Paused)
             })
             .map_or(0, |record| record.request.app_id)
@@ -1461,11 +1628,21 @@ impl Controller {
         self.poll_with_trust(now, send, |_| true)
     }
 
+    #[cfg(test)]
     pub fn poll_with_trust(
         &mut self,
         now: Instant,
         send: &mut Send<'_>,
         mut trusted: impl FnMut(&[u8]) -> bool,
+    ) -> Vec<(u64, Reply)> {
+        self.poll_with_authorization(now, send, |certificate, _| trusted(certificate))
+    }
+
+    pub fn poll_with_authorization(
+        &mut self,
+        now: Instant,
+        send: &mut Send<'_>,
+        mut allowed: impl FnMut(&[u8], crate::wire::Permission) -> bool,
     ) -> Vec<(u64, Reply)> {
         let mut replies = std::mem::take(&mut self.management_replies);
         self.synchronize_application_cleanup(now);
@@ -1488,10 +1665,10 @@ impl Controller {
                 .get(&pending.record)
                 .is_some_and(|record| record.state == State::Stopped)
             {
-                let resume_trusted = self
-                    .records
-                    .get(&pending.record)
-                    .is_some_and(|record| !record.revoked && trusted(&pending.peer.certificate));
+                let resume_trusted = self.records.get(&pending.record).is_some_and(|record| {
+                    !record.revoked
+                        && allowed(&pending.peer.certificate, record.delivery_permission)
+                });
                 if !resume_trusted {
                     if let Some(record) = self.records.get_mut(&pending.record) {
                         record.revoked = true;
@@ -1508,9 +1685,13 @@ impl Controller {
                         // The old record is terminal and no longer owns live input.
                         old_record.request.remote_input_key = [0; 16];
                     }
-                    if let Some(reply) =
-                        self.launch(pending.connection, pending.request, pending.peer, now)
-                    {
+                    if let Some(reply) = self.launch_for_route(
+                        pending.connection,
+                        pending.request,
+                        pending.peer,
+                        pending.response_kind,
+                        now,
+                    ) {
                         replies.push((pending.connection, reply));
                     } else if let Some(record) = self
                         .records
@@ -1535,6 +1716,7 @@ impl Controller {
         }) {
             self.pending_resume = None;
         }
+        self.advance_auxiliary_reconnects(now, &mut allowed, &mut replies);
         replies
     }
 
@@ -1562,6 +1744,8 @@ impl Controller {
     }
 
     pub fn connection_closed(&mut self, connection: u64, now: Instant) {
+        self.pending_auxiliary
+            .retain(|_, pending| pending.connection != connection);
         if self
             .pending_resume
             .as_ref()
@@ -1606,23 +1790,48 @@ impl Controller {
         }
     }
 
+    #[cfg(test)]
     pub fn revoke_untrusted(
         &mut self,
         now: Instant,
         mut trusted: impl FnMut(&[u8]) -> bool,
     ) -> Vec<u64> {
+        self.revoke_unauthorized(now, |certificate, _| trusted(certificate))
+    }
+
+    pub fn revoke_unauthorized(
+        &mut self,
+        now: Instant,
+        mut allowed: impl FnMut(&[u8], crate::wire::Permission) -> bool,
+    ) -> Vec<u64> {
         let mut close = Vec::new();
-        if self
-            .pending_resume
-            .as_ref()
-            .is_some_and(|pending| !trusted(&pending.peer.certificate))
-            && let Some(pending) = self.pending_resume.take()
+        if self.pending_resume.as_ref().is_some_and(|pending| {
+            !allowed(
+                &pending.peer.certificate,
+                self.records
+                    .get(&pending.record)
+                    .map_or(crate::wire::Permission::Launch, |record| {
+                        record.delivery_permission
+                    }),
+            )
+        }) && let Some(pending) = self.pending_resume.take()
         {
             close.push(pending.connection);
         }
+        self.pending_auxiliary.retain(|_, pending| {
+            if allowed(pending.peer.certificate(), pending.delivery_permission) {
+                true
+            } else {
+                close.push(pending.connection);
+                false
+            }
+        });
         let mut affected = Vec::new();
         for record in self.records.values_mut() {
-            if !record.state.terminal() && !record.revoked && !trusted(&record.peer.certificate) {
+            if !record.state.terminal()
+                && !record.revoked
+                && !allowed(&record.peer.certificate, record.delivery_permission)
+            {
                 record.revoked = true;
                 close.extend(record.launch_connection.take());
                 close.extend(record.cancel_connection.take());
@@ -1651,6 +1860,7 @@ impl Controller {
 
     pub fn quiesce(&mut self, now: Instant) -> bool {
         self.pending_resume = None;
+        self.pending_auxiliary.clear();
         for record in self.records.values_mut() {
             if !record.state.terminal()
                 && !matches!(record.state, State::Stopping | State::CleanupFailed)
@@ -1668,6 +1878,7 @@ impl Controller {
         self.package_activation_pending = pending;
         self.job.is_none()
             && self.pending_resume.is_none()
+            && self.pending_auxiliary.is_empty()
             && self.records.values().all(|record| record.state.terminal())
     }
 
@@ -1715,18 +1926,22 @@ fn private_error(status: u16, message: &str) -> Reply {
 }
 
 fn success_reply(record: &Record) -> Reply {
+    let response_key = match record.response_kind {
+        StreamResponse::Launch => "gamesession",
+        StreamResponse::Resume => "resume",
+    };
     let stream_width = record.request.width.to_string();
     let stream_height = record.request.height.to_string();
     let stream_fps = record.request.fps.to_string();
     let physical_width = record.physical_display_mode.width.to_string();
     let physical_height = record.physical_display_mode.height.to_string();
     let physical_refresh = record.physical_display_mode.refresh_millihz.to_string();
-    let mut fields = vec![
+    let fields = vec![
         (
             "sessionUrl0",
             record.rtsp_url.as_deref().unwrap_or_default(),
         ),
-        ("gamesession", "1"),
+        (response_key, "1"),
         ("historyActivityState", record.history_state),
         ("streamWidth", stream_width.as_str()),
         ("streamHeight", stream_height.as_str()),
@@ -1755,12 +1970,9 @@ fn success_reply(record: &Record) -> Reply {
                 .unwrap_or_default(),
         ),
     ];
-    if record.resumed {
-        fields.push(("resume", "1"));
-    }
     let mut reply = xml::response(200, "OK", &fields);
     reply.requires_paired_tls = true;
-    reply.permission = Some(crate::wire::Permission::Launch);
+    reply.permission = Some(record.delivery_permission);
     reply
 }
 

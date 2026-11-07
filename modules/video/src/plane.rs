@@ -5,6 +5,8 @@ mod dmabuf;
 mod freshness_tests;
 mod gpu_processor;
 mod lease_lifecycle;
+#[cfg(test)]
+mod preflight_tests;
 #[cfg(amaterasu_swscale)]
 mod preprocess;
 mod processor;
@@ -12,6 +14,7 @@ mod provider_output;
 mod resize;
 mod resource_cpu;
 mod resource_generic;
+mod resource_processor;
 mod source;
 use crate::{
     model::{CaptureProvider, Configuration},
@@ -147,6 +150,14 @@ pub struct FrameMetadata {
     pub sequence: u64,
 }
 pub trait Plane {
+    /// Query the selected capture provider without allocating a capture source.
+    fn source_preflight(
+        &mut self,
+        _: CaptureProvider,
+        _: &amaterasu_module_sdk::capture::SourcePreflightRequest,
+    ) -> Result<amaterasu_module_sdk::capture::SourcePreflightResponse, Status> {
+        Err(MEDIA_UNSUPPORTED)
+    }
     /// Admit one immutable stream selection before any provider operation.
     fn configure_gpu(
         &mut self,
@@ -245,6 +256,7 @@ pub trait Plane {
 
 pub struct NativePlane {
     require_frame_lease: bool,
+    resource_processor: Option<resource_processor::Processor>,
     // Destroy downstream bindings before their source bindings. Drop first
     // quiesces every tracked lease while all of these bindings remain alive.
     encoders: BTreeMap<String, NativeBinding>,
@@ -261,6 +273,8 @@ pub struct NativePlane {
     gpu_configured: std::collections::BTreeSet<u64>,
     processor: Option<NativeBinding>,
     captures: BTreeMap<CaptureProvider, NativeBinding>,
+    capture_preflights:
+        BTreeMap<CaptureProvider, amaterasu_module_sdk::capture::SourcePreflightConnection>,
     /// Optional providers whose startup binding failed, with the reason.
     unbound: BTreeMap<CaptureProvider, &'static str>,
     leased_streams: lease_lifecycle::LeasedStreams,
@@ -273,6 +287,42 @@ pub struct NativePlane {
 }
 
 impl NativePlane {
+    pub fn with_resource_processor(
+        mut self,
+        runtime: &RuntimeClient,
+        service: Option<&str>,
+    ) -> ModuleResult<Self> {
+        self.resource_processor = service
+            .map(|service| resource_processor::Processor::bind(runtime, service))
+            .transpose()?;
+        Ok(self)
+    }
+    /// Bind the optional query tail only for signed logical routes. Ordinary
+    /// capture selections retain their original bindings and table headers.
+    pub fn with_source_preflight_routes(
+        mut self,
+        runtime: &RuntimeClient,
+        routes: &BTreeMap<String, crate::model::SourcePreflightRoute>,
+    ) -> Self {
+        for route in routes.values() {
+            let provider = route.provider;
+            if self.captures.contains_key(&provider)
+                && !self.capture_preflights.contains_key(&provider)
+            {
+                // SAFETY: this service is already selected through the exact
+                // typed Capture family; bindings retain the runtime/provider.
+                if let Ok(binding) = unsafe {
+                    amaterasu_module_sdk::capture::SourcePreflightConnection::bind(
+                        runtime,
+                        provider.service(),
+                    )
+                } {
+                    self.capture_preflights.insert(provider, binding);
+                }
+            }
+        }
+        self
+    }
     pub fn with_gpu_processor_opt_in(mut self, opt_in: bool) -> Self {
         self.gpu_processor_opt_in = opt_in;
         self
@@ -359,12 +409,14 @@ impl NativePlane {
             }
             Ok(Self {
                 require_frame_lease: false,
+                resource_processor: None,
                 resource_consumers,
                 resource_bridges: BTreeMap::new(),
                 stream_clocks: BTreeMap::new(),
                 source_encoders,
                 sources: BTreeMap::new(),
                 captures,
+                capture_preflights: BTreeMap::new(),
                 unbound,
                 encoders,
                 active_encoder: ENCODE.to_owned(),
@@ -408,6 +460,11 @@ impl NativePlane {
 
 impl Drop for NativePlane {
     fn drop(&mut self) {
+        // Processing may borrow source/encoder bindings only until synchronous
+        // retirement; cancel every resource session before other bindings drop.
+        if let Some(processor) = self.resource_processor.as_mut() {
+            processor.finish_all();
+        }
         for (_, (service, mut bridge)) in std::mem::take(&mut self.resource_bridges) {
             if let Some(binding) = self.resource_consumers.get(&service)
                 && let Ok(api) = unsafe { binding.table::<FrameResourceConsumerApi>() }
@@ -670,11 +727,24 @@ unsafe extern "C" fn packet(context: *mut c_void, packet: *const EncodedPacket) 
 }
 
 impl Plane for NativePlane {
+    fn source_preflight(
+        &mut self,
+        provider: CaptureProvider,
+        request: &amaterasu_module_sdk::capture::SourcePreflightRequest,
+    ) -> Result<amaterasu_module_sdk::capture::SourcePreflightResponse, Status> {
+        self.capture_preflights
+            .get(&provider)
+            .ok_or(MEDIA_UNSUPPORTED)?
+            .query(request)
+    }
     fn configure_gpu(
         &mut self,
         stream: u64,
         selection: Option<&crate::model::GpuProcessing>,
     ) -> Result<(), &'static str> {
+        if let Some(processor) = self.resource_processor.as_mut() {
+            return processor.configure(stream, selection);
+        }
         let Some(selection) = selection else {
             if self.gpu_processor_opt_in {
                 self.gpu_bypassed.insert(stream);
@@ -706,6 +776,9 @@ impl Plane for NativePlane {
         stream: u64,
         settings: &serde_json::Value,
     ) -> Result<(), &'static str> {
+        if self.resource_processor.is_some() {
+            return Err("resource_processor_live_updates_unsupported");
+        }
         if !self.gpu_configured.contains(&stream) || self.gpu_bypassed.contains(&stream) {
             return Err("gpu_processor_update_unavailable");
         }
@@ -933,6 +1006,11 @@ impl Plane for NativePlane {
         provider: CaptureProvider,
         stream: u64,
     ) -> Result<Option<HdrMetadata>, &'static str> {
+        if let Some(processor) = self.resource_processor.as_ref()
+            && processor.is_active(video)
+        {
+            return Ok(processor.hdr_metadata(video));
+        }
         if let Some(binding) = &self.gpu_processor
             && !self.gpu_bypassed.contains(&video)
         {
@@ -970,7 +1048,10 @@ impl Plane for NativePlane {
         if self.require_frame_lease && input.frame_path != FramePath::DmaBuf {
             return Err("capture_frame_lease_required");
         }
-        if input.configuration.gpu_processing.is_some() && input.frame_path != FramePath::DmaBuf {
+        if input.configuration.gpu_processing.is_some()
+            && input.frame_path != FramePath::DmaBuf
+            && self.resource_processor.is_none()
+        {
             // Explicit processing policy requires capture-owned color provenance;
             // untagged CPU frames cannot prove the requested source range.
             return Err("capture_range_verification_requires_dmabuf");
@@ -990,6 +1071,33 @@ impl Plane for NativePlane {
                 Err(MEDIA_PENDING | MEDIA_BUSY) => return Ok(Progress::default()),
                 _ => return Err("capture_color_provenance_unavailable"),
             }
+        }
+        if let Some(processor) = self.resource_processor.as_mut()
+            && processor.is_active(input.video)
+        {
+            if input.frame_path != FramePath::Cpu {
+                return Err("resource_processor_requires_cpu_resources");
+            }
+            let capture = self
+                .captures
+                .get(&input.provider)
+                .ok_or("capture_provider_unavailable")?;
+            let prefix =
+                unsafe { capture.table::<CaptureApiPrefix>() }.map_err(|_| "capture_interface")?;
+            if !capture_resources_available(prefix.base.header) {
+                return Err("capture_resources_unavailable");
+            }
+            let capture =
+                unsafe { capture.table::<CaptureApiV1_8>() }.map_err(|_| "capture_interface")?;
+            let encoder = unsafe {
+                self.encoders
+                    .get(&self.active_encoder)
+                    .ok_or("encoder_interface")?
+                    .table::<EncoderApi>()
+            }
+            .map_err(|_| "encoder_interface")?;
+            let progress = processor.pump(capture, encoder, &input)?;
+            return self.receive_packets(encoder, &input, progress);
         }
         // SAFETY: configured services promise these layouts; bindings remain live.
         if input.frame_path == FramePath::Generic {
@@ -1135,6 +1243,9 @@ impl Plane for NativePlane {
     }
 
     fn finish_stream(&mut self, video: u64) {
+        if let Some(processor) = self.resource_processor.as_mut() {
+            processor.finish(video);
+        }
         self.release_stream(video);
         self.stream_clocks.remove(&video);
         self.resource_selections.remove(&video);

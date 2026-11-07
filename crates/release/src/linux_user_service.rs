@@ -104,6 +104,11 @@ pub fn prepare(
         ("preflight-user-service.sh", preflight_script().into()),
         ("README.md", render_readme(active_digest)),
     ];
+    crate::capture_precheck::validate_package(
+        &package_path,
+        &verified.manifest.components,
+        &verified.runtime_config.settings,
+    )?;
     if crate::linux_owned_display::enabled(&verified.runtime_config.settings) {
         crate::linux_owned_display::validate(
             &package_path,
@@ -292,6 +297,11 @@ pub fn preflight(
         )?)?;
     }
     crate::linux_owned_display::validate(
+        &package_path,
+        &verified.manifest.components,
+        &verified.runtime_config.settings,
+    )?;
+    crate::capture_precheck::validate_package(
         &package_path,
         &verified.manifest.components,
         &verified.runtime_config.settings,

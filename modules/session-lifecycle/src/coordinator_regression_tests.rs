@@ -1903,6 +1903,81 @@ fn activate_external_consumer(harness: &mut Harness, target: &Value, prefix: &st
     assert_eq!(harness.call("capture",json!({"operation":"ack_stream","operation_id":format!("{prefix}-ack"),"target":target,"consumer":"capture"}))["status"],"succeeded");
     assert_eq!(harness.call("transport",json!({"operation":"start_stream","operation_id":format!("{prefix}-start"),"target":target}))["status"],"succeeded");
 }
+
+#[test]
+fn borrowed_capture_preserves_all_required_application_and_stream_policy_hooks() {
+    let mut harness = Harness::with_processing_mode(true, None, false, true);
+    harness
+        .settings
+        .borrowed_capture_callers
+        .insert("transport".into());
+    harness
+        .settings
+        .operation_grants
+        .get_mut("capture")
+        .unwrap()
+        .insert("ack_stream".into());
+    harness
+        .coordinator
+        .as_mut()
+        .unwrap()
+        .configure_for_test(harness.settings.clone());
+    let borrowed = json!({"client_id":"authenticated-borrower","session_id":"retained-monitor","generation":4,
+        "reservation_id":"provider-held-reservation","transport_id":"rtsp-operation","transport_epoch":"transport-epoch",
+        "output":"exact-target:retained-monitor","mode":{"width":2560,"height":1440,"refresh_millihz":144000,"hdr":true}});
+    let prepared = harness.call(
+        "transport",
+        json!({"operation":"prepare","operation_id":"borrowed.session",
+        "application_ref":{"kind":"application","app_id":"app"},"borrowed_capture":borrowed,
+        "requested_video":{"width":1920,"height":1080,"refresh_millihz":60000,"hdr":false}}),
+    );
+    assert_eq!(prepared["status"], "pending", "{prepared}");
+    let prepared = wait_shared_operation(&mut harness, "borrowed.session");
+    assert_eq!(prepared["status"], "succeeded", "{prepared}");
+    let session = prepared["target"].clone();
+    assert_eq!(harness.call("transport",json!({"operation":"bind_application","operation_id":"borrowed.app","target":session,"launch_id":42,"application_operation_id":"launch-42"}))["status"],"succeeded");
+    let stream = harness.call(
+        "transport",
+        json!({"operation":"prepare_stream","operation_id":"borrowed.stream",
+        "target":session,"intent":"initial","borrowed_capture":borrowed,
+        "requested_video":{"width":1920,"height":1080,"refresh_millihz":60000,"hdr":false},
+        "consumer_requirements":["capture"]}),
+    );
+    assert_eq!(stream["status"], "pending", "{stream}");
+    let stream = wait_shared_operation(&mut harness, "borrowed.stream");
+    assert_eq!(stream["status"], "succeeded", "{stream}");
+    assert_eq!(stream["capture_binding_mode"], "external");
+    for provider in ["display", "settings"] {
+        for phase in ["session.prepare", "stream.prepare"] {
+            assert!(
+                harness
+                    .events
+                    .iter()
+                    .any(|(principal, payload)| principal == provider
+                        && payload["method"] == "lifecycle_callback"
+                        && payload["arguments"]["phase"] == phase),
+                "missing {provider} {phase}"
+            );
+        }
+    }
+    activate_external_consumer(&mut harness, &stream["target"], "borrowed-live");
+    let retired = retire_shared_client(&mut harness, &stream["target"], "borrowed-close");
+    assert_eq!(retired["status"], "succeeded", "{retired}");
+    end_shared_application(&mut harness, &session, "borrowed-application-close");
+    for provider in ["display", "settings"] {
+        for phase in ["stream.release", "session.release"] {
+            assert!(
+                harness
+                    .events
+                    .iter()
+                    .any(|(principal, payload)| principal == provider
+                        && payload["method"] == "lifecycle_callback"
+                        && payload["arguments"]["phase"] == phase),
+                "missing {provider} {phase}"
+            );
+        }
+    }
+}
 fn join_external_consumer(
     harness: &mut Harness,
     session: &Value,

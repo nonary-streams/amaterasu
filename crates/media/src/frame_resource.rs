@@ -52,6 +52,18 @@ pub struct CpuResourceCapabilities {
     pub max_height: u32,
 }
 
+/// Standard CPU resource schema v2 makes source color part of negotiation.
+/// The offer's resource descriptor has version=2 and this complete payload;
+/// each distinct color/range needs a separate offer ID. Delivered descriptors
+/// also use version=2, retain the CpuFrame payload layout, and must carry exactly
+/// this known color in CaptureResourceFrame.color for every presentation.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CpuResourceCapabilitiesV2 {
+    pub base: CpuResourceCapabilities,
+    pub color: FrameColorMetadata,
+}
+
 /// DMA-BUF v1 offer payload: one format/modifier/color tuple and size range.
 /// `device_id` is an agreed 16-byte device UUID; zero means unknown, not a
 /// wildcard proving interoperability. Consumer configure must check importability.
@@ -306,6 +318,8 @@ mod tests {
     fn c_layouts_match_public_header() {
         assert_eq!(size_of::<FrameDescriptor>(), 40);
         assert_eq!(size_of::<FrameColorMetadata>(), 24);
+        assert_eq!(size_of::<CpuResourceCapabilitiesV2>(), 44);
+        assert_eq!(std::mem::offset_of!(CpuResourceCapabilitiesV2, color), 20);
         assert_eq!(size_of::<FrameClockMetadata>(), 32);
         assert_eq!(size_of::<CaptureResourceOffer>(), 144);
         assert_eq!(size_of::<CaptureResourceFrame>(), 248);

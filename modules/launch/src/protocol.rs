@@ -101,6 +101,16 @@ pub enum Operation {
     },
     #[serde(rename = "operation_epoch")]
     EpochRead {},
+    ApplicationRetirementStatus {
+        operation_id: String,
+        expected_runtime_epoch: String,
+    },
+    /// Owner-only replay fence or exact native cleanup for a known operation.
+    #[serde(rename = "retire_operation")]
+    RetireOwned {
+        operation_id: String,
+        expected_runtime_epoch: String,
+    },
     VerifyRetirement {
         owner: String,
         #[serde(default)]
@@ -152,6 +162,18 @@ impl Operation {
                 validate_legacy_preparation(legacy_global_preparation)?;
             }
             Self::Lookup { operation_id } if !valid_operation_id(operation_id) => {
+                return Err("invalid_request");
+            }
+            Self::ApplicationRetirementStatus {
+                operation_id,
+                expected_runtime_epoch,
+            }
+            | Self::RetireOwned {
+                operation_id,
+                expected_runtime_epoch,
+            } if crate::records::tracked_operation_epoch(operation_id)
+                != Some(expected_runtime_epoch.as_str()) =>
+            {
                 return Err("invalid_request");
             }
             Self::VerifyRetirement {
@@ -2003,6 +2025,9 @@ pub struct Settings {
     pub inherit_environment: BTreeSet<String>,
     pub environment: BTreeMap<String, String>,
     pub retirement_observers: BTreeSet<String>,
+    /// Read-only verifier to exact launch owner mapping. Mapped verifiers
+    /// cannot use launch, stop, preflight or mutating retirement operations.
+    pub application_retirement_observers: BTreeMap<String, String>,
     pub provider_routes: BTreeMap<String, ProviderRoute>,
     pub library_routes: BTreeMap<String, crate::library::Route>,
     /// Trusted startup selection; callers cannot substitute the context provider.
@@ -2047,6 +2072,19 @@ impl Settings {
                 .retirement_observers
                 .iter()
                 .any(|observer| !valid_catalog_principal(observer))
+        {
+            return Err("invalid_launch_settings");
+        }
+        if self.application_retirement_observers.len() > 32
+            || self
+                .application_retirement_observers
+                .iter()
+                .any(|(observer, owner)| {
+                    !valid_catalog_principal(observer)
+                        || !valid_catalog_principal(owner)
+                        || observer == owner
+                        || self.retirement_observers.contains(observer)
+                })
         {
             return Err("invalid_launch_settings");
         }

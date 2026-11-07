@@ -33,10 +33,11 @@ cryptographic checks in `test_native_media.py`, `test_control_transport.py` and 
 `cryptography` package in the test environment.
 
 Initialize all core plugin submodules before building the workspace. Display,
-Frame limiting, Stats and RTX HDR have independent source repositories and pinned
+Frame limiting, Stats, RTX HDR and Remote Session have independent source repositories and pinned
 versions. Their browser settings surfaces use the shared SDK and approved APIs.
 See [Display](https://github.com/nonary-streams/amaterasu-display) and
-[Frame limiting](https://github.com/nonary-streams/amaterasu-frame-limiter) for
+[Frame limiting](https://github.com/nonary-streams/amaterasu-frame-limiter), and
+[Remote Session](https://github.com/nonary-streams/amaterasu-remote-session) for
 standalone build and UI packaging instructions. Source extraction does not
 activate a package on an installed host.
 

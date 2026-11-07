@@ -9,6 +9,7 @@ use amaterasu_module_sdk::{EncoderSelection, network::Network};
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+use std::collections::BTreeMap;
 #[cfg(test)]
 use std::net::UdpSocket;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -39,6 +40,11 @@ pub struct Settings {
     pub address_family: Option<AddressFamily>,
     pub bind_address: Option<String>,
     pub allowed_principals: Vec<String>,
+    /// Installed observers may only read generation-bound transport retirement.
+    pub retirement_status_principals: Vec<String>,
+    /// Each observer is pinned to an original transport owner by signed startup.
+    pub retirement_status_owners: BTreeMap<String, String>,
+    pub max_live_tickets: usize,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -50,6 +56,9 @@ impl Default for Settings {
             address_family: None,
             bind_address: None,
             allowed_principals: Vec::new(),
+            retirement_status_principals: Vec::new(),
+            retirement_status_owners: BTreeMap::new(),
+            max_live_tickets: 2,
         }
     }
 }
@@ -61,6 +70,22 @@ impl Settings {
             .is_some_and(|service| !amaterasu_contracts::valid_name(service))
             || self.allowed_principals.len() > 16
             || self.allowed_principals.iter().any(|name| !valid_name(name))
+            || self.retirement_status_principals.len() > 16
+            || self
+                .retirement_status_principals
+                .iter()
+                .any(|name| !valid_name(name) || !self.retirement_status_owners.contains_key(name))
+            || self.retirement_status_owners.len() > 16
+            || self
+                .retirement_status_owners
+                .iter()
+                .any(|(observer, owner)| {
+                    !valid_name(observer)
+                        || !valid_name(owner)
+                        || !self.allowed_principals.contains(owner)
+                        || (self.allowed_principals.contains(observer) && observer != owner)
+                })
+            || !(1..=32).contains(&self.max_live_tickets)
         {
             return Err("invalid_settings");
         }
@@ -608,6 +633,13 @@ pub struct VideoEncryptionPolicySnapshot {
 #[serde(deny_unknown_fields)]
 pub struct Open {
     pub operation_id: String,
+    /// Runtime observation persisted before this transport's admission.
+    #[serde(default)]
+    pub expected_runtime_epoch: Option<String>,
+    #[serde(default)]
+    pub borrowed_capture: Option<amaterasu_extension_api::BorrowedCaptureContext>,
+    #[serde(default)]
+    pub source_capture_context: Option<amaterasu_module_sdk::capture::SourceCaptureContext>,
     /// Coordinator-issued session selector; it grants no authority by itself.
     #[serde(default)]
     pub lifecycle_session_target: Option<amaterasu_extension_api::LifecycleTarget>,
@@ -697,6 +729,8 @@ pub struct Open {
     pub capture_sink_without_routing: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub virtual_sink: Option<String>,
+    /// Stream channel count. Capture-only host endpoints request PCM conversion;
+    /// only an explicit virtual sink also selects a native sink layout.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channels: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -758,6 +792,32 @@ impl Open {
     }
 
     pub fn validate(&self, allow_remote: bool) -> Result<[u8; 16], &'static str> {
+        if self
+            .source_capture_context
+            .as_ref()
+            .is_some_and(|context| context.validate().is_err())
+        {
+            return Err("invalid_source_capture_context");
+        }
+        if self
+            .expected_runtime_epoch
+            .as_deref()
+            .is_some_and(|epoch| !valid_runtime_epoch(epoch))
+        {
+            return Err("invalid_runtime_epoch");
+        }
+        if let Some(source) = &self.borrowed_capture
+            && (source.validate().is_err()
+                || !self.lifecycle_capture_mode.is_external()
+                || self.lifecycle_session_target.is_none()
+                || source.transport_id != self.operation_id
+                || Some(source.transport_epoch.as_str()) != self.expected_runtime_epoch.as_deref()
+                || source.output != self.capture.output
+                || !borrowed_source_context_matches(self.source_capture_context.as_ref(), source)
+                || self.display_admission_required())
+        {
+            return Err("invalid_borrowed_capture");
+        }
         match (&self.app_id, self.catalog_revision) {
             (Some(app_id), Some(_)) if valid_name(app_id) => {}
             (None, None) => {}
@@ -1051,7 +1111,13 @@ impl Open {
             return Err("invalid_profile");
         }
         match (&self.virtual_sink, self.channels) {
-            (None, None) if valid_label(&self.capture.audio_endpoint, 4096) => {}
+            (None, None)
+                if !self.stream_audio || valid_label(&self.capture.audio_endpoint, 4096) => {}
+            (None, Some(channels))
+                if self.stream_audio
+                    && self.capture_sink_without_routing
+                    && valid_label(&self.capture.audio_endpoint, 4096)
+                    && matches!(channels, 2 | 6 | 8) => {}
             (None, _) => return Err("invalid_virtual_sink_channels"),
             (Some(selector), Some(channels))
                 if selector.len() <= 4096
@@ -1165,6 +1231,12 @@ impl Open {
         if let Some(source) = &self.shared_source_operation_id {
             payload["shared_source_operation_id"] = serde_json::json!(source);
         }
+        if let Some(source) = &self.borrowed_capture {
+            payload["borrowed_capture"] = serde_json::json!(source);
+        }
+        if let Some(context) = &self.source_capture_context {
+            payload["source_capture_context"] = serde_json::json!(context);
+        }
         if let Some(session) = &self.lifecycle_session_target {
             payload["lifecycle_session_target"] = serde_json::json!(session);
             payload["lifecycle_capture_mode"] = serde_json::json!(self.lifecycle_capture_mode);
@@ -1228,6 +1300,9 @@ impl Open {
         }
         if let Some(continuous_audio) = self.continuous_audio {
             payload["configuration"]["continuous_audio"] = serde_json::json!(continuous_audio);
+        }
+        if let Some(context) = &self.source_capture_context {
+            payload["configuration"]["source_capture_context"] = serde_json::json!(context);
         }
         payload
     }
@@ -1641,6 +1716,43 @@ pub enum Operation {
     Lookup {
         operation_id: String,
     },
+    RetirementStatus {
+        #[serde(default)]
+        operation_id: Option<String>,
+        #[serde(default)]
+        expected_runtime_epoch: Option<String>,
+    },
+    ReconcileStartup {},
+    #[serde(rename = "retire_operation")]
+    RetireTransport {
+        operation_id: String,
+        expected_runtime_epoch: String,
+    },
+}
+
+pub(super) fn valid_runtime_epoch(value: &str) -> bool {
+    value.len() == 32
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn borrowed_source_context_matches(
+    context: Option<&amaterasu_module_sdk::capture::SourceCaptureContext>,
+    source: &amaterasu_extension_api::BorrowedCaptureContext,
+) -> bool {
+    match context {
+        None => source.route_key == "default",
+        Some(context) => {
+            context.route_key == source.route_key
+                && context.source_mode.is_some_and(|mode| {
+                    mode.width == source.mode.width
+                        && mode.height == source.mode.height
+                        && mode.refresh_millihz == source.mode.refresh_millihz
+                        && mode.hdr == source.mode.hdr
+                })
+        }
+    }
 }
 
 pub fn valid_name(value: &str) -> bool {
@@ -2310,12 +2422,19 @@ mod tests {
         assert!(settings.address_family.is_none());
         assert!(settings.bind_address.is_none());
         assert!(settings.allowed_principals.is_empty());
+        assert_eq!(settings.max_live_tickets, 2);
         assert_eq!(settings.validate(), Ok(()));
 
         for value in [
             json!({"allowed_principals": vec!["owner"; 17]}),
             json!({"allowed_principals": [""]}),
             json!({"allowed_principals": ["line\nfeed"]}),
+            json!({"retirement_status_principals":[""]}),
+            json!({"allowed_principals":["owner"],"retirement_status_principals":["observer"]}),
+            json!({"retirement_status_owners":{"observer":"unapproved-owner"}}),
+            json!({"allowed_principals":["owner","other"],"retirement_status_owners":{"owner":"other"}}),
+            json!({"max_live_tickets":0}),
+            json!({"max_live_tickets":33}),
         ] {
             assert_eq!(
                 serde_json::from_value::<Settings>(value)
@@ -2324,6 +2443,12 @@ mod tests {
                 Err("invalid_settings")
             );
         }
+        let scoped: Settings = serde_json::from_value(json!({
+            "allowed_principals":["owner"],
+            "retirement_status_owners":{"observer":"owner"}
+        }))
+        .unwrap();
+        assert!(scoped.validate().is_ok());
     }
 
     #[test]
@@ -2680,6 +2805,201 @@ mod tests {
         assert_eq!(payload["audio"]["packet_ms"], 10);
         assert_eq!(payload["audio"]["bitrate"], 128_000);
         assert_eq!(payload["encrypt_audio"], true);
+    }
+
+    #[test]
+    fn host_capture_channels_are_stream_format_without_a_virtual_sink_selection() {
+        for channels in [2, 6, 8] {
+            let mut selected = open();
+            selected.channels = Some(channels);
+            selected.capture_sink_without_routing = true;
+            selected.capture.host_audio_enabled = true;
+            selected.profile.audio_bitrate = if channels == 2 { 128000 } else { 512000 };
+            assert!(selected.validate(false).is_ok());
+            let prepare = selected.prepare("host-capture", None);
+            if channels != 2 {
+                assert_eq!(prepare["audio"]["channels"], channels);
+                assert_eq!(
+                    prepare["audio"]["channel_mask"],
+                    audio_channel_mask(channels)
+                );
+            }
+            let arm = selected.arm(51);
+            assert_eq!(arm["configuration"]["channels"], channels);
+            assert!(arm["configuration"]["virtual_sink"].is_null());
+            assert_eq!(arm["configuration"]["host_audio_enabled"], true);
+            assert_eq!(arm["configuration"]["capture_sink_without_routing"], true);
+            selected.capture_sink_without_routing = false;
+            assert_eq!(
+                selected.validate(false),
+                Err("invalid_virtual_sink_channels")
+            );
+            selected.capture_sink_without_routing = true;
+            selected.capture.audio_endpoint.clear();
+            assert_eq!(
+                selected.validate(false),
+                Err("invalid_virtual_sink_channels")
+            );
+        }
+    }
+
+    #[test]
+    fn auxiliary_capture_without_audio_needs_no_audio_endpoint_or_display_admission() {
+        for (provider, output) in [("black", "black"), ("virtual_screen", "kwin:Virtual-17")] {
+            let mut input = open_json();
+            input["stream_audio"] = json!(false);
+            input["capture_sink_without_routing"] = json!(true);
+            input["capture"]["capture_provider"] = json!(provider);
+            input["capture"]["output"] = json!(output);
+            input["capture"]["audio_endpoint"] = json!("");
+            input["capture"]["host_audio_enabled"] = json!(true);
+            let selected: Open = serde_json::from_value(input.clone()).unwrap();
+            assert_eq!(selected.validate(false), decode_key(&selected.key_hex));
+            assert!(!selected.display_admission_required());
+            let prepare = selected.prepare("auxiliary", None);
+            assert_eq!(prepare["stream_audio"], false);
+            assert!(prepare.get("display_request").is_none());
+            assert!(prepare.get("virtual_display_intent").is_none());
+            assert!(prepare.get("lifecycle_session_target").is_none());
+            let arm = selected.arm(51);
+            assert_eq!(arm["configuration"]["capture_provider"], provider);
+            assert_eq!(arm["configuration"]["output"], output);
+            assert_eq!(arm["configuration"]["audio_endpoint"], "");
+            assert_eq!(arm["configuration"]["capture_sink_without_routing"], true);
+
+            input["stream_audio"] = json!(true);
+            let missing_endpoint: Open = serde_json::from_value(input.clone()).unwrap();
+            assert_eq!(
+                missing_endpoint.validate(false),
+                Err("invalid_virtual_sink_channels")
+            );
+            input["stream_audio"] = json!(false);
+            input["capture"]["audio_endpoint"] = json!("invalid\nendpoint");
+            let malformed: Open = serde_json::from_value(input).unwrap();
+            assert_eq!(malformed.validate(false), Err("invalid_profile"));
+        }
+    }
+
+    #[test]
+    fn borrowed_capture_context_is_bound_to_the_admitted_runtime_and_exact_output() {
+        let source = json!({"client_id":"paired-client","session_id":"retained-source",
+            "generation":7,"reservation_id":"source-hold","transport_id":"launch-one",
+            "transport_epoch":"ab".repeat(16),"output":"kwin:Virtual-17",
+            "mode":{"width":2560,"height":1440,"refresh_millihz":144000,"hdr":true}});
+        let mut request = open_json();
+        request["lifecycle_capture_mode"] = json!("external");
+        request["lifecycle_session_target"] =
+            json!({"kind":"session","host_epoch":"host","session_id":"app","generation":1});
+        request["lifecycle_settings_revision"] = json!("revision");
+        request["lifecycle_intent"] = json!("initial");
+        request["expected_runtime_epoch"] = json!("ab".repeat(16));
+        request["capture"]["output"] = json!("kwin:Virtual-17");
+        request["borrowed_capture"] = source.clone();
+        let admitted: Open = serde_json::from_value(request.clone()).unwrap();
+        assert!(admitted.validate(false).is_ok());
+        assert_eq!(
+            admitted.prepare("provider-operation", None)["borrowed_capture"],
+            source
+        );
+        for field in ["transport_id", "transport_epoch", "output"] {
+            let mut changed = request.clone();
+            changed["borrowed_capture"][field] = json!("changed");
+            let rejected: Open = serde_json::from_value(changed).unwrap();
+            assert_eq!(
+                rejected.validate(false),
+                Err("invalid_borrowed_capture"),
+                "{field}"
+            );
+        }
+        request["lifecycle_capture_mode"] = json!("managed");
+        let rejected: Open = serde_json::from_value(request).unwrap();
+        assert_eq!(rejected.validate(false), Err("invalid_borrowed_capture"));
+    }
+
+    #[test]
+    fn source_capture_context_stays_outside_encoder_configuration_and_omits_legacy_none() {
+        let legacy = open();
+        assert!(
+            legacy
+                .prepare("legacy", None)
+                .get("source_capture_context")
+                .is_none()
+        );
+        assert!(
+            legacy.arm(51)["configuration"]
+                .get("source_capture_context")
+                .is_none()
+        );
+        for context in [
+            json!({"route_key":"synthetic_black"}),
+            json!({"route_key":"selected-desktop", "source_mode":{"width":2560,"height":1440,"refresh_millihz":144000,"hdr":false,"bit_depth":10}}),
+        ] {
+            let mut request = open_json();
+            request["source_capture_context"] = context.clone();
+            let selected: Open = serde_json::from_value(request.clone()).unwrap();
+            assert!(selected.validate(false).is_ok());
+            assert_eq!(
+                selected.prepare("prepare", None)["source_capture_context"],
+                context
+            );
+            let arm = selected.arm(51);
+            assert_eq!(arm["configuration"]["source_capture_context"], context);
+            assert!(
+                arm["configuration"]["configuration"]
+                    .get("source_capture_context")
+                    .is_none()
+            );
+            request["source_capture_context"]["route_key"] = json!("");
+            let invalid: Open = serde_json::from_value(request).unwrap();
+            assert_eq!(
+                invalid.validate(false),
+                Err("invalid_source_capture_context")
+            );
+        }
+        let mut forged = open_json();
+        forged["source_capture_context"] = json!({"route_key":"selected-desktop","provider":"chosen-provider","source_class":"synthetic"});
+        assert!(serde_json::from_value::<Open>(forged).is_err());
+    }
+
+    #[test]
+    fn nondefault_borrowed_routes_require_the_exact_frozen_source_mode() {
+        let source = json!({"client_id":"paired-client","session_id":"retained-source",
+            "generation":7,"reservation_id":"source-hold","transport_id":"launch-one",
+            "transport_epoch":"ab".repeat(16),"output":"kwin:Virtual-17","route_key":"retained-route",
+            "mode":{"width":2560,"height":1440,"refresh_millihz":144000,"hdr":true}});
+        let mut request = open_json();
+        request["lifecycle_capture_mode"] = json!("external");
+        request["lifecycle_session_target"] =
+            json!({"kind":"session","host_epoch":"host","session_id":"app","generation":1});
+        request["lifecycle_settings_revision"] = json!("revision");
+        request["lifecycle_intent"] = json!("initial");
+        request["expected_runtime_epoch"] = json!("ab".repeat(16));
+        request["capture"]["output"] = source["output"].clone();
+        request["borrowed_capture"] = source.clone();
+        let missing: Open = serde_json::from_value(request.clone()).unwrap();
+        assert_eq!(missing.validate(false), Err("invalid_borrowed_capture"));
+        request["source_capture_context"] =
+            json!({"route_key":"retained-route", "source_mode":source["mode"]});
+        let valid: Open = serde_json::from_value(request.clone()).unwrap();
+        assert!(valid.validate(false).is_ok());
+        for (field, value) in [
+            ("width", json!(1280)),
+            ("height", json!(720)),
+            ("refresh_millihz", json!(60000)),
+            ("hdr", json!(false)),
+        ] {
+            let mut changed = request.clone();
+            changed["source_capture_context"]["source_mode"][field] = value;
+            let invalid: Open = serde_json::from_value(changed).unwrap();
+            assert_eq!(
+                invalid.validate(false),
+                Err("invalid_borrowed_capture"),
+                "{field}"
+            );
+        }
+        request["source_capture_context"]["route_key"] = json!("other-route");
+        let changed: Open = serde_json::from_value(request).unwrap();
+        assert_eq!(changed.validate(false), Err("invalid_borrowed_capture"));
     }
 
     #[test]

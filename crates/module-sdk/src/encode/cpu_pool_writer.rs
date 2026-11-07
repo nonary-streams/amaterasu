@@ -318,9 +318,10 @@ pub unsafe fn write<G>(
     let row_bytes = match cpu.format {
         PIXEL_BGRA8 => cpu.width as usize * 4,
         PIXEL_NV12 => cpu.width as usize,
+        PIXEL_P010 => cpu.width as usize * 2,
         _ => return Err(abandon(lease, STATUS_INVALID_ARGUMENT)),
     };
-    let rows = if cpu.format == PIXEL_NV12 {
+    let rows = if matches!(cpu.format, PIXEL_NV12 | PIXEL_P010) {
         cpu.height as usize + cpu.height as usize / 2
     } else {
         cpu.height as usize

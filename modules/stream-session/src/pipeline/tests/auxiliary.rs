@@ -1,0 +1,227 @@
+use super::*;
+
+fn assert_no_display_calls(host: &Harness) {
+    assert!(host.broker.calls.iter().all(|call| !matches!(
+        call.service.as_str(),
+        "amaterasu.display/1" | "amaterasu.virtual-display/1"
+    )));
+}
+
+#[test]
+fn independent_capture_without_audio_only_owns_its_input_and_transport() {
+    for (provider, output) in [("black", "black"), ("replacement_black", "blank-frame")] {
+        let mut host = Harness::new();
+        host.pipeline.settings.enable_input = true;
+        host.pipeline.settings.input_lease_ttl_ms = 1_000;
+        let mut request = prepare();
+        request["stream_audio"] = json!(false);
+        let prepared = host.response(1, request);
+        assert_eq!(prepared["state"], "prepared", "{prepared}");
+        let session = prepared["session"].as_u64().unwrap();
+        let mut configuration = start(session);
+        configuration["configuration"]["capture_provider"] = json!(provider);
+        configuration["configuration"]["output"] = json!(output);
+        configuration["configuration"]["audio_endpoint"] = json!("");
+        configuration["configuration"]["capture_sink_without_routing"] = json!(true);
+        let active = host.response(2, configuration);
+        assert_eq!(active["state"], "active", "{active}");
+        let video = host
+            .broker
+            .calls
+            .iter()
+            .find(|call| {
+                call.service == Resource::Video.service() && call.payload["action"] == "open"
+            })
+            .expect("selected external capture reaches video");
+        assert_eq!(video.payload["capture_provider"], provider);
+        assert_eq!(video.payload["output"], output);
+        assert!(host.broker.input_lease.is_some());
+        assert_eq!(host.broker.leases(), 1);
+        assert_no_display_calls(&host);
+        assert!(host.broker.calls.iter().all(|call| !matches!(
+            call.service.as_str(),
+            "amaterasu.audio/1" | "amaterasu.audio-encode/1"
+        )));
+
+        let stopped = host.response(3, json!({"action":"stop","session":session}));
+        assert_eq!(stopped["state"], "stopped", "{stopped}");
+        assert_eq!(host.broker.leases(), 0);
+        assert_eq!(host.broker.live_components(), 0);
+        assert!(host.broker.input_lease.is_none());
+        assert_no_display_calls(&host);
+    }
+}
+
+#[test]
+fn borrowed_exact_output_never_creates_or_releases_the_retained_monitor() {
+    for stream_audio in [false, true] {
+        let mut host = Harness::new();
+        host.pipeline.settings.enable_input = true;
+        host.pipeline.settings.input_lease_ttl_ms = 1_000;
+        let monitor = json!({"identity":"retained-client-monitor","state":"ready"});
+        host.broker
+            .virtual_displays
+            .insert("retained-client-monitor".into(), monitor.clone());
+        let mut request = prepare();
+        request["stream_audio"] = json!(stream_audio);
+        let session = host.response(1, request)["session"].as_u64().unwrap();
+        let mut configuration = start(session);
+        configuration["configuration"]["capture_provider"] = json!("virtual_screen");
+        configuration["configuration"]["output"] = json!("kwin:Virtual-17");
+        configuration["configuration"]["host_audio_enabled"] = json!(true);
+        configuration["configuration"]["capture_sink_without_routing"] = json!(true);
+        if !stream_audio {
+            configuration["configuration"]["audio_endpoint"] = json!("");
+        }
+        let active = host.response(2, configuration);
+        assert_eq!(active["state"], "active", "{active}");
+        let video = host
+            .broker
+            .calls
+            .iter()
+            .find(|call| {
+                call.service == Resource::Video.service() && call.payload["action"] == "open"
+            })
+            .expect("exact retained capture reaches video");
+        assert_eq!(video.payload["capture_provider"], "virtual_screen");
+        assert_eq!(video.payload["output"], "kwin:Virtual-17");
+        assert_no_display_calls(&host);
+        let audio = host.broker.calls.iter().find(|call| {
+            call.service == Resource::AudioCapture.service() && call.payload["action"] == "open"
+        });
+        assert_eq!(audio.is_some(), stream_audio);
+        if let Some(audio) = audio {
+            assert_eq!(audio.payload["host_audio_enabled"], true);
+            assert_eq!(audio.payload["capture_sink_without_routing"], true);
+        }
+        let stopped = host.response(3, json!({"action":"stop","session":session}));
+        assert_eq!(stopped["state"], "stopped", "{stopped}");
+        assert_eq!(host.broker.leases(), 0);
+        assert_no_display_calls(&host);
+        assert_eq!(
+            host.broker.virtual_displays.get("retained-client-monitor"),
+            Some(&monitor)
+        );
+    }
+}
+
+#[test]
+fn signed_session_capacity_keeps_every_cleanup_intent_in_the_journal() {
+    let mut host = Harness::new();
+    host.pipeline.settings.max_live_sessions = 3;
+    for sequence in 1..=3 {
+        let mut request = prepare();
+        request["operation_id"] = json!(format!("concurrent-{sequence}"));
+        request["stream_audio"] = json!(false);
+        assert_eq!(host.response(sequence, request)["state"], "prepared");
+    }
+    assert_eq!(host.pipeline.journal.document.entries.len(), 3);
+    let mut request = prepare();
+    request["operation_id"] = json!("over-capacity");
+    assert_eq!(host.response(4, request)["code"], "capacity_exceeded");
+    assert_eq!(host.pipeline.journal.document.entries.len(), 3);
+}
+
+#[test]
+fn source_capture_route_is_frozen_before_video_open_and_is_independent_of_encoder_settings() {
+    for context in [
+        json!({"route_key":"synthetic_black"}),
+        json!({"route_key":"selected-desktop", "source_mode":{"width":2560,"height":1440,"refresh_millihz":144000,"hdr":false,"bit_depth":10}}),
+    ] {
+        let mut host = Harness::new();
+        let mut request = prepare();
+        request["stream_audio"] = json!(false);
+        request["source_capture_context"] = context.clone();
+        let prepared = host.response(1, request.clone());
+        assert_eq!(prepared["state"], "prepared", "{prepared}");
+        assert_eq!(prepared["source_capture_context"], context);
+        request["source_capture_context"]["route_key"] = json!("changed-after-admission");
+        assert_eq!(host.response(2, request)["code"], "operation_conflict");
+        let session = prepared["session"].as_u64().unwrap();
+        let mut configuration = start(session);
+        configuration["configuration"]["audio_endpoint"] = json!("");
+        assert_eq!(
+            host.response(3, configuration.clone())["code"],
+            "source_capture_context_changed"
+        );
+        assert!(
+            !host
+                .broker
+                .calls
+                .iter()
+                .any(|call| call.service == Resource::Video.service())
+        );
+        configuration["configuration"]["source_capture_context"] = context.clone();
+        let active = host.response(4, configuration.clone());
+        assert_eq!(active["state"], "active", "{active}");
+        let video = host
+            .broker
+            .calls
+            .iter()
+            .find(|call| {
+                call.service == Resource::Video.service() && call.payload["action"] == "open"
+            })
+            .unwrap();
+        assert_eq!(video.payload["source_capture_context"], context);
+        assert!(
+            video.payload["configuration"]
+                .get("source_capture_context")
+                .is_none()
+        );
+        configuration["configuration"]["source_capture_context"]["route_key"] =
+            json!("changed-while-running");
+        assert_eq!(
+            host.response(5, configuration)["code"],
+            "source_capture_context_changed"
+        );
+        assert_eq!(
+            host.broker
+                .calls
+                .iter()
+                .filter(|call| call.service == Resource::Video.service()
+                    && call.payload["action"] == "open")
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn borrowed_capture_readback_freezes_the_exact_source_before_stream_effects() {
+    let mut host = Harness::new();
+    host.pipeline
+        .settings
+        .allowed_principals
+        .push("amaterasu.rtsp".into());
+    host.broker.lifecycle_success = true;
+    let source = json!({"client_id":"paired-client","session_id":"retained-source",
+        "generation":7,"reservation_id":"source-hold","transport_id":"nvhttp-transport",
+        "transport_epoch":"ab".repeat(16),"output":"kwin:Virtual-17",
+        "mode":{"width":2560,"height":1440,"refresh_millihz":144000,"hdr":false}});
+    let mut request = prepare();
+    request["lifecycle_capture_mode"] = json!("external");
+    request["lifecycle_session_target"] =
+        json!({"kind":"session","host_epoch":"host","session_id":"app","generation":1});
+    request["rtsp_operation_id"] = json!("nvhttp-transport");
+    request["borrowed_capture"] = source.clone();
+    let prepared = host.response_from(1, "amaterasu.rtsp", request);
+    assert_eq!(prepared["state"], "prepared", "{prepared}");
+    assert_eq!(prepared["borrowed_capture"], source);
+    let session = prepared["session"].as_u64().unwrap();
+    let mut configuration = start(session);
+    configuration["configuration"]["lifecycle_capture_mode"] = json!("external");
+    configuration["configuration"]["lifecycle_target"] = json!({"kind":"stream","host_epoch":"host","session_id":"app","stream_id":"transport","generation":1});
+    let rejected = host.response_from(2, "amaterasu.rtsp", configuration.clone());
+    assert_eq!(rejected["code"], "borrowed_capture_changed");
+    assert!(
+        !host
+            .broker
+            .calls
+            .iter()
+            .any(|call| call.service == Resource::Video.service())
+    );
+    configuration["configuration"]["output"] = json!("kwin:Virtual-17");
+    let active = host.response_from(3, "amaterasu.rtsp", configuration);
+    assert_eq!(active["state"], "active", "{active}");
+    assert_no_display_calls(&host);
+}

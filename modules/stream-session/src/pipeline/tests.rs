@@ -1,7 +1,9 @@
 mod armed;
+mod auxiliary;
 mod display;
 mod harness;
 mod history;
+mod host_audio;
 mod input;
 mod providers;
 mod restart;
@@ -97,6 +99,15 @@ fn authenticated_control_disconnect_is_confirmed_on_exact_owned_stream() {
             record.authenticated_disconnect_reason, expected,
             "{reason} {plane_error}"
         );
+        let witness = record.response()["authenticated_disconnect"].clone();
+        if let Some(expected) = expected {
+            assert_eq!(witness["session"], id);
+            assert_eq!(witness["operation_id"], record.config.operation_id);
+            assert_eq!(witness["control_authenticated"], true);
+            assert_eq!(witness["reason"], expected);
+        } else {
+            assert!(witness.is_null());
+        }
     }
     let mut host = Harness::new();
     let id = host.response(1, prepare())["session"].as_u64().unwrap();

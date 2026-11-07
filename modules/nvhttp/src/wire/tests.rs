@@ -877,6 +877,8 @@ fn peer(
         peer_trusted,
         list_allowed: peer_trusted,
         launch_allowed: peer_trusted,
+        view_allowed: peer_trusted,
+        terminate_allowed: peer_trusted,
     }
 }
 

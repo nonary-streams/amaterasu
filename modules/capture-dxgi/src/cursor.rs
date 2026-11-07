@@ -159,6 +159,108 @@ fn invalid_shape() -> CaptureError {
     CaptureError::new("invalid_frame", "DXGI returned an invalid pointer shape")
 }
 
+impl Shape {
+    /// Compose only cursor-covered pixels in the high-depth source encoding.
+    /// Color cursors are premultiplied sRGB. Mask/XOR cursors apply their
+    /// documented byte logic to the SDR reference layer at that pixel; all
+    /// pixels outside the cursor retain their original high-depth words.
+    pub fn compose_rgb(
+        &self,
+        surface: &mut amaterasu_module_sdk::capture::high_depth::RgbSurface,
+        left: i32,
+        top: i32,
+        white_scale: f64,
+    ) -> CaptureResult<()> {
+        if !white_scale.is_finite() || white_scale <= 0.0 || white_scale > 125.0 {
+            return Err(invalid_shape());
+        }
+        let shape_height = if self.kind == ShapeKind::Monochrome {
+            self.height / 2
+        } else {
+            self.height
+        };
+        let x0 = i64::from(left).max(0);
+        let y0 = i64::from(top).max(0);
+        let x1 = (i64::from(left) + i64::from(self.width)).min(i64::from(surface.width));
+        let y1 = (i64::from(top) + i64::from(shape_height)).min(i64::from(surface.height));
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let sx = (x - i64::from(left)) as usize;
+                let sy = (y - i64::from(top)) as usize;
+                surface
+                    .transform_linear_pixel(x as u32, y as u32, |background| match self.kind {
+                        ShapeKind::Color => {
+                            let src = sy * self.pitch as usize + sx * 4;
+                            let pixel = &self.bytes[src..src + 4];
+                            let alpha = f64::from(pixel[3]) / 255.0;
+                            if alpha == 0.0 {
+                                return background;
+                            }
+                            let color = [pixel[2], pixel[1], pixel[0]].map(|v| {
+                                cursor_linear((f64::from(v) / 255.0 / alpha).clamp(0.0, 1.0))
+                                    * white_scale
+                            });
+                            std::array::from_fn(|i| {
+                                color[i] * alpha + background[i] * (1.0 - alpha)
+                            })
+                        }
+                        ShapeKind::MaskedColor => {
+                            let src = sy * self.pitch as usize + sx * 4;
+                            let pixel = &self.bytes[src..src + 4];
+                            let color = [pixel[2], pixel[1], pixel[0]];
+                            std::array::from_fn(|i| {
+                                cursor_linear(
+                                    f64::from(if pixel[3] == 0 {
+                                        color[i]
+                                    } else {
+                                        cursor_srgb(background[i] / white_scale) ^ color[i]
+                                    }) / 255.0,
+                                ) * white_scale
+                            })
+                        }
+                        ShapeKind::Monochrome => {
+                            let bit = 0x80 >> (sx % 8);
+                            let and = self.bytes[sy * self.pitch as usize + sx / 8] & bit != 0;
+                            let xor = self.bytes
+                                [(sy + shape_height as usize) * self.pitch as usize + sx / 8]
+                                & bit
+                                != 0;
+                            if and && !xor {
+                                return background;
+                            }
+                            background.map(|v| {
+                                cursor_linear(
+                                    f64::from(
+                                        (if and { cursor_srgb(v / white_scale) } else { 0 })
+                                            ^ if xor { 255 } else { 0 },
+                                    ) / 255.0,
+                                ) * white_scale
+                            })
+                        }
+                    })
+                    .map_err(|_| invalid_shape())?;
+            }
+        }
+        Ok(())
+    }
+}
+fn cursor_linear(v: f64) -> f64 {
+    if v <= 0.04045 {
+        v / 12.92
+    } else {
+        ((v + 0.055) / 1.055).powf(2.4)
+    }
+}
+fn cursor_srgb(v: f64) -> u8 {
+    let v = v.clamp(0.0, 1.0);
+    ((if v <= 0.0031308 {
+        12.92 * v
+    } else {
+        1.055 * v.powf(1.0 / 2.4) - 0.055
+    }) * 255.0)
+        .round() as u8
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

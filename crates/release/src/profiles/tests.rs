@@ -436,7 +436,7 @@ fn nvhttp_upnp_management_poll_has_a_scoped_call_grant_without_a_load_cycle() {
     std::fs::remove_dir_all(directory).unwrap();
     assert_eq!(
         policy.principals[NVHTTP.id].call,
-        platform_extensions::TRANSPORT.grants().call
+        remote_sessions::PLATFORM_TRANSPORT.grants().call
     );
     let management_calls = &policy.principals[MANAGEMENT.id].call;
     assert!(

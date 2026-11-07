@@ -266,13 +266,27 @@ impl ManagedModule for NvhttpModule {
             launches.set_logger(log_emitter);
             launches.set_session_lifecycle_required(settings.session_lifecycle_required);
             launches.set_session_lifecycle_capture_mode(settings.session_lifecycle_capture_mode);
-            let router = wire::Router::new(
+            let mut router = wire::Router::new(
                 wire::RouterConfig {
                     hostname: hostname.clone(),
                     http_port: server.http_address().port(),
                     https_port: server.https_address().port(),
                 },
                 launches,
+            );
+            router.select_session_presentation(
+                &runtime,
+                settings.session_presentation_provider.as_deref(),
+            )?;
+            router.set_auxiliary_capture_routes(
+                settings.auxiliary_black_capture_provider.clone(),
+                settings.auxiliary_exact_capture_provider.clone(),
+            );
+            router.set_auxiliary_black_capture_route_key(
+                settings.auxiliary_black_capture_route_key.clone(),
+            );
+            router.set_auxiliary_exact_capture_routes(
+                settings.auxiliary_exact_capture_routes.clone(),
             );
             (Some(server), Some(router), Some(identity))
         } else {
@@ -510,10 +524,10 @@ impl ManagedModule for NvhttpModule {
         self.product_settings.flush_completion(&self.runtime);
         self.refresh_identity();
         if let (Some(server), Some(router)) = (&mut self.server, &mut self.router) {
-            let revoked = router.revoke_untrusted(|certificate| {
+            let revoked = router.revoke_unauthorized(|certificate, permission| {
                 self.identity
                     .as_ref()
-                    .is_none_or(|identity| identity.launch_not_revoked(certificate))
+                    .is_none_or(|identity| identity.permission_not_revoked(certificate, permission))
             });
             for connection in revoked {
                 server.close(connection);
@@ -555,6 +569,8 @@ impl ManagedModule for NvhttpModule {
                 };
                 let list_allowed = trusted && allowed(wire::Permission::List);
                 let launch_allowed = trusted && allowed(wire::Permission::Launch);
+                let view_allowed = trusted && allowed(wire::Permission::View);
+                let terminate_allowed = trusted && allowed(wire::Permission::Terminate);
                 if incoming.request.target.split('?').next() == Some("/launch") {
                     // Deliberately omit the query: Moonlight sends session keys there.
                     eprintln!(
@@ -572,6 +588,8 @@ impl ManagedModule for NvhttpModule {
                         peer_trusted: trusted,
                         list_allowed,
                         launch_allowed,
+                        view_allowed,
+                        terminate_allowed,
                     },
                     &self.runtime,
                 ) {

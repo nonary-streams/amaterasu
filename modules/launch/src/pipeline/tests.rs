@@ -4220,6 +4220,7 @@ fn cleanup_readback_list_paginates_by_bytes_and_preserves_owner() {
     assert_eq!(seen, expected);
 }
 
+mod application_retirement;
 mod desktop;
 mod prepared_context;
 

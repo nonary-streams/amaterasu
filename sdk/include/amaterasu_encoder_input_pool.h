@@ -6,7 +6,7 @@ extern "C" {
 #endif
 /* Pool-only writable CPU schema: FrameDescriptor kind=3, version=1,
  * zero namespace. Offer data is capabilities; acquired data is writable frame.
- * BGRA8 and NV12 only; NONE acquire/completion sync; CPU writes must complete
+ * BGRA8, NV12 and P010; NONE acquire/completion sync; CPU writes must complete
  * before commit or abandon. Alignment values are nonzero powers of two. */
 #define AMATERASU_ENCODER_INPUT_RESOURCE_CPU_WRITABLE 3u
 typedef struct {

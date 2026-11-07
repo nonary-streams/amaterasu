@@ -16,6 +16,10 @@ pub(super) fn install(policy: &mut RuntimeConfig) -> Result<(), String> {
             include_str!("../../../../modules/nvhttp/metadata/api.json"),
         ),
         (
+            "amaterasu.remote-session",
+            include_str!("../../../../modules/remote-session/metadata/api.json"),
+        ),
+        (
             "amaterasu.host-metrics",
             include_str!("../../../../modules/stats/metadata/api.json"),
         ),

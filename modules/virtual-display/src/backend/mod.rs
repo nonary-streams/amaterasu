@@ -2,6 +2,9 @@ use crate::model::Specification;
 use crate::protocol::Binding;
 use serde::Serialize;
 
+#[cfg(any(windows, test))]
+mod capture_target;
+
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
@@ -11,6 +14,10 @@ pub use windows::NativeDriver;
 pub struct Ready {
     pub device_path: String,
     pub active: bool,
+    /// Opaque exact selector, present only after mode, color and capture
+    /// enumeration independently agree on this owned target.
+    pub capture_output: Option<String>,
+    pub capture_error: Option<&'static str>,
 }
 pub struct Observation {
     pub exists: bool,
@@ -22,6 +29,15 @@ pub struct Observation {
 }
 
 pub trait Driver {
+    /// Independently observe a requested effective mode. This never changes the
+    /// native allocation and cannot stand in for ownership inspection.
+    fn capture_target(
+        &mut self,
+        _binding: Option<Binding>,
+        _expected: &Specification,
+    ) -> Result<Option<Ready>, &'static str> {
+        Err("unsupported_mode_observation")
+    }
     fn supported(&self) -> bool;
     fn create(
         &mut self,

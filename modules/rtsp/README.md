@@ -25,6 +25,10 @@ or a configured external alias), optional `constant_rate`
 (default false), `output`, `encoder`, `audio_endpoint` and optional
 `host_audio_enabled` (default false). That flag snapshots Moonlight's
 `localAudioPlayMode` choice and is forwarded through stream-session to AudioCapture.
+Top-level `channels` may request 2, 6 or 8 stream channels for a regular
+`audio_endpoint` when `stream_audio` and `capture_sink_without_routing` are true.
+This requests capture-format conversion without selecting a virtual sink layout;
+`virtual_sink` remains absent and the selected host playback policy is preserved.
 External aliases are 1–64 lowercase ASCII letters, digits, underscores or hyphens;
 Video resolves them against its configured providers and rejects unknown aliases.
 Constant-rate capture is accepted only with WGC and is forwarded to stream-session
@@ -164,3 +168,69 @@ x264 ABR ignores it and Amaterasu has no VAAPI CQP consumer. The backend policy
 supports `auto` and `software`, and real codec availability remains a separate
 requirement. [NVHTTP policy](../nvhttp/README.md#software-encoder-policy)
 documents persistence, scope precedence and platform qualification limits.
+
+
+## Retained-source retirement observations
+
+Trusted startup selects `retirement_status_owners`, mapping each observer to one
+original transport owner, for observation only. The older
+`retirement_status_principals` list is accepted only when every listed observer
+has an explicit owner mapping; an unscoped observer policy fails validation.
+They may call `amaterasu.rtsp/1` with
+`{"action":"retirement_status","operation_id":"opaque-transport","expected_runtime_epoch":"32-lowercase-hex-digits"}`.
+Both selectors are optional for a startup snapshot. Replies identify
+`runtime_epoch`, `startup_reconciled`, `operation_id`, `state`, `retired`,
+`active_operations`, `pending_admissions`, and `cleanup_pending`. Observers never
+receive stream keys, peer addresses or private ticket URLs. Normal transport
+owners see only their operations; an installed retirement observer sees only its
+selected owner's operations, admission fences, and occupancy counts. Requests
+cannot select another owner. Each selected owner must already have an installed
+transport admission grant.
+
+Persist the observed runtime epoch before admitting a retained-source transport,
+then send it as `expected_runtime_epoch` on Open. Late requests for a previous
+runtime are rejected before effects. Missing current-epoch tickets report
+`unknown`, never retirement. A different saved epoch reports `epoch_fenced` only
+after the downstream durable cleanup journal and RTSP's native startup cleanup
+have reconciled. Existing tickets override epoch fencing until exact native
+retirement is confirmed. A snapshot with `active_operations: 0` proves only the
+scoped operations currently known to this runtime; also require reconciled
+startup, no pending admission and no pending cleanup. `startup_reconciled` names
+the prior-runtime native recovery barrier: current-epoch admission or cleanup
+does not make a fresh epoch observation unready. Its separate occupancy fields
+still describe the exact selected owner's current work.
+
+A normal owner may call `retire_operation` with the exact operation and saved
+epoch. It installs an owner-bound admission fence before looking up effects,
+then drives real close/cleanup for an existing ticket. Only an operation that
+never entered this runtime can immediately report `operation_fenced`; late Open
+requests cannot pass that fence. Fences remain for the runtime lifetime and are
+bounded at 128; capacity exhaustion rejects another fence without forgetting old
+ones. Observation-only principals cannot call this operation. After a failed
+startup pass has settled, a normal owner may call `reconcile_startup` to retry
+its native reconciliation; this never marks cleanup successful by itself.
+
+Signed startup `max_live_tickets` and downstream `max_live_sessions` are bounded
+from 1 to 32 and default to 2. Configured media endpoints reserve three UDP
+ports per concurrent ticket, starting at the usual video/control/audio offsets
+and continuing in blocks of three. Slots remain reserved through uncertain
+cleanup; port arithmetic fails closed at the u16 limit. The cleanup journal can
+retain all 32 admitted sessions even when a later startup policy lowers capacity.
+
+Borrowed capture uses the public `BorrowedCaptureContext` under the
+`borrowed_capture` field. RTSP passes the frozen context to stream preparation
+and the lifecycle coordinator, requires external capture ownership, binds it to
+the exact operation/epoch/output, and rejects display mutation admission. The
+stream consumer checks the unchanged context before opening its exact source.
+App-independent streams report authenticated client disconnect only after exact
+native retirement and a control witness bound to their owned stream operation.
+
+
+The optional top-level `source_capture_context` carries a public Capture SDK
+logical route and optional actual source mode. RTSP freezes it through Prepare
+and Start; stream-session forwards it unchanged to Video Open, outside encoder
+configuration. The installed video provider resolves the logical route's provider
+and source class. A nondefault borrowed route requires the context's explicit
+source mode to match its frozen retained geometry and range. Missing context
+preserves the legacy default route; unknown source mode or depth does not imply
+eight-bit capture. Changing the context after admission fails before capture.

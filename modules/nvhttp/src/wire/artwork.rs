@@ -130,6 +130,8 @@ mod tests {
             peer_trusted: true,
             list_allowed: true,
             launch_allowed: false,
+            view_allowed: true,
+            terminate_allowed: false,
         }
     }
     #[test]

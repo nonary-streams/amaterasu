@@ -594,7 +594,9 @@ int am_pw_valid_named_output(const char *output) {
 }
 struct am_pw_session *am_pw_start_output(const char *output, uint32_t timeout_seconds,
     am_pw_frame_callback callback, void *context) {
-    if (!am_pw_valid_named_output(output)) return NULL;
+    if (!output || !*output || strlen(output)>127) return NULL;
+    if (strncmp(output,"Virtual-",8)==0 && !am_pw_valid_named_output(output)) return NULL;
+    for (const unsigned char *p=(const unsigned char *)output;*p;++p) if (*p<0x20 || *p==0x7f) return NULL;
     return start(1, timeout_seconds, NULL, 0, NULL, callback, context, output);
 }
 #endif

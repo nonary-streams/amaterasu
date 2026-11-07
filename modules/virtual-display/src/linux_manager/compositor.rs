@@ -21,6 +21,13 @@ pub(super) enum Placement {
 }
 
 pub(super) trait Compositor: Send {
+    fn verify_retained_mode(
+        &mut self,
+        _output: &str,
+        _desired: &Specification,
+    ) -> Result<(), String> {
+        Err("retained mode observation unavailable".into())
+    }
     fn verify_mode_only(
         &mut self,
         _output: &str,
@@ -66,6 +73,13 @@ pub(super) trait Compositor: Send {
 }
 pub(super) struct KScreen;
 impl Compositor for KScreen {
+    fn verify_retained_mode(
+        &mut self,
+        output: &str,
+        desired: &Specification,
+    ) -> Result<(), String> {
+        verify_retained_readback(&query()?, output, desired)
+    }
     fn verify_mode_only(
         &mut self,
         output: &str,
@@ -488,6 +502,45 @@ fn find_output<'a>(configuration: &'a Value, name: &str) -> Option<&'a Value> {
         .iter()
         .find(|output| output["name"] == name && output["connected"] == true)
 }
+
+fn verify_retained_readback(
+    configuration: &Value,
+    name: &str,
+    desired: &Specification,
+) -> Result<(), String> {
+    let outputs = configuration["outputs"]
+        .as_array()
+        .filter(|outputs| outputs.len() <= 64)
+        .ok_or("invalid output inventory")?;
+    let mut matches = outputs
+        .iter()
+        .filter(|output| output["name"] == name && output["connected"] == true);
+    let output = matches.next().ok_or("owned output unavailable")?;
+    if matches.next().is_some()
+        || output["enabled"] != true
+        || output["hdr"].as_bool() != Some(desired.hdr_enabled)
+    {
+        return Err("owned output activation or color differs".into());
+    }
+    let mode_id = output["currentModeId"]
+        .as_str()
+        .ok_or("current mode unavailable")?;
+    let modes = output["modes"]
+        .as_array()
+        .ok_or("mode inventory unavailable")?;
+    let mut modes = modes.iter().filter(|mode| mode["id"] == mode_id);
+    let mode = modes.next().ok_or("current mode missing")?;
+    if modes.next().is_some()
+        || mode["size"]["width"].as_u64() != Some(u64::from(desired.width))
+        || mode["size"]["height"].as_u64() != Some(u64::from(desired.height))
+        || !mode["refreshRate"].as_f64().is_some_and(|rate| {
+            rate.is_finite() && (rate * 1000.0).round() == f64::from(desired.refresh_millihz)
+        })
+    {
+        return Err("owned output mode differs".into());
+    }
+    Ok(())
+}
 fn mode(configuration: &Value, output: &str, spec: &Specification) -> Option<String> {
     find_output(configuration, output)?["modes"]
         .as_array()?
@@ -496,7 +549,7 @@ fn mode(configuration: &Value, output: &str, spec: &Specification) -> Option<Str
             mode["size"]["width"].as_u64() == Some(u64::from(spec.width))
                 && mode["size"]["height"].as_u64() == Some(u64::from(spec.height))
                 && mode["refreshRate"].as_f64().is_some_and(|rate| {
-                    (rate * 1000.0 - f64::from(spec.refresh_millihz)).abs() <= 100.0
+                    rate.is_finite() && (rate * 1000.0).round() == f64::from(spec.refresh_millihz)
                 })
         })?["id"]
         .as_str()
@@ -745,5 +798,46 @@ mod tests {
         let actual = json!({"enabled":true,"scale":1.75,"pos":{"x":0,"y":0},"currentModeId":"7","rotation":1,"hdr":false,"wcg":false});
         assert!(retained.matches(&actual, 0));
         assert!(!automatic.matches(&actual, 0));
+    }
+}
+
+#[cfg(test)]
+mod retained_mode_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn retained_readback_checks_only_the_exact_connected_active_mode_and_color() {
+        let configuration = json!({"outputs":[{"name":"Virtual-2","connected":true,"enabled":true,"hdr":true,"currentModeId":"7","modes":[{"id":"7","size":{"width":1280,"height":720},"refreshRate":119.88}]}]});
+        let desired = Specification {
+            identity: "11111111-1111-4111-8111-111111111111".into(),
+            name: "Monitor".into(),
+            width: 1280,
+            height: 720,
+            refresh_millihz: 119880,
+            hdr_enabled: true,
+        };
+        assert!(verify_retained_readback(&configuration, "Virtual-2", &desired).is_ok());
+        assert!(verify_retained_readback(&configuration, "Virtual-3", &desired).is_err());
+        for (field, value) in [
+            ("enabled", json!(false)),
+            ("connected", json!(false)),
+            ("hdr", json!(false)),
+            ("hdr", json!(null)),
+            ("currentModeId", json!("99")),
+        ] {
+            let mut invalid = configuration.clone();
+            invalid["outputs"][0][field] = value;
+            assert!(verify_retained_readback(&invalid, "Virtual-2", &desired).is_err());
+        }
+        let mut wrong_mode = configuration.clone();
+        wrong_mode["outputs"][0]["modes"][0]["refreshRate"] = json!(120.0);
+        assert!(verify_retained_readback(&wrong_mode, "Virtual-2", &desired).is_err());
+        let mut duplicate = configuration.clone();
+        duplicate["outputs"]
+            .as_array_mut()
+            .unwrap()
+            .push(configuration["outputs"][0].clone());
+        assert!(verify_retained_readback(&duplicate, "Virtual-2", &desired).is_err());
     }
 }

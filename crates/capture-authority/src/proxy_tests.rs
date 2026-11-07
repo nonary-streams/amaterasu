@@ -216,6 +216,9 @@ fn revocation_after_driver_response_prevents_descriptor_delivery() {
         pitches: [4, 0, 0, 0],
         offsets: [0; 4],
         fence_mask: 0,
+        guard_count: 0,
+        color: 0,
+        hdr_metadata: [0; 12],
     };
     let descriptor = File::open("/dev/null").unwrap();
     helper
