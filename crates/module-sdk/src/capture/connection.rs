@@ -3,7 +3,7 @@ use amaterasu_abi::{STATUS_INVALID_ARGUMENT, STATUS_OK, Status};
 use amaterasu_media::{
     CaptureApiV1_8, CaptureResourceFrame, CaptureResourceFrameSink, CaptureResourceOffer,
     CaptureResourceOfferSink, FRAME_ACCESS_CPU, FRAME_ACCESS_GPU, FrameResourceConsumerApi,
-    MEDIA_UNSUPPORTED,
+    MEDIA_BUSY, MEDIA_PENDING, MEDIA_UNSUPPORTED,
 };
 use std::{ffi::c_void, marker::PhantomData, rc::Rc};
 
@@ -82,6 +82,7 @@ struct Configure<'a> {
     required: u32,
     selected: Option<u64>,
     failure: Option<Status>,
+    uncertain: bool,
 }
 unsafe extern "C" fn configure(context: *mut c_void, offer: *const CaptureResourceOffer) -> Status {
     if context.is_null() {
@@ -97,6 +98,9 @@ unsafe extern "C" fn configure(context: *mut c_void, offer: *const CaptureResour
     let offer = unsafe { &*offer };
     if !state.ids.add(offer) {
         return STATUS_INVALID_ARGUMENT;
+    }
+    if let Some(status) = state.failure {
+        return status;
     }
     if state.selected.is_some() || offer.accessibility & state.required != state.required {
         return STATUS_OK;
@@ -118,6 +122,9 @@ unsafe extern "C" fn configure(context: *mut c_void, offer: *const CaptureResour
             break;
         }
         if status != MEDIA_UNSUPPORTED {
+            // Only UNSUPPORTED is specified to leave the previous
+            // configuration unchanged. Other errors may have effects.
+            state.uncertain = true;
             state.failure = Some(status);
             return status;
         }
@@ -254,6 +261,13 @@ impl<'a> ResourceConnection<'a> {
         self.selected = None;
     }
 
+    fn negotiation_error(&mut self, error: ConnectionError) -> ConnectionError {
+        if !matches!(error, ConnectionError::Native(MEDIA_BUSY | MEDIA_PENDING)) {
+            self.cancel();
+        }
+        error
+    }
+
     fn enumerate_capture(&self, sink: CaptureResourceOfferSink) -> Result<u64, ConnectionError> {
         let mut generation = 0;
         // SAFETY: sink context is live and enumeration is synchronous.
@@ -300,12 +314,14 @@ impl<'a> ResourceConnection<'a> {
                 )
             };
             if consumer_ids.invalid {
+                self.cancel();
                 return Err(ConnectionError::Protocol);
             }
             if status != STATUS_OK {
-                return Err(ConnectionError::Native(status));
+                return Err(self.negotiation_error(ConnectionError::Native(status)));
             }
             if consumer_generation == 0 {
+                self.cancel();
                 return Err(ConnectionError::Protocol);
             }
             let mut first = Ids::new(0);
@@ -315,9 +331,13 @@ impl<'a> ResourceConnection<'a> {
             };
             let first_result = self.enumerate_capture(sink);
             if first.invalid {
+                self.cancel();
                 return Err(ConnectionError::Protocol);
             }
-            let producer_generation = first_result?;
+            let producer_generation = match first_result {
+                Ok(generation) => generation,
+                Err(error) => return Err(self.negotiation_error(error)),
+            };
             let mut state = Configure {
                 ids: Ids::new(0),
                 consumer_ids: &consumer_ids.eligible,
@@ -328,13 +348,14 @@ impl<'a> ResourceConnection<'a> {
                 required: self.required,
                 selected: None,
                 failure: None,
+                uncertain: false,
             };
             let sink = CaptureResourceOfferSink {
                 context: (&mut state as *mut Configure<'_>).cast(),
                 write: configure,
             };
             let second = self.enumerate_capture(sink);
-            self.active = state.selected.is_some();
+            self.active |= state.selected.is_some() || state.uncertain;
             if state.ids.invalid {
                 self.cancel();
                 return Err(ConnectionError::Protocol);
@@ -346,8 +367,7 @@ impl<'a> ResourceConnection<'a> {
             let second_generation = match second {
                 Ok(generation) => generation,
                 Err(error) => {
-                    self.cancel();
-                    return Err(error);
+                    return Err(self.negotiation_error(error));
                 }
             };
             first.ids.sort_unstable();
@@ -374,8 +394,7 @@ impl<'a> ResourceConnection<'a> {
                 return Err(ConnectionError::Stale);
             }
             if status != STATUS_OK {
-                self.cancel();
-                return Err(ConnectionError::Native(status));
+                return Err(self.negotiation_error(ConnectionError::Native(status)));
             }
             self.selected = Some((producer_generation, offer));
             Ok(())
@@ -452,6 +471,9 @@ mod tests {
         epoch: [u8; 16],
         cancelled: u32,
         reject: bool,
+        configure_error: Option<Status>,
+        producer_offer: u64,
+        producer_generation: u64,
     }
     unsafe extern "C" fn enumerate(
         _: *mut c_void,
@@ -466,7 +488,7 @@ mod tests {
         _: u64,
         _: u64,
         id: u64,
-        _: u64,
+        producer_generation: u64,
         offer: *const CaptureResourceOffer,
     ) -> Status {
         // SAFETY: fixture supplies both pointers for the call.
@@ -475,6 +497,11 @@ mod tests {
             return MEDIA_UNSUPPORTED;
         }
         consumer.configured += 1;
+        consumer.producer_offer = offer.id;
+        consumer.producer_generation = producer_generation;
+        if let Some(error) = consumer.configure_error.take() {
+            return error;
+        }
         STATUS_OK
     }
     unsafe extern "C" fn submit(
@@ -550,6 +577,7 @@ mod tests {
             required: 0,
             selected: None,
             failure: None,
+            uncertain: false,
         };
         let offer = offer();
         // SAFETY: fixture objects outlive each synchronous callback.
@@ -629,6 +657,7 @@ mod tests {
             required: 0,
             selected: None,
             failure: None,
+            uncertain: false,
         };
         let offer = offer();
         // SAFETY: fixture objects outlive each synchronous callback.
@@ -642,6 +671,40 @@ mod tests {
             STATUS_INVALID_ARGUMENT
         );
         assert!(state.ids.invalid);
+    }
+    #[test]
+    fn swallowed_configure_error_cannot_trigger_another_configuration() {
+        let mut consumer = Consumer {
+            configure_error: Some(MEDIA_BUSY),
+            ..Consumer::default()
+        };
+        let api = table(&mut consumer);
+        let mut state = Configure {
+            ids: Ids::new(0),
+            consumer_ids: &[8],
+            consumer: &api,
+            stream: 3,
+            generation: 4,
+            producer_generation: 9,
+            required: 0,
+            selected: None,
+            failure: None,
+            uncertain: false,
+        };
+        let mut candidate = offer();
+        // SAFETY: the context and offers are valid for each synchronous callback.
+        assert_eq!(
+            unsafe { configure((&mut state as *mut Configure<'_>).cast(), &candidate) },
+            MEDIA_BUSY
+        );
+        candidate.id += 1;
+        assert_eq!(
+            unsafe { configure((&mut state as *mut Configure<'_>).cast(), &candidate) },
+            MEDIA_BUSY
+        );
+        assert_eq!(consumer.configured, 1);
+        assert!(state.uncertain);
+        assert!(state.selected.is_none());
     }
     #[test]
     fn gpu_requirement_rejects_unspecified_and_cpu_access() {
@@ -686,6 +749,7 @@ mod tests {
             required: 0,
             selected: None,
             failure: None,
+            uncertain: false,
         };
         assert_eq!(
             unsafe { configure((&mut state as *mut Configure<'_>).cast(), ptr::null()) },
@@ -705,6 +769,10 @@ mod tests {
         selection_fails: bool,
         enumerate_calls: u32,
         change_generation: bool,
+        enumerate_errors: std::collections::BTreeMap<u32, Status>,
+        select_error: Option<Status>,
+        generation: u64,
+        offer_id: u64,
     }
     unsafe extern "C" fn producer_enumerate(
         context: *mut c_void,
@@ -716,17 +784,27 @@ mod tests {
         let producer = unsafe { &mut *context.cast::<Producer>() };
         producer.enumerate_calls += 1;
         let mut candidate = offer();
+        candidate.id = if producer.offer_id == 0 {
+            5
+        } else {
+            producer.offer_id
+        };
         candidate.accessibility = FRAME_ACCESS_GPU;
         let status = unsafe { (sink.write)(sink.context, &candidate) };
         if status != STATUS_OK {
             return status;
         }
+        if let Some(error) = producer.enumerate_errors.remove(&producer.enumerate_calls) {
+            return error;
+        }
         unsafe {
             *generation =
                 if producer.change_generation && producer.enumerate_calls.is_multiple_of(2) {
                     10
-                } else {
+                } else if producer.generation == 0 {
                     9
+                } else {
+                    producer.generation
                 };
         }
         STATUS_OK
@@ -738,7 +816,20 @@ mod tests {
         id: u64,
     ) -> Status {
         let producer = unsafe { &mut *context.cast::<Producer>() };
-        if producer.selection_fails || generation != 9 || id != 5 {
+        if let Some(error) = producer.select_error.take() {
+            return error;
+        }
+        let current_generation = if producer.generation == 0 {
+            9
+        } else {
+            producer.generation
+        };
+        let current_offer = if producer.offer_id == 0 {
+            5
+        } else {
+            producer.offer_id
+        };
+        if producer.selection_fails || generation != current_generation || id != current_offer {
             return MEDIA_UNSUPPORTED;
         }
         producer.selected = true;
@@ -755,8 +846,16 @@ mod tests {
         }
         let descriptor = descriptor(FRAME_RESOURCE_VENDOR_BASE);
         let frame = CaptureResourceFrame {
-            offer_generation: 9,
-            offer_id: 5,
+            offer_generation: if producer.generation == 0 {
+                9
+            } else {
+                producer.generation
+            },
+            offer_id: if producer.offer_id == 0 {
+                5
+            } else {
+                producer.offer_id
+            },
             timestamp_us: 1,
             capture_pacing_timestamp_us: 1,
             sequence: 1,
@@ -941,6 +1040,150 @@ mod tests {
         );
         drop(connection);
         assert_eq!(consumer.cancelled, 0);
+    }
+    #[test]
+    fn transient_producer_failures_keep_configuration_owned_until_retry_or_drop() {
+        for status in [MEDIA_BUSY, MEDIA_PENDING] {
+            let mut producer = Producer::default();
+            // The second pass invokes configure, then reports an invalidated
+            // enumeration. The next attempt fails on its first pass as well.
+            producer.enumerate_errors.insert(2, status);
+            producer.enumerate_errors.insert(3, status);
+            let capture = capture_table(&mut producer);
+            let mut consumer = Consumer::default();
+            let mut api = table(&mut consumer);
+            api.enumerate_resources = consumer_enumerate;
+            // SAFETY: fixture tables and their contexts outlive this connection.
+            let mut connection =
+                unsafe { ResourceConnection::new(&capture, 1, &api, 3, FRAME_ACCESS_GPU).unwrap() };
+            assert_eq!(connection.forward(0), Err(ConnectionError::Native(status)));
+            assert_eq!(consumer.configured, 1);
+            assert_eq!(consumer.cancelled, 0);
+            assert_eq!(consumer.submitted, 0);
+            assert_eq!(connection.forward(0), Err(ConnectionError::Native(status)));
+            assert_eq!(consumer.cancelled, 0);
+            assert_eq!(consumer.submitted, 0);
+            assert_eq!(connection.forward(0), Ok(STATUS_OK));
+            assert_eq!(consumer.configured, 2);
+            assert_eq!(consumer.submitted, 1);
+            drop(connection);
+            assert_eq!(consumer.cancelled, 1);
+
+            let mut producer = Producer::default();
+            producer.enumerate_errors.insert(2, status);
+            let capture = capture_table(&mut producer);
+            let mut consumer = Consumer::default();
+            let mut api = table(&mut consumer);
+            api.enumerate_resources = consumer_enumerate;
+            let mut connection =
+                unsafe { ResourceConnection::new(&capture, 1, &api, 3, FRAME_ACCESS_GPU).unwrap() };
+            assert_eq!(connection.negotiate(), Err(ConnectionError::Native(status)));
+            drop(connection);
+            assert_eq!(consumer.configured, 1);
+            assert_eq!(consumer.cancelled, 1);
+            assert_eq!(consumer.submitted, 0);
+        }
+    }
+    #[test]
+    fn transient_select_retries_but_uncertain_configure_is_retired() {
+        for status in [MEDIA_BUSY, MEDIA_PENDING] {
+            let mut producer = Producer {
+                select_error: Some(status),
+                ..Producer::default()
+            };
+            let capture = capture_table(&mut producer);
+            let mut consumer = Consumer::default();
+            let mut api = table(&mut consumer);
+            api.enumerate_resources = consumer_enumerate;
+            // SAFETY: fixture tables and their contexts outlive this connection.
+            let mut connection =
+                unsafe { ResourceConnection::new(&capture, 1, &api, 3, FRAME_ACCESS_GPU).unwrap() };
+            assert_eq!(connection.forward(0), Err(ConnectionError::Native(status)));
+            assert_eq!(consumer.configured, 1);
+            assert_eq!(consumer.cancelled, 0);
+            assert_eq!(consumer.submitted, 0);
+            assert_eq!(connection.forward(0), Ok(STATUS_OK));
+            drop(connection);
+            assert_eq!(consumer.cancelled, 1);
+
+            let mut producer = Producer::default();
+            let capture = capture_table(&mut producer);
+            let mut consumer = Consumer {
+                configure_error: Some(status),
+                ..Consumer::default()
+            };
+            let mut api = table(&mut consumer);
+            api.enumerate_resources = consumer_enumerate;
+            let mut connection =
+                unsafe { ResourceConnection::new(&capture, 1, &api, 3, FRAME_ACCESS_GPU).unwrap() };
+            assert_eq!(connection.negotiate(), Err(ConnectionError::Native(status)));
+            assert_eq!(consumer.configured, 1);
+            assert_eq!(consumer.cancelled, 1);
+            assert_eq!(connection.negotiate(), Err(ConnectionError::Stale));
+            drop(connection);
+            assert_eq!(consumer.cancelled, 1);
+        }
+    }
+    #[test]
+    fn terminal_error_after_pending_retires_the_retained_configuration() {
+        let mut producer = Producer::default();
+        producer.enumerate_errors.insert(2, MEDIA_BUSY);
+        producer
+            .enumerate_errors
+            .insert(3, amaterasu_media::MEDIA_CLOSED);
+        let capture = capture_table(&mut producer);
+        let mut consumer = Consumer::default();
+        let mut api = table(&mut consumer);
+        api.enumerate_resources = consumer_enumerate;
+        // SAFETY: fixture tables and their contexts outlive this connection.
+        let mut connection =
+            unsafe { ResourceConnection::new(&capture, 1, &api, 3, FRAME_ACCESS_GPU).unwrap() };
+        assert_eq!(
+            connection.negotiate(),
+            Err(ConnectionError::Native(MEDIA_BUSY))
+        );
+        assert_eq!(consumer.cancelled, 0);
+        assert_eq!(
+            connection.negotiate(),
+            Err(ConnectionError::Native(amaterasu_media::MEDIA_CLOSED))
+        );
+        assert_eq!(consumer.cancelled, 1);
+        assert_eq!(connection.negotiate(), Err(ConnectionError::Stale));
+        drop(connection);
+        assert_eq!(consumer.cancelled, 1);
+    }
+    #[test]
+    fn retry_reconfigures_a_replacement_offer_before_first_frame() {
+        let mut producer = Producer::default();
+        producer.enumerate_errors.insert(2, MEDIA_BUSY);
+        let capture = capture_table(&mut producer);
+        let mut consumer = Consumer::default();
+        let mut api = table(&mut consumer);
+        api.enumerate_resources = consumer_enumerate;
+        // SAFETY: fixture tables and their contexts outlive this connection.
+        let mut connection =
+            unsafe { ResourceConnection::new(&capture, 1, &api, 3, FRAME_ACCESS_GPU).unwrap() };
+        assert_eq!(
+            connection.forward(0),
+            Err(ConnectionError::Native(MEDIA_BUSY))
+        );
+        assert_eq!(
+            (consumer.producer_generation, consumer.producer_offer),
+            (9, 5)
+        );
+        assert_eq!(consumer.submitted, 0);
+        producer.generation = 10;
+        producer.offer_id = 6;
+        std::hint::black_box(&producer);
+        assert_eq!(connection.forward(0), Ok(STATUS_OK));
+        assert_eq!(
+            (consumer.producer_generation, consumer.producer_offer),
+            (10, 6)
+        );
+        assert_eq!(consumer.configured, 2);
+        assert_eq!(consumer.submitted, 1);
+        drop(connection);
+        assert_eq!(consumer.cancelled, 1);
     }
     #[test]
     fn malformed_known_metadata_is_rejected_and_unknown_versions_remain_opaque() {
