@@ -563,11 +563,40 @@ pub(crate) fn start_sunshine_actor() {
 
 pub(crate) fn stop_sunshine_actor() {
     #[cfg(windows)]
-    if let Ok(mut slot) = sunshine_actor_slot().lock()
-        && let Some(actor) = slot.take()
     {
-        let _ = actor.commands.try_send(SunshineCommand::Shutdown);
+        let mut slot = sunshine_actor_slot()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(actor) = slot.take() {
+            // The final unload barrier may wait, but must not lose Shutdown when
+            // the command queue is full and then join a still-running actor.
+            let _ = actor.commands.send(SunshineCommand::Shutdown);
+            let _ = actor.worker.join();
+        }
+    }
+}
+
+/// Begin retirement without waiting for the actor's bounded I/O to complete.
+pub(crate) fn poll_sunshine_actor_shutdown() -> bool {
+    #[cfg(windows)]
+    {
+        let mut slot = sunshine_actor_slot()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(actor) = slot.as_ref() else {
+            return true;
+        };
+        if !actor.worker.is_finished() {
+            let _ = actor.commands.try_send(SunshineCommand::Shutdown);
+            return false;
+        }
+        let actor = slot.take().expect("actor exists");
         let _ = actor.worker.join();
+        true
+    }
+    #[cfg(not(windows))]
+    {
+        true
     }
 }
 

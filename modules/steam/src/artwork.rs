@@ -199,6 +199,9 @@ impl LocalArtworkWorker {
     }
 
     fn start_if_needed(&mut self) -> Result<(), &'static str> {
+        if self.stopped.load(Ordering::Acquire) {
+            return Err("artwork_unavailable");
+        }
         if self.requests.is_some() {
             return Ok(());
         }
@@ -313,6 +316,13 @@ impl LocalArtworkWorker {
         self.completions = Some(completion_receiver);
         self.thread = Some(worker_thread);
         Ok(())
+    }
+
+    pub fn poll_shutdown(&mut self) -> bool {
+        self.stopped.store(true, Ordering::Release);
+        self.completions.take();
+        self.requests.take();
+        retire_finished_worker(&mut self.thread)
     }
 }
 
@@ -793,6 +803,9 @@ impl RemoteArtworkWorker {
     }
 
     fn start_if_needed(&mut self) -> Result<(), &'static str> {
+        if self.stopped.load(Ordering::Acquire) {
+            return Err("artwork_unavailable");
+        }
         if self.requests.is_some() {
             return Ok(());
         }
@@ -804,6 +817,9 @@ impl RemoteArtworkWorker {
         &mut self,
         fetcher: impl Fn(u32) -> Result<Vec<u8>, &'static str> + Send + 'static,
     ) -> Result<(), &'static str> {
+        if self.stopped.load(Ordering::Acquire) {
+            return Err("artwork_unavailable");
+        }
         if self.requests.is_some() {
             return Ok(());
         }
@@ -861,6 +877,23 @@ impl RemoteArtworkWorker {
         self.thread = Some(worker_thread);
         Ok(())
     }
+
+    pub fn poll_shutdown(&mut self) -> bool {
+        self.stopped.store(true, Ordering::Release);
+        self.completions.take();
+        self.requests.take();
+        retire_finished_worker(&mut self.thread)
+    }
+}
+
+fn retire_finished_worker(worker: &mut Option<JoinHandle<()>>) -> bool {
+    if worker.as_ref().is_some_and(|thread| !thread.is_finished()) {
+        return false;
+    }
+    if let Some(thread) = worker.take() {
+        let _ = thread.join();
+    }
+    true
 }
 
 impl Drop for RemoteArtworkWorker {
@@ -1795,6 +1828,34 @@ fn revision(path: &Path, size: u64, modified_nanos: u128) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn artwork_shutdown_waits_without_blocking_and_cannot_restart_workers() {
+        let (release_local, local_wait) = mpsc::channel();
+        let (release_remote, remote_wait) = mpsc::channel();
+        let mut local = LocalArtworkWorker::default();
+        local.thread = Some(thread::spawn(move || {
+            let _ = local_wait.recv();
+        }));
+        let mut remote = RemoteArtworkWorker::default();
+        remote.thread = Some(thread::spawn(move || {
+            let _ = remote_wait.recv();
+        }));
+        assert!(!local.poll_shutdown());
+        assert!(!remote.poll_shutdown());
+        assert_eq!(local.start_if_needed(), Err("artwork_unavailable"));
+        assert_eq!(
+            remote.start_with_fetcher(|_| Ok(Vec::new())),
+            Err("artwork_unavailable")
+        );
+        release_local.send(()).unwrap();
+        release_remote.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !local.poll_shutdown() || !remote.poll_shutdown() {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+    }
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);

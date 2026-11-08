@@ -148,7 +148,7 @@ impl Action {
 #[derive(Default)]
 struct SnapshotWorker {
     receiver: Option<Receiver<Result<Snapshot, String>>>,
-    _thread: Option<JoinHandle<()>>,
+    thread: Option<JoinHandle<()>>,
     settings_epoch: u64,
     processes: Vec<discovery::ProcessImage>,
 }
@@ -215,13 +215,20 @@ impl SnapshotWorker {
         });
         Self {
             receiver: Some(receiver),
-            _thread: Some(worker),
+            thread: Some(worker),
             settings_epoch,
             processes,
         }
     }
 
     fn take_result(&mut self) -> Option<Result<Snapshot, String>> {
+        if self
+            .thread
+            .as_ref()
+            .is_some_and(|thread| !thread.is_finished())
+        {
+            return None;
+        }
         let result = match self.receiver.as_ref()?.try_recv() {
             Ok(result) => result,
             Err(mpsc::TryRecvError::Empty) => return None,
@@ -230,7 +237,9 @@ impl SnapshotWorker {
             }
         };
         self.receiver = None;
-        self._thread = None;
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
         Some(result)
     }
 
@@ -245,7 +254,16 @@ impl SnapshotWorker {
     }
 }
 
+impl Drop for SnapshotWorker {
+    fn drop(&mut self) {
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 struct PlayniteModule {
+    quiescing: bool,
     runtime: RuntimeClient,
     library_principal: String,
     configuration: ProductConfiguration,
@@ -359,6 +377,7 @@ impl ManagedModule for PlayniteModule {
         }
         connector::start_sunshine_actor();
         Ok(Self {
+            quiescing: false,
             runtime,
             library_principal,
             configuration: ProductConfiguration::new(),
@@ -396,6 +415,9 @@ impl ManagedModule for PlayniteModule {
     }
 
     fn tick(&mut self) -> ModuleResult<()> {
+        if self.quiescing {
+            return Ok(());
+        }
         self.binary_artwork.reap();
         self.poll_binary_releases();
         self.configuration
@@ -445,6 +467,15 @@ impl ManagedModule for PlayniteModule {
             } => self.handle_request(id, &caller, payload),
             response => Err(format!("Playnite polling failed: {response:?}")),
         }
+    }
+
+    fn quiesce(&mut self) -> ModuleResult<bool> {
+        self.quiescing = true;
+        let actor_retired = connector::poll_sunshine_actor_shutdown();
+        let launches_retired = self.launches.quiesce();
+        let fullscreen_retired = self.fullscreen_launches.quiesce();
+        let _ = self.snapshot_worker.take_result();
+        Ok(actor_retired && launches_retired && fullscreen_retired && !self.snapshot_worker.busy())
     }
 }
 

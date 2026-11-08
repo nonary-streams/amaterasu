@@ -9,6 +9,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 amaterasu-module-sdk = { workspace = true, features = ["network-http"] }
+getrandom.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }

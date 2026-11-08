@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::configuration::release_terminal_child_result;
 
@@ -21,6 +21,7 @@ const MAX_RETRIES: u8 = 8;
 const MAX_CONFLICT_RESTARTS: u8 = 3;
 const INVENTORY_PAGE_SIZE: usize = 32;
 const MAX_INVENTORY_ENTRIES: usize = 100_000;
+const BROKER_RESULT_RETENTION: Duration = Duration::from_secs(300);
 static SYNC_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -59,6 +60,7 @@ struct Transaction {
     conflicts: u8,
     operation_sequence: u64,
     operation_id: String,
+    first_attempt: Option<Instant>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -127,6 +129,7 @@ impl Transaction {
             conflicts: 0,
             operation_sequence: 0,
             operation_id: String::new(),
+            first_attempt: None,
         };
         let operation_id = transaction.next_operation_id();
         transaction.operation_id = operation_id;
@@ -204,6 +207,7 @@ impl Transaction {
         self.operation_sequence = 0;
         let operation_id = self.next_operation_id();
         self.operation_id = operation_id;
+        self.first_attempt = None;
     }
 
     fn consume(&mut self, response: &Value) -> Result<bool, String> {
@@ -303,6 +307,7 @@ impl Transaction {
         self.retries = 0;
         let operation_id = self.next_operation_id();
         self.operation_id = operation_id;
+        self.first_attempt = None;
         Ok(false)
     }
 
@@ -394,6 +399,7 @@ impl Transaction {
         self.call = Call::Submit;
         let operation_id = self.next_operation_id();
         self.operation_id = operation_id;
+        self.first_attempt = None;
         Ok(false)
     }
 
@@ -539,6 +545,90 @@ impl CatalogSync {
         self.transaction.is_some() || self.cancel_request.is_some()
     }
 
+    /// Wait for every accepted child to reach a terminal result and release it
+    /// before allowing the owning module to unload.
+    pub fn poll_shutdown(&mut self, runtime: &RuntimeClient) -> bool {
+        self.poll_shutdown_with(Instant::now(), &mut |command| runtime.send(command))
+    }
+
+    fn poll_shutdown_with(
+        &mut self,
+        now: Instant,
+        send: &mut impl FnMut(Command) -> ModuleResult<Response>,
+    ) -> bool {
+        if self.cancel_request.is_some() {
+            self.settle_cancel_with(send);
+            return self.cancel_request.is_none() && self.transaction.is_none();
+        }
+
+        let Some(mut transaction) = self.transaction.take() else {
+            return true;
+        };
+        match transaction.call {
+            Call::Submit | Call::Delay { .. } => {
+                let Some(first_attempt) = transaction.first_attempt else {
+                    return true;
+                };
+                if now.saturating_duration_since(first_attempt) >= BROKER_RESULT_RETENTION {
+                    self.transaction = Some(transaction);
+                    return false;
+                }
+                match send(Command::LookupRequest {
+                    service: SERVICE.into(),
+                    payload: transaction.payload(),
+                    operation_id: transaction.operation_id.clone(),
+                    parent: None,
+                }) {
+                    Ok(Response::Accepted { id }) => {
+                        transaction.call = Call::Waiting { request: id };
+                        self.transaction = Some(transaction);
+                        false
+                    }
+                    Ok(Response::Error { code, .. })
+                        if code == "not_found"
+                            && now.saturating_duration_since(first_attempt)
+                                < BROKER_RESULT_RETENTION =>
+                    {
+                        true
+                    }
+                    _ => {
+                        self.transaction = Some(transaction);
+                        false
+                    }
+                }
+            }
+            Call::Waiting { request } => {
+                let response = match send(Command::TakeResult { request }) {
+                    Ok(Response::Pending) | Err(_) => {
+                        transaction.call = Call::Waiting { request };
+                        self.transaction = Some(transaction);
+                        return false;
+                    }
+                    Ok(response) => response,
+                };
+                if !matches!(response, Response::Result { .. }) {
+                    // Cancellation, expiry and missing results do not prove a
+                    // delivered catalog mutation has stopped.
+                    transaction.call = Call::Waiting { request };
+                    self.transaction = Some(transaction);
+                    return false;
+                }
+                if matches!(
+                    release_terminal_child_result(request, response, |request| {
+                        send(Command::ReleaseResult { request })
+                    }),
+                    Some(Response::Result { .. })
+                ) {
+                    true
+                } else {
+                    transaction.call = Call::Waiting { request };
+                    self.transaction = Some(transaction);
+                    false
+                }
+            }
+        }
+    }
+
     fn settle_cancel_with(&mut self, mut send: impl FnMut(Command) -> ModuleResult<Response>) {
         let Some(request) = self.cancel_request.take() else {
             return;
@@ -593,6 +683,7 @@ impl CatalogSync {
     ) -> ModuleResult<()> {
         let payload = transaction.payload();
         let operation_id = transaction.operation_id.clone();
+        transaction.first_attempt.get_or_insert_with(Instant::now);
         match runtime.send(Command::Request {
             service: SERVICE.into(),
             payload,
@@ -1764,6 +1855,56 @@ mod tests {
         transaction.call = Call::Delay { ticks: 1 };
         assert_eq!(transaction.payload(), payload_before_retry);
         assert_eq!(transaction.operation_id, operation_before_retry);
+    }
+
+    #[test]
+    fn shutdown_waits_for_accepted_catalog_child_and_releases_exact_result() {
+        let transaction = Transaction::new(1, ProductSettings::default(), Vec::new(), Vec::new());
+        let mut transaction = transaction;
+        transaction.call = Call::Waiting { request: 71 };
+        let mut catalog = CatalogSync {
+            transaction: Some(transaction),
+            ..Default::default()
+        };
+        let now = Instant::now();
+        assert!(!catalog.poll_shutdown_with(now, &mut |command| {
+            assert!(matches!(command, Command::TakeResult { request: 71 }));
+            Ok(Response::Pending)
+        }));
+        assert!(
+            catalog.poll_shutdown_with(now, &mut |command| match command {
+                Command::TakeResult { request: 71 } => Ok(Response::Result {
+                    payload: json!({"ok":true}),
+                }),
+                Command::ReleaseResult { request: 71 } => Ok(Response::Ok),
+                other => panic!("unexpected shutdown command: {other:?}"),
+            })
+        );
+        assert!(!catalog.busy());
+    }
+
+    #[test]
+    fn shutdown_looks_up_catalog_admission_by_its_original_operation_id() {
+        let now = Instant::now();
+        let mut transaction =
+            Transaction::new(1, ProductSettings::default(), Vec::new(), Vec::new());
+        transaction.first_attempt = Some(now);
+        transaction.call = Call::Delay { ticks: 2 };
+        let operation_id = transaction.operation_id.clone();
+        let mut catalog = CatalogSync {
+            transaction: Some(transaction),
+            ..Default::default()
+        };
+        assert!(!catalog.poll_shutdown_with(now, &mut |command| {
+            assert!(matches!(command, Command::LookupRequest {
+                service, operation_id: ref found, ..
+            } if service == SERVICE && found == &operation_id));
+            Ok(Response::Accepted { id: 72 })
+        }));
+        assert!(matches!(
+            catalog.transaction.as_ref().unwrap().call,
+            Call::Waiting { request: 72 }
+        ));
     }
 
     #[test]

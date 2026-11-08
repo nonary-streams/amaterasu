@@ -13,6 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::mpsc::{self, Receiver, Sender};
 #[cfg(not(test))]
 use std::thread;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 const START_TIMEOUT: Duration = Duration::from_secs(30);
@@ -71,6 +72,8 @@ struct Session {
     return_allowed: bool,
     focus_policy: FocusPolicy,
     watch_command_sender: Sender<FullscreenWatchCommand>,
+    watch_worker: Option<JoinHandle<()>>,
+    watch_stopping: bool,
     #[cfg(test)]
     watch_event_sender: Sender<FullscreenWatchEvent>,
     watch_event_receiver: Receiver<FullscreenWatchEvent>,
@@ -99,12 +102,46 @@ pub struct FullscreenSessions {
     by_ticket: BTreeMap<String, Session>,
 }
 
+impl Drop for Session {
+    fn drop(&mut self) {
+        let _ = self
+            .watch_command_sender
+            .send(FullscreenWatchCommand::Cancel);
+        if let Some(worker) = self.watch_worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
 struct StartOptions {
     focus_policy: FocusPolicy,
     now: Instant,
 }
 
 impl FullscreenSessions {
+    /// Stop admitting worker activity and poll retirement without blocking.
+    pub(crate) fn quiesce(&mut self) -> bool {
+        let mut retired = true;
+        for session in self.by_ticket.values_mut() {
+            if !session.watch_stopping {
+                let _ = session
+                    .watch_command_sender
+                    .send(FullscreenWatchCommand::Cancel);
+                session.watch_stopping = true;
+            }
+            if session
+                .watch_worker
+                .as_ref()
+                .is_some_and(|worker| !worker.is_finished())
+            {
+                retired = false;
+            } else if let Some(worker) = session.watch_worker.take() {
+                let _ = worker.join();
+            }
+        }
+        retired
+    }
+
     pub fn active_count(&self) -> usize {
         self.by_ticket
             .values()
@@ -503,15 +540,17 @@ impl FullscreenSessions {
         let session_watch_event_sender = watch_event_sender.clone();
         let initial_watch_processes = watch_processes.clone();
         #[cfg(not(test))]
-        thread::spawn(move || {
+        let watch_worker = Some(thread::spawn(move || {
             connector::watch_fullscreen(
                 &initial_watch_processes,
                 watch_commands,
                 watch_event_sender,
             );
-        });
+        }));
         #[cfg(test)]
         drop((watch_commands, initial_watch_processes, watch_event_sender));
+        #[cfg(test)]
+        let watch_worker = None;
         let session = Session {
             operation_id: operation_id.into(),
             ticket: ticket.clone(),
@@ -528,6 +567,8 @@ impl FullscreenSessions {
             return_allowed: true,
             focus_policy,
             watch_command_sender,
+            watch_worker,
+            watch_stopping: false,
             #[cfg(test)]
             watch_event_sender: session_watch_event_sender,
             watch_event_receiver,
@@ -639,6 +680,10 @@ impl FullscreenSessions {
     fn prune(&mut self, now: Instant) {
         self.by_ticket.retain(|_, session| {
             !session.state.terminal()
+                || session
+                    .watch_worker
+                    .as_ref()
+                    .is_some_and(|worker| !worker.is_finished())
                 || now.saturating_duration_since(session.state_changed_at) < SESSION_RETENTION
         });
     }
@@ -1189,6 +1234,42 @@ mod tests {
             |_| panic!("exit grace must elapse before return"),
         );
         assert_eq!(sessions.status(ticket)["state"], "playing");
+    }
+
+    #[test]
+    fn quiescence_waits_for_fullscreen_watcher_retirement() {
+        let mut sessions = FullscreenSessions::default();
+        let response = sessions.start_with(
+            "operation-watch",
+            Some(installation()),
+            &[],
+            FocusPolicy::disabled(),
+            Instant::now(),
+            |_| Ok(launch_process(77)),
+        );
+        let ticket = response["ticket"].as_str().unwrap();
+        let session = sessions.by_ticket.get_mut(ticket).unwrap();
+        let (commands, receiver) = mpsc::channel();
+        let (cancelled, observed) = mpsc::channel();
+        let (release, wait) = mpsc::channel();
+        session.watch_command_sender = commands;
+        session.watch_worker = Some(std::thread::spawn(move || {
+            assert!(matches!(
+                receiver.recv(),
+                Ok(FullscreenWatchCommand::Cancel)
+            ));
+            cancelled.send(()).unwrap();
+            wait.recv().unwrap();
+        }));
+        assert!(!sessions.quiesce());
+        observed.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(!sessions.quiesce());
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !sessions.quiesce() {
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
     }
 
     #[test]

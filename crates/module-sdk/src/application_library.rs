@@ -167,6 +167,7 @@ pub const CATALOG_SERVICE: &str = "amaterasu.catalog/1";
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum CatalogProfileRequest {
+    /// Read existing profiles without mutating or migrating stored catalog data.
     ProfileList {
         cursor: Option<LibraryCursor>,
         limit: Option<usize>,

@@ -151,7 +151,7 @@ impl SettingsPatch {
 #[derive(Default)]
 struct SnapshotWorker {
     receiver: Option<Receiver<Result<Snapshot, String>>>,
-    _thread: Option<JoinHandle<()>>,
+    thread: Option<JoinHandle<()>>,
     settings: Option<ProductSettings>,
     manual: bool,
     settings_epoch: u64,
@@ -165,7 +165,7 @@ impl SnapshotWorker {
         });
         Self {
             receiver: Some(receiver),
-            _thread: Some(worker),
+            thread: Some(worker),
             settings: Some(settings),
             manual,
             settings_epoch,
@@ -173,6 +173,13 @@ impl SnapshotWorker {
     }
 
     fn take_result(&mut self) -> Option<(ProductSettings, bool, u64, Result<Snapshot, String>)> {
+        if self
+            .thread
+            .as_ref()
+            .is_some_and(|thread| !thread.is_finished())
+        {
+            return None;
+        }
         let result = match self.receiver.as_ref()?.try_recv() {
             Ok(result) => result,
             Err(mpsc::TryRecvError::Empty) => return None,
@@ -181,7 +188,15 @@ impl SnapshotWorker {
             }
         };
         self.receiver = None;
-        self._thread = None;
+        let result = if self
+            .thread
+            .take()
+            .is_some_and(|thread| thread.join().is_err())
+        {
+            Err("Lutris scanner thread panicked".into())
+        } else {
+            result
+        };
         let settings = self
             .settings
             .take()
@@ -191,6 +206,31 @@ impl SnapshotWorker {
 
     fn busy(&self) -> bool {
         self.receiver.is_some()
+    }
+
+    fn quiesce(&mut self) -> bool {
+        if self
+            .thread
+            .as_ref()
+            .is_some_and(|thread| !thread.is_finished())
+        {
+            return false;
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        self.receiver = None;
+        self.settings = None;
+        true
+    }
+}
+
+impl Drop for SnapshotWorker {
+    fn drop(&mut self) {
+        // Native code cannot be unloaded until the worker has actually exited.
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 
@@ -240,6 +280,7 @@ struct LutrisModule {
     artwork: artwork::ArtworkStore,
     binary_artwork: amaterasu_module_sdk::artwork_transfer::Source,
     snapshot_worker: SnapshotWorker,
+    shutdown_announced: bool,
     steam_read: Option<PendingSteamRead>,
     settings_epoch: u64,
     observed_settings_epoch: u64,
@@ -254,6 +295,8 @@ struct LutrisModule {
     last_reconciled_at: Option<Instant>,
     pending_source: Option<(SourceSignature, u64)>,
     pending_artwork: Option<(Snapshot, u64)>,
+    startup_id: String,
+    steam_read_sequence: u64,
 }
 
 impl ManagedModule for LutrisModule {
@@ -264,6 +307,12 @@ impl ManagedModule for LutrisModule {
         let settings: StartupSettings =
             serde_json::from_value(payload).map_err(|_| "invalid Lutris settings")?;
         settings.validate()?;
+        let mut startup_nonce = [0u8; 16];
+        getrandom::fill(&mut startup_nonce).map_err(|_| "Lutris startup randomness unavailable")?;
+        let startup_id: String = startup_nonce
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
         runtime.require_success(Command::Register {
             service: SERVICE.into(),
         })?;
@@ -275,11 +324,12 @@ impl ManagedModule for LutrisModule {
         Ok(Self {
             runtime,
             library_principal: settings.library_principal,
-            configuration: configuration::ProductConfiguration::new(),
+            configuration: configuration::ProductConfiguration::new(&startup_id),
             catalog: catalog_sync::CatalogSync::default(),
             artwork: artwork::ArtworkStore::default(),
             binary_artwork,
             snapshot_worker: SnapshotWorker::default(),
+            shutdown_announced: false,
             steam_read: None,
             settings_epoch: 0,
             observed_settings_epoch: u64::MAX,
@@ -294,10 +344,15 @@ impl ManagedModule for LutrisModule {
             last_reconciled_at: None,
             pending_source: None,
             pending_artwork: None,
+            startup_id,
+            steam_read_sequence: 0,
         })
     }
 
     fn tick(&mut self) -> ModuleResult<()> {
+        if self.shutdown_announced {
+            return Ok(());
+        }
         self.binary_artwork.reap();
         self.configuration
             .advance(&self.runtime, &mut self.settings_epoch)?;
@@ -317,6 +372,28 @@ impl ManagedModule for LutrisModule {
             } => self.handle_request(id, &caller, payload),
             response => Err(format!("Lutris polling failed: {response:?}")),
         }
+    }
+
+    fn prepare_shutdown(&mut self, _remaining_ms: u64) -> ModuleResult<()> {
+        self.shutdown_announced = true;
+        Ok(())
+    }
+
+    fn quiesce(&mut self) -> ModuleResult<bool> {
+        self.shutdown_announced = true;
+        let snapshot_ready = self.snapshot_worker.quiesce();
+        let configuration_ready = self
+            .configuration
+            .poll_shutdown(&self.runtime, &mut self.settings_epoch)?;
+        let catalog_ready = self.catalog.poll_shutdown(&self.runtime);
+        let steam_ready = self
+            .steam_read
+            .as_mut()
+            .is_none_or(|pending| pending.reader.poll_shutdown(&self.runtime));
+        if steam_ready {
+            self.steam_read = None;
+        }
+        Ok(snapshot_ready && configuration_ready && catalog_ready && steam_ready)
     }
 }
 
@@ -379,9 +456,15 @@ impl LutrisModule {
                     settings_epoch,
                 };
                 if scan.settings.include_steam {
+                    let Some(sequence) = self.steam_read_sequence.checked_add(1) else {
+                        self.last_error = Some("Steam catalog read sequence exhausted".into());
+                        self.schedule_next_auto_sync(false);
+                        return;
+                    };
+                    self.steam_read_sequence = sequence;
                     self.steam_read = Some(PendingSteamRead {
                         scan,
-                        reader: SteamCatalogRead::new(),
+                        reader: SteamCatalogRead::with_identity(&self.startup_id, sequence),
                     });
                 } else {
                     self.start_catalog_scan(scan, &Default::default());
@@ -496,7 +579,8 @@ impl LutrisModule {
     }
 
     fn start_scan_if_due(&mut self) {
-        if !self.configuration.ready()
+        if self.shutdown_announced
+            || !self.configuration.ready()
             || self.snapshot_worker.busy()
             || self.steam_read.is_some()
             || self.catalog.busy()
@@ -1051,11 +1135,56 @@ mod tests {
         let _ = sender.send(Ok(snapshot));
         SnapshotWorker {
             receiver: Some(receiver),
-            _thread: None,
+            thread: None,
             settings: Some(settings),
             manual: false,
             settings_epoch: 3,
         }
+    }
+
+    #[test]
+    fn snapshot_result_does_not_retire_a_still_running_worker() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let (release, wait) = mpsc::channel();
+        let (sent, sent_wait) = mpsc::channel();
+        let thread = thread::spawn(move || {
+            sender.send(Ok(snapshot())).unwrap();
+            sent.send(()).unwrap();
+            wait.recv().unwrap();
+        });
+        let mut worker = SnapshotWorker {
+            receiver: Some(receiver),
+            thread: Some(thread),
+            settings: Some(ProductSettings::default()),
+            manual: false,
+            settings_epoch: 1,
+        };
+        sent_wait.recv_timeout(Duration::from_secs(2)).unwrap();
+        let result_before_exit = worker.take_result().is_some();
+        let quiesced_before_exit = worker.quiesce();
+        release.send(()).unwrap();
+        // Drop joins even if a caller skips cooperative quiescence.
+        drop(worker);
+        assert!(!result_before_exit);
+        assert!(!quiesced_before_exit);
+    }
+
+    #[test]
+    fn dropping_snapshot_worker_waits_for_worker_exit() {
+        let (release, wait) = mpsc::channel();
+        let (finished, completion) = mpsc::channel();
+        let thread = thread::spawn(move || wait.recv().unwrap());
+        let mut worker = SnapshotWorker::default();
+        worker.thread = Some(thread);
+        let dropper = thread::spawn(move || {
+            drop(worker);
+            finished.send(()).unwrap();
+        });
+        let early = completion.recv_timeout(Duration::from_millis(50)).is_ok();
+        release.send(()).unwrap();
+        completion.recv_timeout(Duration::from_secs(2)).unwrap();
+        dropper.join().unwrap();
+        assert!(!early);
     }
 
     #[test]
@@ -1241,7 +1370,7 @@ mod tests {
             .unwrap();
         let mut worker = SnapshotWorker {
             receiver: Some(receiver),
-            _thread: None,
+            thread: None,
             settings: Some(settings_at_start.clone()),
             manual: false,
             settings_epoch: 3,

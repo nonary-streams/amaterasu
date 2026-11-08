@@ -410,13 +410,72 @@ fn disconnected_snapshot_worker_does_not_stick_in_busy_state() {
     drop(sender);
     let mut worker = SnapshotWorker {
         receiver: Some(receiver),
-        _thread: None,
+        thread: None,
         settings_epoch: 0,
         processes: Vec::new(),
     };
 
     assert!(worker.take_result().unwrap().is_err());
     assert!(!worker.busy());
+}
+
+#[test]
+fn snapshot_result_does_not_retire_worker_until_thread_exits() {
+    let (sender, receiver) = mpsc::channel();
+    let (release, wait) = mpsc::channel();
+    let (sent, received) = mpsc::channel();
+    let thread = std::thread::spawn(move || {
+        sender.send(Err("fixture".into())).unwrap();
+        sent.send(()).unwrap();
+        wait.recv().unwrap();
+    });
+    let mut worker = SnapshotWorker {
+        receiver: Some(receiver),
+        thread: Some(thread),
+        settings_epoch: 0,
+        processes: Vec::new(),
+    };
+    received.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(worker.take_result().is_none());
+    assert!(worker.busy());
+    release.send(()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while worker
+        .thread
+        .as_ref()
+        .is_some_and(|thread| !thread.is_finished())
+    {
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    assert!(worker.take_result().unwrap().is_err());
+    assert!(!worker.busy());
+    assert!(worker.thread.is_none());
+}
+
+#[test]
+fn snapshot_drop_joins_live_worker() {
+    let (release, wait) = mpsc::channel();
+    let (started, ready) = mpsc::channel();
+    let (done, completed) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        started.send(()).unwrap();
+        wait.recv().unwrap();
+    });
+    ready.recv_timeout(Duration::from_secs(2)).unwrap();
+    let dropper = std::thread::spawn(move || {
+        drop(SnapshotWorker {
+            receiver: None,
+            thread: Some(worker),
+            settings_epoch: 0,
+            processes: Vec::new(),
+        });
+        done.send(()).unwrap();
+    });
+    assert!(completed.recv_timeout(Duration::from_millis(30)).is_err());
+    release.send(()).unwrap();
+    completed.recv_timeout(Duration::from_secs(2)).unwrap();
+    dropper.join().unwrap();
 }
 
 #[test]
@@ -520,7 +579,7 @@ fn manual_mode_keeps_imported_launches_on_focus_change_but_revokes_on_disable() 
     let (_sender, receiver) = mpsc::channel();
     let mut in_flight = SnapshotWorker {
         receiver: Some(receiver),
-        _thread: None,
+        thread: None,
         settings_epoch: 7,
         processes: vec![playnite.clone()],
     };

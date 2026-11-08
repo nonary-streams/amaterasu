@@ -1,6 +1,5 @@
 //! Reconciles successful Steam discovery snapshots into the fixed Steam catalog.
 use crate::Provider;
-use crate::configuration::release_terminal_child_result;
 use crate::discovery::Game;
 use crate::settings::ProductSettings;
 use amaterasu_module_sdk::{Command, ModuleResult, Response, RuntimeClient};
@@ -27,8 +26,13 @@ enum Stage {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CallState {
     Submit,
+    Recovering { sequence: u64, sent_at: Instant },
     Waiting { request: u64 },
+    Completed { request: u64 },
+    Unresolved,
 }
+
+const BROKER_RETENTION: Duration = Duration::from_secs(300);
 
 struct Transaction {
     sync_id: String,
@@ -45,6 +49,7 @@ struct Transaction {
     conflict_restarts: u8,
     stage: Stage,
     call: CallState,
+    completed_payload: Option<Value>,
     retry_attempt: u32,
     delay_ticks: u32,
     cancel_after_call: bool,
@@ -108,6 +113,7 @@ impl Transaction {
         self.batch_index = 0;
         self.stage = Stage::Begin;
         self.call = CallState::Submit;
+        self.completed_payload = None;
         self.retry_attempt = 0;
         self.delay_ticks = 0;
     }
@@ -380,6 +386,68 @@ impl CatalogSync {
         })
     }
 
+    /// Stop issuing snapshot stages and wait for any submitted mutation to
+    /// finish. Broker cancellation is not proof that a delivered write stopped.
+    pub(super) fn poll_shutdown(&mut self, runtime: &RuntimeClient) -> bool {
+        self.poll_shutdown_with(Instant::now(), &mut |command| runtime.send(command))
+    }
+
+    fn poll_shutdown_with(
+        &mut self,
+        now: Instant,
+        send: &mut impl FnMut(Command) -> ModuleResult<Response>,
+    ) -> bool {
+        self.poll_shutdown_with_clock(now, send, Instant::now)
+    }
+
+    fn poll_shutdown_with_clock(
+        &mut self,
+        now: Instant,
+        send: &mut impl FnMut(Command) -> ModuleResult<Response>,
+        clock: impl FnOnce() -> Instant,
+    ) -> bool {
+        let Some(transaction) = self.transaction.as_mut() else {
+            return true;
+        };
+        match transaction.call {
+            CallState::Submit => self.transaction = None,
+            CallState::Recovering { sequence, sent_at } => {
+                if !within_broker_retention(sent_at, now) {
+                    return false;
+                }
+                match send(lookup_command(transaction, sequence)) {
+                    Ok(Response::Accepted { id }) => {
+                        transaction.call = CallState::Waiting { request: id }
+                    }
+                    Ok(Response::Error { code, .. })
+                        if code == "not_found" && within_broker_retention(sent_at, clock()) =>
+                    {
+                        self.transaction = None
+                    }
+                    _ => {}
+                }
+            }
+            CallState::Waiting { request } => {
+                if matches!(
+                    send(Command::TakeResult { request }),
+                    Ok(Response::Result { .. })
+                ) {
+                    transaction.call = CallState::Completed { request };
+                    if release_confirmed(send(Command::ReleaseResult { request })) {
+                        self.transaction = None;
+                    }
+                }
+            }
+            CallState::Completed { request } => {
+                if release_confirmed(send(Command::ReleaseResult { request })) {
+                    self.transaction = None;
+                }
+            }
+            CallState::Unresolved => {}
+        }
+        self.transaction.is_none()
+    }
+
     pub(super) fn request_force_sync(
         &mut self,
         provider: &mut Provider,
@@ -405,7 +473,13 @@ impl CatalogSync {
         });
         let finish_may_have_committed = self.transaction.as_ref().is_some_and(|transaction| {
             transaction.stage == Stage::Finish
-                && matches!(transaction.call, CallState::Waiting { .. })
+                && matches!(
+                    transaction.call,
+                    CallState::Waiting { .. }
+                        | CallState::Recovering { .. }
+                        | CallState::Completed { .. }
+                        | CallState::Unresolved
+                )
         });
         if finish_may_have_committed {
             self.last_successful_fingerprint = None;
@@ -567,7 +641,13 @@ impl CatalogSync {
                 {
                     transaction.cancel_after_call = true;
                     transaction.stage == Stage::Finish
-                        && matches!(transaction.call, CallState::Waiting { .. })
+                        && matches!(
+                            transaction.call,
+                            CallState::Waiting { .. }
+                                | CallState::Recovering { .. }
+                                | CallState::Completed { .. }
+                                | CallState::Unresolved
+                        )
                 } else {
                     false
                 }
@@ -625,6 +705,7 @@ impl CatalogSync {
             conflict_restarts: 0,
             stage: Stage::Begin,
             call: CallState::Submit,
+            completed_payload: None,
             retry_attempt: 0,
             delay_ticks: 0,
             cancel_after_call: false,
@@ -640,14 +721,7 @@ impl CatalogSync {
             return Ok(());
         };
         if transaction.cancel_after_call {
-            match transaction.call {
-                CallState::Submit => self.transaction = None,
-                CallState::Waiting { request } => {
-                    if settle_canceled_request(runtime, request) {
-                        self.transaction = None;
-                    }
-                }
-            }
+            self.poll_shutdown_with(now, &mut |command| runtime.send(command));
             return Ok(());
         }
         if transaction.delay_ticks > 0 {
@@ -656,7 +730,10 @@ impl CatalogSync {
         }
         match transaction.call {
             CallState::Submit => {
-                self.operation_sequence = self.operation_sequence.saturating_add(1);
+                self.operation_sequence = self
+                    .operation_sequence
+                    .checked_add(1)
+                    .ok_or("catalog operation sequence exhausted")?;
                 let operation_id = format!(
                     "steam.catalog.{}.{}.{}",
                     transaction.sync_id,
@@ -682,36 +759,86 @@ impl CatalogSync {
                     }
                     Ok(response) => {
                         self.handle_retry(&format!("unexpected catalog submission: {response:?}"));
+                        if let Some(transaction) = &mut self.transaction {
+                            transaction.call = CallState::Recovering {
+                                sequence: self.operation_sequence,
+                                sent_at: now,
+                            };
+                        }
                     }
-                    Err(error) => self.handle_retry(&format!("catalog transport: {error}")),
+                    Err(error) => {
+                        self.handle_retry(&format!("catalog transport: {error}"));
+                        if let Some(transaction) = &mut self.transaction {
+                            transaction.call = CallState::Recovering {
+                                sequence: self.operation_sequence,
+                                sent_at: now,
+                            };
+                        }
+                    }
                 }
             }
+            CallState::Recovering { sequence, sent_at } => {
+                if !within_broker_retention(sent_at, now) {
+                    self.last_error = Some(
+                        "catalog admission could not be reconciled before broker retention expired"
+                            .into(),
+                    );
+                    return Ok(());
+                }
+                match runtime.send(lookup_command(transaction, sequence)) {
+                    Ok(Response::Accepted { id }) => {
+                        transaction.call = CallState::Waiting { request: id }
+                    }
+                    Ok(Response::Error { code, .. })
+                        if code == "not_found"
+                            && within_broker_retention(sent_at, Instant::now()) =>
+                    {
+                        transaction.call = CallState::Submit
+                    }
+                    _ => transaction.delay_ticks = 1,
+                }
+            }
+            CallState::Completed { request } => {
+                if release_confirmed(runtime.send(Command::ReleaseResult { request })) {
+                    let payload = transaction
+                        .completed_payload
+                        .take()
+                        .expect("terminal result retained");
+                    self.consume_payload(payload, now);
+                }
+            }
+            CallState::Unresolved => {}
             CallState::Waiting { request } => {
                 let response = match runtime.send(Command::TakeResult { request }) {
                     Ok(Response::Pending) => return Ok(()),
-                    Ok(Response::Error { code, .. }) if code == "not_found" => {
-                        transaction.call = CallState::Submit;
-                        self.handle_retry("catalog child result expired; replaying snapshot step");
+                    Ok(Response::Error { code, .. }) => {
+                        transaction.call = CallState::Unresolved;
+                        self.last_error =
+                            Some(format!("catalog child outcome unconfirmed: {code}"));
                         return Ok(());
                     }
                     Ok(response) => response,
                     Err(error) => {
                         self.handle_retry(&format!("catalog result transport: {error}"));
+                        if let Some(transaction) = &mut self.transaction {
+                            transaction.call = CallState::Waiting { request };
+                        }
                         return Ok(());
                     }
                 };
-                let Some(response) = release_terminal_child_result(request, response, |request| {
-                    runtime.send(Command::ReleaseResult { request })
-                }) else {
-                    transaction.delay_ticks = 1;
-                    return Ok(());
-                };
                 match response {
-                    Response::Result { payload } => self.consume_payload(payload, now),
-                    Response::Error { code, message } => {
-                        self.handle_runtime_failure(&code, &message, now)
+                    Response::Result { payload } => {
+                        transaction.completed_payload = Some(payload);
+                        transaction.call = CallState::Completed { request };
+                        if release_confirmed(runtime.send(Command::ReleaseResult { request })) {
+                            let payload = transaction
+                                .completed_payload
+                                .take()
+                                .expect("terminal result retained");
+                            self.consume_payload(payload, now);
+                        }
                     }
-                    other => self.handle_retry(&format!("unexpected catalog result: {other:?}")),
+                    _ => transaction.call = CallState::Unresolved,
                 }
             }
         }
@@ -785,15 +912,32 @@ impl CatalogSync {
     }
 }
 
-fn settle_canceled_request(runtime: &RuntimeClient, request: u64) -> bool {
-    // A failed or lost Cancel response can still have canceled the child. Try
-    // ReleaseResult independently; retain ownership until release is confirmed.
-    let _ = runtime.send(Command::Cancel { request });
-    match runtime.send(Command::ReleaseResult { request }) {
+fn lookup_command(transaction: &Transaction, sequence: u64) -> Command {
+    Command::LookupRequest {
+        service: CATALOG_SERVICE.into(),
+        payload: transaction.payload(),
+        operation_id: format!(
+            "steam.catalog.{}.{}.{}",
+            transaction.sync_id,
+            transaction.operation_suffix(),
+            sequence
+        ),
+        parent: None,
+    }
+}
+
+fn release_confirmed(result: ModuleResult<Response>) -> bool {
+    match result {
         Ok(Response::Ok) => true,
-        Ok(Response::Error { code, .. }) if code == "not_found" => true,
+        Ok(Response::Error { code, .. }) => code == "not_found",
         _ => false,
     }
+}
+
+fn within_broker_retention(sent_at: Instant, observed_at: Instant) -> bool {
+    observed_at
+        .checked_duration_since(sent_at)
+        .is_some_and(|age| age < BROKER_RETENTION)
 }
 
 fn source_fingerprint(provider: &Provider) -> SourceFingerprint {
@@ -1161,10 +1305,177 @@ mod tests {
             conflict_restarts: 0,
             stage: Stage::Finish,
             call: CallState::Submit,
+            completed_payload: None,
             retry_attempt: 0,
             delay_ticks: 0,
             cancel_after_call: false,
         }
+    }
+
+    #[test]
+    fn shutdown_waits_for_catalog_write_then_releases_observed_result() {
+        let mut sync = CatalogSync::new();
+        let mut transaction = finish_transaction(SourceFingerprint(1), 1, 1);
+        transaction.call = CallState::Waiting { request: 7 };
+        sync.transaction = Some(transaction);
+        assert!(!sync.poll_shutdown_with(Instant::now(), &mut |command| {
+            assert!(matches!(command, Command::TakeResult { request: 7 }));
+            Ok(Response::Pending)
+        }));
+        assert!(!sync.poll_shutdown_with(Instant::now(), &mut |command| {
+            match command {
+                Command::TakeResult { request: 7 } => Ok(Response::Result {
+                    payload: json!({"ok":true}),
+                }),
+                Command::ReleaseResult { request: 7 } => Err("lost release acknowledgement".into()),
+                other => panic!("unexpected command: {other:?}"),
+            }
+        }));
+        assert!(sync.poll_shutdown_with(Instant::now(), &mut |command| {
+            assert!(matches!(command, Command::ReleaseResult { request: 7 }));
+            Ok(Response::Error {
+                code: "not_found".into(),
+                message: "released".into(),
+            })
+        }));
+    }
+
+    #[test]
+    fn shutdown_recovers_lost_admission_without_resubmitting_write() {
+        let now = Instant::now();
+        let mut sync = CatalogSync::new();
+        let mut transaction = finish_transaction(SourceFingerprint(1), 1, 1);
+        transaction.call = CallState::Recovering {
+            sequence: 9,
+            sent_at: now,
+        };
+        sync.transaction = Some(transaction);
+        assert!(!sync.poll_shutdown_with(now, &mut |command| {
+            assert!(matches!(command, Command::LookupRequest { operation_id, .. } if operation_id == "steam.catalog.finish-test.finish.9"));
+            Ok(Response::Accepted { id: 7 })
+        }));
+        assert!(!sync.poll_shutdown_with(now, &mut |command| {
+            assert!(matches!(command, Command::TakeResult { request: 7 }));
+            Ok(Response::Error {
+                code: "deadline_exceeded".into(),
+                message: "expired".into(),
+            })
+        }));
+    }
+
+    #[test]
+    fn delayed_missing_lookup_cannot_clear_ambiguous_admission() {
+        let sent_at = Instant::now();
+        let before = sent_at + BROKER_RETENTION - Duration::from_millis(1);
+        let after = sent_at + BROKER_RETENTION;
+        let mut sync = CatalogSync::new();
+        let mut transaction = finish_transaction(SourceFingerprint(1), 1, 1);
+        transaction.call = CallState::Recovering {
+            sequence: 9,
+            sent_at,
+        };
+        sync.transaction = Some(transaction);
+        assert!(!sync.poll_shutdown_with_clock(
+            before,
+            &mut |command| {
+                assert!(matches!(command, Command::LookupRequest { .. }));
+                Ok(Response::error("not_found", "expired during lookup"))
+            },
+            || after
+        ));
+        assert!(matches!(
+            sync.transaction.as_ref().unwrap().call,
+            CallState::Recovering { sequence: 9, .. }
+        ));
+        assert!(!within_broker_retention(sent_at, after));
+        assert!(within_broker_retention(sent_at, before));
+    }
+
+    #[test]
+    fn normal_result_transport_and_release_failures_keep_exact_result() {
+        use amaterasu_module_sdk::abi::{
+            AbiHeader, BorrowedBytes, HostApi, ReplySink, STATUS_INTERNAL_ERROR, STATUS_OK,
+        };
+        use std::ffi::c_void;
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct Host {
+            commands: Vec<Command>,
+            takes: usize,
+            releases: usize,
+        }
+        unsafe extern "C" fn invoke(
+            context: *mut c_void,
+            input: BorrowedBytes,
+            reply: ReplySink,
+        ) -> i32 {
+            // SAFETY: the boxed mutex and input buffer remain live for the call.
+            let host = unsafe { &*context.cast::<Mutex<Host>>() };
+            let command: Command =
+                serde_json::from_slice(unsafe { input.read().unwrap() }).unwrap();
+            let mut host = host.lock().unwrap();
+            host.commands.push(command.clone());
+            let response = match command {
+                Command::TakeResult { request: 7 } => {
+                    host.takes += 1;
+                    if host.takes == 1 {
+                        return STATUS_INTERNAL_ERROR;
+                    }
+                    Response::Result {
+                        payload: json!({"ok":true,"revision":8,"generation":2,"complete":true,"cleanup_pending":false,"remove_stale":true}),
+                    }
+                }
+                Command::ReleaseResult { request: 7 } => {
+                    host.releases += 1;
+                    if host.releases == 1 {
+                        return STATUS_INTERNAL_ERROR;
+                    }
+                    Response::error("not_found", "release acknowledgement was lost")
+                }
+                other => panic!("unexpected command: {other:?}"),
+            };
+            let bytes = serde_json::to_vec(&response).unwrap();
+            // SAFETY: reply synchronously copies the live response bytes.
+            unsafe { reply.send(&bytes) };
+            STATUS_OK
+        }
+        let host = Box::new(Mutex::new(Host::default()));
+        let api = HostApi {
+            header: AbiHeader::of::<HostApi>(),
+            context: (&*host as *const Mutex<Host>).cast_mut().cast(),
+            invoke,
+        };
+        // SAFETY: the host outlives the synchronous calls below.
+        let runtime = unsafe { RuntimeClient::from_endpoint(api) };
+        let mut sync = CatalogSync::new();
+        let mut transaction = finish_transaction(SourceFingerprint(1), 1, 1);
+        transaction.call = CallState::Waiting { request: 7 };
+        sync.transaction = Some(transaction);
+        for _ in 0..10 {
+            sync.advance_transaction(&runtime, Instant::now()).unwrap();
+        }
+        assert!(sync.transaction.is_none());
+        let commands = &host.lock().unwrap().commands;
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|c| matches!(c, Command::TakeResult { request: 7 }))
+                .count(),
+            2
+        );
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|c| matches!(c, Command::ReleaseResult { request: 7 }))
+                .count(),
+            2
+        );
+        assert!(
+            !commands
+                .iter()
+                .any(|c| matches!(c, Command::Request { .. } | Command::Cancel { .. }))
+        );
     }
 
     #[test]
@@ -1791,6 +2102,7 @@ mod tests {
             conflict_restarts: 0,
             stage: Stage::Finish,
             call: CallState::Submit,
+            completed_payload: None,
             retry_attempt: 0,
             delay_ticks: 0,
             cancel_after_call: false,
@@ -1877,6 +2189,7 @@ mod tests {
             conflict_restarts: 0,
             stage: Stage::Begin,
             call: CallState::Submit,
+            completed_payload: None,
             retry_attempt: 0,
             delay_ticks: 0,
             cancel_after_call: false,
@@ -1919,6 +2232,7 @@ mod tests {
             conflict_restarts: 0,
             stage: Stage::Begin,
             call: CallState::Submit,
+            completed_payload: None,
             retry_attempt: 0,
             delay_ticks: 0,
             cancel_after_call: false,

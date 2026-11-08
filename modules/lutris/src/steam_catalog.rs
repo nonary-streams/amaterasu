@@ -14,13 +14,26 @@ const MAX_SETTLEMENT_ATTEMPTS: u8 = 4;
 const PAGE_SIZE: usize = 32;
 const MAX_STEAM_IDS: usize = 20_000;
 const MAX_CATALOG_CURSOR_BYTES: usize = 256;
+const BROKER_RESULT_RETENTION: Duration = Duration::from_secs(300);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Call {
-    Submit { operation_id: String },
-    Waiting { request: u64, deadline: Instant },
-    Settling { request: u64, attempts: u8 },
-    Delay { ticks: u8 },
+    Submit {
+        operation_id: String,
+        first_attempt: Option<Instant>,
+    },
+    Recovering {
+        operation_id: String,
+        sent_at: Instant,
+    },
+    Waiting {
+        request: u64,
+        deadline: Instant,
+    },
+    Settling {
+        request: u64,
+        attempts: u8,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -35,10 +48,35 @@ pub struct SteamCatalogRead {
     cursor: Option<String>,
     steam_ids: BTreeSet<u32>,
     call: Call,
+    generation: String,
+    read_sequence: u64,
     operation_sequence: u64,
 }
 
 impl SteamCatalogRead {
+    pub(crate) fn with_identity(generation: &str, read_sequence: u64) -> Self {
+        let operation_sequence = 1;
+        let operation_id =
+            format!("lutris.steam-id-export.{generation}.{read_sequence}.{operation_sequence}");
+        Self {
+            revision: None,
+            cursor: None,
+            steam_ids: BTreeSet::new(),
+            call: Call::Submit {
+                operation_id,
+                first_attempt: None,
+            },
+            generation: generation.to_owned(),
+            read_sequence,
+            operation_sequence,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new() -> Self {
+        Self::with_identity("test-generation", 1)
+    }
+
     /// Abandon pages from the old settings, settling an accepted child first.
     pub fn cancel(&mut self) -> bool {
         match self.call {
@@ -50,19 +88,75 @@ impl SteamCatalogRead {
                 false
             }
             Call::Settling { .. } => false,
+            Call::Recovering { .. }
+            | Call::Submit {
+                first_attempt: Some(_),
+                ..
+            } => false,
             _ => true,
         }
     }
 
-    pub fn new() -> Self {
-        Self {
-            revision: None,
-            cursor: None,
-            steam_ids: BTreeSet::new(),
-            call: Call::Submit {
-                operation_id: "lutris.steam-id-export.1".into(),
-            },
-            operation_sequence: 1,
+    /// Retire the exact read-only catalog child before unloading the module.
+    pub fn poll_shutdown(&mut self, runtime: &RuntimeClient) -> bool {
+        self.poll_shutdown_with(|command| runtime.send(command))
+    }
+
+    fn poll_shutdown_with(
+        &mut self,
+        mut send: impl FnMut(Command) -> ModuleResult<Response>,
+    ) -> bool {
+        match self.call.clone() {
+            Call::Submit {
+                first_attempt: None,
+                ..
+            } => true,
+            Call::Submit {
+                operation_id,
+                first_attempt: Some(sent_at),
+            }
+            | Call::Recovering {
+                operation_id,
+                sent_at,
+            } => {
+                if Instant::now().saturating_duration_since(sent_at) >= BROKER_RESULT_RETENTION {
+                    return false;
+                }
+                match send(Command::LookupRequest {
+                    service: SERVICE.into(),
+                    payload: self.request_payload(),
+                    operation_id,
+                    parent: None,
+                }) {
+                    Ok(Response::Accepted { id }) => {
+                        self.call = Call::Waiting {
+                            request: id,
+                            deadline: Instant::now()
+                                + Duration::from_millis(TIMEOUT_MS)
+                                + RESULT_GRACE,
+                        };
+                        false
+                    }
+                    Ok(Response::Error { code, .. })
+                        if code == "not_found"
+                            && Instant::now().saturating_duration_since(sent_at)
+                                < BROKER_RESULT_RETENTION =>
+                    {
+                        true
+                    }
+                    _ => false,
+                }
+            }
+            Call::Waiting { request, .. } | Call::Settling { request, .. } => {
+                let response = match send(Command::TakeResult { request }) {
+                    Ok(Response::Pending) | Err(_) => return false,
+                    Ok(response) => response,
+                };
+                release_terminal_child_result(request, response, |request| {
+                    send(Command::ReleaseResult { request })
+                })
+                .is_some()
+            }
         }
     }
 
@@ -76,42 +170,73 @@ impl SteamCatalogRead {
         mut send: impl FnMut(Command) -> ModuleResult<Response>,
     ) -> ModuleResult<Progress> {
         match self.call.clone() {
-            Call::Delay { ticks } if ticks > 1 => {
-                self.call = Call::Delay { ticks: ticks - 1 };
+            Call::Submit {
+                operation_id,
+                first_attempt,
+            } => {
+                let first_attempt = first_attempt.unwrap_or(now);
+                match send(Command::Request {
+                    service: SERVICE.into(),
+                    payload: self.request_payload(),
+                    timeout_ms: TIMEOUT_MS,
+                    operation_id: operation_id.clone(),
+                    parent: None,
+                }) {
+                    Ok(Response::Accepted { id }) => {
+                        self.call = Call::Waiting {
+                            request: id,
+                            deadline: now + Duration::from_millis(TIMEOUT_MS) + RESULT_GRACE,
+                        };
+                        Ok(Progress::Pending)
+                    }
+                    Ok(Response::Result { payload }) => Ok(self.consume_page(payload)),
+                    Ok(Response::Error { code, message }) => {
+                        Ok(Progress::Failed(format!("{code}: {message}")))
+                    }
+                    Ok(response) => Ok(Progress::Failed(format!(
+                        "unexpected Steam-ID catalog response: {response:?}"
+                    ))),
+                    Err(_) => {
+                        self.call = Call::Recovering {
+                            operation_id,
+                            sent_at: first_attempt,
+                        };
+                        Ok(Progress::Pending)
+                    }
+                }
+            }
+            Call::Recovering {
+                operation_id,
+                sent_at,
+            } => {
+                if now.saturating_duration_since(sent_at) >= BROKER_RESULT_RETENTION {
+                    return Ok(Progress::Pending);
+                }
+                match send(Command::LookupRequest {
+                    service: SERVICE.into(),
+                    payload: self.request_payload(),
+                    operation_id: operation_id.clone(),
+                    parent: None,
+                }) {
+                    Ok(Response::Accepted { id }) => {
+                        self.call = Call::Waiting {
+                            request: id,
+                            deadline: now + Duration::from_millis(TIMEOUT_MS) + RESULT_GRACE,
+                        };
+                    }
+                    Ok(Response::Error { code, .. })
+                        if code == "not_found"
+                            && now.saturating_duration_since(sent_at) < BROKER_RESULT_RETENTION =>
+                    {
+                        self.call = Call::Submit {
+                            operation_id,
+                            first_attempt: Some(sent_at),
+                        };
+                    }
+                    _ => {}
+                }
                 Ok(Progress::Pending)
             }
-            Call::Delay { .. } => {
-                self.call = Call::Submit {
-                    operation_id: self.next_operation_id(),
-                };
-                Ok(Progress::Pending)
-            }
-            Call::Submit { operation_id } => match send(Command::Request {
-                service: SERVICE.into(),
-                payload: self.request_payload(),
-                timeout_ms: TIMEOUT_MS,
-                operation_id: operation_id.clone(),
-                parent: None,
-            }) {
-                Ok(Response::Accepted { id }) => {
-                    self.call = Call::Waiting {
-                        request: id,
-                        deadline: now + Duration::from_millis(TIMEOUT_MS) + RESULT_GRACE,
-                    };
-                    Ok(Progress::Pending)
-                }
-                Ok(Response::Result { payload }) => Ok(self.consume_page(payload)),
-                Ok(Response::Error { code, message }) => {
-                    Ok(Progress::Failed(format!("{code}: {message}")))
-                }
-                Ok(response) => Ok(Progress::Failed(format!(
-                    "unexpected Steam-ID catalog response: {response:?}"
-                ))),
-                Err(_) => {
-                    self.call = Call::Delay { ticks: 2 };
-                    Ok(Progress::Pending)
-                }
-            },
             Call::Waiting { request, deadline } => {
                 if now >= deadline {
                     self.call = Call::Settling {
@@ -279,6 +404,7 @@ impl SteamCatalogRead {
             self.cursor = Some(next_after);
             self.call = Call::Submit {
                 operation_id: self.next_operation_id(),
+                first_attempt: None,
             };
             Ok(Progress::Pending)
         } else {
@@ -290,10 +416,14 @@ impl SteamCatalogRead {
 
     fn next_operation_id(&mut self) -> String {
         self.operation_sequence = self.operation_sequence.saturating_add(1);
-        format!("lutris.steam-id-export.{}", self.operation_sequence)
+        format!(
+            "lutris.steam-id-export.{}.{}.{}",
+            self.generation, self.read_sequence, self.operation_sequence
+        )
     }
 }
 
+#[cfg(test)]
 impl Default for SteamCatalogRead {
     fn default() -> Self {
         Self::new()
@@ -303,6 +433,95 @@ impl Default for SteamCatalogRead {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repeated_steam_catalog_reads_use_distinct_same_principal_operations() {
+        use std::collections::HashMap;
+
+        let mut requests = HashMap::<String, u64>::new();
+        let mut send = |command| {
+            let Command::Request {
+                service,
+                payload,
+                operation_id,
+                parent,
+                ..
+            } = command
+            else {
+                panic!("expected Steam catalog request");
+            };
+            assert_eq!(service, SERVICE);
+            assert_eq!(
+                payload,
+                json!({"action":"export_steam_ids","limit":PAGE_SIZE})
+            );
+            assert_eq!(parent, None);
+            let next = requests.len() as u64 + 1;
+            let request = *requests.entry(operation_id).or_insert(next);
+            Ok(Response::Accepted { id: request })
+        };
+
+        let now = Instant::now();
+        let mut first = SteamCatalogRead::with_identity("same-module", 1);
+        assert_eq!(
+            first.advance_with(now, &mut send).unwrap(),
+            Progress::Pending
+        );
+        let first_id = match first.call {
+            Call::Waiting { request, .. } => request,
+            _ => panic!("first Steam catalog request should be accepted"),
+        };
+
+        let mut second = SteamCatalogRead::with_identity("same-module", 2);
+        assert_eq!(
+            second.advance_with(now, &mut send).unwrap(),
+            Progress::Pending
+        );
+        let second_id = match second.call {
+            Call::Waiting { request, .. } => request,
+            _ => panic!("second Steam catalog request should be accepted"),
+        };
+        assert_ne!(first_id, second_id);
+        assert_eq!(requests.len(), 2);
+    }
+
+    #[test]
+    fn shutdown_waits_for_the_exact_accepted_steam_catalog_read() {
+        let mut read = SteamCatalogRead::new();
+        read.call = Call::Waiting {
+            request: 51,
+            deadline: Instant::now() + Duration::from_secs(30),
+        };
+        assert!(!read.poll_shutdown_with(|command| {
+            assert!(matches!(command, Command::TakeResult { request: 51 }));
+            Ok(Response::Pending)
+        }));
+        assert!(read.poll_shutdown_with(|command| match command {
+            Command::TakeResult { request: 51 } => Ok(Response::Result {
+                payload: json!({"ok":true,"revision":1,"steam_ids":[],"next_cursor":null}),
+            }),
+            Command::ReleaseResult { request: 51 } => Ok(Response::Ok),
+            other => panic!("unexpected shutdown command: {other:?}"),
+        }));
+    }
+
+    #[test]
+    fn shutdown_recovers_a_lost_steam_catalog_admission_without_replaying() {
+        let now = Instant::now();
+        let operation_id = "lutris.steam-id-export.test-generation.1.9".to_owned();
+        let mut read = SteamCatalogRead::new();
+        read.call = Call::Recovering {
+            operation_id: operation_id.clone(),
+            sent_at: now,
+        };
+        assert!(!read.poll_shutdown_with(|command| {
+            assert!(matches!(command, Command::LookupRequest {
+                service, operation_id: ref found, ..
+            } if service == SERVICE && found == &operation_id));
+            Ok(Response::Accepted { id: 52 })
+        }));
+        assert!(matches!(read.call, Call::Waiting { request: 52, .. }));
+    }
 
     #[test]
     fn settings_change_settles_accepted_export_without_reading_pages() {

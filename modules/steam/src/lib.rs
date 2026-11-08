@@ -825,6 +825,7 @@ struct SteamModule {
     catalog_sync: catalog_sync::CatalogSync,
     artwork_refresh: artwork_refresh::Refresh,
     library_principal: String,
+    quiescing: bool,
 }
 
 impl ManagedModule for SteamModule {
@@ -842,7 +843,13 @@ impl ManagedModule for SteamModule {
         ) {
             return Err("Steam artwork requires network TCP and DNS capabilities".into());
         }
-        let configuration = ProductConfiguration::new();
+        let mut startup_nonce = [0u8; 16];
+        getrandom::fill(&mut startup_nonce).map_err(|_| "Steam startup randomness unavailable")?;
+        let startup_id: String = startup_nonce
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let configuration = ProductConfiguration::new(&startup_id);
         runtime.require_success(Command::Register {
             service: SERVICE.into(),
         })?;
@@ -867,10 +874,24 @@ impl ManagedModule for SteamModule {
             catalog_sync: catalog_sync::CatalogSync::new(),
             artwork_refresh: artwork_refresh::Refresh::default(),
             library_principal: settings.library_principal,
+            quiescing: false,
         })
     }
 
+    fn quiesce(&mut self) -> ModuleResult<bool> {
+        self.quiescing = true;
+        let local = self.provider.local_artwork.poll_shutdown();
+        let remote = self.provider.remote_artwork.poll_shutdown();
+        let configuration = self.configuration.poll_shutdown(&self.runtime);
+        let catalog = self.catalog_sync.poll_shutdown(&self.runtime);
+        let artwork_refresh = self.artwork_refresh.poll_shutdown(&self.runtime);
+        Ok(local && remote && configuration && catalog && artwork_refresh)
+    }
+
     fn tick(&mut self) -> ModuleResult<()> {
+        if self.quiescing {
+            return Ok(());
+        }
         self.provider.binary_artwork.as_mut().unwrap().reap();
         self.provider.tick();
         for (request, payload) in self.provider.drain_local_artwork() {

@@ -1169,6 +1169,48 @@ fn start_test_module(host: &mut Box<FakeHost>) -> SteamModule {
     module
 }
 
+#[test]
+fn module_quiescence_waits_for_active_artwork_fetch() {
+    let mut host = Box::<FakeHost>::default();
+    let mut module = start_test_module(&mut host);
+    let (started, entered) = std::sync::mpsc::channel();
+    let (release, wait_release) = std::sync::mpsc::channel();
+    let wait_release = std::sync::Mutex::new(wait_release);
+    module
+        .provider
+        .remote_artwork
+        .start_with_fetcher(move |_| {
+            started.send(()).unwrap();
+            wait_release.lock().unwrap().recv().unwrap();
+            Err("artwork_unavailable")
+        })
+        .unwrap();
+    module
+        .provider
+        .remote_artwork
+        .enqueue(artwork::RemoteArtworkRequest {
+            prefetch: false,
+            generation: 0,
+            request_id: 1,
+            app_id: 42,
+            last_updated: 123,
+            revision: artwork::remote_revision(42, 123).unwrap(),
+            offset: 0,
+            deadline: Instant::now() + Duration::from_secs(5),
+        })
+        .unwrap();
+    entered.recv_timeout(Duration::from_secs(2)).unwrap();
+    let pending = module.quiesce();
+    release.send(()).unwrap();
+    assert_eq!(pending, Ok(false));
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !module.quiesce().unwrap() {
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    assert!(module.tick().is_ok());
+}
+
 fn persisted_settings(enabled: bool, revision: u64) -> Response {
     Response::Result {
         payload: json!({
@@ -1653,71 +1695,36 @@ fn status_and_list_are_served_while_startup_settings_are_pending() {
 }
 
 #[test]
-fn cancelled_update_releases_results_reads_back_state_and_never_claims_success() {
+fn expired_update_remains_fenced_while_status_requests_continue() {
     let mut host = Box::new(FakeHost::default());
     host.product_get_results
         .push_back(persisted_settings(true, 3));
-    // Simulate the update having committed but its state result acknowledgement
-    // being lost before Steam can consume it.
+    // A broker deadline does not prove a delivered write has stopped.
     host.product_update_results
         .push_back(Response::error("deadline_exceeded", "acknowledgement lost"));
-    host.product_get_results.push_back(Response::error(
-        "unavailable",
-        "the first authoritative readback failed",
-    ));
-    host.product_get_results
-        .push_back(persisted_settings(false, 4));
     let mut module = start_test_module(&mut host);
     module.tick().unwrap();
     module.tick().unwrap();
-    assert_eq!(module.configuration.revision(), 3);
-    assert!(module.provider.enabled);
-
     host.queue_service_request(
         20,
         MANAGEMENT_CALLER,
         json!({"action":"settings_update","enabled":false,"expected_revision":3}),
     );
-    module.tick().unwrap(); // accept the management update
-    module.tick().unwrap(); // submit the product update
-
+    module.tick().unwrap();
+    module.tick().unwrap();
+    let update_request = host.next_child;
     host.queue_service_request(21, "amaterasu.console", json!({"action":"status"}));
-    host.queue_service_request(22, "amaterasu.console", json!({"action":"refresh"}));
-    host.queue_service_request(23, "amaterasu.console", json!({"action":"list"}));
-    host.queue_service_request(24, "amaterasu.console", json!({"action":"status"}));
-    module.tick().unwrap(); // consume the ambiguous update and begin readback
-    module.tick().unwrap(); // submit readback and serve status
-    module.tick().unwrap(); // fail readback and serve refresh
-    assert_eq!(host.configuration_actions.len(), 3);
-    module.tick().unwrap(); // backoff tick still serves list
-    assert_eq!(host.configuration_actions.len(), 3);
-    module.tick().unwrap(); // retry readback while serving status
-    module.tick().unwrap(); // apply retried authoritative settings
-
-    let update = host
-        .completed
-        .iter()
-        .find(|(id, _)| *id == 20)
-        .expect("management update is completed");
-    assert_eq!(update.1["ok"], false);
-    assert_eq!(update.1["error"]["code"], "settings_outcome_unknown");
-    assert_eq!(update.1["error"]["current_revision"], 3);
+    for _ in 0..4 {
+        module.tick().unwrap();
+    }
+    assert!(!host.released.contains(&update_request));
+    assert!(host.completed.iter().all(|(id, _)| *id != 20));
     assert_eq!(
         host.completed.iter().find(|(id, _)| *id == 21).unwrap().1["enabled"],
         true
     );
-    let refresh = &host.completed.iter().find(|(id, _)| *id == 22).unwrap().1;
-    assert_eq!(refresh["enabled"], true);
-    assert_eq!(refresh["scanning"], true);
-    let list = &host.completed.iter().find(|(id, _)| *id == 23).unwrap().1;
-    assert_eq!(list["enabled"], true);
-    assert_eq!(list["settings_ready"], true);
-    let retried_status = &host.completed.iter().find(|(id, _)| *id == 24).unwrap().1;
-    assert_eq!(retried_status["enabled"], true);
-    assert_eq!(host.configuration_actions.len(), 4);
-    assert_eq!(host.released.len(), 4);
-    assert_eq!(module.provider.enabled, cfg!(target_os = "linux"));
-    assert_eq!(module.configuration.revision(), 4);
+    assert_eq!(module.configuration.revision(), 3);
+    assert_eq!(module.quiesce(), Ok(false));
 }
 
 #[test]
@@ -1895,7 +1902,6 @@ fn interrupted_scan_settles_pending_catalog_child_before_current_reconciliation(
     assert_eq!(module.catalog_sync.status()["syncing"], true);
 
     module.provider.scan = Some(Scan::new(&[]));
-    host.catalog_cancel_failures_remaining = 1;
     host.catalog_release_failures_remaining = 2;
     module
         .catalog_sync
@@ -1911,12 +1917,22 @@ fn interrupted_scan_settles_pending_catalog_child_before_current_reconciliation(
         .catalog_sync
         .tick_at(&module.runtime, &mut module.provider, &settings, now)
         .unwrap();
-    assert_eq!(host.canceled, vec![old_request]);
+    assert!(host.canceled.is_empty());
     assert_eq!(module.catalog_sync.status()["syncing"], true);
-    module
-        .catalog_sync
-        .tick_at(&module.runtime, &mut module.provider, &settings, now)
-        .unwrap();
+    // Cancelling broker bookkeeping cannot prove a delivered catalog write has
+    // stopped. Let the provider finish before retiring its exact result.
+    host.child_results.insert(
+        old_request,
+        Response::Result {
+            payload: json!({"ok": true}),
+        },
+    );
+    for _ in 0..3 {
+        module
+            .catalog_sync
+            .tick_at(&module.runtime, &mut module.provider, &settings, now)
+            .unwrap();
+    }
     assert!(!module.catalog_sync.status()["syncing"].as_bool().unwrap());
     assert!(host.released.contains(&old_request));
     assert_eq!(host.catalog_requests.len(), 1);

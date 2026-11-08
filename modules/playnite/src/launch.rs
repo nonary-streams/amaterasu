@@ -68,6 +68,15 @@ pub struct Launches {
 }
 
 impl Launches {
+    /// Close worker command channels and poll retirement without blocking the host.
+    pub(crate) fn quiesce(&mut self) -> bool {
+        let mut retired = true;
+        for launch in self.by_ticket.values_mut() {
+            retired &= launch.retire_previous_worker();
+        }
+        retired
+    }
+
     pub fn active_count(&self) -> usize {
         self.by_ticket
             .values()
@@ -331,6 +340,16 @@ impl Launches {
                     .is_some_and(|worker| !worker.is_finished())
                 || now.duration_since(launch.changed_at) < LAUNCH_RETENTION
         });
+    }
+}
+
+impl Drop for Launch {
+    fn drop(&mut self) {
+        // A native module must not unload while its worker is executing code.
+        self.stop_sender.take();
+        if let Some(worker) = self._worker.take() {
+            let _ = worker.join();
+        }
     }
 }
 
@@ -628,6 +647,45 @@ mod tests {
         let response = launches.stop(&ticket, 30, vec![unrelated]);
         assert_eq!(response["state"], "cleanup_failed");
         assert!(observed.recv_timeout(Duration::from_millis(20)).is_err());
+    }
+
+    #[test]
+    fn quiescence_waits_for_launch_watcher_retirement() {
+        let (stop_sender, stop_receiver) = mpsc::sync_channel::<StopRequest>(1);
+        let (cancelled, observed) = mpsc::channel();
+        let (release, wait) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            assert!(stop_receiver.recv().is_err());
+            cancelled.send(()).unwrap();
+            wait.recv().unwrap();
+        });
+        let mut launches = Launches::default();
+        launches.by_ticket.insert(
+            "ticket".into(),
+            Launch {
+                operation_id: "operation".into(),
+                game_id: "game".into(),
+                processes: Vec::new(),
+                trusted_install_roots: BTreeSet::new(),
+                focus_policy: FocusPolicy::default(),
+                ticket: "ticket".into(),
+                state: State::Running,
+                stop_requested: false,
+                changed_at: Instant::now(),
+                stop_sender: Some(stop_sender),
+                events: None,
+                _worker: Some(worker),
+            },
+        );
+        assert!(!launches.quiesce());
+        observed.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(!launches.quiesce());
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !launches.quiesce() {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
     }
 
     #[test]
