@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 // The original 1 MiB limit can be exhausted by ordinary retained sessions,
 // leaving too little room to record the next plan or its cleanup. Keep a
 // finite limit while allowing the coordinator's bounded history to grow.
-const MAX_DOCUMENT_BYTES: u64 = 16 * 1024 * 1024;
+pub(crate) const MAX_DOCUMENT_BYTES: u64 = 16 * 1024 * 1024;
 #[cfg(test)]
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 

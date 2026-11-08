@@ -485,7 +485,8 @@ fn failed_native_proof_write_cannot_send_ack_or_repeat_the_native_revoke() {
             .get_mut("session")
             .unwrap()
             .settings_revision;
-        std::mem::replace(revision, "x".repeat(1_100_000))
+        // Larger than the journal may ever be, so the next durable write fails.
+        std::mem::replace(revision, "x".repeat(crate::store::MAX_DOCUMENT_BYTES as usize + 1))
     };
     let failure = fixture
         .coordinator()
