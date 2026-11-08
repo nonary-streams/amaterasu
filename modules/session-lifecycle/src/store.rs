@@ -19,7 +19,11 @@ use std::{
 #[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
 
-const MAX_DOCUMENT_BYTES: u64 = 1024 * 1024;
+// Recovery receipts retain provider plans and their exact dispatch evidence.
+// The original 1 MiB limit can be exhausted by ordinary retained sessions,
+// leaving too little room to record the next plan or its cleanup. Keep a
+// finite limit while allowing the coordinator's bounded history to grow.
+const MAX_DOCUMENT_BYTES: u64 = 16 * 1024 * 1024;
 #[cfg(test)]
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -274,7 +278,7 @@ mod tests {
         let path = root.join("journal.json");
         let mut store = LifecycleStore::new(path.clone()).unwrap();
         let history = serde_json::json!(vec![serde_json::json!({"closed": true}); 40_000]);
-        assert!(serde_json::to_vec_pretty(&history).unwrap().len() as u64 > MAX_DOCUMENT_BYTES);
+        assert!(serde_json::to_vec_pretty(&history).unwrap().len() > 1024 * 1024);
         store.replace(&history).unwrap();
         assert!(fs::metadata(&path).unwrap().len() <= MAX_DOCUMENT_BYTES);
         assert_eq!(
@@ -291,6 +295,33 @@ mod tests {
         store.replace(&1).unwrap();
         assert_eq!(store.load::<u64>().unwrap(), Some(1));
         drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn retained_history_can_cross_the_legacy_limit_without_blocking_next_transition() {
+        let root = test_dir();
+        let path = root.join("journal.json");
+        let mut store = LifecycleStore::new(path.clone()).unwrap();
+        let mut journal = serde_json::json!({
+            "retained_evidence": "x".repeat(1024 * 1024 - 4096),
+            "pending_plan": null
+        });
+        store.replace(&journal).unwrap();
+        journal["pending_plan"] = serde_json::json!({"evidence":"y".repeat(8192)});
+        assert!(serde_json::to_vec(&journal).unwrap().len() > 1024 * 1024);
+        store.replace(&journal).unwrap();
+        drop(store);
+
+        let mut reopened = LifecycleStore::new(path).unwrap();
+        assert_eq!(
+            reopened.load::<serde_json::Value>().unwrap(),
+            Some(journal.clone())
+        );
+        journal["pending_plan"] = serde_json::json!({"cleanup":"recorded"});
+        reopened.replace(&journal).unwrap();
+        assert_eq!(reopened.load::<serde_json::Value>().unwrap(), Some(journal));
+        drop(reopened);
         fs::remove_dir_all(root).unwrap();
     }
 

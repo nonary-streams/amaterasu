@@ -612,10 +612,10 @@ fn save(shared: &Shared, mut next: Journal) -> ModuleResult<()> {
     join::compact(&mut next);
     action_root_retirement::compact_replaced_roots(&mut next);
     let mut shared = shared.borrow_mut();
-    shared
-        .store
-        .replace(&next)
-        .map_err(|_| "journal_write_failed".to_owned())?;
+    shared.store.replace(&next).map_err(|error| {
+        eprintln!("lifecycle journal replacement failed: {error}");
+        "journal_write_failed".to_owned()
+    })?;
     shared.value = next;
     shared.retirement_scan_pending = true;
     Ok(())
