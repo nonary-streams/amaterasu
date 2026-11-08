@@ -3056,37 +3056,72 @@ pub fn startup(state_root: &Path) -> AudioResult<()> {
 }
 
 pub fn shutdown() {
-    let (worker, final_shutdown) = RESTORE_WORKER.get().map_or((None, false), |workers| {
-        let mut workers = workers
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(worker) = workers.as_mut() else {
-            return (None, false);
-        };
-        if worker.owners > 1 {
-            worker.owners -= 1;
-            (None, false)
-        } else {
-            (workers.take(), true)
-        }
-    });
-    if let Some(worker) = worker {
-        let _ = worker.stop.send(());
-        let _ = worker.thread.join();
+    if let Some(workers) = RESTORE_WORKER.get() {
+        shutdown_restore_worker(workers, || {
+            // One final bounded pass. Failed or indeterminate operations remain in
+            // the durable journal for the next worker start.
+            if let Ok(mut client) = PulseClient::connect() {
+                let _ = reconcile_persisted_route(&mut client);
+                retry_virtual_sink_cleanups_with_client(&mut client, None);
+            }
+        });
     }
-    if final_shutdown {
-        // One final bounded pass. Failed or indeterminate operations remain in
-        // the durable journal for the next worker start.
-        if let Ok(mut client) = PulseClient::connect() {
-            let _ = reconcile_persisted_route(&mut client);
-            retry_virtual_sink_cleanups_with_client(&mut client, None);
-        }
+}
+
+fn shutdown_restore_worker(workers: &Mutex<Option<RestoreWorker>>, final_cleanup: impl FnOnce()) {
+    // Startup uses this same lock. Keep it until the old worker and its final
+    // cleanup have retired, so they cannot operate on a replacement journal.
+    // The restore worker itself never takes this lock.
+    let mut workers = workers
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(worker) = workers.as_mut() else {
+        return;
+    };
+    if worker.owners > 1 {
+        worker.owners -= 1;
+        return;
     }
+    let worker = workers.take().expect("worker exists");
+    let _ = worker.stop.send(());
+    let _ = worker.thread.join();
+    final_cleanup();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restore_worker_replacement_waits_for_final_cleanup() {
+        let (stop, stopped) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let _ = stopped.recv();
+        });
+        let workers = Arc::new(Mutex::new(Some(RestoreWorker {
+            stop,
+            thread: worker,
+            owners: 1,
+        })));
+        let (cleanup_entered, entered) = mpsc::channel();
+        let (finish_cleanup, finished) = mpsc::channel();
+        let shutdown_workers = Arc::clone(&workers);
+        let shutdown = thread::spawn(move || {
+            shutdown_restore_worker(&shutdown_workers, || {
+                cleanup_entered.send(()).unwrap();
+                finished.recv().unwrap();
+            });
+        });
+        entered.recv_timeout(Duration::from_secs(2)).unwrap();
+        // Startup takes this same lock before configuring a new journal.
+        assert!(matches!(
+            workers.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        ));
+        finish_cleanup.send(()).unwrap();
+        shutdown.join().unwrap();
+        assert!(workers.lock().unwrap().is_none());
+    }
 
     #[test]
     fn acknowledged_route_can_publish_after_stale_server_info() {
