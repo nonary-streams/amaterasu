@@ -34,6 +34,12 @@ digest, readiness, cleanup journals and local HTTP service. Use
 `reconcile-package-activation` if authenticated candidate recovery is needed.
 Never edit cleanup evidence or selection files to manufacture success.
 
+Install complete sets only. Interfaces between components are not always
+versioned when they change, so replacing some libraries can produce a set that
+loads and then fails while streaming. `scripts/local_full_update.py prepare`
+refuses any library or host not compiled from the named tree and records what it
+installed; `scripts/local_full_update.py check ROOT` reports later drift.
+
 An install request authorizes these routine local steps and an idle service
 restart. Interrupting an active stream and publishing a shared release are
 separate actions. Report real client playback only after it is observed.
