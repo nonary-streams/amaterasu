@@ -5,29 +5,30 @@ use std::collections::BTreeMap;
 #[cfg(all(target_os = "linux", not(test)))]
 use std::collections::BTreeSet;
 #[cfg(target_os = "linux")]
-use std::io::{BufRead, BufReader};
+use std::io::{self, Read};
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
 #[cfg(target_os = "linux")]
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
-use std::process::{Child, ChildStdin};
+use std::process::{Child, ChildStdin, ChildStdout};
 #[cfg(target_os = "linux")]
 use std::process::{Command, Stdio};
 #[cfg(target_os = "linux")]
-use std::sync::mpsc;
-#[cfg(target_os = "linux")]
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(target_os = "linux")]
 const HOOK_SERVER: &str = include_str!("proton_hook_server.py");
+pub(crate) const SERVER_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 #[cfg(target_os = "linux")]
-const SERVER_READY_TIMEOUT: Duration = Duration::from_secs(10);
+const RESTART_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 #[derive(Default)]
 pub(crate) struct ProtonHookManager {
     #[cfg(target_os = "linux")]
     active: BTreeMap<String, ActiveHook>,
     #[cfg(target_os = "linux")]
-    retiring: Vec<Child>,
+    retiring: Vec<(String, Child)>,
     #[cfg(target_os = "linux")]
     shutting_down: bool,
     #[cfg(all(test, target_os = "linux"))]
@@ -40,6 +41,9 @@ struct ActiveHook {
     references: usize,
     roots: Vec<PathBuf>,
     server: Option<HookServer>,
+    startup_failed: bool,
+    was_ready: bool,
+    next_start_at: Instant,
 }
 
 #[cfg(target_os = "linux")]
@@ -48,6 +52,21 @@ struct HookServer {
     // Closing the owner side of this pipe makes the helper exit after a
     // service crash, so the installed Proton hook cannot outlive its owner.
     _keepalive: ChildStdin,
+    readiness: Option<Readiness>,
+}
+
+#[cfg(target_os = "linux")]
+struct Readiness {
+    stdout: ChildStdout,
+    deadline: Instant,
+    line: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HookReadiness {
+    Pending,
+    Ready,
+    Failed,
 }
 
 impl ProtonHookManager {
@@ -62,11 +81,17 @@ impl ProtonHookManager {
                 return Ok(None);
             };
             let roots = self.roots(spec.steam_install_dir.as_deref());
+            let retiring = self.retiring.iter().any(|(id, _)| id == app_id);
             if let Some(active) = self.active.get_mut(app_id) {
+                if active.startup_failed {
+                    return Err("proton_hook_unavailable");
+                }
                 if active.enabled != spec.proton_dualsense_compatibility {
                     return Err("proton_hook_policy_conflict");
                 }
-                ensure_server(app_id, active)?;
+                if !retiring && Instant::now() >= active.next_start_at {
+                    start_for_acquire(app_id, active, ensure_server)?;
+                }
                 active.references = active
                     .references
                     .checked_add(1)
@@ -78,8 +103,13 @@ impl ProtonHookManager {
                 references: 1,
                 roots,
                 server: None,
+                startup_failed: false,
+                was_ready: false,
+                next_start_at: Instant::now(),
             };
-            ensure_server(app_id, &mut active)?;
+            if !retiring {
+                ensure_server(app_id, &mut active)?;
+            }
             self.active.insert(app_id.to_owned(), active);
             Ok(Some(app_id.to_owned()))
         }
@@ -87,6 +117,34 @@ impl ProtonHookManager {
         {
             let _ = spec;
             Ok(None)
+        }
+    }
+
+    pub(crate) fn readiness(&self, app_id: &str) -> HookReadiness {
+        #[cfg(target_os = "linux")]
+        {
+            let Some(active) = self.active.get(app_id) else {
+                return HookReadiness::Failed;
+            };
+            if active.startup_failed {
+                HookReadiness::Failed
+            } else if self.retiring.iter().any(|(id, _)| id == app_id) {
+                HookReadiness::Pending
+            } else if !active.enabled
+                || active
+                    .server
+                    .as_ref()
+                    .is_some_and(|server| server.readiness.is_none())
+            {
+                HookReadiness::Ready
+            } else {
+                HookReadiness::Pending
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = app_id;
+            HookReadiness::Ready
         }
     }
 
@@ -99,15 +157,9 @@ impl ProtonHookManager {
             active.references = active.references.saturating_sub(1);
             if active.references == 0
                 && let Some(mut active) = self.active.remove(_app_id)
+                && let Some(child) = retire_server(active.server.take())
             {
-                if self.shutting_down {
-                    if let Some(child) = retire_server(active.server.take()) {
-                        self.retiring.push(child);
-                    }
-                } else {
-                    // Preserve ordinary Stop's existing same-app restart ordering.
-                    stop_server(active.server.take());
-                }
+                self.retiring.push((_app_id.to_owned(), child));
             }
         }
     }
@@ -115,21 +167,59 @@ impl ProtonHookManager {
     /// Restart a helper that exited unexpectedly while an application owns it.
     pub(crate) fn reap(&mut self) {
         #[cfg(target_os = "linux")]
+        self.reap_with_starter(ensure_server);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn reap_with_starter(
+        &mut self,
+        mut start: impl FnMut(&str, &mut ActiveHook) -> Result<(), &'static str>,
+    ) {
+        self.retiring.retain_mut(|(_, child)| !retire_child(child));
         for (app_id, active) in &mut self.active {
+            if let Some(server) = &mut active.server
+                && let Some(readiness) = &mut server.readiness
+            {
+                match readiness.poll() {
+                    Ok(Some(true)) => {
+                        server.readiness = None;
+                        active.was_ready = true;
+                    }
+                    Ok(None) => {}
+                    Ok(Some(false)) | Err(_) => {
+                        active.startup_failed = !active.was_ready;
+                        active.next_start_at = Instant::now() + RESTART_RETRY_DELAY;
+                        if let Some(child) = retire_server(active.server.take()) {
+                            self.retiring.push((app_id.clone(), child));
+                        }
+                    }
+                }
+            }
             if active
                 .server
                 .as_mut()
                 .is_some_and(|server| server.child.try_wait().ok().flatten().is_some())
             {
+                if active
+                    .server
+                    .as_ref()
+                    .is_some_and(|server| server.readiness.is_some())
+                {
+                    active.startup_failed = !active.was_ready;
+                }
+                active.next_start_at = Instant::now() + RESTART_RETRY_DELAY;
                 active.server = None;
             }
-            if !self.shutting_down {
-                let _ = ensure_server(app_id, active);
+            if !self.shutting_down
+                && !active.startup_failed
+                && !self.retiring.iter().any(|(id, _)| id == app_id)
+                && Instant::now() >= active.next_start_at
+                && start(app_id, active).is_err()
+            {
+                active.startup_failed = !active.was_ready;
+                active.next_start_at = Instant::now() + RESTART_RETRY_DELAY;
             }
         }
-        #[cfg(target_os = "linux")]
-        self.retiring
-            .retain_mut(|child| !matches!(child.try_wait(), Ok(Some(_))));
     }
 
     /// Close helper restart admission without stopping the current consumer's hook.
@@ -154,12 +244,12 @@ impl ProtonHookManager {
     pub(crate) fn force_shutdown(&mut self) {
         #[cfg(target_os = "linux")]
         {
-            for (_, mut active) in std::mem::take(&mut self.active) {
+            for (app_id, mut active) in std::mem::take(&mut self.active) {
                 if let Some(child) = retire_server(active.server.take()) {
-                    self.retiring.push(child);
+                    self.retiring.push((app_id, child));
                 }
             }
-            for child in &mut self.retiring {
+            for (_, child) in &mut self.retiring {
                 let _ = retire_child(child);
             }
         }
@@ -198,11 +288,29 @@ impl Drop for ProtonHookManager {
 
 #[cfg(target_os = "linux")]
 fn ensure_server(app_id: &str, active: &mut ActiveHook) -> Result<(), &'static str> {
+    if active.startup_failed {
+        return Err("proton_hook_unavailable");
+    }
     if !active.enabled || active.server.is_some() {
         return Ok(());
     }
     active.server = Some(start_server(app_id, &active.roots)?);
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn start_for_acquire(
+    app_id: &str,
+    active: &mut ActiveHook,
+    mut start: impl FnMut(&str, &mut ActiveHook) -> Result<(), &'static str>,
+) -> Result<(), &'static str> {
+    match start(app_id, active) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            active.next_start_at = Instant::now() + RESTART_RETRY_DELAY;
+            Err(error)
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -228,22 +336,67 @@ fn start_server(app_id: &str, roots: &[PathBuf]) -> Result<HookServer, &'static 
         terminate_server(&mut child);
         return Err("proton_hook_unavailable");
     };
-    let (sender, receiver) = mpsc::sync_channel(1);
-    std::thread::spawn(move || {
-        let mut line = String::new();
-        let result = BufReader::new(stdout).read_line(&mut line).map(|_| line);
-        let _ = sender.send(result);
-    });
-    match receiver.recv_timeout(SERVER_READY_TIMEOUT) {
-        Ok(Ok(line)) if line.starts_with("READY ") => Ok(HookServer {
-            child,
-            _keepalive: keepalive,
+    Ok(HookServer {
+        child,
+        _keepalive: keepalive,
+        readiness: Some(Readiness {
+            stdout,
+            deadline: Instant::now() + SERVER_READY_TIMEOUT,
+            line: Vec::new(),
         }),
-        _ => {
-            drop(keepalive);
-            terminate_server(&mut child);
-            Err("proton_hook_unavailable")
+    })
+}
+
+#[cfg(target_os = "linux")]
+impl Readiness {
+    fn poll(&mut self) -> io::Result<Option<bool>> {
+        poll_ready_line(&mut self.stdout, &mut self.line, self.deadline)
+    }
+}
+
+/// Read at most one available chunk per host tick. An inherited open pipe cannot
+/// block shutdown or leave a reader thread executing unloaded module code.
+#[cfg(target_os = "linux")]
+fn poll_ready_line(
+    stdout: &mut (impl Read + AsRawFd),
+    line: &mut Vec<u8>,
+    deadline: Instant,
+) -> io::Result<Option<bool>> {
+    const MAX_READY_LINE: usize = 4096;
+    if Instant::now() >= deadline {
+        return Ok(Some(false));
+    }
+    let mut descriptor = libc::pollfd {
+        fd: stdout.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: descriptor is valid writable storage for one pollfd, and the
+    // borrowed stream keeps the file descriptor open throughout this call.
+    let ready = unsafe { libc::poll(&mut descriptor, 1, 0) };
+    if ready < 0 {
+        let error = io::Error::last_os_error();
+        return if error.kind() == io::ErrorKind::Interrupted {
+            Ok(None)
+        } else {
+            Err(error)
+        };
+    }
+    if ready == 0 {
+        return Ok(None);
+    }
+    let mut bytes = [0; 256];
+    match stdout.read(&mut bytes) {
+        Ok(0) => Ok(Some(false)),
+        Ok(count) => {
+            line.extend_from_slice(&bytes[..count]);
+            if let Some(end) = line.iter().position(|byte| *byte == b'\n') {
+                return Ok(Some(end < MAX_READY_LINE && line.starts_with(b"READY ")));
+            }
+            Ok((line.len() >= MAX_READY_LINE).then_some(false))
         }
+        Err(error) if error.kind() == io::ErrorKind::Interrupted => Ok(None),
+        Err(error) => Err(error),
     }
 }
 
@@ -253,14 +406,6 @@ fn terminate_server(server: &mut Child) {
         let _ = server.kill();
     }
     let _ = server.wait();
-}
-
-#[cfg(target_os = "linux")]
-fn stop_server(server: Option<HookServer>) {
-    if let Some(mut server) = server {
-        drop(server._keepalive);
-        terminate_server(&mut server.child);
-    }
 }
 
 #[cfg(target_os = "linux")]
@@ -335,6 +480,79 @@ fn steam_roots(steam_install_directory: Option<&str>) -> Vec<PathBuf> {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+    use std::os::fd::FromRawFd;
+
+    fn test_pipe() -> (std::fs::File, std::fs::File) {
+        let mut descriptors = [-1; 2];
+        // SAFETY: the array has room for both descriptors and successful pipe2
+        // transfers unique ownership of them to the two File values below.
+        assert_eq!(
+            unsafe { libc::pipe2(descriptors.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        unsafe {
+            (
+                std::fs::File::from_raw_fd(descriptors[0]),
+                std::fs::File::from_raw_fd(descriptors[1]),
+            )
+        }
+    }
+
+    #[test]
+    fn helper_readiness_is_bounded_when_a_pipe_stays_open() {
+        let (mut reader, _held_writer) = test_pipe();
+        let start = Instant::now();
+        let mut line = Vec::new();
+        assert_eq!(
+            poll_ready_line(&mut reader, &mut line, start + Duration::from_secs(5)).unwrap(),
+            None
+        );
+        assert!(start.elapsed() < Duration::from_millis(100));
+        assert_eq!(
+            poll_ready_line(&mut reader, &mut line, Instant::now()).unwrap(),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn helper_readiness_requires_a_complete_bounded_line() {
+        use std::io::Write;
+
+        for (bytes, expected) in [
+            (b"READY 1 2 0\n".to_vec(), true),
+            (b"READY incomplete".to_vec(), false),
+            (
+                [b"READY ".as_slice(), &vec![b'x'; 4096], b"\n"].concat(),
+                false,
+            ),
+        ] {
+            let (mut reader, mut writer) = test_pipe();
+            let writer = std::thread::spawn(move || writer.write_all(&bytes));
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut line = Vec::new();
+            let ready = loop {
+                if let Some(ready) = poll_ready_line(&mut reader, &mut line, deadline).unwrap() {
+                    break ready;
+                }
+                assert!(Instant::now() < deadline);
+                std::thread::yield_now();
+            };
+            // The oversized case may stop reading before its writer finishes.
+            drop(reader);
+            let _ = writer.join().unwrap();
+            assert_eq!(ready, expected);
+        }
+    }
+
+    fn wait_hook_ready(manager: &mut ProtonHookManager, app_id: &str) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while manager.readiness(app_id) == HookReadiness::Pending {
+            manager.reap();
+            assert!(Instant::now() < deadline, "helper did not start");
+            std::thread::yield_now();
+        }
+        assert_eq!(manager.readiness(app_id), HookReadiness::Ready);
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
@@ -428,6 +646,7 @@ mod tests {
             manager.acquire(&enabled_spec).unwrap().as_deref(),
             Some(app_id.as_str())
         );
+        wait_hook_ready(&mut manager, &app_id);
         assert_eq!(
             manager.acquire(&enabled_spec).unwrap().as_deref(),
             Some(app_id.as_str())
@@ -475,6 +694,12 @@ mod tests {
         assert!(manager.active.contains_key(&app_id));
         manager.release(&app_id);
         assert!(!manager.active.contains_key(&app_id));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !manager.retiring.is_empty() {
+            manager.reap();
+            assert!(Instant::now() < deadline, "helper did not retire");
+            std::thread::yield_now();
+        }
         let mut inert_source = b"user_settings = {}\n".to_vec();
         inert_source.extend_from_slice(hook_block.as_bytes());
         std::fs::write(&settings_file, inert_source).unwrap();
@@ -488,6 +713,14 @@ mod tests {
     fn linux_proton_hook_helper_exits_when_its_owner_pipe_closes() {
         let app_id = format!("{}", 3_000_000_000u64 + (std::process::id() as u64));
         let mut server = start_server(&app_id, &[]).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while server.readiness.is_some() {
+            if server.readiness.as_mut().unwrap().poll().unwrap() == Some(true) {
+                server.readiness = None;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
         drop(server._keepalive);
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         loop {
@@ -556,6 +789,7 @@ mod tests {
         let app_id = format!("{}", 3_500_000_000u64 + std::process::id() as u64);
         let mut manager = ProtonHookManager::with_roots(Vec::new());
         manager.acquire(&launch_spec(&app_id, true)).unwrap();
+        wait_hook_ready(&mut manager, &app_id);
         let pid = manager
             .active
             .get(&app_id)
@@ -591,10 +825,117 @@ mod tests {
     }
 
     #[test]
+    fn replacement_waits_for_previous_helper_to_retire() {
+        let app_id = format!("{}", 3_700_000_000u64 + std::process::id() as u64);
+        let mut manager = ProtonHookManager::with_roots(Vec::new());
+        let previous = Command::new("/bin/sleep").arg("5").spawn().unwrap();
+        manager.retiring.push((app_id.clone(), previous));
+        manager.acquire(&launch_spec(&app_id, true)).unwrap();
+        assert_eq!(manager.readiness(&app_id), HookReadiness::Pending);
+        assert!(manager.active[&app_id].server.is_none());
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !manager.retiring.is_empty() {
+            manager.reap();
+            assert!(Instant::now() < deadline, "previous helper did not retire");
+            std::thread::yield_now();
+        }
+        wait_hook_ready(&mut manager, &app_id);
+        manager.release(&app_id);
+    }
+
+    #[test]
+    fn disabled_replacement_waits_for_an_enabled_helper_to_retire() {
+        let app_id = format!("{}", 3_800_000_000u64 + std::process::id() as u64);
+        let mut manager = ProtonHookManager::with_roots(Vec::new());
+        let previous = Command::new("/bin/sleep").arg("5").spawn().unwrap();
+        manager.retiring.push((app_id.clone(), previous));
+        manager.acquire(&launch_spec(&app_id, false)).unwrap();
+        assert_eq!(manager.readiness(&app_id), HookReadiness::Pending);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !manager.retiring.is_empty() {
+            manager.reap();
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert_eq!(manager.readiness(&app_id), HookReadiness::Ready);
+        manager.release(&app_id);
+    }
+
+    #[test]
+    fn delayed_helper_spawn_failure_is_terminal_for_waiting_launches() {
+        let app_id = "123456";
+        let mut manager = ProtonHookManager::with_roots(Vec::new());
+        manager.acquire(&launch_spec(app_id, false)).unwrap();
+        manager.active.get_mut(app_id).unwrap().enabled = true;
+        manager.reap_with_starter(|_, _| Err("injected spawn failure"));
+        assert_eq!(manager.readiness(app_id), HookReadiness::Failed);
+        manager.release(app_id);
+    }
+
+    #[test]
+    fn already_running_hook_can_retry_after_helper_restart_failure() {
+        let app_id = "123457";
+        let mut manager = ProtonHookManager::with_roots(Vec::new());
+        manager.acquire(&launch_spec(app_id, false)).unwrap();
+        let active = manager.active.get_mut(app_id).unwrap();
+        active.enabled = true;
+        active.was_ready = true;
+        let mut attempts = 0;
+        for _ in 0..2 {
+            manager.reap_with_starter(|_, _| {
+                attempts += 1;
+                Err("injected restart failure")
+            });
+        }
+        assert_eq!(attempts, 1, "failed restarts must be rate limited");
+        manager.active.get_mut(app_id).unwrap().next_start_at = Instant::now();
+        manager.reap_with_starter(|_, _| {
+            attempts += 1;
+            Err("injected restart failure")
+        });
+        assert_eq!(attempts, 2);
+        assert_eq!(manager.readiness(app_id), HookReadiness::Pending);
+        manager.release(app_id);
+    }
+
+    #[test]
+    fn new_reference_cannot_bypass_helper_restart_backoff() {
+        let app_id = "123458";
+        let mut manager = ProtonHookManager::with_roots(Vec::new());
+        manager.acquire(&launch_spec(app_id, false)).unwrap();
+        let active = manager.active.get_mut(app_id).unwrap();
+        active.enabled = true;
+        active.was_ready = true;
+        active.next_start_at = Instant::now() + Duration::from_secs(60);
+        manager.acquire(&launch_spec(app_id, true)).unwrap();
+        assert!(manager.active[app_id].server.is_none());
+        assert_eq!(manager.readiness(app_id), HookReadiness::Pending);
+        manager.release(app_id);
+        manager.release(app_id);
+    }
+
+    #[test]
+    fn failed_acquire_start_applies_restart_backoff() {
+        let app_id = "123459";
+        let mut manager = ProtonHookManager::with_roots(Vec::new());
+        manager.acquire(&launch_spec(app_id, false)).unwrap();
+        let active = manager.active.get_mut(app_id).unwrap();
+        active.enabled = true;
+        active.was_ready = true;
+        assert!(start_for_acquire(app_id, active, |_, _| Err("spawn failed")).is_err());
+        manager.acquire(&launch_spec(app_id, true)).unwrap();
+        assert!(manager.active[app_id].server.is_none());
+        assert_eq!(manager.readiness(app_id), HookReadiness::Pending);
+        manager.release(app_id);
+        manager.release(app_id);
+    }
+
+    #[test]
     fn announced_shutdown_does_not_restart_an_exited_owned_helper() {
         let app_id = format!("{}", 3_600_000_000u64 + std::process::id() as u64);
         let mut manager = ProtonHookManager::with_roots(Vec::new());
         manager.acquire(&launch_spec(&app_id, true)).unwrap();
+        wait_hook_ready(&mut manager, &app_id);
         manager.prepare_shutdown();
         let server = manager
             .active

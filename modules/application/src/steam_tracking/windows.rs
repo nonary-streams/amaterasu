@@ -28,7 +28,6 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 const MAX_PROCESS_COUNT: usize = 131_072;
 const MAX_TOKEN_INFORMATION_BYTES: u32 = 64 * 1024;
-const GAME_ASSOCIATION_WINDOW: Duration = Duration::from_secs(15);
 const PROCESS_IMAGE_BUFFER_UNITS: usize = 32_768;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -61,10 +60,18 @@ pub(super) struct Tracker {
     started_at: Instant,
     associated: bool,
     stopping_at: Option<Instant>,
+    stop_grace: Duration,
     shutdown_deadline: Option<Instant>,
 }
 
 impl Tracker {
+    #[cfg(test)]
+    pub(super) fn expire_association_window_for_test(&mut self, now: Instant) {
+        self.started_at = now
+            .checked_sub(super::GAME_ASSOCIATION_WINDOW + Duration::from_secs(1))
+            .unwrap_or(now);
+    }
+
     pub(super) fn begin(install_directory: &str) -> Option<Self> {
         let install_root = canonical_install_directory(install_directory)?;
         let processes = scan_processes()?;
@@ -87,6 +94,7 @@ impl Tracker {
             started_at: Instant::now(),
             associated: false,
             stopping_at: None,
+            stop_grace: Duration::ZERO,
             shutdown_deadline: None,
         })
     }
@@ -107,7 +115,7 @@ impl Tracker {
             self.associated = true;
             SteamGameLiveness::Associated
         } else if self.associated
-            || now.saturating_duration_since(self.started_at) >= GAME_ASSOCIATION_WINDOW
+            || now.saturating_duration_since(self.started_at) >= super::GAME_ASSOCIATION_WINDOW
         {
             SteamGameLiveness::Unknown
         } else {
@@ -148,6 +156,7 @@ impl Tracker {
         mut scan: impl FnMut() -> Option<BTreeMap<u32, Process>>,
         mut close: impl FnMut(&TrackedProcess, &[u8]),
     ) -> SteamStopProgress {
+        self.stop_grace = grace;
         let requested = match self.shutdown_deadline {
             Some(deadline) => (now + grace).min(
                 deadline
@@ -167,6 +176,11 @@ impl Tracker {
         };
         self.refresh_tracking(&processes);
         if self.tracked.is_empty() {
+            if !self.associated && now < self.started_at + super::GAME_ASSOCIATION_WINDOW {
+                // Steam can accept the launch request before creating the game.
+                // Keep the stop obligation through the bounded association window.
+                return SteamStopProgress::Pending;
+            }
             self.stopping_at = None;
             return SteamStopProgress::Complete;
         }
@@ -200,13 +214,33 @@ impl Tracker {
     }
 
     pub(super) fn advance_stop(&mut self, now: Instant) -> SteamStopProgress {
-        self.advance_stop_with(now, scan_processes, terminate_validated_process)
+        self.advance_stop_with_actions(
+            now,
+            scan_processes,
+            request_graceful_close,
+            terminate_validated_process,
+        )
     }
 
     fn advance_stop_with(
         &mut self,
         now: Instant,
+        scan: impl FnMut() -> Option<BTreeMap<u32, Process>>,
+        mut terminate: impl FnMut(&TrackedProcess, &[u8]),
+    ) -> SteamStopProgress {
+        self.advance_stop_with_actions(
+            now,
+            scan,
+            |_, _| {},
+            |process, user_sid| terminate(process, user_sid),
+        )
+    }
+
+    fn advance_stop_with_actions(
+        &mut self,
+        now: Instant,
         mut scan: impl FnMut() -> Option<BTreeMap<u32, Process>>,
+        mut close: impl FnMut(&TrackedProcess, &[u8]),
         mut terminate: impl FnMut(&TrackedProcess, &[u8]),
     ) -> SteamStopProgress {
         let Some(processes) = scan() else {
@@ -219,10 +253,22 @@ impl Tracker {
                 SteamStopProgress::Pending
             };
         };
+        let was_associated = self.associated;
         self.refresh_tracking(&processes);
         if self.tracked.is_empty() {
+            if !self.associated && now < self.started_at + super::GAME_ASSOCIATION_WINDOW {
+                return SteamStopProgress::Pending;
+            }
             self.stopping_at = None;
             return SteamStopProgress::Complete;
+        }
+        if !was_associated {
+            // Start the configured grace when the first late game is discovered,
+            // then retain the existing graceful-close/terminate confirmation path.
+            self.stopping_at = Some(self.stop_deadline(now));
+            for process in self.tracked_descendant_first(&processes) {
+                close(&process, &self.user_sid);
+            }
         }
         let Some(deadline) = self.stopping_at else {
             return SteamStopProgress::Pending;
@@ -252,6 +298,17 @@ impl Tracker {
             }
         }
         SteamStopProgress::Pending
+    }
+
+    fn stop_deadline(&self, now: Instant) -> Instant {
+        let requested = now + self.stop_grace;
+        self.shutdown_deadline.map_or(requested, |deadline| {
+            requested.min(
+                deadline
+                    .checked_sub(STOP_CONFIRMATION_TIMEOUT)
+                    .unwrap_or(deadline),
+            )
+        })
     }
 
     fn refresh_tracking(&mut self, processes: &BTreeMap<u32, Process>) {
@@ -788,6 +845,7 @@ mod tests {
             started_at: Instant::now(),
             associated: false,
             stopping_at: None,
+            stop_grace: Duration::ZERO,
             shutdown_deadline: None,
         }
     }
@@ -895,6 +953,102 @@ mod tests {
             tracker.request_stop_with(retry_at, grace, || Some(processes.clone()), |_, _| {});
             assert_eq!(tracker.stopping_at, Some(retry_at + grace));
         }
+    }
+
+    #[test]
+    fn cancellation_waits_for_and_stops_a_late_steam_game() {
+        let mut tracker = tracker();
+        let started_at = Instant::now();
+        tracker.started_at = started_at;
+        let cancelled_at = started_at + Duration::from_secs(1);
+        assert_eq!(
+            tracker.request_stop_with(
+                cancelled_at,
+                TEST_STOP_GRACE,
+                || Some(BTreeMap::new()),
+                |_, _| panic!("there is no process to close"),
+            ),
+            SteamStopProgress::Pending,
+            "an empty snapshot during launch association cannot prove retirement",
+        );
+        assert!(tracker.is_stopping());
+
+        let game = owned_game();
+        let game_identity = game[&20].identity.unwrap();
+        let discovered_at = cancelled_at + Duration::from_secs(1);
+        let mut closed = Vec::new();
+        let mut terminated = Vec::new();
+        assert_eq!(
+            tracker.advance_stop_with_actions(
+                discovered_at,
+                || Some(game.clone()),
+                |process, _| closed.push(process.identity),
+                |process, _| terminated.push(process.identity),
+            ),
+            SteamStopProgress::Pending,
+        );
+        assert_eq!(closed, [game_identity]);
+        assert!(terminated.is_empty());
+        assert_eq!(tracker.stopping_at, Some(discovered_at + TEST_STOP_GRACE));
+
+        let force_at = discovered_at + TEST_STOP_GRACE;
+        assert_eq!(
+            tracker.advance_stop_with_actions(
+                force_at - Duration::from_millis(1),
+                || Some(game.clone()),
+                |_, _| panic!("the late game must be closed only once"),
+                |process, _| terminated.push(process.identity),
+            ),
+            SteamStopProgress::Pending,
+        );
+        assert!(terminated.is_empty());
+        assert_eq!(
+            tracker.advance_stop_with_actions(
+                force_at,
+                || Some(game.clone()),
+                |_, _| panic!("the late game must be closed only once"),
+                |process, _| terminated.push(process.identity),
+            ),
+            SteamStopProgress::Pending,
+        );
+        assert_eq!(terminated, [game_identity]);
+        assert_eq!(
+            tracker.advance_stop_with_actions(
+                force_at + Duration::from_millis(1),
+                || Some(BTreeMap::new()),
+                |_, _| panic!("confirmed absence must not be closed"),
+                |_, _| panic!("confirmed absence must not be terminated"),
+            ),
+            SteamStopProgress::Complete,
+        );
+        assert!(!tracker.is_stopping());
+    }
+
+    #[test]
+    fn empty_stop_wait_is_bounded_by_the_association_window() {
+        let mut tracker = tracker();
+        let started_at = Instant::now();
+        tracker.started_at = started_at;
+        let cancelled_at = started_at + Duration::from_secs(1);
+        assert_eq!(
+            tracker.request_stop_with(
+                cancelled_at,
+                Duration::ZERO,
+                || Some(BTreeMap::new()),
+                |_, _| panic!("there is no process to close"),
+            ),
+            SteamStopProgress::Pending,
+        );
+        assert_eq!(
+            tracker.advance_stop_with_actions(
+                started_at + super::super::GAME_ASSOCIATION_WINDOW,
+                || Some(BTreeMap::new()),
+                |_, _| panic!("there is no process to close"),
+                |_, _| panic!("there is no process to terminate"),
+            ),
+            SteamStopProgress::Complete,
+        );
+        assert!(!tracker.is_stopping());
     }
 
     #[test]

@@ -16,6 +16,7 @@ pub(crate) enum SteamGameLiveness {
 #[cfg(all(test, any(target_os = "linux", windows)))]
 const TEST_STOP_GRACE: Duration = Duration::from_secs(2);
 const STOP_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(10);
+const GAME_ASSOCIATION_WINDOW: Duration = Duration::from_secs(15);
 
 /// Retirement requires a successful snapshot proving no attributed game remains.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -140,8 +141,35 @@ impl SteamProcessTracker {
         self.inner.force_shutdown();
     }
 
+    /// Retire background scans before the native provider can unload.
+    pub(crate) fn poll_scanner_shutdown(&mut self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            self.inner.poll_scanner_shutdown()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            true
+        }
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn hold_scan_for_test(
+        &mut self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        self.inner.hold_scan_for_test()
+    }
+
     pub(crate) fn stop_budget(grace: Duration) -> Duration {
-        grace + STOP_CONFIRMATION_TIMEOUT
+        GAME_ASSOCIATION_WINDOW + grace + STOP_CONFIRMATION_TIMEOUT
+    }
+
+    #[cfg(all(test, any(target_os = "linux", windows)))]
+    pub(crate) fn expire_association_window_for_test(&mut self, now: Instant) {
+        #[cfg(target_os = "linux")]
+        self.inner.expire_association_window_for_test(now);
+        #[cfg(windows)]
+        self.inner.expire_association_window_for_test(now);
     }
 
     pub(crate) fn is_stopping(&self) -> bool {
@@ -169,7 +197,10 @@ mod linux {
     mod scanner;
     #[cfg(test)]
     use super::TEST_STOP_GRACE;
-    use super::{Instant, STOP_CONFIRMATION_TIMEOUT, SteamGameLiveness, SteamStopProgress};
+    use super::{
+        GAME_ASSOCIATION_WINDOW, Instant, STOP_CONFIRMATION_TIMEOUT, SteamGameLiveness,
+        SteamStopProgress,
+    };
     use scanner::ProcessScanner;
     use std::collections::{BTreeMap, BTreeSet};
     use std::ffi::c_void;
@@ -180,8 +211,6 @@ mod linux {
     use std::time::Duration;
 
     const MAX_PROCESS_SCAN: usize = 131_072;
-    const GAME_ASSOCIATION_WINDOW: Duration = Duration::from_secs(15);
-
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     struct Identity {
         pid: u32,
@@ -225,10 +254,31 @@ mod linux {
         scan_failed: bool,
         associated: bool,
         stopping_at: Option<Instant>,
+        stop_grace: Duration,
         shutdown_deadline: Option<Instant>,
     }
 
     impl Tracker {
+        #[cfg(test)]
+        pub(super) fn hold_scan_for_test(
+            &mut self,
+        ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+            let (scanner, observed, release) = ProcessScanner::held_for_test();
+            self.scanner = scanner;
+            (observed, release)
+        }
+
+        pub(super) fn poll_scanner_shutdown(&mut self) -> bool {
+            self.scanner.poll_shutdown()
+        }
+
+        #[cfg(test)]
+        pub(super) fn expire_association_window_for_test(&mut self, now: Instant) {
+            self.started_at = now
+                .checked_sub(GAME_ASSOCIATION_WINDOW + Duration::from_secs(1))
+                .unwrap_or(now);
+        }
+
         pub(super) fn begin(install_directory: &str, steam_id: Option<&str>) -> Option<Self> {
             let install_root = Path::new(install_directory).canonicalize().ok()?;
             if !install_root.is_dir() || install_root == Path::new("/") {
@@ -262,6 +312,7 @@ mod linux {
                 scan_failed: false,
                 associated: false,
                 stopping_at: None,
+                stop_grace: Duration::ZERO,
                 shutdown_deadline: None,
             })
         }
@@ -290,7 +341,7 @@ mod linux {
                 self.associated = true;
                 SteamGameLiveness::Associated
             } else if self.associated
-                || now.saturating_duration_since(self.started_at) > GAME_ASSOCIATION_WINDOW
+                || now.saturating_duration_since(self.started_at) >= GAME_ASSOCIATION_WINDOW
             {
                 SteamGameLiveness::Unknown
             } else {
@@ -339,6 +390,7 @@ mod linux {
             mut scan: impl FnMut() -> Option<ProcessSnapshot>,
             mut signal: impl FnMut(Identity, i32, u32),
         ) -> SteamStopProgress {
+            self.stop_grace = grace;
             // Retain the stop obligation even when its first snapshot fails, so
             // an explicit cleanup retry returns to this tracker.
             let requested = match self.shutdown_deadline {
@@ -360,6 +412,12 @@ mod linux {
             };
             self.refresh_snapshot(&processes);
             if self.tracked.is_empty() {
+                if !self.associated && now < self.started_at + GAME_ASSOCIATION_WINDOW {
+                    // Steam may accept the handoff before its game process
+                    // appears. Keep scanning within the existing association
+                    // window so a cancelled launch cannot escape cleanup.
+                    return SteamStopProgress::Pending;
+                }
                 self.stopping_at = None;
                 return SteamStopProgress::Complete;
             }
@@ -438,10 +496,23 @@ mod linux {
                     SteamStopProgress::Pending
                 };
             };
+            let was_associated = self.associated;
             self.refresh_snapshot(&processes);
             if self.tracked.is_empty() {
+                if !self.associated && now < self.started_at + GAME_ASSOCIATION_WINDOW {
+                    return SteamStopProgress::Pending;
+                }
                 self.stopping_at = None;
                 return SteamStopProgress::Complete;
+            }
+            if !was_associated {
+                // This is the first process observed after cancellation. Start
+                // its configured grace now, then use the existing TERM/KILL
+                // confirmation path against this exact tracked identity.
+                self.stopping_at = Some(self.stop_deadline(now));
+                for identity in self.tracked_descendant_first(&processes.processes) {
+                    signal(identity, libc::SIGTERM, self.user_id);
+                }
             }
             let Some(deadline) = self.stopping_at else {
                 return SteamStopProgress::Pending;
@@ -472,6 +543,17 @@ mod linux {
                 }
             }
             SteamStopProgress::Pending
+        }
+
+        fn stop_deadline(&self, now: Instant) -> Instant {
+            let requested = now + self.stop_grace;
+            self.shutdown_deadline.map_or(requested, |deadline| {
+                requested.min(
+                    deadline
+                        .checked_sub(STOP_CONFIRMATION_TIMEOUT)
+                        .unwrap_or(deadline),
+                )
+            })
         }
 
         #[cfg(test)]
@@ -847,6 +929,7 @@ mod linux {
                 scan_failed: false,
                 associated: false,
                 stopping_at: None,
+                stop_grace: Duration::ZERO,
                 shutdown_deadline: None,
             }
         }
@@ -1128,6 +1211,95 @@ mod linux {
                 );
                 assert_eq!(tracker.stopping_at, Some(retry_at + grace));
             }
+        }
+
+        #[test]
+        fn cancellation_waits_for_and_stops_a_late_steam_game() {
+            let mut tracker = tracker();
+            let started_at = Instant::now();
+            tracker.started_at = started_at;
+            let cancelled_at = started_at + Duration::from_secs(1);
+            let mut signals = Vec::new();
+            assert_eq!(
+                tracker.request_stop_with(
+                    cancelled_at,
+                    TEST_STOP_GRACE,
+                    || Some(ProcessSnapshot::default()),
+                    |identity, signal, _| signals.push((identity.pid, signal)),
+                ),
+                SteamStopProgress::Pending,
+                "an empty snapshot during launch association cannot prove retirement",
+            );
+            assert!(tracker.is_stopping());
+
+            let game = synthetic_process(12, 1, "/games/title/game", 1000);
+            let game_processes = vec![game.clone()];
+            let discovered_at = cancelled_at + Duration::from_secs(1);
+            assert_eq!(
+                tracker.advance_stop_with(
+                    discovered_at,
+                    || Some(game_processes.clone().into()),
+                    |identity, signal, _| signals.push((identity.pid, signal)),
+                ),
+                SteamStopProgress::Pending,
+            );
+            assert_eq!(signals, [(12, libc::SIGTERM)]);
+            assert_eq!(tracker.stopping_at, Some(discovered_at + TEST_STOP_GRACE));
+
+            let force_at = discovered_at + TEST_STOP_GRACE;
+            assert_eq!(
+                tracker.advance_stop_with(
+                    force_at - Duration::from_millis(1),
+                    || Some(game_processes.clone().into()),
+                    |identity, signal, _| signals.push((identity.pid, signal)),
+                ),
+                SteamStopProgress::Pending,
+            );
+            assert_eq!(signals, [(12, libc::SIGTERM)]);
+            assert_eq!(
+                tracker.advance_stop_with(
+                    force_at,
+                    || Some(game_processes.clone().into()),
+                    |identity, signal, _| signals.push((identity.pid, signal)),
+                ),
+                SteamStopProgress::Pending,
+            );
+            assert_eq!(signals, [(12, libc::SIGTERM), (12, libc::SIGKILL)]);
+            assert_eq!(
+                tracker.advance_stop_with(
+                    force_at + Duration::from_millis(1),
+                    || Some(ProcessSnapshot::default()),
+                    |_, _, _| panic!("confirmed absence must not be signaled"),
+                ),
+                SteamStopProgress::Complete,
+            );
+            assert!(!tracker.is_stopping());
+        }
+
+        #[test]
+        fn empty_stop_wait_is_bounded_by_the_association_window() {
+            let mut tracker = tracker();
+            let started_at = Instant::now();
+            tracker.started_at = started_at;
+            let cancelled_at = started_at + Duration::from_secs(1);
+            assert_eq!(
+                tracker.request_stop_with(
+                    cancelled_at,
+                    Duration::ZERO,
+                    || Some(ProcessSnapshot::default()),
+                    |_, _, _| panic!("there is no process to signal"),
+                ),
+                SteamStopProgress::Pending,
+            );
+            assert_eq!(
+                tracker.advance_stop_with(
+                    started_at + GAME_ASSOCIATION_WINDOW,
+                    || Some(ProcessSnapshot::default()),
+                    |_, _, _| panic!("there is no process to signal"),
+                ),
+                SteamStopProgress::Complete,
+            );
+            assert!(!tracker.is_stopping());
         }
 
         #[test]

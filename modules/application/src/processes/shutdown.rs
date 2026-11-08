@@ -26,12 +26,16 @@ impl ProcessManager {
         }
         self.shutdown_started = true;
         let mut release_hooks = Vec::new();
+        let mut scanners_retired = true;
         for record in self.records.values_mut() {
             if let Err(error) = record.prepare_shutdown() {
                 self.shutdown_error = Some(error);
             }
             if let Err(error) = record.advance_at(now) {
                 self.shutdown_error = Some(error);
+            }
+            if let Some(tracker) = &mut record.steam_tracker {
+                scanners_retired &= tracker.poll_scanner_shutdown();
             }
             if record.is_terminal()
                 && let Some(app_id) = record.steam_proton_hook_app_id.take()
@@ -46,10 +50,11 @@ impl ProcessManager {
             lease.prepare_shutdown(now);
         }
         self.proton_hooks.reap();
-        let settled = self
-            .records
-            .values()
-            .all(ProcessRecord::settled_for_shutdown)
+        let settled = scanners_retired
+            && self
+                .records
+                .values()
+                .all(ProcessRecord::settled_for_shutdown)
             && self
                 .preparations
                 .values()

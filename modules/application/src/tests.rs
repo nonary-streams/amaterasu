@@ -107,8 +107,14 @@ fn controlled_child() {
         "detached-output" => {
             use std::io::Write;
             let value = std::env::var("AMATERASU_TEST_VALUE").unwrap();
-            writeln!(std::io::stdout(), "OUT-{value}").unwrap();
-            writeln!(std::io::stderr(), "ERR-{value}").unwrap();
+            // Several detached commands share an append-only output file. A
+            // single write keeps each fixture marker intact when they overlap.
+            std::io::stdout()
+                .write_all(format!("OUT-{value}\n").as_bytes())
+                .unwrap();
+            std::io::stderr()
+                .write_all(format!("ERR-{value}\n").as_bytes())
+                .unwrap();
         }
         "application-output-main" => {
             use std::io::Write;

@@ -4,12 +4,26 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 
 pub(super) struct ProcessScanner {
-    requests: SyncSender<()>,
+    requests: Option<SyncSender<()>>,
     results: Receiver<Option<ProcessSnapshot>>,
     pending: bool,
+    worker: Option<std::thread::JoinHandle<()>>,
 }
 
 impl ProcessScanner {
+    #[cfg(test)]
+    pub(super) fn held_for_test() -> (Self, Receiver<()>, mpsc::Sender<()>) {
+        let (started, observed) = mpsc::channel();
+        let (release, blocked) = mpsc::channel();
+        let mut scanner = Self::with_reader(move || {
+            let _ = started.send(());
+            let _ = blocked.recv();
+            Some(ProcessSnapshot::default())
+        })
+        .unwrap();
+        assert!(scanner.request());
+        (scanner, observed, release)
+    }
     pub(super) fn start(install_root: PathBuf) -> Option<Self> {
         Self::with_reader(move || scan_processes(&install_root))
     }
@@ -19,7 +33,7 @@ impl ProcessScanner {
     ) -> Option<Self> {
         let (requests, incoming) = mpsc::sync_channel(1);
         let (outgoing, results) = mpsc::sync_channel(1);
-        std::thread::Builder::new()
+        let worker = std::thread::Builder::new()
             .name("amaterasu-steam-scan".into())
             .spawn(move || {
                 while incoming.recv().is_ok() {
@@ -29,21 +43,42 @@ impl ProcessScanner {
                 }
             })
             .ok()?;
-        // Dropping the scanner closes both channels. A pending read is allowed
-        // to finish; it cannot signal processes and its worker then retires.
         Some(Self {
-            requests,
+            requests: Some(requests),
             results,
             pending: false,
+            worker: Some(worker),
         })
     }
 
     pub(super) fn request(&mut self) -> bool {
+        if self.requests.is_none() {
+            return false;
+        }
         if self.pending {
             return true;
         }
-        self.pending = self.requests.try_send(()).is_ok();
+        self.pending = self
+            .requests
+            .as_ref()
+            .is_some_and(|requests| requests.try_send(()).is_ok());
         self.pending
+    }
+
+    /// Stop admitting scans and report retirement without waiting on a live read.
+    pub(super) fn poll_shutdown(&mut self) -> bool {
+        self.requests.take();
+        if self
+            .worker
+            .as_ref()
+            .is_some_and(|worker| !worker.is_finished())
+        {
+            return false;
+        }
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+        true
     }
 
     pub(super) fn poll(&mut self) -> Option<Option<ProcessSnapshot>> {
@@ -61,13 +96,23 @@ impl ProcessScanner {
     }
 }
 
+impl Drop for ProcessScanner {
+    fn drop(&mut self) {
+        self.requests.take();
+        // Native module code must stay loaded until its scan has returned.
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
 
     #[test]
-    fn dropping_the_scanner_retires_a_pending_reader() {
+    fn shutdown_waits_nonblocking_for_pending_reader() {
         use std::sync::{
             Arc,
             atomic::{AtomicBool, Ordering},
@@ -91,13 +136,17 @@ mod tests {
         .unwrap();
         scanner.request();
         observed.recv_timeout(Duration::from_secs(2)).unwrap();
-        drop(scanner);
+        let retired_early = scanner.poll_shutdown();
+        let admitted = scanner.request();
         release.send(()).unwrap();
+        assert!(!retired_early);
+        assert!(!admitted);
         let deadline = Instant::now() + Duration::from_secs(2);
-        while !retired.load(Ordering::SeqCst) {
+        while !scanner.poll_shutdown() {
             assert!(Instant::now() < deadline);
             std::thread::yield_now();
         }
+        assert!(retired.load(Ordering::SeqCst));
     }
 
     #[test]

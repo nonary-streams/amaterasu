@@ -1,5 +1,8 @@
 #[cfg(test)]
 mod capacity_tests;
+#[cfg(all(test, target_os = "linux"))]
+#[path = "processes/hook_tests.rs"]
+mod hook_tests;
 mod shutdown;
 
 use crate::command_paths::resolve_command_executable;
@@ -171,6 +174,10 @@ struct ProcessRecord {
     steam_tracker: Option<SteamProcessTracker>,
     #[serde(skip)]
     steam_proton_hook_app_id: Option<String>,
+    #[serde(skip)]
+    hook_pending: bool,
+    #[serde(skip)]
+    hook_deadline: Option<Instant>,
     #[serde(skip_serializing_if = "Option::is_none")]
     steam_game_liveness: Option<SteamGameLiveness>,
 }
@@ -191,6 +198,7 @@ impl ProcessRecord {
         operation_id: String,
         spec: LaunchSpec,
         detached_requests: Vec<DetachedCommandRequest>,
+        hook_pending: bool,
     ) -> Self {
         let lifecycle = ApplicationLifecycle::new_with_context(
             spec.preparation.clone(),
@@ -219,6 +227,9 @@ impl ProcessRecord {
             steam_launcher: None,
             steam_tracker: None,
             steam_proton_hook_app_id: None,
+            hook_pending,
+            hook_deadline: hook_pending
+                .then(|| Instant::now() + crate::proton_hook::SERVER_READY_TIMEOUT),
             steam_game_liveness: None,
         };
         match SharedOutput::open(record.spec.output.as_deref()) {
@@ -229,6 +240,8 @@ impl ProcessRecord {
                 record.output = output;
             }
             Err(error) => {
+                record.hook_pending = false;
+                record.hook_deadline = None;
                 if let Some(lifecycle) = &mut record.lifecycle {
                     lifecycle.output_open_failed(&error);
                 }
@@ -238,7 +251,7 @@ impl ProcessRecord {
                 return record;
             }
         }
-        if record.lifecycle.is_none() {
+        if record.lifecycle.is_none() && !record.hook_pending {
             record.spawn_application();
         }
         record
@@ -348,7 +361,11 @@ impl ProcessRecord {
             .flatten()
         {
             self.steam_launcher = None;
-            if !status.success()
+            // A detached launcher may finish after cancellation or after its
+            // game has already retired. Its late exit must not replace the
+            // settled outcome or start lifecycle cleanup a second time.
+            if matches!(self.state, ProcessState::Running)
+                && !status.success()
                 && !self.steam_tracker.as_mut().is_some_and(|tracker| {
                     tracker.observe(Instant::now());
                     tracker.was_associated()
@@ -571,6 +588,9 @@ impl ProcessRecord {
 
     fn advance_at(&mut self, now: Instant) -> Result<(), &'static str> {
         self.reap_detached_commands();
+        if self.hook_pending {
+            return Ok(());
+        }
         match self.state {
             ProcessState::Preparing => self.advance_preparation(now),
             ProcessState::Running if !self.auto_detached => self.observe_running(now),
@@ -599,6 +619,12 @@ impl ProcessRecord {
     }
 
     fn request_termination(&mut self) -> Result<(), &'static str> {
+        if self.hook_pending {
+            self.hook_pending = false;
+            self.hook_deadline = None;
+            self.complete_or_clean(Completion::Cancelled);
+            return Ok(());
+        }
         if self.is_steam_metadata_launch() {
             return self.request_steam_termination();
         }
@@ -934,6 +960,7 @@ impl ProcessManager {
         payload: Value,
         host_environment_lookup: &dyn Fn(&str) -> Option<String>,
     ) -> Value {
+        self.refresh_hook_readiness();
         if caller.is_empty() || caller.len() > 256 {
             return error("invalid_caller");
         }
@@ -1123,8 +1150,17 @@ impl ProcessManager {
         self.ensure_capacity(caller)?;
         let process_id = self.next_id.checked_add(1).ok_or("process_limit")?;
         let proton_hook_app_id = self.proton_hooks.acquire(&spec)?;
-        let mut record =
-            ProcessRecord::new(process_id, caller, operation_id, spec, detached_requests);
+        let hook_pending = proton_hook_app_id.as_deref().is_some_and(|app_id| {
+            self.proton_hooks.readiness(app_id) != crate::proton_hook::HookReadiness::Ready
+        });
+        let mut record = ProcessRecord::new(
+            process_id,
+            caller,
+            operation_id,
+            spec,
+            detached_requests,
+            hook_pending,
+        );
         record.steam_proton_hook_app_id = proton_hook_app_id;
         let response = json!({"ok":true,"process":record});
         self.records.insert(process_id, record);
@@ -1255,6 +1291,7 @@ impl ProcessManager {
 
     /// Advance every process and lifecycle command once without waiting.
     pub fn reap_exited(&mut self) -> Result<(), &'static str> {
+        self.refresh_hook_readiness();
         let mut failure = None;
         let mut release_hooks = Vec::new();
         for record in self.records.values_mut() {
@@ -1275,6 +1312,49 @@ impl ProcessManager {
             lease.advance();
         }
         failure.map_or(Ok(()), Err)
+    }
+
+    fn refresh_hook_readiness(&mut self) {
+        self.proton_hooks.reap();
+        for record in self
+            .records
+            .values_mut()
+            .filter(|record| record.hook_pending)
+        {
+            if !matches!(record.state, ProcessState::Preparing) {
+                record.hook_pending = false;
+                record.hook_deadline = None;
+                continue;
+            }
+            let readiness = if record
+                .hook_deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+            {
+                crate::proton_hook::HookReadiness::Failed
+            } else {
+                record
+                    .steam_proton_hook_app_id
+                    .as_deref()
+                    .map_or(crate::proton_hook::HookReadiness::Failed, |app_id| {
+                        self.proton_hooks.readiness(app_id)
+                    })
+            };
+            match readiness {
+                crate::proton_hook::HookReadiness::Pending => {}
+                crate::proton_hook::HookReadiness::Ready => {
+                    record.hook_pending = false;
+                    record.hook_deadline = None;
+                    if record.lifecycle.is_none() {
+                        record.spawn_application();
+                    }
+                }
+                crate::proton_hook::HookReadiness::Failed => {
+                    record.hook_pending = false;
+                    record.hook_deadline = None;
+                    record.complete_or_clean(Completion::LaunchFailed { os_error: None });
+                }
+            }
+        }
     }
 
     fn shutdown_budget(&self) -> Duration {
@@ -1393,7 +1473,7 @@ mod steam_cleanup_tests {
                 .unwrap()
                 .spec
                 .exit_timeout_seconds = seconds;
-            assert_eq!(manager.shutdown_budget(), Duration::from_secs(seconds + 10));
+            assert_eq!(manager.shutdown_budget(), Duration::from_secs(seconds + 25));
         }
     }
 
@@ -1453,6 +1533,17 @@ mod steam_cleanup_tests {
 
             // A successful retry confirms this empty install tree before undo.
             record.request_termination().unwrap();
+            record.advance().unwrap();
+            assert_eq!(record.state, ProcessState::Stopping);
+            assert_eq!(record.cleanup_error, None);
+            assert!(record.steam_tracker.as_ref().unwrap().is_stopping());
+            assert!(!record.settled_for_shutdown());
+            record
+                .steam_tracker
+                .as_mut()
+                .unwrap()
+                .expire_association_window_for_test(Instant::now());
+            record.advance().unwrap();
             record.advance().unwrap();
             assert_eq!(record.state, ProcessState::Cancelled);
             assert_eq!(record.cleanup_error, None);

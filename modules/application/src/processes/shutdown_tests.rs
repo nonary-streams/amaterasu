@@ -5,6 +5,57 @@ fn missing_request(operation_id: &str) -> Value {
         "executable":std::env::temp_dir().join("amaterasu-no-such-shutdown-launcher")})
 }
 
+#[cfg(unix)]
+#[test]
+fn late_steam_launcher_failure_does_not_replace_cancellation() {
+    let directory = std::env::temp_dir().join(format!(
+        "amaterasu-steam-late-exit-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    ));
+    std::fs::create_dir(&directory).unwrap();
+    let release = directory.join("release");
+    let mut manager = ProcessManager::default();
+    struct ReleaseOnDrop(std::path::PathBuf);
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            let _ = std::fs::write(&self.0, b"exit");
+        }
+    }
+    let release_on_drop = ReleaseOnDrop(release.clone());
+    let launched = manager.handle(
+        "alice",
+        json!({
+            "action":"launch",
+            "operation_id":"late-steam-exit",
+            "executable":"/bin/sh",
+            "args":["-c", "while [ ! -e \"$1\" ]; do /bin/sleep 0.01; done; exit 23", "launcher", release],
+            "steam_id":"42"
+        }),
+    );
+    let id = launched["process"]["process_id"].as_u64().unwrap();
+    assert_eq!(launched["process"]["state"], "running", "{launched}");
+    let stopped = manager.handle("alice", json!({"action":"terminate", "process_id":id}));
+    assert_eq!(stopped["process"]["state"], "cancelled", "{stopped}");
+
+    std::fs::write(&release, b"exit").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while manager.records[&id].steam_launcher.is_some() {
+        manager.reap_exited().unwrap();
+        assert!(Instant::now() < deadline, "launcher did not exit");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(matches!(
+        manager.records[&id].state,
+        ProcessState::Cancelled
+    ));
+    drop(release_on_drop);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
 fn cleanup_lease(manager: &mut ProcessManager, operation_id: &str) {
     let reply = manager.handle("alice", json!({
         "action":"prepare", "operation_id":operation_id,
@@ -110,6 +161,37 @@ fn announced_drop_does_not_start_an_owed_undo() {
     let before_drop = Instant::now();
     drop(manager);
     assert!(before_drop.elapsed() < Duration::from_secs(1));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn shutdown_waits_for_a_live_steam_scanner_without_blocking() {
+    let directory =
+        std::env::temp_dir().join(format!("amaterasu-scanner-shutdown-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let mut manager = ProcessManager::default();
+    let reply = manager.handle("alice", missing_request("held-scanner"));
+    let id = reply["process"]["process_id"].as_u64().unwrap();
+    let record = manager.records.get_mut(&id).unwrap();
+    record.state = ProcessState::Cancelled;
+    let mut tracker = SteamProcessTracker::begin(directory.to_str().unwrap(), Some("42")).unwrap();
+    let (started, release) = tracker.hold_scan_for_test();
+    started.recv_timeout(Duration::from_secs(2)).unwrap();
+    record.steam_tracker = Some(tracker);
+    let now = Instant::now();
+    manager.prepare_shutdown_until(now + Duration::from_secs(5));
+    let pending = manager.poll_shutdown(now);
+    release.send(()).unwrap();
+    assert_eq!(pending, Ok(false));
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if manager.poll_shutdown(Instant::now()).unwrap() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "scanner did not retire");
+        std::thread::yield_now();
+    }
+    std::fs::remove_dir(directory).unwrap();
 }
 
 #[cfg(any(target_os = "linux", windows))]
