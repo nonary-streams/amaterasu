@@ -414,7 +414,7 @@ fn unconfirmed_write_closes_ingress_and_reloads_the_durable_document() {
 }
 
 #[test]
-fn timeout_and_parent_cancellation_cancel_and_release_the_owned_child_before_reload() {
+fn timeout_and_parent_end_do_not_cancel_or_release_a_pending_write() {
     for expired in [true, false] {
         let mut settings = ProductSettings::default();
         let mut transport = Transport::default();
@@ -423,18 +423,9 @@ fn timeout_and_parent_cancellation_cancel_and_release_the_owned_child_before_rel
         let check = if expired {
             Response::Ok
         } else {
-            Response::Error {
-                code: "request_ended".into(),
-                message: "cancelled parent".into(),
-            }
+            Response::error("request_ended", "ended")
         };
-        transport.push([
-            check,
-            Response::Ok,
-            Response::Ok,
-            Response::Ok,
-            Response::Accepted { id: 30 },
-        ]);
+        transport.push([check, Response::Pending]);
         let now = if expired {
             Instant::now() + Duration::from_secs(4)
         } else {
@@ -445,13 +436,16 @@ fn timeout_and_parent_cancellation_cancel_and_release_the_owned_child_before_rel
             .unwrap();
         assert!(matches!(
             transport.commands[5],
-            Command::Cancel { request: 20 }
+            Command::TakeResult { request: 20 }
         ));
-        assert!(matches!(
-            transport.commands[6],
-            Command::ReleaseResult { request: 20 }
-        ));
+        assert!(settings.pending.is_some());
         assert_eq!(settings.maximum_peer(), None);
+        assert!(
+            !transport
+                .commands
+                .iter()
+                .any(|command| matches!(command, Command::Cancel { .. }))
+        );
     }
 }
 
@@ -533,7 +527,7 @@ fn immutable_runtime_caller_is_required_for_policy_writes() {
 }
 
 #[test]
-fn ambiguous_admission_ends_parent_then_replays_exact_request_and_cleans_owned_child() {
+fn ambiguous_admission_uses_lookup_and_waits_for_the_provider_result() {
     for ambiguous in [
         Err("lost admission reply".into()),
         Ok(Response::Pending),
@@ -548,46 +542,56 @@ fn ambiguous_admission_ends_parent_then_replays_exact_request_and_cleans_owned_c
         );
         transport.responses.push_back(ambiguous);
         settings.receive("amaterasu.management", 7, 2000, json!({"action":"product_update","expected_revision":1,"origin_web_ui_allowed":"pc"}), &mut |command| transport.send(command)).unwrap();
-        let original = serde_json::to_value(&transport.commands[3]).unwrap();
+        let Command::Request {
+            service,
+            payload,
+            operation_id,
+            parent,
+            ..
+        } = &transport.commands[3]
+        else {
+            panic!()
+        };
+        let expected = (
+            service.clone(),
+            payload.clone(),
+            operation_id.clone(),
+            *parent,
+        );
         assert_eq!(settings.maximum_peer(), None);
         transport.push([
-            Response::Ok,
             Response::Accepted { id: 20 },
             Response::Ok,
-            Response::Ok,
-            Response::Ok,
-            Response::Accepted { id: 30 },
+            Response::Pending,
         ]);
         settings
             .tick(Instant::now(), &mut |command| transport.send(command))
             .unwrap();
-        assert!(matches!(
-            transport.commands[4],
-            Command::Complete { request: 7, .. }
-        ));
-        assert_eq!(
-            serde_json::to_value(&transport.commands[5]).unwrap(),
-            original
+        assert!(
+            matches!(&transport.commands[4], Command::LookupRequest { service, payload, operation_id, parent } if (service, payload, operation_id, parent) == (&expected.0, &expected.1, &expected.2, &expected.3))
         );
-        assert!(matches!(
-            transport.commands[6],
-            Command::Cancel { request: 20 }
-        ));
-        assert!(matches!(
-            transport.commands[7],
-            Command::ReleaseResult { request: 20 }
-        ));
-        assert_eq!(settings.maximum_peer(), None);
-        transport.push([stored(2, Some(PeerTier::Pc)), Response::Ok]);
+        assert!(settings.pending.is_some());
+        transport.push([
+            Response::Ok,
+            stored(2, Some(PeerTier::Pc)),
+            Response::Ok,
+            Response::Ok,
+        ]);
         settings
             .tick(Instant::now(), &mut |command| transport.send(command))
             .unwrap();
         assert_eq!(settings.maximum_peer(), Some(PeerTier::Pc));
+        assert!(
+            !transport
+                .commands
+                .iter()
+                .any(|command| matches!(command, Command::Cancel { .. }))
+        );
     }
 }
 
 #[test]
-fn repeated_ambiguous_admission_retains_operation_until_explicit_rejection_after_parent_end() {
+fn ambiguous_lookup_conflict_retains_operation_until_absence_is_proven() {
     let mut settings = ProductSettings::default();
     let mut transport = Transport::default();
     load(
@@ -607,31 +611,32 @@ fn repeated_ambiguous_admission_retains_operation_until_explicit_rejection_after
             &mut |command| transport.send(command),
         )
         .unwrap();
-    transport.push([Response::Ok, Response::Pending]);
+    transport.push([Response::error("conflict", "unknown operation")]);
     settings
         .tick(Instant::now(), &mut |command| transport.send(command))
         .unwrap();
     assert!(settings.pending.is_some());
     assert_eq!(settings.maximum_peer(), None);
-    transport.push([Response::Error {
-        code: "permission_denied".into(),
-        message: "ended parent cannot create a request".into(),
-    }]);
+    transport.push([
+        Response::error("not_found", "absent"),
+        Response::Ok,
+        Response::Accepted { id: 30 },
+    ]);
     settings
         .tick(Instant::now(), &mut |command| transport.send(command))
         .unwrap();
-    assert!(settings.pending.is_none());
-    assert_eq!(settings.maximum_peer(), None);
-    for command in [
-        &transport.commands[3],
-        &transport.commands[5],
-        &transport.commands[6],
-    ] {
-        assert_eq!(
-            serde_json::to_value(command).unwrap(),
-            serde_json::to_value(&transport.commands[3]).unwrap()
-        );
-    }
+    assert!(matches!(
+        transport.commands[4],
+        Command::LookupRequest { .. }
+    ));
+    assert!(matches!(
+        transport.commands[5],
+        Command::LookupRequest { .. }
+    ));
+    assert!(matches!(
+        transport.commands[6],
+        Command::Complete { request: 7, .. }
+    ));
 }
 
 #[test]

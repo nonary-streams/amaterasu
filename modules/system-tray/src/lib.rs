@@ -20,54 +20,86 @@ struct SystemTrayModule {
     product_settings: ProductSettings,
     tray: TrayRuntime<DesktopTrayBackend>,
     deferred_settings: VecDeque<(u64, Operation)>,
+    pending_completions: VecDeque<(u64, Value)>,
     tray_events: TrayEventQueue,
+    shutdown_announced: bool,
 }
 
 impl ManagedModule for SystemTrayModule {
     fn start(runtime: RuntimeClient) -> ModuleResult<Self> {
+        let mut nonce = [0u8; 16];
+        getrandom::fill(&mut nonce).map_err(|_| "system tray startup randomness unavailable")?;
+        let startup_id: String = nonce.iter().map(|byte| format!("{byte:02x}")).collect();
         runtime.require_success(Command::Register {
             service: SERVICE.into(),
         })?;
         Ok(Self {
             runtime,
-            product_settings: ProductSettings::new(),
+            product_settings: ProductSettings::new(&startup_id),
             tray: TrayRuntime::new(DesktopTrayBackend::default()),
             deferred_settings: VecDeque::new(),
+            pending_completions: VecDeque::new(),
             tray_events: TrayEventQueue::default(),
+            shutdown_announced: false,
         })
     }
 
+    fn prepare_shutdown(&mut self, _remaining_ms: u64) -> ModuleResult<()> {
+        self.shutdown_announced = true;
+        Ok(())
+    }
+
+    fn quiesce(&mut self) -> ModuleResult<bool> {
+        self.shutdown_announced = true;
+        while let Some((request, _)) = self.deferred_settings.pop_front() {
+            self.complete(
+                request,
+                failure("shutting_down", "system tray is shutting down"),
+            )?;
+        }
+        let runtime = &mut self.runtime;
+        let settings_ready = self
+            .product_settings
+            .quiesce(&mut |command| runtime.send(command))?;
+        let tray_ready = self.tray.quiesce();
+        self.complete_settings_updates()?;
+        let completions_ready = self.flush_completions();
+        Ok(settings_ready && tray_ready && completions_ready)
+    }
+
     fn tick(&mut self) -> ModuleResult<()> {
-        match self.runtime.send(Command::Poll {})? {
-            Response::Request {
-                id,
-                caller,
-                payload,
-                ..
-            } => match serde_json::from_value::<Operation>(payload) {
-                Ok(operation) if operation.authorized_for(&caller) => {
-                    self.accept_request(id, operation)?;
+        if self.flush_completions() {
+            match self.runtime.send(Command::Poll {})? {
+                Response::Request {
+                    id,
+                    caller,
+                    payload,
+                    ..
+                } => match serde_json::from_value::<Operation>(payload) {
+                    Ok(operation) if operation.authorized_for(&caller) => {
+                        self.accept_request(id, operation)?;
+                    }
+                    Ok(_) => self.complete(
+                        id,
+                        failure(
+                            "permission_denied",
+                            "caller is not authorized for this system tray operation",
+                        ),
+                    )?,
+                    Err(_) => self.complete(
+                        id,
+                        failure(
+                            "invalid_request",
+                            "request does not match the system tray schema",
+                        ),
+                    )?,
+                },
+                Response::Pending => {}
+                response => {
+                    return Err(format!(
+                        "unexpected system tray poll response: {response:?}"
+                    ));
                 }
-                Ok(_) => self.complete(
-                    id,
-                    failure(
-                        "permission_denied",
-                        "caller is not authorized for this system tray operation",
-                    ),
-                )?,
-                Err(_) => self.complete(
-                    id,
-                    failure(
-                        "invalid_request",
-                        "request does not match the system tray schema",
-                    ),
-                )?,
-            },
-            Response::Pending => {}
-            response => {
-                return Err(format!(
-                    "unexpected system tray poll response: {response:?}"
-                ));
             }
         }
 
@@ -79,12 +111,24 @@ impl ManagedModule for SystemTrayModule {
         self.drain_deferred_settings()?;
         self.tray.reconcile(Instant::now());
         self.collect_tray_events();
+        self.flush_completions();
         Ok(())
     }
 }
 
 impl SystemTrayModule {
     fn accept_request(&mut self, request: u64, operation: Operation) -> ModuleResult<()> {
+        if self.shutdown_announced
+            && matches!(
+                operation,
+                Operation::SettingsGet {} | Operation::SettingsUpdate { .. }
+            )
+        {
+            return self.complete(
+                request,
+                failure("shutting_down", "system tray is shutting down"),
+            );
+        }
         if matches!(
             operation,
             Operation::SettingsGet {} | Operation::SettingsUpdate { .. }
@@ -226,14 +270,39 @@ impl SystemTrayModule {
         self.tray_events.push_batch(self.tray.take_events());
     }
 
-    fn complete(&self, request: u64, payload: Value) -> ModuleResult<()> {
-        match self.runtime.send(Command::Complete { request, payload })? {
-            Response::Ok => Ok(()),
-            response => Err(format!(
-                "unexpected system tray completion response: {response:?}"
-            )),
-        }
+    fn complete(&mut self, request: u64, payload: Value) -> ModuleResult<()> {
+        self.pending_completions.push_back((request, payload));
+        Ok(())
     }
+
+    fn flush_completions(&mut self) -> bool {
+        let runtime = &self.runtime;
+        flush_completions(&mut self.pending_completions, &mut |command| {
+            runtime.send(command)
+        })
+    }
+}
+
+fn flush_completions(
+    pending: &mut VecDeque<(u64, Value)>,
+    send: &mut impl FnMut(Command) -> ModuleResult<Response>,
+) -> bool {
+    while let Some((request, payload)) = pending.front() {
+        match send(Command::Complete {
+            request: *request,
+            payload: payload.clone(),
+        }) {
+            Ok(Response::Ok) => {}
+            Ok(Response::Error { code, .. })
+                if matches!(
+                    code.as_str(),
+                    "cancelled" | "deadline_exceeded" | "request_ended" | "not_found"
+                ) => {}
+            _ => return false,
+        }
+        pending.pop_front();
+    }
+    true
 }
 
 #[derive(Default)]
@@ -291,6 +360,26 @@ amaterasu_module_sdk::export_module!(SystemTrayModule);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lost_completion_acknowledgement_keeps_exact_response_until_retired() {
+        let payload = json!({"ok":true,"delivery":"notified"});
+        let mut pending = VecDeque::from([(42, payload.clone())]);
+        assert!(!flush_completions(&mut pending, &mut |command| {
+            assert!(
+                matches!(command, Command::Complete { request: 42, payload: ref value } if *value == payload)
+            );
+            Err("reply lost".into())
+        }));
+        assert_eq!(pending.len(), 1);
+        assert!(flush_completions(&mut pending, &mut |command| {
+            assert!(
+                matches!(command, Command::Complete { request: 42, payload: ref value } if *value == payload)
+            );
+            Ok(Response::error("request_ended", "already completed"))
+        }));
+        assert!(pending.is_empty());
+    }
 
     #[test]
     fn management_and_updater_response_shapes_are_stable() {

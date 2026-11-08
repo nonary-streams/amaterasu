@@ -6,7 +6,11 @@ use std::time::{Duration, Instant};
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 use std::{
     collections::VecDeque,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
 };
 
 const MAX_QUEUED_TRAY_EVENTS: usize = 32;
@@ -29,6 +33,13 @@ pub enum Delivery {
     Notified,
     Disabled,
     Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StartState {
+    Ready,
+    Pending,
+    Failed,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -58,7 +69,7 @@ pub struct TrayEventBatch {
 /// Desktop-specific operations are injectable so lifecycle policy can be tested
 /// without opening a live session bus or creating an operating-system tray icon.
 pub trait TrayBackend {
-    fn start(&mut self) -> bool;
+    fn start(&mut self) -> StartState;
     fn is_running(&self) -> bool;
     fn notify_update(&mut self, notice: &UpdateNotice) -> bool;
     fn set_activity(&mut self, update: &ActivityUpdate) -> bool;
@@ -67,7 +78,8 @@ pub trait TrayBackend {
     fn take_events(&mut self) -> TrayEventBatch {
         TrayEventBatch::default()
     }
-    fn stop(&mut self);
+    /// Request shutdown and return true only after the native worker retires.
+    fn stop(&mut self) -> bool;
 }
 
 pub struct TrayRuntime<B: TrayBackend> {
@@ -75,6 +87,7 @@ pub struct TrayRuntime<B: TrayBackend> {
     settings: Option<TraySettings>,
     availability: Availability,
     retry_at: Option<Instant>,
+    shutdown: bool,
 }
 
 impl<B: TrayBackend> TrayRuntime<B> {
@@ -84,6 +97,7 @@ impl<B: TrayBackend> TrayRuntime<B> {
             settings: None,
             availability: Availability::NotReady,
             retry_at: None,
+            shutdown: false,
         }
     }
 
@@ -101,6 +115,9 @@ impl<B: TrayBackend> TrayRuntime<B> {
     }
 
     pub fn reconcile(&mut self, now: Instant) {
+        if self.shutdown {
+            return;
+        }
         let Some(settings) = self.settings.as_ref() else {
             self.availability = Availability::NotReady;
             return;
@@ -132,13 +149,26 @@ impl<B: TrayBackend> TrayRuntime<B> {
             return;
         }
 
-        if self.backend.start() {
-            self.retry_at = None;
-            self.availability = Availability::Available;
-        } else {
-            self.retry_at = Some(now + START_RETRY_INTERVAL);
-            self.availability = Availability::Unavailable;
+        match self.backend.start() {
+            StartState::Ready => {
+                self.retry_at = None;
+                self.availability = Availability::Available;
+            }
+            StartState::Pending => {
+                self.retry_at = None;
+                self.availability = Availability::Unavailable;
+            }
+            StartState::Failed => {
+                self.retry_at = Some(now + START_RETRY_INTERVAL);
+                self.availability = Availability::Unavailable;
+            }
         }
+    }
+
+    pub fn quiesce(&mut self) -> bool {
+        self.shutdown = true;
+        self.availability = Availability::Unavailable;
+        self.backend.stop()
     }
 
     pub fn notify_update(&mut self, notice: &UpdateNotice, now: Instant) -> Delivery {
@@ -200,8 +230,11 @@ pub struct DesktopTrayBackend {
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 struct RunningTray {
-    handle: ldtray::TrayHandle,
+    handle: Option<ldtray::TrayHandle>,
+    ready: mpsc::Receiver<ldtray::TrayHandle>,
     thread: thread::JoinHandle<ldtray::Result<()>>,
+    cancelled: Arc<AtomicBool>,
+    quit_sent: bool,
     event_queue: Arc<Mutex<NativeEventQueue>>,
     release_url: Arc<Mutex<Option<String>>>,
 }
@@ -232,36 +265,59 @@ impl NativeEventQueue {
 }
 
 impl TrayBackend for DesktopTrayBackend {
-    fn start(&mut self) -> bool {
+    fn start(&mut self) -> StartState {
         #[cfg(any(target_os = "linux", target_os = "windows"))]
         {
-            if self.is_running() {
-                return true;
+            if let Some(running) = self.running.as_mut() {
+                if running.cancelled.load(Ordering::Acquire) {
+                    return if self.stop() {
+                        StartState::Failed
+                    } else {
+                        StartState::Pending
+                    };
+                }
+                if running.handle.is_none() {
+                    running.handle = running.ready.try_recv().ok();
+                }
+                if running.thread.is_finished() {
+                    let running = self.running.take().expect("finished tray exists");
+                    let _ = running.thread.join();
+                    return StartState::Failed;
+                }
+                return if running.handle.is_some() {
+                    StartState::Ready
+                } else {
+                    StartState::Pending
+                };
             }
-            self.stop();
-
-            let menu = ldtray::Menu::new()
-                .item(ldtray::MenuItem::button(1, "Open Amaterasu"))
-                .item(ldtray::MenuItem::separator())
-                .item(ldtray::MenuItem::button(2, "Check for Update"))
-                .item(ldtray::MenuItem::button(3, "Restart"))
-                .item(ldtray::MenuItem::button(4, "Quit"));
-            let tray = match ldtray::Tray::new(
-                ldtray::TrayConfig::new(tray_icon(ActivityState::Stopped))
-                    .tooltip("Amaterasu")
-                    .menu(menu),
-            ) {
-                Ok(tray) => tray,
-                Err(_) => return false,
-            };
-            let handle = tray.handle();
             let event_queue = Arc::new(Mutex::new(NativeEventQueue::default()));
             let thread_event_queue = Arc::clone(&event_queue);
             let release_url = Arc::new(Mutex::new(None));
             let event_release_url = Arc::clone(&release_url);
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let thread_cancelled = Arc::clone(&cancelled);
+            let (ready_tx, ready) = mpsc::sync_channel(1);
             let thread = match thread::Builder::new()
                 .name("amaterasu-system-tray".into())
                 .spawn(move || {
+                    let menu = ldtray::Menu::new()
+                        .item(ldtray::MenuItem::button(1, "Open Amaterasu"))
+                        .item(ldtray::MenuItem::separator())
+                        .item(ldtray::MenuItem::button(2, "Check for Update"))
+                        .item(ldtray::MenuItem::button(3, "Restart"))
+                        .item(ldtray::MenuItem::button(4, "Quit"));
+                    let tray = ldtray::Tray::new(
+                        ldtray::TrayConfig::new(tray_icon(ActivityState::Stopped))
+                            .tooltip("Amaterasu")
+                            .menu(menu),
+                    )?;
+                    if thread_cancelled.load(Ordering::Acquire) {
+                        return Ok(());
+                    }
+                    let _ = ready_tx.send(tray.handle());
+                    if thread_cancelled.load(Ordering::Acquire) {
+                        return Ok(());
+                    }
                     tray.run(|event| {
                         if let Some(event) = translate_event(event, &event_release_url)
                             && let Ok(mut queue) = thread_event_queue.lock()
@@ -271,29 +327,34 @@ impl TrayBackend for DesktopTrayBackend {
                     })
                 }) {
                 Ok(thread) => thread,
-                Err(_) => return false,
+                Err(_) => return StartState::Failed,
             };
             self.running = Some(RunningTray {
-                handle,
+                handle: None,
+                ready,
                 thread,
+                cancelled,
+                quit_sent: false,
                 event_queue,
                 release_url,
             });
-            true
+            StartState::Pending
         }
 
         #[cfg(not(any(target_os = "linux", target_os = "windows")))]
         {
-            false
+            StartState::Failed
         }
     }
 
     fn is_running(&self) -> bool {
         #[cfg(any(target_os = "linux", target_os = "windows"))]
         {
-            self.running
-                .as_ref()
-                .is_some_and(|running| !running.thread.is_finished())
+            self.running.as_ref().is_some_and(|running| {
+                running.handle.is_some()
+                    && !running.cancelled.load(Ordering::Acquire)
+                    && !running.thread.is_finished()
+            })
         }
 
         #[cfg(not(any(target_os = "linux", target_os = "windows")))]
@@ -311,6 +372,9 @@ impl TrayBackend for DesktopTrayBackend {
             if running.thread.is_finished() {
                 return false;
             }
+            let Some(handle) = running.handle.as_ref() else {
+                return false;
+            };
             let body = format!(
                 "Version {} is available.\n{}",
                 notice.version, notice.release_url
@@ -319,8 +383,7 @@ impl TrayBackend for DesktopTrayBackend {
                 return false;
             };
             *release_url = Some(notice.release_url.clone());
-            running
-                .handle
+            handle
                 .notify(
                     ldtray::Notification::new("Amaterasu update available", body)
                         .action(OPEN_RELEASE_ACTION, "View release"),
@@ -344,12 +407,14 @@ impl TrayBackend for DesktopTrayBackend {
             if running.thread.is_finished() {
                 return false;
             }
+            let Some(handle) = running.handle.as_ref() else {
+                return false;
+            };
             let (tooltip, title, body) = activity_notice(update);
             let icon = tray_icon(update.state);
-            running.handle.set_icon(icon.clone()).is_ok()
-                && running.handle.set_tooltip(tooltip).is_ok()
-                && running
-                    .handle
+            handle.set_icon(icon.clone()).is_ok()
+                && handle.set_tooltip(tooltip).is_ok()
+                && handle
                     .notify(ldtray::Notification::new(title, body).with_icon(icon))
                     .is_ok()
         }
@@ -370,14 +435,13 @@ impl TrayBackend for DesktopTrayBackend {
             if running.thread.is_finished() {
                 return false;
             }
+            let Some(handle) = running.handle.as_ref() else {
+                return false;
+            };
             let icon = tray_icon_with_mark([238, 97, 104, 255]);
-            running.handle.set_icon(icon.clone()).is_ok()
-                && running
-                    .handle
-                    .set_tooltip("Amaterasu — pairing required")
-                    .is_ok()
-                && running
-                    .handle
+            handle.set_icon(icon.clone()).is_ok()
+                && handle.set_tooltip("Amaterasu — pairing required").is_ok()
+                && handle
                     .notify(
                         ldtray::Notification::new(
                             "Incoming Pairing Request",
@@ -404,14 +468,15 @@ impl TrayBackend for DesktopTrayBackend {
             if running.thread.is_finished() {
                 return false;
             }
+            let Some(handle) = running.handle.as_ref() else {
+                return false;
+            };
             let icon = tray_icon(ActivityState::Stopped);
-            running.handle.set_icon(icon.clone()).is_ok()
-                && running
-                    .handle
+            handle.set_icon(icon.clone()).is_ok()
+                && handle
                     .set_tooltip("Amaterasu — gamepad input unavailable")
                     .is_ok()
-                && running
-                    .handle
+                && handle
                     .notify(
                         ldtray::Notification::new(
                             "Gamepad Input Unavailable",
@@ -444,18 +509,47 @@ impl TrayBackend for DesktopTrayBackend {
         }
     }
 
-    fn stop(&mut self) {
+    fn stop(&mut self) -> bool {
         #[cfg(any(target_os = "linux", target_os = "windows"))]
-        if let Some(running) = self.running.take() {
-            let _ = running.handle.quit();
+        if let Some(running) = self.running.as_mut() {
+            running.cancelled.store(true, Ordering::Release);
+            if running.handle.is_none() {
+                running.handle = running.ready.try_recv().ok();
+            }
+            if !running.quit_sent
+                && let Some(handle) = &running.handle
+            {
+                let _ = handle.quit();
+                running.quit_sent = true;
+            }
+            if !running.thread.is_finished() {
+                return false;
+            }
+            let running = self.running.take().expect("finished tray exists");
             let _ = running.thread.join();
         }
+        true
     }
 }
 
 impl Drop for DesktopTrayBackend {
     fn drop(&mut self) {
-        self.stop();
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        if let Some(mut running) = self.running.take() {
+            running.cancelled.store(true, Ordering::Release);
+            // Initialization may still be obtaining native resources. Wait
+            // for either its handle or thread exit before joining, so a racing
+            // event loop receives quit and cannot outlive this library.
+            if running.handle.is_none() {
+                running.handle = running.ready.recv().ok();
+            }
+            if !running.quit_sent
+                && let Some(handle) = &running.handle
+            {
+                let _ = handle.quit();
+            }
+            let _ = running.thread.join();
+        }
     }
 }
 
@@ -552,10 +646,14 @@ mod tests {
     }
 
     impl TrayBackend for FakeTrayBackend {
-        fn start(&mut self) -> bool {
+        fn start(&mut self) -> StartState {
             self.starts += 1;
             self.running = self.start_succeeds;
-            self.running
+            if self.running {
+                StartState::Ready
+            } else {
+                StartState::Failed
+            }
         }
 
         fn is_running(&self) -> bool {
@@ -605,11 +703,12 @@ mod tests {
             }
         }
 
-        fn stop(&mut self) {
+        fn stop(&mut self) -> bool {
             if self.running {
                 self.stops += 1;
             }
             self.running = false;
+            true
         }
     }
 
@@ -829,5 +928,43 @@ mod tests {
                 release_url: release_url.lock().unwrap().clone().unwrap(),
             })
         );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[test]
+    fn shutdown_during_initialization_waits_without_blocking_or_detaching_worker() {
+        let (release, hold) = mpsc::channel();
+        let (ready, ready_rx) = mpsc::sync_channel(1);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let thread = thread::spawn(move || {
+            let _keep_sender_alive = ready;
+            hold.recv().unwrap();
+            assert!(worker_cancelled.load(Ordering::Acquire));
+            Ok(())
+        });
+        let backend = DesktopTrayBackend {
+            running: Some(RunningTray {
+                handle: None,
+                ready: ready_rx,
+                thread,
+                cancelled,
+                quit_sent: false,
+                event_queue: Arc::new(Mutex::new(NativeEventQueue::default())),
+                release_url: Arc::new(Mutex::new(None)),
+            }),
+        };
+        let mut runtime = TrayRuntime::new(backend);
+        let start = Instant::now();
+        assert!(!runtime.quiesce());
+        assert!(start.elapsed() < Duration::from_millis(500));
+        assert!(runtime.backend.running.is_some());
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !runtime.quiesce() {
+            assert!(Instant::now() < deadline, "tray worker failed to retire");
+            thread::yield_now();
+        }
+        assert!(runtime.backend.running.is_none());
     }
 }

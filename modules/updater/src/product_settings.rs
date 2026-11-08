@@ -3,9 +3,13 @@ use crate::model::{MAX_UPDATE_CHECK_INTERVAL_SECONDS, Settings};
 use amaterasu_module_sdk::{Command, ModuleResult, Response};
 use serde_json::{Value, json};
 use std::collections::VecDeque;
+use std::time::{Duration, Instant};
 
 const CONFIGURATION: &str = "amaterasu.configuration/1";
 const CALL_TIMEOUT_MS: u64 = 30_000;
+// The broker keeps completed operation IDs for five minutes. Never replay an
+// unknown admission after that horizon, when it could become a second write.
+const ADMISSION_RECOVERY_WINDOW: Duration = Duration::from_secs(300);
 
 #[derive(Clone)]
 enum Purpose {
@@ -21,6 +25,7 @@ enum Purpose {
 enum CallState {
     Submit,
     Waiting(u64),
+    Uncertain,
     Release {
         request: u64,
         outcome: Result<Value, (String, String)>,
@@ -33,6 +38,8 @@ struct PendingCall {
     operation_id: String,
     parent: Option<u64>,
     state: CallState,
+    first_attempt: Option<Instant>,
+    admission_uncertain: bool,
 }
 
 pub enum Completion {
@@ -47,6 +54,7 @@ pub struct ProductSettings {
     sequence: u64,
     pending: Option<PendingCall>,
     completions: VecDeque<Completion>,
+    quiescing: bool,
 }
 
 impl ProductSettings {
@@ -63,8 +71,11 @@ impl ProductSettings {
                 operation_id: format!("updater.configuration.register.{startup_id}"),
                 parent: None,
                 state: CallState::Submit,
+                first_attempt: None,
+                admission_uncertain: false,
             }),
             completions: VecDeque::new(),
+            quiescing: false,
         }
     }
 
@@ -82,6 +93,9 @@ impl ProductSettings {
         expected_revision: u64,
         desired: Settings,
     ) -> Result<(), Value> {
+        if self.quiescing {
+            return Err(failure("shutting_down", "updater is shutting down"));
+        }
         if !self.ready {
             return Err(failure(
                 "configuration_unavailable",
@@ -124,8 +138,36 @@ impl ProductSettings {
             operation_id,
             parent: Some(request),
             state: CallState::Submit,
+            first_attempt: None,
+            admission_uncertain: false,
         });
         Ok(())
+    }
+
+    /// Settle the exact outstanding configuration operation without cancelling
+    /// a write that may already be executing in the provider. The caller must
+    /// also deliver any queued completions before treating the module as idle.
+    pub fn quiesce(
+        &mut self,
+        send: &mut impl FnMut(Command) -> ModuleResult<Response>,
+    ) -> ModuleResult<bool> {
+        self.quiescing = true;
+        if self.pending.as_ref().is_some_and(|pending| {
+            matches!(pending.state, CallState::Submit) && pending.first_attempt.is_none()
+        }) {
+            let pending = self.pending.take().expect("unsubmitted operation exists");
+            if let Purpose::Update {
+                management_request, ..
+            } = pending.purpose
+            {
+                self.completions.push_back(Completion::Update {
+                    request: management_request,
+                    response: failure("shutting_down", "updater is shutting down"),
+                });
+            }
+        }
+        self.advance(send)?;
+        Ok(self.pending.is_none() && self.completions.is_empty())
     }
 
     pub fn take_completion(&mut self) -> Option<Completion> {
@@ -142,20 +184,42 @@ impl ProductSettings {
         let mut finished = false;
         let state = std::mem::replace(&mut pending.state, CallState::Submit);
         match state {
-            CallState::Submit => match send(Command::Request {
-                service: CONFIGURATION.into(),
-                payload: pending.payload.clone(),
-                timeout_ms: CALL_TIMEOUT_MS,
-                operation_id: pending.operation_id.clone(),
-                parent: pending.parent,
-            }) {
-                Ok(Response::Accepted { id }) => pending.state = CallState::Waiting(id),
-                Ok(Response::Error { code, message }) => {
-                    self.finish_error(pending.purpose.clone(), &code, &message);
-                    finished = true;
+            CallState::Submit => {
+                let now = Instant::now();
+                if pending.admission_uncertain
+                    && pending.first_attempt.is_some_and(|first| {
+                        now.saturating_duration_since(first) >= ADMISSION_RECOVERY_WINDOW
+                    })
+                {
+                    pending.state = CallState::Uncertain;
+                } else {
+                    pending.first_attempt.get_or_insert(now);
+                    match send(Command::Request {
+                        service: CONFIGURATION.into(),
+                        payload: pending.payload.clone(),
+                        timeout_ms: CALL_TIMEOUT_MS,
+                        operation_id: pending.operation_id.clone(),
+                        parent: pending.parent,
+                    }) {
+                        Ok(Response::Accepted { id }) => pending.state = CallState::Waiting(id),
+                        Ok(Response::Error { .. }) if pending.admission_uncertain => {
+                            // A later rejection cannot disprove the original
+                            // admission. Retry the exact identity while the
+                            // broker's retention window still protects it.
+                            pending.state = CallState::Submit;
+                        }
+                        Ok(Response::Error { code, message }) => {
+                            self.finish_error(pending.purpose.clone(), &code, &message);
+                            finished = true;
+                        }
+                        Ok(_) | Err(_) => {
+                            pending.admission_uncertain = true;
+                            pending.state = CallState::Submit;
+                        }
+                    }
                 }
-                Ok(_) | Err(_) => pending.state = CallState::Submit,
-            },
+            }
+            CallState::Uncertain => pending.state = CallState::Uncertain,
             CallState::Waiting(request) => match send(Command::TakeResult { request }) {
                 Ok(Response::Pending) | Err(_) => pending.state = CallState::Waiting(request),
                 Ok(Response::Result { payload }) => {
@@ -164,25 +228,9 @@ impl ProductSettings {
                         outcome: Ok(payload),
                     };
                 }
-                Ok(Response::Error { code, message }) if code == "not_found" => {
-                    self.finish_error(pending.purpose.clone(), &code, &message);
-                    finished = true;
-                }
-                Ok(Response::Error { code, message }) => {
-                    pending.state = CallState::Release {
-                        request,
-                        outcome: Err((code, message)),
-                    };
-                }
-                Ok(_) => {
-                    pending.state = CallState::Release {
-                        request,
-                        outcome: Err((
-                            "invalid_response".into(),
-                            "configuration returned an unexpected response".into(),
-                        )),
-                    };
-                }
+                // A broker error, including deadline expiry or a missing
+                // result, does not fence an already delivered provider write.
+                Ok(_) => pending.state = CallState::Uncertain,
             },
             CallState::Release { request, outcome } => {
                 match send(Command::ReleaseResult { request }) {
@@ -278,22 +326,32 @@ impl ProductSettings {
     }
 
     fn schedule_load(&mut self) {
+        if self.quiescing {
+            return;
+        }
         self.pending = Some(PendingCall {
             purpose: Purpose::Load,
             payload: json!({"action":"get"}),
             operation_id: self.next_id("load"),
             parent: None,
             state: CallState::Submit,
+            first_attempt: None,
+            admission_uncertain: false,
         });
     }
 
     fn schedule_register(&mut self) {
+        if self.quiescing {
+            return;
+        }
         self.pending = Some(PendingCall {
             purpose: Purpose::Register,
             payload: register_payload(),
             operation_id: self.next_id("register-retry"),
             parent: None,
             state: CallState::Submit,
+            first_attempt: None,
+            admission_uncertain: false,
         });
     }
 
@@ -495,5 +553,180 @@ mod tests {
         assert!(restarted.is_ready());
         assert_eq!(restarted.settings(), (&desired, 2));
         assert!(restarted.take_completion().is_none());
+    }
+
+    #[test]
+    fn quiescence_waits_for_admitted_update_and_releases_its_result() {
+        let mut settings = ProductSettings::new("quiesce");
+        advance_configuration_call(
+            &mut settings,
+            "register",
+            10,
+            json!({"ok":true,"revision":1,"values":settings_value(&Settings::default())}),
+        );
+        let desired = Settings {
+            notify_pre_releases: true,
+            ..Settings::default()
+        };
+        settings.begin_update(45, 1, desired.clone()).unwrap();
+        settings
+            .advance(&mut |_| Ok(Response::Accepted { id: 11 }))
+            .unwrap();
+        assert!(
+            !settings
+                .quiesce(&mut |command| {
+                    assert!(matches!(command, Command::TakeResult { request: 11 }));
+                    Ok(Response::Pending)
+                })
+                .unwrap()
+        );
+        assert!(
+            !settings
+                .quiesce(&mut |command| {
+                    assert!(matches!(command, Command::TakeResult { request: 11 }));
+                    Ok(Response::Result {
+                        payload: json!({"ok":true,"revision":2,"values":settings_value(&desired)}),
+                    })
+                })
+                .unwrap()
+        );
+        assert!(
+            !settings
+                .quiesce(&mut |command| {
+                    assert!(matches!(command, Command::ReleaseResult { request: 11 }));
+                    Ok(Response::Ok)
+                })
+                .unwrap()
+        );
+        assert!(matches!(
+            settings.take_completion(),
+            Some(Completion::Update { request: 45, .. })
+        ));
+        assert!(
+            settings
+                .quiesce(&mut |_| panic!("settled update must not send more requests"))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn quiescence_preserves_unknown_admission_without_cancelling_or_resubmitting_after_horizon() {
+        let mut settings = ProductSettings::new("uncertain");
+        settings
+            .advance(&mut |_| Err("lost response".into()))
+            .unwrap();
+        settings.pending.as_mut().unwrap().first_attempt =
+            Some(Instant::now() - ADMISSION_RECOVERY_WINDOW);
+        assert!(
+            !settings
+                .quiesce(&mut |_| panic!("expired unknown admission must not be replayed"))
+                .unwrap()
+        );
+        assert!(matches!(
+            settings.pending.as_ref().unwrap().state,
+            CallState::Uncertain
+        ));
+    }
+
+    #[test]
+    fn a_lost_admission_followed_by_rejection_keeps_retrying_the_same_operation() {
+        let mut settings = ProductSettings::new("lost-admission");
+        settings
+            .advance(&mut |_| Err("lost response".into()))
+            .unwrap();
+        settings
+            .advance(&mut |_| Ok(Response::error("unavailable", "provider unavailable")))
+            .unwrap();
+        assert!(matches!(
+            settings.pending.as_ref().unwrap().state,
+            CallState::Submit
+        ));
+        assert!(
+            !settings
+                .quiesce(&mut |command| {
+                    assert!(matches!(command, Command::Request { ref operation_id, .. }
+                if operation_id == "updater.configuration.register.lost-admission"));
+                    Ok(Response::Accepted { id: 41 })
+                })
+                .unwrap()
+        );
+        assert!(matches!(
+            settings.pending.as_ref().unwrap().state,
+            CallState::Waiting(41)
+        ));
+    }
+
+    #[test]
+    fn broker_deadline_does_not_prove_an_admitted_write_retired() {
+        let mut settings = ProductSettings::new("deadline");
+        settings
+            .advance(&mut |_| Ok(Response::Accepted { id: 19 }))
+            .unwrap();
+        assert!(
+            !settings
+                .quiesce(&mut |command| {
+                    assert!(matches!(command, Command::TakeResult { request: 19 }));
+                    Ok(Response::error("deadline_exceeded", "expired"))
+                })
+                .unwrap()
+        );
+        assert!(matches!(
+            settings.pending.as_ref().unwrap().state,
+            CallState::Uncertain
+        ));
+    }
+
+    #[test]
+    fn quiescence_discards_only_never_submitted_work_and_does_not_schedule_retries() {
+        let mut settings = ProductSettings::new("never-sent");
+        assert!(
+            settings
+                .quiesce(&mut |_| panic!("never submitted work must be dropped"))
+                .unwrap()
+        );
+
+        let mut settings = ProductSettings::new("registered");
+        settings
+            .advance(&mut |_| Ok(Response::Accepted { id: 9 }))
+            .unwrap();
+        assert!(
+            !settings
+                .quiesce(&mut |_| Ok(Response::Result {
+                    payload: json!({"ok":false})
+                }))
+                .unwrap()
+        );
+        assert!(settings.quiesce(&mut |_| Ok(Response::Ok)).unwrap());
+        assert!(
+            settings.pending.is_none(),
+            "shutdown must not start a follow-up load"
+        );
+    }
+
+    #[test]
+    fn quiescence_completes_an_update_that_was_never_submitted() {
+        let mut settings = ProductSettings::new("unsubmitted-update");
+        advance_configuration_call(
+            &mut settings,
+            "register",
+            10,
+            json!({"ok":true,"revision":1,"values":settings_value(&Settings::default())}),
+        );
+        settings.begin_update(45, 1, Settings::default()).unwrap();
+        assert!(
+            !settings
+                .quiesce(&mut |_| panic!("unsent update must not be sent"))
+                .unwrap()
+        );
+        let Some(Completion::Update { request, response }) = settings.take_completion() else {
+            panic!("the accepted parent request must be completed");
+        };
+        assert_eq!(request, 45);
+        assert_eq!(response["code"], "shutting_down");
+        assert!(
+            settings
+                .quiesce(&mut |_| panic!("no work remains"))
+                .unwrap()
+        );
     }
 }

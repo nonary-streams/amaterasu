@@ -11,6 +11,7 @@ const SYSTEM_TRAY_SERVICE: &str = "amaterasu.system-tray/1";
 const UPDATER_SERVICE: &str = "amaterasu.updater/1";
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const REQUEST_TIMEOUT_MS: u64 = 5_000;
+const OPERATION_RETENTION: Duration = Duration::from_secs(300);
 
 #[derive(Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -47,30 +48,95 @@ struct PendingRequest {
     stage: PendingStage,
 }
 
+struct UncertainAdmission {
+    service: String,
+    payload: Value,
+    operation_id: String,
+    kind: PendingKind,
+    sent_at: Instant,
+}
+
 pub(super) struct TrayEventConsumer {
     pending: Option<PendingRequest>,
+    uncertain: Option<UncertainAdmission>,
     queued_event: Option<TrayEvent>,
     next_poll: Instant,
     sequence: u64,
+    instance_id: String,
+    shutdown_announced: bool,
 }
 
+#[cfg(test)]
 impl Default for TrayEventConsumer {
     fn default() -> Self {
-        Self {
-            pending: None,
-            queued_event: None,
-            next_poll: Instant::now(),
-            sequence: 0,
-        }
+        Self::new().expect("test operation namespace")
     }
 }
 
 impl TrayEventConsumer {
+    pub fn new() -> ModuleResult<Self> {
+        Ok(Self {
+            pending: None,
+            uncertain: None,
+            queued_event: None,
+            next_poll: Instant::now(),
+            sequence: 0,
+            instance_id: amaterasu_package::random_identifier()?,
+            shutdown_announced: false,
+        })
+    }
+    pub fn prepare_shutdown(&mut self) {
+        self.shutdown_announced = true;
+    }
+
+    /// Retain the request ID until the provider has returned and its result is released.
+    pub fn quiesce(&mut self, runtime: &RuntimeClient) -> bool {
+        self.quiesce_with(&mut |command| runtime.send(command))
+    }
+
+    fn quiesce_with(&mut self, send: &mut impl FnMut(Command) -> ModuleResult<Response>) -> bool {
+        self.shutdown_announced = true;
+        self.queued_event = None;
+        if !self.resolve_uncertain(send) {
+            return false;
+        }
+        let Some(mut pending) = self.pending.take() else {
+            return true;
+        };
+        if matches!(pending.stage, PendingStage::Waiting) {
+            match send(Command::TakeResult {
+                request: pending.id,
+            }) {
+                Ok(Response::Result { .. }) => pending.stage = PendingStage::Releasing,
+                _ => {
+                    self.pending = Some(pending);
+                    return false;
+                }
+            }
+        }
+        match send(Command::ReleaseResult {
+            request: pending.id,
+        }) {
+            Ok(Response::Ok) => true,
+            Ok(Response::Error { code, .. }) if code == "not_found" => true,
+            _ => {
+                self.pending = Some(pending);
+                false
+            }
+        }
+    }
+
     pub fn tick(
         &mut self,
         runtime: &RuntimeClient,
         management: Option<&super::server::Server>,
     ) -> ModuleResult<()> {
+        if self.shutdown_announced {
+            return Ok(());
+        }
+        if !self.resolve_uncertain(&mut |command| runtime.send(command)) {
+            return Ok(());
+        }
         if let Some(mut pending) = self.pending.take() {
             match pending.stage {
                 PendingStage::Waiting => {
@@ -87,6 +153,7 @@ impl TrayEventConsumer {
                         }
                         Ok(Response::Error { code, .. }) if code == "not_found" => {
                             self.next_poll = Instant::now() + EVENT_POLL_INTERVAL;
+                            self.pending = Some(pending);
                         }
                         Ok(_) | Err(_) => {
                             self.next_poll = Instant::now() + EVENT_POLL_INTERVAL;
@@ -110,7 +177,7 @@ impl TrayEventConsumer {
             }
         }
 
-        if self.pending.is_some() {
+        if self.pending.is_some() || self.shutdown_announced {
             return Ok(());
         }
         if let Some(event) = self.queued_event.take() {
@@ -122,23 +189,12 @@ impl TrayEventConsumer {
         if Instant::now() < self.next_poll {
             return Ok(());
         }
-        self.sequence = self.sequence.saturating_add(1);
-        match runtime.send(Command::Request {
-            service: SYSTEM_TRAY_SERVICE.into(),
-            payload: json!({"action":"event_next"}),
-            timeout_ms: REQUEST_TIMEOUT_MS,
-            operation_id: format!("management.tray-event.{}", self.sequence),
-            parent: None,
-        }) {
-            Ok(Response::Accepted { id }) => {
-                self.pending = Some(PendingRequest {
-                    id,
-                    kind: PendingKind::Event,
-                    stage: PendingStage::Waiting,
-                });
-            }
-            Ok(_) | Err(_) => self.next_poll = Instant::now() + EVENT_POLL_INTERVAL,
-        }
+        self.submit(
+            SYSTEM_TRAY_SERVICE,
+            json!({"action":"event_next"}),
+            PendingKind::Event,
+            &mut |command| runtime.send(command),
+        );
         Ok(())
     }
 
@@ -175,21 +231,93 @@ impl TrayEventConsumer {
     }
 
     fn begin_update_check(&mut self, runtime: &RuntimeClient) -> ModuleResult<()> {
-        self.sequence = self.sequence.saturating_add(1);
-        if let Ok(Response::Accepted { id }) = runtime.send(Command::Request {
-            service: UPDATER_SERVICE.into(),
-            payload: json!({"action":"check"}),
+        self.submit(
+            UPDATER_SERVICE,
+            json!({"action":"check"}),
+            PendingKind::UpdateCheck,
+            &mut |command| runtime.send(command),
+        );
+        Ok(())
+    }
+
+    fn submit(
+        &mut self,
+        service: &str,
+        payload: Value,
+        kind: PendingKind,
+        send: &mut impl FnMut(Command) -> ModuleResult<Response>,
+    ) {
+        let Some(sequence) = self.sequence.checked_add(1) else {
+            return;
+        };
+        self.sequence = sequence;
+        let label = match kind {
+            PendingKind::Event => "tray-event",
+            PendingKind::UpdateCheck => "tray-update-check",
+        };
+        let operation_id = format!("management.{label}.{}.{sequence}", self.instance_id);
+        let sent_at = Instant::now();
+        match send(Command::Request {
+            service: service.into(),
+            payload: payload.clone(),
             timeout_ms: REQUEST_TIMEOUT_MS,
-            operation_id: format!("management.tray-update-check.{}", self.sequence),
+            operation_id: operation_id.clone(),
             parent: None,
         }) {
-            self.pending = Some(PendingRequest {
-                id,
-                kind: PendingKind::UpdateCheck,
-                stage: PendingStage::Waiting,
-            });
+            Ok(Response::Accepted { id }) => {
+                self.pending = Some(PendingRequest {
+                    id,
+                    kind,
+                    stage: PendingStage::Waiting,
+                })
+            }
+            Ok(Response::Error { code, .. }) if code != "conflict" => {
+                self.next_poll = Instant::now() + EVENT_POLL_INTERVAL
+            }
+            _ => {
+                self.uncertain = Some(UncertainAdmission {
+                    service: service.into(),
+                    payload,
+                    operation_id,
+                    kind,
+                    sent_at,
+                })
+            }
         }
-        Ok(())
+    }
+
+    fn resolve_uncertain(
+        &mut self,
+        send: &mut impl FnMut(Command) -> ModuleResult<Response>,
+    ) -> bool {
+        let Some(uncertain) = self.uncertain.take() else {
+            return true;
+        };
+        match send(Command::LookupRequest {
+            service: uncertain.service.clone(),
+            payload: uncertain.payload.clone(),
+            operation_id: uncertain.operation_id.clone(),
+            parent: None,
+        }) {
+            Ok(Response::Accepted { id }) => {
+                self.pending = Some(PendingRequest {
+                    id,
+                    kind: uncertain.kind,
+                    stage: PendingStage::Waiting,
+                });
+                true
+            }
+            Ok(Response::Error { code, .. })
+                if code == "not_found" && uncertain.sent_at.elapsed() < OPERATION_RETENTION =>
+            {
+                self.next_poll = Instant::now() + EVENT_POLL_INTERVAL;
+                true
+            }
+            _ => {
+                self.uncertain = Some(uncertain);
+                false
+            }
+        }
     }
 }
 
@@ -313,6 +441,185 @@ fn open_url(_url: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn module_instances_use_distinct_operation_namespaces() {
+        let first = TrayEventConsumer::new().unwrap();
+        let second = TrayEventConsumer::new().unwrap();
+        assert_ne!(first.instance_id, second.instance_id);
+    }
+
+    #[test]
+    fn lost_admission_is_looked_up_without_reissuing_and_then_retired() {
+        let mut consumer = TrayEventConsumer::default();
+        let mut submitted = Vec::new();
+        consumer.submit(
+            SYSTEM_TRAY_SERVICE,
+            json!({"action":"event_next"}),
+            PendingKind::Event,
+            &mut |command| {
+                submitted.push(command);
+                Err("lost response".into())
+            },
+        );
+        assert!(consumer.uncertain.is_some());
+        consumer.prepare_shutdown();
+        let mut calls = Vec::new();
+        assert!(!consumer.quiesce_with(&mut |command| {
+            calls.push(command);
+            Err("lookup unavailable".into())
+        }));
+        assert!(matches!(calls.as_slice(), [Command::LookupRequest { .. }]));
+        calls.clear();
+        assert!(consumer.quiesce_with(&mut |command| {
+            let response = if matches!(command, Command::LookupRequest { .. }) {
+                Response::Accepted { id: 99 }
+            } else if matches!(command, Command::TakeResult { .. }) {
+                Response::Result {
+                    payload: json!({"ok":true}),
+                }
+            } else {
+                Response::Ok
+            };
+            calls.push(command);
+            Ok(response)
+        }));
+        assert!(matches!(
+            (&submitted[0], calls.as_slice()),
+            (Command::Request { service: original_service, payload: original_payload, operation_id: original_id, parent: None, .. },
+             [Command::LookupRequest { service, payload, operation_id, parent: None }, Command::TakeResult { request: 99 }, Command::ReleaseResult { request: 99 }])
+                if service == original_service && payload == original_payload && operation_id == original_id
+        ));
+        assert_eq!(submitted.len(), 1);
+    }
+
+    #[test]
+    fn absent_lookup_after_retention_horizon_remains_fenced() {
+        let mut consumer = TrayEventConsumer {
+            uncertain: Some(UncertainAdmission {
+                service: SYSTEM_TRAY_SERVICE.into(),
+                payload: json!({"action":"event_next"}),
+                operation_id: "op".into(),
+                kind: PendingKind::Event,
+                sent_at: Instant::now() - OPERATION_RETENTION,
+            }),
+            ..Default::default()
+        };
+        assert!(!consumer.quiesce_with(&mut |_| Ok(Response::error("not_found", "absent"))));
+        assert!(consumer.uncertain.is_some());
+    }
+
+    #[test]
+    fn absent_lookup_inside_retention_proves_no_admission() {
+        let mut consumer = TrayEventConsumer {
+            uncertain: Some(UncertainAdmission {
+                service: SYSTEM_TRAY_SERVICE.into(),
+                payload: json!({"action":"event_next"}),
+                operation_id: "op".into(),
+                kind: PendingKind::Event,
+                sent_at: Instant::now(),
+            }),
+            ..Default::default()
+        };
+        assert!(consumer.quiesce_with(&mut |_| Ok(Response::error("not_found", "absent"))));
+        assert!(consumer.uncertain.is_none());
+    }
+
+    #[test]
+    fn shutdown_retries_terminal_result_and_release_before_retiring_request() {
+        let mut consumer = TrayEventConsumer {
+            pending: Some(PendingRequest {
+                id: 42,
+                kind: PendingKind::Event,
+                stage: PendingStage::Waiting,
+            }),
+            ..Default::default()
+        };
+        consumer.prepare_shutdown();
+        assert!(consumer.shutdown_announced);
+        let mut calls = Vec::new();
+        assert!(!consumer.quiesce_with(&mut |command| {
+            calls.push(command);
+            Err("transport unavailable".into())
+        }));
+        assert!(matches!(
+            calls.as_slice(),
+            [Command::TakeResult { request: 42 }]
+        ));
+        calls.clear();
+        assert!(!consumer.quiesce_with(&mut |command| {
+            let is_result = matches!(command, Command::TakeResult { .. });
+            calls.push(command);
+            if is_result {
+                Ok(Response::Result {
+                    payload: json!({"ok":true}),
+                })
+            } else {
+                Err("release unavailable".into())
+            }
+        }));
+        assert!(matches!(
+            calls.as_slice(),
+            [
+                Command::TakeResult { request: 42 },
+                Command::ReleaseResult { request: 42 }
+            ]
+        ));
+        calls.clear();
+        assert!(consumer.quiesce_with(&mut |command| {
+            calls.push(command);
+            Ok(Response::Ok)
+        }));
+        assert!(matches!(
+            calls.as_slice(),
+            [Command::ReleaseResult { request: 42 }]
+        ));
+        assert!(consumer.pending.is_none());
+    }
+
+    #[test]
+    fn shutdown_drops_queued_event_and_fences_unknown_retirement() {
+        let mut consumer = TrayEventConsumer {
+            queued_event: Some(TrayEvent::OpenClients),
+            pending: Some(PendingRequest {
+                id: 4,
+                kind: PendingKind::UpdateCheck,
+                stage: PendingStage::Waiting,
+            }),
+            ..Default::default()
+        };
+        assert!(!consumer.quiesce_with(&mut |_| Ok(Response::error("not_found", "retired"))));
+        assert!(consumer.queued_event.is_none());
+    }
+
+    #[test]
+    fn announced_shutdown_does_not_poll_or_dispatch_new_events() {
+        use amaterasu_module_sdk::abi::{AbiHeader, BorrowedBytes, HostApi, ReplySink, Status};
+        use std::ffi::c_void;
+        unsafe extern "C" fn reject_call(
+            _context: *mut c_void,
+            _input: BorrowedBytes,
+            _reply: ReplySink,
+        ) -> Status {
+            amaterasu_module_sdk::abi::STATUS_INTERNAL_ERROR
+        }
+        let api = HostApi {
+            header: AbiHeader::of::<HostApi>(),
+            context: std::ptr::null_mut(),
+            invoke: reject_call,
+        };
+        // SAFETY: the callback uses no context and remains valid throughout the test.
+        let runtime = unsafe { RuntimeClient::from_endpoint(api) };
+        let mut consumer = TrayEventConsumer {
+            queued_event: Some(TrayEvent::Menu {
+                action: MenuAction::CheckUpdates,
+            }),
+            ..Default::default()
+        };
+        consumer.prepare_shutdown();
+        assert!(consumer.tick(&runtime, None).is_ok());
+        assert!(consumer.pending.is_none());
+    }
 
     #[test]
     fn tray_events_are_typed_and_unknown_shapes_are_discarded() {

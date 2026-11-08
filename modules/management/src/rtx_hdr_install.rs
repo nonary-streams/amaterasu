@@ -35,6 +35,7 @@ pub struct Installer {
     #[cfg(target_os = "linux")]
     candidate: Option<crate::rtx_hdr_candidate::PreparedCandidate>,
     install_requested: bool,
+    shutdown_announced: bool,
 }
 
 struct Job {
@@ -71,6 +72,7 @@ impl Installer {
             #[cfg(target_os = "linux")]
             candidate: None,
             install_requested: false,
+            shutdown_announced: false,
         };
         #[cfg(target_os = "linux")]
         {
@@ -109,11 +111,30 @@ impl Installer {
         self.advance_candidate();
     }
 
+    /// Close admission without starting cleanup while consumers still drain.
+    pub fn prepare_shutdown(&mut self) {
+        self.shutdown_announced = true;
+    }
+
+    /// Request cancellation and retire finished workers without joining a live
+    /// provider call. The host retains this module and its dependencies until
+    /// both workers have returned.
+    pub fn quiesce(&mut self) -> bool {
+        self.shutdown_announced = true;
+        self.install_requested = false;
+        self.cancelled.store(true, Ordering::Release);
+        self.advance();
+        !self.busy()
+    }
+
     pub fn request(&mut self, action: &str) -> Value {
         self.advance();
         match action {
             "rtx_hdr_status" => {}
             "rtx_hdr_install" => {
+                if self.shutdown_announced {
+                    return json!({"ok":false,"code":"shutting_down"});
+                }
                 if matches!(self.phase, "waiting_stream" | "activating") {
                     return json!({"ok":false,"code":"activation_in_progress"});
                 }
@@ -150,6 +171,9 @@ impl Installer {
         &mut self,
     ) -> Result<amaterasu_contracts::HostPackageActivation, &'static str> {
         self.advance();
+        if self.shutdown_announced {
+            return Err("shutting_down");
+        }
         if matches!(self.phase, "waiting_stream" | "activating") {
             return Err("activation_in_progress");
         }
@@ -302,7 +326,11 @@ impl Installer {
             }
             self.install_requested = false;
         }
-        if self.install_requested && self.runtime_ready && self.candidate.is_none() && !self.busy()
+        if !self.shutdown_announced
+            && self.install_requested
+            && self.runtime_ready
+            && self.candidate.is_none()
+            && !self.busy()
         {
             let Some((repository, root)) = self.package_roots.clone() else {
                 self.phase = "failed";
@@ -653,6 +681,73 @@ mod tests {
         release.send(()).unwrap();
         retire(&mut installer);
         assert_eq!(installer.request("rtx_hdr_status")["phase"], "cancelled");
+    }
+
+    #[test]
+    fn shutdown_waits_nonblocking_for_installer_worker_and_closes_admission() {
+        let mut installer = Installer::new(
+            PathBuf::from("/tmp/rtx-test-nonexistent"),
+            Network::test_provider(),
+        )
+        .unwrap();
+        let (release, wait) = std::sync::mpsc::sync_channel::<()>(1);
+        let cancel = installer.cancelled.clone();
+        installer.job = Some(Job {
+            verifying: false,
+            thread: thread::spawn(move || {
+                wait.recv().unwrap();
+                assert!(cancel.load(Ordering::Acquire));
+                Err(std::io::ErrorKind::Interrupted.into())
+            }),
+        });
+
+        installer.prepare_shutdown();
+        assert!(!installer.cancelled.load(Ordering::Acquire));
+        assert_eq!(
+            installer.request("rtx_hdr_install")["code"],
+            "shutting_down"
+        );
+        #[cfg(target_os = "linux")]
+        assert_eq!(installer.activation_request().unwrap_err(), "shutting_down");
+        let started = Instant::now();
+        assert!(!installer.quiesce());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(installer.cancelled.load(Ordering::Acquire));
+
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !installer.quiesce() {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        assert!(installer.job.is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shutdown_retires_candidate_without_starting_a_followup_job() {
+        let mut installer = Installer::new(
+            PathBuf::from("/tmp/rtx-test-nonexistent"),
+            Network::test_provider(),
+        )
+        .unwrap();
+        let (release, wait) = std::sync::mpsc::sync_channel::<()>(1);
+        installer.runtime_ready = true;
+        installer.install_requested = true;
+        installer.candidate_job = Some(thread::spawn(move || {
+            wait.recv().unwrap();
+            Err("cancelled".into())
+        }));
+        installer.prepare_shutdown();
+        assert!(!installer.quiesce());
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !installer.quiesce() {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        assert!(installer.candidate_job.is_none());
+        assert!(!installer.install_requested);
     }
 }
 

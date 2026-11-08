@@ -99,9 +99,11 @@ fn verify_cookie_route(
         origin: None,
         csrf_exception: None,
         stage: Stage::Closed,
+        terminal_result: None,
+        released_request: None,
         peer: "127.0.0.1".parse().unwrap(),
     };
-    let mut operation = 1;
+    let mut operation = OperationSequence::new().unwrap();
     let mut selection_owners = SelectionOwners::default();
     connection
         .authorize(
@@ -317,9 +319,11 @@ fn host_log_dispatch_uses_verified_session_context() {
         origin: None,
         csrf_exception: None,
         stage: Stage::Closed,
+        terminal_result: None,
+        released_request: None,
         peer: "127.0.0.1".parse().unwrap(),
     };
-    let mut operation = 1;
+    let mut operation = OperationSequence::new().unwrap();
     let mut selection_owners = SelectionOwners::default();
     connection
         .authorize(
@@ -410,9 +414,11 @@ fn pipewire_selection_route_verifies_capture_scope_and_binds_the_handle_to_sessi
         origin: None,
         csrf_exception: None,
         stage: Stage::Closed,
+        terminal_result: None,
+        released_request: None,
         peer: "127.0.0.1".parse().unwrap(),
     };
-    let mut operation = 1;
+    let mut operation = OperationSequence::new().unwrap();
     let mut selection_owners = SelectionOwners::default();
     connection
         .authorize(
@@ -507,5 +513,7 @@ fn rate_limits_and_unknown_or_malformed_verification_remain_closed() {
     ] {
         assert_denied(Response::Result { payload }, 'f', 403, "unauthorized");
     }
-    assert_denied(Response::Ok, 'a', 503, "authentication_unavailable");
+    let (stage, commands) = verify_cookie(Response::Ok, 'a');
+    assert_eq!(commands.len(), 2);
+    assert!(matches!(stage, Stage::Retiring { request_id: 41, .. }));
 }

@@ -49,13 +49,14 @@ pub struct Server {
     address: String,
     origins: Vec<String>,
     connections: Vec<Connection>,
-    next_operation: u64,
+    next_operation: OperationSequence,
     assets: Option<Assets>,
     maximum_peer: Option<PeerTier>,
     csrf_origins: CsrfOrigins,
     selection_owners: SelectionOwners,
     authentication_admission: AuthenticationAdmission,
     extensions: Option<crate::extensions::Extensions>,
+    accepting: bool,
 }
 
 impl Server {
@@ -114,13 +115,14 @@ impl Server {
             address,
             origins,
             connections: Vec::new(),
-            next_operation: 1,
+            next_operation: OperationSequence::new()?,
             assets,
             maximum_peer: None,
             csrf_origins: CsrfOrigins::default(),
             selection_owners: SelectionOwners::default(),
             authentication_admission: AuthenticationAdmission::default(),
             extensions: None,
+            accepting: true,
         })
     }
 
@@ -133,7 +135,9 @@ impl Server {
     }
 
     pub fn tick(&mut self, runtime: &RuntimeClient) -> ModuleResult<()> {
-        self.accept()?;
+        if self.accepting {
+            self.accept()?;
+        }
         let mut tick = ConnectionTick {
             runtime,
             audio_providers: &self.audio_providers,
@@ -153,7 +157,12 @@ impl Server {
                     .as_deref()
                     .is_some_and(|origin| !self.csrf_origins.permits(Some(origin)))
             {
-                connection.expire(runtime);
+                connection.expire(runtime, true);
+                continue;
+            }
+            // Existing requests may finish while dependents drain, but a
+            // partially read external request must not start new work.
+            if !self.accepting && matches!(connection.stage, Stage::Reading(_)) {
                 continue;
             }
             connection.tick(&mut tick)?;
@@ -161,6 +170,23 @@ impl Server {
         self.connections
             .retain(|connection| !matches!(connection.stage, Stage::Closed));
         Ok(())
+    }
+
+    /// Seal external admission as soon as host shutdown is announced.
+    pub(crate) fn prepare_shutdown(&mut self) {
+        self.accepting = false;
+    }
+
+    /// Retire connection-owned requests while their providers are still live.
+    /// Failure to contact the broker leaves the exact request queued for retry.
+    pub(crate) fn quiesce(&mut self, runtime: &RuntimeClient) -> bool {
+        self.prepare_shutdown();
+        for connection in &mut self.connections {
+            connection.expire(runtime, false);
+        }
+        self.connections
+            .retain(|connection| !matches!(connection.stage, Stage::Closed));
+        self.connections.is_empty()
     }
 
     pub(crate) fn set_audio_providers(&mut self, providers: AudioProviders) {
@@ -222,6 +248,8 @@ impl Server {
                             tls_closing: false,
                             deadline: Instant::now() + CONNECTION_TIMEOUT,
                             stage: Stage::Reading(Vec::new()),
+                            terminal_result: None,
+                            released_request: None,
                             origin: None,
                             csrf_exception: None,
                             peer: peer.ip(),
@@ -238,6 +266,40 @@ impl Server {
     }
 }
 
+fn retirement_succeeded(response: ModuleResult<Response>) -> bool {
+    matches!(response, Ok(Response::Ok))
+        || matches!(response, Ok(Response::Error { code, .. }) if code == "not_found")
+}
+
+fn is_terminal_caller_result(response: &Response) -> bool {
+    match response {
+        Response::Result { .. } => true,
+        Response::Error { code, .. } => matches!(code.as_str(), "deadline_exceeded" | "cancelled"),
+        _ => false,
+    }
+}
+
+struct OperationSequence {
+    instance: String,
+    next: u64,
+}
+
+impl OperationSequence {
+    fn new() -> ModuleResult<Self> {
+        Ok(Self {
+            instance: amaterasu_package::random_identifier()?,
+            next: 1,
+        })
+    }
+
+    fn next_id(&mut self) -> Option<String> {
+        let next = self.next.checked_add(1)?;
+        let id = format!("management.{}.{}", self.instance, self.next);
+        self.next = next;
+        Some(id)
+    }
+}
+
 struct Connection {
     stream: TcpStream,
     tls: Option<ServerConnection>,
@@ -246,6 +308,8 @@ struct Connection {
     origin: Option<String>,
     csrf_exception: Option<String>,
     stage: Stage,
+    terminal_result: Option<(u64, Response)>,
+    released_request: Option<u64>,
     peer: IpAddr,
 }
 
@@ -260,7 +324,7 @@ struct ConnectionTick<'a> {
     authority: &'a str,
     origins: &'a [String],
     csrf_origins: &'a CsrfOrigins,
-    operation: &'a mut u64,
+    operation: &'a mut OperationSequence,
     assets: &'a mut Option<Assets>,
     selection_owners: &'a mut SelectionOwners,
     authentication_admission: &'a mut AuthenticationAdmission,
@@ -354,6 +418,17 @@ enum Stage {
         bytes: Vec<u8>,
         offset: usize,
     },
+    Retiring {
+        request_id: u64,
+        settled: bool,
+        revoked: bool,
+        cancelled: bool,
+    },
+    AdmissionUncertain {
+        command: Command,
+        first_sent: Instant,
+        revoked: bool,
+    },
     Closed,
 }
 
@@ -375,123 +450,211 @@ struct ServiceReply<'a> {
 impl Connection {
     fn tick(&mut self, context: &mut ConnectionTick<'_>) -> ModuleResult<()> {
         let runtime = context.runtime;
-        if Instant::now() >= self.deadline {
-            self.expire(runtime);
+        if matches!(self.stage, Stage::AdmissionUncertain { .. }) {
+            self.expire(runtime, Instant::now() >= self.deadline);
+            return Ok(());
+        }
+        if matches!(self.stage, Stage::Retiring { .. }) || Instant::now() >= self.deadline {
+            self.expire(runtime, Instant::now() >= self.deadline);
             return Ok(());
         }
         if self.tls.is_some() && !self.tls_io() {
-            self.stage = Stage::Closed;
+            self.expire(runtime, true);
             return Ok(());
         }
-        match std::mem::replace(&mut self.stage, Stage::Closed) {
-            Stage::Reading(bytes) => self.read_request(bytes, context)?,
-            Stage::Verifying {
-                request_id,
-                request,
-            } => self.verify_result(
-                runtime,
-                request_id,
-                *request,
-                context.operation,
-                context.selection_owners,
-                VerifiedDispatch {
-                    extensions: context.extensions,
-                    audio_providers: context.audio_providers,
-                },
-            )?,
-            Stage::Dispatching {
-                request_id,
-                login,
-                operational_health,
-                browser_auth,
-                capture,
-            } => self.service_result(
-                runtime,
-                request_id,
-                ServiceReply {
+        let request_id = self.active_request();
+        self.released_request = None;
+        let result = (|| -> ModuleResult<()> {
+            match std::mem::replace(&mut self.stage, Stage::Closed) {
+                Stage::Reading(bytes) => self.read_request(bytes, context)?,
+                Stage::Verifying {
+                    request_id,
+                    request,
+                } => self.verify_result(
+                    runtime,
+                    request_id,
+                    *request,
+                    context.operation,
+                    context.selection_owners,
+                    VerifiedDispatch {
+                        extensions: context.extensions,
+                        audio_providers: context.audio_providers,
+                    },
+                )?,
+                Stage::Dispatching {
+                    request_id,
                     login,
                     operational_health,
                     browser_auth,
                     capture,
-                    selection_owners: context.selection_owners,
-                },
-            )?,
-            Stage::SessionExtensionDispatching { request_id, action } => {
-                match runtime.send_ephemeral(Command::TakeResult {
-                    request: request_id,
-                })? {
-                    Response::Pending => {
-                        self.stage = Stage::SessionExtensionDispatching { request_id, action }
-                    }
-                    Response::Result { payload } => {
-                        let (status, body) = session_extension_response(action, payload);
-                        self.respond(status, body);
-                    }
-                    _ => self.fail(503, "service_unavailable"),
-                }
-            }
-            Stage::ExtensionDispatching { request_id } => {
-                match runtime.send_ephemeral(Command::TakeResult {
-                    request: request_id,
-                })? {
-                    Response::Pending => self.stage = Stage::ExtensionDispatching { request_id },
-                    Response::Result { payload } => {
-                        self.respond(200, json!({"ok":true,"result":payload}))
-                    }
-                    _ => self.fail(503, "service_unavailable"),
-                }
-            }
-            Stage::Artwork {
-                request_id,
-                service,
-            } => {
-                match runtime.send_ephemeral(Command::TakeResult {
-                    request: request_id,
-                })? {
-                    Response::Pending => {
-                        self.stage = Stage::Artwork {
-                            request_id,
-                            service,
+                } => self.service_result(
+                    runtime,
+                    request_id,
+                    ServiceReply {
+                        login,
+                        operational_health,
+                        browser_auth,
+                        capture,
+                        selection_owners: context.selection_owners,
+                    },
+                )?,
+                Stage::SessionExtensionDispatching { request_id, action } => {
+                    match self.take_result(runtime, request_id)? {
+                        Response::Pending => {
+                            self.stage = Stage::SessionExtensionDispatching { request_id, action }
                         }
+                        Response::Result { payload } => {
+                            let (status, body) = session_extension_response(action, payload);
+                            self.respond(status, body);
+                        }
+                        _ => self.fence_request(request_id),
                     }
-                    Response::Result { payload } => {
-                        let image = (|| -> ModuleResult<_> {
-                            if payload["ok"] != true {
-                                return Err("artwork unavailable".into());
+                }
+                Stage::ExtensionDispatching { request_id } => {
+                    match self.take_result(runtime, request_id)? {
+                        Response::Pending => {
+                            self.stage = Stage::ExtensionDispatching { request_id }
+                        }
+                        Response::Result { payload } => {
+                            self.respond(200, json!({"ok":true,"result":payload}))
+                        }
+                        _ => self.fence_request(request_id),
+                    }
+                }
+                Stage::Artwork {
+                    request_id,
+                    service,
+                } => {
+                    match self.take_result(runtime, request_id)? {
+                        Response::Pending => {
+                            self.stage = Stage::Artwork {
+                                request_id,
+                                service,
                             }
-                            let offer = serde_json::from_value(payload["offer"].clone())
-                                .map_err(|e| e.to_string())?;
-                            // SAFETY: only the authorized startup route selects this provider.
-                            unsafe {
-                                amaterasu_module_sdk::artwork_transfer::receive(
-                                    runtime, &service, offer,
-                                )
-                            }
-                        })();
-                        match image {
-                            Ok(image) => {
-                                self.stage = Stage::Writing {
-                                    bytes: http::image_response(
-                                        &image.mime_type,
-                                        image.bytes,
-                                        self.origin.as_deref(),
-                                    ),
-                                    offset: 0,
+                        }
+                        Response::Result { payload } => {
+                            let image = (|| -> ModuleResult<_> {
+                                if payload["ok"] != true {
+                                    return Err("artwork unavailable".into());
                                 }
+                                let offer = serde_json::from_value(payload["offer"].clone())
+                                    .map_err(|e| e.to_string())?;
+                                // SAFETY: only the authorized startup route selects this provider.
+                                unsafe {
+                                    amaterasu_module_sdk::artwork_transfer::receive(
+                                        runtime, &service, offer,
+                                    )
+                                }
+                            })();
+                            match image {
+                                Ok(image) => {
+                                    self.stage = Stage::Writing {
+                                        bytes: http::image_response(
+                                            &image.mime_type,
+                                            image.bytes,
+                                            self.origin.as_deref(),
+                                        ),
+                                        offset: 0,
+                                    }
+                                }
+                                Err(_) => self.fail(404, "artwork_unavailable"),
                             }
-                            Err(_) => self.fail(404, "artwork_unavailable"),
                         }
+                        _ => self.fence_request(request_id),
                     }
-                    _ => self.fail(503, "service_unavailable"),
                 }
+                Stage::Writing { bytes, offset } => self.write_response(bytes, offset),
+                Stage::Retiring { .. } => unreachable!("retirement is handled before socket I/O"),
+                Stage::AdmissionUncertain { .. } => {
+                    unreachable!("admission recovery is handled before socket I/O")
+                }
+                Stage::Closed => {}
             }
-            Stage::Writing { bytes, offset } => self.write_response(bytes, offset),
-            Stage::Closed => {}
+            Ok(())
+        })();
+        if let Err(error) = result {
+            // A failed result or release call does not relinquish this broker
+            // request. Keep its ID available to the shutdown retirement path.
+            if matches!(self.stage, Stage::Closed)
+                && let Some(request_id) = request_id
+                && self.released_request != Some(request_id)
+            {
+                self.stage = Stage::Retiring {
+                    request_id,
+                    settled: false,
+                    revoked: false,
+                    cancelled: false,
+                };
+            }
+            return Err(error);
         }
         if self.tls.is_some() && !self.tls_io() {
-            self.stage = Stage::Closed;
+            self.expire(runtime, true);
         }
         Ok(())
+    }
+
+    fn active_request(&self) -> Option<u64> {
+        match self.stage {
+            Stage::Artwork { request_id, .. }
+            | Stage::Verifying { request_id, .. }
+            | Stage::Dispatching { request_id, .. }
+            | Stage::ExtensionDispatching { request_id }
+            | Stage::SessionExtensionDispatching { request_id, .. }
+            | Stage::Retiring { request_id, .. } => Some(request_id),
+            _ => None,
+        }
+    }
+
+    fn fence_request(&mut self, request_id: u64) {
+        self.stage = Stage::Retiring {
+            request_id,
+            settled: false,
+            revoked: false,
+            cancelled: false,
+        };
+    }
+
+    /// Settle the caller-owned broker result before discarding its response.
+    /// Provider delivery retirement has a separate receipt.
+    fn take_result(&mut self, runtime: &RuntimeClient, request_id: u64) -> ModuleResult<Response> {
+        self.settle_result(request_id, |command| runtime.send(command))
+    }
+
+    fn settle_result(
+        &mut self,
+        request_id: u64,
+        mut send: impl FnMut(Command) -> ModuleResult<Response>,
+    ) -> ModuleResult<Response> {
+        if self.terminal_result.is_none() {
+            match send(Command::TakeResult {
+                request: request_id,
+            }) {
+                Ok(result) if is_terminal_caller_result(&result) => {
+                    self.terminal_result = Some((request_id, result));
+                }
+                Ok(response) => return Ok(response),
+                Err(_) => return Ok(Response::Pending),
+            }
+        }
+        if !self
+            .terminal_result
+            .as_ref()
+            .is_some_and(|(id, _)| *id == request_id)
+        {
+            return Err("management retained result does not match request".into());
+        }
+        if !retirement_succeeded(send(Command::ReleaseResult {
+            request: request_id,
+        })) {
+            return Ok(Response::Pending);
+        }
+        let (_, result) = self
+            .terminal_result
+            .take()
+            .expect("checked retained result");
+        self.released_request = Some(request_id);
+        Ok(result)
     }
 
     fn tls_io(&mut self) -> bool {
@@ -520,21 +683,131 @@ impl Connection {
         true
     }
 
-    fn expire(&mut self, runtime: &RuntimeClient) {
-        if let Stage::Artwork { request_id, .. }
-        | Stage::Verifying { request_id, .. }
-        | Stage::Dispatching { request_id, .. }
-        | Stage::ExtensionDispatching { request_id }
-        | Stage::SessionExtensionDispatching { request_id, .. } = self.stage
-        {
-            let _ = runtime.send(Command::Cancel {
-                request: request_id,
-            });
-            let _ = runtime.send(Command::ReleaseResult {
-                request: request_id,
-            });
+    fn expire(&mut self, runtime: &RuntimeClient, revoke: bool) {
+        let (request_id, mut settled, revoked, mut cancelled) = match self.stage {
+            Stage::Artwork { request_id, .. }
+            | Stage::Verifying { request_id, .. }
+            | Stage::Dispatching { request_id, .. }
+            | Stage::ExtensionDispatching { request_id }
+            | Stage::SessionExtensionDispatching { request_id, .. } => {
+                (request_id, false, revoke, false)
+            }
+            Stage::Retiring {
+                request_id,
+                settled,
+                revoked,
+                cancelled,
+            } => (request_id, settled, revoked || revoke, cancelled),
+            // With no parent request, replay could create a new side effect.
+            // Keep the exact unknown admission fenced during shutdown.
+            Stage::AdmissionUncertain {
+                ref mut revoked, ..
+            } => {
+                *revoked |= revoke;
+                self.lookup_admission(runtime);
+                return;
+            }
+            _ => {
+                self.stage = Stage::Closed;
+                return;
+            }
+        };
+        let result_observed = self
+            .terminal_result
+            .as_ref()
+            .is_some_and(|(id, _)| *id == request_id);
+        if !settled {
+            settled = self.released_request == Some(request_id)
+                || self
+                    .take_result(runtime, request_id)
+                    .is_ok_and(|response| is_terminal_caller_result(&response));
         }
-        self.stage = Stage::Closed;
+        if revoked && !settled && !result_observed && !cancelled {
+            // Revoke client authority promptly, but cancellation is not proof
+            // that a delivered provider effect has retired.
+            cancelled = retirement_succeeded(runtime.send(Command::Cancel {
+                request: request_id,
+            }));
+        }
+        if settled {
+            self.terminal_result = None;
+            self.stage = Stage::Closed;
+        } else {
+            self.stage = Stage::Retiring {
+                request_id,
+                settled,
+                revoked,
+                cancelled,
+            };
+        }
+    }
+
+    fn lookup_admission(&mut self, runtime: &RuntimeClient) {
+        let Stage::AdmissionUncertain {
+            command,
+            first_sent,
+            revoked,
+        } = &self.stage
+        else {
+            return;
+        };
+        let first_sent = *first_sent;
+        let revoked = *revoked;
+        if first_sent.elapsed() >= Duration::from_secs(300) {
+            return;
+        }
+        let query = match command {
+            Command::Request {
+                service,
+                payload,
+                operation_id,
+                parent,
+                ..
+            } => Command::LookupRequest {
+                service: service.clone(),
+                payload: payload.clone(),
+                operation_id: operation_id.clone(),
+                parent: *parent,
+            },
+            Command::CallApi {
+                service,
+                method,
+                interface_major,
+                interface_minor,
+                payload,
+                operation_id,
+                parent,
+                ..
+            } => Command::LookupApiRequest {
+                service: service.clone(),
+                method: method.clone(),
+                interface_major: *interface_major,
+                interface_minor: *interface_minor,
+                payload: payload.clone(),
+                operation_id: operation_id.clone(),
+                parent: *parent,
+            },
+            _ => return,
+        };
+        match runtime.send(query) {
+            Ok(Response::Accepted { id }) => {
+                self.stage = Stage::Retiring {
+                    request_id: id,
+                    settled: false,
+                    revoked,
+                    cancelled: false,
+                };
+                self.expire(runtime, false);
+            }
+            Ok(Response::Error { code, .. })
+                if code == "not_found" && first_sent.elapsed() < Duration::from_secs(300) =>
+            {
+                // No other code retries or releases an unknown admission, and
+                // the broker has not yet expired its original retry record.
+                self.stage = Stage::Closed;
+            }
+            _ => {}
+        }
     }
 
     fn read_request(
@@ -634,13 +907,11 @@ impl Connection {
         runtime: &RuntimeClient,
         request_id: u64,
         mut request: http::Request,
-        operation: &mut u64,
+        operation: &mut OperationSequence,
         selection_owners: &mut SelectionOwners,
         providers: VerifiedDispatch<'_>,
     ) -> ModuleResult<()> {
-        match runtime.send_ephemeral(Command::TakeResult {
-            request: request_id,
-        })? {
+        match self.take_result(runtime, request_id)? {
             Response::Pending => {
                 self.stage = Stage::Verifying {
                     request_id,
@@ -701,7 +972,7 @@ impl Connection {
                     _ => self.fail(403, "unauthorized"),
                 }
             }
-            _ => self.fail(503, "authentication_unavailable"),
+            _ => self.fence_request(request_id),
         }
         Ok(())
     }
@@ -719,9 +990,7 @@ impl Connection {
             capture,
             selection_owners,
         } = reply;
-        match runtime.send_ephemeral(Command::TakeResult {
-            request: request_id,
-        })? {
+        match self.take_result(runtime, request_id)? {
             Response::Pending => {
                 self.stage = Stage::Dispatching {
                     request_id,
@@ -751,7 +1020,7 @@ impl Connection {
                     }
                 }
             },
-            _ => self.fail(503, "service_unavailable"),
+            _ => self.fence_request(request_id),
         }
         Ok(())
     }
@@ -797,7 +1066,7 @@ impl Connection {
         &mut self,
         runtime: &RuntimeClient,
         mut request: http::Request,
-        operation: &mut u64,
+        operation: &mut OperationSequence,
         assets: &mut Option<Assets>,
         selection_owners: &mut SelectionOwners,
         audio_providers: &AudioProviders,
@@ -866,7 +1135,7 @@ impl Connection {
         &mut self,
         runtime: &RuntimeClient,
         mut request: http::Request,
-        operation: &mut u64,
+        operation: &mut OperationSequence,
         selection_owners: &mut SelectionOwners,
         audio_providers: &AudioProviders,
     ) -> ModuleResult<()> {
@@ -985,7 +1254,7 @@ impl Connection {
         runtime: &RuntimeClient,
         mut request: http::Request,
         auth: &Value,
-        operation: &mut u64,
+        operation: &mut OperationSequence,
         extensions: Option<&crate::extensions::Extensions>,
     ) -> ModuleResult<()> {
         let RequestTarget::Api(route) = request.target else {
@@ -1019,12 +1288,10 @@ impl Connection {
                 return Ok(());
             }
         }
-        let Some(next) = operation.checked_add(1) else {
+        let Some(operation_id) = operation.next_id() else {
             self.fail(503, "operation_ids_exhausted");
             return Ok(());
         };
-        let operation_id = format!("management.{}", *operation);
-        *operation = next;
         let remaining = self
             .deadline
             .saturating_duration_since(Instant::now())
@@ -1033,11 +1300,8 @@ impl Connection {
             self.fail(504, "deadline_exceeded");
             return Ok(());
         }
-        match runtime.send(call.call(remaining - 100, operation_id))? {
-            Response::Accepted { id } => {
-                self.stage = Stage::ExtensionDispatching { request_id: id }
-            }
-            _ => self.fail(503, "service_unavailable"),
+        if let Some(id) = self.submit_command(runtime, call.call(remaining - 100, operation_id)) {
+            self.stage = Stage::ExtensionDispatching { request_id: id };
         }
         Ok(())
     }
@@ -1047,7 +1311,7 @@ impl Connection {
         runtime: &RuntimeClient,
         request: &mut http::Request,
         action: &str,
-        operation: &mut u64,
+        operation: &mut OperationSequence,
         selection_owners: &mut SelectionOwners,
     ) -> ModuleResult<()> {
         let identity = request.verified_identity.as_ref().map(|identity| {
@@ -1128,7 +1392,10 @@ impl Connection {
         let Some(request_id) =
             self.submit(runtime, "amaterasu.capture-pipewire/1", payload, operation)?
         else {
-            if created && let Some(operation_id) = &operation_id {
+            if created
+                && !matches!(self.stage, Stage::AdmissionUncertain { .. })
+                && let Some(operation_id) = &operation_id
+            {
                 selection_owners.remove(operation_id);
             }
             return Ok(());
@@ -1152,14 +1419,12 @@ impl Connection {
         runtime: &RuntimeClient,
         service: &str,
         payload: Value,
-        operation: &mut u64,
+        operation: &mut OperationSequence,
     ) -> ModuleResult<Option<u64>> {
-        let Some(next) = operation.checked_add(1) else {
+        let Some(operation_id) = operation.next_id() else {
             self.fail(503, "operation_ids_exhausted");
             return Ok(None);
         };
-        let operation_id = format!("management.{}", *operation);
-        *operation = next;
         let remaining = self
             .deadline
             .saturating_duration_since(Instant::now())
@@ -1170,17 +1435,31 @@ impl Connection {
         }
         // Network ingress has no runtime parent. Authority is the packaged management
         // principal; token scopes are checked separately before product dispatch.
-        match runtime.send(Command::Request {
+        let command = Command::Request {
             service: service.into(),
             payload,
             timeout_ms: remaining - 100,
             operation_id,
             parent: None,
-        })? {
-            Response::Accepted { id } => Ok(Some(id)),
-            _ => {
+        };
+        Ok(self.submit_command(runtime, command))
+    }
+
+    fn submit_command(&mut self, runtime: &RuntimeClient, command: Command) -> Option<u64> {
+        let first_sent = Instant::now();
+        match runtime.send(command.clone()) {
+            Ok(Response::Accepted { id }) => Some(id),
+            Ok(Response::Error { code, .. }) if code != "conflict" => {
                 self.fail(503, "service_unavailable");
-                Ok(None)
+                None
+            }
+            _ => {
+                self.stage = Stage::AdmissionUncertain {
+                    command,
+                    first_sent,
+                    revoked: false,
+                };
+                None
             }
         }
     }
@@ -1567,6 +1846,8 @@ mod tests {
             origin: None,
             csrf_exception: None,
             stage: Stage::Closed,
+            terminal_result: None,
+            released_request: None,
             peer: "127.0.0.1".parse().unwrap(),
         };
         connection.respond_browser_auth(action, payload);
@@ -1574,6 +1855,101 @@ mod tests {
             panic!("expected response")
         };
         String::from_utf8(bytes).unwrap()
+    }
+
+    #[test]
+    fn cancelled_terminal_result_retries_release_without_claiming_provider_retirement() {
+        let (_peer, client) = test_stream_pair();
+        let mut connection = Connection {
+            stream: client,
+            tls: None,
+            tls_closing: false,
+            deadline: Instant::now() + CONNECTION_TIMEOUT,
+            origin: None,
+            csrf_exception: None,
+            stage: Stage::Retiring {
+                request_id: 41,
+                settled: false,
+                revoked: true,
+                cancelled: true,
+            },
+            terminal_result: None,
+            released_request: None,
+            peer: "127.0.0.1".parse().unwrap(),
+        };
+        let mut commands = Vec::new();
+        let first = connection
+            .settle_result(41, |command| {
+                commands.push(command.clone());
+                match command {
+                    Command::TakeResult { request: 41 } => {
+                        Ok(Response::error("cancelled", "cancelled by request owner"))
+                    }
+                    Command::ReleaseResult { request: 41 } => {
+                        Err("lost release acknowledgement".into())
+                    }
+                    _ => panic!("unexpected management command"),
+                }
+            })
+            .unwrap();
+        assert!(matches!(first, Response::Pending));
+        assert!(connection.terminal_result.is_some());
+        assert_eq!(connection.released_request, None);
+
+        for failure in [
+            Err("release transport failed".to_owned()),
+            Ok(Response::error("permission_denied", "wrong owner")),
+            Ok(Response::error("unknown", "release outcome unknown")),
+        ] {
+            assert!(matches!(
+                connection
+                    .settle_result(41, |command| {
+                        commands.push(command.clone());
+                        assert!(matches!(command, Command::ReleaseResult { request: 41 }));
+                        failure.clone()
+                    })
+                    .unwrap(),
+                Response::Pending
+            ));
+            assert!(connection.terminal_result.is_some());
+            assert_eq!(connection.released_request, None);
+        }
+
+        let settled = connection
+            .settle_result(41, |command| {
+                commands.push(command.clone());
+                assert!(matches!(command, Command::ReleaseResult { request: 41 }));
+                Ok(Response::error("not_found", "already released"))
+            })
+            .unwrap();
+        assert!(matches!(settled, Response::Error { code, .. } if code == "cancelled"));
+        assert!(connection.terminal_result.is_none());
+        assert_eq!(connection.released_request, Some(41));
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| matches!(command, Command::TakeResult { request: 41 }))
+                .count(),
+            1
+        );
+        assert!(
+            commands
+                .iter()
+                .filter(|command| matches!(command, Command::ReleaseResult { request: 41 }))
+                .count()
+                == 5
+        );
+
+        // Broker regression `reliable_retirement_survives_cancel_release_and_result_expiry`
+        // proves this caller settlement leaves the provider's unretired receipt intact.
+        assert!(matches!(
+            connection.stage,
+            Stage::Retiring {
+                request_id: 41,
+                settled: false,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1645,6 +2021,8 @@ mod tests {
             origin: None,
             csrf_exception: None,
             stage: Stage::Closed,
+            terminal_result: None,
+            released_request: None,
             peer: "127.0.0.1".parse().unwrap(),
         };
         connection.write_response(b"response".to_vec(), 0);

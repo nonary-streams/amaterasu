@@ -3,10 +3,12 @@ use crate::settings::TraySettings;
 use amaterasu_module_sdk::{Command, ModuleResult, Response};
 use serde_json::{Value, json};
 use std::collections::VecDeque;
+use std::time::{Duration, Instant};
 
 const CONFIGURATION_SERVICE: &str = "amaterasu.configuration/1";
 const PRODUCT_VERSION: u32 = 1;
 const CONFIGURATION_TIMEOUT_MS: u64 = 30_000;
+const ADMISSION_RECOVERY_WINDOW: Duration = Duration::from_secs(300);
 
 type Sender<'a> = &'a mut dyn FnMut(Command) -> ModuleResult<Response>;
 
@@ -25,9 +27,15 @@ enum Work {
     },
 }
 
+impl Work {
+    fn is_read_only(&self) -> bool {
+        matches!(self, Self::StartupGet | Self::ReconcileUpdate { .. })
+    }
+}
+
 enum ChildOutcome {
     Payload(Value),
-    Failure,
+    ReadFailed,
 }
 
 enum Call {
@@ -36,6 +44,8 @@ enum Call {
         operation_id: String,
         parent: Option<u64>,
         retry_ticks: u8,
+        first_attempt: Option<Instant>,
+        admission_uncertain: bool,
     },
     Waiting {
         request: u64,
@@ -43,6 +53,9 @@ enum Call {
     Releasing {
         request: u64,
         outcome: ChildOutcome,
+    },
+    Uncertain {
+        request: u64,
     },
 }
 
@@ -70,10 +83,12 @@ pub struct ProductSettings {
     next_operation: u64,
     pending: Option<Pending>,
     completions: VecDeque<UpdateCompletion>,
+    generation: String,
+    quiescing: bool,
 }
 
 impl ProductSettings {
-    pub fn new() -> Self {
+    pub fn new(generation: &str) -> Self {
         Self {
             settings: TraySettings::default(),
             revision: 0,
@@ -83,12 +98,16 @@ impl ProductSettings {
                 work: Work::StartupGet,
                 call: Call::Submit {
                     payload: product_get(),
-                    operation_id: "system-tray.configuration.startup".into(),
+                    operation_id: format!("system-tray.configuration.startup.{generation}"),
                     parent: None,
                     retry_ticks: 0,
+                    first_attempt: None,
+                    admission_uncertain: false,
                 },
             }),
             completions: VecDeque::new(),
+            generation: generation.to_owned(),
+            quiescing: false,
         }
     }
 
@@ -110,6 +129,9 @@ impl ProductSettings {
         expected_revision: u64,
         desired: TraySettings,
     ) -> Result<(), Value> {
+        if self.quiescing {
+            return Err(failure("shutting_down", "system tray is shutting down"));
+        }
         if !self.ready {
             return Err(failure(
                 "configuration_unavailable",
@@ -136,6 +158,8 @@ impl ProductSettings {
                 operation_id: self.next_operation_id("update"),
                 parent: Some(request),
                 retry_ticks: 0,
+                first_attempt: None,
+                admission_uncertain: false,
             },
         });
         Ok(())
@@ -143,6 +167,26 @@ impl ProductSettings {
 
     pub fn take_completion(&mut self) -> Option<UpdateCompletion> {
         self.completions.pop_front()
+    }
+
+    /// Retire the exact configuration call without cancelling a potentially
+    /// delivered write. The caller must also deliver pending completions.
+    pub fn quiesce(&mut self, send: Sender<'_>) -> ModuleResult<bool> {
+        self.quiescing = true;
+        if self.pending.as_ref().is_some_and(|pending| {
+            matches!(
+                pending.call,
+                Call::Submit {
+                    first_attempt: None,
+                    ..
+                }
+            )
+        }) {
+            let pending = self.pending.take().expect("unsubmitted call exists");
+            self.fail_unfinished_update(pending.work);
+        }
+        self.advance(send)?;
+        Ok(self.pending.is_none() && self.completions.is_empty())
     }
 
     pub fn advance(&mut self, send: Sender<'_>) -> ModuleResult<()> {
@@ -156,6 +200,8 @@ impl ProductSettings {
                 operation_id,
                 parent,
                 retry_ticks,
+                first_attempt,
+                admission_uncertain,
             } => {
                 if retry_ticks > 0 {
                     self.pending = Some(Pending {
@@ -165,10 +211,32 @@ impl ProductSettings {
                             operation_id,
                             parent,
                             retry_ticks: retry_ticks - 1,
+                            first_attempt,
+                            admission_uncertain,
                         },
                     });
                     return Ok(());
                 }
+                let now = Instant::now();
+                if admission_uncertain
+                    && first_attempt.is_some_and(|first| {
+                        now.saturating_duration_since(first) >= ADMISSION_RECOVERY_WINDOW
+                    })
+                {
+                    self.pending = Some(Pending {
+                        work: pending.work,
+                        call: Call::Submit {
+                            payload,
+                            operation_id,
+                            parent,
+                            retry_ticks: 0,
+                            first_attempt,
+                            admission_uncertain,
+                        },
+                    });
+                    return Ok(());
+                }
+                let first_attempt = first_attempt.or(Some(now));
                 match send(Command::Request {
                     service: CONFIGURATION_SERVICE.into(),
                     payload: payload.clone(),
@@ -184,6 +252,19 @@ impl ProductSettings {
                     }
                     // A stable ID recovers a child operation accepted before its
                     // acknowledgement was lost by the host transport.
+                    Ok(_) | Err(_) if admission_uncertain => {
+                        self.pending = Some(Pending {
+                            work: pending.work,
+                            call: Call::Submit {
+                                payload,
+                                operation_id,
+                                parent,
+                                retry_ticks: 1,
+                                first_attempt,
+                                admission_uncertain: true,
+                            },
+                        });
+                    }
                     Err(_) => {
                         self.pending = Some(Pending {
                             work: pending.work,
@@ -192,11 +273,39 @@ impl ProductSettings {
                                 operation_id,
                                 parent,
                                 retry_ticks: 1,
+                                first_attempt,
+                                admission_uncertain: true,
                             },
                         });
                     }
-                    Ok(Response::Error { .. }) | Ok(_) => {
+                    Ok(Response::Error { code, .. }) if code == "conflict" => {
+                        self.pending = Some(Pending {
+                            work: pending.work,
+                            call: Call::Submit {
+                                payload,
+                                operation_id,
+                                parent,
+                                retry_ticks: 1,
+                                first_attempt,
+                                admission_uncertain: true,
+                            },
+                        });
+                    }
+                    Ok(Response::Error { .. }) => {
                         self.on_submit_failure(pending.work);
+                    }
+                    Ok(_) => {
+                        self.pending = Some(Pending {
+                            work: pending.work,
+                            call: Call::Submit {
+                                payload,
+                                operation_id,
+                                parent,
+                                retry_ticks: 1,
+                                first_attempt,
+                                admission_uncertain: true,
+                            },
+                        });
                     }
                 }
             }
@@ -207,9 +316,6 @@ impl ProductSettings {
                         call: Call::Waiting { request },
                     });
                 }
-                Ok(Response::Error { code, .. }) if code == "not_found" => {
-                    self.on_child_missing(pending.work);
-                }
                 Ok(Response::Result { payload }) => {
                     self.pending = Some(Pending {
                         work: pending.work,
@@ -219,16 +325,30 @@ impl ProductSettings {
                         },
                     });
                 }
-                Ok(_) => {
+                Ok(Response::Error { .. }) if pending.work.is_read_only() => {
+                    // A read has no durable effect to fence. Release its
+                    // terminal broker result before retrying or shutting down.
                     self.pending = Some(Pending {
                         work: pending.work,
                         call: Call::Releasing {
                             request,
-                            outcome: ChildOutcome::Failure,
+                            outcome: ChildOutcome::ReadFailed,
                         },
                     });
                 }
+                Ok(_) => {
+                    self.pending = Some(Pending {
+                        work: pending.work,
+                        call: Call::Uncertain { request },
+                    });
+                }
             },
+            Call::Uncertain { request } => {
+                self.pending = Some(Pending {
+                    work: pending.work,
+                    call: Call::Uncertain { request },
+                });
+            }
             Call::Releasing { request, outcome } => {
                 match send(Command::ReleaseResult { request }) {
                     Ok(Response::Ok) => self.on_terminal(pending.work, outcome),
@@ -263,28 +383,11 @@ impl ProductSettings {
         }
     }
 
-    fn on_child_missing(&mut self, work: Work) {
-        match work {
-            Work::StartupGet | Work::Initialize => self.retry_startup(1),
-            Work::Update {
-                management_request,
-                expected_revision,
-                desired,
-            }
-            | Work::ReconcileUpdate {
-                management_request,
-                expected_revision,
-                desired,
-            } => self.start_reconciliation(management_request, expected_revision, desired, 1),
-        }
-    }
-
     fn on_terminal(&mut self, work: Work, outcome: ChildOutcome) {
         let ChildOutcome::Payload(payload) = outcome else {
             self.on_submit_failure(work);
             return;
         };
-
         match work {
             Work::StartupGet => match read_document(&payload) {
                 Ok(Document::Found(settings, revision)) => self.adopt(settings, revision),
@@ -352,6 +455,9 @@ impl ProductSettings {
     }
 
     fn start_initialization(&mut self) {
+        if self.quiescing {
+            return;
+        }
         let settings = TraySettings::default();
         self.pending = Some(Pending {
             work: Work::Initialize,
@@ -360,18 +466,25 @@ impl ProductSettings {
                 operation_id: self.next_operation_id("initialize"),
                 parent: None,
                 retry_ticks: 0,
+                first_attempt: None,
+                admission_uncertain: false,
             },
         });
     }
 
     fn retry_startup(&mut self, retry_ticks: u8) {
+        if self.quiescing {
+            return;
+        }
         self.pending = Some(Pending {
             work: Work::StartupGet,
             call: Call::Submit {
                 payload: product_get(),
-                operation_id: "system-tray.configuration.startup".into(),
+                operation_id: format!("system-tray.configuration.startup.{}", self.generation),
                 parent: None,
                 retry_ticks,
+                first_attempt: None,
+                admission_uncertain: false,
             },
         });
     }
@@ -383,6 +496,16 @@ impl ProductSettings {
         desired: TraySettings,
         retry_ticks: u8,
     ) {
+        if self.quiescing {
+            self.complete_failure(
+                management_request,
+                failure(
+                    "shutting_down",
+                    "system tray settings outcome requires reconciliation",
+                ),
+            );
+            return;
+        }
         self.pending = Some(Pending {
             work: Work::ReconcileUpdate {
                 management_request,
@@ -394,6 +517,8 @@ impl ProductSettings {
                 operation_id: self.next_operation_id("update-reconcile"),
                 parent: None,
                 retry_ticks,
+                first_attempt: None,
+                admission_uncertain: false,
             },
         });
     }
@@ -414,13 +539,25 @@ impl ProductSettings {
     fn next_operation_id(&mut self, purpose: &str) -> String {
         let operation = self.next_operation;
         self.next_operation = self.next_operation.saturating_add(1);
-        format!("system-tray.configuration.{purpose}.{operation}")
+        format!(
+            "system-tray.configuration.{purpose}.{}.{operation}",
+            self.generation
+        )
     }
-}
 
-impl Default for ProductSettings {
-    fn default() -> Self {
-        Self::new()
+    fn fail_unfinished_update(&mut self, work: Work) {
+        if let Work::Update {
+            management_request, ..
+        }
+        | Work::ReconcileUpdate {
+            management_request, ..
+        } = work
+        {
+            self.complete_failure(
+                management_request,
+                failure("shutting_down", "system tray is shutting down"),
+            );
+        }
     }
 }
 
@@ -633,7 +770,7 @@ mod tests {
 
     #[test]
     fn absent_document_is_initialized_once_with_the_default_enabled_setting() {
-        let mut settings = ProductSettings::new();
+        let mut settings = ProductSettings::new("test");
         assert!(!settings.is_ready());
         initialize_default(&mut settings);
         assert!(settings.take_completion().is_none());
@@ -641,7 +778,7 @@ mod tests {
 
     #[test]
     fn update_waits_for_durable_commit_before_completing_management_request() {
-        let mut settings = ProductSettings::new();
+        let mut settings = ProductSettings::new("test");
         initialize_default(&mut settings);
         settings
             .begin_update(70, 1, TraySettings { system_tray: false })
@@ -681,7 +818,7 @@ mod tests {
 
     #[test]
     fn compare_and_swap_conflict_reloads_the_durable_setting_and_revision() {
-        let mut settings = ProductSettings::new();
+        let mut settings = ProductSettings::new("test");
         initialize_default(&mut settings);
         settings
             .begin_update(71, 1, TraySettings { system_tray: false })
@@ -724,5 +861,167 @@ mod tests {
                 if response["error"]["code"] == "revision_conflict"
                     && response["error"]["revision"] == 2
         ));
+    }
+
+    #[test]
+    fn quiescence_waits_for_admitted_update_and_releases_result() {
+        let mut settings = ProductSettings::new("shutdown");
+        initialize_default(&mut settings);
+        settings
+            .begin_update(70, 1, TraySettings { system_tray: false })
+            .unwrap();
+        advance_once(
+            &mut settings,
+            expect_configuration_request("product_update", |_| {}),
+            Response::Accepted { id: 20 },
+        );
+        assert!(
+            !settings
+                .quiesce(&mut |command| {
+                    expect_take(20)(command);
+                    Ok(Response::Pending)
+                })
+                .unwrap()
+        );
+        assert!(
+            !settings
+                .quiesce(&mut |command| {
+                    expect_take(20)(command);
+                    Ok(Response::Result {
+                        payload: found_document(false, 2),
+                    })
+                })
+                .unwrap()
+        );
+        assert!(
+            !settings
+                .quiesce(&mut |command| {
+                    expect_release(20)(command);
+                    Ok(Response::Ok)
+                })
+                .unwrap()
+        );
+        assert!(matches!(
+            settings.take_completion(),
+            Some(UpdateCompletion::Applied {
+                request: 70,
+                revision: 2,
+                ..
+            })
+        ));
+        assert!(
+            settings
+                .quiesce(&mut |_| panic!("settled operation sends nothing"))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn quiescence_completes_an_unsubmitted_update_without_starting_it() {
+        let mut settings = ProductSettings::new("shutdown");
+        initialize_default(&mut settings);
+        settings
+            .begin_update(70, 1, TraySettings { system_tray: false })
+            .unwrap();
+        assert!(
+            !settings
+                .quiesce(&mut |_| panic!("unsent operation must not be started"))
+                .unwrap()
+        );
+        assert!(
+            matches!(settings.take_completion(), Some(UpdateCompletion::Failed { request: 70, response }) if response["error"]["code"] == "shutting_down")
+        );
+        assert!(
+            settings
+                .quiesce(&mut |_| panic!("settled operation sends nothing"))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn lost_admission_retries_same_operation_and_fences_after_retention() {
+        let mut settings = ProductSettings::new("unique-start");
+        settings
+            .advance(&mut |_| Err("lost response".into()))
+            .unwrap();
+        settings
+            .advance(&mut |_| panic!("backoff tick must not send"))
+            .unwrap();
+        settings.advance(&mut |command| {
+            assert!(matches!(command, Command::Request { ref operation_id, .. } if operation_id == "system-tray.configuration.startup.unique-start"));
+            Ok(Response::error("unavailable", "retry"))
+        }).unwrap();
+        let Call::Submit { first_attempt, .. } = &mut settings.pending.as_mut().unwrap().call
+        else {
+            panic!("original submission must remain");
+        };
+        *first_attempt = Some(Instant::now() - ADMISSION_RECOVERY_WINDOW);
+        assert!(
+            !settings
+                .quiesce(&mut |_| panic!("backoff tick must not send"))
+                .unwrap()
+        );
+        assert!(
+            !settings
+                .quiesce(&mut |_| panic!("expired operation must not replay"))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn broker_expiry_does_not_prove_admitted_write_is_retired() {
+        let mut settings = ProductSettings::new("deadline");
+        initialize_default(&mut settings);
+        settings
+            .begin_update(70, 1, TraySettings { system_tray: false })
+            .unwrap();
+        advance_once(
+            &mut settings,
+            expect_configuration_request("product_update", |_| {}),
+            Response::Accepted { id: 10 },
+        );
+        assert!(
+            !settings
+                .quiesce(&mut |command| {
+                    expect_take(10)(command);
+                    Ok(Response::error("deadline_exceeded", "expired"))
+                })
+                .unwrap()
+        );
+        assert!(
+            !settings
+                .quiesce(&mut |_| panic!("unknown work must remain fenced"))
+                .unwrap()
+        );
+        assert!(matches!(
+            settings.pending.unwrap().call,
+            Call::Uncertain { request: 10 }
+        ));
+    }
+
+    #[test]
+    fn expired_read_can_be_released_and_shutdown_can_finish() {
+        let mut settings = ProductSettings::new("expired-read");
+        advance_once(
+            &mut settings,
+            expect_configuration_request("product_get", |_| {}),
+            Response::Accepted { id: 10 },
+        );
+        assert!(
+            !settings
+                .quiesce(&mut |command| {
+                    expect_take(10)(command);
+                    Ok(Response::error("deadline_exceeded", "expired"))
+                })
+                .unwrap()
+        );
+        assert!(
+            settings
+                .quiesce(&mut |command| {
+                    expect_release(10)(command);
+                    Ok(Response::Ok)
+                })
+                .unwrap()
+        );
     }
 }

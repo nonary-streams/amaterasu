@@ -9,6 +9,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 amaterasu-module-sdk.workspace = true
+getrandom.workspace = true
 ldtray = "=0.1.2"
 serde.workspace = true
 serde_json.workspace = true

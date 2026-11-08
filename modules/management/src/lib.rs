@@ -3,6 +3,7 @@ mod assets;
 mod capture_management;
 mod csrf_policy;
 mod extensions;
+mod health_lifecycle;
 mod http;
 mod peer_policy;
 mod product_settings;
@@ -27,7 +28,7 @@ use serde_json::json;
 use server::Server;
 use std::net::SocketAddr;
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 const SERVICE: &str = "amaterasu.management/1";
 const AUTH_SERVICE: &str = "amaterasu.authentication/1";
@@ -56,25 +57,13 @@ struct ManagementModule {
     server: Option<Server>,
     repositories: Option<RepositoryStore>,
     rtx_hdr_installer: Option<rtx_hdr_install::Installer>,
-    operational_health: Option<OperationalHealth>,
+    operational_health: Option<health_lifecycle::OperationalHealth>,
     product_settings: product_settings::ProductSettings,
     tray_events: tray_events::TrayEventConsumer,
-}
-
-const CATALOG_SERVICE: &str = "amaterasu.catalog/1";
-const PAIRING_SERVICE: &str = "amaterasu.pairing/1";
-
-enum HealthProbe {
-    Authentication,
-    Catalog,
-    Pairing,
-}
-
-struct OperationalHealth {
-    request: u64,
-    child: u64,
-    deadline: Instant,
-    probe: HealthProbe,
+    shutdown_announced: bool,
+    shutdown_poll_drained: bool,
+    quiesce_started: bool,
+    quiescing: bool,
 }
 
 impl ManagedModule for ManagementModule {
@@ -162,12 +151,72 @@ impl ManagedModule for ManagementModule {
             repositories,
             rtx_hdr_installer,
             operational_health: None,
-            product_settings: product_settings::ProductSettings::default(),
-            tray_events: tray_events::TrayEventConsumer::default(),
+            product_settings: product_settings::ProductSettings::new()?,
+            tray_events: tray_events::TrayEventConsumer::new()?,
+            shutdown_announced: false,
+            shutdown_poll_drained: false,
+            quiesce_started: false,
+            quiescing: false,
         })
     }
 
+    fn prepare_shutdown(&mut self, _remaining_ms: u64) -> ModuleResult<()> {
+        self.shutdown_announced = true;
+        if let Some(installer) = &mut self.rtx_hdr_installer {
+            installer.prepare_shutdown();
+        }
+        if let Some(server) = &mut self.server {
+            server.prepare_shutdown();
+        }
+        self.product_settings.prepare_shutdown();
+        self.tray_events.prepare_shutdown();
+        Ok(())
+    }
+
+    fn quiesce(&mut self) -> ModuleResult<bool> {
+        if !self.shutdown_announced {
+            self.prepare_shutdown(0)?;
+        }
+        if !self.quiesce_started {
+            self.quiesce_started = true;
+            // Consumers could submit after an earlier idle poll during the
+            // announcement phase. Observe the queue again after they drain.
+            self.shutdown_poll_drained = false;
+        }
+        // Already accepted server calls can target this module itself. Drain
+        // the broker queue before stopping ticks, or they cannot complete.
+        if !self.shutdown_poll_drained {
+            self.tick()?;
+            if !self.shutdown_poll_drained {
+                return Ok(false);
+            }
+        }
+        self.quiescing = true;
+        let installer_ready = self
+            .rtx_hdr_installer
+            .as_mut()
+            .is_none_or(rtx_hdr_install::Installer::quiesce);
+        let server_ready = self
+            .server
+            .as_mut()
+            .is_none_or(|server| server.quiesce(&self.runtime));
+        let settings_ready = self
+            .product_settings
+            .quiesce(Instant::now(), &mut |command| self.runtime.send(command));
+        let tray_ready = self.tray_events.quiesce(&self.runtime);
+        let health_ready = self.operational_health.as_mut().is_none_or(|health| {
+            health.quiesce(Instant::now(), &mut |command| self.runtime.send(command))
+        });
+        if health_ready {
+            self.operational_health = None;
+        }
+        Ok(installer_ready && server_ready && settings_ready && tray_ready && health_ready)
+    }
+
     fn tick(&mut self) -> ModuleResult<()> {
+        if self.quiescing {
+            return Ok(());
+        }
         if let Some(installer) = &mut self.rtx_hdr_installer {
             installer.advance();
         }
@@ -180,7 +229,11 @@ impl ManagedModule for ManagementModule {
             server.tick(&self.runtime)?;
         }
         self.tray_events.tick(&self.runtime, self.server.as_ref())?;
-        match self.runtime.send(Command::Poll {})? {
+        let polled = self.runtime.send(Command::Poll {})?;
+        if self.shutdown_announced {
+            self.shutdown_poll_drained = matches!(polled, Response::Pending);
+        }
+        match polled {
             Response::Pending => Ok(()),
             Response::Request {
                 id,
@@ -540,148 +593,22 @@ impl ManagementModule {
                 json!({"ok":false,"code":"health_busy"}),
             );
         }
-        let deadline = Instant::now() + Duration::from_millis(remaining_ms.min(10_000));
-        let child = submit_health_request(
-            &self.runtime,
+        self.operational_health = Some(health_lifecycle::OperationalHealth::new(
             request,
-            deadline,
-            AUTH_SERVICE,
-            json!({"action":"status"}),
-            "authentication",
-        )?;
-        self.operational_health = Some(OperationalHealth {
-            request,
-            child,
-            deadline,
-            probe: HealthProbe::Authentication,
-        });
+            remaining_ms,
+            Instant::now(),
+        ));
         Ok(())
     }
 
     fn advance_operational_health(&mut self) -> ModuleResult<()> {
-        let Some(check) = self.operational_health.take() else {
-            return Ok(());
-        };
-        if Instant::now() >= check.deadline {
-            let _ = self.runtime.send(Command::Cancel {
-                request: check.child,
-            });
-            let _ = self.runtime.send(Command::ReleaseResult {
-                request: check.child,
-            });
-            return complete(
-                &self.runtime,
-                check.request,
-                json!({"ok":false,"code":"health_timeout"}),
-            );
+        if self.operational_health.as_mut().is_some_and(|health| {
+            health.advance(Instant::now(), &mut |command| self.runtime.send(command))
+        }) {
+            self.operational_health = None;
         }
-        match self.runtime.send(Command::TakeResult {
-            request: check.child,
-        })? {
-            Response::Pending => {
-                self.operational_health = Some(check);
-                Ok(())
-            }
-            Response::Result { payload } if health_response(&check.probe, &payload) => {
-                let (probe, service, payload, name) = match check.probe {
-                    HealthProbe::Authentication => (
-                        HealthProbe::Catalog,
-                        CATALOG_SERVICE,
-                        json!({"action":"list","cursor":null,"limit":1}),
-                        "catalog",
-                    ),
-                    HealthProbe::Catalog => (
-                        HealthProbe::Pairing,
-                        PAIRING_SERVICE,
-                        json!({"action":"identity"}),
-                        "pairing",
-                    ),
-                    HealthProbe::Pairing => {
-                        return complete(
-                            &self.runtime,
-                            check.request,
-                            json!({
-                                "ok":true,
-                                "authentication_verifier":true,
-                                "catalog_loaded":true,
-                                "pairing_identity":true,
-                            }),
-                        );
-                    }
-                };
-                let child = submit_health_request(
-                    &self.runtime,
-                    check.request,
-                    check.deadline,
-                    service,
-                    payload,
-                    name,
-                )?;
-                self.operational_health = Some(OperationalHealth {
-                    probe,
-                    child,
-                    ..check
-                });
-                Ok(())
-            }
-            Response::Result { .. } => complete(
-                &self.runtime,
-                check.request,
-                json!({"ok":false,"code":"required_state_unavailable"}),
-            ),
-            _ => complete(
-                &self.runtime,
-                check.request,
-                json!({"ok":false,"code":"required_service_unavailable"}),
-            ),
-        }
+        Ok(())
     }
-}
-
-fn submit_health_request(
-    runtime: &RuntimeClient,
-    parent: u64,
-    deadline: Instant,
-    service: &str,
-    payload: serde_json::Value,
-    name: &str,
-) -> ModuleResult<u64> {
-    let timeout_ms = deadline
-        .saturating_duration_since(Instant::now())
-        .as_millis() as u64;
-    if timeout_ms == 0 {
-        return Err("operational health deadline elapsed".into());
-    }
-    match runtime.send(Command::Request {
-        service: service.into(),
-        payload,
-        timeout_ms,
-        operation_id: format!("management.health.{parent}.{name}"),
-        parent: Some(parent),
-    })? {
-        Response::Accepted { id } => Ok(id),
-        _ => Err("operational health service is unavailable".into()),
-    }
-}
-
-fn health_response(probe: &HealthProbe, payload: &serde_json::Value) -> bool {
-    payload.get("ok").and_then(serde_json::Value::as_bool) == Some(true)
-        && match probe {
-            HealthProbe::Authentication => {
-                payload
-                    .get("verifier_available")
-                    .and_then(serde_json::Value::as_bool)
-                    == Some(true)
-            }
-            HealthProbe::Catalog => payload
-                .get("entries")
-                .and_then(serde_json::Value::as_array)
-                .is_some(),
-            HealthProbe::Pairing => payload
-                .get("host_id")
-                .and_then(serde_json::Value::as_str)
-                .is_some(),
-        }
 }
 
 fn complete(runtime: &RuntimeClient, request: u64, payload: serde_json::Value) -> ModuleResult<()> {
@@ -740,6 +667,73 @@ amaterasu_module_sdk::export_module!(ManagementModule);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shutdown_drains_queued_management_calls_before_stopping_ticks() {
+        use amaterasu_module_sdk::abi::{
+            AbiHeader, BorrowedBytes, HostApi, ReplySink, STATUS_OK, Status,
+        };
+        use std::{ffi::c_void, sync::Mutex};
+
+        let commands = Mutex::new(Vec::<Command>::new());
+        unsafe extern "C" fn invoke(
+            context: *mut c_void,
+            input: BorrowedBytes,
+            reply: ReplySink,
+        ) -> Status {
+            // SAFETY: the test retains the command ledger and synchronous borrows.
+            let commands = unsafe { &*context.cast::<Mutex<Vec<Command>>>() };
+            let command: Command =
+                serde_json::from_slice(unsafe { input.read().unwrap() }).unwrap();
+            let mut commands = commands.lock().unwrap();
+            let response = match &command {
+                Command::GetSettings {} => Response::Result { payload: json!({}) },
+                Command::Register { .. } | Command::Complete { .. } => Response::Ok,
+                Command::Poll {} if !commands.iter().any(|c| matches!(c, Command::Poll {})) => {
+                    Response::Request {
+                        id: 17,
+                        caller: "test".into(),
+                        initiator: "test".into(),
+                        service: SERVICE.into(),
+                        payload: json!({"action":"operational_health"}),
+                        remaining_ms: 1000,
+                    }
+                }
+                Command::Poll {} => Response::Pending,
+                _ => panic!("unexpected command: {command:?}"),
+            };
+            commands.push(command);
+            let bytes = serde_json::to_vec(&response).unwrap();
+            // SAFETY: the sink copies the bytes during this call.
+            unsafe { reply.send(&bytes) };
+            STATUS_OK
+        }
+        let endpoint = HostApi {
+            header: AbiHeader::of::<HostApi>(),
+            context: std::ptr::from_ref(&commands).cast_mut().cast(),
+            invoke,
+        };
+        // SAFETY: the ledger outlives the module and all calls.
+        let runtime = unsafe { RuntimeClient::from_endpoint(endpoint) };
+        let mut module = ManagementModule::start(runtime).unwrap();
+        module.prepare_shutdown(1000).unwrap();
+        assert!(!module.quiesce().unwrap());
+        assert!(module.quiesce().unwrap());
+        module.tick().unwrap();
+        let commands = commands.lock().unwrap();
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|c| matches!(c, Command::Poll {}))
+                .count(),
+            2
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|c| matches!(c, Command::Complete { request: 17, .. }))
+        );
+    }
 
     #[test]
     fn audio_provider_settings_are_versioned_and_validated_at_startup() {
@@ -845,6 +839,7 @@ mod tests {
                     "test provider is deliberately unavailable",
                 ),
                 Command::Register { .. } => Response::Ok,
+                Command::Poll {} => Response::Pending,
                 _ => return STATUS_INVALID_ARGUMENT,
             };
             host.commands.lock().unwrap().push(command);
@@ -871,7 +866,11 @@ mod tests {
             let runtime = unsafe { RuntimeClient::from_endpoint(endpoint) };
             let module = ManagementModule::start(runtime);
             assert_eq!(module.is_ok(), !enabled);
-            drop(module);
+            if let Ok(mut module) = module {
+                assert!(module.quiesce().unwrap());
+                // Host ticks after a ready result must not poll and admit work.
+                module.tick().unwrap();
+            }
             let commands = host.commands.lock().unwrap();
             assert!(
                 !commands
