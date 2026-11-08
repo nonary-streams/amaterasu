@@ -14,11 +14,13 @@ pub mod native_contracts {
 
 mod generic;
 mod lease;
+mod readiness;
 mod timing;
 use amaterasu_abi::{STATUS_INVALID_ARGUMENT, Status};
 use amaterasu_media::{CpuFrame, frame_size};
 pub use generic::{BorrowedResourceFrame, OwnedResourceCpuFrame, RetainedResourceFrame};
 pub use lease::RetainedDmaBufFrame;
+pub use readiness::encoder_gpu_input_ready;
 pub use timing::*;
 
 /// A validated CPU frame whose pixels remain borrowed for its lifetime.

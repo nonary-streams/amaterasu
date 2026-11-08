@@ -25,6 +25,13 @@ _Static_assert(sizeof(AmaterasuCaptureResourceOffer) == 144, "resource offer lay
 _Static_assert(sizeof(AmaterasuCaptureResourceFrame) == 248, "resource frame layout");
 _Static_assert(sizeof(AmaterasuFrameColorMetadata) == 24, "frame color metadata layout");
 _Static_assert(sizeof(AmaterasuFrameClockMetadata) == 32, "frame clock metadata layout");
+_Static_assert(offsetof(AmaterasuGpuProcessorApiV1_4, enumerate_outputs) == sizeof(AmaterasuGpuProcessorApiV1_3), "processor v1.3 prefix preserved");
+_Static_assert(offsetof(AmaterasuEncoderApiV1_5, enumerate_resources) == sizeof(AmaterasuEncoderApiV1_4), "encoder v1.4 prefix preserved");
+_Static_assert(sizeof(AmaterasuCudaDeviceCapabilities) == 40, "CUDA offer layout");
+_Static_assert(sizeof(AmaterasuCudaDeviceFrame) == 40, "CUDA frame layout");
+_Static_assert(offsetof(AmaterasuCudaDeviceFrame, device_pointer) == 16, "CUDA pointer offset");
+_Static_assert(sizeof(AmaterasuCudaEventCapabilities) == 16, "CUDA event offer layout");
+_Static_assert(sizeof(AmaterasuCudaEventSync) == 8, "CUDA event layout");
 _Static_assert(sizeof(AmaterasuNativeInterfaceQuery) == 24, "native query layout");
 _Static_assert(sizeof(AmaterasuNativeServiceFactory) == 32, "native factory layout");
 _Static_assert(sizeof(AmaterasuCpuFrame) == 48, "frame layout");
@@ -88,6 +95,7 @@ _Static_assert(offsetof(AmaterasuCaptureApiV1_6, read_dmabuf_frame_leased) == 80
 _Static_assert(AMATERASU_ENCODER_API_V1_2_SIZE == 80, "encoder v1.2 layout");
 _Static_assert(offsetof(AmaterasuEncoderApiV1_2, submit_dmabuf_leased) == 64, "encoder lease offset");
 _Static_assert(offsetof(AmaterasuEncoderApiV1_2, cancel_dmabuf_leases) == 72, "encoder lease cancel offset");
+_Static_assert(offsetof(AmaterasuEncoderApiV1_4, gpu_input_ready) == sizeof(AmaterasuEncoderApiV1_3), "encoder readiness preserves timing prefix");
 _Static_assert(sizeof(AmaterasuVideoApi) == 40, "video table layout");
 _Static_assert(sizeof(AmaterasuVideoApiV1_1) == 48, "video v1.1 table layout");
 _Static_assert(offsetof(AmaterasuVideoApiV1_1, geometry) == 40, "video geometry offset");

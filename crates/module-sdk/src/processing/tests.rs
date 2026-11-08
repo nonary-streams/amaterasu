@@ -275,6 +275,10 @@ fn factory_checks_version_and_uses_authenticated_principal() {
         query.min_size = GPU_PROCESSOR_API_V1_3_SIZE;
         assert_eq!(invoke(&factory, principal, &query, &mut result), STATUS_OK);
         (*result).release.unwrap()((*result).context);
+        query.min_minor = GPU_PROCESSOR_RESOURCE_OUTPUT_INTERFACE_MINOR;
+        query.min_size = GPU_PROCESSOR_API_V1_4_SIZE;
+        assert_eq!(invoke(&factory, principal, &query, &mut result), STATUS_OK);
+        (*result).release.unwrap()((*result).context);
         query.min_minor += 1;
         assert_eq!(
             invoke(&factory, principal, &query, &mut result),

@@ -574,6 +574,52 @@ typedef struct {
     AmaterasuStatus (*encode_timing)(void *, uint64_t, AmaterasuEncodeTimingSnapshotV1 *);
 } AmaterasuEncoderApiV1_3;
 #define AMATERASU_ENCODER_API_V1_3_SIZE ((uint32_t)sizeof(AmaterasuEncoderApiV1_3))
+/* Advisory GPU input readiness; the query reserves nothing and does not
+ * consume output. Submit can still return BUSY after an OK result. */
+#define AMATERASU_ENCODER_GPU_READINESS_INTERFACE_MINOR 4u
+typedef struct {
+    AmaterasuEncoderApiV1_3 base;
+    AmaterasuStatus (*gpu_input_ready)(void *, uint64_t);
+} AmaterasuEncoderApiV1_4;
+#define AMATERASU_ENCODER_API_V1_4_SIZE ((uint32_t)sizeof(AmaterasuEncoderApiV1_4))
+/* v1.5 frame-resource consumer operations for an encoder session, with the
+ * semantics of AmaterasuFrameResourceConsumerApi configure and submit. OK
+ * retains for asynchronous work and releases only after it completed (or with
+ * the negotiated completion object); other results retain nothing.
+ * cancel_dmabuf_leases also retires every retained resource reference. */
+#define AMATERASU_ENCODER_RESOURCE_INTERFACE_MINOR 5u
+typedef struct {
+    AmaterasuEncoderApiV1_4 base;
+    AmaterasuStatus (*enumerate_resources)(void *, uint64_t, AmaterasuCaptureResourceOfferSink, uint64_t *generation);
+    AmaterasuStatus (*configure_resource)(void *, uint64_t, uint64_t consumer_generation, uint64_t consumer_id, uint64_t producer_generation, const AmaterasuCaptureResourceOffer *producer_offer);
+    AmaterasuStatus (*submit_resource)(void *, uint64_t, const AmaterasuCaptureResourceFrame *, uint32_t flags);
+} AmaterasuEncoderApiV1_5;
+#define AMATERASU_ENCODER_API_V1_5_SIZE ((uint32_t)sizeof(AmaterasuEncoderApiV1_5))
+
+/* NVIDIA CUDA vendor schema (namespace UUID below): frames in pitch-linear
+ * device memory of the primary CUDA context of the device named by UUID,
+ * ordered by a CUDA event recorded after the last write. The producer does not
+ * record it again while a reference is retained, so a consumer holding one may
+ * enqueue cuStreamWaitEvent any time before release; otherwise before submit
+ * returns. v1 completion is SYNC_NONE: release only after reads completed. */
+#define AMATERASU_CUDA_RESOURCE_NAMESPACE \
+    {0x6a, 0x8e, 0x2f, 0x41, 0x93, 0x0c, 0x4d, 0x57, 0xa1, 0x7b, 0x3c, 0x58, 0xe2, 0x19, 0xd4, 0x06}
+#define AMATERASU_FRAME_RESOURCE_CUDA_DEVICE (AMATERASU_FRAME_RESOURCE_VENDOR_BASE | 1u)
+#define AMATERASU_FRAME_SYNC_CUDA_EVENT (AMATERASU_FRAME_SYNC_VENDOR_BASE | 1u)
+#define AMATERASU_CUDA_RESOURCE_VERSION 1u
+/* Packed 32-bit little endian: R bits 0-9, G 10-19, B 20-29 (DRM ABGR2101010). */
+#define AMATERASU_CUDA_FORMAT_X2B10G10R10 1u
+typedef struct {
+    uint8_t device_uuid[16];
+    uint32_t format, min_width, max_width, min_height, max_height, reserved;
+} AmaterasuCudaDeviceCapabilities;
+typedef struct {
+    uint8_t device_uuid[16];
+    uint64_t device_pointer;
+    uint32_t pitch, format, width, height;
+} AmaterasuCudaDeviceFrame;
+typedef struct { uint8_t device_uuid[16]; } AmaterasuCudaEventCapabilities;
+typedef struct { void *event; } AmaterasuCudaEventSync;
 #define AMATERASU_ENCODER_API_V1_0_SIZE ((uint32_t)sizeof(AmaterasuEncoderApi))
 #define AMATERASU_ENCODER_API_V1_1_SIZE ((uint32_t)sizeof(AmaterasuEncoderApiV1_1))
 typedef struct {
@@ -671,6 +717,21 @@ typedef struct {
     AmaterasuStatus (*update_stream)(void *, uint64_t, const uint8_t *, size_t);
 } AmaterasuGpuProcessorApiV1_3;
 #define AMATERASU_GPU_PROCESSOR_API_V1_3_SIZE ((uint32_t)sizeof(AmaterasuGpuProcessorApiV1_3))
+/* v1.4 negotiated output. Output offers follow the frame-resource enumeration
+ * rules for the configured stream. Selecting one switches process_to_resource
+ * to that schema; before a successful selection it returns UNSUPPORTED. It
+ * takes the same borrowed input lease and freshness as process, delivers at
+ * most one output synchronously (preserving sequence, timestamps, freshness)
+ * and propagates sink rejection. A retained output stays valid until released,
+ * even after cancellation; the provider stays loaded until then. */
+#define AMATERASU_GPU_PROCESSOR_RESOURCE_OUTPUT_INTERFACE_MINOR 4u
+typedef struct {
+    AmaterasuGpuProcessorApiV1_3 base;
+    AmaterasuStatus (*enumerate_outputs)(void *, uint64_t, AmaterasuCaptureResourceOfferSink, uint64_t *generation);
+    AmaterasuStatus (*select_output)(void *, uint64_t, uint64_t generation, uint64_t offer_id);
+    AmaterasuStatus (*process_to_resource)(void *, uint64_t, const AmaterasuDmaBufFrameLease *, uint32_t freshness, AmaterasuCaptureResourceFrameSink);
+} AmaterasuGpuProcessorApiV1_4;
+#define AMATERASU_GPU_PROCESSOR_API_V1_4_SIZE ((uint32_t)sizeof(AmaterasuGpuProcessorApiV1_4))
 typedef struct {
     AmaterasuCaptureApiV1_8 base;
     AmaterasuStatus (*hdr_metadata)(void *, uint64_t, AmaterasuHdrMetadata *);
