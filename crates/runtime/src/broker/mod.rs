@@ -665,6 +665,17 @@ impl Broker {
         }
     }
 
+    /// The runtime's own diagnostic; bounded and dropped like any other record.
+    pub(crate) fn record_tick_holds(&mut self, report: String) {
+        const INFO_LEVEL: u8 = 2;
+        let _ = self.enqueue_log(
+            "amaterasu.runtime",
+            INFO_LEVEL,
+            "runtime.tick_holds".to_owned(),
+            report,
+        );
+    }
+
     fn enqueue_log(
         &mut self,
         caller: &str,

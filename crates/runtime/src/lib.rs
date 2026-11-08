@@ -6,6 +6,7 @@
 mod broker;
 mod ffi;
 mod native;
+mod tick_holds;
 mod work_signal;
 
 pub use broker::Broker;

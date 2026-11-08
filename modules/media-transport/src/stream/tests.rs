@@ -97,6 +97,49 @@ fn actual_media_stream_sends_over_ipv6_loopback_and_releases_both_ports() {
     }
 }
 
+#[test]
+fn admitted_frames_reach_the_wire_without_waiting_for_a_module_tick() {
+    let (video, audio) = receivers();
+    let mut stream = Stream::open("owner", &request(&video, &audio, false)).unwrap();
+    let frame = [0, 0, 0, 1, 0x65, 1, 2, 3];
+
+    // SAFETY: the owned frame remains live through this synchronous submission.
+    assert_eq!(
+        unsafe { stream.submit_video(&video_packet(&frame, 0)) },
+        STATUS_OK
+    );
+
+    assert_eq!(stream.delivery.queued(), 0);
+    assert!(!receive(&video).is_empty());
+}
+
+#[test]
+fn drain_waits_for_datagrams_the_socket_refused_at_admission() {
+    let (video, audio) = receivers();
+    let mut stream = Stream::open("owner", &request(&video, &audio, false)).unwrap();
+    stream.delivery.push(Medium::Video, vec![vec![1, 2, 3]]);
+
+    assert_eq!(stream.drain(), STATUS_OK);
+    assert_eq!(stream.state(), "draining");
+
+    stream.delivery.tick();
+    assert_eq!(stream.state(), "drained");
+}
+
+#[test]
+fn latency_histogram_places_a_stall_in_its_own_bucket() {
+    let mut latency = ProcessingLatency::default();
+    latency.record(Some(20));
+    latency.record(Some(21));
+    latency.record(Some(600));
+    latency.record(None);
+
+    assert_eq!(latency.buckets[0], 1);
+    assert_eq!(latency.buckets[1], 1);
+    assert_eq!(latency.buckets[LATENCY_BUCKET_BOUNDS_TENTHS_MS.len()], 1);
+    assert!(latency.histogram().ends_with(">50.0ms:1"));
+}
+
 pub(crate) fn video_packet(bytes: &[u8], sequence: u64) -> EncodedPacket {
     EncodedPacket {
         codec: CODEC_H264,
@@ -536,9 +579,9 @@ fn real_udp_video_fec_and_audio_groups_flush_with_no_invented_eos_datagram() {
             STATUS_OK
         );
     }
-    assert_eq!(stream.delivery.queued(), 9); // One data+two parity video; four+two audio.
+    // One data+two parity video; four+two audio, all sent at admission.
+    assert_eq!(stream.delivery.sent_datagrams, 9);
     assert_eq!(stream.drain(), STATUS_OK);
-    assert_eq!(stream.state(), "draining");
     stream.delivery.tick();
     assert_eq!(stream.state(), "drained");
     for _ in 0..3 {
@@ -596,7 +639,7 @@ fn surround_audio_packetize_submit_and_drain_keep_channel_and_wire_bounds() {
                 for sequence in 0..4 {
                     assert_eq!(unsafe { stream.submit_audio(&packet(sequence)) }, STATUS_OK);
                 }
-                assert_eq!(stream.delivery.queued(), 6);
+                assert_eq!(stream.delivery.sent_datagrams, 6);
                 assert_eq!(stream.drain(), STATUS_OK);
                 stream.delivery.tick();
                 for index in 0..6 {
@@ -651,7 +694,7 @@ fn maximum_surround_opus_payload_respects_plain_and_encrypted_wire_caps() {
                 ..audio_packet(&opus, 0)
             };
             assert_eq!(unsafe { stream.submit_audio(&packet) }, STATUS_OK);
-            assert_eq!(stream.delivery.queued(), 1);
+            assert_eq!(stream.delivery.sent_datagrams, 1);
             assert_eq!(stream.drain(), STATUS_OK);
             stream.delivery.tick();
             assert_eq!(receive(&audio).len(), if encrypted { 1_292 } else { 1_287 });
@@ -673,9 +716,8 @@ fn real_udp_video_without_fec_emits_only_the_data_datagram() {
         unsafe { stream.submit_video(&video_packet(&frame, 0)) },
         STATUS_OK
     );
-    assert_eq!(stream.delivery.queued(), 1);
+    assert_eq!(stream.delivery.sent_datagrams, 1);
     assert_eq!(stream.drain(), STATUS_OK);
-    assert_eq!(stream.state(), "draining");
     stream.delivery.tick();
     assert_eq!(stream.state(), "drained");
 

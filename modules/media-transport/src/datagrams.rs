@@ -317,7 +317,29 @@ impl Delivery {
         })
     }
 
-    fn tick_with_batch_sender<F>(&mut self, send_limit: usize, mut send_batch: F) -> usize
+    /// Offers everything queued to the socket as soon as it is admitted.
+    ///
+    /// Stream-session admits media after this module's tick in every host pass,
+    /// so waiting for that tick delays each frame by up to a whole pass and
+    /// spreads large frames over several. Socket backpressure still applies:
+    /// whatever the socket refuses stays queued, in order, for a later tick.
+    pub fn flush(&mut self) -> usize {
+        self.flush_with_batch_sender(|lane, payload, segment_size| {
+            lane.batch_sender.send(&lane.socket, payload, segment_size)
+        })
+    }
+
+    fn flush_with_batch_sender<F>(&mut self, send_batch: F) -> usize
+    where
+        F: FnMut(&Lane, &[u8], usize) -> Result<usize, BatchError>,
+    {
+        if self.failure.is_some() || !self.ready() {
+            return 0;
+        }
+        self.send_queued(MAX_DATAGRAMS, send_batch)
+    }
+
+    fn tick_with_batch_sender<F>(&mut self, send_limit: usize, send_batch: F) -> usize
     where
         F: FnMut(&Lane, &[u8], usize) -> Result<usize, BatchError>,
     {
@@ -334,9 +356,15 @@ impl Delivery {
             self.fail("udp_stalled");
             return 0;
         }
+        self.send_queued(send_limit.min(MAX_VIDEO_BATCH_PACKETS), send_batch)
+    }
+
+    fn send_queued<F>(&mut self, send_limit: usize, mut send_batch: F) -> usize
+    where
+        F: FnMut(&Lane, &[u8], usize) -> Result<usize, BatchError>,
+    {
         let mut sent = 0;
         let mut audio_sent = 0;
-        let send_limit = send_limit.min(MAX_VIDEO_BATCH_PACKETS);
         while sent < send_limit {
             let Some(packet) = self.queue.front() else {
                 break;

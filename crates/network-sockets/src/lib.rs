@@ -530,6 +530,15 @@ unsafe extern "C" fn tcp_connect(
         unsafe { output(out, id) }
     })
 }
+/// Room for a large video frame's burst. These sockets never block, so anything
+/// past the kernel's small default buffer waits for a later send attempt.
+const UDP_SEND_BUFFER_BYTES: usize = 1024 * 1024;
+
+/// Best effort: the kernel clamps the request to its configured ceiling.
+fn request_udp_send_buffer(socket: &Socket) {
+    let _ = socket.set_send_buffer_size(UDP_SEND_BUFFER_BYTES);
+}
+
 unsafe extern "C" fn udp_bind(
     context: *mut c_void,
     address: net::Address,
@@ -553,6 +562,7 @@ unsafe extern "C" fn udp_bind(
         }
         socket.bind(&address.into()).map_err(io_status)?;
         socket.set_nonblocking(true).map_err(io_status)?;
+        request_udp_send_buffer(&socket);
         let id = insert(binding, SocketResource::Udp(socket.into()), permit)?;
         unsafe { output(out, id) }
     })

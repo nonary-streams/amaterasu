@@ -160,6 +160,85 @@ fn batch_dequeues_only_after_full_byte_count_is_confirmed() {
 }
 
 #[test]
+fn flush_sends_a_frame_larger_than_the_tick_budget_in_one_call() {
+    let mut delivery = delivery();
+    delivery.push_video(1, vec![vec![7; 1024]; 300]);
+    let mut batches = 0;
+
+    let sent = delivery.flush_with_batch_sender(|_, payload, _| {
+        batches += 1;
+        Ok(payload.len())
+    });
+
+    assert_eq!(sent, 300);
+    assert_eq!(delivery.queued(), 0);
+    assert!(batches > 1, "each provider call stays bounded");
+}
+
+#[test]
+fn tick_keeps_its_budget_for_datagrams_a_flush_could_not_send() {
+    let mut delivery = delivery();
+    delivery.push_video(1, vec![vec![7; 1024]; 300]);
+
+    let sent = delivery.tick_with_batch_sender(64, |_, payload, _| Ok(payload.len()));
+
+    assert_eq!(sent, 64);
+    assert_eq!(delivery.queued(), 236);
+}
+
+#[test]
+fn flush_keeps_the_refused_suffix_queued_in_order() {
+    let mut delivery = delivery();
+    delivery.push_video(1, vec![vec![1; 4], vec![2; 4], vec![3; 4]]);
+
+    let sent = delivery.flush_with_batch_sender(|_, _, segment_size| Ok(segment_size));
+
+    assert_eq!(sent, 1);
+    assert_eq!(delivery.queued(), 2);
+    assert_eq!(delivery.failure, None);
+    let sent = delivery.tick_with_batch_sender(64, |_, payload, _| {
+        assert_eq!(payload, [vec![2; 4], vec![3; 4]].concat());
+        Ok(payload.len())
+    });
+    assert_eq!(sent, 2);
+    assert_eq!(delivery.queued(), 0);
+}
+
+#[test]
+fn flush_retry_leaves_the_frame_queued_without_failing_the_stream() {
+    let mut delivery = delivery();
+    delivery.push_video(1, vec![vec![1; 4], vec![2; 4]]);
+
+    let sent = delivery.flush_with_batch_sender(|_, _, _| Err(BatchError::Retry));
+
+    assert_eq!(sent, 0);
+    assert_eq!(delivery.queued(), 2);
+    assert_eq!(delivery.failure, None);
+}
+
+#[test]
+fn flush_before_peer_discovery_keeps_datagrams_and_never_touches_the_socket() {
+    let local = "127.0.0.1:0".parse().unwrap();
+    let mut delivery = Delivery::discover(
+        local,
+        local,
+        "127.0.0.1".parse().unwrap(),
+        DiscoveryTokens {
+            video: VIDEO_TOKEN,
+            audio: AUDIO_TOKEN,
+        },
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    delivery.push_video(1, vec![vec![1; 4]]);
+
+    let sent = delivery.flush_with_batch_sender(|_, _, _| panic!("no peer to send to"));
+
+    assert_eq!(sent, 0);
+    assert_eq!(delivery.queued(), 1);
+}
+
+#[test]
 fn partial_batch_send_result_fails_without_counting_any_datagrams_as_sent() {
     let mut delivery = delivery();
     delivery.push_video(1, vec![vec![1; 4], vec![2; 4], vec![3; 4]]);

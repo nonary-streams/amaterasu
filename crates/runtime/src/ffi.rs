@@ -17,6 +17,7 @@ struct Endpoint {
 struct Runtime {
     endpoints: BTreeMap<String, Box<Endpoint>>,
     work: Arc<crate::work_signal::WorkSignal>,
+    broker: Arc<Mutex<Broker>>,
 }
 fn guard(f: impl FnOnce() -> Result<(), Status>) -> Status {
     match catch_unwind(AssertUnwindSafe(f)) {
@@ -58,7 +59,11 @@ unsafe extern "C" fn create_runtime(config: BorrowedBytes, output: *mut *mut c_v
             .collect();
         // SAFETY: The caller supplies writable output storage; ownership transfers to destroy.
         unsafe {
-            *output = Box::into_raw(Box::new(Runtime { endpoints, work })) as *mut c_void;
+            *output = Box::into_raw(Box::new(Runtime {
+                endpoints,
+                work,
+                broker,
+            })) as *mut c_void;
         }
         Ok(())
     })
@@ -101,6 +106,10 @@ unsafe extern "C" fn invoke_command(
         }
         // SAFETY: The host keeps the runtime and its immutable endpoint alive for this call.
         let endpoint = unsafe { &*(endpoint as *const Endpoint) };
+        let _hold_boundary = crate::tick_holds::enter_call(
+            std::ptr::from_ref(endpoint) as usize,
+            &endpoint.principal,
+        );
         // SAFETY: Input bytes remain readable until this synchronous invocation returns.
         let response = match serde_json::from_slice::<Command>(unsafe { input.read()? }) {
             Ok(Command::NotifyWorkReady {}) => {
@@ -167,9 +176,16 @@ unsafe extern "C" fn wait_work(runtime: *mut c_void, observed: u64, timeout_us: 
             return Err(STATUS_INVALID_ARGUMENT);
         }
         // SAFETY: the host retains this runtime until the synchronous wait returns.
-        unsafe { &*runtime.cast::<Runtime>() }
+        let runtime = unsafe { &*runtime.cast::<Runtime>() };
+        if let Some(report) = crate::tick_holds::begin_wait()
+            && let Ok(mut broker) = runtime.broker.lock()
+        {
+            broker.record_tick_holds(report);
+        }
+        runtime
             .work
             .wait(observed, std::time::Duration::from_micros(timeout_us));
+        crate::tick_holds::end_wait();
         Ok(())
     })
 }

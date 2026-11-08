@@ -15,7 +15,7 @@ use amaterasu_module_sdk::{
 };
 use std::{
     net::{IpAddr, SocketAddr},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 pub struct Stream {
@@ -48,6 +48,11 @@ pub struct Stream {
     processing_latency: ProcessingLatency,
 }
 
+/// Upper bounds, in tenths of a millisecond, of the latency histogram buckets.
+/// A final overflow bucket holds everything slower than the last bound.
+pub(crate) const LATENCY_BUCKET_BOUNDS_TENTHS_MS: [u16; 10] =
+    [20, 30, 40, 50, 60, 80, 100, 150, 250, 500];
+
 /// Wire latency in tenths of a millisecond. Unknown timestamps are tracked
 /// separately so averages use known samples only.
 #[derive(Default)]
@@ -57,6 +62,14 @@ pub(crate) struct ProcessingLatency {
     pub max_tenths_ms: u16,
     pub zero_samples: u64,
     pub unknown_samples: u64,
+    /// A stall is a tail property, so averages and a single maximum cannot
+    /// show how often it happens.
+    pub buckets: [u64; LATENCY_BUCKET_BOUNDS_TENTHS_MS.len() + 1],
+    /// Time spent handing admitted frames to the socket.
+    pub flush_total_us: u64,
+    pub flush_max_us: u64,
+    /// Datagrams the socket refused at admission; they wait for a later tick.
+    pub flush_deferred_datagrams: u64,
 }
 
 impl ProcessingLatency {
@@ -66,9 +79,38 @@ impl ProcessingLatency {
             self.total_tenths_ms = self.total_tenths_ms.saturating_add(u64::from(latency));
             self.max_tenths_ms = self.max_tenths_ms.max(latency);
             self.zero_samples = self.zero_samples.saturating_add(u64::from(latency == 0));
+            let bucket = LATENCY_BUCKET_BOUNDS_TENTHS_MS
+                .iter()
+                .position(|bound| latency <= *bound)
+                .unwrap_or(LATENCY_BUCKET_BOUNDS_TENTHS_MS.len());
+            self.buckets[bucket] = self.buckets[bucket].saturating_add(1);
         } else {
             self.unknown_samples = self.unknown_samples.saturating_add(1);
         }
+    }
+
+    fn record_flush(&mut self, elapsed_us: u64, deferred_datagrams: usize) {
+        self.flush_total_us = self.flush_total_us.saturating_add(elapsed_us);
+        self.flush_max_us = self.flush_max_us.max(elapsed_us);
+        self.flush_deferred_datagrams = self
+            .flush_deferred_datagrams
+            .saturating_add(deferred_datagrams as u64);
+    }
+
+    /// Renders the histogram as `<=2.0ms:12,...,>50.0ms:0` for the window log.
+    pub(crate) fn histogram(&self) -> String {
+        let mut parts: Vec<String> = LATENCY_BUCKET_BOUNDS_TENTHS_MS
+            .iter()
+            .zip(self.buckets)
+            .map(|(bound, count)| format!("<={:.1}ms:{count}", f64::from(*bound) / 10.0))
+            .collect();
+        let last_bound = LATENCY_BUCKET_BOUNDS_TENTHS_MS[LATENCY_BUCKET_BOUNDS_TENTHS_MS.len() - 1];
+        parts.push(format!(
+            ">{:.1}ms:{}",
+            f64::from(last_bound) / 10.0,
+            self.buckets[LATENCY_BUCKET_BOUNDS_TENTHS_MS.len()]
+        ));
+        parts.join(",")
     }
 }
 
@@ -458,7 +500,16 @@ impl Stream {
         self.video_sequence = Some(sequence);
         self.video_timestamp = Some(timestamp_us);
         self.next_frame_index = frame_index.checked_add(1);
+        self.flush_admitted_video();
         STATUS_OK
+    }
+
+    fn flush_admitted_video(&mut self) {
+        let started = Instant::now();
+        self.delivery.flush();
+        let elapsed_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        self.processing_latency
+            .record_flush(elapsed_us, self.delivery.queued());
     }
 
     pub(crate) fn take_processing_latency(&mut self) -> ProcessingLatency {
@@ -521,6 +572,7 @@ impl Stream {
             Ok(datagrams) => {
                 self.delivery.push_audio(datagrams);
                 self.audio_sequence = Some(packet.sequence);
+                self.delivery.flush();
                 STATUS_OK
             }
             Err(_) => self.fail("audio_packetization_failed"),

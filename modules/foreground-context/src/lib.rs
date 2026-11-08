@@ -1,8 +1,10 @@
 //! Trusted foreground-window observation. Missing evidence is reported as unavailable.
+mod observer;
 mod platform;
 
 use amaterasu_module_sdk::foreground_context::{Request as Operation, SERVICE, Snapshot};
 use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};
+use observer::Observer;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -38,27 +40,40 @@ fn new_snapshot(executable: String, fullscreen: Option<bool>) -> Option<Snapshot
 struct ForegroundModule {
     runtime: RuntimeClient,
     settings: Settings,
+    observer: Observer,
 }
 
+fn authorize(settings: &Settings, caller: &str, payload: Value) -> Result<(), Value> {
+    if !settings
+        .allowed_principals
+        .iter()
+        .any(|principal| principal == caller)
+    {
+        return Err(json!({"ok":false,"code":"forbidden"}));
+    }
+    if payload != json!({"action":"snapshot"})
+        || serde_json::from_value::<Operation>(payload).is_err()
+    {
+        return Err(json!({"ok":false,"code":"invalid_request"}));
+    }
+    Ok(())
+}
+
+fn snapshot_response(snapshot: Option<Snapshot>) -> Value {
+    json!({"ok":true,"snapshot":snapshot})
+}
+
+#[cfg(test)]
 fn handle(
     settings: &Settings,
     caller: &str,
     payload: Value,
     observe: impl FnOnce() -> Option<Snapshot>,
 ) -> Value {
-    if !settings
-        .allowed_principals
-        .iter()
-        .any(|principal| principal == caller)
-    {
-        return json!({"ok":false,"code":"forbidden"});
+    match authorize(settings, caller, payload) {
+        Ok(()) => snapshot_response(observe()),
+        Err(response) => response,
     }
-    if payload != json!({"action":"snapshot"})
-        || serde_json::from_value::<Operation>(payload).is_err()
-    {
-        return json!({"ok":false,"code":"invalid_request"});
-    }
-    json!({"ok":true,"snapshot":observe()})
 }
 
 impl ManagedModule for ForegroundModule {
@@ -73,10 +88,24 @@ impl ManagedModule for ForegroundModule {
         runtime.require_success(Command::Register {
             service: SERVICE.into(),
         })?;
-        Ok(Self { runtime, settings })
+        Ok(Self {
+            runtime,
+            settings,
+            observer: Observer::start(platform::observe)?,
+        })
+    }
+
+    fn quiesce(&mut self) -> ModuleResult<bool> {
+        self.deliver_finished_observation()?;
+        Ok(self.observer.retire())
     }
 
     fn tick(&mut self) -> ModuleResult<()> {
+        self.deliver_finished_observation()?;
+        // Requests stay queued in the broker while an observation is running.
+        if self.observer.busy() {
+            return Ok(());
+        }
         match self.runtime.send(Command::Poll {})? {
             Response::Pending => Ok(()),
             Response::Request {
@@ -92,25 +121,37 @@ impl ManagedModule for ForegroundModule {
                 ) {
                     return Ok(());
                 }
-                let result = if service == SERVICE {
-                    handle(&self.settings, &caller, payload, platform::observe)
-                } else {
-                    json!({"ok":false,"code":"invalid_service"})
-                };
-                match self.runtime.send(Command::Complete {
-                    request: id,
-                    payload: result,
-                })? {
-                    Response::Ok => Ok(()),
-                    Response::Error { code, .. }
-                        if code == "request_ended" || code == "not_found" =>
-                    {
-                        Ok(())
-                    }
-                    _ => Err("foreground completion failed".into()),
+                if service != SERVICE {
+                    return self.complete(id, json!({"ok":false,"code":"invalid_service"}));
+                }
+                match authorize(&self.settings, &caller, payload) {
+                    Ok(()) if self.observer.submit(id) => Ok(()),
+                    Ok(()) => self.complete(id, snapshot_response(None)),
+                    Err(response) => self.complete(id, response),
                 }
             }
             _ => Err("foreground poll failed".into()),
+        }
+    }
+}
+
+impl ForegroundModule {
+    fn deliver_finished_observation(&mut self) -> ModuleResult<()> {
+        match self.observer.poll() {
+            Some(observation) => {
+                self.complete(observation.request, snapshot_response(observation.snapshot))
+            }
+            None => Ok(()),
+        }
+    }
+
+    fn complete(&mut self, request: u64, payload: Value) -> ModuleResult<()> {
+        match self.runtime.send(Command::Complete { request, payload })? {
+            Response::Ok => Ok(()),
+            Response::Error { code, .. } if code == "request_ended" || code == "not_found" => {
+                Ok(())
+            }
+            _ => Err("foreground completion failed".into()),
         }
     }
 }

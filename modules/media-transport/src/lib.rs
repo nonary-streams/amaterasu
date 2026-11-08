@@ -75,14 +75,18 @@ impl ManagedModule for MediaTransportModule {
             self.latency_window_started = now;
             for (stream, sample) in summaries {
                 let message = format!(
-                    "stream={stream} window_ms={} samples={} known_samples={} unknown_samples={} total_tenths_ms={} max_tenths_ms={} zero_known={} scope=capture_start_to_media_admission_not_delivery",
+                    "stream={stream} window_ms={} samples={} known_samples={} unknown_samples={} total_tenths_ms={} max_tenths_ms={} zero_known={} histogram={} flush_total_us={} flush_max_us={} flush_deferred_datagrams={} scope=capture_start_to_media_admission_not_delivery",
                     elapsed.as_millis(),
                     sample.samples,
                     sample.samples.saturating_sub(sample.unknown_samples),
                     sample.unknown_samples,
                     sample.total_tenths_ms,
                     sample.max_tenths_ms,
-                    sample.zero_samples
+                    sample.zero_samples,
+                    sample.histogram(),
+                    sample.flush_total_us,
+                    sample.flush_max_us,
+                    sample.flush_deferred_datagrams
                 );
                 let _ = self
                     .runtime

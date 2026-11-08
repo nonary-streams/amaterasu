@@ -431,3 +431,13 @@ fn dns_numeric_address_and_unsupported_options_are_explicit() {
         STATUS_INVALID_ARGUMENT
     );
 }
+
+#[test]
+fn udp_send_buffer_request_never_shrinks_the_default() {
+    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+    let default = socket.send_buffer_size().unwrap();
+
+    request_udp_send_buffer(&socket);
+
+    assert!(socket.send_buffer_size().unwrap() >= default);
+}
