@@ -255,11 +255,15 @@ impl<D: Driver> Manager<D> {
             }
             if monitor.prospective_lease.is_none() {
                 let new_lease = random_lease().ok_or("entropy_unavailable")?;
+                if new_lease == monitor.lease {
+                    return Err("lease_collision".into());
+                }
+                let mut record = monitor.record(&key.0);
+                record.prospective_lease = Some(new_lease);
+                self.journal.as_mut().expect("journal").upsert(record)?;
+                // Only expose the new lease to the reclaim path after its
+                // ownership intent has been durably recorded.
                 monitor.prospective_lease = Some(new_lease);
-                self.journal
-                    .as_mut()
-                    .expect("journal")
-                    .upsert(monitor.record(&key.0))?;
             }
             let new_lease = monitor.prospective_lease.expect("prepared lease");
             if self

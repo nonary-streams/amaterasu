@@ -35,6 +35,11 @@ struct VirtualDisplayModule {
 }
 
 impl ManagedModule for VirtualDisplayModule {
+    #[cfg(amaterasu_libvirtualdisplay)]
+    fn quiesce(&mut self) -> ModuleResult<bool> {
+        self.manager.quiesce()
+    }
+
     fn start(runtime: RuntimeClient) -> ModuleResult<Self> {
         let Response::Result { payload } = runtime.send(Command::GetSettings {})? else {
             return Err("virtual display settings unavailable".into());

@@ -1255,6 +1255,7 @@ fn parked_status_is_explicit_and_does_not_claim_connector_removal() {
         sender: None,
         receiver: Some(receiver),
         worker: None,
+        shutdown_result: None,
         cleanup_pending: std::collections::BTreeSet::from([key.clone()]),
         recovery_pending: Default::default(),
         observer: None,
@@ -1308,6 +1309,83 @@ fn parked_status_is_explicit_and_does_not_claim_connector_removal() {
 }
 
 #[test]
+fn reference_persistence_drains_full_completion_queue() {
+    use super::super::{Manager, Monitor};
+    use std::sync::mpsc::{self, TrySendError};
+    use std::time::{Duration, Instant};
+
+    let (sender, jobs) = mpsc::sync_channel(1);
+    let (events, receiver) = mpsc::sync_channel(1);
+    let key = ("owner".to_owned(), FIRST.to_owned());
+    let unrelated = ("other".to_owned(), SECOND.to_owned());
+    let event = || Event::RetainedMode {
+        key: unrelated.clone(),
+        result: Err("unrelated completion".into()),
+    };
+    events.send(event()).unwrap();
+    let second = event();
+    let worker = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut pending = second;
+        loop {
+            match events.try_send(pending) {
+                Ok(()) => break,
+                Err(TrySendError::Full(event)) if Instant::now() < deadline => {
+                    pending = event;
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                _ => return Err("completion queue remained full".into()),
+            }
+        }
+        if let Ok(Work::References { reply, .. }) = jobs.recv_timeout(Duration::from_secs(2)) {
+            let _ = reply.send(Ok(()));
+        }
+        Ok(())
+    });
+    let mut manager = Manager {
+        settings: serde_json::from_value(serde_json::json!({"enabled":true})).unwrap(),
+        monitors: BTreeMap::from([(
+            key.clone(),
+            Monitor {
+                retained_mode: None,
+                retained_mode_pending: false,
+                retained_mode_durable: false,
+                creation_cleanup_complete: false,
+                specification: specification(FIRST),
+                state: "ready",
+                output: Some("Virtual-2".into()),
+                error: None,
+                references: Some(Default::default()),
+                layout: VirtualDisplayLayout::Extended,
+                scale: ScaleSetting::Automatic,
+            },
+        )]),
+        parked: Default::default(),
+        ready: true,
+        recovery_error: None,
+        sender: Some(sender),
+        receiver: Some(receiver),
+        worker: Some(worker),
+        shutdown_result: None,
+        cleanup_pending: Default::default(),
+        recovery_pending: Default::default(),
+        observer: None,
+        borrows: Default::default(),
+        reconfigurations: Default::default(),
+        domain_id: "provider_session:test".into(),
+        topology_revision: 1,
+        pending_mutations: 0,
+        stopped: Default::default(),
+    };
+    let references = std::collections::BTreeSet::from(["next-ref".to_owned()]);
+    assert!(manager.persist_references(&key, references.clone()));
+    assert_eq!(
+        manager.monitors[&key].references.as_ref(),
+        Some(&references)
+    );
+}
+
+#[test]
 fn manager_releases_parks_and_reuses_output_through_public_operations() {
     use super::super::Manager;
     let (root, mut controller) = fixture();
@@ -1338,6 +1416,7 @@ fn manager_releases_parks_and_reuses_output_through_public_operations() {
         sender: Some(sender),
         receiver: Some(receiver),
         worker: Some(worker),
+        shutdown_result: None,
         cleanup_pending: Default::default(),
         recovery_pending: Default::default(),
         observer: None,
@@ -1424,7 +1503,7 @@ fn manager_with_fake_worker(
             jobs,
             events,
             worker_stopped,
-        );
+        )
     });
     let mut manager = super::super::Manager {
         settings: serde_json::from_value(serde_json::json!({"enabled":true})).unwrap(),
@@ -1435,6 +1514,7 @@ fn manager_with_fake_worker(
         sender: Some(sender),
         receiver: Some(receiver),
         worker: Some(worker),
+        shutdown_result: None,
         cleanup_pending: Default::default(),
         recovery_pending: Default::default(),
         observer: None,
@@ -1647,7 +1727,7 @@ fn linux_shared_references_persist_and_release_only_the_last_connector_owner() {
             jobs,
             events,
             worker_stopped,
-        );
+        )
     });
     let mut manager = Manager {
         settings: serde_json::from_value(serde_json::json!({"enabled":true})).unwrap(),
@@ -1658,6 +1738,7 @@ fn linux_shared_references_persist_and_release_only_the_last_connector_owner() {
         sender: Some(sender),
         receiver: Some(receiver),
         worker: Some(worker),
+        shutdown_result: None,
         cleanup_pending: Default::default(),
         recovery_pending: Default::default(),
         observer: None,

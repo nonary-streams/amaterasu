@@ -174,6 +174,11 @@ impl Journal {
         self.records.values()
     }
 
+    #[cfg(test)]
+    pub(crate) fn poison_for_test(&mut self) {
+        self.poisoned = true;
+    }
+
     pub fn upsert(&mut self, record: Record) -> Result<(), String> {
         if self.records.values().any(|existing| {
             (existing.owner != record.owner

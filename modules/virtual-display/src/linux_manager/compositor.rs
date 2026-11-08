@@ -4,8 +4,10 @@ use super::layout::Layout;
 use crate::{model::Specification, scale::ScaleSetting};
 use serde_json::Value;
 use std::{
-    io::Read,
-    process::{Command, Stdio},
+    io::{self, Read},
+    os::fd::AsRawFd,
+    os::unix::process::CommandExt,
+    process::{Child, Command, ExitStatus, Stdio},
     thread,
     time::{Duration, Instant},
 };
@@ -612,52 +614,200 @@ fn right_edge_of(configuration: &Value, included: impl Fn(&str) -> bool) -> Resu
     Ok(right)
 }
 fn run(arguments: &[String]) -> Result<Vec<u8>, String> {
-    let mut child = Command::new("kscreen-doctor")
+    let child = Command::new("kscreen-doctor")
         .args(arguments)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .process_group(0)
         .spawn()
         .map_err(|e| e.to_string())?;
-    let stdout = child.stdout.take().ok_or("KScreen stdout unavailable")?;
-    let stderr = child.stderr.take().ok_or("KScreen stderr unavailable")?;
-    let output = thread::spawn(move || {
-        let mut bytes = Vec::new();
-        stdout
-            .take(1024 * 1024 + 1)
-            .read_to_end(&mut bytes)
-            .map(|_| bytes)
-    });
-    let errors = thread::spawn(move || {
-        let mut bytes = Vec::new();
-        stderr.take(65537).read_to_end(&mut bytes).map(|_| bytes)
-    });
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let status = loop {
-        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
-            break Some(status);
+    collect_output(child, Duration::from_secs(5))
+}
+
+/// A failed pipe setup, read, wait or deadline must not orphan the command.
+struct CommandOwner {
+    child: Child,
+    process_group: libc::pid_t,
+    status: Option<ExitStatus>,
+    output_complete: bool,
+}
+
+impl Drop for CommandOwner {
+    fn drop(&mut self) {
+        if !self.output_complete {
+            // The direct child can exit while a helper still owns one of its
+            // pipes. Retire that fresh process group on every incomplete path.
+            // SAFETY: process_group was created specifically for this child.
+            unsafe { libc::kill(-self.process_group, libc::SIGKILL) };
+        }
+        if self.status.is_none() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+fn nonblocking(pipe: &(impl AsRawFd + ?Sized)) -> io::Result<()> {
+    // SAFETY: this live owned pipe descriptor is valid for both fcntl calls.
+    let flags = unsafe { libc::fcntl(pipe.as_raw_fd(), libc::F_GETFL) };
+    if flags == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: F_SETFL accepts the existing status flags plus O_NONBLOCK.
+    if unsafe { libc::fcntl(pipe.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[derive(PartialEq, Eq)]
+enum PipeProgress {
+    Closed,
+    Pending,
+    More,
+}
+
+fn read_batch(
+    reader: &mut impl Read,
+    saved: &mut Vec<u8>,
+    limit: usize,
+) -> io::Result<PipeProgress> {
+    let mut buffer = [0; 8192];
+    // Bound each pass to preserve deadline and stderr fairness even if a
+    // descendant writes continuously.
+    for _ in 0..8 {
+        match reader.read(&mut buffer) {
+            Ok(0) => return Ok(PipeProgress::Closed),
+            Ok(count) => {
+                let retained = count.min((limit + 1).saturating_sub(saved.len()));
+                saved.extend_from_slice(&buffer[..retained]);
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                return Ok(PipeProgress::Pending);
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(PipeProgress::More)
+}
+
+fn collect_output(child: Child, timeout: Duration) -> Result<Vec<u8>, String> {
+    const MAX_STDOUT: usize = 1024 * 1024;
+    const MAX_STDERR: usize = 65536;
+    let process_group = child.id() as libc::pid_t;
+    let mut owner = CommandOwner {
+        child,
+        process_group,
+        status: None,
+        output_complete: false,
+    };
+    let mut stdout = owner
+        .child
+        .stdout
+        .take()
+        .ok_or("KScreen stdout unavailable")?;
+    let mut stderr = owner
+        .child
+        .stderr
+        .take()
+        .ok_or("KScreen stderr unavailable")?;
+    nonblocking(&stdout).map_err(|error| error.to_string())?;
+    nonblocking(&stderr).map_err(|error| error.to_string())?;
+    let mut bytes = Vec::new();
+    let mut errors = Vec::new();
+    let deadline = Instant::now() + timeout;
+    loop {
+        // Observe exit before reading so EOF proves all command output was read.
+        if owner.status.is_none() {
+            owner.status = owner.child.try_wait().map_err(|error| error.to_string())?;
+        }
+        let output_state =
+            read_batch(&mut stdout, &mut bytes, MAX_STDOUT).map_err(|error| error.to_string())?;
+        let error_state =
+            read_batch(&mut stderr, &mut errors, MAX_STDERR).map_err(|error| error.to_string())?;
+        if let Some(status) = owner.status {
+            if output_state == PipeProgress::Closed && error_state == PipeProgress::Closed {
+                owner.output_complete = true;
+                if status.success() && bytes.len() <= MAX_STDOUT && errors.len() <= MAX_STDERR {
+                    return Ok(bytes);
+                }
+                return Err("KScreen command failed or exceeded its bound".into());
+            }
+            if output_state == PipeProgress::Pending || error_state == PipeProgress::Pending {
+                return Err("KScreen output pipe remained open after command exit".into());
+            }
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            break None;
+            return Err("KScreen command exceeded its deadline".into());
         }
-        thread::sleep(Duration::from_millis(10));
-    };
-    let bytes = output
-        .join()
-        .map_err(|_| "KScreen output reader panicked")?
-        .map_err(|e| e.to_string())?;
-    let _ = errors.join();
-    if !status.is_some_and(|status| status.success()) || bytes.len() > 1024 * 1024 {
-        return Err("KScreen command failed or exceeded its bound".into());
+        if output_state != PipeProgress::More && error_state != PipeProgress::More {
+            thread::sleep(Duration::from_millis(10));
+        }
     }
-    Ok(bytes)
 }
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn test_command(script: &str) -> Child {
+        Command::new("/bin/sh")
+            .args(["-c", script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap()
+    }
+
+    #[test]
+    fn command_does_not_accept_unfinished_descendant_output() {
+        let child = test_command("(sleep 2; printf 'failed' >&2) & printf good");
+        let start = Instant::now();
+        let result = collect_output(child, Duration::from_secs(1));
+        assert!(result.unwrap_err().contains("pipe remained open"));
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn command_kills_descendants_that_keep_output_pipes_open() {
+        let marker = std::env::temp_dir().join(format!(
+            "amaterasu-virtual-display-descendant-{}-{}.tmp",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let quoted_marker = format!("'{}'", marker.to_string_lossy().replace('\'', "'\\''"));
+        let script = format!("(sleep 0.15; printf leaked > {quoted_marker}) & printf good");
+        let result = collect_output(test_command(&script), Duration::from_secs(1));
+        assert!(result.unwrap_err().contains("pipe remained open"));
+        thread::sleep(Duration::from_millis(300));
+        let descendant_ran = marker.exists();
+        let _ = std::fs::remove_file(marker);
+        assert!(!descendant_ran, "a descendant outlived command collection");
+    }
+
+    #[test]
+    fn command_deadline_does_not_wait_for_inherited_pipes() {
+        let child = test_command("sleep 2 & exec sleep 5");
+        let start = Instant::now();
+        let result = collect_output(child, Duration::from_millis(50));
+        assert!(result.unwrap_err().contains("deadline"));
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn command_drains_large_stderr_without_blocking_the_child() {
+        let child = test_command("head -c 70000 /dev/zero >&2; printf done");
+        let result = collect_output(child, Duration::from_secs(2));
+        assert!(result.unwrap_err().contains("exceeded its bound"));
+    }
+
     #[test]
     fn preservation_digest_is_stable_and_covers_nested_changes() {
         let before = json!({"z":{"b":2,"a":1},"a":[true,false]});

@@ -295,7 +295,8 @@ pub struct Manager {
     recovery_error: Option<String>,
     sender: Option<SyncSender<Work>>,
     receiver: Option<Receiver<Event>>,
-    worker: Option<JoinHandle<()>>,
+    worker: Option<JoinHandle<Result<(), String>>>,
+    shutdown_result: Option<Result<(), String>>,
     cleanup_pending: std::collections::BTreeSet<(String, String)>,
     recovery_pending: std::collections::BTreeSet<(String, String)>,
     observer: Option<observer::Observer>,
@@ -326,6 +327,7 @@ impl Manager {
             sender: None,
             receiver: None,
             worker: None,
+            shutdown_result: None,
             cleanup_pending: Default::default(),
             recovery_pending: Default::default(),
             observer: None,
@@ -354,7 +356,7 @@ impl Manager {
                         jobs,
                         events,
                         stopped,
-                    );
+                    )
                 })
                 .map_err(|e| e.to_string())?;
             manager.sender = Some(sender);
@@ -362,6 +364,33 @@ impl Manager {
             manager.worker = Some(worker);
         }
         Ok(manager)
+    }
+
+    pub fn quiesce(&mut self) -> Result<bool, String> {
+        if let Some(result) = &self.shutdown_result {
+            return result.as_ref().map(|()| true).map_err(Clone::clone);
+        }
+        self.stopped
+            .store(true, std::sync::atomic::Ordering::Release);
+        // Closing both channels wakes a worker blocked in recv or publishing a
+        // completion. Native cleanup remains owned by the worker until it exits.
+        self.sender.take();
+        self.receiver.take();
+        let Some(worker) = self.worker.as_ref() else {
+            self.shutdown_result = Some(Ok(()));
+            return Ok(true);
+        };
+        if !worker.is_finished() {
+            return Ok(false);
+        }
+        let result = self
+            .worker
+            .take()
+            .expect("worker just checked")
+            .join()
+            .unwrap_or_else(|_| Err("virtual display worker panicked during shutdown".into()));
+        self.shutdown_result = Some(result.clone());
+        result.map(|()| true)
     }
     pub fn tick(&mut self) {
         while let Some(event) = self
@@ -505,6 +534,9 @@ impl Manager {
         }
     }
     pub fn admit(&mut self, caller: &str, operation: Operation) -> (Value, Option<Admission>) {
+        if self.stopped.load(std::sync::atomic::Ordering::Acquire) {
+            return (failure("shutting_down"), None);
+        }
         self.tick();
         match operation {
             Operation::ReconfigureModeOnlyStatus {
@@ -926,13 +958,23 @@ impl Manager {
         }) {
             return false;
         }
-        if !matches!(result.recv(), Ok(Ok(()))) {
-            return false;
+        loop {
+            match result.recv_timeout(std::time::Duration::from_millis(10)) {
+                Ok(Ok(())) => break,
+                Ok(Err(_)) | Err(mpsc::RecvTimeoutError::Disconnected) => return false,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    // The actor sends prior work's completions through a bounded
+                    // channel before it can reach this reference update. Drain
+                    // those events while waiting, or a full channel can block
+                    // the actor and this synchronous reply forever.
+                    self.tick();
+                }
+            }
         }
-        self.monitors
-            .get_mut(key)
-            .expect("owned monitor")
-            .references = Some(references);
+        let Some(monitor) = self.monitors.get_mut(key) else {
+            return false;
+        };
+        monitor.references = Some(references);
         true
     }
     fn release_creation_references(
@@ -1814,6 +1856,39 @@ impl Drop for Manager {
 #[cfg(test)]
 mod owner_target_tests {
     use super::*;
+
+    #[test]
+    fn quiescence_polls_worker_retirement_and_preserves_cleanup_failure() {
+        let mut manager = Manager::start(Settings::default()).unwrap();
+        let (release, wait) = mpsc::channel();
+        manager.worker = Some(std::thread::spawn(move || {
+            wait.recv_timeout(std::time::Duration::from_secs(2))
+                .map_err(|error| error.to_string())?;
+            Err("native cleanup remains unconfirmed".into())
+        }));
+        let started = std::time::Instant::now();
+        assert_eq!(manager.quiesce(), Ok(false));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        let (response, admission) = manager.admit(
+            "owner",
+            Operation::Borrow {
+                identity: "00000000-0000-0000-0000-000000000001".into(),
+                reference_id: "reference".into(),
+            },
+        );
+        assert_eq!(response["code"], "shutting_down");
+        assert!(admission.is_none());
+        release.send(()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let outcome = loop {
+            match manager.quiesce() {
+                Ok(false) if std::time::Instant::now() < deadline => std::thread::yield_now(),
+                result => break result,
+            }
+        };
+        assert_eq!(outcome, Err("native cleanup remains unconfirmed".into()));
+        assert_eq!(manager.quiesce(), outcome);
+    }
 
     #[test]
     fn cross_provider_target_proof_requires_explicit_verifier_and_live_exact_reference() {

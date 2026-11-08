@@ -489,7 +489,7 @@ pub(super) fn run<B: Broker, C: Compositor, I: ConnectorInventory>(
     jobs: Receiver<Work>,
     events: SyncSender<Event>,
     stopped: std::sync::Arc<std::sync::atomic::AtomicBool>,
-) {
+) -> Result<(), String> {
     let mut controller = Controller {
         journal,
         broker,
@@ -502,12 +502,11 @@ pub(super) fn run<B: Broker, C: Compositor, I: ConnectorInventory>(
     if events
         .send(Event::Recovered {
             records: controller.journal.records.clone(),
-            error,
+            error: error.clone(),
         })
         .is_err()
     {
-        let _ = controller.recover();
-        return;
+        return error.map_or(Ok(()), Err);
     }
     while let Ok(work) = jobs.recv() {
         if stopped.load(std::sync::atomic::Ordering::Acquire) {
@@ -613,7 +612,7 @@ pub(super) fn run<B: Broker, C: Compositor, I: ConnectorInventory>(
         }
     }
     // Only journaled Amaterasu connectors are eligible; the broker rechecks UID.
-    let _ = controller.recover();
+    controller.recover().map_or(Ok(()), Err)
 }
 
 #[cfg(test)]

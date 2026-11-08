@@ -303,6 +303,7 @@ struct RecoveryCalls {
     mismatch: bool,
     lost_reclaim_reply: bool,
     shared_lease_count: u32,
+    inspect_unavailable: bool,
 }
 
 struct RecoveryFake(Rc<RefCell<RecoveryCalls>>);
@@ -329,6 +330,9 @@ impl Driver for RecoveryFake {
         _: &Specification,
     ) -> Result<Observation, &'static str> {
         let calls = self.0.borrow();
+        if calls.inspect_unavailable {
+            return Err("driver_unavailable");
+        }
         let exists = calls.lease == Some(lease) && calls.display == display;
         Ok(Observation {
             exists,
@@ -471,6 +475,42 @@ fn restart_reclaims_prepared_owned_create_without_replaying_create() {
         true
     );
     assert_eq!(calls.borrow().creates, 0);
+    drop(manager);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn failed_reclaim_intent_never_admits_an_unjournaled_lease() {
+    let (mut journal, root) = recovery_journal();
+    let record = recovery_record(None);
+    journal.upsert(record.clone()).unwrap();
+    let calls = Rc::new(RefCell::new(RecoveryCalls {
+        lease: Some(record.lease),
+        display: record.display_id,
+        capability: record.capability,
+        inspect_unavailable: true,
+        ..Default::default()
+    }));
+    let mut manager =
+        Manager::with_journal(Settings::default(), RecoveryFake(calls.clone()), journal).unwrap();
+    calls.borrow_mut().inspect_unavailable = false;
+    manager.journal.as_mut().unwrap().poison_for_test();
+    for _ in 0..2 {
+        for monitor in manager.monitors.values_mut() {
+            monitor.next_poll = Instant::now();
+        }
+        manager.tick();
+        assert!(
+            manager
+                .monitors
+                .values()
+                .next()
+                .unwrap()
+                .prospective_lease
+                .is_none()
+        );
+        assert_eq!(calls.borrow().reclaims, 0);
+    }
     drop(manager);
     std::fs::remove_dir_all(root).unwrap();
 }
