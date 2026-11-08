@@ -27,18 +27,25 @@ struct Request {
 }
 struct Pending {
     request: Request,
-    state_request: u64,
+    state_request: Option<u64>,
+    result: Option<Response>,
+    provider_retirement_uncertain: bool,
+    command: Command,
+    admission_uncertain: bool,
+    first_sent: Instant,
     stage: Stage,
 }
 struct DeferredImport {
     response: Response,
     deadline: Instant,
 }
+#[derive(Clone)]
 struct EffectiveIdentityPaths {
     provider_revision: u64,
     certificate_path: String,
     private_key_path: String,
 }
+#[derive(Clone)]
 struct PairingStateSnapshot {
     paths: EffectiveIdentityPaths,
     revision: Option<u64>,
@@ -66,6 +73,20 @@ struct IdentityGeneration {
     initialization: Option<Initialization>,
 }
 
+struct RetainedHostResult {
+    request: u64,
+    response: Response,
+    action: HostResultAction,
+}
+
+#[derive(Clone)]
+enum HostResultAction {
+    Readiness,
+    Get,
+    PairingState,
+    MarkerDelete,
+}
+
 pub struct Pipeline {
     engine: Engine,
     identity_generation: Option<IdentityGeneration>,
@@ -77,16 +98,24 @@ pub struct Pipeline {
     deferred_import: Option<DeferredImport>,
     identity: Arc<Shared>,
     host_configuration: HostConfigurationState,
+    host_result: Option<RetainedHostResult>,
     refresh_identity: Option<Arc<ConfiguredIdentity>>,
     host_configuration_retry_seconds: u64,
     identity_migration_checked: bool,
     pairing_notice: Option<PairingNoticeStage>,
     recovery_needed: bool,
     recovery_request: Option<(u64, bool, Option<u64>)>,
+    recovery_result: Option<Response>,
     recovery_retry_at: Option<Instant>,
+    shutdown_announced: bool,
+    quiescing: bool,
 }
 
 enum PairingNoticeStage {
+    Submitting {
+        command: Command,
+        first_sent: Instant,
+    },
     Waiting(u64),
     Releasing(u64),
 }
@@ -105,6 +134,18 @@ enum HostConfigurationState {
         request: u64,
         paths: EffectiveIdentityPaths,
         expected_revision: u64,
+    },
+    UncertainMigrationMarkerDelete {
+        request: u64,
+        paths: EffectiveIdentityPaths,
+        expected_revision: u64,
+    },
+    SubmittingMigrationMarkerDelete {
+        command: Command,
+        paths: EffectiveIdentityPaths,
+        expected_revision: u64,
+        first_sent: Instant,
+        admission_uncertain: bool,
     },
     Ready {
         identity: Arc<ConfiguredIdentity>,
@@ -147,13 +188,17 @@ impl Pipeline {
             deferred_import: None,
             identity,
             host_configuration,
+            host_result: None,
             refresh_identity: None,
             host_configuration_retry_seconds: 1,
             identity_migration_checked: false,
             pairing_notice: None,
             recovery_needed: false,
             recovery_request: None,
+            recovery_result: None,
             recovery_retry_at: None,
+            shutdown_announced: false,
+            quiescing: false,
         }
     }
 
@@ -161,23 +206,54 @@ impl Pipeline {
         self.identity.invalidate();
     }
 
+    pub fn prepare_shutdown(&mut self) {
+        self.shutdown_announced = true;
+    }
+
+    /// Keep module code and state alive while either owned RSA/provisioning
+    /// worker is still executing. Completed output is discarded at shutdown.
+    pub fn retire_identity_workers(&mut self) -> bool {
+        self.shutdown_announced = true;
+        self.quiescing = true;
+        if let Some(generation) = &mut self.identity_generation {
+            if generation.worker.take_finished().is_none() {
+                return false;
+            }
+            self.identity_generation = None;
+        }
+        if let HostConfigurationState::LoadingIdentity(worker) = &mut self.host_configuration {
+            if worker.take_finished().is_none() {
+                return false;
+            }
+            self.host_configuration = HostConfigurationState::Disabled;
+        }
+        true
+    }
+
     fn request_pairing_notice(
         &mut self,
         request: u64,
         send: &mut impl FnMut(Command) -> Transport,
     ) {
-        if self.pairing_notice.is_some() {
+        if self.shutdown_announced || self.pairing_notice.is_some() {
             return;
         }
-        if let Ok(Response::Accepted { id }) = send(Command::Request {
+        let command = Command::Request {
             service: SYSTEM_TRAY_SERVICE.into(),
             payload: json!({"action":"notify_pairing"}),
             timeout_ms: 5_000,
             operation_id: format!("pairing.{request}.tray-notification"),
             parent: None,
-        }) {
-            self.pairing_notice = Some(PairingNoticeStage::Waiting(id));
-        }
+        };
+        let first_sent = Instant::now();
+        self.pairing_notice = match send(command.clone()) {
+            Ok(Response::Accepted { id }) => Some(PairingNoticeStage::Waiting(id)),
+            Ok(Response::Error { code, .. }) if code != "conflict" => None,
+            _ => Some(PairingNoticeStage::Submitting {
+                command,
+                first_sent,
+            }),
+        };
     }
 
     fn progress_pairing_notice(&mut self, send: &mut impl FnMut(Command) -> Transport) {
@@ -185,9 +261,27 @@ impl Pipeline {
             return;
         };
         self.pairing_notice = match stage {
+            PairingNoticeStage::Submitting {
+                command,
+                first_sent,
+            } => {
+                if self.shutdown_announced || first_sent.elapsed() >= Duration::from_secs(300) {
+                    Some(PairingNoticeStage::Submitting {
+                        command,
+                        first_sent,
+                    })
+                } else {
+                    match send(command.clone()) {
+                        Ok(Response::Accepted { id }) => Some(PairingNoticeStage::Waiting(id)),
+                        _ => Some(PairingNoticeStage::Submitting {
+                            command,
+                            first_sent,
+                        }),
+                    }
+                }
+            }
             PairingNoticeStage::Waiting(request) => match send(Command::TakeResult { request }) {
                 Ok(Response::Result { .. }) => Some(PairingNoticeStage::Releasing(request)),
-                Ok(Response::Error { code, .. }) if code == "not_found" => None,
                 _ => Some(PairingNoticeStage::Waiting(request)),
             },
             PairingNoticeStage::Releasing(request) => {
@@ -213,6 +307,9 @@ impl Pipeline {
         now: u64,
         mut send: impl FnMut(Command) -> Transport,
     ) -> ModuleResult<()> {
+        if self.quiescing {
+            return Ok(());
+        }
         self.progress_pairing_notice(&mut send);
         if self.identity_generation.is_some() {
             let result = self.advance_identity_generation(now, &mut send);
@@ -252,6 +349,23 @@ impl Pipeline {
         now: u64,
         send: &mut impl FnMut(Command) -> Transport,
     ) -> ModuleResult<bool> {
+        if self.host_result.is_some() {
+            return self.release_host_result(now, send);
+        }
+        if self.shutdown_announced {
+            // A ready identity remains available to draining consumers, but
+            // refresh and provisioning cannot start more background work.
+            return Ok(matches!(
+                self.host_configuration,
+                HostConfigurationState::Disabled | HostConfigurationState::Ready { .. }
+            ));
+        }
+        if matches!(
+            self.host_configuration,
+            HostConfigurationState::SubmittingMigrationMarkerDelete { .. }
+        ) {
+            return self.retry_migration_marker_delete(now, send);
+        }
         if let HostConfigurationState::LoadingIdentity(worker) = &mut self.host_configuration {
             return match worker.take_finished() {
                 None => Ok(false),
@@ -262,6 +376,7 @@ impl Pipeline {
             &self.host_configuration,
             HostConfigurationState::WaitingPairingState { .. }
                 | HostConfigurationState::WaitingMigrationMarkerDelete { .. }
+                | HostConfigurationState::UncertainMigrationMarkerDelete { .. }
         ) {
             return self.advance_imported_identity_migration(now, send);
         }
@@ -284,6 +399,8 @@ impl Pipeline {
             }
             HostConfigurationState::WaitingPairingState { .. }
             | HostConfigurationState::WaitingMigrationMarkerDelete { .. }
+            | HostConfigurationState::UncertainMigrationMarkerDelete { .. }
+            | HostConfigurationState::SubmittingMigrationMarkerDelete { .. }
             | HostConfigurationState::LoadingIdentity(_) => return Ok(false),
             HostConfigurationState::Start => {}
         }
@@ -298,18 +415,55 @@ impl Pipeline {
             return Ok(false);
         }
 
-        let request = match &self.host_configuration {
-            HostConfigurationState::WaitingReadiness(request)
-            | HostConfigurationState::WaitingGet(request) => *request,
+        let (request, action) = match &self.host_configuration {
+            HostConfigurationState::WaitingReadiness(request) => {
+                (*request, HostResultAction::Readiness)
+            }
+            HostConfigurationState::WaitingGet(request) => (*request, HostResultAction::Get),
             _ => return Ok(false),
         };
-        let waiting_for_readiness = matches!(
-            &self.host_configuration,
-            HostConfigurationState::WaitingReadiness(_)
-        );
         match send(Command::TakeResult { request }) {
             Ok(Response::Pending) => Ok(false),
-            Ok(Response::Result { payload }) if waiting_for_readiness => {
+            Ok(result @ Response::Result { .. }) | Ok(result @ Response::Error { .. }) => {
+                self.host_result = Some(RetainedHostResult {
+                    request,
+                    response: result,
+                    action,
+                });
+                self.release_host_result(now, send)
+            }
+            _ => {
+                self.fail_host_configuration(now);
+                Ok(false)
+            }
+        }
+    }
+
+    fn release_host_result(
+        &mut self,
+        now: u64,
+        send: &mut impl FnMut(Command) -> Transport,
+    ) -> ModuleResult<bool> {
+        let Some(result) = self.host_result.take() else {
+            return Ok(false);
+        };
+        if !result_released(send(Command::ReleaseResult {
+            request: result.request,
+        })) {
+            self.host_result = Some(result);
+            return Ok(false);
+        }
+        self.consume_host_result(result, now, send)
+    }
+
+    fn consume_host_result(
+        &mut self,
+        result: RetainedHostResult,
+        now: u64,
+        send: &mut impl FnMut(Command) -> Transport,
+    ) -> ModuleResult<bool> {
+        match (result.action, result.response) {
+            (HostResultAction::Readiness, Response::Result { payload }) => {
                 if payload["ok"] != true || payload["ready"] != true {
                     self.fail_host_configuration(now);
                     return Ok(false);
@@ -323,7 +477,7 @@ impl Pipeline {
                 };
                 Ok(false)
             }
-            Ok(Response::Result { payload }) => {
+            (HostResultAction::Get, Response::Result { payload }) => {
                 let Some(revision) = payload["revision"].as_u64() else {
                     self.fail_host_configuration(now);
                     return Ok(false);
@@ -359,7 +513,35 @@ impl Pipeline {
                     self.begin_imported_identity_migration(paths, now, send)
                 }
             }
-            _ => {
+            (HostResultAction::PairingState, Response::Result { payload }) => {
+                self.consume_pairing_state_snapshot_page(payload, now, send)
+            }
+            (HostResultAction::MarkerDelete, Response::Result { payload }) => {
+                self.finish_imported_identity_marker_delete(payload, now)
+            }
+            (HostResultAction::MarkerDelete, Response::Error { .. }) => {
+                let HostConfigurationState::WaitingMigrationMarkerDelete {
+                    request,
+                    paths,
+                    expected_revision,
+                } = std::mem::replace(
+                    &mut self.host_configuration,
+                    HostConfigurationState::Start,
+                )
+                else {
+                    return Ok(false);
+                };
+                debug_assert_eq!(request, result.request);
+                self.host_configuration = HostConfigurationState::UncertainMigrationMarkerDelete {
+                    request,
+                    paths,
+                    expected_revision,
+                };
+                self.identity.invalidate();
+                self.recovery_needed = true;
+                Ok(false)
+            }
+            (_, Response::Error { .. }) | (_, _) => {
                 self.fail_host_configuration(now);
                 Ok(false)
             }
@@ -510,6 +692,11 @@ impl Pipeline {
             Ok(Response::Result { payload }) => {
                 self.consume_pairing_state_snapshot_page(payload, now, send)
             }
+            _ if deleting_marker => {
+                // A broker failure or expiry cannot prove that a delivered
+                // delete has stopped executing. Preserve its exact identity.
+                Ok(false)
+            }
             _ => {
                 self.fail_host_configuration(now);
                 Ok(false)
@@ -603,21 +790,15 @@ impl Pipeline {
                     self.fail_host_configuration(now);
                     return Ok(false);
                 };
-                match self.request_imported_identity_marker_delete(expected_revision, send) {
-                    Ok(Some(request)) => {
-                        self.host_configuration =
-                            HostConfigurationState::WaitingMigrationMarkerDelete {
-                                request,
-                                paths: state_snapshot.paths,
-                                expected_revision,
-                            };
-                        Ok(false)
-                    }
-                    _ => {
-                        self.fail_host_configuration(now);
-                        Ok(false)
-                    }
-                }
+                let command = self.request_imported_identity_marker_delete(expected_revision)?;
+                self.host_configuration = HostConfigurationState::SubmittingMigrationMarkerDelete {
+                    command,
+                    paths: state_snapshot.paths,
+                    expected_revision,
+                    first_sent: Instant::now(),
+                    admission_uncertain: false,
+                };
+                self.retry_migration_marker_delete(now, send)
             }
         }
     }
@@ -625,11 +806,10 @@ impl Pipeline {
     fn request_imported_identity_marker_delete(
         &mut self,
         expected_revision: u64,
-        send: &mut impl FnMut(Command) -> Transport,
-    ) -> ModuleResult<Option<u64>> {
+    ) -> ModuleResult<Command> {
         let mut nonce = [0; 16];
         getrandom::fill(&mut nonce).map_err(|_| "pairing state entropy unavailable")?;
-        match send(Command::Request {
+        Ok(Command::Request {
             service: STATE_SERVICE.into(),
             payload: json!({
                 "action":"delete",
@@ -642,10 +822,56 @@ impl Pipeline {
                 u128::from_le_bytes(nonce)
             ),
             parent: None,
-        })? {
-            Response::Accepted { id } => Ok(Some(id)),
-            _ => Ok(None),
+        })
+    }
+
+    fn retry_migration_marker_delete(
+        &mut self,
+        now: u64,
+        send: &mut impl FnMut(Command) -> Transport,
+    ) -> ModuleResult<bool> {
+        let HostConfigurationState::SubmittingMigrationMarkerDelete {
+            command,
+            paths,
+            expected_revision,
+            first_sent,
+            admission_uncertain,
+        } = std::mem::replace(&mut self.host_configuration, HostConfigurationState::Start)
+        else {
+            unreachable!()
+        };
+        if first_sent.elapsed() >= Duration::from_secs(300) {
+            self.host_configuration = HostConfigurationState::SubmittingMigrationMarkerDelete {
+                command,
+                paths,
+                expected_revision,
+                first_sent,
+                admission_uncertain,
+            };
+            return Ok(false);
         }
+        match send(command.clone()) {
+            Ok(Response::Accepted { id }) => {
+                self.host_configuration = HostConfigurationState::WaitingMigrationMarkerDelete {
+                    request: id,
+                    paths,
+                    expected_revision,
+                };
+            }
+            Ok(Response::Error { code, .. }) if !admission_uncertain && code != "conflict" => {
+                self.fail_host_configuration(now);
+            }
+            _ => {
+                self.host_configuration = HostConfigurationState::SubmittingMigrationMarkerDelete {
+                    command,
+                    paths,
+                    expected_revision,
+                    first_sent,
+                    admission_uncertain: true,
+                };
+            }
+        }
+        Ok(false)
     }
 
     fn finish_imported_identity_marker_delete(
@@ -805,6 +1031,9 @@ impl Pipeline {
                 let Ok(operation) = serde_json::from_value::<Operation>(payload) else {
                     return complete(&mut send, id, error("invalid_request"));
                 };
+                if self.shutdown_announced && operation.may_write() {
+                    return complete(&mut send, id, error("pairing_shutdown"));
+                }
                 if let Err(code) = self.engine.admit(&caller, &operation) {
                     return complete(&mut send, id, error(code));
                 }
@@ -863,38 +1092,155 @@ impl Pipeline {
             Stage::Loading(_) => "load",
             Stage::Saving { .. } => "save",
         };
-        match send(Command::Request {
+        let mutation = matches!(&stage, Stage::Saving { .. });
+        let command = Command::Request {
             service: STATE_SERVICE.into(),
             payload,
             timeout_ms: timeout_ms.min(30_000),
             operation_id: format!("pairing.{}.{}", request.id, stage_name),
+            // Parent authority gates admission atomically with cancellation.
+            // A cancelled child is retained as uncertain below: cancellation
+            // does not prove a delivered provider write has retired.
             parent: Some(request.id),
-        })? {
-            Response::Accepted { id } => {
-                self.pending = Some(Pending {
-                    request,
-                    state_request: id,
-                    stage,
-                });
+        };
+        let mut pending = Pending {
+            request,
+            state_request: None,
+            result: None,
+            provider_retirement_uncertain: false,
+            command,
+            admission_uncertain: false,
+            first_sent: Instant::now(),
+            stage,
+        };
+        match send(pending.command.clone()) {
+            Ok(Response::Accepted { id }) => {
+                pending.state_request = Some(id);
+                self.pending = Some(pending);
+                Ok(())
+            }
+            result
+                if mutation
+                    && !matches!(result, Ok(Response::Error { ref code, .. }) if code != "conflict") =>
+            {
+                // The broker may have admitted the request despite a lost
+                // response. Retry the identical operation while retaining it.
+                pending.admission_uncertain = true;
+                self.pending = Some(pending);
                 Ok(())
             }
             _ => {
                 self.identity.invalidate();
                 self.recovery_needed = true;
-                complete(send, request.id, error("state_unavailable"))
+                complete(send, pending.request.id, error("state_unavailable"))
             }
         }
     }
 
     fn advance(
         &mut self,
-        pending: Pending,
+        mut pending: Pending,
         now: u64,
         send: &mut impl FnMut(Command) -> Transport,
     ) -> ModuleResult<()> {
-        match send(Command::TakeResult {
-            request: pending.state_request,
-        })? {
+        let Some(state_request) = pending.state_request else {
+            // The runtime retains operation IDs for at most five minutes;
+            // replay after that horizon could start a second mutation.
+            if self.shutdown_announced || pending.first_sent.elapsed() >= Duration::from_secs(300) {
+                self.pending = Some(pending);
+                return Ok(());
+            }
+            let caller_ended = if Instant::now() >= pending.request.deadline {
+                true
+            } else {
+                match send(Command::CheckRequest {
+                    request: pending.request.id,
+                }) {
+                    Ok(Response::Ok) => false,
+                    Ok(Response::Error { code, .. })
+                        if matches!(
+                            code.as_str(),
+                            "request_ended" | "not_found" | "cancelled" | "deadline_exceeded"
+                        ) =>
+                    {
+                        true
+                    }
+                    _ => {
+                        self.pending = Some(pending);
+                        return Ok(());
+                    }
+                }
+            };
+            if caller_ended {
+                // Do not start a possibly unadmitted write after its caller
+                // has ended. A read-only lookup can recover an admitted one.
+                match quiescence::lookup(&pending.command, pending.first_sent, send) {
+                    quiescence::Lookup::Found(id) => {
+                        pending.state_request = Some(id);
+                        self.pending = Some(pending);
+                    }
+                    quiescence::Lookup::NotAdmitted => {
+                        self.identity.invalidate();
+                        self.recovery_needed = true;
+                        return complete(send, pending.request.id, error("request_ended"));
+                    }
+                    quiescence::Lookup::Unknown => self.pending = Some(pending),
+                }
+                return Ok(());
+            }
+            match send(pending.command.clone()) {
+                Ok(Response::Accepted { id }) => pending.state_request = Some(id),
+                _ => pending.admission_uncertain = true,
+            }
+            self.pending = Some(pending);
+            return Ok(());
+        };
+        if pending.provider_retirement_uncertain {
+            self.pending = Some(pending);
+            return Ok(());
+        }
+        let result = match pending.result.take() {
+            Some(result) => result,
+            None => match send(Command::TakeResult {
+                request: state_request,
+            }) {
+                Ok(Response::Result { payload }) => Response::Result { payload },
+                Ok(Response::Error { code, message }) => Response::Error { code, message },
+                Ok(Response::Pending) | Err(_) => {
+                    self.pending = Some(pending);
+                    return Ok(());
+                }
+                Ok(_) => {
+                    // Unexpected broker responses cannot clear a delivered
+                    // mutation from the lifecycle fence.
+                    if matches!(&pending.stage, Stage::Saving { .. }) {
+                        self.identity.invalidate();
+                        self.recovery_needed = true;
+                        pending.provider_retirement_uncertain = true;
+                    }
+                    self.pending = Some(pending);
+                    return Ok(());
+                }
+            },
+        };
+        if !result_released(send(Command::ReleaseResult {
+            request: state_request,
+        })) {
+            pending.result = Some(result);
+            self.pending = Some(pending);
+            return Ok(());
+        }
+        if matches!(&pending.stage, Stage::Saving { .. })
+            && matches!(&result, Response::Error { .. })
+        {
+            // Settling the caller result does not retire a provider handler.
+            self.identity.invalidate();
+            self.recovery_needed = true;
+            pending.provider_retirement_uncertain = true;
+            self.pending = Some(pending);
+            return Ok(());
+        }
+        match result {
             Response::Pending => {
                 self.pending = Some(pending);
                 Ok(())
@@ -1056,6 +1402,9 @@ impl Pipeline {
                 let Some(initialization) = generation.initialization.take() else {
                     return Ok(());
                 };
+                if self.shutdown_announced {
+                    return complete(send, initialization.request.id, error("pairing_shutdown"));
+                }
                 match result {
                     Ok(identity) => {
                         let initialization = Initialization {
@@ -1478,6 +1827,13 @@ fn complete(
         _ => Err("pairing completion failure".into()),
     }
 }
+
+fn result_released(response: Transport) -> bool {
+    matches!(response, Ok(Response::Ok))
+        || matches!(response, Ok(Response::Error { code, .. }) if code == "not_found")
+}
+
+mod quiescence;
 
 #[cfg(test)]
 mod tests;

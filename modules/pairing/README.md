@@ -50,6 +50,7 @@ X.509 certificate, and random UUID:
 ```
 
 Initialize is idempotent after persistence, returning existing public identity.
+`identity` reads the initialized public identity without changing durable state.
 Both successful operations return `ok`, `host_id`, `certificate_pem`, and
 `certificate_id` (SHA-256 of certificate DER). No public response returns the
 private key. Initial RSA generation runs on one owned worker so host ticks remain

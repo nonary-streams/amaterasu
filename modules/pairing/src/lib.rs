@@ -48,6 +48,19 @@ impl ManagedModule for PairingModule {
         self.pipeline
             .tick(|command| self.runtime.send_ephemeral(command))
     }
+
+    fn prepare_shutdown(&mut self, _remaining_ms: u64) -> ModuleResult<()> {
+        self.pipeline.prepare_shutdown();
+        Ok(())
+    }
+
+    fn quiesce(&mut self) -> ModuleResult<bool> {
+        let workers_retired = self.pipeline.retire_identity_workers();
+        let broker_retired = self
+            .pipeline
+            .quiesce_broker(|command| self.runtime.send_ephemeral(command));
+        Ok(workers_retired && broker_retired)
+    }
 }
 impl Drop for PairingModule {
     fn drop(&mut self) {

@@ -3267,6 +3267,80 @@ fn pipeline_teardown_joins_the_owned_identity_worker() {
 }
 
 #[test]
+fn quiescence_waits_for_identity_generation_without_committing_it() {
+    let mut state = Harness::new();
+    let mut pipeline = Pipeline::new(settings());
+    let mut delay = start_delayed_initialization(&mut pipeline, &mut state);
+    let started = Instant::now();
+    assert!(!pipeline.retire_identity_workers());
+    assert!(started.elapsed() < Duration::from_secs(1));
+    // Ticks between quiescence polls must not publish the worker's result.
+    pipeline
+        .tick_at(now(), |command| state.send(command))
+        .unwrap();
+    delay.finish();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !pipeline.retire_identity_workers() {
+        assert!(Instant::now() < deadline, "identity worker did not retire");
+        std::thread::yield_now();
+    }
+    assert_eq!(state.writes, 0);
+    assert!(state.document.is_none());
+    assert!(pipeline.identity.get(now()).is_err());
+}
+
+#[test]
+fn identity_generation_finishing_after_shutdown_announcement_does_not_write() {
+    let mut state = Harness::new();
+    let mut pipeline = Pipeline::new(settings());
+    let mut delay = start_delayed_initialization(&mut pipeline, &mut state);
+    pipeline.prepare_shutdown();
+    delay.finish();
+    drain_identity_work(&mut pipeline, &mut state);
+    assert_eq!(state.writes, 0);
+    assert_eq!(state.output.as_ref().unwrap()["code"], "pairing_shutdown");
+    assert!(pipeline.identity.get(now()).is_err());
+}
+
+#[test]
+fn quiescence_waits_for_configured_identity_provisioning_worker() {
+    let mut pipeline = Pipeline::new(settings());
+    let (mut delay, generator) =
+        DelayedIdentityWork::generator(|| Err::<ConfiguredIdentity, _>("test"));
+    pipeline.host_configuration =
+        HostConfigurationState::LoadingIdentity(IdentityWorker::start(generator).unwrap());
+    delay.wait_started();
+    assert!(!pipeline.retire_identity_workers());
+    delay.finish();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !pipeline.retire_identity_workers() {
+        assert!(
+            Instant::now() < deadline,
+            "provisioning worker did not retire"
+        );
+        std::thread::yield_now();
+    }
+    assert!(matches!(
+        pipeline.host_configuration,
+        HostConfigurationState::Disabled
+    ));
+}
+
+#[test]
+fn shutdown_announcement_rejects_new_mutations() {
+    let mut state = Harness::new();
+    let mut pipeline = Pipeline::new(settings());
+    pipeline.prepare_shutdown();
+    state.enqueue("console", json!({"action":"initialize"}));
+    pipeline
+        .tick_at(now(), |command| state.send(command))
+        .unwrap();
+    assert_eq!(state.output.as_ref().unwrap()["code"], "pairing_shutdown");
+    assert!(pipeline.identity_generation.is_none());
+    assert_eq!(state.writes, 0);
+}
+
+#[test]
 fn missing_configured_identity_provisioning_yields_ticks_and_invalidates_stale_tls() {
     let (directory, effective) = configured_fixture_files();
     let mut harness = HostConfigurationHarness::new(effective.clone());
