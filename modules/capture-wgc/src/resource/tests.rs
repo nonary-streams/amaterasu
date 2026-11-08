@@ -197,7 +197,7 @@ unsafe extern "C" fn collect_offer(
     let offer = unsafe { &*offer };
     let out = unsafe { &mut *context.cast::<Vec<(u64, u32, u32)>>() };
     assert_eq!(offer.resource.version, 2);
-    assert_eq!(offer.ownership, FRAME_OWNERSHIP_BORROWED);
+    assert_eq!(offer.ownership, FRAME_OWNERSHIP_RETAINABLE);
     let caps = unsafe { &*offer.resource.data.cast::<CpuResourceCapabilitiesV2>() };
     out.push((offer.id, caps.base.format, caps.color.transfer));
     STATUS_OK
@@ -213,7 +213,16 @@ unsafe extern "C" fn collect_frame(
     assert_eq!(cpu.format, PIXEL_P010);
     assert_eq!(cpu.stride, 4);
     assert_eq!(cpu.len, 12);
-    assert_eq!(unsafe { (frame.retain)(frame.context) }, MEDIA_UNSUPPORTED);
+    assert_eq!(unsafe { (frame.retain)(frame.context) }, STATUS_OK);
+    let none = FrameDescriptor {
+        kind: FRAME_SYNC_NONE,
+        version: 0,
+        size: 0,
+        reserved: 0,
+        namespace: [0; 16],
+        data: std::ptr::null(),
+    };
+    unsafe { (frame.release)(frame.context, &none) };
     let out = unsafe { &mut *context.cast::<Vec<u8>>() };
     out.extend_from_slice(unsafe { std::slice::from_raw_parts(cpu.data, cpu.len) });
     STATUS_OK
@@ -328,7 +337,7 @@ fn owner_format_replay_and_native_range_loss_keep_source_lifecycle_exact() {
     assert_eq!(first.freshness, CAPTURE_FRAME_FRESH);
     let repeated = provider.read("video", stream, &format).unwrap().unwrap();
     assert_eq!(repeated.freshness, CAPTURE_FRAME_CACHED_REUSE);
-    assert_eq!(repeated.bytes, owned);
+    assert_eq!(repeated.bytes.as_ref(), owned.as_ref());
     assert_eq!(repeated.capture_pacing_timestamp_us, 90);
     state.hdr.store(false, Ordering::SeqCst);
     assert!(matches!(
@@ -343,15 +352,16 @@ fn owner_format_replay_and_native_range_loss_keep_source_lifecycle_exact() {
     assert_eq!(owned.len(), 12);
 }
 #[test]
-fn eight_bit_source_remains_explicitly_legacy_and_does_not_claim_known_color() {
+fn explicit_eight_bit_source_advertises_verified_sdr_color() {
     let (controller, _) = setup::<false>(false);
     let stream = open(&controller, 8, false)["stream"].as_u64().unwrap();
     let provider = Provider::new(controller);
     let description = provider.describe("video", stream).unwrap();
-    assert!(!description.authoritative_color);
+    assert!(description.authoritative_color);
     assert_eq!(description.formats.len(), 1);
     assert_eq!(description.formats[0].pixel_format, PIXEL_BGRA8);
-    assert_eq!(description.formats[0].color.version, 0);
+    assert_eq!(description.formats[0].color.version, 1);
+    assert_eq!(description.formats[0].color.transfer, FRAME_TRANSFER_SRGB);
     assert_eq!(description.hdr.unwrap().enabled, 0);
 }
 

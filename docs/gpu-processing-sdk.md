@@ -1,89 +1,106 @@
-# Host-invoked GPU processing
+# Capture-independent frame processing
 
-The SDK follows the Hollywood principle: the framework calls an effect at the
-processing stage. An effect implements `GpuFrameProcessor`; its
-`process_to_resource` method receives a `GpuFrame` and returns an owned
-`ResourceOutputFrame` or a status. It does not obtain
-capture/video internals, pull frames, choose other plugins, or run an alternate
-pipeline. The SDK invokes the downstream sink and propagates rejection.
+Effects implement the public `FrameProcessor` trait and register a
+`FrameProcessorFactory` under `amaterasu.frame-processor.native/1`. C providers
+use `AmaterasuFrameProcessorApi`. The service alias chooses a provider; the exact
+native contract identifies its table. The superseded GPU-only processor API is
+removed. Rebuild providers and consumers together; there is no compatibility
+route.
 
-`GpuProcessorFactory` creates independent state for each runtime-authenticated
-consumer principal. Its factory closure is `Send + Sync`; each produced effect
-is local to the consumer's module thread. Keep the boxed factory alive through
-all bindings and register it through `GpuProcessorFactory::register`. Runtime
-registration uses `amaterasu.gpu-frame-processor.native/1`, independently of the
-service alias. Consumers select an alias in trusted startup composition with
-explicit native-use grants and provider dependencies. Native plugins are
-trusted code, and these grants are not a native-code sandbox.
+The framework selects and invokes an effect. Effects do not pull capture frames,
+choose other plugins, or replace the host pipeline. Native plugins are trusted
+code; grants select and authorize them rather than sandboxing native execution.
 
-Built-in video uses `negotiate_resource_handoff` and `process_gpu_to_resource`
-to pass the selected processor's output into the encoder's resource API.
-Negotiation is mandatory for a selected GPU processor: missing resource tables
-or incompatible offers fail explicitly, while BUSY/PENDING defer capture and
-retry. Video never substitutes the older processor-to-DMA-BUF output route.
-External consumers use these same SDK adapters. They validate output identity,
-synchronous single delivery and sink status, while `ScopedGpuFrame` bounds
-temporary retained input references to the call.
-The SDK provider adapter handles the native ABI, binding release, panic
-containment, output delivery, metadata queries and cancellation dispatch.
-Factories reject unsupported versions before invoking user code and never
-replace a failed provider with another implementation.
+## Negotiation and delivery
 
-The effect owns its GPU allocation and lifetime callbacks. Creating a
-`ResourceOutputFrame` is an unsafe platform boundary: it transfers one real reference
-whose storage and code must outlive every downstream retained reference and
-completion fence. The SDK releases that initial reference after synchronous
-delivery. The effect must finish input reads before returning (or independently
-retain and fence its input according to the native contract), never mutate
-input pixels, and bound its output storage. BUSY returns no delivery before
-admission, and downstream rejection is returned unchanged.
+`FrameProcessingSession` connects capture resources, up to 16 processor stages,
+and a resource consumer. `FrameProcessingStage` accepts the common
+`FrameResourceProcessorApi` prefix, including typed CPU resource processors.
+Built-in video uses this same session and `EncoderResourceConsumer`; external
+consumers have the same adapters. Bind every table under its authenticated
+contract and keep every owner loaded through ordered cancellation.
 
-`cancel` and `shutdown` are synchronous barriers. Callers retire downstream
-consumers before the processor; a provider must not destroy referenced storage
-or return a false GPU completion guarantee. A panic during either void barrier
-aborts the worker. Source sequence, timestamp and freshness are preserved.
-The input contract transports Linux DMA-BUF leases. The resource output contract
-negotiates storage and synchronization schemas between processor and encoder;
-video does not interpret vendor GPU handles or own their allocations.
+Negotiate source to first processor before asking that processor for outputs.
+For each edge, the consumer validates the producer's actual format, dimensions,
+device, accessibility, ownership and synchronization schemas. Configure the
+consumer, then select that exact producer generation and offer. Each provider
+owns its imports and allocations. The SDK interprets no platform handles and
+provides no implicit format conversion. Unsupported combinations fail explicitly.
 
-## Additive output metadata
+A pump immediately relays one borrowed `CaptureResourceFrame` through the bounded
+chain. It adds no pixel copy, frame queue or GPU completion wait. BUSY/PENDING
+consume no queued SDK frame; the next pump reads the current source. Source
+sequence, timestamp, capture pacing timestamp, both clock identities and freshness
+survive every processing step. Only the final encoder adapter assigns the encoded
+stream's timeline and submission sequence.
 
-`GpuProcessorApiV1_1` preserves the entire v1.0 table and appends
-`hdr_metadata(context, stream, output)`. Both minor >= 1 and sufficient size are
-required before reading this tail. The query performs no GPU work:
+## Shared ownership and readiness
 
-| Result | Meaning |
-| --- | --- |
-| OK, `enabled=1` | HDR10 output with the returned metadata |
-| OK, `enabled=0` | SDR output |
-| UNSUPPORTED | Output metadata is unspecified |
-| Other failure | Query failure; stop the stream |
+`ProcessingFrame::retain` acquires an independent provider reference.
+`ProcessingFrame::forward` offers unchanged storage and readiness under the
+selected output identity, using the original owner's lifetime callbacks. Additional
+readers retain the same immutable storage. Sharing a descriptor never proves that
+pixels are ready: queue the exact negotiated acquire dependency before access.
 
-SDK implementers override `GpuFrameProcessor::hdr_metadata`; the default is
-unspecified. Video uses the video stream ID for the query, checks known output
-range against the negotiated encoder stream before processing, and publishes
-the processed metadata. It does not substitute capture metadata for transformed
-output. The current video path requires the v1.4 resource-output table, which
-includes this metadata operation. C providers use `AmaterasuGpuProcessorApiV1_1` and its matching size
-constant from `sdk/include/amaterasu_media.h`.
+A provider returns `ResourceOutputFrame` by transferring one real reference through
+its documented unsafe platform boundary. Its payloads and callbacks remain valid
+while referenced. The SDK releases the initial reference after the sink returns;
+asynchronous readers retain their own. Each reader releases after its own reads
+finish, or supplies its own negotiated completion dependency. Never overwrite or
+free storage merely because a different reader finished. Abandoning a retained
+input without proving completion pins it rather than authorizing early reuse.
 
-## Stream settings and live updates
+`CpuPixels` wraps capture-owned immutable storage without copying bytes.
+`CpuFrameLeasePool` bounds outstanding references and bytes (defaults: 64 references,
+256 MiB); exhaustion returns BUSY. `CpuSourceFactory::retirement_ready` keeps source
+modules loaded until their retained resources retire. CPU transforms expose their
+owned result through the same pool, allowing subsequent asynchronous GPU steps.
+Unknown completion objects quarantine their storage and block retirement.
+`CpuPresentationReceipt` acknowledges the synchronous callback separately, so a
+retained GPU reader never holds a source mailbox admission gate.
 
-The v1.2 `configure_stream` operation supplies bounded JSON before processing.
-The optional v1.3 `update_stream` operation replaces the full configuration
-for an already configured stream. The provider owns the format and must copy
-any data it needs after the call. SDK consumers use `update_gpu_stream` on a live,
-typed GPU processor binding; the interface identity must be verified separately
-from the table version and size. Older processors and providers that do not
-implement updates return `MEDIA_UNSUPPORTED`.
+## Cancellation and controls
 
-Updates must be serialized with frame processing and stream retirement. A
-rejected update leaves the previous configuration usable and does not cancel the
-stream. Successful updates must preserve the negotiated output format and HDR
-metadata; changes that cannot preserve them must be rejected. A settings save
-or a newly observed revision only establishes that configuration was stored or
-read. It does not establish that the processor accepted an update or that the
-result reached a client display.
+The SDK cancels the final consumer first, then processors in reverse order. Every
+provider's cancel/shutdown barrier retires its queued native work. A failed void
+barrier aborts rather than falsely proving completion. Frame bindings, source
+storage owners and provider libraries outlive the barrier and outstanding references.
+Replacing an encoder retires the old reader and renegotiates only the final edge;
+it does not retire the processor stream. Stream and graph admission are bounded.
+
+`configure_frame_stream` and `update_frame_stream` use bounded JSON settings.
+Updates reject atomically and preserve active settings on failure. HDR metadata
+belongs to the processor's output and is independent of source layout or storage
+depth. Ten-bit SDR and ten-bit HDR remain distinct supported source modes.
+
+## RTX HDR and capture adoption
+
+RTX HDR imports packed SDR DMA-BUF formats at eight or ten bits and explicit SDR
+CPU BGRA8, NV12 and P010 resources. CPU uploads and format conversion belong to
+that provider; their cost is not a zero-copy guarantee. It publishes CUDA output
+with a readiness event, retains inputs through queued reads, and bounds both output
+slots and in-flight reads. CUDA storage and reader references also have provider-wide
+budgets. Independent readers keep their output and native session valid across
+processing-stream cancellation; module retirement waits for them. Unknown or
+contradictory source color is rejected.
+
+VKMS snapshot capture queues source acquire fences on the GPU and exports the
+immutable copy with its completion fence. It retains source imports and driver
+read guards until that copy completes. The ordinary path contains no `glFinish`
+barrier; native fence support is required. PipeWire coalesces a busy sink's stale
+presentation to the newest available frame. CPU capture adapters share their
+existing owned buffers through the resource SDK.
+
+Source tests cover multiple schemas, multiple steps/readers, independent completion,
+backpressure, stale generations, consumer replacement and bounded retirement.
+Opt-in RTX fixtures cover real GPU output, one-slot pressure and CPU import modes.
+These checks do not establish game-to-photon latency or a comparative frame delta;
+that requires an installed candidate and equivalent live capture/encode/client
+conditions. Processor callback CPU time excludes nested capture/encoder work.
+GL sampling and CUDA pipeline timings are reported separately, without
+claiming an end-to-end total.
+
+## Lifecycle participation and source range
 
 The versioned `processing_intent` API describes pipeline participation separately
 from the effect's settings. Version 1.1 adds optional `output_hdr` to the existing
@@ -114,11 +131,11 @@ different source-range requirements.
 For an HDR output, a provider can return `enabled: true` to reserve its processing
 path while its own effect switch is false. It must still supply matching source
 and output range requirements and preserve the frozen settings. The source is
-selected before capture begins. Live effect changes then use `update_gpu_stream`
+selected before capture begins. Live effect changes then use `update_frame_stream`
 without changing negotiated formats or replacing the stream. For example, RTX
 HDR retains an SDR source and PQ output while its disabled effect maps SDR into
 that output; its enable option is a `live_action` at all supported scopes.
 
 The [RTX HDR module](../modules/rtx-hdr/README.md) implements this interface using
-NVIDIA TrueHDR. The SDK's replacement test runs an unchanged consumer with two
-independent effect types, including sink rejection, retained output and teardown.
+NVIDIA TrueHDR. The SDK replacement tests cover independently implemented processors, sink
+backpressure, retained output and ordered teardown.

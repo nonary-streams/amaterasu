@@ -501,19 +501,6 @@ fn leased_media_tables_preserve_prefixes_and_match_c() {
     assert_eq!(offset_of!(DmaBufFrameLease, retain), 120);
     assert_eq!(offset_of!(DmaBufFrameLease, release), 128);
     assert_eq!(size_of::<DmaBufLeaseSink>(), 16);
-    assert_eq!(GPU_PROCESSOR_API_V1_0_SIZE, 48);
-    assert_eq!(GPU_PROCESSOR_API_V1_1_SIZE, 56);
-    assert_eq!(GPU_PROCESSOR_API_V1_2_SIZE, 64);
-    assert_eq!(GPU_PROCESSOR_API_V1_3_SIZE, 72);
-    assert_eq!(
-        offset_of!(GpuProcessorApiV1_3, update_stream),
-        size_of::<GpuProcessorApiV1_2>()
-    );
-    assert_eq!(
-        offset_of!(GpuProcessorApiV1_2, configure_stream),
-        size_of::<GpuProcessorApiV1_1>()
-    );
-    assert_eq!(offset_of!(GpuProcessorApi, cancel_dmabuf_leases), 40);
     assert_eq!(CAPTURE_API_V1_6_SIZE, 88);
     assert_eq!(
         offset_of!(CaptureApiV1_6, read_dmabuf_frame_leased),

@@ -211,7 +211,7 @@ pub(super) fn with_offer<T>(
     };
     call(&CaptureResourceOffer {
         id: offer.id,
-        ownership: FRAME_OWNERSHIP_BORROWED,
+        ownership: FRAME_OWNERSHIP_RETAINABLE,
         accessibility: FRAME_ACCESS_CPU,
         reserved: 0,
         resource: FrameDescriptor {

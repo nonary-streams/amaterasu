@@ -30,9 +30,9 @@ extern "C" {
 #define AMATERASU_VIDEO_ENCODER_CONTRACT "amaterasu.video-encoder.native/1"
 #define AMATERASU_ENCODER_PROVIDER_CONTRACT "amaterasu.encoder-provider.native/1"
 #define AMATERASU_FRAME_RESOURCE_CONSUMER_CONTRACT "amaterasu.frame-resource-consumer.native/1"
+#define AMATERASU_FRAME_PROCESSOR_CONTRACT "amaterasu.frame-processor.native/1"
 #define AMATERASU_FRAME_RESOURCE_PROCESSOR_CONTRACT "amaterasu.frame-resource-processor.native/1"
 #define AMATERASU_CPU_FRAME_PROCESSOR_CONTRACT "amaterasu.cpu-frame-processor.native/1"
-#define AMATERASU_GPU_FRAME_PROCESSOR_CONTRACT "amaterasu.gpu-frame-processor.native/1"
 #define AMATERASU_AUDIO_CAPTURE_CONTRACT "amaterasu.audio-capture.native/1"
 #define AMATERASU_AUDIO_ENCODER_CONTRACT "amaterasu.audio-encoder.native/1"
 #define AMATERASU_PCM_F32 1
@@ -174,27 +174,6 @@ typedef struct {
     void *context;
     AmaterasuStatus (*write)(void *context, const AmaterasuDmaBufFrameLease *lease, uint32_t freshness);
 } AmaterasuDmaBufLeaseSink;
-
-/* Optional synchronous GPU transform. Input/output leases are borrowed;
- * retain explicitly for later use. On OK call the sink exactly once preserving
- * timestamp, sequence, and the supplied freshness. Propagate sink rejection unchanged. BUSY before
- * delivery consumes nothing. No callback may happen after process returns.
- * Processing cannot mutate input pixels and must honor all GPU fences. Finish
- * borrowed input reads before return or retain a separate reference and release
- * it after GPU completion/with a completion fence. Pending output writes require
- * acquire fences. The caller releasing its reference does not retire processor
- * work; the processor owns that independently retained reference. */
-#define AMATERASU_GPU_PROCESSOR_INTERFACE_MAJOR 1u
-#define AMATERASU_GPU_PROCESSOR_INTERFACE_MINOR 0u
-typedef struct {
-    AmaterasuNativeInterface base;
-    AmaterasuStatus (*process)(void *context, uint64_t stream, const AmaterasuDmaBufFrameLease *lease, uint32_t freshness, AmaterasuDmaBufLeaseSink sink);
-    /* Stop stream permanently; synchronously retire all retained input/output
-     * references and completion fences before return. May block on vendor/GPU
-     * work. Source bindings must remain live throughout cancellation. */
-    void (*cancel_dmabuf_leases)(void *context, uint64_t stream);
-} AmaterasuGpuProcessorApi;
-#define AMATERASU_GPU_PROCESSOR_API_V1_0_SIZE ((uint32_t)sizeof(AmaterasuGpuProcessorApi))
 
 /* H264/HEVC bytes are Annex B; AV1 bytes are one OBU temporal unit. EOS has flags=2, len=0, no payload.
  * When open selects packet_boundaries=true, flag 4 marks the last fragment of
@@ -504,6 +483,8 @@ typedef struct {
 } AmaterasuFrameResourceProcessorApi;
 #define AMATERASU_FRAME_RESOURCE_CONSUMER_API_V1_0_SIZE ((uint32_t)sizeof(AmaterasuFrameResourceConsumerApi))
 #define AMATERASU_FRAME_RESOURCE_PROCESSOR_API_V1_0_SIZE ((uint32_t)sizeof(AmaterasuFrameResourceProcessorApi))
+
+
 #undef AMATERASU_CAPTURE_V1_4_FIELDS
 #undef AMATERASU_CAPTURE_V1_3_FIELDS
 #undef AMATERASU_CAPTURE_V1_2_FIELDS
@@ -685,53 +666,23 @@ typedef struct {
 /* HDR metadata is tied to a completed capture presentation. Fields: RGB xy,
  * white xy (1/50000), max nits, min 1/10000 nit, MaxCLL and MaxFALL. */
 typedef struct { uint32_t enabled; uint16_t fields[12]; uint32_t reserved; } AmaterasuHdrMetadata;
-/* GPU processor v1.1: output metadata, independent of the capture source.
- * OK initializes output (enabled=0 is SDR); UNSUPPORTED is unspecified.
- * This query must not start GPU work. The complete v1.0 prefix is preserved. */
-#define AMATERASU_GPU_PROCESSOR_METADATA_INTERFACE_MINOR 1u
+
+/* Canonical capture-independent processing. Bind this exact contract; input
+ * and output resources and synchronization are independently negotiated. A
+ * processing callback immediately offers pending GPU work with an acquire
+ * dependency and retains every input until its reads complete. No compatibility
+ * route or implicit capture/encoder implementation is supplied. */
+#define AMATERASU_FRAME_PROCESSOR_INTERFACE_MAJOR 1u
+#define AMATERASU_FRAME_PROCESSOR_INTERFACE_MINOR 0u
+#define AMATERASU_FRAME_PROCESSOR_MAX_CONFIGURATION_BYTES 16384u
 typedef struct {
-    AmaterasuGpuProcessorApi base;
-    AmaterasuStatus (*hdr_metadata)(void *, uint64_t, AmaterasuHdrMetadata *);
-} AmaterasuGpuProcessorApiV1_1;
-#define AMATERASU_GPU_PROCESSOR_API_V1_1_SIZE ((uint32_t)sizeof(AmaterasuGpuProcessorApiV1_1))
-/* v1.2 borrows at most 16384 bytes of UTF-8 JSON synchronously. Configure once
- * before metadata or frames; the provider copies anything retained. Cancel
- * retires the configured stream. An unsupported provider may reject it. */
-#define AMATERASU_GPU_PROCESSOR_MAX_CONFIGURATION_BYTES 16384u
-#define AMATERASU_GPU_PROCESSOR_CONFIGURATION_INTERFACE_MINOR 2u
-typedef struct {
-    AmaterasuGpuProcessorApiV1_1 base;
+    AmaterasuFrameResourceProcessorApi base;
     AmaterasuStatus (*configure_stream)(void *, uint64_t, const uint8_t *, size_t);
-} AmaterasuGpuProcessorApiV1_2;
-#define AMATERASU_GPU_PROCESSOR_API_V1_2_SIZE ((uint32_t)sizeof(AmaterasuGpuProcessorApiV1_2))
-/* v1.3 atomically replaces settings of an active configured stream. JSON has
- * the same size and borrowing rules as configure_stream. Failure leaves the
- * previous settings active and does not cancel the stream, except that an
- * internal error is fatal: stop frame submission, retire downstream leases,
- * then cancel the stream. Calls are serialized
- * with processing and retirement. Updates must preserve the negotiated output
- * format and HDR metadata. */
-#define AMATERASU_GPU_PROCESSOR_UPDATE_INTERFACE_MINOR 3u
-typedef struct {
-    AmaterasuGpuProcessorApiV1_2 base;
     AmaterasuStatus (*update_stream)(void *, uint64_t, const uint8_t *, size_t);
-} AmaterasuGpuProcessorApiV1_3;
-#define AMATERASU_GPU_PROCESSOR_API_V1_3_SIZE ((uint32_t)sizeof(AmaterasuGpuProcessorApiV1_3))
-/* v1.4 negotiated output. Output offers follow the frame-resource enumeration
- * rules for the configured stream. Selecting one switches process_to_resource
- * to that schema; before a successful selection it returns UNSUPPORTED. It
- * takes the same borrowed input lease and freshness as process, delivers at
- * most one output synchronously (preserving sequence, timestamps, freshness)
- * and propagates sink rejection. A retained output stays valid until released,
- * even after cancellation; the provider stays loaded until then. */
-#define AMATERASU_GPU_PROCESSOR_RESOURCE_OUTPUT_INTERFACE_MINOR 4u
-typedef struct {
-    AmaterasuGpuProcessorApiV1_3 base;
-    AmaterasuStatus (*enumerate_outputs)(void *, uint64_t, AmaterasuCaptureResourceOfferSink, uint64_t *generation);
-    AmaterasuStatus (*select_output)(void *, uint64_t, uint64_t generation, uint64_t offer_id);
-    AmaterasuStatus (*process_to_resource)(void *, uint64_t, const AmaterasuDmaBufFrameLease *, uint32_t freshness, AmaterasuCaptureResourceFrameSink);
-} AmaterasuGpuProcessorApiV1_4;
-#define AMATERASU_GPU_PROCESSOR_API_V1_4_SIZE ((uint32_t)sizeof(AmaterasuGpuProcessorApiV1_4))
+    AmaterasuStatus (*hdr_metadata)(void *, uint64_t, AmaterasuHdrMetadata *);
+} AmaterasuFrameProcessorApi;
+#define AMATERASU_FRAME_PROCESSOR_API_SIZE ((uint32_t)sizeof(AmaterasuFrameProcessorApi))
+
 typedef struct {
     AmaterasuCaptureApiV1_8 base;
     AmaterasuStatus (*hdr_metadata)(void *, uint64_t, AmaterasuHdrMetadata *);

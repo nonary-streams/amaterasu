@@ -1,231 +1,124 @@
-use crate::{backend::Backend, controller::Controller};
-use amaterasu_media::{
-    CAPTURE_INTERFACE_MINOR, CaptureApi, CaptureGeometry, CpuFrame, FrameSink, INTERFACE_MAJOR,
-    MEDIA_BACKEND_ERROR, MEDIA_BUSY, MEDIA_CLOSED, MEDIA_PENDING, MEDIA_UNSUPPORTED, PIXEL_BGRA8,
+//! PipeWire's immutable mailbox through the common bounded resource SDK.
+use crate::{
+    backend::Backend,
+    controller::{Controller, Reader},
 };
-use amaterasu_module_sdk::abi::{
-    AbiHeader, BorrowedBytes, NativeInterface, NativeInterfaceQuery, NativeServiceFactory,
-    STATUS_INTERNAL_ERROR, STATUS_INVALID_ARGUMENT, STATUS_OK, Status,
+use amaterasu_media::*;
+use amaterasu_module_sdk::{
+    abi::{NativeServiceFactory, Status},
+    capture::{
+        CpuPresentationReceipt, CpuSourceDescription, CpuSourceFactory, CpuSourceFormat,
+        CpuSourcePresentation, CpuSourceProvider,
+    },
+    media::CpuPixels,
 };
-use std::{
-    ffi::c_void,
-    panic::{AssertUnwindSafe, catch_unwind},
-    sync::{Arc, Mutex, TryLockError},
-};
-
+use std::sync::{Arc, Mutex};
 pub type Shared<B> = Arc<Mutex<Controller<B>>>;
 pub struct Factory<B: Backend> {
     pub api: NativeServiceFactory,
-    controller: Shared<B>,
+    source: Box<CpuSourceFactory<Bridge<B>>>,
 }
 impl<B: Backend + 'static> Factory<B> {
     pub fn new(controller: Shared<B>) -> Box<Self> {
-        let mut factory = Box::new(Self {
-            api: NativeServiceFactory {
-                header: AbiHeader::of::<NativeServiceFactory>(),
-                context: std::ptr::null_mut(),
-                bind: Some(bind::<B>),
-            },
-            controller,
-        });
-        factory.api.context = (&mut *factory as *mut Self).cast();
-        factory
+        let source = CpuSourceFactory::new(Arc::new(Bridge { controller }));
+        Box::new(Self {
+            api: source.api,
+            source,
+        })
+    }
+    pub fn retirement_ready(&self) -> Result<bool, Status> {
+        self.source.retirement_ready()
     }
 }
-
-struct Binding<B: Backend> {
-    api: CaptureApi,
+struct Bridge<B: Backend> {
     controller: Shared<B>,
-    caller: String,
 }
-impl<B: Backend> Binding<B> {
-    fn new(controller: Shared<B>, caller: String) -> Box<Self> {
-        let mut binding = Box::new(Self {
-            api: CaptureApi {
-                base: NativeInterface {
-                    header: AbiHeader {
-                        size: size_of::<CaptureApi>() as u32,
-                        major: INTERFACE_MAJOR,
-                        minor: CAPTURE_INTERFACE_MINOR,
-                    },
-                    context: std::ptr::null_mut(),
-                    release: Some(release::<B>),
-                },
-                read_frame: read_frame::<B>,
-                geometry: geometry::<B>,
-            },
-            controller,
-            caller,
-        });
-        binding.api.base.context = (&mut *binding as *mut Self).cast();
-        binding
+impl<B: Backend> Bridge<B> {
+    fn reader(&self, caller: &str, stream: u64) -> Result<Reader, Status> {
+        let c = match self.controller.try_lock() {
+            Ok(c) => c,
+            Err(std::sync::TryLockError::WouldBlock) => return Err(MEDIA_BUSY),
+            Err(_) => return Err(MEDIA_BACKEND_ERROR),
+        };
+        c.reader(caller, stream).map_err(|e| {
+            if e == "not_found" {
+                MEDIA_CLOSED
+            } else {
+                MEDIA_BACKEND_ERROR
+            }
+        })
     }
 }
-
-unsafe extern "C" fn bind<B: Backend + 'static>(
-    context: *mut c_void,
-    caller: BorrowedBytes,
-    query: *const NativeInterfaceQuery,
-    output: *mut *const NativeInterface,
-) -> Status {
-    guarded(|| {
-        if output.is_null()
-            || !(output as usize).is_multiple_of(align_of::<*const NativeInterface>())
-        {
-            return STATUS_INVALID_ARGUMENT;
-        }
-        // SAFETY: broker supplies an aligned writable output slot for this call.
-        unsafe { output.write(std::ptr::null()) };
-        if context.is_null()
-            || query.is_null()
-            || !(query as usize).is_multiple_of(align_of::<NativeInterfaceQuery>())
-        {
-            return STATUS_INVALID_ARGUMENT;
-        }
-        // SAFETY: broker retains the initialized aligned query until return.
-        let query = unsafe { &*query };
-        if !query.header.supports::<NativeInterfaceQuery>()
-            || query.interface_major != INTERFACE_MAJOR
-            || query.min_minor > CAPTURE_INTERFACE_MINOR
-            || query.min_size as usize > size_of::<CaptureApi>()
-        {
-            return MEDIA_UNSUPPORTED;
-        }
-        // SAFETY: authenticated immediate caller bytes last through this synchronous bind.
-        let Some(caller) = (unsafe { caller.read() })
-            .ok()
-            .and_then(|bytes| std::str::from_utf8(bytes).ok())
-            .filter(|caller| !caller.is_empty() && caller.len() <= 128)
-        else {
-            return STATUS_INVALID_ARGUMENT;
-        };
-        // SAFETY: provider retains this stable boxed factory until all binds stop.
-        let factory = unsafe { &*context.cast::<Factory<B>>() };
-        let binding = Binding::new(factory.controller.clone(), caller.into());
-        let interface = &binding.api.base as *const NativeInterface;
-        let _ = Box::into_raw(binding);
-        // SAFETY: transfers one stable boxed table, uniquely released by the broker.
-        unsafe { output.write(interface) };
-        STATUS_OK
-    })
+fn sdr() -> FrameColorMetadata {
+    FrameColorMetadata {
+        version: 1,
+        size: size_of::<FrameColorMetadata>() as u32,
+        primaries: FRAME_PRIMARIES_BT709,
+        transfer: FRAME_TRANSFER_SRGB,
+        matrix: FRAME_MATRIX_RGB,
+        range: FRAME_RANGE_FULL,
+    }
 }
-
-unsafe extern "C" fn release<B: Backend>(context: *mut c_void) {
-    let _ = catch_unwind(AssertUnwindSafe(|| {
-        if !context.is_null() {
-            // SAFETY: broker uniquely releases the binding after native calls stop.
-            unsafe { drop(Box::from_raw(context.cast::<Binding<B>>())) };
+impl<B: Backend> CpuSourceProvider for Bridge<B> {
+    fn describe(&self, caller: &str, stream: u64) -> Result<CpuSourceDescription, Status> {
+        let reader = self.reader(caller, stream)?;
+        let (width, height) = reader.mailbox.dimensions()?.ok_or(MEDIA_PENDING)?;
+        Ok(CpuSourceDescription {
+            generation: 1,
+            width,
+            height,
+            formats: vec![CpuSourceFormat {
+                pixel_format: PIXEL_BGRA8,
+                color: sdr(),
+            }],
+            hdr: None,
+            authoritative_color: false,
+        })
+    }
+    fn read(
+        &self,
+        caller: &str,
+        stream: u64,
+        format: &CpuSourceFormat,
+    ) -> Result<Option<CpuSourcePresentation>, Status> {
+        if format.pixel_format != PIXEL_BGRA8 {
+            return Err(MEDIA_UNSUPPORTED);
         }
-    }));
+        let reader = self.reader(caller, stream)?;
+        let delivery = match reader.mailbox.claim()? {
+            Some(d) => d,
+            None => return Ok(None),
+        };
+        let permit = reader.admission.enter().ok_or(MEDIA_CLOSED)?;
+        self.reader(caller, stream)?;
+        let pixels = delivery.frame.clone();
+        let frame = &pixels;
+        let timestamp_us = frame.timestamp_us;
+        let sequence = frame.sequence;
+        let presentation = CpuSourcePresentation {
+            receipt: Some(CpuPresentationReceipt::new(move |status| {
+                let _permit = permit;
+                delivery.finish(status);
+            })),
+            width: frame.width,
+            height: frame.height,
+            stride: frame.stride,
+            pixel_format: PIXEL_BGRA8,
+            color: sdr(),
+            bytes: CpuPixels::from_owner(pixels.clone()),
+            timestamp_us,
+            capture_pacing_timestamp_us: timestamp_us,
+            sequence,
+            freshness: CAPTURE_FRAME_FRESH,
+        };
+        // Read immutable identity from the shared owner before transferring it.
+        Ok(Some(presentation))
+    }
+    fn geometry(&self, caller: &str, stream: u64) -> Result<CaptureGeometry, Status> {
+        self.reader(caller, stream)?
+            .geometry
+            .ok_or(MEDIA_UNSUPPORTED)
+    }
 }
-
-unsafe extern "C" fn read_frame<B: Backend>(
-    context: *mut c_void,
-    stream: u64,
-    sink: FrameSink,
-) -> Status {
-    guarded(|| {
-        if context.is_null() {
-            return STATUS_INVALID_ARGUMENT;
-        }
-        // SAFETY: broker retains the native binding until the synchronous call ends.
-        let binding = unsafe { &*context.cast::<Binding<B>>() };
-        let reader = {
-            let controller = match binding.controller.try_lock() {
-                Ok(controller) => controller,
-                Err(TryLockError::WouldBlock) => return MEDIA_BUSY,
-                Err(TryLockError::Poisoned(_)) => return MEDIA_BACKEND_ERROR,
-            };
-            match controller.reader(&binding.caller, stream) {
-                Ok(reader) => reader,
-                Err("not_found") => return MEDIA_CLOSED,
-                Err(_) => return MEDIA_BACKEND_ERROR,
-            }
-        };
-        if reader.admission.is_closed() {
-            return MEDIA_CLOSED;
-        }
-        let delivery = match reader.mailbox.claim() {
-            Ok(Some(delivery)) => delivery,
-            Ok(None) => return MEDIA_PENDING,
-            Err(status) => return status,
-        };
-        // This atomic admission point races safely with close: callbacks admitted
-        // before close may finish, while close prevents all later callbacks.
-        let Some(_admission) = reader.admission.enter() else {
-            return MEDIA_CLOSED;
-        };
-        // Portal revocation or source close can occur between the initial source
-        // check and callback admission. Revalidate before entering foreign code.
-        {
-            let controller = match binding.controller.try_lock() {
-                Ok(controller) => controller,
-                Err(TryLockError::WouldBlock) => return MEDIA_BUSY,
-                Err(TryLockError::Poisoned(_)) => return MEDIA_BACKEND_ERROR,
-            };
-            match controller.reader(&binding.caller, stream) {
-                Ok(_) => {}
-                Err("not_found") => return MEDIA_CLOSED,
-                Err(_) => return MEDIA_BACKEND_ERROR,
-            }
-        }
-        let pixels = &delivery.frame;
-        let frame = CpuFrame {
-            width: pixels.width,
-            height: pixels.height,
-            format: PIXEL_BGRA8,
-            stride: pixels.stride,
-            data: pixels.bytes.as_ptr(),
-            len: pixels.bytes.len(),
-            timestamp_us: pixels.timestamp_us,
-            sequence: pixels.sequence,
-        };
-        // SAFETY: an independently owned immutable pixel allocation survives source
-        // close and remains borrowed only until this callback returns. No controller
-        // or mailbox lock is held in foreign code; consumers must copy retained bytes.
-        let status = unsafe { sink.send(&frame) };
-        delivery.finish(status)
-    })
-}
-
-unsafe extern "C" fn geometry<B: Backend>(
-    context: *mut c_void,
-    stream: u64,
-    output: *mut CaptureGeometry,
-) -> Status {
-    guarded(|| {
-        if context.is_null()
-            || output.is_null()
-            || !(output as usize).is_multiple_of(align_of::<CaptureGeometry>())
-        {
-            return STATUS_INVALID_ARGUMENT;
-        }
-        // SAFETY: binding context is retained by the broker through this call.
-        let binding = unsafe { &*context.cast::<Binding<B>>() };
-        let controller = match binding.controller.try_lock() {
-            Ok(controller) => controller,
-            Err(TryLockError::WouldBlock) => return MEDIA_BUSY,
-            Err(TryLockError::Poisoned(_)) => return MEDIA_BACKEND_ERROR,
-        };
-        match controller.reader(&binding.caller, stream) {
-            Ok(reader) => match reader.geometry {
-                Some(geometry) => {
-                    // SAFETY: the validated aligned output slot is writable for
-                    // this synchronous native call and geometry is an owned copy.
-                    unsafe { output.write(geometry) };
-                    STATUS_OK
-                }
-                None => MEDIA_UNSUPPORTED,
-            },
-            Err("not_found") => MEDIA_CLOSED,
-            Err(_) => MEDIA_BACKEND_ERROR,
-        }
-    })
-}
-
-fn guarded(operation: impl FnOnce() -> Status) -> Status {
-    catch_unwind(AssertUnwindSafe(operation)).unwrap_or(STATUS_INTERNAL_ERROR)
-}
-
 #[cfg(test)]
 mod tests;

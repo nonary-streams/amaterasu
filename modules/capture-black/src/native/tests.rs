@@ -137,10 +137,16 @@ unsafe extern "C" fn inspect_resource(
     assert_eq!(frame.timestamp_us, resource.timestamp_us);
     assert_eq!(frame.sequence, resource.sequence);
     // SAFETY: borrowed-only retain callback is valid during this resource callback.
-    assert_eq!(
-        unsafe { (resource.retain)(resource.context) },
-        MEDIA_UNSUPPORTED
-    );
+    assert_eq!(unsafe { (resource.retain)(resource.context) }, STATUS_OK);
+    let none = FrameDescriptor {
+        kind: FRAME_SYNC_NONE,
+        version: 0,
+        size: 0,
+        reserved: 0,
+        namespace: [0; 16],
+        data: std::ptr::null(),
+    };
+    unsafe { (resource.release)(resource.context, &none) };
     // SAFETY: the same test-owned sink and frame remain valid for nested synchronous copying.
     unsafe { copy_frame(context, frame) }
 }
@@ -158,7 +164,7 @@ unsafe extern "C" fn inspect_offer(
     let state = unsafe { &mut *context.cast::<Offers>() };
     let offer = unsafe { &*offer };
     state.calls += 1;
-    assert_eq!(offer.ownership, FRAME_OWNERSHIP_BORROWED);
+    assert_eq!(offer.ownership, FRAME_OWNERSHIP_RETAINABLE);
     assert_eq!(offer.accessibility, FRAME_ACCESS_CPU);
     // SAFETY: negotiated CPU capability schema points at initialized capabilities.
     let caps = unsafe { &*offer.resource.data.cast::<CpuResourceCapabilities>() };

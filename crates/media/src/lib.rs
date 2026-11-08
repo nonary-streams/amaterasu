@@ -21,6 +21,8 @@ mod dmabuf_lease;
 pub use dmabuf_lease::*;
 mod capture_events;
 pub use capture_events::*;
+mod frame_processing;
+pub use frame_processing::*;
 mod frame_resource;
 pub use frame_resource::*;
 mod source_preflight;

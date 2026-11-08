@@ -16,6 +16,9 @@ pub struct Factory<B: Backend> {
     _source: Box<CpuSourceFactory<Bridge<B>>>,
 }
 impl<B: Backend + 'static> Factory<B> {
+    pub fn retirement_ready(&self) -> Result<bool, Status> {
+        self._source.retirement_ready()
+    }
     pub fn new(controller: SharedController<B>) -> Box<Self> {
         let source = CpuSourceFactory::new(Arc::new(Bridge { controller }));
         Box::new(Self {
@@ -48,11 +51,10 @@ impl<B: Backend> Bridge<B> {
     }
     fn legacy(&self, caller: &str, stream: u64) -> Result<Option<CpuSourcePresentation>, Status> {
         let mut controller = self.controller()?;
-        if controller
+        let capture_format = controller
             .capture_format(caller, stream)
-            .map_err(|e| capture_error_status(&e))?
-            .ten_bit
-        {
+            .map_err(|e| capture_error_status(&e))?;
+        if capture_format.ten_bit {
             return Err(MEDIA_UNSUPPORTED);
         }
         let Some(frame) = controller
@@ -65,12 +67,17 @@ impl<B: Backend> Bridge<B> {
             return Err(MEDIA_UNSUPPORTED);
         }
         Ok(Some(CpuSourcePresentation {
+            receipt: None,
             width: frame.width,
             height: frame.height,
             stride: frame.stride,
             pixel_format: PIXEL_BGRA8,
-            color: FrameColorMetadata::default(),
-            bytes: Arc::new(frame.bytes),
+            color: if capture_format.explicit {
+                sdr_color()
+            } else {
+                FrameColorMetadata::default()
+            },
+            bytes: Arc::new(frame.bytes).into(),
             timestamp_us: frame.timestamp_us,
             capture_pacing_timestamp_us: frame.timestamp_us,
             sequence: frame.sequence,
@@ -102,7 +109,11 @@ impl<B: Backend> CpuSourceProvider for Bridge<B> {
         } else {
             vec![CpuSourceFormat {
                 pixel_format: PIXEL_BGRA8,
-                color: FrameColorMetadata::default(),
+                color: if info.format.explicit {
+                    sdr_color()
+                } else {
+                    FrameColorMetadata::default()
+                },
             }]
         };
         Ok(CpuSourceDescription {
@@ -114,7 +125,7 @@ impl<B: Backend> CpuSourceProvider for Bridge<B> {
                 enabled: u32::from(info.format.hdr),
                 ..HdrMetadata::default()
             }),
-            authoritative_color: info.format.ten_bit,
+            authoritative_color: info.format.explicit,
         })
     }
     fn read(
@@ -148,12 +159,13 @@ impl<B: Backend> CpuSourceProvider for Bridge<B> {
         };
         let pixels = surface.to_p010(requested.hdr, range)?;
         Ok(Some(CpuSourcePresentation {
+            receipt: None,
             width: pixels.width,
             height: pixels.height,
             stride: pixels.stride,
             pixel_format: pixels.pixel_format,
             color: pixels.color,
-            bytes: pixels.bytes,
+            bytes: pixels.bytes.into(),
             timestamp_us: frame.timestamp_us,
             capture_pacing_timestamp_us: frame.timestamp_us,
             sequence: frame.sequence,
@@ -172,5 +184,16 @@ impl<B: Backend> CpuSourceProvider for Bridge<B> {
             .geometry(caller, stream)
             .map_err(|e| capture_error_status(&e))?
             .ok_or(MEDIA_UNSUPPORTED)
+    }
+}
+
+fn sdr_color() -> FrameColorMetadata {
+    FrameColorMetadata {
+        version: 1,
+        size: size_of::<FrameColorMetadata>() as u32,
+        primaries: FRAME_PRIMARIES_BT709,
+        transfer: FRAME_TRANSFER_SRGB,
+        matrix: FRAME_MATRIX_RGB,
+        range: FRAME_RANGE_FULL,
     }
 }

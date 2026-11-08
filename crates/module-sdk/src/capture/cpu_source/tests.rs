@@ -55,12 +55,13 @@ impl CpuSourceProvider for Provider {
             self.generation.store(generation, Ordering::SeqCst);
         }
         Ok(Some(CpuSourcePresentation {
+            receipt: None,
             width: 2,
             height: 2,
             stride: 4,
             pixel_format: format.pixel_format,
             color: format.color,
-            bytes,
+            bytes: bytes.into(),
             timestamp_us: 123,
             capture_pacing_timestamp_us: 120,
             sequence: 8,
@@ -127,7 +128,7 @@ unsafe extern "C" fn offer_sink(
     // SAFETY: test owns context, and factory lends descriptor and payload.
     let out = unsafe { &mut *context.cast::<Vec<(u64, u32, [u32; 6])>>() };
     let offer = unsafe { &*offer };
-    assert_eq!(offer.ownership, FRAME_OWNERSHIP_BORROWED);
+    assert_eq!(offer.ownership, FRAME_OWNERSHIP_RETAINABLE);
     assert_eq!(offer.resource.version, 2);
     let caps = unsafe { &*offer.resource.data.cast::<CpuResourceCapabilitiesV2>() };
     out.push((offer.id, caps.base.format, color_tuple(caps.color)));
@@ -150,7 +151,8 @@ unsafe extern "C" fn frame_sink(
     assert_eq!(frame.offer_generation, 1);
     assert_eq!(frame.offer_id, 1);
     assert_eq!(frame.color.transfer, FRAME_TRANSFER_PQ);
-    assert_eq!(unsafe { (frame.retain)(frame.context) }, MEDIA_UNSUPPORTED);
+    assert_eq!(unsafe { (frame.retain)(frame.context) }, STATUS_OK);
+    unsafe { (frame.release)(frame.context, &none()) };
     let out = unsafe { &mut *context.cast::<Vec<u8>>() };
     out.extend_from_slice(unsafe { std::slice::from_raw_parts(cpu.data, cpu.len) });
     MEDIA_BUSY

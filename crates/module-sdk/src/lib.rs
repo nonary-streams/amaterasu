@@ -7,6 +7,7 @@ pub mod display;
 pub mod encode;
 pub mod exports;
 pub mod foreground_context;
+pub mod frame_processing;
 pub mod input;
 pub mod media;
 mod native;

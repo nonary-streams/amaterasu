@@ -118,7 +118,11 @@ impl ManagedModule for CaptureModule {
         match self.controller.try_lock() {
             Ok(mut controller) => {
                 controller.shutdown();
-                Ok(controller.retired()
+                Ok(self
+                    ._factory
+                    .retirement_ready()
+                    .map_err(|status| format!("capture resources did not retire: {status}"))?
+                    && controller.retired()
                     && self.pending_opens.is_empty()
                     && self.polled_request.is_none())
             }

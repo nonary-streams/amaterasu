@@ -2,7 +2,7 @@ use super::{format::*, *};
 use crate::{
     ModuleResult, RuntimeClient,
     abi::*,
-    media::{BorrowedCpuFrame, OwnedCpuFrame, native_contracts},
+    media::{OwnedCpuFrame, native_contracts},
 };
 use amaterasu_media::*;
 use std::{
@@ -53,6 +53,7 @@ struct Binding<P> {
     processor: RefCell<P>,
     states: RefCell<BTreeMap<u64, State>>,
     poisoned: Cell<bool>,
+    leases: crate::capture::CpuFrameLeasePool,
 }
 fn guarded<P>(binding: &Binding<P>, call: impl FnOnce() -> Status) -> Status {
     if binding.poisoned.get() {
@@ -101,9 +102,19 @@ fn commit<P: CpuResourceProcessor>(b: &Binding<P>, stream: u64, mut state: State
 unsafe extern "C" fn release<P: CpuResourceProcessor>(context: *mut c_void) {
     // SAFETY: runtime uniquely releases this provider binding after callbacks.
     let binding = unsafe { Box::from_raw(context.cast::<Binding<P>>()) };
-    let _ = catch_unwind(AssertUnwindSafe(|| {
-        binding.processor.borrow_mut().shutdown()
-    }));
+    if catch_unwind(AssertUnwindSafe(|| {
+        binding.processor.borrow_mut().shutdown();
+        assert_eq!(
+            binding.leases.retirement_ready(),
+            Ok(true),
+            "processor outputs remain referenced at binding release"
+        );
+        drop(binding);
+    }))
+    .is_err()
+    {
+        std::process::abort();
+    }
 }
 unsafe extern "C" fn enumerate<P: CpuResourceProcessor, const OUTPUT: bool>(
     context: *mut c_void,
@@ -244,13 +255,9 @@ unsafe extern "C" fn cancel<P: CpuResourceProcessor>(context: *mut c_void, strea
         STATUS_OK
     }));
     if result.is_err() {
-        b.poisoned.set(true);
+        std::process::abort();
     }
 }
-unsafe extern "C" fn retain(_: *mut c_void) -> Status {
-    MEDIA_UNSUPPORTED
-}
-unsafe extern "C" fn release_frame(_: *mut c_void, _: *const FrameDescriptor) {}
 unsafe extern "C" fn process<P: CpuResourceProcessor>(
     context: *mut c_void,
     stream: u64,
@@ -299,8 +306,7 @@ unsafe extern "C" fn process<P: CpuResourceProcessor>(
             Ok(pixels) => pixels,
             Err(status) => return status,
         };
-        let borrow: BorrowedCpuFrame<'_> = pixels.borrow();
-        let cpu = borrow.descriptor();
+        let cpu = *pixels.borrow().descriptor();
         let caps = output.capabilities.base;
         if cpu.sequence != frame.sequence
             || cpu.timestamp_us != frame.timestamp_us
@@ -312,41 +318,30 @@ unsafe extern "C" fn process<P: CpuResourceProcessor>(
         {
             return STATUS_INVALID_ARGUMENT;
         }
-        let output_frame = CaptureResourceFrame {
-            offer_generation: state.generation,
-            offer_id: output.id,
+        let presentation = crate::capture::CpuSourcePresentation {
+            receipt: None,
+            width: cpu.width,
+            height: cpu.height,
+            stride: cpu.stride,
+            pixel_format: cpu.format,
+            color: output.capabilities.color,
+            bytes: crate::media::CpuPixels::from_owner(std::sync::Arc::new(pixels)),
             timestamp_us: frame.timestamp_us,
             capture_pacing_timestamp_us: frame.capture_pacing_timestamp_us,
             sequence: frame.sequence,
-            width: cpu.width,
-            height: cpu.height,
             freshness: frame.freshness,
-            reserved: 0,
-            color: output.capabilities.color,
+        };
+        let lease = match b.leases.lease(presentation, state.generation, output.id) {
+            Ok(lease) => lease,
+            Err(error) => return error,
+        };
+        let output_frame = CaptureResourceFrame {
             clock: frame.clock,
             pacing_clock: frame.pacing_clock,
-            resource: FrameDescriptor {
-                kind: FRAME_RESOURCE_CPU,
-                version: 2,
-                size: size_of::<CpuFrame>() as u32,
-                reserved: 0,
-                namespace: [0; 16],
-                data: std::ptr::from_ref(cpu).cast(),
-            },
-            acquire_sync: FrameDescriptor {
-                kind: FRAME_SYNC_NONE,
-                version: 0,
-                size: 0,
-                reserved: 0,
-                namespace: [0; 16],
-                data: std::ptr::null(),
-            },
-            context: std::ptr::null_mut(),
-            retain,
-            release: release_frame,
+            ..*lease.descriptor()
         };
-        // SAFETY: all independent output bytes live until this synchronous sink
-        // returns. Provider state is not borrowed across a foreign callback.
+        // The owned transform result is shared directly; no staging copy or
+        // callback-scoped pixel lifetime is imposed on downstream GPU steps.
         unsafe { (sink.write)(sink.context, &output_frame) }
     })
 }
@@ -378,6 +373,7 @@ pub fn into_resource_processor_binding<P: CpuResourceProcessor>(
         processor: RefCell::new(processor),
         states: RefCell::new(BTreeMap::new()),
         poisoned: Cell::new(false),
+        leases: crate::capture::CpuFrameLeasePool::default(),
     });
     b.api.base.base.context = std::ptr::from_mut(&mut *b).cast();
     let pointer = std::ptr::from_ref(&b.api);

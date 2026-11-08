@@ -1,6 +1,6 @@
 //! A safe CPU capture producer behind the public capture v1.10 native table.
-//! Every frame is borrowed only during its callback; no provider allocation or
-//! native capture handle crosses into the consumer contract.
+//! Borrowed callbacks and bounded retained resources share immutable pixel storage.
+//! Native capture handles remain inside the provider.
 use crate::abi::{
     AbiHeader, BorrowedBytes, NativeInterface, NativeInterfaceQuery, NativeServiceFactory,
     STATUS_INTERNAL_ERROR, STATUS_INVALID_ARGUMENT, STATUS_OK, Status,
@@ -27,13 +27,28 @@ pub struct CpuSourceDescription {
     pub hdr: Option<HdrMetadata>,
     pub authoritative_color: bool,
 }
+/// A synchronous presentation acknowledgement, independent of pixel readers.
+/// The callback runs once after sink delivery; dropping an unfinished receipt
+/// retires its captured admission guard without accepting the presentation.
+pub struct CpuPresentationReceipt(Option<Box<dyn FnOnce(Status) + Send>>);
+impl CpuPresentationReceipt {
+    pub fn new(finish: impl FnOnce(Status) + Send + 'static) -> Self {
+        Self(Some(Box::new(finish)))
+    }
+    pub fn finish(mut self, status: Status) {
+        if let Some(finish) = self.0.take() {
+            finish(status);
+        }
+    }
+}
 pub struct CpuSourcePresentation {
+    pub receipt: Option<CpuPresentationReceipt>,
     pub width: u32,
     pub height: u32,
     pub stride: u32,
     pub pixel_format: u32,
     pub color: FrameColorMetadata,
-    pub bytes: Arc<Vec<u8>>,
+    pub bytes: crate::media::CpuPixels,
     pub timestamp_us: u64,
     pub capture_pacing_timestamp_us: u64,
     pub sequence: u64,
@@ -73,8 +88,13 @@ pub trait CpuSourceProvider: Send + Sync {
 pub struct CpuSourceFactory<P: CpuSourceProvider> {
     pub api: NativeServiceFactory,
     provider: Arc<P>,
+    leases: super::CpuFrameLeasePool,
 }
 impl<P: CpuSourceProvider + 'static> CpuSourceFactory<P> {
+    pub fn retirement_ready(&self) -> Result<bool, Status> {
+        self.leases.retirement_ready()
+    }
+
     pub fn new(provider: Arc<P>) -> Box<Self> {
         let mut factory = Box::new(Self {
             api: NativeServiceFactory {
@@ -83,6 +103,7 @@ impl<P: CpuSourceProvider + 'static> CpuSourceFactory<P> {
                 bind: Some(bind::<P>),
             },
             provider,
+            leases: super::CpuFrameLeasePool::default(),
         });
         factory.api.context = (&mut *factory as *mut Self).cast();
         factory
@@ -98,6 +119,7 @@ struct Binding<P: CpuSourceProvider> {
     provider: Arc<P>,
     caller: String,
     selections: Mutex<BTreeMap<u64, Selection>>,
+    leases: super::CpuFrameLeasePool,
 }
 fn guarded(f: impl FnOnce() -> Status) -> Status {
     catch_unwind(AssertUnwindSafe(f)).unwrap_or(STATUS_INTERNAL_ERROR)
@@ -232,6 +254,11 @@ impl<P: CpuSourceProvider> Binding<P> {
     }
 }
 impl CpuSourcePresentation {
+    fn finish_delivery(&mut self, status: Status) {
+        if let Some(receipt) = self.receipt.take() {
+            receipt.finish(status);
+        }
+    }
     fn frame(&self) -> CpuFrame {
         CpuFrame {
             width: self.width,
@@ -291,6 +318,7 @@ unsafe extern "C" fn bind<P: CpuSourceProvider + 'static>(
             provider: factory.provider.clone(),
             caller,
             selections: Mutex::new(BTreeMap::new()),
+            leases: factory.leases.clone(),
         });
         let context = (&*b as *const Binding<P>).cast_mut().cast();
         b.api.base.base.base.base.context = context;
@@ -362,11 +390,13 @@ unsafe extern "C" fn legacy<P: CpuSourceProvider>(
             Ok(b) => b,
             Err(e) => return e,
         };
-        let p = match b.legacy(s) {
+        let mut p = match b.legacy(s) {
             Ok(p) => p,
             Err(e) => return e,
         }; // SAFETY: owned presentation keeps bytes alive through the synchronous sink.
-        b.finish_delivery(s, unsafe { sink.send(&p.frame()) })
+        let status = unsafe { sink.send(&p.frame()) };
+        p.finish_delivery(status);
+        b.finish_delivery(s, status)
     })
 }
 unsafe extern "C" fn fresh<P: CpuSourceProvider>(
@@ -379,11 +409,13 @@ unsafe extern "C" fn fresh<P: CpuSourceProvider>(
             Ok(b) => b,
             Err(e) => return e,
         };
-        let p = match b.legacy(s) {
+        let mut p = match b.legacy(s) {
             Ok(p) => p,
             Err(e) => return e,
         }; // SAFETY: owned presentation keeps bytes alive through the synchronous sink.
-        b.finish_delivery(s, unsafe { sink.send(&p.frame(), p.freshness) })
+        let status = unsafe { sink.send(&p.frame(), p.freshness) };
+        p.finish_delivery(status);
+        b.finish_delivery(s, status)
     })
 }
 unsafe extern "C" fn timed<P: CpuSourceProvider>(
@@ -396,11 +428,11 @@ unsafe extern "C" fn timed<P: CpuSourceProvider>(
             Ok(b) => b,
             Err(e) => return e,
         };
-        let p = match b.legacy(s) {
+        let mut p = match b.legacy(s) {
             Ok(p) => p,
             Err(e) => return e,
         }; // SAFETY: owned presentation keeps bytes alive through the synchronous sink.
-        b.finish_delivery(s, unsafe {
+        let status = unsafe {
             sink.send(
                 &CaptureFrameV1_3 {
                     frame: p.frame(),
@@ -408,7 +440,9 @@ unsafe extern "C" fn timed<P: CpuSourceProvider>(
                 },
                 p.freshness,
             )
-        })
+        };
+        p.finish_delivery(status);
+        b.finish_delivery(s, status)
     })
 }
 unsafe extern "C" fn geometry<P: CpuSourceProvider>(
@@ -466,7 +500,7 @@ unsafe extern "C" fn enumerate<P: CpuSourceProvider>(
             let known = known_color(f.color);
             let offer = CaptureResourceOffer {
                 id: index as u64 + 1,
-                ownership: FRAME_OWNERSHIP_BORROWED,
+                ownership: FRAME_OWNERSHIP_RETAINABLE,
                 accessibility: FRAME_ACCESS_CPU,
                 reserved: 0,
                 resource: FrameDescriptor {
@@ -570,36 +604,15 @@ unsafe extern "C" fn read_resource<P: CpuSourceProvider>(
             Ok(p) => p,
             Err(e) => return e,
         };
-        let cpu = p.frame();
-        let frame = CaptureResourceFrame {
-            offer_generation: d.generation,
-            offer_id: selection.index as u64 + 1,
-            timestamp_us: p.timestamp_us,
-            capture_pacing_timestamp_us: p.capture_pacing_timestamp_us,
-            sequence: p.sequence,
-            width: p.width,
-            height: p.height,
-            freshness: p.freshness,
-            reserved: 0,
-            color: p.color,
-            clock: FrameClockMetadata::default(),
-            pacing_clock: FrameClockMetadata::default(),
-            resource: FrameDescriptor {
-                kind: FRAME_RESOURCE_CPU,
-                version: if known_color(p.color) { 2 } else { 1 },
-                size: size_of::<CpuFrame>() as u32,
-                reserved: 0,
-                namespace: [0; 16],
-                data: (&cpu as *const CpuFrame).cast(),
-            },
-            acquire_sync: none(),
-            context: std::ptr::null_mut(),
-            retain: retain_borrowed,
-            release: release_borrowed,
+        let mut leased = match b.leases.lease(p, d.generation, selection.index as u64 + 1) {
+            Ok(leased) => leased,
+            Err(error) => return error,
         };
-        // SAFETY: immutable Arc storage, frame and descriptor live until callback
-        // returns. Borrowed-only retention is explicitly rejected.
-        b.finish_delivery(s, unsafe { (sink.write)(sink.context, &frame) })
+        // The resource owner pins the original immutable allocation. Native
+        // consumers may retain it for queued work without copying its pixels.
+        let status = unsafe { (sink.write)(sink.context, leased.descriptor()) };
+        leased.finish_delivery(status);
+        b.finish_delivery(s, status)
     })
 }
 unsafe extern "C" fn hdr<P: CpuSourceProvider>(
@@ -653,10 +666,6 @@ unsafe extern "C" fn provenance<P: CpuSourceProvider>(
         STATUS_OK
     })
 }
-unsafe extern "C" fn retain_borrowed(_: *mut c_void) -> Status {
-    MEDIA_UNSUPPORTED
-}
-unsafe extern "C" fn release_borrowed(_: *mut c_void, _: *const FrameDescriptor) {}
 unsafe extern "C" fn dmabuf(_: *mut c_void, _: u64, _: DmaBufFrameSink) -> Status {
     MEDIA_UNSUPPORTED
 }

@@ -1,7 +1,7 @@
 //! Explicit lifetime for immutable DMA-BUF presentations.
 use crate::{CAPTURE_FRAME_CACHED_REUSE, CAPTURE_FRAME_FRESH, DmaBufFrame};
-use amaterasu_abi::{NativeInterface, STATUS_INVALID_ARGUMENT, Status};
-use std::{ffi::c_void, mem::size_of};
+use amaterasu_abi::{STATUS_INVALID_ARGUMENT, Status};
+use std::ffi::c_void;
 
 /// One immutable presentation with an explicit provider-owned lifetime.
 ///
@@ -70,89 +70,3 @@ impl DmaBufLeaseSink {
         unsafe { (self.write)(self.context, lease, freshness) }
     }
 }
-
-pub const GPU_PROCESSOR_INTERFACE_MAJOR: u32 = 1;
-pub const GPU_PROCESSOR_INTERFACE_MINOR: u32 = 0;
-
-/// Optional synchronous GPU transform. It receives a borrowed input lease and
-/// delivers one borrowed output lease through the sink on success, preserving
-/// sequence, timestamp, and the supplied source freshness. The processor owns
-/// the output during the callback; the sink explicitly retains any output
-/// needed afterward. It propagates a
-/// rejected sink status unchanged; BUSY before delivery consumes nothing.
-///
-/// All submitted GPU operations must obey acquire/completion fences. Processing
-/// may change layout and pixels, but cannot mutate the immutable input. Before
-/// returning, the processor finishes every read from the borrowed input or
-/// explicitly retains a separate reference and releases it after GPU completion
-/// (or with its own completion fence). An output with pending GPU writes carries
-/// valid acquire fences covering those writes. Releasing the caller's input
-/// reference does not retire the processor's independently retained GPU work.
-/// No sink callback may occur after `process` returns. An asynchronous processor
-/// should
-/// retain inputs privately and expose a separate scheduling API; this interface
-/// promises no asynchronous callback or unbounded internal queue.
-#[repr(C)]
-pub struct GpuProcessorApi {
-    pub base: NativeInterface,
-    pub process: unsafe extern "C" fn(
-        *mut c_void,
-        u64,
-        *const DmaBufFrameLease,
-        u32,
-        DmaBufLeaseSink,
-    ) -> Status,
-    /// Stops this processing stream and synchronously retires every retained
-    /// input/output reference and completion fence before returning. May block
-    /// on GPU/vendor work; source bindings remain live throughout this call.
-    /// No more work may be submitted for this stream after cancellation.
-    pub cancel_dmabuf_leases: unsafe extern "C" fn(*mut c_void, u64),
-}
-
-pub const GPU_PROCESSOR_API_V1_0_SIZE: u32 = size_of::<GpuProcessorApi>() as u32;
-
-/// v1.1 describes the processed output's HDR10 metadata, independently of the
-/// capture source. STATUS_OK initializes metadata (enabled=0 means SDR);
-/// UNSUPPORTED means unspecified, never an inferred color space. Query before
-/// processing to reject an incompatible stream; queries must not start GPU work.
-#[repr(C)]
-pub struct GpuProcessorApiV1_1 {
-    pub base: GpuProcessorApi,
-    pub hdr_metadata: unsafe extern "C" fn(*mut c_void, u64, *mut crate::HdrMetadata) -> Status,
-}
-
-pub const GPU_PROCESSOR_METADATA_INTERFACE_MINOR: u32 = 1;
-pub const GPU_PROCESSOR_API_V1_1_SIZE: u32 = size_of::<GpuProcessorApiV1_1>() as u32;
-
-/// Maximum size of the UTF-8 JSON configuration borrowed by `configure_stream`.
-pub const GPU_PROCESSOR_MAX_CONFIGURATION_BYTES: usize = 16 * 1024;
-pub const GPU_PROCESSOR_CONFIGURATION_INTERFACE_MINOR: u32 = 2;
-
-/// Additive stream configuration. The consumer invokes this synchronously once
-/// before metadata or frame processing. The provider must copy any needed bytes;
-/// the pointer is borrowed for the call and the stream must be retired by cancel.
-/// A selected provider may reject unsupported or invalid configuration.
-#[repr(C)]
-pub struct GpuProcessorApiV1_2 {
-    pub base: GpuProcessorApiV1_1,
-    pub configure_stream: unsafe extern "C" fn(*mut c_void, u64, *const u8, usize) -> Status,
-}
-
-pub const GPU_PROCESSOR_API_V1_2_SIZE: u32 = size_of::<GpuProcessorApiV1_2>() as u32;
-
-pub const GPU_PROCESSOR_UPDATE_INTERFACE_MINOR: u32 = 3;
-
-/// Atomic replacement of an active stream's configuration. The JSON has the
-/// same size and lifetime bounds as `configure_stream`. The call is serialized
-/// with processing and cancellation. An ordinary rejected update leaves the
-/// previous configuration active and does not cancel the stream. An internal
-/// error is fatal: stop submissions, retire downstream leases, then cancel the
-/// stream. Successful updates must preserve the negotiated output format and
-/// HDR metadata; changes that cannot satisfy those invariants must be rejected.
-#[repr(C)]
-pub struct GpuProcessorApiV1_3 {
-    pub base: GpuProcessorApiV1_2,
-    pub update_stream: unsafe extern "C" fn(*mut c_void, u64, *const u8, usize) -> Status,
-}
-
-pub const GPU_PROCESSOR_API_V1_3_SIZE: u32 = size_of::<GpuProcessorApiV1_3>() as u32;

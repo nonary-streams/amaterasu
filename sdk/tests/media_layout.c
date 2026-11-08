@@ -25,7 +25,6 @@ _Static_assert(sizeof(AmaterasuCaptureResourceOffer) == 144, "resource offer lay
 _Static_assert(sizeof(AmaterasuCaptureResourceFrame) == 248, "resource frame layout");
 _Static_assert(sizeof(AmaterasuFrameColorMetadata) == 24, "frame color metadata layout");
 _Static_assert(sizeof(AmaterasuFrameClockMetadata) == 32, "frame clock metadata layout");
-_Static_assert(offsetof(AmaterasuGpuProcessorApiV1_4, enumerate_outputs) == sizeof(AmaterasuGpuProcessorApiV1_3), "processor v1.3 prefix preserved");
 _Static_assert(offsetof(AmaterasuEncoderApiV1_5, enumerate_resources) == sizeof(AmaterasuEncoderApiV1_4), "encoder v1.4 prefix preserved");
 _Static_assert(sizeof(AmaterasuCudaDeviceCapabilities) == 40, "CUDA offer layout");
 _Static_assert(sizeof(AmaterasuCudaDeviceFrame) == 40, "CUDA frame layout");
@@ -84,12 +83,6 @@ _Static_assert(offsetof(AmaterasuDmaBufFrameLease, context) == 112, "GPU lease o
 _Static_assert(offsetof(AmaterasuDmaBufFrameLease, retain) == 120, "GPU lease retain");
 _Static_assert(offsetof(AmaterasuDmaBufFrameLease, release) == 128, "GPU lease release");
 _Static_assert(sizeof(AmaterasuDmaBufLeaseSink) == 16, "GPU lease sink");
-_Static_assert(sizeof(AmaterasuGpuProcessorApi) == 48, "GPU processor layout");
-_Static_assert(sizeof(AmaterasuGpuProcessorApiV1_1) == 56, "GPU processor v1.1 layout");
-_Static_assert(sizeof(AmaterasuGpuProcessorApiV1_2) == 64, "GPU processor v1.2 layout");
-_Static_assert(offsetof(AmaterasuGpuProcessorApiV1_2, configure_stream) == sizeof(AmaterasuGpuProcessorApiV1_1), "GPU processor v1.1 prefix preserved");
-_Static_assert(offsetof(AmaterasuGpuProcessorApiV1_1, hdr_metadata) == sizeof(AmaterasuGpuProcessorApi), "GPU processor v1.0 prefix preserved");
-_Static_assert(offsetof(AmaterasuGpuProcessorApi, cancel_dmabuf_leases) == 40, "GPU processor cancel offset");
 _Static_assert(AMATERASU_CAPTURE_API_V1_6_SIZE == 88, "capture v1.6 layout");
 _Static_assert(offsetof(AmaterasuCaptureApiV1_6, read_dmabuf_frame_leased) == 80, "capture lease offset");
 _Static_assert(AMATERASU_ENCODER_API_V1_2_SIZE == 80, "encoder v1.2 layout");
@@ -121,3 +114,6 @@ _Static_assert(offsetof(AmaterasuControlMessage, sequence) == 32, "control seque
 _Static_assert(sizeof(AmaterasuControlTransportApi) == 48, "control API layout");
 _Static_assert(offsetof(AmaterasuControlTransportApi, send) == 32, "control send layout");
 _Static_assert(offsetof(AmaterasuControlTransportApi, receive) == 40, "control receive layout");
+
+_Static_assert(offsetof(AmaterasuFrameProcessorApi, base) == 0, "frame processor resource prefix");
+_Static_assert(sizeof(AmaterasuFrameProcessorApi) == sizeof(AmaterasuFrameResourceProcessorApi) + 3 * sizeof(void *), "complete frame processor layout");

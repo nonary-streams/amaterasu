@@ -6,7 +6,7 @@ use amaterasu_media::{
     CaptureApiV1_8, CaptureEventSink, CaptureFrameV1_3, CaptureGeometry, CaptureResourceFrame,
     CaptureResourceFrameSink, CaptureResourceOffer, CaptureResourceOfferSink, CpuFrame,
     CpuResourceCapabilities, CpuResourceCapabilitiesV2, DmaBufFrameSink, DmaBufLeaseSink,
-    FRAME_ACCESS_CPU, FRAME_CLOCK_HOST_MONOTONIC, FRAME_OWNERSHIP_BORROWED, FRAME_RESOURCE_CPU,
+    FRAME_ACCESS_CPU, FRAME_CLOCK_HOST_MONOTONIC, FRAME_OWNERSHIP_RETAINABLE, FRAME_RESOURCE_CPU,
     FRAME_SYNC_NONE, FrameClockMetadata, FrameDescriptor, FrameSink, FreshFrameSinkV1_2,
     FreshFrameSinkV1_3, INTERFACE_MAJOR, MEDIA_BACKEND_ERROR, MEDIA_BUSY, MEDIA_UNSUPPORTED,
     PresentationStatus, host_monotonic_micros,
@@ -26,9 +26,13 @@ pub type SharedController = Arc<Mutex<Controller>>;
 pub struct Factory {
     pub api: NativeServiceFactory,
     controller: SharedController,
+    leases: amaterasu_module_sdk::capture::CpuFrameLeasePool,
 }
 
 impl Factory {
+    pub fn retirement_ready(&self) -> Result<bool, Status> {
+        self.leases.retirement_ready()
+    }
     pub fn new(controller: SharedController) -> Box<Self> {
         let mut factory = Box::new(Self {
             api: NativeServiceFactory {
@@ -37,6 +41,7 @@ impl Factory {
                 bind: Some(bind),
             },
             controller,
+            leases: amaterasu_module_sdk::capture::CpuFrameLeasePool::default(),
         });
         factory.api.context = (&mut *factory as *mut Self).cast();
         factory
@@ -46,11 +51,16 @@ impl Factory {
 struct Binding {
     api: CaptureApiV1_8,
     controller: SharedController,
+    leases: amaterasu_module_sdk::capture::CpuFrameLeasePool,
     caller: String,
 }
 
 impl Binding {
-    fn new(controller: SharedController, caller: String) -> Box<Self> {
+    fn new(
+        controller: SharedController,
+        caller: String,
+        leases: amaterasu_module_sdk::capture::CpuFrameLeasePool,
+    ) -> Box<Self> {
         let mut binding = Box::new(Self {
             api: CaptureApiV1_8 {
                 base: CaptureApiV1_7 {
@@ -82,6 +92,7 @@ impl Binding {
             },
             controller,
             caller,
+            leases,
         });
         binding.api.base.base.base.context = (&mut *binding as *mut Self).cast();
         binding
@@ -133,7 +144,11 @@ unsafe extern "C" fn bind(
         };
         // SAFETY: module retains the boxed factory through all binds.
         let factory = unsafe { &*context.cast::<Factory>() };
-        let binding = Binding::new(factory.controller.clone(), caller.into());
+        let binding = Binding::new(
+            factory.controller.clone(),
+            caller.into(),
+            factory.leases.clone(),
+        );
         let interface = &binding.api.base.base.base as *const NativeInterface;
         let _ = Box::into_raw(binding);
         // SAFETY: broker uniquely owns and releases this boxed binding.
@@ -314,7 +329,7 @@ unsafe extern "C" fn enumerate_resources(
             };
             let offer = CaptureResourceOffer {
                 id: resource.id,
-                ownership: FRAME_OWNERSHIP_BORROWED,
+                ownership: FRAME_OWNERSHIP_RETAINABLE,
                 accessibility: FRAME_ACCESS_CPU,
                 reserved: 0,
                 resource: FrameDescriptor {
@@ -384,31 +399,33 @@ unsafe extern "C" fn read_resource_frame(
                     reserved: 0,
                     epoch_id,
                 });
+            let binding = unsafe { &*context.cast::<Binding>() };
+            let lease = match binding.leases.lease(
+                amaterasu_module_sdk::capture::CpuSourcePresentation {
+                    receipt: None,
+                    width: frame.width,
+                    height: frame.height,
+                    stride: frame.stride,
+                    pixel_format: frame.format,
+                    color: selected.color.unwrap_or_default(),
+                    bytes: amaterasu_module_sdk::media::CpuPixels::from_owner(Arc::new(
+                        delivery.pixels.clone(),
+                    )),
+                    timestamp_us: frame.timestamp_us,
+                    capture_pacing_timestamp_us: frame.timestamp_us,
+                    sequence: frame.sequence,
+                    freshness: CAPTURE_FRAME_FRESH,
+                },
+                stream,
+                selected.id,
+            ) {
+                Ok(lease) => lease,
+                Err(status) => return status,
+            };
             let offered = CaptureResourceFrame {
-                offer_generation: stream,
-                offer_id: selected.id,
-                timestamp_us: frame.timestamp_us,
-                capture_pacing_timestamp_us: frame.timestamp_us,
-                sequence: frame.sequence,
-                width: frame.width,
-                height: frame.height,
-                freshness: CAPTURE_FRAME_FRESH,
-                reserved: 0,
-                color: selected.color.unwrap_or_default(),
                 clock,
                 pacing_clock: clock,
-                resource: FrameDescriptor {
-                    kind: FRAME_RESOURCE_CPU,
-                    version: selected.schema(),
-                    size: size_of::<CpuFrame>() as u32,
-                    reserved: 0,
-                    namespace: [0; 16],
-                    data: (frame as *const CpuFrame).cast(),
-                },
-                acquire_sync: none_descriptor(),
-                context: std::ptr::null_mut(),
-                retain: unsupported_retain,
-                release: release_borrowed,
+                ..*lease.descriptor()
             };
             // SAFETY: synchronous borrowed resource, descriptor and pixels remain live through the sink.
             unsafe { (sink.write)(sink.context, &offered) }
@@ -416,10 +433,6 @@ unsafe extern "C" fn read_resource_frame(
     })
 }
 
-unsafe extern "C" fn unsupported_retain(_: *mut c_void) -> Status {
-    MEDIA_UNSUPPORTED
-}
-unsafe extern "C" fn release_borrowed(_: *mut c_void, _: *const FrameDescriptor) {}
 unsafe extern "C" fn unsupported_dmabuf(_: *mut c_void, _: u64, _: DmaBufFrameSink) -> Status {
     MEDIA_UNSUPPORTED
 }

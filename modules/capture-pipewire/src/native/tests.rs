@@ -4,6 +4,8 @@ use crate::{
     model::Operation,
     test_support::{Driver, FakeBackend, settings, setup},
 };
+use amaterasu_module_sdk::abi::*;
+use std::ffi::c_void;
 use std::sync::atomic::Ordering;
 
 struct TestBinding(*const CaptureApi);
@@ -151,8 +153,8 @@ fn factory_binds_before_selection_and_rejects_incompatible_versions_and_size() {
     let before = Arc::strong_count(&shared);
     for (major, minor, size) in [
         (2, 1, size_of::<CaptureApi>() as u32),
-        (1, 2, size_of::<CaptureApi>() as u32),
-        (1, 1, size_of::<CaptureApi>() as u32 + 1),
+        (1, 11, size_of::<CaptureApi>() as u32),
+        (1, 10, size_of::<CaptureApiV1_10>() as u32 + 1),
     ] {
         let query = NativeInterfaceQuery {
             header: AbiHeader::of::<NativeInterfaceQuery>(),
@@ -204,7 +206,7 @@ fn binding_copies_principal_and_enforces_owner_geometry_and_closed_handles() {
 }
 
 #[test]
-fn busy_sink_retains_identical_pending_frame_and_native_copy_outlives_provider() {
+fn busy_sink_coalesces_to_newest_frame_and_owned_pixels_outlive_provider() {
     let (controller, driver, factory, id) = selected();
     let binding = TestBinding::new(&factory, b"amaterasu.video");
     let mut sink = Sink {
@@ -216,9 +218,7 @@ fn busy_sink_retains_identical_pending_frame_and_native_copy_outlives_provider()
     driver.frame(200, 2000);
     sink.status = STATUS_OK;
     assert_eq!(binding.read(id, &mut sink), STATUS_OK);
-    assert_eq!(sink.frames[0], sink.frames[1]);
-    assert_eq!(binding.read(id, &mut sink), STATUS_OK);
-    assert_eq!(sink.frames[2], (1, vec![200; 16]));
+    assert_eq!(sink.frames[1], (1, vec![200; 16]));
     assert_eq!(binding.read(id, &mut sink), MEDIA_PENDING);
     controller.lock().unwrap().shutdown();
     drop(factory);
@@ -283,4 +283,68 @@ fn a_terminal_source_observed_after_claim_never_starts_a_new_sink_callback() {
     assert_eq!(binding.read(id, &mut sink), MEDIA_BACKEND_ERROR);
     assert!(sink.frames.is_empty());
     assert_eq!(driver.mailbox.delivered.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn retained_pixels_do_not_hold_capture_admission_or_delay_the_newest_frame() {
+    let (controller, driver, factory, id) = selected();
+    let binding = TestBinding::new(&factory, b"amaterasu.video");
+    // SAFETY: the factory advertises the complete resource table, retained by
+    // this fixture until both borrowed calls and independent readers retire.
+    let api = unsafe { &*binding.0.cast::<CaptureApiV1_8>() };
+    let context = api.base.base.base.context;
+    assert_eq!(
+        unsafe { (api.select_resource)(context, id, 1, 1) },
+        STATUS_OK
+    );
+    let mut held = Vec::<CaptureResourceFrame>::new();
+    unsafe extern "C" fn keep(context: *mut c_void, frame: *const CaptureResourceFrame) -> Status {
+        // SAFETY: the fixture owns this collection and capture lends the live
+        // immutable frame. A successful retain transfers one independent read.
+        let frame = unsafe { &*frame };
+        let status = unsafe { (frame.retain)(frame.context) };
+        if status == STATUS_OK {
+            unsafe { &mut *context.cast::<Vec<CaptureResourceFrame>>() }.push(*frame);
+        }
+        status
+    }
+    let sink = CaptureResourceFrameSink {
+        context: std::ptr::from_mut(&mut held).cast(),
+        write: keep,
+    };
+    assert_eq!(
+        unsafe { (api.read_resource_frame)(context, id, sink) },
+        STATUS_OK
+    );
+    assert_eq!(factory.retirement_ready(), Ok(false));
+    driver.frame(200, 2000);
+    assert_eq!(
+        unsafe { (api.read_resource_frame)(context, id, sink) },
+        STATUS_OK
+    );
+    assert_eq!(
+        held.iter().map(|frame| frame.sequence).collect::<Vec<_>>(),
+        [0, 1]
+    );
+    controller
+        .lock()
+        .unwrap()
+        .close("amaterasu.video", id)
+        .unwrap();
+    for (frame, value) in held.into_iter().zip([100, 200]) {
+        // SAFETY: the retained reference keeps its original CPU payload and
+        // pixels live even after source close; this fixture has queued no work.
+        let pixels = unsafe { (*frame.resource.data.cast::<CpuFrame>()).bytes() }.unwrap();
+        assert_eq!(pixels, [value; 16]);
+        let none = FrameDescriptor {
+            kind: FRAME_SYNC_NONE,
+            version: 0,
+            size: 0,
+            reserved: 0,
+            namespace: [0; 16],
+            data: std::ptr::null(),
+        };
+        unsafe { (frame.release)(frame.context, &none) };
+    }
+    assert_eq!(factory.retirement_ready(), Ok(true));
 }

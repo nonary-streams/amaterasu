@@ -3,6 +3,8 @@
 //! The queue does not schedule an encoder or relax its thread-affinity rules.
 //! A consumer reads the front packet, calls its sink, and acknowledges only on
 //! success. Rejection leaves the same immutable packet at the front for retry.
+mod resource_consumer;
+pub use resource_consumer::{EncoderPresentation, EncoderResourceConsumer};
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;

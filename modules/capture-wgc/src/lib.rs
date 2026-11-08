@@ -161,7 +161,12 @@ impl ManagedModule for CaptureModule {
         if let Some(error) = failure {
             return Err(error);
         }
+        let resources_retired = self
+            ._factory
+            .retirement_ready()
+            .map_err(|status| format!("capture resources did not retire: {status}"))?;
         Ok(retired
+            && resources_retired
             && self.pending_closes.is_empty()
             && self.pending_opens.is_empty()
             && self.pending_lookups.is_empty()

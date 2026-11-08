@@ -85,7 +85,7 @@ fn rejects_unmapped_dma_planes_unreadable_memory_and_invalid_fd_or_chunks() {
 }
 
 #[test]
-fn rejected_frame_remains_pending_while_latest_real_copy_is_replaced() {
+fn rejected_frame_is_coalesced_to_the_latest_real_copy() {
     let mailbox = Arc::new(Mailbox::default());
     let mut bytes = [1u8; 24];
     // SAFETY: byte allocation remains initialized and alive through publish.
@@ -98,19 +98,16 @@ fn rejected_frame_remains_pending_while_latest_real_copy_is_replaced() {
     assert_eq!(unsafe { mailbox.publish(&plane(&bytes), 2, 2, 1, 2000) }, 1);
     delivery.finish(MEDIA_BUSY);
     let retry = mailbox.claim().unwrap().unwrap();
-    assert_eq!(retry.frame.sequence, 0);
-    assert_eq!(retry.frame.bytes, retained);
+    assert_eq!(retained, [1u8; 16]);
+    assert_eq!(retry.frame.sequence, 1);
+    assert_eq!(retry.frame.timestamp_us, 1000);
+    assert_eq!(retry.frame.bytes, [2u8; 16]);
     retry.finish(STATUS_OK);
-    let next = mailbox.claim().unwrap().unwrap();
-    assert_eq!(next.frame.sequence, 1);
-    assert_eq!(next.frame.timestamp_us, 1000);
-    assert_eq!(next.frame.bytes, [2u8; 16]);
-    next.finish(STATUS_OK);
     assert!(mailbox.claim().unwrap().is_none());
     assert!(
         mailbox.has_frame(),
         "initial validated copy remains established after consumption"
     );
-    assert_eq!(mailbox.delivered.load(Ordering::SeqCst), 2);
+    assert_eq!(mailbox.delivered.load(Ordering::SeqCst), 1);
     assert_eq!(mailbox.copied.load(Ordering::SeqCst), 2);
 }

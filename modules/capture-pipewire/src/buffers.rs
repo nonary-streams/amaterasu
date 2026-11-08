@@ -33,6 +33,12 @@ pub struct OwnedFrame {
     accepted: AtomicBool,
 }
 
+impl AsRef<[u8]> for OwnedFrame {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
 /// # Safety
 /// `plane.data` must address `plane.max_size` bytes mapped readably for this
 /// synchronous call. Only validated initialized pixel rows are read; padding
@@ -156,6 +162,14 @@ impl Mailbox {
         self.published.load(Ordering::SeqCst)
     }
 
+    pub fn dimensions(&self) -> Result<Option<(u32, u32)>, Status> {
+        let frames = self.frames.try_lock().map_err(|_| MEDIA_BUSY)?;
+        Ok(frames
+            .latest
+            .as_ref()
+            .or(frames.pending.as_ref())
+            .map(|f| (f.width, f.height)))
+    }
     pub fn claim(self: &Arc<Self>) -> Result<Option<Delivery>, Status> {
         if self
             .in_flight
@@ -178,7 +192,9 @@ impl Mailbox {
         {
             frames.pending = None;
         }
-        if frames.pending.is_none() {
+        // Coalesce to the newest presentation even when the previous sink was
+        // busy. Replaying rejected older pixels would add a capture frame of lag.
+        if frames.latest.is_some() {
             frames.pending = frames.latest.take();
         }
         let frame = frames.pending.clone();
@@ -203,8 +219,7 @@ pub struct Delivery {
 
 impl Delivery {
     pub fn finish(self, status: Status) -> Status {
-        if status == STATUS_OK {
-            self.frame.accepted.store(true, Ordering::SeqCst);
+        if status == STATUS_OK && !self.frame.accepted.swap(true, Ordering::SeqCst) {
             self.mailbox.delivered.fetch_add(1, Ordering::SeqCst);
         }
         status

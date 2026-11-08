@@ -37,7 +37,7 @@ fn formats(format: CaptureFormat) -> Vec<CpuSourceFormat> {
     } else {
         vec![CpuSourceFormat {
             pixel_format: PIXEL_BGRA8,
-            color: FrameColorMetadata::default(),
+            color: sdr_color(format),
         }]
     }
 }
@@ -92,7 +92,7 @@ impl<B: Backend> CpuSourceProvider for Provider<B> {
                 enabled: u32::from(format.hdr),
                 ..HdrMetadata::default()
             }),
-            authoritative_color: format.ten_bit,
+            authoritative_color: format.color_proof,
         })
     }
     fn read(
@@ -135,15 +135,16 @@ impl<B: Backend> CpuSourceProvider for Provider<B> {
             let pixels = source.to_p010(format.hdr, range)?;
             (pixels.stride, pixels.bytes, pixels.color)
         } else {
-            (frame.stride, frame.bytes, FrameColorMetadata::default())
+            (frame.stride, frame.bytes, sdr_color(format))
         };
         Ok(Some(CpuSourcePresentation {
+            receipt: None,
             width: frame.width,
             height: frame.height,
             stride,
             pixel_format: requested.pixel_format,
             color,
-            bytes,
+            bytes: bytes.into(),
             timestamp_us: frame.timestamp_us,
             capture_pacing_timestamp_us: frame.capture_pacing_timestamp_us,
             sequence: frame.sequence,
@@ -155,7 +156,7 @@ impl<B: Backend> CpuSourceProvider for Provider<B> {
         }))
     }
     fn delivery_failed(&self, caller: &str, stream: u64, _status: Status) {
-        if let Ok(mut controller) = self.controller.lock() {
+        if let Ok(mut controller) = self.controller.try_lock() {
             let _ = controller.discard_cached_frame(caller, stream);
         }
     }
@@ -169,3 +170,17 @@ impl<B: Backend> CpuSourceProvider for Provider<B> {
 
 #[cfg(test)]
 mod tests;
+
+fn sdr_color(format: CaptureFormat) -> FrameColorMetadata {
+    if !format.color_proof {
+        return FrameColorMetadata::default();
+    }
+    FrameColorMetadata {
+        version: 1,
+        size: size_of::<FrameColorMetadata>() as u32,
+        primaries: FRAME_PRIMARIES_BT709,
+        transfer: FRAME_TRANSFER_SRGB,
+        matrix: FRAME_MATRIX_RGB,
+        range: FRAME_RANGE_FULL,
+    }
+}

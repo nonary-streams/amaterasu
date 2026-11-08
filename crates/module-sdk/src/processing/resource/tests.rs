@@ -82,16 +82,17 @@ impl CpuSourceProvider for Source {
     ) -> Result<Option<CpuSourcePresentation>, Status> {
         self.0.reads.fetch_add(1, Ordering::SeqCst);
         assert_eq!(format.pixel_format, PIXEL_P010);
-        let bytes = (0..16 * 16 * 3 / 2)
+        let bytes: Vec<u8> = (0..16 * 16 * 3 / 2)
             .flat_map(|i| if i < 16 * 16 { 64u16 << 6 } else { 512u16 << 6 }.to_le_bytes())
             .collect();
         Ok(Some(CpuSourcePresentation {
+            receipt: None,
             width: 16,
             height: 16,
             stride: 32,
             pixel_format: PIXEL_P010,
             color: color(true, false),
-            bytes: Arc::new(bytes),
+            bytes: Arc::new(bytes).into(),
             timestamp_us: 3,
             capture_pacing_timestamp_us: 2,
             sequence: 1,

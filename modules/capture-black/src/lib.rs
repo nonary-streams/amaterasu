@@ -81,6 +81,18 @@ impl ManagedModule for BlackCapture {
         })
     }
 
+    fn prepare_shutdown(&mut self, _remaining_ms: u64) -> ModuleResult<()> {
+        self.controller
+            .lock()
+            .map_err(|_| "black capture controller poisoned")?
+            .shutdown();
+        Ok(())
+    }
+    fn quiesce(&mut self) -> ModuleResult<bool> {
+        self._factory
+            .retirement_ready()
+            .map_err(|status| format!("capture resources did not retire: {status}"))
+    }
     fn tick(&mut self) -> ModuleResult<()> {
         self.controller
             .lock()

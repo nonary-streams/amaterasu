@@ -251,6 +251,19 @@ impl<'a> ResourceConnection<'a> {
         })
     }
 
+    // Processing sessions own the same cancellation barrier across pump calls.
+    // Transferring only selection metadata keeps native tables borrowed solely
+    // during each call; no frame or descriptor is cached here.
+    pub(crate) fn restore_state(&mut self, state: (Option<(u64, u64)>, bool, bool)) {
+        (self.selected, self.active, self.retired) = state;
+    }
+    pub(crate) fn take_state(&mut self) -> (Option<(u64, u64)>, bool, bool) {
+        let state = (self.selected, self.active, self.retired);
+        self.active = false;
+        self.selected = None;
+        state
+    }
+
     fn cancel(&mut self) {
         if self.active {
             // SAFETY: the constructor guarantees the consumer remains live.
