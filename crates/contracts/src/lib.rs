@@ -326,7 +326,52 @@ pub enum Command {
         #[serde(default)]
         parent: Option<u64>,
     },
+    /// Finds a retained ordinary request without admitting new work. A missing
+    /// result is only evidence about this runtime's current retained records;
+    /// callers must account for expiry, release, and concurrent submissions.
+    LookupRequest {
+        service: String,
+        payload: Value,
+        operation_id: String,
+        #[serde(default)]
+        parent: Option<u64>,
+    },
+    /// Looks up a retained typed API call without submitting new work.
+    LookupApiRequest {
+        service: String,
+        method: String,
+        interface_major: u32,
+        interface_minor: u32,
+        payload: Value,
+        operation_id: String,
+        #[serde(default)]
+        parent: Option<u64>,
+    },
     Poll {},
+    /// Select a request delivery mode when no delivery is in flight.
+    SelectRequestDeliveryMode {
+        reliable: bool,
+    },
+    /// Offer one request repeatedly until accepted or ended.
+    PollV2 {
+        receiver: String,
+    },
+    /// Inspect this receiver's unaccepted offer without offering queued work.
+    InspectRequestOffer {
+        receiver: String,
+    },
+    /// Accept an offered request before invoking provider effects.
+    AcceptRequest {
+        request: u64,
+        receiver: String,
+    },
+    /// Report that the accepted delivery's handler and effects have retired.
+    /// The broker requires a terminal caller result and retains this receipt
+    /// independently of result expiry. Only the accepting receiver may retire.
+    RetireRequestDelivery {
+        request: u64,
+        receiver: String,
+    },
     Complete {
         request: u64,
         payload: Value,

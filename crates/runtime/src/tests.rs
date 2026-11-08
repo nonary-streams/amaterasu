@@ -948,6 +948,23 @@ fn installed_user_api_methods_enforce_identity_schema_version_and_raw_route_bloc
         operation_id: operation.into(),
         parent: None,
     };
+    let lookup = |payload, minor, operation: &str| Command::LookupApiRequest {
+        service: method.service.clone(),
+        method: "render".into(),
+        interface_major: 1,
+        interface_minor: minor,
+        payload,
+        operation_id: operation.into(),
+        parent: None,
+    };
+    assert_error_code(
+        broker.dispatch(client, lookup(json!({"size":4}), 2, "valid.call")),
+        "not_found",
+    );
+    assert!(matches!(
+        broker.dispatch(provider, Command::Poll {}),
+        Response::Pending
+    ));
     assert_error_code(
         broker.dispatch(client, call(json!({"size":"1"}), 2, "bad.shape")),
         "invalid_request",
@@ -961,6 +978,22 @@ fn installed_user_api_methods_enforce_identity_schema_version_and_raw_route_bloc
         "permission_denied",
     );
     let id = accepted_id(broker.dispatch(client, call(json!({"size":4}), 2, "valid.call")));
+    assert_eq!(
+        accepted_id(broker.dispatch(client, lookup(json!({"size":4}), 2, "valid.call"))),
+        id
+    );
+    assert_error_code(
+        broker.dispatch(client, lookup(json!({"size":5}), 2, "valid.call")),
+        "conflict",
+    );
+    assert_error_code(
+        broker.dispatch(client, lookup(json!({"size":4}), 1, "valid.call")),
+        "incompatible_api",
+    );
+    assert_error_code(
+        broker.dispatch(outsider, lookup(json!({"size":4}), 2, "valid.call")),
+        "permission_denied",
+    );
     assert!(
         matches!(broker.dispatch(provider, Command::Poll {}), Response::Request { payload, .. }
         if payload == json!({"method":"render","interface_major":1,"interface_minor":2,"arguments":{"size":4}}))
@@ -987,6 +1020,77 @@ fn installed_user_api_methods_enforce_identity_schema_version_and_raw_route_bloc
     ));
     assert!(
         matches!(broker.dispatch(client, Command::TakeResult { request:id }), Response::Result { payload } if payload == json!({"done":true}))
+    );
+    assert_eq!(
+        accepted_id(broker.dispatch(client, lookup(json!({"size":4}), 2, "valid.call"))),
+        id
+    );
+    assert_error_code(
+        broker.dispatch_at(
+            client,
+            lookup(json!({"size":4}), 2, "valid.call"),
+            Instant::now() + Duration::from_secs(301),
+        ),
+        "not_found",
+    );
+    assert!(matches!(
+        broker.dispatch(provider, Command::Poll {}),
+        Response::Pending
+    ));
+}
+
+#[test]
+fn typed_lookup_conflicts_with_an_ordinary_operation_id() {
+    let (mut config, method) = synthetic_api(ApiPrivilege::User);
+    config
+        .principals
+        .get_mut("org.example.client")
+        .unwrap()
+        .call
+        .insert("work/1".into());
+    config
+        .principals
+        .get_mut("org.example.provider")
+        .unwrap()
+        .provide
+        .insert("work/1".into());
+    let mut broker = Broker::new(config).unwrap();
+    broker.dispatch(
+        "org.example.provider",
+        Command::RegisterApi {
+            method: method.clone(),
+        },
+    );
+    broker.dispatch(
+        "org.example.provider",
+        Command::Register {
+            service: "work/1".into(),
+        },
+    );
+    accepted_id(broker.dispatch(
+        "org.example.client",
+        Command::Request {
+            service: "work/1".into(),
+            payload: json!({}),
+            timeout_ms: 1000,
+            operation_id: "shared".into(),
+            parent: None,
+        },
+    ));
+    assert_error_code(
+        broker.dispatch(
+            "org.example.client",
+            Command::LookupApiRequest {
+                service: method.service,
+                method: method.method,
+                interface_major: 1,
+                interface_minor: 2,
+                payload: json!({"size":1}),
+                operation_id: "shared".into(),
+                parent: None,
+            },
+        ),
+        "conflict",
     );
 }
 
@@ -1111,10 +1215,91 @@ fn delegated_api_call_requires_approval_for_the_original_initiator() {
         broker.dispatch(intermediary, Command::Poll {}),
         Response::Request { id, .. } if id == good_parent
     ));
+    let child = accepted_id(broker.dispatch(intermediary, api_call(good_parent)));
+    assert_error_code(
+        broker.dispatch(
+            intermediary,
+            Command::LookupRequest {
+                service: method.service.clone(),
+                payload: json!({"size": 1}),
+                operation_id: format!("api.{good_parent}"),
+                parent: Some(good_parent),
+            },
+        ),
+        "conflict",
+    );
     assert!(matches!(
-        broker.dispatch(intermediary, api_call(good_parent)),
-        Response::Accepted { .. }
+        broker.dispatch(
+            intermediary,
+            Command::Complete {
+                request: good_parent,
+                payload: json!({})
+            }
+        ),
+        Response::Ok
     ));
+    assert!(matches!(
+        broker.dispatch(
+            "org.example.client",
+            Command::ReleaseResult {
+                request: good_parent
+            }
+        ),
+        Response::Ok
+    ));
+    assert_eq!(
+        accepted_id(broker.dispatch(intermediary, api_call(good_parent))),
+        child
+    );
+    let lookup_child = |parent| Command::LookupApiRequest {
+        service: method.service.clone(),
+        method: method.method.clone(),
+        interface_major: 1,
+        interface_minor: 2,
+        payload: json!({"size":1}),
+        operation_id: format!("api.{good_parent}"),
+        parent: Some(parent),
+    };
+    assert_eq!(
+        accepted_id(broker.dispatch(intermediary, lookup_child(good_parent))),
+        child
+    );
+    assert_error_code(
+        broker.dispatch(intermediary, lookup_child(good_parent + 1000)),
+        "permission_denied",
+    );
+    assert_error_code(
+        broker.dispatch(intermediary, Command::TakeResult { request: child }),
+        "cancelled",
+    );
+    let mut altered = api_call(good_parent);
+    if let Command::CallApi {
+        ref mut payload, ..
+    } = altered
+    {
+        *payload = json!({"size": 2});
+    }
+    assert_error_code(broker.dispatch(intermediary, altered), "conflict");
+    let mut changed_method = api_call(good_parent);
+    if let Command::CallApi { ref mut method, .. } = changed_method {
+        *method = "other".into();
+    }
+    assert_error_code(
+        broker.dispatch(intermediary, changed_method),
+        "permission_denied",
+    );
+    let mut changed_parent = api_call(good_parent);
+    if let Command::CallApi { ref mut parent, .. } = changed_parent {
+        *parent = Some(good_parent + 1_000);
+    }
+    assert_error_code(
+        broker.dispatch(intermediary, changed_parent),
+        "permission_denied",
+    );
+    assert_error_code(
+        broker.dispatch("org.example.client", api_call(good_parent)),
+        "permission_denied",
+    );
 }
 fn assert_error_code(request_id: Response, expected: &str) {
     assert!(
@@ -1668,6 +1853,780 @@ fn delegated_retries_survive_parent_completion_and_children_cancel() {
 }
 
 #[test]
+fn reliable_poll_repeats_offers_until_accepted_and_fences_mode_changes() {
+    let mut broker = test_broker();
+    let now = Instant::now();
+    let first = accepted_id(broker.dispatch_at("client", request("reliable.first"), now));
+    let second = accepted_id(broker.dispatch_at("client", request("reliable.second"), now));
+    for _ in 0..3 {
+        assert!(
+            matches!(broker.dispatch_at("provider", Command::PollV2 { receiver: "worker".into() }, now), Response::Request { id, .. } if id == first)
+        );
+    }
+    assert_error_code(
+        broker.dispatch_at(
+            "provider",
+            Command::SelectRequestDeliveryMode { reliable: false },
+            now,
+        ),
+        "busy",
+    );
+    assert_error_code(
+        broker.dispatch_at("provider", Command::Poll {}, now),
+        "delivery_mode_mismatch",
+    );
+    assert_error_code(
+        broker.dispatch_at(
+            "provider",
+            Command::AcceptRequest {
+                request: second,
+                receiver: "worker".into(),
+            },
+            now,
+        ),
+        "permission_denied",
+    );
+    assert_error_code(
+        broker.dispatch_at(
+            "secret",
+            Command::AcceptRequest {
+                request: first,
+                receiver: "worker".into(),
+            },
+            now,
+        ),
+        "delivery_mode_mismatch",
+    );
+    assert!(matches!(
+        broker.dispatch_at(
+            "provider",
+            Command::AcceptRequest {
+                request: first,
+                receiver: "worker".into()
+            },
+            now
+        ),
+        Response::Ok
+    ));
+    assert!(matches!(
+        broker.dispatch_at(
+            "provider",
+            Command::AcceptRequest {
+                request: first,
+                receiver: "worker".into()
+            },
+            now
+        ),
+        Response::Ok
+    ));
+    assert!(
+        matches!(broker.dispatch_at("provider", Command::PollV2 { receiver: "worker".into() }, now), Response::Request { id, .. } if id == second)
+    );
+    assert!(matches!(
+        broker.dispatch_at(
+            "provider",
+            Command::AcceptRequest {
+                request: second,
+                receiver: "worker".into()
+            },
+            now
+        ),
+        Response::Ok
+    ));
+    assert_error_code(
+        broker.dispatch_at(
+            "provider",
+            Command::SelectRequestDeliveryMode { reliable: false },
+            now,
+        ),
+        "busy",
+    );
+    for id in [first, second] {
+        assert!(matches!(
+            broker.dispatch_at(
+                "provider",
+                Command::Complete {
+                    request: id,
+                    payload: json!({})
+                },
+                now
+            ),
+            Response::Ok
+        ));
+        assert!(matches!(
+            broker.dispatch_at(
+                "provider",
+                Command::RetireRequestDelivery {
+                    request: id,
+                    receiver: "worker".into()
+                },
+                now
+            ),
+            Response::Ok
+        ));
+    }
+    assert!(matches!(
+        broker.dispatch_at(
+            "provider",
+            Command::SelectRequestDeliveryMode { reliable: false },
+            now
+        ),
+        Response::Ok
+    ));
+    assert!(matches!(
+        broker.dispatch_at("provider", Command::Poll {}, now),
+        Response::Pending
+    ));
+}
+
+#[test]
+fn reliable_retirement_survives_cancel_release_and_result_expiry() {
+    let mut broker = test_broker();
+    let now = Instant::now();
+    let id = accepted_id(broker.dispatch_at("client", request("retire.active"), now));
+    broker.dispatch_at(
+        "provider",
+        Command::PollV2 {
+            receiver: "old".into(),
+        },
+        now,
+    );
+    assert!(matches!(
+        broker.dispatch_at(
+            "provider",
+            Command::AcceptRequest {
+                request: id,
+                receiver: "old".into()
+            },
+            now
+        ),
+        Response::Ok
+    ));
+    assert_error_code(
+        broker.dispatch_at(
+            "provider",
+            Command::RetireRequestDelivery {
+                request: id,
+                receiver: "old".into(),
+            },
+            now,
+        ),
+        "request_pending",
+    );
+    broker.dispatch_at("client", Command::Cancel { request: id }, now);
+    broker.dispatch_at("client", Command::ReleaseResult { request: id }, now);
+    let later = now + Duration::from_secs(301);
+    assert_error_code(
+        broker.dispatch_at(
+            "provider",
+            Command::PollV2 {
+                receiver: "new".into(),
+            },
+            later,
+        ),
+        "busy",
+    );
+    assert_error_code(
+        broker.dispatch_at(
+            "provider",
+            Command::SelectRequestDeliveryMode { reliable: false },
+            later,
+        ),
+        "busy",
+    );
+    assert_error_code(
+        broker.dispatch_at(
+            "provider",
+            Command::RetireRequestDelivery {
+                request: id,
+                receiver: "new".into(),
+            },
+            later,
+        ),
+        "permission_denied",
+    );
+    assert!(matches!(
+        broker.dispatch_at(
+            "provider",
+            Command::RetireRequestDelivery {
+                request: id,
+                receiver: "old".into()
+            },
+            later
+        ),
+        Response::Ok
+    ));
+    assert_error_code(
+        broker.dispatch_at(
+            "provider",
+            Command::RetireRequestDelivery {
+                request: id,
+                receiver: "old".into(),
+            },
+            later,
+        ),
+        "not_found",
+    );
+    assert!(matches!(
+        broker.dispatch_at(
+            "provider",
+            Command::SelectRequestDeliveryMode { reliable: false },
+            later
+        ),
+        Response::Ok
+    ));
+}
+
+#[test]
+fn sdk_retires_lost_acceptance_after_the_caller_cancels_and_releases() {
+    use amaterasu_abi::{
+        AbiHeader, BorrowedBytes, HostApi, ReplySink, STATUS_INTERNAL_ERROR, STATUS_OK, Status,
+    };
+    use amaterasu_module_sdk::{RuntimeClient, requests::ReliableRequestReceiver};
+    use std::ffi::c_void;
+    use std::sync::Mutex;
+
+    struct Endpoint {
+        broker: Mutex<Broker>,
+        // 1 loses the reply before acceptance; 2 loses it after acceptance.
+        lose_acceptance: std::sync::atomic::AtomicUsize,
+    }
+
+    unsafe extern "C" fn invoke(
+        context: *mut c_void,
+        input: BorrowedBytes,
+        reply: ReplySink,
+    ) -> Status {
+        // SAFETY: the fixture and request bytes are kept alive for this call.
+        let endpoint = unsafe { &*context.cast::<Endpoint>() };
+        let Ok(bytes) = (unsafe { input.read() }) else {
+            return STATUS_INTERNAL_ERROR;
+        };
+        let Ok(command) = serde_json::from_slice::<Command>(bytes) else {
+            return STATUS_INTERNAL_ERROR;
+        };
+        let failure = if matches!(command, Command::AcceptRequest { .. }) {
+            endpoint
+                .lose_acceptance
+                .swap(0, std::sync::atomic::Ordering::SeqCst)
+        } else {
+            0
+        };
+        if failure == 1 {
+            return STATUS_INTERNAL_ERROR;
+        }
+        let Ok(mut broker) = endpoint.broker.lock() else {
+            return STATUS_INTERNAL_ERROR;
+        };
+        let response = broker.dispatch("provider", command);
+        drop(broker);
+        if failure == 2 {
+            return STATUS_INTERNAL_ERROR;
+        }
+        let Ok(bytes) = serde_json::to_vec(&response) else {
+            return STATUS_INTERNAL_ERROR;
+        };
+        // SAFETY: the SDK's synchronous reply sink copies these response bytes.
+        unsafe { reply.send(&bytes) };
+        STATUS_OK
+    }
+
+    for failure in [1, 2] {
+        let endpoint = Endpoint {
+            broker: Mutex::new(test_broker()),
+            lose_acceptance: std::sync::atomic::AtomicUsize::new(failure),
+        };
+        let api = HostApi {
+            header: AbiHeader::of::<HostApi>(),
+            context: (&endpoint as *const Endpoint).cast_mut().cast(),
+            invoke,
+        };
+        // SAFETY: the fixture outlives the client and serializes broker calls.
+        let runtime = unsafe { RuntimeClient::from_endpoint(api) };
+        let id = accepted_id(
+            endpoint
+                .broker
+                .lock()
+                .unwrap()
+                .dispatch("client", request("lost.accept")),
+        );
+        let mut receiver = ReliableRequestReceiver::new().unwrap();
+        receiver.select(&runtime).unwrap();
+        assert!(receiver.poll(&runtime).is_err());
+        {
+            let mut broker = endpoint.broker.lock().unwrap();
+            assert!(matches!(
+                broker.dispatch("client", Command::Cancel { request: id }),
+                Response::Ok
+            ));
+            assert!(matches!(
+                broker.dispatch("client", Command::ReleaseResult { request: id }),
+                Response::Ok
+            ));
+        }
+        assert!(receiver.poll(&runtime).unwrap().is_none());
+        assert!(!receiver.is_idle());
+        assert!(receiver.drain(&runtime).unwrap().is_none());
+        assert!(receiver.is_idle());
+        receiver.deselect(&runtime).unwrap();
+    }
+}
+
+#[test]
+fn reliable_unretired_capacity_applies_backpressure() {
+    let mut broker = test_broker();
+    for index in 0..512 {
+        let id = accepted_id(broker.dispatch("client", request(&format!("unretired.{index}"))));
+        broker.dispatch(
+            "provider",
+            Command::PollV2 {
+                receiver: "worker".into(),
+            },
+        );
+        assert!(matches!(
+            broker.dispatch(
+                "provider",
+                Command::AcceptRequest {
+                    request: id,
+                    receiver: "worker".into()
+                }
+            ),
+            Response::Ok
+        ));
+        broker.dispatch("client", Command::Cancel { request: id });
+        broker.dispatch("client", Command::ReleaseResult { request: id });
+    }
+    let id = accepted_id(broker.dispatch("client", request("unretired.overflow")));
+    broker.dispatch(
+        "provider",
+        Command::PollV2 {
+            receiver: "worker".into(),
+        },
+    );
+    assert_error_code(
+        broker.dispatch(
+            "provider",
+            Command::AcceptRequest {
+                request: id,
+                receiver: "worker".into(),
+            },
+        ),
+        "resource_exhausted",
+    );
+}
+
+#[test]
+fn reliable_offers_cannot_be_accepted_after_cancel_or_deadline() {
+    let mut broker = test_broker();
+    let now = Instant::now();
+    let first = accepted_id(broker.dispatch_at("client", request("cancel.offer"), now));
+    assert!(
+        matches!(broker.dispatch_at("provider", Command::PollV2 { receiver: "worker".into() }, now), Response::Request { id, .. } if id == first)
+    );
+    broker.dispatch_at("client", Command::Cancel { request: first }, now);
+    assert_error_code(
+        broker.dispatch_at(
+            "provider",
+            Command::AcceptRequest {
+                request: first,
+                receiver: "worker".into(),
+            },
+            now,
+        ),
+        "request_ended",
+    );
+    let second = accepted_id(broker.dispatch_at("client", request("deadline.offer"), now));
+    assert!(
+        matches!(broker.dispatch_at("provider", Command::PollV2 { receiver: "worker".into() }, now), Response::Request { id, .. } if id == second)
+    );
+    assert_error_code(
+        broker.dispatch_at(
+            "provider",
+            Command::AcceptRequest {
+                request: second,
+                receiver: "worker".into(),
+            },
+            now + Duration::from_millis(101),
+        ),
+        "request_ended",
+    );
+    assert!(matches!(
+        broker.dispatch_at(
+            "provider",
+            Command::PollV2 {
+                receiver: "worker".into()
+            },
+            now + Duration::from_millis(101)
+        ),
+        Response::Pending
+    ));
+}
+
+#[test]
+fn legacy_delivery_cannot_switch_modes_until_the_active_request_ends() {
+    let mut broker = test_broker();
+    let id = accepted_id(broker.dispatch("client", request("legacy.active")));
+    assert!(
+        matches!(broker.dispatch("provider", Command::Poll {}), Response::Request { id: delivered, .. } if delivered == id)
+    );
+    assert_error_code(
+        broker.dispatch(
+            "provider",
+            Command::PollV2 {
+                receiver: "worker".into(),
+            },
+        ),
+        "delivery_mode_mismatch",
+    );
+    assert_error_code(
+        broker.dispatch(
+            "provider",
+            Command::SelectRequestDeliveryMode { reliable: true },
+        ),
+        "busy",
+    );
+    broker.dispatch("client", Command::Cancel { request: id });
+    assert_error_code(
+        broker.dispatch(
+            "provider",
+            Command::SelectRequestDeliveryMode { reliable: true },
+        ),
+        "busy",
+    );
+}
+
+#[test]
+fn legacy_success_allows_mode_switch_but_timeout_taints_past_result_retention() {
+    let mut successful = test_broker();
+    let now = Instant::now();
+    let id = accepted_id(successful.dispatch_at("client", request("legacy.success"), now));
+    successful.dispatch_at("provider", Command::Poll {}, now);
+    assert!(matches!(
+        successful.dispatch_at(
+            "provider",
+            Command::Complete {
+                request: id,
+                payload: json!({})
+            },
+            now
+        ),
+        Response::Ok
+    ));
+    assert!(matches!(
+        successful.dispatch_at(
+            "provider",
+            Command::SelectRequestDeliveryMode { reliable: true },
+            now
+        ),
+        Response::Ok
+    ));
+    let mut expired = test_broker();
+    accepted_id(expired.dispatch_at("client", request("legacy.expired"), now));
+    expired.dispatch_at("provider", Command::Poll {}, now);
+    assert_error_code(
+        expired.dispatch_at(
+            "provider",
+            Command::SelectRequestDeliveryMode { reliable: true },
+            now + Duration::from_secs(301),
+        ),
+        "busy",
+    );
+    assert_error_code(
+        expired.dispatch_at(
+            "provider",
+            Command::SelectRequestDeliveryMode { reliable: true },
+            now + Duration::from_secs(602),
+        ),
+        "busy",
+    );
+}
+
+#[test]
+fn inspecting_offers_never_delivers_queued_work_and_observes_retirement() {
+    let mut broker = test_broker();
+    let now = Instant::now();
+    let inspect = |receiver: &str| Command::InspectRequestOffer {
+        receiver: receiver.into(),
+    };
+    let id = accepted_id(broker.dispatch_at("client", request("inspect.offer"), now));
+    assert!(matches!(
+        broker.dispatch_at("provider", inspect("worker"), now),
+        Response::Pending
+    ));
+    assert!(matches!(
+        broker.dispatch_at(
+            "provider",
+            Command::SelectRequestDeliveryMode { reliable: true },
+            now
+        ),
+        Response::Ok
+    ));
+    assert!(matches!(
+        broker.dispatch_at("provider", inspect("worker"), now),
+        Response::Pending
+    ));
+    assert!(
+        matches!(broker.dispatch_at("provider", Command::PollV2 { receiver: "worker".into() }, now), Response::Request { id: offered, .. } if offered == id)
+    );
+    assert!(
+        matches!(broker.dispatch_at("provider", inspect("worker"), now + Duration::from_millis(50)), Response::Request { id: offered, remaining_ms, .. } if offered == id && remaining_ms <= 50)
+    );
+    assert!(matches!(
+        broker.dispatch_at("provider", inspect("other"), now),
+        Response::Pending
+    ));
+    broker.dispatch_at("client", Command::Cancel { request: id }, now);
+    assert!(matches!(
+        broker.dispatch_at("provider", inspect("worker"), now),
+        Response::Pending
+    ));
+    let expired = accepted_id(broker.dispatch_at("client", request("inspect.deadline"), now));
+    assert!(
+        matches!(broker.dispatch_at("provider", Command::PollV2 { receiver: "worker".into() }, now), Response::Request { id: offered, .. } if offered == expired)
+    );
+    assert!(matches!(
+        broker.dispatch_at(
+            "provider",
+            inspect("worker"),
+            now + Duration::from_millis(101)
+        ),
+        Response::Pending
+    ));
+    assert!(matches!(
+        broker.dispatch_at(
+            "provider",
+            Command::SelectRequestDeliveryMode { reliable: false },
+            now + Duration::from_millis(101)
+        ),
+        Response::Ok
+    ));
+}
+
+#[test]
+fn replacement_receiver_waits_for_original_offer_to_end() {
+    let mut broker = test_broker();
+    let now = Instant::now();
+    let first = accepted_id(broker.dispatch_at("client", request("old.receiver"), now));
+    assert!(
+        matches!(broker.dispatch_at("provider", Command::PollV2 { receiver: "old".into() }, now), Response::Request { id, .. } if id == first)
+    );
+    assert_error_code(
+        broker.dispatch_at(
+            "provider",
+            Command::PollV2 {
+                receiver: "new".into(),
+            },
+            now,
+        ),
+        "busy",
+    );
+    assert_error_code(
+        broker.dispatch_at(
+            "provider",
+            Command::SelectRequestDeliveryMode { reliable: false },
+            now,
+        ),
+        "busy",
+    );
+    let later = now + Duration::from_millis(101);
+    let second = accepted_id(broker.dispatch_at("client", request("new.receiver"), later));
+    assert!(
+        matches!(broker.dispatch_at("provider", Command::PollV2 { receiver: "new".into() }, later), Response::Request { id, .. } if id == second)
+    );
+    assert_error_code(
+        broker.dispatch_at(
+            "provider",
+            Command::AcceptRequest {
+                request: first,
+                receiver: "old".into(),
+            },
+            later,
+        ),
+        "request_ended",
+    );
+}
+
+#[test]
+fn concurrent_reliable_polls_observe_one_offer() {
+    let broker = std::sync::Arc::new(std::sync::Mutex::new(test_broker()));
+    let id = accepted_id(
+        broker
+            .lock()
+            .unwrap()
+            .dispatch("client", request("parallel.offer")),
+    );
+    let threads: Vec<_> = (0..8)
+        .map(|index| {
+            let broker = broker.clone();
+            std::thread::spawn(move || {
+                let receiver = format!("worker.{index}");
+                let response = broker.lock().unwrap().dispatch(
+                    "provider",
+                    Command::PollV2 {
+                        receiver: receiver.clone(),
+                    },
+                );
+                (receiver, response)
+            })
+        })
+        .collect();
+    let mut winner = None;
+    for thread in threads {
+        let (receiver, response) = thread.join().unwrap();
+        match response {
+            Response::Request { id: offered, .. } => {
+                assert_eq!(offered, id);
+                assert!(winner.replace(receiver).is_none());
+            }
+            Response::Error { code, .. } => assert_eq!(code, "busy"),
+            other => panic!("unexpected poll response: {other:?}"),
+        }
+    }
+    let winner = winner.unwrap();
+    assert_error_code(
+        broker.lock().unwrap().dispatch(
+            "provider",
+            Command::AcceptRequest {
+                request: id,
+                receiver: "other".into(),
+            },
+        ),
+        "permission_denied",
+    );
+    assert!(matches!(
+        broker.lock().unwrap().dispatch(
+            "provider",
+            Command::AcceptRequest {
+                request: id,
+                receiver: winner.clone()
+            }
+        ),
+        Response::Ok
+    ));
+    assert_error_code(
+        broker.lock().unwrap().dispatch(
+            "provider",
+            Command::AcceptRequest {
+                request: id,
+                receiver: "other".into(),
+            },
+        ),
+        "permission_denied",
+    );
+    assert!(matches!(
+        broker.lock().unwrap().dispatch(
+            "provider",
+            Command::AcceptRequest {
+                request: id,
+                receiver: winner
+            }
+        ),
+        Response::Ok
+    ));
+}
+
+#[test]
+fn request_lookup_is_caller_scoped_and_never_admits_work() {
+    let mut configuration = RuntimeConfig::default();
+    for caller in ["owner", "other"] {
+        configuration.principals.insert(
+            caller.into(),
+            Grants {
+                call: names(&["work/1"]),
+                ..Default::default()
+            },
+        );
+    }
+    configuration.principals.insert(
+        "provider".into(),
+        Grants {
+            provide: names(&["work/1"]),
+            ..Default::default()
+        },
+    );
+    let mut broker = Broker::new(configuration).unwrap();
+    broker.dispatch(
+        "provider",
+        Command::Register {
+            service: "work/1".into(),
+        },
+    );
+    let now = Instant::now();
+    let lookup = |payload, parent| Command::LookupRequest {
+        service: "work/1".into(),
+        payload,
+        operation_id: "unique".into(),
+        parent,
+    };
+    assert_error_code(
+        broker.dispatch_at("owner", lookup(json!(1), None), now),
+        "not_found",
+    );
+    assert!(matches!(
+        broker.dispatch_at("provider", Command::Poll {}, now),
+        Response::Pending
+    ));
+    let id = accepted_id(broker.dispatch_at(
+        "owner",
+        Command::Request {
+            service: "work/1".into(),
+            payload: json!(1),
+            timeout_ms: 1000,
+            operation_id: "unique".into(),
+            parent: None,
+        },
+        now,
+    ));
+    assert_eq!(
+        accepted_id(broker.dispatch_at("owner", lookup(json!(1), None), now)),
+        id
+    );
+    assert_error_code(
+        broker.dispatch_at("owner", lookup(json!(2), None), now),
+        "conflict",
+    );
+    assert_error_code(
+        broker.dispatch_at("owner", lookup(json!(1), Some(1)), now),
+        "conflict",
+    );
+    assert_error_code(
+        broker.dispatch_at("other", lookup(json!(1), None), now),
+        "not_found",
+    );
+    assert!(
+        matches!(broker.dispatch_at("provider", Command::Poll {}, now), Response::Request { id: delivered, .. } if delivered == id)
+    );
+    assert!(matches!(
+        broker.dispatch_at("provider", Command::Poll {}, now),
+        Response::Pending
+    ));
+    broker.dispatch_at(
+        "provider",
+        Command::Complete {
+            request: id,
+            payload: json!(true),
+        },
+        now,
+    );
+    assert_eq!(
+        accepted_id(broker.dispatch_at("owner", lookup(json!(1), None), now)),
+        id
+    );
+    assert_error_code(
+        broker.dispatch_at(
+            "owner",
+            lookup(json!(1), None),
+            now + Duration::from_secs(301),
+        ),
+        "not_found",
+    );
+    assert!(matches!(
+        broker.dispatch_at("provider", Command::Poll {}, now + Duration::from_secs(301)),
+        Response::Pending
+    ));
+}
+
+#[test]
 fn cancelling_a_hook_cancels_delegated_children_before_releasing_the_participant() {
     for cleanup in [false, true] {
         let mut configuration = RuntimeConfig::default();
@@ -1866,6 +2825,18 @@ fn hook_operations_do_not_conflict_with_caller_operation_identifiers() {
         },
     ));
     broker.dispatch("client", Command::HookResult { invocation });
+    assert_error_code(
+        broker.dispatch(
+            "client",
+            Command::LookupRequest {
+                service: "echo/1".into(),
+                payload: json!({}),
+                operation_id: format!("hook.{invocation}.provider"),
+                parent: None,
+            },
+        ),
+        "not_found",
+    );
     accepted_id(broker.dispatch("client", request(&format!("hook.{invocation}.provider"))));
 }
 

@@ -235,7 +235,9 @@ impl NativeServices {
         };
         let valid = status == STATUS_OK && unsafe { valid_interface(output, &query) };
         let Ok(mut registry) = self.registry.lock() else {
-            if valid {
+            // Even an incompatible table can own native resources. A complete
+            // ABI prefix is sufficient to release it, as on ordinary rejection.
+            if status == STATUS_OK && unsafe { releasable(output) } {
                 unsafe { release_interface(output) };
             }
             return unavailable();

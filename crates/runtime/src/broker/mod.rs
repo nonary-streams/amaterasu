@@ -135,7 +135,20 @@ impl Broker {
                 return errors::permission_denied();
             }
             return match command {
-                Command::Poll {} => self.requests.poll(caller, now),
+                Command::Poll {} => self.requests.poll(caller, now, None),
+                Command::PollV2 { receiver } => self.requests.poll(caller, now, Some(&receiver)),
+                Command::InspectRequestOffer { receiver } => {
+                    self.requests.inspect_offer(caller, &receiver, now)
+                }
+                Command::SelectRequestDeliveryMode { reliable } => {
+                    self.requests.select_delivery_mode(caller, reliable)
+                }
+                Command::AcceptRequest { request, receiver } => {
+                    self.requests.accept(caller, request, &receiver)
+                }
+                Command::RetireRequestDelivery { request, receiver } => {
+                    self.requests.retire_delivery(caller, request, &receiver)
+                }
                 Command::CheckRequest { request } => self.requests.check_active(caller, request),
                 Command::Complete { request, payload } => {
                     self.requests.complete(caller, request, payload, now)
@@ -434,7 +447,14 @@ impl Broker {
                     Some(parent_id) => {
                         match self.requests.initiator_for_parent(caller, parent_id) {
                             Ok(initiator) => initiator.to_owned(),
-                            Err(error) => return error,
+                            Err(error) => match self.requests.initiator_for_retry(
+                                caller,
+                                &operation_id,
+                                parent_id,
+                            ) {
+                                Some(initiator) => initiator.to_owned(),
+                                None => return error,
+                            },
                         }
                     }
                     None => caller.to_owned(),
@@ -490,7 +510,89 @@ impl Broker {
                 };
                 self.requests.submit(caller, grants, options, now)
             }
-            Command::Poll {} => self.requests.poll(caller, now),
+            Command::LookupRequest {
+                service,
+                payload,
+                operation_id,
+                parent,
+            } => self.requests.lookup(
+                caller,
+                grants,
+                &RequestOptions {
+                    service,
+                    payload,
+                    operation_id,
+                    parent,
+                    timeout_ms: 0,
+                    response_schema: None,
+                },
+            ),
+            Command::LookupApiRequest {
+                service,
+                method,
+                interface_major,
+                interface_minor,
+                payload,
+                operation_id,
+                parent,
+            } => {
+                let initiator = match parent {
+                    Some(parent_id) => {
+                        match self.requests.initiator_for_parent(caller, parent_id) {
+                            Ok(initiator) => initiator,
+                            Err(error) => match self.requests.initiator_for_retry(
+                                caller,
+                                &operation_id,
+                                parent_id,
+                            ) {
+                                Some(initiator) => initiator,
+                                None => return error,
+                            },
+                        }
+                    }
+                    None => caller,
+                };
+                match self.api.callable(
+                    caller,
+                    initiator,
+                    grants,
+                    ApiInvocation {
+                        service: &service,
+                        method: &method,
+                        major: interface_major,
+                        minor: interface_minor,
+                        payload: &payload,
+                    },
+                ) {
+                    Ok((payload, response_schema)) => self.requests.lookup(
+                        caller,
+                        grants,
+                        &RequestOptions {
+                            service,
+                            payload,
+                            operation_id,
+                            parent,
+                            timeout_ms: 0,
+                            response_schema: Some(response_schema),
+                        },
+                    ),
+                    Err(error) => error,
+                }
+            }
+            Command::Poll {} => self.requests.poll(caller, now, None),
+            Command::PollV2 { receiver } => self.requests.poll(caller, now, Some(&receiver)),
+            Command::InspectRequestOffer { receiver } => {
+                self.requests.inspect_offer(caller, &receiver, now)
+            }
+            Command::SelectRequestDeliveryMode { reliable } => {
+                self.requests.select_delivery_mode(caller, reliable)
+            }
+            Command::AcceptRequest { request, receiver } => {
+                self.requests.accept(caller, request, &receiver)
+            }
+            Command::RetireRequestDelivery { request, receiver } => {
+                self.requests.retire_delivery(caller, request, &receiver)
+            }
             Command::CheckRequest { request } => self.requests.check_active(caller, request),
             Command::Complete { request, payload } => {
                 self.requests.complete(caller, request, payload, now)

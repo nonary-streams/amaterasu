@@ -24,6 +24,512 @@ impl IncomingRequest<Value> {
     }
 }
 
+/// Opt-in receiver for broker deliveries that must survive a lost poll reply.
+/// Serialize calls through each receiver. Every instance has a unique broker
+/// identity; a replacement cannot claim a live receiver's unaccepted offer.
+/// An offer is retained locally until its acceptance is confirmed, so an
+/// acceptance reply lost in transport cannot dispatch the handler twice.
+pub struct ReliableRequestReceiver {
+    receiver: String,
+    offered: Option<IncomingRequest<Value>>,
+    offer_started: Option<std::time::Instant>,
+    poll_uncertain: bool,
+    undispatched: Option<u64>,
+}
+
+impl ReliableRequestReceiver {
+    /// Create a receiver with an unpredictable identity. Entropy failure is
+    /// returned rather than reusing an identity from another provider instance.
+    pub fn new() -> ModuleResult<Self> {
+        let mut bytes = [0u8; 16];
+        getrandom::fill(&mut bytes)
+            .map_err(|error| format!("receiver identity unavailable: {error}"))?;
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut receiver = String::with_capacity(32);
+        for byte in bytes {
+            receiver.push(HEX[(byte >> 4) as usize] as char);
+            receiver.push(HEX[(byte & 15) as usize] as char);
+        }
+        Ok(Self {
+            receiver,
+            offered: None,
+            offer_started: None,
+            poll_uncertain: false,
+            undispatched: None,
+        })
+    }
+    /// Select reliable delivery. A broker may reject a mode transition while
+    /// previous deliveries are still active; do not fall back to legacy poll.
+    pub fn select(&mut self, runtime: &RuntimeClient) -> ModuleResult<()> {
+        runtime.require_success(Command::SelectRequestDeliveryMode { reliable: true })
+    }
+
+    /// Permit a later legacy provider to select its delivery mode. Call only
+    /// after all requests handed to handlers have actually retired; broker
+    /// request completion alone does not prove native effects have stopped.
+    pub fn deselect(&mut self, runtime: &RuntimeClient) -> ModuleResult<()> {
+        if !self.is_idle() {
+            return Err("reliable receiver still owns an offer".into());
+        }
+        runtime.require_success(Command::SelectRequestDeliveryMode { reliable: false })
+    }
+
+    /// Poll or retry acceptance. An error preserves any unaccepted offer for
+    /// the next call. A returned request must be handed to its handler once.
+    /// Check broker liveness immediately before effects; cancellation can
+    /// still race that check and requires provider-specific reconciliation.
+    pub fn poll(
+        &mut self,
+        runtime: &RuntimeClient,
+    ) -> ModuleResult<Option<IncomingRequest<Value>>> {
+        self.poll_with(&mut |command| runtime.send(command))
+    }
+
+    /// Resolve a lost poll reply without admitting new work. Returned requests
+    /// still require handling and completion before the provider can retire.
+    pub fn drain(
+        &mut self,
+        runtime: &RuntimeClient,
+    ) -> ModuleResult<Option<IncomingRequest<Value>>> {
+        self.drain_with(&mut |command| runtime.send(command))
+    }
+
+    /// This excludes work already handed to handlers, which the provider must
+    /// track separately through completion.
+    pub fn is_idle(&self) -> bool {
+        self.offered.is_none() && !self.poll_uncertain && self.undispatched.is_none()
+    }
+
+    /// Confirm that a previously returned handler and all of its effects have
+    /// actually retired. A false result means the broker request is still active;
+    /// retry without releasing the provider or its resources.
+    pub fn retire(&mut self, runtime: &RuntimeClient, request: u64) -> ModuleResult<bool> {
+        self.retire_with(request, &mut |command| runtime.send(command))
+    }
+
+    fn retire_with(
+        &self,
+        request: u64,
+        send: &mut impl FnMut(Command) -> ModuleResult<Response>,
+    ) -> ModuleResult<bool> {
+        match send(Command::RetireRequestDelivery {
+            request,
+            receiver: self.receiver.clone(),
+        })? {
+            Response::Ok => Ok(true),
+            Response::Error { code, .. } if code == "not_found" => Ok(true),
+            Response::Error { code, .. } if code == "request_pending" => Ok(false),
+            response => Err(format!(
+                "unexpected delivery retirement response: {response:?}"
+            )),
+        }
+    }
+
+    fn retire_undispatched(
+        &mut self,
+        send: &mut impl FnMut(Command) -> ModuleResult<Response>,
+    ) -> ModuleResult<()> {
+        if let Some(request) = self.undispatched
+            && self.retire_with(request, send)?
+        {
+            self.undispatched = None;
+        }
+        Ok(())
+    }
+
+    fn drain_with(
+        &mut self,
+        send: &mut impl FnMut(Command) -> ModuleResult<Response>,
+    ) -> ModuleResult<Option<IncomingRequest<Value>>> {
+        if self.undispatched.is_some() {
+            self.retire_undispatched(send)?;
+            return Ok(None);
+        }
+        if self.offered.is_none() && self.poll_uncertain {
+            let started = std::time::Instant::now();
+            match send(Command::InspectRequestOffer {
+                receiver: self.receiver.clone(),
+            })? {
+                Response::Pending => self.poll_uncertain = false,
+                Response::Request {
+                    id,
+                    caller,
+                    initiator,
+                    service,
+                    payload,
+                    remaining_ms,
+                } => {
+                    self.offered = Some(IncomingRequest {
+                        id,
+                        caller,
+                        initiator,
+                        service,
+                        payload,
+                        remaining_ms,
+                    });
+                    self.offer_started = Some(started);
+                    self.poll_uncertain = false;
+                }
+                response => {
+                    return Err(format!(
+                        "unexpected reliable offer inspection response: {response:?}"
+                    ));
+                }
+            }
+        }
+        self.accept_offered(send)
+    }
+
+    fn poll_with(
+        &mut self,
+        send: &mut impl FnMut(Command) -> ModuleResult<Response>,
+    ) -> ModuleResult<Option<IncomingRequest<Value>>> {
+        if self.undispatched.is_some() {
+            self.retire_undispatched(send)?;
+            return Ok(None);
+        }
+        if self.offered.is_none() {
+            // Charge time spent in the poll call as well as acceptance retries
+            // against the broker's remaining deadline.
+            let offer_started = std::time::Instant::now();
+            self.poll_uncertain = true;
+            match send(Command::PollV2 {
+                receiver: self.receiver.clone(),
+            })? {
+                Response::Pending => {
+                    self.poll_uncertain = false;
+                    return Ok(None);
+                }
+                Response::Request {
+                    id,
+                    caller,
+                    initiator,
+                    service,
+                    payload,
+                    remaining_ms,
+                } => {
+                    self.offered = Some(IncomingRequest {
+                        id,
+                        caller,
+                        initiator,
+                        service,
+                        payload,
+                        remaining_ms,
+                    });
+                    self.offer_started = Some(offer_started);
+                    self.poll_uncertain = false;
+                }
+                response => return Err(format!("unexpected reliable poll response: {response:?}")),
+            }
+        }
+        self.accept_offered(send)
+    }
+
+    fn accept_offered(
+        &mut self,
+        send: &mut impl FnMut(Command) -> ModuleResult<Response>,
+    ) -> ModuleResult<Option<IncomingRequest<Value>>> {
+        let Some(request) = self.offered.as_ref().map(|offer| offer.id) else {
+            return Ok(None);
+        };
+        match send(Command::AcceptRequest {
+            request,
+            receiver: self.receiver.clone(),
+        })? {
+            Response::Ok => {
+                let mut request = self.offered.take().expect("offer retained");
+                let elapsed = self
+                    .offer_started
+                    .take()
+                    .expect("offer timestamp")
+                    .elapsed()
+                    .as_millis();
+                request.remaining_ms = request
+                    .remaining_ms
+                    .saturating_sub(elapsed.min(u128::from(u64::MAX)) as u64);
+                if request.remaining_ms == 0 {
+                    // No handler ran. Wait for the broker deadline before
+                    // retiring the delivery, without fabricating a result.
+                    self.undispatched = Some(request.id);
+                    return Ok(None);
+                }
+                Ok(Some(request))
+            }
+            Response::Error { code, .. } if code == "request_ended" || code == "not_found" => {
+                self.offered = None;
+                self.offer_started = None;
+                // An earlier acceptance reply may have been lost before the
+                // request ended. Retire a possible accepted delivery even
+                // though this receiver never dispatched it to a handler.
+                self.undispatched = Some(request);
+                Ok(None)
+            }
+            response => Err(format!(
+                "unexpected reliable acceptance response: {response:?}"
+            )),
+        }
+    }
+}
+
+#[cfg(test)]
+mod reliable_delivery_tests {
+    use super::*;
+
+    fn offer() -> Response {
+        Response::Request {
+            id: 17,
+            caller: "caller".into(),
+            initiator: "initiator".into(),
+            service: "service/1".into(),
+            payload: serde_json::json!({"action":"write"}),
+            remaining_ms: 500,
+        }
+    }
+
+    #[test]
+    fn lost_poll_and_acceptance_replies_do_not_dispatch_twice() {
+        let mut receiver = ReliableRequestReceiver::new().unwrap();
+        assert!(
+            receiver
+                .poll_with(&mut |_| Err("lost poll".into()))
+                .is_err()
+        );
+        let mut calls = 0;
+        assert!(
+            receiver
+                .poll_with(&mut |command| {
+                    calls += 1;
+                    match command {
+                        Command::PollV2 { .. } => Ok(offer()),
+                        Command::AcceptRequest { request: 17, .. } => Err("lost acceptance".into()),
+                        _ => panic!("unexpected command"),
+                    }
+                })
+                .is_err()
+        );
+        assert_eq!(calls, 2);
+        let request = receiver
+            .poll_with(&mut |command| {
+                assert!(matches!(
+                    command,
+                    Command::AcceptRequest { request: 17, .. }
+                ));
+                Ok(Response::Ok)
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(request.id, 17);
+        assert!(
+            receiver
+                .poll_with(&mut |command| {
+                    assert!(matches!(command, Command::PollV2 { .. }));
+                    Ok(Response::Pending)
+                })
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn expired_offer_is_not_dispatched() {
+        let mut receiver = ReliableRequestReceiver::new().unwrap();
+        assert!(
+            receiver
+                .poll_with(&mut |command| match command {
+                    Command::PollV2 { .. } => Ok(offer()),
+                    Command::AcceptRequest { request: 17, .. } =>
+                        Ok(Response::error("request_ended", "expired")),
+                    _ => panic!("unexpected command"),
+                })
+                .unwrap()
+                .is_none()
+        );
+        assert!(!receiver.is_idle());
+        assert!(
+            receiver
+                .drain_with(&mut |command| {
+                    assert!(matches!(
+                        command,
+                        Command::RetireRequestDelivery { request: 17, .. }
+                    ));
+                    Ok(Response::error("not_found", "not accepted"))
+                })
+                .unwrap()
+                .is_none()
+        );
+        assert!(receiver.is_idle());
+    }
+
+    #[test]
+    fn lost_acceptance_then_expiry_still_retires_delivery() {
+        let mut receiver = ReliableRequestReceiver::new().unwrap();
+        assert!(
+            receiver
+                .poll_with(&mut |command| match command {
+                    Command::PollV2 { .. } => Ok(offer()),
+                    Command::AcceptRequest { .. } => Err("accept reply lost".into()),
+                    _ => panic!("unexpected command"),
+                })
+                .is_err()
+        );
+        assert!(
+            receiver
+                .drain_with(&mut |command| {
+                    assert!(matches!(
+                        command,
+                        Command::AcceptRequest { request: 17, .. }
+                    ));
+                    Ok(Response::error("request_ended", "expired"))
+                })
+                .unwrap()
+                .is_none()
+        );
+        assert!(!receiver.is_idle());
+        assert!(
+            receiver
+                .drain_with(&mut |command| {
+                    assert!(matches!(
+                        command,
+                        Command::RetireRequestDelivery { request: 17, .. }
+                    ));
+                    Ok(Response::Ok)
+                })
+                .unwrap()
+                .is_none()
+        );
+        assert!(receiver.is_idle());
+    }
+
+    #[test]
+    fn delayed_acceptance_waits_for_deadline_without_dispatching() {
+        let mut receiver = ReliableRequestReceiver::new().unwrap();
+        assert!(
+            receiver
+                .poll_with(&mut |command| match command {
+                    Command::PollV2 { .. } => Ok(offer()),
+                    Command::AcceptRequest { .. } => Err("lost reply".into()),
+                    _ => panic!("unexpected command"),
+                })
+                .is_err()
+        );
+        receiver.offer_started =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+        assert!(
+            receiver
+                .poll_with(&mut |_| Ok(Response::Ok))
+                .unwrap()
+                .is_none()
+        );
+        assert!(!receiver.is_idle());
+        assert!(
+            receiver
+                .drain_with(&mut |command| {
+                    assert!(matches!(
+                        command,
+                        Command::RetireRequestDelivery { request: 17, .. }
+                    ));
+                    Ok(Response::error("request_pending", "not yet expired"))
+                })
+                .unwrap()
+                .is_none()
+        );
+        assert!(!receiver.is_idle());
+        assert!(
+            receiver
+                .drain_with(&mut |command| {
+                    assert!(matches!(
+                        command,
+                        Command::RetireRequestDelivery { request: 17, .. }
+                    ));
+                    Err("retirement reply lost".into())
+                })
+                .is_err()
+        );
+        assert!(!receiver.is_idle());
+        assert!(
+            receiver
+                .drain_with(&mut |command| {
+                    assert!(matches!(
+                        command,
+                        Command::RetireRequestDelivery { request: 17, .. }
+                    ));
+                    Ok(Response::error("not_found", "already retired"))
+                })
+                .unwrap()
+                .is_none()
+        );
+        assert!(receiver.is_idle());
+    }
+
+    #[test]
+    fn submillisecond_deadline_rounding_never_dispatches() {
+        let mut receiver = ReliableRequestReceiver::new().unwrap();
+        let result = receiver
+            .poll_with(&mut |command| match command {
+                Command::PollV2 { .. } => match offer() {
+                    Response::Request {
+                        id,
+                        caller,
+                        initiator,
+                        service,
+                        payload,
+                        ..
+                    } => Ok(Response::Request {
+                        id,
+                        caller,
+                        initiator,
+                        service,
+                        payload,
+                        remaining_ms: 0,
+                    }),
+                    _ => unreachable!(),
+                },
+                Command::AcceptRequest { .. } => Ok(Response::Ok),
+                _ => panic!("unexpected command"),
+            })
+            .unwrap();
+        assert!(result.is_none());
+        assert!(!receiver.is_idle());
+    }
+
+    #[test]
+    fn drain_resolves_lost_poll_without_offering_new_work() {
+        let mut receiver = ReliableRequestReceiver::new().unwrap();
+        assert!(
+            receiver
+                .poll_with(&mut |_| Err("lost poll".into()))
+                .is_err()
+        );
+        assert!(!receiver.is_idle());
+        assert!(
+            receiver
+                .drain_with(&mut |command| {
+                    assert!(matches!(command, Command::InspectRequestOffer { .. }));
+                    Ok(Response::Pending)
+                })
+                .unwrap()
+                .is_none()
+        );
+        assert!(receiver.is_idle());
+
+        assert!(
+            receiver
+                .poll_with(&mut |_| Err("lost poll".into()))
+                .is_err()
+        );
+        let request = receiver
+            .drain_with(&mut |command| match command {
+                Command::InspectRequestOffer { .. } => Ok(offer()),
+                Command::AcceptRequest { request: 17, .. } => Ok(Response::Ok),
+                _ => panic!("drain admitted new work"),
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(request.id, 17);
+        assert!(receiver.is_idle());
+    }
+}
+
 /// Request admission parameters. Reuse the same operation ID and unchanged
 /// payload when retrying a lost admission reply; choose a new ID for new work.
 pub struct RequestOptions<'a> {

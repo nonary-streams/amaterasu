@@ -176,6 +176,62 @@ fn incompatible_interface_is_released_and_reservation_recovered() {
     assert_eq!(context.releases.load(Ordering::SeqCst), 1);
     assert!(services.registry.lock().unwrap().bindings.is_empty());
 }
+
+unsafe extern "C" fn release_after_poison(context: *mut c_void) {
+    // SAFETY: the factory transfers this unique table to the runtime.
+    let table = unsafe { Box::from_raw(context.cast::<Table>()) };
+    let context = unsafe { &*table.context };
+    // A poisoned but unlocked mutex proves the callback is outside the lock.
+    assert!(matches!(
+        unsafe { &*context.services }.registry.try_lock(),
+        Err(std::sync::TryLockError::Poisoned(_))
+    ));
+    context.releases.fetch_add(1, Ordering::SeqCst);
+}
+
+unsafe extern "C" fn bind_then_poison_registry(
+    context: *mut c_void,
+    caller: BorrowedBytes,
+    query: *const NativeInterfaceQuery,
+    output: *mut *const NativeInterface,
+) -> Status {
+    // SAFETY: this fixture uses the same live context and output as `bind`.
+    let status = unsafe { bind(context, caller, query, output) };
+    let table = unsafe { (*output).cast_mut().cast::<Table>() };
+    unsafe { (*table).base.release = Some(release_after_poison) };
+    let context = unsafe { &*context.cast::<Context>() };
+    let services = unsafe { &*context.services };
+    let _ = std::panic::catch_unwind(|| {
+        let _guard = services.registry.lock().unwrap();
+        panic!("injected registry failure during bind");
+    });
+    status
+}
+
+#[test]
+fn poisoned_registry_releases_incompatible_factory_output() {
+    let services = services();
+    let context = context(&services, true);
+    let mut factory = factory(&context);
+    factory.bind = Some(bind_then_poison_registry);
+    assert!(matches!(
+        unsafe {
+            services.dispatch(
+                "provider",
+                Command::NativeRegister {
+                    service: "frames/1".into(),
+                    factory: &factory as *const _ as usize,
+                },
+            )
+        },
+        Response::Ok
+    ));
+    assert!(matches!(
+        unsafe { services.dispatch("consumer", query()) },
+        Response::Error { code, .. } if code == "runtime_unavailable"
+    ));
+    assert_eq!(context.releases.load(Ordering::SeqCst), 1);
+}
 #[test]
 fn short_factory_header_is_rejected_before_callback_read() {
     let services = services();

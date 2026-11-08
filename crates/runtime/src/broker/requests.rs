@@ -31,10 +31,25 @@ struct RequestRecord {
     completed_at: Option<Instant>,
     result: Option<Response>,
     delivered: bool,
+    accepted_receiver: Option<String>,
     internal_hook: bool,
 }
 
 impl RequestRecord {
+    fn offer_response(&self, id: u64, now: Instant) -> Response {
+        Response::Request {
+            id,
+            caller: self.caller.clone(),
+            initiator: self.authority.initiator.clone(),
+            service: self.options.service.clone(),
+            payload: self.options.payload.clone(),
+            remaining_ms: self
+                .authority
+                .deadline
+                .saturating_duration_since(now)
+                .as_millis() as u64,
+        }
+    }
     fn finish(&mut self, result: Response, now: Instant) {
         self.result = Some(result);
         self.completed_at = Some(now);
@@ -44,6 +59,7 @@ impl RequestRecord {
         self.options.service == options.service
             && self.options.payload == options.payload
             && self.options.parent == options.parent
+            && self.options.response_schema == options.response_schema
     }
 }
 
@@ -52,6 +68,10 @@ pub(super) struct RequestRouter {
     providers: BTreeMap<String, String>,
     requests: BTreeMap<u64, RequestRecord>,
     provider_queues: BTreeMap<String, VecDeque<u64>>,
+    delivery_modes: BTreeMap<String, bool>,
+    offers: BTreeMap<String, (u64, String)>,
+    unretired: BTreeMap<u64, (String, String)>,
+    legacy_tainted: BTreeSet<String>,
     next_request_id: u64,
     last_capacity_report: Option<Instant>,
 }
@@ -68,6 +88,19 @@ impl RequestRouter {
             return Err(permission_denied());
         }
         Ok(&parent.authority.initiator)
+    }
+
+    /// Recover only the authority of this caller's retained operation when its
+    /// parent has already been released. Submission still checks the complete
+    /// request against the retained operation before returning its identifier.
+    pub fn initiator_for_retry(&self, caller: &str, operation: &str, parent: u64) -> Option<&str> {
+        self.requests.values().find_map(|request| {
+            (!request.internal_hook
+                && request.caller == caller
+                && request.options.operation_id == operation
+                && request.options.parent == Some(parent))
+            .then_some(request.authority.initiator.as_str())
+        })
     }
 
     pub fn discovery_authority(
@@ -195,6 +228,31 @@ impl RequestRouter {
         }
     }
 
+    /// Inspect a request without admitting a replacement operation.
+    pub fn lookup(&self, caller: &str, grants: &Grants, options: &RequestOptions) -> Response {
+        if !grants.call.contains(&options.service) {
+            return permission_denied();
+        }
+        if !valid_name(&options.operation_id) || !payload_fits(&options.payload) {
+            return Response::error("invalid_request", "invalid lookup operation or payload");
+        }
+        let Some((id, request)) = self.requests.iter().find(|(_, request)| {
+            !request.internal_hook
+                && request.caller == caller
+                && request.options.operation_id == options.operation_id
+        }) else {
+            return not_found();
+        };
+        if request.matches_retry(options) {
+            Response::Accepted { id: *id }
+        } else {
+            Response::error(
+                "conflict",
+                "operation identifier was already used for a different request",
+            )
+        }
+    }
+
     fn enqueue(
         &mut self,
         caller: &str,
@@ -245,6 +303,7 @@ impl RequestRouter {
                 completed_at: None,
                 result: None,
                 delivered: false,
+                accepted_receiver: None,
                 internal_hook,
             },
         );
@@ -252,33 +311,170 @@ impl RequestRouter {
         Response::Accepted { id: request_id }
     }
 
-    pub fn poll(&mut self, provider: &str, now: Instant) -> Response {
+    pub fn select_delivery_mode(&mut self, provider: &str, reliable: bool) -> Response {
+        if self.delivery_modes.get(provider) == Some(&reliable) {
+            return Response::Ok;
+        }
+        if self.offers.contains_key(provider)
+            || self.unretired.values().any(|(owner, _)| owner == provider)
+            || self.legacy_tainted.contains(provider)
+            || self.requests.values().any(|request| {
+                request.provider == provider && request.delivered && request.result.is_none()
+            })
+        {
+            return Response::error("busy", "request delivery is still in flight");
+        }
+        self.delivery_modes.insert(provider.to_owned(), reliable);
+        Response::Ok
+    }
+
+    pub fn poll(&mut self, provider: &str, now: Instant, receiver: Option<&str>) -> Response {
+        let reliable = receiver.is_some();
+        if receiver.is_some_and(|receiver| !valid_name(receiver)) {
+            return Response::error("invalid_request", "invalid receiver identifier");
+        }
+        if let Some(receiver) = receiver
+            && self
+                .unretired
+                .values()
+                .any(|(owner, previous)| owner == provider && previous != receiver)
+        {
+            return Response::error("busy", "another receiver has unretired deliveries");
+        }
+        match self.delivery_modes.get(provider) {
+            Some(selected) if *selected != reliable => {
+                return Response::error("delivery_mode_mismatch", "request delivery mode differs");
+            }
+            None => {
+                self.delivery_modes.insert(provider.to_owned(), reliable);
+            }
+            _ => {}
+        }
         let queue = self.provider_queues.entry(provider.to_owned()).or_default();
 
-        while let Some(request_id) = queue.pop_front() {
+        while let Some(request_id) = queue.front().copied() {
             let Some(request) = self.requests.get_mut(&request_id) else {
+                queue.pop_front();
                 continue;
             };
             if request.result.is_some() {
+                queue.pop_front();
+                self.offers.remove(provider);
                 continue;
             }
-
-            request.delivered = true;
-            return Response::Request {
-                id: request_id,
-                caller: request.caller.clone(),
-                initiator: request.authority.initiator.clone(),
-                service: request.options.service.clone(),
-                payload: request.options.payload.clone(),
-                remaining_ms: request
-                    .authority
-                    .deadline
-                    .saturating_duration_since(now)
-                    .as_millis() as u64,
-            };
+            if let Some(receiver) = receiver {
+                if self
+                    .offers
+                    .get(provider)
+                    .is_some_and(|(id, owner)| *id != request_id || owner != receiver)
+                {
+                    return Response::error("busy", "another receiver owns the offer");
+                }
+                self.offers
+                    .insert(provider.to_owned(), (request_id, receiver.to_owned()));
+            } else {
+                queue.pop_front();
+                request.delivered = true;
+            }
+            return request.offer_response(request_id, now);
         }
 
         Response::Pending
+    }
+
+    pub fn inspect_offer(&self, provider: &str, receiver: &str, now: Instant) -> Response {
+        if !valid_name(receiver) {
+            return Response::error("invalid_request", "invalid receiver identifier");
+        }
+        match self.delivery_modes.get(provider) {
+            None => return Response::Pending,
+            Some(false) => {
+                return Response::error(
+                    "delivery_mode_mismatch",
+                    "reliable delivery is not selected",
+                );
+            }
+            Some(true) => {}
+        }
+        match self.offers.get(provider) {
+            Some((id, owner)) if owner == receiver => self
+                .requests
+                .get(id)
+                .filter(|request| request.result.is_none() && !request.delivered)
+                .map_or(Response::Pending, |request| {
+                    request.offer_response(*id, now)
+                }),
+            _ => Response::Pending,
+        }
+    }
+
+    pub fn accept(&mut self, provider: &str, id: u64, receiver: &str) -> Response {
+        if !valid_name(receiver) {
+            return Response::error("invalid_request", "invalid receiver identifier");
+        }
+        if self.delivery_modes.get(provider) != Some(&true) {
+            return Response::error(
+                "delivery_mode_mismatch",
+                "reliable delivery is not selected",
+            );
+        }
+        let Some(request) = self.requests.get_mut(&id) else {
+            return not_found();
+        };
+        if request.provider != provider {
+            return permission_denied();
+        }
+        if request.result.is_some() {
+            return Response::error("request_ended", "request is no longer active");
+        }
+        if request.delivered {
+            return if request.accepted_receiver.as_deref() == Some(receiver) {
+                Response::Ok
+            } else {
+                permission_denied()
+            };
+        }
+        if !self
+            .offers
+            .get(provider)
+            .is_some_and(|(offered, owner)| *offered == id && owner == receiver)
+        {
+            return permission_denied();
+        }
+        if self.unretired.len() >= MAX_RETAINED_REQUESTS {
+            return capacity_exhausted();
+        }
+        request.delivered = true;
+        request.accepted_receiver = Some(receiver.to_owned());
+        self.unretired
+            .insert(id, (provider.to_owned(), receiver.to_owned()));
+        self.offers.remove(provider);
+        if let Some(queue) = self.provider_queues.get_mut(provider)
+            && queue.front() == Some(&id)
+        {
+            queue.pop_front();
+        }
+        Response::Ok
+    }
+
+    /// A receiver may retire only after its handler has stopped and the caller
+    /// result is terminal. Entries survive ordinary result eviction.
+    pub fn retire_delivery(&mut self, provider: &str, id: u64, receiver: &str) -> Response {
+        let Some((owner, recorded_receiver)) = self.unretired.get(&id) else {
+            return not_found();
+        };
+        if owner != provider || recorded_receiver != receiver {
+            return permission_denied();
+        }
+        if self
+            .requests
+            .get(&id)
+            .is_some_and(|request| request.result.is_none())
+        {
+            return Response::error("request_pending", "request has not ended");
+        }
+        self.unretired.remove(&id);
+        Response::Ok
     }
 
     pub fn complete(
@@ -350,6 +546,9 @@ impl RequestRouter {
             return permission_denied();
         }
         if request.result.is_none() {
+            if request.delivered && request.accepted_receiver.is_none() {
+                self.legacy_tainted.insert(request.provider.clone());
+            }
             request.finish(
                 Response::error("cancelled", "cancelled by the request owner"),
                 now,
@@ -378,6 +577,13 @@ impl RequestRouter {
         if let Some(queue) = self.provider_queues.get_mut(&provider) {
             queue.retain(|queued| *queued != request_id);
         }
+        if self
+            .offers
+            .get(&provider)
+            .is_some_and(|(offered, _)| *offered == request_id)
+        {
+            self.offers.remove(&provider);
+        }
         Response::Ok
     }
 
@@ -385,11 +591,19 @@ impl RequestRouter {
         self.finish_expired_requests(now);
         self.cancel_orphaned_delegations(now);
         self.remove_expired_results(now);
+        self.offers.retain(|_, (id, _)| {
+            self.requests
+                .get(id)
+                .is_some_and(|request| request.result.is_none())
+        });
     }
 
     fn finish_expired_requests(&mut self, now: Instant) {
         for request in self.requests.values_mut() {
             if request.result.is_none() && now >= request.authority.deadline {
+                if request.delivered && request.accepted_receiver.is_none() {
+                    self.legacy_tainted.insert(request.provider.clone());
+                }
                 request.finish(
                     Response::error("deadline_exceeded", "request deadline elapsed"),
                     now,
@@ -416,6 +630,9 @@ impl RequestRouter {
                     .parent
                     .is_some_and(|id| finished.contains(&id));
                 if request.result.is_none() && parent_ended {
+                    if request.delivered && request.accepted_receiver.is_none() {
+                        self.legacy_tainted.insert(request.provider.clone());
+                    }
                     request.finish(Response::error("cancelled", "parent request ended"), now);
                     cancelled_any = true;
                 }
@@ -438,6 +655,7 @@ impl RequestRouter {
         for queue in self.provider_queues.values_mut() {
             queue.retain(|id| retained_ids.contains(id));
         }
+        self.offers.retain(|_, (id, _)| retained_ids.contains(id));
     }
 
     pub fn submit_hook(
@@ -477,4 +695,58 @@ fn validate_options(options: &RequestOptions) -> Result<(), Response> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod retry_contract_tests {
+    use super::*;
+    use amaterasu_contracts::ApiFieldKind;
+
+    #[test]
+    fn retry_rejects_different_response_contract_and_ordinary_collision() {
+        let mut router = RequestRouter::default();
+        let owner_grants = Grants {
+            call: ["example/1".into()].into(),
+            ..Default::default()
+        };
+        let provider_grants = Grants {
+            provide: ["example/1".into()].into(),
+            ..Default::default()
+        };
+        assert!(matches!(
+            router.register_service("provider", &provider_grants, "example/1".into()),
+            Response::Ok
+        ));
+        let schema = ApiSchema {
+            required: [("result".into(), ApiFieldKind::String)].into(),
+            optional: BTreeMap::new(),
+            allow_extra: false,
+        };
+        let options = |response_schema| RequestOptions {
+            service: "example/1".into(),
+            payload: serde_json::json!({"method":"write"}),
+            timeout_ms: 1000,
+            operation_id: "stable".into(),
+            parent: None,
+            response_schema,
+        };
+        let now = Instant::now();
+        let first = router.submit("owner", &owner_grants, options(Some(schema.clone())), now);
+        assert!(matches!(first, Response::Accepted { .. }));
+        assert!(matches!(
+            router.submit("owner", &owner_grants, options(Some(schema.clone())), now),
+            Response::Accepted { .. }
+        ));
+        for changed in [
+            None,
+            Some(ApiSchema {
+                allow_extra: true,
+                ..schema
+            }),
+        ] {
+            assert!(
+                matches!(router.submit("owner", &owner_grants, options(changed), now), Response::Error { code, .. } if code == "conflict")
+            );
+        }
+    }
 }
