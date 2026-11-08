@@ -69,6 +69,70 @@ impl Script {
 }
 
 #[test]
+fn shutdown_discards_unsubmitted_startup_read() {
+    let mut settings = ProductSettings::new();
+    settings.prepare_shutdown();
+    assert!(!settings.busy());
+}
+
+#[test]
+fn shutdown_looks_up_lost_startup_admission_without_resubmitting() {
+    let mut settings = ProductSettings::new();
+    let mut controller = Controller::new(TestBackend::default(), false);
+    settings
+        .advance(&mut |_| Err("lost acknowledgement".into()), &mut controller)
+        .unwrap();
+    settings.prepare_shutdown();
+    let mut script = Script::new([
+        Response::Accepted { id: 42 },
+        Response::Result {
+            payload: json!({"ok":true,"found":false,"version":null,"revision":0,"values":{}}),
+        },
+        Response::Ok,
+    ]);
+    while settings.busy() {
+        settings
+            .advance(&mut |command| script.send(command), &mut controller)
+            .unwrap();
+    }
+    assert!(matches!(&script.commands[0], Command::LookupRequest { .. }));
+    assert!(matches!(
+        &script.commands[1],
+        Command::TakeResult { request: 42 }
+    ));
+    assert!(matches!(
+        &script.commands[2],
+        Command::ReleaseResult { request: 42 }
+    ));
+    assert!(!settings.ready());
+}
+
+#[test]
+fn shutdown_does_not_retry_a_failed_admitted_startup_read() {
+    let mut settings = ProductSettings::new();
+    let mut controller = Controller::new(TestBackend::default(), false);
+    let mut script = Script::new([
+        Response::Accepted { id: 7 },
+        Response::Error {
+            code: "unavailable".into(),
+            message: "read failed".into(),
+        },
+        Response::Ok,
+    ]);
+    settings
+        .advance(&mut |command| script.send(command), &mut controller)
+        .unwrap();
+    settings.prepare_shutdown();
+    settings
+        .advance(&mut |command| script.send(command), &mut controller)
+        .unwrap();
+    settings
+        .advance(&mut |command| script.send(command), &mut controller)
+        .unwrap();
+    assert!(!settings.busy());
+}
+
+#[test]
 fn absent_product_document_uses_enabled_bootstrap_defaults() {
     let (policy, revision) = read_document(&json!({
         "ok":true,

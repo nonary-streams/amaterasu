@@ -242,6 +242,7 @@ impl ManagedModule for InputModule {
         })
     }
     fn prepare_shutdown(&mut self, remaining_ms: u64) -> ModuleResult<()> {
+        self.product_settings.prepare_shutdown();
         self.shutdown.announce(Instant::now(), remaining_ms);
         self.controller
             .restrict_shutdown_deadline(self.shutdown.deadline());

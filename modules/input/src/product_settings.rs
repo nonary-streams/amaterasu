@@ -266,6 +266,9 @@ pub struct ProductSettings {
     revision: u64,
     ready: bool,
     pending: Option<Pending>,
+    shutting_down: bool,
+    startup_admission_uncertain: bool,
+    startup_first_sent: Option<std::time::Instant>,
 }
 
 impl ProductSettings {
@@ -274,6 +277,9 @@ impl ProductSettings {
             policy: InputPolicy::default(),
             revision: 0,
             ready: false,
+            shutting_down: false,
+            startup_admission_uncertain: false,
+            startup_first_sent: None,
             pending: Some(Pending {
                 work: Work::StartupLoad,
                 call: Call::Submit {
@@ -292,6 +298,18 @@ impl ProductSettings {
 
     pub fn busy(&self) -> bool {
         self.pending.is_some()
+    }
+
+    pub fn prepare_shutdown(&mut self) {
+        self.shutting_down = true;
+        if !self.startup_admission_uncertain
+            && self.pending.as_ref().is_some_and(|pending| {
+                matches!(pending.work, Work::StartupLoad)
+                    && matches!(pending.call, Call::Submit { .. })
+            })
+        {
+            self.pending = None;
+        }
     }
 
     pub fn merge_update(&self, update: InputPolicyUpdate) -> InputPolicy {
@@ -404,6 +422,51 @@ impl ProductSettings {
                 parent,
                 retry_ticks,
             } => {
+                if self.shutting_down && matches!(pending.work, Work::StartupLoad) {
+                    if !self.startup_admission_uncertain {
+                        return Ok(());
+                    }
+                    let within_retention = self
+                        .startup_first_sent
+                        .is_some_and(|sent| sent.elapsed() < std::time::Duration::from_secs(300));
+                    if within_retention {
+                        match send(Command::LookupRequest {
+                            service: CONFIGURATION_SERVICE.into(),
+                            payload: payload.clone(),
+                            operation_id: operation_id.clone(),
+                            parent,
+                        }) {
+                            Ok(Response::Accepted { id }) => {
+                                self.startup_admission_uncertain = false;
+                                self.pending = Some(Pending {
+                                    work: pending.work,
+                                    call: Call::Waiting { request: id },
+                                });
+                                return Ok(());
+                            }
+                            Ok(Response::Error { code, .. })
+                                if code == "not_found"
+                                    && self.startup_first_sent.is_some_and(|sent| {
+                                        sent.elapsed() < std::time::Duration::from_secs(300)
+                                    }) =>
+                            {
+                                self.startup_admission_uncertain = false;
+                                return Ok(());
+                            }
+                            _ => {}
+                        }
+                    }
+                    self.pending = Some(Pending {
+                        work: pending.work,
+                        call: Call::Submit {
+                            payload,
+                            operation_id,
+                            parent,
+                            retry_ticks,
+                        },
+                    });
+                    return Ok(());
+                }
                 if retry_ticks > 0 {
                     self.pending = Some(Pending {
                         work: pending.work,
@@ -417,6 +480,9 @@ impl ProductSettings {
                     return Ok(());
                 }
                 let timeout_ms = CONFIGURATION_TIMEOUT_MS;
+                if matches!(pending.work, Work::StartupLoad) && self.startup_first_sent.is_none() {
+                    self.startup_first_sent = Some(std::time::Instant::now());
+                }
                 match send(Command::Request {
                     service: CONFIGURATION_SERVICE.into(),
                     payload: payload.clone(),
@@ -425,6 +491,9 @@ impl ProductSettings {
                     parent,
                 }) {
                     Ok(Response::Accepted { id }) => {
+                        if matches!(pending.work, Work::StartupLoad) {
+                            self.startup_admission_uncertain = false;
+                        }
                         self.pending = Some(Pending {
                             work: pending.work,
                             call: Call::Waiting { request: id },
@@ -444,6 +513,9 @@ impl ProductSettings {
                         self.on_terminal(send, controller, pending.work, ChildOutcome::Failure)?;
                     }
                     Err(_) => {
+                        if matches!(pending.work, Work::StartupLoad) {
+                            self.startup_admission_uncertain = true;
+                        }
                         // Repeating the same operation id retrieves the existing request if the
                         // transport accepted it before the local acknowledgement was lost.
                         self.pending = Some(Pending {
@@ -533,6 +605,12 @@ impl ProductSettings {
     ) -> ModuleResult<()> {
         match work {
             Work::StartupLoad => {
+                if self.shutting_down {
+                    return Ok(());
+                }
+                if !self.startup_admission_uncertain {
+                    self.startup_first_sent = None;
+                }
                 self.pending = Some(Pending {
                     work: Work::StartupLoad,
                     call: Call::Submit {
@@ -580,6 +658,7 @@ impl ProductSettings {
         outcome: ChildOutcome,
     ) -> ModuleResult<()> {
         match work {
+            Work::StartupLoad if self.shutting_down => {}
             Work::StartupLoad => match outcome {
                 ChildOutcome::Payload(payload) => match read_document(&payload) {
                     Ok((policy, revision)) => {
@@ -710,6 +789,11 @@ impl ProductSettings {
     }
 
     fn retry_startup_load(&mut self, retry_ticks: u8) {
+        if self.shutting_down {
+            return;
+        }
+        self.startup_admission_uncertain = false;
+        self.startup_first_sent = None;
         self.pending = Some(Pending {
             work: Work::StartupLoad,
             call: Call::Submit {

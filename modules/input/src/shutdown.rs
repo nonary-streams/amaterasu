@@ -85,6 +85,7 @@ impl InputModule {
     }
 
     pub(super) fn quiesce_input(&mut self, now: Instant) -> ModuleResult<bool> {
+        self.product_settings.prepare_shutdown();
         if self.shutdown.deadline.is_none() {
             self.shutdown.announce(now, DEFAULT_SHUTDOWN_BUDGET_MS);
         }
