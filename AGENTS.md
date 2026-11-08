@@ -1,5 +1,24 @@
 # Working on Amaterasu
 
+## Initiative and follow-through
+
+- Infer the user's intent and scope from the request and conversation. Treat
+  requests to change, build, or fix something as instructions to do the work;
+  make reasonable decisions using the available evidence and continue through
+  implementation and appropriate verification.
+- Do not ask routine or non-blocking clarifying questions. State material
+  assumptions when useful, and ask only when missing information could
+  materially change the outcome or when authorization is required. Continue
+  independent, authorized work while a necessary answer is pending.
+- Before requesting a decision or approval, complete the authorized work
+  needed to make the proposed action concrete and reviewable. Read-only work,
+  reviews, in-scope fixes, and reversible actions do not need a separate
+  confirmation when already authorized or implied by the request.
+- Honor explicit user instructions and the specific authorization boundaries
+  elsewhere in this file, including protection of unrelated work and active
+  streams. Do not invent approval requirements from hypothetical risks or
+  interpret routine implementation choices as requiring permission.
+
 ## Local worktrees
 
 - On this Linux host, create new Git worktrees at
