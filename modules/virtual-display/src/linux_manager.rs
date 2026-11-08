@@ -1,6 +1,6 @@
 //! Linux connector ownership uses libvirtualdisplay's broker, never Windows leases.
 mod compositor;
-mod connectors;
+pub(crate) mod connectors;
 mod journal;
 mod layout;
 mod observer;
@@ -491,6 +491,10 @@ impl Manager {
                                 monitor.state = "ready";
                             }
                             Err(failure) => {
+                                eprintln!(
+                                    "amaterasu virtual display creation failed: {:?}; cleanup_complete={}",
+                                    failure.error, failure.cleanup_complete
+                                );
                                 monitor.error = Some(failure.error);
                                 monitor.creation_cleanup_complete = failure.cleanup_complete;
                                 monitor.state = "cleanup_failed";

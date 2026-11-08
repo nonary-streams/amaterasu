@@ -678,7 +678,14 @@ mod owned {
                 record.virtual_display_output = Some(output.into());
                 Ok(true)
             }
-            _ => Err("virtual_display_not_ready"),
+            state => {
+                let detail = monitor["error"].as_str().unwrap_or("unavailable");
+                let detail: String = detail.chars().take(256).collect();
+                eprintln!(
+                    "amaterasu virtual display readiness failed: state={state:?} detail={detail:?}"
+                );
+                Err("virtual_display_not_ready")
+            }
         }
     }
     /// KWin names virtual outputs `Virtual-N`. Connector numbers keep counting

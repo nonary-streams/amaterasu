@@ -11,11 +11,24 @@ use std::{
 struct FakeBroker {
     outputs: Arc<Mutex<BTreeMap<String, bool>>>,
     effects: Arc<Mutex<Vec<(String, bool)>>>,
+    modes: Arc<Mutex<Vec<(String, u32, u32, u32)>>>,
     journal: PathBuf,
     reject_removal: Arc<Mutex<bool>>,
     reject_connection: Arc<Mutex<bool>>,
 }
 impl Broker for FakeBroker {
+    fn request_mode(&self, output: &str, spec: &Specification) -> Result<(), String> {
+        if !self.connected(output)? {
+            return Err("connector is disconnected".into());
+        }
+        self.modes.lock().unwrap().push((
+            output.into(),
+            spec.width,
+            spec.height,
+            spec.refresh_millihz,
+        ));
+        Ok(())
+    }
     fn connected(&self, output: &str) -> Result<bool, String> {
         Ok(*self.outputs.lock().unwrap().get(output).unwrap_or(&false))
     }
@@ -214,6 +227,7 @@ fn fixture() -> (
     let broker = FakeBroker {
         outputs: Arc::new(Mutex::new(BTreeMap::from([("Virtual-1".into(), true)]))),
         effects: Default::default(),
+        modes: Default::default(),
         journal: root.join("connectors.json"),
         reject_removal: Default::default(),
         reject_connection: Default::default(),
@@ -240,6 +254,24 @@ fn specification(identity: &str) -> Specification {
 }
 const FIRST: &str = "11111111-1111-4111-8111-111111111111";
 const SECOND: &str = "22222222-2222-4222-8222-222222222222";
+#[test]
+fn creation_provisions_requested_mode_after_connector_is_connected() {
+    let (root, mut controller) = fixture();
+    let mut spec = specification(FIRST);
+    spec.width = 2560;
+    spec.height = 1440;
+    spec.refresh_millihz = 120000;
+    let record = controller
+        .create("owner".into(), spec, ScaleSetting::Automatic)
+        .unwrap();
+    assert_eq!(
+        *controller.broker.modes.lock().unwrap(),
+        vec![(record.output.clone(), 2560, 1440, 120000)]
+    );
+    controller.remove(&record.key()).unwrap();
+    drop(controller);
+    fs::remove_dir_all(root).unwrap();
+}
 #[test]
 fn mode_change_retains_the_same_compositor_and_registry_global() {
     use super::super::{observer::Observation, same_output_identity};
@@ -1144,6 +1176,28 @@ fn parked_connector_is_recovered_and_reused_after_restart() {
     restarted.compositor.guard_available = true;
     restarted.remove(&next.key()).unwrap();
     drop(restarted);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn recovery_retires_disappeared_connector_only_after_restoring_desktop() {
+    let (root, mut controller) = fixture();
+    let record = controller
+        .create(
+            "owner".into(),
+            specification(FIRST),
+            ScaleSetting::Automatic,
+        )
+        .unwrap();
+    controller.connectors = FakeConnectors::named(9..=16);
+    controller.compositor.guard_available = false;
+    assert!(controller.remove(&record.key()).is_err());
+    assert_eq!(controller.journal.records.len(), 1);
+    controller.compositor.guard_available = true;
+    assert_eq!(controller.remove(&record.key()), Ok(false));
+    assert!(controller.journal.records.is_empty());
+    assert!(!controller.compositor.restored.is_empty());
+    drop(controller);
     fs::remove_dir_all(root).unwrap();
 }
 

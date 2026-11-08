@@ -15,8 +15,18 @@ use std::sync::mpsc::{Receiver, SyncSender};
 pub(super) trait Broker: Send {
     fn connected(&self, output: &str) -> Result<bool, String>;
     fn set_connected(&self, output: &str, connected: bool) -> Result<(), String>;
+    fn request_mode(&self, output: &str, specification: &Specification) -> Result<(), String>;
 }
 impl Broker for LinuxControlClient {
+    fn request_mode(&self, output: &str, specification: &Specification) -> Result<(), String> {
+        LinuxControlClient::request_mode(
+            self,
+            output,
+            specification.width,
+            specification.height,
+            specification.refresh_millihz,
+        )
+    }
     fn connected(&self, output: &str) -> Result<bool, String> {
         self.query_connector(output).map_err(|error| error.detail)
     }
@@ -236,6 +246,31 @@ impl<B: Broker, C: Compositor, I: ConnectorInventory> Controller<B, C, I> {
         else {
             return Ok(false);
         };
+        // A recreated pool assigns new DRM connector names. The broker cannot
+        // query an old name once its native connector has disappeared.
+        if !self.connectors.connectors()?.contains(&record.output) {
+            if record
+                .references
+                .as_ref()
+                .is_some_and(|refs| !refs.is_empty())
+            {
+                return Err("reference_retirement_required".into());
+            }
+            while let Some(layout) = record.setup_layouts.last() {
+                self.compositor.restore(Some(layout))?;
+                record.setup_layouts.pop();
+                self.journal.update(record.clone())?;
+            }
+            self.compositor.restore(record.layout.as_ref())?;
+            if !self.compositor.verify_removal_guard(&record.output)? {
+                return Err("no surviving desktop output".into());
+            }
+            if self.connectors.connectors()?.contains(&record.output) {
+                return Err("virtual connector reappeared during recovery".into());
+            }
+            self.journal.remove(key)?;
+            return Ok(false);
+        }
         let connected = self.broker.connected(&record.output)?;
         if record.layout.is_none() {
             record.layout = self.compositor.snapshot(&record.output)?;
@@ -436,6 +471,8 @@ impl<B: Broker, C: Compositor, I: ConnectorInventory> Controller<B, C, I> {
             // Even an already connected parked output must be checked by the
             // broker: status alone does not prove that this UID still owns it.
             self.broker.set_connected(&record.output, true)?;
+            self.broker
+                .request_mode(&record.output, &record.specification)?;
             if self.stopped.load(std::sync::atomic::Ordering::Acquire) {
                 return Err("display manager stopping".into());
             }

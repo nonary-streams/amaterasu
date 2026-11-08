@@ -215,7 +215,10 @@ impl Compositor for KScreen {
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut configuration = loop {
             let configuration = query()?;
-            if find_output(&configuration, output).is_some() {
+            if find_output(&configuration, output).is_some()
+                && (mode(&configuration, output, specification).is_some()
+                    || Instant::now() >= deadline)
+            {
                 break configuration;
             }
             if Instant::now() >= deadline {

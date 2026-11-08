@@ -68,6 +68,23 @@ fn another_uids_connector_cannot_be_adopted_by_status_shortcut() {
 }
 
 #[test]
+fn requested_mode_uses_authenticated_broker_and_exact_reply() {
+    use std::os::unix::fs::PermissionsExt;
+    let (client, server, directory) = broker(vec![(
+        "mode Virtual-2 2560 1440 120000\n",
+        "OK mode Virtual-2 2560 1440 120000\n",
+    )]);
+    fs::set_permissions(client.socket_path(), fs::Permissions::from_mode(0o660)).unwrap();
+    // SAFETY: geteuid has no arguments or memory-safety preconditions.
+    let uid = unsafe { libc::geteuid() };
+    client
+        .request_mode_from_peer("Virtual-2", 2560, 1440, 120000, uid)
+        .unwrap();
+    server.join().unwrap();
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn rejects_invalid_outputs_before_connecting() {
     let client =
         LinuxControlClient::new(PathBuf::from("/nonexistent/amaterasu-display.sock")).unwrap();

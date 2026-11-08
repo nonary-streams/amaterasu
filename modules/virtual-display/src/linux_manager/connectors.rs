@@ -84,7 +84,7 @@ impl ConnectorInventory for SysfsConnectors {
 
 /// The DRM connector type id of a public `Virtual-<id>` name: a positive
 /// 32-bit id without leading zeros, matching the broker's accepted names.
-pub(super) fn connector_id(name: &str) -> Option<u32> {
+pub(crate) fn connector_id(name: &str) -> Option<u32> {
     let index = name.strip_prefix("Virtual-")?;
     if index.is_empty()
         || index.len() > 10
