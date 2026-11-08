@@ -10,6 +10,7 @@ mod action_endpoints;
 mod action_release_proof;
 mod action_root_retirement;
 mod action_target;
+mod admission_recovery;
 mod application;
 mod borrowed_capture;
 mod checkpoint_queries;
@@ -1184,6 +1185,8 @@ impl Coordinator {
             action_dispositions: Default::default(),
             admission_transitions: Default::default(),
         });
+        validate_journal(&journal)?;
+        admission_recovery::release_undispatched(&mut journal);
         validate_journal(&journal)?;
         journal.version = 3;
         for receipt in journal.receipts.values_mut() {
