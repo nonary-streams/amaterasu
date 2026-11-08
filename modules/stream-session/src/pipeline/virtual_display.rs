@@ -591,9 +591,18 @@ mod owned {
             .as_ref()
             .expect("start precedes virtual display allocation")
             .configuration;
+        // A processor may require SDR capture while encoding HDR output.
+        let source_hdr = record
+            .gpu_processing
+            .as_ref()
+            .and_then(|plan| plan["source_hdr_required"].as_bool())
+            .unwrap_or(
+                configuration.video_stream_format.dynamic_range
+                    == amaterasu_module_sdk::DynamicRange::Hdr,
+            );
         json!({"action":"create","identity":identity(record),"width":configuration.width,"height":configuration.height,
         "refresh_millihz":configuration.fps*1000,"name":"Amaterasu",
-        "hdr_enabled":configuration.video_stream_format.dynamic_range == amaterasu_module_sdk::DynamicRange::Hdr})
+        "hdr_enabled":source_hdr})
     }
     pub(in super::super) fn owned_status(record: &Record) -> Value {
         if let Some(source) = &record.shared_capture {

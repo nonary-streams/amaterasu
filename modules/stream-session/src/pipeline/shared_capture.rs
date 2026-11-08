@@ -195,8 +195,17 @@ pub(super) fn initialize_source(record: &mut Record) -> Result<(), &'static str>
         width: start.configuration.width,
         height: start.configuration.height,
         refresh_millihz: start.configuration.fps * 1000,
-        hdr_enabled: start.configuration.video_stream_format.dynamic_range
-            == amaterasu_module_sdk::DynamicRange::Hdr,
+        // Freeze the processing input range on the shared source. Transport
+        // output HDR belongs to the encoder and must not enable source HDR
+        // for an SDR-to-HDR processor or change when another client joins.
+        hdr_enabled: record
+            .gpu_processing
+            .as_ref()
+            .and_then(|plan| plan["source_hdr_required"].as_bool())
+            .unwrap_or(
+                start.configuration.video_stream_format.dynamic_range
+                    == amaterasu_module_sdk::DynamicRange::Hdr,
+            ),
         output: None,
     };
     if !source.valid() {

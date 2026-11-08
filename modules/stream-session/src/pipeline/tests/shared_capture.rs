@@ -506,3 +506,100 @@ fn shared_source_journal_carries_exact_native_cleanup_reference_for_every_consum
                 && call.payload["action"] == "create")
     );
 }
+
+#[test]
+fn owned_source_uses_processing_input_range_while_video_keeps_hdr_output() {
+    for (provider, control, processor, source_hdr) in [
+        (
+            "example.sdr-effect",
+            "example.sdr-control/1",
+            "example.sdr-effect/1",
+            false,
+        ),
+        (
+            "replacement.hdr-effect",
+            "replacement.hdr-control/1",
+            "replacement.hdr-effect/1",
+            true,
+        ),
+    ] {
+        for enabled in [false, true] {
+            let mut host = host();
+            host.pipeline.settings.processing_plan = Some(crate::model::ProcessingPlanProvider {
+                interface_minor: 0,
+                provider: provider.into(),
+                control_service: control.into(),
+                processor_service: processor.into(),
+                omit_disabled: true,
+            });
+            host.broker.processing_plan_enabled = enabled;
+            host.broker.processing_plan_source_hdr = source_hdr;
+            host.broker.processing_plan_identity = Some((control.into(), processor.into()));
+            let expected_source_hdr = !enabled || source_hdr;
+            let mut prepare = preparation(1, false);
+            prepare["video"]["codecs"] = json!(["h264", "hevc"]);
+            let prepared = host.response_from(10, OWNER, prepare);
+            let id = prepared["session"].as_u64().unwrap();
+            let mut start = configuration(id, 1, false);
+            start["configuration"]["configuration"]["video_stream_format"] =
+                json!({"codec":"hevc","bit_depth":10,"dynamic_range":"hdr"});
+            let started = host.response_from(11, OWNER, start);
+            assert_eq!(started["state"], "active", "{started}");
+            let create = host
+                .broker
+                .calls
+                .iter()
+                .find(|call| {
+                    call.service == "amaterasu.virtual-display/1"
+                        && call.payload["action"] == "create"
+                })
+                .unwrap();
+            assert_eq!(create.payload["hdr_enabled"], expected_source_hdr);
+            assert_eq!(
+                host.pipeline.records[&id]
+                    .shared_capture
+                    .as_ref()
+                    .unwrap()
+                    .hdr_enabled,
+                expected_source_hdr
+            );
+            let video = host
+                .broker
+                .calls
+                .iter()
+                .find(|call| {
+                    call.service == "amaterasu.video/1" && call.payload["action"] == "open"
+                })
+                .unwrap();
+            assert_eq!(
+                video.payload["configuration"]["gpu_processing"]["service"],
+                processor
+            );
+            assert_eq!(
+                video.payload["configuration"]["video_stream_format"]["dynamic_range"],
+                "hdr"
+            );
+            assert_eq!(
+                video.payload["configuration"]["gpu_processing"]["source_hdr_required"],
+                expected_source_hdr
+            );
+            let mut join = preparation(2, true);
+            join["video"]["codecs"] = json!(["h264", "hevc"]);
+            let prepared_join = host.response_from(20, OWNER, join);
+            let join_id = prepared_join["session"].as_u64().unwrap();
+            let mut join_start = configuration(join_id, 2, true);
+            join_start["configuration"]["configuration"]["video_stream_format"] =
+                json!({"codec":"hevc","bit_depth":10,"dynamic_range":"hdr"});
+            let joined = host.response_from(21, OWNER, join_start);
+            assert_eq!(joined["state"], "active", "{joined}");
+            assert_eq!(display_calls(&host, "create"), 1);
+            let source = host.pipeline.records[&id].shared_capture.as_ref().unwrap();
+            let joined_source = host.pipeline.records[&join_id]
+                .shared_capture
+                .as_ref()
+                .unwrap();
+            assert_eq!(source, joined_source);
+            assert_eq!(joined_source.hdr_enabled, expected_source_hdr);
+        }
+    }
+}

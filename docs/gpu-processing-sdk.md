@@ -86,6 +86,24 @@ from the effect's settings. Version 1.1 adds optional `output_hdr` to the existi
 shape. Consumers build either request with the shared SDK's
 `processing_intent_payload` helper.
 
+The selected provider's successful reply declares the source and output ranges
+independently. For example, an SDR-to-HDR effect returns these fields alongside
+the echoed target/revision, selected processor service, and processor settings:
+
+```json
+{"enabled":true,"source_hdr_required":false,"output_hdr_required":true}
+```
+
+The session provider uses that frozen source requirement when creating its
+owned virtual display, including a shared source retained for additional
+clients. Video and the encoder retain the negotiated output range. Joining
+clients reuse the source's recorded range; their output requests do not
+reconfigure it. With processing bypassed, capture follows the output range.
+Providers declare requirements through this contract; they do not need display
+provider identities, OS handles, or direct display mutation. The same unchanged
+session consumer accepts independently selected processing providers and their
+different source-range requirements.
+
 For an HDR output, a provider can return `enabled: true` to reserve its processing
 path while its own effect switch is false. It must still supply matching source
 and output range requirements and preserve the frozen settings. The source is

@@ -40,6 +40,7 @@ pub struct Broker {
     pub processing_plan_bad_revision: bool,
     pub processing_plan_omit_ranges: bool,
     pub processing_plan_context: Option<Value>,
+    pub processing_plan_identity: Option<(String, String)>,
     pub lifecycle_omit_consumer_confirmation: bool,
     pub lifecycle_observation_override: Option<Value>,
     pub lifecycle_input_target: Option<Value>,
@@ -485,7 +486,12 @@ impl Broker {
             }
             return result;
         }
-        if call.service == "example.processing-control/1" {
+        let (processing_control, processing_service) = self
+            .processing_plan_identity
+            .as_ref()
+            .map(|(control, service)| (control.as_str(), service.as_str()))
+            .unwrap_or(("example.processing-control/1", "example.gpu/1"));
+        if call.service == processing_control {
             assert_eq!(call.payload["method"], "processing_intent");
             assert_eq!(call.payload["interface_major"], 1);
             let minor = call.payload["interface_minor"].as_u64().unwrap();
@@ -505,7 +511,7 @@ impl Broker {
                 "source_hdr_required":if prepared && !self.processing_plan_omit_ranges {Some(self.processing_plan_source_hdr)} else {None},
                 "output_hdr_required":if prepared && !self.processing_plan_omit_ranges {Some(true)} else {None},
                 "processor_settings":settings,
-                "processor_service":"example.gpu/1"});
+                "processor_service":processing_service});
         }
         let action = call.payload["action"].as_str().unwrap();
         let service = call.service.as_str();
