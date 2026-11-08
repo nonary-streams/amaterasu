@@ -98,6 +98,14 @@ impl ManagedModule for CaptureModule {
     fn tick(&mut self) -> ModuleResult<()> {
         self.stop_admission_when_available()?;
         for _ in 0..8 {
+            // A native read may own the controller while a driver call is in
+            // flight. Do not dequeue a request that cannot be handled without
+            // blocking the host's cooperative tick and shutdown.
+            let mut controller = match self.controller.try_lock() {
+                Ok(controller) => controller,
+                Err(std::sync::TryLockError::WouldBlock) => break,
+                Err(_) => return Err("capture controller poisoned".into()),
+            };
             let (id, caller, service, payload) = match self.runtime.send(Command::Poll {})? {
                 Response::Pending => break,
                 Response::Request {
@@ -109,16 +117,19 @@ impl ManagedModule for CaptureModule {
                 } => (id, caller, service, payload),
                 response => return Err(format!("capture poll failed: {response:?}")),
             };
+            match self.runtime.send(Command::CheckRequest { request: id })? {
+                Response::Ok => {}
+                Response::Error { code, .. } if code == "request_ended" || code == "not_found" => {
+                    continue;
+                }
+                response => return Err(format!("capture request check failed: {response:?}")),
+            }
             let mut opened_stream = None;
             let reply = if service != SERVICE {
                 CaptureError::new("invalid_service", "unsupported capture service").payload()
             } else {
                 match serde_json::from_value::<Operation>(payload) {
                     Ok(operation) => {
-                        let mut controller = self
-                            .controller
-                            .lock()
-                            .map_err(|_| "capture controller poisoned")?;
                         if self.shutdown_requested {
                             controller.stop_admission();
                         }
@@ -145,11 +156,7 @@ impl ManagedModule for CaptureModule {
                 Ok(Response::Ok) => (),
                 result => {
                     if let Some(stream) = opened_stream {
-                        let _ = self
-                            .controller
-                            .lock()
-                            .map_err(|_| "capture controller poisoned")?
-                            .close(&caller, stream);
+                        let _ = controller.close(&caller, stream);
                     }
                     if !matches!(result, Ok(Response::Error { ref code, .. }) if code == "request_ended" || code == "not_found")
                     {

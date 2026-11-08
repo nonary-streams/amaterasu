@@ -10,6 +10,14 @@ use std::{
 
 unsafe extern "C" {
     fn am_pw_test_dispatch_pending(stop_mode: u32) -> u32;
+    fn am_pw_test_retirement_barrier() -> i32;
+}
+
+#[test]
+fn retirement_waits_for_cancel_callbacks_and_worker_exit() {
+    // SAFETY: the native fixture owns every semaphore, session and worker and
+    // joins them before returning; no real portal or capture device is used.
+    assert_eq!(unsafe { am_pw_test_retirement_barrier() }, 0);
 }
 
 #[test]

@@ -34,6 +34,11 @@ struct Selection {
     ready_at: Option<u64>,
 }
 
+struct RetiringSelection {
+    selection: Selection,
+    lease: Option<Lease>,
+}
+
 struct Lease {
     id: u64,
     owner: String,
@@ -72,6 +77,7 @@ pub struct Controller<B: Backend> {
     direct: direct::DirectSources,
     settings: Settings,
     selection: Option<Selection>,
+    retiring_selection: Option<RetiringSelection>,
     selections: BTreeMap<(String, String), SelectionRecord>,
     last_selection: Option<(String, String)>,
     lease: Option<Lease>,
@@ -89,6 +95,7 @@ impl<B: Backend> Controller<B> {
             direct: self.direct,
             settings: self.settings,
             selection: self.selection,
+            retiring_selection: self.retiring_selection,
             selections: self.selections,
             last_selection: self.last_selection,
             lease: self.lease,
@@ -105,6 +112,7 @@ impl<B: Backend> Controller<B> {
             direct: direct::DirectSources::default(),
             settings,
             selection: None,
+            retiring_selection: None,
             selections: BTreeMap::new(),
             last_selection: None,
             lease: None,
@@ -139,6 +147,13 @@ impl<B: Backend> Controller<B> {
                     selection.owner == caller && selection.operation == operation_id
                 }) {
                     self.stop_selection(SourceState::Failed("source_selection_cancelled"));
+                }
+                self.poll_retired_selection();
+                if self.retiring_selection.as_ref().is_some_and(|retiring| {
+                    retiring.selection.owner == caller
+                        && retiring.selection.operation == operation_id
+                }) {
+                    return Err("source_retirement_pending");
                 }
                 self.poll_selection(caller, &operation_id)
                     .map(Reply::existing)
@@ -196,7 +211,7 @@ impl<B: Backend> Controller<B> {
             }
             return Ok(Reply::existing(selection_reply(record, Some(&operation))));
         }
-        if self.selection.is_some() || self.lease.is_some() {
+        if self.selection.is_some() || self.lease.is_some() || self.retiring_selection.is_some() {
             return Err("source_selection_busy");
         }
         if self.selections.len() >= MAX_SELECTIONS {
@@ -285,6 +300,9 @@ impl<B: Backend> Controller<B> {
             && self.settings.remember_source
             && self.settings.selection_principals.contains(caller)
         {
+            if self.retiring_selection.is_some() {
+                return Err("source_retirement_pending");
+            }
             // Reuse one internal operation slot across reconnects. Restoration
             // can only use this caller's previously approved monitor token.
             if let Some(source) = [SourceType::Monitor, SourceType::Window]
@@ -378,11 +396,19 @@ impl<B: Backend> Controller<B> {
     }
 
     pub fn close(&mut self, caller: &str, id: u64) -> CaptureResult<()> {
-        if self.direct.close(caller, id) {
-            return Ok(());
+        if let Some(result) = self.direct.close(caller, id) {
+            return result;
         }
         if self.closed.get(&id).is_some_and(|owner| owner == caller) {
             return Ok(());
+        }
+        if self
+            .retiring_selection
+            .as_ref()
+            .and_then(|retiring| retiring.lease.as_ref())
+            .is_some_and(|lease| lease.owner == caller && lease.id == id)
+        {
+            return Err("source_retirement_pending");
         }
         if !self
             .lease
@@ -392,7 +418,12 @@ impl<B: Backend> Controller<B> {
             return Err("not_found");
         }
         self.stop_selection(SourceState::Failed("source_lease_closed"));
-        Ok(())
+        self.poll_retired_selection();
+        if self.closed.get(&id).is_some_and(|owner| owner == caller) {
+            Ok(())
+        } else {
+            Err("source_retirement_pending")
+        }
     }
 
     pub fn rollback(&mut self, caller: &str, created: Option<Created>) {
@@ -413,6 +444,7 @@ impl<B: Backend> Controller<B> {
     }
 
     pub fn refresh(&mut self, now: u64) {
+        self.poll_retired_selection();
         self.direct
             .refresh(now, self.settings.selection_timeout_seconds);
         let Some(selection) = self.selection.as_mut() else {
@@ -467,18 +499,46 @@ impl<B: Backend> Controller<B> {
     }
 
     fn stop_selection(&mut self, state: SourceState) {
-        if let Some(lease) = self.lease.take() {
+        let lease = self.lease.take();
+        if let Some(lease) = &lease {
             lease.admission.close();
-            self.closed.insert(lease.id, lease.owner);
         }
-        if let Some(selection) = self.selection.take() {
+        if let Some(mut selection) = self.selection.take() {
             self.selections
                 .get_mut(&(selection.owner.clone(), selection.operation.clone()))
                 .expect("selected record")
                 .state = state;
-            let mailbox = selection.source.mailbox();
-            // SourceSession Drop cancels/joins native work before this returns.
-            drop(selection);
+            selection.source.begin_stop();
+            self.retiring_selection = Some(RetiringSelection { selection, lease });
+            self.poll_retired_selection();
+        }
+    }
+
+    fn poll_retired_selection(&mut self) {
+        if self.retiring_selection.as_ref().is_some_and(|retiring| {
+            retiring.selection.source.stopped()
+                && retiring
+                    .lease
+                    .as_ref()
+                    .is_none_or(|lease| lease.admission.retired())
+        }) {
+            let retiring = self.retiring_selection.take().expect("retiring selection");
+            let mailbox = retiring.selection.source.mailbox();
+            let selection_key = (
+                retiring.selection.owner.clone(),
+                retiring.selection.operation.clone(),
+            );
+            drop(retiring.selection);
+            if let Some(record) = self.selections.get(&selection_key)
+                && record.state == SourceState::Failed("source_selection_cancelled")
+            {
+                // A token callback already in flight when cancellation began
+                // may have persisted another token after the initial forget.
+                self.backend.forget(&selection_key.0, record.source_type);
+            }
+            if let Some(lease) = retiring.lease {
+                self.closed.insert(lease.id, lease.owner);
+            }
             self.frames_copied += mailbox.copied.load(Ordering::Relaxed);
             self.frames_accepted += mailbox.delivered.load(Ordering::Relaxed);
         }
@@ -586,6 +646,11 @@ impl<B: Backend> Controller<B> {
         self.settings.enabled = false;
         self.direct.shutdown();
         self.stop_selection(SourceState::Failed("capture_shutdown"));
+        self.poll_retired_selection();
+    }
+
+    pub fn retired(&self) -> bool {
+        self.direct.retired() && self.retiring_selection.is_none()
     }
 }
 

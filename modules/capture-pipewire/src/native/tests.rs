@@ -119,6 +119,7 @@ struct Sink {
     frames: Vec<(u64, Vec<u8>)>,
     controller: Option<Shared<FakeBackend>>,
     close: Option<u64>,
+    close_result: Option<crate::model::CaptureResult<()>>,
 }
 unsafe extern "C" fn copy(context: *mut c_void, frame: *const CpuFrame) -> Status {
     // SAFETY: native read passes one valid live descriptor and test-owned sink.
@@ -131,7 +132,7 @@ unsafe extern "C" fn copy(context: *mut c_void, frame: *const CpuFrame) -> Statu
             .try_lock()
             .expect("foreign callback has no controller lock");
         if let Some(id) = sink.close {
-            locked.close("amaterasu.video", id).unwrap();
+            sink.close_result = Some(locked.close("amaterasu.video", id));
         }
     }
     // SAFETY: immutable owned pixels survive even callback-triggered source close.
@@ -236,8 +237,10 @@ fn close_in_callback_keeps_borrow_alive_and_blocks_later_reads() {
         ..Default::default()
     };
     assert_eq!(binding.read(id, &mut sink), STATUS_OK);
+    assert_eq!(sink.close_result, Some(Err("source_retirement_pending")));
     assert_eq!(sink.frames[0], (0, vec![100; 16]));
     assert_eq!(binding.read(id, &mut sink), MEDIA_CLOSED);
+    controller.lock().unwrap().refresh(3);
     assert_eq!(driver.drops.load(Ordering::SeqCst), 1);
 }
 

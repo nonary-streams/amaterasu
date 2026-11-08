@@ -19,6 +19,7 @@ struct Source {
 #[derive(Default)]
 pub(super) struct DirectSources {
     sources: BTreeMap<(String, String), Source>,
+    retiring: BTreeMap<(String, String), Source>,
     closed: BTreeMap<u64, String>,
     opened: u64,
 }
@@ -46,7 +47,10 @@ impl DirectSources {
                 return Err("operation_conflict");
             }
         } else {
-            if self.sources.len() >= 4 || self.opened >= 128 {
+            if self.retiring.contains_key(&key) {
+                return Err("source_retirement_pending");
+            }
+            if self.sources.len() + self.retiring.len() >= 4 || self.opened >= 128 {
                 return Err("resource_exhausted");
             }
             let source = backend.select_output(name, timeout)?;
@@ -79,7 +83,7 @@ impl DirectSources {
                 })
             }
             _ => {
-                self.sources.remove(&key);
+                self.retire(&key);
                 Err("named_source_unavailable")
             }
         }
@@ -107,9 +111,16 @@ impl DirectSources {
             },
         )
     }
-    pub fn close(&mut self, caller: &str, id: u64) -> bool {
+    pub fn close(&mut self, caller: &str, id: u64) -> Option<CaptureResult<()>> {
         if self.closed.get(&id).is_some_and(|owner| owner == caller) {
-            return true;
+            return Some(Ok(()));
+        }
+        if self
+            .retiring
+            .values()
+            .any(|source| source.owner == caller && source.id == Some(id))
+        {
+            return Some(Err("source_retirement_pending"));
         }
         let key = self
             .sources
@@ -117,13 +128,15 @@ impl DirectSources {
             .find(|(_, source)| source.owner == caller && source.id == Some(id))
             .map(|(key, _)| key.clone());
         if let Some(key) = key {
-            if let Some(source) = self.sources.remove(&key) {
-                source.admission.close();
-                self.closed.insert(id, source.owner.clone());
-            }
-            true
+            self.retire(&key);
+            self.poll_retired();
+            Some(if self.closed.contains_key(&id) {
+                Ok(())
+            } else {
+                Err("source_retirement_pending")
+            })
         } else {
-            false
+            None
         }
     }
     pub fn cancel_pending(&mut self, caller: &str, operation: &str) {
@@ -133,7 +146,7 @@ impl DirectSources {
             .get(&key)
             .is_some_and(|source| source.id.is_none())
         {
-            self.sources.remove(&key);
+            self.retire(&key);
         }
     }
     pub fn active_count(&self) -> usize {
@@ -144,9 +157,19 @@ impl DirectSources {
     }
 
     pub fn refresh(&mut self, now: u64, timeout: u32) {
-        self.sources.retain(|_, source| {
-            source.id.is_some() || now.saturating_sub(source.started) < u64::from(timeout) * 1000
-        });
+        let expired: Vec<_> = self
+            .sources
+            .iter()
+            .filter(|(_, source)| {
+                source.id.is_none()
+                    && now.saturating_sub(source.started) >= u64::from(timeout) * 1000
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in expired {
+            self.retire(&key);
+        }
+        self.poll_retired();
     }
     pub fn streams(&self, caller: &str) -> Vec<Value> {
         self.sources
@@ -156,10 +179,41 @@ impl DirectSources {
             .collect()
     }
     pub fn shutdown(&mut self) {
-        for source in self.sources.values() {
-            source.admission.close();
+        let keys: Vec<_> = self.sources.keys().cloned().collect();
+        for key in keys {
+            self.retire(&key);
         }
-        self.sources.clear();
+        self.poll_retired();
+    }
+
+    pub fn retired(&self) -> bool {
+        self.retiring.is_empty()
+    }
+
+    fn retire(&mut self, key: &(String, String)) {
+        if let Some(mut source) = self.sources.remove(key) {
+            source.admission.close();
+            source.session.begin_stop();
+            self.retiring.insert(key.clone(), source);
+            self.poll_retired();
+        }
+    }
+
+    fn poll_retired(&mut self) {
+        let finished: Vec<_> = self
+            .retiring
+            .iter()
+            .filter(|(_, source)| source.session.stopped() && source.admission.retired())
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in finished {
+            if let Some(source) = self.retiring.remove(&key) {
+                if let Some(id) = source.id {
+                    self.closed.insert(id, source.owner.clone());
+                }
+                drop(source);
+            }
+        }
     }
 }
 fn response(source: &Source) -> Value {

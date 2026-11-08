@@ -1,4 +1,4 @@
-#define _POSIX_C_SOURCE 200809L
+#define _GNU_SOURCE
 #include "adapter.h"
 #include "dispatch.h"
 #include "kwin.h"
@@ -9,9 +9,13 @@
 #include <spa/param/buffers.h>
 #include <spa/buffer/meta.h>
 #include <stdatomic.h>
+#include <errno.h>
 #include <limits.h>
+#include <pthread.h>
+#include <semaphore.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -23,6 +27,10 @@
 
 struct am_pw_session {
     GThread *thread;
+    pthread_t reaper;
+    sem_t reap_requested;
+    atomic_bool reap_signaled;
+    bool reaper_joined;
     char *named_output;
     GMutex geometry_lock;
     struct am_kwin_geometry geometry;
@@ -35,7 +43,7 @@ struct am_pw_session {
     char *session_path;
     char *request_path;
     guint closed_subscription;
-    atomic_bool stopped;
+    atomic_bool stopped, cleanup_complete;
     atomic_uint state, stage, node, width, height, format, error, node_present, serial_present;
     atomic_int pipewire_state, pipewire_error;
     uint32_t source_type, timeout_seconds;
@@ -543,6 +551,24 @@ static gpointer worker(gpointer data) {
     return NULL;
 }
 
+/* Cancellation can invoke GIO handlers synchronously. Run both cancellation
+ * and the worker join away from the host's cooperative quiescence thread. The
+ * reaper itself is joined nonblocking before retirement is reported. */
+static void *reap_worker(void *data) {
+    struct am_pw_session *session = data;
+    int result;
+    do {
+        result = sem_wait(&session->reap_requested);
+    } while (result != 0 && errno == EINTR);
+    if (result != 0) return NULL;
+    if (session->thread) {
+        g_cancellable_cancel(session->cancel);
+        g_thread_join(session->thread);
+    }
+    atomic_store(&session->cleanup_complete, true);
+    return NULL;
+}
+
 static struct am_pw_session *start(uint32_t source_type, uint32_t timeout_seconds,
     const char *restore_token, uint32_t persist, am_pw_token_callback token_callback,
     am_pw_frame_callback callback, void *context, const char *named_output) {
@@ -550,6 +576,8 @@ static struct am_pw_session *start(uint32_t source_type, uint32_t timeout_second
     struct am_pw_session *session = g_new0(struct am_pw_session, 1);
     g_mutex_init(&session->geometry_lock);
     atomic_init(&session->stopped, false);
+    atomic_init(&session->cleanup_complete, false);
+    atomic_init(&session->reap_signaled, false);
     atomic_init(&session->state, AM_PW_SELECTING);
     atomic_init(&session->stage, AM_PW_STAGE_CONNECTING_SESSION_BUS);
     atomic_init(&session->node, 0);
@@ -571,8 +599,18 @@ static struct am_pw_session *start(uint32_t source_type, uint32_t timeout_second
     session->persist = persist;
     session->token_callback = token_callback;
     session->callback_context = context;
+    if (sem_init(&session->reap_requested, 0, 0) != 0) {
+        g_object_unref(session->cancel); g_free(session->restore_token); g_free(session->named_output); g_mutex_clear(&session->geometry_lock); g_free(session); return NULL;
+    }
+    if (pthread_create(&session->reaper, NULL, reap_worker, session) != 0) {
+        sem_destroy(&session->reap_requested); g_object_unref(session->cancel); g_free(session->restore_token); g_free(session->named_output); g_mutex_clear(&session->geometry_lock); g_free(session); return NULL;
+    }
     session->thread = g_thread_try_new("amaterasu-portal", worker, session, NULL);
-    if (!session->thread) { g_object_unref(session->cancel); g_free(session->restore_token); g_free(session->named_output); g_mutex_clear(&session->geometry_lock); g_free(session); return NULL; }
+    if (!session->thread) {
+        sem_post(&session->reap_requested);
+        if (pthread_join(session->reaper, NULL) != 0) abort();
+        sem_destroy(&session->reap_requested); g_object_unref(session->cancel); g_free(session->restore_token); g_free(session->named_output); g_mutex_clear(&session->geometry_lock); g_free(session); return NULL;
+    }
     return session;
 }
 
@@ -625,11 +663,35 @@ void am_pw_snapshot(struct am_pw_session *session, struct am_pw_snapshot *output
     g_mutex_unlock(&session->geometry_lock);
 }
 
-void am_pw_destroy(struct am_pw_session *session) {
+void am_pw_begin_stop(struct am_pw_session *session) {
     if (!session) return;
     atomic_store(&session->stopped, true);
-    g_cancellable_cancel(session->cancel);
-    g_thread_join(session->thread);
+    if (!atomic_exchange(&session->reap_signaled, true)) {
+        (void)sem_post(&session->reap_requested);
+    }
+}
+
+int am_pw_stopped(struct am_pw_session *session) {
+    if (!session || !atomic_load(&session->cleanup_complete)) return 0;
+    if (!session->reaper_joined) {
+        int result = pthread_tryjoin_np(session->reaper, NULL);
+        if (result != 0) return 0;
+        session->reaper_joined = true;
+    }
+    return 1;
+}
+
+void am_pw_destroy(struct am_pw_session *session) {
+    if (!session) return;
+    am_pw_begin_stop(session);
+    if (!session->reaper_joined && pthread_join(session->reaper, NULL) != 0) abort();
+    if (!atomic_load(&session->cleanup_complete)) {
+        /* A failed reaper cannot establish retirement. Preserve the final
+         * destruction safety barrier even in this exceptional path. */
+        g_cancellable_cancel(session->cancel);
+        g_thread_join(session->thread);
+    }
+    sem_destroy(&session->reap_requested);
     g_object_unref(session->cancel);
     g_free(session->restore_token);
     g_free(session->named_output);

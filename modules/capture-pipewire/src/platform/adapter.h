@@ -50,7 +50,11 @@ int am_pw_memfd_extent_valid(int64_t fd, uint32_t map_offset, uint32_t max_size)
  * the call. Both callbacks share context, retained until destroy joins the worker. */
 struct am_pw_session *am_pw_start(uint32_t source_type, uint32_t timeout_seconds, const char *restore_token, uint32_t persist, am_pw_token_callback, am_pw_frame_callback, void *);
 void am_pw_snapshot(struct am_pw_session *, struct am_pw_snapshot *);
-/* Cancels synchronous D-Bus I/O, closes request/session and joins the sole worker.
+/* Request cancellation without waiting. Poll stopped only from the session's
+ * serialized owner; true proves both the native worker and reaper were joined. */
+void am_pw_begin_stop(struct am_pw_session *);
+int am_pw_stopped(struct am_pw_session *);
+/* Final safety barrier: waits for cancellation and every adapter worker.
  * No callback or adapter worker can outlive this return. */
 void am_pw_destroy(struct am_pw_session *);
 #endif

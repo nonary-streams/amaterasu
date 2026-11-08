@@ -305,6 +305,446 @@ fn open_reply_with_geometry(
     reply
 }
 
+// Experimental scheduler; it is not registered by the production module.
+#[cfg(all(test, feature = "isolated-helper", target_os = "linux", amaterasu_kms))]
+mod isolated {
+    use super::*;
+    use crate::{
+        backend::{
+            IsolatedOpenTask, IsolatedSession, convert_isolated_info, convert_isolated_outputs,
+        },
+        helper_process::Registry,
+        metadata_task::{Metadata, MetadataRequest, MetadataTask},
+        open_task::TaskPoll,
+    };
+
+    const MAX_PENDING: usize = 8;
+
+    pub(crate) struct IsolatedCompletion {
+        pub id: u64,
+        pub caller: String,
+        pub payload: Value,
+        pub opened_stream: Option<u64>,
+    }
+
+    struct IsolatedStream {
+        owner: String,
+        operation: Option<String>,
+        session: IsolatedSession,
+    }
+    enum Work {
+        Metadata(MetadataTask),
+        Open(IsolatedOpenTask),
+        Ready(CaptureResult<Outcome>),
+        Close(u64),
+    }
+    enum Outcome {
+        Metadata(Metadata),
+        Open(IsolatedSession),
+    }
+    enum Kind {
+        Status,
+        Enumerate {
+            offset: Option<usize>,
+            limit: Option<usize>,
+        },
+        Open {
+            output: String,
+            operation: Option<String>,
+        },
+        Close,
+    }
+    struct Pending {
+        caller: String,
+        kind: Kind,
+        work: Work,
+        cancelled: bool,
+    }
+
+    pub(crate) struct IsolatedController {
+        registry: Registry,
+        enabled: bool,
+        streams: BTreeMap<u64, IsolatedStream>,
+        retiring: BTreeMap<u64, IsolatedStream>,
+        pending: BTreeMap<u64, Pending>,
+    }
+
+    impl IsolatedController {
+        pub fn new(enabled: bool) -> Self {
+            Self {
+                registry: Registry::default(),
+                enabled,
+                streams: BTreeMap::new(),
+                retiring: BTreeMap::new(),
+                pending: BTreeMap::new(),
+            }
+        }
+
+        pub fn submit(
+            &mut self,
+            id: u64,
+            caller: String,
+            operation: Operation,
+        ) -> CaptureResult<Option<Value>> {
+            if self.pending.contains_key(&id) || self.pending.len() >= MAX_PENDING {
+                return Err(CaptureError::new(
+                    "resource_exhausted",
+                    "KMS request capacity exhausted",
+                ));
+            }
+            let (kind, work) = match operation {
+                Operation::Status => (
+                    Kind::Status,
+                    Work::Metadata(
+                        MetadataTask::spawn(self.registry.clone(), MetadataRequest::Probe)
+                            .map_err(start_error)?,
+                    ),
+                ),
+                Operation::Enumerate { offset, limit } => (
+                    Kind::Enumerate { offset, limit },
+                    Work::Metadata(
+                        MetadataTask::spawn(self.registry.clone(), MetadataRequest::Enumerate)
+                            .map_err(start_error)?,
+                    ),
+                ),
+                Operation::Open {
+                    output,
+                    operation_id,
+                } => {
+                    if !self.enabled {
+                        return Err(CaptureError::new(
+                            "capture_disabled",
+                            "DRM capture requires enabled startup policy",
+                        ));
+                    }
+                    crate::model::validate_output_id(&output)?;
+                    if let Some(operation) = &operation_id {
+                        validate_operation_id(operation)?;
+                        if let Some((stream_id, stream)) =
+                            self.streams.iter().find(|(_, stream)| {
+                                stream.owner == caller
+                                    && stream.operation.as_ref() == Some(operation)
+                            })
+                        {
+                            if stream.session.output().id != output {
+                                return Err(CaptureError::new(
+                                    "operation_conflict",
+                                    "operation ID already selected a different DRM output",
+                                ));
+                            }
+                            return Ok(Some(open_payload(*stream_id, stream, false)));
+                        }
+                        if self.pending.values().any(|pending| pending.caller == caller && matches!(&pending.kind, Kind::Open { operation: Some(existing), .. } if existing == operation)) {
+                            return Err(CaptureError::new("operation_pending", "DRM open operation is still pending"));
+                        }
+                    }
+                    let inflight = self
+                        .pending
+                        .values()
+                        .filter(|pending| matches!(pending.kind, Kind::Open { .. }))
+                        .count();
+                    if self.streams.len() + self.retiring.len() + inflight >= MAX_STREAMS {
+                        return Err(CaptureError::new(
+                            "resource_exhausted",
+                            "at most four DRM streams may be open",
+                        ));
+                    }
+                    let task = IsolatedOpenTask::spawn(self.registry.clone(), output.clone())
+                        .map_err(start_error)?;
+                    (
+                        Kind::Open {
+                            output,
+                            operation: operation_id,
+                        },
+                        Work::Open(task),
+                    )
+                }
+                Operation::Lookup { operation_id } => {
+                    validate_operation_id(&operation_id)?;
+                    let (stream_id, stream) = self
+                        .streams
+                        .iter()
+                        .find(|(_, stream)| {
+                            stream.owner == caller
+                                && stream.operation.as_ref() == Some(&operation_id)
+                        })
+                        .ok_or_else(|| {
+                            CaptureError::new("not_found", "DRM stream was not found")
+                        })?;
+                    return Ok(Some(open_payload(*stream_id, stream, false)));
+                }
+                Operation::Close { stream } => {
+                    let entry = self
+                        .streams
+                        .get(&stream)
+                        .filter(|entry| entry.owner == caller)
+                        .ok_or_else(|| {
+                            CaptureError::new(
+                                "not_found",
+                                "DRM stream was not found for this caller",
+                            )
+                        })?;
+                    let _ = entry;
+                    let entry = self.streams.remove(&stream).expect("authorized stream");
+                    self.retiring.insert(stream, entry);
+                    (Kind::Close, Work::Close(stream))
+                }
+            };
+            self.pending.insert(
+                id,
+                Pending {
+                    caller,
+                    kind,
+                    work,
+                    cancelled: false,
+                },
+            );
+            Ok(None)
+        }
+
+        pub fn cancel(&mut self, id: u64) {
+            if let Some(pending) = self.pending.get_mut(&id) {
+                pending.cancelled = true;
+                match &pending.work {
+                    Work::Metadata(task) => {
+                        task.cancel();
+                    }
+                    Work::Open(task) => {
+                        task.cancel();
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        pub fn rollback(&mut self, caller: &str, id: u64) {
+            if self
+                .streams
+                .get(&id)
+                .is_some_and(|stream| stream.owner == caller)
+            {
+                let stream = self.streams.remove(&id).expect("owned stream");
+                self.retiring.insert(id, stream);
+            }
+        }
+
+        pub fn poll(
+            &mut self,
+            active: &mut impl FnMut(u64) -> CaptureResult<bool>,
+        ) -> CaptureResult<Vec<IsolatedCompletion>> {
+            self.registry.poll().map_err(cleanup_error)?;
+            for (id, pending) in &mut self.pending {
+                if !pending.cancelled && !active(*id)? {
+                    pending.cancelled = true;
+                }
+                if pending.cancelled {
+                    match &pending.work {
+                        Work::Metadata(task) => {
+                            task.cancel();
+                        }
+                        Work::Open(task) => {
+                            task.cancel();
+                        }
+                        _ => {}
+                    }
+                }
+                let outcome = match &mut pending.work {
+                    Work::Metadata(task) => match task.poll() {
+                        TaskPoll::Pending => None,
+                        TaskPoll::Failed(error) => return Err(cleanup_error(error)),
+                        TaskPoll::Retired(result) => Some(
+                            result
+                                .map_err(cleanup_error)
+                                .and_then(|result| result.map(Outcome::Metadata)),
+                        ),
+                    },
+                    Work::Open(task) => match task.poll() {
+                        TaskPoll::Pending => None,
+                        TaskPoll::Failed(error) => return Err(cleanup_error(error)),
+                        TaskPoll::Retired(result) => Some(
+                            result
+                                .map_err(cleanup_error)
+                                .and_then(|result| result.map(Outcome::Open)),
+                        ),
+                    },
+                    _ => None,
+                };
+                if let Some(outcome) = outcome {
+                    pending.work = Work::Ready(outcome);
+                }
+            }
+            let mut retired = Vec::new();
+            for (id, stream) in &mut self.retiring {
+                if stream.session.retire()? {
+                    retired.push(*id);
+                }
+            }
+            for id in retired {
+                self.retiring.remove(&id);
+            }
+            let ready: Vec<u64> = self
+                .pending
+                .iter()
+                .filter_map(|(id, pending)| match &pending.work {
+                    Work::Ready(_) => Some(*id),
+                    Work::Close(stream) if !self.retiring.contains_key(stream) => Some(*id),
+                    _ => None,
+                })
+                .collect();
+            let mut completions = Vec::new();
+            for id in ready {
+                // Check before moving a completed allocation into the stream table.
+                let is_active = if self.pending[&id].cancelled {
+                    false
+                } else {
+                    active(id)?
+                };
+                let pending = self.pending.remove(&id).expect("ready request");
+                if !is_active {
+                    continue;
+                }
+                let (payload, opened_stream) = match (pending.kind, pending.work) {
+                    (Kind::Close, Work::Close(_)) => (json!({"ok":true}), None),
+                    (kind, Work::Ready(result)) => match result {
+                        Err(error) => (error.payload(), None),
+                        Ok(Outcome::Metadata(metadata)) => (
+                            self.metadata_payload(&pending.caller, kind, metadata)
+                                .unwrap_or_else(CaptureError::payload),
+                            None,
+                        ),
+                        Ok(Outcome::Open(session)) => {
+                            let Kind::Open { output, operation } = kind else {
+                                return Err(CaptureError::new(
+                                    "capture_unavailable",
+                                    "mismatched KMS operation",
+                                ));
+                            };
+                            if session.output().id != output {
+                                return Err(CaptureError::new(
+                                    "capture_unavailable",
+                                    "mismatched KMS output",
+                                ));
+                            }
+                            let stream_id = self.next_stream_id()?;
+                            let stream = IsolatedStream {
+                                owner: pending.caller.clone(),
+                                operation,
+                                session,
+                            };
+                            let payload = open_payload(stream_id, &stream, true);
+                            self.streams.insert(stream_id, stream);
+                            (payload, Some(stream_id))
+                        }
+                    },
+                    _ => {
+                        return Err(CaptureError::new(
+                            "capture_unavailable",
+                            "invalid KMS request state",
+                        ));
+                    }
+                };
+                completions.push(IsolatedCompletion {
+                    id,
+                    caller: pending.caller,
+                    payload,
+                    opened_stream,
+                });
+            }
+            Ok(completions)
+        }
+
+        pub fn shutdown(&mut self) -> CaptureResult<bool> {
+            self.enabled = false;
+            for pending in self.pending.values_mut() {
+                pending.cancelled = true;
+                match &pending.work {
+                    Work::Metadata(task) => {
+                        task.cancel();
+                    }
+                    Work::Open(task) => {
+                        task.cancel();
+                    }
+                    _ => {}
+                }
+            }
+            self.retiring.append(&mut self.streams);
+            self.poll(&mut |_| Ok(false))?;
+            Ok(self.pending.is_empty()
+                && self.retiring.is_empty()
+                && self.registry.poll().map_err(cleanup_error)?)
+        }
+
+        fn next_stream_id(&self) -> CaptureResult<u64> {
+            for _ in 0..4 {
+                let mut random = [0; 8];
+                getrandom::fill(&mut random)
+                    .map_err(|error| CaptureError::new("entropy_error", error.to_string()))?;
+                let id = u64::from_le_bytes(random);
+                if id != 0 && !self.streams.contains_key(&id) && !self.retiring.contains_key(&id) {
+                    return Ok(id);
+                }
+            }
+            Err(CaptureError::new(
+                "entropy_error",
+                "DRM stream ID collision",
+            ))
+        }
+
+        fn metadata_payload(
+            &self,
+            caller: &str,
+            kind: Kind,
+            metadata: Metadata,
+        ) -> CaptureResult<Value> {
+            match (kind, metadata) {
+                (Kind::Status, Metadata::Probe(info)) => {
+                    let availability = convert_isolated_info(info);
+                    let streams: Vec<_> = self.streams.iter().filter(|(_, stream)| stream.owner == caller).map(|(id, stream)| json!({"stream":id,"output":stream.session.output().id,"frame_readback_verified":false})).collect();
+                    Ok(
+                        json!({"ok":true,"enabled":self.enabled,"native_supported":availability.native_supported,"available":availability.available,"framebuffer_export_supported":availability.framebuffer_export_supported,"presentation_events":false,"managed_virtual_output":false,"display_composition":"active_primary_plane_only","cursor_and_overlay_planes_captured":false,"crtc_color_pipeline_captured":false,"timestamp_source":"monotonic_acquisition","pixel_path":"gbm_egl_gles_cpu_bgra","reason":availability.reason,"streams":streams}),
+                    )
+                }
+                (Kind::Enumerate { offset, limit }, Metadata::Enumerate(records)) => {
+                    let (outputs, _) = convert_isolated_outputs(&records)?;
+                    let offset = offset.unwrap_or(0);
+                    let limit = limit.unwrap_or(MAX_OUTPUTS).min(MAX_OUTPUTS);
+                    if offset > outputs.len() {
+                        return Err(CaptureError::new(
+                            "invalid_request",
+                            "output offset is out of range",
+                        ));
+                    }
+                    let end = offset.saturating_add(limit).min(outputs.len());
+                    Ok(
+                        json!({"ok":true,"outputs":outputs[offset..end],"total":outputs.len(),"next_offset":(end < outputs.len()).then_some(end),"presentation_events":false,"managed_virtual_output":false,"display_composition":"active_primary_plane_only","cursor_and_overlay_planes_captured":false,"crtc_color_pipeline_captured":false}),
+                    )
+                }
+                _ => Err(CaptureError::new(
+                    "capture_unavailable",
+                    "mismatched KMS metadata",
+                )),
+            }
+        }
+    }
+
+    fn open_payload(id: u64, stream: &IsolatedStream, geometry: bool) -> Value {
+        let mut value = json!({"ok":true,"stream":id,"output":stream.session.output().id,"frame_readback_verified":false});
+        if geometry {
+            value["desktop_geometry"] = json!(stream.session.geometry().capture);
+        }
+        value
+    }
+    fn start_error(error: std::io::Error) -> CaptureError {
+        CaptureError::new("capture_unavailable", error.to_string())
+    }
+    fn cleanup_error(error: std::io::Error) -> CaptureError {
+        CaptureError::new("cleanup_failed", error.to_string())
+    }
+}
+
+#[cfg(all(test, feature = "isolated-helper", target_os = "linux", amaterasu_kms))]
+pub(crate) use isolated::{IsolatedCompletion, IsolatedController};
+
 #[cfg(test)]
 mod tests {
     use super::Controller;
@@ -491,6 +931,65 @@ mod tests {
         assert_eq!(dropped.load(Ordering::SeqCst), 1);
         assert_eq!(module.quiesce(), Ok(true));
         assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn tick_does_not_dequeue_work_while_native_read_holds_controller() {
+        use amaterasu_module_sdk::{Command, ManagedModule, Response, RuntimeClient, abi::*};
+        use std::{ffi::c_void, sync::Mutex, time::Duration};
+
+        unsafe extern "C" fn host(
+            context: *mut c_void,
+            request: BorrowedBytes,
+            reply: ReplySink,
+        ) -> Status {
+            // SAFETY: this test retains the counter and request for the call.
+            let polls = unsafe { &*context.cast::<AtomicUsize>() };
+            let command: Command =
+                serde_json::from_slice(unsafe { request.read().unwrap() }).unwrap();
+            assert!(matches!(command, Command::Poll {}));
+            polls.fetch_add(1, Ordering::SeqCst);
+            let response = serde_json::to_vec(&Response::Pending).unwrap();
+            // SAFETY: the synchronous reply sink copies this byte slice.
+            unsafe { reply.send(&response) };
+            STATUS_OK
+        }
+
+        let polls = Arc::new(AtomicUsize::new(0));
+        let controller = Arc::new(Mutex::new(Controller::new(
+            crate::backend::NativeBackend::new(),
+            true,
+        )));
+        let factory = crate::native::Factory::new(controller.clone());
+        // SAFETY: polls remains alive until after the module is dropped.
+        let runtime = unsafe {
+            RuntimeClient::from_endpoint(HostApi {
+                header: AbiHeader::of::<HostApi>(),
+                context: Arc::as_ptr(&polls).cast_mut().cast(),
+                invoke: host,
+            })
+        };
+        let mut module = crate::CaptureModule {
+            runtime,
+            controller: controller.clone(),
+            _factory: factory,
+            shutting_down: false,
+        };
+        let (locked, ready) = std::sync::mpsc::channel();
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let _guard = controller.lock().unwrap();
+            locked.send(()).unwrap();
+            let _ = wait.recv_timeout(Duration::from_secs(2));
+        });
+        ready.recv_timeout(Duration::from_secs(1)).unwrap();
+        module.tick().unwrap();
+        let calls_while_locked = polls.load(Ordering::SeqCst);
+        release.send(()).unwrap();
+        holder.join().unwrap();
+        assert_eq!(calls_while_locked, 0);
+        module.tick().unwrap();
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

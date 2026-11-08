@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
+[features]
+# Development-only until process isolation is fully integrated and reviewed.
+isolated-helper = []
+
 [lib]
 crate-type = ["cdylib", "rlib"]
 
@@ -13,6 +17,9 @@ amaterasu-media.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 getrandom.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
 
 [build-dependencies]
 cc = "1"

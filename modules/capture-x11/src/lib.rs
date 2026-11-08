@@ -82,6 +82,16 @@ impl ManagedModule for CaptureModule {
 
     fn tick(&mut self) -> ModuleResult<()> {
         for _ in 0..8 {
+            // A native read can be in progress on another worker. Do not
+            // dequeue a request unless it can be handled without blocking the
+            // host's cooperative shutdown loop.
+            let mut controller = match self.controller.try_lock() {
+                Ok(controller) => controller,
+                Err(std::sync::TryLockError::WouldBlock) => return Ok(()),
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    return Err("X11 capture controller poisoned".into());
+                }
+            };
             let (id, caller, service, payload) = match self.runtime.send(Command::Poll {})? {
                 Response::Pending => break,
                 Response::Request {
@@ -109,10 +119,6 @@ impl ManagedModule for CaptureModule {
                             .payload()
                     }
                     Ok(operation) => {
-                        let mut controller = self
-                            .controller
-                            .lock()
-                            .map_err(|_| "X11 capture controller poisoned")?;
                         let reply = controller.handle(&caller, operation, &mut || match self
                             .runtime
                             .send(Command::CheckRequest { request: id })
@@ -133,11 +139,7 @@ impl ManagedModule for CaptureModule {
                 Ok(Response::Ok) => (),
                 result => {
                     if let Some(stream) = opened_stream {
-                        let _ = self
-                            .controller
-                            .lock()
-                            .map_err(|_| "X11 capture controller poisoned")?
-                            .close(&caller, stream);
+                        let _ = controller.close(&caller, stream);
                     }
                     if !matches!(result, Ok(Response::Error { ref code, .. }) if code == "request_ended" || code == "not_found")
                     {

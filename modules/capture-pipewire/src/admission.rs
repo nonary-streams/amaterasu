@@ -34,6 +34,10 @@ impl Admission {
     pub fn is_closed(&self) -> bool {
         self.0.load(Ordering::SeqCst) & CLOSED != 0
     }
+
+    pub fn retired(&self) -> bool {
+        self.0.load(Ordering::SeqCst) == CLOSED
+    }
 }
 
 pub struct Permit(Arc<Admission>);
@@ -56,8 +60,10 @@ mod tests {
         admission.close();
 
         assert!(admission.is_closed());
+        assert!(!admission.retired());
         assert!(admission.enter().is_none());
         drop(admitted);
+        assert!(admission.retired());
         assert!(admission.enter().is_none());
     }
 }

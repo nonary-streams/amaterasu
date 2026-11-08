@@ -101,6 +101,7 @@ fn module(controller: Controller<FakeBackend>) -> crate::CaptureModule {
         _preflight_factory: preflight_factory,
         epoch: Instant::now(),
         pending_opens: Vec::new(),
+        polled_request: None,
         shutting_down: false,
     }
 }
@@ -137,6 +138,123 @@ fn module_quiescence_releases_capture_before_reporting_ready() {
     frame.finish(STATUS_OK);
     assert_eq!(module.quiesce(), Ok(true));
     assert_eq!(driver.drops.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn close_waits_for_native_cleanup_and_inflight_callback() {
+    let (mut controller, driver) = setup(settings());
+    let output = ready(&mut controller, &driver);
+    let stream = open(&mut controller, &output, "amaterasu.video", "one").payload["stream"]
+        .as_u64()
+        .unwrap();
+    let admission = controller
+        .reader("amaterasu.video", stream)
+        .unwrap()
+        .admission;
+    let permit = admission.enter().unwrap();
+    driver.retirement_ready.store(false, Ordering::SeqCst);
+    assert_eq!(
+        controller.close("amaterasu.video", stream),
+        Err("source_retirement_pending")
+    );
+    assert!(admission.is_closed());
+    assert_eq!(driver.retirement_started.load(Ordering::SeqCst), 1);
+    assert_eq!(driver.drops.load(Ordering::SeqCst), 0);
+    assert!(select(&mut controller, "administrator", "new", 20).is_err());
+    driver.retirement_ready.store(true, Ordering::SeqCst);
+    controller.refresh(21);
+    assert_eq!(
+        controller.close("amaterasu.video", stream),
+        Err("source_retirement_pending")
+    );
+    assert_eq!(driver.drops.load(Ordering::SeqCst), 0);
+    drop(permit);
+    controller.refresh(22);
+    assert_eq!(driver.drops.load(Ordering::SeqCst), 1);
+    assert_eq!(controller.close("amaterasu.video", stream), Ok(()));
+}
+
+#[test]
+fn cancelled_selection_keeps_retiring_source_until_cleanup_finishes() {
+    let (mut controller, driver) = setup(settings());
+    select(&mut controller, "administrator", "selection", 0).unwrap();
+    driver.retirement_ready.store(false, Ordering::SeqCst);
+    let cancel = || Operation::CancelSelection {
+        operation_id: "selection".into(),
+    };
+    assert!(matches!(
+        controller.handle("administrator", cancel(), 1),
+        Err("source_retirement_pending")
+    ));
+    // Simulate a token callback that was already running when cancellation
+    // first forgot the previous authorization.
+    driver.restore_available.store(true, Ordering::SeqCst);
+    assert_eq!(driver.drops.load(Ordering::SeqCst), 0);
+    assert!(matches!(
+        select(&mut controller, "administrator", "second", 2),
+        Err("source_selection_busy")
+    ));
+    driver.retirement_ready.store(true, Ordering::SeqCst);
+    controller.refresh(3);
+    assert!(!driver.restore_available.load(Ordering::SeqCst));
+    assert!(controller.handle("administrator", cancel(), 3).is_ok());
+    assert_eq!(driver.drops.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn named_retirement_consumes_capacity_and_waits_for_callback() {
+    let mut config = settings();
+    config.allow_named_outputs = true;
+    let (mut controller, driver) = setup(config);
+    *driver.state.lock().unwrap() = SourceState::Ready {
+        node: 42,
+        width: 2,
+        height: 2,
+    };
+    let stream =
+        open(&mut controller, "kwin:Virtual-1", "amaterasu.video", "one").payload["stream"]
+            .as_u64()
+            .unwrap();
+    let permit = controller
+        .reader("amaterasu.video", stream)
+        .unwrap()
+        .admission
+        .enter()
+        .unwrap();
+    driver.retirement_ready.store(false, Ordering::SeqCst);
+    assert_eq!(
+        controller.close("amaterasu.video", stream),
+        Err("source_retirement_pending")
+    );
+    for number in 2..=4 {
+        open(
+            &mut controller,
+            &format!("kwin:Virtual-{number}"),
+            "amaterasu.video",
+            &format!("op-{number}"),
+        );
+    }
+    assert!(matches!(
+        controller.handle(
+            "amaterasu.video",
+            Operation::Open {
+                output: "kwin:Virtual-5".into(),
+                operation_id: Some("five".into()),
+                constant_rate: None
+            },
+            20
+        ),
+        Err("resource_exhausted")
+    ));
+    driver.retirement_ready.store(true, Ordering::SeqCst);
+    controller.refresh(21);
+    assert_eq!(
+        controller.close("amaterasu.video", stream),
+        Err("source_retirement_pending")
+    );
+    drop(permit);
+    controller.refresh(22);
+    assert_eq!(controller.close("amaterasu.video", stream), Ok(()));
 }
 
 #[test]
@@ -217,6 +335,236 @@ fn module_shutdown_settles_pending_opens_and_rejects_new_sources() {
     assert_eq!(completed[1]["payload"]["error"]["code"], "capture_shutdown");
     assert_eq!(module.quiesce(), Ok(true));
     drop(module);
+}
+
+#[test]
+fn cancelled_open_retains_shared_selection_until_its_last_waiter_leaves() {
+    use amaterasu_module_sdk::{ManagedModule, RuntimeClient, abi::*};
+    use std::ffi::c_void;
+
+    unsafe extern "C" fn host(_: *mut c_void, input: BorrowedBytes, reply: ReplySink) -> Status {
+        // SAFETY: input and reply are borrowed for this synchronous call.
+        let Ok(input) = (unsafe { input.read() }) else {
+            return STATUS_INVALID_ARGUMENT;
+        };
+        let Ok(command) = serde_json::from_slice::<crate::Command>(input) else {
+            return STATUS_INVALID_ARGUMENT;
+        };
+        let response = match command {
+            crate::Command::CheckRequest { request: 1 } => {
+                crate::Response::error("not_found", "cancelled")
+            }
+            crate::Command::CheckRequest { request: 2 } => crate::Response::Ok,
+            crate::Command::Poll {} => crate::Response::Pending,
+            _ => return STATUS_INVALID_ARGUMENT,
+        };
+        let bytes = serde_json::to_vec(&response).unwrap();
+        // SAFETY: reply copies this response synchronously.
+        unsafe { reply.send(&bytes) };
+        STATUS_OK
+    }
+    let mut configuration = settings();
+    configuration.allow_named_outputs = true;
+    let (mut controller, driver) = setup(configuration);
+    let operation = Operation::Open {
+        output: "kwin:Virtual-2".into(),
+        operation_id: Some("shared".into()),
+        constant_rate: None,
+    };
+    assert!(matches!(
+        controller.handle("amaterasu.video", operation.clone(), 0),
+        Err("named_source_pending")
+    ));
+    let mut module = module(controller);
+    // SAFETY: this stateless endpoint remains live throughout the test.
+    module.runtime = unsafe {
+        RuntimeClient::from_endpoint(HostApi {
+            header: AbiHeader::of::<HostApi>(),
+            context: std::ptr::null_mut(),
+            invoke: host,
+        })
+    };
+    for request in [1, 2] {
+        module.pending_opens.push(crate::PendingOpen {
+            request,
+            caller: "amaterasu.video".into(),
+            operation: operation.clone(),
+        });
+    }
+    module.tick().unwrap();
+    assert_eq!(driver.drops.load(Ordering::SeqCst), 0);
+    assert_eq!(driver.selections.load(Ordering::SeqCst), 1);
+    assert_eq!(module.pending_opens.len(), 1);
+    let portal = Operation::Open {
+        output: "portal-selected-session-source".into(),
+        operation_id: Some("shared".into()),
+        constant_rate: None,
+    };
+    module
+        .cancel_unreferenced_open("amaterasu.video", &portal)
+        .unwrap();
+    assert_eq!(driver.drops.load(Ordering::SeqCst), 0);
+    module.pending_opens[0].operation = portal;
+    module
+        .cancel_unreferenced_open("amaterasu.video", &operation)
+        .unwrap();
+    assert_eq!(driver.drops.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn broker_failure_keeps_pending_open_identities_for_retry() {
+    use amaterasu_module_sdk::ManagedModule;
+    let mut configuration = settings();
+    configuration.allow_named_outputs = true;
+    let (mut controller, driver) = setup(configuration);
+    let operation = Operation::Open {
+        output: "kwin:Virtual-2".into(),
+        operation_id: Some("shared".into()),
+        constant_rate: None,
+    };
+    assert!(matches!(
+        controller.handle("amaterasu.video", operation.clone(), 0),
+        Err("named_source_pending")
+    ));
+    let mut module = module(controller);
+    for request in [1, 2] {
+        module.pending_opens.push(crate::PendingOpen {
+            request,
+            caller: "amaterasu.video".into(),
+            operation: operation.clone(),
+        });
+    }
+    // A native preflight may hold this lock. The host tick must not wait,
+    // poll the failing endpoint, or dequeue either pending request.
+    let shared = module.controller.clone();
+    let guard = shared.lock().unwrap();
+    assert!(module.tick().is_ok());
+    assert_eq!(module.pending_opens.len(), 2);
+    drop(guard);
+    assert!(module.tick().is_err());
+    assert_eq!(
+        module
+            .pending_opens
+            .iter()
+            .map(|pending| pending.request)
+            .collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    assert_eq!(driver.drops.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn dequeued_request_survives_check_failure_and_is_retired_on_cancellation() {
+    use amaterasu_module_sdk::{ManagedModule, RuntimeClient, abi::*};
+    use std::ffi::c_void;
+    #[derive(Default)]
+    struct State {
+        polls: usize,
+        checks: usize,
+    }
+    unsafe extern "C" fn host(
+        context: *mut c_void,
+        input: BorrowedBytes,
+        reply: ReplySink,
+    ) -> Status {
+        // SAFETY: the fixture owns the state and input throughout this call.
+        let state = unsafe { &mut *context.cast::<State>() };
+        let Ok(input) = (unsafe { input.read() }) else {
+            return STATUS_INVALID_ARGUMENT;
+        };
+        let Ok(command) = serde_json::from_slice::<crate::Command>(input) else {
+            return STATUS_INVALID_ARGUMENT;
+        };
+        let response = match command {
+            crate::Command::Poll {} => {
+                state.polls += 1;
+                if state.polls == 1 {
+                    crate::Response::Request {
+                        id: 42,
+                        caller: "amaterasu.video".into(),
+                        initiator: "amaterasu.video".into(),
+                        service: crate::SERVICE.into(),
+                        payload: json!({"action":"status"}),
+                        remaining_ms: 5000,
+                    }
+                } else {
+                    crate::Response::Pending
+                }
+            }
+            crate::Command::CheckRequest { request: 42 } => {
+                state.checks += 1;
+                if state.checks == 1 {
+                    return STATUS_INTERNAL_ERROR;
+                }
+                crate::Response::error("request_ended", "cancelled")
+            }
+            _ => return STATUS_INVALID_ARGUMENT,
+        };
+        let bytes = serde_json::to_vec(&response).unwrap();
+        // SAFETY: the reply copies bytes synchronously.
+        unsafe { reply.send(&bytes) };
+        STATUS_OK
+    }
+    let mut state = State::default();
+    let (controller, _) = setup(settings());
+    let mut module = module(controller);
+    // SAFETY: fixture state and endpoint outlive the module.
+    module.runtime = unsafe {
+        RuntimeClient::from_endpoint(HostApi {
+            header: AbiHeader::of::<HostApi>(),
+            context: (&mut state as *mut State).cast(),
+            invoke: host,
+        })
+    };
+    assert!(module.tick().is_err());
+    assert_eq!(module.polled_request.as_ref().unwrap().id, 42);
+    assert_eq!(state.polls, 1);
+    module.tick().unwrap();
+    assert!(module.polled_request.is_none());
+    assert_eq!(state.checks, 2);
+    assert_eq!(state.polls, 2);
+    drop(module);
+}
+
+#[test]
+fn named_cancellation_does_not_retire_a_waiting_portal_restore() {
+    let mut configuration = settings();
+    configuration.allow_named_outputs = true;
+    configuration.remember_source = true;
+    configuration
+        .selection_principals
+        .insert("amaterasu.video".into());
+    let (mut controller, driver) = setup(configuration);
+    driver.restore_available.store(true, Ordering::SeqCst);
+    let portal = Operation::Open {
+        output: "portal-selected-session-source".into(),
+        operation_id: Some("portal".into()),
+        constant_rate: None,
+    };
+    let named = Operation::Open {
+        output: "kwin:Virtual-2".into(),
+        operation_id: Some("named".into()),
+        constant_rate: None,
+    };
+    assert!(matches!(
+        controller.handle("amaterasu.video", portal.clone(), 0),
+        Err("source_restore_pending")
+    ));
+    assert!(matches!(
+        controller.handle("amaterasu.video", named.clone(), 0),
+        Err("named_source_pending")
+    ));
+    let mut module = module(controller);
+    module.pending_opens.push(crate::PendingOpen {
+        request: 1,
+        caller: "amaterasu.video".into(),
+        operation: portal,
+    });
+    module
+        .cancel_unreferenced_open("amaterasu.video", &named)
+        .unwrap();
+    assert_eq!(driver.drops.load(Ordering::SeqCst), 1);
+    assert!(module.controller.lock().unwrap().selection.is_some());
 }
 
 #[test]

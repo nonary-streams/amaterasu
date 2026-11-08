@@ -1,5 +1,5 @@
 use super::*;
-use crate::{CaptureModule, NativeBackend};
+use crate::{CaptureModule, NativeBackend, SERVICE};
 use amaterasu_module_sdk::abi::{AbiHeader, BorrowedBytes, HostApi, ReplySink, STATUS_OK, Status};
 use amaterasu_module_sdk::{ManagedModule, RuntimeClient};
 use std::ffi::c_void;
@@ -23,6 +23,74 @@ impl Drop for OwnedSession {
 unsafe extern "C" fn idle_runtime(_: *mut c_void, _: BorrowedBytes, sink: ReplySink) -> Status {
     let response = serde_json::to_vec(&crate::Response::Pending).unwrap();
     // SAFETY: RuntimeClient provides this live reply sink for the current call.
+    unsafe { sink.send(&response) };
+    STATUS_OK
+}
+
+unsafe extern "C" fn counting_runtime(
+    context: *mut c_void,
+    _: BorrowedBytes,
+    sink: ReplySink,
+) -> Status {
+    // SAFETY: the fixture retains the counter until after module destruction.
+    let polls = unsafe { &*context.cast::<AtomicUsize>() };
+    polls.fetch_add(1, Ordering::SeqCst);
+    let response = serde_json::to_vec(&crate::Response::Pending).unwrap();
+    // SAFETY: RuntimeClient provides this live reply sink for the current call.
+    unsafe { sink.send(&response) };
+    STATUS_OK
+}
+
+struct CancelledCloseRuntime {
+    polls: AtomicUsize,
+    checks: AtomicUsize,
+    completions: AtomicUsize,
+}
+
+unsafe extern "C" fn cancelled_close_runtime(
+    context: *mut c_void,
+    input: BorrowedBytes,
+    sink: ReplySink,
+) -> Status {
+    if context.is_null() {
+        return amaterasu_module_sdk::abi::STATUS_INVALID_ARGUMENT;
+    }
+    // SAFETY: the test keeps this counter alive until after module destruction.
+    let calls = unsafe { &*context.cast::<CancelledCloseRuntime>() };
+    // SAFETY: RuntimeClient supplies command bytes valid for this call.
+    let Ok(command) = (unsafe { input.read() }) else {
+        return amaterasu_module_sdk::abi::STATUS_INVALID_ARGUMENT;
+    };
+    let Ok(command) = serde_json::from_slice::<serde_json::Value>(command) else {
+        return amaterasu_module_sdk::abi::STATUS_INVALID_ARGUMENT;
+    };
+    let response = match command["op"].as_str() {
+        Some("poll") if calls.polls.fetch_add(1, Ordering::SeqCst) == 0 => {
+            crate::Response::Request {
+                id: 19,
+                caller: "video".into(),
+                initiator: "client".into(),
+                service: SERVICE.into(),
+                payload: serde_json::json!({"action":"close","stream":1}),
+                remaining_ms: 1_000,
+            }
+        }
+        Some("poll") => crate::Response::Pending,
+        Some("check_request") => {
+            calls.checks.fetch_add(1, Ordering::SeqCst);
+            crate::Response::Error {
+                code: "request_ended".into(),
+                message: "request was cancelled".into(),
+            }
+        }
+        Some("complete") => {
+            calls.completions.fetch_add(1, Ordering::SeqCst);
+            crate::Response::Ok
+        }
+        _ => crate::Response::Pending,
+    };
+    let response = serde_json::to_vec(&response).unwrap();
+    // SAFETY: RuntimeClient provides a live reply sink for this call.
     unsafe { sink.send(&response) };
     STATUS_OK
 }
@@ -139,6 +207,58 @@ fn quiescence_does_not_wait_for_a_native_read_holding_the_controller() {
     release.send(()).unwrap();
     held_read.join().unwrap();
     assert!(module.quiesce().unwrap());
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn tick_defers_polling_while_a_native_read_owns_the_controller() {
+    let polls = AtomicUsize::new(0);
+    let mut module = module_with_session(Box::new(OwnedSession(Arc::new(AtomicUsize::new(0)))));
+    // SAFETY: polls stays alive until the module has been dropped below.
+    module.runtime = unsafe {
+        RuntimeClient::from_endpoint(HostApi {
+            header: AbiHeader::of::<HostApi>(),
+            context: std::ptr::from_ref(&polls).cast_mut().cast(),
+            invoke: counting_runtime,
+        })
+    };
+    let (release, held_read) = hold_controller(&module);
+    let started = std::time::Instant::now();
+    module.tick().unwrap();
+    assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    assert_eq!(polls.load(Ordering::SeqCst), 0);
+    release.send(()).unwrap();
+    held_read.join().unwrap();
+    module.tick().unwrap();
+    assert_eq!(polls.load(Ordering::SeqCst), 1);
+    drop(module);
+}
+
+#[test]
+fn cancelled_close_does_not_retire_the_owned_capture_stream() {
+    let drops = Arc::new(AtomicUsize::new(0));
+    let mut module = module_with_session(Box::new(OwnedSession(drops.clone())));
+    let calls = CancelledCloseRuntime {
+        polls: AtomicUsize::new(0),
+        checks: AtomicUsize::new(0),
+        completions: AtomicUsize::new(0),
+    };
+    // SAFETY: calls remains live until the module is dropped below.
+    module.runtime = unsafe {
+        RuntimeClient::from_endpoint(HostApi {
+            header: AbiHeader::of::<HostApi>(),
+            context: std::ptr::from_ref(&calls).cast_mut().cast(),
+            invoke: cancelled_close_runtime,
+        })
+    };
+
+    module.tick().unwrap();
+
+    assert_eq!(calls.checks.load(Ordering::SeqCst), 1);
+    assert_eq!(calls.completions.load(Ordering::SeqCst), 0);
+    assert!(module.controller.lock().unwrap().streams.contains_key(&1));
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    drop(module);
     assert_eq!(drops.load(Ordering::SeqCst), 1);
 }
 

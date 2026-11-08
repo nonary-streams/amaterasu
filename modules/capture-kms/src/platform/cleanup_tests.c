@@ -3,6 +3,7 @@
 #define eglMakeCurrent am_kms_test_make_current
 #define eglGetCurrentContext am_kms_test_get_current_context
 #define eglGetCurrentDisplay am_kms_test_get_current_display
+#define eglGetCurrentSurface am_kms_test_get_current_surface
 #define eglQueryAPI am_kms_test_query_api
 #define eglBindAPI am_kms_test_bind_api
 #define eglDestroySurface am_kms_test_destroy_surface
@@ -21,6 +22,7 @@
 #undef eglMakeCurrent
 #undef eglGetCurrentContext
 #undef eglGetCurrentDisplay
+#undef eglGetCurrentSurface
 #undef eglQueryAPI
 #undef eglBindAPI
 #undef eglDestroySurface
@@ -57,18 +59,21 @@ struct cleanup_trace {
     bool owns_current_context;
     EGLContext current_context;
     EGLDisplay current_display;
+    EGLSurface current_draw;
+    EGLSurface current_read;
     EGLenum selected_api;
     EGLContext vg_context;
     EGLDisplay vg_display;
     uint32_t fail_bind_call;
+    uint32_t fail_make_current_call;
 };
 
 static _Thread_local struct cleanup_trace trace;
 
 EGLBoolean EGLAPIENTRY am_kms_test_make_current(EGLDisplay display,
     EGLSurface draw, EGLSurface read, EGLContext context) {
-    (void)draw; (void)read;
     trace.observed.make_current_calls++;
+    if (trace.observed.make_current_calls == trace.fail_make_current_call) return EGL_FALSE;
     if (context == EGL_NO_CONTEXT) {
         trace.observed.unbind_calls++;
         if (trace.selected_api == EGL_OPENVG_API) {
@@ -85,13 +90,17 @@ EGLBoolean EGLAPIENTRY am_kms_test_make_current(EGLDisplay display,
         }
         trace.current_context = EGL_NO_CONTEXT;
         trace.current_display = EGL_NO_DISPLAY;
+        trace.current_draw = EGL_NO_SURFACE;
+        trace.current_read = EGL_NO_SURFACE;
         trace.owns_current_context = false;
         return EGL_TRUE;
     }
     if (trace.make_current_succeeds == EGL_TRUE) {
-        trace.owns_current_context = true;
+        trace.owns_current_context = context == (EGLContext)(uintptr_t)2;
         trace.current_context = context;
         trace.current_display = display;
+        trace.current_draw = draw;
+        trace.current_read = read;
     }
     return trace.make_current_succeeds;
 }
@@ -102,6 +111,10 @@ EGLContext EGLAPIENTRY am_kms_test_get_current_context(void) {
 
 EGLDisplay EGLAPIENTRY am_kms_test_get_current_display(void) {
     return trace.selected_api == EGL_OPENVG_API ? trace.vg_display : trace.current_display;
+}
+
+EGLSurface EGLAPIENTRY am_kms_test_get_current_surface(EGLint which) {
+    return which == EGL_DRAW ? trace.current_draw : trace.current_read;
 }
 
 EGLenum EGLAPIENTRY am_kms_test_query_api(void) {
@@ -235,10 +248,80 @@ void am_kms_test_full_cleanup(uint32_t make_current_succeeds,
 int am_kms_test_read_without_current_context(
     struct am_kms_cleanup_observation *output) {
     trace = (struct cleanup_trace){0};
+    trace.selected_api = EGL_OPENGL_ES_API;
     struct am_kms_session session = test_session();
     uint8_t pixels[16] = {0};
     uint32_t width = 0, height = 0;
     int result = am_kms_test_read(&session, pixels, sizeof(pixels), &width, &height);
     *output = trace.observed;
     return result;
+}
+
+int am_kms_test_read_binding(uint32_t scenario,
+    struct am_kms_cleanup_observation *output) {
+    trace = (struct cleanup_trace){0};
+    trace.selected_api = scenario == 2 ? EGL_OPENVG_API : EGL_OPENGL_ES_API;
+    trace.make_current_succeeds = EGL_TRUE;
+    if (scenario != 0) {
+        trace.current_context = (EGLContext)(uintptr_t)5;
+        trace.current_display = (EGLDisplay)(uintptr_t)7;
+        trace.current_draw = (EGLSurface)(uintptr_t)8;
+        trace.current_read = (EGLSurface)(uintptr_t)9;
+    }
+    trace.vg_context = (EGLContext)(uintptr_t)6;
+    trace.vg_display = (EGLDisplay)(uintptr_t)7;
+    struct am_kms_session session = test_session();
+    uint8_t pixels[16] = {0};
+    uint32_t width = 0, height = 0;
+    int result = am_kms_test_read(&session, pixels, sizeof(pixels), &width, &height);
+    trace.observed.current_context_after = (uint32_t)(uintptr_t)trace.current_context;
+    trace.observed.selected_api_after = trace.selected_api;
+    trace.observed.vg_context_after = (uint32_t)(uintptr_t)trace.vg_context;
+    /* Distinct result values verify both restored surfaces. */
+    trace.observed.texture_after = (uint32_t)(uintptr_t)trace.current_draw;
+    trace.observed.framebuffer_after = (uint32_t)(uintptr_t)trace.current_read;
+    *output = trace.observed;
+    return result;
+}
+
+uint32_t am_kms_test_open_binding(uint32_t fail_restore,
+    struct am_kms_cleanup_observation *output) {
+    trace = (struct cleanup_trace){0};
+    trace.selected_api = EGL_OPENGL_ES_API;
+    trace.make_current_succeeds = EGL_TRUE;
+    trace.current_context = (EGLContext)(uintptr_t)5;
+    trace.current_display = (EGLDisplay)(uintptr_t)7;
+    trace.current_draw = (EGLSurface)(uintptr_t)8;
+    trace.current_read = (EGLSurface)(uintptr_t)9;
+    trace.fail_make_current_call = fail_restore ? 2 : 0;
+    struct am_kms_session session = test_session();
+    struct am_kms_egl_binding binding;
+    if (!save_egl_binding(&binding) ||
+        am_kms_test_make_current(session.display, session.surface, session.surface, session.context) != EGL_TRUE) {
+        return 2;
+    }
+    bool restored = restore_egl_binding(&binding, session.display, session.context);
+    trace.observed.current_context_after = (uint32_t)(uintptr_t)trace.current_context;
+    trace.observed.texture_after = (uint32_t)(uintptr_t)trace.current_draw;
+    trace.observed.framebuffer_after = (uint32_t)(uintptr_t)trace.current_read;
+    *output = trace.observed;
+    return restored ? 1 : 0;
+}
+
+void am_kms_test_close_binding(struct am_kms_cleanup_observation *output) {
+    trace = (struct cleanup_trace){0};
+    trace.selected_api = EGL_OPENGL_ES_API;
+    trace.make_current_succeeds = EGL_TRUE;
+    trace.current_context = (EGLContext)(uintptr_t)5;
+    trace.current_display = (EGLDisplay)(uintptr_t)7;
+    trace.current_draw = (EGLSurface)(uintptr_t)8;
+    trace.current_read = (EGLSurface)(uintptr_t)9;
+    struct am_kms_session *session = malloc(sizeof(*session));
+    if (session == NULL) abort();
+    *session = test_session();
+    am_kms_test_close(session);
+    trace.observed.current_context_after = (uint32_t)(uintptr_t)trace.current_context;
+    trace.observed.texture_after = (uint32_t)(uintptr_t)trace.current_draw;
+    trace.observed.framebuffer_after = (uint32_t)(uintptr_t)trace.current_read;
+    *output = trace.observed;
 }

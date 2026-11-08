@@ -17,6 +17,10 @@ pub struct ObservedCapture {
 }
 
 pub trait SourceSession: Send {
+    /// Begin retirement without waiting for native cleanup.
+    fn begin_stop(&mut self);
+    /// True only after native cleanup is complete and destruction can finish.
+    fn stopped(&self) -> bool;
     fn observed_capture(&self) -> Option<ObservedCapture> {
         None
     }

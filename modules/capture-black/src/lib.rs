@@ -14,6 +14,15 @@ use controller::Controller;
 use model::{Operation, SERVICE, Settings, failure};
 use std::sync::{Arc, Mutex};
 
+const MAX_PENDING_CLOSES: usize = 32;
+
+struct PendingClose {
+    request: Option<u64>,
+    caller: String,
+    stream: u64,
+    reply: Option<serde_json::Value>,
+}
+
 struct BlackPreflight(native::SharedController);
 impl SourcePreflightProvider for BlackPreflight {
     fn query(
@@ -32,6 +41,7 @@ impl SourcePreflightProvider for BlackPreflight {
 struct BlackCapture {
     runtime: RuntimeClient,
     controller: native::SharedController,
+    pending_closes: Vec<PendingClose>,
     _factory: Box<native::Factory>,
     _preflight_factory: Box<SourcePreflightFactory<BlackPreflight>>,
 }
@@ -65,6 +75,7 @@ impl ManagedModule for BlackCapture {
         Ok(Self {
             runtime,
             controller,
+            pending_closes: Vec::new(),
             _factory: factory,
             _preflight_factory: preflight_factory,
         })
@@ -75,6 +86,7 @@ impl ManagedModule for BlackCapture {
             .lock()
             .map_err(|_| "black capture controller poisoned")?
             .maintain(host_monotonic_micros());
+        self.poll_pending_closes()?;
         for _ in 0..8 {
             let (id, caller, service, payload) = match self.runtime.send(Command::Poll {})? {
                 Response::Pending => break,
@@ -93,25 +105,57 @@ impl ManagedModule for BlackCapture {
             ) {
                 continue;
             }
+            let operation = serde_json::from_value::<Operation>(payload);
+            let close_stream = if service == SERVICE {
+                operation
+                    .as_ref()
+                    .ok()
+                    .and_then(|operation| match operation {
+                        Operation::Close { stream } => Some(*stream),
+                        _ => None,
+                    })
+            } else {
+                None
+            };
             let (payload, created) = {
                 let mut controller = self
                     .controller
                     .lock()
                     .map_err(|_| "black capture controller poisoned")?;
-                let response = match serde_json::from_value::<Operation>(payload) {
-                    Ok(operation) if service == SERVICE => {
-                        controller.handle(&caller, operation, host_monotonic_micros(), &mut || {
-                            match self.runtime.send(Command::CheckRequest { request: id }) {
+                let response = if close_stream.is_some()
+                    && self.pending_closes.len() >= MAX_PENDING_CLOSES
+                {
+                    Err("resource_exhausted")
+                } else {
+                    match operation {
+                        Ok(operation) if service == SERVICE => controller.handle(
+                            &caller,
+                            operation,
+                            host_monotonic_micros(),
+                            &mut || match self.runtime.send(Command::CheckRequest { request: id }) {
                                 Ok(Response::Ok) => Ok(()),
                                 _ => Err("request_ended"),
-                            }
-                        })
+                            },
+                        ),
+                        Ok(_) => Err("invalid_service"),
+                        Err(_) => Err("invalid_request"),
                     }
-                    Ok(_) => Err("invalid_service"),
-                    Err(_) => Err("invalid_request"),
                 };
                 response.unwrap_or_else(|code| (failure(code), None))
             };
+            if let Some(stream) = close_stream
+                && payload["error"]["code"].as_str() == Some("busy")
+            {
+                // Close was admitted, so cancellation of its broker waiter
+                // must not cancel retirement of this exact stream.
+                self.pending_closes.push(PendingClose {
+                    request: Some(id),
+                    caller,
+                    stream,
+                    reply: None,
+                });
+                continue;
+            }
             let completion = self.runtime.send(Command::Complete {
                 request: id,
                 payload,
@@ -127,7 +171,80 @@ impl ManagedModule for BlackCapture {
                 }
             }
         }
+        self.poll_pending_closes()?;
         Ok(())
+    }
+}
+
+impl BlackCapture {
+    fn poll_pending_closes(&mut self) -> ModuleResult<()> {
+        let now_us = host_monotonic_micros();
+        let pending = std::mem::take(&mut self.pending_closes);
+        let mut retry = Vec::with_capacity(pending.len());
+        let mut first_failure = None;
+        let mut pending = pending.into_iter();
+
+        while let Some(mut close) = pending.next() {
+            let mut activity_confirmed = close.reply.is_some() || close.request.is_none();
+            if close.reply.is_none()
+                && let Some(request) = close.request
+            {
+                match self.runtime.send(Command::CheckRequest { request }) {
+                    Ok(Response::Ok) => activity_confirmed = true,
+                    Ok(Response::Error { code, .. })
+                        if code == "request_ended" || code == "not_found" =>
+                    {
+                        close.request = None;
+                    }
+                    response => {
+                        first_failure.get_or_insert_with(|| {
+                            format!("black capture close activity check failed: {response:?}")
+                        });
+                    }
+                }
+            }
+
+            if close.reply.is_none() {
+                let result = match self.controller.lock() {
+                    Ok(mut controller) => controller.close(&close.caller, close.stream, now_us),
+                    Err(_) => {
+                        retry.push(close);
+                        retry.extend(pending);
+                        self.pending_closes = retry;
+                        return Err("black capture controller poisoned".into());
+                    }
+                };
+                match result {
+                    Ok(()) => close.reply = Some(serde_json::json!({"ok":true})),
+                    Err("busy") => (),
+                    Err(code) => close.reply = Some(failure(code)),
+                }
+            }
+
+            match (close.request, close.reply.as_ref(), activity_confirmed) {
+                (Some(request), Some(payload), true) => {
+                    match self.runtime.send(Command::Complete {
+                        request,
+                        payload: payload.clone(),
+                    }) {
+                        Ok(Response::Ok) => (),
+                        Ok(Response::Error { code, .. })
+                            if code == "request_ended" || code == "not_found" => {}
+                        response => {
+                            first_failure.get_or_insert_with(|| {
+                                format!("black capture close completion failed: {response:?}")
+                            });
+                            retry.push(close);
+                        }
+                    }
+                }
+                (None, Some(_), _) => (),
+                _ => retry.push(close),
+            }
+        }
+
+        self.pending_closes = retry;
+        first_failure.map_or(Ok(()), Err)
     }
 }
 
@@ -141,3 +258,7 @@ impl Drop for BlackCapture {
 }
 
 amaterasu_module_sdk::export_module!(BlackCapture);
+
+#[cfg(test)]
+#[path = "module_tests.rs"]
+mod module_tests;

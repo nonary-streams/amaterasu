@@ -200,6 +200,23 @@ fn shutdown_announcement_preserves_capture_until_consumers_drain() {
 }
 
 #[test]
+fn tick_defers_polling_while_native_capture_holds_controller() {
+    use amaterasu_module_sdk::ManagedModule;
+
+    let (controller, _, _) = controller(true);
+    let mut module = module(controller);
+    let shared = module.controller.clone();
+    let held = shared.lock().unwrap();
+    // The fixture's runtime rejects every call, so success also proves that
+    // Poll was not sent while a native reader held the controller.
+    assert_eq!(module.tick(), Ok(()));
+    assert_eq!(module.quiesce(), Ok(false));
+    drop(held);
+    assert!(module.tick().is_err());
+    assert_eq!(module.quiesce(), Ok(true));
+}
+
+#[test]
 fn stream_leases_are_caller_scoped_for_read_lookup_and_close() {
     let (mut controller, opened, _) = controller(true);
     let stream = open(&mut controller, "console.one", "launch.one");

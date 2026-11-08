@@ -97,6 +97,8 @@ unsafe extern "C" {
     ) -> *mut c_void;
     fn am_pw_snapshot(session: *mut c_void, output: *mut Snapshot);
     fn am_pw_destroy(session: *mut c_void);
+    fn am_pw_begin_stop(session: *mut c_void);
+    fn am_pw_stopped(session: *mut c_void) -> i32;
 }
 
 pub struct NativeBackend {
@@ -271,6 +273,14 @@ struct CallbackContext {
 unsafe impl Send for NativeSession {}
 
 impl SourceSession for NativeSession {
+    fn begin_stop(&mut self) {
+        // SAFETY: this session uniquely owns the live adapter handle.
+        unsafe { am_pw_begin_stop(self.native.as_ptr()) };
+    }
+    fn stopped(&self) -> bool {
+        // SAFETY: the live handle and its callback context remain owned here.
+        unsafe { am_pw_stopped(self.native.as_ptr()) != 0 }
+    }
     fn observed_capture(&self) -> Option<ObservedCapture> {
         let mut snapshot = Snapshot::default();
         // SAFETY: the session is live and the adapter writes a fixed-layout snapshot.

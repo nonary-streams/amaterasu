@@ -444,9 +444,13 @@ impl Controller {
         }
         let stream = self
             .streams
-            .get(&id)
+            .get_mut(&id)
             .filter(|stream| stream.owner == caller)
             .ok_or("not_found")?;
+        // Once Close is admitted, keep ownership even when a synchronous
+        // frame callback still holds a borrow. `maintain` will retry retirement
+        // after that callback releases its delivery lease.
+        stream.abandoned = true;
         let mut pacing = stream
             .pacing
             .lock()

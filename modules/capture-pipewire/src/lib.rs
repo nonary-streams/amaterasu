@@ -45,8 +45,17 @@ struct CaptureModule {
     _preflight_factory: Box<SourcePreflightFactory<PipewirePreflight>>,
     epoch: Instant,
     pending_opens: Vec<PendingOpen>,
+    polled_request: Option<PolledRequest>,
     shutting_down: bool,
 }
+#[derive(Clone)]
+struct PolledRequest {
+    id: u64,
+    caller: String,
+    service: String,
+    payload: serde_json::Value,
+}
+#[derive(Clone)]
 struct PendingOpen {
     request: u64,
     caller: String,
@@ -94,6 +103,7 @@ impl ManagedModule for CaptureModule {
             _preflight_factory: preflight_factory,
             epoch: Instant::now(),
             pending_opens: Vec::new(),
+            polled_request: None,
             shutting_down: false,
         })
     }
@@ -107,10 +117,10 @@ impl ManagedModule for CaptureModule {
         self.shutting_down = true;
         match self.controller.try_lock() {
             Ok(mut controller) => {
-                // Native SourceSession destruction cancels and joins its worker.
-                // Its callback storage must remain owned until that join returns.
                 controller.shutdown();
-                Ok(self.pending_opens.is_empty())
+                Ok(controller.retired()
+                    && self.pending_opens.is_empty()
+                    && self.polled_request.is_none())
             }
             Err(std::sync::TryLockError::WouldBlock) => Ok(false),
             Err(std::sync::TryLockError::Poisoned(_)) => {
@@ -121,63 +131,110 @@ impl ManagedModule for CaptureModule {
 
     fn tick(&mut self) -> ModuleResult<()> {
         let now = self.epoch.elapsed().as_millis().min(u64::MAX as u128) as u64;
-        self.controller
-            .lock()
-            .map_err(|_| "PipeWire controller poisoned")?
-            .refresh(now);
+        // Acquire before polling or removing pending requests: a concurrent
+        // native preflight must not block the host or strand dequeued work.
+        let shared = self.controller.clone();
+        let mut controller = match shared.try_lock() {
+            Ok(controller) => controller,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(()),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err("PipeWire controller poisoned".into());
+            }
+        };
+        controller.refresh(now);
         let mut cancelled = Vec::new();
-        for pending in std::mem::take(&mut self.pending_opens) {
-            if matches!(
-                self.runtime.send(Command::CheckRequest {
-                    request: pending.request
-                })?,
-                Response::Ok
-            ) {
-                self.dispatch(pending.request, pending.caller, pending.operation, now)?;
-            } else {
-                self.controller
-                    .lock()
-                    .map_err(|_| "PipeWire controller poisoned")?
-                    .cancel_pending_open(&pending.caller, &pending.operation);
-                cancelled.push(pending.caller);
+        let mut pending_opens = std::mem::take(&mut self.pending_opens).into_iter();
+        while let Some(pending) = pending_opens.next() {
+            let outcome = self.runtime.send(Command::CheckRequest {
+                request: pending.request,
+            });
+            let result = match outcome {
+                Ok(Response::Ok) => self.dispatch_locked(
+                    &mut controller,
+                    pending.request,
+                    pending.caller.clone(),
+                    pending.operation.clone(),
+                    now,
+                ),
+                Ok(Response::Error { code, .. })
+                    if code == "not_found" || code == "request_ended" =>
+                {
+                    cancelled.push(pending.clone());
+                    Ok(())
+                }
+                Ok(response) => Err(format!("PipeWire request check failed: {response:?}")),
+                Err(error) => Err(error),
+            };
+            if let Err(error) = result {
+                // Keep all unresolved identities for retry or shutdown rather than
+                // silently dropping the remaining queue after a broker failure.
+                self.pending_opens.extend(cancelled);
+                self.pending_opens.push(pending);
+                self.pending_opens.extend(pending_opens);
+                return Err(error);
             }
         }
-        for caller in cancelled {
-            if !self
-                .pending_opens
-                .iter()
-                .any(|pending| pending.caller == caller)
-            {
-                self.controller
-                    .lock()
-                    .map_err(|_| "PipeWire controller poisoned")?
-                    .cancel_pending_restore(&caller);
-            }
+        for pending in cancelled {
+            self.cancel_unreferenced_open_locked(
+                &mut controller,
+                &pending.caller,
+                &pending.operation,
+            );
         }
         for _ in 0..8 {
-            let (id, caller, service, payload) = match self.runtime.send(Command::Poll {})? {
-                Response::Pending => break,
-                Response::Request {
-                    id,
-                    caller,
-                    service,
-                    payload,
-                    ..
-                } => (id, caller, service, payload),
-                response => return Err(format!("PipeWire poll failed: {response:?}")),
+            let request = match self.polled_request.take() {
+                Some(request) => request,
+                None => match self.runtime.send(Command::Poll {})? {
+                    Response::Pending => break,
+                    Response::Request {
+                        id,
+                        caller,
+                        service,
+                        payload,
+                        ..
+                    } => PolledRequest {
+                        id,
+                        caller,
+                        service,
+                        payload,
+                    },
+                    response => return Err(format!("PipeWire poll failed: {response:?}")),
+                },
             };
-            if !matches!(
-                self.runtime.send(Command::CheckRequest { request: id })?,
-                Response::Ok
-            ) {
-                continue;
+            match self.runtime.send(Command::CheckRequest {
+                request: request.id,
+            }) {
+                Ok(Response::Ok) => {}
+                Ok(Response::Error { code, .. })
+                    if code == "not_found" || code == "request_ended" =>
+                {
+                    continue;
+                }
+                result => {
+                    self.polled_request = Some(request);
+                    return Err(format!("PipeWire request check failed: {result:?}"));
+                }
             }
-            if service == SERVICE
-                && let Ok(operation) = serde_json::from_value::<Operation>(payload)
+            let result = if request.service == SERVICE
+                && let Ok(operation) = serde_json::from_value::<Operation>(request.payload.clone())
             {
-                self.dispatch(id, caller, operation, now)?;
+                self.dispatch_locked(
+                    &mut controller,
+                    request.id,
+                    request.caller.clone(),
+                    operation,
+                    now,
+                )
             } else {
-                self.runtime.send(Command::Complete {request:id,payload:json!({"ok":false,"error":{"code":"invalid_request","message":"invalid_request"}})})?;
+                self.runtime.send(Command::Complete {request:request.id,payload:json!({"ok":false,"error":{"code":"invalid_request","message":"invalid_request"}})}).and_then(|response| match response {
+                    Response::Ok => Ok(()),
+                    Response::Error { code, .. } if code == "not_found" || code == "request_ended" => Ok(()),
+                    response => Err(format!("PipeWire completion failed: {response:?}")),
+                })
+            };
+            if let Err(error) = result {
+                self.polled_request = Some(request);
+                return Err(error);
             }
         }
         Ok(())
@@ -185,8 +242,22 @@ impl ManagedModule for CaptureModule {
 }
 
 impl CaptureModule {
+    #[cfg(test)]
     fn dispatch(
         &mut self,
+        id: u64,
+        caller: String,
+        operation: Operation,
+        now: u64,
+    ) -> ModuleResult<()> {
+        let shared = self.controller.clone();
+        let mut controller = shared.lock().map_err(|_| "PipeWire controller poisoned")?;
+        self.dispatch_locked(&mut controller, id, caller, operation, now)
+    }
+
+    fn dispatch_locked(
+        &mut self,
+        controller: &mut Controller<NativeBackend>,
         id: u64,
         caller: String,
         operation: Operation,
@@ -199,22 +270,21 @@ impl CaptureModule {
             ) {
             Err("capture_shutdown")
         } else {
-            self.controller
-                .lock()
-                .map_err(|_| "PipeWire controller poisoned")?
-                .handle(&caller, operation.clone(), now)
+            controller.handle(&caller, operation.clone(), now)
         };
         if matches!(
             reply,
-            Err("source_restore_pending" | "named_source_pending")
-        ) && self.pending_opens.len() < 8
-        {
-            self.pending_opens.push(PendingOpen {
-                request: id,
-                caller,
-                operation,
-            });
-            return Ok(());
+            Err("source_restore_pending" | "named_source_pending" | "source_retirement_pending")
+        ) {
+            if self.pending_opens.len() < 8 {
+                self.pending_opens.push(PendingOpen {
+                    request: id,
+                    caller,
+                    operation,
+                });
+                return Ok(());
+            }
+            self.cancel_unreferenced_open_locked(controller, &caller, &operation);
         }
         let (payload, created) = match reply {
             Ok(reply) => (reply.payload, reply.created),
@@ -228,16 +298,57 @@ impl CaptureModule {
             payload,
         });
         if !matches!(completion, Ok(Response::Ok)) {
-            self.controller
-                .lock()
-                .map_err(|_| "PipeWire controller poisoned")?
-                .rollback(&caller, created);
+            controller.rollback(&caller, created);
             if !matches!(completion, Ok(Response::Error { ref code, .. }) if code == "request_ended" || code == "not_found")
             {
                 return Err(format!("PipeWire completion failed: {completion:?}"));
             }
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn cancel_unreferenced_open(
+        &mut self,
+        caller: &str,
+        operation: &Operation,
+    ) -> ModuleResult<()> {
+        let shared = self.controller.clone();
+        let mut controller = shared.lock().map_err(|_| "PipeWire controller poisoned")?;
+        self.cancel_unreferenced_open_locked(&mut controller, caller, operation);
+        Ok(())
+    }
+
+    fn cancel_unreferenced_open_locked(
+        &mut self,
+        controller: &mut Controller<NativeBackend>,
+        caller: &str,
+        operation: &Operation,
+    ) {
+        let operation_id = match operation {
+            Operation::Open {
+                output,
+                operation_id: Some(id),
+                ..
+            } if output.starts_with("kwin:") => Some(id),
+            _ => None,
+        };
+        let still_referenced = operation_id.is_some_and(|id| {
+            self.pending_opens.iter().any(|pending| {
+                pending.caller == caller
+                    && matches!(&pending.operation,
+                Operation::Open { output, operation_id: Some(other), .. } if output.starts_with("kwin:") && other == id)
+            })
+        });
+        if operation_id.is_some() && !still_referenced {
+            controller.cancel_pending_open(caller, operation);
+        }
+        if matches!(operation, Operation::Open { output, .. } if output == "portal-selected-session-source") && !self.pending_opens.iter().any(|pending| {
+            pending.caller == caller && matches!(&pending.operation, Operation::Open { output, .. } if output == "portal-selected-session-source")
+        })
+        {
+            controller.cancel_pending_restore(caller);
+        }
     }
 }
 

@@ -21,6 +21,8 @@ pub struct Driver {
     pub state_reads: AtomicUsize,
     pub revoke_at_read: AtomicUsize,
     pub restore_available: AtomicBool,
+    pub retirement_ready: AtomicBool,
+    pub retirement_started: AtomicUsize,
 }
 
 impl Driver {
@@ -86,6 +88,12 @@ impl Backend for FakeBackend {
     }
 }
 impl SourceSession for FakeSession {
+    fn begin_stop(&mut self) {
+        self.0.retirement_started.fetch_add(1, Ordering::SeqCst);
+    }
+    fn stopped(&self) -> bool {
+        self.0.retirement_ready.load(Ordering::SeqCst)
+    }
     fn observed_capture(&self) -> Option<ObservedCapture> {
         self.0.observed.lock().unwrap().clone()
     }
@@ -121,6 +129,8 @@ pub fn setup(settings: Settings) -> (Controller<FakeBackend>, Arc<Driver>) {
         state_reads: AtomicUsize::new(0),
         revoke_at_read: AtomicUsize::new(usize::MAX),
         restore_available: AtomicBool::new(false),
+        retirement_ready: AtomicBool::new(true),
+        retirement_started: AtomicUsize::new(0),
     });
     let backend = FakeBackend {
         driver: driver.clone(),

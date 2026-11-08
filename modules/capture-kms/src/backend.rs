@@ -402,7 +402,7 @@ fn error_reason(error: u32) -> &'static str {
     }
 }
 
-fn native_error(error: u32) -> CaptureError {
+pub(crate) fn native_error(error: u32) -> CaptureError {
     let code = match error {
         1 => "device_lost",
         2 => "output_unavailable",
@@ -416,6 +416,242 @@ fn native_error(error: u32) -> CaptureError {
     };
     CaptureError::new(code, error_reason(error))
 }
+
+// Prototype remains test-only until lifecycle and package integration are
+// qualified. No production consumer silently switches providers.
+#[cfg(all(test, feature = "isolated-helper", target_os = "linux", amaterasu_kms))]
+mod isolated {
+    use super::*;
+    use crate::{
+        helper_client::Client,
+        helper_process::{self, Registry},
+        open_task::{OpenTask, TaskPoll},
+    };
+    use std::io;
+
+    pub(crate) fn convert_isolated_info(info: NativeInfo) -> NativeAvailability {
+        NativeAvailability {
+            native_supported: true,
+            available: info.error == 0 && info.available != 0,
+            framebuffer_export_supported: info.error == 0 && info.framebuffer_export_supported != 0,
+            presentation_events: false,
+            managed_virtual_output: false,
+            reason: (info.error != 0).then_some(error_reason(info.error)),
+        }
+    }
+
+    pub(crate) fn convert_isolated_outputs(
+        records: &[NativeOutput],
+    ) -> CaptureResult<(Vec<Output>, DesktopRect)> {
+        let outputs = records
+            .iter()
+            .map(convert_native_output)
+            .collect::<CaptureResult<Vec<_>>>()?;
+        let rectangles = outputs
+            .iter()
+            .map(|output| {
+                DesktopRect::new(output.left, output.top, output.width, output.height).map_err(
+                    |_| {
+                        CaptureError::new(
+                            "invalid_geometry",
+                            "DRM returned an invalid output rectangle",
+                        )
+                    },
+                )
+            })
+            .collect::<CaptureResult<Vec<_>>>()?;
+        let desktop = bounding_rectangle(&rectangles)?;
+        Ok((outputs, desktop))
+    }
+
+    pub(crate) struct IsolatedOpenTask(OpenTask<CaptureResult<IsolatedSession>>);
+    impl IsolatedOpenTask {
+        pub fn spawn(registry: Registry, output: String) -> io::Result<Self> {
+            OpenTask::spawn(move |cancellation| {
+                validate_output_id(&output)?;
+                if cancellation.cancelled() {
+                    return Err(CaptureError::new("cancelled", "KMS open cancelled"));
+                }
+                let image = include_bytes!(concat!(env!("OUT_DIR"), "/amaterasu-kms-helper"));
+                let (socket, receipt) =
+                    helper_process::spawn_cancellable(&registry, image, &cancellation).map_err(
+                        |error| CaptureError::new("capture_unavailable", error.to_string()),
+                    )?;
+                if let Err(error) = cancellation.register(&socket) {
+                    receipt.stop();
+                    return Err(CaptureError::new("capture_unavailable", error.to_string()));
+                }
+                let mut client = Client::new(socket, receipt)
+                    .map_err(|error| CaptureError::new("capture_unavailable", error.to_string()))?;
+                let records = client.enumerate()?;
+                let (outputs, _) = convert_isolated_outputs(&records)?;
+                let selected = outputs
+                    .iter()
+                    .find(|candidate| candidate.id == output && candidate.attached)
+                    .ok_or_else(|| {
+                        CaptureError::new("output_unavailable", "selected DRM output is not active")
+                    })?;
+                if !selected.framebuffer_export_supported {
+                    return Err(CaptureError::new(
+                        "unsupported_pixel_format",
+                        selected
+                            .readback_reason
+                            .unwrap_or("DRM framebuffer is not exportable"),
+                    ));
+                }
+                let opened = convert_native_output(&client.open(&output)?)?;
+                if opened.id != output || !opened.framebuffer_export_supported {
+                    return Err(CaptureError::new(
+                        "output_unavailable",
+                        "selected DRM output changed or cannot export its framebuffer",
+                    ));
+                }
+                let records = client.enumerate()?;
+                let (outputs, desktop) = convert_isolated_outputs(&records)?;
+                let selected = outputs
+                    .into_iter()
+                    .find(|candidate| candidate.id == output)
+                    .ok_or_else(|| {
+                        CaptureError::new("output_unavailable", "selected DRM output disappeared")
+                    })?;
+                if !selected.framebuffer_export_supported
+                    || !selected.attached
+                    || (
+                        selected.left,
+                        selected.top,
+                        selected.width,
+                        selected.height,
+                        selected.rotation,
+                    ) != (
+                        opened.left,
+                        opened.top,
+                        opened.width,
+                        opened.height,
+                        opened.rotation,
+                    )
+                {
+                    return Err(CaptureError::new(
+                        "access_lost",
+                        "DRM output geometry changed while opening the capture stream",
+                    ));
+                }
+                let output_rect =
+                    DesktopRect::new(selected.left, selected.top, selected.width, selected.height)
+                        .map_err(|_| {
+                            CaptureError::new("invalid_geometry", "invalid DRM output bounds")
+                        })?;
+                let geometry = CaptureGeometry::new(output_rect, desktop).map_err(|_| {
+                    CaptureError::new("invalid_geometry", "DRM output is outside desktop")
+                })?;
+                frame_layout(selected.width, selected.height)?;
+                Ok(IsolatedSession {
+                    client,
+                    output: selected,
+                    geometry: DesktopGeometry { capture: geometry },
+                    opened_at: Instant::now(),
+                    sequence: 0,
+                    last_timestamp_us: 0,
+                })
+            })
+            .map(Self)
+        }
+        pub fn cancel(&self) -> bool {
+            self.0.cancel()
+        }
+        pub fn poll(&mut self) -> TaskPoll<CaptureResult<IsolatedSession>> {
+            self.0.poll()
+        }
+    }
+
+    pub(crate) struct IsolatedSession {
+        client: Client,
+        output: Output,
+        geometry: DesktopGeometry,
+        opened_at: Instant,
+        sequence: u64,
+        last_timestamp_us: u64,
+    }
+    impl IsolatedSession {
+        pub fn output(&self) -> &Output {
+            &self.output
+        }
+        pub fn retire(&mut self) -> CaptureResult<bool> {
+            self.client.retire()
+        }
+    }
+    impl CaptureSession for IsolatedSession {
+        fn read(&mut self) -> CaptureResult<Frame> {
+            let (stride, length) = frame_layout(self.output.width, self.output.height)?;
+            let mut bytes = vec![0; length];
+            self.client
+                .read_frame(self.output.width, self.output.height, &mut bytes)?;
+            self.sequence = self.sequence.checked_add(1).ok_or_else(|| {
+                CaptureError::new("sequence_exhausted", "DRM capture sequence exhausted")
+            })?;
+            let elapsed = self.opened_at.elapsed().as_micros().min(u64::MAX as u128) as u64;
+            self.last_timestamp_us =
+                elapsed.max(self.last_timestamp_us.checked_add(1).ok_or_else(|| {
+                    CaptureError::new("timestamp_exhausted", "DRM capture timestamp exhausted")
+                })?);
+            Ok(Frame {
+                width: self.output.width,
+                height: self.output.height,
+                stride,
+                timestamp_us: self.last_timestamp_us,
+                sequence: self.sequence,
+                bytes,
+            })
+        }
+        fn geometry(&self) -> DesktopGeometry {
+            self.geometry
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn record(id: &str, left: i32) -> NativeOutput {
+            let mut output = NativeOutput {
+                left,
+                width: 1920,
+                height: 1080,
+                attached: 1,
+                framebuffer_export_supported: 1,
+                ..NativeOutput::default()
+            };
+            for (destination, byte) in output.id.iter_mut().zip(id.bytes()) {
+                *destination = byte as _;
+            }
+            output.name[0] = b'D' as _;
+            output.card[0] = b'c' as _;
+            output
+        }
+
+        #[test]
+        fn metadata_conversion_preserves_desktop_geometry_and_probe_failure() {
+            let (outputs, desktop) = convert_isolated_outputs(&[
+                record("kms:card0/conn=1/crtc=2/plane=3", -1920),
+                record("kms:card0/conn=4/crtc=5/plane=6", 0),
+            ])
+            .unwrap();
+            assert_eq!(outputs.len(), 2);
+            assert_eq!((desktop.left, desktop.width), (-1920, 3840));
+            let info = convert_isolated_info(NativeInfo {
+                error: 3,
+                ..NativeInfo::default()
+            });
+            assert!(!info.available);
+            assert_eq!(info.reason, Some("drm_framebuffer_access_denied"));
+            assert!(convert_isolated_outputs(&[record("invalid", 0)]).is_err());
+        }
+    }
+}
+
+#[cfg(all(test, feature = "isolated-helper", target_os = "linux", amaterasu_kms))]
+pub(crate) use isolated::{
+    IsolatedOpenTask, IsolatedSession, convert_isolated_info, convert_isolated_outputs,
+};
 
 #[cfg(test)]
 mod tests {

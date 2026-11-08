@@ -99,6 +99,9 @@ mod tests {
             output: *mut CleanupObservation,
         );
         fn am_kms_test_read_without_current_context(output: *mut CleanupObservation) -> i32;
+        fn am_kms_test_read_binding(scenario: u32, output: *mut CleanupObservation) -> i32;
+        fn am_kms_test_open_binding(fail_restore: u32, output: *mut CleanupObservation) -> u32;
+        fn am_kms_test_close_binding(output: *mut CleanupObservation);
         fn am_kms_test_full_cleanup(
             make_current_succeeds: u32,
             initially_owned: u32,
@@ -247,6 +250,61 @@ mod tests {
         assert_eq!(observed.make_current_calls, 1);
         assert_eq!(observed.plane_queries, 0, "{observed:?}");
         assert_eq!(observed.wrong_context_deletions, 0);
+    }
+
+    #[test]
+    fn failed_read_releases_its_context_for_another_thread() {
+        let mut observed = CleanupObservation::default();
+        // SAFETY: the adapter's EGL and DRM calls are mocked by this fixture.
+        let result = unsafe { am_kms_test_read_binding(0, &mut observed) };
+        assert_ne!(result, 0);
+        assert_eq!(observed.plane_queries, 1);
+        assert_eq!(observed.unbind_calls, 1);
+        assert_eq!(observed.current_context_after, 0);
+    }
+
+    #[test]
+    fn successful_initial_binding_restores_the_callers_context() {
+        let mut observed = CleanupObservation::default();
+        // SAFETY: all EGL handles in this fixture are mocked.
+        assert_eq!(unsafe { am_kms_test_open_binding(0, &mut observed) }, 1);
+        assert_eq!(observed.current_context_after, 5);
+        assert_eq!((observed.texture_after, observed.framebuffer_after), (8, 9));
+    }
+
+    #[test]
+    fn failed_context_restoration_attempts_to_release_our_context() {
+        let mut observed = CleanupObservation::default();
+        // SAFETY: all EGL handles in this fixture are mocked.
+        assert_eq!(unsafe { am_kms_test_open_binding(1, &mut observed) }, 0);
+        assert_eq!(observed.current_context_after, 0);
+        assert_eq!(observed.unbind_calls, 1);
+    }
+
+    #[test]
+    fn closing_capture_restores_the_callers_context() {
+        let mut observed = CleanupObservation::default();
+        // SAFETY: the fixture owns the fake session and mocks all EGL calls.
+        unsafe { am_kms_test_close_binding(&mut observed) };
+        assert_eq!(observed.current_context_after, 5);
+        assert_eq!((observed.texture_after, observed.framebuffer_after), (8, 9));
+        assert_eq!(observed.context_destructions, 1);
+    }
+
+    #[test]
+    fn failed_read_restores_foreign_context_surfaces_and_selected_api() {
+        for (scenario, api) in [(1, 0x30a0), (2, 0x30a1)] {
+            let mut observed = CleanupObservation::default();
+            // SAFETY: all handles are mock-only values owned by the fixture.
+            let result = unsafe { am_kms_test_read_binding(scenario, &mut observed) };
+            assert_ne!(result, 0);
+            assert_eq!(observed.plane_queries, 1);
+            assert_eq!(observed.current_context_after, 5, "{observed:?}");
+            assert_eq!((observed.texture_after, observed.framebuffer_after), (8, 9));
+            assert_eq!(observed.selected_api_after, api);
+            assert_eq!(observed.vg_context_after, 6);
+            assert_eq!(observed.foreign_context_unbinds, 0);
+        }
     }
 
     #[test]

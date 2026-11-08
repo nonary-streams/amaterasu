@@ -8,6 +8,7 @@ fn main() {
         "src/platform/adapter.h",
         "src/platform/dispatch.h",
         "src/platform/dispatch_tests.c",
+        "src/platform/retirement_tests.c",
     ] {
         println!("cargo:rerun-if-changed={file}");
     }
@@ -42,6 +43,7 @@ fn main() {
         );
         return;
     }
+    println!("cargo:rustc-link-lib=pthread");
     let mut build = cc::Build::new();
     if env::var_os("CARGO_FEATURE_LINUX_KWIN_SCREENCAST").is_some() {
         configure_kwin(&mut build);
@@ -51,6 +53,7 @@ fn main() {
         // This separate archive object is referenced only by Rust unit tests;
         // ordinary native-library linking does not pull the fixture into use.
         .file("src/platform/dispatch_tests.c")
+        .file("src/platform/retirement_tests.c")
         .flag("-std=c11");
     for flag in String::from_utf8(output.stdout)
         .expect("pkg-config UTF-8 flags")

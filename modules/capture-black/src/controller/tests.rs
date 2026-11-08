@@ -265,6 +265,39 @@ fn close_and_lost_open_completion_wait_for_inflight_callbacks_then_retire_storag
 }
 
 #[test]
+fn explicit_close_retries_after_delivery_finishes_and_releases_storage_once() {
+    let mut controller = Controller::new(true);
+    let id = open(&mut controller, "owner", "explicit-close", 1_000_000);
+    let delivery = controller.prepare("owner", id, 1_000_000, false).unwrap();
+    let pixels = Arc::downgrade(&delivery.pixels);
+
+    assert_eq!(controller.close("owner", id, 1_000_001), Err("busy"));
+    assert!(controller.streams[&id].abandoned);
+    assert_eq!(controller.bytes, delivery.pixels.len());
+    assert!(matches!(
+        controller.prepare("owner", id, 1_000_002, false),
+        Err(MEDIA_CLOSED)
+    ));
+
+    assert_eq!(delivery.finish(STATUS_OK), STATUS_OK);
+    assert!(pixels.upgrade().is_some(), "stream still owns its pixels");
+    controller.maintain(1_000_003);
+
+    assert!(controller.streams.is_empty());
+    assert_eq!(controller.bytes, 0);
+    assert!(controller.retired.contains_key(&id));
+    assert!(
+        pixels.upgrade().is_none(),
+        "retirement releases the last pixel owner"
+    );
+    controller.close("owner", id, 1_000_004).unwrap();
+    assert_eq!(
+        controller.bytes, 0,
+        "an idempotent retry cannot release twice"
+    );
+}
+
+#[test]
 fn cancelled_open_rechecks_authority_after_allocating_and_leaves_no_stream() {
     let mut controller = Controller::new(true);
     let mut calls = 0;

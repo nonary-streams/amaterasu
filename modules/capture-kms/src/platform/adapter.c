@@ -719,6 +719,62 @@ static bool has_extension(const char *extensions, const char *required) {
     return false;
 }
 
+/* EGL contexts are current to a thread, while the broker may open, read and
+ * close a session on different threads. Save the calling thread's GLES binding
+ * and API around every operation, and never leave our context current. */
+struct am_kms_egl_binding {
+    EGLenum api;
+    EGLDisplay display;
+    EGLContext context;
+    EGLSurface draw;
+    EGLSurface read;
+};
+
+static bool save_egl_binding(struct am_kms_egl_binding *binding) {
+    binding->api = eglQueryAPI();
+    if (binding->api == EGL_NONE) {
+        return false;
+    }
+    if (binding->api != EGL_OPENGL_ES_API && eglBindAPI(EGL_OPENGL_ES_API) != EGL_TRUE) {
+        return false;
+    }
+    binding->display = eglGetCurrentDisplay();
+    binding->context = eglGetCurrentContext();
+    binding->draw = eglGetCurrentSurface(EGL_DRAW);
+    binding->read = eglGetCurrentSurface(EGL_READ);
+    return true;
+}
+
+static bool restore_egl_binding(const struct am_kms_egl_binding *binding,
+                                EGLDisplay owned_display, EGLContext owned_context) {
+    EGLContext previous = binding->context == owned_context ? EGL_NO_CONTEXT : binding->context;
+    EGLContext current = eglGetCurrentContext();
+    EGLDisplay current_display = eglGetCurrentDisplay();
+    bool restored = true;
+    if (previous != EGL_NO_CONTEXT) {
+        if (current != previous || current_display != binding->display ||
+            eglGetCurrentSurface(EGL_DRAW) != binding->draw ||
+            eglGetCurrentSurface(EGL_READ) != binding->read) {
+            restored = eglMakeCurrent(binding->display, binding->draw, binding->read,
+                                      previous) == EGL_TRUE;
+        }
+    } else if (owned_context != EGL_NO_CONTEXT && current == owned_context &&
+               current_display == owned_display) {
+        restored = eglMakeCurrent(owned_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
+                                  EGL_NO_CONTEXT) == EGL_TRUE;
+    }
+    if (!restored && owned_context != EGL_NO_CONTEXT &&
+        eglGetCurrentContext() == owned_context && eglGetCurrentDisplay() == owned_display) {
+        /* Even if a foreign context can no longer be restored, try to release
+         * our own context so another worker can safely retire the session. */
+        (void)eglMakeCurrent(owned_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    }
+    if (binding->api != EGL_OPENGL_ES_API && eglBindAPI(binding->api) != EGL_TRUE) {
+        restored = false;
+    }
+    return restored;
+}
+
 static int initialize_egl(struct am_kms_session *session) {
     session->gbm = gbm_create_device(session->card.fd);
     if (session->gbm == NULL) {
@@ -739,9 +795,6 @@ static int initialize_egl(struct am_kms_session *session) {
         return AM_KMS_EGL_UNAVAILABLE;
     }
     session->egl_initialized = true;
-    if (eglBindAPI(EGL_OPENGL_ES_API) != EGL_TRUE) {
-        return AM_KMS_EGL_UNAVAILABLE;
-    }
     const char *egl_extensions = eglQueryString(session->display, EGL_EXTENSIONS);
     if (!has_extension(egl_extensions, "EGL_EXT_image_dma_buf_import")) {
         return AM_KMS_EGL_UNAVAILABLE;
@@ -1072,11 +1125,17 @@ struct am_kms_session *am_kms_open(const char *output_id, uint32_t *error) {
     session->plane_id = plane_id;
 
     result = open_card(path, &session->card);
+    struct am_kms_egl_binding binding;
+    bool binding_saved = false;
     if (result == AM_KMS_OK) {
-        result = initialize_egl(session);
+        binding_saved = save_egl_binding(&binding);
+        result = binding_saved ? initialize_egl(session) : AM_KMS_EGL_UNAVAILABLE;
     }
     if (result == AM_KMS_OK) {
         result = refresh_image(session);
+    }
+    if (binding_saved && !restore_egl_binding(&binding, session->display, session->context)) {
+        result = AM_KMS_EGL_UNAVAILABLE;
     }
     if (result != AM_KMS_OK) {
         *error = (uint32_t)result;
@@ -1110,18 +1169,26 @@ int am_kms_read(struct am_kms_session *session, uint8_t *destination,
         expected_length > AM_KMS_MAX_FRAME_BYTES || length != expected_length) {
         return AM_KMS_INVALID_ARGUMENT;
     }
-    if (eglMakeCurrent(session->display, session->surface, session->surface,
-                       session->context) != EGL_TRUE) {
+    struct am_kms_egl_binding binding;
+    if (!save_egl_binding(&binding)) {
         return AM_KMS_EGL_UNAVAILABLE;
     }
-    int result = refresh_image(session);
+    int result = AM_KMS_OK;
+    uint8_t *rgba = NULL;
+    if (eglMakeCurrent(session->display, session->surface, session->surface,
+                       session->context) != EGL_TRUE) {
+        result = AM_KMS_EGL_UNAVAILABLE;
+        goto restore;
+    }
+    result = refresh_image(session);
     if (result != AM_KMS_OK) {
-        return result;
+        goto restore;
     }
     size_t pixel_count = (size_t)session->output.width * session->output.height;
-    uint8_t *rgba = malloc(pixel_count * 4U);
+    rgba = malloc(pixel_count * 4U);
     if (rgba == NULL) {
-        return AM_KMS_CAPTURE_FAILED;
+        result = AM_KMS_CAPTURE_FAILED;
+        goto restore;
     }
     glBindFramebuffer(GL_FRAMEBUFFER, session->framebuffer_object);
     glPixelStorei(GL_PACK_ALIGNMENT, 1);
@@ -1130,8 +1197,8 @@ int am_kms_read(struct am_kms_session *session, uint8_t *destination,
                  (GLsizei)session->output.height, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
     GLenum gl_error = glGetError();
     if (gl_error != GL_NO_ERROR) {
-        free(rgba);
-        return AM_KMS_CAPTURE_FAILED;
+        result = AM_KMS_CAPTURE_FAILED;
+        goto restore;
     }
     const size_t row_bytes = (size_t)session->output.width * 4U;
     for (uint32_t y = 0; y < session->output.height; ++y) {
@@ -1145,17 +1212,30 @@ int am_kms_read(struct am_kms_session *session, uint8_t *destination,
             target[x * 4U + 3U] = 255U;
         }
     }
+restore:
     free(rgba);
-    *width = session->output.width;
-    *height = session->output.height;
-    return AM_KMS_OK;
+    if (!restore_egl_binding(&binding, session->display, session->context)) {
+        return AM_KMS_EGL_UNAVAILABLE;
+    }
+    if (result == AM_KMS_OK) {
+        *width = session->output.width;
+        *height = session->output.height;
+    }
+    return result;
 }
 
 void am_kms_close(struct am_kms_session *session) {
     if (session == NULL) {
         return;
     }
+    struct am_kms_egl_binding binding;
+    bool binding_saved = save_egl_binding(&binding);
+    EGLDisplay owned_display = session->display;
+    EGLContext owned_context = session->context;
     destroy_egl(session);
+    if (binding_saved) {
+        (void)restore_egl_binding(&binding, owned_display, owned_context);
+    }
     close_card(&session->card);
     free(session);
 }
