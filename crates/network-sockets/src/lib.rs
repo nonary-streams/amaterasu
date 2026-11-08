@@ -238,7 +238,25 @@ fn permit(binding: &Binding) -> Result<Permit, Status> {
     Ok(Permit(shared.clone()))
 }
 fn insert(binding: &Binding, socket: SocketResource, permit: Permit) -> Result<u64, Status> {
+    insert_from_listener(binding, socket, permit, None)
+}
+fn insert_from_listener(
+    binding: &Binding,
+    socket: SocketResource,
+    permit: Permit,
+    listener: Option<(u64, &Arc<Resource>)>,
+) -> Result<u64, Status> {
     let mut resources = lock(&binding.resources)?;
+    // The accept call may have held the listener alive while another thread
+    // closed its handle. Serialize this check with close so no child can be
+    // published after its owning listener has been removed.
+    if let Some((id, expected)) = listener
+        && !resources
+            .get(&id)
+            .is_some_and(|resource| Arc::ptr_eq(resource, expected))
+    {
+        return Err(net::NOT_FOUND);
+    }
     if resources.len() >= binding.shared.max_handles as usize {
         return Err(net::RESOURCE_EXHAUSTED);
     }
@@ -557,7 +575,12 @@ unsafe extern "C" fn accept(
         let permit = permit(binding)?;
         let (stream, address) = listener.accept().map_err(io_status)?;
         stream.set_nonblocking(true).map_err(io_status)?;
-        let id = insert(binding, SocketResource::Tcp(stream), permit)?;
+        let id = insert_from_listener(
+            binding,
+            SocketResource::Tcp(stream),
+            permit,
+            Some((id, &parent)),
+        )?;
         unsafe {
             output(out, id)?;
             output(peer, to_address(address))

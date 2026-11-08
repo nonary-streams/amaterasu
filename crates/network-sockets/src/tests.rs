@@ -247,6 +247,63 @@ fn tcp_listener_connection_peek_and_shutdown_use_the_same_contract() {
         STATUS_OK
     );
 }
+
+#[test]
+fn closing_listener_prevents_inflight_accept_from_publishing_a_child() {
+    let factory = Factory::with_limits(2);
+    let provider = Bound::new(&factory);
+    let mut listener = 0;
+    let options = net::ListenOptions {
+        size: size_of::<net::ListenOptions>() as u32,
+        flags: 0,
+        backlog: 16,
+        reserved: 0,
+    };
+    assert_eq!(
+        unsafe {
+            (provider.api().tcp_listen)(
+                provider.context(),
+                to_address("127.0.0.1:0".parse().unwrap()),
+                options,
+                &mut listener,
+            )
+        },
+        STATUS_OK
+    );
+    let address = provider.local(listener);
+    let context = provider.context() as usize;
+    let accept = provider.api().accept;
+    let worker = std::thread::spawn(move || {
+        let mut child = 0;
+        let mut peer = net::Address::default();
+        // SAFETY: the test retains the binding until the worker joins.
+        let status = unsafe { accept(context as *mut c_void, listener, &mut child, &mut peer) };
+        (status, child)
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while factory.shared.handles.load(Ordering::Acquire) != 2
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::yield_now();
+    }
+    let entered = factory.shared.handles.load(Ordering::Acquire) == 2;
+    if !entered {
+        let client = TcpStream::connect_timeout(&address, Duration::from_secs(2)).unwrap();
+        let _ = worker.join();
+        drop(client);
+        panic!("accept worker did not reach the blocking call");
+    }
+    let close_status = unsafe { (provider.api().close)(provider.context(), listener) };
+    // The in-flight accept retains the listener; connect wakes it even after
+    // the handle has been closed. Close itself is not a cancellation API.
+    let client = TcpStream::connect_timeout(&address, Duration::from_secs(2)).unwrap();
+    let (status, child) = worker.join().unwrap();
+    drop(client);
+    assert_eq!(close_status, STATUS_OK);
+    assert_eq!(status, net::NOT_FOUND);
+    assert_eq!(child, 0);
+    assert_eq!(factory.shared.handles.load(Ordering::Acquire), 0);
+}
 #[test]
 fn explicitly_nonblocking_connected_tcp_reads_and_peeks_do_not_wait_for_an_idle_peer() {
     for peek in [false, true] {
