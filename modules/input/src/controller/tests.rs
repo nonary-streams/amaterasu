@@ -45,11 +45,15 @@ struct FakeBackend {
     right_alt_mapping_trace: Vec<(KeyState, bool)>,
     fail_controller_disable: bool,
     controller_disable_calls: usize,
+    feedback_generation: u64,
     active_controller_slots: BTreeSet<u16>,
     full_advances: usize,
     pen_touch_advances: usize,
 }
 impl Backend for FakeBackend {
+    fn set_feedback_generation(&mut self, generation: u64) {
+        self.feedback_generation = generation;
+    }
     fn stop_retires_inputs(&self) -> bool {
         self.stop_retires_inputs
     }
@@ -2123,6 +2127,45 @@ fn failed_controller_slot_removal_retries_without_blocking_keyboard_or_mouse() {
     assert_eq!(
         controller.backend.active_controller_slots,
         BTreeSet::from([0])
+    );
+}
+
+#[test]
+fn reenabled_controller_restores_feedback_after_pending_cleanup() {
+    let now = Instant::now();
+    let mut controller = Controller::new(
+        FakeBackend {
+            controller_input_supported: true,
+            fail_controller_disable: true,
+            ..Default::default()
+        },
+        true,
+    );
+    let token = acquire(&mut controller, now);
+    let old_generation = controller.backend.feedback_generation;
+    let stale = controller.feedback.producer(old_generation, 0, 0);
+    assert!(controller.set_controller_enabled(false, now).is_err());
+
+    // Make the immediate retry fail too, then let the normal tick retire it.
+    controller.backend.fail_controller_disable = true;
+    assert!(controller.set_controller_enabled(true, now).is_err());
+    controller.expire(now + Duration::from_millis(101));
+    assert!(!controller.cleanup_required());
+    let new_generation = controller.backend.feedback_generation;
+    assert_ne!(old_generation, new_generation);
+    let current = controller.feedback.producer(new_generation, 0, 0);
+    let feedback = HostFeedback::RgbLed {
+        controller: 0,
+        red: 1,
+        green: 2,
+        blue: 3,
+    };
+    assert!(!stale.push(feedback.clone()));
+    assert!(current.push(feedback));
+    assert_eq!(controller.feedback.peek(1).len(), 1);
+    assert_eq!(
+        batch(&mut controller, &token, vec![controller_event()])["ok"],
+        true
     );
 }
 

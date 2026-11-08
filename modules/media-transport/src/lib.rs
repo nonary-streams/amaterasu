@@ -11,7 +11,7 @@ use amaterasu_module_sdk::{
 use controller::{ControlReply, Controller};
 use model::{Operation, Settings};
 use serde_json::json;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, TryLockError};
 use std::time::{Duration, Instant};
 
 const SERVICE: &str = "amaterasu.media-transport/1";
@@ -21,6 +21,7 @@ struct MediaTransportModule {
     controller: native::Shared,
     latency_window_started: Instant,
     _factory: Box<native::Factory>,
+    shutdown_announced: bool,
 }
 
 impl ManagedModule for MediaTransportModule {
@@ -29,20 +30,23 @@ impl ManagedModule for MediaTransportModule {
     }
 
     fn prepare_shutdown(&mut self, _remaining_ms: u64) -> ModuleResult<()> {
-        self.controller
-            .lock()
-            .map_err(|_| "transport state unavailable")?
-            .prepare_shutdown();
+        self.shutdown_announced = true;
+        if let Ok(mut controller) = self.controller.try_lock() {
+            controller.prepare_shutdown();
+        }
         Ok(())
     }
 
     fn quiesce(&mut self) -> ModuleResult<bool> {
         // The host starts provider quiescence only after its consumers drain.
         // No transport workers outlive this bounded queue/socket destruction.
-        self.controller
-            .lock()
-            .map_err(|_| "transport state unavailable")?
-            .shutdown();
+        self.shutdown_announced = true;
+        let mut controller = match self.controller.try_lock() {
+            Ok(controller) => controller,
+            Err(TryLockError::WouldBlock) => return Ok(false),
+            Err(TryLockError::Poisoned(error)) => error.into_inner(),
+        };
+        controller.shutdown();
         Ok(true)
     }
 
@@ -54,10 +58,11 @@ impl ManagedModule for MediaTransportModule {
         let elapsed = now.saturating_duration_since(self.latency_window_started);
         let due = elapsed >= Duration::from_secs(10);
         let summaries = {
-            let mut controller = self
-                .controller
-                .lock()
-                .map_err(|_| "transport state unavailable")?;
+            let mut controller = match self.controller.try_lock() {
+                Ok(controller) => controller,
+                Err(TryLockError::WouldBlock) => return Ok(()),
+                Err(TryLockError::Poisoned(_)) => return Err("transport state unavailable".into()),
+            };
             controller.tick();
             if due {
                 controller.take_processing_latencies()
@@ -83,6 +88,13 @@ impl ManagedModule for MediaTransportModule {
                     .log(LogLevel::Info, "media.processing_latency", &message);
             }
         }
+        // Acquire before polling so a contended native call cannot strand an
+        // already-dequeued request or block the host's cooperative tick.
+        let mut controller = match self.controller.try_lock() {
+            Ok(controller) => controller,
+            Err(TryLockError::WouldBlock) => return Ok(()),
+            Err(TryLockError::Poisoned(_)) => return Err("transport state unavailable".into()),
+        };
         match self.runtime.send(Command::Poll {})? {
             Response::Pending => Ok(()),
             Response::Request {
@@ -102,10 +114,10 @@ impl ManagedModule for MediaTransportModule {
                     serde_json::from_value::<Operation>(payload)
                         .map_err(|_| "invalid_request")
                         .and_then(|operation| {
-                            self.controller
-                                .lock()
-                                .map_err(|_| "transport_state_failed")?
-                                .handle(&caller, operation)
+                            if self.shutdown_announced && matches!(operation, Operation::Open(_)) {
+                                return Err("shutting_down");
+                            }
+                            controller.handle(&caller, operation)
                         })
                 } else {
                     Err("invalid_service")
@@ -124,10 +136,7 @@ impl ManagedModule for MediaTransportModule {
                 ) && let Some(stream) = created
                 {
                     // A lost/cancelled open response cannot leave a hidden UDP sender.
-                    let _ = self
-                        .controller
-                        .lock()
-                        .map(|mut controller| controller.close(&caller, stream));
+                    let _ = controller.close(&caller, stream);
                 }
                 Ok(())
             }
@@ -167,15 +176,17 @@ impl MediaTransportModule {
             controller,
             latency_window_started: Instant::now(),
             _factory: factory,
+            shutdown_announced: false,
         })
     }
 }
 
 impl Drop for MediaTransportModule {
     fn drop(&mut self) {
-        if let Ok(mut controller) = self.controller.lock() {
-            controller.shutdown();
-        }
+        self.controller
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .shutdown();
     }
 }
 

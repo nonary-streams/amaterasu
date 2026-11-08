@@ -249,6 +249,7 @@ impl Broker {
                 self.cancelled.insert(request);
                 Response::Ok
             }
+            Command::ReleaseResult { .. } => Response::Ok,
             other => panic!("unexpected runtime command {other:?}"),
         })
     }
@@ -622,6 +623,116 @@ fn launch_identity_and_client_override_come_from_the_authenticated_certificate()
     assert_eq!(rtsp_open["keyboard"], false);
     assert_eq!(rtsp_open["mouse"], true);
     assert_eq!(rtsp_open["ds4_back_as_touchpad_click"], false);
+}
+
+#[test]
+fn production_router_retains_launch_result_after_lost_release_acknowledgement() {
+    use amaterasu_module_sdk::abi::{
+        AbiHeader, BorrowedBytes, HostApi, ReplySink, STATUS_INTERNAL_ERROR, STATUS_OK, Status,
+    };
+    use std::{ffi::c_void, sync::Mutex};
+
+    #[derive(Default)]
+    struct Host {
+        broker: Broker,
+        launch_request: Option<u64>,
+        lost_ack: bool,
+    }
+    unsafe extern "C" fn invoke(
+        context: *mut c_void,
+        input: BorrowedBytes,
+        reply: ReplySink,
+    ) -> Status {
+        // SAFETY: test keeps this mutex and all borrowed buffers alive until the synchronous call returns.
+        let host = unsafe { &*context.cast::<Mutex<Host>>() };
+        let Ok(input) = (unsafe { input.read() }) else {
+            return STATUS_INTERNAL_ERROR;
+        };
+        let Ok(command) = serde_json::from_slice::<Command>(input) else {
+            return STATUS_INTERNAL_ERROR;
+        };
+        let mut host = host.lock().unwrap();
+        if let Command::TakeResult { request } = &command
+            && host
+                .broker
+                .services
+                .get(request)
+                .is_some_and(|service| service == "amaterasu.launch/1")
+            && host
+                .broker
+                .requests
+                .get(request)
+                .is_some_and(|payload| payload["action"] == "launch_export")
+        {
+            host.launch_request = Some(*request);
+        }
+        if let Command::ReleaseResult { request } = &command
+            && host.launch_request == Some(*request)
+        {
+            if !host.lost_ack {
+                host.lost_ack = true;
+                // The release succeeded, but the host reply did not arrive.
+                return STATUS_INTERNAL_ERROR;
+            }
+            let output =
+                serde_json::to_vec(&Response::error("not_found", "already released")).unwrap();
+            // SAFETY: the reply sink copies these initialized bytes synchronously.
+            unsafe { reply.send(&output) };
+            return STATUS_OK;
+        }
+        let response = host.broker.send(command).unwrap();
+        let output = serde_json::to_vec(&response).unwrap();
+        // SAFETY: the reply sink copies these initialized bytes synchronously.
+        unsafe { reply.send(&output) };
+        STATUS_OK
+    }
+
+    let mut router = streaming_router();
+    let host = Box::new(Mutex::new(Host::default()));
+    let endpoint = HostApi {
+        header: AbiHeader::of::<HostApi>(),
+        context: (&*host as *const Mutex<Host>).cast_mut().cast(),
+        invoke,
+    };
+    // SAFETY: the boxed host outlives the runtime and every synchronous callback.
+    let runtime = unsafe { RuntimeClient::from_endpoint(endpoint) };
+    let target = concat!(
+        "/launch?appid=7&mode=1280x720x60&",
+        "rikey=00112233445566778899aabbccddeeff&rikeyid=17"
+    );
+    assert!(
+        router
+            .dispatch(
+                19,
+                request(target),
+                peer("127.0.0.1", true, Some(vec![1, 2, 3]), true),
+                &runtime
+            )
+            .is_none()
+    );
+    let mut replies = Vec::new();
+    for _ in 0..100 {
+        replies.extend(router.poll_with_trust(&runtime, |_, _| true));
+        if !replies.is_empty() {
+            break;
+        }
+    }
+    let host = host.lock().unwrap();
+    let launch_request = host
+        .launch_request
+        .expect("launch mutation reached the provider");
+    assert!(host.lost_ack);
+    assert!(!host.broker.cancelled.contains(&launch_request));
+    assert_eq!(
+        host.broker
+            .accepted
+            .iter()
+            .filter(|payload| payload["action"] == "launch_export")
+            .count(),
+        1
+    );
+    assert_eq!(replies.len(), 1);
+    assert_eq!(replies[0].1.status, 200);
 }
 
 #[test]

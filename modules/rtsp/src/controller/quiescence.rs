@@ -62,7 +62,7 @@ impl Controller {
                 .is_some_and(|job| job.phase == Phase::Observe)
         {
             let mut job = self.job.take().expect("background status job");
-            job.call.cancel();
+            job.call.cancel_read_only();
             // A read-only broker observation cannot fence native Stop. Retain
             // its independent settlement proof until cancellation/release ends.
             self.shutdown_settlement.push(job.call);
@@ -94,7 +94,9 @@ impl Controller {
         if let Some(mut admission) = self.display_admission.take() {
             rpc::complete(runtime, admission.request, error("module_quiescing"));
             if !admission.verified {
-                admission.call.cancel();
+                // The verifier only reads the existing Launch admission; the
+                // stream ticket is created after verification succeeds.
+                admission.call.cancel_read_only();
                 self.display_cleanup.push(DisplayCleanup {
                     owner: admission.caller,
                     operation_id: admission.config.operation_id,

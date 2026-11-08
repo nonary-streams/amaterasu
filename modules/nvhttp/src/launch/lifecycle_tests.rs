@@ -305,7 +305,7 @@ fn extension_lifecycle_result_release_uncertainty_remains_fenced() {
     assert_eq!(reply.status, 503);
     let record = controller.records.values().next().unwrap();
     assert_eq!(record.state, State::CleanupFailed);
-    assert_eq!(record.cleanup_error, Some("lifecycle_result_release_unconfirmed"));
+    assert_eq!(record.cleanup_error, Some("lifecycle_prepare_unconfirmed"));
     assert_eq!(record.uncertain.len(), 1);
     assert!(!broker.actions().contains(&("amaterasu.launch/1", "launch_export")));
 }
@@ -620,18 +620,10 @@ fn connected_resume_history_settlement_uncertainty_preserves_application() {
         assert_eq!(record.application_launch, Some(42));
         assert!(record.application_requested);
         assert_eq!(record.uncertain.len(), 1);
-        assert!(
-            commands
-                .iter()
-                .any(|command| matches!(command, Command::Cancel { request: 7 }))
-        );
-        if fail_release {
-            assert!(
-                commands
-                    .iter()
-                    .any(|command| matches!(command, Command::ReleaseResult { request: 7 }))
-            );
-        }
+        assert!(commands.iter().any(|command| matches!(command, Command::TakeResult { request: 7 })));
+        // A lost result leaves the provider operation fenced; cancellation or
+        // release would not prove that a delivered mutation has retired.
+        assert!(!commands.iter().any(|command| matches!(command, Command::Cancel { request: 7 } | Command::ReleaseResult { request: 7 })));
         assert!(!commands.iter().any(|command| matches!(command, Command::Request { service, .. } if service == "amaterasu.launch/1")));
     }
 }

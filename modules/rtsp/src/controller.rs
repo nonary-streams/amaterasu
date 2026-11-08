@@ -302,6 +302,12 @@ impl Controller {
             call.shutdown(runtime);
         }
         if let Some(mut job) = self.job.take() {
+            if matches!(
+                job.phase,
+                Phase::Observe | Phase::Status | Phase::Find | Phase::LifecycleLookup
+            ) {
+                job.call.cancel_read_only();
+            }
             let outcome = job.call.shutdown(runtime);
             if let Some(record) = self.records.get_mut(&job.ticket) {
                 apply_observed_shutdown_result(record, job.phase, &job.call);
@@ -323,6 +329,12 @@ impl Controller {
             if let Some(mut call) = record.uncertain.take() {
                 let phase = record.uncertain_phase.take().unwrap_or(Phase::Prepare);
                 apply_observed_shutdown_result(record, phase, &call);
+                if matches!(
+                    phase,
+                    Phase::Observe | Phase::Status | Phase::Find | Phase::LifecycleLookup
+                ) {
+                    call.cancel_read_only();
+                }
                 if matches!(call.shutdown(runtime), Outcome::SettledFailure) {
                     apply_undispatched_shutdown_proof(record, phase, &call);
                 } else {

@@ -80,11 +80,17 @@ fn quiesce_settles_a_queued_spawn_before_lookup_and_cancels_the_original_caller(
     assert_eq!(pipeline.records.values[&1].outstanding_request, Some(50));
     assert!(pipeline.job.as_ref().unwrap().pending.is_none());
 
+    harness.drop_spawn_result = false;
+    for _ in 0..3 {
+        pipeline.tick(|command| harness.send(command)).unwrap();
+    }
+    assert!(harness.sessions[0].lease.is_some());
+    assert!(!pipeline.records.values[&1].native_retirement_confirmed);
+    harness.complete_queued_spawn();
     drain(&mut pipeline, &mut harness);
 
     assert!(harness.queued_spawn.is_none());
-    assert_eq!(harness.released, 1);
-    assert!(harness.processes.is_empty());
+    assert!(harness.processes[0].child.is_none());
     assert!(harness.sessions[0].lease.is_none());
     assert!(pipeline.records.values[&1].outstanding_request.is_none());
     let output = harness.output.as_ref().unwrap();
@@ -193,43 +199,38 @@ fn cleanup_failure_blocks_readiness_without_replaying_undo_or_blocking_other_lau
 }
 
 #[test]
-fn quiesce_preserves_failed_broker_settlement_for_an_explicit_stop_retry() {
-    for fail_cancel in [true, false] {
-        let mut pipeline = pipeline();
-        let mut harness = Harness::new();
-        harness.queue_spawn = true;
-        begin_launch(&mut pipeline, &mut harness, "unsettled");
-        for _ in 0..30 {
-            if harness.queued_spawn.is_some() {
-                break;
-            }
-            pipeline.tick(|command| harness.send(command)).unwrap();
+fn quiesce_fences_an_expired_delivered_mutation_until_completion_is_proved() {
+    let mut pipeline = pipeline();
+    let mut harness = Harness::new();
+    harness.queue_spawn = true;
+    begin_launch(&mut pipeline, &mut harness, "unsettled");
+    for _ in 0..30 {
+        if harness.queued_spawn.is_some() {
+            break;
         }
-        harness.fail_cancel = fail_cancel;
-        harness.fail_release = !fail_cancel;
-        assert!(!pipeline.quiesce());
         pipeline.tick(|command| harness.send(command)).unwrap();
-        assert!(pipeline.records.values[&1].state == State::CleanupFailed);
-        assert_eq!(pipeline.records.values[&1].outstanding_request, Some(50));
-        assert!(harness.sessions[0].lease.is_some());
-        let commands = harness.commands.len();
-        for _ in 0..5 {
-            assert!(!pipeline.quiesce());
-            pipeline.tick(|command| harness.send(command)).unwrap();
-        }
-        assert_eq!(harness.commands.len(), commands);
-        harness.fail_cancel = false;
-        harness.fail_release = false;
-        let retried = harness.request(
-            &mut pipeline,
-            "alice",
-            json!({"action":"stop","launch_id":1}),
-        );
-        assert_eq!(retried["launch"]["state"], "cancelled");
-        assert!(pipeline.quiesce());
-        assert!(harness.queued_spawn.is_none());
-        assert!(harness.sessions[0].lease.is_none());
     }
+    assert!(!pipeline.quiesce());
+    harness.drop_spawn_result = false;
+    harness.reply = Some(Response::error(
+        "deadline_exceeded",
+        "delivered request expired",
+    ));
+    pipeline.tick(|command| harness.send(command)).unwrap();
+    assert!(pipeline.records.values[&1].state == State::CleanupFailed);
+    assert_eq!(pipeline.records.values[&1].outstanding_request, Some(50));
+    assert!(harness.sessions[0].lease.is_some());
+    assert!(!pipeline.quiesce());
+    // An exact provider completion allows the owner's explicit retry to proceed.
+    harness.complete_queued_spawn();
+    let retried = harness.request(
+        &mut pipeline,
+        "alice",
+        json!({"action":"stop","launch_id":1}),
+    );
+    assert_eq!(retried["launch"]["state"], "cancelled");
+    assert!(pipeline.quiesce());
+    assert!(harness.sessions[0].lease.is_none());
 }
 
 #[test]
@@ -311,7 +312,7 @@ fn expired_pending_cleanup_is_settled_and_reports_unresolved_retirement() {
         Some("deadline_exceeded")
     );
     assert!(pipeline.records.values[&1].outstanding_request.is_none());
-    assert_eq!(harness.released, 1);
+    assert_eq!(harness.released, 0);
     assert!(!pipeline.quiesce());
     assert!(harness.sessions[0].lease.is_some());
 }
@@ -414,7 +415,7 @@ fn expired_host_deadline_preserves_a_pending_request_and_unresolved_lease() {
     assert!(!pipeline.quiesce());
     pipeline.tick(|command| harness.send(command)).unwrap();
     assert!(pipeline.job.as_ref().unwrap().pending.is_some());
-    harness.fail_cancel = true;
+    harness.reply = None;
 
     pipeline.prepare_shutdown(0);
     assert!(!pipeline.quiesce());
@@ -471,6 +472,7 @@ fn shutdown_announcement_preserves_pending_startup_until_its_consumer_drains() {
     assert!(tightened < announced);
     assert!(!pipeline.quiesce());
     assert_eq!(pipeline.job.as_ref().unwrap().deadline, tightened);
+    harness.complete_queued_spawn();
     drain(&mut pipeline, &mut harness);
 }
 

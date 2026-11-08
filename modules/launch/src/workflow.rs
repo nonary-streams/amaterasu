@@ -51,6 +51,23 @@ pub enum Step {
     AwaitPlayniteStop,
     Finish,
 }
+
+impl Step {
+    /// These operations can create, extend, or release owned resources. A
+    /// broker cancellation does not stop a request already delivered to a provider.
+    pub fn mutates_resources(self) -> bool {
+        !matches!(
+            self,
+            Self::Catalog
+                | Self::Library
+                | Self::LutrisStatus
+                | Self::LutrisPreSpawn
+                | Self::ReadPreparationContext
+                | Self::IdentifyProvider
+                | Self::FindSession
+        )
+    }
+}
 #[derive(Clone)]
 pub struct Workflow {
     pub launch_id: u64,

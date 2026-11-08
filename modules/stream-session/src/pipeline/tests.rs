@@ -15,6 +15,40 @@ use super::*;
 use harness::*;
 
 #[test]
+fn failed_journal_fences_cleanup_writes_for_other_sessions() {
+    let mut host = Harness::new();
+    let first = host.response(1, prepare())["session"].as_u64().unwrap();
+    let mut next = prepare();
+    next["operation_id"] = json!("another-session");
+    let second = host.response(2, next)["session"].as_u64().unwrap();
+    let saved = host.broker.state_value.clone();
+    let writes_before = host
+        .broker
+        .calls
+        .iter()
+        .filter(|call| call.service == "amaterasu.state/1" && call.payload["action"] == "set")
+        .count();
+    // Model an unresolved write owned by a different session. Cleanup can
+    // release provider resources, but must not race that write's revision.
+    host.pipeline.journal.failed = true;
+    let response = host.response(3, json!({"action":"stop", "session": second}));
+    assert_eq!(response["state"], "cleanup_failed");
+    assert_eq!(host.broker.state_value, saved);
+    assert_eq!(
+        host.broker
+            .calls
+            .iter()
+            .filter(|call| {
+                call.service == "amaterasu.state/1" && call.payload["action"] == "set"
+            })
+            .count(),
+        writes_before
+    );
+    assert!(host.pipeline.journal.document.entries.contains_key(&first));
+    assert!(host.pipeline.journal.document.entries.contains_key(&second));
+}
+
+#[test]
 fn plugin_replacement_waits_for_active_stream_and_fences_new_streams() {
     let mut host = Harness::new();
     let id = host.response(1, prepare())["session"].as_u64().unwrap();

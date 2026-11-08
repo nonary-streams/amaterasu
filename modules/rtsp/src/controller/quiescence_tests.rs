@@ -159,7 +159,7 @@ fn sdk_quiesce_resolves_admitted_pending_preparation_before_stopping_stream() {
     record.lifecycle_prepare_outstanding = true;
     let mut call = Call::for_service(
         "amaterasu.session-lifecycle/1",
-        json!({"operation":"prepare"}),
+        json!({"operation":"prepare", "operation_id":format!("{}-lifecycle-prepare", record.operation())}),
         format!("{}-lifecycle-prepare", record.operation()),
         None,
     );

@@ -395,7 +395,10 @@ impl Controller {
             return;
         }
         if now >= admission.deadline || !rpc::active(runtime, admission.request) {
-            admission.call.cancel();
+            // Display verification only reads the Launch-owned admission token.
+            // It creates no ticket or native resource, so cancellation can
+            // retire this broker request without awaiting a verifier result.
+            admission.call.cancel_read_only();
         }
         match admission.call.poll(runtime) {
             Outcome::Waiting => {
@@ -450,7 +453,7 @@ impl Controller {
                 );
             }
             Outcome::Uncertain => {
-                admission.call.retry_settlement();
+                admission.call.cancel_read_only();
                 rpc::complete(
                     runtime,
                     admission.request,
@@ -468,9 +471,9 @@ impl Controller {
     pub(super) fn advance_display_cleanup(&mut self, runtime: &RuntimeClient) {
         self.display_cleanup
             .retain_mut(|cleanup| match cleanup.call.poll(runtime) {
-                Outcome::SettledFailure => false,
+                Outcome::SettledFailure | Outcome::Result(_) => false,
                 Outcome::Waiting => true,
-                Outcome::Uncertain | Outcome::Result(_) => {
+                Outcome::Uncertain => {
                     cleanup.call.retry_settlement();
                     true
                 }

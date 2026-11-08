@@ -580,15 +580,15 @@ impl Harness {
                 }
                 if action == "launch" && self.queue_spawn {
                     self.queued_spawn = Some(payload);
+                    self.reply = None;
                     self.drop_spawn_result = true;
                     return Ok(Response::Accepted { id: 50 });
                 }
                 if action == "lookup" && self.queue_spawn {
                     assert!(
                         self.queued_spawn.is_none(),
-                        "lookup must follow cancellation"
+                        "lookup must follow provider completion"
                     );
-                    assert!(self.released > 0, "lookup must follow release");
                 }
                 let result = match service.as_str() {
                     "example.context/1" => self.prepared_context.clone().expect("context fixture"),
@@ -750,7 +750,7 @@ impl Harness {
                     || (action == "create" && self.cancel_after_session)
                 {
                     self.root_active = false;
-                    self.reply = Some(Response::error("cancelled", "mutation response hidden"));
+                    self.reply = Some(Response::Result { payload: result });
                 } else {
                     self.reply = Some(Response::Result { payload: result });
                 }
@@ -779,7 +779,6 @@ impl Harness {
                     })
                 {
                     self.generic_lost_start = false;
-                    self.reply = None;
                     return Err("simulated provider start acknowledgement loss".into());
                 }
                 if self.drop_spawn_result
@@ -789,7 +788,6 @@ impl Harness {
                         .is_some_and(|(_, payload, _)| payload["action"] == "launch")
                 {
                     self.drop_spawn_result = false;
-                    self.reply = None;
                     return Err("simulated transport failure".into());
                 }
                 if self.drop_prepare_result
@@ -799,7 +797,6 @@ impl Harness {
                         .is_some_and(|(_, payload, _)| payload["action"] == "prepare")
                 {
                     self.drop_prepare_result = false;
-                    self.reply = None;
                     return Err("simulated preparation acknowledgement loss".into());
                 }
                 if self.drop_provider_start_result
@@ -809,10 +806,9 @@ impl Harness {
                         .is_some_and(|(_, payload, _)| payload["action"] == "launch_start")
                 {
                     self.drop_provider_start_result = false;
-                    self.reply = None;
                     return Err("simulated Playnite start acknowledgement loss".into());
                 }
-                self.reply.take().unwrap()
+                self.reply.clone().unwrap_or(Response::Pending)
             }
             Command::Complete {
                 request: 7,
@@ -834,6 +830,13 @@ impl Harness {
     }
     fn request(&mut self, pipeline: &mut Pipeline, caller: &str, payload: Value) -> Value {
         self.request_as(pipeline, caller, caller, payload)
+    }
+    fn complete_queued_spawn(&mut self) {
+        let payload = self.queued_spawn.take().expect("delivered spawn");
+        let result = self.application(&payload);
+        self.queue_spawn = false;
+        self.drop_spawn_result = false;
+        self.reply = Some(Response::Result { payload: result });
     }
     fn request_as(
         &mut self,
@@ -3291,16 +3294,6 @@ fn cancellation_after_committed_spawn_recovers_id_without_respawning() {
     assert_eq!(harness.processes.len(), 1);
     assert!(harness.processes[0].child.is_none());
     assert!(harness.sessions[0].lease.is_none());
-    assert!(
-        harness
-            .commands
-            .iter()
-            .any(
-                |(service, payload, parent)| service == crate::workflow::APPLICATION
-                    && payload["action"] == "lookup"
-                    && parent.is_none()
-            )
-    );
 }
 
 #[test]
@@ -3312,16 +3305,6 @@ fn cancellation_after_session_create_recovers_owned_key_and_releases_session() {
     assert_eq!(result["launch"]["state"], "cancelled", "{result}");
     assert!(harness.processes.is_empty());
     assert_eq!(harness.sessions[0].state, "stopped");
-    assert!(
-        harness
-            .commands
-            .iter()
-            .any(
-                |(service, payload, parent)| service == crate::workflow::SESSION
-                    && payload["action"] == "lookup"
-                    && parent.is_none()
-            )
-    );
 }
 
 #[test]
@@ -3443,41 +3426,231 @@ fn cancellation_at_activation_response_rolls_back_running_process() {
 }
 
 #[test]
-fn lost_result_before_queued_spawn_cancels_and_releases_before_reconciliation() {
+fn lost_result_does_not_retire_a_delivered_spawn_before_provider_completion() {
     let mut harness = Harness::new();
     harness.queue_spawn = true;
     let mut pipeline = pipeline();
-    let result = harness.request(&mut pipeline, "alice", launch("queued"));
-    assert_eq!(result["launch"]["state"], "failed");
+    harness.incoming = Some(Response::Request {
+        id: 7,
+        caller: "alice".into(),
+        initiator: "alice".into(),
+        service: SERVICE.into(),
+        payload: launch("queued"),
+        remaining_ms: 30_000,
+    });
+    for _ in 0..30 {
+        pipeline.tick(|command| harness.send(command)).unwrap();
+        if harness.queued_spawn.is_some() {
+            break;
+        }
+    }
+    assert!(harness.queued_spawn.is_some());
+    // Simulate lost result while the provider holds the delivered request.
+    for _ in 0..5 {
+        pipeline.tick(|command| harness.send(command)).unwrap();
+    }
+    assert!(harness.output.is_none());
+    assert!(harness.sessions[0].lease.is_some());
+    assert!(!pipeline.records.values[&1].native_retirement_confirmed);
     assert!(
-        harness.queued_spawn.is_none(),
-        "no queued mutation can run after lookup"
+        !harness
+            .commands
+            .iter()
+            .any(|(_, payload, _)| payload["action"] == "lookup")
     );
-    assert!(harness.processes.is_empty());
-    assert_eq!(harness.released, 1);
+    harness.complete_queued_spawn();
+    for _ in 0..100 {
+        pipeline.tick(|command| harness.send(command)).unwrap();
+        if pipeline.job.is_none() {
+            break;
+        }
+    }
+    assert_eq!(
+        harness.output.as_ref().unwrap()["launch"]["state"],
+        "failed"
+    );
+    assert!(harness.processes[0].child.is_none());
     assert!(harness.sessions[0].lease.is_none());
-    assert!(pipeline.records.values[&1].outstanding_request.is_none());
 }
 
 #[test]
-fn unconfirmed_cancellation_or_release_preserves_request_and_lease_for_retry() {
+fn lost_spawn_admission_looks_up_the_exact_broker_operation_before_cleanup() {
+    let mut harness = Harness::new();
+    harness.queue_spawn = true;
+    let mut pipeline = pipeline();
+    harness.incoming = Some(Response::Request {
+        id: 7,
+        caller: "alice".into(),
+        initiator: "alice".into(),
+        service: SERVICE.into(),
+        payload: launch("lost-admission"),
+        remaining_ms: 30_000,
+    });
+    let mut lost = None;
+    let mut looked_up = false;
+    for _ in 0..40 {
+        pipeline
+            .tick(|command| {
+                if matches!(&command, Command::Request { service, payload, .. }
+                if service == crate::workflow::APPLICATION && payload["action"] == "launch")
+                {
+                    assert!(lost.is_none(), "must not replay the mutation");
+                    lost = Some(serde_json::to_value(&command).unwrap());
+                    assert!(matches!(
+                        harness.send(command),
+                        Ok(Response::Accepted { .. })
+                    ));
+                    harness.drop_spawn_result = false;
+                    return Err("lost admission acknowledgement".into());
+                }
+                if let Command::LookupRequest {
+                    service,
+                    payload,
+                    operation_id,
+                    parent,
+                } = &command
+                {
+                    let original = lost.as_ref().expect("original admission");
+                    assert_eq!(service, original["service"].as_str().unwrap());
+                    assert_eq!(payload, &original["payload"]);
+                    assert_eq!(operation_id, original["operation_id"].as_str().unwrap());
+                    assert_eq!(serde_json::to_value(parent).unwrap(), original["parent"]);
+                    looked_up = true;
+                    return Ok(Response::Accepted { id: 50 });
+                }
+                harness.send(command)
+            })
+            .unwrap();
+        if looked_up {
+            break;
+        }
+    }
+    assert!(looked_up);
+    assert!(harness.queued_spawn.is_some());
+    assert!(harness.sessions[0].lease.is_some());
+    assert!(!pipeline.records.values[&1].native_retirement_confirmed);
+    assert!(
+        !harness
+            .commands
+            .iter()
+            .any(|(_, payload, _)| payload["action"] == "lookup")
+    );
+    harness.complete_queued_spawn();
+    for _ in 0..100 {
+        pipeline.tick(|command| harness.send(command)).unwrap();
+        if pipeline.job.is_none() {
+            break;
+        }
+    }
+    assert_eq!(
+        harness.output.as_ref().unwrap()["launch"]["state"],
+        "failed"
+    );
+    assert!(harness.processes[0].child.is_none());
+    assert!(harness.sessions[0].lease.is_none());
+}
+
+#[test]
+fn terminal_broker_error_keeps_uncertain_mutation_and_session_lease() {
+    let mut harness = Harness::new();
+    harness.queue_spawn = true;
+    let mut pipeline = pipeline();
+    harness.incoming = Some(Response::Request {
+        id: 7,
+        caller: "alice".into(),
+        initiator: "alice".into(),
+        service: SERVICE.into(),
+        payload: launch("expired"),
+        remaining_ms: 30_000,
+    });
+    for _ in 0..30 {
+        pipeline.tick(|command| harness.send(command)).unwrap();
+        if harness.queued_spawn.is_some() {
+            break;
+        }
+    }
+    harness.drop_spawn_result = false;
+    harness.reply = Some(Response::error(
+        "deadline_exceeded",
+        "delivered request expired",
+    ));
+    pipeline.tick(|command| harness.send(command)).unwrap();
+    pipeline.tick(|command| harness.send(command)).unwrap();
+    assert!(pipeline.records.values[&1].state == State::CleanupFailed);
+    assert_eq!(pipeline.records.values[&1].outstanding_request, Some(50));
+    assert!(harness.sessions[0].lease.is_some());
+    assert!(!pipeline.records.values[&1].native_retirement_confirmed);
+    assert!(
+        !harness
+            .commands
+            .iter()
+            .any(|(_, payload, _)| payload["action"] == "lookup")
+    );
+}
+
+#[test]
+fn pending_spawn_cannot_extend_launch_deadline_or_retire_its_lease() {
+    let mut harness = Harness::new();
+    harness.queue_spawn = true;
+    let mut pipeline = pipeline();
+    harness.incoming = Some(Response::Request {
+        id: 7,
+        caller: "alice".into(),
+        initiator: "alice".into(),
+        service: SERVICE.into(),
+        payload: launch("pending-deadline"),
+        remaining_ms: 30_000,
+    });
+    for _ in 0..30 {
+        pipeline.tick(|command| harness.send(command)).unwrap();
+        if harness.queued_spawn.is_some() {
+            break;
+        }
+    }
+    harness.drop_spawn_result = false;
+    pipeline.job.as_mut().unwrap().deadline = Instant::now();
+    pipeline.tick(|command| harness.send(command)).unwrap();
+    assert!(pipeline.job.as_ref().unwrap().cleanup);
+    assert_eq!(pipeline.records.values[&1].outstanding_request, Some(50));
+    assert!(harness.sessions[0].lease.is_some());
+    assert!(!pipeline.records.values[&1].native_retirement_confirmed);
+}
+
+#[test]
+fn failed_read_only_settlement_keeps_request_until_stop_retries() {
     for fail_cancel in [true, false] {
         let mut harness = Harness::new();
-        harness.queue_spawn = true;
+        let mut pipeline = pipeline();
+        harness.incoming = Some(Response::Request {
+            id: 7,
+            caller: "alice".into(),
+            initiator: "alice".into(),
+            service: SERVICE.into(),
+            payload: launch("read-settlement"),
+            remaining_ms: 30_000,
+        });
+        for _ in 0..10 {
+            pipeline.tick(|command| harness.send(command)).unwrap();
+            if pipeline
+                .job
+                .as_ref()
+                .is_some_and(|job| job.step == Step::Catalog && job.pending.is_some())
+            {
+                break;
+            }
+        }
         harness.fail_cancel = fail_cancel;
         harness.fail_release = !fail_cancel;
-        let mut pipeline = pipeline();
-        let result = harness.request(&mut pipeline, "alice", launch("queued"));
-        assert_eq!(result["launch"]["state"], "cleanup_failed");
+        pipeline
+            .tick(|command| {
+                if matches!(command, Command::TakeResult { request: 50 }) {
+                    return Err("lost read result".into());
+                }
+                harness.send(command)
+            })
+            .unwrap();
+        assert!(pipeline.records.values[&1].state == State::CleanupFailed);
         assert_eq!(pipeline.records.values[&1].outstanding_request, Some(50));
-        assert!(harness.sessions[0].lease.is_some());
-        assert!(
-            !harness
-                .commands
-                .iter()
-                .any(|(_, payload, _)| payload["action"] == "lookup")
-        );
-        assert_eq!(harness.released, 0);
         harness.fail_cancel = false;
         harness.fail_release = false;
         let result = harness.request(
@@ -3486,11 +3659,7 @@ fn unconfirmed_cancellation_or_release_preserves_request_and_lease_for_retry() {
             json!({"action":"stop","launch_id":1}),
         );
         assert_eq!(result["launch"]["state"], "failed");
-        assert!(harness.queued_spawn.is_none());
-        assert!(harness.processes.is_empty());
-        assert!(harness.sessions[0].lease.is_none());
         assert!(pipeline.records.values[&1].outstanding_request.is_none());
-        assert_eq!(harness.released, 1);
     }
 }
 

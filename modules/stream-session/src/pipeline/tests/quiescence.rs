@@ -257,6 +257,508 @@ fn shutdown_deadline_retains_an_unconfirmed_ownership_write_without_cancelling_i
 }
 
 #[test]
+fn journal_write_timeout_is_fenced_even_without_shutdown() {
+    let mut host = Harness::new();
+    host.broker.enqueue(1, "owner", prepare());
+    for _ in 0..10 {
+        host.tick();
+        if host.pipeline.job.as_ref().is_some_and(|job| {
+            job.step == Step::PersistJournal
+                && job.pending.as_ref().is_some_and(rpc::Pending::was_admitted)
+        }) {
+            break;
+        }
+    }
+    let job = host.pipeline.job.as_ref().unwrap();
+    assert_eq!(job.step, Step::PersistJournal);
+    let id = job.session;
+    host.now = job.deadline;
+    host.tick();
+    assert_eq!(host.pipeline.records[&id].state, State::CleanupFailed);
+    assert!(host.pipeline.records[&id].journal_uncertain.is_some());
+    assert!(
+        !host
+            .broker
+            .commands
+            .iter()
+            .any(|command| matches!(command, Command::Cancel { .. }))
+    );
+}
+
+#[test]
+fn final_shutdown_never_releases_an_unvalidated_journal_write() {
+    let mut host = Harness::new();
+    host.broker.enqueue(1, "owner", prepare());
+    for _ in 0..10 {
+        host.tick();
+        if host.pipeline.job.as_ref().is_some_and(|job| {
+            job.step == Step::PersistJournal
+                && job.pending.as_ref().is_some_and(rpc::Pending::was_admitted)
+        }) {
+            break;
+        }
+    }
+    let job = host.pipeline.job.as_ref().unwrap();
+    let id = job.session;
+    let request = job.pending.as_ref().unwrap().request_id().unwrap();
+    assert!(host.pipeline.retained_journal_requests().contains(&request));
+    let before = host.broker.commands.len();
+    assert!(
+        !host
+            .pipeline
+            .shutdown_with(&mut |command| host.broker.send(command))
+    );
+    assert!(!host.broker.commands[before..].iter().any(|command| matches!(command,
+        Command::TakeResult { request: current } | Command::Cancel { request: current } | Command::ReleaseResult { request: current } if *current == request)));
+    host.now = host.pipeline.job.as_ref().unwrap().deadline;
+    host.tick();
+    assert!(host.pipeline.records[&id].journal_uncertain.is_some());
+    let before = host.broker.commands.len();
+    assert!(
+        !host
+            .pipeline
+            .shutdown_with(&mut |command| host.broker.send(command))
+    );
+    assert!(!host.broker.commands[before..].iter().any(|command| matches!(command,
+        Command::TakeResult { request: current } | Command::Cancel { request: current } | Command::ReleaseResult { request: current } if *current == request)));
+    assert!(host.pipeline.retained_journal_requests().contains(&request));
+}
+
+#[test]
+fn journal_release_ack_loss_keeps_validated_result_and_finishes() {
+    let mut host = Harness::new();
+    host.broker.enqueue(1, "owner", prepare());
+    for _ in 0..10 {
+        host.tick();
+        if host.pipeline.job.as_ref().is_some_and(|job| {
+            job.step == Step::PersistJournal
+                && job.pending.as_ref().is_some_and(rpc::Pending::was_admitted)
+        }) {
+            break;
+        }
+    }
+    let request = host
+        .pipeline
+        .job
+        .as_ref()
+        .unwrap()
+        .pending
+        .as_ref()
+        .unwrap()
+        .request_id()
+        .unwrap();
+    assert!(host.pipeline.retained_journal_requests().contains(&request));
+    host.now += 1;
+    host.broker.now = host.now;
+    let mut lost = false;
+    host.pipeline
+        .tick_with(
+            host.now,
+            &mut |command| {
+                let is_release =
+                    matches!(command, Command::ReleaseResult { request: id } if id == request);
+                let response = host.broker.send(command);
+                if is_release && !lost {
+                    lost = true;
+                    Err("release acknowledgement lost".into())
+                } else {
+                    response
+                }
+            },
+            &mut |_, _| panic!("journal settlement must not open a plane"),
+        )
+        .unwrap();
+    assert!(lost);
+    assert!(host.pipeline.job.as_ref().unwrap().journal_committed);
+    assert!(!host.pipeline.journal.failed);
+    for _ in 0..100 {
+        host.tick();
+        if host.broker.replies.contains_key(&1) {
+            break;
+        }
+    }
+    assert_eq!(host.broker.replies[&1]["state"], "prepared");
+    assert!(!host.pipeline.journal.failed);
+}
+
+#[test]
+fn late_confirmed_journal_write_runs_cleanup_before_reopening_admission() {
+    let mut host = Harness::new();
+    host.broker.enqueue(1, "owner", prepare());
+    for _ in 0..10 {
+        host.tick();
+        if host.pipeline.job.as_ref().is_some_and(|job| {
+            job.step == Step::PersistJournal
+                && job.pending.as_ref().is_some_and(rpc::Pending::was_admitted)
+        }) {
+            break;
+        }
+    }
+    let job = host.pipeline.job.as_ref().unwrap();
+    let id = job.session;
+    host.now = job.deadline;
+    host.tick();
+    assert!(host.pipeline.records[&id].journal_uncertain.is_some());
+    assert!(!host.pipeline.startup_reconciled());
+    host.now += 100;
+    host.tick();
+    assert!(host.pipeline.records[&id].journal_uncertain.is_none());
+    assert!(!host.pipeline.startup_reconciled());
+    for _ in 0..200 {
+        host.tick();
+        if host.pipeline.startup_reconciled() {
+            break;
+        }
+    }
+    assert!(host.pipeline.startup_reconciled());
+    assert!(host.pipeline.journal.document.entries.is_empty());
+    assert_eq!(host.pipeline.records[&id].state, State::Failed);
+    assert_eq!(host.broker.live_components(), 0);
+}
+
+#[test]
+fn unsent_expired_journal_step_does_not_create_an_uncertain_write() {
+    let mut host = Harness::new();
+    host.broker.enqueue(1, "owner", prepare());
+    for _ in 0..10 {
+        host.tick();
+        if host
+            .pipeline
+            .job
+            .as_ref()
+            .is_some_and(|job| job.step == Step::PersistJournal)
+        {
+            break;
+        }
+    }
+    let job = host.pipeline.job.as_mut().unwrap();
+    let id = job.session;
+    // Model the distinct state before any broker dispatch, such as a cleanup
+    // workflow which just moved to PersistJournal on the previous tick.
+    job.pending = None;
+    job.cleanup = true;
+    host.now = job.deadline;
+    host.tick();
+    assert!(host.pipeline.records[&id].journal_uncertain.is_none());
+    assert!(!host.pipeline.journal.failed);
+    assert!(!host.pipeline.recovery_blocked);
+}
+
+#[test]
+fn mismatched_late_journal_revision_keeps_recovery_fenced() {
+    let mut host = Harness::new();
+    host.broker.enqueue(1, "owner", prepare());
+    for _ in 0..10 {
+        host.tick();
+        if host.pipeline.job.as_ref().is_some_and(|job| {
+            job.step == Step::PersistJournal
+                && job.pending.as_ref().is_some_and(rpc::Pending::was_admitted)
+        }) {
+            break;
+        }
+    }
+    let job = host.pipeline.job.as_ref().unwrap();
+    let id = job.session;
+    host.now = job.deadline;
+    host.tick();
+    host.pipeline
+        .progress_uncertain_journal(host.now + 100, &mut |command| match command {
+            Command::TakeResult { .. } => Ok(Response::Result {
+                payload: json!({"ok": true, "revision": 999}),
+            }),
+            _ => panic!("must not release or dispatch after a mismatched revision"),
+        });
+    assert!(host.pipeline.records[&id].journal_uncertain.is_some());
+    assert!(host.pipeline.journal.failed);
+    assert!(!host.pipeline.startup_reconciled());
+}
+
+#[test]
+fn validated_late_journal_result_retries_release_without_recommitting() {
+    let mut host = Harness::new();
+    host.broker.enqueue(1, "owner", prepare());
+    for _ in 0..10 {
+        host.tick();
+        if host.pipeline.job.as_ref().is_some_and(|job| {
+            job.step == Step::PersistJournal
+                && job.pending.as_ref().is_some_and(rpc::Pending::was_admitted)
+        }) {
+            break;
+        }
+    }
+    let job = host.pipeline.job.as_ref().unwrap();
+    let id = job.session;
+    host.now = job.deadline;
+    host.tick();
+    let revision = host.pipeline.journal.revision + 1;
+    host.pipeline
+        .progress_uncertain_journal(host.now + 100, &mut |command| match command {
+            Command::TakeResult { .. } => Ok(Response::Result {
+                payload: json!({"ok": true, "revision": revision}),
+            }),
+            Command::ReleaseResult { .. } => Err("lost release".into()),
+            _ => panic!("unexpected command"),
+        });
+    assert!(host.pipeline.records[&id].journal_uncertain.is_some());
+    assert!(host.pipeline.journal.failed);
+    assert_eq!(host.pipeline.journal.revision, revision);
+    host.pipeline
+        .progress_uncertain_journal(host.now + 1100, &mut |command| match command {
+            Command::ReleaseResult { .. } => Ok(Response::Ok),
+            _ => panic!("completed result must not be fetched again"),
+        });
+    assert!(host.pipeline.records[&id].journal_uncertain.is_none());
+    assert_eq!(host.pipeline.journal.revision, revision);
+}
+
+#[test]
+fn late_journal_completion_does_not_clear_another_recovery_failure() {
+    let mut host = Harness::new();
+    host.broker.enqueue(1, "owner", prepare());
+    for _ in 0..10 {
+        host.tick();
+        if host.pipeline.job.as_ref().is_some_and(|job| {
+            job.step == Step::PersistJournal
+                && job.pending.as_ref().is_some_and(rpc::Pending::was_admitted)
+        }) {
+            break;
+        }
+    }
+    let job = host.pipeline.job.as_ref().unwrap();
+    let id = job.session;
+    host.now = job.deadline;
+    host.tick();
+    let mut other = Record::new(
+        999,
+        "owner".into(),
+        host.pipeline.records[&id].config.clone(),
+        1000,
+    );
+    other.state = State::CleanupFailed;
+    host.pipeline.records.insert(other.id, other);
+    host.pipeline.recovery_ids.insert(999);
+    host.now += 100;
+    host.tick();
+    assert!(host.pipeline.records[&id].journal_uncertain.is_none());
+    assert!(host.pipeline.recovery_blocked);
+    assert!(!host.pipeline.startup_reconciled());
+    for _ in 0..200 {
+        host.tick();
+        if host.pipeline.job.is_none() {
+            break;
+        }
+    }
+    assert_eq!(host.pipeline.records[&999].state, State::CleanupFailed);
+    assert!(host.pipeline.recovery_blocked);
+    assert!(!host.pipeline.journal.failed);
+}
+
+#[test]
+fn late_journal_completion_does_not_retire_a_new_unpersisted_target() {
+    let (_, _, configuration) = super::armed::prepared_lifecycle_for_cleanup(false);
+    let mut host = Harness::new();
+    host.pipeline
+        .settings
+        .allowed_principals
+        .push("amaterasu.rtsp".into());
+    let mut request = prepare();
+    request["lifecycle_session_target"] =
+        json!({"kind":"session","host_epoch":"epoch","session_id":"session","generation":1});
+    host.broker.enqueue(1, "amaterasu.rtsp", request);
+    for _ in 0..10 {
+        host.tick();
+        if host.pipeline.job.as_ref().is_some_and(|job| {
+            job.step == Step::PersistJournal
+                && job.pending.as_ref().is_some_and(rpc::Pending::was_admitted)
+        }) {
+            break;
+        }
+    }
+    let job = host.pipeline.job.as_ref().unwrap();
+    let id = job.session;
+    host.now = job.deadline;
+    host.tick();
+    host.pipeline.records.get_mut(&id).unwrap().start =
+        Some(serde_json::from_value(configuration).unwrap());
+    host.pipeline.records.get_mut(&id).unwrap().uncertain = Some(rpc::Pending::new(
+        "test",
+        json!({}),
+        "prior-provider".into(),
+        None,
+    ));
+    host.pipeline.records.get_mut(&id).unwrap().uncertain_step = Some(Step::Close(Resource::Video));
+    host.now += 100;
+    host.tick();
+    assert!(host.pipeline.records[&id].journal_uncertain.is_none());
+    let job = host.pipeline.job.as_ref().expect("automatic cleanup job");
+    assert_eq!(job.step, Step::PersistJournal);
+    assert!(job.journal_document.is_some());
+    assert!(host.pipeline.records[&id].uncertain.is_some());
+    assert!(
+        !host
+            .pipeline
+            .journal
+            .matches_lifecycle_identity(&host.pipeline.records[&id])
+    );
+    assert!(!host.pipeline.journal.failed);
+    assert!(!host.pipeline.startup_reconciled());
+    for _ in 0..10 {
+        host.tick();
+        if host
+            .pipeline
+            .journal
+            .matches_lifecycle_identity(&host.pipeline.records[&id])
+        {
+            break;
+        }
+        assert!(host.pipeline.records[&id].uncertain.is_some());
+    }
+    assert!(
+        host.pipeline
+            .journal
+            .matches_lifecycle_identity(&host.pipeline.records[&id])
+    );
+    assert!(host.pipeline.job.as_ref().unwrap().pending.is_some());
+}
+
+#[test]
+fn late_journal_completion_retries_another_stop_waiting_on_the_fence() {
+    let mut host = Harness::new();
+    host.broker.enqueue(1, "owner", prepare());
+    for _ in 0..10 {
+        host.tick();
+        if host.pipeline.job.as_ref().is_some_and(|job| {
+            job.step == Step::PersistJournal
+                && job.pending.as_ref().is_some_and(rpc::Pending::was_admitted)
+        }) {
+            break;
+        }
+    }
+    let job = host.pipeline.job.as_ref().unwrap();
+    let id = job.session;
+    host.now = job.deadline;
+    host.tick();
+    let mut other = Record::new(
+        999,
+        "owner".into(),
+        host.pipeline.records[&id].config.clone(),
+        1000,
+    );
+    other.state = State::CleanupFailed;
+    other.cleanup_error = Some("lifecycle_journal_write_unconfirmed");
+    host.pipeline.records.insert(other.id, other);
+    host.pipeline.journal_waiting_stops.insert(999);
+    host.now += 100;
+    host.tick();
+    assert!(host.pipeline.recovery_ids.contains(&999));
+    for _ in 0..200 {
+        host.tick();
+        if host.pipeline.startup_reconciled() {
+            break;
+        }
+    }
+    assert!(host.pipeline.startup_reconciled());
+    assert_ne!(host.pipeline.records[&999].state, State::CleanupFailed);
+}
+
+#[test]
+fn deferred_journal_stop_keeps_uncertain_provider_request_owned() {
+    let mut host = Harness::new();
+    host.broker.enqueue(1, "owner", prepare());
+    for _ in 0..10 {
+        host.tick();
+        if host.pipeline.job.as_ref().is_some_and(|job| {
+            job.step == Step::PersistJournal
+                && job.pending.as_ref().is_some_and(rpc::Pending::was_admitted)
+        }) {
+            break;
+        }
+    }
+    let job = host.pipeline.job.as_ref().unwrap();
+    let id = job.session;
+    host.now = job.deadline;
+    host.tick();
+    let mut other = Record::new(
+        999,
+        "owner".into(),
+        host.pipeline.records[&id].config.clone(),
+        1000,
+    );
+    other.state = State::CleanupFailed;
+    other.cleanup_error = Some("lifecycle_journal_write_unconfirmed");
+    other.uncertain = Some(rpc::Pending::new("test", json!({}), "owned".into(), None));
+    other.uncertain_step = Some(Step::Close(Resource::Video));
+    host.pipeline.records.insert(other.id, other);
+    host.pipeline.journal_waiting_stops.insert(999);
+    host.now += 100;
+    host.tick();
+    assert!(host.pipeline.records[&999].uncertain.is_some());
+    for _ in 0..200 {
+        host.tick();
+        if host
+            .pipeline
+            .job
+            .as_ref()
+            .is_some_and(|job| job.session == 999)
+        {
+            break;
+        }
+    }
+    let job = host.pipeline.job.as_ref().expect("deferred stop runs");
+    assert_eq!(job.session, 999);
+    assert!(job.pending.is_some() || host.pipeline.records[&999].uncertain.is_some());
+}
+
+#[test]
+fn unresolved_journal_admission_retains_the_original_operation() {
+    let mut host = Harness::new();
+    host.broker.enqueue(1, "owner", prepare());
+    for _ in 0..10 {
+        host.tick();
+        if host
+            .pipeline
+            .job
+            .as_ref()
+            .is_some_and(|job| job.step == Step::PersistJournal && job.pending.is_some())
+        {
+            break;
+        }
+    }
+    let job = host.pipeline.job.as_mut().unwrap();
+    assert_eq!(job.step, Step::PersistJournal);
+    let id = job.session;
+    let mut pending = job.pending.take().unwrap();
+    for _ in 0..3 {
+        assert!(matches!(
+            pending.poll(&mut |_| Err("lost admission".into()), host.now),
+            rpc::Progress::Waiting
+        ));
+    }
+    job.pending = Some(pending);
+    host.tick();
+    assert_eq!(host.pipeline.records[&id].state, State::CleanupFailed);
+    assert!(host.pipeline.records[&id].journal_uncertain.is_some());
+    assert!(host.pipeline.recovery_blocked);
+}
+
+#[test]
+fn transient_journal_result_failure_does_not_cancel_the_write() {
+    let mut host = Harness::new();
+    host.broker.fault = Some(("amaterasu.state/1".into(), Fault::BeforeMutation));
+    let response = host.response(1, prepare());
+    assert_eq!(response["state"], "prepared");
+    assert!(!host.pipeline.journal.failed);
+    assert!(host.broker.fault.is_none());
+    assert!(
+        !host
+            .broker
+            .commands
+            .iter()
+            .any(|command| matches!(command, Command::Cancel { .. }))
+    );
+}
+
+#[test]
 fn expiring_adoption_journal_preserves_earlier_uncertain_provider_operation() {
     let (mut host, id, configuration) = super::armed::prepared_lifecycle_for_cleanup(false);
     let mut original = rpc::Pending::new(

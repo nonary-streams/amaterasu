@@ -92,6 +92,8 @@ pub struct Pipeline {
     recovery_initialized: bool,
     recovery_queue: VecDeque<u64>,
     recovery_ids: BTreeSet<u64>,
+    deferred_journal_stops: BTreeSet<u64>,
+    journal_waiting_stops: BTreeSet<u64>,
     recovery_ready: bool,
     recovery_blocked: bool,
     package_barrier_registered: bool,
@@ -120,6 +122,8 @@ impl Pipeline {
             recovery_initialized: false,
             recovery_queue: VecDeque::new(),
             recovery_ids: BTreeSet::new(),
+            deferred_journal_stops: BTreeSet::new(),
+            journal_waiting_stops: BTreeSet::new(),
             recovery_ready: false,
             recovery_blocked: false,
             package_barrier_registered: false,
@@ -161,7 +165,9 @@ impl Pipeline {
     }
 
     fn shutdown_with(&mut self, send: &mut Send<'_>) -> bool {
-        let mut settled = true;
+        // A pending startup read is caller-owned broker work too. Do not
+        // consume it during final teardown without validating its response.
+        let mut settled = !self.journal.load_was_sent();
 
         if let Some(job) = self.job.as_mut()
             && job.step == Step::ApplyDisplay
@@ -225,8 +231,10 @@ impl Pipeline {
             if let Some(pending) = record.uncertain.as_mut() {
                 settled &= pending.shutdown(send);
             }
-            if let Some(pending) = record.journal_uncertain.as_mut() {
-                settled &= pending.shutdown(send);
+            if record.journal_uncertain.is_some() {
+                // Keep the broker result and exact document for normal-tick
+                // validation; Drop cannot safely settle an unverified write.
+                settled = false;
             }
             for pending in &mut record.shutdown_observations {
                 settled &= pending.shutdown(send);
@@ -263,8 +271,15 @@ impl Pipeline {
             }
         }
         settled &= self.history_activities.shutdown(send);
-        if let Some(pending) = self.job.as_mut().and_then(|job| job.pending.as_mut()) {
-            settled &= pending.shutdown(send);
+        if let Some(job) = self.job.as_mut() {
+            if job.step == Step::PersistJournal {
+                settled &= job
+                    .pending
+                    .as_ref()
+                    .is_none_or(|pending| !pending.was_sent());
+            } else if let Some(pending) = job.pending.as_mut() {
+                settled &= pending.shutdown(send);
+            }
         }
         settled
     }
@@ -310,9 +325,16 @@ impl Pipeline {
             }
             self.package_barrier_next_poll = now.saturating_add(100);
         }
+        let journal_requests = self.retained_journal_requests();
         let result = self.tick_with(
             now,
-            &mut |command| runtime.send_ephemeral(command),
+            &mut |command| {
+                if matches!(&command, Command::TakeResult { request } if journal_requests.contains(request)) {
+                    runtime.send(command)
+                } else {
+                    runtime.send_ephemeral(command)
+                }
+            },
             &mut |handles, providers| {
                 Plane::new(runtime, handles, providers)
                     .map(|plane| Box::new(plane) as Box<dyn Drive>)
@@ -327,6 +349,25 @@ impl Pipeline {
             }
         }
         result
+    }
+
+    fn retained_journal_requests(&self) -> BTreeSet<u64> {
+        let mut requests = BTreeSet::new();
+        requests.extend(self.journal.load_request_id());
+        if let Some(job) = self
+            .job
+            .as_ref()
+            .filter(|job| job.step == Step::PersistJournal)
+            && let Some(id) = job.pending.as_ref().and_then(rpc::Pending::request_id)
+        {
+            requests.insert(id);
+        }
+        requests.extend(
+            self.records
+                .values()
+                .filter_map(|record| record.journal_uncertain.as_ref()?.pending.request_id()),
+        );
+        requests
     }
 
     fn tick_with(
@@ -346,6 +387,9 @@ impl Pipeline {
         }
         if self.journal.loaded && !self.recovery_initialized {
             self.initialize_recovery(now)?;
+        }
+        if self.job.is_none() {
+            self.progress_uncertain_journal(now, send);
         }
         if self.job.is_none() && !self.recovery_queue.is_empty() {
             self.start_next_recovery(now);
@@ -495,6 +539,107 @@ impl Pipeline {
         }
     }
 
+    fn progress_uncertain_journal(&mut self, now: u64, send: &mut Send<'_>) {
+        let Some(id) = self
+            .records
+            .values()
+            .find(|record| {
+                record
+                    .journal_uncertain
+                    .as_ref()
+                    .is_some_and(|write| now >= write.next_poll)
+            })
+            .map(|record| record.id)
+        else {
+            return;
+        };
+        // Settlement does not depend on other failed recoveries, which may
+        // themselves need this write fence to clear before they can retry.
+        let other_recovery_blocked = self.recovery_ids.iter().any(|other| {
+            *other != id
+                && self.records.get(other).is_none_or(|record| {
+                    record.state == State::CleanupFailed
+                        && !self.journal_waiting_stops.contains(other)
+                })
+        });
+        let record = self.records.get_mut(&id).expect("selected record");
+        let write = record.journal_uncertain.as_mut().expect("selected write");
+        write.next_poll = now.saturating_add(1000);
+        match write.pending.poll(send, now) {
+            rpc::Progress::Result(payload) => {
+                if !write.validated {
+                    let Some(document) = write.document.as_ref() else {
+                        return;
+                    };
+                    if self
+                        .journal
+                        .validate_saved_response(&payload, document.clone())
+                        .is_err()
+                    {
+                        return;
+                    }
+                    write.document = None;
+                    write.validated = true;
+                }
+                if !write.pending.release_result(send) {
+                    return;
+                }
+                record.journal_uncertain = None;
+                self.journal.failed = false;
+                self.recovery_ready = false;
+                self.recovery_ids.insert(record.id);
+                self.recovery_blocked = other_recovery_blocked;
+                // The expired operation is never resumed. Retire its resources
+                // using the same owned cleanup workflow as an explicit stop.
+                let outcome = record.outcome;
+                let job = match actions::prepare_stop_job(
+                    record,
+                    &self.journal,
+                    self.sequence,
+                    None,
+                    now,
+                    self.settings.drain_timeout_ms,
+                ) {
+                    Ok(job) => job,
+                    Err(_) => {
+                        self.journal.failed = true;
+                        self.recovery_blocked = true;
+                        record.cleanup_error = Some("lifecycle_journal_write_failed");
+                        return;
+                    }
+                };
+                record.outcome = outcome;
+                self.journal_waiting_stops.remove(&id);
+                self.job = Some(job);
+                // Other stops can reach the journal fence while this write is
+                // unresolved. Resume their owned cleanup once this one has
+                // settled, instead of stranding their durable entries.
+                let waiting: Vec<u64> = self
+                    .records
+                    .values()
+                    .filter(|other| {
+                        other.id != id
+                            && other.state == State::CleanupFailed
+                            && other.cleanup_error == Some("lifecycle_journal_write_unconfirmed")
+                            && other.journal_uncertain.is_none()
+                            && self.journal_waiting_stops.contains(&other.id)
+                    })
+                    .map(|other| other.id)
+                    .collect();
+                for other in waiting {
+                    self.recovery_ids.insert(other);
+                    self.deferred_journal_stops.insert(other);
+                    self.journal_waiting_stops.remove(&other);
+                    if !self.recovery_queue.contains(&other) {
+                        self.recovery_queue.push_back(other);
+                    }
+                }
+            }
+            rpc::Progress::Unresolved => write.pending.retry(),
+            rpc::Progress::Waiting | rpc::Progress::Failed => {}
+        }
+    }
+
     fn initialize_recovery(&mut self, now: u64) -> ModuleResult<()> {
         self.recovery_initialized = true;
         let entries: Vec<_> = self.journal.entries().cloned().collect();
@@ -540,6 +685,29 @@ impl Pipeline {
         let Some(id) = self.recovery_queue.pop_front() else {
             return;
         };
+        if self.deferred_journal_stops.remove(&id) {
+            let record = self.records.get_mut(&id).expect("deferred stop record");
+            let outcome = record.outcome;
+            let job = match actions::prepare_stop_job(
+                record,
+                &self.journal,
+                self.sequence,
+                None,
+                now,
+                self.settings.drain_timeout_ms,
+            ) {
+                Ok(job) => job,
+                Err(_) => {
+                    self.journal.failed = true;
+                    self.recovery_blocked = true;
+                    record.cleanup_error = Some("lifecycle_journal_write_failed");
+                    return;
+                }
+            };
+            record.outcome = outcome;
+            self.job = Some(job);
+            return;
+        }
         let mut job = Job::new(id, None, Step::WaitDrain, now.saturating_add(30_000));
         job.cleanup = true;
         self.job = Some(job);

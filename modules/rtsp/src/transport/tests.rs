@@ -49,6 +49,59 @@ fn configured_loopback_port_restarts_without_sharing_an_existing_listener() {
     assert_eq!(restarted.local_addr().unwrap(), address);
 }
 
+#[test]
+fn invalid_rebind_preserves_connections_waiting_in_listener_backlog() {
+    let mut server = server();
+    let address = server.local_addr().unwrap();
+    let _client = TcpStream::connect(address).unwrap();
+
+    assert_eq!(
+        server.rebind_all(vec!["0.0.0.0:0".parse().unwrap()], false),
+        Err("invalid_listen_address")
+    );
+    assert_eq!(server.local_addr().unwrap(), address);
+    // The existing listener must remain open, not just be rebound at the same
+    // address, because a successful TCP handshake may be waiting to be accepted.
+    assert!(server.listeners[0].accept().is_ok());
+}
+
+#[test]
+fn unrelated_bind_collision_preserves_existing_listener_backlog() {
+    let mut server = server();
+    let address = server.local_addr().unwrap();
+    let _client = TcpStream::connect(address).unwrap();
+    let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+
+    assert_eq!(
+        server.rebind_all(vec![occupied.local_addr().unwrap()], false),
+        Err("tcp_bind_failed")
+    );
+    assert_eq!(server.local_addr().unwrap(), address);
+    assert!(server.listeners[0].accept().is_ok());
+}
+
+#[test]
+fn later_bind_collision_or_duplicate_preserves_existing_listener_backlog() {
+    for duplicate in [false, true] {
+        let mut server = server();
+        let address = server.local_addr().unwrap();
+        let _client = TcpStream::connect(address).unwrap();
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let second = if duplicate {
+            address
+        } else {
+            occupied.local_addr().unwrap()
+        };
+
+        assert_eq!(
+            server.rebind_all(vec![address, second], false),
+            Err("tcp_bind_failed")
+        );
+        assert_eq!(server.local_addr().unwrap(), address);
+        assert!(server.listeners[0].accept().is_ok());
+    }
+}
+
 fn request(cseq: u32) -> Vec<u8> {
     format!("OPTIONS rtsp://localhost/ RTSP/1.0\r\nCSeq: {cseq}\r\n\r\n").into_bytes()
 }

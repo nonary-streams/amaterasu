@@ -125,6 +125,13 @@ pub struct Record {
     // Retained until cancellation and broker release are confirmed.
     #[serde(skip)]
     pub outstanding_request: Option<u64>,
+    /// A delivered mutation may still run after broker cancellation or expiry.
+    #[serde(skip)]
+    pub outstanding_mutation: bool,
+    /// Preserve an admission whose broker reply was lost, including its exact
+    /// operation ID and payload, until it can be recovered inside the replay window.
+    #[serde(skip)]
+    pub outstanding_admission: Option<(amaterasu_module_sdk::Command, Instant)>,
     /// Set only by the completed provider cleanup workflow, never a status label.
     #[serde(skip)]
     pub native_retirement_confirmed: bool,
@@ -298,6 +305,8 @@ impl Records {
                 prepared_environment: None,
                 state: State::Starting,
                 outstanding_request: None,
+                outstanding_mutation: false,
+                outstanding_admission: None,
                 native_retirement_confirmed: false,
                 session_id: None,
                 process_id: None,
@@ -370,6 +379,7 @@ impl Records {
             || !record.state.terminal()
             || record.cleanup_error.is_some()
             || record.outstanding_request.is_some()
+            || record.outstanding_admission.is_some()
             || !self.current_epoch_operation(&record.operation_id)
         {
             return;
@@ -430,6 +440,7 @@ impl Records {
             || record.preflight_token.is_none()
             || record.cleanup_error.is_some()
             || record.outstanding_request.is_some()
+            || record.outstanding_admission.is_some()
             || record.session_requested
             || record.process_requested
             || record.preparation_requested

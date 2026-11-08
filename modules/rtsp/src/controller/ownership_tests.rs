@@ -1161,7 +1161,7 @@ fn lost_prepare_completion_stops_only_its_session_and_retains_cleanup_outcome() 
 }
 
 #[test]
-fn post_commit_lost_prepare_result_settles_before_lookup_and_owned_stop() {
+fn lost_prepare_result_is_retried_without_cancelling_or_reallocating() {
     let mut endpoint = Endpoint {
         lose_prepare_result_once: true,
         ..Endpoint::default()
@@ -1169,44 +1169,31 @@ fn post_commit_lost_prepare_result_settles_before_lookup_and_owned_stop() {
     endpoint.enqueue(1, "owner", open("lost-result"));
     let runtime = runtime(&mut endpoint);
     let mut controller = Controller::new(settings(true, &["owner"])).expect("controller");
-
     for now in 0..9 {
         tick(&mut controller, &runtime, now);
     }
-
     let requests = endpoint.downstream_requests();
     assert_eq!(
         requests
             .iter()
             .map(|(action, _, _)| *action)
             .collect::<Vec<_>>(),
-        ["prepare", "lookup", "stop"]
+        ["prepare"]
     );
     assert_eq!(requests[0].2, Some(1));
-    assert_eq!(requests[1].2, None);
-    assert_eq!(requests[2].2, None);
-
-    let cancelled = endpoint
-        .commands
-        .iter()
-        .position(|command| matches!(command, Command::Cancel { request: 1001 }))
-        .expect("prepare cancellation");
-    let released = endpoint
-        .commands
-        .iter()
-        .rposition(|command| matches!(command, Command::ReleaseResult { request: 1001 }))
-        .expect("prepare release");
-    let lookup = endpoint
-        .commands
-        .iter()
-        .position(|command| {
-            matches!(command, Command::Request { payload, .. } if payload["action"] == "lookup")
-        })
-        .expect("lookup request");
-    assert!(cancelled < lookup && released < lookup);
-
+    assert!(
+        !endpoint
+            .commands
+            .iter()
+            .any(|command| matches!(command, Command::Cancel { request: 1001 }))
+    );
+    assert!(
+        endpoint
+            .commands
+            .iter()
+            .any(|command| matches!(command, Command::ReleaseResult { request: 1001 }))
+    );
     let record = controller.records.values().next().expect("retained record");
-    assert_eq!(record.response()["state"], "failed");
-    assert_eq!(record.response()["failure"], "dependency_unavailable");
+    assert_eq!(record.response()["state"], "ready");
     assert!(record.response()["cleanup_error"].is_null());
 }

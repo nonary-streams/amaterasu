@@ -65,7 +65,8 @@ impl Pipeline {
                     if record.native_retirement_confirmed
                         && record.state.terminal()
                         && record.cleanup_error.is_none()
-                        && record.outstanding_request.is_none() =>
+                        && record.outstanding_request.is_none()
+                        && record.outstanding_admission.is_none() =>
                 {
                     ("retired", true)
                 }
@@ -139,6 +140,7 @@ impl Pipeline {
         record.display_admission = None;
         if let Some(pending) = job.pending.take() {
             record.outstanding_request = Some(pending);
+            record.outstanding_mutation = job.step.mutates_resources();
         }
         job.begin_cleanup(record, outcome, None);
         job.request = Some(request);

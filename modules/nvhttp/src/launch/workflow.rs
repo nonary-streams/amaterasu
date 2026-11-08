@@ -284,38 +284,33 @@ impl Controller {
         match job.call.poll(send) {
             Outcome::Waiting => self.job = Some(take_job(job)),
             Outcome::Result(payload) => {
-                if matches!(
-                    job.phase,
-                    Phase::BindPresentationApplication
-                        | Phase::ReadRtspRuntimeEpoch
-                        | Phase::BindPresentationTransport
-                        | Phase::VerifyBorrowedCapture
-                        | Phase::ReadLaunchEpoch
-                        | Phase::PrepareLifecycle
-                        | Phase::LookupLifecycle
-                        | Phase::BindApplication
-                        | Phase::LookupApplicationBinding
-                        | Phase::EndLifecycle
-                        | Phase::ReportApplicationRetired
-                        | Phase::LookupApplicationRetirement
-                        | Phase::AwaitLifecycleEnd
-                        | Phase::VerifyPaused
-                        | Phase::VerifyResumeSession
-                        | Phase::VerifyResumeApplication
-                        | Phase::RefreshResumePolicy
-                        | Phase::AwaitApplication
-                        | Phase::MonitorApplication
-                        | Phase::MonitorRtsp
-                        | Phase::VerifyRtspStopped
-                        | Phase::VerifyApplicationStopped
-                ) && !job.call.release_result(send)
+                let expired_start = job.phase != Phase::AwaitApplication
+                    && self.records.get(&job.record).is_some_and(|record| {
+                        record.state == State::Starting && now >= record.deadline
+                    });
+                if expired_start
+                    && !matches!(job.phase, Phase::PrepareLifecycle | Phase::LookupLifecycle)
                 {
+                    self.records
+                        .get_mut(&job.record)
+                        .expect("workflow record")
+                        .request_cleanup(Some("launch_deadline_exceeded"), now);
+                }
+                // Consume known mutation results so cleanup has their exact
+                // identities, but never publish success or admit another effect
+                // from a result that arrived after the overall launch deadline.
+                self.consume(job, payload, now, replies);
+                if expired_start {
                     let record = self.records.get_mut(&job.record).expect("workflow record");
-                    record.uncertain.push_back((job.phase, take_call(job)));
-                    record.fail_cleanup("lifecycle_result_release_unconfirmed");
-                    reply_failure(record, replies);
-                } else {
-                    self.consume(job, payload, now, replies);
+                    if record.state == State::Starting {
+                        record.request_cleanup(Some("launch_deadline_exceeded"), now);
+                    }
+                    if record.state == State::Stopping {
+                        record.stage = Stage::Cleanup;
+                        self.finish_or_retain(job.record, now, replies);
+                    } else if record.state == State::CleanupFailed {
+                        reply_failure(record, replies);
+                    }
                 }
             }
             Outcome::Rejected => self.rejected(job, now, replies),
@@ -338,6 +333,38 @@ impl Controller {
                 {
                     record.fail_cleanup("resume_settlement_unconfirmed");
                     reply_failure(record, replies);
+                    return;
+                }
+                // A stop can continue after its broker response is lost or
+                // expires. Retain that exact call, but do not let it prevent
+                // read-only status checks or cleanup of independent owners.
+                // Plain terminal status alone does not retire the retained call.
+                if job.phase == Phase::StopApplication && record.application_launch.is_some() {
+                    record.application_cleanup_blocked = false;
+                    record.stage = Stage::VerifyApplicationCleanup;
+                    record.next_cleanup_poll = now;
+                    self.finish_or_retain(job.record, now, replies);
+                    return;
+                }
+                if job.phase == Phase::StopRtsp && record.rtsp_ticket.is_some() {
+                    record.rtsp_cleanup_blocked = false;
+                    record.stage = Stage::VerifyRtspCleanup;
+                    self.finish_or_retain(job.record, now, replies);
+                    return;
+                }
+                // A dispatched open may already own resources even when its
+                // response was lost. Allow the ordinary owner lookup to find
+                // and clean them while retaining the original broker call.
+                if job.phase == Phase::LaunchApplication && record.application_requested {
+                    record.application_cleanup_blocked = false;
+                    record.request_cleanup(Some("application_launch_unconfirmed"), now);
+                    self.finish_or_retain(job.record, now, replies);
+                    return;
+                }
+                if job.phase == Phase::OpenRtsp && record.rtsp_requested {
+                    record.rtsp_cleanup_blocked = false;
+                    record.request_cleanup(Some("rtsp_open_unconfirmed"), now);
+                    self.finish_or_retain(job.record, now, replies);
                     return;
                 }
                 match job.phase {
@@ -1533,7 +1560,16 @@ impl Controller {
                         record.request_cleanup(None, now);
                     }
                     Err("launch_not_found") if job.phase == Phase::LookupApplication => {
-                        record.application_requested = false;
+                        if record
+                            .uncertain
+                            .iter()
+                            .any(|(phase, _)| *phase == Phase::LaunchApplication)
+                        {
+                            // An earlier open can still arrive after this read.
+                            record.application_cleanup_blocked = true;
+                        } else {
+                            record.application_requested = false;
+                        }
                         record
                             .failure
                             .get_or_insert("application_launch_unavailable");
@@ -1597,7 +1633,15 @@ impl Controller {
                     record.request_cleanup(None, now);
                 }
                 Err("ticket_not_found") if job.phase == Phase::LookupRtsp => {
-                    record.rtsp_requested = false;
+                    if record
+                        .uncertain
+                        .iter()
+                        .any(|(phase, _)| *phase == Phase::OpenRtsp)
+                    {
+                        record.rtsp_cleanup_blocked = true;
+                    } else {
+                        record.rtsp_requested = false;
+                    }
                     fail_record(record, "rtsp_launch_unavailable", now);
                 }
                 Err(code) => fail_record(record, code, now),

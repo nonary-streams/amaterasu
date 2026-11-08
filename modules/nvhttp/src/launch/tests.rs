@@ -1,4 +1,6 @@
 use super::*;
+use super::call::{Call, Outcome};
+use super::workflow::Phase;
 use amaterasu_module_sdk::{Command, Response};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -1307,6 +1309,7 @@ struct Broker {
     next: u64,
     results: BTreeMap<u64, Value>,
     commands: Vec<Command>,
+    lost_operation: Option<(String, Value, String, u64)>,
     history_reserve_unavailable: bool,
     history_reserve_wrong_identity: bool,
     history_release_unavailable: bool,
@@ -1391,6 +1394,7 @@ impl Default for Broker {
             next: 0,
             results: BTreeMap::new(),
             commands: Vec::new(),
+            lost_operation: None,
             history_reserve_unavailable: false,
             history_reserve_wrong_identity: false,
             history_release_unavailable: false,
@@ -1477,7 +1481,10 @@ impl Broker {
         self.commands.push(command.clone());
         match command {
             Command::Request {
-                service, payload, ..
+                service,
+                payload,
+                operation_id,
+                ..
             } => {
                 if service == "amaterasu.session-lifecycle/1" && self.lifecycle_unavailable {
                     return Ok(Response::error("unavailable", "fixture"));
@@ -1488,7 +1495,10 @@ impl Broker {
                     && payload["action"] == "reserve_history_activity"
                 {
                     self.lost_history_reserve = true;
-                    self.history_reserved = true;
+                    self.next += 1;
+                    let result = self.response(&service, &payload);
+                    self.results.insert(self.next, result);
+                    self.lost_operation = Some((service, payload, operation_id, self.next));
                     return Err("lost history reservation admission".into());
                 }
                 if self.lose_rtsp_open_once
@@ -1497,6 +1507,10 @@ impl Broker {
                     && payload["action"] == "open"
                 {
                     self.lost_rtsp_open = true;
+                    self.next += 1;
+                    let result = self.response(&service, &payload);
+                    self.results.insert(self.next, result);
+                    self.lost_operation = Some((service, payload, operation_id, self.next));
                     return Err("lost admission".into());
                 }
                 self.next += 1;
@@ -1532,6 +1546,21 @@ impl Broker {
                 self.results.insert(request, result);
                 Ok(Response::Accepted { id: request })
             }
+            Command::LookupRequest {
+                service,
+                payload,
+                operation_id,
+                ..
+            } => match &self.lost_operation {
+                Some((expected_service, expected_payload, expected_operation, id))
+                    if *expected_service == service
+                        && *expected_payload == payload
+                        && *expected_operation == operation_id =>
+                {
+                    Ok(Response::Accepted { id: *id })
+                }
+                _ => Ok(Response::error("not_found", "operation not retained")),
+            },
             Command::TakeResult { request }
                 if self.held_application_stop_request == Some(request) =>
             {
@@ -2713,7 +2742,7 @@ fn mismatched_history_reservation_does_not_tag_rtsp_and_is_released() {
 }
 
 #[test]
-fn lost_history_reservation_admission_retries_same_id_and_releases_on_cancel() {
+fn lost_history_reservation_admission_looks_up_without_replaying_and_releases_on_cancel() {
     let now = Instant::now();
     let mut controller = Controller::new(Some(config())).unwrap();
     let mut broker = Broker {
@@ -2739,8 +2768,10 @@ fn lost_history_reservation_admission_retries_same_id_and_releases_on_cancel() {
             _ => None,
         })
         .collect();
-    assert_eq!(reserve_requests.len(), 2);
-    assert_eq!(reserve_requests[0], reserve_requests[1]);
+    assert_eq!(reserve_requests.len(), 1);
+    assert!(broker.commands.iter().any(|command| matches!(command,
+        Command::LookupRequest { service, payload, .. }
+            if service == "amaterasu.stream-session/1" && payload == reserve_requests[0])));
     assert!(controller.cancel(20, &peer(1), now).is_none());
     let (_, stopped) = poll_until_reply(&mut controller, &mut broker, now);
     assert_eq!(stopped.status, 200);
@@ -2795,7 +2826,7 @@ fn history_in_use_release_keeps_cleanup_owned_until_retry() {
 }
 
 #[test]
-fn lost_history_release_result_accepts_idempotent_terminal_readback() {
+fn lost_history_release_result_is_retried_without_replaying_mutation() {
     let now = Instant::now();
     let mut controller = Controller::new(Some(config())).unwrap();
     let mut broker = Broker::default();
@@ -2803,12 +2834,8 @@ fn lost_history_release_result_accepts_idempotent_terminal_readback() {
     broker.lose_history_release_result_once = true;
     assert!(controller.cancel(20, &peer(1), now).is_none());
     let (_, first) = poll_until_reply(&mut controller, &mut broker, now);
-    assert_eq!(first.status, 503);
+    assert_eq!(first.status, 200);
     assert!(!broker.history_reserved);
-    assert!(controller.busy());
-    assert!(controller.cancel(21, &peer(1), now).is_none());
-    let (_, retry) = poll_until_reply(&mut controller, &mut broker, now);
-    assert_eq!(retry.status, 200);
     let releases: Vec<_> = broker
         .commands
         .iter()
@@ -2823,8 +2850,9 @@ fn lost_history_release_result_accepts_idempotent_terminal_readback() {
             _ => None,
         })
         .collect();
-    assert_eq!(releases.len(), 2);
-    assert_eq!(releases[0], releases[1]);
+    assert_eq!(releases.len(), 1);
+    let request = broker.history_release_request.unwrap();
+    assert!(broker.commands.iter().filter(|command| matches!(command, Command::TakeResult { request: id } if *id == request)).count() >= 2);
 }
 
 fn opened_audio_endpoint(broker: &Broker) -> &str {
@@ -4362,7 +4390,78 @@ fn expired_preflight_settles_without_scheduling_application_cleanup() {
             .actions()
             .contains(&("amaterasu.launch/1", "launch_export"))
     );
-    assert!(!broker.actions().contains(&("amaterasu.launch/1", "lookup")));
+    // A read-only lookup is safe during reconciliation; no application may
+    // have been started or require a stop for this preflight-only path.
+    assert!(!broker.actions().contains(&("amaterasu.launch/1", "stop")));
+}
+
+#[test]
+fn successful_launch_result_after_deadline_is_cleaned_up_not_published() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut broker = Broker { hold_launch_export_result: true, ..Broker::default() };
+    assert!(controller.launch(10, request(1), peer(1), now).is_none());
+    for _ in 0..32 {
+        if broker.held_launch_export_request.is_some() {
+            break;
+        }
+        assert!(controller.poll(now, &mut |command| broker.send(command)).is_empty());
+    }
+    assert!(broker.held_launch_export_request.is_some());
+    let deadline = controller.records.values().next().unwrap().deadline;
+    broker.hold_launch_export_result = false;
+    let (_, reply) = poll_until_reply(&mut controller, &mut broker, deadline);
+    assert_ne!(reply.status, 200);
+    assert!(broker.application_stopped);
+    assert!(!broker.actions().contains(&("amaterasu.rtsp/1", "open")));
+}
+
+#[test]
+fn successful_rtsp_result_after_deadline_is_cleaned_up_not_published() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut broker = Broker::default();
+    assert!(controller.launch(10, request(1), peer(1), now).is_none());
+    for _ in 0..64 {
+        if broker.actions().contains(&("amaterasu.rtsp/1", "open")) {
+            break;
+        }
+        assert!(controller.poll(now, &mut |command| broker.send(command)).is_empty());
+    }
+    assert!(broker.actions().contains(&("amaterasu.rtsp/1", "open")));
+    let deadline = controller.records.values().next().unwrap().deadline;
+    let (_, reply) = poll_until_reply(&mut controller, &mut broker, deadline);
+    assert_ne!(reply.status, 200);
+    assert!(broker.rtsp_closed);
+    assert!(broker.application_stopped);
+}
+
+#[test]
+fn late_pending_lifecycle_result_fences_and_replies_to_caller() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    controller.set_session_lifecycle_required(true);
+    controller.set_global_display_policy(7, json!({}));
+    let mut broker = Broker::default();
+    broker.lifecycle_replies.push_back(json!({"status":"pending"}));
+    assert!(controller.launch(10, request(1), peer(1), now).is_none());
+    for _ in 0..64 {
+        if broker.commands.iter().any(|command| matches!(command,
+            Command::Request { service, payload, .. }
+                if service == "amaterasu.session-lifecycle/1" && payload["operation"] == "prepare")) {
+            break;
+        }
+        assert!(controller.poll(now, &mut |command| broker.send(command)).is_empty());
+    }
+    assert!(controller.records.values().next().unwrap().lifecycle_prepare_dispatched);
+    let deadline = controller.records.values().next().unwrap().deadline;
+    let replies = controller.poll(deadline, &mut |command| broker.send(command));
+    assert_eq!(replies.len(), 1);
+    assert_eq!(replies[0].1.status, 503);
+    let record = controller.records.values().next().unwrap();
+    assert_eq!(record.state, super::record::State::CleanupFailed);
+    assert!(record.lifecycle_prepare_pending);
+    assert!(controller.busy());
 }
 
 #[test]
@@ -4455,25 +4554,59 @@ fn lost_rtsp_admission_is_settled_before_owned_lookup_without_reopening() {
             _ => None,
         })
         .collect();
-    assert_eq!(rtsp_requests.len(), 3);
-    assert_eq!(rtsp_requests[0].1, rtsp_requests[1].1);
+    assert_eq!(rtsp_requests.len(), 1);
     assert!(rtsp_requests[0].1.get("application_operation_id").is_none());
     assert!(rtsp_requests[0].1.get("app_id").is_none());
     assert!(rtsp_requests[0].1.get("catalog_revision").is_none());
     assert!(rtsp_requests[0].1.get("display_request").is_none());
-    assert_eq!(rtsp_requests[0].2, rtsp_requests[1].2);
-    assert_eq!(rtsp_requests[2].1["action"], "lookup");
-    let cancel = broker
+    let lookup = broker
         .commands
         .iter()
-        .position(|command| matches!(command, Command::Cancel { .. }))
-        .expect("cancel uncertain admission");
+        .position(|command| matches!(command, Command::LookupRequest { service, payload, operation_id, .. }
+            if service == "amaterasu.rtsp/1" && *payload == rtsp_requests[0].1 && *operation_id == rtsp_requests[0].2))
+        .expect("lookup uncertain admission");
+    let id = broker.lost_operation.as_ref().unwrap().3;
+    let result = broker.commands.iter().position(|command| matches!(command, Command::TakeResult { request } if *request == id)).unwrap();
     let release = broker
         .commands
         .iter()
-        .position(|command| matches!(command, Command::ReleaseResult { .. }))
+        .position(|command| matches!(command, Command::ReleaseResult { request } if *request == id))
         .expect("release uncertain admission");
-    assert!(rtsp_requests[1].0 < cancel && cancel < release && release < rtsp_requests[2].0);
+    assert!(rtsp_requests[0].0 < lookup && lookup < result && result < release);
+    assert!(!broker.commands.iter().any(|command| matches!(command, Command::Cancel { request } if *request == id)));
+}
+
+#[test]
+fn missing_owner_lookup_never_retires_an_uncertain_open() {
+    for (opening, lookup, code) in [
+        (Phase::LaunchApplication, Phase::LookupApplication, "launch_not_found"),
+        (Phase::OpenRtsp, Phase::LookupRtsp, "ticket_not_found"),
+    ] {
+        let now = Instant::now();
+        let mut controller = Controller::new(Some(config())).unwrap();
+        let mut broker = Broker::default();
+        launch_ready(&mut controller, &mut broker, now);
+        let id = *controller.records.keys().next().unwrap();
+        let record = controller.records.get_mut(&id).unwrap();
+        record.request_cleanup(None, now);
+        let mut pending = Call::new("service/1", json!({}), "uncertain".into(), 1000);
+        assert!(matches!(pending.poll(&mut |_| Ok(Response::Accepted { id: 77 })), Outcome::Waiting));
+        record.uncertain.push_back((opening, pending));
+        match opening {
+            Phase::LaunchApplication => { record.application_requested = true; record.application_launch = None; }
+            Phase::OpenRtsp => { record.rtsp_requested = true; record.rtsp_ticket = None; }
+            _ => unreachable!(),
+        }
+        let job = Job { record: id, phase: lookup, call: Call::new("service/1", json!({}), "lookup".into(), 1000), deadline: now };
+        controller.consume(&job, json!({"ok": false, "code": code}), now, &mut Vec::new());
+        let record = &controller.records[&id];
+        assert_eq!(record.uncertain.len(), 1);
+        match opening {
+            Phase::LaunchApplication => assert!(record.application_requested && record.application_cleanup_blocked),
+            Phase::OpenRtsp => assert!(record.rtsp_requested && record.rtsp_cleanup_blocked),
+            _ => unreachable!(),
+        }
+    }
 }
 
 #[test]
@@ -4519,7 +4652,7 @@ fn verified_application_stop_returns_to_lifecycle_cleanup() {
 }
 
 #[test]
-fn long_cleanup_outlives_short_stop_rpc_and_automatically_observes_terminal_undo() {
+fn long_cleanup_keeps_expired_stop_fenced_after_terminal_status() {
     for disconnect_cancel in [false, true] {
         let now = Instant::now();
         let mut controller = Controller::new(Some(config())).unwrap();
@@ -4593,16 +4726,15 @@ fn long_cleanup_outlives_short_stop_rpc_and_automatically_observes_terminal_undo
             );
         }
         let record = controller.records.values().next().unwrap();
-        assert_eq!(record.state, super::record::State::Stopped);
-        assert!(!record.application_requested);
-        assert!(record.application_launch.is_none());
-        assert!(!controller.busy());
+        assert_eq!(record.state, super::record::State::CleanupFailed);
+        assert!(!record.uncertain.is_empty());
+        assert!(controller.busy());
         if disconnect_cancel {
             assert!(replies.is_empty());
         } else {
             assert_eq!(replies.len(), 1);
             assert_eq!(replies[0].0, 20);
-            assert_eq!(replies[0].1.status, 200);
+            assert_eq!(replies[0].1.status, 503);
         }
         assert_eq!(
             broker
@@ -4656,9 +4788,13 @@ fn cleanup_deadline_expiry_retains_application_until_explicit_retry() {
     let retry_at = deadline + Duration::from_secs(1);
     assert!(controller.cancel(21, &peer(1), retry_at).is_none());
     let (_, retried) = poll_until_reply(&mut controller, &mut broker, retry_at);
-    assert_eq!(retried.status, 200);
-    assert!(controller.records.values().next().unwrap().state.terminal());
-    assert!(!controller.busy());
+    // The old broker Stop still reports an expired outcome. Plain terminal
+    // status does not prove that exact admitted operation has retired.
+    assert_eq!(retried.status, 503);
+    let record = controller.records.values().next().unwrap();
+    assert_eq!(record.state, super::record::State::CleanupFailed);
+    assert!(!record.uncertain.is_empty());
+    assert!(controller.busy());
 }
 
 #[test]

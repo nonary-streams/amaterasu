@@ -595,28 +595,51 @@ impl Router {
     pub fn poll_with_trust(
         &mut self,
         runtime: &RuntimeClient,
-        allowed: impl FnMut(&[u8], Permission) -> bool,
+        mut allowed: impl FnMut(&[u8], Permission) -> bool,
     ) -> Vec<(u64, Reply)> {
-        self.poll_artwork_with_identity(
-            Instant::now(),
+        let now = Instant::now();
+        // Launch mutations retain terminal payloads before explicitly releasing
+        // their broker results. The ephemeral helper can hide a known payload
+        // if only the release acknowledgement is lost.
+        let mut replies = self.launches.poll_with_authorization(
+            now,
+            &mut |command| runtime.send(command),
+            &mut allowed,
+        );
+        let mut receive = |payload: Value| {
+            if payload["ok"] != true {
+                return Err("artwork unavailable".into());
+            }
+            let offer =
+                serde_json::from_value(payload["offer"].clone()).map_err(|e| e.to_string())?;
+            // SAFETY: startup-selected library dependency retains the native provider.
+            unsafe {
+                amaterasu_module_sdk::artwork_transfer::receive(
+                    runtime,
+                    "amaterasu.library/1",
+                    offer,
+                )
+            }
+        };
+        if let Some(presentation) = &mut self.presentation {
+            replies.extend(presentation.poll(
+                &mut self.launches,
+                &self.config,
+                now,
+                &mut |command| runtime.send(command),
+                &mut allowed,
+                &mut receive,
+            ));
+        }
+        replies.extend(self.poll_artwork_with_identity(
+            now,
             &mut |command| runtime.send_ephemeral(command),
-            allowed,
-            &mut |payload| {
-                if payload["ok"] != true {
-                    return Err("artwork unavailable".into());
-                }
-                let offer =
-                    serde_json::from_value(payload["offer"].clone()).map_err(|e| e.to_string())?;
-                // SAFETY: startup-selected library dependency retains the native provider.
-                unsafe {
-                    amaterasu_module_sdk::artwork_transfer::receive(
-                        runtime,
-                        "amaterasu.library/1",
-                        offer,
-                    )
-                }
-            },
-        )
+            &mut allowed,
+            false,
+            false,
+            &mut receive,
+        ));
+        replies
     }
 
     #[cfg(test)]
@@ -635,7 +658,7 @@ impl Router {
         send: &mut impl FnMut(Command) -> ModuleResult<Response>,
         allowed: impl FnMut(&[u8], Permission) -> bool,
     ) -> Vec<(u64, Reply)> {
-        self.poll_artwork_with_identity(now, send, allowed, &mut |_| {
+        self.poll_artwork_with_identity(now, send, allowed, true, true, &mut |_| {
             Err("native artwork reader required".into())
         })
     }
@@ -644,13 +667,18 @@ impl Router {
         now: Instant,
         send: &mut impl FnMut(Command) -> ModuleResult<Response>,
         mut allowed: impl FnMut(&[u8], Permission) -> bool,
+        poll_launches: bool,
+        poll_presentation: bool,
         receive: &mut impl FnMut(Value) -> ModuleResult<amaterasu_module_sdk::artwork_transfer::Image>,
     ) -> Vec<(u64, Reply)> {
         self.poll_cancellations(now, send);
-        let mut replies = self
-            .launches
-            .poll_with_authorization(now, send, &mut allowed);
-        if let Some(presentation) = &mut self.presentation {
+        let mut replies = if poll_launches {
+            self.launches
+                .poll_with_authorization(now, send, &mut allowed)
+        } else {
+            Vec::new()
+        };
+        if poll_presentation && let Some(presentation) = &mut self.presentation {
             replies.extend(presentation.poll(
                 &mut self.launches,
                 &self.config,
@@ -860,8 +888,7 @@ impl Router {
     }
 
     pub fn shutdown(&mut self, runtime: &RuntimeClient) {
-        self.launches
-            .shutdown(&mut |command| runtime.send_ephemeral(command));
+        self.launches.shutdown(&mut |command| runtime.send(command));
     }
 
     fn expire_job(

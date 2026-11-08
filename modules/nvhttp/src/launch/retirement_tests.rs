@@ -384,7 +384,7 @@ fn explicit_retirement_retry_settles_unknown_broker_ownership_before_same_id_loo
         .unwrap();
     assert!(broker.commands[..proof_lookup_index].windows(2).any(|commands|
         matches!((&commands[0], &commands[1]),
-            (Command::Cancel { request: cancel }, Command::ReleaseResult { request: release }) if cancel == release)));
+            (Command::TakeResult { request: result }, Command::ReleaseResult { request: release }) if result == release)));
 }
 
 #[test]

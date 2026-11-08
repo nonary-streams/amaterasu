@@ -680,8 +680,14 @@ fn run_worker(
         let now = Instant::now();
         let refresh_due = now >= next_discovery;
         let has_candidate = desired.enabled && has_ipv4_candidate(&desired.endpoints);
-        let rediscover =
-            should_rediscover(has_candidate, configuration_changed, now, next_discovery);
+        let rediscover = should_rediscover(
+            has_candidate,
+            configuration_changed,
+            last_discovery_error.is_some(),
+            now,
+            next_discovery,
+            next_retry,
+        );
         let status;
         if desired.enabled && !desired.endpoints.is_empty() {
             if !has_ipv4_candidate(&desired.endpoints) {
@@ -783,11 +789,12 @@ fn run_worker(
                     };
                 } else {
                     let cleanup_error = cleanup_gateways(&mut gateways, &mut active_gateway);
-                    next_retry = if cleanup_error.is_some() {
-                        Instant::now() + CLEANUP_RETRY_INTERVAL
-                    } else {
-                        next_discovery
-                    };
+                    next_retry = next_gateway_retry(
+                        Instant::now(),
+                        next_discovery,
+                        discovery_error.is_some(),
+                        cleanup_error.is_some(),
+                    );
                     status = UpnpRuntimeStatus {
                         status: "error".into(),
                         error: Some(
@@ -829,10 +836,15 @@ fn has_ipv4_candidate(endpoints: &[MappingEndpoint]) -> bool {
 fn should_rediscover(
     has_candidate: bool,
     configuration_changed: bool,
+    discovery_failed: bool,
     now: Instant,
     next_discovery: Instant,
+    next_retry: Instant,
 ) -> bool {
-    has_candidate && (configuration_changed || now >= next_discovery)
+    has_candidate
+        && (configuration_changed
+            || now >= next_discovery
+            || (discovery_failed && now >= next_retry))
 }
 
 fn next_worker_wakeup(
@@ -844,6 +856,19 @@ fn next_worker_wakeup(
         next_discovery.min(next_retry)
     } else {
         next_retry
+    }
+}
+
+fn next_gateway_retry(
+    now: Instant,
+    next_discovery: Instant,
+    discovery_failed: bool,
+    cleanup_failed: bool,
+) -> Instant {
+    if discovery_failed || cleanup_failed {
+        now + CLEANUP_RETRY_INTERVAL
+    } else {
+        next_discovery
     }
 }
 
@@ -1626,26 +1651,66 @@ mod tests {
         assert!(!should_rediscover(
             true,
             false,
+            false,
             now + CLEANUP_RETRY_INTERVAL,
             next_discovery,
+            now + CLEANUP_RETRY_INTERVAL,
         ));
         assert!(should_rediscover(
             true,
             true,
+            false,
             now + CLEANUP_RETRY_INTERVAL,
             next_discovery,
+            now + CLEANUP_RETRY_INTERVAL,
         ));
         assert!(should_rediscover(
             true,
             false,
+            false,
             next_discovery,
             next_discovery,
+            now + CLEANUP_RETRY_INTERVAL,
         ));
         assert!(!should_rediscover(
             false,
             true,
+            true,
             next_discovery,
             next_discovery,
+            now + CLEANUP_RETRY_INTERVAL,
+        ));
+    }
+
+    #[test]
+    fn failed_gateway_discovery_retries_without_waiting_for_refresh() {
+        let now = Instant::now();
+        let next_discovery = now + RECOMMENDED_REFRESH_INTERVAL;
+        let next_retry = next_gateway_retry(now, next_discovery, true, false);
+        assert_eq!(next_retry, now + CLEANUP_RETRY_INTERVAL);
+        assert!(!should_rediscover(
+            true,
+            false,
+            true,
+            now,
+            next_discovery,
+            next_retry
+        ));
+        assert!(should_rediscover(
+            true,
+            false,
+            true,
+            next_retry,
+            next_discovery,
+            next_retry,
+        ));
+        assert!(!should_rediscover(
+            false,
+            false,
+            true,
+            next_retry,
+            next_discovery,
+            next_retry,
         ));
     }
 

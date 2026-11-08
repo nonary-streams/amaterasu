@@ -594,6 +594,45 @@ fn failed_restore_keeps_virtual_reference_until_explicit_recovery() {
 }
 
 #[test]
+fn failed_journal_keeps_shared_display_restore_with_original_owner() {
+    let mut host = Harness::new();
+    let first = host.response(
+        1,
+        prepare_with_intent(
+            "shared-first",
+            intent(
+                "reference-first",
+                VirtualDisplayMode::Shared,
+                VirtualDisplayLayout::ExtendedPrimary,
+            ),
+        ),
+    );
+    let first_id = first["session"].as_u64().unwrap();
+    let second = host.response(
+        2,
+        prepare_with_intent(
+            "shared-second",
+            intent(
+                "reference-second",
+                VirtualDisplayMode::Shared,
+                VirtualDisplayLayout::ExtendedPrimary,
+            ),
+        ),
+    );
+    let second_id = second["session"].as_u64().unwrap();
+    host.pipeline.journal.failed = true;
+    let stopped = host.response(3, json!({"action":"stop", "session":first_id}));
+    assert_eq!(stopped["state"], "cleanup_failed");
+    assert!(host.pipeline.records[&first_id].owns_display_restore);
+    assert!(!host.pipeline.records[&second_id].owns_display_restore);
+    assert!(
+        host.broker
+            .virtual_display_references
+            .contains("reference-first")
+    );
+}
+
+#[test]
 fn shared_monitor_applies_once_and_transfers_restore_ownership_until_last_stop() {
     let mut host = Harness::new();
     let original_topology = host.broker.display_topology.clone();

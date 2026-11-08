@@ -199,7 +199,7 @@ impl Controller {
             admission.caller == caller && admission.config.operation_id == operation
         }) {
             admission.deadline = now;
-            admission.call.cancel();
+            admission.call.cancel_read_only();
         }
         let ticket = self
             .records

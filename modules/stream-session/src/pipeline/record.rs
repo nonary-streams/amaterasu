@@ -118,7 +118,7 @@ pub(super) struct Record {
     pub attempted: BTreeSet<Resource>,
     pub uncertain: Option<rpc::Pending>,
     pub uncertain_step: Option<Step>,
-    pub journal_uncertain: Option<rpc::Pending>,
+    pub journal_uncertain: Option<UncertainJournalWrite>,
     /// At most one read-only observation can be in flight when shutdown begins.
     /// Its broker bookkeeping cannot keep native resources alive after teardown.
     pub shutdown_observations: Vec<rpc::Pending>,
@@ -191,6 +191,13 @@ pub(super) struct Record {
     pub control_local: Option<String>,
     pub video_local: Option<String>,
     pub audio_local: Option<String>,
+}
+
+pub(super) struct UncertainJournalWrite {
+    pub pending: rpc::Pending,
+    pub document: Option<super::journal::Document>,
+    pub validated: bool,
+    pub next_poll: u64,
 }
 
 impl Record {

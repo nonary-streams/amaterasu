@@ -23,6 +23,7 @@ struct Endpoint {
     completions: Vec<(u64, Value)>,
     active_request: bool,
     verifier_reply: Option<Value>,
+    verifier_pending: bool,
     deny_launch: bool,
     deny_settlement: bool,
     deny_settlement_requests: BTreeSet<u64>,
@@ -84,6 +85,7 @@ impl Endpoint {
             Command::TakeResult { request } if self.recovery_requests.contains_key(request) => {
                 Response::Pending
             }
+            Command::TakeResult { .. } if self.verifier_pending => Response::Pending,
             Command::TakeResult { .. } if self.verifier_reply.is_some() => Response::Result {
                 payload: self.verifier_reply.clone().unwrap(),
             },
@@ -156,6 +158,33 @@ fn startup_recovery_pending(controller: &mut Controller, deadline: u64) {
 
 fn listed_stream_sessions(sessions: Value, total: usize) -> Value {
     json!({"ok":true,"sessions":sessions,"total":total,"truncated":false,"startup_reconciled":true})
+}
+
+fn admit_pending_display_verifier(
+    controller: &mut Controller,
+    runtime: &RuntimeClient,
+    deadline: u64,
+) {
+    let config = attested_open();
+    let request_sha256 = config.display_request_sha256().unwrap();
+    let mut admission = DisplayAdmission {
+        request: 19,
+        caller: "amaterasu.nvhttp".into(),
+        config,
+        deadline,
+        request_sha256,
+        verified: false,
+        verification_started_at: 0,
+        display_preflight_deadline: None,
+        call: Call::for_service(
+            "amaterasu.launch/1",
+            json!({"action":"verify_display_admission"}),
+            "rtsp-display-test".into(),
+            Some(19),
+        ),
+    };
+    assert!(matches!(admission.call.poll(runtime), Outcome::Waiting));
+    controller.display_admission = Some(admission);
 }
 
 #[test]
@@ -1642,6 +1671,94 @@ fn uncertain_verifier_settlement_keeps_child_identity_until_release() {
 }
 
 #[test]
+fn expired_pending_display_verification_is_cancelled_without_waiting_for_result() {
+    let mut controller = Controller::new(Settings::default()).unwrap();
+    let mut endpoint = Endpoint {
+        active_request: true,
+        verifier_pending: true,
+        ..Endpoint::default()
+    };
+    let runtime = client(&mut endpoint);
+    admit_pending_display_verifier(&mut controller, &runtime, 5);
+
+    controller.advance_display_admission(&runtime, 1);
+    assert!(controller.display_admission.is_some());
+    controller.advance_display_admission(&runtime, 5);
+
+    assert!(controller.display_admission.is_none());
+    assert!(controller.display_cleanup.is_empty());
+    assert!(controller.records.is_empty());
+    assert!(controller.job.is_none());
+    assert!(
+        endpoint
+            .commands
+            .iter()
+            .any(|command| matches!(command, Command::Cancel { request: 71 }))
+    );
+    assert!(
+        endpoint
+            .commands
+            .iter()
+            .any(|command| matches!(command, Command::ReleaseResult { request: 71 }))
+    );
+    assert_eq!(
+        endpoint
+            .commands
+            .iter()
+            .filter(|command| matches!(command, Command::TakeResult { request: 71 }))
+            .count(),
+        1,
+        "the pre-deadline poll observes Pending once; cancellation settles without another read"
+    );
+    assert!(!endpoint.commands.iter().any(|command| matches!(
+        command,
+        Command::Request { service, .. } if service == "amaterasu.stream-session/1"
+    )));
+}
+
+#[test]
+fn quiescence_cancels_pending_display_verification_without_waiting_for_result() {
+    let mut controller = Controller::new(Settings::default()).unwrap();
+    let mut endpoint = Endpoint {
+        active_request: true,
+        verifier_pending: true,
+        ..Endpoint::default()
+    };
+    let runtime = client(&mut endpoint);
+    admit_pending_display_verifier(&mut controller, &runtime, 5_000);
+    assert!(controller.display_admission.is_some());
+
+    assert!(!controller.quiesce(&runtime, 2));
+    controller.advance_display_cleanup(&runtime);
+
+    assert!(controller.display_cleanup.is_empty());
+    assert!(controller.records.is_empty());
+    assert!(controller.job.is_none());
+    assert!(
+        endpoint
+            .commands
+            .iter()
+            .any(|command| matches!(command, Command::Cancel { request: 71 }))
+    );
+    assert!(
+        endpoint
+            .commands
+            .iter()
+            .any(|command| matches!(command, Command::ReleaseResult { request: 71 }))
+    );
+    assert!(
+        !endpoint
+            .commands
+            .iter()
+            .any(|command| matches!(command, Command::TakeResult { request: 71 }))
+    );
+    assert!(!endpoint.commands.iter().any(|command| matches!(
+        command,
+        Command::Request { service, .. } if service == "amaterasu.stream-session/1"
+    )));
+}
+
+#[test]
 fn cancelled_parent_reaches_cleanup_failed_when_settlement_stays_unavailable() {
     let mut controller = Controller::new(Settings::default()).expect("disabled controller");
     let config = open();
@@ -2732,6 +2849,71 @@ fn unavailable_play_response_never_marks_the_ticket_playing() {
 }
 
 #[test]
+fn late_prepare_and_arm_results_do_not_revive_a_closing_ticket() {
+    let mut controller = Controller::new(Settings::default()).unwrap();
+    let mut endpoint = Endpoint {
+        active_request: true,
+        ..Endpoint::default()
+    };
+    let runtime = client(&mut endpoint);
+    let mut record = record(State::Closing);
+    record.session = None;
+    record.needs_lookup = true;
+    let prepare = Job {
+        ticket: record.id,
+        phase: Phase::Prepare,
+        call: Call::new(json!({"action":"prepare"}), "prepare".into(), None),
+        caller: Some(19),
+        network: None,
+        deadline: 5_000,
+    };
+    controller.prepared(
+        &mut record,
+        prepare,
+        &json!({"ok":true,"state":"prepared","session":23}),
+        10,
+        &runtime,
+    );
+    assert!(record.state == State::Closing);
+    assert_eq!(record.session, Some(23));
+    assert!(record.negotiation.is_none());
+    assert!(
+        controller
+            .job
+            .as_ref()
+            .is_some_and(|job| job.phase == Phase::Stop)
+    );
+    assert!(endpoint.completions.is_empty());
+
+    controller.job = None;
+    let arm = Job {
+        ticket: record.id,
+        phase: Phase::Arm,
+        call: Call::new(
+            json!({"action":"start_when_authenticated"}),
+            "arm".into(),
+            None,
+        ),
+        caller: None,
+        network: Some((999, 1)),
+        deadline: 5_000,
+    };
+    controller.armed(
+        &mut record,
+        arm,
+        &json!({"ok":true,"state":"active","session":23}),
+        11,
+    );
+    assert!(record.state == State::Closing);
+    assert!(
+        controller
+            .job
+            .as_ref()
+            .is_some_and(|job| job.phase == Phase::Stop)
+    );
+}
+
+#[test]
 fn lifecycle_gate_waits_for_authority_and_passes_matching_candidate_to_stream_session() {
     let (mut record, announce) = announced_profile_record();
     assert!(record.accept_announce(&announce));
@@ -3312,12 +3494,8 @@ fn disconnect_during_lifecycle_prepare_resolves_admission_before_owned_cleanup()
         controller.disconnected(8, Some(5), "peer_disconnected");
         controller.advance_job(&runtime, 2);
         controller.advance_job(&runtime, 3);
-        assert!(endpoint.commands.iter().any(|command| matches!(command,
-            Command::Request { service, payload, .. } if service == "amaterasu.session-lifecycle/1"
-                && payload["operation"] == "lookup"
-                && payload["operation_id"] == "rtsp-0000000000000005-lifecycle-prepare")));
         assert!(
-            endpoint
+            !endpoint
                 .commands
                 .iter()
                 .any(|command| matches!(command, Command::Cancel { .. }))
@@ -3405,7 +3583,7 @@ fn lifecycle_prepare_deadline_and_late_success_preserve_cleanup_only_admission()
                 controller
                     .job
                     .as_ref()
-                    .is_some_and(|job| job.phase == Phase::LifecycleLookup)
+                    .is_some_and(|job| job.phase == Phase::LifecyclePrepare)
             );
             endpoint.verifier_reply = Some(reply);
             controller.advance_job(&runtime, deadline + 2);
@@ -3466,9 +3644,7 @@ fn disconnect_during_lifecycle_lookup_retries_the_exact_preparation_before_clean
     }
     controller.disconnected(8, Some(5), "peer_disconnected");
     controller.advance_job(&runtime, 4);
-    assert_eq!(controller.records[&5].state, State::CleanupFailed);
-    controller.schedule_background(5);
-    controller.schedule_background(5 + CLEANUP_RETRY_DELAYS_MS[0]);
+    assert_eq!(controller.records[&5].state, State::Closing);
     endpoint.verifier_reply = Some(reply);
     for now in 256..=258 {
         controller.advance_job(&runtime, now);
@@ -3522,6 +3698,17 @@ fn shutdown_during_lifecycle_prepare_resolves_admission_before_native_cleanup() 
                 controller.advance_job(&runtime, now);
             }
             controller.shutdown(&runtime);
+            if !during_lookup {
+                assert!(controller.records[&5].uncertain.is_some());
+                assert!(!controller.records[&5].cleanup_confirmed);
+                assert!(!endpoint.commands.iter().any(|command| matches!(
+                    command,
+                    Command::Cancel { .. } | Command::ReleaseResult { .. }
+                )));
+                assert!(!endpoint.commands.iter().any(|command| matches!(command,
+                    Command::Request { payload, .. } if payload["action"] == "stop")));
+                continue;
+            }
             assert!(endpoint.commands.iter().any(|command| matches!(command,
                 Command::Request { service, payload, .. } if service == "amaterasu.session-lifecycle/1"
                     && payload["operation"] == "lookup" && payload["operation_id"] == "rtsp-0000000000000005-lifecycle-prepare")));
@@ -3930,4 +4117,37 @@ fn shutdown_announcement_does_not_replace_an_existing_forward_start_deadline() {
     controller.prepare_shutdown(100, 10);
     assert_eq!(controller.job.as_ref().unwrap().deadline, original_deadline);
     assert_eq!(controller.records[&5].state, State::Arming);
+}
+
+#[test]
+fn exhausted_operation_sequence_does_not_reuse_an_identifier() {
+    let mut controller = Controller::new(Settings::default()).unwrap();
+    let record = record(State::Preparing);
+    controller.sequence = u64::MAX - 1;
+    let last = controller.operation_id(&record, "stop");
+    assert!(!last.is_empty());
+    assert!(controller.operation_id(&record, "stop").is_empty());
+    assert!(controller.operation_id(&record, "status").is_empty());
+}
+
+#[test]
+fn exhausted_stop_cannot_claim_session_cleanup() {
+    let mut controller = Controller::new(Settings::default()).unwrap();
+    let record = record(State::Closing);
+    controller.sequence = u64::MAX;
+    controller.schedule_stop(&record, None, 0);
+    controller.records.insert(record.id, record);
+    let mut endpoint = Endpoint::default();
+    let runtime = client(&mut endpoint);
+    controller.advance_job(&runtime, 1);
+    controller.advance_job(&runtime, 2);
+    let record = &controller.records[&5];
+    assert_eq!(record.state, State::CleanupFailed);
+    assert!(!record.cleanup_confirmed);
+    assert!(
+        endpoint
+            .commands
+            .iter()
+            .all(|command| !matches!(command, Command::Request { .. }))
+    );
 }

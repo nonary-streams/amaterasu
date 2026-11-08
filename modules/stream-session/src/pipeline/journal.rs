@@ -341,6 +341,8 @@ pub(super) struct LifecycleJournal {
     pub revision: u64,
     pub document: Document,
     load: Option<rpc::Pending>,
+    load_validated: bool,
+    load_next_poll: u64,
 }
 
 pub(super) enum LoadProgress {
@@ -360,6 +362,8 @@ impl LifecycleJournal {
             revision: 0,
             document: Document::default(),
             load: None,
+            load_validated: false,
+            load_next_poll: 0,
         })
     }
 
@@ -372,11 +376,21 @@ impl LifecycleJournal {
             revision: 0,
             document: Document::default(),
             load: None,
+            load_validated: false,
+            load_next_poll: 0,
         }
     }
 
     pub fn entries(&self) -> impl Iterator<Item = &Entry> {
         self.document.entries.values()
+    }
+
+    pub fn load_request_id(&self) -> Option<u64> {
+        self.load.as_ref().and_then(rpc::Pending::request_id)
+    }
+
+    pub fn load_was_sent(&self) -> bool {
+        self.load.as_ref().is_some_and(rpc::Pending::was_sent)
     }
 
     pub fn matches_record(&self, record: &Record) -> bool {
@@ -432,13 +446,19 @@ impl LifecycleJournal {
         if self.loaded {
             return LoadProgress::Ready;
         }
+        if now < self.load_next_poll {
+            return LoadProgress::Waiting;
+        }
         if self.load.is_none() {
-            self.load = Some(rpc::Pending::new(
-                "amaterasu.state/1",
-                json!({"action":"get","key":KEY}),
-                format!("ss-journal-{}-load", self.nonce),
-                None,
-            ));
+            self.load = Some(
+                rpc::Pending::new(
+                    "amaterasu.state/1",
+                    json!({"action":"get","key":KEY}),
+                    format!("ss-journal-{}-load", self.nonce),
+                    None,
+                )
+                .retry_uncertain_admission(),
+            );
         }
         let progress = self
             .load
@@ -447,26 +467,42 @@ impl LifecycleJournal {
             .poll(send, now);
         match progress {
             rpc::Progress::Waiting => LoadProgress::Waiting,
-            rpc::Progress::Unresolved | rpc::Progress::Failed => {
+            rpc::Progress::Unresolved => {
+                self.load.as_mut().expect("load remains owned").retry();
+                self.load_next_poll = now.saturating_add(1000);
+                LoadProgress::Waiting
+            }
+            rpc::Progress::Failed => {
                 self.failed = true;
-                self.load = None;
+                if self
+                    .load
+                    .as_ref()
+                    .is_some_and(rpc::Pending::admission_rejected)
+                {
+                    self.load = None;
+                }
                 LoadProgress::Failed
             }
             rpc::Progress::Result(payload) => {
-                let result = self.accept_load(&payload);
+                if !self.load_validated {
+                    if self.accept_load(&payload).is_err() {
+                        self.failed = true;
+                        return LoadProgress::Failed;
+                    }
+                    self.load_validated = true;
+                }
                 let released = self
                     .load
                     .as_mut()
                     .expect("load result remains owned")
                     .release_result(send);
-                self.load = None;
-                if result.is_err() || !released {
-                    self.failed = true;
-                    LoadProgress::Failed
-                } else {
-                    self.loaded = true;
-                    LoadProgress::Ready
+                if !released {
+                    self.load_next_poll = now.saturating_add(1000);
+                    return LoadProgress::Waiting;
                 }
+                self.load = None;
+                self.loaded = true;
+                LoadProgress::Ready
             }
         }
     }
@@ -525,6 +561,115 @@ mod tests {
     use super::*;
     use crate::model::PrepareConfig;
     use serde_json::json;
+
+    #[test]
+    fn startup_load_keeps_validated_result_when_release_acknowledgement_is_lost() {
+        let mut journal = LifecycleJournal::new().unwrap();
+        let mut send = |command| match command {
+            amaterasu_module_sdk::Command::Request { .. } => Ok(Response::Accepted { id: 9 }),
+            amaterasu_module_sdk::Command::TakeResult { request: 9 } => Ok(Response::Result {
+                payload: json!({"ok":true,"found":false,"revision":7}),
+            }),
+            amaterasu_module_sdk::Command::ReleaseResult { request: 9 } => {
+                Err("lost release".into())
+            }
+            _ => panic!("unexpected journal command"),
+        };
+        assert!(matches!(
+            journal.progress_load(&mut send, 1),
+            LoadProgress::Waiting
+        ));
+        assert_eq!(journal.load_request_id(), Some(9));
+        assert!(matches!(
+            journal.progress_load(&mut send, 2),
+            LoadProgress::Waiting
+        ));
+        assert!(!journal.failed);
+        assert_eq!(journal.revision, 7);
+        assert!(matches!(
+            journal.progress_load(
+                &mut |command| match command {
+                    amaterasu_module_sdk::Command::ReleaseResult { request: 9 } =>
+                        Ok(Response::error("not_found", "already released")),
+                    _ => panic!("must retry only release"),
+                },
+                1002
+            ),
+            LoadProgress::Ready
+        ));
+        assert!(journal.loaded);
+        assert_eq!(journal.revision, 7);
+    }
+
+    #[test]
+    fn startup_load_retries_transient_result_failures_without_cancelling() {
+        let mut journal = LifecycleJournal::new().unwrap();
+        assert!(matches!(
+            journal.progress_load(
+                &mut |command| match command {
+                    amaterasu_module_sdk::Command::Request { .. } =>
+                        Ok(Response::Accepted { id: 9 }),
+                    _ => panic!("expected read admission"),
+                },
+                1
+            ),
+            LoadProgress::Waiting
+        ));
+        for now in 2..=4 {
+            assert!(matches!(
+                journal.progress_load(
+                    &mut |command| match command {
+                        amaterasu_module_sdk::Command::TakeResult { request: 9 } =>
+                            Err("temporary failure".into()),
+                        _ => panic!("must not cancel or replay the read"),
+                    },
+                    now
+                ),
+                LoadProgress::Waiting
+            ));
+        }
+        assert!(matches!(
+            journal.progress_load(&mut |_| panic!("backoff must not poll"), 5),
+            LoadProgress::Waiting
+        ));
+        assert!(matches!(
+            journal.progress_load(&mut |_| panic!("backoff must not poll"), 6),
+            LoadProgress::Waiting
+        ));
+        assert!(matches!(
+            journal.progress_load(
+                &mut |command| match command {
+                    amaterasu_module_sdk::Command::TakeResult { request: 9 } =>
+                        Ok(Response::Result {
+                            payload: json!({"ok":true,"found":false,"revision":0})
+                        }),
+                    amaterasu_module_sdk::Command::ReleaseResult { request: 9 } => Ok(Response::Ok),
+                    _ => panic!("must retain the same request"),
+                },
+                1005
+            ),
+            LoadProgress::Ready
+        ));
+        assert!(!journal.failed);
+    }
+
+    #[test]
+    fn failed_load_keeps_an_uncertain_admission_owned_for_shutdown() {
+        let mut journal = LifecycleJournal::new().unwrap();
+        assert!(matches!(
+            journal.progress_load(&mut |_| Err("lost admission".into()), 1),
+            LoadProgress::Waiting
+        ));
+        assert!(matches!(
+            journal.progress_load(
+                &mut |_| Ok(Response::error("unavailable", "retry rejected")),
+                2
+            ),
+            LoadProgress::Failed
+        ));
+        assert!(journal.failed);
+        assert!(journal.load_was_sent());
+    }
 
     #[test]
     fn lifecycle_marker_survives_restart_and_blocks_legacy_recovery() {

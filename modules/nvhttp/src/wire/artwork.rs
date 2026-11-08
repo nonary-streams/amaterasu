@@ -181,10 +181,17 @@ mod tests {
         };
         assert!(
             router
-                .poll_artwork_with_identity(now, &mut send, |_, _| true, &mut receive)
+                .poll_artwork_with_identity(now, &mut send, |_, _| true, true, true, &mut receive)
                 .is_empty()
         );
-        let replies = router.poll_artwork_with_identity(now, &mut send, |_, _| true, &mut receive);
+        let replies = router.poll_artwork_with_identity(
+            now,
+            &mut send,
+            |_, _| true,
+            true,
+            true,
+            &mut receive,
+        );
         assert_eq!(calls, 1);
         assert_eq!(replies.len(), 1);
         assert_eq!(replies[0].1.status, 200);

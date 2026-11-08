@@ -251,3 +251,63 @@ fn quiesce_releases_stream_sockets_and_never_readmits_work() {
         amaterasu_media::MEDIA_CLOSED
     );
 }
+
+#[test]
+fn shutdown_defers_contended_native_calls_and_seals_open_admission() {
+    use crate::stream::tests::receivers;
+    let mut host = Host {
+        typed_network_binds: 0,
+        replies: VecDeque::new(),
+        complete: None,
+    };
+    let mut module = lifecycle_fixture(&mut host);
+    let (video, audio) = receivers();
+    let retained = module.controller.clone();
+    let native_call = retained.lock().unwrap();
+    module.prepare_shutdown(1000).unwrap();
+    assert!(!module.quiesce().unwrap());
+    host.replies.extend([
+        Response::Request {
+            id: 1,
+            caller: "owner".into(),
+            initiator: "owner".into(),
+            service: SERVICE.into(),
+            remaining_ms: 1000,
+            payload: json!({"action":"open","peer_ip":"127.0.0.1","video_port":video.local_addr().unwrap().port(),"audio_port":audio.local_addr().unwrap().port(),"audio":{"channels":2,"packet_ms":10,"wire_payload_bytes":4}}),
+        },
+        Response::Ok,
+        Response::Ok,
+    ]);
+    module.tick().unwrap();
+    assert_eq!(host.replies.len(), 3);
+    drop(native_call);
+    module.tick().unwrap();
+    assert_eq!(host.complete.unwrap()["code"], "shutting_down");
+    assert!(module.quiesce().unwrap());
+}
+
+#[test]
+fn quiesce_releases_sockets_after_controller_panic() {
+    use crate::stream::tests::{receivers, request};
+    let mut host = Host {
+        typed_network_binds: 0,
+        replies: VecDeque::new(),
+        complete: None,
+    };
+    let mut module = lifecycle_fixture(&mut host);
+    let (video, audio) = receivers();
+    let opened = module
+        .controller
+        .lock()
+        .unwrap()
+        .handle("owner", Operation::Open(request(&video, &audio, false)))
+        .unwrap();
+    let retained = module.controller.clone();
+    let _ = std::panic::catch_unwind(|| {
+        let _guard = retained.lock().unwrap();
+        panic!("simulated controller failure");
+    });
+    assert!(module.quiesce().unwrap());
+    assert!(UdpSocket::bind(opened.payload["video_local"].as_str().unwrap()).is_ok());
+    assert!(UdpSocket::bind(opened.payload["audio_local"].as_str().unwrap()).is_ok());
+}

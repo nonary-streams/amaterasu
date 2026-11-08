@@ -19,6 +19,11 @@ use std::{
 };
 
 type Transport = ModuleResult<Response>;
+enum Settlement {
+    Ready,
+    Waiting,
+    Unconfirmed,
+}
 mod retirement;
 
 fn display_admission_eligible(record: &crate::records::Record, now: Instant) -> bool {
@@ -164,6 +169,7 @@ impl Pipeline {
             || !record.state.terminal()
             || record.cleanup_error.is_some()
             || record.outstanding_request.is_some()
+            || record.outstanding_admission.is_some()
         {
             return error("retirement_unconfirmed");
         }
@@ -189,6 +195,7 @@ impl Pipeline {
                 record.state.terminal()
                     && record.cleanup_error.is_none()
                     && record.outstanding_request.is_none()
+                    && record.outstanding_admission.is_none()
             })
     }
 
@@ -223,6 +230,7 @@ impl Pipeline {
             // A submitted mutation may have committed even without its reply.
             // Settle exactly that broker entry before cleanup performs lookup.
             record.outstanding_request = Some(pending);
+            record.outstanding_mutation = job.step.mutates_resources();
         }
         let starting = record.state == State::Starting;
         job.begin_cleanup(
@@ -278,16 +286,37 @@ impl Pipeline {
                 return Err(error);
             }
             if let Some(request) = job.pending.take() {
+                if !job.cleanup && job.request.is_some() && Instant::now() >= job.deadline {
+                    let record = self
+                        .records
+                        .values
+                        .get_mut(&job.launch_id)
+                        .expect("workflow record");
+                    record.outstanding_request = Some(request);
+                    record.outstanding_mutation = job.step.mutates_resources();
+                    self.dependency_failed(&mut job, "deadline_exceeded", &mut send)?;
+                    return Ok(());
+                }
                 if job.cleanup && Instant::now() >= job.deadline {
                     self.records
                         .values
                         .get_mut(&job.launch_id)
                         .expect("workflow record")
                         .outstanding_request = Some(request);
-                    if self.settle_outstanding(job.launch_id, &mut send) {
-                        self.dependency_failed(&mut job, "deadline_exceeded", &mut send)?;
-                    } else {
-                        self.cleanup_failed(&job, "request_cancellation_unconfirmed", &mut send)?;
+                    self.records
+                        .values
+                        .get_mut(&job.launch_id)
+                        .expect("workflow record")
+                        .outstanding_mutation = job.step.mutates_resources();
+                    match self.settle_outstanding(job.launch_id, &mut send) {
+                        Settlement::Ready => {
+                            self.dependency_failed(&mut job, "deadline_exceeded", &mut send)?
+                        }
+                        _ => self.cleanup_failed(
+                            &job,
+                            "request_cancellation_unconfirmed",
+                            &mut send,
+                        )?,
                     }
                     return Ok(());
                 }
@@ -307,17 +336,30 @@ impl Pipeline {
                             .get_mut(&job.launch_id)
                             .expect("workflow record");
                         record.outstanding_request = Some(request);
+                        record.outstanding_mutation = job.step.mutates_resources();
                         if !job.cleanup {
                             record.cleanup_outcome = Outcome::Failed;
                         }
-                        if self.settle_outstanding(job.launch_id, &mut send) {
+                        if job.step.mutates_resources() {
+                            // Reconcile from the cleanup workflow after the
+                            // provider confirms this exact mutation completed.
                             self.dependency_failed(&mut job, "dependency_unavailable", &mut send)?;
-                        } else {
-                            self.cleanup_failed(
+                            return Ok(());
+                        }
+                        match self.settle_outstanding(job.launch_id, &mut send) {
+                            Settlement::Ready => self.dependency_failed(
+                                &mut job,
+                                "dependency_unavailable",
+                                &mut send,
+                            )?,
+                            Settlement::Waiting if Instant::now() < job.deadline => {
+                                self.retain(&mut job)?
+                            }
+                            _ => self.cleanup_failed(
                                 &job,
                                 "request_cancellation_unconfirmed",
                                 &mut send,
-                            )?;
+                            )?,
                         }
                     }
                 }
@@ -548,6 +590,7 @@ impl Pipeline {
                 record.display_admission = None;
                 if let Some(pending) = job.pending.take() {
                     record.outstanding_request = Some(pending);
+                    record.outstanding_mutation = job.step.mutates_resources();
                 }
                 job.begin_cleanup(record, outcome, None);
                 job.request = Some(id);
@@ -1060,15 +1103,61 @@ impl Pipeline {
         &mut self,
         launch_id: u64,
         send: &mut impl FnMut(Command) -> Transport,
-    ) -> bool {
+    ) -> Settlement {
         let record = self
             .records
             .values
             .get_mut(&launch_id)
             .expect("workflow record");
+        if let Some((command, sent_at)) = &record.outstanding_admission {
+            // Broker retry records are retained for five minutes. Replaying
+            // after that horizon could create a second mutation.
+            if sent_at.elapsed() >= Duration::from_secs(240) {
+                return Settlement::Unconfirmed;
+            }
+            let Command::Request {
+                service,
+                payload,
+                operation_id,
+                parent,
+                ..
+            } = command
+            else {
+                return Settlement::Unconfirmed;
+            };
+            // Replaying a lost admission here could create a new mutation after
+            // shutdown began. Lookup retains its exact identity without sending
+            // new provider work; missing/expired evidence remains fenced.
+            match send(Command::LookupRequest {
+                service: service.clone(),
+                payload: payload.clone(),
+                operation_id: operation_id.clone(),
+                parent: *parent,
+            }) {
+                Ok(Response::Accepted { id }) => {
+                    record.outstanding_request = Some(id);
+                    record.outstanding_mutation = true;
+                    record.outstanding_admission = None;
+                }
+                _ => return Settlement::Unconfirmed,
+            }
+        }
         let Some(request) = record.outstanding_request else {
-            return true;
+            return Settlement::Ready;
         };
+        if record.outstanding_mutation {
+            return match send(Command::TakeResult { request }) {
+                Ok(Response::Pending) => Settlement::Waiting,
+                Ok(Response::Result { .. }) => {
+                    record.outstanding_request = None;
+                    record.outstanding_mutation = false;
+                    Settlement::Ready
+                }
+                // Cancelled, expired and missing broker entries do not prove
+                // that a delivered provider mutation has finished.
+                _ => Settlement::Unconfirmed,
+            };
+        }
         for command in [
             Command::Cancel { request },
             Command::ReleaseResult { request },
@@ -1078,11 +1167,11 @@ impl Pipeline {
                 // An ephemeral TakeResult may have released the entry before
                 // its transport failed; broker expiration also removes entries.
                 Ok(Response::Error { code, .. }) if code == "not_found" => {}
-                _ => return false,
+                _ => return Settlement::Unconfirmed,
             }
         }
         record.outstanding_request = None;
-        true
+        Settlement::Ready
     }
 
     fn schedule_monitor(&mut self) {
@@ -1118,8 +1207,10 @@ impl Pipeline {
         send: &mut impl FnMut(Command) -> Transport,
     ) -> ModuleResult<()> {
         self.bound_cleanup_deadline(job);
-        if !self.settle_outstanding(job.launch_id, send) {
-            return self.cleanup_failed(job, "request_cancellation_unconfirmed", send);
+        match self.settle_outstanding(job.launch_id, send) {
+            Settlement::Ready => {}
+            Settlement::Waiting if Instant::now() < job.deadline => return self.retain(job),
+            _ => return self.cleanup_failed(job, "request_cancellation_unconfirmed", send),
         }
         if job.cleanup
             && job.step == Step::Finish
@@ -1181,17 +1272,27 @@ impl Pipeline {
                 .as_millis()
                 .clamp(1, 5_000) as u64
         };
-        let response = send(Command::Request {
+        let command = Command::Request {
             service,
             payload,
             timeout_ms,
             operation_id: format!("{}.{}", record.session_key, self.sequence),
             parent: job.parent(),
-        });
+        };
+        let sent_at = Instant::now();
+        let response = send(command.clone());
         match response {
             Ok(Response::Accepted { id }) => {
                 job.pending = Some(id);
                 self.retain(job)
+            }
+            Err(_) if job.step.mutates_resources() => {
+                self.records
+                    .values
+                    .get_mut(&job.launch_id)
+                    .expect("workflow record")
+                    .outstanding_admission = Some((command, sent_at));
+                self.dependency_failed(job, "dependency_unavailable", send)
             }
             _ => self.dependency_failed(job, "dependency_unavailable", send),
         }

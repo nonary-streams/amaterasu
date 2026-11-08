@@ -18,20 +18,38 @@ impl Pipeline {
         });
         if let Some(deadline) = shutdown_deadline {
             job.deadline = job.deadline.min(deadline);
-            if now >= job.deadline && job.step == Step::PersistJournal {
-                // Ownership persistence may already have committed. Retain its
-                // exact broker identity for reconciliation; shutdown expiry must
-                // not cancel the write or continue into unjournaled effects.
-                record.journal_uncertain = job.pending.take();
-                self.journal.failed = true;
-                self.recovery_blocked = true;
-                record.cleanup_error = Some("lifecycle_journal_write_unconfirmed");
-                record.state = State::CleanupFailed;
-                self.reply(record, job, send);
-                // Keep this separately from any uncertain dependent operation,
-                // while releasing the workflow so status/stop remain available.
-                return false;
+        }
+        if now >= job.deadline && job.step == Step::PersistJournal {
+            if job.pending.is_none() {
+                // No broker request was issued, so there is no late write to
+                // fence. Retire the expired workflow without claiming one.
+                if job.cleanup {
+                    record.cleanup_error = Some("cleanup_deadline");
+                    record.state = State::CleanupFailed;
+                    self.reply(record, job, send);
+                    return false;
+                }
+                job.step = job.journal_resume.take().unwrap_or(Step::WaitDrain);
+                job.journal_document = None;
+                job.journal_payload = None;
+                job.journal_operation_id = None;
+                job.fail(record, "operation_deadline", now);
+                return true;
             }
+            // Ownership persistence may already have committed. Retain its
+            // exact broker identity for reconciliation; expiry must
+            // not cancel the write or continue into unjournaled effects.
+            if let Some(pending) = job.pending.take() {
+                self.retain_uncertain_journal(record, job, pending, now);
+            }
+            self.journal.failed = true;
+            self.recovery_blocked = true;
+            record.cleanup_error = Some("lifecycle_journal_write_unconfirmed");
+            record.state = State::CleanupFailed;
+            self.reply(record, job, send);
+            // Keep this separately from any uncertain dependent operation,
+            // while releasing the workflow so status/stop remain available.
+            return false;
         }
         if let Some(deadline) = self.shutdown_deadline
             && now >= job.deadline
@@ -98,6 +116,7 @@ impl Pipeline {
                 }
                 rpc::Progress::Unresolved => {
                     if job.step == Step::PersistJournal {
+                        self.retain_uncertain_journal(record, job, pending, now);
                         self.journal.failed = true;
                         self.recovery_blocked = true;
                         record.cleanup_error = Some("lifecycle_journal_write_unconfirmed");
@@ -141,6 +160,24 @@ impl Pipeline {
                     return false;
                 }
                 rpc::Progress::Result(payload) => {
+                    if job.step == Step::PersistJournal {
+                        if !job.journal_committed {
+                            let saved = job.journal_document.as_ref().is_some_and(|document| {
+                                self.journal
+                                    .validate_saved_response(&payload, document.clone())
+                                    .is_ok()
+                            });
+                            if !saved {
+                                self.journal.failed = true;
+                                return self.journal_write_failed(record, job, now, send);
+                            }
+                            job.journal_committed = true;
+                        }
+                        if !pending.release_result(send) {
+                            job.pending = Some(pending);
+                            return true;
+                        }
+                    }
                     if matches!(
                         job.step,
                         Step::ValidateLifecycleCandidate
@@ -185,6 +222,17 @@ impl Pipeline {
                         record.feedback_poll_at = now.saturating_add(100);
                         return false;
                     } else if job.step == Step::PersistJournal {
+                        if !pending.admission_rejected() {
+                            // A lost admission may have delivered this write even
+                            // if a later retry failed. Keep its identity fenced.
+                            self.retain_uncertain_journal(record, job, pending, now);
+                            self.journal.failed = true;
+                            self.recovery_blocked = true;
+                            record.cleanup_error = Some("lifecycle_journal_write_unconfirmed");
+                            record.state = State::CleanupFailed;
+                            self.reply(record, job, send);
+                            return false;
+                        }
                         self.journal.failed = true;
                         self.recovery_blocked = true;
                         if job.cleanup {
@@ -281,7 +329,16 @@ impl Pipeline {
                 return self.finish_cleanup(record, job, send);
             }
             super::shared_capture::detach_if_borrowed(record, &self.records);
-            transferred_display_restore = self.transfer_shared_display_restore(record);
+            transferred_display_restore = match self.transfer_shared_display_restore(record) {
+                Ok(transferred) => transferred,
+                Err(()) => {
+                    self.journal_waiting_stops.insert(record.id);
+                    record.cleanup_error = Some("lifecycle_journal_write_unconfirmed");
+                    record.state = State::CleanupFailed;
+                    self.reply(record, job, send);
+                    return false;
+                }
+            };
             let Some(step) = job.next_cleanup(record) else {
                 return self.finish_cleanup(record, job, send);
             };
@@ -419,6 +476,17 @@ impl Pipeline {
             job.journal_operation_id = Some(self.journal.op_id(self.sequence.saturating_add(1)));
             job.step = Step::PersistJournal;
         }
+        // An unconfirmed write anywhere in the pipeline owns the current
+        // revision. Never dispatch a later write until that fence is resolved.
+        if job.step == Step::PersistJournal && self.journal.failed {
+            if job.cleanup {
+                self.journal_waiting_stops.insert(record.id);
+            }
+            record.cleanup_error = Some("lifecycle_journal_write_unconfirmed");
+            record.state = State::CleanupFailed;
+            self.reply(record, job, send);
+            return false;
+        }
         let (service, payload) = job.command(record);
         self.sequence = match self.sequence.checked_add(1) {
             Some(value) => value,
@@ -452,12 +520,31 @@ impl Pipeline {
         } else {
             rpc::Pending::new(&service, payload, operation_id, parent)
         };
-        job.pending = Some(if job.step == Step::RecoverAudio {
-            pending.retry_uncertain_admission()
-        } else {
-            pending
-        });
+        job.pending = Some(
+            if matches!(job.step, Step::RecoverAudio | Step::PersistJournal) {
+                // Reuse the exact broker operation ID after a lost admission and
+                // never cancel a possibly delivered ownership write.
+                pending.retry_uncertain_admission()
+            } else {
+                pending
+            },
+        );
         true
+    }
+
+    fn retain_uncertain_journal(
+        &self,
+        record: &mut Record,
+        job: &mut Job,
+        pending: rpc::Pending,
+        now: u64,
+    ) {
+        record.journal_uncertain = Some(super::record::UncertainJournalWrite {
+            pending,
+            document: job.journal_document.take(),
+            validated: job.journal_committed,
+            next_poll: now.saturating_add(100),
+        });
     }
 
     fn consume(
@@ -470,18 +557,9 @@ impl Pipeline {
         factory: &mut Factory<'_>,
     ) -> bool {
         if job.step == Step::PersistJournal {
-            let Some(document) = job.journal_document.take() else {
-                self.journal.failed = true;
-                return self.journal_write_failed(record, job, now, send);
-            };
-            if self
-                .journal
-                .validate_saved_response(&payload, document)
-                .is_err()
-            {
-                self.journal.failed = true;
-                return self.journal_write_failed(record, job, now, send);
-            }
+            debug_assert!(job.journal_committed);
+            job.journal_document = None;
+            job.journal_committed = false;
             job.journal_payload = None;
             job.journal_operation_id = None;
             job.step = job.journal_resume.take().unwrap_or(Step::WaitDrain);
@@ -1436,13 +1514,13 @@ impl Pipeline {
         true
     }
 
-    fn transfer_shared_display_restore(&mut self, record: &mut Record) -> bool {
+    fn transfer_shared_display_restore(&mut self, record: &mut Record) -> Result<bool, ()> {
         if !record.owns_display_restore
             || !record.display_applied
             || record.display_lease.is_none()
             || !record.virtual_display_reference_owned
         {
-            return false;
+            return Ok(false);
         }
         let Some(shared) = self.records.values_mut().find(|candidate| {
             candidate.state != State::Stopping
@@ -1451,8 +1529,13 @@ impl Pipeline {
                 && candidate.display_applied
                 && super::virtual_display::same_shared_specification(record, candidate)
         }) else {
-            return false;
+            return Ok(false);
         };
+        // Moving ownership in memory requires a durable update for both
+        // records before the original reference may be released.
+        if self.journal.failed {
+            return Err(());
+        }
         shared.display_attempted = true;
         shared.display_lease = record.display_lease.take();
         shared.display_status_verified = record.display_status_verified;
@@ -1467,7 +1550,7 @@ impl Pipeline {
         record.display_applied = false;
         record.owns_display_restore = false;
         record.display_operation_id = None;
-        true
+        Ok(true)
     }
 
     fn journal_write_failed(

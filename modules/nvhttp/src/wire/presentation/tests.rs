@@ -1,4 +1,144 @@
 use super::*;
+
+#[test]
+fn broker_call_retains_mutation_result_when_release_acknowledgement_is_lost() {
+    let mut call = BrokerCall {
+        command: Command::Request {
+            service: "example/1".into(),
+            payload: serde_json::json!({}),
+            operation_id: "example".into(),
+            timeout_ms: 1000,
+            parent: None,
+        },
+        request: None,
+        cancelling: false,
+        terminal: None,
+        first_sent: None,
+        admission_uncertain: false,
+    };
+    let mut step = 0;
+    let mut send = |command| {
+        step += 1;
+        match (step, command) {
+            (1, Command::Request { .. }) => Ok(Response::Accepted { id: 3 }),
+            (2, Command::TakeResult { request: 3 }) => Ok(Response::Result {
+                payload: serde_json::json!({"owned": 42}),
+            }),
+            (3, Command::ReleaseResult { request: 3 }) => Err("lost acknowledgement".into()),
+            (4, Command::ReleaseResult { request: 3 }) => {
+                Ok(Response::error("not_found", "released"))
+            }
+            _ => panic!("unexpected command"),
+        }
+    };
+    assert!(matches!(call.poll(&mut send), CallOutcome::Waiting));
+    assert!(matches!(call.poll(&mut send), CallOutcome::Waiting));
+    // The caller may disconnect after the provider's result was observed but
+    // before its broker release was acknowledged. Its identity is still needed
+    // to retire the just-created projection.
+    call.cancelling = true;
+    assert!(
+        matches!(call.poll(&mut send), CallOutcome::Result(payload) if payload == serde_json::json!({"owned": 42}))
+    );
+}
+
+#[test]
+fn cancelled_mutation_waits_for_provider_and_never_replays_unknown_admission() {
+    let command = Command::Request {
+        service: "example/1".into(),
+        payload: serde_json::json!({}),
+        operation_id: "operation".into(),
+        timeout_ms: 1000,
+        parent: None,
+    };
+    let mut call = BrokerCall {
+        command,
+        request: None,
+        cancelling: false,
+        terminal: None,
+        first_sent: None,
+        admission_uncertain: false,
+    };
+    assert!(matches!(
+        call.poll(&mut |_| Err("lost admission".into())),
+        CallOutcome::Waiting
+    ));
+    call.cancelling = true;
+    assert!(matches!(
+        call.poll(&mut |command| {
+            assert!(matches!(command, Command::LookupRequest { .. }));
+            Ok(Response::error("not_found", "admission not yet visible"))
+        }),
+        CallOutcome::Waiting
+    ));
+    assert!(matches!(
+        call.poll(&mut |command| {
+            assert!(matches!(command, Command::LookupRequest { .. }));
+            Ok(Response::Accepted { id: 9 })
+        }),
+        CallOutcome::Waiting
+    ));
+    assert!(matches!(
+        call.poll(&mut |command| {
+            assert!(matches!(command, Command::TakeResult { request: 9 }));
+            Ok(Response::error(
+                "deadline_exceeded",
+                "unknown provider state",
+            ))
+        }),
+        CallOutcome::Waiting
+    ));
+    let mut calls = 0;
+    assert!(matches!(
+        call.poll(&mut |command| {
+            calls += 1;
+            match command {
+                Command::TakeResult { request: 9 } => Ok(Response::Result {
+                    payload: serde_json::json!({"projection_id":"owned"}),
+                }),
+                Command::ReleaseResult { request: 9 } => Ok(Response::Ok),
+                _ => panic!("must not cancel or resubmit"),
+            }
+        }),
+        CallOutcome::Result(_)
+    ));
+    assert_eq!(calls, 2);
+}
+
+#[test]
+fn lookup_crossing_retention_horizon_does_not_adopt_a_reused_request_id() {
+    let start = Instant::now();
+    let mut call = BrokerCall {
+        command: Command::Request {
+            service: "example/1".into(),
+            payload: serde_json::json!({}),
+            operation_id: "operation".into(),
+            timeout_ms: 1000,
+            parent: None,
+        },
+        request: None,
+        cancelling: true,
+        terminal: None,
+        first_sent: Some(start),
+        admission_uncertain: true,
+    };
+    let mut times = [
+        start + Duration::from_secs(299),
+        start + Duration::from_secs(300),
+    ]
+    .into_iter();
+    assert!(matches!(
+        call.poll_with_clock(
+            &mut |command| {
+                assert!(matches!(command, Command::LookupRequest { .. }));
+                Ok(Response::Accepted { id: 9 })
+            },
+            &mut || times.next().unwrap()
+        ),
+        CallOutcome::Waiting
+    ));
+    assert!(call.request.is_none());
+}
 use crate::wire::{Request as HttpRequest, Router};
 use session::{Application, Presentation};
 use std::collections::BTreeSet;
@@ -12,6 +152,7 @@ struct Provider {
     calls: Vec<(String, Value)>,
     cancelled: BTreeSet<u64>,
     hold_dispatch: bool,
+    hold_begin_release: bool,
     observation_failure: bool,
     timeouts: Vec<(String, u64)>,
 }
@@ -25,6 +166,7 @@ impl Provider {
             calls: Vec::new(),
             cancelled: BTreeSet::new(),
             hold_dispatch: false,
+            hold_begin_release: false,
             observation_failure: false,
             timeouts: Vec::new(),
         }
@@ -75,7 +217,17 @@ impl Provider {
                 self.cancelled.insert(request);
                 Response::Ok
             }
-            Command::ReleaseResult { .. } => Response::Ok,
+            Command::ReleaseResult { request } => {
+                if self.hold_begin_release
+                    && self
+                        .requests
+                        .get(&request)
+                        .is_some_and(|(method, _)| method == "begin_project")
+                {
+                    return Err("lost release acknowledgement".into());
+                }
+                Response::Ok
+            }
             other => panic!("unexpected presentation broker command: {other:?}"),
         })
     }
@@ -150,6 +302,55 @@ impl Provider {
             other => panic!("unhandled presentation method {other}"),
         }
     }
+}
+
+#[test]
+fn revoked_catalog_releases_projection_with_lost_release_acknowledgement() {
+    let mut router = router();
+    let mut provider = Provider::new("policy");
+    provider.hold_begin_release = true;
+    let now = Instant::now();
+    assert!(dispatch(&mut router, "/applist", peer(), now).is_none());
+    for _ in 0..40 {
+        poll(&mut router, &mut provider, now);
+        if provider
+            .calls
+            .iter()
+            .any(|(method, _)| method == "begin_project")
+        {
+            break;
+        }
+    }
+    assert!(
+        provider
+            .calls
+            .iter()
+            .any(|(method, _)| method == "begin_project")
+    );
+    // Observe the provider result while release acknowledgement remains lost.
+    poll(&mut router, &mut provider, now);
+    provider.hold_begin_release = false;
+    for _ in 0..20 {
+        router.poll_with_identity(
+            now,
+            &mut |command| provider.send(command),
+            |_, permission| permission != Permission::List,
+        );
+        if provider
+            .calls
+            .iter()
+            .any(|(method, _)| method == "release_project")
+        {
+            break;
+        }
+    }
+    assert!(
+        provider
+            .calls
+            .iter()
+            .any(|(method, payload)| method == "release_project"
+                && payload["projection_id"] == "projection-1")
+    );
 }
 
 fn router() -> Router {
@@ -460,6 +661,21 @@ fn revoked_grants_cancel_a_pending_decision_before_any_consumer_effect() {
         }));
         observed_replies.extend(replies);
     }
+    assert!(observed_replies.is_empty());
+    assert!(
+        !provider
+            .calls
+            .iter()
+            .any(|call| call.0 == "cancel_dispatch")
+    );
+    provider.hold_dispatch = false;
+    for _ in 0..8 {
+        observed_replies.extend(router.poll_with_identity(
+            now,
+            &mut |command| provider.send(command),
+            |_, permission| permission != Permission::Terminate,
+        ));
+    }
     assert!(
         observed_replies
             .iter()
@@ -563,11 +779,18 @@ fn expired_dispatch_releases_with_a_fresh_cleanup_budget_and_answers_the_open_re
             break;
         }
     }
-    let reply = complete(
-        &mut router,
-        &mut provider,
-        now + WORK_TIMEOUT + Duration::from_secs(1),
+    let expired = now + WORK_TIMEOUT + Duration::from_secs(1);
+    for _ in 0..4 {
+        assert!(poll(&mut router, &mut provider, expired).is_empty());
+    }
+    assert!(
+        !provider
+            .calls
+            .iter()
+            .any(|call| call.0 == "cancel_dispatch")
     );
+    provider.hold_dispatch = false;
+    let reply = complete(&mut router, &mut provider, expired);
     assert_eq!(reply.status, 504);
     assert!(
         provider

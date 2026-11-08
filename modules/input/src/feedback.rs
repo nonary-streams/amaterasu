@@ -32,8 +32,6 @@ impl FeedbackQueue {
         let mut state = self.lock();
         state.generation = state.generation.wrapping_add(1).max(1);
         state.active = true;
-        state.next_sequence = 0;
-        state.last_peeked_sequence = 0;
         state.events.clear();
         state.generation
     }
@@ -42,8 +40,6 @@ impl FeedbackQueue {
         let mut state = self.lock();
         state.generation = state.generation.wrapping_add(1).max(1);
         state.active = false;
-        state.next_sequence = 0;
-        state.last_peeked_sequence = 0;
         state.events.clear();
     }
 
@@ -80,7 +76,10 @@ impl FeedbackQueue {
 
     pub(crate) fn acknowledge(&self, through_sequence: u64) -> bool {
         let mut state = self.lock();
-        if !state.active || through_sequence > state.last_peeked_sequence {
+        // A consumer may have delivered a peeked event while the controller
+        // was disabled. Accept its acknowledgement even while inactive, and
+        // never reuse sequence numbers across producer generations.
+        if through_sequence > state.last_peeked_sequence {
             return false;
         }
         while state
@@ -285,6 +284,22 @@ mod tests {
         assert_ne!(old_generation, new_generation);
         assert!(!stale.push(rumble(1, 1, 2)));
         assert!(queue.peek(1).is_empty());
+    }
+
+    #[test]
+    fn acknowledgement_survives_generation_retirement_without_removing_new_feedback() {
+        let queue = FeedbackQueue::default();
+        let first = queue.producer(queue.begin_lease(), 0, 0);
+        assert!(first.push(rumble(0, 1, 2)));
+        let previous_sequence = queue.peek(1)[0].sequence;
+        queue.end_lease();
+        assert!(queue.acknowledge(previous_sequence));
+        let next = queue.producer(queue.begin_lease(), 0, 0);
+        assert!(next.push(rumble(0, 3, 4)));
+        let new_feedback = queue.peek(1);
+        assert!(new_feedback[0].sequence > previous_sequence);
+        assert!(queue.acknowledge(previous_sequence));
+        assert_eq!(queue.peek(1), new_feedback);
     }
 
     #[test]

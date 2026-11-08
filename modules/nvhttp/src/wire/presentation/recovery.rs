@@ -29,6 +29,7 @@ pub(super) struct RecoveryPump {
     next_operation: u64,
     phase: Phase,
     call: Option<BrokerCall>,
+    parked: VecDeque<ParkedCall>,
     current: Option<Attempt>,
     queued: VecDeque<RecoveryWorkItem>,
     cursor: Option<String>,
@@ -40,7 +41,7 @@ pub(super) struct RecoveryPump {
     observed_empty: bool,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
     List,
     Retire,
@@ -62,6 +63,15 @@ struct BrokerCall {
     attempted: bool,
     cancelling: bool,
     terminal: Option<Result<Value, ()>>,
+    mutation: bool,
+    first_sent: Option<Instant>,
+    admission_uncertain: bool,
+}
+
+struct ParkedCall {
+    item: RecoveryWorkItem,
+    call: BrokerCall,
+    phase: Phase,
 }
 
 enum CallResult {
@@ -78,6 +88,7 @@ impl RecoveryPump {
             next_operation: 0,
             phase: Phase::List,
             call: None,
+            parked: VecDeque::new(),
             current: None,
             queued: VecDeque::new(),
             cursor: None,
@@ -99,18 +110,57 @@ impl RecoveryPump {
         send: &mut impl FnMut(Command) -> ModuleResult<Response>,
         mut may_retire: impl FnMut(&RecoveryBinding) -> bool,
     ) {
+        // Each retained mutation settles independently, even while normal work
+        // is in backoff. No second mutation may race its exact owner binding.
+        for _ in 0..self.parked.len().min(session::MAX_RECOVERY_ITEMS) {
+            let mut parked = self.parked.pop_front().expect("bounded parked call");
+            if matches!(parked.call.poll(send, now), CallResult::Waiting) {
+                self.parked.push_back(parked);
+            }
+        }
         if self.next_poll.is_some_and(|next| now < next) {
             return;
         }
         self.next_poll = None;
         if let Some(attempt) = &self.current {
+            if self.parked.iter().any(|parked| {
+                parked.item.id == attempt.item.id
+                    || owner_reference(&parked.item.binding)
+                        == owner_reference(&attempt.item.binding)
+                    || (self.phase == Phase::ReconcileOwner
+                        && parked.phase == Phase::ReconcileOwner)
+            }) {
+                self.current = None;
+                self.schedule_next(now);
+                return;
+            }
             if matches!(self.phase, Phase::Retire | Phase::ReconcileOwner)
                 && !may_retire(&attempt.item.binding)
             {
                 if self.call.as_ref().is_some_and(|call| call.attempted) {
-                    // Its admission may already exist. Keep the exact command
-                    // and obligation until ownership permits safe settlement.
-                    self.next_poll = Some(now + RETRY_INTERVAL);
+                    // Retain its exact admission without blocking independent
+                    // recovery intents; lookup and settlement admit no effects.
+                    if self.parked.len() < MAX_SCAN_ITEMS {
+                        let call = self.call.take().expect("attempted call");
+                        self.parked.push_back(ParkedCall {
+                            item: attempt.item.clone(),
+                            call,
+                            phase: self.phase,
+                        });
+                        self.current = None;
+                        self.schedule_next(now);
+                    } else {
+                        if matches!(
+                            self.call.as_mut().expect("attempted call").poll(send, now),
+                            CallResult::Complete(_)
+                        ) {
+                            self.call = None;
+                            self.current = None;
+                            self.schedule_next(now);
+                        } else {
+                            self.next_poll = Some(now + RETRY_INTERVAL);
+                        }
+                    }
                     return;
                 }
                 self.call = None;
@@ -137,9 +187,34 @@ impl RecoveryPump {
         }
         let call = self.call.as_mut().expect("prepared recovery call");
         if now >= call.deadline {
-            call.cancelling = true;
+            if call.mutation {
+                if !call.attempted {
+                    self.call = None;
+                    self.defer_current(now, RETRY_INTERVAL);
+                    return;
+                } else if self.parked.len() < MAX_SCAN_ITEMS {
+                    let call = self.call.take().expect("prepared recovery call");
+                    let item = self
+                        .current
+                        .as_ref()
+                        .expect("mutation owns a recovery item")
+                        .item
+                        .clone();
+                    self.parked.push_back(ParkedCall {
+                        item,
+                        call,
+                        phase: self.phase,
+                    });
+                    self.defer_current(now, RETRY_INTERVAL);
+                    return;
+                }
+                // At capacity, keep polling this already-admitted call; never
+                // detach it or stop polling solely because the queue is full.
+            } else {
+                call.cancelling = true;
+            }
         }
-        let result = match call.poll(send) {
+        let result = match call.poll(send, now) {
             CallResult::Waiting => return,
             CallResult::Complete(result) => result,
         };
@@ -205,6 +280,7 @@ impl RecoveryPump {
     pub(super) fn is_idle(&self) -> bool {
         self.observed_empty
             && self.call.is_none()
+            && self.parked.is_empty()
             && self.current.is_none()
             && self.queued.is_empty()
     }
@@ -276,6 +352,12 @@ impl RecoveryPump {
             attempted: false,
             cancelling: false,
             terminal: None,
+            mutation: matches!(
+                self.phase,
+                Phase::Retire | Phase::ReconcileOwner | Phase::ReconcilePolicy
+            ),
+            first_sent: None,
+            admission_uncertain: false,
         })
     }
 
@@ -393,7 +475,11 @@ impl RecoveryPump {
 }
 
 impl BrokerCall {
-    fn poll(&mut self, send: &mut impl FnMut(Command) -> ModuleResult<Response>) -> CallResult {
+    fn poll(
+        &mut self,
+        send: &mut impl FnMut(Command) -> ModuleResult<Response>,
+        now: Instant,
+    ) -> CallResult {
         if self.terminal.is_some() {
             return self.release(send);
         }
@@ -401,17 +487,53 @@ impl BrokerCall {
             if self.cancelling && !self.attempted {
                 return CallResult::Complete(Err(()));
             }
+            if self.mutation && (self.cancelling || self.admission_uncertain) {
+                let Some(started) = self.first_sent else {
+                    return CallResult::Waiting;
+                };
+                if now.saturating_duration_since(started) >= Duration::from_secs(300) {
+                    return CallResult::Waiting;
+                }
+                let Some(lookup) = super::lookup_command(&self.command) else {
+                    return CallResult::Waiting;
+                };
+                let response = send(lookup);
+                if Instant::now().max(now).saturating_duration_since(started)
+                    >= Duration::from_secs(300)
+                {
+                    return CallResult::Waiting;
+                }
+                if let Ok(Response::Accepted { id }) = response {
+                    self.request = Some(id);
+                }
+                return CallResult::Waiting;
+            }
             self.attempted = true;
+            self.first_sent.get_or_insert(now);
             return match send(self.command.clone()) {
                 Ok(Response::Accepted { id }) => {
                     self.request = Some(id);
                     CallResult::Waiting
                 }
-                Ok(Response::Error { .. }) => CallResult::Complete(Err(())),
-                _ => CallResult::Waiting,
+                Ok(Response::Error { code, .. })
+                    if !self.mutation
+                        || matches!(
+                            code.as_str(),
+                            "permission_denied"
+                                | "invalid_request"
+                                | "unavailable"
+                                | "resource_exhausted"
+                        ) =>
+                {
+                    CallResult::Complete(Err(()))
+                }
+                _ => {
+                    self.admission_uncertain = true;
+                    CallResult::Waiting
+                }
             };
         };
-        if self.cancelling {
+        if self.cancelling && !self.mutation {
             let _ = send(Command::Cancel { request });
         }
         match send(Command::TakeResult { request }) {
@@ -424,17 +546,19 @@ impl BrokerCall {
                 });
                 self.release(send)
             }
-            Ok(Response::Error { code, .. }) if code == "not_found" => {
+            Ok(Response::Error { code, .. }) if !self.mutation && code == "not_found" => {
                 CallResult::Complete(Err(()))
             }
             Ok(Response::Error { code, .. })
-                if matches!(code.as_str(), "cancelled" | "deadline_exceeded") =>
+                if !self.mutation && matches!(code.as_str(), "cancelled" | "deadline_exceeded") =>
             {
                 self.terminal = Some(Err(()));
                 self.release(send)
             }
             _ => {
-                self.cancelling = true;
+                if !self.mutation {
+                    self.cancelling = true;
+                }
                 CallResult::Waiting
             }
         }

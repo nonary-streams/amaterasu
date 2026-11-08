@@ -399,33 +399,27 @@ impl Pipeline {
             record
                 .cleanup_error
                 .get_or_insert("lifecycle_journal_write_unconfirmed");
+            self.journal_waiting_stops.insert(record.id);
             rpc::complete(send, request, record.response());
             return;
         }
-        let mut job = stop_job(
+        let job = match prepare_stop_job(
             record,
+            &self.journal,
+            self.sequence,
             Some(request),
             now,
             self.settings.drain_timeout_ms,
-            persist_lifecycle_identity,
-        );
-        if persist_lifecycle_identity {
-            let document = match self.journal.with_record(record) {
-                Ok(document) => document,
-                Err(_) => {
-                    self.journal.failed = true;
-                    record.state = State::CleanupFailed;
-                    record.cleanup_error = Some("lifecycle_journal_write_failed");
-                    rpc::complete(send, request, record.response());
-                    return;
-                }
-            };
-            job.journal_resume = Some(job.step);
-            job.journal_payload = Some(self.journal.set_payload(&document));
-            job.journal_document = Some(document);
-            job.journal_operation_id = Some(self.journal.op_id(self.sequence.saturating_add(1)));
-            job.step = Step::PersistJournal;
-        }
+        ) {
+            Ok(job) => job,
+            Err(_) => {
+                self.journal.failed = true;
+                record.state = State::CleanupFailed;
+                record.cleanup_error = Some("lifecycle_journal_write_failed");
+                rpc::complete(send, request, record.response());
+                return;
+            }
+        };
         self.job = Some(job);
     }
 
@@ -675,6 +669,33 @@ fn validate_start_configuration(
         return Err("start_conflict");
     }
     Ok(())
+}
+
+/// Persist an adopted lifecycle identity before any provider cleanup is sent.
+pub(super) fn prepare_stop_job(
+    record: &mut Record,
+    journal: &journal::LifecycleJournal,
+    sequence: u64,
+    request: Option<u64>,
+    now: u64,
+    drain_timeout_ms: u64,
+) -> Result<Job, &'static str> {
+    let persist = record
+        .start
+        .as_ref()
+        .is_some_and(|start| start.lifecycle_target.is_some())
+        && !journal.matches_lifecycle_identity(record);
+    // Construct before moving any uncertain provider operation into the job.
+    let document = persist.then(|| journal.with_record(record)).transpose()?;
+    let mut job = stop_job(record, request, now, drain_timeout_ms, persist);
+    if let Some(document) = document {
+        job.journal_resume = Some(job.step);
+        job.journal_payload = Some(journal.set_payload(&document));
+        job.journal_document = Some(document);
+        job.journal_operation_id = Some(journal.op_id(sequence.saturating_add(1)));
+        job.step = Step::PersistJournal;
+    }
+    Ok(job)
 }
 
 /// Build the ordinary owned stop workflow without dispatching provider work.

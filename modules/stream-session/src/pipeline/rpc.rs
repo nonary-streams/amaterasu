@@ -135,6 +135,10 @@ impl Pending {
         self.request.is_some()
     }
 
+    pub fn request_id(&self) -> Option<u64> {
+        self.request
+    }
+
     pub fn was_sent(&self) -> bool {
         self.first_sent_at.is_some()
     }

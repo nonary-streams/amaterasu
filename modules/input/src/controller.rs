@@ -689,6 +689,18 @@ impl<B: Backend> Controller<B> {
         match self.backend.disable_controller_input() {
             Ok(()) => {
                 self.controller_cleanup_pending = false;
+                // Re-enabling can race a failed detach. Only start a fresh
+                // feedback generation once the old devices are retired, so
+                // their callbacks cannot enter the resumed lease.
+                if self.effective_controller_enabled()
+                    && self
+                        .lease
+                        .as_ref()
+                        .is_some_and(|lease| !lease.cleanup_required)
+                {
+                    let generation = self.feedback.begin_lease();
+                    self.backend.set_feedback_generation(generation);
+                }
                 if self.lease.is_none() {
                     self.retry_at = now;
                 }

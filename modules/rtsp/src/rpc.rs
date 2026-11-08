@@ -1,6 +1,7 @@
 //! Broker calls retain exact admission identity until cancellation is confirmed.
 use amaterasu_module_sdk::{Command, Response, RuntimeClient};
 use serde_json::Value;
+use std::time::{Duration, Instant};
 
 pub enum Outcome {
     Waiting,
@@ -23,6 +24,8 @@ pub struct Call {
     failures: u8,
     result: Option<Value>,
     admission: Admission,
+    first_sent: Option<Instant>,
+    read_only: bool,
 }
 
 impl Call {
@@ -36,6 +39,13 @@ impl Call {
         operation: String,
         parent: Option<u64>,
     ) -> Self {
+        // An empty operation denotes exhausted local ID allocation. Never let
+        // it reach the broker or reuse the last successfully allocated ID.
+        let admission = if operation.is_empty() {
+            Admission::Rejected
+        } else {
+            Admission::Unsubmitted
+        };
         Self {
             command: Command::Request {
                 service: service.into(),
@@ -48,13 +58,22 @@ impl Call {
             cancelling: false,
             failures: 0,
             result: None,
-            admission: Admission::Unsubmitted,
+            admission,
+            first_sent: None,
+            read_only: false,
         }
     }
 
     pub fn cancel(&mut self) {
         self.cancelling = true;
         self.failures = 0;
+    }
+
+    /// The caller must use this only for an observation that cannot mutate
+    /// provider resources. Broker cancellation then safely retires bookkeeping.
+    pub fn cancel_read_only(&mut self) {
+        self.read_only = true;
+        self.cancel();
     }
 
     pub fn retry_settlement(&mut self) {
@@ -73,6 +92,9 @@ impl Call {
     }
 
     pub fn poll(&mut self, runtime: &RuntimeClient) -> Outcome {
+        if self.admission == Admission::Rejected {
+            return Outcome::SettledFailure;
+        }
         if self.cancelling && self.proven_not_dispatched() {
             return Outcome::SettledFailure;
         }
@@ -80,7 +102,34 @@ impl Call {
             return Outcome::Uncertain;
         }
         let Some(request) = self.request else {
-            return match runtime.send_ephemeral(self.command.clone()) {
+            let command = if self.admission == Admission::Possible {
+                if self
+                    .first_sent
+                    .is_some_and(|sent| sent.elapsed() >= Duration::from_secs(300))
+                {
+                    return Outcome::Uncertain;
+                }
+                let Command::Request {
+                    service,
+                    payload,
+                    operation_id,
+                    parent,
+                    ..
+                } = &self.command
+                else {
+                    return Outcome::Uncertain;
+                };
+                Command::LookupRequest {
+                    service: service.clone(),
+                    payload: payload.clone(),
+                    operation_id: operation_id.clone(),
+                    parent: *parent,
+                }
+            } else {
+                self.first_sent = Some(Instant::now());
+                self.command.clone()
+            };
+            return match runtime.send(command) {
                 Ok(Response::Accepted { id }) => {
                     self.request = Some(id);
                     self.admission = Admission::Possible;
@@ -88,6 +137,21 @@ impl Call {
                     Outcome::Waiting
                 }
                 Ok(Response::Error { code, .. }) => {
+                    if self.admission == Admission::Possible {
+                        // The host invocation is synchronous and this Call is
+                        // the only submitter/releaser of its unique operation.
+                        // Recheck after lookup, which itself may have stalled.
+                        if code == "not_found"
+                            && self
+                                .first_sent
+                                .is_some_and(|sent| sent.elapsed() < Duration::from_secs(300))
+                        {
+                            self.admission = Admission::Rejected;
+                            return Outcome::SettledFailure;
+                        }
+                        self.failures += 1;
+                        return Outcome::Waiting;
+                    }
                     self.admission = if self.admission == Admission::Unsubmitted
                         && matches!(
                             code.as_str(),
@@ -100,11 +164,16 @@ impl Call {
                     } else {
                         Admission::Possible
                     };
-                    Outcome::SettledFailure
+                    if self.admission == Admission::Rejected {
+                        Outcome::SettledFailure
+                    } else {
+                        self.cancelling = true;
+                        Outcome::Waiting
+                    }
                 }
                 _ => {
-                    // The command may have reached the broker. Resubmit this exact
-                    // operation only to recover its request ID, then settle it.
+                    // The command may have reached the broker. Look up its
+                    // identity without dispatching a new mutation.
                     self.admission = Admission::Possible;
                     self.cancelling = true;
                     self.failures += 1;
@@ -112,12 +181,36 @@ impl Call {
                 }
             };
         };
-        if self.cancelling {
-            if settle(runtime, request) {
-                return Outcome::SettledFailure;
+        if self.cancelling && self.result.is_some() {
+            // A terminal provider result is stronger evidence than broker
+            // cancellation. Preserve it for the caller while retrying only its
+            // release, including after a lost release acknowledgement.
+            return match runtime.send(Command::ReleaseResult { request }) {
+                Ok(Response::Ok) => Outcome::Result(self.result.clone().expect("result retained")),
+                Ok(Response::Error { code, .. }) if code == "not_found" => {
+                    Outcome::Result(self.result.clone().expect("result retained"))
+                }
+                _ => {
+                    self.failures += 1;
+                    Outcome::Waiting
+                }
+            };
+        }
+        if self.cancelling && self.read_only {
+            for command in [
+                Command::Cancel { request },
+                Command::ReleaseResult { request },
+            ] {
+                match runtime.send(command) {
+                    Ok(Response::Ok) => {}
+                    Ok(Response::Error { code, .. }) if code == "not_found" => {}
+                    _ => {
+                        self.failures += 1;
+                        return Outcome::Waiting;
+                    }
+                }
             }
-            self.failures += 1;
-            return Outcome::Waiting;
+            return Outcome::SettledFailure;
         }
         if self.result.is_none() {
             // Keep the payload before releasing its broker record. The SDK's
@@ -128,14 +221,15 @@ impl Call {
                 Ok(Response::Result { payload }) => self.result = Some(payload),
                 _ => {
                     self.cancelling = true;
+                    self.failures += 1;
                     return Outcome::Waiting;
                 }
             }
         }
         match runtime.send_ephemeral(Command::ReleaseResult { request }) {
-            Ok(Response::Ok) => Outcome::Result(self.result.take().expect("result retained")),
+            Ok(Response::Ok) => Outcome::Result(self.result.clone().expect("result retained")),
             Ok(Response::Error { code, .. }) if code == "not_found" => {
-                Outcome::Result(self.result.take().expect("result retained"))
+                Outcome::Result(self.result.clone().expect("result retained"))
             }
             _ => {
                 self.failures += 1;
@@ -154,20 +248,6 @@ impl Call {
         }
         Outcome::Uncertain
     }
-}
-
-fn settle(runtime: &RuntimeClient, request: u64) -> bool {
-    for command in [
-        Command::Cancel { request },
-        Command::ReleaseResult { request },
-    ] {
-        match runtime.send_ephemeral(command) {
-            Ok(Response::Ok) => {}
-            Ok(Response::Error { code, .. }) if code == "not_found" => {}
-            _ => return false,
-        }
-    }
-    true
 }
 
 pub fn active(runtime: &RuntimeClient, request: u64) -> bool {
@@ -196,6 +276,8 @@ mod tests {
         lose_first_admission: bool,
         fail_settlement: bool,
         admission_rejection: Option<&'static str>,
+        lookup_error: Option<&'static str>,
+        take_result: Option<Value>,
     }
 
     impl Endpoint {
@@ -205,6 +287,17 @@ mod tests {
                     Response::error(self.admission_rejection.unwrap(), "not admitted")
                 }
                 Command::Request { .. } => Response::Accepted { id: 41 },
+                Command::LookupRequest { .. } if self.lookup_error.is_some() => {
+                    Response::error(self.lookup_error.unwrap(), "lookup failed")
+                }
+                Command::LookupRequest { .. } => Response::Accepted { id: 41 },
+                Command::TakeResult { .. } => {
+                    self.take_result
+                        .as_ref()
+                        .map_or(Response::Pending, |payload| Response::Result {
+                            payload: payload.clone(),
+                        })
+                }
                 Command::Cancel { .. } | Command::ReleaseResult { .. } if self.fail_settlement => {
                     Response::error("unavailable", "deliberate settlement failure")
                 }
@@ -261,6 +354,16 @@ mod tests {
     }
 
     #[test]
+    fn exhausted_operation_id_never_dispatches() {
+        let mut endpoint = Endpoint::default();
+        let runtime = client(&mut endpoint);
+        let mut call = Call::new(json!({"action":"prepare"}), String::new(), None);
+        assert!(matches!(call.poll(&runtime), Outcome::SettledFailure));
+        assert!(call.proven_not_dispatched());
+        assert!(endpoint.commands.is_empty());
+    }
+
+    #[test]
     fn first_admission_rejection_proves_no_dispatch_only_for_known_pre_enqueue_errors() {
         for code in [
             "permission_denied",
@@ -276,7 +379,12 @@ mod tests {
             };
             let runtime = client(&mut endpoint);
             let mut call = Call::new(json!({"action":"prepare"}), "rejected".into(), None);
-            assert!(matches!(call.poll(&runtime), Outcome::SettledFailure));
+            let outcome = call.poll(&runtime);
+            assert!(if matches!(code, "conflict" | "unexpected") {
+                matches!(outcome, Outcome::Waiting)
+            } else {
+                matches!(outcome, Outcome::SettledFailure)
+            });
             assert_eq!(
                 call.proven_not_dispatched(),
                 !matches!(code, "conflict" | "unexpected")
@@ -288,7 +396,7 @@ mod tests {
     fn rejection_after_lost_admission_cannot_prove_no_dispatch() {
         let mut endpoint = Endpoint {
             lose_first_admission: true,
-            admission_rejection: Some("unavailable"),
+            lookup_error: Some("unavailable"),
             ..Endpoint::default()
         };
         let runtime = client(&mut endpoint);
@@ -296,8 +404,24 @@ mod tests {
         assert!(matches!(call.poll(&runtime), Outcome::Waiting));
         assert!(!call.proven_not_dispatched());
         call.cancel();
-        assert!(matches!(call.poll(&runtime), Outcome::SettledFailure));
+        assert!(matches!(call.poll(&runtime), Outcome::Waiting));
         assert!(!call.proven_not_dispatched());
+    }
+
+    #[test]
+    fn lookup_after_retention_expiry_cannot_prove_nonadmission() {
+        let mut endpoint = Endpoint {
+            lose_first_admission: true,
+            lookup_error: Some("not_found"),
+            ..Endpoint::default()
+        };
+        let runtime = client(&mut endpoint);
+        let mut call = Call::new(json!({"action":"prepare"}), "lost".into(), None);
+        assert!(matches!(call.poll(&runtime), Outcome::Waiting));
+        call.first_sent = Some(Instant::now() - Duration::from_secs(300));
+        assert!(matches!(call.poll(&runtime), Outcome::Uncertain));
+        assert!(!call.proven_not_dispatched());
+        assert_eq!(endpoint.commands.len(), 1);
     }
 
     #[test]
@@ -312,13 +436,19 @@ mod tests {
 
         assert!(matches!(call.poll(&runtime), Outcome::Waiting));
         assert!(matches!(call.poll(&runtime), Outcome::Waiting));
-        assert!(matches!(call.poll(&runtime), Outcome::SettledFailure));
+        assert!(matches!(call.poll(&runtime), Outcome::Waiting));
 
         let requests: Vec<_> = endpoint
             .commands
             .iter()
             .filter_map(|command| match command {
                 Command::Request {
+                    payload,
+                    operation_id,
+                    parent,
+                    ..
+                }
+                | Command::LookupRequest {
                     payload,
                     operation_id,
                     parent,
@@ -333,19 +463,26 @@ mod tests {
         assert_eq!(requests[0].1, "broker-operation");
         assert_eq!(*requests[0].2, Some(9));
         assert!(matches!(
-            endpoint.commands[2],
-            Command::Cancel { request: 41 }
+            endpoint.commands[1],
+            Command::LookupRequest { .. }
         ));
         assert!(matches!(
-            endpoint.commands[3],
-            Command::ReleaseResult { request: 41 }
+            endpoint.commands[2],
+            Command::TakeResult { request: 41 }
         ));
+        assert!(!endpoint.commands.iter().any(|command| matches!(
+            command,
+            Command::Cancel { .. } | Command::ReleaseResult { .. }
+        )));
+        endpoint.take_result = Some(json!({"ok":true,"session":23}));
+        assert!(matches!(call.poll(&runtime), Outcome::Result(_)));
     }
 
     #[test]
     fn unconfirmed_settlement_is_retained_and_can_be_retried() {
         let mut endpoint = Endpoint {
-            fail_settlement: true,
+            lookup_error: Some("unavailable"),
+            lose_first_admission: true,
             ..Endpoint::default()
         };
         let runtime = client(&mut endpoint);
@@ -357,9 +494,11 @@ mod tests {
         }
         assert!(matches!(call.poll(&runtime), Outcome::Uncertain));
 
-        endpoint.fail_settlement = false;
+        endpoint.lookup_error = None;
+        endpoint.take_result = Some(json!({"ok":true}));
         call.retry_settlement();
-        assert!(matches!(call.poll(&runtime), Outcome::SettledFailure));
+        assert!(matches!(call.poll(&runtime), Outcome::Waiting));
+        assert!(matches!(call.poll(&runtime), Outcome::Result(_)));
         assert_eq!(
             endpoint
                 .commands
@@ -367,6 +506,32 @@ mod tests {
                 .filter(|command| matches!(command, Command::Request { .. }))
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn cancellation_preserves_observed_result_and_only_retries_release() {
+        let mut endpoint = Endpoint {
+            fail_settlement: true,
+            ..Endpoint::default()
+        };
+        let runtime = client(&mut endpoint);
+        let mut call = Call::new(json!({"action":"stop"}), "stop".into(), None);
+        assert!(matches!(call.poll(&runtime), Outcome::Waiting));
+        call.result = Some(json!({"ok":true,"session":23}));
+        call.cancel();
+        assert!(matches!(call.poll(&runtime), Outcome::Waiting));
+        endpoint.fail_settlement = false;
+        assert!(matches!(call.poll(&runtime), Outcome::Result(_)));
+        assert_eq!(
+            call.observed_result(),
+            Some(&json!({"ok":true,"session":23}))
+        );
+        assert!(
+            !endpoint
+                .commands
+                .iter()
+                .any(|command| matches!(command, Command::Cancel { .. }))
         );
     }
 }

@@ -696,7 +696,7 @@ fn lost_prelaunch_export_result_at_deadline_restores_display_and_reconciles_appl
         position("amaterasu.launch/1", "launch_export") < position("amaterasu.rtsp/1", "close")
     );
     assert!(position("amaterasu.launch/1", "lookup") < position("amaterasu.launch/1", "stop"));
-    assert!(broker.commands.iter().any(|command| matches!(
+    assert!(!broker.commands.iter().any(|command| matches!(
         command,
         Command::Cancel { request } if *request == held_request
     )));
@@ -711,8 +711,9 @@ fn lost_prelaunch_export_result_at_deadline_restores_display_and_reconciles_appl
     );
     assert_eq!(
         controller.records.values().next().unwrap().state,
-        State::Failed
+        State::CleanupFailed
     );
+    assert!(!controller.records.values().next().unwrap().uncertain.is_empty());
     assert_eq!(
         controller
             .launch(12, stream, paired, deadline)

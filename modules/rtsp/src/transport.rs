@@ -14,6 +14,23 @@ use std::{
 use tickets::Tickets;
 
 pub type TransportResult<T> = Result<T, &'static str>;
+enum BindError {
+    Failure(&'static str),
+    Listen {
+        address: SocketAddr,
+        kind: io::ErrorKind,
+        selected_port: Option<u16>,
+    },
+}
+
+impl BindError {
+    fn code(&self) -> &'static str {
+        match self {
+            Self::Failure(code) => code,
+            Self::Listen { .. } => "tcp_bind_failed",
+        }
+    }
+}
 const MAX_CONNECTIONS: usize = 16;
 const MAX_CONNECTIONS_PER_IP: usize = 8;
 const ACCEPT_BUDGET: usize = 4;
@@ -57,18 +74,18 @@ impl Transport {
         addresses: Vec<SocketAddr>,
         allow_remote: bool,
     ) -> TransportResult<Self> {
-        if addresses.is_empty() {
-            return Err("invalid_listen_address");
-        }
+        Self::try_bind_all(network, addresses, allow_remote).map_err(|error| error.code())
+    }
+
+    fn try_bind_all(
+        network: Network,
+        addresses: Vec<SocketAddr>,
+        allow_remote: bool,
+    ) -> Result<Self, BindError> {
+        validate_listen_addresses(&addresses, allow_remote).map_err(BindError::Failure)?;
         let mut listeners = Vec::with_capacity(addresses.len());
         let mut selected_port = None;
         for mut address in addresses {
-            if mapped(address.ip())
-                || address.ip().is_multicast()
-                || (!allow_remote && !address.ip().is_loopback())
-            {
-                return Err("invalid_listen_address");
-            }
             if address.port() == 0
                 && let Some(port) = selected_port
             {
@@ -76,12 +93,24 @@ impl Transport {
             }
             // Socket ownership and platform listener semantics belong to the
             // selected provider; RTSP retains address admission and tickets.
-            let listener = network.bind_tcp(address).map_err(|_| "tcp_bind_failed")?;
+            let listener = network
+                .bind_tcp(address)
+                .map_err(|error| BindError::Listen {
+                    address,
+                    kind: error.kind(),
+                    selected_port,
+                })?;
             listener
                 .set_nonblocking(true)
-                .map_err(|_| "tcp_configuration_failed")?;
-            selected_port
-                .get_or_insert_with(|| listener.local_addr().expect("bound listener").port());
+                .map_err(|_| BindError::Failure("tcp_configuration_failed"))?;
+            if selected_port.is_none() {
+                selected_port = Some(
+                    listener
+                        .local_addr()
+                        .map_err(|_| BindError::Failure("tcp_address_failed"))?
+                        .port(),
+                );
+            }
             listeners.push(listener);
         }
         Ok(Self {
@@ -120,14 +149,62 @@ impl Transport {
         if self.connection_count() != 0 {
             return Err("tcp_listener_active");
         }
+        // Invalid configuration is not a bind collision. Reject it before
+        // releasing listeners, including connections already in their backlog.
+        validate_listen_addresses(&addresses, allow_remote)?;
         let previous_addresses = self.local_addrs()?;
-        match Self::bind_all_with_network(self.network.clone(), addresses.clone(), allow_remote) {
+        match Self::try_bind_all(self.network.clone(), addresses.clone(), allow_remote) {
             Ok(replacement) => {
                 self.listeners = replacement.listeners;
                 self.allow_remote = allow_remote;
                 Ok(())
             }
             Err(preflight_error) => {
+                if !matches!(&preflight_error, BindError::Listen { address, kind: io::ErrorKind::AddrInUse, .. }
+                    if previous_addresses.iter().any(|previous| listeners_overlap(*previous, *address)))
+                {
+                    return Err(preflight_error.code());
+                }
+                // A self-collision may hide a later independent failure. Probe
+                // every non-overlapping target and reject conflicting targets
+                // before releasing any old listener or its accept backlog.
+                let selected_port = match &preflight_error {
+                    BindError::Listen { selected_port, .. } => *selected_port,
+                    BindError::Failure(_) => None,
+                }
+                .or_else(|| (addresses[0].port() != 0).then_some(addresses[0].port()));
+                let effective: Vec<_> = addresses
+                    .iter()
+                    .copied()
+                    .map(|mut address| {
+                        if address.port() == 0
+                            && let Some(port) = selected_port
+                        {
+                            address.set_port(port);
+                        }
+                        address
+                    })
+                    .collect();
+                if effective.iter().enumerate().any(|(index, address)| {
+                    effective[..index]
+                        .iter()
+                        .any(|earlier| listeners_overlap(*earlier, *address))
+                }) {
+                    return Err("tcp_bind_failed");
+                }
+                let mut probes = Vec::new();
+                for address in effective {
+                    if !previous_addresses
+                        .iter()
+                        .any(|previous| listeners_overlap(*previous, address))
+                    {
+                        probes.push(
+                            Self::try_bind_all(self.network.clone(), vec![address], allow_remote)
+                                .map_err(|error| error.code())?,
+                        );
+                    }
+                }
+                drop(probes);
                 // Same-port wildcard expansion can overlap an existing specific
                 // bind. Release all listeners together, retry, and restore the
                 // old set if any member of the new set still fails.
@@ -146,7 +223,6 @@ impl Transport {
                         )
                         .map_err(|_| "tcp_rebind_rollback_failed")?
                         .listeners;
-                        let _ = preflight_error;
                         Err(replacement_error)
                     }
                 }
@@ -266,6 +342,29 @@ impl Transport {
             ticket: connection.ticket(),
             reason,
         }
+    }
+}
+
+fn listeners_overlap(first: SocketAddr, second: SocketAddr) -> bool {
+    first.port() == second.port()
+        && first.port() != 0
+        && first.is_ipv4() == second.is_ipv4()
+        && (first.ip() == second.ip()
+            || first.ip().is_unspecified()
+            || second.ip().is_unspecified())
+}
+
+fn validate_listen_addresses(addresses: &[SocketAddr], allow_remote: bool) -> TransportResult<()> {
+    if addresses.is_empty()
+        || addresses.iter().any(|address| {
+            mapped(address.ip())
+                || address.ip().is_multicast()
+                || (!allow_remote && !address.ip().is_loopback())
+        })
+    {
+        Err("invalid_listen_address")
+    } else {
+        Ok(())
     }
 }
 

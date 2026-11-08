@@ -115,6 +115,13 @@ impl Broker {
                 let method = payload["action"].as_str().unwrap().to_owned();
                 self.admit(service, method, payload, operation_id, timeout_ms)
             }
+            Command::LookupRequest { operation_id, .. }
+            | Command::LookupApiRequest { operation_id, .. } => {
+                match self.operation_ids.get(&operation_id) {
+                    Some(id) => Ok(Response::Accepted { id: *id }),
+                    None => Ok(Response::error("not_found", "unknown operation")),
+                }
+            }
             Command::TakeResult { request } => {
                 let admission = self
                     .admissions
@@ -537,8 +544,7 @@ fn lost_admission_is_recovered_with_the_identical_broker_operation() {
         .iter()
         .filter(|(_, method, _, _)| method == "retire_operation")
         .collect();
-    assert_eq!(retires.len(), 2);
-    assert_eq!(retires[0], retires[1]);
+    assert_eq!(retires.len(), 1);
     assert!(pump.is_idle());
 }
 
@@ -563,7 +569,7 @@ fn timed_out_attempts_settle_their_broker_slot_and_preserve_durable_intents() {
     let now = Instant::now();
     broker.hold_retire_reply = true;
     advance(&mut pump, &mut broker, now, 0, 30);
-    assert!(broker.cancellations > 0);
+    assert_eq!(broker.cancellations, 0);
     assert_eq!(broker.provider_reconciles, 0);
     assert!(!pump.is_idle());
     assert!(!broker.items.is_empty());
@@ -578,6 +584,150 @@ fn timed_out_attempts_settle_their_broker_slot_and_preserve_durable_intents() {
             .filter(|(_, method, _, _)| method == "retire_operation")
             .all(|(_, _, _, budget)| *budget > 1)
     );
+}
+
+#[test]
+fn parked_mutation_fences_other_intents_for_the_same_binding() {
+    let mut first = transport();
+    first.budget_ms = 50;
+    let mut alias = first.clone();
+    alias.id = "different-work-same-owner".into();
+    let mut broker = Broker::new(first);
+    broker.items.push(alias);
+    broker.hold_retire_reply = true;
+    let mut pump = RecoveryPump::new().unwrap();
+    advance(&mut pump, &mut broker, Instant::now(), 0, 120);
+    assert_eq!(
+        broker
+            .commands
+            .iter()
+            .filter(|(_, method, _, _)| method == "retire_operation")
+            .count(),
+        1
+    );
+    assert_eq!(broker.cancellations, 0);
+    assert_eq!(pump.parked.len(), 1);
+    assert!(!pump.is_idle());
+}
+
+#[test]
+fn parked_application_mutation_fences_generation_aliases_of_same_owner() {
+    let mut first = transport();
+    first.budget_ms = 50;
+    first.binding = RecoveryBinding::Application {
+        operation_id: format!("ale1:{EPOCH}:application-owned"),
+        epoch: EPOCH.into(),
+        application_generation: 1,
+    };
+    let mut alias = first.clone();
+    alias.id = "same-operation-new-generation".into();
+    if let RecoveryBinding::Application {
+        application_generation,
+        ..
+    } = &mut alias.binding
+    {
+        *application_generation = 2;
+    }
+    let mut broker = Broker::new(first);
+    broker.items.push(alias);
+    broker.hold_retire_reply = true;
+    let mut pump = RecoveryPump::new().unwrap();
+    advance(&mut pump, &mut broker, Instant::now(), 0, 120);
+    assert_eq!(
+        broker
+            .commands
+            .iter()
+            .filter(|(_, method, _, _)| method == "retire_operation")
+            .count(),
+        1
+    );
+    assert_eq!(broker.cancellations, 0);
+    assert_eq!(pump.parked.len(), 1);
+    assert!(!pump.is_idle());
+}
+
+#[test]
+fn full_parked_queue_still_polls_its_current_admitted_mutation() {
+    for may_retire in [true, false] {
+        let now = Instant::now();
+        let mut pump = RecoveryPump::new().unwrap();
+        for index in 0..MAX_SCAN_ITEMS {
+            let mut item = transport();
+            item.id = format!("parked-{index}");
+            if let RecoveryBinding::Transport { operation_id, .. } = &mut item.binding {
+                *operation_id = format!("operation-{index}");
+            }
+            pump.parked.push_back(ParkedCall {
+                item,
+                phase: Phase::Retire,
+                call: BrokerCall {
+                    command: Command::Request {
+                        service: TRANSPORT_SERVICE.into(),
+                        payload: json!({}),
+                        timeout_ms: 1000,
+                        operation_id: format!("parked-{index}"),
+                        parent: None,
+                    },
+                    deadline: now,
+                    request: Some(index as u64 + 1),
+                    attempted: true,
+                    cancelling: false,
+                    terminal: None,
+                    mutation: true,
+                    first_sent: Some(now),
+                    admission_uncertain: false,
+                },
+            });
+        }
+        let item = transport();
+        let current_request = MAX_SCAN_ITEMS as u64 + 1;
+        pump.current = Some(Attempt {
+            item,
+            deadline: now,
+            owner_reconciled: false,
+        });
+        pump.phase = Phase::Retire;
+        pump.call = Some(BrokerCall {
+            command: Command::Request {
+                service: TRANSPORT_SERVICE.into(),
+                payload: json!({}),
+                timeout_ms: 1000,
+                operation_id: "current".into(),
+                parent: None,
+            },
+            deadline: now,
+            request: Some(current_request),
+            attempted: true,
+            cancelling: false,
+            terminal: None,
+            mutation: true,
+            first_sent: Some(now),
+            admission_uncertain: false,
+        });
+        pump.poll(
+            now,
+            &mut |command| match command {
+                Command::TakeResult { request } if request == current_request => {
+                    Ok(Response::Result {
+                        payload: json!({"ok": true}),
+                    })
+                }
+                Command::TakeResult { .. } => Ok(Response::Pending),
+                Command::ReleaseResult { request } if request == current_request => {
+                    Ok(Response::Ok)
+                }
+                _ => panic!("unexpected broker call"),
+            },
+            |_| may_retire,
+        );
+        assert!(pump.call.is_none());
+        if may_retire {
+            assert!(matches!(pump.phase, Phase::Status));
+        } else {
+            assert!(pump.current.is_none());
+        }
+        assert_eq!(pump.parked.len(), MAX_SCAN_ITEMS);
+    }
 }
 
 #[test]
@@ -674,7 +824,7 @@ fn settled_application_timeout_preserves_the_paired_transport_turn() {
     broker.hold_application_retire_reply = true;
     let now = Instant::now();
     advance_until_idle(&mut pump, &mut broker, now, 0, 400);
-    assert!(broker.cancellations > 0);
+    assert_eq!(broker.cancellations, 0);
     assert!(broker.application_retired && broker.transport_retired);
     assert!(broker.items.is_empty());
     assert!(broker.admissions.is_empty());

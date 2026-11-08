@@ -14,7 +14,7 @@ impl Controller {
         {
             // Status is read-only: preserve its exact cancellation/release
             // ownership while allowing native cleanup to proceed independently.
-            job.call.cancel();
+            job.call.cancel_read_only();
             self.shutdown_settlement.push(job.call);
             self.records.insert(record.id, record);
             return;
@@ -245,6 +245,15 @@ impl Controller {
         runtime: &RuntimeClient,
     ) {
         record.session = response_session(payload).or(record.session);
+        if matches!(record.state, State::Closing | State::CleanupFailed) {
+            // A late successful prepare still owns its session, but shutdown
+            // or cancellation has already closed admission to this ticket.
+            if record.session.is_some() {
+                record.needs_lookup = false;
+            }
+            self.schedule_cleanup(record, job.caller, now);
+            return;
+        }
         let prepared = (|| {
             if payload["ok"] != true || payload["state"] != "prepared" {
                 eprintln!(
@@ -417,6 +426,12 @@ impl Controller {
     }
 
     pub(super) fn armed(&mut self, record: &mut Record, job: Job, payload: &Value, now: u64) {
+        if matches!(record.state, State::Closing | State::CleanupFailed) {
+            // Do not send PLAY success or revive a ticket that was closed while
+            // its provider was completing the authenticated start.
+            self.schedule_cleanup(record, job.caller, now);
+            return;
+        }
         let state = stream_state(payload);
         let valid = payload["ok"] == true
             && response_session(payload) == record.session
@@ -799,7 +814,11 @@ impl Controller {
     }
 
     pub(super) fn operation_id(&mut self, record: &Record, phase: &str) -> String {
-        self.sequence = self.sequence.saturating_add(1);
+        let Some(next) = self.sequence.checked_add(1) else {
+            // Empty IDs are rejected locally by Call before any broker request.
+            return String::new();
+        };
+        self.sequence = next;
         format!("{}-{phase}-{:016x}", record.operation(), self.sequence)
     }
 }

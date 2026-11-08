@@ -149,6 +149,9 @@ struct BrokerCall {
     command: Command,
     request: Option<u64>,
     cancelling: bool,
+    terminal: Option<Value>,
+    first_sent: Option<Instant>,
+    admission_uncertain: bool,
 }
 
 enum CallOutcome {
@@ -434,9 +437,20 @@ impl PresentationRouter {
             if work.cancelled {
                 if let Some(call) = &mut work.call {
                     call.cancelling = true;
-                    if matches!(call.poll(send), CallOutcome::Waiting) {
-                        self.jobs.insert(key, work);
-                        continue;
+                    match call.poll(send) {
+                        CallOutcome::Waiting => {
+                            self.jobs.insert(key, work);
+                            continue;
+                        }
+                        CallOutcome::Result(payload) => {
+                            // A just-created projection owns provider state. Its
+                            // identity must be recorded even when the client has
+                            // gone away, so the release below can retire it.
+                            if let Stage::Catalog { projection, .. } = &mut work.stage {
+                                let _ = projection.accept(payload);
+                            }
+                        }
+                        CallOutcome::Rejected | CallOutcome::Retired => {}
                     }
                     work.call = None;
                 }
@@ -519,6 +533,9 @@ impl PresentationRouter {
                             command,
                             request: None,
                             cancelling: false,
+                            terminal: None,
+                            first_sent: None,
+                            admission_uncertain: false,
                         })
                     }
                     Err(reply) => {
@@ -1340,41 +1357,125 @@ impl PresentationRouter {
 
 impl BrokerCall {
     fn poll(&mut self, send: &mut impl FnMut(Command) -> ModuleResult<Response>) -> CallOutcome {
+        self.poll_with_clock(send, &mut Instant::now)
+    }
+
+    fn poll_with_clock(
+        &mut self,
+        send: &mut impl FnMut(Command) -> ModuleResult<Response>,
+        clock: &mut impl FnMut() -> Instant,
+    ) -> CallOutcome {
+        if self.terminal.is_some() {
+            return self.release(send);
+        }
         let Some(request) = self.request else {
-            return match send(self.command.clone()) {
+            if self.cancelling && self.first_sent.is_none() {
+                return CallOutcome::Retired;
+            }
+            let lookup = self.cancelling || self.admission_uncertain;
+            let command = if lookup {
+                if self.first_sent.is_some_and(|sent| {
+                    clock().saturating_duration_since(sent) >= Duration::from_secs(300)
+                }) {
+                    return CallOutcome::Waiting;
+                }
+                match lookup_command(&self.command) {
+                    Some(command) => command,
+                    None => return CallOutcome::Waiting,
+                }
+            } else {
+                self.first_sent.get_or_insert_with(&mut *clock);
+                self.command.clone()
+            };
+            let response = send(command);
+            if lookup
+                && self.first_sent.is_some_and(|sent| {
+                    clock().saturating_duration_since(sent) >= Duration::from_secs(300)
+                })
+            {
+                return CallOutcome::Waiting;
+            }
+            return match response {
                 Ok(Response::Accepted { id }) => {
                     self.request = Some(id);
                     CallOutcome::Waiting
                 }
-                Ok(Response::Error { .. }) => CallOutcome::Rejected,
-                _ => CallOutcome::Waiting,
+                // Missing lookup is not proof an uncertain concurrent
+                // admission cannot still arrive; keep the exact call fenced.
+                Ok(Response::Error { code, .. })
+                    if !lookup
+                        && matches!(
+                            code.as_str(),
+                            "permission_denied"
+                                | "invalid_request"
+                                | "unavailable"
+                                | "resource_exhausted"
+                        ) =>
+                {
+                    CallOutcome::Rejected
+                }
+                _ => {
+                    self.admission_uncertain = true;
+                    CallOutcome::Waiting
+                }
             };
         };
-        if self.cancelling {
-            let _ = send(Command::Cancel { request });
-            let result = send(Command::TakeResult { request });
-            return if super::cleanup::released(&result) {
-                CallOutcome::Retired
-            } else {
-                CallOutcome::Waiting
-            };
-        }
         match send(Command::TakeResult { request }) {
             Ok(Response::Pending) => CallOutcome::Waiting,
-            Ok(Response::Result { payload }) => CallOutcome::Result(payload),
-            Ok(Response::Error { code, .. })
-                if matches!(
-                    code.as_str(),
-                    "cancelled" | "deadline_exceeded" | "not_found"
-                ) =>
-            {
-                CallOutcome::Rejected
+            Ok(Response::Result { payload }) => {
+                self.terminal = Some(payload);
+                self.release(send)
             }
-            _ => {
-                self.cancelling = true;
-                CallOutcome::Waiting
-            }
+            // Broker cancellation, expiry or loss is not proof that a
+            // delivered provider mutation has completed. Retain its identity.
+            _ => CallOutcome::Waiting,
         }
+    }
+
+    fn release(&mut self, send: &mut impl FnMut(Command) -> ModuleResult<Response>) -> CallOutcome {
+        let request = self.request.expect("terminal call has an admission");
+        match send(Command::ReleaseResult { request }) {
+            Ok(Response::Ok) => {}
+            Ok(Response::Error { code, .. }) if code == "not_found" => {}
+            _ => return CallOutcome::Waiting,
+        }
+        CallOutcome::Result(self.terminal.take().expect("terminal result"))
+    }
+}
+
+fn lookup_command(command: &Command) -> Option<Command> {
+    match command {
+        Command::Request {
+            service,
+            payload,
+            operation_id,
+            parent,
+            ..
+        } => Some(Command::LookupRequest {
+            service: service.clone(),
+            payload: payload.clone(),
+            operation_id: operation_id.clone(),
+            parent: *parent,
+        }),
+        Command::CallApi {
+            service,
+            method,
+            interface_major,
+            interface_minor,
+            payload,
+            operation_id,
+            parent,
+            ..
+        } => Some(Command::LookupApiRequest {
+            service: service.clone(),
+            method: method.clone(),
+            interface_major: *interface_major,
+            interface_minor: *interface_minor,
+            payload: payload.clone(),
+            operation_id: operation_id.clone(),
+            parent: *parent,
+        }),
+        _ => None,
     }
 }
 
