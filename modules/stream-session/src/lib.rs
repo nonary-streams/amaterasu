@@ -39,9 +39,7 @@ impl ManagedModule for StreamSession {
         runtime.require_success(Command::Register {
             service: SERVICE.into(),
         })?;
-        for method in public_api_methods() {
-            runtime.require_success(Command::RegisterApi { method })?;
-        }
+        amaterasu_module_sdk::operation_api::register_selected(&runtime, &public_api_methods())?;
         // A host may select this provider as its non-disruptive activation
         // barrier. Older hosts and profiles continue without the capability.
         if matches!(
