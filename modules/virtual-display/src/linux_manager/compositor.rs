@@ -213,26 +213,21 @@ impl Compositor for KScreen {
         scale: ScaleSetting,
     ) -> Result<(), String> {
         let deadline = Instant::now() + Duration::from_secs(5);
-        let mut configuration = loop {
+        let configuration = loop {
             let configuration = query()?;
-            if find_output(&configuration, output).is_some()
-                && (mode(&configuration, output, specification).is_some()
-                    || Instant::now() >= deadline)
-            {
+            if mode(&configuration, output, specification).is_some() {
                 break configuration;
             }
             if Instant::now() >= deadline {
-                return Err("owned connector did not appear in KScreen".into());
+                return Err(if find_output(&configuration, output).is_some() {
+                    "requested owned display mode is unavailable"
+                } else {
+                    "owned connector did not appear in KScreen"
+                }
+                .into());
             }
             thread::sleep(Duration::from_millis(25));
         };
-        if mode(&configuration, output, specification).is_none() {
-            run(&[format!(
-                "output.{output}.addCustomMode.{}.{}.{}.reduced",
-                specification.width, specification.height, specification.refresh_millihz
-            )])?;
-            configuration = query()?;
-        }
         let selected = mode(&configuration, output, specification)
             .ok_or("requested owned display mode is unavailable")?;
         let target = OwnedTarget {
@@ -538,9 +533,9 @@ fn verify_retained_readback(
     if modes.next().is_some()
         || mode["size"]["width"].as_u64() != Some(u64::from(desired.width))
         || mode["size"]["height"].as_u64() != Some(u64::from(desired.height))
-        || !mode["refreshRate"].as_f64().is_some_and(|rate| {
-            rate.is_finite() && (rate * 1000.0).round() == f64::from(desired.refresh_millihz)
-        })
+        || !mode["refreshRate"]
+            .as_f64()
+            .is_some_and(|rate| refresh_matches(rate, desired.refresh_millihz))
     {
         return Err("owned output mode differs".into());
     }
@@ -550,16 +545,26 @@ fn mode(configuration: &Value, output: &str, spec: &Specification) -> Option<Str
     find_output(configuration, output)?["modes"]
         .as_array()?
         .iter()
-        .find(|mode| {
-            mode["size"]["width"].as_u64() == Some(u64::from(spec.width))
+        .filter_map(|mode| {
+            let id = mode["id"]
+                .as_str()
+                .filter(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))?;
+            let rate = mode["refreshRate"].as_f64()?;
+            (mode["size"]["width"].as_u64() == Some(u64::from(spec.width))
                 && mode["size"]["height"].as_u64() == Some(u64::from(spec.height))
-                && mode["refreshRate"].as_f64().is_some_and(|rate| {
-                    rate.is_finite() && (rate * 1000.0).round() == f64::from(spec.refresh_millihz)
-                })
-        })?["id"]
-        .as_str()
-        .filter(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
-        .map(str::to_owned)
+                && refresh_matches(rate, spec.refresh_millihz))
+            .then_some((id, rate))
+        })
+        .min_by(|left, right| {
+            let requested = f64::from(spec.refresh_millihz) / 1000.0;
+            (left.1 - requested)
+                .abs()
+                .total_cmp(&(right.1 - requested).abs())
+        })
+        .map(|(id, _)| id.to_owned())
+}
+fn refresh_matches(rate: f64, requested_millihz: u32) -> bool {
+    rate.is_finite() && (rate - f64::from(requested_millihz) / 1000.0).abs() < 0.2
 }
 fn live_next_priority(configuration: &Value, owned: &str) -> Result<usize, String> {
     let outputs = configuration["outputs"]
@@ -960,7 +965,7 @@ mod retained_mode_tests {
     use serde_json::json;
 
     #[test]
-    fn retained_readback_checks_only_the_exact_connected_active_mode_and_color() {
+    fn retained_readback_checks_connected_active_mode_and_color() {
         let configuration = json!({"outputs":[{"name":"Virtual-2","connected":true,"enabled":true,"hdr":true,"currentModeId":"7","modes":[{"id":"7","size":{"width":1280,"height":720},"refreshRate":119.88}]}]});
         let desired = Specification {
             identity: "11111111-1111-4111-8111-111111111111".into(),
@@ -984,7 +989,7 @@ mod retained_mode_tests {
             assert!(verify_retained_readback(&invalid, "Virtual-2", &desired).is_err());
         }
         let mut wrong_mode = configuration.clone();
-        wrong_mode["outputs"][0]["modes"][0]["refreshRate"] = json!(120.0);
+        wrong_mode["outputs"][0]["modes"][0]["refreshRate"] = json!(119.0);
         assert!(verify_retained_readback(&wrong_mode, "Virtual-2", &desired).is_err());
         let mut duplicate = configuration.clone();
         duplicate["outputs"]
@@ -992,5 +997,30 @@ mod retained_mode_tests {
             .unwrap()
             .push(configuration["outputs"][0].clone());
         assert!(verify_retained_readback(&duplicate, "Virtual-2", &desired).is_err());
+    }
+
+    #[test]
+    fn mode_selection_prefers_the_closest_valid_nominal_refresh() {
+        let configuration = json!({"outputs":[{"name":"Virtual-2","connected":true,"modes":[
+            {"id":"invalid","size":{"width":2560,"height":1440},"refreshRate":120.0},
+            {"id":"1","size":{"width":2560,"height":1440},"refreshRate":119.88},
+            {"id":"2","size":{"width":2560,"height":1440},"refreshRate":119.999},
+            {"id":"3","size":{"width":2560,"height":1440},"refreshRate":144.0}
+        ]}]});
+        let desired = Specification {
+            identity: "11111111-1111-4111-8111-111111111111".into(),
+            name: "Monitor".into(),
+            width: 2560,
+            height: 1440,
+            refresh_millihz: 120000,
+            hdr_enabled: false,
+        };
+        assert_eq!(
+            mode(&configuration, "Virtual-2", &desired).as_deref(),
+            Some("2")
+        );
+        assert!(refresh_matches(119.88, 120000));
+        assert!(!refresh_matches(119.0, 120000));
+        assert!(!refresh_matches(f64::NAN, 120000));
     }
 }

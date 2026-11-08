@@ -37,13 +37,17 @@ impl SysfsConnectors {
         Self { root }
     }
 
-    fn card_is_vibeshine(&self, cards: &mut BTreeMap<String, bool>, card: &str) -> bool {
+    fn card_is_vibeshine(
+        &self,
+        cards: &mut BTreeMap<String, bool>,
+        card: &str,
+    ) -> Result<bool, String> {
         if let Some(owned) = cards.get(card) {
-            return *owned;
+            return Ok(*owned);
         }
-        let owned = is_vibeshine_card(&self.root.join(card));
+        let owned = is_vibeshine_card(&self.root.join(card))?;
         cards.insert(card.to_owned(), owned);
-        owned
+        Ok(owned)
     }
 }
 
@@ -63,7 +67,7 @@ impl ConnectorInventory for SysfsConnectors {
             else {
                 continue;
             };
-            if !self.card_is_vibeshine(&mut cards, card) {
+            if !self.card_is_vibeshine(&mut cards, card)? {
                 continue;
             }
             if connectors.insert(id, connector.to_owned()).is_some() {
@@ -110,19 +114,27 @@ fn split_connector_entry(name: &str) -> Option<(&str, &str, u32)> {
 /// A card belongs to vibeshine when its device is bound to a vibeshine driver,
 /// or is the `vibeshine` faux device. Faux devices all bind the generic
 /// `faux_driver`, so the device name distinguishes vibeshine from stock vkms.
-fn is_vibeshine_card(card: &Path) -> bool {
-    let Ok(device) = fs::canonicalize(card.join("device")) else {
-        return false;
-    };
-    let Ok(driver) = fs::canonicalize(device.join("driver")) else {
-        return false;
-    };
+fn is_vibeshine_card(card: &Path) -> Result<bool, String> {
+    // An unclassifiable virtual connector is not proof that an old owner has
+    // vanished: another managed card may be in the middle of a hotplug.
+    let device = fs::canonicalize(card.join("device")).map_err(|error| {
+        format!(
+            "cannot inspect virtual connector card {}: {error}",
+            card.display()
+        )
+    })?;
+    let driver = fs::canonicalize(device.join("driver")).map_err(|error| {
+        format!(
+            "cannot inspect virtual connector driver {}: {error}",
+            card.display()
+        )
+    })?;
     let device_name = device.file_name().and_then(OsStr::to_str);
-    match driver.file_name().and_then(OsStr::to_str) {
+    Ok(match driver.file_name().and_then(OsStr::to_str) {
         Some("vibeshine" | "vibeshine_drm") => true,
         Some("faux_driver") => device_name == Some("vibeshine"),
         _ => false,
-    }
+    })
 }
 
 #[cfg(test)]

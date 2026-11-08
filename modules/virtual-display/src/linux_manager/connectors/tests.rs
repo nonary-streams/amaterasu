@@ -112,8 +112,12 @@ fn malformed_entries_are_ignored_and_missing_sysfs_fails_closed() {
         &["Virtual-0", "Virtual-01", "Virtual-2147483648", "Virtual-7"],
     );
     fs::create_dir(sysfs.root().join("cardX-Virtual-8")).unwrap();
-    fs::create_dir(sysfs.root().join("card9-Virtual-9")).unwrap();
     assert_eq!(sysfs.connectors().unwrap(), ["Virtual-7"]);
+
+    // A syntactically valid connector with no readable card must not be
+    // omitted from an inventory later used as proof of native absence.
+    fs::create_dir(sysfs.root().join("card9-Virtual-9")).unwrap();
+    assert!(sysfs.connectors().unwrap_err().contains("cannot inspect"));
 
     let missing = SysfsConnectors::new(sysfs.base.join("absent"));
     assert!(missing.connectors().is_err());

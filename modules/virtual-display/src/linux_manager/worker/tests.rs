@@ -7,11 +7,13 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+type RequestedMode = (String, u32, u32, u32);
+
 #[derive(Clone)]
 struct FakeBroker {
     outputs: Arc<Mutex<BTreeMap<String, bool>>>,
     effects: Arc<Mutex<Vec<(String, bool)>>>,
-    modes: Arc<Mutex<Vec<(String, u32, u32, u32)>>>,
+    modes: Arc<Mutex<Vec<RequestedMode>>>,
     journal: PathBuf,
     reject_removal: Arc<Mutex<bool>>,
     reject_connection: Arc<Mutex<bool>>,
