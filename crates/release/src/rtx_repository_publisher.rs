@@ -1,5 +1,4 @@
 //! Offline publisher of a signed, opt-in RTX HDR native-set repository.
-use crate::profiles::{PackageProfile, linux_session::VIDEO_COMPONENT_ID};
 use amaterasu_package::{
     BootstrapConfig, PackageResult, ReleaseManifest, ReleaseSignature, VerificationPolicy,
     current_target, decode_hex, encode_hex, read_json,
@@ -62,7 +61,7 @@ pub fn publish(
     if expires_unix > now.saturating_add(MAX_PUBLISHED_LIFETIME) {
         return Err("published repository lifetime exceeds one year".into());
     }
-    let version = check_composition(&verified.manifest)?;
+    let version = check_composition(&verified.manifest, &verified.runtime_config)?;
     let files = checked_payload_files(&verified.manifest)?;
     // The publisher signs the exact verified source composition with its own
     // release lifetime; development builds have a short source validity.
@@ -131,56 +130,121 @@ pub fn publish(
     result
 }
 
-fn check_composition(manifest: &ReleaseManifest) -> PackageResult<&str> {
-    let actual: BTreeSet<_> = manifest.components.iter().map(|c| c.id.as_str()).collect();
-    let expected: BTreeSet<_> = PackageProfile::LinuxSessionRtxHdr
-        .components()
-        .iter()
-        .map(|c| c.id)
-        .collect();
-    if actual != expected || actual.len() != manifest.components.len() {
-        return Err("source is not the complete RTX HDR Linux session composition".into());
-    }
+pub(crate) fn check_composition<'a>(
+    manifest: &'a ReleaseManifest,
+    policy: &amaterasu_contracts::RuntimeConfig,
+) -> PackageResult<&'a str> {
     let plugin = manifest
         .components
         .iter()
         .find(|c| c.id == SLOT)
         .ok_or("RTX HDR plugin is absent")?;
-    let video = manifest
-        .components
-        .iter()
-        .find(|c| c.id == VIDEO_COMPONENT_ID)
-        .ok_or("Linux video component is absent")?;
-    let lifecycle = manifest
-        .components
-        .iter()
-        .find(|c| c.id == "amaterasu.session-lifecycle")
-        .ok_or("session lifecycle component is absent")?;
-    let foreground = manifest
-        .components
-        .iter()
-        .find(|c| c.id == "amaterasu.foreground-context")
-        .ok_or("foreground context component is absent")?;
+    let plugin_grants = policy
+        .principals
+        .get(SLOT)
+        .ok_or("RTX HDR approval is absent")?;
     if !plugin.requested.provide.contains(SERVICE)
         || !plugin.requested.native_provide.contains(SERVICE)
-        || !video.requested.native_use.contains(SERVICE)
-        || video.requires.get(SLOT) != Some(&plugin.version)
-        || !video
-            .requested
-            .call
-            .contains("amaterasu.session-lifecycle/1")
-        || video.requires.get(&lifecycle.id) != Some(&lifecycle.version)
-        || !foreground
-            .requested
-            .provide
-            .contains("amaterasu.foreground-context/1")
-        || !plugin
-            .requested
-            .call
-            .contains("amaterasu.foreground-context/1")
-        || plugin.requires.get(&foreground.id) != Some(&foreground.version)
+        || !plugin_grants.provide.contains(SERVICE)
+        || !plugin_grants.native_provide.contains(SERVICE)
     {
-        return Err("RTX HDR signed grants or video dependency are missing".into());
+        return Err("RTX HDR signed or approved provider grants are missing".into());
+    }
+    let composition = policy
+        .processing_compositions
+        .get(SLOT)
+        .ok_or("RTX HDR processing composition is absent")?;
+    amaterasu_module_sdk::processing_composition::validate(composition)?;
+    let selected = composition
+        .processor
+        .as_ref()
+        .ok_or("RTX HDR processor is not selected")?;
+    amaterasu_module_sdk::processing_composition::require_contract(
+        selected,
+        amaterasu_module_sdk::media::native_contracts::FRAME_PROCESSOR,
+        1,
+        0,
+    )?;
+    if selected.principal != SLOT || selected.service != SERVICE {
+        return Err("RTX HDR processing selection differs from the signed provider".into());
+    }
+    let consumer = composition
+        .frame_consumer
+        .as_ref()
+        .ok_or("RTX HDR frame consumer is not selected")?;
+    if consumer.contract != amaterasu_module_sdk::video::CONTRACT
+        && consumer.contract
+            != amaterasu_module_sdk::media::native_contracts::FRAME_RESOURCE_CONSUMER
+    {
+        return Err("RTX HDR frame consumer contract is incompatible".into());
+    }
+    if consumer.interface_major != 1 {
+        return Err("RTX HDR frame consumer version is incompatible".into());
+    }
+    let selected_consumer = manifest
+        .components
+        .iter()
+        .find(|component| component.id == consumer.principal)
+        .ok_or("RTX HDR selected frame consumer is absent")?;
+    if !selected_consumer
+        .requested
+        .native_provide
+        .contains(&consumer.service)
+        || !selected_consumer.requested.native_use.contains(SERVICE)
+        || selected_consumer.requires.get(SLOT) != Some(&plugin.version)
+        || !policy
+            .principals
+            .get(&consumer.principal)
+            .is_some_and(|grants| {
+                grants.native_provide.contains(&consumer.service)
+                    && grants.native_use.contains(SERVICE)
+            })
+    {
+        return Err("RTX HDR selected frame consumer is not approved or ordered".into());
+    }
+    {
+        for (field, binding) in [
+            ("display_settings", &composition.display_settings),
+            ("foreground", &composition.foreground),
+        ] {
+            let Some(binding) = binding else {
+                continue;
+            };
+            let service = binding.service.as_str();
+            if !plugin_grants.call.contains(service) {
+                return Err("RTX HDR capability call is not approved".into());
+            }
+            let providers: Vec<_> = manifest
+                .components
+                .iter()
+                .filter(|provider| {
+                    provider.requested.provide.contains(service)
+                        && policy
+                            .principals
+                            .get(&provider.id)
+                            .is_some_and(|grants| grants.provide.contains(service))
+                })
+                .collect();
+            if providers.len() != 1
+                || providers[0].id != binding.principal
+                || plugin.requires.get(&providers[0].id) != Some(&providers[0].version)
+            {
+                return Err("RTX HDR capability provider is missing or unordered".into());
+            }
+            if field == "display_settings" {
+                for method in amaterasu_module_sdk::display_settings::methods(service) {
+                    if !policy.api_methods.iter().any(|approval| {
+                        approval.provider == providers[0].id
+                            && approval.method == method
+                            && (method.method != "acquire" || approval.callers.contains(SLOT))
+                            && (!matches!(method.method.as_str(), "open_scope" | "close_scope")
+                                || approval.callers.iter().any(|caller| caller != SLOT))
+                    }) {
+                        return Err("RTX HDR display settings contract is not approved".into());
+                    }
+                }
+            }
+        }
     }
     Ok(&plugin.version)
 }
@@ -225,6 +289,7 @@ fn checked_payload_files(manifest: &ReleaseManifest) -> PackageResult<Vec<&str>>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::profiles::{PackageProfile, linux_session::VIDEO_COMPONENT_ID};
     use amaterasu_package::{ComponentManifest, random_identifier};
     use std::collections::BTreeMap;
 
@@ -271,6 +336,24 @@ mod tests {
                     requested,
                 });
             }
+            let selected = crate::profiles::linux_session::default_rtx_hdr_selection();
+            policy.processing_compositions.insert(
+                SLOT.into(),
+                amaterasu_module_sdk::processing_composition::ProcessingComposition {
+                    processor: Some(selected.processor.clone()),
+                    frame_consumer: Some(selected.frame_consumer.clone()),
+                    ..Default::default()
+                },
+            );
+            policy.processing_compositions.insert(
+                VIDEO_COMPONENT_ID.into(),
+                amaterasu_module_sdk::processing_composition::ProcessingComposition {
+                    processor: Some(selected.processor),
+                    frame_consumer: Some(selected.frame_consumer),
+                    frame_settings: Some(serde_json::json!({})),
+                    ..Default::default()
+                },
+            );
             let config = BootstrapConfig {
                 development: true,
                 allow_unsigned: false,
@@ -356,10 +439,11 @@ mod tests {
     }
 
     #[test]
-    fn publisher_requires_signed_live_settings_authority() {
+    fn publisher_requires_an_approved_ordered_processor_consumer() {
         let fixture = Fixture::new();
         let manifest: ReleaseManifest = read_json(&fixture.source.join("manifest.json")).unwrap();
-        assert!(check_composition(&manifest).is_ok());
+        let bootstrap: BootstrapConfig = read_json(&fixture.bootstrap).unwrap();
+        assert!(check_composition(&manifest, &bootstrap.policy).is_ok());
 
         let mut missing_grant = manifest.clone();
         let video = missing_grant
@@ -367,8 +451,8 @@ mod tests {
             .iter_mut()
             .find(|c| c.id == VIDEO_COMPONENT_ID)
             .unwrap();
-        video.requested.call.remove("amaterasu.session-lifecycle/1");
-        assert!(check_composition(&missing_grant).is_err());
+        video.requested.native_use.remove(SERVICE);
+        assert!(check_composition(&missing_grant, &bootstrap.policy).is_err());
 
         let mut missing_dependency = manifest;
         let video = missing_dependency
@@ -376,8 +460,48 @@ mod tests {
             .iter_mut()
             .find(|c| c.id == VIDEO_COMPONENT_ID)
             .unwrap();
-        video.requires.remove("amaterasu.session-lifecycle");
-        assert!(check_composition(&missing_dependency).is_err());
+        video.requires.remove(SLOT);
+        assert!(check_composition(&missing_dependency, &bootstrap.policy).is_err());
+    }
+
+    #[test]
+    fn publisher_accepts_a_different_consumer_without_unrelated_plugins() {
+        let fixture = Fixture::new();
+        let mut manifest: ReleaseManifest =
+            read_json(&fixture.source.join("manifest.json")).unwrap();
+        let mut bootstrap: BootstrapConfig = read_json(&fixture.bootstrap).unwrap();
+        manifest.components.retain(|component| {
+            component.runtime || component.id == SLOT || component.id == VIDEO_COMPONENT_ID
+        });
+        let plugin = manifest
+            .components
+            .iter_mut()
+            .find(|component| component.id == SLOT)
+            .unwrap();
+        plugin.requires.retain(|id, _| id == "amaterasu.runtime");
+        let consumer = manifest
+            .components
+            .iter_mut()
+            .find(|component| component.id == VIDEO_COMPONENT_ID)
+            .unwrap();
+        consumer.id = "example.video".into();
+        consumer
+            .requires
+            .retain(|id, _| id == "amaterasu.runtime" || id == SLOT);
+        bootstrap
+            .policy
+            .principals
+            .insert("example.video".into(), consumer.requested.clone());
+        bootstrap
+            .policy
+            .processing_compositions
+            .get_mut(SLOT)
+            .unwrap()
+            .frame_consumer
+            .as_mut()
+            .unwrap()
+            .principal = "example.video".into();
+        assert!(check_composition(&manifest, &bootstrap.policy).is_ok());
     }
 
     #[test]

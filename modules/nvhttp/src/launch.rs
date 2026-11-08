@@ -703,6 +703,8 @@ pub struct Controller {
     logger: Option<LogEmitter>,
     config: Option<StreamingConfig>,
     session_lifecycle_required: bool,
+    stream_service: String,
+    lifecycle_service: Option<String>,
     session_lifecycle_capture_mode: amaterasu_module_sdk::extension_api::CaptureBindingMode,
     /// Latest encoder enumeration; `None` until the first one completes.
     encoder_snapshot: Option<EncoderSnapshot>,
@@ -761,6 +763,8 @@ impl Controller {
             logger: None,
             config,
             session_lifecycle_required: false,
+            stream_service: "amaterasu.stream-session/1".into(),
+            lifecycle_service: Some("amaterasu.session-lifecycle/1".into()),
             session_lifecycle_capture_mode: Default::default(),
             encoder_snapshot: None,
             configured_output_name: None,
@@ -819,6 +823,36 @@ impl Controller {
             // contents and client identities are deliberately excluded.
             let _ = logger.emit(level, "launch", &format!("phase={phase:?} event={event}"));
         }
+    }
+
+    pub fn select_processing_services(
+        &mut self,
+        composition: &amaterasu_module_sdk::processing_composition::ProcessingComposition,
+    ) -> ModuleResult<()> {
+        use amaterasu_module_sdk::processing_composition as sdk;
+        let owner = composition
+            .stream_owner
+            .as_ref()
+            .ok_or("NVHTTP has no selected stream owner")?;
+        self.stream_service =
+            sdk::require_contract(owner, sdk::STREAM_OWNER_CONTRACT, 1, 0)?.to_owned();
+        self.lifecycle_service = composition
+            .lifecycle
+            .as_ref()
+            .map(|binding| {
+                sdk::require_contract(
+                    binding,
+                    amaterasu_module_sdk::extension_api::SESSION_LIFECYCLE_SERVICE,
+                    1,
+                    0,
+                )
+                .map(str::to_owned)
+            })
+            .transpose()?;
+        if self.session_lifecycle_required && self.lifecycle_service.is_none() {
+            return Err("NVHTTP requires a selected lifecycle provider".into());
+        }
+        Ok(())
     }
 
     pub fn set_session_lifecycle_required(&mut self, required: bool) {

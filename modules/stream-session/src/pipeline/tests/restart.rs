@@ -4,7 +4,10 @@ use std::collections::BTreeSet;
 
 fn journal_with_owned_session(record_id: u64) -> Value {
     let entry = Entry {
-        providers: Default::default(),
+        providers: crate::providers::ProviderServices {
+            lifecycle: Some("amaterasu.session-lifecycle/1".into()),
+            ..Default::default()
+        },
         lifecycle_recovery: None,
         record_id,
         owner: "owner".into(),
@@ -13,6 +16,7 @@ fn journal_with_owned_session(record_id: u64) -> Value {
         virtual_display_attempted: false,
         virtual_display: None,
         shared_capture: None,
+        source_scope: None,
         display_attempted: false,
         display_operation_id: None,
         legacy_effect_pending: false,
@@ -74,6 +78,25 @@ fn legacy_effect_intent_is_retained_and_never_reported_as_clean() {
             .iter()
             .any(|call| call.service == "amaterasu.frame-limiter/1")
     );
+}
+
+#[test]
+fn restart_preserves_journal_when_provider_is_the_selected_owner() {
+    let mut document = journal_with_owned_session(0xabcd);
+    document["entries"]["43981"]["providers"]["video"] = json!("replacement.owner/1");
+    let original = document.clone();
+    let mut host = Harness::with_restart_state(document, 7);
+    host.pipeline.service = "replacement.owner/1".into();
+    host.idle();
+    assert_eq!(host.broker.state_revision, 7);
+    assert_eq!(host.broker.state_value, Some(original));
+    assert_eq!(
+        host.response(1, prepare())["code"],
+        "restart_recovery_unconfirmed"
+    );
+    assert!(!host.broker.calls.iter().any(|call| {
+        call.service == "replacement.owner/1" || call.service == "amaterasu.session/1"
+    }));
 }
 
 #[test]

@@ -188,8 +188,8 @@ impl Harness {
                     .as_array_mut()
                     .unwrap()
                     .push(json!("example.processing/1"));
-                configuration["settings"][COORDINATOR]["processing_policy"] = json!({"provider":"settings","service":"example.processing/1","processor_service":"example.processor/1","source_mode_providers":["display"]});
-                methods.push(json!({"service":"example.processing/1","method":"processing_intent","interface_major":1,"interface_minor":0,"request":{"required":{},"optional":{},"allow_extra":true},"response":{"required":{},"optional":{},"allow_extra":true},"privilege":"user"}));
+                configuration["settings"][COORDINATOR]["processing_policy"] = json!({"provider":"settings","service":"example.processing/1","processor_service":"example.processor/1","interface_minor":1,"source_mode_providers":["display"]});
+                methods.push(json!({"service":"example.processing/1","method":"processing_intent","interface_major":1,"interface_minor":1,"request":{"required":{},"optional":{},"allow_extra":true},"response":{"required":{},"optional":{},"allow_extra":true},"privilege":"user"}));
             }
             if external {
                 configuration["settings"][COORDINATOR]["capture_binding_mode"] = json!("external");

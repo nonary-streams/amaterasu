@@ -6,6 +6,7 @@ fn alternatives() -> ProviderServices {
     ProviderServices {
         session: "vendor.sessions/1".into(),
         video: "vendor.frames/1".into(),
+        lifecycle: None,
         audio_capture: "vendor.audio-capture/1".into(),
         audio_encoder: "vendor.audio-encoder/1".into(),
         audio_processor: None,

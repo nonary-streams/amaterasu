@@ -211,10 +211,11 @@ impl Controller {
             if let Some(source) = &record.config.borrowed_capture {
                 request["borrowed_capture"] = json!(source);
             }
+            let operation = self.operation_id(record, "lifecycle-prepare");
             let call = Call::for_service(
-                "amaterasu.session-lifecycle/1",
+                self.settings.lifecycle_service.as_deref().unwrap_or(""),
                 request,
-                self.operation_id(record, "lifecycle-prepare"),
+                operation,
                 None,
             );
             self.job = Some(Job {
@@ -238,10 +239,11 @@ impl Controller {
         action_ticket: u64,
         deadline: u64,
     ) {
+        let operation = self.operation_id(record, "arm");
         self.job = Some(Job {
             ticket: record.id,
             phase: Phase::Arm,
-            call: Call::new(payload, self.operation_id(record, "arm"), None),
+            call: Call::for_service(&self.settings.stream_service, payload, operation, None),
             caller: None,
             network: Some((connection, action_ticket)),
             deadline,

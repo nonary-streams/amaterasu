@@ -25,3 +25,8 @@ pub(super) fn capacity_exhausted() -> Response {
 pub(super) fn payload_fits(payload: &Value) -> bool {
     serde_json::to_vec(payload).is_ok_and(|bytes| bytes.len() <= MAX_PAYLOAD_BYTES)
 }
+
+pub(super) fn result_fits(payload: &Value) -> bool {
+    serde_json::to_vec(payload)
+        .is_ok_and(|bytes| bytes.len() <= amaterasu_contracts::MAX_BROKER_RESULT_BYTES)
+}

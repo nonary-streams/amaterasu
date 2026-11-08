@@ -12,7 +12,13 @@ use std::io::Write;
 use std::path::Path;
 
 /// Creates only an external report; does not provision the host or grant authority.
-pub fn prepare(root: &Path, expected: &str, publisher: &str, output: &Path) -> PackageResult<()> {
+pub fn prepare(
+    root: &Path,
+    expected: &str,
+    publisher: &str,
+    output: &Path,
+    capabilities: &crate::profiles::linux_session::ProcessingSelection,
+) -> PackageResult<()> {
     let root = root.canonicalize().map_err(|e| e.to_string())?;
     let parent = output
         .parent()
@@ -59,9 +65,10 @@ pub fn prepare(root: &Path, expected: &str, publisher: &str, output: &Path) -> P
     if Path::new(configured) != runtime_parent {
         return Err("RTX HDR runtime parent differs from host state".into());
     }
-    crate::profiles::linux_session::enable_rtx_hdr(
+    crate::profiles::linux_session::enable_rtx_hdr_with_selection(
         &mut optional.policy,
         &runtime_parent.join("runtime"),
+        capabilities,
     )?;
     let optional_bytes = serde_json::to_vec_pretty(&optional).map_err(|e| e.to_string())?;
     let placeholder = "0".repeat(64);
@@ -72,7 +79,8 @@ pub fn prepare(root: &Path, expected: &str, publisher: &str, output: &Path) -> P
     };
     let proposal = propose_policy_approval(&baseline_bytes, &optional_bytes, &context)?;
     let report = serde_json::to_vec_pretty(&json!({
-        "kind": "activation_policy_review_v1",
+        "kind": "activation_policy_review_v3",
+        "selection": capabilities,
         "source_bootstrap_sha256": expected,
         "note": "Review only; this report does not authorize or modify host policy.",
         "baseline_bootstrap": baseline,
@@ -173,9 +181,16 @@ pub fn provision(root: &Path, report_path: &Path, expected_report: &str) -> Pack
         return Err("review report changed".into());
     }
     let report: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-    if report.get("kind").and_then(|v| v.as_str()) != Some("activation_policy_review_v1") {
+    if report.get("kind").and_then(|v| v.as_str()) != Some("activation_policy_review_v3") {
         return Err("invalid activation review report".into());
     }
+    let capabilities: crate::profiles::linux_session::ProcessingSelection = serde_json::from_value(
+        report
+            .get("selection")
+            .cloned()
+            .ok_or("review capabilities missing")?,
+    )
+    .map_err(|_| "invalid review capabilities")?;
     let path = root.join("bootstrap.json");
     let meta = fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
     if !meta.is_file()
@@ -264,9 +279,10 @@ pub fn provision(root: &Path, report_path: &Path, expected_report: &str) -> Pack
     {
         return Err("runtime path differs from trusted host state".into());
     }
-    crate::profiles::linux_session::enable_rtx_hdr(
+    crate::profiles::linux_session::enable_rtx_hdr_with_selection(
         &mut optional.policy,
         &runtime_parent.join("runtime"),
+        &capabilities,
     )?;
     if serde_json::to_value(&optional).map_err(|e| e.to_string())? != report["optional_bootstrap"] {
         return Err("reviewed optional policy does not match host policy".into());
@@ -427,16 +443,10 @@ pub fn provision_default(root: &Path) -> PackageResult<()> {
                     "existing activation authority differs from the active publisher".into(),
                 );
             }
-            let mut expected = bootstrap.policy.clone();
-            crate::profiles::linux_session::enable_rtx_hdr(
-                &mut expected,
-                &root.join("data/state/rtx-hdr/runtime"),
+            crate::rtx_repository_publisher::check_composition(
+                &active.manifest,
+                &active.runtime_config,
             )?;
-            if serde_json::to_value(&expected).map_err(|e| e.to_string())?
-                != serde_json::to_value(&bootstrap.policy).map_err(|e| e.to_string())?
-            {
-                return Err("active RTX HDR policy differs from the installed composition".into());
-            }
             return enroll_project_repository(&root, &bootstrap, &publisher);
         }
         (sha256(&bytes), publisher)
@@ -453,7 +463,13 @@ pub fn provision_default(root: &Path) -> PackageResult<()> {
         .map_err(|e| e.to_string())?;
     let report = directory.join("policy.json");
     let result = (|| {
-        prepare(&root, &source_digest, &publisher, &report)?;
+        prepare(
+            &root,
+            &source_digest,
+            &publisher,
+            &report,
+            &crate::profiles::linux_session::default_rtx_hdr_selection(),
+        )?;
         let digest = sha256(&read_bounded(&report, 1024 * 1024)?);
         provision(&root, &report, &digest)
     })();
@@ -592,10 +608,30 @@ mod tests {
         .unwrap();
         let digest = sha256(&before);
         let report = base.join("review.json");
-        assert!(prepare(&root, &"0".repeat(64), &fingerprint, &report).is_err());
+        let capabilities = crate::profiles::linux_session::default_rtx_hdr_selection();
+        let lean = crate::profiles::linux_session::ProcessingSelection {
+            display_settings: None,
+            foreground: None,
+            ..crate::profiles::linux_session::default_rtx_hdr_selection()
+        };
+        let lean_report = base.join("lean-review.json");
+        prepare(&root, &digest, &fingerprint, &lean_report, &lean).unwrap();
+        let lean_value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&lean_report).unwrap()).unwrap();
+        assert!(
+            lean_value["optional_bootstrap"]["policy"]["principals"]
+                .get("amaterasu.foreground-context")
+                .is_none()
+        );
+        assert!(
+            lean_value["optional_bootstrap"]["policy"]["principals"]
+                .get("amaterasu.display-settings")
+                .is_none()
+        );
+        assert!(prepare(&root, &"0".repeat(64), &fingerprint, &report, &capabilities).is_err());
         assert!(!report.exists());
-        assert!(prepare(&root, &digest, &"0".repeat(64), &report).is_err());
-        prepare(&root, &digest, &fingerprint, &report).unwrap();
+        assert!(prepare(&root, &digest, &"0".repeat(64), &report, &capabilities).is_err());
+        prepare(&root, &digest, &fingerprint, &report, &capabilities).unwrap();
         assert_eq!(fs::read(root.join("bootstrap.json")).unwrap(), before);
         assert!(!root.join("package-activation-policy.json").exists());
         let value: serde_json::Value = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
@@ -627,6 +663,12 @@ mod tests {
             altered["optional_bootstrap"]["policy"]["settings"]["extra"] = json!({"forged":true});
             let altered_path = base.join("altered.json");
             let altered_bytes = serde_json::to_vec(&altered).unwrap();
+            fs::write(&altered_path, &altered_bytes).unwrap();
+            assert!(provision(&root, &altered_path, &sha256(&altered_bytes)).is_err());
+            let mut altered_capabilities: serde_json::Value =
+                serde_json::from_slice(&report_bytes).unwrap();
+            altered_capabilities["selection"]["display_settings"] = serde_json::Value::Null;
+            let altered_bytes = serde_json::to_vec(&altered_capabilities).unwrap();
             fs::write(&altered_path, &altered_bytes).unwrap();
             assert!(provision(&root, &altered_path, &sha256(&altered_bytes)).is_err());
             assert_eq!(fs::read(root.join("bootstrap.json")).unwrap(), before);

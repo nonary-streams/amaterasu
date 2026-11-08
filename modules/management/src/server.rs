@@ -20,6 +20,14 @@ const CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) struct AudioProviders {
     pub capture: String,
     pub encoder: String,
+    pub processing: Option<ProcessingRoutes>,
+}
+
+pub(crate) struct ProcessingRoutes {
+    pub video: String,
+    pub stream: String,
+    pub lifecycle: Option<String>,
+    pub registry: Option<String>,
 }
 
 impl Default for AudioProviders {
@@ -27,6 +35,7 @@ impl Default for AudioProviders {
         Self {
             capture: "amaterasu.audio/1".into(),
             encoder: "amaterasu.audio-encode/1".into(),
+            processing: None,
         }
     }
 }
@@ -36,6 +45,26 @@ impl AudioProviders {
         match service {
             "amaterasu.audio/1" => &self.capture,
             "amaterasu.audio-encode/1" => &self.encoder,
+            "amaterasu.video/1" if self.processing.is_some() => {
+                &self.processing.as_ref().unwrap().video
+            }
+            "amaterasu.stream-session/1" if self.processing.is_some() => {
+                &self.processing.as_ref().unwrap().stream
+            }
+            "amaterasu.session-lifecycle/1" if self.processing.is_some() => self
+                .processing
+                .as_ref()
+                .unwrap()
+                .lifecycle
+                .as_deref()
+                .unwrap_or(""),
+            "amaterasu.extension-registry/1" if self.processing.is_some() => self
+                .processing
+                .as_ref()
+                .unwrap()
+                .registry
+                .as_deref()
+                .unwrap_or(""),
             _ => service,
         }
     }
@@ -1214,9 +1243,12 @@ impl Connection {
             route.service,
             "amaterasu.extension-actions/1" | "amaterasu.session-lifecycle/1"
         ) {
-            if let Some(request_id) =
-                self.submit(runtime, route.service, request.payload, operation)?
-            {
+            if let Some(request_id) = self.submit(
+                runtime,
+                audio_providers.service(route.service),
+                request.payload,
+                operation,
+            )? {
                 self.stage = Stage::SessionExtensionDispatching {
                     request_id,
                     action: route.action,

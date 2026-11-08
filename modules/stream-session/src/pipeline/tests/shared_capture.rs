@@ -526,16 +526,17 @@ fn owned_source_uses_processing_input_range_while_video_keeps_hdr_output() {
         for enabled in [false, true] {
             let mut host = host();
             host.pipeline.settings.processing_plan = Some(crate::model::ProcessingPlanProvider {
-                interface_minor: 0,
+                interface_minor: 1,
                 provider: provider.into(),
                 control_service: control.into(),
                 processor_service: processor.into(),
                 omit_disabled: true,
+                live_settings: true,
             });
             host.broker.processing_plan_enabled = enabled;
             host.broker.processing_plan_source_hdr = source_hdr;
             host.broker.processing_plan_identity = Some((control.into(), processor.into()));
-            let expected_source_hdr = !enabled || source_hdr;
+            let expected_source_hdr = source_hdr;
             let mut prepare = preparation(1, false);
             prepare["video"]["codecs"] = json!(["h264", "hevc"]);
             let prepared = host.response_from(10, OWNER, prepare);
@@ -602,4 +603,94 @@ fn owned_source_uses_processing_input_range_while_video_keeps_hdr_output() {
             assert_eq!(joined_source.hdr_enabled, expected_source_hdr);
         }
     }
+}
+
+fn sdk_source_host() -> Harness {
+    let mut host = host();
+    host.pipeline.settings.source_preparation = Some(crate::model::SourcePreparation {
+        display_settings_service: "fixture.display-settings/1".into(),
+        hooks: vec![crate::model::SourceHook {
+            provider: "fixture.source-effect".into(),
+            service: "fixture.adjustments/1".into(),
+        }],
+    });
+    host
+}
+#[test]
+fn display_sdk_preparation_precedes_capture_and_survives_shared_owner_handoff() {
+    let mut host = sdk_source_host();
+    let first = launch(&mut host, 1, false);
+    let prepare = host
+        .broker
+        .calls
+        .iter()
+        .position(|c| c.service == "fixture.adjustments/1")
+        .unwrap();
+    let open = host
+        .broker
+        .calls
+        .iter()
+        .position(|c| c.service == "amaterasu.video/1" && c.payload["action"] == "open")
+        .unwrap();
+    assert!(prepare < open);
+    assert!(host.broker.source_scope.is_some());
+    let second = launch(&mut host, 2, true);
+    assert_eq!(
+        host.broker
+            .calls
+            .iter()
+            .filter(|c| c.service == "fixture.adjustments/1")
+            .count(),
+        1
+    );
+    host.response_from(31, OWNER, json!({"action":"stop","session":first}));
+    assert!(host.broker.source_scope.is_some());
+    host.response_from(32, OWNER, json!({"action":"stop","session":second}));
+    assert!(host.broker.source_scope.is_none());
+    let close = host
+        .broker
+        .calls
+        .iter()
+        .position(|c| {
+            c.service == "fixture.display-settings/1" && c.payload["method"] == "close_scope"
+        })
+        .unwrap();
+    let remove = host
+        .broker
+        .calls
+        .iter()
+        .position(|c| c.service == "amaterasu.virtual-display/1" && c.payload["action"] == "remove")
+        .unwrap();
+    assert!(close < remove);
+}
+#[test]
+fn failed_source_plugin_never_opens_capture_and_releases_its_scope() {
+    let mut host = sdk_source_host();
+    host.broker.source_plugin_fail = true;
+    let prepared = host.response_from(10, OWNER, preparation(1, false));
+    let id = prepared["session"].as_u64().unwrap();
+    let failed = host.response_from(11, OWNER, configuration(id, 1, false));
+    assert_eq!(failed["state"], "failed");
+    assert!(
+        !host
+            .broker
+            .calls
+            .iter()
+            .any(|c| c.service == "amaterasu.video/1" && c.payload["action"] == "open")
+    );
+    assert!(host.broker.source_scope.is_none());
+}
+
+#[test]
+fn failed_adjustment_restore_keeps_the_source_for_a_later_retry() {
+    let mut host = sdk_source_host();
+    let id = launch(&mut host, 1, false);
+    host.broker.source_scope_close_fail = true;
+    let failed = host.response_from(31, OWNER, json!({"action":"stop","session":id}));
+    assert_eq!(failed["state"], "cleanup_failed");
+    assert_eq!(display_calls(&host, "remove"), 0);
+    host.broker.source_scope_close_fail = false;
+    let stopped = host.response_from(32, OWNER, json!({"action":"stop","session":id}));
+    assert_eq!(stopped["state"], "stopped");
+    assert!(host.broker.source_scope.is_none());
 }

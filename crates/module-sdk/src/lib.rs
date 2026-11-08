@@ -4,6 +4,7 @@ pub mod audio;
 pub mod capture;
 pub mod data_plane;
 pub mod display;
+pub mod display_settings;
 pub mod encode;
 pub mod exports;
 pub mod foreground_context;
@@ -19,6 +20,7 @@ pub mod pairing_authority;
 #[cfg(feature = "process")]
 pub mod process;
 pub mod processing;
+pub mod processing_composition;
 pub mod requests;
 pub mod retained_options;
 pub mod retirement;
@@ -40,7 +42,8 @@ pub use amaterasu_contracts::encoder::{
 };
 pub use amaterasu_contracts::{
     ApiFieldKind, ApiMethod, ApiPrivilege, ApiSchema, Command, HOST_PACKAGE_BARRIER_SERVICE,
-    HostLifecycleAction, Response, RunningModuleIdentity, RuntimeHostContext,
+    HostLifecycleAction, MAX_BROKER_RESULT_BYTES, Response, RunningModuleIdentity,
+    RuntimeHostContext,
 };
 pub use amaterasu_extension_api as extension_api;
 pub use amaterasu_media as media_abi;

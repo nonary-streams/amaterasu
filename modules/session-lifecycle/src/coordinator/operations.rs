@@ -135,13 +135,40 @@ fn required_reprepare(
 }
 
 impl Coordinator {
-    pub(super) fn snapshot(&self, caller: &str, initiator: &str) -> Value {
+    pub(super) fn snapshot(&self, caller: &str, initiator: &str, payload: &Value) -> Value {
         let journal = &self.shared.borrow().value;
-        let sessions: Vec<_> = journal.sessions.values().filter(|s| allowed(s,caller,initiator)).map(|s| {
-            let streams: Vec<_> = s.streams.iter().map(|(id,stream)| json!({"stream_id":id,"generation":stream.generation,"phase":stream.phase,"candidate":stream.candidate})).collect();
-            json!({"session_id":s.id,"generation":s.generation,"phase":s.phase,"application_ref":s.application_ref,"streams":streams})
+        let target = match payload.get("target").filter(|value| !value.is_null()) {
+            Some(value) => match serde_json::from_value::<LifecycleTarget>(value.clone()) {
+                Ok(target) => Some(target),
+                Err(_) => return rejection("invalid_target"),
+            },
+            None => None,
+        };
+        let selected = match target.as_ref() {
+            Some(target) => match checked_target(journal, target, caller, initiator) {
+                Ok(selected) => Some(selected),
+                Err(reason) => return rejection(&reason),
+            },
+            None => None,
+        };
+        let sessions: Vec<_> = journal.sessions.values().filter(|session| {
+            allowed(session, caller, initiator)
+                && selected.as_ref().is_none_or(|(selected, _)| selected.id == session.id)
+        }).map(|session| {
+            let selected_stream = selected.as_ref().and_then(|(_, stream)| stream.as_ref());
+            let streams: Vec<_> = session.streams.iter()
+                .filter(|(id, _)| selected_stream.is_none_or(|stream| stream == *id))
+                .map(|(id, stream)| json!({"stream_id":id,"generation":stream.generation,"phase":stream.phase,"candidate":stream.candidate})).collect();
+            json!({"session_id":session.id,"generation":session.generation,"phase":session.phase,"application_ref":session.application_ref,"streams":streams})
         }).collect();
-        json!({"status":"ok","host_epoch":journal.host_epoch,"sessions":sessions})
+        let response = json!({"status":"ok","host_epoch":journal.host_epoch,"sessions":sessions});
+        if serde_json::to_vec(&response)
+            .is_ok_and(|bytes| bytes.len() <= amaterasu_module_sdk::MAX_BROKER_RESULT_BYTES)
+        {
+            response
+        } else {
+            rejection("snapshot_requires_target")
+        }
     }
 
     pub(super) fn new_work(

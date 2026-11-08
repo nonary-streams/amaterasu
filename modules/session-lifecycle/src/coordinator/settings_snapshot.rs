@@ -175,6 +175,15 @@ impl SettingsSnapshotJob {
         participants: &[ParticipantSettings],
         scopes: SnapshotScopes,
     ) -> ModuleResult<Self> {
+        Self::new_with_static(service, participants, scopes, &BTreeSet::new())
+    }
+
+    pub(super) fn new_with_static(
+        service: Option<&str>,
+        participants: &[ParticipantSettings],
+        scopes: SnapshotScopes,
+        static_providers: &BTreeSet<String>,
+    ) -> ModuleResult<Self> {
         if participants.len() > MAX_PROVIDERS
             || service.is_some_and(str::is_empty)
             || !scopes.valid()
@@ -190,36 +199,47 @@ impl SettingsSnapshotJob {
                 return Err("invalid settings snapshot participant".into());
             }
         }
-        let snapshots = if service.is_none() {
-            participants
-                .iter()
-                .map(|p| {
-                    Ok((
-                        p.provider.clone(),
-                        FrozenSettings {
-                            settings: p.settings.clone(),
-                            revision: p.settings_revision.clone(),
-                            contract: Some(FrozenParticipantContract::from_participant(p)?),
-                        },
-                    ))
-                })
-                .collect::<ModuleResult<BTreeMap<_, _>>>()?
-        } else {
-            BTreeMap::new()
+        if static_providers
+            .iter()
+            .any(|provider| !seen.contains(provider))
+        {
+            return Err("static settings provider is not selected".into());
+        }
+        let fixed = |participant: &&ParticipantSettings| {
+            service.is_none() || static_providers.contains(&participant.provider)
         };
-        let index = if service.is_none() {
-            participants.len()
-        } else {
-            0
-        };
+        let snapshots = participants
+            .iter()
+            .filter(fixed)
+            .map(|p| {
+                Ok((
+                    p.provider.clone(),
+                    FrozenSettings {
+                        settings: p.settings.clone(),
+                        revision: p.settings_revision.clone(),
+                        contract: Some(FrozenParticipantContract::from_participant(p)?),
+                    },
+                ))
+            })
+            .collect::<ModuleResult<BTreeMap<_, _>>>()?;
+        let live_options = snapshots
+            .keys()
+            .map(|provider| (provider.clone(), Vec::new()))
+            .collect();
+        let participants: Vec<_> = participants
+            .iter()
+            .filter(|p| service.is_some() && !static_providers.contains(&p.provider))
+            .cloned()
+            .collect();
+        let index = 0;
         Ok(Self {
             service: service.map(str::to_owned),
-            participants: participants.to_vec(),
+            participants,
             index,
             snapshots,
             stage: Stage::Submit,
             scopes,
-            live_options: BTreeMap::new(),
+            live_options,
             descriptor_revisions: BTreeMap::new(),
         })
     }
@@ -460,6 +480,37 @@ mod tests {
         let snapshot = serde_json::to_value(&snapshots["provider"]).unwrap();
         assert_eq!(snapshot["contract"]["version"], 1);
         assert_eq!(snapshot["contract"]["digest"].as_str().unwrap().len(), 64);
+    }
+
+    #[test]
+    fn direct_processing_settings_do_not_use_an_unrelated_registry() {
+        let mut job = SettingsSnapshotJob::new_with_static(
+            Some("replacement.registry/1"),
+            &[participant("direct"), participant("scoped")],
+            SnapshotScopes::default(),
+            &["direct".to_owned()].into(),
+        )
+        .unwrap();
+        let mut commands = Vec::new();
+        let mut replies = VecDeque::from([
+            Response::Accepted { id: 1 },
+            registry_result(json!(7), 4),
+            Response::Ok,
+        ]);
+        let mut send = |command| {
+            commands.push(command);
+            Ok(replies.pop_front().unwrap())
+        };
+        assert!(job.advance(&mut send).unwrap().is_none());
+        assert!(job.advance(&mut send).unwrap().is_none());
+        let snapshots = job.advance(&mut send).unwrap().unwrap();
+        assert_eq!(snapshots["direct"].settings, participant("direct").settings);
+        assert_eq!(snapshots["scoped"].settings, json!({"x":7}));
+        assert!(
+            matches!(&commands[0], Command::Request { service, payload, .. }
+            if service == "replacement.registry/1" && payload["provider"] == "scoped")
+        );
+        assert_eq!(job.live_options("direct"), Some([].as_slice()));
     }
 
     #[test]

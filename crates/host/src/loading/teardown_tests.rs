@@ -419,11 +419,46 @@ fn cooperative_shutdown_deadline_retains_the_failing_module_identity() {
 
     assert_eq!(
         loaded.quiesce(std::time::Duration::ZERO).unwrap_err(),
-        "module drain deadline elapsed: quiesce failing failed with ABI status 2"
+        "module drain deadline elapsed: quiesce failing failed with ABI status 2; waiting=[failing]; blocked=[]"
     );
     assert!(!loaded.quiesced);
     drop(loaded);
     assert!(trace.lock().unwrap().is_empty());
+}
+
+#[test]
+fn shutdown_deadline_identifies_waiting_consumers_and_blocked_providers() {
+    unsafe extern "C" fn pending(_: *mut c_void, ready: *mut u8) -> Status {
+        // SAFETY: the host provides a writable readiness byte for this call.
+        unsafe { *ready = 0 };
+        STATUS_OK
+    }
+    let trace = DestructionTrace::default();
+    let mut loaded = LoadedComponents::load_features(
+        runtime(&trace),
+        None,
+        lifecycle_endpoint(),
+        false,
+        ["provider", "consumer", "independent"],
+        |_, name| {
+            let mut module = feature(name, &trace);
+            if name == "consumer" {
+                module.dependencies.insert("provider".into());
+                module.quiesce_api = Some(amaterasu_abi::ModuleQuiesceApi {
+                    header: AbiHeader::of::<amaterasu_abi::ModuleQuiesceApi>(),
+                    poll: pending,
+                });
+            }
+            Ok(module)
+        },
+        &mut |_| Ok(()),
+    )
+    .unwrap();
+
+    assert_eq!(
+        loaded.quiesce(std::time::Duration::ZERO).unwrap_err(),
+        "module drain deadline elapsed; waiting=[consumer]; blocked=[provider <- [consumer]]"
+    );
 }
 
 #[test]

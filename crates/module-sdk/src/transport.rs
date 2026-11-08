@@ -56,6 +56,7 @@ pub unsafe fn media_timed(binding: &NativeBinding) -> ModuleResult<Option<&Media
     // SAFETY: the advertised v1.1 tail is checked for size by table().
     unsafe { binding.table::<MediaTransportApiV1_1>() }.map(Some)
 }
+
 /// # Safety
 /// The runtime and provider must outlive the binding and its calls.
 pub unsafe fn bind_control(runtime: &RuntimeClient, service: &str) -> ModuleResult<NativeBinding> {

@@ -165,6 +165,10 @@ impl Controller {
             rpc::complete(runtime, request, error(code));
             return;
         }
+        if config.lifecycle_session_target.is_some() && self.settings.lifecycle_service.is_none() {
+            rpc::complete(runtime, request, error("lifecycle_provider_not_selected"));
+            return;
+        }
         if config.lifecycle_session_target.is_some() && caller != "amaterasu.nvhttp" {
             rpc::complete(runtime, request, error("permission_denied"));
             return;
@@ -358,7 +362,12 @@ impl Controller {
         self.job = Some(Job {
             ticket,
             phase: Phase::Prepare,
-            call: Call::new(payload, operation, Some(request)),
+            call: Call::for_service(
+                &self.settings.stream_service,
+                payload,
+                operation,
+                Some(request),
+            ),
             caller: Some(request),
             network: None,
             deadline: expires,

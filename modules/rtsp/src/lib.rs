@@ -39,8 +39,30 @@ impl ManagedModule for RtspModule {
         let Response::Result { payload } = runtime.send(Command::GetSettings {})? else {
             return Err("RTSP settings unavailable".into());
         };
-        let settings = decode_startup_settings(&payload)?;
+        let mut settings = decode_startup_settings(&payload)?;
         let network = Network::from_settings(&runtime, &payload)?;
+        if let Some(composition) = runtime.processing_composition()? {
+            use amaterasu_module_sdk::processing_composition as sdk;
+            let owner = composition
+                .stream_owner
+                .as_ref()
+                .ok_or("RTSP has no selected stream owner")?;
+            settings.stream_service =
+                sdk::require_contract(owner, sdk::STREAM_OWNER_CONTRACT, 1, 0)?.to_owned();
+            settings.lifecycle_service = composition
+                .lifecycle
+                .as_ref()
+                .map(|binding| {
+                    sdk::require_contract(
+                        binding,
+                        amaterasu_module_sdk::extension_api::SESSION_LIFECYCLE_SERVICE,
+                        1,
+                        0,
+                    )
+                    .map(str::to_owned)
+                })
+                .transpose()?;
+        }
         let controller = Controller::with_network(settings, network)?;
         runtime.require_success(Command::Register {
             service: SERVICE.into(),

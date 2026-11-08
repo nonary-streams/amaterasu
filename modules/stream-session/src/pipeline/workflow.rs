@@ -29,6 +29,10 @@ pub(super) enum Step {
     FindOwnedVirtualDisplay,
     RemoveOwnedVirtualDisplay,
     AcquireOutput,
+    OpenSourceScope,
+    ReadSourceHookSettings,
+    PrepareSourceHook,
+    CloseSourceScope,
     ValidateLifecycleCandidate,
     ReadFrozenProcessingSettings,
     PlanGpuProcessing,
@@ -82,6 +86,7 @@ pub(super) struct Job {
     pub tried: std::collections::BTreeSet<Resource>,
     pub input_tried: bool,
     pub virtual_display_tried: bool,
+    pub source_scope_tried: bool,
     pub virtual_display_removing: bool,
     pub display_tried: bool,
     pub journal_resume: Option<Step>,
@@ -109,6 +114,7 @@ impl Job {
             tried: Default::default(),
             input_tried: false,
             virtual_display_tried: false,
+            source_scope_tried: false,
             virtual_display_removing: false,
             display_tried: false,
             journal_resume: None,
@@ -233,6 +239,12 @@ impl Job {
         {
             return None;
         }
+        if super::source_preparation::needs_cleanup(record) {
+            if !self.source_scope_tried {
+                return Some(Step::CloseSourceScope);
+            }
+            return None;
+        }
         if !self.display_tried {
             if record.display_attempted && !record.display_status_verified {
                 return Some(Step::FindDisplay);
@@ -324,13 +336,21 @@ impl Job {
     pub fn command(&self, record: &Record) -> (String, Value) {
         let session = || record.resources[&Resource::Session];
         match self.step {
+            Step::OpenSourceScope
+            | Step::ReadSourceHookSettings
+            | Step::PrepareSourceHook
+            | Step::CloseSourceScope => super::source_preparation::command(record, self.step),
             Step::ResolveLifecyclePreparation => {
                 let preparation = record
                     .restart_lifecycle_preparation
                     .as_ref()
                     .expect("preparation recovery");
                 (
-                    "amaterasu.session-lifecycle/1".into(),
+                    record
+                        .providers
+                        .lifecycle
+                        .clone()
+                        .expect("selected lifecycle service"),
                     serde_json::to_value(
                         preparation.lookup(
                             record
@@ -355,10 +375,21 @@ impl Job {
                     "restart_recovery":true,"target":record.restart_lifecycle_target,
                     "retirement_receipt":record.lifecycle_retirement_receipt})
                 };
-                ("amaterasu.session-lifecycle/1".into(), payload)
+                (
+                    record
+                        .providers
+                        .lifecycle
+                        .clone()
+                        .expect("selected lifecycle service"),
+                    payload,
+                )
             }
             Step::ReadFrozenProcessingSettings => (
-                "amaterasu.session-lifecycle/1".into(),
+                record
+                    .providers
+                    .lifecycle
+                    .clone()
+                    .expect("selected lifecycle service"),
                 json!({"operation":"read_frozen_provider_settings",
                     "target":record.start.as_ref().expect("start").lifecycle_target,
                     "provider":record.processing_plan_provider.as_ref().expect("provider").provider}),
@@ -371,7 +402,6 @@ impl Job {
                 (
                     plan.control_service.clone(),
                     amaterasu_module_sdk::requests::processing_intent_payload(
-                        plan.interface_minor,
                         start
                             .lifecycle_target
                             .as_ref()
@@ -466,7 +496,14 @@ impl Job {
                     }
                     payload
                 };
-                ("amaterasu.session-lifecycle/1".into(), payload)
+                (
+                    record
+                        .providers
+                        .lifecycle
+                        .clone()
+                        .expect("selected lifecycle service"),
+                    payload,
+                )
             }
             Step::PersistJournal => (
                 "amaterasu.state/1".into(),

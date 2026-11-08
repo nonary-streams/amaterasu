@@ -708,10 +708,11 @@ impl Controller {
         } else {
             deadline
         };
+        let operation = self.operation_id(record, "lifecycle-lookup");
         let call = Call::for_service(
-            "amaterasu.session-lifecycle/1",
+            self.settings.lifecycle_service.as_deref().unwrap_or(""),
             json!({"operation":"lookup", "operation_id":format!("{}-lifecycle-prepare", record.operation())}),
-            self.operation_id(record, "lifecycle-lookup"),
+            operation,
             None,
         );
         self.job = Some(Job {
@@ -725,9 +726,11 @@ impl Controller {
     }
 
     pub(super) fn schedule_lookup(&mut self, record: &Record, caller: Option<u64>, now: u64) {
-        let call = Call::new(
+        let operation = self.operation_id(record, "lookup");
+        let call = Call::for_service(
+            &self.settings.stream_service,
             json!({"action":"lookup","operation_id":record.operation()}),
-            self.operation_id(record, "lookup"),
+            operation,
             None,
         );
         self.job = Some(Job {
@@ -781,9 +784,11 @@ impl Controller {
         } else {
             deadline
         };
-        let call = Call::new(
+        let operation = self.operation_id(record, "status");
+        let call = Call::for_service(
+            &self.settings.stream_service,
             json!({"action":"status","session":record.session}),
-            self.operation_id(record, "status"),
+            operation,
             None,
         );
         self.job = Some(Job {
@@ -806,9 +811,11 @@ impl Controller {
     }
 
     pub(super) fn stop_call(&mut self, record: &Record) -> Call {
-        Call::new(
+        let operation = self.operation_id(record, "stop");
+        Call::for_service(
+            &self.settings.stream_service,
             record.stop_payload(),
-            self.operation_id(record, "stop"),
+            operation,
             None,
         )
     }

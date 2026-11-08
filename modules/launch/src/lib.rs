@@ -68,8 +68,24 @@ impl ManagedModule for LaunchModule {
         let Response::Result { payload } = runtime.send(Command::GetSettings {})? else {
             return Err("launch settings unavailable".into());
         };
-        let settings: Settings =
+        let mut settings: Settings =
             serde_json::from_value(payload).map_err(|_| "invalid launch settings")?;
+        if let Some(composition) = runtime.processing_composition()? {
+            let lifecycle = composition
+                .lifecycle
+                .as_ref()
+                .ok_or("launch lifecycle not selected")?;
+            let service = amaterasu_module_sdk::processing_composition::require_contract(
+                lifecycle,
+                amaterasu_module_sdk::extension_api::SESSION_LIFECYCLE_SERVICE,
+                1,
+                0,
+            )?;
+            settings.prepared_context_service = Some(service.to_owned());
+            settings
+                .retirement_observers
+                .insert(lifecycle.principal.clone());
+        }
         settings.validate().map_err(str::to_owned)?;
         let enable_library_launch = !settings.library_routes.is_empty();
         let environment = settings

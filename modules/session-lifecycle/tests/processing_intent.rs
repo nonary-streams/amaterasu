@@ -171,6 +171,7 @@ impl Drop for PrivateRoot {
 fn frozen_settings(enabled: bool) -> Value {
     json!({
         "rtx_hdr_contrast":0,"rtx_hdr_debanding":true,"rtx_hdr_enable":enabled,
+        "rtx_hdr_scope":"global","rtx_hdr_application_enable":false,
         "rtx_hdr_foreground_only":false,"rtx_hdr_fullscreen_only":false,"rtx_hdr_middle_gray":50,
         "rtx_hdr_peak_brightness":1000,"rtx_hdr_saturation":0,"rtx_hdr_sdr_brightness":0
     })
@@ -203,8 +204,7 @@ impl PolicyProvider {
                 assert_eq!(caller, COORDINATOR);
                 let args = &payload["arguments"];
                 let response = if payload["method"] == "processing_intent" {
-                    let enabled = args["settings"]["rtx_hdr_enable"].as_bool().unwrap()
-                        || args["output_hdr"] == true;
+                    let enabled = args["output_hdr"] == true;
                     let mut configuration = args["settings"].clone();
                     configuration["replacement_context"] =
                         json!({"target":args["target"],"version":1});
@@ -216,30 +216,46 @@ impl PolicyProvider {
                 } else {
                     let request: ProviderRequest = serde_json::from_value(args.clone()).unwrap();
                     amaterasu_extension_api::validate_provider_request(&request).unwrap();
-                    let response = match request.operation {
-                        ProviderOperation::ResourcePlan => ProviderResponse::Planned {
-                            plan: ResourcePlan {
-                                plan_id: "replacement-policy".into(),
-                                revision: 1,
-                                resources: vec![],
-                                mutation_domains: vec![],
-                                required_capabilities: vec![],
-                                constraints: json!({}),
-                                obligations: vec![],
-                                affected_consumers: vec![],
-                                consumer_change: ConsumerChange::Live,
-                                candidate_constraint: None,
-                                allowed_degradation: vec![],
-                                control_proposals: vec![],
-                                resource_disposition: None,
+                    let response = if request.intent
+                        == Some(amaterasu_extension_api::StreamIntent::Join)
+                    {
+                        match request.operation {
+                            ProviderOperation::ResourcePlan => ProviderResponse::Planned {
+                                plan: amaterasu_extension_api::stream_join_plan(&request, PROVIDER)
+                                    .unwrap(),
                             },
-                        },
-                        ProviderOperation::LifecycleCallback => ProviderResponse::Prepared {
-                            candidate: None,
-                            obligations: vec![],
-                            outputs: vec![],
-                        },
-                        _ => panic!("fixture never requests status or native operations"),
+                            ProviderOperation::LifecycleCallback => {
+                                amaterasu_extension_api::stream_join_callback(&request, PROVIDER)
+                                    .unwrap()
+                            }
+                            _ => panic!("fixture never requests status or native operations"),
+                        }
+                    } else {
+                        match request.operation {
+                            ProviderOperation::ResourcePlan => ProviderResponse::Planned {
+                                plan: ResourcePlan {
+                                    plan_id: "replacement-policy".into(),
+                                    revision: 1,
+                                    resources: vec![],
+                                    mutation_domains: vec![],
+                                    required_capabilities: vec![],
+                                    constraints: json!({}),
+                                    obligations: vec![],
+                                    affected_consumers: vec![],
+                                    consumer_change: ConsumerChange::Live,
+                                    candidate_constraint: None,
+                                    allowed_degradation: vec![],
+                                    control_proposals: vec![],
+                                    resource_disposition: None,
+                                },
+                            },
+                            ProviderOperation::LifecycleCallback => ProviderResponse::Prepared {
+                                candidate: None,
+                                obligations: vec![],
+                                outputs: vec![],
+                            },
+                            _ => panic!("fixture never requests status or native operations"),
+                        }
                     };
                     amaterasu_extension_api::validate_provider_response(&request, &response)
                         .unwrap();
@@ -287,12 +303,12 @@ impl Fixture {
         let method = |name: &str| json!({"service":POLICY,"method":name,"interface_major":1,"interface_minor":0,"schema_revision":1});
         let settings:LifecycleSettings=serde_json::from_value(json!({"journal_path":root.0.join("journal.json"),
             "capture_binding_mode":"external","trusted_callers":["transport",PROVIDER],"session_delegates":["transport"],
-            "consumers":{"capture":["transport"]},"operation_grants":{"transport":["prepare","prepare_stream","lookup","snapshot"]},
+            "consumers":{"capture":["transport"]},"operation_grants":{"transport":["prepare","prepare_stream","lookup","snapshot","ack_stream","start_stream"]},
             "consumer_requirements":{"execution_domain":"desktop","capture_providers":[],"selector_schemas":[]},
             "processing_policy":{"provider":PROVIDER,"service":POLICY,"processor_service":PROCESSOR,"interface_minor":1,"source_mode_providers":[]},
             "participants":[{"provider":PROVIDER,"plan_method":method("resource_plan"),"callback_method":method("lifecycle_callback"),
                 "status_method":method("lifecycle_status"),"settings_revision":"registry-0","settings":frozen_settings(enabled),
-                "capabilities":[],"cleanup_methods":[method("lifecycle_callback")]}]})).unwrap();
+                "capabilities":[amaterasu_extension_api::STREAM_JOIN_CAPABILITY],"cleanup_methods":[method("lifecycle_callback")]}]})).unwrap();
         let config=serde_json::from_value(json!({"principals":{
             COORDINATOR:{"provide":[LIFECYCLE],"call":[POLICY]},PROVIDER:{"provide":[POLICY,PROCESSOR]},
             "transport":{"call":[LIFECYCLE]}},"settings":{PROVIDER:startup},
@@ -414,7 +430,7 @@ fn installed_processing_context_and_replacement_pass_unchanged_coordinator_prefl
     );
     assert!(library.is_absolute());
     for installed in [true, false] {
-        for (enabled, hdr) in [(false, false), (false, true), (true, true)] {
+        for (enabled, hdr) in [(false, false), (false, true), (true, false), (true, true)] {
             let mut fixture = Fixture::new(&library, installed, enabled);
             let video = json!({"width":1920,"height":1080,"refresh_millihz":60000,"hdr":hdr});
             let admitted=fixture.call(json!({"operation":"prepare","operation_id":"desktop","application_ref":{
@@ -433,7 +449,7 @@ fn installed_processing_context_and_replacement_pass_unchanged_coordinator_prefl
                 "session and stream preflights use the selected provider"
             );
             for intent in fixture.provider.intents() {
-                assert_eq!(intent["enabled"], enabled || hdr);
+                assert_eq!(intent["enabled"], hdr);
                 let configuration = &intent["processor_settings"];
                 for (key, value) in frozen_settings(enabled).as_object().unwrap() {
                     assert_eq!(&configuration[key], value);
@@ -455,6 +471,21 @@ fn installed_processing_context_and_replacement_pass_unchanged_coordinator_prefl
             if let PolicyProvider::Installed(module) = &fixture.provider {
                 assert_eq!(module.endpoint.native_bind_attempts, 0);
                 assert_eq!(module.endpoint.native_factory_registrations, 1);
+            }
+            if enabled && hdr {
+                let target = &stream["target"];
+                let ack = fixture.call(json!({"operation":"ack_stream","operation_id":"ack","target":target,"consumer":"capture"}));
+                assert_eq!(ack["status"], "succeeded", "{ack}");
+                let started = fixture.call(
+                    json!({"operation":"start_stream","operation_id":"start","target":target}),
+                );
+                assert_eq!(started["status"], "succeeded", "{started}");
+                let sdr = json!({"width":1920,"height":1080,"refresh_millihz":60000,"hdr":false});
+                let joining = fixture.call(json!({"operation":"prepare_stream","operation_id":"join","target":session["target"],"intent":"join","requested_video":sdr,"consumer_requirements":["capture"]}));
+                assert_eq!(joining["status"], "pending", "{joining}");
+                let joined = fixture.settled("join");
+                assert_eq!(joined["status"], "succeeded", "{joined}");
+                assert_eq!(fixture.provider.intents().last().unwrap()["enabled"], false);
             }
         }
     }

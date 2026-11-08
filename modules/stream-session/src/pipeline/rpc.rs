@@ -69,6 +69,29 @@ impl Pending {
         pending
     }
 
+    pub fn versioned_api(
+        service: &str,
+        envelope: Value,
+        operation: String,
+        parent: Option<u64>,
+    ) -> Self {
+        let mut pending = Self::new(service, envelope.clone(), operation.clone(), parent);
+        pending.command = Command::CallApi {
+            service: service.into(),
+            method: envelope["method"]
+                .as_str()
+                .expect("typed API method")
+                .into(),
+            interface_major: envelope["interface_major"].as_u64().unwrap() as u32,
+            interface_minor: envelope["interface_minor"].as_u64().unwrap() as u32,
+            payload: envelope["arguments"].clone(),
+            timeout_ms: 5000,
+            operation_id: operation,
+            parent,
+        };
+        pending
+    }
+
     /// Broker operation IDs make replay of this command safe after a lost
     /// admission. The caller must use this only for an idempotent provider action.
     pub fn retry_uncertain_admission(mut self) -> Self {

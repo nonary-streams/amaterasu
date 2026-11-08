@@ -10,10 +10,14 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 #[serde(default, deny_unknown_fields)]
 pub struct Settings {
     pub providers: crate::providers::ProviderServices,
+    #[serde(skip)]
     pub processing_plan: Option<ProcessingPlanProvider>,
+    pub source_preparation: Option<SourcePreparation>,
     pub enabled: bool,
     pub allow_remote: bool,
     pub allowed_principals: Vec<String>,
+    pub lifecycle_admitters: std::collections::BTreeSet<String>,
+    pub history_owners: std::collections::BTreeSet<String>,
     pub max_live_sessions: usize,
     pub prepare_timeout_ms: u64,
     pub drain_timeout_ms: u64,
@@ -25,9 +29,12 @@ impl Default for Settings {
         Self {
             providers: Default::default(),
             processing_plan: None,
+            source_preparation: None,
             enabled: false,
             allow_remote: false,
             allowed_principals: Vec::new(),
+            lifecycle_admitters: Default::default(),
+            history_owners: Default::default(),
             max_live_sessions: 2,
             prepare_timeout_ms: 5000,
             drain_timeout_ms: 5000,
@@ -39,10 +46,41 @@ impl Default for Settings {
 impl Settings {
     pub fn validate(&self) -> Result<(), &'static str> {
         self.providers.validate()?;
+        if let Some(preparation) = &self.source_preparation
+            && (!valid_name(&preparation.display_settings_service)
+                || preparation.hooks.is_empty()
+                || preparation.hooks.len() > 16
+                || preparation
+                    .hooks
+                    .iter()
+                    .any(|hook| !valid_name(&hook.provider) || !valid_name(&hook.service))
+                || preparation
+                    .hooks
+                    .iter()
+                    .map(|hook| &hook.provider)
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len()
+                    != preparation.hooks.len())
+        {
+            return Err("invalid_source_preparation");
+        }
         if let Some(plan) = &self.processing_plan {
             plan.validate()?;
+            if self.providers.lifecycle.is_none() {
+                return Err("processing_lifecycle_required");
+            }
+        }
+        if self.source_preparation.is_some() && self.providers.lifecycle.is_none() {
+            return Err("source_preparation_lifecycle_required");
         }
         if self.allowed_principals.len() > 16
+            || self.lifecycle_admitters.len() > 16
+            || self.history_owners.len() > 16
+            || self
+                .lifecycle_admitters
+                .iter()
+                .chain(&self.history_owners)
+                .any(|principal| !valid_name(principal) || principal.contains('/'))
             || self
                 .allowed_principals
                 .iter()
@@ -58,6 +96,19 @@ impl Settings {
     }
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourcePreparation {
+    pub display_settings_service: String,
+    pub hooks: Vec<SourceHook>,
+}
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceHook {
+    pub provider: String,
+    pub service: String,
+}
+
 /// Processing identities are selected by signed startup composition.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -66,16 +117,16 @@ pub struct ProcessingPlanProvider {
     pub control_service: String,
     pub processor_service: String,
     /// Version 1.1 supplies the negotiated output range to the provider.
-    #[serde(default)]
     pub interface_minor: u32,
-    /// Signed composition must also set video's gpu_processor_opt_in when true.
+    /// Omit a disabled processor when it did not reserve the negotiated path.
     #[serde(default)]
     pub omit_disabled: bool,
+    pub live_settings: bool,
 }
 
 impl ProcessingPlanProvider {
     fn validate(&self) -> Result<(), &'static str> {
-        if self.interface_minor > 1
+        if self.interface_minor != 1
             || !amaterasu_contracts::valid_name(&self.provider)
             || self.provider.contains('/')
             || !amaterasu_contracts::valid_name(&self.control_service)

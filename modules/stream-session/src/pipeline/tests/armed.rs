@@ -111,7 +111,7 @@ fn arm_lifecycle(host: &mut Harness) -> (u64, Value) {
 fn processing_plan_uses_frozen_settings_and_rejects_source_mismatch() {
     for (enabled, source_hdr, output_hdr, bad_revision, omit_ranges, expected_open) in [
         (false, false, false, false, false, true),
-        (false, false, true, false, false, false),
+        (false, false, true, false, false, true),
         (true, false, true, false, false, true),
         (true, true, true, false, false, false),
         (true, false, false, false, false, false),
@@ -124,11 +124,12 @@ fn processing_plan_uses_frozen_settings_and_rejects_source_mismatch() {
             .allowed_principals
             .push("amaterasu.rtsp".into());
         host.pipeline.settings.processing_plan = Some(crate::model::ProcessingPlanProvider {
-            interface_minor: 0,
+            interface_minor: 1,
             provider: "example.gpu".into(),
             control_service: "example.processing-control/1".into(),
             processor_service: "example.gpu/1".into(),
             omit_disabled: false,
+            live_settings: true,
         });
         host.broker.lifecycle_success = true;
         host.broker.processing_plan_enabled = enabled;
@@ -153,7 +154,7 @@ fn processing_plan_uses_frozen_settings_and_rejects_source_mismatch() {
         );
         host.idle();
         assert!(host.broker.commands.iter().any(|command| matches!(command,
-            Command::CallApi { service, method, interface_major: 1, interface_minor: 0, .. }
+            Command::CallApi { service, method, interface_major: 1, interface_minor: 1, .. }
                 if service == "example.processing-control/1" && method == "processing_intent"
         )));
         let open =
@@ -169,7 +170,7 @@ fn processing_plan_uses_frozen_settings_and_rejects_source_mismatch() {
             assert_eq!(
                 open.payload["configuration"]["gpu_processing"],
                 json!({
-                    "service":"example.gpu/1","enabled":enabled,"settings":{"test_control":42},
+                    "service":"example.gpu/1","enabled":enabled || output_hdr,"settings":{"test_control":42},
                     "source_hdr_required":false,
                     "live_settings":{"target":{"kind":"stream","host_epoch":"epoch","session_id":"session","stream_id":"stream","generation":1},"provider":"example.gpu","revision":"r1"}
                 })
@@ -180,13 +181,11 @@ fn processing_plan_uses_frozen_settings_and_rejects_source_mismatch() {
 
 #[test]
 fn external_capture_receives_source_requirement_from_frozen_processing_plan() {
-    for (minor, enabled, hdr_output, omit_disabled, selected) in [
-        (0, false, false, false, true),
-        (0, false, false, true, false),
-        (0, false, true, true, true),
-        (0, true, true, true, true),
-        (1, false, true, true, true),
-        (1, false, false, true, false),
+    for (enabled, hdr_output, omit_disabled, selected) in [
+        (false, false, false, true),
+        (false, false, true, false),
+        (false, true, true, true),
+        (true, true, true, true),
     ] {
         let mut host = Harness::new();
         host.pipeline
@@ -194,11 +193,12 @@ fn external_capture_receives_source_requirement_from_frozen_processing_plan() {
             .allowed_principals
             .push("amaterasu.rtsp".into());
         host.pipeline.settings.processing_plan = Some(crate::model::ProcessingPlanProvider {
-            interface_minor: minor,
+            interface_minor: 1,
             provider: "example.gpu".into(),
             control_service: "example.processing-control/1".into(),
             processor_service: "example.gpu/1".into(),
             omit_disabled,
+            live_settings: true,
         });
         host.broker.lifecycle_success = true;
         host.broker.processing_plan_enabled = enabled;
@@ -228,7 +228,7 @@ fn external_capture_receives_source_requirement_from_frozen_processing_plan() {
         let selection = open.payload["configuration"].get("gpu_processing");
         assert_eq!(selection.is_some(), selected);
         if let Some(selection) = selection {
-            let prepared = enabled || (minor == 1 && hdr_output);
+            let prepared = enabled || hdr_output;
             assert_eq!(selection["enabled"], prepared);
             // With conversion disabled, the source must match the output.
             assert_eq!(
@@ -243,11 +243,12 @@ fn external_capture_receives_source_requirement_from_frozen_processing_plan() {
 fn selected_processing_rejects_legacy_stream_without_frozen_authority() {
     let mut host = Harness::new();
     host.pipeline.settings.processing_plan = Some(crate::model::ProcessingPlanProvider {
-        interface_minor: 0,
+        interface_minor: 1,
         provider: "example.gpu".into(),
         control_service: "example.processing-control/1".into(),
         processor_service: "example.gpu/1".into(),
         omit_disabled: false,
+        live_settings: true,
     });
     let id = host.response(1, prepare())["session"].as_u64().unwrap();
     let response = host.response(2, start(id));
@@ -283,11 +284,12 @@ fn processing_provider_context_reaches_video_without_changing_frozen_settings() 
                 .allowed_principals
                 .push("amaterasu.rtsp".into());
             host.pipeline.settings.processing_plan = Some(crate::model::ProcessingPlanProvider {
-                interface_minor: 0,
+                interface_minor: 1,
                 provider: "example.gpu".into(),
                 control_service: "example.processing-control/1".into(),
                 processor_service: "example.gpu/1".into(),
                 omit_disabled: false,
+                live_settings: true,
             });
             host.broker.lifecycle_success = true;
             host.broker.processing_plan_enabled = enabled;

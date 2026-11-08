@@ -685,13 +685,14 @@ impl Coordinator {
         if !self.settings_jobs.contains_key(&job_key) {
             self.settings_jobs.insert(
                 job_key.clone(),
-                super::settings_snapshot::SettingsSnapshotJob::new(
+                super::settings_snapshot::SettingsSnapshotJob::new_with_static(
                     self.settings.settings_registry_service.as_deref(),
                     &self.settings.participants,
                     super::settings_snapshot::SnapshotScopes::from_work(
                         &self.shared.borrow().value,
                         work,
                     )?,
+                    &self.settings.static_processing_settings,
                 )?,
             );
         }
@@ -1344,11 +1345,12 @@ impl Coordinator {
                 .processing_decision
                 .as_ref()
                 .ok_or("session_processing_policy_missing")?;
-            if previous.enabled != decision.enabled
-                || previous.source_video_mode.as_ref().map(|mode| mode.hdr)
-                    != decision.source_video_mode.as_ref().map(|mode| mode.hdr)
-                || previous.processor_service != decision.processor_service
-            {
+            if !super::processing_preflight::compatible_with_session(
+                previous,
+                &decision,
+                work.join_context.as_ref(),
+                work.video.as_ref(),
+            ) {
                 return Err("processing_source_range_changed".into());
             }
         } else {

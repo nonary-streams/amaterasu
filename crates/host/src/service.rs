@@ -558,6 +558,9 @@ fn run_linux_user_service_inner(
                 Instant,
             )> = None;
             while !USER_SERVICE_STOP_REQUESTED.load(Ordering::Relaxed) {
+                // Observe before dispatch so a provider notification during
+                // this tick also prevents the following wait from sleeping.
+                let observed_work = components.observe_work()?;
                 let tick_started = Instant::now();
                 components.tick()?;
                 components.health()?;
@@ -593,9 +596,10 @@ fn run_linux_user_service_inner(
                     return Ok(Some(LinuxUserAction::Lifecycle(action)));
                 }
                 input.refresh(root, &digest, pid, starttime)?;
-                std::thread::sleep(crate::timing::remaining_tick_interval(
-                    tick_started.elapsed(),
-                ));
+                components.wait_for_work(
+                    observed_work,
+                    crate::timing::remaining_tick_interval(tick_started.elapsed()),
+                )?;
             }
             input.revoke();
             components.shutdown(Duration::from_millis(HOST_MODULE_SHUTDOWN_TIMEOUT_MS))?;

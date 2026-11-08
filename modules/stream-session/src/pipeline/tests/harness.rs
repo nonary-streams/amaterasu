@@ -40,6 +40,9 @@ pub struct Broker {
     pub processing_plan_bad_revision: bool,
     pub processing_plan_omit_ranges: bool,
     pub processing_plan_context: Option<Value>,
+    pub source_plugin_fail: bool,
+    pub source_scope_close_fail: bool,
+    pub source_scope: Option<amaterasu_module_sdk::display_settings::Scope>,
     pub processing_plan_identity: Option<(String, String)>,
     pub lifecycle_omit_consumer_confirmation: bool,
     pub lifecycle_observation_override: Option<Value>,
@@ -488,6 +491,39 @@ impl Broker {
             }
             return result;
         }
+        if call.service == "fixture.display-settings/1" {
+            return match call.payload["method"].as_str().unwrap() {
+                "open_scope" => {
+                    let scope = amaterasu_module_sdk::display_settings::Scope {
+                        id: call.payload["arguments"]["operation_id"]
+                            .as_str()
+                            .unwrap()
+                            .into(),
+                        target: amaterasu_module_sdk::display_settings::Target {
+                            id: "display".into(),
+                            generation: "one".into(),
+                        },
+                    };
+                    self.source_scope = Some(scope.clone());
+                    json!({"ok":true,"scope":scope})
+                }
+                "close_scope" => {
+                    if self.source_scope_close_fail {
+                        json!({"ok":false,"code":"restore_failed"})
+                    } else {
+                        self.source_scope = None;
+                        json!({"ok":true,"closed":true})
+                    }
+                }
+                _ => panic!("unexpected display SDK method"),
+            };
+        }
+        if call.service == "fixture.adjustments/1" {
+            assert_eq!(call.payload["method"], "prepare_source");
+            let scope = call.payload["arguments"]["context"]["display_scope"].clone();
+            assert_eq!(scope, json!(self.source_scope));
+            return json!({"ok":!self.source_plugin_fail,"scope":scope});
+        }
         let (processing_control, processing_service) = self
             .processing_plan_identity
             .as_ref()
@@ -496,10 +532,9 @@ impl Broker {
         if call.service == processing_control {
             assert_eq!(call.payload["method"], "processing_intent");
             assert_eq!(call.payload["interface_major"], 1);
-            let minor = call.payload["interface_minor"].as_u64().unwrap();
-            assert!(minor <= 1);
-            let prepared = self.processing_plan_enabled
-                || (minor == 1 && call.payload["arguments"]["output_hdr"] == true);
+            assert_eq!(call.payload["interface_minor"], 1);
+            let prepared =
+                self.processing_plan_enabled || call.payload["arguments"]["output_hdr"] == true;
             let mut settings = call.payload["arguments"]["settings"].clone();
             if let Some(context) = &self.processing_plan_context {
                 settings
@@ -1493,6 +1528,12 @@ impl Harness {
             pipeline: Pipeline::new_for_test(Settings {
                 enabled: true,
                 allowed_principals: vec!["owner".into()],
+                providers: crate::providers::ProviderServices {
+                    lifecycle: Some("amaterasu.session-lifecycle/1".into()),
+                    ..Default::default()
+                },
+                lifecycle_admitters: ["amaterasu.rtsp".into()].into(),
+                history_owners: ["amaterasu.nvhttp".into()].into(),
                 ..Settings::default()
             })
             .unwrap(),
@@ -1506,6 +1547,12 @@ impl Harness {
         host.pipeline = Pipeline::new_for_restart_test(Settings {
             enabled: true,
             allowed_principals: vec!["owner".into()],
+            providers: crate::providers::ProviderServices {
+                lifecycle: Some("amaterasu.session-lifecycle/1".into()),
+                ..Default::default()
+            },
+            lifecycle_admitters: ["amaterasu.rtsp".into()].into(),
+            history_owners: ["amaterasu.nvhttp".into()].into(),
             ..Settings::default()
         })
         .unwrap();

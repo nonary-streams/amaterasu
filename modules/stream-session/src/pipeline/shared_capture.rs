@@ -9,6 +9,29 @@ use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(super) struct SettingsScope {
+    pub service: String,
+    pub operation_id: String,
+    pub scope: Option<amaterasu_module_sdk::display_settings::Scope>,
+    pub prepared: bool,
+    pub closed: bool,
+}
+
+impl SettingsScope {
+    pub fn valid(&self) -> bool {
+        amaterasu_module_sdk::display_settings::valid_id(&self.service)
+            && self.service.ends_with("/1")
+            && amaterasu_module_sdk::display_settings::valid_id(&self.operation_id)
+            && self
+                .scope
+                .as_ref()
+                .is_none_or(|scope| scope.validate().is_ok())
+            && (!self.prepared || self.scope.is_some())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct Source {
     pub version: u32,
     pub operation_id: String,
@@ -22,11 +45,17 @@ pub(super) struct Source {
     pub refresh_millihz: u32,
     pub hdr_enabled: bool,
     pub output: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings_scope: Option<SettingsScope>,
 }
 
 impl Source {
     pub fn valid(&self) -> bool {
         self.version == 1
+            && self
+                .settings_scope
+                .as_ref()
+                .is_none_or(SettingsScope::valid)
             && crate::model::valid_name(&self.operation_id)
             && matches!(&self.session, amaterasu_extension_api::LifecycleTarget::Session {
                 host_epoch, session_id, generation:1.. } if crate::model::valid_name(host_epoch) && crate::model::valid_name(session_id))
@@ -106,12 +135,13 @@ impl Source {
 pub(super) fn borrow_source(
     records: &BTreeMap<u64, Record>,
     owner: &str,
+    lifecycle_admitter: bool,
     config: &PrepareConfig,
 ) -> Result<Option<Source>, &'static str> {
     let Some(operation) = &config.shared_source_operation_id else {
         return Ok(None);
     };
-    if owner != "amaterasu.rtsp" {
+    if !lifecycle_admitter {
         return Err("permission_denied");
     }
     let source = records
@@ -199,14 +229,26 @@ pub(super) fn initialize_source(record: &mut Record) -> Result<(), &'static str>
         // output HDR belongs to the encoder and must not enable source HDR
         // for an SDR-to-HDR processor or change when another client joins.
         hdr_enabled: record
-            .gpu_processing
-            .as_ref()
+            .source_preparation
+            .is_none()
+            .then_some(record.gpu_processing.as_ref())
+            .flatten()
             .and_then(|plan| plan["source_hdr_required"].as_bool())
             .unwrap_or(
                 start.configuration.video_stream_format.dynamic_range
                     == amaterasu_module_sdk::DynamicRange::Hdr,
             ),
         output: None,
+        settings_scope: record
+            .source_preparation
+            .as_ref()
+            .map(|selection| SettingsScope {
+                service: selection.display_settings_service.clone(),
+                operation_id: format!("source-settings-{}", identity_for_scope(record)),
+                scope: None,
+                prepared: false,
+                closed: false,
+            }),
     };
     if !source.valid() {
         return Err("invalid_shared_source_reference");
@@ -251,4 +293,8 @@ pub(super) fn detach_if_borrowed(record: &mut Record, records: &BTreeMap<u64, Re
         record.virtual_display_output = None;
         record.virtual_display_state = "shared_retained".into();
     }
+}
+
+fn identity_for_scope(record: &Record) -> String {
+    super::virtual_display::identity(record)
 }

@@ -263,6 +263,7 @@ fn policy_diff(
         if ![
             "principals",
             "settings",
+            "processing_compositions",
             "api_methods",
             "legacy_native_contracts",
             "hooks",

@@ -129,6 +129,57 @@ impl ManagedModule for ManagementModule {
                 settings.tls_bind,
                 tls_configuration,
             )?;
+            let processing = runtime
+                .processing_composition()?
+                .map(|composition| -> ModuleResult<_> {
+                    use amaterasu_module_sdk::processing_composition as sdk;
+                    let video = composition
+                        .frame_consumer
+                        .as_ref()
+                        .ok_or("management frame consumer not selected")?;
+                    let owner = composition
+                        .stream_owner
+                        .as_ref()
+                        .ok_or("management stream owner not selected")?;
+                    Ok(server::ProcessingRoutes {
+                        video: sdk::require_contract(
+                            video,
+                            amaterasu_module_sdk::video::CONTRACT,
+                            1,
+                            0,
+                        )?
+                        .to_owned(),
+                        stream: sdk::require_contract(owner, sdk::STREAM_OWNER_CONTRACT, 1, 0)?
+                            .to_owned(),
+                        lifecycle: composition
+                            .lifecycle
+                            .as_ref()
+                            .map(|binding| {
+                                sdk::require_contract(
+                                    binding,
+                                    amaterasu_module_sdk::extension_api::SESSION_LIFECYCLE_SERVICE,
+                                    1,
+                                    0,
+                                )
+                                .map(str::to_owned)
+                            })
+                            .transpose()?,
+                        registry: composition
+                            .settings_registry
+                            .as_ref()
+                            .map(|binding| {
+                                sdk::require_contract(
+                                    binding,
+                                    amaterasu_module_sdk::extension_api::EXTENSION_REGISTRY_SERVICE,
+                                    1,
+                                    0,
+                                )
+                                .map(str::to_owned)
+                            })
+                            .transpose()?,
+                    })
+                })
+                .transpose()?;
             server.set_audio_providers(server::AudioProviders {
                 capture: settings
                     .audio_capture_provider
@@ -136,6 +187,7 @@ impl ManagedModule for ManagementModule {
                 encoder: settings
                     .audio_encoder_provider
                     .unwrap_or_else(|| "amaterasu.audio-encode/1".into()),
+                processing,
             });
             server.set_extensions(extensions);
             Some(server)

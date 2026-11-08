@@ -62,6 +62,50 @@ fn test_broker() -> Broker {
     broker
 }
 
+#[test]
+fn broker_accepts_large_results_and_rejects_results_over_the_limit() {
+    let mut broker = test_broker();
+    let id = accepted_id(broker.dispatch(
+        "client",
+        Command::Request {
+            service: "echo/1".into(),
+            payload: json!({}),
+            timeout_ms: 1000,
+            operation_id: "large-result".into(),
+            parent: None,
+        },
+    ));
+    assert!(matches!(
+        broker.dispatch("provider", Command::Poll {}),
+        Response::Request { .. }
+    ));
+    let oversized = json!({"data":"x".repeat(MAX_BROKER_RESULT_BYTES)});
+    assert_error_code(
+        broker.dispatch(
+            "provider",
+            Command::Complete {
+                request: id,
+                payload: oversized,
+            },
+        ),
+        "invalid_request",
+    );
+    let large = json!({"data":"x".repeat(128 * 1024)});
+    assert!(matches!(
+        broker.dispatch(
+            "provider",
+            Command::Complete {
+                request: id,
+                payload: large.clone()
+            }
+        ),
+        Response::Ok
+    ));
+    assert!(
+        matches!(broker.dispatch("client", Command::TakeResult { request: id }), Response::Result { payload } if payload == large)
+    );
+}
+
 fn logging_broker() -> Broker {
     let configuration = RuntimeConfig {
         principals: [
@@ -270,7 +314,7 @@ fn host_log_requests_honor_cancellation_deadline_and_response_bounds() {
             HOST_LIFECYCLE_CONTROL_PRINCIPAL,
             Command::Complete {
                 request: id,
-                payload: json!({"data":"x".repeat(20_000)}),
+                payload: json!({"data":"x".repeat(MAX_BROKER_RESULT_BYTES)}),
             },
             now,
         ),
@@ -1755,6 +1799,69 @@ fn settings_are_isolated_to_the_bound_endpoint() {
         serde_json::from_value::<Command>(json!({"op": "get_settings", "principal": "second"}))
             .is_err()
     );
+}
+
+#[test]
+fn processing_compositions_are_isolated_and_do_not_grant_service_access() {
+    use amaterasu_contracts::processing_composition::{CapabilityBinding, ProcessingComposition};
+    let mut configuration = RuntimeConfig::default();
+    configuration.principals.insert(
+        "effect".into(),
+        Grants {
+            native_provide: names(&["effect/1"]),
+            ..Default::default()
+        },
+    );
+    for principal in ["consumer", "other"] {
+        configuration
+            .principals
+            .insert(principal.into(), Grants::default());
+    }
+    let binding = CapabilityBinding {
+        principal: "effect".into(),
+        service: "effect/1".into(),
+        contract: "amaterasu.frame-processor.native/1".into(),
+        interface_major: 1,
+        interface_minor: 0,
+    };
+    let selected = ProcessingComposition {
+        processor: Some(binding.clone()),
+        ..Default::default()
+    };
+    configuration
+        .processing_compositions
+        .insert("consumer".into(), selected.clone());
+    let mut broker = Broker::new(configuration.clone()).unwrap();
+    assert!(matches!(
+        broker.dispatch("consumer", Command::GetProcessingComposition {}),
+        Response::Result { payload } if payload == serde_json::to_value(&selected).unwrap()
+    ));
+    assert_error_code(
+        broker.dispatch("other", Command::GetProcessingComposition {}),
+        "not_found",
+    );
+    assert_error_code(
+        broker.dispatch("unknown", Command::GetProcessingComposition {}),
+        "permission_denied",
+    );
+    assert!(
+        serde_json::from_value::<Command>(
+            json!({"op":"get_processing_composition","principal":"consumer"})
+        )
+        .is_err()
+    );
+    assert!(
+        !configuration.principals["consumer"]
+            .native_use
+            .contains("effect/1")
+    );
+    configuration
+        .principals
+        .get_mut("effect")
+        .unwrap()
+        .native_provide
+        .clear();
+    assert!(Broker::new(configuration).is_err());
 }
 
 #[test]

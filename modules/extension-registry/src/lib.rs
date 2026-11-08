@@ -41,16 +41,46 @@ impl ManagedModule for Registry {
         let Response::Result { payload } = runtime.send(Command::GetSettings {})? else {
             return Err("extension registry settings unavailable".into());
         };
-        let policy: policy::Settings =
+        let mut policy: policy::Settings =
             serde_json::from_value(payload).map_err(|e| e.to_string())?;
+        let mut lifecycle_service =
+            Some(amaterasu_extension_api::SESSION_LIFECYCLE_SERVICE.to_owned());
+        let service = if let Some(composition) = runtime.processing_composition()? {
+            let binding = composition
+                .settings_registry
+                .as_ref()
+                .ok_or("registry processing composition lacks its selected binding")?;
+            let service = amaterasu_module_sdk::processing_composition::require_contract(
+                binding,
+                EXTENSION_REGISTRY_SERVICE,
+                1,
+                0,
+            )?
+            .to_owned();
+            lifecycle_service = composition
+                .lifecycle
+                .as_ref()
+                .map(|binding| {
+                    amaterasu_module_sdk::processing_composition::require_contract(
+                        binding,
+                        amaterasu_extension_api::SESSION_LIFECYCLE_SERVICE,
+                        1,
+                        0,
+                    )
+                    .map(str::to_owned)
+                })
+                .transpose()?;
+            policy.add_processing_registrations(&composition.registrations)?;
+            service
+        } else {
+            EXTENSION_REGISTRY_SERVICE.to_owned()
+        };
         policy.validate()?;
-        runtime.require_success(Command::Register {
-            service: EXTENSION_REGISTRY_SERVICE.into(),
-        })?;
+        runtime.require_success(Command::Register { service })?;
         Ok(Self {
             runtime,
             policy,
-            settings: settings_service::SettingsService::default(),
+            settings: settings_service::SettingsService::new(lifecycle_service),
             quiescing: false,
         })
     }

@@ -1,0 +1,14 @@
+{
+  "id": "example.frame-processor",
+  "version": "0.1.0",
+  "file": "libexample_frame_processor.so",
+  "sha256": "",
+  "size": 0,
+  "abi_major": 1,
+  "runtime": false,
+  "requires": { "amaterasu.runtime": "0.1.0" },
+  "requested": {
+    "provide": ["example.frame-processor/1"],
+    "native_provide": ["example.frame-processor/1"]
+  }
+}

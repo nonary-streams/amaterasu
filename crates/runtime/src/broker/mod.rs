@@ -324,6 +324,21 @@ impl Broker {
                     .cloned()
                     .unwrap_or_else(|| serde_json::json!({})),
             },
+            Command::GetProcessingComposition {} => {
+                match self.configuration.processing_compositions.get(caller) {
+                    Some(composition) => match serde_json::to_value(composition) {
+                        Ok(payload) => Response::Result { payload },
+                        Err(_) => Response::error(
+                            "invalid_processing_composition",
+                            "cannot encode selected processing composition",
+                        ),
+                    },
+                    None => Response::error(
+                        "not_found",
+                        "no processing composition selected for this principal",
+                    ),
+                }
+            }
             Command::GetHostContext {} => {
                 // Audio needs the host-owned state root on Linux to reconcile
                 // its own Pulse cleanup journal after a worker restart.

@@ -1,0 +1,13 @@
+[package]
+name = "example-frame-processor"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+amaterasu-module-sdk.workspace = true
+amaterasu-media.workspace = true
+serde_json.workspace = true

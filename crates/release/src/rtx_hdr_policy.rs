@@ -9,7 +9,12 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::Path;
 
-pub fn prepare(root: &Path, expected_digest: &str, output: &Path) -> PackageResult<()> {
+pub fn prepare(
+    root: &Path,
+    expected_digest: &str,
+    output: &Path,
+    selection: &crate::profiles::linux_session::ProcessingSelection,
+) -> PackageResult<()> {
     let root = root.canonicalize().map_err(|error| error.to_string())?;
     let output_parent = output
         .parent()
@@ -42,9 +47,10 @@ pub fn prepare(root: &Path, expected_digest: &str, output: &Path) -> PackageResu
             "trusted RTX HDR runtime parent differs from the installation state directory".into(),
         );
     }
-    crate::profiles::linux_session::enable_rtx_hdr(
+    crate::profiles::linux_session::enable_rtx_hdr_with_selection(
         &mut bootstrap.policy,
         &expected_parent.join("runtime"),
+        selection,
     )?;
     let report = serde_json::to_vec_pretty(&json!({
         "kind": "rtx_hdr_bootstrap_review_v1",
@@ -110,12 +116,21 @@ mod tests {
         write_json_atomically(&root.join("bootstrap.json"), &bootstrap).unwrap();
         let before = fs::read(root.join("bootstrap.json")).unwrap();
         let digest = sha256(&before);
-        assert!(prepare(&root, &"0".repeat(64), &base.join("stale.json")).is_err());
+        let capabilities = crate::profiles::linux_session::default_rtx_hdr_selection();
+        assert!(
+            prepare(
+                &root,
+                &"0".repeat(64),
+                &base.join("stale.json"),
+                &capabilities
+            )
+            .is_err()
+        );
         assert!(!base.join("stale.json").exists());
-        assert!(prepare(&root, &digest, &root.join("forbidden.json")).is_err());
+        assert!(prepare(&root, &digest, &root.join("forbidden.json"), &capabilities).is_err());
         let output = base.join("candidate.json");
-        prepare(&root, &digest, &output).unwrap();
-        assert!(prepare(&root, &digest, &output).is_err());
+        prepare(&root, &digest, &output, &capabilities).unwrap();
+        assert!(prepare(&root, &digest, &output, &capabilities).is_err());
         assert_eq!(fs::read(root.join("bootstrap.json")).unwrap(), before);
         let report: serde_json::Value = serde_json::from_slice(&fs::read(output).unwrap()).unwrap();
         assert_eq!(report["source_bootstrap_sha256"], digest);
@@ -124,7 +139,8 @@ mod tests {
             true
         );
         assert_eq!(
-            report["candidate_bootstrap"]["policy"]["settings"]["amaterasu.linux-session-video"]["gpu_processor_service"],
+            report["candidate_bootstrap"]["policy"]["processing_compositions"]["amaterasu.linux-session-video"]
+                ["processor"]["service"],
             "amaterasu.rtx-hdr/1"
         );
         fs::remove_dir_all(base).unwrap();

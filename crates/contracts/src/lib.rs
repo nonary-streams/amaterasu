@@ -1,9 +1,13 @@
 //! Version 1 control-plane messages. These types are independent of the bootstrap ABI.
 pub mod encoder;
+pub mod processing_composition;
 pub mod virtual_display;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
+
+/// Maximum serialized broker result, leaving room for its ABI message envelope.
+pub const MAX_BROKER_RESULT_BYTES: usize = 256 * 1024;
 
 /// Service name required in a module's explicit effective `call` grants before
 /// it may request that the trusted host restart or stop the selected runtime.
@@ -110,6 +114,10 @@ pub struct RuntimeConfig {
     pub hooks: BTreeMap<String, HookSpec>,
     #[serde(default)]
     pub settings: BTreeMap<String, Value>,
+    /// Per-principal processing selections approved by trusted composition.
+    /// These are separate from each provider's private settings and confer no grants.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub processing_compositions: BTreeMap<String, processing_composition::ProcessingComposition>,
     /// Host-owned runtime facts are never serialized into a signed package
     /// policy. The host injects this context only after the selected package
     /// has been verified.
@@ -277,6 +285,8 @@ pub enum Command {
     /// Reserved for the host endpoint; returns pending product log events.
     DrainLogEvents {},
     GetSettings {},
+    /// Return only this principal's approved SDK processing composition.
+    GetProcessingComposition {},
     /// A bounded readiness hint; carries no provider data or effect authority.
     NotifyWorkReady {},
     /// Returns host-owned context to the state service, and to the Linux audio

@@ -239,6 +239,7 @@ fn authorized_audio_discovery_uses_the_selected_provider() {
     let providers = AudioProviders {
         capture: "vendor.capture/1".into(),
         encoder: "vendor.opus/1".into(),
+        processing: None,
     };
     for (path, service, action) in [
         ("media/audio_endpoints", "vendor.capture/1", "enumerate"),
@@ -265,6 +266,7 @@ fn selected_audio_provider_is_not_called_without_media_scope() {
     let providers = AudioProviders {
         capture: "vendor.capture/1".into(),
         encoder: "vendor.opus/1".into(),
+        processing: None,
     };
     let (stage, commands) = verify_cookie_route(
         Response::Result {
@@ -516,4 +518,48 @@ fn rate_limits_and_unknown_or_malformed_verification_remain_closed() {
     let (stage, commands) = verify_cookie(Response::Ok, 'a');
     assert_eq!(commands.len(), 2);
     assert!(matches!(stage, Stage::Retiring { request_id: 41, .. }));
+}
+
+#[test]
+fn authenticated_routes_use_selected_processing_provider_aliases() {
+    let providers = AudioProviders {
+        processing: Some(ProcessingRoutes {
+            video: "vendor.video/1".into(),
+            stream: "vendor.stream/1".into(),
+            lifecycle: Some("vendor.lifecycle/1".into()),
+            registry: Some("vendor.settings/1".into()),
+        }),
+        ..AudioProviders::default()
+    };
+    for (path, selected) in [
+        ("media/video_status", "vendor.video/1"),
+        ("live-streams/status", "vendor.stream/1"),
+        ("extension-actions-target/snapshot", "vendor.lifecycle/1"),
+        ("session-extensions/list", "vendor.settings/1"),
+    ] {
+        let (stage, commands) = verify_cookie_route(
+            Response::Result {
+                payload: json!({"ok":true,"kind":"administrator_session",
+                "role":"administrator","subject":"admin",
+                "scopes":["media.read","session.read","configuration.read","configuration.write"],
+                "expires_at":1_800_000_000}),
+            },
+            'd',
+            path,
+            &providers,
+        );
+        assert!(
+            matches!(
+                stage,
+                Stage::Dispatching { request_id: 42, .. }
+                    | Stage::SessionExtensionDispatching { request_id: 42, .. }
+            ),
+            "{path}"
+        );
+        assert!(
+            commands.iter().any(|command| matches!(command,
+            Command::Request { service, .. } if service == selected)),
+            "{path}"
+        );
+    }
 }

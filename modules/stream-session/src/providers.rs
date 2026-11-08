@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 pub struct ProviderServices {
     pub session: String,
     pub video: String,
+    pub lifecycle: Option<String>,
     pub audio_capture: String,
     pub audio_encoder: String,
     pub audio_processor: Option<String>,
@@ -21,6 +22,7 @@ impl Default for ProviderServices {
         Self {
             session: "amaterasu.session/1".into(),
             video: "amaterasu.video/1".into(),
+            lifecycle: None,
             audio_capture: "amaterasu.audio/1".into(),
             audio_encoder: "amaterasu.audio-encode/1".into(),
             audio_processor: None,
@@ -41,7 +43,11 @@ impl ProviderServices {
             &self.control_transport,
         ];
         let mut unique = std::collections::BTreeSet::new();
-        for service in services.into_iter().chain(self.audio_processor.iter()) {
+        for service in services
+            .into_iter()
+            .chain(self.audio_processor.iter())
+            .chain(self.lifecycle.iter())
+        {
             let Some((name, version)) = service.split_once('/') else {
                 return Err("invalid_provider_services");
             };
@@ -52,11 +58,32 @@ impl ProviderServices {
                 || name.is_empty()
                 || name.contains('/')
                 || !version_is_valid
-                || name == "amaterasu.stream-session"
                 || !unique.insert(service)
             {
                 return Err("invalid_provider_services");
             }
+        }
+        Ok(())
+    }
+
+    /// A provider cannot also be this instance's own broker endpoint.
+    pub fn validate_for_owner(&self, owner_service: &str) -> Result<(), &'static str> {
+        self.validate()?;
+        if [
+            Some(&self.session),
+            Some(&self.video),
+            self.lifecycle.as_ref(),
+            Some(&self.audio_capture),
+            Some(&self.audio_encoder),
+            self.audio_processor.as_ref(),
+            Some(&self.media_transport),
+            Some(&self.control_transport),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|service| service == owner_service)
+        {
+            return Err("provider_service_is_stream_owner");
         }
         Ok(())
     }
@@ -81,8 +108,6 @@ mod tests {
             "acme.media/not-a-number",
             "acme.media/4294967296",
             "acme/media/1",
-            "amaterasu.stream-session/1",
-            "amaterasu.stream-session/2",
         ] {
             let roles = ProviderServices {
                 media_transport: service.into(),
@@ -105,5 +130,20 @@ mod tests {
             ..roles
         };
         assert!(duplicate.validate().is_err());
+    }
+
+    #[test]
+    fn selected_owner_identity_is_used_to_reject_self_calls() {
+        let roles = ProviderServices {
+            video: "replacement.owner/1".into(),
+            ..Default::default()
+        };
+        assert!(roles.validate_for_owner("replacement.owner/1").is_err());
+        assert!(roles.validate_for_owner("replacement.owner/2").is_ok());
+        let other = ProviderServices {
+            video: "amaterasu.stream-session/1".into(),
+            ..Default::default()
+        };
+        assert!(other.validate_for_owner("replacement.owner/1").is_ok());
     }
 }

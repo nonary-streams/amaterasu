@@ -401,18 +401,25 @@ impl LoadedComponents {
             let mut ready = true;
             let mut poll_error = None;
             let mut drained = vec![false; self.graph.modules.len()];
+            let mut waiting = Vec::new();
+            let mut blocked = Vec::new();
             for index in (0..self.graph.modules.len()).rev() {
                 if dependents[index].iter().any(|consumer| !drained[*consumer]) {
                     ready = false;
+                    blocked.push(index);
                     continue;
                 }
                 match self.graph.modules[index].quiesce() {
                     Ok(module_ready) => {
                         drained[index] = module_ready;
                         ready &= module_ready;
+                        if !module_ready {
+                            waiting.push(index);
+                        }
                     }
                     Err(error) => {
                         ready = false;
+                        waiting.push(index);
                         poll_error.get_or_insert(error);
                     }
                 }
@@ -430,10 +437,28 @@ impl LoadedComponents {
                 let failure = poll_error
                     .or(progress_error)
                     .or_else(|| self.shutdown_prepare_error.clone());
-                return Err(match failure {
-                    Some(error) => format!("module drain deadline elapsed: {error}"),
-                    None => "module drain deadline elapsed".into(),
-                });
+                let waiting = waiting
+                    .iter()
+                    .map(|index| self.graph.modules[*index].id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let blocked = blocked
+                    .iter()
+                    .map(|index| {
+                        let consumers = dependents[*index]
+                            .iter()
+                            .filter(|consumer| !drained[**consumer])
+                            .map(|consumer| self.graph.modules[*consumer].id.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        format!("{} <- [{consumers}]", self.graph.modules[*index].id)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                let detail = failure.map_or_else(String::new, |error| format!(": {error}"));
+                return Err(format!(
+                    "module drain deadline elapsed{detail}; waiting=[{waiting}]; blocked=[{blocked}]"
+                ));
             }
             // Quiesce is a repeated progress poll. A failed participant must
             // not prevent independent consumers from draining their effects,

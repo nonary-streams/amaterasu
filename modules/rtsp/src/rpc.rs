@@ -29,6 +29,7 @@ pub struct Call {
 }
 
 impl Call {
+    #[cfg(test)]
     pub fn new(payload: Value, operation: String, parent: Option<u64>) -> Self {
         Self::for_service("amaterasu.stream-session/1", payload, operation, parent)
     }

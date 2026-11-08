@@ -58,6 +58,7 @@ members = [
     "modules/nvhttp",
     "modules/remote-session",
     "modules/display",
+    "modules/display-settings",
     "modules/launch",
     "modules/input",
     "modules/virtual-display",

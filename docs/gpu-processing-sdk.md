@@ -103,12 +103,11 @@ claiming an end-to-end total.
 ## Lifecycle participation and source range
 
 The versioned `processing_intent` API describes pipeline participation separately
-from the effect's settings. Version 1.1 adds optional `output_hdr` to the existing
-`target`, `revision`, and `settings` request. Trusted composition selects
-`interface_minor: 1` in both the lifecycle `processing_policy` and stream-session
-`processing_plan`; omitted versions remain 1.0 and receive the original request
-shape. Consumers build either request with the shared SDK's
-`processing_intent_payload` helper.
+from the effect's settings. The selected binding identifies the interface and
+version independently from its service alias. The SDK composition supplies the
+selected provider and settings to each participant; provider-private settings
+remain separate. A native-only selection instead supplies explicit per-stream
+settings to the frame consumer and needs no lifecycle or settings registry.
 
 The selected provider's successful reply declares the source and output ranges
 independently. For example, an SDR-to-HDR effect returns these fields alongside
@@ -118,15 +117,20 @@ the echoed target/revision, selected processor service, and processor settings:
 {"enabled":true,"source_hdr_required":false,"output_hdr_required":true}
 ```
 
-The session provider uses that frozen source requirement when creating its
-owned virtual display, including a shared source retained for additional
-clients. Video and the encoder retain the negotiated output range. Joining
-clients reuse the source's recorded range; their output requests do not
-reconfigure it. With processing bypassed, capture follows the output range.
-Providers declare requirements through this contract; they do not need display
-provider identities, OS handles, or direct display mutation. The same unchanged
-session consumer accepts independently selected processing providers and their
-different source-range requirements.
+The source/output requirements validate frame formats. A composition that needs
+display adjustments selects a compatible [Display Settings SDK](display-settings-sdk.md)
+provider. After source allocation, the host invokes the plugin's generic
+`prepare_source` hook; RTX HDR acquires a scoped SDR display lease through that
+provider. The session scheduler coordinates the scope lifetime without
+interpreting the adjustment. An already suitable SDR source needs no display
+adjustment provider.
+
+The release tool accepts explicitly approved native and API bindings for
+independently packaged providers. Each binding adds the selected provider's exact
+version as a signed dependency, so consumers retire before that provider. The
+typed SDK binding still verifies interface identity at runtime. Optional profile
+providers absent from the trusted composition are omitted from the package;
+providers still selected by policy cannot be omitted.
 
 For an HDR output, a provider can return `enabled: true` to reserve its processing
 path while its own effect switch is false. It must still supply matching source
@@ -139,3 +143,51 @@ that output; its enable option is a `live_action` at all supported scopes.
 The [RTX HDR module](../modules/rtx-hdr/README.md) implements this interface using
 NVIDIA TrueHDR. The SDK replacement tests cover independently implemented processors, sink
 backpressure, retained output and ordered teardown.
+
+
+## Local SDK and a separately built processor
+
+Create a new local workspace and build the included example; no SDK publication
+is needed:
+
+```sh
+python3 /path/to/amaterasu/scripts/create-processing-sdk.py /absolute/path/to/sdk-workspace
+cd /absolute/path/to/sdk-workspace
+cargo build -p example-frame-processor
+```
+
+`modules/example-frame-processor/component-linux.json` is the complete component
+template; `selection.json` supplies the exact provider, consumer, versioned
+contracts, explicit frame settings and absent optional capabilities. The example
+is an SDR pass-through, not an HDR effect. It uses the SDK factory and preserves
+source reference ownership through cancellation. A separate RTX HDR checkout
+can be built in `modules/rtx-hdr`, as its README describes.
+
+For an isolated development installation, build the ordinary Linux session
+artifacts first, then create and inspect a review candidate:
+
+```sh
+amaterasu-release init-linux-session DEVROOT --external-extension-composition
+BOOTSTRAP_SHA256=$(sha256sum DEVROOT/bootstrap.json | cut -d' ' -f1)
+amaterasu-release prepare-processing-bootstrap DEVROOT "$BOOTSTRAP_SHA256" REVIEW.json \
+  /absolute/path/to/sdk-workspace/modules/example-frame-processor/selection.json \
+  /absolute/path/to/sdk-workspace/modules/example-frame-processor/component-linux.json \
+  /absolute/path/to/sdk-workspace/modules/example-frame-processor/settings.json
+```
+
+`REVIEW.json` contains the proposed grants and `candidate_bootstrap`; it does not
+change the installation. After reviewing it, use the candidate as the bootstrap
+of that disposable development root. Then build a signed package using its local
+development key:
+
+```sh
+amaterasu-release pack-linux-session DEVROOT ARTIFACTS PACKAGE 1 \
+  --external-component /absolute/path/to/sdk-workspace/modules/example-frame-processor/component-linux.json \
+  /absolute/path/to/sdk-workspace/target/debug/libexample_frame_processor.so
+amaterasu-release verify DEVROOT PACKAGE
+```
+
+For a production RTX HDR installation, use the RTX-specific policy review and
+approved local publisher described in the [RTX HDR README](../modules/rtx-hdr/README.md),
+then use the normal [local signed package update](local-package-updates.md) flow.
+The generic review command does not itself approve or activate a production policy.

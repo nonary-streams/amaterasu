@@ -43,6 +43,8 @@ pub(super) struct Entry {
     pub virtual_display: Option<VirtualDisplayRecovery>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shared_capture: Option<super::shared_capture::Source>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_scope: Option<super::shared_capture::SettingsScope>,
     pub display_attempted: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_operation_id: Option<String>,
@@ -176,14 +178,14 @@ impl Entry {
                             .map(|candidate| candidate.plan_revision)
                     }),
                     preparation: record.restart_lifecycle_preparation.clone().or_else(|| {
-                        (record.owner == "amaterasu.rtsp"
-                            && record.config.lifecycle_capture_mode.is_external())
-                        .then(|| PreparationRecovery {
-                            operation_id: format!(
-                                "{}-lifecycle-prepare",
-                                record.config.operation_id
-                            ),
-                            caller: record.owner.clone(),
+                        record.config.lifecycle_capture_mode.is_external().then(|| {
+                            PreparationRecovery {
+                                operation_id: format!(
+                                    "{}-lifecycle-prepare",
+                                    record.config.operation_id
+                                ),
+                                caller: record.owner.clone(),
+                            }
                         })
                     }),
                 },
@@ -209,6 +211,7 @@ impl Entry {
                 .shared_capture_attached
                 .then(|| record.shared_capture.clone())
                 .flatten(),
+            source_scope: record.source_scope.clone(),
             display_attempted: record.display_attempted,
             display_operation_id: record.display_attempted.then(|| record.display_operation()),
             legacy_effect_pending: false,
@@ -218,6 +221,12 @@ impl Entry {
 
     pub fn validate(&self) -> bool {
         self.providers.validate().is_ok()
+            && (self.lifecycle_recovery.is_none() || self.providers.lifecycle.is_some())
+            && (self.source_scope.is_none() || self.providers.lifecycle.is_some())
+            && self
+                .source_scope
+                .as_ref()
+                .is_none_or(super::shared_capture::SettingsScope::valid)
             && self.record_id != 0
             && !self.owner.is_empty()
             && self.owner.len() <= 128
@@ -272,8 +281,7 @@ impl Entry {
                 || recovery.plan_revision.is_some()
                 || (recovery.stream_target.is_none()
                     && recovery.preparation.as_ref().is_none_or(|preparation| {
-                        preparation.caller != "amaterasu.rtsp"
-                            || preparation.caller != self.owner
+                        preparation.caller != self.owner
                             || amaterasu_extension_api::validate_stream_preparation_lookup(
                                 &preparation.lookup(&recovery.session_target),
                             )
@@ -300,6 +308,7 @@ impl Entry {
             // The coordinator verifies the old epoch and exact consumer scope.
             record.lifecycle_fenced = true;
         }
+        record.source_scope = self.source_scope.clone();
         record.providers = self.providers.clone();
         record.attempted = self
             .attempted_resources
@@ -678,6 +687,7 @@ mod tests {
     #[test]
     fn lifecycle_marker_survives_restart_and_blocks_legacy_recovery() {
         let mut record = record();
+        record.providers.lifecycle = Some("amaterasu.session-lifecycle/1".into());
         record.config.lifecycle_session_target = Some(serde_json::from_value(json!({"kind":"session","host_epoch":"epoch","session_id":"session","generation":1})).unwrap());
         let entry = Entry::from_record(&record);
         let encoded = serde_json::to_value(&entry).unwrap();

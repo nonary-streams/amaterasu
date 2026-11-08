@@ -13,13 +13,15 @@ mod responses;
 mod rpc;
 mod session_effects;
 mod shared_capture;
+mod source_preparation;
 #[cfg(test)]
 mod tests;
 mod virtual_display;
 mod workflow;
 
+#[cfg(test)]
+use crate::SERVICE;
 use crate::{
-    SERVICE,
     model::{Operation, Settings},
     plane::{
         FeedbackEnqueueError, FeedbackEnqueueOutcome, Handles, Plane, Progress as PlaneProgress,
@@ -78,6 +80,7 @@ type Factory<'a> = dyn FnMut(Handles, &crate::providers::ProviderServices) -> Re
 
 pub struct Pipeline {
     settings: Settings,
+    service: String,
     records: BTreeMap<u64, Record>,
     job: Option<Job>,
     sequence: u64,
@@ -104,10 +107,12 @@ pub struct Pipeline {
 }
 
 impl Pipeline {
-    pub fn new(settings: Settings) -> Result<Self, &'static str> {
+    pub fn new(settings: Settings, service: String) -> Result<Self, &'static str> {
         settings.validate()?;
+        settings.providers.validate_for_owner(&service)?;
         Ok(Self {
             settings,
+            service,
             records: BTreeMap::new(),
             job: None,
             sequence: 0,
@@ -136,7 +141,7 @@ impl Pipeline {
 
     #[cfg(test)]
     pub(super) fn new_for_test(settings: Settings) -> Result<Self, &'static str> {
-        let mut pipeline = Self::new(settings)?;
+        let mut pipeline = Self::new(settings, crate::SERVICE.into())?;
         pipeline.journal = journal::LifecycleJournal::empty_for_test();
         pipeline.recovery_initialized = true;
         pipeline.recovery_ready = true;
@@ -145,7 +150,7 @@ impl Pipeline {
 
     #[cfg(test)]
     pub(super) fn new_for_restart_test(settings: Settings) -> Result<Self, &'static str> {
-        Self::new(settings)
+        Self::new(settings, crate::SERVICE.into())
     }
 
     fn startup_reconciled(&self) -> bool {
@@ -451,11 +456,11 @@ impl Pipeline {
                     payload,
                     ..
                 } => {
-                    if (service == SERVICE || service == "nonary.stream-status/1")
+                    if (service == self.service || service == "nonary.stream-status/1")
                         && let Ok(operation) = amaterasu_module_sdk::operation_api::decode_delivery(
                             payload,
                             &service,
-                            SERVICE,
+                            &self.service,
                             &crate::public_api_methods(),
                         )
                         .and_then(|payload| {
@@ -508,14 +513,14 @@ impl Pipeline {
                 ..
             } => {
                 self.background_turn = true;
-                if service != SERVICE && service != "nonary.stream-status/1" {
+                if service != self.service && service != "nonary.stream-status/1" {
                     rpc::complete(send, id, error("invalid_service"));
                     return Ok(());
                 }
                 match amaterasu_module_sdk::operation_api::decode_delivery(
                     payload,
                     &service,
-                    SERVICE,
+                    &self.service,
                     &crate::public_api_methods(),
                 )
                 .and_then(|payload| {
@@ -662,7 +667,11 @@ impl Pipeline {
                 self.recovery_ready = false;
                 return Ok(());
             }
-            let record = match entry.recovery_record() {
+            let record = match entry
+                .providers
+                .validate_for_owner(&self.service)
+                .and_then(|()| entry.recovery_record())
+            {
                 Ok(record) => record,
                 Err(_) => {
                     self.recovery_blocked = true;

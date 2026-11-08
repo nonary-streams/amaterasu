@@ -35,6 +35,10 @@ pub enum AddressFamily {
 pub struct Settings {
     pub enabled: bool,
     pub network_provider: Option<String>,
+    #[serde(skip)]
+    pub stream_service: String,
+    #[serde(skip)]
+    pub lifecycle_service: Option<String>,
     pub allow_remote: bool,
     pub bind: SocketAddr,
     pub address_family: Option<AddressFamily>,
@@ -51,6 +55,8 @@ impl Default for Settings {
         Self {
             enabled: false,
             network_provider: None,
+            stream_service: "amaterasu.stream-session/1".into(),
+            lifecycle_service: Some("amaterasu.session-lifecycle/1".into()),
             allow_remote: false,
             bind: SocketAddr::from(([127, 0, 0, 1], DEFAULT_BASE_PORT + RTSP_SETUP_OFFSET)),
             address_family: None,

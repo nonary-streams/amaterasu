@@ -66,6 +66,112 @@ pub(super) fn validate(configuration: &RuntimeConfig) -> Result<(), String> {
         }
     }
 
+    if configuration.processing_compositions.len() > MAX_PRINCIPALS {
+        return Err("too many processing compositions".into());
+    }
+    for (principal, composition) in &configuration.processing_compositions {
+        if !configuration.principals.contains_key(principal) {
+            return Err("processing composition refers to unknown principal".into());
+        }
+        composition.validate().map_err(str::to_owned)?;
+        let payload = serde_json::to_value(composition).map_err(|error| error.to_string())?;
+        if !super::errors::payload_fits(&payload) {
+            return Err("processing composition exceeds payload limit".into());
+        }
+        for caller in &composition.prepared_context_consumers {
+            let lifecycle = composition
+                .lifecycle
+                .as_ref()
+                .ok_or("prepared context has no lifecycle")?;
+            if !configuration
+                .principals
+                .get(caller)
+                .is_some_and(|grants| grants.call.contains(&lifecycle.service))
+            {
+                return Err("prepared context consumer lacks lifecycle approval".into());
+            }
+        }
+        for ancestor in &composition.request_ancestors {
+            if composition.stream_owner.is_none() {
+                return Err("processing request ancestor has no stream owner".into());
+            }
+            let grants = configuration
+                .principals
+                .get(ancestor)
+                .ok_or("processing request ancestor is not selected")?;
+            for binding in [
+                &composition.processor_control,
+                &composition.display_settings,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if !grants.call.contains(&binding.service) {
+                    return Err("processing request ancestor lacks effective approval".into());
+                }
+            }
+        }
+        for caller in composition
+            .lifecycle_admitters
+            .iter()
+            .chain(&composition.history_owners)
+        {
+            let grants = configuration
+                .principals
+                .get(caller)
+                .ok_or("processing caller is not selected")?;
+            let owner = composition
+                .stream_owner
+                .as_ref()
+                .ok_or("processing caller has no stream owner")?;
+            if !grants.call.contains(&owner.service) {
+                return Err("processing caller lacks stream owner grant".into());
+            }
+        }
+        for binding in composition.bindings() {
+            let grants = configuration
+                .principals
+                .get(&binding.principal)
+                .ok_or("processing binding refers to unknown provider")?;
+            if !grants.provide.contains(&binding.service)
+                && !grants.native_provide.contains(&binding.service)
+            {
+                return Err("processing binding refers to an unapproved service".into());
+            }
+        }
+        for registration in &composition.registrations {
+            let grants = configuration
+                .principals
+                .get(&registration.provider)
+                .ok_or("processing registration refers to unknown provider")?;
+            if registration
+                .methods
+                .iter()
+                .any(|method| !grants.provide.contains(&method.service))
+                || registration
+                    .consumers
+                    .iter()
+                    .any(|consumer| !configuration.principals.contains_key(consumer))
+                || registration
+                    .settings_grants
+                    .iter()
+                    .any(|grant| !configuration.principals.contains_key(&grant.caller))
+                || registration
+                    .lifecycle_grants
+                    .iter()
+                    .any(|grant| !configuration.principals.contains_key(&grant.caller))
+                || registration
+                    .depends_on
+                    .iter()
+                    .any(|provider| !configuration.principals.contains_key(provider))
+            {
+                return Err(
+                    "processing registration refers to an unapproved service or consumer".into(),
+                );
+            }
+        }
+    }
+
     for (name, hook) in &configuration.hooks {
         validate_hook(name, hook, configuration)?;
     }

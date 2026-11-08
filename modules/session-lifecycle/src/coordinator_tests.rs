@@ -5,6 +5,56 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+#[test]
+fn targeted_snapshot_stays_bounded_with_large_history_and_checks_authority() {
+    let dir = TestDirectory::new();
+    let mut coordinator = Coordinator::open(&dir.journal()).unwrap();
+    let prepared = coordinator.handle(
+        "transport",
+        "client",
+        json!({"operation":"prepare", "operation_id":"snapshot-seed"}),
+    );
+    let target = prepared["target"].clone();
+    {
+        let mut shared = coordinator.shared.borrow_mut();
+        let seed = shared.value.sessions.values().next().unwrap().clone();
+        for index in 0..1000 {
+            let mut session = seed.clone();
+            session.id = format!("historical-session-{index:04}");
+            session.application_ref = json!("historical-application".repeat(20));
+            shared.value.sessions.insert(session.id.clone(), session);
+        }
+    }
+    let snapshot = coordinator.handle(
+        "transport",
+        "client",
+        json!({"operation":"snapshot", "target":target}),
+    );
+    assert_eq!(snapshot["status"], "ok");
+    assert_eq!(snapshot["sessions"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        snapshot["sessions"][0]["session_id"],
+        prepared["session_id"]
+    );
+    assert!(serde_json::to_vec(&snapshot).unwrap().len() < 16_384);
+    let unscoped = coordinator.handle("transport", "client", json!({"operation":"snapshot"}));
+    assert_eq!(unscoped["reason"], "snapshot_requires_target");
+    let denied = coordinator.handle(
+        "transport",
+        "other",
+        json!({"operation":"snapshot", "target":target}),
+    );
+    assert_eq!(denied["reason"], "permission_denied");
+    let mut stale = target;
+    stale["generation"] = json!(2);
+    let rejected = coordinator.handle(
+        "transport",
+        "client",
+        json!({"operation":"snapshot", "target":stale}),
+    );
+    assert_eq!(rejected["reason"], "stale_generation");
+}
+
 struct TestDirectory(std::path::PathBuf);
 
 impl TestDirectory {

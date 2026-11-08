@@ -1,6 +1,7 @@
 //! Reviewable systemd --user service artifacts for an already active, signed
 //! LinuxSession package. Generation never installs or starts the unit.
 
+#[cfg(test)]
 use crate::profiles::PackageProfile;
 #[cfg(test)]
 use amaterasu_package::linux_user_unit::systemd_quote;
@@ -79,7 +80,18 @@ pub fn prepare(
     {
         return Err("active package is not the selected signed LinuxSession package".into());
     }
-    validate_linux_session_composition(&verified.manifest.components)?;
+    validate_linux_session_composition(&verified.manifest.components, &verified.runtime_config)?;
+    if verified
+        .manifest
+        .components
+        .iter()
+        .any(|component| component.id == "amaterasu.rtx-hdr")
+    {
+        crate::rtx_repository_publisher::check_composition(
+            &verified.manifest,
+            &verified.runtime_config,
+        )?;
+    }
     if host_executable_sha256(&host_executable)? != expected_host_digest {
         return Err("host executable changed during service artifact preparation".into());
     }
@@ -206,31 +218,20 @@ pub fn preflight(
     {
         return Err("active package is not the selected signed LinuxSession package".into());
     }
-    validate_linux_session_composition(&verified.manifest.components)?;
+    validate_linux_session_composition(&verified.manifest.components, &verified.runtime_config)?;
     let rtx_selected = verified
         .manifest
         .components
         .iter()
         .any(|component| component.id == "amaterasu.rtx-hdr");
-    let authority_request = verified.privileged_requests.iter().any(|request| {
-        request.component == "amaterasu.capture-vkms"
-            && request.operation == amaterasu_package::PrivilegedOperation::VkmsFrameExportV1
-    });
-    if let Some(helper) = validate_rtx_capture_configuration(
-        &verified.runtime_config.settings,
-        rtx_selected,
-        authority_request,
-    )? {
-        let helper = existing_path(&helper, "RTX HDR frame helper", false)?;
-        validate_executable(&helper)?;
+    if rtx_selected {
+        crate::rtx_repository_publisher::check_composition(
+            &verified.manifest,
+            &verified.runtime_config,
+        )?;
     }
     if rtx_selected {
-        println!(
-            "[ok] RTX HDR requires immutable VKMS snapshots and an explicitly selected helper"
-        );
-        println!(
-            "[info] capture/helper build features, leased driver ioctl, and GPU processing require runtime validation"
-        );
+        println!("[info] RTX HDR capture and encoder compatibility require runtime negotiation");
     }
     let expected_unit = render_service_unit(
         &host_executable,
@@ -257,32 +258,35 @@ pub fn preflight(
         "[ok] loader and desktop session environment matches the target user's systemd manager"
     );
 
-    let encoder = verified
+    if let Some(encoder) = verified
         .manifest
         .components
         .iter()
         .find(|component| component.id == "amaterasu.encode")
-        .ok_or("signed LinuxSession package has no encoder component")?;
-    let encoder_bytes = read_bounded(&package_path.join(&encoder.file), 256 * 1024 * 1024)?;
-    let x264_build = crate::development::embedded_x264_build(&encoder_bytes)
-        .ok_or("active encoder has no embedded software-x264 ABI marker")?;
-    if !crate::development::x264_runtime_available(x264_build) {
-        return Err(format!(
-            "loader cannot find a compatible system x264 runtime for build {x264_build}"
-        ));
-    }
-    println!(
-        "[ok] signed active LinuxSession package {active_digest} verified; x264 ABI {x264_build} is loader-visible"
-    );
-    if let Some((avcodec, avutil)) = crate::development::embedded_ffmpeg_abi(&encoder_bytes)? {
-        if !crate::development::ffmpeg_runtime_available(avcodec, avutil) {
+    {
+        let encoder_bytes = read_bounded(&package_path.join(&encoder.file), 256 * 1024 * 1024)?;
+        let x264_build = crate::development::embedded_x264_build(&encoder_bytes)
+            .ok_or("active encoder has no embedded software-x264 ABI marker")?;
+        if !crate::development::x264_runtime_available(x264_build) {
             return Err(format!(
-                "loader cannot find compatible system FFmpeg runtimes for avcodec {avcodec} and avutil {avutil}"
+                "loader cannot find a compatible system x264 runtime for build {x264_build}"
             ));
         }
         println!(
-            "[ok] optional FFmpeg NVENC encoder ABI avcodec {avcodec}/avutil {avutil} is loader-visible"
+            "[ok] signed active LinuxSession package {active_digest} verified; x264 ABI {x264_build} is loader-visible"
         );
+        if let Some((avcodec, avutil)) = crate::development::embedded_ffmpeg_abi(&encoder_bytes)? {
+            if !crate::development::ffmpeg_runtime_available(avcodec, avutil) {
+                return Err(format!(
+                    "loader cannot find compatible system FFmpeg runtimes for avcodec {avcodec} and avutil {avutil}"
+                ));
+            }
+            println!(
+                "[ok] optional FFmpeg NVENC encoder ABI avcodec {avcodec}/avutil {avutil} is loader-visible"
+            );
+        }
+    } else {
+        println!("[info] selected encoder compatibility requires runtime negotiation");
     }
 
     if let Some(video) = verified
@@ -368,76 +372,6 @@ fn setting_enabled(
         .and_then(|value| value.get("enabled"))
         .and_then(serde_json::Value::as_bool)
         == Some(true)
-}
-
-/// Check only signed profile configuration. Actual capture and helper features
-/// are checked by the provider and wire handshake; driver support requires a
-/// real frame export and cannot be established from package filenames.
-fn validate_rtx_capture_configuration(
-    settings: &std::collections::BTreeMap<String, serde_json::Value>,
-    rtx_selected: bool,
-    authority_request: bool,
-) -> PackageResult<Option<PathBuf>> {
-    if !rtx_selected {
-        return Ok(None);
-    }
-    let video = settings
-        .get(crate::profiles::linux_session::VIDEO_COMPONENT_ID)
-        .and_then(serde_json::Value::as_object)
-        .ok_or("RTX HDR requires the Linux session video settings")?;
-    if video
-        .get("gpu_processor_service")
-        .and_then(serde_json::Value::as_str)
-        != Some("amaterasu.rtx-hdr/1")
-        || video
-            .get("gpu_processor_opt_in")
-            .and_then(serde_json::Value::as_bool)
-            != Some(true)
-    {
-        return Err("RTX HDR signed profile must select the opt-in GPU processor".into());
-    }
-    let capture = settings
-        .get("amaterasu.capture-vkms")
-        .and_then(serde_json::Value::as_object)
-        .ok_or("RTX HDR requires VKMS capture settings")?;
-    if capture.get("enabled").and_then(serde_json::Value::as_bool) != Some(true)
-        || capture
-            .get("gpu_snapshot")
-            .and_then(serde_json::Value::as_bool)
-            != Some(true)
-        || capture
-            .get("require_lease")
-            .and_then(serde_json::Value::as_bool)
-            != Some(true)
-        || !capture
-            .get("capture_principals")
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(|principals| {
-                principals.iter().any(|principal| {
-                    principal == crate::profiles::linux_session::VIDEO_COMPONENT_ID
-                })
-            })
-    {
-        return Err(
-            "RTX HDR requires enabled VKMS capture, GPU snapshots and immutable driver leases"
-                .into(),
-        );
-    }
-    let authority = capture
-        .get("authority_channel")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    let helper = capture
-        .get("frame_helper")
-        .and_then(serde_json::Value::as_str);
-    match (authority, helper) {
-        (true, None) if authority_request => Ok(None),
-        (false, Some(path)) if !path.is_empty() => Ok(Some(PathBuf::from(path))),
-        (true, None) => {
-            Err("RTX HDR authority capture requires a signed VKMS helper request".into())
-        }
-        _ => Err("RTX HDR requires exactly one configured VKMS helper or authority channel".into()),
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -900,27 +834,59 @@ fn check_existing_ancestors_for_symlinks(path: &Path) -> PackageResult<()> {
 
 fn validate_linux_session_composition(
     components: &[amaterasu_package::ComponentManifest],
+    policy: &amaterasu_contracts::RuntimeConfig,
 ) -> PackageResult<()> {
-    let actual = components
+    let ids = components
         .iter()
         .map(|component| component.id.as_str())
         .collect::<BTreeSet<_>>();
-    let supported_profiles = [
-        PackageProfile::LinuxSession,
-        PackageProfile::LinuxSessionRtxHdr,
-    ];
-    if supported_profiles.into_iter().any(|profile| {
-        let expected = profile
-            .components()
-            .iter()
-            .map(|component| component.id)
-            .collect::<BTreeSet<_>>();
-        actual == expected && components.len() == expected.len()
-    }) {
-        Ok(())
-    } else {
-        Err("signed package does not match a supported LinuxSession composition".into())
+    if ids.len() != components.len() || components.iter().filter(|c| c.runtime).count() != 1 {
+        return Err("invalid Linux session component identities".into());
     }
+    let mut graphs = policy
+        .processing_compositions
+        .iter()
+        .filter_map(|(principal, view)| {
+            view.processor
+                .as_ref()
+                .filter(|processor| &processor.principal == principal)
+                .map(|_| view)
+        });
+    let graph = graphs.next();
+    if graphs.next().is_some() {
+        return Err("Linux session has multiple processing selections".into());
+    }
+    let stream = graph
+        .and_then(|view| view.stream_owner.as_ref())
+        .map_or("amaterasu.stream-session/1", |binding| {
+            binding.service.as_str()
+        });
+    let video = graph
+        .and_then(|view| view.frame_consumer.as_ref())
+        .map_or("amaterasu.video/1", |binding| binding.service.as_str());
+    for service in [
+        "amaterasu.management/1",
+        "amaterasu.nvhttp/1",
+        "amaterasu.rtsp/1",
+        stream,
+        video,
+    ] {
+        if components
+            .iter()
+            .filter(|component| {
+                component.requested.provide.contains(service)
+                    && policy
+                        .principals
+                        .get(&component.id)
+                        .is_some_and(|grants| grants.provide.contains(service))
+            })
+            .count()
+            != 1
+        {
+            return Err(format!("Linux session requires one provider of {service}"));
+        }
+    }
+    Ok(())
 }
 
 fn existing_path(path: &Path, description: &str, directory: bool) -> PackageResult<PathBuf> {
@@ -1265,7 +1231,6 @@ The generated service scripts affect only the current user service directory sel
 #[cfg(test)]
 mod tests {
     use super::*;
-    use amaterasu_contracts::Grants;
     use amaterasu_package::ComponentManifest;
 
     #[test]
@@ -1820,48 +1785,6 @@ esac
     }
 
     #[test]
-    fn rtx_preflight_rejects_unqualified_capture_and_missing_authority() {
-        use serde_json::json;
-        let mut settings = std::collections::BTreeMap::from([
-            (
-                crate::profiles::linux_session::VIDEO_COMPONENT_ID.to_owned(),
-                json!({
-                    "gpu_processor_service":"amaterasu.rtx-hdr/1", "gpu_processor_opt_in":true
-                }),
-            ),
-            (
-                "amaterasu.capture-vkms".to_owned(),
-                json!({
-                    "enabled":true, "gpu_snapshot":true, "require_lease":true,
-                    "capture_principals":[crate::profiles::linux_session::VIDEO_COMPONENT_ID],
-                    "authority_channel":true
-                }),
-            ),
-        ]);
-        assert!(validate_rtx_capture_configuration(&settings, false, false).is_ok());
-        assert!(validate_rtx_capture_configuration(&settings, true, false).is_err());
-        assert_eq!(
-            validate_rtx_capture_configuration(&settings, true, true).unwrap(),
-            None
-        );
-        settings.get_mut("amaterasu.capture-vkms").unwrap()["gpu_snapshot"] = json!(false);
-        assert!(validate_rtx_capture_configuration(&settings, true, true).is_err());
-        settings.get_mut("amaterasu.capture-vkms").unwrap()["gpu_snapshot"] = json!(true);
-        settings.get_mut("amaterasu.capture-vkms").unwrap()["require_lease"] = json!(false);
-        assert!(validate_rtx_capture_configuration(&settings, true, true).is_err());
-        settings.get_mut("amaterasu.capture-vkms").unwrap()["require_lease"] = json!(true);
-        settings.get_mut("amaterasu.capture-vkms").unwrap()["authority_channel"] = json!(false);
-        settings.get_mut("amaterasu.capture-vkms").unwrap()["frame_helper"] =
-            json!("/usr/libexec/amaterasu-vkms-frame-helper");
-        assert_eq!(
-            validate_rtx_capture_configuration(&settings, true, false).unwrap(),
-            Some(PathBuf::from("/usr/libexec/amaterasu-vkms-frame-helper"))
-        );
-        settings.get_mut("amaterasu.capture-vkms").unwrap()["authority_channel"] = json!(true);
-        assert!(validate_rtx_capture_configuration(&settings, true, true).is_err());
-    }
-
-    #[test]
     fn loader_checks_follow_actual_linux_session_capture_settings() {
         let root = std::env::temp_dir().join(format!(
             "amaterasu-linux-session-preflight-settings-{}-{}",
@@ -1924,7 +1847,7 @@ esac
     }
 
     #[test]
-    fn package_composition_must_match_exact_linux_session_component_set() {
+    fn package_composition_accepts_extra_or_omitted_optional_providers() {
         for profile in [
             PackageProfile::LinuxSession,
             PackageProfile::LinuxSessionRtxHdr,
@@ -1941,13 +1864,41 @@ esac
                     abi_major: 1,
                     runtime: component.id == "amaterasu.runtime",
                     requires: Default::default(),
-                    requested: Grants::default(),
+                    requested: component.grants(),
                 })
                 .collect::<Vec<_>>();
-            assert!(validate_linux_session_composition(&manifests).is_ok());
-            assert!(validate_linux_session_composition(&manifests[..manifests.len() - 1]).is_err());
+            let mut policy = amaterasu_contracts::RuntimeConfig {
+                principals: manifests
+                    .iter()
+                    .map(|component| (component.id.clone(), component.requested.clone()))
+                    .collect(),
+                ..Default::default()
+            };
+            assert!(validate_linux_session_composition(&manifests, &policy).is_ok());
+            manifests.retain(|component| component.id != "amaterasu.frame-limiter");
+            assert!(validate_linux_session_composition(&manifests, &policy).is_ok());
+            let video = manifests
+                .iter()
+                .position(|component| component.requested.provide.contains("amaterasu.video/1"))
+                .unwrap();
+            let mut no_video = manifests.clone();
+            no_video.remove(video);
+            assert!(validate_linux_session_composition(&no_video, &policy).is_err());
+            policy
+                .principals
+                .get_mut(&manifests[video].id)
+                .unwrap()
+                .provide
+                .remove("amaterasu.video/1");
+            assert!(validate_linux_session_composition(&manifests, &policy).is_err());
+            policy
+                .principals
+                .get_mut(&manifests[video].id)
+                .unwrap()
+                .provide
+                .insert("amaterasu.video/1".into());
             manifests.push(manifests[0].clone());
-            assert!(validate_linux_session_composition(&manifests).is_err());
+            assert!(validate_linux_session_composition(&manifests, &policy).is_err());
         }
     }
 

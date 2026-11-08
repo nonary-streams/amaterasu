@@ -99,13 +99,29 @@ enum Stage {
     },
 }
 
-#[derive(Default)]
 pub struct SettingsService {
     store: Store,
     pending: BTreeMap<u64, Pending>,
+    lifecycle_service: Option<String>,
+}
+
+impl Default for SettingsService {
+    fn default() -> Self {
+        Self::new(Some(
+            amaterasu_extension_api::SESSION_LIFECYCLE_SERVICE.into(),
+        ))
+    }
 }
 
 impl SettingsService {
+    pub fn new(lifecycle_service: Option<String>) -> Self {
+        Self {
+            store: Store::default(),
+            pending: BTreeMap::new(),
+            lifecycle_service,
+        }
+    }
+
     pub fn accept(
         &mut self,
         runtime: &RuntimeClient,
@@ -792,8 +808,15 @@ impl SettingsService {
                 .as_millis()
                 .min(30_000) as u64;
             let payload = json!({"operation":"resolve_settings_scope","operation_id":operation_id,"target":target,"scope":kind,"scope_id":scope_id,"access":"read","source":{"caller":pending.source_caller,"initiator":pending.source_initiator},"input_binding":input_binding,"input_boot_epoch":input_boot_epoch});
+            let Some(service) = &self.lifecycle_service else {
+                completed.push((
+                    *id,
+                    discovery::failure("permission_denied", "scope authority unavailable"),
+                ));
+                continue;
+            };
             match runtime.send(Command::Request {
-                service: "amaterasu.session-lifecycle/1".into(),
+                service: service.clone(),
                 payload,
                 timeout_ms: remaining_ms.max(1),
                 operation_id,

@@ -3,7 +3,7 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
 
-use super::errors::{capacity_exhausted, not_found, payload_fits, permission_denied};
+use super::errors::{capacity_exhausted, not_found, payload_fits, permission_denied, result_fits};
 
 const MAX_RETAINED_REQUESTS: usize = 512;
 const RESULT_RETENTION: Duration = Duration::from_secs(300);
@@ -496,7 +496,7 @@ impl RequestRouter {
                 "completion arrived after the request ended",
             );
         }
-        if !payload_fits(&payload) {
+        if !result_fits(&payload) {
             return Response::error("invalid_request", "result payload is too large");
         }
         if request

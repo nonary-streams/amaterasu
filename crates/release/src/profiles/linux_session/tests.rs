@@ -995,20 +995,12 @@ fn rtx_hdr_composition_is_explicit_and_authorizes_the_processor() {
         .iter()
         .find(|component| component.id == "amaterasu.foreground-context")
         .unwrap();
-    assert!(provider.calls.contains(&"amaterasu.foreground-context/1"));
-    assert!(provider.dependencies.contains(&foreground.id));
+    assert!(!provider.dependencies.contains(&foreground.id));
+    assert!(!enabled.principals.contains_key(foreground.id));
     assert!(
-        enabled.principals[provider.id]
-            .call
-            .contains("amaterasu.foreground-context/1")
-    );
-    assert_eq!(
-        enabled.settings[provider.id]["foreground_context_service"],
-        "amaterasu.foreground-context/1"
-    );
-    assert_eq!(
-        enabled.settings[foreground.id]["allowed_principals"],
-        json!([provider.id])
+        enabled.settings[provider.id]
+            .get("foreground_context_service")
+            .is_none()
     );
     assert!(!default.principals.contains_key(foreground.id));
     assert!(video.native_uses.contains(&"amaterasu.rtx-hdr/1"));
@@ -1030,8 +1022,9 @@ fn rtx_hdr_composition_is_explicit_and_authorizes_the_processor() {
             .native_provide
             .contains("amaterasu.rtx-hdr/1")
     );
+    let video_view = &enabled.processing_compositions[VIDEO_COMPONENT_ID];
     assert_eq!(
-        enabled.settings[VIDEO_COMPONENT_ID]["gpu_processor_service"],
+        video_view.processor.as_ref().unwrap().service,
         "amaterasu.rtx-hdr/1"
     );
     assert_eq!(
@@ -1041,77 +1034,60 @@ fn rtx_hdr_composition_is_explicit_and_authorizes_the_processor() {
     assert_eq!(enabled.settings[provider.id]["max_streams"], 2);
     assert!(
         enabled.settings[VIDEO_COMPONENT_ID]
-            .get("require_frame_lease")
+            .get("gpu_processor_service")
             .is_none()
     );
-    assert_eq!(
-        enabled.settings[VIDEO_COMPONENT_ID]["gpu_processor_opt_in"],
-        true
+    assert!(
+        enabled.settings[VIDEO_COMPONENT_ID]
+            .get("gpu_processor_opt_in")
+            .is_none()
     );
-    assert_eq!(
-        enabled.settings["amaterasu.capture-vkms"]["gpu_snapshot"],
-        true
+    assert!(
+        enabled.settings["amaterasu.capture-vkms"]
+            .get("gpu_snapshot")
+            .is_none()
     );
-    assert_eq!(
-        enabled.settings["amaterasu.capture-vkms"]["require_lease"],
-        true
+    assert!(
+        enabled.settings["amaterasu.capture-vkms"]
+            .get("require_lease")
+            .is_none()
     );
+    let owner = &enabled.processing_compositions["amaterasu.stream-session"];
     assert_eq!(
-        enabled.settings["amaterasu.stream-session"]["processing_plan"]["provider"],
+        owner.processor.as_ref().unwrap().principal,
         "amaterasu.rtx-hdr"
     );
+    assert_eq!(owner.processor_control.as_ref().unwrap().interface_minor, 1);
+    let lifecycle = &enabled.processing_compositions["amaterasu.session-lifecycle"];
     assert_eq!(
-        enabled.settings["amaterasu.stream-session"]["processing_plan"]["omit_disabled"],
-        true
-    );
-    for (component, key) in [
-        ("amaterasu.stream-session", "processing_plan"),
-        ("amaterasu.session-lifecycle", "processing_policy"),
-    ] {
-        assert_eq!(enabled.settings[component][key]["interface_minor"], 1);
-    }
-    assert_eq!(
-        enabled.settings["amaterasu.session-lifecycle"]["processing_policy"]["processor_service"],
+        lifecycle.processor.as_ref().unwrap().service,
         "amaterasu.rtx-hdr/1"
     );
-    assert!(enabled.settings["amaterasu.session-lifecycle"]["provider_settings_readers"]["amaterasu.stream-session"].as_array().unwrap().contains(&json!("amaterasu.rtx-hdr")));
-    let lifecycle = &enabled.settings["amaterasu.session-lifecycle"];
     assert!(
-        lifecycle["trusted_callers"]
-            .as_array()
-            .unwrap()
-            .contains(&json!(VIDEO_COMPONENT_ID))
-    );
-    assert!(
-        lifecycle["operation_grants"][VIDEO_COMPONENT_ID]
-            .as_array()
-            .unwrap()
-            .contains(&json!("read_live_provider_settings"))
-    );
-    assert!(
-        lifecycle["provider_settings_readers"][VIDEO_COMPONENT_ID]
-            .as_array()
-            .unwrap()
-            .contains(&json!("amaterasu.rtx-hdr"))
-    );
-    assert!(
-        default.settings["amaterasu.session-lifecycle"]["provider_settings_readers"]
-            .get(VIDEO_COMPONENT_ID)
-            .is_none()
-    );
-    assert!(
-        enabled.settings["amaterasu.session-lifecycle"]["participants"]
-            .as_array()
-            .unwrap()
+        lifecycle
+            .registrations
             .iter()
-            .any(|participant| participant["provider"] == "amaterasu.rtx-hdr")
+            .any(|entry| entry.provider == "amaterasu.rtx-hdr")
     );
     assert!(
-        enabled.settings["amaterasu.extension-registry"]["descriptors"]
-            .as_array()
-            .unwrap()
+        lifecycle.registrations[0]
+            .lifecycle_grants
             .iter()
-            .any(|descriptor| descriptor["descriptor"]["provider"] == "amaterasu.rtx-hdr")
+            .any(|grant| grant.caller == VIDEO_COMPONENT_ID && grant.read_live_settings)
+    );
+    assert!(
+        enabled.processing_compositions["amaterasu.extension-registry"]
+            .registrations
+            .iter()
+            .any(|entry| entry.provider == "amaterasu.rtx-hdr")
+    );
+    assert_eq!(
+        enabled.settings["amaterasu.session-lifecycle"],
+        default.settings["amaterasu.session-lifecycle"]
+    );
+    assert_eq!(
+        enabled.settings["amaterasu.extension-registry"],
+        default.settings["amaterasu.extension-registry"]
     );
     for approval in enabled
         .api_methods
@@ -1144,7 +1120,40 @@ fn rtx_hdr_composition_is_explicit_and_authorizes_the_processor() {
             .any(|approval| approval.provider == "amaterasu.rtx-hdr"
                 && approval.method.method == "processing_intent")
     );
-    assert_eq!(RTX_HDR_COMPONENTS.len(), COMPONENTS.len() + 2);
+    // Validate the complete API/grant graph and the new provider's settings.
+    // The fixture embeds unrelated extension metadata beyond the broker's
+    // request-sized settings budget; those modules are outside this API check.
+    let mut api_policy = enabled.clone();
+    api_policy
+        .settings
+        .retain(|principal, _| principal == "amaterasu.display-settings");
+    amaterasu_runtime::Broker::new(api_policy)
+        .expect("display SDK API/grant composition must be accepted by the runtime");
+    assert_eq!(RTX_HDR_COMPONENTS.len(), COMPONENTS.len() + 3);
+    assert_eq!(
+        enabled.processing_compositions["amaterasu.stream-session"]
+            .display_settings
+            .as_ref()
+            .unwrap()
+            .service,
+        "nonary.display-settings/1"
+    );
+    assert_eq!(
+        enabled.processing_compositions["amaterasu.rtx-hdr"]
+            .display_settings
+            .as_ref()
+            .unwrap()
+            .service,
+        "nonary.display-settings/1"
+    );
+    assert!(
+        enabled
+            .api_methods
+            .iter()
+            .any(|approval| approval.provider == "amaterasu.display-settings"
+                && approval.method.method == "acquire"
+                && approval.callers.contains("amaterasu.rtx-hdr"))
+    );
     for component in COMPONENTS {
         assert!(
             RTX_HDR_COMPONENTS
@@ -1172,12 +1181,252 @@ fn rtx_hdr_policy_conflicts_leave_existing_policy_unchanged() {
 }
 
 #[test]
-fn rtx_hdr_policy_rejects_missing_capture_helper_without_mutation() {
-    let root = TemporaryRoot::new("rtx-hdr-missing-helper");
+fn rtx_hdr_does_not_require_vkms_or_other_optional_extensions() {
+    let root = TemporaryRoot::new("rtx-hdr-independent");
     let mut policy = linux_session_policy(root.path(), &LinuxSessionOptions::default()).unwrap();
+    policy.settings.remove("amaterasu.capture-vkms");
+    policy.principals.remove("amaterasu.capture-vkms");
+    policy.settings.remove("amaterasu.frame-limiter");
+    policy.principals.remove("amaterasu.frame-limiter");
+    policy
+        .api_methods
+        .retain(|method| method.provider != "amaterasu.frame-limiter");
+    policy
+        .settings
+        .get_mut("amaterasu.extension-registry")
+        .unwrap()["descriptors"] = json!([]);
+    let lifecycle = policy
+        .settings
+        .get_mut("amaterasu.session-lifecycle")
+        .unwrap();
+    lifecycle["participants"] = json!([]);
+    lifecycle["operation_grants"]
+        .as_object_mut()
+        .unwrap()
+        .remove("amaterasu.frame-limiter");
+    lifecycle["trusted_callers"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|caller| caller != "amaterasu.frame-limiter");
+
+    enable_rtx_hdr_with_selection(
+        &mut policy,
+        &root.path().join("runtime"),
+        &ProcessingSelection {
+            display_settings: None,
+            foreground: None,
+            ..default_rtx_hdr_selection()
+        },
+    )
+    .unwrap();
+
+    assert!(!policy.principals.contains_key("amaterasu.capture-vkms"));
+    assert!(!policy.principals.contains_key("amaterasu.frame-limiter"));
+    assert!(
+        !policy
+            .principals
+            .contains_key("amaterasu.foreground-context")
+    );
+    assert!(!policy.principals.contains_key("amaterasu.display-settings"));
+    assert!(
+        policy.settings["amaterasu.rtx-hdr"]
+            .get("foreground_context_service")
+            .is_none()
+    );
+    assert!(
+        policy.settings["amaterasu.rtx-hdr"]
+            .get("display_settings_service")
+            .is_none()
+    );
+    assert_eq!(
+        policy.processing_compositions["amaterasu.stream-session"]
+            .processor
+            .as_ref()
+            .unwrap()
+            .principal,
+        "amaterasu.rtx-hdr"
+    );
+}
+
+#[test]
+fn external_extension_composition_can_start_with_only_rtx_hdr_selected() {
+    let root = TemporaryRoot::new("rtx-hdr-external-composition");
+    let policy = linux_session_policy(
+        root.path(),
+        &LinuxSessionOptions {
+            external_extension_composition: true,
+            rtx_hdr_runtime_directory: Some(root.path().join("runtime")),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    for unrelated in [
+        "amaterasu.frame-limiter",
+        "amaterasu.foreground-context",
+        "amaterasu.display-settings",
+    ] {
+        assert!(!policy.principals.contains_key(unrelated));
+    }
+    let registrations =
+        &policy.processing_compositions["amaterasu.session-lifecycle"].registrations;
+    assert_eq!(registrations.len(), 1);
+    assert_eq!(registrations[0].provider, "amaterasu.rtx-hdr");
+    assert_eq!(
+        policy.processing_compositions["amaterasu.stream-session"]
+            .processor
+            .as_ref()
+            .unwrap()
+            .principal,
+        "amaterasu.rtx-hdr"
+    );
+}
+
+#[test]
+fn rtx_hdr_composes_selected_sdk_providers_and_preserves_other_hooks() {
+    let root = TemporaryRoot::new("rtx-hdr-replacement-providers");
+    let mut policy = linux_session_policy(root.path(), &LinuxSessionOptions::default()).unwrap();
+    let selected = ProcessingSelection {
+        display_settings: Some(CapabilityBinding {
+            principal: "example.display".into(),
+            service: "example.display-settings/1".into(),
+            contract: amaterasu_module_sdk::display_settings::SERVICE.into(),
+            interface_major: 1,
+            interface_minor: 0,
+        }),
+        foreground: Some(CapabilityBinding {
+            principal: "example.foreground".into(),
+            service: "example.foreground/1".into(),
+            contract: amaterasu_module_sdk::foreground_context::SERVICE.into(),
+            interface_major: 1,
+            interface_minor: 0,
+        }),
+        ..default_rtx_hdr_selection()
+    };
+    for provider in [&selected.display_settings, &selected.foreground]
+        .into_iter()
+        .flatten()
+    {
+        policy.principals.insert(
+            provider.principal.clone(),
+            Grants {
+                provide: [provider.service.clone()].into(),
+                ..Default::default()
+            },
+        );
+        policy
+            .settings
+            .insert(provider.principal.clone(), json!({"provider_owned":true}));
+    }
+    let other_hook = json!({"provider":"example.other-effect","service":"example.other-effect/1"});
+    policy.settings.get_mut("amaterasu.stream-session").unwrap()["source_preparation"] =
+        json!({"display_settings_service":"example.display-settings/1","hooks":[other_hook]});
+    let method = amaterasu_module_sdk::display_settings::methods("example.display-settings/1")
+        .into_iter()
+        .find(|method| method.method == "acquire")
+        .unwrap();
+    policy
+        .api_methods
+        .push(amaterasu_contracts::ApiMethodApproval {
+            provider: "example.display".into(),
+            callers: ["example.other-effect".into()].into(),
+            method,
+        });
+
+    enable_rtx_hdr_with_selection(&mut policy, &root.path().join("runtime"), &selected).unwrap();
+
+    assert!(!policy.principals.contains_key("amaterasu.display-settings"));
+    assert!(
+        !policy
+            .principals
+            .contains_key("amaterasu.foreground-context")
+    );
+    assert_eq!(
+        policy.settings["example.display"],
+        json!({"provider_owned":true})
+    );
+    assert_eq!(
+        policy.settings["example.foreground"],
+        json!({"provider_owned":true})
+    );
+    let view = &policy.processing_compositions["amaterasu.rtx-hdr"];
+    assert_eq!(
+        view.display_settings.as_ref().unwrap().service,
+        "example.display-settings/1"
+    );
+    assert_eq!(
+        view.foreground.as_ref().unwrap().service,
+        "example.foreground/1"
+    );
+    let hooks = policy.settings["amaterasu.stream-session"]["source_preparation"]["hooks"]
+        .as_array()
+        .unwrap();
+    assert_eq!(hooks, &[other_hook]);
+    let acquire = policy
+        .api_methods
+        .iter()
+        .find(|approval| {
+            approval.provider == "example.display" && approval.method.method == "acquire"
+        })
+        .unwrap();
+    assert!(acquire.callers.contains("example.other-effect"));
+    assert!(acquire.callers.contains("amaterasu.rtx-hdr"));
+    assert!(acquire.callers.contains("amaterasu.stream-session"));
+    let open = policy
+        .api_methods
+        .iter()
+        .find(|approval| {
+            approval.provider == "example.display" && approval.method.method == "open_scope"
+        })
+        .unwrap();
+    assert!(open.callers.contains("amaterasu.stream-session"));
+    assert!(!open.callers.contains("amaterasu.rtx-hdr"));
+}
+
+#[test]
+fn rtx_hdr_rejects_an_unapproved_or_incompatible_selected_provider_atomically() {
+    let root = TemporaryRoot::new("rtx-hdr-invalid-capability");
+    let mut policy = linux_session_policy(root.path(), &LinuxSessionOptions::default()).unwrap();
+    let selected = ProcessingSelection {
+        display_settings: Some(CapabilityBinding {
+            principal: "example.display".into(),
+            service: "example.display/1".into(),
+            contract: amaterasu_module_sdk::display_settings::SERVICE.into(),
+            interface_major: 1,
+            interface_minor: 0,
+        }),
+        foreground: None,
+        ..default_rtx_hdr_selection()
+    };
     let before = serde_json::to_value(&policy).unwrap();
-    let error = enable_rtx_hdr(&mut policy, &root.path().join("runtime")).unwrap_err();
-    assert!(error.contains("frame helper"));
+    assert!(
+        enable_rtx_hdr_with_selection(&mut policy, &root.path().join("runtime"), &selected)
+            .is_err()
+    );
+    assert_eq!(serde_json::to_value(&policy).unwrap(), before);
+    policy.principals.insert(
+        "example.display".into(),
+        Grants {
+            provide: ["example.display/1".into()].into(),
+            ..Default::default()
+        },
+    );
+    let mut incompatible = amaterasu_module_sdk::display_settings::methods("example.display/1")
+        .into_iter()
+        .find(|method| method.method == "acquire")
+        .unwrap();
+    incompatible.request.allow_extra = !incompatible.request.allow_extra;
+    policy
+        .api_methods
+        .push(amaterasu_contracts::ApiMethodApproval {
+            provider: "example.display".into(),
+            callers: Default::default(),
+            method: incompatible,
+        });
+    let before = serde_json::to_value(&policy).unwrap();
+    assert!(
+        enable_rtx_hdr_with_selection(&mut policy, &root.path().join("runtime"), &selected)
+            .is_err()
+    );
     assert_eq!(serde_json::to_value(&policy).unwrap(), before);
 }
 
@@ -1189,8 +1438,72 @@ fn rtx_hdr_policy_rejects_conflicting_foreground_provider_without_mutation() {
         json!("/opt/amaterasu/amaterasu-vkms-frame-helper");
     policy.settings.insert(
         "amaterasu.foreground-context".into(),
-        json!({"allowed_principals": ["other"]}),
+        json!({"allowed_principals": "invalid"}),
     );
+    let before = serde_json::to_value(&policy).unwrap();
+    let capabilities = ProcessingSelection {
+        foreground: Some(CapabilityBinding {
+            principal: FOREGROUND_CONTEXT.id.into(),
+            service: amaterasu_module_sdk::foreground_context::SERVICE.into(),
+            contract: amaterasu_module_sdk::foreground_context::SERVICE.into(),
+            interface_major: 1,
+            interface_minor: 0,
+        }),
+        ..default_rtx_hdr_selection()
+    };
+    assert!(
+        enable_rtx_hdr_with_selection(&mut policy, &root.path().join("runtime"), &capabilities)
+            .is_err()
+    );
+    assert_eq!(serde_json::to_value(&policy).unwrap(), before);
+}
+
+#[test]
+fn rtx_hdr_preserves_existing_default_capability_consumers() {
+    let root = TemporaryRoot::new("rtx-hdr-shared-capabilities");
+    let mut policy = linux_session_policy(root.path(), &LinuxSessionOptions::default()).unwrap();
+    policy.settings.insert(
+        "amaterasu.foreground-context".into(),
+        json!({"allowed_principals":["other"]}),
+    );
+    policy.settings.insert(
+        "amaterasu.display-settings".into(),
+        json!({"enabled":true,"registrars":["other.owner"],"consumers":["other.effect"]}),
+    );
+    let capabilities = ProcessingSelection {
+        foreground: Some(CapabilityBinding {
+            principal: FOREGROUND_CONTEXT.id.into(),
+            service: amaterasu_module_sdk::foreground_context::SERVICE.into(),
+            contract: amaterasu_module_sdk::foreground_context::SERVICE.into(),
+            interface_major: 1,
+            interface_minor: 0,
+        }),
+        ..default_rtx_hdr_selection()
+    };
+    enable_rtx_hdr_with_selection(&mut policy, &root.path().join("runtime"), &capabilities)
+        .unwrap();
+    assert_eq!(
+        policy.settings["amaterasu.foreground-context"]["allowed_principals"],
+        json!(["other", "amaterasu.rtx-hdr"])
+    );
+    assert_eq!(
+        policy.settings["amaterasu.display-settings"]["registrars"],
+        json!(["other.owner", "amaterasu.stream-session"])
+    );
+    assert_eq!(
+        policy.settings["amaterasu.display-settings"]["consumers"],
+        json!(["other.effect", "amaterasu.rtx-hdr"])
+    );
+}
+
+#[test]
+fn display_settings_selection_conflicts_do_not_overwrite_policy() {
+    let root = TemporaryRoot::new("display-settings-conflict");
+    let mut policy = linux_session_policy(root.path(), &LinuxSessionOptions::default()).unwrap();
+    policy.settings.get_mut("amaterasu.capture-vkms").unwrap()["frame_helper"] =
+        json!("/opt/amaterasu/helper");
+    policy.settings.get_mut("amaterasu.stream-session").unwrap()["source_preparation"] =
+        json!({"display_settings_service":"other.settings/1","hooks":[]});
     let before = serde_json::to_value(&policy).unwrap();
     assert!(enable_rtx_hdr(&mut policy, &root.path().join("runtime")).is_err());
     assert_eq!(serde_json::to_value(&policy).unwrap(), before);

@@ -1273,7 +1273,7 @@ impl Coordinator {
             return self.resolve_stream_preparation(caller, initiator, payload);
         }
         if operation == "snapshot" {
-            return self.snapshot(caller, initiator);
+            return self.snapshot(caller, initiator, &payload);
         }
         if matches!(
             operation,

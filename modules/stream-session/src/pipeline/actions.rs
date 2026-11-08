@@ -70,7 +70,7 @@ impl Pipeline {
                 activity_id,
                 rtsp_operation_id,
             } => {
-                if input.owner != "amaterasu.nvhttp" || !self.settings.enabled {
+                if !self.settings.history_owners.contains(&input.owner) || !self.settings.enabled {
                     rpc::complete(send, input.request, error("permission_denied"));
                 } else if self.shutdown_admission_closed()
                     && !self.history_activities.contains(&activity_id)
@@ -96,7 +96,7 @@ impl Pipeline {
                 activity_id,
                 rtsp_operation_id,
             } => {
-                if input.owner != "amaterasu.nvhttp" || !self.settings.enabled {
+                if !self.settings.history_owners.contains(&input.owner) || !self.settings.enabled {
                     rpc::complete(send, input.request, error("permission_denied"));
                 } else if !valid_name(&activity_id) || activity_id != rtsp_operation_id {
                     rpc::complete(send, input.request, error("invalid_history_activity"));
@@ -215,6 +215,11 @@ impl Pipeline {
             rpc::complete(send, request, error(code));
             return;
         }
+        if config.lifecycle_session_target.is_some() && self.settings.providers.lifecycle.is_none()
+        {
+            rpc::complete(send, request, error("lifecycle_provider_not_selected"));
+            return;
+        }
         if config
             .audio
             .custom
@@ -225,15 +230,16 @@ impl Pipeline {
             rpc::complete(send, request, error("audio_processor_not_selected"));
             return;
         }
-        if config.lifecycle_session_target.is_some() && owner != "amaterasu.rtsp" {
+        let lifecycle_admitter = self.settings.lifecycle_admitters.contains(&owner);
+        if config.lifecycle_session_target.is_some() && !lifecycle_admitter {
             rpc::complete(send, request, error("permission_denied"));
             return;
         }
-        if config.rtsp_operation_id.is_some() && owner != "amaterasu.rtsp" {
+        if config.rtsp_operation_id.is_some() && !lifecycle_admitter {
             rpc::complete(send, request, error("permission_denied"));
             return;
         }
-        if config.borrowed_capture.is_some() && owner != "amaterasu.rtsp" {
+        if config.borrowed_capture.is_some() && !lifecycle_admitter {
             rpc::complete(send, request, error("permission_denied"));
             return;
         }
@@ -256,7 +262,7 @@ impl Pipeline {
         if let (Some(activity_id), Some(rtsp_operation_id)) =
             (&config.history_activity_id, &config.rtsp_operation_id)
         {
-            if owner != "amaterasu.rtsp" {
+            if !lifecycle_admitter {
                 rpc::complete(send, request, error("permission_denied"));
                 return;
             }
@@ -290,20 +296,25 @@ impl Pipeline {
             .lifecycle_session_target
             .as_ref()
             .map(|_| self.settings.enable_input);
-        let shared_capture =
-            match super::shared_capture::borrow_source(&self.records, &owner, &config) {
-                Ok(source) => source,
-                Err(code) => {
-                    rpc::complete(send, request, error(code));
-                    return;
-                }
-            };
+        let shared_capture = match super::shared_capture::borrow_source(
+            &self.records,
+            &owner,
+            lifecycle_admitter,
+            &config,
+        ) {
+            Ok(source) => source,
+            Err(code) => {
+                rpc::complete(send, request, error(code));
+                return;
+            }
+        };
         let mut record = Record::new(id, owner, config, self.settings.input_lease_ttl_ms);
         record.shared_capture_attached = shared_capture.is_some();
         record.virtual_display_attempted = shared_capture.is_some();
         record.shared_capture = shared_capture;
         record.providers = self.settings.providers.clone();
         record.processing_plan_provider = self.settings.processing_plan.clone();
+        record.source_preparation = self.settings.source_preparation.clone();
         record.lifecycle_input_required = lifecycle_input_required;
         self.records.insert(id, record);
         self.job = Some(Job::new(
@@ -330,7 +341,8 @@ impl Pipeline {
             ..
         } = input;
 
-        if configuration.client_feature_flags.is_some() && owner != "amaterasu.rtsp" {
+        let lifecycle_admitter = self.settings.lifecycle_admitters.contains(&owner);
+        if configuration.client_feature_flags.is_some() && !lifecycle_admitter {
             rpc::complete(send, request, error("permission_denied"));
             return;
         }
@@ -343,7 +355,9 @@ impl Pipeline {
             rpc::complete(send, request, error("session_not_found"));
             return;
         };
-        if let Err(code) = validate_start_configuration(&owner, record, &mut configuration) {
+        if let Err(code) =
+            validate_start_configuration(lifecycle_admitter, record, &mut configuration)
+        {
             rpc::complete(send, request, error(code));
             return;
         }
@@ -406,6 +420,7 @@ impl Pipeline {
             ..
         } = input;
 
+        let lifecycle_admitter = self.settings.lifecycle_admitters.contains(&owner);
         let startup_reconciled = self.startup_reconciled();
         let Some(record) = self
             .records
@@ -419,11 +434,13 @@ impl Pipeline {
         };
         let mut adopted_lifecycle = false;
         if let Some(mut configuration) = lifecycle_configuration {
-            if owner != "amaterasu.rtsp" || configuration.lifecycle_target.is_none() {
+            if !lifecycle_admitter || configuration.lifecycle_target.is_none() {
                 rpc::complete(send, request, error("permission_denied"));
                 return;
             }
-            if let Err(code) = validate_start_configuration(&owner, record, &mut configuration) {
+            if let Err(code) =
+                validate_start_configuration(lifecycle_admitter, record, &mut configuration)
+            {
                 rpc::complete(send, request, error(code));
                 return;
             }
@@ -607,11 +624,14 @@ fn unix_time_millis() -> i64 {
 /// Startup and cleanup adoption share the same owner, frozen configuration and
 /// coordinator binding checks. Validation alone never opens native resources.
 fn validate_start_configuration(
-    owner: &str,
+    lifecycle_admitter: bool,
     record: &Record,
     configuration: &mut StartConfig,
 ) -> Result<(), &'static str> {
-    if configuration.client_feature_flags.is_some() && owner != "amaterasu.rtsp" {
+    if configuration.lifecycle_target.is_some() && record.providers.lifecycle.is_none() {
+        return Err("lifecycle_provider_not_selected");
+    }
+    if configuration.client_feature_flags.is_some() && !lifecycle_admitter {
         return Err("permission_denied");
     }
     if record.processing_plan_provider.is_some()
@@ -642,7 +662,7 @@ fn validate_start_configuration(
                 generation,
             }),
             None,
-        ) if owner == "amaterasu.rtsp"
+        ) if lifecycle_admitter
             && configuration.lifecycle_capture_mode.is_external()
             && record.config.lifecycle_capture_mode.is_external()
             && host_epoch == stream_epoch
@@ -662,7 +682,7 @@ fn validate_start_configuration(
                 generation,
             }),
             Some(candidate),
-        ) if owner == "amaterasu.rtsp"
+        ) if lifecycle_admitter
             && configuration.lifecycle_capture_mode.is_managed()
             && record.config.lifecycle_capture_mode.is_managed()
             && host_epoch == stream_epoch

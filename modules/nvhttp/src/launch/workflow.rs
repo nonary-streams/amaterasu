@@ -26,8 +26,6 @@ const LAUNCH_SERVICE: &str = "amaterasu.launch/1";
 const INPUT_SERVICE: &str = "amaterasu.input/1";
 const RTSP_SERVICE: &str = "amaterasu.rtsp/1";
 const DISPLAY_SERVICE: &str = "amaterasu.display/1";
-const STREAM_SESSION_SERVICE: &str = "amaterasu.stream-session/1";
-const SESSION_LIFECYCLE_SERVICE: &str = "amaterasu.session-lifecycle/1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
@@ -613,6 +611,8 @@ impl Controller {
         if record.application_reconcile == Some(phase) {
             record.application_reconcile = None;
         }
+        let lifecycle_service = self.lifecycle_service.clone().unwrap_or_default();
+        let stream_service = self.stream_service.clone();
         let (service, mut payload, timeout_ms) = match phase {
             Phase::BindPresentationApplication => {
                 unreachable!("handled before ordinary broker calls")
@@ -627,7 +627,7 @@ impl Controller {
             Phase::PrepareLifecycle => {
                 record.lifecycle_prepare_dispatched = true;
                 (
-                    SESSION_LIFECYCLE_SERVICE,
+                    lifecycle_service.as_str(),
                     json!({"operation":"prepare",
                         "operation_id":format!("{}-lifecycle", record.application_operation),
                         "application_ref":{"kind":if record.desktop {"desktop"} else {"application"},"app_id":app_id(record.request.app_id),
@@ -643,22 +643,22 @@ impl Controller {
                 )
             }
             Phase::LookupLifecycle => (
-                SESSION_LIFECYCLE_SERVICE,
+                lifecycle_service.as_str(),
                 json!({"operation":"lookup", "operation_id":format!("{}-lifecycle", record.application_operation)}),
                 5_000,
             ),
             Phase::BindApplication => (
-                SESSION_LIFECYCLE_SERVICE,
+                lifecycle_service.as_str(),
                 json!({"operation":"bind_application", "operation_id":format!("{}-lifecycle-bind",record.application_operation), "target":record.lifecycle_session_target, "launch_id":record.application_launch, "application_operation_id":record.application_operation}),
                 5_000,
             ),
             Phase::LookupApplicationBinding => (
-                SESSION_LIFECYCLE_SERVICE,
+                lifecycle_service.as_str(),
                 json!({"operation":"lookup", "operation_id":format!("{}-lifecycle-bind",record.application_operation)}),
                 5_000,
             ),
             Phase::EndLifecycle => (
-                SESSION_LIFECYCLE_SERVICE,
+                lifecycle_service.as_str(),
                 json!({"operation":"end_session", "operation_id":format!("{}-lifecycle-end",record.application_operation), "target":record.lifecycle_session_target}),
                 5_000,
             ),
@@ -667,23 +667,23 @@ impl Controller {
                 // exact proof operation before considering another attempt.
                 record.lifecycle_application_retirement = ApplicationRetirementState::Pending;
                 (
-                    SESSION_LIFECYCLE_SERVICE,
+                    lifecycle_service.as_str(),
                     json!({"operation":"application_retired", "operation_id":record.application_retirement_operation(), "target":record.lifecycle_session_target, "retired":true, "retirement_receipt":{"service":LAUNCH_SERVICE,"launch_id":record.lifecycle_retirement_launch,"operation_id":record.application_operation}}),
                     5_000,
                 )
             }
             Phase::LookupApplicationRetirement => (
-                SESSION_LIFECYCLE_SERVICE,
+                lifecycle_service.as_str(),
                 json!({"operation":"lookup", "operation_id":record.application_retirement_operation()}),
                 5_000,
             ),
             Phase::AwaitLifecycleEnd => (
-                SESSION_LIFECYCLE_SERVICE,
+                lifecycle_service.as_str(),
                 json!({"operation":"lookup", "operation_id":format!("{}-lifecycle-end",record.application_operation)}),
                 5_000,
             ),
             Phase::VerifyPaused | Phase::VerifyResumeSession => (
-                SESSION_LIFECYCLE_SERVICE,
+                lifecycle_service.as_str(),
                 json!({"operation":"snapshot", "target":record.lifecycle_session_target}),
                 5_000,
             ),
@@ -697,7 +697,7 @@ impl Controller {
             Phase::ReserveHistory => {
                 record.history_release_required = true;
                 (
-                    STREAM_SESSION_SERVICE,
+                    stream_service.as_str(),
                     json!({"action":"reserve_history_activity", "activity_id":record.rtsp_operation,
                         "rtsp_operation_id":record.rtsp_operation}),
                     5_000,
@@ -922,7 +922,7 @@ impl Controller {
                 15_000,
             ),
             Phase::ReleaseHistory => (
-                STREAM_SESSION_SERVICE,
+                stream_service.as_str(),
                 json!({"action":"release_history_activity", "activity_id":record.rtsp_operation,
                     "rtsp_operation_id":record.rtsp_operation}),
                 5_000,

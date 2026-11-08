@@ -9,6 +9,7 @@ mod default_extensions;
 pub mod linux_session;
 mod operation_apis;
 mod platform_extensions;
+mod processing;
 mod remote_sessions;
 
 pub const RUNTIME_ID: &str = "amaterasu.runtime";
@@ -2145,6 +2146,15 @@ fn names(values: &[&str]) -> BTreeSet<String> {
 
 #[cfg(test)]
 mod tests;
+
+/// Apply a trusted developer-selected processor graph to a review candidate.
+pub(crate) fn install_processing(
+    policy: &mut amaterasu_contracts::RuntimeConfig,
+    selection: &amaterasu_contracts::processing_composition::ProcessingSelection,
+    metadata: &str,
+) -> amaterasu_package::PackageResult<()> {
+    processing::install(policy, selection, metadata)
+}
 
 #[cfg(test)]
 mod extension_example_tests {

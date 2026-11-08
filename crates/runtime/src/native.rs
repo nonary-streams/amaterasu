@@ -352,3 +352,6 @@ mod network_typed_tests;
 
 #[cfg(test)]
 mod capture_preflight_tests;
+
+#[cfg(test)]
+mod external_processing_tests;

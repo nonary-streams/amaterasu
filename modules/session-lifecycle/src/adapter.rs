@@ -55,6 +55,9 @@ pub struct LifecycleSettings {
     pub provider_settings_readers: BTreeMap<String, BTreeSet<String>>,
     /// Optional installed selection for generic processing source policy.
     pub processing_policy: Option<ProcessingPolicy>,
+    /// Processing participants whose settings were supplied directly by composition.
+    #[serde(skip)]
+    pub static_processing_settings: BTreeSet<String>,
     pub participants: Vec<ParticipantSettings>,
     /// Installed owner-mediated control grants; absent means no control is allowed.
     pub control_policies: Vec<ControlPolicy>,
@@ -83,6 +86,7 @@ impl Default for LifecycleSettings {
             operation_grants: BTreeMap::new(),
             provider_settings_readers: BTreeMap::new(),
             processing_policy: None,
+            static_processing_settings: BTreeSet::new(),
             participants: Vec::new(),
             control_policies: Vec::new(),
             finalize_policies: Vec::new(),
@@ -111,7 +115,6 @@ pub struct ProcessingPolicy {
     pub service: String,
     pub processor_service: String,
     /// Version 1.1 supplies the requested output range before source selection.
-    #[serde(default)]
     pub interface_minor: u32,
     /// Participants explicitly advertising the generic source mode contract.
     pub source_mode_providers: BTreeSet<String>,
@@ -198,6 +201,129 @@ fn valid_domain_scope(scope: DomainScope, domains: &BTreeSet<String>) -> bool {
 }
 
 impl LifecycleSettings {
+    /// Apply provider-neutral processing declarations to this provider's
+    /// internal policy. The host never edits these provider-specific fields.
+    fn add_processing_composition(
+        &mut self,
+        composition: &amaterasu_module_sdk::processing_composition::ProcessingComposition,
+    ) -> ModuleResult<()> {
+        use amaterasu_module_sdk::{media::native_contracts, processing_composition as sdk};
+        let selected = composition
+            .processor
+            .as_ref()
+            .ok_or("processing composition has no processor")?;
+        sdk::require_contract(selected, native_contracts::FRAME_PROCESSOR, 1, 0)?;
+        if let Some(registry) = &composition.settings_registry {
+            sdk::require_contract(
+                registry,
+                amaterasu_extension_api::EXTENSION_REGISTRY_SERVICE,
+                1,
+                0,
+            )?;
+            if !self.participants.is_empty()
+                && (self
+                    .settings_registry_service
+                    .as_deref()
+                    .is_some_and(|service| service != registry.service)
+                    || (!self.settings_registry_caller.is_empty()
+                        && self.settings_registry_caller != registry.principal))
+            {
+                return Err(
+                    "processing registry conflicts with other lifecycle participants".into(),
+                );
+            }
+            self.settings_registry_service = Some(registry.service.clone());
+            self.settings_registry_caller = registry.principal.clone();
+            self.trusted_callers.insert(registry.principal.clone());
+            self.operation_grants
+                .entry(registry.principal.clone())
+                .or_default()
+                .insert("resolve_settings_scope".into());
+        } else {
+            self.static_processing_settings
+                .insert(selected.principal.clone());
+        }
+        for caller in &composition.prepared_context_consumers {
+            self.trusted_callers.insert(caller.clone());
+            self.operation_grants
+                .entry(caller.clone())
+                .or_default()
+                .insert("read_prepared_plans".into());
+        }
+        for registration in &composition.registrations {
+            let declaration = sdk::lifecycle_participant(registration)?;
+            let participant: ParticipantSettings = serde_json::from_value(
+                serde_json::to_value(declaration).map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| format!("invalid processing participant: {error}"))?;
+            if self
+                .participants
+                .iter()
+                .any(|old| old.provider == participant.provider)
+            {
+                return Err("processing participant already configured".into());
+            }
+            self.participants.push(participant);
+            for grant in &registration.lifecycle_grants {
+                self.trusted_callers.insert(grant.caller.clone());
+                let operations = self
+                    .operation_grants
+                    .entry(grant.caller.clone())
+                    .or_default();
+                if grant.read_context {
+                    operations.insert("read_provider_context".into());
+                }
+                if grant.read_frozen_settings {
+                    operations.insert("read_frozen_provider_settings".into());
+                }
+                if grant.read_live_settings {
+                    operations.insert("read_live_provider_settings".into());
+                }
+                if grant.read_frozen_settings || grant.read_live_settings {
+                    self.provider_settings_readers
+                        .entry(grant.caller.clone())
+                        .or_default()
+                        .insert(registration.provider.clone());
+                }
+            }
+        }
+        let registration = composition
+            .registrations
+            .iter()
+            .find(|registration| registration.provider == selected.principal)
+            .ok_or("selected processor has no lifecycle registration")?;
+        let intent = sdk::registration_method(registration, "processing_intent")?;
+        let control = composition
+            .processor_control
+            .as_ref()
+            .ok_or("selected processor has no processing intent binding")?;
+        sdk::require_contract(
+            control,
+            sdk::PROCESSING_INTENT_CONTRACT,
+            intent.interface_major,
+            intent.interface_minor,
+        )?;
+        if control.principal != selected.principal || control.service != intent.service {
+            return Err("processing intent differs from selected processor".into());
+        }
+        let policy = ProcessingPolicy {
+            provider: selected.principal.clone(),
+            service: intent.service,
+            processor_service: selected.service.clone(),
+            interface_minor: intent.interface_minor,
+            source_mode_providers: BTreeSet::new(),
+        };
+        if self
+            .processing_policy
+            .as_ref()
+            .is_some_and(|existing| *existing != policy)
+        {
+            return Err("processing policy conflicts with lifecycle settings".into());
+        }
+        self.processing_policy = Some(policy);
+        Ok(())
+    }
+
     /// Compile only policy-supplied local documents; no runtime fetch or request
     /// payload can add a schema. Every control and finalization pin must resolve exactly.
     pub(crate) fn schema_catalog(
@@ -382,7 +508,7 @@ impl LifecycleSettings {
 
     pub(crate) fn validate(&self) -> ModuleResult<()> {
         if self.processing_policy.as_ref().is_some_and(|policy| {
-            policy.interface_minor > 1
+            policy.interface_minor != 1
                 || !valid_identifier(&policy.provider)
                 || !valid_identifier(&policy.service)
                 || !valid_identifier(&policy.processor_service)
@@ -588,6 +714,7 @@ impl LifecycleSettings {
 
 pub struct LifecycleAdapter<H> {
     runtime: RuntimeClient,
+    service: String,
     trusted_callers: BTreeSet<String>,
     operation_grants: BTreeMap<String, BTreeSet<String>>,
     handler: H,
@@ -600,14 +727,32 @@ impl<H: LifecycleHandler> ManagedModule for LifecycleAdapter<H> {
         };
         let mut settings: LifecycleSettings =
             serde_json::from_value(payload).map_err(|_| "invalid lifecycle settings".to_owned())?;
+        let service = if let Some(composition) = runtime.processing_composition()? {
+            let binding = composition
+                .lifecycle
+                .as_ref()
+                .ok_or("lifecycle processing composition lacks its selected binding")?;
+            let service = amaterasu_module_sdk::processing_composition::require_contract(
+                binding,
+                amaterasu_extension_api::SESSION_LIFECYCLE_SERVICE,
+                1,
+                0,
+            )?
+            .to_owned();
+            settings.add_processing_composition(&composition)?;
+            service
+        } else {
+            SERVICE.to_owned()
+        };
         settings.validate()?;
         resolve_journal_location(&mut settings, || runtime.runtime_state_root())?;
         let handler = H::from_settings(&settings)?;
         runtime.require_success(Command::Register {
-            service: SERVICE.into(),
+            service: service.clone(),
         })?;
         Ok(Self {
             runtime,
+            service,
             trusted_callers: settings.trusted_callers,
             operation_grants: settings.operation_grants,
             handler,
@@ -640,7 +785,7 @@ impl<H: LifecycleHandler> ManagedModule for LifecycleAdapter<H> {
                 ));
             }
         }
-        let response = if service != SERVICE {
+        let response = if service != self.service {
             json!({"ok": false, "code": "invalid_service"})
         } else if !self.trusted_callers.contains(&caller)
             || !payload
@@ -656,6 +801,16 @@ impl<H: LifecycleHandler> ManagedModule for LifecycleAdapter<H> {
         } else {
             self.handler.handle(&caller, &initiator, payload)
         };
+        // The broker bounds each result independently. Return an explicit failure
+        // instead of letting an oversized result terminate the lifecycle module;
+        // any durable transition remains available for reconciliation.
+        let response = if serde_json::to_vec(&response)
+            .is_ok_and(|bytes| bytes.len() <= amaterasu_module_sdk::MAX_BROKER_RESULT_BYTES)
+        {
+            response
+        } else {
+            json!({"status":"rejected", "reason":"response_too_large"})
+        };
         match self.runtime.send(Command::Complete {
             request: id,
             payload: response,
@@ -664,6 +819,26 @@ impl<H: LifecycleHandler> ManagedModule for LifecycleAdapter<H> {
             // A committed transition survives a request cancelled after dispatch.
             Response::Error { code, .. } if code == "request_ended" || code == "not_found" => {
                 Ok(())
+            }
+            Response::Error { code, message }
+                if code == "invalid_request" && message == "result payload is too large" =>
+            {
+                // Older runtimes enforce a smaller limit. Preserve the module
+                // and return an honest failure without replaying the handler.
+                match self.runtime.send(Command::Complete {
+                    request: id,
+                    payload: json!({"status":"rejected", "reason":"response_too_large"}),
+                })? {
+                    Response::Ok => Ok(()),
+                    Response::Error { code, .. }
+                        if code == "request_ended" || code == "not_found" =>
+                    {
+                        Ok(())
+                    }
+                    response => Err(format!(
+                        "unexpected lifecycle completion response: {response:?}"
+                    )),
+                }
             }
             response => Err(format!(
                 "unexpected lifecycle completion response: {response:?}"
@@ -698,8 +873,87 @@ fn resolve_journal_location(
 mod tests {
     use super::*;
     use amaterasu_module_sdk::abi::{self, AbiHeader, BorrowedBytes, HostApi, ReplySink};
+    use amaterasu_module_sdk::processing_composition::{
+        CapabilityBinding, ProcessingComposition, ProcessingLifecycleGrant, ProcessingRegistration,
+    };
     use std::collections::VecDeque;
     use std::ffi::c_void;
+
+    #[test]
+    fn processing_registration_populates_lifecycle_from_the_sdk_contract() {
+        let binding = CapabilityBinding {
+            principal: "example.effect".into(),
+            service: "example.effect.native/1".into(),
+            contract: amaterasu_module_sdk::media::native_contracts::FRAME_PROCESSOR.into(),
+            interface_major: 1,
+            interface_minor: 0,
+        };
+        let methods = [
+            "settings_validate",
+            "resource_plan",
+            "lifecycle_callback",
+            "lifecycle_status",
+            "processing_intent",
+        ]
+        .into_iter()
+        .map(|name| {
+            let mut method =
+                amaterasu_module_sdk::operation_api::method("example.effect/1", name, &[], &[]);
+            if name == "processing_intent" {
+                method.interface_minor = 1;
+            }
+            method
+        })
+        .collect();
+        let registration = ProcessingRegistration {
+            provider: "example.effect".into(),
+            descriptor: json!({"provider":"example.effect","revision":1,"options":[],"actions":[],"capabilities":[],"settings_validate":{"service":"example.effect/1","method":"settings_validate","interface_major":1,"interface_minor":0,"schema_revision":1}}),
+            methods,
+            consumers: ["example.stream".into()].into(),
+            depends_on: vec![],
+            lifecycle_grants: vec![ProcessingLifecycleGrant {
+                caller: "example.stream".into(),
+                read_context: false,
+                read_frozen_settings: true,
+                read_live_settings: false,
+            }],
+            settings_revision: "revision".into(),
+            initial_settings: json!({}),
+            settings_grants: vec![],
+            migrations: vec![],
+        };
+        let composition = ProcessingComposition {
+            processor: Some(binding),
+            processor_control: Some(CapabilityBinding {
+                principal: "example.effect".into(),
+                service: "example.effect/1".into(),
+                contract: amaterasu_module_sdk::processing_composition::PROCESSING_INTENT_CONTRACT
+                    .into(),
+                interface_major: 1,
+                interface_minor: 1,
+            }),
+            registrations: vec![registration],
+            ..Default::default()
+        };
+        let mut settings = LifecycleSettings::default();
+        settings.add_processing_composition(&composition).unwrap();
+        assert_eq!(settings.participants[0].provider, "example.effect");
+        assert_eq!(
+            settings
+                .processing_policy
+                .as_ref()
+                .unwrap()
+                .processor_service,
+            "example.effect.native/1"
+        );
+        assert!(
+            settings.operation_grants["example.stream"].contains("read_frozen_provider_settings")
+        );
+        assert!(settings.provider_settings_readers["example.stream"].contains("example.effect"));
+        assert!(
+            !settings.operation_grants["example.stream"].contains("read_live_provider_settings")
+        );
+    }
 
     #[derive(Default)]
     struct Handler;
@@ -720,6 +974,7 @@ mod tests {
         completions: Vec<Value>,
         active: bool,
         completion_error: Option<&'static str>,
+        legacy_result_limit: bool,
         advances: usize,
     }
 
@@ -729,6 +984,9 @@ mod tests {
                 Command::GetSettings {} => Response::Result {
                     payload: self.settings.clone(),
                 },
+                Command::GetProcessingComposition {} => {
+                    Response::error("not_found", "no processing selection")
+                }
                 Command::Register { .. } => Response::Ok,
                 Command::Log { .. } => {
                     self.advances += 1;
@@ -738,6 +996,12 @@ mod tests {
                 Command::CheckRequest { .. } if self.active => Response::Ok,
                 Command::CheckRequest { .. } => Response::error("request_ended", "cancelled"),
                 Command::Complete { payload, .. } => {
+                    if self.legacy_result_limit
+                        && serde_json::to_vec(&payload).unwrap().len() > 16_384
+                    {
+                        self.completions.push(payload);
+                        return Response::error("invalid_request", "result payload is too large");
+                    }
                     self.completions.push(payload);
                     match self.completion_error {
                         Some(code) => Response::error(code, "completion failed"),
@@ -807,6 +1071,7 @@ mod tests {
             completions: Vec::new(),
             active: true,
             completion_error: None,
+            legacy_result_limit: false,
             advances: 0,
         }
     }
@@ -832,6 +1097,34 @@ mod tests {
         run(&mut allowed).unwrap();
         assert_eq!(allowed.completions[0]["caller"], "transport");
         assert_eq!(allowed.completions[0]["initiator"], "real-initiator");
+    }
+
+    #[test]
+    fn oversized_result_is_reported_without_terminating_the_module() {
+        let mut broker = broker(
+            json!({"trusted_callers":["transport"], "operation_grants":{"transport":["prepare"]}}),
+            "transport",
+        );
+        if let Some(Response::Request { payload, .. }) = broker.requests.front_mut() {
+            payload["large"] = json!("x".repeat(amaterasu_module_sdk::MAX_BROKER_RESULT_BYTES));
+        }
+        run(&mut broker).unwrap();
+        assert_eq!(broker.completions[0]["reason"], "response_too_large");
+    }
+
+    #[test]
+    fn older_broker_limit_returns_failure_without_replaying_handler() {
+        let mut broker = broker(
+            json!({"trusted_callers":["transport"], "operation_grants":{"transport":["prepare"]}}),
+            "transport",
+        );
+        broker.legacy_result_limit = true;
+        if let Some(Response::Request { payload, .. }) = broker.requests.front_mut() {
+            payload["large"] = json!("x".repeat(20_000));
+        }
+        run(&mut broker).unwrap();
+        assert_eq!(broker.completions.len(), 2);
+        assert_eq!(broker.completions[1]["reason"], "response_too_large");
     }
 
     #[test]
@@ -902,7 +1195,7 @@ mod tests {
             "consumer_requirements":{"execution_domain":"desktop", "capture_providers":[], "selector_schemas":[]},
             "participants":[participant],
             "processing_policy":{"provider":"provider","service":"provider/1",
-                "processor_service":"processor/1", "source_mode_providers":[]}
+                "processor_service":"processor/1", "interface_minor":1, "source_mode_providers":[]}
         })).unwrap();
         assert!(settings.validate().is_ok());
         settings.capture_binding_mode = amaterasu_extension_api::CaptureBindingMode::Managed;

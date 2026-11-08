@@ -491,9 +491,13 @@ impl Manager {
                                 monitor.state = "ready";
                             }
                             Err(failure) => {
+                                // This detail otherwise disappears when the failed
+                                // admission is cleaned up, leaving only a generic
+                                // stream-level readiness failure in the journal.
+                                let detail: String = failure.error.chars().take(512).collect();
                                 eprintln!(
-                                    "amaterasu virtual display creation failed: {:?}; cleanup_complete={}",
-                                    failure.error, failure.cleanup_complete
+                                    "amaterasu virtual display creation failed: {detail:?}; cleanup_complete={}",
+                                    failure.cleanup_complete
                                 );
                                 monitor.error = Some(failure.error);
                                 monitor.creation_cleanup_complete = failure.cleanup_complete;

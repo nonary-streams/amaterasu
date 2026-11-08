@@ -553,18 +553,14 @@ pub struct LiveProviderSettings {
     pub settings: Value,
 }
 
-/// Build the selected processing-intent contract. Version 1.0 keeps its exact
-/// legacy shape; 1.1 adds the requested output range so a provider can reserve
-/// a compatible processing path even when its effect is initially disabled.
+/// Build a processing-intent request, including the output range when known.
 pub fn processing_intent_payload(
-    interface_minor: u32,
     target: &crate::extension_api::LifecycleTarget,
     revision: &str,
     settings: &Value,
     output_hdr: Option<bool>,
 ) -> ModuleResult<Value> {
-    if interface_minor > 1
-        || revision.is_empty()
+    if revision.is_empty()
         || revision.len() > 128
         || revision.chars().any(char::is_control)
         || !settings.is_object()
@@ -572,9 +568,7 @@ pub fn processing_intent_payload(
         return Err("invalid processing intent".into());
     }
     let mut payload = serde_json::json!({"target":target,"revision":revision,"settings":settings});
-    if interface_minor == 1
-        && let Some(output_hdr) = output_hdr
-    {
+    if let Some(output_hdr) = output_hdr {
         payload["output_hdr"] = Value::Bool(output_hdr);
     }
     Ok(payload)
@@ -585,19 +579,24 @@ mod processing_intent_tests {
     use super::*;
 
     #[test]
-    fn output_range_is_only_sent_with_the_selected_version_one_one_contract() {
+    fn output_range_is_included_when_known() {
         let target = serde_json::from_value(serde_json::json!({"kind":"stream","host_epoch":"epoch","session_id":"session","stream_id":"stream","generation":1})).unwrap();
         let settings = serde_json::json!({"enabled":false});
-        let legacy =
-            processing_intent_payload(0, &target, "revision", &settings, Some(true)).unwrap();
-        assert_eq!(legacy.as_object().unwrap().len(), 3);
         for hdr in [false, true] {
             let current =
-                processing_intent_payload(1, &target, "revision", &settings, Some(hdr)).unwrap();
+                processing_intent_payload(&target, "revision", &settings, Some(hdr)).unwrap();
             assert_eq!(current["output_hdr"], hdr);
             assert_eq!(current["settings"], settings);
         }
-        assert!(processing_intent_payload(2, &target, "revision", &settings, Some(true)).is_err());
+        assert!(processing_intent_payload(&target, "", &settings, Some(true)).is_err());
+        assert_eq!(
+            processing_intent_payload(&target, "revision", &settings, None)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .len(),
+            3
+        );
     }
 }
 

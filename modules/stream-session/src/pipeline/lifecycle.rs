@@ -420,6 +420,10 @@ impl Pipeline {
                 Step::CreateOwnedVirtualDisplay
             };
         }
+        if let Err(code) = super::source_preparation::redirect(record, job) {
+            job.fail(record, code, now);
+            return true;
+        }
         if job.step == Step::CreateOwnedVirtualDisplay {
             record.virtual_display_attempted = true;
         }
@@ -505,7 +509,12 @@ impl Pipeline {
             .journal_operation_id
             .clone()
             .unwrap_or_else(|| format!("ss-{:x}-{}", record.id, self.sequence));
-        let pending = if job.step == Step::PlanGpuProcessing {
+        let pending = if matches!(
+            job.step,
+            Step::OpenSourceScope | Step::PrepareSourceHook | Step::CloseSourceScope
+        ) {
+            rpc::Pending::versioned_api(&service, payload, operation_id, parent)
+        } else if job.step == Step::PlanGpuProcessing {
             rpc::Pending::processing_api(
                 &service,
                 record
@@ -566,6 +575,9 @@ impl Pipeline {
             if job.cleanup {
                 job.settle_uncertain(record);
             }
+            return true;
+        }
+        if super::source_preparation::consume(record, job, &payload, now) {
             return true;
         }
         if job.cleanup {
@@ -696,11 +708,14 @@ impl Pipeline {
             // video path only when trusted composition selects opt-in behavior.
             // HDR output retains frame provenance checks even on bypass.
             if enabled != Some(false) || actual_output || !plan.omit_disabled {
-                record.gpu_processing = Some(json!({"service":plan.processor_service,
+                let mut processing = json!({"service":plan.processor_service,
                     "enabled":enabled.unwrap(), "settings":payload["processor_settings"],
-                    "source_hdr_required":required_source,
-                    "live_settings":{"target":start.lifecycle_target,
-                        "provider":plan.provider,"revision":revision}}));
+                    "source_hdr_required":required_source});
+                if plan.live_settings {
+                    processing["live_settings"] = json!({"target":start.lifecycle_target,
+                        "provider":plan.provider,"revision":revision});
+                }
+                record.gpu_processing = Some(processing);
             }
             record.processing_plan_complete = true;
             job.step = Step::AcquireOutput;

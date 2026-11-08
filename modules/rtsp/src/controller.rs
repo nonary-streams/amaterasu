@@ -391,7 +391,7 @@ impl Controller {
         if record.session.is_none() && record.needs_lookup {
             let lookup = shutdown_request(
                 runtime,
-                "amaterasu.stream-session/1",
+                &self.settings.stream_service,
                 json!({"action":"lookup","operation_id":record.operation()}),
                 format!("{}-module-shutdown-lookup", record.operation()),
                 deadline,
@@ -436,7 +436,7 @@ impl Controller {
         };
         let stop = shutdown_request(
             runtime,
-            "amaterasu.stream-session/1",
+            &self.settings.stream_service,
             record.stop_payload(),
             format!("{}-module-shutdown-stop", record.operation()),
             deadline,
@@ -465,7 +465,7 @@ impl Controller {
             let operation_id = self.operation_id(record, "shutdown-lifecycle-lookup");
             let response = shutdown_request(
                 runtime,
-                "amaterasu.session-lifecycle/1",
+                self.settings.lifecycle_service.as_deref().unwrap_or(""),
                 json!({"operation":"lookup", "operation_id":format!("{}-lifecycle-prepare", record.operation())}),
                 operation_id,
                 deadline,
@@ -533,7 +533,12 @@ impl Controller {
                         return;
                     }
                     let operation = recovery.operation_id("list", None);
-                    recovery.call = Some(Call::new(json!({"action":"status"}), operation, None));
+                    recovery.call = Some(Call::for_service(
+                        &self.settings.stream_service,
+                        json!({"action":"status"}),
+                        operation,
+                        None,
+                    ));
                 }
                 RecoveryPhase::Stop => {
                     let Some(session) = recovery.stale_sessions.pop_front() else {
@@ -546,7 +551,8 @@ impl Controller {
                     };
                     recovery.current_session = Some(session);
                     let operation = recovery.operation_id("stop", Some(session));
-                    recovery.call = Some(Call::new(
+                    recovery.call = Some(Call::for_service(
+                        &self.settings.stream_service,
                         json!({"action":"stop","session":session}),
                         operation,
                         None,
@@ -559,7 +565,8 @@ impl Controller {
                         return;
                     };
                     let operation = recovery.operation_id("status", Some(session));
-                    recovery.call = Some(Call::new(
+                    recovery.call = Some(Call::for_service(
+                        &self.settings.stream_service,
                         json!({"action":"status","session":session}),
                         operation,
                         None,

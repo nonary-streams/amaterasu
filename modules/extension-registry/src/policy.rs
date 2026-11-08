@@ -89,6 +89,30 @@ impl GrantedScope {
 }
 
 impl Settings {
+    /// Translate the shared SDK registrations into this provider's own policy.
+    pub fn add_processing_registrations(
+        &mut self,
+        registrations: &[amaterasu_module_sdk::processing_composition::ProcessingRegistration],
+    ) -> Result<(), String> {
+        for registration in registrations {
+            let descriptor: ExtensionDescriptor =
+                serde_json::from_value(registration.descriptor.clone())
+                    .map_err(|error| error.to_string())?;
+            let descriptor_bytes =
+                serde_json::to_vec(&descriptor).map_err(|error| error.to_string())?;
+            let item: InstalledDescriptor = serde_json::from_value(serde_json::json!({
+                "descriptor": descriptor,
+                "descriptor_sha256": format!("{:x}", Sha256::digest(descriptor_bytes)),
+                "grants": registration.settings_grants,
+                "approved_methods": registration.methods,
+                "migrations": registration.migrations,
+            }))
+            .map_err(|error| format!("invalid processing descriptor: {error}"))?;
+            self.descriptors.push(item);
+        }
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if self.descriptors.len() > 128 {
             return Err("too many descriptors".into());
@@ -163,6 +187,9 @@ pub fn approved(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use amaterasu_module_sdk::processing_composition::{
+        ProcessingRegistration, SettingsAccessGrant, SettingsScopeGrant,
+    };
 
     use serde_json::json;
 
@@ -174,6 +201,40 @@ mod tests {
             interface_minor: 2,
             schema_revision: 1,
         }
+    }
+
+    #[test]
+    fn sdk_registration_installs_scoped_settings_without_private_host_configuration() {
+        let descriptor = json!({"provider":"example.effect","revision":1,"options":[],"actions":[],"capabilities":[],"settings_validate":{"service":"example.effect/1","method":"validate","interface_major":1,"interface_minor":0,"schema_revision":1}});
+        let method: ApiMethod = serde_json::from_value(json!({"service":"example.effect/1","method":"validate","interface_major":1,"interface_minor":0,"request":{"required":{},"optional":{},"allow_extra":false},"response":{"required":{},"optional":{},"allow_extra":false},"privilege":"user"})).unwrap();
+        let registration = ProcessingRegistration {
+            provider: "example.effect".into(),
+            descriptor,
+            methods: vec![method],
+            consumers: Default::default(),
+            depends_on: vec![],
+            lifecycle_grants: vec![],
+            settings_revision: "revision".into(),
+            initial_settings: json!({}),
+            settings_grants: vec![SettingsAccessGrant {
+                caller: "example.reader".into(),
+                scope: SettingsScopeGrant::AllApplications,
+                read: true,
+                write: false,
+            }],
+            migrations: vec![],
+        };
+        let mut settings = Settings {
+            descriptors: vec![],
+        };
+        settings
+            .add_processing_registrations(&[registration])
+            .unwrap();
+        settings.validate().unwrap();
+        let item = &settings.descriptors[0];
+        assert!(item.allows("example.reader", &Scope::Application("a".into()), false));
+        assert!(!item.allows("example.reader", &Scope::Application("a".into()), true));
+        assert!(!item.allows("example.reader", &Scope::Host, false));
     }
 
     #[test]

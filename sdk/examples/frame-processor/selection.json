@@ -1,0 +1,28 @@
+{
+  "processor": {
+    "principal": "example.frame-processor",
+    "service": "example.frame-processor/1",
+    "contract": "amaterasu.frame-processor.native/1",
+    "interface_major": 1,
+    "interface_minor": 0
+  },
+  "frame_consumer": {
+    "principal": "amaterasu.linux-session-video",
+    "service": "amaterasu.video/1",
+    "contract": "amaterasu.video.native/1",
+    "interface_major": 1,
+    "interface_minor": 0
+  },
+  "frame_settings": {},
+  "stream_owner": null,
+  "lifecycle": null,
+  "settings_registry": null,
+  "display_settings": null,
+  "foreground": null,
+  "request_ancestors": [],
+  "settings_editors": [],
+  "prepared_context_consumers": [],
+  "lifecycle_admitters": [],
+  "history_owners": [],
+  "source_preflight_consumers": []
+}

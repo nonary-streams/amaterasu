@@ -354,6 +354,43 @@ pub fn build_package_with_library_selection(
     call_grants: Option<&Path>,
     replacement_id: Option<&str>,
 ) -> PackageResult<()> {
+    build_package_with_bindings(
+        root,
+        artifacts,
+        output,
+        sequence,
+        profile,
+        external,
+        call_grants,
+        replacement_id,
+        &[],
+        &BTreeSet::new(),
+    )
+}
+
+/// An explicit SDK service binding. The signed set retains the selected
+/// provider for the complete lifetime of its consumer.
+#[derive(Clone, Debug)]
+pub struct ComponentBinding {
+    pub consumer: String,
+    pub provider: String,
+    pub service: String,
+    pub native: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_package_with_bindings(
+    root: &Path,
+    artifacts: &Path,
+    output: &Path,
+    sequence: u64,
+    profile: PackageProfile,
+    external: &[(&Path, &Path)],
+    call_grants: Option<&Path>,
+    replacement_id: Option<&str>,
+    bindings: &[ComponentBinding],
+    omitted: &BTreeSet<String>,
+) -> PackageResult<()> {
     build_package_with_library_selection_and_probe(
         root,
         artifacts,
@@ -363,6 +400,8 @@ pub fn build_package_with_library_selection(
         external,
         call_grants,
         replacement_id,
+        bindings,
+        omitted,
         x264_runtime_available,
     )
 }
@@ -377,11 +416,34 @@ fn build_package_with_library_selection_and_probe(
     external: &[(&Path, &Path)],
     call_grants: Option<&Path>,
     replacement_id: Option<&str>,
+    bindings: &[ComponentBinding],
+    omitted: &BTreeSet<String>,
     runtime_available: impl FnOnce(u32) -> bool,
 ) -> PackageResult<()> {
     let bootstrap: BootstrapConfig = read_json(&root.join("bootstrap.json"))?;
     if !bootstrap.development {
         return Err("development publisher cannot use a production root".into());
+    }
+    // A profile may carry optional defaults, but an explicitly composed policy
+    // selects providers through principals. Do not require artifacts for defaults
+    // that are absent from that composition.
+    let mut omitted = omitted.clone();
+    for id in [
+        "amaterasu.frame-limiter",
+        "amaterasu.foreground-context",
+        "amaterasu.display-settings",
+        "amaterasu.session-lifecycle",
+        "amaterasu.extension-registry",
+        crate::profiles::linux_session::VIDEO_COMPONENT_ID,
+    ] {
+        if profile
+            .components()
+            .iter()
+            .any(|component| component.id == id)
+            && !bootstrap.policy.principals.contains_key(id)
+        {
+            omitted.insert(id.to_owned());
+        }
     }
     if crate::capture_precheck::requested(&bootstrap.policy.settings)? {
         let capture = profile
@@ -415,8 +477,9 @@ fn build_package_with_library_selection_and_probe(
         if !ids.insert(&component.manifest.id)
             || !files.insert(&component.manifest.file)
             || profile.components().iter().any(|entry| {
-                entry.id == component.manifest.id
-                    || library_filename(entry.library) == component.manifest.file
+                !omitted.contains(entry.id)
+                    && (entry.id == component.manifest.id
+                        || library_filename(entry.library) == component.manifest.file)
             })
         {
             return Err(
@@ -425,14 +488,27 @@ fn build_package_with_library_selection_and_probe(
         }
     }
     validate_library_selection(profile, &external, replacement_id)?;
-    validate_unique_service_providers(profile, &external, replacement_id)?;
+    validate_omitted_components(profile, &external, &bootstrap, &omitted)?;
+    validate_unique_service_providers(profile, &external, replacement_id, &omitted)?;
     validate_library_principal_binding(&bootstrap, &external, replacement_id)?;
+    validate_component_bindings(profile, &external, &bootstrap, replacement_id, bindings)?;
+    let absent =
+        |id: &str| omitted.contains(id) && !external.iter().any(|entry| entry.manifest.id == id);
+    if bindings
+        .iter()
+        .any(|binding| absent(&binding.consumer) || absent(&binding.provider))
+    {
+        return Err("binding refers to an omitted component".into());
+    }
     let call_grants = match call_grants {
         Some(path) => {
             if external.is_empty() {
                 return Err("call grants require an external component".into());
             }
             let grants: BTreeMap<String, BTreeSet<String>> = read_json(path)?;
+            if grants.keys().any(|component| absent(component)) {
+                return Err("call grant targets an omitted component".into());
+            }
             if replacement_id.is_some() && grants.contains_key("amaterasu.library") {
                 return Err("call grants cannot target the replaced component".into());
             }
@@ -471,9 +547,16 @@ fn build_package_with_library_selection_and_probe(
         &external,
         &call_grants,
         replacement_id,
+        bindings,
+        &omitted,
+        Some(&bootstrap.policy),
     )?;
-    if !external.is_empty() {
-        verify_package(
+    if !external.is_empty()
+        || !bindings.is_empty()
+        || !omitted.is_empty()
+        || matches!(profile, PackageProfile::LinuxSessionRtxHdr)
+    {
+        let verified = verify_package(
             output,
             &bootstrap,
             VerificationPolicy {
@@ -482,6 +565,17 @@ fn build_package_with_library_selection_and_probe(
                 now: unix_timestamp(),
             },
         )?;
+        if verified
+            .manifest
+            .components
+            .iter()
+            .any(|component| component.id == "amaterasu.rtx-hdr")
+        {
+            crate::rtx_repository_publisher::check_composition(
+                &verified.manifest,
+                &verified.runtime_config,
+            )?;
+        }
     }
     Ok(())
 }
@@ -1541,6 +1635,1154 @@ mod provision_tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    #[test]
+    #[ignore = "requires EXTERNAL_FRAME_PROCESSOR to point at the separately built SDK example"]
+    fn signed_package_binds_an_independently_built_frame_only_processor() {
+        let artifact =
+            std::path::PathBuf::from(std::env::var_os("EXTERNAL_FRAME_PROCESSOR").unwrap());
+        let base = fixture("independent-frame-processor");
+        let root = base.join("root");
+        let artifacts = base.join("artifacts");
+        let output = base.join("package");
+        initialize_linux_session(
+            &root,
+            &LinuxSessionOptions {
+                external_extension_composition: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let example = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../sdk/examples/frame-processor");
+        let manifest_path = example.join("component-linux.json");
+        let manifest: ComponentManifest = read_json(&manifest_path).unwrap();
+        let selection: amaterasu_contracts::processing_composition::ProcessingSelection =
+            read_json(&example.join("selection.json")).unwrap();
+        let mut bootstrap: BootstrapConfig = read_json(&root.join("bootstrap.json")).unwrap();
+        bootstrap
+            .policy
+            .principals
+            .insert(manifest.id.clone(), manifest.requested.clone());
+        bootstrap
+            .policy
+            .settings
+            .insert(manifest.id.clone(), serde_json::json!({}));
+        crate::profiles::install_processing(&mut bootstrap.policy, &selection, "").unwrap();
+        write_json_atomically(&root.join("bootstrap.json"), &bootstrap).unwrap();
+        fs::create_dir_all(&artifacts).unwrap();
+        for definition in PackageProfile::LinuxSession.components() {
+            if definition.id != "amaterasu.frame-limiter" {
+                fs::write(
+                    artifacts.join(library_filename(definition.library)),
+                    definition.id.as_bytes(),
+                )
+                .unwrap();
+            }
+        }
+        fs::write(
+            artifacts.join(library_filename("amaterasu_encode")),
+            b"AMATERASU_X264_BUILD=164\0",
+        )
+        .unwrap();
+        build_package_with_library_selection_and_probe(
+            &root,
+            &artifacts,
+            &output,
+            1,
+            PackageProfile::LinuxSession,
+            &[(&manifest_path, &artifact)],
+            None,
+            None,
+            &[],
+            &BTreeSet::new(),
+            |_| true,
+        )
+        .unwrap();
+        let verified = verify_package(
+            &output,
+            &bootstrap,
+            VerificationPolicy {
+                minimum_sequence: 0,
+                allow_historical: false,
+                now: unix_timestamp(),
+            },
+        )
+        .unwrap();
+        assert!(verified.signed);
+        for id in [
+            "amaterasu.frame-limiter",
+            "amaterasu.session-lifecycle",
+            "amaterasu.extension-registry",
+        ] {
+            assert!(
+                verified
+                    .manifest
+                    .components
+                    .iter()
+                    .all(|component| component.id != id)
+            );
+        }
+        let processor = verified
+            .manifest
+            .components
+            .iter()
+            .find(|component| component.id == manifest.id)
+            .unwrap();
+        assert_eq!(processor.sha256, sha256(&fs::read(&artifact).unwrap()));
+        let video = verified
+            .manifest
+            .components
+            .iter()
+            .find(|component| component.id == selection.frame_consumer.principal)
+            .unwrap();
+        assert_eq!(video.requires.get(&processor.id), Some(&processor.version));
+        assert!(
+            verified.runtime_config.principals[&video.id]
+                .native_use
+                .contains(&selection.processor.service)
+        );
+        assert_eq!(
+            verified.runtime_config.processing_compositions[&video.id].frame_settings,
+            Some(serde_json::json!({}))
+        );
+        let mut unapproved = bootstrap.clone();
+        unapproved
+            .policy
+            .principals
+            .get_mut(&video.id)
+            .unwrap()
+            .native_use
+            .clear();
+        assert!(
+            verify_package(
+                &output,
+                &unapproved,
+                VerificationPolicy {
+                    minimum_sequence: 0,
+                    allow_historical: false,
+                    now: unix_timestamp(),
+                }
+            )
+            .is_err()
+        );
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn signed_rtx_package_can_omit_unselected_optional_plugins() {
+        let base = fixture("rtx-without-optional-plugins");
+        let root = base.join("root");
+        let artifacts = base.join("artifacts");
+        let output = base.join("package");
+        let options = LinuxSessionOptions {
+            external_extension_composition: true,
+            rtx_hdr_runtime_directory: Some(root.join("data/state/rtx-hdr/runtime")),
+            ..Default::default()
+        };
+        initialize_linux_session(&root, &options).unwrap();
+        fs::create_dir_all(&artifacts).unwrap();
+        let omitted: BTreeSet<String> = [
+            "amaterasu.frame-limiter",
+            "amaterasu.foreground-context",
+            "amaterasu.display-settings",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        for definition in PackageProfile::LinuxSessionRtxHdr.components() {
+            if !omitted.contains(definition.id) {
+                fs::write(
+                    artifacts.join(library_filename(definition.library)),
+                    definition.id.as_bytes(),
+                )
+                .unwrap();
+            }
+        }
+        fs::write(
+            artifacts.join(library_filename("amaterasu_encode")),
+            b"AMATERASU_X264_BUILD=164\0",
+        )
+        .unwrap();
+        build_package_with_library_selection_and_probe(
+            &root,
+            &artifacts,
+            &output,
+            1,
+            PackageProfile::LinuxSessionRtxHdr,
+            &[],
+            None,
+            None,
+            &[],
+            &BTreeSet::new(),
+            |_| true,
+        )
+        .unwrap();
+        let bootstrap: BootstrapConfig = read_json(&root.join("bootstrap.json")).unwrap();
+        let verified = verify_package(
+            &output,
+            &bootstrap,
+            VerificationPolicy {
+                minimum_sequence: 0,
+                allow_historical: false,
+                now: unix_timestamp(),
+            },
+        )
+        .unwrap();
+        for id in &omitted {
+            assert!(
+                verified
+                    .manifest
+                    .components
+                    .iter()
+                    .all(|component| component.id != *id && !component.requires.contains_key(id))
+            );
+        }
+        assert!(
+            crate::rtx_repository_publisher::check_composition(
+                &verified.manifest,
+                &verified.runtime_config
+            )
+            .is_ok()
+        );
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn default_rtx_package_does_not_require_foreground_observation() {
+        let base = fixture("rtx-without-foreground");
+        let root = base.join("root");
+        let artifacts = base.join("artifacts");
+        let output = base.join("package");
+        initialize_linux_session(
+            &root,
+            &LinuxSessionOptions {
+                rtx_hdr_runtime_directory: Some(root.join("data/state/rtx-hdr/runtime")),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        fs::create_dir_all(&artifacts).unwrap();
+        for definition in PackageProfile::LinuxSessionRtxHdr.components() {
+            if definition.id != "amaterasu.foreground-context" {
+                fs::write(
+                    artifacts.join(library_filename(definition.library)),
+                    definition.id.as_bytes(),
+                )
+                .unwrap();
+            }
+        }
+        fs::write(
+            artifacts.join(library_filename("amaterasu_encode")),
+            b"AMATERASU_X264_BUILD=164\0",
+        )
+        .unwrap();
+        build_package_with_library_selection_and_probe(
+            &root,
+            &artifacts,
+            &output,
+            1,
+            PackageProfile::LinuxSessionRtxHdr,
+            &[],
+            None,
+            None,
+            &[],
+            &BTreeSet::new(),
+            |_| true,
+        )
+        .unwrap();
+        let bootstrap: BootstrapConfig = read_json(&root.join("bootstrap.json")).unwrap();
+        let package = verify_package(
+            &output,
+            &bootstrap,
+            VerificationPolicy {
+                minimum_sequence: 0,
+                allow_historical: false,
+                now: unix_timestamp(),
+            },
+        )
+        .unwrap();
+        assert!(
+            package
+                .manifest
+                .components
+                .iter()
+                .all(|c| c.id != "amaterasu.foreground-context")
+        );
+        assert!(
+            crate::rtx_repository_publisher::check_composition(
+                &package.manifest,
+                &package.runtime_config
+            )
+            .is_ok()
+        );
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn signed_rtx_package_orders_selected_replacement_capability_providers() {
+        use crate::profiles::linux_session::{
+            CapabilityBinding, ProcessingSelection, default_rtx_hdr_selection,
+        };
+        let base = fixture("rtx-replacement-display");
+        let root = base.join("root");
+        let artifacts = base.join("artifacts");
+        let missing_binding = base.join("missing-binding");
+        let output = base.join("package");
+        initialize_linux_session(&root, &LinuxSessionOptions::default()).unwrap();
+        let mut bootstrap: BootstrapConfig = read_json(&root.join("bootstrap.json")).unwrap();
+        let service = "example.display-settings/1";
+        let foreground_service = "example.foreground/1";
+        let requested = Grants {
+            provide: [service.into()].into(),
+            ..Default::default()
+        };
+        let foreground_requested = Grants {
+            provide: [foreground_service.into()].into(),
+            ..Default::default()
+        };
+        bootstrap
+            .policy
+            .principals
+            .insert("example.display".into(), requested.clone());
+        bootstrap
+            .policy
+            .principals
+            .insert("example.foreground".into(), foreground_requested.clone());
+        crate::profiles::linux_session::enable_rtx_hdr_with_selection(
+            &mut bootstrap.policy,
+            &root.join("data/state/rtx-hdr/runtime"),
+            &ProcessingSelection {
+                display_settings: Some(CapabilityBinding {
+                    principal: "example.display".into(),
+                    service: service.into(),
+                    contract: amaterasu_module_sdk::display_settings::SERVICE.into(),
+                    interface_major: 1,
+                    interface_minor: 0,
+                }),
+                foreground: Some(CapabilityBinding {
+                    principal: "example.foreground".into(),
+                    service: foreground_service.into(),
+                    contract: amaterasu_module_sdk::foreground_context::SERVICE.into(),
+                    interface_major: 1,
+                    interface_minor: 0,
+                }),
+                ..default_rtx_hdr_selection()
+            },
+        )
+        .unwrap();
+        write_json_atomically(&root.join("bootstrap.json"), &bootstrap).unwrap();
+        fs::create_dir_all(&artifacts).unwrap();
+        for definition in PackageProfile::LinuxSessionRtxHdr.components() {
+            if !["amaterasu.foreground-context", "amaterasu.display-settings"]
+                .contains(&definition.id)
+            {
+                fs::write(
+                    artifacts.join(library_filename(definition.library)),
+                    definition.id.as_bytes(),
+                )
+                .unwrap();
+            }
+        }
+        fs::write(
+            artifacts.join(library_filename("amaterasu_encode")),
+            b"AMATERASU_X264_BUILD=164\0",
+        )
+        .unwrap();
+        let template = base.join("display.json");
+        let artifact = base.join("display.so");
+        write_json_atomically(
+            &template,
+            &ComponentManifest {
+                id: "example.display".into(),
+                version: "0.2.0".into(),
+                file: "example_display.so".into(),
+                sha256: String::new(),
+                size: 0,
+                abi_major: amaterasu_abi::ABI_MAJOR,
+                runtime: false,
+                requires: BTreeMap::from([(RUNTIME_ID.into(), "0.1.0".into())]),
+                requested,
+            },
+        )
+        .unwrap();
+        fs::write(&artifact, b"independent display fixture").unwrap();
+        let foreground_template = base.join("foreground.json");
+        let foreground_artifact = base.join("foreground.so");
+        write_json_atomically(
+            &foreground_template,
+            &ComponentManifest {
+                id: "example.foreground".into(),
+                version: "0.3.0".into(),
+                file: "example_foreground.so".into(),
+                sha256: String::new(),
+                size: 0,
+                abi_major: amaterasu_abi::ABI_MAJOR,
+                runtime: false,
+                requires: BTreeMap::from([(RUNTIME_ID.into(), "0.1.0".into())]),
+                requested: foreground_requested,
+            },
+        )
+        .unwrap();
+        fs::write(&foreground_artifact, b"independent foreground fixture").unwrap();
+        let external = [
+            (&*template, &*artifact),
+            (&*foreground_template, &*foreground_artifact),
+        ];
+        let omitted = BTreeSet::new();
+        let mut unapproved = bootstrap.clone();
+        unapproved
+            .policy
+            .principals
+            .get_mut("amaterasu.rtx-hdr")
+            .unwrap()
+            .call
+            .remove(service);
+        write_json_atomically(&root.join("bootstrap.json"), &unapproved).unwrap();
+        assert!(
+            build_package_with_library_selection_and_probe(
+                &root,
+                &artifacts,
+                &missing_binding,
+                1,
+                PackageProfile::LinuxSessionRtxHdr,
+                &external,
+                None,
+                None,
+                &[],
+                &omitted,
+                |_| true
+            )
+            .is_err()
+        );
+        write_json_atomically(&root.join("bootstrap.json"), &bootstrap).unwrap();
+        let mut bindings: Vec<_> = [
+            "amaterasu.rtx-hdr",
+            "amaterasu.session-lifecycle",
+            "amaterasu.extension-registry",
+            "amaterasu.management",
+            "amaterasu.nvhttp",
+            "amaterasu.rtsp",
+            "amaterasu.stream-session",
+        ]
+        .into_iter()
+        .map(|consumer| ComponentBinding {
+            consumer: consumer.into(),
+            provider: "example.display".into(),
+            service: service.into(),
+            native: false,
+        })
+        .collect();
+        bindings.push(ComponentBinding {
+            consumer: "amaterasu.rtx-hdr".into(),
+            provider: "example.foreground".into(),
+            service: foreground_service.into(),
+            native: false,
+        });
+        build_package_with_library_selection_and_probe(
+            &root,
+            &artifacts,
+            &output,
+            1,
+            PackageProfile::LinuxSessionRtxHdr,
+            &external,
+            None,
+            None,
+            &bindings,
+            &omitted,
+            |_| true,
+        )
+        .unwrap();
+        let package = verify_package(
+            &output,
+            &bootstrap,
+            VerificationPolicy {
+                minimum_sequence: 0,
+                allow_historical: false,
+                now: unix_timestamp(),
+            },
+        )
+        .unwrap();
+        assert!(
+            crate::rtx_repository_publisher::check_composition(
+                &package.manifest,
+                &package.runtime_config
+            )
+            .is_ok()
+        );
+        let plugin = package
+            .manifest
+            .components
+            .iter()
+            .find(|c| c.id == "amaterasu.rtx-hdr")
+            .unwrap();
+        assert_eq!(
+            plugin.requires.get("example.display").map(String::as_str),
+            Some("0.2.0")
+        );
+        assert!(!plugin.requires.contains_key("amaterasu.display-settings"));
+        assert_eq!(
+            plugin
+                .requires
+                .get("example.foreground")
+                .map(String::as_str),
+            Some("0.3.0")
+        );
+        for binding in &bindings {
+            let consumer = package
+                .manifest
+                .components
+                .iter()
+                .find(|component| component.id == binding.consumer)
+                .unwrap();
+            assert!(consumer.requested.call.contains(&binding.service));
+            assert!(
+                package.runtime_config.principals[&binding.consumer]
+                    .call
+                    .contains(&binding.service)
+            );
+            assert_eq!(
+                consumer.requires.get(&binding.provider).map(String::as_str),
+                Some(if binding.provider == "example.display" {
+                    "0.2.0"
+                } else {
+                    "0.3.0"
+                })
+            );
+        }
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn signed_rtx_graph_accepts_selected_lifecycle_and_registry_identities() {
+        use crate::profiles::linux_session::{CapabilityBinding, default_rtx_hdr_selection};
+        let base = fixture("rtx-replacement-session-contracts");
+        let root = base.join("root");
+        let artifacts = base.join("artifacts");
+        initialize_linux_session(
+            &root,
+            &LinuxSessionOptions {
+                external_extension_composition: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut bootstrap: BootstrapConfig = read_json(&root.join("bootstrap.json")).unwrap();
+        let endpoint = |principal: &str, service: &str, contract: &str| CapabilityBinding {
+            principal: principal.into(),
+            service: service.into(),
+            contract: contract.into(),
+            interface_major: 1,
+            interface_minor: 0,
+        };
+        let lifecycle = endpoint(
+            "example.lifecycle",
+            "example.lifecycle/1",
+            amaterasu_module_sdk::extension_api::SESSION_LIFECYCLE_SERVICE,
+        );
+        let registry = endpoint(
+            "example.registry",
+            "example.registry/1",
+            amaterasu_module_sdk::extension_api::EXTENSION_REGISTRY_SERVICE,
+        );
+        let mut external_paths = Vec::new();
+        for selected in [&lifecycle, &registry] {
+            let requested = Grants {
+                provide: [selected.service.clone()].into(),
+                ..Default::default()
+            };
+            bootstrap
+                .policy
+                .principals
+                .insert(selected.principal.clone(), requested.clone());
+            bootstrap
+                .policy
+                .settings
+                .insert(selected.principal.clone(), serde_json::json!({}));
+            let template = base.join(format!("{}.json", selected.principal));
+            let artifact = base.join(format!("{}.so", selected.principal));
+            write_json_atomically(
+                &template,
+                &ComponentManifest {
+                    id: selected.principal.clone(),
+                    version: "0.2.0".into(),
+                    file: format!("{}.so", selected.principal),
+                    sha256: String::new(),
+                    size: 0,
+                    abi_major: amaterasu_abi::ABI_MAJOR,
+                    runtime: false,
+                    requires: BTreeMap::from([(RUNTIME_ID.into(), "0.1.0".into())]),
+                    requested,
+                },
+            )
+            .unwrap();
+            fs::write(&artifact, selected.principal.as_bytes()).unwrap();
+            external_paths.push((template, artifact));
+        }
+        let mut selection = default_rtx_hdr_selection();
+        selection.lifecycle = Some(lifecycle.clone());
+        selection.settings_registry = Some(registry.clone());
+        selection.display_settings = None;
+        crate::profiles::linux_session::enable_rtx_hdr_with_selection(
+            &mut bootstrap.policy,
+            &root.join("data/state/rtx-hdr/runtime"),
+            &selection,
+        )
+        .unwrap();
+        write_json_atomically(&root.join("bootstrap.json"), &bootstrap).unwrap();
+        fs::create_dir_all(&artifacts).unwrap();
+        for definition in PackageProfile::LinuxSessionRtxHdr.components() {
+            if bootstrap.policy.principals.contains_key(definition.id)
+                || definition.id == RUNTIME_ID
+            {
+                fs::write(
+                    artifacts.join(library_filename(definition.library)),
+                    definition.id.as_bytes(),
+                )
+                .unwrap();
+            }
+        }
+        fs::write(
+            artifacts.join(library_filename("amaterasu_encode")),
+            b"AMATERASU_X264_BUILD=164\0",
+        )
+        .unwrap();
+        let external: Vec<_> = external_paths
+            .iter()
+            .map(|(template, artifact)| (template.as_path(), artifact.as_path()))
+            .collect();
+        let output = base.join("package");
+        build_package_with_library_selection_and_probe(
+            &root,
+            &artifacts,
+            &output,
+            1,
+            PackageProfile::LinuxSessionRtxHdr,
+            &external,
+            None,
+            None,
+            &[],
+            &BTreeSet::new(),
+            |_| true,
+        )
+        .unwrap();
+        let package = verify_package(
+            &output,
+            &bootstrap,
+            VerificationPolicy {
+                minimum_sequence: 0,
+                allow_historical: false,
+                now: unix_timestamp(),
+            },
+        )
+        .unwrap();
+        assert!(package.signed);
+        for removed in [
+            "amaterasu.session-lifecycle",
+            "amaterasu.extension-registry",
+        ] {
+            assert!(
+                package
+                    .manifest
+                    .components
+                    .iter()
+                    .all(|component| component.id != removed)
+            );
+        }
+        let stream = package
+            .manifest
+            .components
+            .iter()
+            .find(|component| component.id == selection.stream_owner.as_ref().unwrap().principal)
+            .unwrap();
+        assert_eq!(
+            stream
+                .requires
+                .get(&lifecycle.principal)
+                .map(String::as_str),
+            Some("0.2.0")
+        );
+        let lifecycle_component = package
+            .manifest
+            .components
+            .iter()
+            .find(|component| component.id == lifecycle.principal)
+            .unwrap();
+        assert_eq!(
+            lifecycle_component
+                .requires
+                .get(&registry.principal)
+                .map(String::as_str),
+            Some("0.2.0")
+        );
+        let mut unapproved = bootstrap.clone();
+        unapproved
+            .policy
+            .principals
+            .get_mut(&lifecycle.principal)
+            .unwrap()
+            .call
+            .remove(&registry.service);
+        assert!(
+            verify_package(
+                &output,
+                &unapproved,
+                VerificationPolicy {
+                    minimum_sequence: 0,
+                    allow_historical: false,
+                    now: unix_timestamp(),
+                }
+            )
+            .is_err()
+        );
+        let mut no_preflight = bootstrap.clone();
+        no_preflight
+            .policy
+            .principals
+            .get_mut("amaterasu.remote-session")
+            .unwrap()
+            .call
+            .remove(&selection.frame_consumer.service);
+        assert!(
+            verify_package(
+                &output,
+                &no_preflight,
+                VerificationPolicy {
+                    minimum_sequence: 0,
+                    allow_historical: false,
+                    now: unix_timestamp(),
+                }
+            )
+            .is_err()
+        );
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn signed_rtx_graph_selects_a_replacement_video_contract() {
+        use crate::profiles::linux_session::{
+            CapabilityBinding, VIDEO_COMPONENT_ID, default_rtx_hdr_selection,
+        };
+
+        fn replace_identity(value: &mut serde_json::Value, old: &str, new: &str) {
+            match value {
+                serde_json::Value::String(text) if text == old => *text = new.into(),
+                serde_json::Value::Array(values) => {
+                    for value in values {
+                        replace_identity(value, old, new);
+                    }
+                }
+                serde_json::Value::Object(values) => {
+                    for value in values.values_mut() {
+                        replace_identity(value, old, new);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let base = fixture("rtx-replacement-video");
+        let root = base.join("root");
+        let artifacts = base.join("artifacts");
+        initialize_linux_session(&root, &LinuxSessionOptions::default()).unwrap();
+        let mut bootstrap: BootstrapConfig = read_json(&root.join("bootstrap.json")).unwrap();
+        let mut video_settings = bootstrap
+            .policy
+            .settings
+            .remove(VIDEO_COMPONENT_ID)
+            .unwrap();
+        bootstrap
+            .policy
+            .principals
+            .remove(VIDEO_COMPONENT_ID)
+            .unwrap();
+        for value in bootstrap
+            .policy
+            .settings
+            .values_mut()
+            .chain(std::iter::once(&mut video_settings))
+        {
+            replace_identity(value, VIDEO_COMPONENT_ID, "example.video");
+            replace_identity(value, "amaterasu.video/1", "example.video/1");
+        }
+        bootstrap
+            .policy
+            .settings
+            .insert("example.video".into(), video_settings);
+        for approval in &mut bootstrap.policy.api_methods {
+            if approval.provider == VIDEO_COMPONENT_ID {
+                approval.provider = "example.video".into();
+            }
+            if approval.callers.remove(VIDEO_COMPONENT_ID) {
+                approval.callers.insert("example.video".into());
+            }
+        }
+        let requested = Grants {
+            provide: ["example.video/1".into()].into(),
+            native_provide: ["example.video/1".into()].into(),
+            ..Default::default()
+        };
+        bootstrap
+            .policy
+            .principals
+            .insert("example.video".into(), requested.clone());
+        let mut selection = default_rtx_hdr_selection();
+        selection.frame_consumer = CapabilityBinding {
+            principal: "example.video".into(),
+            service: "example.video/1".into(),
+            contract: amaterasu_module_sdk::video::CONTRACT.into(),
+            interface_major: 1,
+            interface_minor: 0,
+        };
+        selection.display_settings = None;
+        crate::profiles::linux_session::enable_rtx_hdr_with_selection(
+            &mut bootstrap.policy,
+            &root.join("data/state/rtx-hdr/runtime"),
+            &selection,
+        )
+        .unwrap();
+        write_json_atomically(&root.join("bootstrap.json"), &bootstrap).unwrap();
+        let template = base.join("video.json");
+        let artifact = base.join("video.so");
+        write_json_atomically(
+            &template,
+            &ComponentManifest {
+                id: "example.video".into(),
+                version: "0.2.0".into(),
+                file: "example_video.so".into(),
+                sha256: String::new(),
+                size: 0,
+                abi_major: amaterasu_abi::ABI_MAJOR,
+                runtime: false,
+                requires: BTreeMap::from([(RUNTIME_ID.into(), "0.1.0".into())]),
+                requested,
+            },
+        )
+        .unwrap();
+        fs::write(&artifact, b"independently packaged video fixture").unwrap();
+        fs::create_dir_all(&artifacts).unwrap();
+        for definition in PackageProfile::LinuxSessionRtxHdr.components() {
+            if definition.id != VIDEO_COMPONENT_ID {
+                fs::write(
+                    artifacts.join(library_filename(definition.library)),
+                    definition.id.as_bytes(),
+                )
+                .unwrap();
+            }
+        }
+        fs::write(
+            artifacts.join(library_filename("amaterasu_encode")),
+            b"AMATERASU_X264_BUILD=164\0",
+        )
+        .unwrap();
+        let output = base.join("package");
+        build_package_with_library_selection_and_probe(
+            &root,
+            &artifacts,
+            &output,
+            1,
+            PackageProfile::LinuxSessionRtxHdr,
+            &[(&template, &artifact)],
+            None,
+            None,
+            &[],
+            &BTreeSet::new(),
+            |_| true,
+        )
+        .unwrap();
+        let package = verify_package(
+            &output,
+            &bootstrap,
+            VerificationPolicy {
+                minimum_sequence: 0,
+                allow_historical: false,
+                now: unix_timestamp(),
+            },
+        )
+        .unwrap();
+        assert!(package.signed);
+        assert!(
+            package
+                .manifest
+                .components
+                .iter()
+                .all(|component| component.id != VIDEO_COMPONENT_ID)
+        );
+        for client in [
+            "amaterasu.stream-session",
+            "amaterasu.remote-session",
+            "amaterasu.management",
+        ] {
+            let component = package
+                .manifest
+                .components
+                .iter()
+                .find(|component| component.id == client)
+                .unwrap();
+            assert_eq!(
+                component.requires.get("example.video").map(String::as_str),
+                Some("0.2.0")
+            );
+            assert!(
+                package.runtime_config.principals[client]
+                    .call
+                    .contains("example.video/1")
+            );
+        }
+        let mut missing_view = bootstrap.clone();
+        missing_view
+            .policy
+            .processing_compositions
+            .remove("amaterasu.remote-session");
+        assert!(
+            verify_package(
+                &output,
+                &missing_view,
+                VerificationPolicy {
+                    minimum_sequence: 0,
+                    allow_historical: false,
+                    now: unix_timestamp(),
+                }
+            )
+            .is_err()
+        );
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn selected_builtin_foreground_also_requires_a_signed_binding() {
+        use crate::profiles::linux_session::{
+            CapabilityBinding, ProcessingSelection, default_rtx_hdr_selection,
+        };
+        let base = fixture("rtx-builtin-foreground");
+        let root = base.join("root");
+        let artifacts = base.join("artifacts");
+        initialize_linux_session(&root, &LinuxSessionOptions::default()).unwrap();
+        let mut bootstrap: BootstrapConfig = read_json(&root.join("bootstrap.json")).unwrap();
+        crate::profiles::linux_session::enable_rtx_hdr_with_selection(
+            &mut bootstrap.policy,
+            &root.join("data/state/rtx-hdr/runtime"),
+            &ProcessingSelection {
+                foreground: Some(CapabilityBinding {
+                    principal: "amaterasu.foreground-context".into(),
+                    service: amaterasu_module_sdk::foreground_context::SERVICE.into(),
+                    contract: amaterasu_module_sdk::foreground_context::SERVICE.into(),
+                    interface_major: 1,
+                    interface_minor: 0,
+                }),
+                ..default_rtx_hdr_selection()
+            },
+        )
+        .unwrap();
+        write_json_atomically(&root.join("bootstrap.json"), &bootstrap).unwrap();
+        fs::create_dir_all(&artifacts).unwrap();
+        for definition in PackageProfile::LinuxSessionRtxHdr.components() {
+            fs::write(
+                artifacts.join(library_filename(definition.library)),
+                definition.id.as_bytes(),
+            )
+            .unwrap();
+        }
+        fs::write(
+            artifacts.join(library_filename("amaterasu_encode")),
+            b"AMATERASU_X264_BUILD=164\0",
+        )
+        .unwrap();
+        let pack = |output: &Path, bindings: &[ComponentBinding]| {
+            build_package_with_library_selection_and_probe(
+                &root,
+                &artifacts,
+                output,
+                1,
+                PackageProfile::LinuxSessionRtxHdr,
+                &[],
+                None,
+                None,
+                bindings,
+                &BTreeSet::new(),
+                |_| true,
+            )
+        };
+        let mut unapproved = bootstrap.clone();
+        unapproved
+            .policy
+            .principals
+            .get_mut("amaterasu.rtx-hdr")
+            .unwrap()
+            .call
+            .remove(amaterasu_module_sdk::foreground_context::SERVICE);
+        write_json_atomically(&root.join("bootstrap.json"), &unapproved).unwrap();
+        assert!(pack(&base.join("missing-binding"), &[]).is_err());
+        write_json_atomically(&root.join("bootstrap.json"), &bootstrap).unwrap();
+        pack(
+            &base.join("complete"),
+            &[ComponentBinding {
+                consumer: "amaterasu.rtx-hdr".into(),
+                provider: "amaterasu.foreground-context".into(),
+                service: amaterasu_module_sdk::foreground_context::SERVICE.into(),
+                native: false,
+            }],
+        )
+        .unwrap();
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn packaging_cannot_omit_an_extension_still_selected_by_policy() {
+        let base = fixture("selected-extension-omission");
+        let policy = crate::profiles::linux_session::linux_session_policy(
+            &base,
+            &LinuxSessionOptions::default(),
+        )
+        .unwrap();
+        let bootstrap = BootstrapConfig {
+            development: true,
+            allow_unsigned: false,
+            trusted_keys: BTreeMap::new(),
+            policy,
+        };
+        let omitted = ["amaterasu.frame-limiter".to_owned()].into();
+        assert!(
+            validate_omitted_components(PackageProfile::LinuxSession, &[], &bootstrap, &omitted)
+                .is_err()
+        );
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn independently_packaged_rtx_provider_binds_into_an_existing_sdk_host() {
+        let base = fixture("external-rtx-sdk");
+        let root = base.join("root");
+        let artifacts = base.join("artifacts");
+        let output = base.join("package");
+        initialize_linux_session(
+            &root,
+            &LinuxSessionOptions {
+                external_extension_composition: true,
+                rtx_hdr_runtime_directory: Some(root.join("data/state/rtx-hdr/runtime")),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        fs::create_dir_all(&artifacts).unwrap();
+        for component in PackageProfile::LinuxSession.components() {
+            if component.id != "amaterasu.frame-limiter" {
+                fs::write(
+                    artifacts.join(library_filename(component.library)),
+                    component.id.as_bytes(),
+                )
+                .unwrap();
+            }
+        }
+        fs::write(
+            artifacts.join(library_filename("amaterasu_encode")),
+            b"AMATERASU_X264_BUILD=164\0",
+        )
+        .unwrap();
+        let artifact = base.join("independent-rtx.so");
+        if let Some(path) = std::env::var_os("EXTERNAL_RTX_PROCESSOR") {
+            fs::copy(path, &artifact).unwrap();
+        } else {
+            fs::write(&artifact, b"independently built RTX HDR fixture").unwrap();
+        }
+        let template = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../modules/rtx-hdr/examples/component-linux.json");
+        let mut bindings = Vec::new();
+        for caller in [
+            "amaterasu.session-lifecycle",
+            "amaterasu.extension-registry",
+            "amaterasu.management",
+            "amaterasu.nvhttp",
+            "amaterasu.rtsp",
+            "amaterasu.stream-session",
+        ] {
+            bindings.push(ComponentBinding {
+                consumer: caller.into(),
+                provider: "amaterasu.rtx-hdr".into(),
+                service: "nonary.rtx-hdr/1".into(),
+                native: false,
+            });
+        }
+        bindings.push(ComponentBinding {
+            consumer: crate::profiles::linux_session::VIDEO_COMPONENT_ID.into(),
+            provider: "amaterasu.rtx-hdr".into(),
+            service: "amaterasu.rtx-hdr/1".into(),
+            native: true,
+        });
+        bindings.push(ComponentBinding {
+            consumer: crate::profiles::linux_session::VIDEO_COMPONENT_ID.into(),
+            provider: "amaterasu.session-lifecycle".into(),
+            service: "amaterasu.session-lifecycle/1".into(),
+            native: false,
+        });
+        let omitted = ["amaterasu.frame-limiter".to_owned()].into();
+        build_package_with_library_selection_and_probe(
+            &root,
+            &artifacts,
+            &output,
+            1,
+            PackageProfile::LinuxSession,
+            &[(&template, &artifact)],
+            None,
+            None,
+            &bindings,
+            &omitted,
+            |_| true,
+        )
+        .unwrap();
+        let bootstrap: BootstrapConfig = read_json(&root.join("bootstrap.json")).unwrap();
+        let package = verify_package(
+            &output,
+            &bootstrap,
+            VerificationPolicy {
+                minimum_sequence: 0,
+                allow_historical: false,
+                now: unix_timestamp(),
+            },
+        )
+        .unwrap();
+        assert!(
+            crate::rtx_repository_publisher::check_composition(
+                &package.manifest,
+                &package.runtime_config
+            )
+            .is_ok()
+        );
+        assert!(
+            package
+                .manifest
+                .components
+                .iter()
+                .all(|c| c.id != "amaterasu.frame-limiter")
+        );
+        let plugin = package
+            .manifest
+            .components
+            .iter()
+            .find(|c| c.id == "amaterasu.rtx-hdr")
+            .unwrap();
+        assert_eq!(plugin.sha256, sha256(&fs::read(&artifact).unwrap()));
+        assert_eq!(
+            plugin
+                .requires
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["amaterasu.runtime"]
+        );
+        let ordered = amaterasu_package::ordered_components(&package.manifest.components).unwrap();
+        let position = |id: &str| {
+            ordered
+                .iter()
+                .position(|component| component.id == id)
+                .unwrap()
+        };
+        assert!(
+            position("amaterasu.rtx-hdr")
+                < position(crate::profiles::linux_session::VIDEO_COMPONENT_ID)
+        );
+        fs::remove_dir_all(base).unwrap();
     }
 
     fn write_artifacts(path: &Path) {
@@ -2659,6 +3901,8 @@ mod provision_tests {
             &[],
             None,
             None,
+            &[],
+            &BTreeSet::new(),
             |_| true,
         )
         .unwrap();
@@ -2807,6 +4051,9 @@ fn build_signed_package_with_runtime_probe(
         &[],
         &BTreeMap::new(),
         None,
+        &[],
+        &BTreeSet::new(),
+        None,
     )
 }
 
@@ -2823,6 +4070,9 @@ fn build_signed_package_with_runtime_probe_and_authority(
     external: &[ExternalComponent],
     call_grants: &BTreeMap<String, BTreeSet<String>>,
     replacement_id: Option<&str>,
+    bindings: &[ComponentBinding],
+    omitted: &BTreeSet<String>,
+    composition_policy: Option<&amaterasu_contracts::RuntimeConfig>,
 ) -> PackageResult<()> {
     if authority.is_some()
         && !matches!(
@@ -2849,6 +4099,9 @@ fn build_signed_package_with_runtime_probe_and_authority(
 
     let mut components = Vec::new();
     for definition in profile.components() {
+        if omitted.contains(definition.id) {
+            continue;
+        }
         if definition.id == "amaterasu.library" && replacement_id.is_some() {
             continue;
         }
@@ -2906,9 +4159,80 @@ fn build_signed_package_with_runtime_probe_and_authority(
         }
     }
     for component in &mut components {
+        for id in omitted {
+            if let Some(version) = component.requires.get_mut(id) {
+                if let Some(replacement) = external.iter().find(|entry| entry.manifest.id == *id) {
+                    *version = replacement.manifest.version.clone();
+                } else {
+                    if id == crate::profiles::linux_session::VIDEO_COMPONENT_ID {
+                        let policy = composition_policy
+                            .ok_or("video replacement needs a processing selection")?;
+                        let selected = selected_video_replacement(policy, external)?;
+                        let has_view = policy
+                            .processing_compositions
+                            .get(&component.id)
+                            .is_some_and(|view| view.frame_consumer.as_ref() == Some(selected));
+                        let has_grant = policy
+                            .principals
+                            .get(&component.id)
+                            .is_some_and(|grants| grants.call.contains(&selected.service));
+                        if !has_view || !has_grant {
+                            return Err(
+                                "video dependent lacks its selected contract and grant".into()
+                            );
+                        }
+                    }
+                    let original = profile
+                        .components()
+                        .iter()
+                        .find(|entry| entry.id == id)
+                        .ok_or("omitted dependency is not in the selected profile")?;
+                    let replacements = external.iter().filter(|entry| {
+                        original
+                            .provides
+                            .iter()
+                            .any(|service| entry.manifest.requested.provide.contains(*service))
+                            || original.native_provides.iter().any(|service| {
+                                entry.manifest.requested.native_provide.contains(*service)
+                            })
+                    });
+                    for replacement in replacements {
+                        let explicitly_bound = bindings.iter().any(|binding| {
+                            binding.consumer == component.id
+                                && binding.provider == replacement.manifest.id
+                                && if binding.native {
+                                    original.native_provides.contains(&binding.service.as_str())
+                                        && replacement
+                                            .manifest
+                                            .requested
+                                            .native_provide
+                                            .contains(&binding.service)
+                                } else {
+                                    original.provides.contains(&binding.service.as_str())
+                                        && replacement
+                                            .manifest
+                                            .requested
+                                            .provide
+                                            .contains(&binding.service)
+                                }
+                        });
+                        if !explicitly_bound {
+                            return Err(
+                                "replacement provider requires an explicit ordered binding".into(),
+                            );
+                        }
+                    }
+                    component.requires.remove(id);
+                }
+            }
+        }
         if let Some(calls) = call_grants.get(&component.id) {
             component.requested.call.extend(calls.iter().cloned());
         }
+    }
+    apply_component_bindings(&mut components, bindings)?;
+    if let Some(policy) = composition_policy {
+        apply_processing_graph(&mut components, policy)?;
     }
 
     let privileged_requests = authority
@@ -3302,6 +4626,7 @@ fn validate_unique_service_providers(
     profile: PackageProfile,
     external: &[ExternalComponent],
     replacement_id: Option<&str>,
+    omitted: &BTreeSet<String>,
 ) -> PackageResult<()> {
     let mut ordinary = BTreeMap::<String, String>::new();
     let mut native = BTreeMap::<String, String>::new();
@@ -3319,6 +4644,9 @@ fn validate_unique_service_providers(
         Ok(())
     };
     for component in profile.components() {
+        if omitted.contains(component.id) {
+            continue;
+        }
         if component.id == "amaterasu.library" && replacement_id.is_some() {
             continue;
         }
@@ -3328,6 +4656,120 @@ fn validate_unique_service_providers(
         add(&component.manifest.id, component.manifest.requested.clone())?;
     }
     Ok(())
+}
+
+fn validate_omitted_components(
+    profile: PackageProfile,
+    external: &[ExternalComponent],
+    bootstrap: &BootstrapConfig,
+    omitted: &BTreeSet<String>,
+) -> PackageResult<()> {
+    const OPTIONAL: &[&str] = &[
+        "amaterasu.frame-limiter",
+        "amaterasu.foreground-context",
+        "amaterasu.display-settings",
+        "amaterasu.session-lifecycle",
+        "amaterasu.extension-registry",
+    ];
+    fn mentions(value: &serde_json::Value, names: &BTreeSet<&str>) -> bool {
+        match value {
+            serde_json::Value::String(text) => names.contains(text.as_str()),
+            serde_json::Value::Array(values) => values.iter().any(|value| mentions(value, names)),
+            serde_json::Value::Object(values) => values
+                .iter()
+                .any(|(key, value)| names.contains(key.as_str()) || mentions(value, names)),
+            _ => false,
+        }
+    }
+    for id in omitted {
+        let definition = profile
+            .components()
+            .iter()
+            .find(|entry| entry.id == id)
+            .ok_or("omitted component is not in the selected profile")?;
+        if id == crate::profiles::linux_session::VIDEO_COMPONENT_ID {
+            selected_video_replacement(&bootstrap.policy, external)?;
+        } else if !OPTIONAL.contains(&id.as_str()) {
+            return Err("only explicitly optional profile providers can be omitted".into());
+        }
+        if external.iter().any(|item| item.manifest.id == *id) {
+            continue;
+        }
+        let mut references = BTreeSet::from([id.as_str()]);
+        for service in definition
+            .provides
+            .iter()
+            .chain(definition.native_provides.iter())
+        {
+            if !external.iter().any(|item| {
+                item.manifest.requested.provide.contains(*service)
+                    || item.manifest.requested.native_provide.contains(*service)
+            }) {
+                references.insert(service);
+            }
+        }
+        if bootstrap
+            .policy
+            .settings
+            .iter()
+            .any(|(principal, value)| principal == id || mentions(value, &references))
+            || bootstrap
+                .policy
+                .api_methods
+                .iter()
+                .any(|approval| approval.provider == *id || approval.callers.contains(id))
+        {
+            return Err("omitted provider is still selected by policy".into());
+        }
+    }
+    Ok(())
+}
+
+fn selected_video_replacement<'a>(
+    policy: &'a amaterasu_contracts::RuntimeConfig,
+    external: &[ExternalComponent],
+) -> PackageResult<&'a amaterasu_contracts::processing_composition::CapabilityBinding> {
+    let mut graphs = policy
+        .processing_compositions
+        .iter()
+        .filter_map(|(principal, view)| {
+            view.processor
+                .as_ref()
+                .filter(|processor| &processor.principal == principal)
+                .map(|_| view)
+        });
+    let graph = graphs
+        .next()
+        .ok_or("video replacement needs a selected processor")?;
+    if graphs.next().is_some() {
+        return Err("video replacement requires one processing graph".into());
+    }
+    amaterasu_module_sdk::processing_composition::validate(graph)?;
+    let selected = graph
+        .frame_consumer
+        .as_ref()
+        .ok_or("video replacement is not selected")?;
+    if selected.principal == crate::profiles::linux_session::VIDEO_COMPONENT_ID
+        || selected.contract != amaterasu_module_sdk::video::CONTRACT
+        || !external.iter().any(|provider| {
+            provider.manifest.id == selected.principal
+                && provider
+                    .manifest
+                    .requested
+                    .provide
+                    .contains(&selected.service)
+                && provider
+                    .manifest
+                    .requested
+                    .native_provide
+                    .contains(&selected.service)
+        })
+    {
+        return Err(
+            "selected video replacement is not packaged with the required contracts".into(),
+        );
+    }
+    Ok(selected)
 }
 
 /// Pack never changes local authorization: the operator must first approve the
@@ -3465,6 +4907,294 @@ fn validate_external_call_grants(
     Ok(())
 }
 
+fn validate_component_bindings(
+    profile: PackageProfile,
+    external: &[ExternalComponent],
+    bootstrap: &BootstrapConfig,
+    replacement_id: Option<&str>,
+    bindings: &[ComponentBinding],
+) -> PackageResult<()> {
+    if bindings.len() > 128 {
+        return Err("too many component bindings".into());
+    }
+    let selected = |id: &str| {
+        external
+            .iter()
+            .find(|item| item.manifest.id == id)
+            .map(|item| item.manifest.requested.clone())
+            .or_else(|| {
+                profile
+                    .components()
+                    .iter()
+                    .find(|item| {
+                        item.id == id && !(id == "amaterasu.library" && replacement_id.is_some())
+                    })
+                    .map(ComponentDefinition::grants)
+            })
+    };
+    let mut seen = BTreeSet::new();
+    for binding in bindings {
+        if binding.consumer == binding.provider
+            || !amaterasu_contracts::valid_name(&binding.service)
+            || !binding.service.ends_with("/1")
+            || !seen.insert((&binding.consumer, &binding.service, binding.native))
+        {
+            return Err("invalid or duplicate component binding".into());
+        }
+        let consumer = selected(&binding.consumer).ok_or("binding consumer is not selected")?;
+        let provider = selected(&binding.provider).ok_or("binding provider is not selected")?;
+        let consumer_policy = bootstrap
+            .policy
+            .principals
+            .get(&binding.consumer)
+            .ok_or("binding consumer has no installed approval")?;
+        let provider_policy = bootstrap
+            .policy
+            .principals
+            .get(&binding.provider)
+            .ok_or("binding provider has no installed approval")?;
+        let approved = if binding.native {
+            provider.native_provide.contains(&binding.service)
+                && provider_policy.native_provide.contains(&binding.service)
+                && consumer_policy.native_use.contains(&binding.service)
+        } else {
+            provider.provide.contains(&binding.service)
+                && provider_policy.provide.contains(&binding.service)
+                && consumer_policy.call.contains(&binding.service)
+        };
+        if !approved || binding.consumer == RUNTIME_ID || binding.provider == RUNTIME_ID {
+            return Err("component binding lacks selected provider or installed approval".into());
+        }
+        let _ = consumer;
+    }
+    Ok(())
+}
+
+fn apply_component_bindings(
+    components: &mut [ComponentManifest],
+    bindings: &[ComponentBinding],
+) -> PackageResult<()> {
+    for binding in bindings {
+        let version = components
+            .iter()
+            .find(|item| item.id == binding.provider)
+            .ok_or("binding provider is not packaged")?
+            .version
+            .clone();
+        let consumer = components
+            .iter_mut()
+            .find(|item| item.id == binding.consumer)
+            .ok_or("binding consumer is not packaged")?;
+        if consumer
+            .requires
+            .get(&binding.provider)
+            .is_some_and(|old| *old != version)
+        {
+            return Err("binding conflicts with an existing dependency".into());
+        }
+        consumer.requires.insert(binding.provider.clone(), version);
+        if binding.native {
+            consumer
+                .requested
+                .native_use
+                .insert(binding.service.clone());
+        } else {
+            consumer.requested.call.insert(binding.service.clone());
+        }
+    }
+    amaterasu_package::ordered_components(components)?;
+    Ok(())
+}
+
+/// Turn the operator-selected processing graph into signed grants and startup
+/// dependencies. Every edge must already be allowed by trusted policy.
+fn apply_processing_graph(
+    components: &mut [ComponentManifest],
+    policy: &amaterasu_contracts::RuntimeConfig,
+) -> PackageResult<()> {
+    use amaterasu_module_sdk::processing_composition::CapabilityBinding;
+    let mut edges: Vec<(String, CapabilityBinding, bool)> = Vec::new();
+    for (principal, view) in &policy.processing_compositions {
+        let Some(processor) = &view.processor else {
+            continue;
+        };
+        if &processor.principal != principal {
+            continue;
+        }
+        amaterasu_module_sdk::processing_composition::validate(view)?;
+        let consumer = view
+            .frame_consumer
+            .as_ref()
+            .ok_or("selected processor lacks a frame consumer")?;
+        edges.push((consumer.principal.clone(), processor.clone(), true));
+        let consumer_view = policy
+            .processing_compositions
+            .get(&consumer.principal)
+            .ok_or("processing frame consumer composition is absent")?;
+        for caller in &consumer_view.source_preflight_consumers {
+            edges.push((caller.clone(), consumer.clone(), false));
+        }
+        if let Some(control) = &view.processor_control {
+            for selected in [&view.stream_owner, &view.lifecycle, &view.settings_registry]
+                .into_iter()
+                .flatten()
+            {
+                edges.push((selected.principal.clone(), control.clone(), false));
+            }
+        }
+        if let Some(owner) = &view.stream_owner {
+            let owner_view = policy
+                .processing_compositions
+                .get(&owner.principal)
+                .ok_or("processing stream owner composition is absent")?;
+            for ancestor in &owner_view.request_ancestors {
+                edges.push((ancestor.clone(), owner.clone(), false));
+                edges.push((ancestor.clone(), consumer.clone(), false));
+                for selected in [&view.lifecycle, &view.settings_registry]
+                    .into_iter()
+                    .flatten()
+                {
+                    edges.push((ancestor.clone(), selected.clone(), false));
+                }
+                if let Some(control) = &view.processor_control {
+                    edges.push((ancestor.clone(), control.clone(), false));
+                }
+                if let Some(display) = &view.display_settings {
+                    edges.push((ancestor.clone(), display.clone(), false));
+                }
+            }
+            // Stream owners invoke the selected video's control service.
+            edges.push((owner.principal.clone(), consumer.clone(), false));
+            if let Some(lifecycle) = &view.lifecycle {
+                edges.push((owner.principal.clone(), lifecycle.clone(), false));
+            }
+            if let Some(display) = &view.display_settings {
+                edges.push((owner.principal.clone(), display.clone(), false));
+            }
+        }
+        if let Some(lifecycle) = &view.lifecycle {
+            // Lifecycle owns these participants and can call them while they
+            // resolve context or scope through it. Do not introduce a cyclic
+            // lifetime edge; all modules keep ticking until the graph drains.
+            for caller in std::iter::once(&processor.principal).chain(
+                view.settings_registry
+                    .iter()
+                    .map(|registry| &registry.principal),
+            ) {
+                let approved = policy
+                    .principals
+                    .get(caller)
+                    .is_some_and(|grants| grants.call.contains(&lifecycle.service));
+                if !approved {
+                    return Err("lifecycle context caller is not approved".into());
+                }
+                let component = components
+                    .iter_mut()
+                    .find(|component| component.id == *caller)
+                    .ok_or("lifecycle context caller is not packaged")?;
+                component.requested.call.insert(lifecycle.service.clone());
+            }
+        }
+        if let Some(lifecycle) = &view.lifecycle {
+            let lifecycle_view = policy
+                .processing_compositions
+                .get(&lifecycle.principal)
+                .ok_or("lifecycle composition is absent")?;
+            for caller in &lifecycle_view.prepared_context_consumers {
+                edges.push((caller.clone(), lifecycle.clone(), false));
+            }
+            if view.settings_registry.is_some() {
+                edges.push((consumer.principal.clone(), lifecycle.clone(), false));
+            }
+            if let Some(registry) = &view.settings_registry {
+                edges.push((lifecycle.principal.clone(), registry.clone(), false));
+            }
+        }
+        for selected in [&view.display_settings, &view.foreground]
+            .into_iter()
+            .flatten()
+        {
+            edges.push((processor.principal.clone(), selected.clone(), false));
+        }
+    }
+    for (caller, provider, native) in edges {
+        if caller == "amaterasu.console" {
+            let grants = policy
+                .principals
+                .get(&caller)
+                .ok_or("console principal is not approved")?;
+            if !(if native {
+                &grants.native_use
+            } else {
+                &grants.call
+            })
+            .contains(&provider.service)
+            {
+                return Err("console processing contract is not approved".into());
+            }
+            continue;
+        }
+        let provider_manifest = components
+            .iter()
+            .find(|component| component.id == provider.principal)
+            .ok_or("processing graph provider is not packaged")?;
+        let requested = if native {
+            &provider_manifest.requested.native_provide
+        } else {
+            &provider_manifest.requested.provide
+        };
+        let provider_grants = policy
+            .principals
+            .get(&provider.principal)
+            .ok_or("processing graph provider is not approved")?;
+        let granted = if native {
+            &provider_grants.native_provide
+        } else {
+            &provider_grants.provide
+        };
+        if !requested.contains(&provider.service) || !granted.contains(&provider.service) {
+            return Err("processing graph provider contract is not approved".into());
+        }
+        let version = provider_manifest.version.clone();
+        let caller_grants = policy
+            .principals
+            .get(&caller)
+            .ok_or("processing graph caller is not approved")?;
+        let granted = if native {
+            &caller_grants.native_use
+        } else {
+            &caller_grants.call
+        };
+        if !granted.contains(&provider.service) {
+            return Err("processing graph caller contract is not approved".into());
+        }
+        let consumer = components
+            .iter_mut()
+            .find(|component| component.id == caller)
+            .ok_or("processing graph caller is not packaged")?;
+        if native {
+            consumer
+                .requested
+                .native_use
+                .insert(provider.service.clone());
+        } else {
+            consumer.requested.call.insert(provider.service.clone());
+        }
+        if caller != provider.principal {
+            if consumer
+                .requires
+                .get(&provider.principal)
+                .is_some_and(|old| *old != version)
+            {
+                return Err("processing graph has a conflicting dependency".into());
+            }
+            consumer.requires.insert(provider.principal, version);
+        }
+    }
+    amaterasu_package::ordered_components(components)?;
+    Ok(())
+}
+
 fn copy_component(
     artifacts: &Path,
     output: &Path,
@@ -3541,6 +5271,147 @@ fn library_filename(name: &str) -> String {
 #[cfg(test)]
 mod external_component_tests {
     use super::*;
+
+    #[test]
+    fn signed_sdk_bindings_follow_selected_providers_and_require_approval() {
+        let base =
+            std::env::temp_dir().join(format!("sdk-bindings-{}", random_identifier().unwrap()));
+        let root = base.join("root");
+        let artifacts = base.join("artifacts");
+        let output = base.join("package");
+        fs::create_dir_all(&artifacts).unwrap();
+        initialize(&root).unwrap();
+        for definition in PackageProfile::Example.components() {
+            fs::write(
+                artifacts.join(library_filename(definition.library)),
+                definition.id.as_bytes(),
+            )
+            .unwrap();
+        }
+        let mut bootstrap: BootstrapConfig = read_json(&root.join("bootstrap.json")).unwrap();
+        let mut paths = Vec::new();
+        for (id, service, native) in [
+            ("example.effect", "example.effect/1", true),
+            ("example.display", "example.display/1", false),
+        ] {
+            let mut requested = Grants::default();
+            if native {
+                requested.native_provide.insert(service.into());
+            } else {
+                requested.provide.insert(service.into());
+            }
+            let manifest = ComponentManifest {
+                id: id.into(),
+                version: "0.4.0".into(),
+                file: format!("{id}.so"),
+                sha256: String::new(),
+                size: 0,
+                abi_major: amaterasu_abi::ABI_MAJOR,
+                runtime: false,
+                requires: BTreeMap::from([(RUNTIME_ID.into(), "0.1.0".into())]),
+                requested: requested.clone(),
+            };
+            bootstrap.policy.principals.insert(id.into(), requested);
+            let template = base.join(format!("{id}.json"));
+            let artifact = base.join(format!("{id}.bin"));
+            write_json_atomically(&template, &manifest).unwrap();
+            fs::write(&artifact, id.as_bytes()).unwrap();
+            paths.push((template, artifact));
+        }
+        let external = paths
+            .iter()
+            .map(|(a, b)| (a.as_path(), b.as_path()))
+            .collect::<Vec<_>>();
+        let bindings = [
+            ComponentBinding {
+                consumer: "amaterasu.example-echo".into(),
+                provider: "example.effect".into(),
+                service: "example.effect/1".into(),
+                native: true,
+            },
+            ComponentBinding {
+                consumer: "example.effect".into(),
+                provider: "example.display".into(),
+                service: "example.display/1".into(),
+                native: false,
+            },
+        ];
+        write_json_atomically(&root.join("bootstrap.json"), &bootstrap).unwrap();
+        assert!(
+            build_package_with_bindings(
+                &root,
+                &artifacts,
+                &output,
+                1,
+                PackageProfile::Example,
+                &external,
+                None,
+                None,
+                &bindings,
+                &BTreeSet::new(),
+            )
+            .is_err()
+        );
+        assert!(!output.exists());
+        bootstrap
+            .policy
+            .principals
+            .get_mut("amaterasu.example-echo")
+            .unwrap()
+            .native_use
+            .insert("example.effect/1".into());
+        bootstrap
+            .policy
+            .principals
+            .get_mut("example.effect")
+            .unwrap()
+            .call
+            .insert("example.display/1".into());
+        write_json_atomically(&root.join("bootstrap.json"), &bootstrap).unwrap();
+        build_package_with_bindings(
+            &root,
+            &artifacts,
+            &output,
+            1,
+            PackageProfile::Example,
+            &external,
+            None,
+            None,
+            &bindings,
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        let verified = verify_package(
+            &output,
+            &bootstrap,
+            VerificationPolicy {
+                minimum_sequence: 0,
+                allow_historical: true,
+                now: unix_timestamp(),
+            },
+        )
+        .unwrap();
+        let order = amaterasu_package::ordered_components(&verified.manifest.components).unwrap();
+        let position = |id: &str| {
+            order
+                .iter()
+                .position(|component| component.id == id)
+                .unwrap()
+        };
+        assert!(position("example.display") < position("example.effect"));
+        assert!(position("example.effect") < position("amaterasu.example-echo"));
+        assert!(
+            verified.runtime_config.principals["amaterasu.example-echo"]
+                .native_use
+                .contains("example.effect/1")
+        );
+        assert!(
+            verified.runtime_config.principals["example.effect"]
+                .call
+                .contains("example.display/1")
+        );
+        fs::remove_dir_all(base).unwrap();
+    }
 
     #[test]
     fn descriptor_digest_does_not_depend_on_input_key_order() {
@@ -3776,7 +5647,15 @@ mod external_component_tests {
             },
             bytes: Vec::new(),
         };
-        assert!(validate_unique_service_providers(PackageProfile::StreamProbe, &[], None).is_ok());
+        assert!(
+            validate_unique_service_providers(
+                PackageProfile::StreamProbe,
+                &[],
+                None,
+                &BTreeSet::new()
+            )
+            .is_ok()
+        );
         component
             .manifest
             .requested
@@ -3786,7 +5665,8 @@ mod external_component_tests {
             validate_unique_service_providers(
                 PackageProfile::StreamProbe,
                 std::slice::from_ref(&component),
-                None
+                None,
+                &BTreeSet::new(),
             )
             .is_err()
         );
@@ -3805,8 +5685,13 @@ mod external_component_tests {
             .to_string();
         component.manifest.requested.native_provide = [native].into();
         assert!(
-            validate_unique_service_providers(PackageProfile::StreamProbe, &[component], None)
-                .is_err()
+            validate_unique_service_providers(
+                PackageProfile::StreamProbe,
+                &[component],
+                None,
+                &BTreeSet::new()
+            )
+            .is_err()
         );
     }
 

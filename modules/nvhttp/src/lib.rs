@@ -266,6 +266,9 @@ impl ManagedModule for NvhttpModule {
             launches.set_logger(log_emitter);
             launches.set_session_lifecycle_required(settings.session_lifecycle_required);
             launches.set_session_lifecycle_capture_mode(settings.session_lifecycle_capture_mode);
+            if let Some(composition) = runtime.processing_composition()? {
+                launches.select_processing_services(&composition)?;
+            }
             let mut router = wire::Router::new(
                 wire::RouterConfig {
                     hostname: hostname.clone(),

@@ -18,6 +18,40 @@ pub(super) struct ProcessingDecision {
     pub processor_service: String,
 }
 
+/// A joined SDR consumer can bypass a transform when the already prepared
+/// source is SDR. Other source changes still require a new session.
+pub(super) fn compatible_with_session(
+    session: &ProcessingDecision,
+    stream: &ProcessingDecision,
+    join: Option<&amaterasu_extension_api::StreamJoinContext>,
+    requested_video: Option<&VideoMode>,
+) -> bool {
+    if session.processor_service != stream.processor_service {
+        return false;
+    }
+    if session.enabled == stream.enabled
+        && session.source_video_mode.as_ref().map(|mode| mode.hdr)
+            == stream.source_video_mode.as_ref().map(|mode| mode.hdr)
+    {
+        return true;
+    }
+    let Some(join) = join else {
+        return false;
+    };
+    session.enabled
+        && session
+            .source_video_mode
+            .as_ref()
+            .is_some_and(|mode| !mode.hdr)
+        && !stream.enabled
+        && stream.source_video_mode.is_none()
+        && requested_video.is_some_and(|mode| !mode.hdr)
+        && join
+            .binding
+            .as_ref()
+            .is_none_or(|binding| !binding.mode.hdr)
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct IntentResponse {
@@ -64,7 +98,7 @@ impl ProcessingPreflightJob {
         settings: Value,
         requested_video: Option<VideoMode>,
     ) -> ModuleResult<Self> {
-        if interface_minor > 1
+        if interface_minor != 1
             || service.is_empty()
             || service.len() > 128
             || processor_service.is_empty()
@@ -116,7 +150,6 @@ impl ProcessingPreflightJob {
                     interface_major: 1,
                     interface_minor: self.interface_minor,
                     payload: amaterasu_module_sdk::requests::processing_intent_payload(
-                        self.interface_minor,
                         &self.target,
                         &self.revision,
                         &self.settings,
@@ -262,7 +295,7 @@ mod tests {
             "source_hdr_required":false,"output_hdr_required":true,"processor_settings":settings,"processor_service":"processor/1"});
         let job = ProcessingPreflightJob::new(
             "policy/1".into(),
-            0,
+            1,
             "processor/1".into(),
             target,
             "rev".into(),
@@ -276,6 +309,58 @@ mod tests {
         )
         .unwrap();
         (job, response)
+    }
+
+    #[test]
+    fn sdr_join_can_bypass_only_a_compatible_retained_sdr_source() {
+        let (job, response) = fixture();
+        let session = job.parse_response(response).unwrap();
+        let mut stream = session.clone();
+        stream.enabled = false;
+        stream.source_video_mode = None;
+        let source = json!({"kind":"stream","host_epoch":"epoch","session_id":"session","stream_id":"source","generation":1});
+        let join: amaterasu_extension_api::StreamJoinContext = serde_json::from_value(json!({
+            "source":source,"source_transition":"transition","capture_binding_mode":"external",
+            "binding_owner":null,"binding":null
+        }))
+        .unwrap();
+        let mut requested = session.source_video_mode.clone().unwrap();
+        assert!(compatible_with_session(
+            &session,
+            &stream,
+            Some(&join),
+            Some(&requested)
+        ));
+        assert!(!compatible_with_session(
+            &session,
+            &stream,
+            None,
+            Some(&requested)
+        ));
+        requested.hdr = true;
+        assert!(!compatible_with_session(
+            &session,
+            &stream,
+            Some(&join),
+            Some(&requested)
+        ));
+        requested.hdr = false;
+        stream.processor_service = "another/1".into();
+        assert!(!compatible_with_session(
+            &session,
+            &stream,
+            Some(&join),
+            Some(&requested)
+        ));
+        stream.processor_service = session.processor_service.clone();
+        let mut incompatible_session = session.clone();
+        incompatible_session.source_video_mode.as_mut().unwrap().hdr = true;
+        assert!(!compatible_with_session(
+            &incompatible_session,
+            &stream,
+            Some(&join),
+            Some(&requested)
+        ));
     }
 
     #[test]
@@ -305,7 +390,7 @@ mod tests {
                             interface_major,
                             interface_minor
                         ),
-                        ("policy/1", "processing_intent", 1, 0)
+                        ("policy/1", "processing_intent", 1, 1)
                     );
                     assert_eq!(payload["revision"], "rev");
                     assert_eq!(payload["settings"], json!({"enabled":true}));
@@ -329,7 +414,6 @@ mod tests {
     #[test]
     fn version_one_one_supplies_output_range_before_effect_enablement() {
         let (mut job, mut response) = fixture();
-        job.interface_minor = 1;
         job.settings = json!({"enabled":false});
         response["processor_settings"] = job.settings.clone();
         let mut send = |command| match command {
