@@ -8,9 +8,9 @@ mod source_video;
 mod transport;
 
 use amaterasu_media::{
-    AudioCaptureApi, AudioEncoderApi, AudioFrame, AudioPacketSink, AudioSink,
+    AudioCaptureApi, AudioEncoderApi, AudioFrame, AudioSink, AudioUnit, AudioUnitSink,
     CAPTURE_INTERFACE_MINOR, CaptureApi, CaptureApiPrefix, CaptureGeometry, CpuFrame,
-    EncodedAudioPacket, EncodedPacket, EncoderApi, FrameSink, PacketSink, VideoApi,
+    EncodedPacket, EncoderApi, FrameSink, PacketSink, VideoApi,
 };
 use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient, abi};
 use std::ffi::c_void;
@@ -217,7 +217,7 @@ impl Probe {
             context,
             write: unexpected_audio,
         };
-        let audio_packet_sink = AudioPacketSink {
+        let audio_packet_sink = AudioUnitSink {
             context,
             write: unexpected_audio_packet,
         };
@@ -354,7 +354,7 @@ unsafe extern "C" fn unexpected_audio(context: *mut c_void, _: *const AudioFrame
 
 unsafe extern "C" fn unexpected_audio_packet(
     context: *mut c_void,
-    _: *const EncodedAudioPacket,
+    _: *const AudioUnit,
 ) -> abi::Status {
     // SAFETY: fixture supplies this exclusive counter for one synchronous call.
     unsafe {

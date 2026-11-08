@@ -13,6 +13,7 @@ pub(super) struct NativeBackend {
     video: NativeBinding,
     capture: Option<NativeBinding>,
     encoder: Option<NativeBinding>,
+    processor: Option<NativeBinding>,
     media: NativeBinding,
     control: NativeBinding,
     handles: Handles,
@@ -70,7 +71,19 @@ impl NativeBackend {
             handles.audio_capture,
             handles.audio_encoder,
         ) {
-            (true, Some(_), Some(_)) => (
+            (true, Some(_), None) if handles.encoded_audio_source => (
+                Some(
+                    unsafe {
+                        amaterasu_module_sdk::audio::bind_encoded_source(
+                            runtime,
+                            &providers.audio_capture,
+                        )
+                    }
+                    .map_err(|_| "native_binding_failed")?,
+                ),
+                None,
+            ),
+            (true, Some(_), Some(_)) if !handles.encoded_audio_source => (
                 Some(
                     unsafe {
                         amaterasu_module_sdk::audio::bind_capture(runtime, &providers.audio_capture)
@@ -87,14 +100,28 @@ impl NativeBackend {
             (false, None, None) => (None, None),
             _ => return Err("invalid_audio_handles"),
         };
+        let media = unsafe {
+            amaterasu_module_sdk::transport::bind_media(runtime, &providers.media_transport)
+        }
+        .map_err(|_| "native_binding_failed")?;
+        let processor = match (
+            handles.audio_processor,
+            handles.processed_audio,
+            &providers.audio_processor,
+        ) {
+            (Some(_), Some(_), Some(service)) if !handles.encoded_audio_source => Some(
+                unsafe { amaterasu_module_sdk::audio::bind_processor(runtime, service) }
+                    .map_err(|_| "native_binding_failed")?,
+            ),
+            (None, None, _) => None,
+            _ => return Err("invalid_audio_handles"),
+        };
         Ok(Self {
             video,
             capture,
             encoder,
-            media: unsafe {
-                amaterasu_module_sdk::transport::bind_media(runtime, &providers.media_transport)
-            }
-            .map_err(|_| "native_binding_failed")?,
+            processor,
+            media,
             control: unsafe {
                 amaterasu_module_sdk::transport::bind_control(runtime, &providers.control_transport)
             }
@@ -275,11 +302,20 @@ impl Backend for NativeBackend {
             )
         };
         let packet = output.finish(status, DeliveryLane::Pcm)?;
-        if packet
-            .as_ref()
-            .is_some_and(|packet| packet.header().channels != self.handles.audio_channels)
-        {
-            return Err("unsupported_audio_channels");
+        if packet.as_ref().is_some_and(|packet| {
+            let frame = packet.header();
+            frame.channels != self.handles.audio_channels
+                || frame.sample_rate != self.handles.audio_sample_rate
+                || self
+                    .handles
+                    .audio_pcm
+                    .is_some_and(|(format, bytes, packing)| {
+                        frame.format != format
+                            || frame.sample_bytes != bytes
+                            || frame.packing != packing
+                    })
+        }) {
+            return Err("unsupported_audio_format");
         }
         Ok(packet)
     }
@@ -287,29 +323,39 @@ impl Backend for NativeBackend {
     fn audio(&mut self) -> PlaneResult<Option<AudioPacket>> {
         let mut output: Delivery<AudioPacket> = Delivery::default();
         // SAFETY: stack output and binding outlive the synchronous encoder call.
-        let encoder = self.encoder.as_ref().ok_or("audio_disabled")?;
-        let stream = self.handles.audio_encoder.ok_or("audio_disabled")?;
-        let api =
-            unsafe { encoder.table::<AudioEncoderApi>() }.map_err(|_| "native_layout_mismatch")?;
-        let status = unsafe {
-            (api.receive)(
-                encoder.context(),
-                stream,
-                AudioPacketSink {
-                    context: (&mut output as *mut Delivery<AudioPacket>).cast(),
-                    write: copy_audio,
-                },
-            )
+        let sink = AudioUnitSink {
+            context: (&mut output as *mut Delivery<AudioPacket>).cast(),
+            write: copy_audio_unit,
+        };
+        let status = if self.handles.encoded_audio_source {
+            let source = self.capture.as_ref().ok_or("audio_disabled")?;
+            let stream = self.handles.audio_capture.ok_or("audio_disabled")?;
+            let api = unsafe { source.table::<EncodedAudioSourceApi>() }
+                .map_err(|_| "native_layout_mismatch")?;
+            unsafe { (api.receive)(source.context(), stream, sink) }
+        } else {
+            let encoder = self.encoder.as_ref().ok_or("audio_disabled")?;
+            let stream = self.handles.audio_encoder.ok_or("audio_disabled")?;
+            let api = unsafe { encoder.table::<AudioEncoderApi>() }
+                .map_err(|_| "native_layout_mismatch")?;
+            unsafe { (api.receive)(encoder.context(), stream, sink) }
         };
         if status == MEDIA_BACKEND_ERROR {
-            Err("audio_encoder_failed")
+            Err(if self.handles.encoded_audio_source {
+                "audio_source_failed"
+            } else {
+                "audio_encoder_failed"
+            })
         } else {
             let packet = output.finish(status, DeliveryLane::Audio)?;
-            if packet
-                .as_ref()
-                .is_some_and(|packet| packet.header().channels != self.handles.audio_channels)
-            {
-                return Err("unsupported_audio_channels");
+            if packet.as_ref().is_some_and(|packet| {
+                packet.unit_header().format
+                    != self.handles.audio_format.unwrap_or(AUDIO_FORMAT_OPUS)
+                    || packet.unit_header().generation != self.handles.audio_generation
+                    || packet.unit_header().payload.len > self.handles.audio_max_unit_bytes
+                    || packet.unit_header().metadata.len > self.handles.audio_max_metadata_bytes
+            }) {
+                return Err("audio_format_mismatch");
             }
             Ok(packet)
         }
@@ -356,7 +402,87 @@ impl Backend for NativeBackend {
         encoder_accepted(unsafe { (api.submit)(encoder.context(), stream, frame) })
     }
 
-    fn submit_audio(&mut self, packet: &EncodedAudioPacket) -> PlaneResult<bool> {
+    fn submit_processor(&mut self, frame: &AudioFrame) -> PlaneResult<bool> {
+        let processor = self
+            .processor
+            .as_ref()
+            .ok_or("audio_processor_unavailable")?;
+        let stream = self
+            .handles
+            .audio_processor
+            .ok_or("audio_processor_unavailable")?;
+        // SAFETY: the selected processor binding and copied frame remain live through the call.
+        let api = unsafe { processor.table::<AudioProcessorApi>() }
+            .map_err(|_| "native_layout_mismatch")?;
+        accepted(
+            unsafe { (api.submit)(processor.context(), stream, frame) },
+            "audio_processor_failed",
+        )
+    }
+
+    fn processor_output(&mut self) -> PlaneResult<ProcessorOutput> {
+        let processor = self
+            .processor
+            .as_ref()
+            .ok_or("audio_processor_unavailable")?;
+        let stream = self
+            .handles
+            .audio_processor
+            .ok_or("audio_processor_unavailable")?;
+        let mut output: Delivery<PcmPacket> = Delivery::default();
+        // SAFETY: callback copies the provider's borrowed frame synchronously.
+        let api = unsafe { processor.table::<AudioProcessorApi>() }
+            .map_err(|_| "native_layout_mismatch")?;
+        let status = unsafe {
+            (api.receive)(
+                processor.context(),
+                stream,
+                AudioSink {
+                    context: (&mut output as *mut Delivery<PcmPacket>).cast(),
+                    write: copy_pcm,
+                },
+            )
+        };
+        if status == MEDIA_CLOSED && output.result.is_none() {
+            return Ok(ProcessorOutput::End);
+        }
+        let Some(packet) = output.finish(status, DeliveryLane::Pcm)? else {
+            return Ok(ProcessorOutput::Pending);
+        };
+        let frame = packet.header();
+        let Some((rate, channels, format, bytes, packing)) = self.handles.processed_audio else {
+            return Err("audio_processor_unavailable");
+        };
+        if frame.sample_rate != rate
+            || frame.channels != channels
+            || frame.format != format
+            || frame.sample_bytes != bytes
+            || frame.packing != packing
+        {
+            return Err("unsupported_audio_processing_format");
+        }
+        Ok(ProcessorOutput::Frame(packet))
+    }
+
+    fn drain_processor(&mut self) -> PlaneResult<bool> {
+        let processor = self
+            .processor
+            .as_ref()
+            .ok_or("audio_processor_unavailable")?;
+        let stream = self
+            .handles
+            .audio_processor
+            .ok_or("audio_processor_unavailable")?;
+        // SAFETY: the pipeline owns the processor stream and retained binding.
+        let api = unsafe { processor.table::<AudioProcessorApi>() }
+            .map_err(|_| "native_layout_mismatch")?;
+        accepted(
+            unsafe { (api.drain)(processor.context(), stream) },
+            "audio_processor_failed",
+        )
+    }
+
+    fn submit_audio(&mut self, packet: &AudioUnit) -> PlaneResult<bool> {
         // SAFETY: packet allocation remains owned by the plane until return.
         let api = unsafe { self.media.table::<MediaTransportApi>() }
             .map_err(|_| "native_layout_mismatch")?;
@@ -370,6 +496,16 @@ impl Backend for NativeBackend {
 
     fn drain_encoder(&mut self) -> PlaneResult<bool> {
         // SAFETY: binding and owned stream ID are retained by the pipeline.
+        if self.handles.encoded_audio_source {
+            let source = self.capture.as_ref().ok_or("audio_disabled")?;
+            let stream = self.handles.audio_capture.ok_or("audio_disabled")?;
+            let api = unsafe { source.table::<EncodedAudioSourceApi>() }
+                .map_err(|_| "native_layout_mismatch")?;
+            return accepted(
+                unsafe { (api.drain)(source.context(), stream) },
+                "audio_source_drain_failed",
+            );
+        }
         let encoder = self.encoder.as_ref().ok_or("audio_disabled")?;
         let stream = self.handles.audio_encoder.ok_or("audio_disabled")?;
         let api =
@@ -513,9 +649,9 @@ unsafe extern "C" fn copy_pcm(context: *mut c_void, frame: *const AudioFrame) ->
     // SAFETY: trusted provider keeps frame and samples live until callback returns.
     unsafe { deliver(context, frame, |frame| PcmPacket::copy(frame)) }
 }
-unsafe extern "C" fn copy_audio(context: *mut c_void, packet: *const EncodedAudioPacket) -> Status {
-    // SAFETY: trusted provider keeps packet bytes initialized and immutable.
-    unsafe { deliver(context, packet, |packet| AudioPacket::copy(packet)) }
+unsafe extern "C" fn copy_audio_unit(context: *mut c_void, unit: *const AudioUnit) -> Status {
+    // SAFETY: provider lends the unit and its allocations through this callback.
+    unsafe { deliver(context, unit, |unit| AudioPacket::copy_unit(unit)) }
 }
 unsafe extern "C" fn copy_control(context: *mut c_void, message: *const ControlMessage) -> Status {
     // SAFETY: provider lends authenticated plaintext for this callback only.

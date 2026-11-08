@@ -1,6 +1,7 @@
 use crate::{
     datagrams::{Delivery, Medium},
     model::*,
+    opus_packet::OpusPacket,
 };
 use amaterasu_gamestream::{
     audio::{AudioConfig, AudioError, AudioPacketizer},
@@ -466,7 +467,7 @@ impl Stream {
 
     /// # Safety
     /// The packet and its initialized immutable bytes live through this call.
-    pub unsafe fn submit_audio(&mut self, packet: &EncodedAudioPacket) -> Status {
+    pub unsafe fn submit_audio(&mut self, packet: &OpusPacket) -> Status {
         if self.delivery.failure.is_some() {
             return MEDIA_BACKEND_ERROR;
         }
@@ -478,6 +479,10 @@ impl Stream {
         }
         if let Err(status) = packet.validate() {
             return status;
+        }
+        // GameStream's audio packetizer accepts only its negotiated Opus clock.
+        if packet.codec != CODEC_OPUS || packet.sample_rate != 48_000 {
+            return MEDIA_UNSUPPORTED;
         }
         if packet.flags & AUDIO_PACKET_END_OF_STREAM != 0 {
             self.audio_ended = true;
@@ -522,7 +527,7 @@ impl Stream {
         }
     }
 
-    fn reserve_audio(&self, packet: &EncodedAudioPacket, opus: &[u8]) -> Result<bool, Status> {
+    fn reserve_audio(&self, packet: &OpusPacket, opus: &[u8]) -> Result<bool, Status> {
         if packet.channels != u32::from(self.audio_settings.channels) {
             return Err(MEDIA_UNSUPPORTED);
         }

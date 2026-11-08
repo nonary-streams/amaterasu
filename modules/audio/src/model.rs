@@ -131,16 +131,72 @@ impl PcmCaptureFormat {
         }
         Ok(())
     }
+
+    pub(crate) fn from_negotiated(
+        format: &amaterasu_module_sdk::audio::PcmFormat,
+    ) -> AudioResult<Self> {
+        use amaterasu_module_sdk::audio::*;
+        format.validate()?;
+        let expected: &[amaterasu_media::AudioFormatId] = match format.speakers.len() {
+            2 => &[SPEAKER_FRONT_LEFT, SPEAKER_FRONT_RIGHT],
+            6 => &[
+                SPEAKER_FRONT_LEFT,
+                SPEAKER_FRONT_RIGHT,
+                SPEAKER_FRONT_CENTER,
+                SPEAKER_LOW_FREQUENCY,
+                SPEAKER_BACK_LEFT,
+                SPEAKER_BACK_RIGHT,
+            ],
+            8 => &[
+                SPEAKER_FRONT_LEFT,
+                SPEAKER_FRONT_RIGHT,
+                SPEAKER_FRONT_CENTER,
+                SPEAKER_LOW_FREQUENCY,
+                SPEAKER_BACK_LEFT,
+                SPEAKER_BACK_RIGHT,
+                SPEAKER_SIDE_LEFT,
+                SPEAKER_SIDE_RIGHT,
+            ],
+            _ => return Err("unsupported_capture_format"),
+        };
+        if format.sample_format != amaterasu_media::AUDIO_PCM_F32
+            || format.sample_bytes != 4
+            || format.valid_bits != 32
+            || format.packing != amaterasu_media::AUDIO_PACKING_INTERLEAVED
+            || format.speakers != expected
+        {
+            return Err("unsupported_capture_format");
+        }
+        let result = Self {
+            sample_rate: format.sample_rate,
+            channels: format.speakers.len() as u32,
+            sample_format: PcmSampleFormat::F32,
+        };
+        result.validate()?;
+        Ok(result)
+    }
 }
 
 pub enum Operation {
     Enumerate,
+    Capabilities,
+    Probe {
+        audio_profile: Box<amaterasu_module_sdk::audio::AudioSessionProfile>,
+    },
+    Effective {
+        stream: u64,
+    },
+    Reconfigure {
+        stream: u64,
+        audio_profile: Box<amaterasu_module_sdk::audio::AudioSessionProfile>,
+    },
     ConfigureSteamDriverInstall {
         enabled: bool,
         revision: u64,
     },
     Open {
         endpoint: String,
+        audio_profile: Option<serde_json::Value>,
         virtual_sink: Option<String>,
         channels: Option<u32>,
         capture_format: Option<PcmCaptureFormat>,
@@ -150,6 +206,7 @@ pub enum Operation {
     },
     OpenContinuous {
         endpoint: String,
+        audio_profile: Option<serde_json::Value>,
         virtual_sink: Option<String>,
         channels: Option<u32>,
         capture_format: Option<PcmCaptureFormat>,
@@ -173,6 +230,17 @@ pub enum Operation {
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 enum OperationInput {
     Enumerate,
+    Capabilities,
+    Probe {
+        audio_profile: Box<amaterasu_module_sdk::audio::AudioSessionProfile>,
+    },
+    Effective {
+        stream: u64,
+    },
+    Reconfigure {
+        stream: u64,
+        audio_profile: Box<amaterasu_module_sdk::audio::AudioSessionProfile>,
+    },
     ConfigureSteamDriverInstall {
         enabled: bool,
         revision: u64,
@@ -180,11 +248,15 @@ enum OperationInput {
     Open {
         endpoint: String,
         #[serde(default)]
+        audio_profile: Option<serde_json::Value>,
+        #[serde(default)]
         virtual_sink: Option<String>,
         #[serde(default)]
         channels: Option<u32>,
         #[serde(default)]
         capture_format: Option<PcmCaptureFormat>,
+        #[serde(default)]
+        pcm_format: Option<amaterasu_module_sdk::audio::PcmFormat>,
         #[serde(default)]
         host_audio_enabled: bool,
         #[serde(default)]
@@ -213,39 +285,87 @@ impl<'de> Deserialize<'de> for Operation {
     {
         Ok(match OperationInput::deserialize(deserializer)? {
             OperationInput::Enumerate => Self::Enumerate,
+            OperationInput::Capabilities => Self::Capabilities,
+            OperationInput::Probe { audio_profile } => Self::Probe { audio_profile },
+            OperationInput::Effective { stream } => Self::Effective { stream },
+            OperationInput::Reconfigure {
+                stream,
+                audio_profile,
+            } => Self::Reconfigure {
+                stream,
+                audio_profile,
+            },
             OperationInput::ConfigureSteamDriverInstall { enabled, revision } => {
                 Self::ConfigureSteamDriverInstall { enabled, revision }
             }
             OperationInput::Open {
                 endpoint,
+                audio_profile,
                 virtual_sink,
                 channels,
                 capture_format,
+                pcm_format,
                 host_audio_enabled,
                 operation_id,
                 capture_sink_without_routing,
                 continuous_audio,
-            } => match continuous_audio {
-                Some(continuous_audio) => Self::OpenContinuous {
-                    endpoint,
-                    virtual_sink,
-                    channels,
-                    capture_format,
-                    host_audio_enabled,
-                    operation_id,
-                    capture_sink_without_routing,
-                    continuous_audio,
-                },
-                None => Self::Open {
-                    endpoint,
-                    virtual_sink,
-                    channels,
-                    capture_format,
-                    host_audio_enabled,
-                    operation_id,
-                    capture_sink_without_routing,
-                },
-            },
+            } => {
+                if pcm_format.is_none()
+                    && audio_profile
+                        .as_ref()
+                        .and_then(|profile| profile.pointer("/custom/pcm"))
+                        .is_some()
+                {
+                    return Err(serde::de::Error::custom(
+                        "PCM format must accompany the audio profile",
+                    ));
+                }
+                if let Some(format) = &pcm_format {
+                    let supplied =
+                        serde_json::to_value(format).map_err(serde::de::Error::custom)?;
+                    if audio_profile
+                        .as_ref()
+                        .and_then(|profile| profile.pointer("/custom/pcm"))
+                        != Some(&supplied)
+                    {
+                        return Err(serde::de::Error::custom("PCM profile mismatch"));
+                    }
+                }
+                let capture_format = match (capture_format, pcm_format) {
+                    (Some(_), Some(_)) => {
+                        return Err(serde::de::Error::custom("conflicting PCM formats"));
+                    }
+                    (Some(format), None) => Some(format),
+                    (None, Some(format)) => Some(
+                        PcmCaptureFormat::from_negotiated(&format)
+                            .map_err(serde::de::Error::custom)?,
+                    ),
+                    (None, None) => None,
+                };
+                match continuous_audio {
+                    Some(continuous_audio) => Self::OpenContinuous {
+                        endpoint,
+                        audio_profile,
+                        virtual_sink,
+                        channels,
+                        capture_format,
+                        host_audio_enabled,
+                        operation_id,
+                        capture_sink_without_routing,
+                        continuous_audio,
+                    },
+                    None => Self::Open {
+                        endpoint,
+                        audio_profile,
+                        virtual_sink,
+                        channels,
+                        capture_format,
+                        host_audio_enabled,
+                        operation_id,
+                        capture_sink_without_routing,
+                    },
+                }
+            }
             OperationInput::Lookup { operation_id } => Self::Lookup { operation_id },
             OperationInput::Close { stream } => Self::Close { stream },
             OperationInput::Status { stream } => Self::Status { stream },

@@ -126,6 +126,9 @@ impl Pipeline {
                 StartMode::WhenAuthenticated,
                 send,
             ),
+            Operation::ReconfigureAudio { session, audio } => {
+                self.reconfigure_audio(input, session, *audio, send)
+            }
             Operation::Stop {
                 session,
                 lifecycle_configuration,
@@ -138,6 +141,50 @@ impl Pipeline {
             Operation::ManagementLiveSessions {} => self.management_live_sessions(input, send),
             Operation::Lookup { operation_id } => self.lookup(input, operation_id, send),
         }
+    }
+
+    fn reconfigure_audio(
+        &mut self,
+        input: Incoming,
+        session: u64,
+        audio: crate::model::AudioWire,
+        send: &mut Send<'_>,
+    ) {
+        let Some(record) = self
+            .records
+            .get_mut(&session)
+            .filter(|record| record.owner == input.owner)
+        else {
+            rpc::complete(send, input.request, error("session_not_found"));
+            return;
+        };
+        if record.state != State::Prepared || !record.config.stream_audio {
+            rpc::complete(send, input.request, error("invalid_state"));
+            return;
+        }
+        let (Some(old), Some(new)) = (&record.config.audio.custom, &audio.custom) else {
+            rpc::complete(
+                send,
+                input.request,
+                error("unsupported_audio_reconfiguration"),
+            );
+            return;
+        };
+        if audio.validate().is_err()
+            || new.source != old.source
+            || new.processing.is_some() != old.processing.is_some()
+            || new.stream.generation <= old.stream.generation
+        {
+            rpc::complete(send, input.request, error("invalid_audio_reconfiguration"));
+            return;
+        }
+        record.pending_audio = Some(audio);
+        self.job = Some(Job::new(
+            session,
+            Some(input.request),
+            Step::ProbeAudioReconfiguration(Resource::AudioCapture),
+            input.now.saturating_add(input.remaining.min(15000)),
+        ));
     }
 
     fn authorize_open(&self, owner: &str) -> Result<(), &'static str> {
@@ -166,6 +213,16 @@ impl Pipeline {
 
         if let Err(code) = config.validate(self.settings.allow_remote) {
             rpc::complete(send, request, error(code));
+            return;
+        }
+        if config
+            .audio
+            .custom
+            .as_ref()
+            .is_some_and(|custom| custom.processing.is_some())
+            && self.settings.providers.audio_processor.is_none()
+        {
+            rpc::complete(send, request, error("audio_processor_not_selected"));
             return;
         }
         if config.lifecycle_session_target.is_some() && owner != "amaterasu.rtsp" {
@@ -631,7 +688,11 @@ fn validate_start_configuration(
         }
     }
     configuration.configuration.normalize_codec()?;
-    configuration.validate(record.config.stream_audio)?;
+    if record.config.audio.custom.is_some() {
+        configuration.validate_audio_profile(record.config.stream_audio, true)?;
+    } else {
+        configuration.validate(record.config.stream_audio)?;
+    }
     if configuration.source_capture_context != record.config.source_capture_context {
         return Err("source_capture_context_changed");
     }

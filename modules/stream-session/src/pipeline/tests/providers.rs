@@ -8,6 +8,7 @@ fn alternatives() -> ProviderServices {
         video: "vendor.frames/1".into(),
         audio_capture: "vendor.audio-capture/1".into(),
         audio_encoder: "vendor.audio-encoder/1".into(),
+        audio_processor: None,
         media_transport: "vendor.media-delivery/1".into(),
         control_transport: "vendor.control/1".into(),
     }

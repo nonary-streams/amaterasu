@@ -12,6 +12,35 @@ fn controller() -> Controller {
 }
 
 #[test]
+fn capabilities_report_gamestream_opus_and_disabled_state() {
+    let mut enabled = controller();
+    let result: amaterasu_module_sdk::audio::AudioCapabilitiesResult = serde_json::from_value(
+        enabled
+            .handle("owner", Operation::Capabilities)
+            .unwrap()
+            .payload,
+    )
+    .unwrap();
+    assert_eq!(result.capabilities.encoded_formats.len(), 3);
+    assert!(
+        result
+            .capabilities
+            .encoded_formats
+            .iter()
+            .all(|offer| offer.codec == AUDIO_FORMAT_OPUS)
+    );
+    let mut disabled = Controller::new(Settings::default());
+    let result: amaterasu_module_sdk::audio::AudioCapabilitiesResult = serde_json::from_value(
+        disabled
+            .handle("owner", Operation::Capabilities)
+            .unwrap()
+            .payload,
+    )
+    .unwrap();
+    assert!(result.capabilities.encoded_formats.is_empty());
+}
+
+#[test]
 fn disabled_authorization_destination_and_lookup_are_fail_closed() {
     let (video, audio) = receivers();
     let request = request(&video, &audio, false);

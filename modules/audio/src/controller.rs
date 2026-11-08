@@ -16,6 +16,7 @@ use std::{
 
 struct Stream {
     owner: String,
+    audio_profile: Option<Value>,
     requested_endpoint: String,
     endpoint: String,
     virtual_sink: Option<String>,
@@ -32,6 +33,7 @@ struct Stream {
 
 struct OperationRecord {
     stream: u64,
+    audio_profile: Option<Value>,
     endpoint: String,
     virtual_sink: Option<String>,
     channels: Option<u32>,
@@ -49,6 +51,7 @@ struct OpenPolicy {
 
 struct OpenRequest {
     endpoint: String,
+    audio_profile: Option<Value>,
     virtual_sink: Option<String>,
     channels: Option<u32>,
     capture_format: Option<PcmCaptureFormat>,
@@ -59,6 +62,7 @@ struct OpenRequest {
 
 struct StreamOpen {
     requested_endpoint: String,
+    audio_profile: Option<Value>,
     virtual_sink: Option<String>,
     channels: Option<u32>,
     continuous_audio: Option<ContinuousAudio>,
@@ -327,6 +331,46 @@ impl Controller {
     pub fn handle(&mut self, owner: &str, operation: Operation) -> AudioResult<ControlReply> {
         let previous = self.next_stream;
         let payload = match operation {
+            Operation::Effective { stream } => {
+                self.owned(owner, stream)?;
+                self.status(owner, Some(stream))
+            }
+            Operation::Reconfigure {
+                stream,
+                audio_profile,
+            } => {
+                let _ = audio_profile;
+                self.owned(owner, stream)?;
+                return Err("unsupported_audio_reconfiguration");
+            }
+            Operation::Capabilities => {
+                use amaterasu_module_sdk::audio::{AudioProviderCapabilities, standard_pcm_format};
+                let pcm_outputs = if self.enabled {
+                    [2, 6, 8]
+                        .into_iter()
+                        .filter_map(|channels| {
+                            standard_pcm_format(channels, amaterasu_media::AUDIO_PCM_F32)
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                json!({"ok":true,"capabilities":AudioProviderCapabilities { pcm_inputs: vec![], pcm_outputs,
+                    encoded_formats: vec![], encoded_source: false, max_buffered_bytes: None,
+                    min_latency_us: None, max_latency_us: None,
+                    properties: json!({"endpoint_capabilities_must_be_probed":true}) }})
+            }
+            Operation::Probe { audio_profile } => {
+                let supported = self.enabled
+                    && audio_profile.custom.source == amaterasu_module_sdk::audio::AudioSource::Pcm
+                    && serde_json::to_vec(&audio_profile).is_ok_and(|bytes| bytes.len() <= 131_072)
+                    && audio_profile
+                        .custom
+                        .pcm
+                        .as_ref()
+                        .is_some_and(|pcm| PcmCaptureFormat::from_negotiated(pcm).is_ok());
+                json!({"ok":true,"supported":supported,"audio_profile":audio_profile})
+            }
             Operation::Enumerate => {
                 let endpoints = if self.enabled {
                     self.backend.enumerate()?
@@ -354,6 +398,7 @@ impl Controller {
             }
             Operation::Open {
                 endpoint,
+                audio_profile,
                 virtual_sink,
                 channels,
                 capture_format,
@@ -364,6 +409,7 @@ impl Controller {
                 owner,
                 OpenRequest {
                     endpoint,
+                    audio_profile,
                     virtual_sink,
                     channels,
                     capture_format,
@@ -377,6 +423,7 @@ impl Controller {
             )?,
             Operation::OpenContinuous {
                 endpoint,
+                audio_profile,
                 virtual_sink,
                 channels,
                 capture_format,
@@ -388,6 +435,7 @@ impl Controller {
                 owner,
                 OpenRequest {
                     endpoint,
+                    audio_profile,
                     virtual_sink: virtual_sink.clone(),
                     channels,
                     capture_format,
@@ -416,6 +464,7 @@ impl Controller {
     fn open(&mut self, owner: &str, request: OpenRequest) -> AudioResult<Value> {
         let OpenRequest {
             endpoint,
+            audio_profile,
             virtual_sink,
             mut channels,
             capture_format,
@@ -425,6 +474,12 @@ impl Controller {
         } = request;
         if !self.enabled {
             return Err("disabled");
+        }
+        if let Some(profile) = &audio_profile
+            && (!profile.is_object()
+                || serde_json::to_vec(profile).map_or(true, |bytes| bytes.len() > 131_072))
+        {
+            return Err("invalid_audio_profile");
         }
         if let Some(continuous_audio) = continuous_audio {
             continuous_audio.validate()?;
@@ -449,7 +504,8 @@ impl Controller {
         if let Some(operation) = &operation {
             validate_operation(operation)?;
             if let Some(record) = self.operations.get(&(owner.into(), operation.clone())) {
-                if record.endpoint != endpoint
+                if record.audio_profile != audio_profile
+                    || record.endpoint != endpoint
                     || record.virtual_sink != virtual_sink
                     || record.channels != channels
                     || record.capture_format != capture_format
@@ -484,6 +540,24 @@ impl Controller {
             policy.host_audio_enabled,
             policy.capture_sink_without_routing,
         )?;
+        if let Some(pcm) = audio_profile
+            .as_ref()
+            .and_then(|profile| profile.pointer("/custom/pcm"))
+        {
+            let pcm: amaterasu_module_sdk::audio::PcmFormat =
+                serde_json::from_value(pcm.clone()).map_err(|_| "invalid_audio_profile")?;
+            let expected_mask = pcm
+                .speakers
+                .iter()
+                .fold(0u32, |mask, speaker| mask | speaker.value as u32);
+            if opened.format.sample_rate != pcm.sample_rate
+                || opened.format.channels as usize != pcm.speakers.len()
+                || opened.format.code() != PCM_F32
+                || opened.format.channel_mask != expected_mask
+            {
+                return Err("unsupported_capture_format");
+            }
+        }
         let continuous = continuous_audio
             .map(|configuration| ContinuousStream::new(opened.format, configuration))
             .transpose()?;
@@ -491,6 +565,7 @@ impl Controller {
             owner,
             StreamOpen {
                 requested_endpoint: endpoint.clone(),
+                audio_profile: audio_profile.clone(),
                 virtual_sink: virtual_sink.clone(),
                 channels,
                 continuous_audio,
@@ -504,6 +579,7 @@ impl Controller {
                 (owner.into(), operation),
                 OperationRecord {
                     stream: id,
+                    audio_profile,
                     endpoint,
                     virtual_sink,
                     channels,
@@ -520,6 +596,7 @@ impl Controller {
     fn insert(&mut self, owner: &str, open: StreamOpen) -> AudioResult<u64> {
         let StreamOpen {
             requested_endpoint,
+            audio_profile,
             virtual_sink,
             channels,
             continuous_audio,
@@ -532,6 +609,7 @@ impl Controller {
             id,
             Stream {
                 owner: owner.into(),
+                audio_profile,
                 requested_endpoint,
                 endpoint: opened.endpoint,
                 virtual_sink,
@@ -589,7 +667,12 @@ impl Controller {
             let health = stream.source.health();
             let failure = stream.failure.or(health.failure);
             let endpoint = health.active_endpoint.as_deref().unwrap_or(&stream.endpoint);
-            json!({"stream":id,"endpoint":endpoint,"requested_endpoint":stream.requested_endpoint,"virtual_sink":stream.virtual_sink,"channels":stream.channels,"host_audio_enabled":stream.host_audio_enabled,"capture_sink_without_routing":stream.capture_sink_without_routing,"continuous_audio":stream.continuous_audio,"format":stream.format,"state":if failure.is_some() { "failed" } else if health.recovering { "recovering" } else { "capturing" },"failure":failure,"discontinuities":health.discontinuities,"dropped_packets":health.dropped_packets})
+            let mut entry = json!({"stream":id,"endpoint":endpoint,"requested_endpoint":stream.requested_endpoint,"virtual_sink":stream.virtual_sink,"channels":stream.channels,"host_audio_enabled":stream.host_audio_enabled,"capture_sink_without_routing":stream.capture_sink_without_routing,"continuous_audio":stream.continuous_audio,"format":stream.format,"state":if failure.is_some() { "failed" } else if health.recovering { "recovering" } else { "capturing" },"failure":failure,"discontinuities":health.discontinuities,"dropped_packets":health.dropped_packets});
+            if let Some(profile) = &stream.audio_profile {
+                entry["audio_profile"] = profile.clone();
+                if let Some(pcm) = profile.pointer("/custom/pcm") { entry["pcm_format"] = pcm.clone(); }
+            }
+            entry
         }).collect();
         json!({"ok":true,"enabled":self.enabled,"audio_route_restore_pending":platform::route_restore_pending(),"virtual_sink_cleanup_pending":platform::virtual_sink_cleanup_pending(),"steam_driver_install":platform::steam_driver_install_status(),"streams":streams})
     }
@@ -630,7 +713,13 @@ impl Controller {
         let frame = AudioFrame {
             sample_rate: stream.format.sample_rate,
             channels: stream.format.channels,
-            format: stream.format.code(),
+            format: amaterasu_media::AudioFormatId::standard(u64::from(stream.format.code())),
+            sample_bytes: if stream.format.code() == PCM_F32 {
+                4
+            } else {
+                2
+            },
+            packing: amaterasu_media::AUDIO_PACKING_INTERLEAVED,
             frames: packet.frames,
             flags: packet.flags,
             data: packet.bytes.as_ptr(),
@@ -648,7 +737,14 @@ impl Controller {
 }
 
 fn open_reply(id: u64, stream: &Stream) -> Value {
-    json!({"ok":true,"stream":id,"endpoint":stream.endpoint,"requested_endpoint":stream.requested_endpoint,"virtual_sink":stream.virtual_sink,"channels":stream.channels,"host_audio_enabled":stream.host_audio_enabled,"capture_sink_without_routing":stream.capture_sink_without_routing,"continuous_audio":stream.continuous_audio,"format":stream.format})
+    let mut reply = json!({"ok":true,"stream":id,"endpoint":stream.endpoint,"requested_endpoint":stream.requested_endpoint,"virtual_sink":stream.virtual_sink,"channels":stream.channels,"host_audio_enabled":stream.host_audio_enabled,"capture_sink_without_routing":stream.capture_sink_without_routing,"continuous_audio":stream.continuous_audio,"format":stream.format});
+    if let Some(profile) = &stream.audio_profile {
+        reply["audio_profile"] = profile.clone();
+        if let Some(pcm) = profile.pointer("/custom/pcm") {
+            reply["pcm_format"] = pcm.clone();
+        }
+    }
+    reply
 }
 
 #[cfg(test)]

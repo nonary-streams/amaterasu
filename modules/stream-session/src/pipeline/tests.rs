@@ -465,6 +465,333 @@ fn surround_prepare_start_and_stop_preserve_layout_and_bounded_wire() {
 }
 
 #[test]
+fn custom_audio_profile_reaches_each_selected_provider_and_retires() {
+    let mut host = Harness::new();
+    let mut request = prepare();
+    request["audio"] = json!({"channels":12,"channel_mask":4095,"layout":"7.1.4",
+        "packet_ms":20,"bitrate":192000,
+        "custom":{"codec":{"namespace":42,"value":4294967302u64,"version":1},
+            "sample_rate":44100,
+            "stream":{"framing":{"namespace":42,"value":3,"version":1},"clock":{"namespace":1,"value":1,"version":1},"layout":{"schema":{"namespace":42,"value":7,"version":1},"positions":[]},"generation":1,"encoder_delay_us":1200,
+                "codec_initialization":{"schema":{"namespace":42,"value":4,"version":1},"bytes":[1,2,3]},
+                "metadata":[{"schema":{"namespace":42,"value":5,"version":1},"bytes":[7,8]}]},
+            "pcm":{"sample_rate":44100,"sample_format":{"namespace":1,"value":3,"version":1},
+                "sample_bytes":3,"valid_bits":24,"packing":{"namespace":1,"value":2,"version":1},
+                "speakers":([1u64,2,4,8,16,32,512,1024,4096,16384,32768,131072]
+                    .map(|value| json!({"namespace":1,"value":value,"version":1})))},
+            "options":{"profile":"custom"}}});
+    let profile = request["audio"].clone();
+    let prepared = host.response(1, request);
+    let id = prepared["session"]
+        .as_u64()
+        .expect("custom profile prepared");
+    assert_eq!(prepared["audio"], profile);
+    assert_eq!(prepared["wire_audio_bytes"], 0);
+    let mut start_request = start(id);
+    start_request["configuration"]["channels"] = json!(12);
+    start_request["configuration"]["capture_sink_without_routing"] = json!(true);
+    assert_eq!(host.response(2, start_request)["state"], "active");
+    for resource in [
+        Resource::AudioEncoder,
+        Resource::AudioCapture,
+        Resource::Media,
+    ] {
+        let open = host
+            .broker
+            .calls
+            .iter()
+            .find(|call| call.service == resource.service() && call.payload["action"] == "open")
+            .unwrap();
+        assert_eq!(open.payload["audio_profile"], profile);
+        if matches!(resource, Resource::AudioCapture) {
+            assert_eq!(open.payload["pcm_format"], profile["custom"]["pcm"]);
+        }
+    }
+    assert_eq!(
+        host.response(3, json!({"action":"stop","session":id}))["state"],
+        "stopped"
+    );
+    assert_eq!(host.broker.leases(), 0);
+}
+
+#[test]
+fn encoded_audio_source_opens_without_an_encoder_and_retires() {
+    let mut host = Harness::new();
+    let mut request = prepare();
+    request["audio"] = json!({"channels":12,"channel_mask":0,"layout":"objects",
+        "packet_ms":20,"bitrate":192000,
+        "custom":{"codec":{"namespace":42,"value":99,"version":1},
+            "sample_rate":48000,"source":"encoded",
+            "stream":{"framing":{"namespace":42,"value":3,"version":1},"clock":{"namespace":1,"value":1,"version":1},"layout":{"schema":{"namespace":42,"value":7,"version":1},"positions":[]},"generation":1,"encoder_delay_us":0},
+            "options":{"profile":"objects"}}});
+    let profile = request["audio"].clone();
+    let id = host.response(1, request)["session"]
+        .as_u64()
+        .expect("profile prepared");
+    let mut start_request = start(id);
+    start_request["configuration"]["channels"] = json!(12);
+    start_request["configuration"]["capture_sink_without_routing"] = json!(true);
+    assert_eq!(host.response(2, start_request)["state"], "active");
+    assert!(
+        !host
+            .broker
+            .calls
+            .iter()
+            .any(|call| call.service == Resource::AudioEncoder.service())
+    );
+    let capture = host
+        .broker
+        .calls
+        .iter()
+        .find(|call| {
+            call.service == Resource::AudioCapture.service() && call.payload["action"] == "open"
+        })
+        .unwrap();
+    assert_eq!(capture.payload["audio_profile"], profile);
+    assert_eq!(capture.payload["audio_source"], "encoded");
+    assert_eq!(
+        capture.payload["required_native_contract"],
+        amaterasu_module_sdk::audio::ENCODED_SOURCE_CONTRACT
+    );
+    assert_eq!(
+        host.response(3, json!({"action":"stop","session":id}))["state"],
+        "stopped"
+    );
+    assert_eq!(host.broker.leases(), 0);
+}
+
+#[test]
+fn prepared_custom_audio_reconfiguration_probes_and_updates_generation_before_start() {
+    let mut host = Harness::new();
+    let mut request = prepare();
+    request["audio"] = json!({"channels":2,"channel_mask":0,"layout":"objects","packet_ms":10,"bitrate":128000,
+        "custom":{"codec":{"namespace":42,"value":99,"version":1},"sample_rate":48000,"source":"encoded",
+            "stream":{"framing":{"namespace":42,"value":3,"version":1},"clock":{"namespace":1,"value":1,"version":1},
+                "layout":{"schema":{"namespace":42,"value":7,"version":1},"positions":[]},"generation":1,"encoder_delay_us":0},"options":{}}});
+    let mut changed = request["audio"].clone();
+    let id = host.response(1, request)["session"].as_u64().unwrap();
+    changed["custom"]["stream"]["generation"] = json!(2);
+    changed["custom"]["options"]["mode"] = json!("updated");
+    host.broker.unsupported_audio_probe = Some(Resource::Media.service());
+    assert_eq!(
+        host.response(
+            2,
+            json!({"action":"reconfigure_audio","session":id,"audio":changed})
+        )["code"],
+        "unsupported_audio_format"
+    );
+    assert_eq!(
+        host.pipeline.records[&id]
+            .config
+            .audio
+            .custom
+            .as_ref()
+            .unwrap()
+            .stream
+            .generation,
+        1
+    );
+    assert!(
+        !host
+            .broker
+            .calls
+            .iter()
+            .any(|call| call.payload["action"] == "reconfigure")
+    );
+    host.broker.unsupported_audio_probe = None;
+    let response = host.response(
+        3,
+        json!({"action":"reconfigure_audio","session":id,"audio":changed}),
+    );
+    assert_eq!(response["state"], "prepared");
+    assert_eq!(response["audio"]["custom"]["stream"]["generation"], 2);
+    let apply = host
+        .broker
+        .calls
+        .iter()
+        .find(|call| {
+            call.service == Resource::Media.service() && call.payload["action"] == "reconfigure"
+        })
+        .unwrap();
+    assert_eq!(apply.payload["audio_profile"], changed);
+    assert_eq!(host.response(4, start(id))["state"], "active");
+    let capture = host
+        .broker
+        .calls
+        .iter()
+        .find(|call| {
+            call.service == Resource::AudioCapture.service() && call.payload["action"] == "open"
+        })
+        .unwrap();
+    assert_eq!(capture.payload["audio_profile"], changed);
+    assert_eq!(
+        host.response(5, json!({"action":"stop","session":id}))["state"],
+        "stopped"
+    );
+}
+
+#[test]
+fn advertised_client_formats_reject_only_unmatched_custom_profiles() {
+    let mut host = Harness::new();
+    let mut request = prepare();
+    let layout = json!({"schema":{"namespace":42,"value":7,"version":1},"positions":[]});
+    request["audio"] = json!({"channels":2,"channel_mask":0,"layout":"objects","packet_ms":10,"bitrate":128000,
+        "custom":{"codec":{"namespace":42,"value":99,"version":1},"sample_rate":48000,"source":"encoded",
+            "stream":{"framing":{"namespace":42,"value":3,"version":1},"clock":{"namespace":1,"value":1,"version":1},
+                "layout":layout,"generation":1,"encoder_delay_us":0},"options":{}},
+        "client_offers":[{"codec":{"namespace":42,"value":100,"version":1},"sample_rate":48000,
+            "framing":{"namespace":42,"value":3,"version":1},"clock":{"namespace":1,"value":1,"version":1},
+            "layout":layout,"metadata_schemas":[],"max_unit_bytes":4096,"max_metadata_bytes":128,
+            "min_latency_us":0,"max_latency_us":100000}]});
+    assert_eq!(
+        host.response(1, request.clone())["code"],
+        "unsupported_audio_format"
+    );
+    request["audio"]["client_offers"][0]["codec"]["value"] = json!(99);
+    assert!(host.response(2, request)["session"].is_u64());
+}
+
+#[test]
+fn unsupported_provider_probe_stops_before_media_allocation() {
+    let mut host = Harness::new();
+    host.broker.unsupported_audio_probe = Some(Resource::Media.service());
+    let mut request = prepare();
+    request["audio"] = json!({"channels":2,"channel_mask":0,"layout":"objects","packet_ms":10,"bitrate":128000,
+        "custom":{"codec":{"namespace":42,"value":99,"version":1},"sample_rate":48000,"source":"encoded",
+            "stream":{"framing":{"namespace":42,"value":3,"version":1},"clock":{"namespace":1,"value":1,"version":1},
+                "layout":{"schema":{"namespace":42,"value":7,"version":1},"positions":[]},"generation":1,"encoder_delay_us":0},"options":{}}});
+    assert_eq!(
+        host.response(1, request)["error"],
+        "unsupported_audio_format"
+    );
+    assert!(
+        !host
+            .broker
+            .calls
+            .iter()
+            .any(|call| call.service == Resource::Media.service()
+                && call.payload["action"] == "open")
+    );
+    assert_eq!(host.broker.leases(), 0);
+}
+
+#[test]
+fn selected_audio_processor_receives_the_negotiated_input_and_output_formats() {
+    let mut host = Harness::new();
+    host.pipeline.settings.providers.audio_processor = Some("vendor.audio-processor/1".into());
+    let input = json!({"sample_rate":44100,"sample_format":{"namespace":1,"value":3,"version":1},
+        "sample_bytes":3,"valid_bits":24,"packing":{"namespace":1,"value":2,"version":1},
+        "speakers":[{"namespace":1,"value":1,"version":1},{"namespace":1,"value":2,"version":1}]});
+    let output = json!({"sample_rate":48000,"sample_format":{"namespace":1,"value":1,"version":1},
+        "sample_bytes":4,"valid_bits":32,"packing":{"namespace":1,"value":1,"version":1},
+        "speakers":([1u64,2,4,8,16,32,512,1024,4096,16384,32768,131072]
+            .map(|value| json!({"namespace":1,"value":value,"version":1})))});
+    let mut request = prepare();
+    request["audio"] = json!({"channels":12,"channel_mask":0,"layout":"7.1.4","packet_ms":10,"bitrate":128000,
+        "custom":{"codec":{"namespace":42,"value":99,"version":1},"sample_rate":48000,
+            "stream":{"framing":{"namespace":42,"value":3,"version":1},"clock":{"namespace":1,"value":1,"version":1},"layout":{"schema":{"namespace":42,"value":7,"version":1},"positions":[]},"generation":1,"encoder_delay_us":0},
+            "pcm":input,"processing":{"output":output,"latency_us":1500,"options":{"gain":0.8}},"options":{}}});
+    let profile = request["audio"].clone();
+    let id = host.response(1, request)["session"]
+        .as_u64()
+        .expect("profile prepared");
+    let processor = host
+        .broker
+        .calls
+        .iter()
+        .find(|call| call.service == "vendor.audio-processor/1" && call.payload["action"] == "open")
+        .unwrap();
+    assert_eq!(processor.payload["audio_profile"], profile);
+    assert_eq!(
+        processor.payload["required_native_contract"],
+        amaterasu_module_sdk::audio::PROCESSOR_CONTRACT
+    );
+    let mut revised = profile.clone();
+    revised["custom"]["stream"]["generation"] = json!(2);
+    revised["custom"]["processing"]["options"]["gain"] = json!(0.5);
+    assert_eq!(
+        host.response(
+            2,
+            json!({"action":"reconfigure_audio","session":id,"audio":revised})
+        )["state"],
+        "prepared"
+    );
+    for service in [
+        "vendor.audio-processor/1",
+        "amaterasu.audio-encode/1",
+        "amaterasu.media-transport/1",
+    ] {
+        assert!(
+            host.broker
+                .calls
+                .iter()
+                .any(|call| call.service == service && call.payload["action"] == "reconfigure")
+        );
+    }
+    assert_eq!(host.response(3, start(id))["state"], "active");
+    let mut live_change = revised.clone();
+    live_change["custom"]["stream"]["generation"] = json!(3);
+    assert_eq!(
+        host.response(
+            4,
+            json!({"action":"reconfigure_audio","session":id,"audio":live_change})
+        )["code"],
+        "invalid_state"
+    );
+    let capture = host
+        .broker
+        .calls
+        .iter()
+        .find(|call| {
+            call.service == Resource::AudioCapture.service() && call.payload["action"] == "open"
+        })
+        .unwrap();
+    assert_eq!(capture.payload["pcm_format"], input);
+    assert_eq!(
+        host.response(5, json!({"action":"stop","session":id}))["state"],
+        "stopped"
+    );
+    assert_eq!(host.broker.leases(), 0);
+}
+
+#[test]
+fn partial_audio_reconfiguration_failure_retires_owned_components() {
+    let mut host = Harness::new();
+    host.pipeline.settings.providers.audio_processor = Some("vendor.audio-processor/1".into());
+    let pcm = json!({"sample_rate":48000,"sample_format":{"namespace":1,"value":1,"version":1},
+        "sample_bytes":4,"valid_bits":32,"packing":{"namespace":1,"value":1,"version":1},
+        "speakers":[{"namespace":1,"value":1,"version":1},{"namespace":1,"value":2,"version":1}]});
+    let mut request = prepare();
+    request["audio"] = json!({"channels":2,"channel_mask":3,"layout":"stereo","packet_ms":10,"bitrate":128000,
+        "custom":{"codec":{"namespace":42,"value":99,"version":1},"sample_rate":48000,
+            "stream":{"framing":{"namespace":42,"value":3,"version":1},"clock":{"namespace":1,"value":1,"version":1},
+                "layout":{"schema":{"namespace":42,"value":7,"version":1},"positions":[]},"generation":1,"encoder_delay_us":0},
+            "pcm":pcm,"processing":{"output":pcm,"latency_us":0,"options":{}},"options":{}}});
+    let mut revised = request["audio"].clone();
+    let id = host.response(1, request)["session"].as_u64().unwrap();
+    revised["custom"]["stream"]["generation"] = json!(2);
+    host.broker.fail_audio_reconfigure = Some(Resource::AudioEncoder.service());
+    let response = host.response(
+        2,
+        json!({"action":"reconfigure_audio","session":id,"audio":revised}),
+    );
+    assert_eq!(response["state"], "failed");
+    assert!(
+        host.broker
+            .calls
+            .iter()
+            .any(|call| call.service == "vendor.audio-processor/1"
+                && call.payload["action"] == "reconfigure")
+    );
+    assert_eq!(host.broker.leases(), 0);
+    assert!(
+        !host.pipeline.records[&id]
+            .resources
+            .contains_key(&Resource::AudioProcessor)
+    );
+}
+
+#[test]
 fn surround_invalid_layout_and_packet_size_fail_before_resources() {
     for (channels, mask, packet_ms, bitrate) in [
         (6, 3, 5, 256_000),

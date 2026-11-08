@@ -3,6 +3,7 @@ mod controller;
 mod datagrams;
 mod model;
 mod native;
+mod opus_packet;
 mod stream;
 
 use amaterasu_module_sdk::{

@@ -92,19 +92,27 @@ _Static_assert(offsetof(AmaterasuEncoderApiV1_4, gpu_input_ready) == sizeof(Amat
 _Static_assert(sizeof(AmaterasuVideoApi) == 40, "video table layout");
 _Static_assert(sizeof(AmaterasuVideoApiV1_1) == 48, "video v1.1 table layout");
 _Static_assert(offsetof(AmaterasuVideoApiV1_1, geometry) == 40, "video geometry offset");
-_Static_assert(sizeof(AmaterasuAudioFrame) == 56, "audio frame layout");
-_Static_assert(offsetof(AmaterasuAudioFrame, data) == 24, "audio data offset");
+_Static_assert(sizeof(AmaterasuAudioFrame) == 104, "audio frame layout");
+_Static_assert(offsetof(AmaterasuAudioFrame, data) == 72, "audio data offset");
 _Static_assert(sizeof(AmaterasuAudioCaptureApi) == 40, "audio table layout");
-_Static_assert(sizeof(AmaterasuEncodedAudioPacket) == 56, "encoded audio layout");
-_Static_assert(offsetof(AmaterasuEncodedAudioPacket, data) == 24, "encoded audio data offset");
-_Static_assert(offsetof(AmaterasuEncodedAudioPacket, timestamp_us) == 40, "encoded audio timestamp offset");
+_Static_assert(sizeof(AmaterasuAudioProcessorApi) == 56, "audio processor table layout");
+_Static_assert(sizeof(AmaterasuEncodedAudioSourceApi) == 48, "encoded audio source table layout");
+_Static_assert(sizeof(AmaterasuAudioFormatId) == 24, "audio format identity layout");
+_Static_assert(sizeof(AmaterasuAudioUnit) == 120, "audio unit layout");
+_Static_assert(offsetof(AmaterasuAudioUnit, timestamp_us) == 56, "audio unit timestamp offset");
+_Static_assert(offsetof(AmaterasuAudioUnit, payload) == 88, "audio unit payload offset");
+_Static_assert(offsetof(AmaterasuAudioUnit, metadata) == 104, "audio unit metadata offset");
 _Static_assert(sizeof(AmaterasuAudioEncoderApi) == 56, "audio encoder table layout");
 _Static_assert(offsetof(AmaterasuAudioEncoderApi, submit) == 32, "audio encoder submit offset");
 _Static_assert(offsetof(AmaterasuAudioEncoderApi, receive) == 40, "audio encoder receive offset");
+_Static_assert(_Generic(((AmaterasuAudioEncoderApi *)0)->receive,
+    AmaterasuStatus (*)(void *, uint64_t, AmaterasuAudioUnitSink): 1, default: 0), "audio encoder unit signature");
 _Static_assert(offsetof(AmaterasuAudioEncoderApi, drain) == 48, "audio encoder drain offset");
 _Static_assert(sizeof(AmaterasuMediaTransportApi) == 56, "media transport table layout");
 _Static_assert(offsetof(AmaterasuMediaTransportApi, submit_video) == 32, "transport video offset");
 _Static_assert(offsetof(AmaterasuMediaTransportApi, submit_audio) == 40, "transport audio offset");
+_Static_assert(_Generic(((AmaterasuMediaTransportApi *)0)->submit_audio,
+    AmaterasuStatus (*)(void *, uint64_t, const AmaterasuAudioUnit *): 1, default: 0), "transport audio unit signature");
 _Static_assert(offsetof(AmaterasuMediaTransportApi, drain) == 48, "transport drain offset");
 #endif
 

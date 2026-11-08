@@ -150,7 +150,15 @@ pub struct AudioWire {
     pub channels: u32,
     #[serde(skip_serializing_if = "is_stereo_mask")]
     pub channel_mask: u32,
+    /// An explicitly negotiated non-GameStream audio profile.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub custom: Option<CustomAudioFormat>,
+    /// Concrete formats advertised by the authenticated protocol/client.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub client_offers: Vec<amaterasu_module_sdk::audio::AudioFormatOffer>,
 }
+
+use amaterasu_module_sdk::audio::{AudioProfile as CustomAudioFormat, AudioSource};
 fn is_stereo_channels(channels: &u32) -> bool {
     *channels == 2
 }
@@ -168,6 +176,8 @@ impl Default for AudioWire {
             layout: "stereo".into(),
             channels: 2,
             channel_mask: 3,
+            custom: None,
+            client_offers: vec![],
         }
     }
 }
@@ -606,6 +616,30 @@ fn valid_ping_payload(value: &str) -> bool {
 }
 
 impl AudioWire {
+    pub fn encoded_source(&self) -> bool {
+        self.custom
+            .as_ref()
+            .is_some_and(|custom| custom.source == AudioSource::Encoded)
+    }
+    /// Complete custom profile, including values omitted from legacy serialization.
+    pub fn custom_session_profile(
+        &self,
+    ) -> Option<amaterasu_module_sdk::audio::AudioSessionProfile> {
+        let custom = self.custom.as_ref()?;
+        Some(amaterasu_module_sdk::audio::AudioSessionProfile {
+            packet_ms: self.packet_ms,
+            bitrate: self.bitrate,
+            layout: self.layout.clone(),
+            channels: self.channels,
+            channel_mask: self.channel_mask,
+            custom: custom.clone(),
+            client_offers: self.client_offers.clone(),
+        })
+    }
+
+    pub fn custom_profile(&self) -> serde_json::Value {
+        serde_json::to_value(self.custom_session_profile()).expect("audio profile serializes")
+    }
     pub fn channel_mapping(&self) -> Option<(u32, u32, &'static [u8], &'static [u8])> {
         match self.channels {
             6 => Some((4, 2, &[0, 4, 1, 2, 3, 5], &[0, 1, 4, 5, 2, 3])),
@@ -613,7 +647,72 @@ impl AudioWire {
             _ => None,
         }
     }
-    fn validate(&self) -> Result<(), &'static str> {
+    pub(crate) fn validate(&self) -> Result<(), &'static str> {
+        if let Some(custom) = &self.custom {
+            if self.client_offers.len() > 64
+                || self
+                    .client_offers
+                    .iter()
+                    .any(|offer| offer.validate().is_err())
+            {
+                return Err("invalid_audio_offers");
+            }
+            if !self.client_offers.is_empty()
+                && !self
+                    .client_offers
+                    .iter()
+                    .any(|offer| offer.supports(custom))
+            {
+                return Err("unsupported_audio_format");
+            }
+            if !custom.codec.is_present()
+                || custom.sample_rate == 0
+                || custom.options_schema.is_some_and(|id| !id.is_present())
+                || custom.stream.validate().is_err()
+                || (custom.stream.layout.schema == amaterasu_module_sdk::audio::SPEAKER_LAYOUT
+                    && (custom.stream.layout.positions.len() != self.channels as usize
+                        || custom
+                            .processing
+                            .as_ref()
+                            .map(|processing| &processing.output)
+                            .or(custom.pcm.as_ref())
+                            .is_some_and(|pcm| pcm.speakers != custom.stream.layout.positions)))
+                || match (&custom.source, &custom.pcm) {
+                    (AudioSource::Pcm, Some(pcm)) => {
+                        pcm.validate().is_err()
+                            || match &custom.processing {
+                                Some(processing) => {
+                                    processing.output.validate().is_err()
+                                        || processing
+                                            .options_schema
+                                            .is_some_and(|id| !id.is_present())
+                                        || processing.output.sample_rate != custom.sample_rate
+                                        || processing.output.speakers.len()
+                                            != self.channels as usize
+                                        || serde_json::to_vec(&processing.options)
+                                            .map_or(true, |bytes| bytes.len() > 65_536)
+                                }
+                                None => {
+                                    pcm.sample_rate != custom.sample_rate
+                                        || pcm.speakers.len() != self.channels as usize
+                                }
+                            }
+                    }
+                    (AudioSource::Encoded, None) => custom.processing.is_some(),
+                    _ => true,
+                }
+                || self.channels == 0
+                || self.layout.is_empty()
+                || self.layout.len() > 4096
+                || serde_json::to_vec(&custom.options).map_or(true, |bytes| bytes.len() > 65_536)
+            {
+                return Err("invalid_audio_configuration");
+            }
+            return Ok(());
+        }
+        if !self.client_offers.is_empty() {
+            return Err("invalid_audio_offers");
+        }
         let bitrate_range = match (self.channels, self.packet_ms, self.channel_mask) {
             (2, 5 | 10, 3) if self.layout == "stereo" => 6000..=512000,
             (6, 5 | 10, 0x3f) if self.layout == "5.1" => 256000..=1536000,
@@ -626,6 +725,61 @@ impl AudioWire {
             return Err("invalid_audio_configuration");
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod custom_audio_profile_tests {
+    use super::*;
+
+    #[test]
+    fn stereo_custom_profile_includes_explicit_layout_and_channels() {
+        let audio = AudioWire {
+            custom: Some(CustomAudioFormat {
+                codec: amaterasu_media::AudioFormatId {
+                    namespace: 42,
+                    value: 99,
+                    version: 1,
+                },
+                sample_rate: 48_000,
+                stream: amaterasu_module_sdk::audio::AudioStreamDescription {
+                    framing: amaterasu_media::AudioFormatId::standard(1),
+                    clock: amaterasu_media::AudioFormatId::standard(1),
+                    layout: amaterasu_module_sdk::audio::AudioLayout {
+                        schema: amaterasu_module_sdk::audio::SPEAKER_LAYOUT,
+                        positions: vec![
+                            amaterasu_module_sdk::audio::SPEAKER_FRONT_LEFT,
+                            amaterasu_module_sdk::audio::SPEAKER_FRONT_RIGHT,
+                        ],
+                        data: None,
+                    },
+                    generation: 1,
+                    encoder_delay_us: 0,
+                    codec_initialization: None,
+                    metadata: vec![],
+                },
+                source: AudioSource::Pcm,
+                processing: None,
+                options_schema: None,
+                pcm: Some(amaterasu_module_sdk::audio::PcmFormat {
+                    sample_rate: 48_000,
+                    sample_format: amaterasu_media::AUDIO_PCM_F32,
+                    sample_bytes: 4,
+                    valid_bits: 32,
+                    packing: amaterasu_media::AUDIO_PACKING_INTERLEAVED,
+                    speakers: vec![
+                        amaterasu_module_sdk::audio::SPEAKER_FRONT_LEFT,
+                        amaterasu_module_sdk::audio::SPEAKER_FRONT_RIGHT,
+                    ],
+                }),
+                options: serde_json::json!({}),
+            }),
+            ..AudioWire::default()
+        };
+        let profile = audio.custom_profile();
+        assert_eq!(profile["layout"], "stereo");
+        assert_eq!(profile["channels"], 2);
+        assert_eq!(profile["channel_mask"], 3);
     }
 }
 
@@ -992,9 +1146,15 @@ impl StartConfig {
     }
 
     pub fn matches_prepared_audio(&self, prepared: &PrepareConfig) -> bool {
+        let channels = prepared
+            .audio
+            .custom
+            .as_ref()
+            .and_then(|custom| custom.pcm.as_ref())
+            .map_or(prepared.audio.channels, |pcm| pcm.speakers.len() as u32);
         !prepared.stream_audio
-            || prepared.audio.channels == 2 && self.channels.is_none()
-            || self.channels == Some(prepared.audio.channels)
+            || channels == 2 && self.channels.is_none()
+            || self.channels == Some(channels)
     }
     pub fn matches_prepared_encryption(&self, prepared: &PrepareConfig) -> bool {
         self.encrypt_video
@@ -1005,6 +1165,14 @@ impl StartConfig {
     }
 
     pub fn validate(&self, stream_audio: bool) -> Result<(), &'static str> {
+        self.validate_audio_profile(stream_audio, false)
+    }
+
+    pub fn validate_audio_profile(
+        &self,
+        stream_audio: bool,
+        custom_audio: bool,
+    ) -> Result<(), &'static str> {
         if self.source_id.is_some() && self.source_capture_context.is_some() {
             return Err("source_mode_cannot_select_capture_context");
         }
@@ -1125,12 +1293,12 @@ impl StartConfig {
                 if stream_audio
                     && self.capture_sink_without_routing
                     && valid_label(&self.audio_endpoint, 4096)
-                    && matches!(channels, 2 | 6 | 8) => {}
+                    && (matches!(channels, 2 | 6 | 8) || (custom_audio && channels != 0)) => {}
             (None, Some(_)) => return Err("invalid_virtual_sink_channels"),
             (Some(selector), Some(channels))
                 if selector.len() <= 4096
                     && !selector.chars().any(char::is_control)
-                    && matches!(channels, 2 | 6 | 8)
+                    && (matches!(channels, 2 | 6 | 8) || (custom_audio && channels != 0))
                     && self.audio_endpoint.is_empty()
                     && !self.capture_sink_without_routing => {}
             (Some(_), _) => return Err("invalid_virtual_sink_channels"),
@@ -1274,6 +1442,11 @@ pub enum Operation {
     StartWhenAuthenticated {
         session: u64,
         configuration: StartConfig,
+    },
+    /// Renegotiate custom audio before the authenticated stream starts.
+    ReconfigureAudio {
+        session: u64,
+        audio: Box<AudioWire>,
     },
     Stop {
         session: u64,

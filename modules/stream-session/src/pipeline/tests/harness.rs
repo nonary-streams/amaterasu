@@ -63,6 +63,8 @@ pub struct Broker {
     pub fault: Option<(String, Fault)>,
     pub fail_cancel: bool,
     pub fail_open: Option<String>,
+    pub unsupported_audio_probe: Option<String>,
+    pub fail_audio_reconfigure: Option<String>,
     pub fail_close: Option<String>,
     pub cleanup_failure: Option<(String, String)>,
     pub fail_session_stop: bool,
@@ -689,6 +691,10 @@ impl Broker {
         if service == "amaterasu.display/1" {
             return self.display(action, &call.payload);
         }
+        if action == "probe" {
+            return json!({"ok":true,"supported":self.unsupported_audio_probe.as_deref() != Some(service),
+                "audio_profile":call.payload["audio_profile"]});
+        }
         if matches!(action, "open" | "create") {
             if self.fail_open.as_deref() == Some(service) {
                 return error("backend_failed");
@@ -760,6 +766,14 @@ impl Broker {
         else {
             return error("not_found");
         };
+        if action == "reconfigure" {
+            if self.fail_audio_reconfigure.as_deref() == Some(service) {
+                return error("reconfigure_failed");
+            }
+            let allocation = self.allocations.get_mut(&key).unwrap();
+            allocation.request["audio_profile"] = call.payload["audio_profile"].clone();
+            return json!({"ok":true,"stream":id,"audio_profile":call.payload["audio_profile"]});
+        }
         if service == "amaterasu.media-transport/1" && action == "configure_video_format" {
             let allocation = self.allocations.get_mut(&key).unwrap();
             allocation.request["video_stream_format"] = call.payload["video_stream_format"].clone();
@@ -1249,12 +1263,19 @@ impl Broker {
                 let channels = allocation.request["channels"].as_u64().unwrap();
                 let mut reply = json!({"ok":true,"stream":id,"sample_rate":48000,"channels":channels,
                     "packet_ms":packet_ms,"bitrate":bitrate,"packet_bytes":packet_bytes,"constant_bitrate":true});
+                if allocation.request["audio_profile"].is_object() {
+                    reply["sample_rate"] =
+                        allocation.request["audio_profile"]["custom"]["sample_rate"].clone();
+                    reply["audio_profile"] = allocation.request["audio_profile"].clone();
+                }
                 if let Some((streams, coupled, mapping, wave_mapping)) = (crate::model::AudioWire {
                     channels: channels as u32,
                     packet_ms: packet_ms as u32,
                     bitrate: bitrate as u32,
                     channel_mask: if channels == 6 { 0x3f } else { 0x63f },
                     layout: if channels == 6 { "5.1" } else { "7.1" }.into(),
+                    custom: None,
+                    client_offers: vec![],
                 })
                 .channel_mapping()
                 {
@@ -1266,6 +1287,9 @@ impl Broker {
                 }
                 reply
             }
+            "vendor.audio-processor/1" => json!({"ok":true,"stream":id,
+                "audio_profile":allocation.request["audio_profile"],
+                "native_contract":allocation.request["required_native_contract"]}),
             "amaterasu.media-transport/1" => {
                 let request = &allocation.request;
                 let video: crate::model::VideoWire =
@@ -1280,6 +1304,9 @@ impl Broker {
                     "video_encrypted":request["encryption"]["video"].as_bool().unwrap_or(false),
                     "audio_encrypted":request["encryption"]["audio"].as_bool().unwrap_or(false),
                     "permit_legacy_audio_iv_wrap":request["encryption"]["permit_legacy_audio_iv_wrap"].as_bool().unwrap_or(false)});
+                if request["audio_profile"].is_object() {
+                    metadata["audio_profile"] = request["audio_profile"].clone();
+                }
                 if request["discovery"].is_object() {
                     metadata["peer_discovery"] = json!(true);
                     metadata["video_port"] = json!(self.discovered_video_port);
@@ -1311,21 +1338,46 @@ impl Broker {
                     .or_else(|| {
                         allocation.request["capture_format"]["channels"]
                             .as_u64()
+                            .or_else(|| {
+                                allocation.request["pcm_format"]["speakers"]
+                                    .as_array()
+                                    .map(|speakers| speakers.len() as u64)
+                            })
+                            .or_else(|| allocation.request["audio_profile"]["channels"].as_u64())
                             .or_else(|| allocation.request["channels"].as_u64())
                     })
                     .unwrap_or(2);
                 let mask = match channels {
                     6 => 0x3f,
                     8 => 0x63f,
-                    _ => 3,
+                    _ => allocation.request["audio_profile"]["channel_mask"]
+                        .as_u64()
+                        .unwrap_or(3),
                 };
-                json!({"ok":true,"stream":id,"endpoint":"resolved-canonical-endpoint",
+                let mut reply = json!({"ok":true,"stream":id,"endpoint":"resolved-canonical-endpoint",
                     "requested_endpoint":allocation.request["endpoint"],
                     "virtual_sink":allocation.request["virtual_sink"],
                     "channels":self.reported_audio_sink_channels.map(Value::from).unwrap_or_else(||allocation.request["channels"].clone()),
                     "host_audio_enabled":allocation.request["host_audio_enabled"],
                     "capture_sink_without_routing":allocation.request["capture_sink_without_routing"],
-                    "format":{"sample_rate":self.format_rate,"channels":channels,"channel_mask":mask,"format":"f32"}})
+                    "format":{"sample_rate":self.format_rate,"channels":channels,"channel_mask":mask,"format":"f32"}});
+                if allocation.request["audio_profile"].is_object() {
+                    reply["format"]["sample_rate"] = if allocation.request["pcm_format"].is_object()
+                    {
+                        allocation.request["pcm_format"]["sample_rate"].clone()
+                    } else {
+                        allocation.request["audio_profile"]["custom"]["sample_rate"].clone()
+                    };
+                    if allocation.request["audio_source"] == "encoded" {
+                        reply["audio_source"] = json!("encoded");
+                        reply["native_contract"] =
+                            allocation.request["required_native_contract"].clone();
+                    } else {
+                        reply["pcm_format"] = allocation.request["pcm_format"].clone();
+                    }
+                    reply["audio_profile"] = allocation.request["audio_profile"].clone();
+                }
+                reply
             }
             _ => panic!("unexpected component"),
         }

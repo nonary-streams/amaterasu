@@ -1,5 +1,5 @@
 //! Encoded media admission to an owned network transport.
-use crate::{EncodedAudioPacket, EncodedPacket, TimedEncodedPacket};
+use crate::{AudioUnit, EncodedPacket, TimedEncodedPacket};
 use amaterasu_abi::{NativeInterface, Status};
 use std::ffi::c_void;
 
@@ -14,9 +14,8 @@ pub struct MediaTransportApi {
     /// producer fragments first. STATUS_OK accepts all bytes; MEDIA_BUSY accepts
     /// nothing and consumes no packet indices or crypto nonces. EOS has no payload.
     pub submit_video: unsafe extern "C" fn(*mut c_void, u64, *const EncodedPacket) -> Status,
-    /// Submit one complete Opus packet matching the negotiated duration and wire
-    /// size. Input bytes remain borrowed only during the call. EOS has no payload.
-    pub submit_audio: unsafe extern "C" fn(*mut c_void, u64, *const EncodedAudioPacket) -> Status,
+    /// Submit one negotiated audio unit. Bytes are borrowed only for this call.
+    pub submit_audio: unsafe extern "C" fn(*mut c_void, u64, *const AudioUnit) -> Status,
     /// Stop accepting input and flush queued datagrams. A successful call starts
     /// draining; control status reports when the local queue has emptied. No EOS
     /// datagram or peer acknowledgement is invented by the transport.

@@ -9,6 +9,9 @@ use serde_json::{Value, json};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Step {
     Open(Resource),
+    ProbeAudio(Resource),
+    ProbeAudioReconfiguration(Resource),
+    ApplyAudioReconfiguration(Resource),
     Authenticate,
     ConfirmControlDisconnect,
     MediaReady,
@@ -472,6 +475,43 @@ impl Job {
                     .expect("journal write step owns a payload"),
             ),
             Step::Open(resource) => (record.service(resource), record.open(resource)),
+            Step::ProbeAudio(resource) => (
+                record.service(resource),
+                amaterasu_module_sdk::audio::AudioControlRequest::Probe {
+                    audio_profile: record
+                        .config
+                        .audio
+                        .custom_session_profile()
+                        .expect("custom audio selected"),
+                }
+                .payload()
+                .expect("audio probe serializes"),
+            ),
+            Step::ProbeAudioReconfiguration(resource) => (
+                record.service(resource),
+                amaterasu_module_sdk::audio::AudioControlRequest::Probe {
+                    audio_profile: record
+                        .pending_audio
+                        .as_ref()
+                        .and_then(|audio| audio.custom_session_profile())
+                        .expect("audio reconfiguration selected"),
+                }
+                .payload()
+                .expect("audio probe serializes"),
+            ),
+            Step::ApplyAudioReconfiguration(resource) => (
+                record.service(resource),
+                amaterasu_module_sdk::audio::AudioControlRequest::Reconfigure {
+                    stream: record.resources[&resource],
+                    audio_profile: record
+                        .pending_audio
+                        .as_ref()
+                        .and_then(|audio| audio.custom_session_profile())
+                        .expect("audio reconfiguration selected"),
+                }
+                .payload()
+                .expect("audio reconfiguration serializes"),
+            ),
             Step::Authenticate => (
                 record.service(Resource::Control),
                 json!({"action":"status","stream":record.resources[&Resource::Control]}),
@@ -651,11 +691,19 @@ impl Job {
             ),
             Step::CloseCapture => (
                 record.service(Resource::AudioCapture),
-                json!({"action":"close","stream":record.resources[&Resource::AudioCapture]}),
+                amaterasu_module_sdk::audio::AudioControlRequest::Close {
+                    stream: record.resources[&Resource::AudioCapture],
+                }
+                .payload()
+                .expect("audio close serializes"),
             ),
             Step::TransportStatus => (
                 record.service(Resource::Media),
-                json!({"action":"status","stream":record.resources[&Resource::Media]}),
+                amaterasu_module_sdk::audio::AudioControlRequest::Status {
+                    stream: record.resources[&Resource::Media],
+                }
+                .payload()
+                .expect("media status serializes"),
             ),
             Step::Find(Resource::Session) => (
                 record.service(Resource::Session),
@@ -667,7 +715,21 @@ impl Job {
             ),
             Step::Close(resource) => (
                 record.service(resource),
-                json!({"action":"close","stream":record.resources[&resource]}),
+                if matches!(
+                    resource,
+                    Resource::AudioCapture
+                        | Resource::AudioEncoder
+                        | Resource::AudioProcessor
+                        | Resource::Media
+                ) {
+                    amaterasu_module_sdk::audio::AudioControlRequest::Close {
+                        stream: record.resources[&resource],
+                    }
+                    .payload()
+                    .expect("audio close serializes")
+                } else {
+                    json!({"action":"close","stream":record.resources[&resource]})
+                },
             ),
             Step::StopSession => (
                 record.service(Resource::Session),

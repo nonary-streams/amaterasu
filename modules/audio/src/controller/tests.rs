@@ -129,16 +129,55 @@ fn controller(enabled: bool) -> (Controller, Arc<Observed>) {
     (controller, observed)
 }
 
+#[test]
+fn capabilities_report_builtin_pcm_without_claiming_encoded_sources() {
+    let (mut controller, _) = controller(true);
+    let reply = controller
+        .handle("owner", Operation::Capabilities)
+        .unwrap()
+        .payload;
+    let caps: amaterasu_module_sdk::audio::AudioCapabilitiesResult =
+        serde_json::from_value(reply).unwrap();
+    assert_eq!(
+        caps.capabilities
+            .pcm_outputs
+            .iter()
+            .map(|format| format.speakers.len())
+            .collect::<Vec<_>>(),
+        [2, 6, 8]
+    );
+    assert!(!caps.capabilities.encoded_source);
+}
+
 fn open() -> Operation {
     Operation::Open {
         endpoint: "render.explicit".into(),
         virtual_sink: None,
         channels: None,
         capture_format: None,
+        audio_profile: None,
         host_audio_enabled: true,
         operation_id: Some("one".into()),
         capture_sink_without_routing: false,
     }
+}
+
+#[test]
+fn capture_echoes_custom_profile_and_pins_it_to_open_identity() {
+    let (mut controller, _) = controller(true);
+    let profile = json!({"channels":2,"channel_mask":3,"layout":"stereo", "custom":{"codec":{"namespace":42,"value":99,"version":1},"sample_rate":48000,"options":{}}});
+    let request = json!({"action":"open","endpoint":"render.explicit","operation_id":"custom-capture",
+        "capture_format":{"sample_rate":48000,"channels":2,"sample_format":"f32"},"audio_profile":profile});
+    let operation: Operation = serde_json::from_value(request.clone()).unwrap();
+    let reply = controller.handle("alice", operation).unwrap().payload;
+    assert_eq!(reply["audio_profile"], request["audio_profile"]);
+    let mut conflicting = request;
+    conflicting["audio_profile"]["custom"]["codec"]["value"] = json!(100);
+    let operation: Operation = serde_json::from_value(conflicting).unwrap();
+    assert_eq!(
+        controller.handle("alice", operation).err(),
+        Some("operation_conflict")
+    );
 }
 
 #[test]
@@ -250,6 +289,7 @@ fn selected_endpoint_open_is_caller_scoped_idempotent_with_stable_endpoint() {
                     virtual_sink: None,
                     channels: None,
                     capture_format: None,
+                    audio_profile: None,
                     host_audio_enabled: true,
                     operation_id: Some("one".into()),
                     capture_sink_without_routing: false
@@ -277,6 +317,7 @@ fn capture_only_routing_snapshot_is_forwarded_and_part_of_open_idempotency() {
         virtual_sink: None,
         channels: None,
         capture_format: None,
+        audio_profile: None,
         host_audio_enabled: true,
         operation_id: Some("capture-only".into()),
         capture_sink_without_routing: true,
@@ -304,6 +345,7 @@ fn capture_only_routing_snapshot_is_forwarded_and_part_of_open_idempotency() {
                     virtual_sink: None,
                     channels: None,
                     capture_format: None,
+                    audio_profile: None,
                     host_audio_enabled: true,
                     operation_id: Some("capture-only".into()),
                     capture_sink_without_routing: false,
@@ -687,6 +729,7 @@ fn empty_ordinary_sink_uses_default_endpoint_and_host_audio_policy_is_idempotent
         virtual_sink: None,
         channels: None,
         capture_format: None,
+        audio_profile: None,
         host_audio_enabled: false,
         operation_id: Some("automatic-sink".into()),
         capture_sink_without_routing: false,
@@ -710,6 +753,7 @@ fn empty_ordinary_sink_uses_default_endpoint_and_host_audio_policy_is_idempotent
                     virtual_sink: None,
                     channels: None,
                     capture_format: None,
+                    audio_profile: None,
                     host_audio_enabled: true,
                     operation_id: Some("automatic-sink".into()),
                     capture_sink_without_routing: false,
@@ -732,6 +776,7 @@ fn status_tracks_followed_default_while_open_and_lookup_keep_initial_endpoint() 
         virtual_sink: None,
         channels: None,
         capture_format: None,
+        audio_profile: None,
         host_audio_enabled: false,
         operation_id: Some("follow-default".into()),
         capture_sink_without_routing: false,
@@ -758,6 +803,7 @@ fn status_tracks_followed_default_while_open_and_lookup_keep_initial_endpoint() 
                 virtual_sink: None,
                 channels: None,
                 capture_format: None,
+                audio_profile: None,
                 host_audio_enabled: false,
                 operation_id: Some("follow-default".into()),
                 capture_sink_without_routing: false,
@@ -790,6 +836,7 @@ fn enabled_host_audio_policy_is_forwarded_and_reported_in_status() {
                 virtual_sink: None,
                 channels: None,
                 capture_format: None,
+                audio_profile: None,
                 host_audio_enabled: true,
                 operation_id: None,
                 capture_sink_without_routing: false,
@@ -845,6 +892,7 @@ fn unavailable_selected_endpoint_fails_without_falling_back_to_the_default() {
             virtual_sink: None,
             channels: None,
             capture_format: None,
+            audio_profile: None,
             host_audio_enabled: true,
             operation_id: Some("missing-endpoint".into()),
             capture_sink_without_routing: false,
@@ -866,6 +914,7 @@ fn virtual_sink_selection_precedes_regular_endpoint_and_binds_layout_to_retry() 
         virtual_sink: Some("Studio Virtual".into()),
         channels: Some(6),
         capture_format: None,
+        audio_profile: None,
         host_audio_enabled: true,
         operation_id: Some("virtual-audio".into()),
         capture_sink_without_routing: false,
@@ -886,6 +935,7 @@ fn virtual_sink_selection_precedes_regular_endpoint_and_binds_layout_to_retry() 
                 virtual_sink: Some("Studio Virtual".into()),
                 channels: Some(6),
                 capture_format: None,
+                audio_profile: None,
                 host_audio_enabled: true,
                 operation_id: Some("virtual-audio".into()),
                 capture_sink_without_routing: false,
@@ -902,6 +952,7 @@ fn virtual_sink_selection_precedes_regular_endpoint_and_binds_layout_to_retry() 
                     virtual_sink: Some("Studio Virtual".into()),
                     channels: Some(8),
                     capture_format: None,
+                    audio_profile: None,
                     host_audio_enabled: true,
                     operation_id: Some("virtual-audio".into()),
                     capture_sink_without_routing: false,
@@ -926,6 +977,7 @@ fn unavailable_virtual_sink_does_not_fall_back_to_requested_regular_endpoint() {
             virtual_sink: Some("Missing Virtual".into()),
             channels: Some(2),
             capture_format: None,
+            audio_profile: None,
             host_audio_enabled: true,
             operation_id: Some("unavailable-virtual".into()),
             capture_sink_without_routing: false,
@@ -954,6 +1006,7 @@ fn virtual_sink_rejects_capture_only_routing_policy() {
             virtual_sink: Some(String::new()),
             channels: Some(2),
             capture_format: None,
+            audio_profile: None,
             host_audio_enabled: true,
             operation_id: None,
             capture_sink_without_routing: true,
@@ -974,6 +1027,7 @@ fn virtual_sink_requires_supported_channel_layout_and_regular_open_rejects_layou
             virtual_sink: Some(String::new()),
             channels: Some(4),
             capture_format: None,
+            audio_profile: None,
             host_audio_enabled: true,
             operation_id: None,
             capture_sink_without_routing: false,
@@ -991,6 +1045,7 @@ fn virtual_sink_requires_supported_channel_layout_and_regular_open_rejects_layou
             virtual_sink: None,
             channels: Some(6),
             capture_format: None,
+            audio_profile: None,
             host_audio_enabled: true,
             operation_id: None,
             capture_sink_without_routing: false,
@@ -1102,6 +1157,7 @@ fn read_failure_overrides_recovery_status_until_close_and_reacquire() {
                 virtual_sink: None,
                 channels: None,
                 capture_format: None,
+                audio_profile: None,
                 host_audio_enabled: true,
                 operation_id: Some("reacquired".into()),
                 capture_sink_without_routing: false,
@@ -1390,6 +1446,7 @@ fn unpublished_opens_release_operation_capacity_and_preserve_other_owners() {
                     virtual_sink: None,
                     channels: None,
                     capture_format: None,
+                    audio_profile: None,
                     host_audio_enabled: true,
                     operation_id: Some(operation_id.clone()),
                     capture_sink_without_routing: false,

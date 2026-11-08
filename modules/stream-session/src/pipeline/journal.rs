@@ -237,12 +237,15 @@ impl Entry {
             })
             && !self.legacy_effect_pending
             && self.legacy_effect_target.is_none()
-            && self.attempted_resources.len() <= 6
+            && self.attempted_resources.len() <= 7
+            && (!self.attempted_resources.contains("audio-processor")
+                || self.providers.audio_processor.is_some())
             && self.attempted_resources.iter().all(|resource| {
                 matches!(
                     resource.as_str(),
                     "session"
                         | "audio-encode"
+                        | "audio-processor"
                         | "media-transport"
                         | "control-transport"
                         | "video"
@@ -326,6 +329,7 @@ fn resource_from_name(name: &str) -> Option<super::record::Resource> {
     match name {
         "session" => Some(Resource::Session),
         "audio-encode" => Some(Resource::AudioEncoder),
+        "audio-processor" => Some(Resource::AudioProcessor),
         "media-transport" => Some(Resource::Media),
         "control-transport" => Some(Resource::Control),
         "video" => Some(Resource::Video),

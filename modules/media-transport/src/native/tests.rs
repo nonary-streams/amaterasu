@@ -6,6 +6,55 @@ use crate::{
 use amaterasu_media::MEDIA_CLOSED;
 
 #[test]
+fn first_revision_audio_unit_reaches_the_gamestream_transport() {
+    let (video, audio) = receivers();
+    let mut controller = Controller::new(Settings {
+        network_provider: None,
+        enabled: true,
+        allow_remote: false,
+        allowed_principals: vec!["owner".into()],
+    });
+    let id = controller
+        .handle("owner", Operation::Open(request(&video, &audio, false)))
+        .unwrap()
+        .created
+        .unwrap();
+    let bytes = [0x04, 1, 2, 3];
+    let unit = AudioUnit {
+        generation: 1,
+        format: amaterasu_media::AUDIO_FORMAT_OPUS,
+        metadata_schema: amaterasu_media::AudioFormatId {
+            namespace: 0,
+            value: 0,
+            version: 0,
+        },
+        flags: 0,
+        timestamp_us: 0,
+        duration_us: 10_000,
+        sequence: 1,
+        payload: BorrowedBytes::new(&bytes),
+        metadata: BorrowedBytes::new(&[]),
+    };
+    let other = AudioUnit {
+        format: amaterasu_media::AudioFormatId {
+            namespace: 42,
+            value: 99,
+            version: 1,
+        },
+        ..unit
+    };
+    // SAFETY: both units borrow the live local packet for the synchronous calls.
+    assert_eq!(
+        unsafe { controller.submit_audio("owner", id, &other) },
+        MEDIA_UNSUPPORTED
+    );
+    assert_eq!(
+        unsafe { controller.submit_audio("owner", id, &unit) },
+        STATUS_OK
+    );
+}
+
+#[test]
 fn bound_native_tables_isolate_owners_and_remain_closed_after_shutdown() {
     let (video, audio) = receivers();
     let shared = Arc::new(Mutex::new(Controller::new(Settings {

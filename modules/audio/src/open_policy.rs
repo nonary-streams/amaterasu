@@ -24,6 +24,7 @@ mod tests {
             virtual_sink: virtual_sink.map(str::to_owned),
             channels: Some(2),
             capture_format: None,
+            audio_profile: None,
             host_audio_enabled: true,
             operation_id: Some("open-operation".into()),
             capture_sink_without_routing,
@@ -40,6 +41,7 @@ mod tests {
             host_audio_enabled,
             operation_id,
             capture_sink_without_routing,
+            ..
         } = normalize(open(Some("Studio Virtual"), true))
         else {
             panic!("open operation must remain open");
@@ -79,6 +81,7 @@ mod tests {
             host_audio_enabled,
             operation_id,
             capture_sink_without_routing,
+            ..
         } = normalize(open(None, true))
         else {
             panic!("open operation must remain open");

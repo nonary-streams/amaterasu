@@ -1,17 +1,189 @@
 use super::*;
 use std::collections::VecDeque;
 
+#[test]
+fn packet_copy_accepts_negotiated_non_opus_audio_and_height_channels() {
+    let samples = vec![0_u8; 12 * 441 * 4];
+    let frame = AudioFrame {
+        sample_rate: 44_100,
+        channels: 12,
+        format: amaterasu_media::AudioFormatId::standard(u64::from(PCM_F32)),
+        sample_bytes: 4,
+        packing: amaterasu_media::AUDIO_PACKING_INTERLEAVED,
+        frames: 441,
+        flags: 0,
+        data: samples.as_ptr(),
+        len: samples.len(),
+        timestamp_us: 0,
+        sequence: 1,
+    };
+    // SAFETY: both packet views borrow their backing allocations through copying.
+    assert!(unsafe { PcmPacket::copy(&frame) }.is_ok());
+    let bytes = [1_u8, 2, 3];
+    let packet = AudioUnit {
+        generation: 1,
+        format: AudioFormatId {
+            namespace: 42,
+            value: 99,
+            version: 1,
+        },
+        metadata_schema: AudioFormatId {
+            namespace: 0,
+            value: 0,
+            version: 0,
+        },
+        flags: 0,
+        duration_us: 10_000,
+        payload: amaterasu_module_sdk::abi::BorrowedBytes::new(&bytes),
+        metadata: amaterasu_module_sdk::abi::BorrowedBytes::new(&[]),
+        timestamp_us: 0,
+        sequence: 1,
+    };
+    assert!(unsafe { AudioPacket::copy_unit(&packet) }.is_ok());
+}
+
+#[test]
+fn custom_audio_unit_and_metadata_survive_backpressure() {
+    let format = AudioFormatId {
+        namespace: 42,
+        value: u64::from(u32::MAX) + 7,
+        version: 1,
+    };
+    let schema = AudioFormatId {
+        namespace: 42,
+        value: 8,
+        version: 1,
+    };
+    let mut bytes = vec![1, 2, 3];
+    let mut metadata = vec![7, 8];
+    let unit = AudioUnit {
+        generation: 1,
+        format,
+        metadata_schema: schema,
+        flags: 0,
+        timestamp_us: 10,
+        duration_us: 1234,
+        sequence: 1,
+        payload: amaterasu_module_sdk::abi::BorrowedBytes::new(&bytes),
+        metadata: amaterasu_module_sdk::abi::BorrowedBytes::new(&metadata),
+    };
+    // SAFETY: both source allocations remain valid through the copy.
+    let packet = unsafe { AudioPacket::copy_unit(&unit) }.unwrap();
+    bytes.fill(0);
+    metadata.fill(0);
+    let mut backend = Fake {
+        audio_unit_busy: true,
+        ..Fake::default()
+    };
+    backend.audios.push_back(packet);
+    let mut pump = Pump::new(backend);
+    pump.tick(true).unwrap();
+    assert!(pump.backend.audio_units.is_empty());
+    pump.backend.audio_unit_busy = false;
+    pump.tick(true).unwrap();
+    assert_eq!(
+        pump.backend.audio_units,
+        [(format, vec![1, 2, 3], vec![7, 8])]
+    );
+}
+
+#[test]
+fn final_custom_audio_unit_keeps_payload_metadata_and_provider_flags() {
+    let format = AudioFormatId {
+        namespace: 42,
+        value: 99,
+        version: 1,
+    };
+    let bytes = [1, 2, 3];
+    let metadata = [7, 8];
+    let unit = AudioUnit {
+        format,
+        metadata_schema: format,
+        generation: 1,
+        flags: AUDIO_EXTENSIBLE_END | 0x80,
+        timestamp_us: 10,
+        duration_us: 10,
+        sequence: 1,
+        payload: amaterasu_module_sdk::abi::BorrowedBytes::new(&bytes),
+        metadata: amaterasu_module_sdk::abi::BorrowedBytes::new(&metadata),
+    };
+    let mut backend = Fake::default();
+    // SAFETY: the source buffers remain live through the synchronous copy.
+    backend
+        .audios
+        .push_back(unsafe { AudioPacket::copy_unit(&unit).unwrap() });
+    let mut pump = Pump::new(backend);
+    let progress = pump.tick(true).unwrap();
+    assert!(pump.audio_ended);
+    assert_eq!(
+        pump.backend.audio_units,
+        [(format, bytes.to_vec(), metadata.to_vec())]
+    );
+    assert_eq!(progress.accepted_media_payload_bytes, 3);
+}
+
+#[test]
+fn encoded_source_drains_and_forwards_without_polling_pcm() {
+    let mut backend = Fake {
+        audio_busy: true,
+        ..Fake::default()
+    };
+    backend.audios.push_back(audio(false));
+    backend.audios.push_back(audio(true));
+    let mut pump = Pump::new(backend);
+    pump.encoded_source = true;
+    pump.stopping = true;
+    pump.tick(true).unwrap();
+    assert_eq!(pump.backend.encoder_drains, 1);
+    assert_eq!(pump.backend.pcm_reads, 0);
+    assert!(!pump.audio_ended);
+    pump.backend.audio_busy = false;
+    pump.tick(true).unwrap();
+    assert_eq!(pump.backend.audio_sent.len(), 2);
+    assert!(pump.audio_ended);
+    assert_eq!(pump.backend.pcm_reads, 0);
+}
+
+#[test]
+fn processor_retains_output_when_encoder_is_busy_and_drains_before_encoder() {
+    let mut backend = Fake {
+        pcm_busy: true,
+        ..Fake::default()
+    };
+    backend.pcms.push_back(pcm());
+    let mut pump = Pump::new(backend);
+    pump.processing = true;
+    pump.tick(true).unwrap();
+    assert_eq!(pump.backend.processor_submits, 1);
+    assert!(pump.pending_processed.is_some());
+    assert_eq!(pump.backend.pcm_sent, 0);
+    pump.stopping = true;
+    pump.tick(true).unwrap();
+    assert_eq!(pump.backend.encoder_drains, 0);
+    pump.backend.pcm_busy = false;
+    pump.tick(true).unwrap();
+    assert_eq!(pump.backend.pcm_sent, 1);
+    assert!(pump.processor_ended);
+    assert_eq!(pump.backend.encoder_drains, 1);
+}
+
 #[derive(Default)]
 struct Fake {
     controls: VecDeque<ControlRecord>,
     videos: VecDeque<VideoPacket>,
     pcms: VecDeque<PcmPacket>,
+    processed: VecDeque<PcmPacket>,
+    processor_busy: bool,
+    processor_draining: bool,
+    processor_submits: usize,
     audios: VecDeque<AudioPacket>,
     video_reads: usize,
     pcm_reads: usize,
     audio_reads: usize,
     video_busy: bool,
     audio_busy: bool,
+    audio_unit_busy: bool,
+    audio_units: Vec<(AudioFormatId, Vec<u8>, Vec<u8>)>,
     pcm_busy: bool,
     control_failed: bool,
     feedback_busy: bool,
@@ -88,14 +260,47 @@ impl Backend for Fake {
         self.pcm_sent += 1;
         Ok(true)
     }
-    fn submit_audio(&mut self, packet: &EncodedAudioPacket) -> PlaneResult<bool> {
+    fn submit_processor(&mut self, frame: &AudioFrame) -> PlaneResult<bool> {
+        if self.processor_busy {
+            return Ok(false);
+        }
+        self.processor_submits += 1;
+        // SAFETY: the pump owns the input samples through this call.
+        self.processed.push_back(unsafe { PcmPacket::copy(frame)? });
+        Ok(true)
+    }
+    fn processor_output(&mut self) -> PlaneResult<ProcessorOutput> {
+        if let Some(packet) = self.processed.pop_front() {
+            Ok(ProcessorOutput::Frame(packet))
+        } else if self.processor_draining {
+            Ok(ProcessorOutput::End)
+        } else {
+            Ok(ProcessorOutput::Pending)
+        }
+    }
+    fn drain_processor(&mut self) -> PlaneResult<bool> {
+        self.processor_draining = true;
+        Ok(true)
+    }
+    fn submit_audio(&mut self, unit: &AudioUnit) -> PlaneResult<bool> {
+        if unit.format != AUDIO_FORMAT_OPUS {
+            if self.audio_unit_busy {
+                return Ok(false);
+            }
+            self.audio_units.push((
+                unit.format,
+                unsafe { unit.payload.read().unwrap() }.to_vec(),
+                unsafe { unit.metadata.read().unwrap() }.to_vec(),
+            ));
+            return Ok(true);
+        }
         if self.audio_busy {
             return Ok(false);
         }
         // SAFETY: pump retains initialized encoded bytes throughout submission.
         self.audio_sent
-            .push(unsafe { packet.bytes().unwrap() }.to_vec());
-        self.audio_flags.push(packet.flags);
+            .push(unsafe { unit.payload.read().unwrap() }.to_vec());
+        self.audio_flags.push(unit.flags);
         Ok(true)
     }
     fn drain_encoder(&mut self) -> PlaneResult<bool> {
@@ -123,19 +328,23 @@ fn video(bytes: &[u8], flags: u32, sequence: u64) -> VideoPacket {
 
 fn audio(eos: bool) -> AudioPacket {
     let bytes = [0xf4, 1, 2];
-    let packet = EncodedAudioPacket {
-        codec: CODEC_OPUS,
+    let packet = AudioUnit {
+        generation: 1,
+        format: AUDIO_FORMAT_OPUS,
+        metadata_schema: AudioFormatId {
+            namespace: 0,
+            value: 0,
+            version: 0,
+        },
         flags: if eos { AUDIO_PACKET_END_OF_STREAM } else { 0 },
-        sample_rate: 48_000,
-        channels: 2,
-        frames: if eos { 0 } else { 480 },
-        data: bytes.as_ptr(),
-        len: if eos { 0 } else { bytes.len() },
+        duration_us: if eos { 0 } else { 10_000 },
+        payload: amaterasu_module_sdk::abi::BorrowedBytes::new(if eos { &[] } else { &bytes }),
+        metadata: amaterasu_module_sdk::abi::BorrowedBytes::new(&[]),
         timestamp_us: 0,
         sequence: 0,
     };
     // SAFETY: local encoded bytes are valid throughout the copy.
-    unsafe { AudioPacket::copy(&packet).unwrap() }
+    unsafe { AudioPacket::copy_unit(&packet).unwrap() }
 }
 
 fn pcm() -> PcmPacket {
@@ -143,7 +352,9 @@ fn pcm() -> PcmPacket {
     let frame = AudioFrame {
         sample_rate: 48_000,
         channels: 2,
-        format: PCM_F32,
+        format: amaterasu_media::AudioFormatId::standard(u64::from(PCM_F32)),
+        sample_bytes: 4,
+        packing: amaterasu_media::AUDIO_PACKING_INTERLEAVED,
         frames: 480,
         flags: 0,
         data: bytes.as_ptr(),
@@ -224,7 +435,9 @@ fn surround_pcm_and_encoded_packets_cross_plane_and_drain() {
         let frame = AudioFrame {
             sample_rate: 48_000,
             channels,
-            format: PCM_F32,
+            format: amaterasu_media::AudioFormatId::standard(u64::from(PCM_F32)),
+            sample_bytes: 4,
+            packing: amaterasu_media::AUDIO_PACKING_INTERLEAVED,
             frames: 480,
             flags: 0,
             data: pcm_bytes.as_ptr(),
@@ -233,14 +446,18 @@ fn surround_pcm_and_encoded_packets_cross_plane_and_drain() {
             sequence: 0,
         };
         let encoded_bytes = [0xf4, 1, 2];
-        let encoded = EncodedAudioPacket {
-            codec: CODEC_OPUS,
+        let encoded = AudioUnit {
+            generation: 1,
+            format: AUDIO_FORMAT_OPUS,
+            metadata_schema: AudioFormatId {
+                namespace: 0,
+                value: 0,
+                version: 0,
+            },
             flags: 0,
-            sample_rate: 48_000,
-            channels,
-            frames: 480,
-            data: encoded_bytes.as_ptr(),
-            len: encoded_bytes.len(),
+            duration_us: 10_000,
+            payload: amaterasu_module_sdk::abi::BorrowedBytes::new(&encoded_bytes),
+            metadata: amaterasu_module_sdk::abi::BorrowedBytes::new(&[]),
             timestamp_us: 0,
             sequence: 0,
         };
@@ -251,7 +468,7 @@ fn surround_pcm_and_encoded_packets_cross_plane_and_drain() {
             .push_back(unsafe { PcmPacket::copy(&frame).unwrap() });
         backend
             .audios
-            .push_back(unsafe { AudioPacket::copy(&encoded).unwrap() });
+            .push_back(unsafe { AudioPacket::copy_unit(&encoded).unwrap() });
         let mut pump = Pump::with_media(backend, true, channels, CODEC_H264);
         assert_eq!(pump.tick(true).unwrap().accepted_media_payload_bytes, 3);
         assert_eq!(pump.backend.audio_sent, [encoded_bytes]);
@@ -693,7 +910,7 @@ fn control_failure_prevents_all_media_polling() {
 }
 
 #[test]
-fn assembler_fragment_count_and_pcm_format_are_explicitly_bounded() {
+fn assembler_fragment_count_and_pcm_shape_are_explicitly_bounded() {
     let mut assembly = VideoAssembly::new(CODEC_H264);
     for _ in 0..1024 {
         assembly.push(video(&[1], 0, 1)).unwrap();
@@ -704,10 +921,10 @@ fn assembler_fragment_count_and_pcm_format_are_explicitly_bounded() {
     );
     let original = pcm();
     let mut frame = original.header();
-    frame.sample_rate = 44_100;
+    frame.len -= 1;
     assert_eq!(
         unsafe { PcmPacket::copy(&frame) }.err(),
-        Some("unsupported_pcm_format")
+        Some("invalid_pcm_frame")
     );
 }
 

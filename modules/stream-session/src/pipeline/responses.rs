@@ -94,6 +94,8 @@ pub(super) fn media_status(record: &Record, payload: &Value) -> Result<MediaStat
         || payload["audio_encrypted"] != (config.stream_audio && config.encrypt_audio)
         || payload["permit_legacy_audio_iv_wrap"]
             != (config.stream_audio && config.permit_legacy_audio_iv_wrap)
+        || (config.audio.custom.is_some()
+            && payload["audio_profile"] != config.audio.custom_profile())
     {
         return Err("invalid_transport_response");
     }

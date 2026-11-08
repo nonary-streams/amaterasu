@@ -2,8 +2,8 @@ use crate::controller::Controller;
 #[cfg(test)]
 use amaterasu_media::INTERFACE_MINOR;
 use amaterasu_media::{
-    EncodedAudioPacket, EncodedPacket, INTERFACE_MAJOR, MEDIA_BACKEND_ERROR, MEDIA_BUSY,
-    MEDIA_UNSUPPORTED, MediaTransportApi, MediaTransportApiV1_1, TimedEncodedPacket,
+    AudioUnit, EncodedPacket, INTERFACE_MAJOR, MEDIA_BACKEND_ERROR, MEDIA_BUSY, MEDIA_UNSUPPORTED,
+    MediaTransportApi, MediaTransportApiV1_1, TimedEncodedPacket,
 };
 use amaterasu_module_sdk::abi::*;
 use std::{
@@ -150,7 +150,7 @@ unsafe extern "C" fn submit_video(
 unsafe extern "C" fn submit_audio(
     context: *mut c_void,
     id: u64,
-    packet: *const EncodedAudioPacket,
+    packet: *const AudioUnit,
 ) -> Status {
     guarded(|| {
         if packet.is_null() {

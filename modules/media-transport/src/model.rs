@@ -376,7 +376,19 @@ pub fn validate_ping_timeout_ms(value: i64) -> TransportResult<u64> {
 // larger Open variant costs nothing worth an extra allocation.
 #[allow(clippy::large_enum_variant)]
 pub enum Operation {
+    Enumerate,
     Open(Open),
+    Capabilities,
+    Probe {
+        audio_profile: amaterasu_module_sdk::audio::AudioSessionProfile,
+    },
+    Effective {
+        stream: u64,
+    },
+    Reconfigure {
+        stream: u64,
+        audio_profile: amaterasu_module_sdk::audio::AudioSessionProfile,
+    },
     ConfigureVideoFormat {
         stream: u64,
         video_stream_format: amaterasu_module_sdk::VideoStreamFormat,

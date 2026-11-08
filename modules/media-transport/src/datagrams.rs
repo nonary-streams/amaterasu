@@ -2,6 +2,7 @@ use crate::model::{
     DISCOVERY_TOKEN_BYTES, DiscoveryTokens, MAX_DATAGRAMS, MAX_QUEUE_BYTES, SENDS_PER_STREAM,
 };
 mod udp_batch;
+use amaterasu_module_sdk::audio::ClientAudioChannel;
 use amaterasu_module_sdk::network::{Network, UdpSocket};
 use std::{
     collections::VecDeque,
@@ -38,6 +39,7 @@ enum VideoBatchSupport {
 
 struct Lane {
     socket: UdpSocket,
+    channel: Option<ClientAudioChannel>,
     batch_sender: BatchSender,
     peer: Option<SocketAddr>,
     ping_payload: Option<[u8; DISCOVERY_TOKEN_BYTES]>,
@@ -50,6 +52,7 @@ impl Lane {
         socket.connect(peer)?;
         Ok(Self {
             batch_sender: BatchSender::new(network),
+            channel: Some(ClientAudioChannel::from_connected_session(socket.clone())),
             socket,
             peer: Some(peer),
             ping_payload: None,
@@ -65,6 +68,7 @@ impl Lane {
         let socket = network.bind_udp(local)?;
         Ok(Self {
             batch_sender: BatchSender::new(network),
+            channel: None,
             socket,
             peer: None,
             ping_payload: Some(ping_payload),
@@ -98,6 +102,9 @@ impl Lane {
                         continue;
                     }
                     self.socket.connect(source)?;
+                    self.channel = Some(ClientAudioChannel::from_connected_session(
+                        self.socket.clone(),
+                    ));
                     self.peer = Some(source);
                     self.ping_payload = None;
                     self.receive_buffer = None;
@@ -392,11 +399,16 @@ impl Delivery {
                     break;
                 }
             }
-            let socket = match packet.medium {
-                Medium::Video => &self.video.socket,
-                Medium::Audio => &self.audio.socket,
+            let result = match packet.medium {
+                Medium::Video => self.video.socket.send(&packet.bytes),
+                Medium::Audio => self
+                    .audio
+                    .channel
+                    .as_ref()
+                    .ok_or_else(|| io::Error::from(io::ErrorKind::NotConnected))
+                    .and_then(|channel| channel.send_datagram(&packet.bytes))
+                    .map(|()| packet.bytes.len()),
             };
-            let result = socket.send(&packet.bytes);
             if !self.record_send(result) {
                 break;
             }

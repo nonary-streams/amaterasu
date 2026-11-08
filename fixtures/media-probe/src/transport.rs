@@ -1,7 +1,8 @@
 //! Finite signed-library workflow; test endpoints are always local loopback.
 use crate::opus::{Packet, encode_transport_packets};
 use amaterasu_media::{
-    CODEC_H264, CODEC_OPUS, EncodedAudioPacket, EncodedPacket, FLAG_KEYFRAME, MediaTransportApi,
+    AUDIO_FORMAT_OPUS, AudioFormatId, AudioUnit, CODEC_H264, EncodedPacket, FLAG_KEYFRAME,
+    MediaTransportApi,
 };
 use amaterasu_module_sdk::{Command, ModuleResult, Response, RuntimeClient, abi};
 use serde_json::{Value, json};
@@ -319,14 +320,18 @@ fn submit_native(runtime: &RuntimeClient, stream: u64, audio: &[Packet]) -> Modu
         "video submit",
     )?;
     for packet in audio {
-        let encoded = EncodedAudioPacket {
-            codec: CODEC_OPUS,
+        let encoded = AudioUnit {
+            generation: 1,
+            format: AUDIO_FORMAT_OPUS,
+            metadata_schema: AudioFormatId {
+                namespace: 0,
+                value: 0,
+                version: 0,
+            },
             flags: packet.flags,
-            sample_rate: 48000,
-            channels: 2,
-            frames: packet.frames,
-            data: packet.bytes.as_ptr(),
-            len: packet.bytes.len(),
+            duration_us: u64::from(packet.frames) * 1_000_000 / 48_000,
+            payload: abi::BorrowedBytes::new(&packet.bytes),
+            metadata: abi::BorrowedBytes::new(&[]),
             timestamp_us: packet.timestamp_us,
             sequence: packet.sequence,
         };

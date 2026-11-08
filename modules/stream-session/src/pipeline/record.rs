@@ -36,6 +36,7 @@ impl State {
 pub(super) enum Resource {
     Session,
     AudioEncoder,
+    AudioProcessor,
     Media,
     Control,
     Video,
@@ -43,11 +44,12 @@ pub(super) enum Resource {
 }
 
 impl Resource {
-    pub const CLEANUP: [Self; 5] = [
+    pub const CLEANUP: [Self; 6] = [
         Self::AudioCapture,
         Self::Video,
         Self::Control,
         Self::Media,
+        Self::AudioProcessor,
         Self::AudioEncoder,
     ];
 
@@ -55,6 +57,7 @@ impl Resource {
         match self {
             Self::Session => "session",
             Self::AudioEncoder => "audio-encode",
+            Self::AudioProcessor => "audio-processor",
             Self::Media => "media-transport",
             Self::Control => "control-transport",
             Self::Video => "video",
@@ -73,6 +76,7 @@ impl Resource {
             Self::Video => Some("amaterasu.video/1"),
             Self::AudioCapture => Some("amaterasu.audio/1"),
             Self::AudioEncoder => Some("amaterasu.audio-encode/1"),
+            Self::AudioProcessor => Some(amaterasu_module_sdk::audio::PROCESSOR_CONTRACT),
             Self::Media => Some("amaterasu.media-transport/1"),
             Self::Control => Some("amaterasu.control-transport/1"),
         }
@@ -87,6 +91,7 @@ pub(super) struct Record {
     pub session_effects: super::session_effects::SessionEffects,
     pub owner: String,
     pub config: PrepareConfig,
+    pub pending_audio: Option<crate::model::AudioWire>,
     pub start: Option<StartConfig>,
     pub shared_capture: Option<super::shared_capture::Source>,
     pub shared_capture_attached: bool,
@@ -202,6 +207,9 @@ pub(super) struct UncertainJournalWrite {
 
 impl Record {
     pub fn required_native_contract(&self, resource: Resource) -> Option<&'static str> {
+        if resource == Resource::AudioCapture && self.config.audio.encoded_source() {
+            return Some(amaterasu_module_sdk::audio::ENCODED_SOURCE_CONTRACT);
+        }
         resource
             .native_contract()
             .filter(|contract| self.service(resource) != *contract)
@@ -226,6 +234,11 @@ impl Record {
             Resource::Video => &self.providers.video,
             Resource::AudioCapture => &self.providers.audio_capture,
             Resource::AudioEncoder => &self.providers.audio_encoder,
+            Resource::AudioProcessor => self
+                .providers
+                .audio_processor
+                .as_ref()
+                .expect("processor selected before allocation"),
             Resource::Media => &self.providers.media_transport,
             Resource::Control => &self.providers.control_transport,
         }
@@ -242,6 +255,7 @@ impl Record {
             session_effects: super::session_effects::SessionEffects::default(),
             owner,
             config,
+            pending_audio: None,
             start: None,
             shared_capture: None,
             shared_capture_attached: false,
@@ -409,11 +423,99 @@ impl Record {
                 .dynamic_range
                 == amaterasu_module_sdk::DynamicRange::Hdr,
             audio_capture: audio_handle(Resource::AudioCapture)?,
-            audio_encoder: audio_handle(Resource::AudioEncoder)?,
+            audio_encoder: if self.config.audio.encoded_source() {
+                None
+            } else {
+                audio_handle(Resource::AudioEncoder)?
+            },
+            audio_processor: if self
+                .config
+                .audio
+                .custom
+                .as_ref()
+                .is_some_and(|custom| custom.processing.is_some())
+            {
+                audio_handle(Resource::AudioProcessor)?
+            } else {
+                None
+            },
             media_transport: get(Resource::Media)?,
             control_transport: get(Resource::Control)?,
             stream_audio: self.config.stream_audio,
-            audio_channels: self.config.audio.channels,
+            audio_channels: self
+                .config
+                .audio
+                .custom
+                .as_ref()
+                .and_then(|custom| custom.pcm.as_ref())
+                .map_or(self.config.audio.channels, |pcm| pcm.speakers.len() as u32),
+            audio_sample_rate: self.config.audio.custom.as_ref().map_or(48_000, |custom| {
+                custom
+                    .pcm
+                    .as_ref()
+                    .map_or(custom.sample_rate, |pcm| pcm.sample_rate)
+            }),
+            audio_format: self.config.audio.custom.as_ref().map(|custom| custom.codec),
+            audio_generation: self
+                .config
+                .audio
+                .custom
+                .as_ref()
+                .map_or(1, |custom| custom.stream.generation),
+            audio_max_unit_bytes: self
+                .config
+                .audio
+                .custom
+                .as_ref()
+                .and_then(|custom| {
+                    self.config
+                        .audio
+                        .client_offers
+                        .iter()
+                        .find(|offer| offer.supports(custom))
+                })
+                .map_or(amaterasu_media::AUDIO_EXTENSIBLE_MAX_PAYLOAD, |offer| {
+                    offer.max_unit_bytes as usize
+                }),
+            audio_max_metadata_bytes: self
+                .config
+                .audio
+                .custom
+                .as_ref()
+                .and_then(|custom| {
+                    self.config
+                        .audio
+                        .client_offers
+                        .iter()
+                        .find(|offer| offer.supports(custom))
+                })
+                .map_or(amaterasu_media::AUDIO_EXTENSIBLE_MAX_METADATA, |offer| {
+                    offer.max_metadata_bytes as usize
+                }),
+            audio_pcm: self
+                .config
+                .audio
+                .custom
+                .as_ref()
+                .and_then(|custom| custom.pcm.as_ref())
+                .map(|pcm| (pcm.sample_format, pcm.sample_bytes, pcm.packing)),
+            encoded_audio_source: self.config.audio.encoded_source(),
+            processed_audio: self
+                .config
+                .audio
+                .custom
+                .as_ref()
+                .and_then(|custom| custom.processing.as_ref())
+                .map(|processing| {
+                    let pcm = &processing.output;
+                    (
+                        pcm.sample_rate,
+                        pcm.speakers.len() as u32,
+                        pcm.sample_format,
+                        pcm.sample_bytes,
+                        pcm.packing,
+                    )
+                }),
             video_codec: self
                 .start
                 .as_ref()
@@ -524,8 +626,17 @@ impl Record {
         let config = &self.config;
         let mut payload = match resource {
             Resource::Session => return json!({"action":"create","key":self.operation(resource)}),
-            Resource::AudioEncoder => json!({"action":"open","channels":config.audio.channels,
-                "packet_ms":config.audio.packet_ms,"bitrate":config.audio.bitrate}),
+            Resource::AudioEncoder => {
+                let mut payload = json!({"action":"open","channels":config.audio.channels,
+                    "packet_ms":config.audio.packet_ms,"bitrate":config.audio.bitrate});
+                if config.audio.custom.is_some() {
+                    payload["audio_profile"] = config.audio.custom_profile();
+                }
+                payload
+            }
+            Resource::AudioProcessor => {
+                json!({"action":"open", "audio_profile":config.audio.custom_profile()})
+            }
             Resource::Media => {
                 let audio_encrypted = config.stream_audio && config.encrypt_audio;
                 let permit_legacy_audio_iv_wrap =
@@ -539,6 +650,9 @@ impl Record {
                         json!({"key_hex":config.key_hex,"key_id":config.key_id,"video":config.encrypt_video,
                             "audio":audio_encrypted,"permit_legacy_audio_iv_wrap":permit_legacy_audio_iv_wrap})
                     } else { Value::Null }});
+                if config.audio.custom.is_some() {
+                    payload["audio_profile"] = config.audio.custom_profile();
+                }
                 if let Some(policy) = &config.video_encryption_policy {
                     payload["video_encryption_policy"] = json!({
                         "lan_mode": policy.lan_mode,
@@ -599,12 +713,22 @@ impl Record {
                     "virtual_sink":start.virtual_sink,
                     "channels":start.virtual_sink.as_ref().and(start.channels),
                     "host_audio_enabled":start.host_audio_enabled});
-                if self.config.stream_audio {
+                if let Some(custom) = &self.config.audio.custom {
+                    if let Some(pcm) = &custom.pcm {
+                        payload["pcm_format"] =
+                            serde_json::to_value(pcm).expect("PCM format serializes");
+                    } else {
+                        payload["audio_source"] = json!("encoded");
+                    }
+                } else if self.config.stream_audio {
                     payload["capture_format"] = json!({
                         "sample_rate": 48_000,
                         "channels": self.config.audio.channels,
                         "sample_format": "f32"
                     });
+                }
+                if config.audio.custom.is_some() {
+                    payload["audio_profile"] = config.audio.custom_profile();
                 }
                 if self.config.stream_audio && start.continuous_audio == Some(true) {
                     payload["continuous_audio"] = json!({"packet_ms":config.audio.packet_ms});
@@ -616,7 +740,20 @@ impl Record {
         if let Some(contract) = self.required_native_contract(resource) {
             payload["required_native_contract"] = json!(contract);
         }
-        payload
+        if matches!(
+            resource,
+            Resource::AudioCapture
+                | Resource::AudioEncoder
+                | Resource::AudioProcessor
+                | Resource::Media
+        ) {
+            let request: amaterasu_module_sdk::audio::AudioControlRequest =
+                serde_json::from_value(payload)
+                    .expect("audio open matches the shared SDK contract");
+            request.payload().expect("audio open serializes")
+        } else {
+            payload
+        }
     }
 }
 

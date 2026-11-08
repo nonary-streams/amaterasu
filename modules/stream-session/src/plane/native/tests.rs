@@ -29,6 +29,10 @@ struct Provider {
     timed_media_busy: bool,
     timing_received: u64,
     presentation_received: u64,
+    audio_unit_busy: bool,
+    audio_units: Vec<(AudioFormatId, Vec<u8>, Vec<u8>)>,
+    processor_pending: bool,
+    processor_draining: bool,
 }
 
 struct Host {
@@ -37,6 +41,9 @@ struct Host {
     video: VideoApi,
     timed_video: Option<Box<VideoApiV1_3>>,
     capture: AudioCaptureApi,
+    encoded_capture: EncodedAudioSourceApi,
+    processor: AudioProcessorApi,
+    use_encoded_capture: bool,
     encoder: AudioEncoderApi,
     media: MediaTransportApi,
     timed_media: Option<Box<MediaTransportApiV1_1>>,
@@ -64,6 +71,18 @@ impl Host {
                 base: prefix::<AudioCaptureApi>(context),
                 read_audio: pcm,
             },
+            encoded_capture: EncodedAudioSourceApi {
+                base: prefix::<EncodedAudioSourceApi>(context),
+                receive: audio,
+                drain,
+            },
+            processor: AudioProcessorApi {
+                base: prefix::<AudioProcessorApi>(context),
+                submit: processor_submit,
+                receive: processor_receive,
+                drain: processor_drain,
+            },
+            use_encoded_capture: false,
             encoder: AudioEncoderApi {
                 base: prefix::<AudioEncoderApi>(context),
                 submit: submit_pcm,
@@ -120,9 +139,15 @@ unsafe extern "C" fn invoke(context: *mut c_void, input: BorrowedBytes, sink: Re
             let expected = if service == host.services.video {
                 amaterasu_module_sdk::video::CONTRACT
             } else if service == host.services.audio_capture {
-                amaterasu_module_sdk::audio::CAPTURE_CONTRACT
+                if host.use_encoded_capture {
+                    amaterasu_module_sdk::audio::ENCODED_SOURCE_CONTRACT
+                } else {
+                    amaterasu_module_sdk::audio::CAPTURE_CONTRACT
+                }
             } else if service == host.services.audio_encoder {
                 amaterasu_module_sdk::audio::ENCODER_CONTRACT
+            } else if host.services.audio_processor.as_ref() == Some(&service) {
+                amaterasu_module_sdk::audio::PROCESSOR_CONTRACT
             } else if service == host.services.media_transport {
                 amaterasu_module_sdk::transport::MEDIA_CONTRACT
             } else if service == host.services.control_transport {
@@ -162,9 +187,18 @@ fn bind_service(host: &mut Host, service: String) -> Response {
                     }),
             )
         } else if service == host.services.audio_capture {
-            (2, &host.capture.base as *const _ as usize)
+            (
+                2,
+                if host.use_encoded_capture {
+                    &host.encoded_capture.base as *const _ as usize
+                } else {
+                    &host.capture.base as *const _ as usize
+                },
+            )
         } else if service == host.services.audio_encoder {
             (3, &host.encoder.base as *const _ as usize)
+        } else if host.services.audio_processor.as_ref() == Some(&service) {
+            (6, &host.processor.base as *const _ as usize)
         } else if service == host.services.media_transport {
             (
                 4,
@@ -181,6 +215,83 @@ fn bind_service(host: &mut Host, service: String) -> Response {
         };
         Response::NativeBound { binding, address }
     }
+}
+
+#[test]
+fn encoded_source_binds_its_own_contract_and_bypasses_encoder() {
+    let mut host = Host::new();
+    host.use_encoded_capture = true;
+    host.provider.submitted_pcm = true;
+    let mut selected = handles();
+    selected.audio_encoder = None;
+    selected.encoded_audio_source = true;
+    let mut backend = NativeBackend::new(
+        &host.runtime(),
+        selected,
+        &crate::providers::ProviderServices::default(),
+    )
+    .unwrap();
+    let packet = backend.audio().unwrap().unwrap();
+    assert_eq!(packet.unit_header().format, AUDIO_FORMAT_OPUS);
+    assert!(backend.drain_encoder().unwrap());
+    drop(backend);
+    assert!(
+        host.typed_contracts
+            .iter()
+            .any(|(_, contract)| contract == amaterasu_module_sdk::audio::ENCODED_SOURCE_CONTRACT)
+    );
+    assert!(!host.bindings.contains(&host.services.audio_encoder));
+}
+
+#[test]
+fn encoded_source_rejects_units_from_a_different_configuration_generation() {
+    let mut host = Host::new();
+    host.use_encoded_capture = true;
+    host.provider.submitted_pcm = true;
+    let mut selected = handles();
+    selected.audio_encoder = None;
+    selected.encoded_audio_source = true;
+    selected.audio_generation = 2;
+    let mut backend = NativeBackend::new(
+        &host.runtime(),
+        selected,
+        &crate::providers::ProviderServices::default(),
+    )
+    .unwrap();
+    assert!(matches!(backend.audio(), Err("audio_format_mismatch")));
+}
+
+#[test]
+fn selected_processor_accepts_pcm_and_delivers_its_negotiated_planar_output() {
+    let mut host = Host::new();
+    host.provider.alternate_audio = true;
+    host.services.audio_processor = Some("vendor.audio-processor/1".into());
+    let providers = host.services.clone();
+    let mut selected = handles();
+    selected.audio_processor = Some(60);
+    selected.processed_audio = Some((96_000, 2, AUDIO_PCM_I24, 3, AUDIO_PACKING_PLANAR));
+    let mut backend = NativeBackend::new(&host.runtime(), selected, &providers).unwrap();
+    let input = backend.pcm().unwrap().unwrap();
+    assert!(backend.submit_processor(&input.header()).unwrap());
+    let ProcessorOutput::Frame(output) = backend.processor_output().unwrap() else {
+        panic!("missing processed frame")
+    };
+    let frame = output.header();
+    assert_eq!(frame.packing, AUDIO_PACKING_PLANAR);
+    assert_eq!(frame.format, AUDIO_PCM_I24);
+    // SAFETY: the copied packet retains the output bytes for this borrow.
+    assert_eq!(unsafe { frame.bytes().unwrap() }, [9u8; 24]);
+    assert!(backend.drain_processor().unwrap());
+    assert!(matches!(
+        backend.processor_output().unwrap(),
+        ProcessorOutput::End
+    ));
+    drop(backend);
+    assert!(
+        host.typed_contracts
+            .iter()
+            .any(|(_, contract)| contract == amaterasu_module_sdk::audio::PROCESSOR_CONTRACT)
+    );
 }
 
 unsafe extern "C" fn video(context: *mut c_void, stream: u64, sink: PacketSink) -> Status {
@@ -270,7 +381,9 @@ unsafe extern "C" fn pcm(context: *mut c_void, _: u64, sink: AudioSink) -> Statu
     let frame = AudioFrame {
         sample_rate: 48_000,
         channels: 2,
-        format: PCM_I16,
+        format: amaterasu_media::AudioFormatId::standard(u64::from(PCM_I16)),
+        sample_bytes: 2,
+        packing: amaterasu_media::AUDIO_PACKING_INTERLEAVED,
         frames: 240,
         flags: 0,
         data: samples.as_ptr(),
@@ -280,7 +393,60 @@ unsafe extern "C" fn pcm(context: *mut c_void, _: u64, sink: AudioSink) -> Statu
     };
     unsafe { sink.send(&frame) }
 }
-unsafe extern "C" fn audio(context: *mut c_void, _: u64, sink: AudioPacketSink) -> Status {
+
+unsafe extern "C" fn processor_submit(
+    context: *mut c_void,
+    _: u64,
+    frame: *const AudioFrame,
+) -> Status {
+    // SAFETY: the test owns the provider and borrows the frame for this call.
+    let provider = unsafe { &mut *context.cast::<Provider>() };
+    if provider.processor_pending {
+        return MEDIA_BUSY;
+    }
+    assert!(unsafe { &*frame }.validate().is_ok());
+    provider.processor_pending = true;
+    STATUS_OK
+}
+
+unsafe extern "C" fn processor_receive(context: *mut c_void, _: u64, sink: AudioSink) -> Status {
+    // SAFETY: test context is a live exclusively called provider.
+    let provider = unsafe { &mut *context.cast::<Provider>() };
+    if !provider.processor_pending {
+        return if provider.processor_draining {
+            MEDIA_CLOSED
+        } else {
+            MEDIA_PENDING
+        };
+    }
+    let samples = [9u8; 24];
+    let frame = AudioFrame {
+        sample_rate: 96_000,
+        channels: 2,
+        format: AUDIO_PCM_I24,
+        sample_bytes: 3,
+        frames: 4,
+        flags: 0,
+        packing: AUDIO_PACKING_PLANAR,
+        data: samples.as_ptr(),
+        len: samples.len(),
+        timestamp_us: 20,
+        sequence: 2,
+    };
+    // SAFETY: sample storage remains live throughout synchronous delivery.
+    let status = unsafe { sink.send(&frame) };
+    if status == STATUS_OK {
+        provider.processor_pending = false;
+    }
+    status
+}
+
+unsafe extern "C" fn processor_drain(context: *mut c_void, _: u64) -> Status {
+    // SAFETY: test context is a live exclusively called provider.
+    unsafe { &mut *context.cast::<Provider>() }.processor_draining = true;
+    STATUS_OK
+}
+unsafe extern "C" fn audio(context: *mut c_void, _: u64, sink: AudioUnitSink) -> Status {
     // SAFETY: the fake provider and callback are live for this synchronous call.
     let provider = unsafe { &*context.cast::<Provider>() };
     if provider.audio_failed {
@@ -290,18 +456,22 @@ unsafe extern "C" fn audio(context: *mut c_void, _: u64, sink: AudioPacketSink) 
         return MEDIA_PENDING;
     }
     let bytes = [1u8, 2, 3];
-    let packet = EncodedAudioPacket {
-        codec: CODEC_OPUS,
+    let packet = AudioUnit {
+        generation: 1,
+        format: AUDIO_FORMAT_OPUS,
+        metadata_schema: AudioFormatId {
+            namespace: 0,
+            value: 0,
+            version: 0,
+        },
         flags: 0,
-        sample_rate: 48_000,
-        channels: 2,
-        frames: 240,
-        data: bytes.as_ptr(),
-        len: bytes.len(),
+        duration_us: 5_000,
+        payload: BorrowedBytes::new(&bytes),
+        metadata: BorrowedBytes::new(&[]),
         timestamp_us: 10,
         sequence: 1,
     };
-    unsafe { sink.send(&packet) }
+    unsafe { (sink.write)(sink.context, &packet) }
 }
 unsafe extern "C" fn control(context: *mut c_void, _: u64, _: ControlMessageSink) -> Status {
     if unsafe { &*context.cast::<Provider>() }.control_failed {
@@ -323,8 +493,45 @@ unsafe extern "C" fn submit_pcm(context: *mut c_void, _: u64, frame: *const Audi
 unsafe extern "C" fn submit_video(_: *mut c_void, _: u64, _: *const EncodedPacket) -> Status {
     MEDIA_BUSY
 }
-unsafe extern "C" fn submit_audio(_: *mut c_void, _: u64, _: *const EncodedAudioPacket) -> Status {
+unsafe extern "C" fn submit_audio(_: *mut c_void, _: u64, _: *const AudioUnit) -> Status {
     MEDIA_BUSY
+}
+unsafe extern "C" fn receive_audio_unit(_: *mut c_void, _: u64, sink: AudioUnitSink) -> Status {
+    let format = AudioFormatId {
+        namespace: 42,
+        value: u64::from(u32::MAX) + 1,
+        version: 1,
+    };
+    let schema = AudioFormatId {
+        namespace: 42,
+        value: 3,
+        version: 1,
+    };
+    // SAFETY: the host supplies a callback valid for this synchronous invocation.
+    let mut output =
+        unsafe { amaterasu_module_sdk::audio::AudioOutput::from_sink(sink, format, 1) }.unwrap();
+    match output.send_packet(&[1, 2], 100, 10_000, 1, Some((schema, &[7, 8]))) {
+        Ok(()) => STATUS_OK,
+        Err(error) => error.status(),
+    }
+}
+unsafe extern "C" fn submit_audio_custom(
+    context: *mut c_void,
+    _: u64,
+    unit: *const AudioUnit,
+) -> Status {
+    // SAFETY: the test binding and borrowed unit remain live for this call.
+    let provider = unsafe { &mut *context.cast::<Provider>() };
+    if provider.audio_unit_busy {
+        return MEDIA_BUSY;
+    }
+    let unit = unsafe { &*unit };
+    provider.audio_units.push((
+        unit.format,
+        unsafe { unit.payload.read().unwrap() }.to_vec(),
+        unsafe { unit.metadata.read().unwrap() }.to_vec(),
+    ));
+    STATUS_OK
 }
 unsafe extern "C" fn send_control(
     context: *mut c_void,
@@ -364,10 +571,19 @@ fn handles() -> Handles {
         video: 10,
         audio_capture: Some(20),
         audio_encoder: Some(30),
+        audio_processor: None,
         media_transport: 40,
         control_transport: 50,
         stream_audio: true,
         audio_channels: 2,
+        audio_sample_rate: 48_000,
+        audio_format: None,
+        audio_generation: 1,
+        audio_max_unit_bytes: AUDIO_EXTENSIBLE_MAX_PAYLOAD,
+        audio_max_metadata_bytes: AUDIO_EXTENSIBLE_MAX_METADATA,
+        audio_pcm: None,
+        encoded_audio_source: false,
+        processed_audio: None,
         video_codec: CODEC_H264,
     }
 }
@@ -378,10 +594,19 @@ fn disabled_audio_handles() -> Handles {
         video: 10,
         audio_capture: None,
         audio_encoder: None,
+        audio_processor: None,
         media_transport: 40,
         control_transport: 50,
         stream_audio: false,
         audio_channels: 2,
+        audio_sample_rate: 48_000,
+        audio_format: None,
+        audio_generation: 1,
+        audio_max_unit_bytes: AUDIO_EXTENSIBLE_MAX_PAYLOAD,
+        audio_max_metadata_bytes: AUDIO_EXTENSIBLE_MAX_METADATA,
+        audio_pcm: None,
+        encoded_audio_source: false,
+        processed_audio: None,
         video_codec: CODEC_H264,
     }
 }
@@ -630,8 +855,11 @@ fn alternative_provider_roles_bind_and_release_the_exact_selected_interfaces() {
     let pcm = backend.pcm().unwrap().unwrap();
     assert!(backend.submit_pcm(&pcm.header()).unwrap());
     let encoded = backend.audio().unwrap().unwrap();
-    let encoded_header = encoded.header();
-    assert_eq!(unsafe { encoded_header.bytes().unwrap() }, &[1, 2, 3]);
+    let encoded_header = encoded.unit_header();
+    assert_eq!(
+        unsafe { encoded_header.payload.read().unwrap() },
+        &[1, 2, 3]
+    );
     assert_eq!(
         host.bindings,
         [
@@ -642,6 +870,41 @@ fn alternative_provider_roles_bind_and_release_the_exact_selected_interfaces() {
             services.control_transport,
         ]
     );
+    drop(backend);
+    assert_eq!(host.released, [1, 2, 3, 4, 5]);
+}
+
+#[test]
+fn negotiated_audio_units_use_typed_providers_and_retain_metadata_on_busy() {
+    let mut host = Host::new();
+    host.encoder.receive = receive_audio_unit;
+    host.media.submit_audio = submit_audio_custom;
+    let mut requested = handles();
+    let format = AudioFormatId {
+        namespace: 42,
+        value: u64::from(u32::MAX) + 1,
+        version: 1,
+    };
+    requested.audio_format = Some(format);
+    let services = host.services.clone();
+    let mut backend = NativeBackend::new(&host.runtime(), requested, &services).unwrap();
+    let packet = backend.audio().unwrap().unwrap();
+    let unit = packet.unit_header();
+    assert_eq!(unit.format, format);
+    host.provider.audio_unit_busy = true;
+    assert!(!backend.submit_audio(&unit).unwrap());
+    host.provider.audio_unit_busy = false;
+    assert!(backend.submit_audio(&unit).unwrap());
+    assert_eq!(
+        host.provider.audio_units,
+        [(format, vec![1u8, 2], vec![7u8, 8])]
+    );
+    backend.handles.audio_format = Some(AudioFormatId {
+        namespace: 42,
+        value: 1,
+        version: 1,
+    });
+    assert_eq!(backend.audio().err(), Some("audio_format_mismatch"));
     drop(backend);
     assert_eq!(host.released, [1, 2, 3, 4, 5]);
 }

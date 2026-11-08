@@ -85,33 +85,34 @@ hardware disabled. These checks do not establish Moonlight or WebRTC streaming.
 
 ## PCM audio capture
 
-`AudioCaptureApi` delivers interleaved PCM through an `AudioSink`. Each `AudioFrame`
-contains sample rate, channel count, format, frame count, flags, initialized bytes,
-stream-relative microsecond timestamp and sequence. Format 1 is 32-bit IEEE float;
-format 2 is signed 16-bit PCM. Both PCM formats use explicit little-endian ordering.
-Control format metadata supplies the channel mask; channel count alone does not
-identify a surround layout.
+`AudioCaptureApi` delivers PCM through an `AudioSink`. Each `AudioFrame` carries
+a namespaced sample format and packing, storage bytes per sample, sample rate,
+channel and frame counts, flags, bytes, timestamp and sequence. The negotiated
+PCM descriptor supplies valid bits and ordered speaker positions. Standard formats
+include 16-, 24- and 32-bit integers and 32- and 64-bit floats; standard packing
+is interleaved or contiguous planar, with little-endian scalar samples. Providers
+can define additional identifiers and layouts.
 
-A delivery spans at most 100 ms, with 8–192 kHz rates and one to eight channels.
-The exact byte count must match frames × channels × bytes per sample and remain
-under 1 MiB. Silent packets still carry initialized zero samples. Flags distinguish
-discontinuity, silence and an estimated timestamp, allowing consumers to reset
-continuity assumptions. The sink borrows samples only until returning; rejection
-must retain the packet for retry. These bounds constrain individual deliveries,
-not the total buffering policy of a provider.
+Each delivery is bounded to 1 MiB. Standard packing has the exact implied byte
+count; provider-defined packing follows its negotiated contract. Flags include
+discontinuity, silence and estimated timestamp and may carry provider-defined
+bits. The sink borrows samples only until returning; rejection retains a packet
+for retry. These bounds constrain individual deliveries, not a provider's total
+buffering policy. The built-in capture provider supports a narrower set of formats.
 
 ## Encoded audio
 
-`AudioEncoderApi` accepts borrowed PCM and delivers `EncodedAudioPacket` through
-an `AudioPacketSink`. Encoded packets carry codec, rate, channels, decoded frame
-count, discontinuity/EOS flags, timestamp and sequence alongside borrowed bytes.
-They use a separate structure from video packets so audio timing does not rely
-on implicit codec-specific metadata. Rejected sink deliveries stay queued.
+`AudioEncoderApi` accepts borrowed PCM and delivers a format-neutral `AudioUnit`
+through an `AudioUnitSink`. Units carry a namespaced format, duration, timestamps,
+sequence, configuration generation, flags, payload, and optional schema-identified
+metadata. Codec initialization and stream metadata are negotiated separately.
+The session negotiates the format and layout; rejected sink deliveries stay queued.
 
-The current Opus provider accepts 48 kHz mono/stereo PCM, encodes fixed 5/10/20 ms
+The current Opus provider accepts 48 kHz mono, stereo, 5.1 and 7.1 PCM, encodes fixed 5/10/20 ms
 packets and reports its actual constant-bitrate packet size in control metadata.
 Drain flushes buffered PCM and codec lookahead before one EOS. Timing drift is
-reported; resampling and audiovisual synchronization belong to future coordination.
+reported; optional selected audio processors can perform resampling or mixing,
+while audiovisual synchronization remains the responsibility of the providers.
 See the [encoder contract](../modules/audio-encode/README.md) for queue limits,
 partial-packet handling and ownership.
 
@@ -121,7 +122,8 @@ partial-packet handling and ownership.
 transport stream. The trusted control caller must first authorize its peer and
 negotiate the wire profile. The transport checks caller ownership but does not
 perform peer authentication. It accepts one complete H.264 Annex B access unit or
-one complete negotiated Opus packet per submission. Consumers must assemble any
+one negotiated audio unit per submission. The GameStream provider accepts Opus;
+other providers may support other negotiated formats. Consumers must assemble any
 video encoder fragments before submitting them.
 
 Success means copied into a bounded local queue. Busy means nothing was accepted,

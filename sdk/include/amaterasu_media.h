@@ -35,19 +35,57 @@ extern "C" {
 #define AMATERASU_CPU_FRAME_PROCESSOR_CONTRACT "amaterasu.cpu-frame-processor.native/1"
 #define AMATERASU_AUDIO_CAPTURE_CONTRACT "amaterasu.audio-capture.native/1"
 #define AMATERASU_AUDIO_ENCODER_CONTRACT "amaterasu.audio-encoder.native/1"
+#define AMATERASU_ENCODED_AUDIO_SOURCE_CONTRACT "amaterasu.encoded-audio-source.native/1"
+#define AMATERASU_AUDIO_PROCESSOR_CONTRACT "amaterasu.audio-processor.native/1"
 #define AMATERASU_PCM_F32 1
 #define AMATERASU_PCM_I16 2
 #define AMATERASU_AUDIO_DISCONTINUITY 1
 #define AMATERASU_AUDIO_SILENT 2
 #define AMATERASU_AUDIO_TIMESTAMP_ESTIMATED 4
-#define AMATERASU_CODEC_OPUS 2
-#define AMATERASU_AUDIO_PACKET_DISCONTINUITY 1
-#define AMATERASU_AUDIO_PACKET_EOS 2
 
-/* Interleaved little-endian initialized PCM, at most 100 ms per callback. Silent packets
- * contain zero samples. Timestamps are stream-relative microseconds. */
+/* Format-neutral unit delivery. IDs must be negotiated before use. */
+#define AMATERASU_AUDIO_UNIT_DISCONTINUITY 1
+#define AMATERASU_AUDIO_UNIT_END 2
+#define AMATERASU_AUDIO_UNIT_MAX_PAYLOAD (1024u * 1024u)
+#define AMATERASU_AUDIO_UNIT_MAX_METADATA (64u * 1024u)
+#define AMATERASU_AUDIO_FORMAT_STANDARD_NAMESPACE 1u
+#define AMATERASU_AUDIO_FORMAT_OPUS 2u
+#define AMATERASU_AUDIO_FORMAT_VERSION 1u
 typedef struct {
-    uint32_t sample_rate, channels, format, frames, flags;
+    uint64_t namespace_id, value, version;
+} AmaterasuAudioFormatId;
+typedef struct {
+    AmaterasuAudioFormatId format, metadata_schema;
+    uint32_t flags;
+    uint64_t timestamp_us, duration_us, sequence, generation;
+    AmaterasuBorrowedBytes payload, metadata;
+} AmaterasuAudioUnit;
+typedef struct {
+    void *context;
+    AmaterasuStatus (*write)(void *context, const AmaterasuAudioUnit *unit);
+} AmaterasuAudioUnitSink;
+
+/* Drain stops new input and eventually emits an END unit after queued data. */
+typedef struct {
+    AmaterasuNativeInterface base;
+    AmaterasuStatus (*receive)(void *context, uint64_t stream, AmaterasuAudioUnitSink sink);
+    AmaterasuStatus (*drain)(void *context, uint64_t stream);
+} AmaterasuEncodedAudioSourceApi;
+
+/* Standard samples are little-endian; planar buffers contain contiguous channel planes.
+ * Custom sample formats and packing are defined by their negotiated identifiers. */
+#define AMATERASU_AUDIO_PCM_F32 1u
+#define AMATERASU_AUDIO_PCM_I16 2u
+#define AMATERASU_AUDIO_PCM_I24 3u
+#define AMATERASU_AUDIO_PCM_I32 4u
+#define AMATERASU_AUDIO_PCM_F64 5u
+#define AMATERASU_AUDIO_PACKING_INTERLEAVED 1u
+#define AMATERASU_AUDIO_PACKING_PLANAR 2u
+typedef struct {
+    uint32_t sample_rate, channels;
+    AmaterasuAudioFormatId format;
+    uint32_t sample_bytes, frames, flags;
+    AmaterasuAudioFormatId packing;
     const uint8_t *data;
     size_t len;
     uint64_t timestamp_us, sequence;
@@ -63,30 +101,23 @@ typedef struct {
     AmaterasuStatus (*read_audio)(void *context, uint64_t stream, AmaterasuAudioSink sink);
 } AmaterasuAudioCaptureApi;
 
-/* One complete Opus packet. frames counts decoded samples per channel at 48 kHz.
- * Data is borrowed only during the callback. EOS has flags=2, frames=0, len=0.
- * Nonterminal packets have 120..5760 frames in multiples of 120, 1..8 channels,
- * and at most 65536 bytes. Mapping/order are negotiated through the control API. */
+/* Receive yields at most one frame; after drain, CLOSED means output is exhausted. */
 typedef struct {
-    uint32_t codec, flags, sample_rate, channels, frames;
-    const uint8_t *data;
-    size_t len;
-    uint64_t timestamp_us, sequence;
-} AmaterasuEncodedAudioPacket;
-
-typedef struct {
-    void *context;
-    AmaterasuStatus (*write)(void *context, const AmaterasuEncodedAudioPacket *packet);
-} AmaterasuAudioPacketSink;
+    AmaterasuNativeInterface base;
+    AmaterasuStatus (*submit)(void *context, uint64_t stream, const AmaterasuAudioFrame *frame);
+    AmaterasuStatus (*receive)(void *context, uint64_t stream, AmaterasuAudioSink sink);
+    AmaterasuStatus (*drain)(void *context, uint64_t stream);
+} AmaterasuAudioProcessorApi;
 
 typedef struct {
     AmaterasuNativeInterface base;
     /* OK accepts all input samples; BUSY accepts none. */
     AmaterasuStatus (*submit)(void *context, uint64_t stream, const AmaterasuAudioFrame *frame);
     /* Rejected sink delivery retains the same packet for retry. */
-    AmaterasuStatus (*receive)(void *context, uint64_t stream, AmaterasuAudioPacketSink sink);
+    AmaterasuStatus (*receive)(void *context, uint64_t stream, AmaterasuAudioUnitSink sink);
     AmaterasuStatus (*drain)(void *context, uint64_t stream);
 } AmaterasuAudioEncoderApi;
+
 
 /* CPU bytes are borrowed only during submit or a synchronous frame callback.
  * NV12/P010 are contiguous Y then UV with equal byte stride and even dimensions.
@@ -624,14 +655,14 @@ typedef struct {
 
 /* The trusted control caller must authorize the peer and negotiate the profile.
  * The provider enforces ownership; it does not authenticate peers. Submit one
- * complete H.264 Annex B access unit or one negotiated Opus packet per call.
+ * complete H.264 Annex B access unit or one negotiated audio unit per call.
  * Bytes are borrowed for each call. OK means queued, never peer delivery.
  * BUSY accepts nothing and consumes no packet indices/nonces. Drain stops input;
  * control status reports completion of local queue flushing, not peer receipt. */
 typedef struct {
     AmaterasuNativeInterface base;
     AmaterasuStatus (*submit_video)(void *context, uint64_t stream, const AmaterasuEncodedPacket *packet);
-    AmaterasuStatus (*submit_audio)(void *context, uint64_t stream, const AmaterasuEncodedAudioPacket *packet);
+    AmaterasuStatus (*submit_audio)(void *context, uint64_t stream, const AmaterasuAudioUnit *packet);
     AmaterasuStatus (*drain)(void *context, uint64_t stream);
 } AmaterasuMediaTransportApi;
 /* v1.1 preserves the entire v1.0 prefix. 0 start is unknown and must not be

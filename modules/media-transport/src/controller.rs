@@ -1,5 +1,8 @@
+use crate::opus_packet::OpusPacket;
 use crate::{model::*, stream::Stream};
-use amaterasu_media::{EncodedAudioPacket, EncodedPacket, MEDIA_CLOSED};
+use amaterasu_media::{
+    AUDIO_FORMAT_OPUS, AudioUnit, CODEC_OPUS, EncodedPacket, MEDIA_CLOSED, MEDIA_UNSUPPORTED,
+};
 use amaterasu_module_sdk::{abi::Status, network::Network};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -47,6 +50,49 @@ impl Controller {
 
     pub fn handle(&mut self, owner: &str, operation: Operation) -> TransportResult<ControlReply> {
         let (payload, created) = match operation {
+            Operation::Enumerate => (
+                json!({"ok":true,"transports":if self.settings.enabled { vec!["gamestream"] } else { vec![] }}),
+                None,
+            ),
+            Operation::Effective { stream } => {
+                self.owned(owner, stream)?;
+                (self.status(owner, Some(stream)), None)
+            }
+            Operation::Reconfigure {
+                stream,
+                audio_profile,
+            } => {
+                let _ = audio_profile;
+                self.owned(owner, stream)?;
+                return Err("unsupported_audio_reconfiguration");
+            }
+            Operation::Capabilities => {
+                use amaterasu_module_sdk::audio::{
+                    AudioProviderCapabilities, standard_encoded_offer,
+                };
+                let encoded_formats = if self.settings.enabled && !self.shutting_down {
+                    [2, 6, 8]
+                        .into_iter()
+                        .filter_map(|channels| {
+                            standard_encoded_offer(AUDIO_FORMAT_OPUS, channels, 1275)
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                (
+                    json!({"ok":true,"capabilities":AudioProviderCapabilities { pcm_inputs: vec![], pcm_outputs: vec![],
+                    encoded_formats, encoded_source: false, max_buffered_bytes: Some(MAX_QUEUE_BYTES as u64),
+                    min_latency_us: None, max_latency_us: None,
+                    properties: json!({"protocol":"gamestream","packet_ms":[5,10],"custom_profiles":false}) }}),
+                    None,
+                )
+            }
+            // GameStream's Opus transport does not advertise arbitrary custom profiles.
+            Operation::Probe { audio_profile } => (
+                json!({"ok":true,"supported":false,"audio_profile":audio_profile}),
+                None,
+            ),
             Operation::Open(request) => self.open(owner, request)?,
             Operation::ConfigureVideoFormat {
                 stream,
@@ -280,14 +326,36 @@ impl Controller {
 
     /// # Safety
     /// Caller keeps the packet and initialized immutable bytes alive through submit.
-    pub unsafe fn submit_audio(
-        &mut self,
-        owner: &str,
-        id: u64,
-        packet: &EncodedAudioPacket,
-    ) -> Status {
+    pub unsafe fn submit_audio(&mut self, owner: &str, id: u64, unit: &AudioUnit) -> Status {
         match self.owned_mut(owner, id) {
-            Some(stream) => unsafe { stream.submit_audio(packet) },
+            Some(stream) => {
+                if let Err(status) = unit.validate() {
+                    return status;
+                }
+                if unit.format != AUDIO_FORMAT_OPUS || unit.metadata.len != 0 {
+                    return MEDIA_UNSUPPORTED;
+                }
+                let samples = u128::from(unit.duration_us) * 48_000;
+                if samples % 1_000_000 != 0 {
+                    return MEDIA_UNSUPPORTED;
+                }
+                let Ok(frames) = u32::try_from(samples / 1_000_000) else {
+                    return MEDIA_UNSUPPORTED;
+                };
+                let packet = OpusPacket {
+                    codec: CODEC_OPUS,
+                    flags: unit.flags,
+                    sample_rate: 48_000,
+                    channels: u32::from(stream.audio_settings.channels),
+                    frames,
+                    data: unit.payload.ptr,
+                    len: unit.payload.len,
+                    timestamp_us: unit.timestamp_us,
+                    sequence: unit.sequence,
+                };
+                // SAFETY: the caller retains unit bytes during this synchronous submission.
+                unsafe { stream.submit_audio(&packet) }
+            }
             None => MEDIA_CLOSED,
         }
     }

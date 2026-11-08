@@ -415,8 +415,8 @@ fn av1_fragments_assemble_one_temporal_unit_and_keep_the_keyframe_flag() {
     assert_eq!(&delta[40..], &AV1_DELTA);
 }
 
-pub(crate) fn audio_packet(bytes: &[u8], sequence: u64) -> EncodedAudioPacket {
-    EncodedAudioPacket {
+pub(crate) fn audio_packet(bytes: &[u8], sequence: u64) -> OpusPacket {
+    OpusPacket {
         codec: CODEC_OPUS,
         flags: 0,
         sample_rate: 48000,
@@ -427,6 +427,34 @@ pub(crate) fn audio_packet(bytes: &[u8], sequence: u64) -> EncodedAudioPacket {
         timestamp_us: sequence * 10000,
         sequence,
     }
+}
+
+#[test]
+fn gamestream_rejects_other_audio_codecs_and_clocks_before_consumption() {
+    let (video, audio) = receivers();
+    let mut stream = Stream::open("owner", &request(&video, &audio, false)).unwrap();
+    let bytes = [0x04, 1, 2, 3];
+    let packet = audio_packet(&bytes, 1);
+    let other_codec = OpusPacket {
+        codec: 99,
+        ..packet
+    };
+    let other_clock = OpusPacket {
+        sample_rate: 44_100,
+        ..packet
+    };
+    // SAFETY: both packet views borrow the live local byte array for the call.
+    assert_eq!(
+        unsafe { stream.submit_audio(&other_codec) },
+        MEDIA_UNSUPPORTED
+    );
+    assert_eq!(
+        unsafe { stream.submit_audio(&other_clock) },
+        MEDIA_UNSUPPORTED
+    );
+    assert_eq!(stream.audio_sequence, None);
+    // SAFETY: the original Opus view remains live and was not consumed above.
+    assert_eq!(unsafe { stream.submit_audio(&packet) }, STATUS_OK);
 }
 
 fn receive(socket: &UdpSocket) -> Vec<u8> {
@@ -455,7 +483,7 @@ fn encrypted_audio_legacy_compatibility_continues_across_rtp_sequence_wrap() {
         // admission and UDP delivery: over 327 seconds at 5 ms and 655 at 10 ms.
         for sequence in 0..65_538 {
             let expected_datagrams = stream.audio.required_datagrams();
-            let packet = EncodedAudioPacket {
+            let packet = OpusPacket {
                 frames: packet_ms * 48,
                 timestamp_us: sequence * u64::from(packet_ms) * 1000,
                 ..audio_packet(&opus, sequence)
@@ -552,13 +580,13 @@ fn surround_audio_packetize_submit_and_drain_keep_channel_and_wire_bounds() {
                 } else {
                     [0x94, 1, 2, 3]
                 };
-                let packet = |sequence| EncodedAudioPacket {
+                let packet = |sequence| OpusPacket {
                     channels: u32::from(channels),
                     frames: packet_ms * 48,
                     timestamp_us: sequence * u64::from(packet_ms) * 1_000,
                     ..audio_packet(&opus, sequence)
                 };
-                let wrong = EncodedAudioPacket {
+                let wrong = OpusPacket {
                     channels: 2,
                     ..packet(0)
                 };
@@ -596,7 +624,7 @@ fn unsupported_surround_counts_and_oversized_opus_fail_without_queue_mutation() 
     settings.audio.channels = 6;
     let mut stream = Stream::open("owner", &settings).unwrap();
     let oversized = vec![0x94; 1_276];
-    let packet = EncodedAudioPacket {
+    let packet = OpusPacket {
         channels: 6,
         ..audio_packet(&oversized, 0)
     };
@@ -618,7 +646,7 @@ fn maximum_surround_opus_payload_respects_plain_and_encrypted_wire_caps() {
             settings.audio.wire_payload_bytes = if encrypted { 1_280 } else { 1_275 };
             let mut stream = Stream::open("owner", &settings).unwrap();
             let opus = vec![0x94; 1_275];
-            let packet = EncodedAudioPacket {
+            let packet = OpusPacket {
                 channels: u32::from(channels),
                 ..audio_packet(&opus, 0)
             };
@@ -714,7 +742,7 @@ fn audio_ciphertext_is_queued_once_and_discontinuity_skips_iv_slots_without_rese
         unsafe { stream.submit_audio(&audio_packet(&opus, 0)) },
         STATUS_OK
     );
-    let reset = EncodedAudioPacket {
+    let reset = OpusPacket {
         flags: AUDIO_PACKET_DISCONTINUITY,
         ..audio_packet(&opus, 9)
     };
@@ -799,7 +827,7 @@ fn disabled_audio_accepts_only_eos_and_never_queues_audio_datagrams() {
     assert_eq!(stream.delivery.queued(), 0);
     assert_eq!(stream.audio_sequence, None);
 
-    let eos = EncodedAudioPacket {
+    let eos = OpusPacket {
         flags: AUDIO_PACKET_END_OF_STREAM,
         frames: 0,
         data: std::ptr::null(),

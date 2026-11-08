@@ -395,7 +395,9 @@ impl Controller {
                 48000
             },
             channels: 2,
-            format: PCM_I16,
+            format: amaterasu_media::AudioFormatId::standard(u64::from(PCM_I16)),
+            sample_bytes: 2,
+            packing: amaterasu_media::AUDIO_PACKING_INTERLEAVED,
             frames: frames as u32,
             flags: 0,
             data: bytes.as_ptr(),

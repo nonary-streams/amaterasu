@@ -983,6 +983,13 @@ impl Pipeline {
             return true;
         }
         if payload["ok"] != true {
+            if matches!(job.step, Step::ProbeAudioReconfiguration(_)) {
+                record.pending_audio = None;
+                if let Some(request) = job.request {
+                    rpc::complete(send, request, error("unsupported_audio_format"));
+                }
+                return false;
+            }
             if matches!(job.step, Step::FeedbackPeek | Step::FeedbackAck) {
                 if job.step == Step::FeedbackPeek {
                     record.feedback_ack_through = None;
@@ -1019,6 +1026,160 @@ impl Pipeline {
                     record.plane = Some(factory(record.handles()?, &record.providers)?);
                 }
                 result
+            }
+            Step::ProbeAudio(resource) => {
+                let probe: amaterasu_module_sdk::audio::AudioProbeResult =
+                    serde_json::from_value(payload.clone()).map_err(|_| "invalid_audio_probe")?;
+                if !probe.ok
+                    || !probe.supported
+                    || serde_json::to_value(probe.audio_profile)
+                        .map_err(|_| "invalid_audio_probe")?
+                        != record.config.audio.custom_profile()
+                {
+                    return Err("unsupported_audio_format");
+                }
+                job.step = match resource {
+                    Resource::AudioCapture if record.config.audio.encoded_source() => {
+                        Step::ProbeAudio(Resource::Media)
+                    }
+                    Resource::AudioCapture
+                        if record
+                            .config
+                            .audio
+                            .custom
+                            .as_ref()
+                            .is_some_and(|custom| custom.processing.is_some()) =>
+                    {
+                        Step::ProbeAudio(Resource::AudioProcessor)
+                    }
+                    Resource::AudioCapture | Resource::AudioProcessor => {
+                        Step::ProbeAudio(Resource::AudioEncoder)
+                    }
+                    Resource::AudioEncoder => Step::ProbeAudio(Resource::Media),
+                    Resource::Media if record.config.audio.encoded_source() => {
+                        record.packet_bytes = 0;
+                        record.wire_audio_bytes = 0;
+                        Step::Open(Resource::Media)
+                    }
+                    Resource::Media
+                        if record
+                            .config
+                            .audio
+                            .custom
+                            .as_ref()
+                            .is_some_and(|custom| custom.processing.is_some()) =>
+                    {
+                        Step::Open(Resource::AudioProcessor)
+                    }
+                    Resource::Media => Step::Open(Resource::AudioEncoder),
+                    _ => return Err("invalid_audio_probe"),
+                };
+                Ok(true)
+            }
+            Step::ProbeAudioReconfiguration(resource) => {
+                let candidate = record
+                    .pending_audio
+                    .as_ref()
+                    .ok_or("invalid_audio_reconfiguration")?;
+                let supported = serde_json::from_value::<
+                    amaterasu_module_sdk::audio::AudioProbeResult,
+                >(payload.clone())
+                .is_ok_and(|probe| {
+                    probe.ok
+                        && probe.supported
+                        && serde_json::to_value(probe.audio_profile)
+                            .is_ok_and(|profile| profile == candidate.custom_profile())
+                });
+                if !supported {
+                    record.pending_audio = None;
+                    if let Some(request) = job.request {
+                        rpc::complete(send, request, error("unsupported_audio_format"));
+                    }
+                    return Ok(false);
+                }
+                job.step = match resource {
+                    Resource::AudioCapture if candidate.encoded_source() => {
+                        Step::ProbeAudioReconfiguration(Resource::Media)
+                    }
+                    Resource::AudioCapture
+                        if candidate
+                            .custom
+                            .as_ref()
+                            .is_some_and(|custom| custom.processing.is_some()) =>
+                    {
+                        Step::ProbeAudioReconfiguration(Resource::AudioProcessor)
+                    }
+                    Resource::AudioCapture | Resource::AudioProcessor => {
+                        Step::ProbeAudioReconfiguration(Resource::AudioEncoder)
+                    }
+                    Resource::AudioEncoder => Step::ProbeAudioReconfiguration(Resource::Media),
+                    Resource::Media if candidate.encoded_source() => {
+                        Step::ApplyAudioReconfiguration(Resource::Media)
+                    }
+                    Resource::Media
+                        if candidate
+                            .custom
+                            .as_ref()
+                            .is_some_and(|custom| custom.processing.is_some()) =>
+                    {
+                        Step::ApplyAudioReconfiguration(Resource::AudioProcessor)
+                    }
+                    Resource::Media => Step::ApplyAudioReconfiguration(Resource::AudioEncoder),
+                    _ => return Err("invalid_audio_probe"),
+                };
+                Ok(true)
+            }
+            Step::ApplyAudioReconfiguration(resource) => {
+                let candidate = record
+                    .pending_audio
+                    .as_ref()
+                    .ok_or("invalid_audio_reconfiguration")?;
+                let reply: amaterasu_module_sdk::audio::AudioOpenResult =
+                    serde_json::from_value(payload.clone())
+                        .map_err(|_| "invalid_audio_reconfiguration_response")?;
+                if !reply.ok
+                    || reply.stream != record.resources[&resource]
+                    || serde_json::to_value(reply.audio_profile)
+                        .map_err(|_| "invalid_audio_reconfiguration_response")?
+                        != candidate.custom_profile()
+                {
+                    return Err("invalid_audio_reconfiguration_response");
+                }
+                if resource == Resource::Media
+                    && [
+                        ("video_local", &record.video_local),
+                        ("audio_local", &record.audio_local),
+                    ]
+                    .into_iter()
+                    .any(|(name, original)| {
+                        reply
+                            .details
+                            .get(name)
+                            .is_some_and(|value| value.as_str() != original.as_deref())
+                    })
+                {
+                    return Err("audio_reconfiguration_changed_transport");
+                }
+                job.step = match resource {
+                    Resource::AudioProcessor => {
+                        Step::ApplyAudioReconfiguration(Resource::AudioEncoder)
+                    }
+                    Resource::AudioEncoder => Step::ApplyAudioReconfiguration(Resource::Media),
+                    Resource::Media => {
+                        record.config.audio = record
+                            .pending_audio
+                            .take()
+                            .expect("pending audio configuration");
+                        record.packet_bytes = 0;
+                        record.wire_audio_bytes = 0;
+                        if let Some(request) = job.request {
+                            rpc::complete(send, request, record.response());
+                        }
+                        return Ok(false);
+                    }
+                    _ => return Err("invalid_audio_reconfiguration"),
+                };
+                Ok(true)
             }
             Step::Authenticate => {
                 let status = component_status(&payload, record.resources[&Resource::Control]);
@@ -1256,7 +1417,9 @@ impl Pipeline {
                 Ok(true)
             }
             Step::DrainVideo => {
-                job.step = if record.resources.contains_key(&Resource::AudioCapture) {
+                job.step = if record.resources.contains_key(&Resource::AudioCapture)
+                    && !record.config.audio.encoded_source()
+                {
                     Step::CloseCapture
                 } else {
                     Step::WaitDrain
@@ -1292,7 +1455,10 @@ impl Pipeline {
             }
             Step::RecoverAudio => {
                 if payload["stream"] != record.resources[&Resource::AudioEncoder]
-                    || payload["packet_bytes"] != record.packet_bytes as u64
+                    || (record.config.audio.custom.is_none()
+                        && payload["packet_bytes"] != record.packet_bytes as u64)
+                    || (record.config.audio.custom.is_some()
+                        && payload["audio_profile"] != record.config.audio.custom_profile())
                 {
                     return Err("invalid_audio_recovery_response");
                 }
@@ -1337,15 +1503,61 @@ impl Pipeline {
                 {
                     return Err("invalid_session_response");
                 }
-                if record.config.stream_audio {
-                    job.step = Step::Open(Resource::AudioEncoder);
+                if record.config.stream_audio && record.config.audio.custom.is_some() {
+                    job.step = Step::ProbeAudio(Resource::AudioCapture);
+                } else if record.config.stream_audio && !record.config.audio.encoded_source() {
+                    job.step = Step::Open(
+                        if record
+                            .config
+                            .audio
+                            .custom
+                            .as_ref()
+                            .is_some_and(|custom| custom.processing.is_some())
+                        {
+                            Resource::AudioProcessor
+                        } else {
+                            Resource::AudioEncoder
+                        },
+                    );
                 } else {
                     record.packet_bytes = 0;
-                    record.wire_audio_bytes = 16;
+                    record.wire_audio_bytes = if record.config.audio.encoded_source() {
+                        0
+                    } else {
+                        16
+                    };
                     job.step = Step::Open(Resource::Media);
                 }
             }
+            Resource::AudioProcessor => {
+                if payload["audio_profile"] != record.config.audio.custom_profile() {
+                    return Err("unsupported_audio_processing_format");
+                }
+                job.step = Step::Open(Resource::AudioEncoder);
+            }
             Resource::AudioEncoder => {
+                if let Some(custom) = &record.config.audio.custom {
+                    if payload["audio_profile"] != record.config.audio.custom_profile()
+                        || payload["channels"] != record.config.audio.channels
+                        || payload["sample_rate"] != custom.sample_rate
+                    {
+                        return Err("unsupported_audio_format");
+                    }
+                    record.packet_bytes = match payload.get("packet_bytes") {
+                        None | Some(Value::Null) => 0,
+                        Some(value) => value
+                            .as_u64()
+                            .filter(|bytes| {
+                                *bytes <= amaterasu_media::MAX_ENCODED_AUDIO_BYTES as u64
+                            })
+                            .ok_or("unsupported_audio_packet")?
+                            as usize,
+                    };
+                    // The selected custom transport owns framing and encryption.
+                    record.wire_audio_bytes = 0;
+                    job.step = Step::Open(Resource::Media);
+                    return Ok(true);
+                }
                 let bytes = payload["packet_bytes"]
                     .as_u64()
                     .filter(|bytes| (1..=1275).contains(bytes))
@@ -1457,10 +1669,41 @@ impl Pipeline {
                     return Err("audio_capture_policy_unverified");
                 }
                 let format = &payload["format"];
-                if format["sample_rate"] != 48000
-                    || format["channels"] != record.config.audio.channels
-                    || !matches!(format["format"].as_str(), Some("f32" | "i16"))
-                    || format["channel_mask"] != record.config.audio.channel_mask
+                let sample_rate = record
+                    .config
+                    .audio
+                    .custom
+                    .as_ref()
+                    .map_or(48_000, |custom| {
+                        custom
+                            .pcm
+                            .as_ref()
+                            .map_or(custom.sample_rate, |pcm| pcm.sample_rate)
+                    });
+                let input_channels = record
+                    .config
+                    .audio
+                    .custom
+                    .as_ref()
+                    .and_then(|custom| custom.pcm.as_ref())
+                    .map_or(record.config.audio.channels as usize, |pcm| {
+                        pcm.speakers.len()
+                    });
+                if format["sample_rate"] != sample_rate
+                    || format["channels"] != input_channels
+                    || if let Some(custom) = &record.config.audio.custom {
+                        payload["audio_profile"] != record.config.audio.custom_profile()
+                            || if let Some(pcm) = &custom.pcm {
+                                payload["pcm_format"]
+                                    != serde_json::to_value(pcm)
+                                        .map_err(|_| "unsupported_audio_format")?
+                            } else {
+                                payload["audio_source"] != "encoded"
+                            }
+                    } else {
+                        !matches!(format["format"].as_str(), Some("f32" | "i16"))
+                            || format["channel_mask"] != record.config.audio.channel_mask
+                    }
                 {
                     return Err("unsupported_audio_format");
                 }

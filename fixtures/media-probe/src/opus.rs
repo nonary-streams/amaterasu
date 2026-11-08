@@ -1,7 +1,7 @@
 //! Controlled integration exercise of the real signed audio encoder library.
 use amaterasu_media::{
-    AUDIO_PACKET_END_OF_STREAM, AudioEncoderApi, AudioFrame, AudioPacketSink, CODEC_OPUS,
-    EncodedAudioPacket, MEDIA_BUSY, MEDIA_CLOSED, MEDIA_PENDING, PCM_I16,
+    AUDIO_FORMAT_OPUS, AUDIO_PACKET_END_OF_STREAM, AudioEncoderApi, AudioFrame, AudioUnit,
+    AudioUnitSink, MEDIA_BUSY, MEDIA_CLOSED, MEDIA_PENDING, PCM_I16,
 };
 use amaterasu_module_sdk::{Command, ModuleResult, Response, RuntimeClient, abi};
 use serde_json::{Value, json};
@@ -235,7 +235,9 @@ fn input_frame(bytes: &[u8], frames: u32, timestamp_us: u64, sequence: u64) -> A
     AudioFrame {
         sample_rate: 48_000,
         channels: 2,
-        format: PCM_I16,
+        format: amaterasu_media::AudioFormatId::standard(u64::from(PCM_I16)),
+        sample_bytes: 2,
+        packing: amaterasu_media::AUDIO_PACKING_INTERLEAVED,
         frames,
         flags: 0,
         data: bytes.as_ptr(),
@@ -261,7 +263,7 @@ struct Delivery {
 }
 
 fn receive(api: &AudioEncoderApi, stream: u64, delivery: &mut Delivery) -> abi::Status {
-    let sink = AudioPacketSink {
+    let sink = AudioUnitSink {
         context: (delivery as *mut Delivery).cast(),
         write: collect_packet,
     };
@@ -269,27 +271,29 @@ fn receive(api: &AudioEncoderApi, stream: u64, delivery: &mut Delivery) -> abi::
     unsafe { (api.receive)(api.base.context, stream, sink) }
 }
 
-unsafe extern "C" fn collect_packet(
-    context: *mut c_void,
-    packet: *const EncodedAudioPacket,
-) -> abi::Status {
+unsafe extern "C" fn collect_packet(context: *mut c_void, packet: *const AudioUnit) -> abi::Status {
     // SAFETY: the provider supplies live packet metadata/bytes; the fixture owns
     // the callback context exclusively and copies all output before returning.
     let delivery = unsafe { &mut *context.cast::<Delivery>() };
     let packet = unsafe { &*packet };
-    let bytes = match unsafe { packet.bytes() } {
-        Ok(bytes)
-            if packet.codec == CODEC_OPUS
-                && packet.sample_rate == 48_000
-                && packet.channels == 2 =>
-        {
-            bytes
-        }
+    if packet.validate().is_err() || packet.format != AUDIO_FORMAT_OPUS || packet.metadata.len != 0
+    {
+        return abi::STATUS_INVALID_ARGUMENT;
+    }
+    let bytes = match unsafe { packet.payload.read() } {
+        Ok(bytes) => bytes,
         _ => return abi::STATUS_INVALID_ARGUMENT,
+    };
+    let samples = u128::from(packet.duration_us) * 48_000;
+    if samples % 1_000_000 != 0 {
+        return abi::STATUS_INVALID_ARGUMENT;
+    }
+    let Ok(frames) = u32::try_from(samples / 1_000_000) else {
+        return abi::STATUS_INVALID_ARGUMENT;
     };
     delivery.packet = Some(Packet {
         flags: packet.flags,
-        frames: packet.frames,
+        frames,
         timestamp_us: packet.timestamp_us,
         sequence: packet.sequence,
         bytes: bytes.to_vec(),

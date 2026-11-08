@@ -27,9 +27,11 @@ Trusted startup settings select the control/native service for each role:
 ```
 
 Omitted roles retain their default service contracts. Each selected service must
-be a distinct bounded version-1 name. The signed composition must include its
+be a distinct bounded name with a positive numeric service version. The signed composition must include its
 initialization dependency, control-call grant and, except for the session role,
-native-use grant. Parented calls also intersect the initiating caller's grants;
+native-use grant. A service version does not change the native interface family:
+the selected service must still implement the exact contract required for its
+role. Parented calls also intersect the initiating caller's grants;
 that caller needs the selected control contracts in its approved composition.
 The role map grants no authority on its own. A replacement implements the same
 control semantics and exact native interface version; a service selector is not
@@ -52,11 +54,14 @@ not redirect cleanup to a different implementation. Keep the old service and
 its cleanup authority available until its journaled work is reconciled. Old
 journal entries without this field retain the original built-in service names.
 
-These role contracts still describe the existing streaming profile. Its shared
-video codec enum, packet assembly bounds, media packet validation and wire
-configuration do not negotiate arbitrary codecs or opaque framing metadata.
-A new format needs a separate negotiated interface and end-to-end consumer
-route, rather than a new name for incompatible legacy bytes. Constant-rate
+The standard audio profile describes GameStream Opus. An explicit custom audio
+profile negotiates a namespaced format with the selected source, optional PCM
+processor and encoder, and media provider. An already encoded source bypasses
+the encoder. Opaque units and metadata travel through the shared SDK interfaces.
+See [Audio plugin SDK](../../docs/audio-plugin-sdk.md).
+The selected protocol and client must support the custom format. The shared
+video codec enum and packet assembly bounds do not negotiate arbitrary video
+codecs or opaque video framing metadata. Constant-rate
 capture likewise remains WGC-specific because the current start contract has no
 provider-neutral timing/pacing capability handshake. Capture table version alone
 does not prove that behavior.
@@ -92,6 +97,8 @@ consumer cleanup while source resources remain retained. Full
 The selected capture and encoder providers still determine which independent
 output sizes and formats they can deliver from that source.
 
+For the standard GameStream profile:
+
 1. `prepare` allocates a session record, an Opus encoder, media UDP sockets
    and an authenticated control endpoint. It returns the bound ports and actual
    encoded audio packet size before opening capture hardware.
@@ -109,7 +116,8 @@ output sizes and formats they can deliver from that source.
 
 For host audio capture, `start.channels` may select 2, 6 or 8 channels without a
 `virtual_sink` when `capture_sink_without_routing` is true and `audio_endpoint`
-names a capture endpoint. The channel count must match `prepare.audio.channels`.
+names a capture endpoint. The channel count must match the negotiated capture
+input; a custom processor's output may have a different channel count.
 AudioCapture receives the requested PCM layout through `capture_format`, while
 its native sink-layout `channels` and `virtual_sink` remain null. The provider
 must confirm the endpoint, capture-only and host playback policy and report the
@@ -141,7 +149,7 @@ backstop for active resources. This is not a claim of seamless live replacement.
 
 ## Media and control
 
-The native plane has separate bounded video, PCM and Opus queues. Backpressure
+The native plane has separate bounded video, PCM and encoded-audio queues. Backpressure
 stops upstream reads. H.264 fragments must share a sequence and timestamp and end
 with the opted-in access-unit flag. Assemblies are capped at 8 MiB and 1,024
 fragments. Video and audio EOS remain distinct from frame boundaries.

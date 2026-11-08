@@ -48,10 +48,19 @@ pub struct Handles {
     pub hdr: bool,
     pub audio_capture: Option<u64>,
     pub audio_encoder: Option<u64>,
+    pub audio_processor: Option<u64>,
     pub media_transport: u64,
     pub control_transport: u64,
     pub stream_audio: bool,
     pub audio_channels: u32,
+    pub audio_sample_rate: u32,
+    pub audio_format: Option<AudioFormatId>,
+    pub audio_generation: u64,
+    pub audio_max_unit_bytes: usize,
+    pub audio_max_metadata_bytes: usize,
+    pub audio_pcm: Option<(AudioFormatId, u32, AudioFormatId)>,
+    pub encoded_audio_source: bool,
+    pub processed_audio: Option<(u32, u32, AudioFormatId, u32, AudioFormatId)>,
     /// ABI codec identifier of the negotiated video codec.
     pub video_codec: u32,
 }
@@ -101,14 +110,15 @@ impl Plane {
         handles: Handles,
         providers: &crate::providers::ProviderServices,
     ) -> PlaneResult<Self> {
-        Ok(Self {
-            pump: Pump::with_media(
-                native::NativeBackend::new(runtime, handles, providers)?,
-                handles.stream_audio,
-                handles.audio_channels,
-                handles.video_codec,
-            ),
-        })
+        let mut pump = Pump::with_media(
+            native::NativeBackend::new(runtime, handles, providers)?,
+            handles.stream_audio,
+            handles.audio_channels,
+            handles.video_codec,
+        );
+        pump.encoded_source = handles.encoded_audio_source;
+        pump.processing = handles.audio_processor.is_some();
+        Ok(Self { pump })
     }
 
     pub fn tick(&mut self, media_active: bool) -> Result<Progress, TickFailure> {
@@ -147,6 +157,12 @@ impl Plane {
     }
 }
 
+enum ProcessorOutput {
+    Frame(PcmPacket),
+    Pending,
+    End,
+}
+
 trait Backend {
     fn encode_timing(&mut self) -> PlaneResult<Option<EncodeTimingSnapshotV1>> {
         Ok(None)
@@ -166,7 +182,16 @@ trait Backend {
         processing_started_host_us: u64,
     ) -> PlaneResult<bool>;
     fn submit_pcm(&mut self, frame: &AudioFrame) -> PlaneResult<bool>;
-    fn submit_audio(&mut self, packet: &EncodedAudioPacket) -> PlaneResult<bool>;
+    fn submit_processor(&mut self, _frame: &AudioFrame) -> PlaneResult<bool> {
+        Err("audio_processor_unavailable")
+    }
+    fn processor_output(&mut self) -> PlaneResult<ProcessorOutput> {
+        Err("audio_processor_unavailable")
+    }
+    fn drain_processor(&mut self) -> PlaneResult<bool> {
+        Err("audio_processor_unavailable")
+    }
+    fn submit_audio(&mut self, packet: &AudioUnit) -> PlaneResult<bool>;
     fn drain_encoder(&mut self) -> PlaneResult<bool>;
     fn drain_transport(&mut self) -> PlaneResult<bool>;
 }
@@ -174,9 +199,14 @@ trait Backend {
 struct Pump<B> {
     backend: B,
     stream_audio: bool,
+    encoded_source: bool,
+    processing: bool,
     audio_channels: u32,
     video: VideoAssembly,
     pending_pcm: Option<PcmPacket>,
+    pending_processed: Option<PcmPacket>,
+    processor_draining: bool,
+    processor_ended: bool,
     pending_audio: Option<AudioPacket>,
     pending_feedback: VecDeque<HostFeedbackMessage>,
     pending_feedback_bytes: usize,
@@ -200,9 +230,14 @@ impl<B: Backend> Pump<B> {
         Self {
             backend,
             stream_audio,
+            encoded_source: false,
+            processing: false,
             audio_channels,
             video: VideoAssembly::new(video_codec),
             pending_pcm: None,
+            pending_processed: None,
+            processor_draining: false,
+            processor_ended: false,
             pending_audio: None,
             pending_feedback: VecDeque::new(),
             pending_feedback_bytes: 0,
@@ -424,25 +459,29 @@ impl<B: Backend> Pump<B> {
         self.last_accepted_video_sequence = Some(packet.sequence);
     }
 
-    fn record_audio_admission(&self, packet: &EncodedAudioPacket, progress: &mut Progress) {
-        if packet.flags != AUDIO_PACKET_END_OF_STREAM {
+    fn record_audio_admission(&self, packet: &AudioUnit, progress: &mut Progress) {
+        if packet.payload.len != 0 {
             progress.accepted_media_payload_bytes = progress
                 .accepted_media_payload_bytes
-                .saturating_add(u64::try_from(packet.len).unwrap_or(u64::MAX));
+                .saturating_add(u64::try_from(packet.payload.len).unwrap_or(u64::MAX));
         }
     }
 
     fn pump_audio(&mut self, progress: &mut Progress) -> PlaneResult<()> {
         if !self.stream_audio {
             if !self.audio_ended {
-                let end = EncodedAudioPacket {
-                    codec: CODEC_OPUS,
-                    flags: AUDIO_PACKET_END_OF_STREAM,
-                    sample_rate: 48_000,
-                    channels: self.audio_channels,
-                    frames: 0,
-                    data: std::ptr::null(),
-                    len: 0,
+                let end = AudioUnit {
+                    generation: 1,
+                    format: AUDIO_FORMAT_OPUS,
+                    metadata_schema: AudioFormatId {
+                        namespace: 0,
+                        value: 0,
+                        version: 0,
+                    },
+                    flags: AUDIO_EXTENSIBLE_END,
+                    duration_us: 0,
+                    payload: amaterasu_module_sdk::abi::BorrowedBytes::new(&[]),
+                    metadata: amaterasu_module_sdk::abi::BorrowedBytes::new(&[]),
                     timestamp_us: 0,
                     sequence: 0,
                 };
@@ -457,18 +496,18 @@ impl<B: Backend> Pump<B> {
         // Output backpressure stops both encoder polling and further PCM capture.
         // Drain several PCM packets per tick: video encoding may make ticks far
         // slower than the capture device's 10 ms packet cadence.
+        if self.encoded_source && self.stopping && !self.encoder_draining {
+            self.encoder_draining = self.backend.drain_encoder()?;
+        }
         for _ in 0..PCM_READ_BUDGET {
             for _ in 0..READ_BUDGET {
                 if let Some(packet) = &self.pending_audio {
-                    let header = packet.header();
-                    if header.channels != self.audio_channels {
-                        return Err("unsupported_audio_channels");
-                    }
+                    let header = packet.unit_header();
                     if !self.backend.submit_audio(&header)? {
                         return Ok(());
                     }
                     self.record_audio_admission(&header, progress);
-                    self.audio_ended = header.flags == AUDIO_PACKET_END_OF_STREAM;
+                    self.audio_ended = header.flags & AUDIO_EXTENSIBLE_END != 0;
                     self.pending_audio = None;
                 }
                 if self.audio_ended {
@@ -478,6 +517,49 @@ impl<B: Backend> Pump<B> {
                     break;
                 };
                 self.pending_audio = Some(packet);
+            }
+            if self.encoded_source {
+                break;
+            }
+            if self.processing {
+                let mut advanced = false;
+                if self.pending_processed.is_none() && !self.processor_ended {
+                    match self.backend.processor_output()? {
+                        ProcessorOutput::Frame(packet) => self.pending_processed = Some(packet),
+                        ProcessorOutput::Pending => {}
+                        ProcessorOutput::End if self.processor_draining => {
+                            self.processor_ended = true
+                        }
+                        ProcessorOutput::End => return Err("audio_processor_closed"),
+                    }
+                }
+                if let Some(packet) = &self.pending_processed {
+                    if !self.backend.submit_pcm(&packet.header())? {
+                        return Ok(());
+                    }
+                    self.pending_processed = None;
+                    advanced = true;
+                }
+                if self.pending_pcm.is_none() && !self.stopping {
+                    self.pending_pcm = self.backend.pcm()?;
+                }
+                if let Some(packet) = &self.pending_pcm {
+                    if packet.header().channels != self.audio_channels {
+                        return Err("unsupported_audio_channels");
+                    }
+                    if !self.backend.submit_processor(&packet.header())? {
+                        return Ok(());
+                    }
+                    self.pending_pcm = None;
+                    advanced = true;
+                } else if self.stopping && !self.processor_draining {
+                    self.processor_draining = self.backend.drain_processor()?;
+                    advanced |= self.processor_draining;
+                }
+                if !advanced {
+                    break;
+                }
+                continue;
             }
             if self.pending_pcm.is_none() && !self.stopping {
                 self.pending_pcm = self.backend.pcm()?;
@@ -493,7 +575,11 @@ impl<B: Backend> Pump<B> {
             }
             self.pending_pcm = None;
         }
-        if self.stopping && !self.encoder_draining {
+        if !self.encoded_source
+            && self.stopping
+            && !self.encoder_draining
+            && (!self.processing || self.processor_ended)
+        {
             self.encoder_draining = self.backend.drain_encoder()?;
         }
         Ok(())

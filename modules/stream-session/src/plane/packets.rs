@@ -117,12 +117,6 @@ impl PcmPacket {
     /// The provider supplies a live header and initialized immutable samples.
     pub(super) unsafe fn copy(frame: &AudioFrame) -> PlaneResult<Self> {
         let bytes = unsafe { frame.bytes() }.map_err(|_| "invalid_pcm_frame")?;
-        if frame.sample_rate != 48_000
-            || !matches!(frame.channels, 2 | 6 | 8)
-            || !matches!(frame.format, PCM_F32 | PCM_I16)
-        {
-            return Err("unsupported_pcm_format");
-        }
         let mut metadata = *frame;
         metadata.data = std::ptr::null();
         Ok(Self {
@@ -140,30 +134,38 @@ impl PcmPacket {
 }
 
 pub(super) struct AudioPacket {
-    metadata: EncodedAudioPacket,
     bytes: Vec<u8>,
+    unit: AudioUnit,
+    side_data: Vec<u8>,
 }
 
 impl AudioPacket {
     /// # Safety
-    /// Provider packet allocation remains live and immutable during this copy.
-    pub(super) unsafe fn copy(packet: &EncodedAudioPacket) -> PlaneResult<Self> {
-        let bytes = unsafe { packet.bytes() }.map_err(|_| "invalid_audio_packet")?;
-        if !matches!(packet.channels, 2 | 6 | 8) {
-            return Err("unsupported_audio_channels");
-        }
-        let mut metadata = *packet;
-        metadata.data = std::ptr::null();
+    /// The provider keeps both unit allocations readable through this copy.
+    pub(super) unsafe fn copy_unit(unit: &AudioUnit) -> PlaneResult<Self> {
+        unit.validate().map_err(|_| "invalid_audio_packet")?;
+        // SAFETY: the provider guarantees initialized callback-lifetime bytes.
+        let bytes = unsafe { unit.payload.read() }
+            .map_err(|_| "invalid_audio_packet")?
+            .to_vec();
+        let side_data = unsafe { unit.metadata.read() }
+            .map_err(|_| "invalid_audio_packet")?
+            .to_vec();
+        let mut header = *unit;
+        header.payload = amaterasu_module_sdk::abi::BorrowedBytes::new(&[]);
+        header.metadata = amaterasu_module_sdk::abi::BorrowedBytes::new(&[]);
         Ok(Self {
-            metadata,
-            bytes: bytes.to_vec(),
+            bytes,
+            unit: header,
+            side_data,
         })
     }
 
-    pub(super) fn header(&self) -> EncodedAudioPacket {
-        EncodedAudioPacket {
-            data: self.bytes.as_ptr(),
-            ..self.metadata
+    pub(super) fn unit_header(&self) -> AudioUnit {
+        AudioUnit {
+            payload: amaterasu_module_sdk::abi::BorrowedBytes::new(&self.bytes),
+            metadata: amaterasu_module_sdk::abi::BorrowedBytes::new(&self.side_data),
+            ..self.unit
         }
     }
 }
