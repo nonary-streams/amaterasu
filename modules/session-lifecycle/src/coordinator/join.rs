@@ -184,6 +184,25 @@ fn closed_join_valid(
     })
 }
 
+// Older journals can contain rejected joins recorded before callback evidence
+// was retained. Keep such closed history readable only after the entire source
+// was released; it is never accepted as proof by `closed_join_valid`.
+fn legacy_closed_join_unproven(lease: &SharedSourceLease, stream_id: &str) -> bool {
+    lease.released
+        && lease.subscribers.is_empty()
+        && lease.deferred_release.is_none()
+        && !lease.release_queued
+        && lease.callbacks.is_empty()
+        && lease.closed.get(stream_id).is_some_and(|closed| {
+            closed.cleanup_providers.is_empty()
+                && closed.failed.as_ref().is_some_and(|failed| {
+                    failed.reason == "processing_output_range_mismatch"
+                        && !failed.uncertain
+                        && failed.states.is_empty()
+                })
+        })
+}
+
 pub(super) fn record_callback(journal: &mut Journal, state: &PrepareState) -> ModuleResult<()> {
     let context = state
         .request
@@ -807,17 +826,18 @@ pub(super) fn validate(journal: &Journal) -> bool {
                         || stream.required != stream.retirements
                         || stream.join_context.as_ref() != Some(&lease.context)
                         || lease.subscribers.contains_key(id)
-                        || !closed_join_valid(
-                            lease,
-                            id,
-                            stream,
-                            &LifecycleTarget::Stream {
-                                host_epoch: epoch.into(),
-                                session_id: session_id.into(),
-                                stream_id: id.clone(),
-                                generation: stream.generation,
-                            },
-                        )
+                        || !(legacy_closed_join_unproven(lease, id)
+                            || closed_join_valid(
+                                lease,
+                                id,
+                                stream,
+                                &LifecycleTarget::Stream {
+                                    host_epoch: epoch.into(),
+                                    session_id: session_id.into(),
+                                    stream_id: id.clone(),
+                                    generation: stream.generation,
+                                },
+                            ))
                 })
             }) || lease.callbacks.iter().any(|(id, proof)| {
                 let request = &proof.callback.request;
@@ -1220,6 +1240,65 @@ impl Coordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn legacy_rejected_join_is_readable_only_as_closed_unproven_history() {
+        let context = StreamJoinContext {
+            source: LifecycleTarget::Stream {
+                host_epoch: "epoch".into(),
+                session_id: "session".into(),
+                stream_id: "source".into(),
+                generation: 1,
+            },
+            source_transition: "transition".into(),
+            capture_binding_mode: amaterasu_extension_api::CaptureBindingMode::External,
+            binding_owner: None,
+            binding: None,
+        };
+        let mut lease = SharedSourceLease {
+            context,
+            subscribers: BTreeMap::new(),
+            callbacks: BTreeMap::new(),
+            retired_subscribers: BTreeSet::from(["child".into()]),
+            closed: BTreeMap::from([(
+                "child".into(),
+                ClosedJoinEvidence {
+                    cleanup_providers: vec![],
+                    failed: Some(FailedPreparation {
+                        reason: "processing_output_range_mismatch".into(),
+                        uncertain: false,
+                        states: BTreeMap::new(),
+                    }),
+                },
+            )]),
+            deferred_release: None,
+            retirement: None,
+            release_queued: false,
+            released: true,
+        };
+        assert!(legacy_closed_join_unproven(&lease, "child"));
+        lease.released = false;
+        assert!(!legacy_closed_join_unproven(&lease, "child"));
+        lease.released = true;
+        lease
+            .closed
+            .get_mut("child")
+            .unwrap()
+            .failed
+            .as_mut()
+            .unwrap()
+            .uncertain = true;
+        assert!(!legacy_closed_join_unproven(&lease, "child"));
+        lease
+            .closed
+            .get_mut("child")
+            .unwrap()
+            .failed
+            .as_mut()
+            .unwrap()
+            .uncertain = false;
+        lease.subscribers.insert("other".into(), 1);
+        assert!(!legacy_closed_join_unproven(&lease, "child"));
+    }
     #[test]
     fn subscription_admission_reserves_closed_history_before_any_effect() {
         let directory =
