@@ -436,6 +436,20 @@ fn serve(
     ledger: Arc<Mutex<PermitLedger>>,
     stop: Arc<AtomicBool>,
 ) -> InputResult<()> {
+    serve_with_spawner(listener, uinput_path, ledger, stop, |worker| {
+        std::thread::Builder::new()
+            .name("amaterasu-input-worker".into())
+            .spawn(worker)
+    })
+}
+
+fn serve_with_spawner(
+    listener: UnixListener,
+    uinput_path: &Path,
+    ledger: Arc<Mutex<PermitLedger>>,
+    stop: Arc<AtomicBool>,
+    mut spawn: impl FnMut(Box<dyn FnOnce() + Send>) -> std::io::Result<JoinHandle<()>>,
+) -> InputResult<()> {
     let count = Arc::new(AtomicUsize::new(0));
     let cleanup_failed = Arc::new(AtomicBool::new(false));
     let mut workers: Vec<JoinHandle<()>> = Vec::new();
@@ -459,9 +473,9 @@ fn serve(
                     let stop = Arc::clone(&stop);
                     let cleanup_failed = Arc::clone(&cleanup_failed);
                     let path = uinput_path.to_path_buf();
-                    let count = Arc::clone(&count);
-                    workers.push(std::thread::spawn(move || {
-                        run_guarded_worker(&count, &stop, &cleanup_failed, || {
+                    let worker_count = Arc::clone(&count);
+                    let worker = Box::new(move || {
+                        run_guarded_worker(&worker_count, &stop, &cleanup_failed, || {
                             serve_worker(
                                 stream,
                                 &path,
@@ -470,7 +484,14 @@ fn serve(
                                 Arc::clone(&cleanup_failed),
                             )
                         });
-                    }));
+                    });
+                    match spawn(worker) {
+                        Ok(worker) => workers.push(worker),
+                        Err(error) => {
+                            count.fetch_sub(1, Ordering::AcqRel);
+                            return Err(system_error(error));
+                        }
+                    }
                 }
                 Ok((_stream, _)) => {
                     count.fetch_sub(1, Ordering::AcqRel);
@@ -1987,6 +2008,57 @@ mod tests {
             listener_exit_diagnostic(Ok(Err(InputError::Device))).as_deref(),
             Some("input companion listener ended: Device")
         );
+    }
+
+    #[test]
+    fn worker_spawn_failure_stops_and_joins_existing_workers() {
+        let directory = socket_test_directory();
+        let path = directory.join("service.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let retired = Arc::new(AtomicBool::new(false));
+        let worker_retired = Arc::clone(&retired);
+        let (started, wait_started) = std::sync::mpsc::channel();
+        let ledger = Arc::new(Mutex::new(PermitLedger::new(
+            GrantRegistry::independent_devices(),
+        )));
+        let server = std::thread::spawn(move || {
+            let mut attempts = 0;
+            serve_with_spawner(
+                listener,
+                Path::new("/unused"),
+                ledger,
+                thread_stop.clone(),
+                |task| {
+                    attempts += 1;
+                    drop(task);
+                    if attempts == 1 {
+                        let worker_stop = Arc::clone(&thread_stop);
+                        let worker_retired = Arc::clone(&worker_retired);
+                        let started = started.clone();
+                        Ok(std::thread::spawn(move || {
+                            started.send(()).unwrap();
+                            while !worker_stop.load(Ordering::Acquire) {
+                                std::thread::yield_now();
+                            }
+                            worker_retired.store(true, Ordering::Release);
+                        }))
+                    } else {
+                        Err(std::io::Error::other("synthetic spawn failure"))
+                    }
+                },
+            )
+        });
+        let _first = UnixStream::connect(&path).unwrap();
+        wait_started.recv_timeout(Duration::from_secs(2)).unwrap();
+        let _second = UnixStream::connect(&path).unwrap();
+        assert!(server.join().unwrap().is_err());
+        assert!(stop.load(Ordering::Acquire));
+        assert!(retired.load(Ordering::Acquire));
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(directory).unwrap();
     }
 
     #[test]

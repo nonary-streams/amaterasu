@@ -27,6 +27,8 @@ pub use linux_client::LinuxInputClient;
 #[cfg(target_os = "linux")]
 pub use linux_service::LinuxInputService;
 
+#[cfg(any(windows, test))]
+mod service_threads;
 #[cfg(windows)]
 mod windows_identity;
 #[cfg(windows)]

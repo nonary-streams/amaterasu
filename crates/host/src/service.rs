@@ -733,6 +733,9 @@ pub(crate) fn run_managed_service(
     on_started: impl FnOnce(),
 ) -> PackageResult<()> {
     let _lock = RootLock::acquire(root)?;
+    // A previous service may have exited without removing its marker. Clear it
+    // before any startup operation can fail or leave stale readiness visible.
+    let readiness = ServiceReadinessGuard::new(root);
     let digest = crate::supervisor::select_active(root)?;
     #[cfg(target_os = "linux")]
     let mut linux_input = crate::linux_input::Supervisor::new(root, &digest)?;
@@ -744,8 +747,9 @@ pub(crate) fn run_managed_service(
     on_started();
 
     while !stop_requested() {
-        match worker.check_idle() {
+        let replaced = match worker.check_idle() {
             Ok(Some(HostLifecycleAction::Restart)) => {
+                remove_service_readiness(root);
                 #[cfg(target_os = "linux")]
                 linux_input.revoke();
                 let Some(replacement) = apply_worker_action(
@@ -760,25 +764,30 @@ pub(crate) fn run_managed_service(
                     unreachable!("restart action always creates a replacement worker")
                 };
                 worker = replacement;
+                true
             }
             Ok(Some(HostLifecycleAction::Quit)) => break,
-            Ok(None) => {}
+            Ok(None) => false,
             Err(_) => {
+                remove_service_readiness(root);
                 #[cfg(target_os = "linux")]
                 linux_input.revoke();
                 drop(worker);
                 worker = restart(root, &digest, &mut restarts, false)?;
+                true
             }
-        }
+        };
         #[cfg(target_os = "linux")]
         linux_input.refresh(root, &digest, worker.child.id(), worker.creation_time)?;
+        if replaced {
+            publish_service_readiness(root, &digest)?;
+        }
         std::thread::sleep(Duration::from_millis(20));
     }
+    drop(readiness);
     #[cfg(target_os = "linux")]
     linux_input.revoke();
-    let result = worker.shutdown();
-    remove_service_readiness(root);
-    result
+    worker.shutdown()
 }
 
 #[cfg(windows)]
@@ -807,6 +816,22 @@ fn publish_service_readiness(root: &Path, digest: &str) -> PackageResult<()> {
 
 fn remove_service_readiness(root: &Path) {
     let _ = std::fs::remove_file(root.join(SERVICE_READY_FILE));
+}
+
+/// Clear readiness on every exit, including errors during worker replacement.
+struct ServiceReadinessGuard<'a>(&'a Path);
+
+impl<'a> ServiceReadinessGuard<'a> {
+    fn new(root: &'a Path) -> Self {
+        remove_service_readiness(root);
+        Self(root)
+    }
+}
+
+impl Drop for ServiceReadinessGuard<'_> {
+    fn drop(&mut self) {
+        remove_service_readiness(self.0);
+    }
 }
 
 fn write_reply(value: &impl serde::Serialize) -> PackageResult<()> {
@@ -1124,6 +1149,26 @@ mod readiness_tests {
         std::fs::write(root.join(SERVICE_READY_FILE), b"{}").unwrap();
         assert!(probe_service_readiness(&root).is_err());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn readiness_is_removed_when_service_exits_with_an_error() {
+        let root = std::env::temp_dir().join(format!(
+            "amaterasu-service-ready-error-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join(SERVICE_READY_FILE), b"stale").unwrap();
+        let result: PackageResult<()> = (|| {
+            let _readiness = ServiceReadinessGuard::new(&root);
+            assert!(!root.join(SERVICE_READY_FILE).exists());
+            publish_service_readiness(&root, &"a".repeat(64))?;
+            assert!(root.join(SERVICE_READY_FILE).exists());
+            Err("worker replacement failed".into())
+        })();
+        assert!(result.is_err());
+        assert!(!root.join(SERVICE_READY_FILE).exists());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(target_os = "linux")]

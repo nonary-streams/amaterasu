@@ -214,89 +214,96 @@ pub fn run(state_root: &Path, stop: Arc<AtomicBool>, on_ready: impl FnOnce()) ->
     let host_ledger = Arc::clone(&ledger);
     let host_stop = Arc::clone(&stop);
     let host_cleanup_failed = Arc::clone(&cleanup_failed);
-    let host_listener = std::thread::spawn(move || -> InputResult<()> {
-        let result = (|| -> InputResult<()> {
-            let mut pipe = host_pipe;
-            while !host_stop.load(Ordering::Acquire) {
-                match pipe.accept_until(Instant::now() + IO_POLL_INTERVAL, &host_stop)? {
+    let host_listener = std::thread::Builder::new()
+        .spawn(move || -> InputResult<()> {
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> InputResult<()> {
+                    let mut pipe = host_pipe;
+                    while !host_stop.load(Ordering::Acquire) {
+                        match pipe.accept_until(Instant::now() + IO_POLL_INTERVAL, &host_stop)? {
+                            None => continue,
+                            Some(false) => {
+                                pipe = Pipe::listen(PipeKind::Host, false)?;
+                                continue;
+                            }
+                            Some(true) => {}
+                        }
+                        let next = Pipe::listen(PipeKind::Host, false)?;
+                        if !host_stop.load(Ordering::Acquire) {
+                            let _ = serve_connection(
+                                pipe,
+                                Arc::clone(&host_ledger),
+                                Arc::clone(&host_stop),
+                                Arc::clone(&host_cleanup_failed),
+                                false,
+                            );
+                        }
+                        pipe = next;
+                    }
+                    Ok(())
+                }))
+                .unwrap_or(Err(crate::InputError::Device));
+            finish_host_listener(result, &host_stop, || {
+                let _ = Pipe::connect(PipeKind::Worker);
+            })
+        })
+        .map_err(|_| crate::InputError::Device)?;
+    let mut workers: Vec<std::thread::JoinHandle<()>> = Vec::new();
+    let listen_result =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> InputResult<()> {
+            on_ready();
+            let mut pipe = worker_pipe;
+            while !stop.load(Ordering::Acquire) {
+                match pipe.accept_until(Instant::now() + IO_POLL_INTERVAL, &stop)? {
                     None => continue,
                     Some(false) => {
-                        pipe = Pipe::listen(PipeKind::Host, false)?;
+                        pipe = Pipe::listen(PipeKind::Worker, false)?;
                         continue;
                     }
                     Some(true) => {}
                 }
-                let next = Pipe::listen(PipeKind::Host, false)?;
-                if !host_stop.load(Ordering::Acquire) {
-                    let _ = serve_connection(
-                        pipe,
-                        Arc::clone(&host_ledger),
-                        Arc::clone(&host_stop),
-                        Arc::clone(&host_cleanup_failed),
-                        false,
-                    );
+                if stop.load(Ordering::Acquire) {
+                    break;
+                }
+                let next = Pipe::listen(PipeKind::Worker, false)?;
+                let mut index = 0;
+                while index < workers.len() {
+                    if workers[index].is_finished() {
+                        workers
+                            .swap_remove(index)
+                            .join()
+                            .map_err(|_| crate::InputError::Device)?;
+                    } else {
+                        index += 1;
+                    }
+                }
+                if connections.fetch_add(1, Ordering::AcqRel) >= MAX_CONNECTIONS {
+                    connections.fetch_sub(1, Ordering::AcqRel);
+                    pipe = next;
+                    continue;
+                }
+                let ledger = Arc::clone(&ledger);
+                let stop = Arc::clone(&stop);
+                let worker_connections = Arc::clone(&connections);
+                let cleanup_failed = Arc::clone(&cleanup_failed);
+                match std::thread::Builder::new().spawn(move || {
+                    let _ = serve_connection(pipe, ledger, stop, cleanup_failed, true);
+                    worker_connections.fetch_sub(1, Ordering::AcqRel);
+                }) {
+                    Ok(worker) => workers.push(worker),
+                    Err(_) => {
+                        connections.fetch_sub(1, Ordering::AcqRel);
+                        return Err(crate::InputError::Device);
+                    }
                 }
                 pipe = next;
             }
             Ok(())
-        })();
-        finish_host_listener(result, &host_stop, || {
-            let _ = Pipe::connect(PipeKind::Worker);
-        })
-    });
-    on_ready();
-    let mut workers: Vec<std::thread::JoinHandle<()>> = Vec::new();
-    let listen_result = (|| -> InputResult<()> {
-        let mut pipe = worker_pipe;
-        while !stop.load(Ordering::Acquire) {
-            match pipe.accept_until(Instant::now() + IO_POLL_INTERVAL, &stop)? {
-                None => continue,
-                Some(false) => {
-                    pipe = Pipe::listen(PipeKind::Worker, false)?;
-                    continue;
-                }
-                Some(true) => {}
-            }
-            if stop.load(Ordering::Acquire) {
-                break;
-            }
-            let next = Pipe::listen(PipeKind::Worker, false)?;
-            let mut index = 0;
-            while index < workers.len() {
-                if workers[index].is_finished() {
-                    workers
-                        .swap_remove(index)
-                        .join()
-                        .map_err(|_| crate::InputError::Device)?;
-                } else {
-                    index += 1;
-                }
-            }
-            if connections.fetch_add(1, Ordering::AcqRel) >= MAX_CONNECTIONS {
-                connections.fetch_sub(1, Ordering::AcqRel);
-                pipe = next;
-                continue;
-            }
-            let ledger = Arc::clone(&ledger);
-            let stop = Arc::clone(&stop);
-            let connections = Arc::clone(&connections);
-            let cleanup_failed = Arc::clone(&cleanup_failed);
-            workers.push(std::thread::spawn(move || {
-                let _ = serve_connection(pipe, ledger, stop, cleanup_failed, true);
-                connections.fetch_sub(1, Ordering::AcqRel);
-            }));
-            pipe = next;
-        }
-        Ok(())
-    })();
+        }))
+        .unwrap_or(Err(crate::InputError::Device));
     stop.store(true, Ordering::Release);
     let _ = Pipe::connect(PipeKind::Host);
-    for worker in workers {
-        worker.join().map_err(|_| crate::InputError::Device)?;
-    }
-    host_listener
-        .join()
-        .map_err(|_| crate::InputError::Device)??;
+    crate::service_threads::join_service_threads(workers, host_listener)?;
     if cleanup_failed.load(Ordering::Acquire) {
         return Err(crate::InputError::Device);
     }
