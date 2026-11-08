@@ -215,16 +215,34 @@ pub fn write_json_atomically(path: &Path, value: &impl Serialize) -> StorageResu
 }
 
 pub fn write_atomically(path: &Path, bytes: &[u8]) -> StorageResult<()> {
-    let parent = path.parent().ok_or("file has no parent directory")?;
-    let temporary_path = parent.join(format!(".write-{}", random_identifier()?));
-    let result = write_and_replace(&temporary_path, path, bytes);
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary_path);
-    }
-    result
+    write_atomically_with_identifier(path, bytes, &random_identifier()?)
 }
 
-fn write_and_replace(temporary: &Path, destination: &Path, bytes: &[u8]) -> StorageResult<()> {
+fn write_atomically_with_identifier(
+    path: &Path,
+    bytes: &[u8],
+    identifier: &str,
+) -> StorageResult<()> {
+    write_atomically_with_identifier_and_sync(path, bytes, identifier, sync_directory)
+}
+
+fn write_atomically_with_identifier_and_sync(
+    path: &Path,
+    bytes: &[u8],
+    identifier: &str,
+    sync_parent: impl FnOnce(&Path) -> StorageResult<()>,
+) -> StorageResult<()> {
+    let parent = path.parent().ok_or("file has no parent directory")?;
+    let temporary_path = parent.join(format!(".write-{identifier}"));
+    write_and_replace_with_sync(&temporary_path, path, bytes, sync_parent)
+}
+
+fn write_and_replace_with_sync(
+    temporary: &Path,
+    destination: &Path,
+    bytes: &[u8],
+    sync_parent: impl FnOnce(&Path) -> StorageResult<()>,
+) -> StorageResult<()> {
     let mut options = OpenOptions::new();
     options.create_new(true).write(true);
     #[cfg(unix)]
@@ -233,13 +251,26 @@ fn write_and_replace(temporary: &Path, destination: &Path, bytes: &[u8]) -> Stor
         options.mode(0o600);
     }
 
+    // Only remove the temporary file after create_new succeeds. On a name
+    // collision the existing file belongs to another writer (or an earlier
+    // recovery attempt), and deleting it would destroy that writer's work.
     let mut file = options.open(temporary).map_err(|error| error.to_string())?;
-    file.write_all(bytes).map_err(|error| error.to_string())?;
-    file.sync_all().map_err(|error| error.to_string())?;
+    let result = (|| {
+        file.write_all(bytes).map_err(|error| error.to_string())?;
+        file.sync_all().map_err(|error| error.to_string())
+    })();
     drop(file);
-
-    replace_file(temporary, destination)?;
-    sync_directory(destination.parent().ok_or("file has no parent directory")?)
+    if result.is_err() {
+        let _ = fs::remove_file(temporary);
+    }
+    result?;
+    if let Err(error) = replace_file(temporary, destination) {
+        let _ = fs::remove_file(temporary);
+        return Err(error);
+    }
+    // After the rename the temporary name no longer belongs to this writer;
+    // a directory-sync failure must not remove a newly created file there.
+    sync_parent(destination.parent().ok_or("file has no parent directory")?)
 }
 
 pub fn sync_directory(path: &Path) -> StorageResult<()> {
@@ -316,6 +347,68 @@ impl RootLock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn temporary_name_collision_preserves_the_existing_writers_file() {
+        let root = std::env::temp_dir().join(format!(
+            "amaterasu-storage-collision-{}-{}",
+            std::process::id(),
+            crate::random_identifier().unwrap()
+        ));
+        fs::create_dir(&root).unwrap();
+        let temporary = root.join(".write-existing");
+        let destination = root.join("state.json");
+        fs::write(&temporary, b"another writer's uncommitted data").unwrap();
+        fs::write(&destination, b"previous state").unwrap();
+
+        assert!(write_atomically_with_identifier(&destination, b"new state", "existing").is_err());
+        assert_eq!(
+            fs::read(&temporary).unwrap(),
+            b"another writer's uncommitted data"
+        );
+        assert_eq!(fs::read(&destination).unwrap(), b"previous state");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_replace_removes_only_the_temporary_file_it_created() {
+        let root = std::env::temp_dir().join(format!(
+            "amaterasu-storage-failed-replace-{}-{}",
+            std::process::id(),
+            crate::random_identifier().unwrap()
+        ));
+        fs::create_dir(&root).unwrap();
+        let temporary = root.join(".write-owned");
+        let destination = root.join("directory");
+        fs::create_dir(&destination).unwrap();
+
+        assert!(write_atomically_with_identifier(&destination, b"new state", "owned").is_err());
+        assert!(!temporary.exists());
+        assert!(destination.is_dir());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sync_failure_does_not_remove_a_reused_temporary_name() {
+        let root = std::env::temp_dir().join(format!(
+            "amaterasu-storage-sync-failure-{}-{}",
+            std::process::id(),
+            crate::random_identifier().unwrap()
+        ));
+        fs::create_dir(&root).unwrap();
+        let temporary = root.join(".write-reused");
+        let destination = root.join("state.json");
+
+        let result =
+            write_atomically_with_identifier_and_sync(&destination, b"committed", "reused", |_| {
+                fs::write(&temporary, b"next writer").unwrap();
+                Err("injected sync failure".into())
+            });
+        assert!(result.is_err());
+        assert_eq!(fs::read(&destination).unwrap(), b"committed");
+        assert_eq!(fs::read(&temporary).unwrap(), b"next writer");
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn machine_secret_protection_requires_a_regular_file() {
