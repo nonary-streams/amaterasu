@@ -177,6 +177,7 @@ dependencies = [
  "amaterasu-module-sdk",
  "cc",
  "getrandom 0.3.4",
+ "libc",
  "serde",
  "serde_json",
 ]
@@ -300,6 +301,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "amaterasu-detached-process"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "amaterasu-diagnostics"
 version = "0.1.0"
 dependencies = [
@@ -316,6 +324,7 @@ dependencies = [
  "amaterasu-module-sdk",
  "amaterasu-windows-capture-geometry",
  "getrandom 0.3.4",
+ "libc",
  "serde",
  "serde_json",
  "windows-sys 0.61.2",
@@ -560,6 +569,7 @@ dependencies = [
  "amaterasu-contracts",
  "amaterasu-module-sdk",
  "amaterasu-runtime",
+ "getrandom 0.3.4",
  "libloading",
  "rusqlite",
  "serde",
@@ -632,6 +642,7 @@ dependencies = [
  "amaterasu-media",
  "amaterasu-network-api",
  "amaterasu-network-sockets",
+ "amaterasu-process-api",
  "base64 0.22.1",
  "getrandom 0.3.4",
  "libc",
@@ -750,6 +761,15 @@ dependencies = [
  "serde_json",
  "sha2",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "amaterasu-process-api"
+version = "0.1.0"
+dependencies = [
+ "amaterasu-abi",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -885,7 +905,9 @@ dependencies = [
 name = "amaterasu-state"
 version = "0.1.0"
 dependencies = [
+ "amaterasu-contracts",
  "amaterasu-module-sdk",
+ "amaterasu-runtime",
  "amaterasu-storage",
  "serde",
  "serde_json",
@@ -898,6 +920,7 @@ dependencies = [
  "amaterasu-module-sdk",
  "amaterasu-network-sockets",
  "base64 0.22.1",
+ "getrandom 0.3.4",
  "image",
  "serde",
  "serde_json",
@@ -945,6 +968,7 @@ name = "amaterasu-system-tray"
 version = "0.1.0"
 dependencies = [
  "amaterasu-module-sdk",
+ "getrandom 0.3.4",
  "ldtray",
  "serde",
  "serde_json",
@@ -956,6 +980,7 @@ name = "amaterasu-updater"
 version = "0.1.0"
 dependencies = [
  "amaterasu-module-sdk",
+ "getrandom 0.3.4",
  "semver",
  "serde",
  "serde_json",
@@ -994,6 +1019,7 @@ dependencies = [
  "amaterasu-windows-capture-geometry",
  "cc",
  "getrandom 0.3.4",
+ "libc",
  "serde",
  "serde_json",
  "sha2",

@@ -15,6 +15,8 @@ pub mod network;
 pub mod network_http;
 pub mod operation_api;
 pub mod pairing_authority;
+#[cfg(feature = "process")]
+pub mod process;
 pub mod processing;
 pub mod requests;
 pub mod retained_options;

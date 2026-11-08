@@ -1,0 +1,11 @@
+[package]
+name = "amaterasu-detached-process"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

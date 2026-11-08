@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/abi",
     "crates/data-plane",
+    "crates/detached-process",
     "crates/configuration-schema",
     "crates/extension-api",
     "crates/media",
@@ -12,6 +13,7 @@ members = [
     "crates/input-policy",
     "crates/network-policy",
     "crates/network-api",
+    "crates/process-api",
     "crates/rtx-runtime",
     "crates/network-sockets",
     "modules/network",
@@ -90,6 +92,7 @@ version = "0.1.0"
 
 [workspace.dependencies]
 amaterasu-network-api = { path = "crates/network-api" }
+amaterasu-process-api = { path = "crates/process-api" }
 amaterasu-network-sockets = { path = "crates/network-sockets" }
 amaterasu-data-plane = { path = "crates/data-plane" }
 amaterasu-configuration-schema = { path = "crates/configuration-schema" }
