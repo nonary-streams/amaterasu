@@ -2520,6 +2520,54 @@ fn cancelled_state_read_does_not_hash_or_issue_and_releases_pending_request() {
 }
 
 #[test]
+fn quiesce_releases_an_accepted_child_and_stops_polling_for_new_requests() {
+    let mut pipeline = Pipeline::new(settings());
+    pipeline.pending = Some(Pending {
+        request: Request {
+            id: 7,
+            caller: "console".into(),
+            deadline: Instant::now() + Duration::from_secs(30),
+        },
+        child_request: 60,
+        stage: Stage::LoadingProductSettings(Operation::SettingsGet {}),
+        phase: PendingPhase::Waiting,
+    });
+    pipeline.prepare_shutdown();
+
+    assert!(
+        !pipeline
+            .quiesce_at(100, |command| match command {
+                Command::TakeResult { request: 60 } => Ok(Response::Pending),
+                Command::Poll {} => panic!("quiescing must not admit another request"),
+                command => panic!("unexpected first quiesce command: {command:?}"),
+            })
+            .unwrap()
+    );
+
+    let mut completed = None;
+    assert!(pipeline
+        .quiesce_at(100, |command| match command {
+            Command::TakeResult { request: 60 } => Ok(Response::Result {
+                payload: json!({"ok":true,"found":false,"version":null,"revision":0,"values":{}}),
+            }),
+            Command::ReleaseResult { request: 60 } => Ok(Response::Ok),
+            Command::Complete { request: 7, payload } => {
+                completed = Some(payload);
+                Ok(Response::Ok)
+            }
+            Command::Poll {} => panic!("quiescing must not admit another request"),
+            command => panic!("unexpected terminal quiesce command: {command:?}"),
+        })
+        .unwrap());
+
+    pipeline
+        .tick_at(101, |_| panic!("quiescing must not poll for new requests"))
+        .unwrap();
+    assert_eq!(completed.unwrap()["ok"], true);
+    assert!(pipeline.pending.is_none());
+}
+
+#[test]
 fn logout_revokes_persistently_and_active_sessions_survive_restart() {
     let mut state = StateHarness::new();
     let mut pipeline = Pipeline::new(settings());

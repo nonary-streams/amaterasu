@@ -1,6 +1,6 @@
 use super::*;
 use std::collections::BTreeMap;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 fn test_root() -> PathBuf {
     let nonce = SystemTime::now()
@@ -1050,4 +1050,124 @@ fn preflight_rejects_later_unready_and_malformed_diagnostics_status() {
         assert_eq!(transport.events, ["read", "preflight"]);
         std::fs::remove_dir_all(root).unwrap();
     }
+}
+
+#[test]
+fn quiesce_drains_saved_configuration_apply_and_compensation_before_ready() {
+    let root = test_root();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let previous = Document::from_settings(5, crate::settings::Settings::default());
+    let saved = Document::from_settings(6, crate::settings::Settings::default());
+    let saved_response = build_read_response(&saved, &root).unwrap();
+    let mut pipeline = Pipeline::new(Ok(root.clone()));
+    pipeline.pending = Some(Pending {
+        request_id: 7,
+        deadline,
+        state_request_id: 25,
+        stage: Stage::Applying {
+            response: saved_response,
+            previous,
+            saved_state_revision: 13,
+        },
+        phase: PendingPhase::Waiting,
+    });
+    pipeline.prepare_shutdown();
+
+    assert!(
+        !pipeline
+            .quiesce(|command| match command {
+                Command::TakeResult { request: 25 } => Ok(Response::Pending),
+                Command::Poll {} => panic!("quiescing must not admit another request"),
+                command => panic!("unexpected apply poll: {command:?}"),
+            })
+            .unwrap()
+    );
+
+    assert!(
+        !pipeline
+            .quiesce(|command| match command {
+                Command::TakeResult { request: 25 } => Ok(Response::error(
+                    "permission_denied",
+                    "diagnostics apply is unavailable",
+                )),
+                Command::ReleaseResult { request: 25 } => Ok(Response::Ok),
+                Command::Request {
+                    service,
+                    payload,
+                    parent,
+                    ..
+                } => {
+                    assert_eq!(service, crate::STATE_SERVICE);
+                    assert_eq!(payload["action"], "set");
+                    assert_eq!(payload["expected_revision"], 13);
+                    assert_eq!(payload["value"]["revision"], 7);
+                    assert_eq!(parent, None);
+                    Ok(Response::Accepted { id: 26 })
+                }
+                command => panic!("unexpected rollback transition: {command:?}"),
+            })
+            .unwrap()
+    );
+
+    assert!(
+        !pipeline
+            .quiesce(|command| match command {
+                Command::TakeResult { request: 26 } => Ok(Response::Result {
+                    payload: json!({"ok":true,"revision":14}),
+                }),
+                Command::ReleaseResult { request: 26 } => Ok(Response::Ok),
+                Command::Request {
+                    service,
+                    payload,
+                    parent,
+                    ..
+                } => {
+                    assert_eq!(service, DIAGNOSTICS_SERVICE);
+                    assert_eq!(payload["action"], "apply_host_logging");
+                    assert_eq!(payload["configuration"]["revision"], 7);
+                    assert_eq!(parent, Some(7));
+                    Ok(Response::Accepted { id: 27 })
+                }
+                command => panic!("unexpected restored apply transition: {command:?}"),
+            })
+            .unwrap()
+    );
+
+    assert!(
+        !pipeline
+            .quiesce(|command| match command {
+                Command::TakeResult { request: 27 } => Ok(Response::Pending),
+                Command::Poll {} => panic!("quiescing must not admit another request"),
+                command => panic!("unexpected restored apply poll: {command:?}"),
+            })
+            .unwrap()
+    );
+
+    let mut completed = None;
+    assert!(
+        pipeline
+            .quiesce(|command| match command {
+                Command::TakeResult { request: 27 } => Ok(Response::Result {
+                    payload: json!({"ok":true,"applied_revision":7}),
+                }),
+                Command::ReleaseResult { request: 27 } => Ok(Response::Ok),
+                Command::Complete {
+                    request: 7,
+                    payload,
+                } => {
+                    completed = Some(payload);
+                    Ok(Response::Ok)
+                }
+                Command::Poll {} => panic!("quiescing must not admit another request"),
+                command => panic!("unexpected terminal apply transition: {command:?}"),
+            })
+            .unwrap()
+    );
+
+    let response = completed.expect("quiesce completes the original request");
+    assert_eq!(response["error"]["code"], "logging_apply_failed");
+    assert_eq!(response["logging"]["saved_revision"], 6);
+    assert_eq!(response["logging"]["restored_revision"], 7);
+    assert_eq!(response["logging"]["status"], "rolled_back");
+    std::fs::remove_dir_all(root).unwrap();
 }

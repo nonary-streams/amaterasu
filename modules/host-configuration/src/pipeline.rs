@@ -77,6 +77,7 @@ enum ChildOutcome {
 pub struct Pipeline {
     trusted_root: Result<PathBuf, String>,
     pending: Option<Pending>,
+    quiescing: bool,
 }
 
 impl Pipeline {
@@ -84,6 +85,7 @@ impl Pipeline {
         Self {
             trusted_root,
             pending: None,
+            quiescing: false,
         }
     }
 
@@ -91,10 +93,28 @@ impl Pipeline {
         if let Some(pending) = self.pending.take() {
             self.advance(pending, &mut send)?;
         }
-        if self.pending.is_none() {
+        if self.pending.is_none() && !self.quiescing {
             self.receive(&mut send)?;
         }
         Ok(())
+    }
+
+    pub fn prepare_shutdown(&mut self) {
+        self.quiescing = true;
+    }
+
+    /// Progress existing work without admitting another host-configuration request.
+    /// The host must retain this module and its dependencies until pending state and
+    /// diagnostics operations, including compensation, have reached a terminal result.
+    pub fn quiesce(
+        &mut self,
+        mut send: impl FnMut(Command) -> TransportResult,
+    ) -> ModuleResult<bool> {
+        self.quiescing = true;
+        if let Some(pending) = self.pending.take() {
+            self.advance(pending, &mut send)?;
+        }
+        Ok(self.pending.is_none())
     }
 
     fn receive(&mut self, send: &mut impl FnMut(Command) -> TransportResult) -> ModuleResult<()> {

@@ -16,5 +16,9 @@ amaterasu-storage = { path = "../../crates/storage" }
 serde.workspace = true
 serde_json.workspace = true
 
+[dev-dependencies]
+amaterasu-contracts.workspace = true
+amaterasu-runtime = { path = "../../crates/runtime" }
+
 [lints]
 workspace = true

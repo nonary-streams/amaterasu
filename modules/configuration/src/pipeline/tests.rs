@@ -235,11 +235,353 @@ fn waiting_save() -> Pipeline {
             key: "principal/team/worker".into(),
             deadline: Instant::now() + Duration::from_secs(30),
             state_request_id: 21,
-            stage: Stage::Saving(registered_document()),
+            stage: Stage::Saving(registered_document(), 11),
             phase: PendingPhase::Waiting,
         }),
         ..Default::default()
     }
+}
+
+#[test]
+fn quiescence_waits_for_a_delivered_save_and_stops_polling() {
+    let mut pipeline = waiting_save();
+    assert!(
+        !pipeline
+            .quiesce(|command| match command {
+                Command::TakeResult { request: 21 } => Ok(Response::Pending),
+                other => panic!("shutdown must wait for the state write: {other:?}"),
+            })
+            .unwrap()
+    );
+    assert!(
+        pipeline
+            .quiesce(|command| Ok(match command {
+                Command::TakeResult { request: 21 } => Response::Result {
+                    payload: json!({"ok":true,"revision":12})
+                },
+                Command::ReleaseResult { request: 21 } => Response::Ok,
+                Command::Publish { .. } | Command::Complete { .. } => Response::Ok,
+                other => panic!("shutdown must not poll for new work: {other:?}"),
+            }))
+            .unwrap()
+    );
+}
+
+#[test]
+fn lost_save_admission_uses_a_non_admitting_lookup_after_parent_deadline() {
+    let mut pipeline = Pipeline::default();
+    let mut first = None;
+    pipeline
+        .save_product(
+            RequestContext {
+                request_id: 37,
+                key: "product/amaterasu.nvhttp".into(),
+                deadline: Instant::now() + Duration::from_secs(30),
+            },
+            12,
+            product_document(1, "saved.local"),
+            &mut |command| {
+                first = Some(serde_json::to_value(command).unwrap());
+                Err("lost admission reply".into())
+            },
+        )
+        .unwrap();
+    let submission = pipeline
+        .submission
+        .as_mut()
+        .expect("uncertain admission retained");
+    submission.deadline = Instant::now() - Duration::from_millis(1);
+    let mut retried = false;
+    pipeline
+        .tick(|command| {
+            Ok(match command {
+                Command::LookupRequest {
+                    service,
+                    payload,
+                    operation_id,
+                    parent,
+                } => {
+                    let original = first.clone().unwrap();
+                    assert_eq!(original["service"], service);
+                    assert_eq!(original["payload"], payload);
+                    assert_eq!(original["operation_id"], operation_id);
+                    assert_eq!(original["parent"], parent.unwrap());
+                    retried = true;
+                    Response::Accepted { id: 101 }
+                }
+                Command::TakeResult { request: 101 } | Command::Poll {} => Response::Pending,
+                other => panic!("unexpected retry command: {other:?}"),
+            })
+        })
+        .unwrap();
+    assert!(retried);
+    assert!(pipeline.pending.is_some());
+    assert!(!pipeline.unconfirmed_write);
+}
+
+#[test]
+fn unresolved_save_past_retention_horizon_uses_a_readback_not_a_write_replay() {
+    let mut pipeline = Pipeline::default();
+    pipeline
+        .save_product(
+            RequestContext {
+                request_id: 37,
+                key: "product/amaterasu.nvhttp".into(),
+                deadline: Instant::now() + Duration::from_secs(30),
+            },
+            12,
+            product_document(1, "saved.local"),
+            &mut |_| Err("lost admission reply".into()),
+        )
+        .unwrap();
+    pipeline.submission.as_mut().unwrap().first_attempt = Instant::now() - Duration::from_secs(301);
+    assert!(
+        !pipeline
+            .quiesce(|_| panic!("expired identity must never be replayed"))
+            .unwrap()
+    );
+    assert!(pipeline.unconfirmed_write);
+    assert!(pipeline.submission.is_some());
+    let submission = pipeline.submission.as_ref().unwrap();
+    let Command::Request {
+        service,
+        payload,
+        parent,
+        operation_id,
+        ..
+    } = &submission.command
+    else {
+        panic!("uncertain mutation must become a state readback");
+    };
+    assert_eq!(service, STATE_SERVICE);
+    assert_eq!(payload["action"], "get");
+    assert_eq!(parent, &None);
+    assert!(operation_id.ends_with(".readback"));
+    pipeline
+        .quiesce(|command| {
+            Ok(match command {
+                Command::Request {
+                    payload, parent, ..
+                } => {
+                    assert_eq!(payload["action"], "get");
+                    assert_eq!(parent, None);
+                    Response::Accepted { id: 102 }
+                }
+                Command::TakeResult { request: 102 } => Response::Pending,
+                other => panic!("only a non-mutating readback may follow: {other:?}"),
+            })
+        })
+        .unwrap();
+    assert!(pipeline.pending.is_some());
+    assert!(pipeline.unconfirmed_write);
+}
+
+#[test]
+fn absent_save_admission_retries_only_while_parent_is_live() {
+    for expired in [false, true] {
+        let mut pipeline = Pipeline::default();
+        let mut original = None;
+        pipeline
+            .save_product(
+                RequestContext {
+                    request_id: 37,
+                    key: "product/amaterasu.nvhttp".into(),
+                    deadline: Instant::now() + Duration::from_secs(30),
+                },
+                12,
+                product_document(1, "saved.local"),
+                &mut |command| {
+                    original = Some(serde_json::to_value(command).unwrap());
+                    Err("request did not reach broker".into())
+                },
+            )
+            .unwrap();
+        if expired {
+            pipeline.submission.as_mut().unwrap().deadline =
+                Instant::now() - Duration::from_millis(1);
+        }
+        let mut completed = false;
+        pipeline
+            .tick(|command| {
+                Ok(match command {
+                    Command::LookupRequest { .. } => Response::error("not_found", "absent"),
+                    Command::Complete { payload, .. } if expired => {
+                        assert_eq!(payload["error"]["code"], "deadline_exceeded");
+                        completed = true;
+                        Response::Ok
+                    }
+                    Command::Poll {} => Response::Pending,
+                    other => panic!("unexpected absent-admission command: {other:?}"),
+                })
+            })
+            .unwrap();
+        assert!(!pipeline.unconfirmed_write);
+        if expired {
+            assert!(completed);
+            assert!(pipeline.submission.is_none());
+        } else {
+            assert!(!pipeline.submission.as_ref().unwrap().uncertain);
+            pipeline
+                .tick(|command| {
+                    Ok(match command {
+                        Command::Request { .. } => {
+                            assert_eq!(
+                                serde_json::to_value(command).unwrap(),
+                                original.clone().unwrap()
+                            );
+                            Response::Accepted { id: 101 }
+                        }
+                        Command::TakeResult { request: 101 } | Command::Poll {} => {
+                            Response::Pending
+                        }
+                        other => panic!("unexpected safe retry command: {other:?}"),
+                    })
+                })
+                .unwrap();
+            assert_eq!(pipeline.pending.as_ref().unwrap().state_request_id, 101);
+        }
+    }
+}
+
+#[test]
+fn cancelled_save_keeps_its_child_until_a_readback_can_start() {
+    let mut pipeline = waiting_save();
+    let ready = pipeline
+        .quiesce(|command| {
+            Ok(match command {
+                Command::TakeResult { request: 21 } => {
+                    Response::error("deadline_exceeded", "delivery may still finish")
+                }
+                other => panic!("first observation must preserve the child identity: {other:?}"),
+            })
+        })
+        .unwrap();
+    assert!(!ready);
+    assert!(pipeline.unconfirmed_write);
+    assert_eq!(pipeline.pending.as_ref().unwrap().state_request_id, 21);
+    assert!(matches!(
+        pipeline.pending.as_ref().unwrap().phase,
+        PendingPhase::Releasing(ChildOutcome::Reconcile(_))
+    ));
+}
+
+#[test]
+fn unexpected_child_status_never_drops_outstanding_work() {
+    let mut saving = waiting_save();
+    assert!(
+        !saving
+            .quiesce(|command| Ok(match command {
+                Command::TakeResult { request: 21 } => Response::Accepted { id: 999 },
+                other => panic!("unexpected status cannot retire the save: {other:?}"),
+            }))
+            .unwrap()
+    );
+    assert!(saving.unconfirmed_write);
+    assert_eq!(saving.pending.as_ref().unwrap().state_request_id, 21);
+
+    let mut loading = Pipeline {
+        pending: Some(Pending {
+            request_id: 7,
+            key: "principal/caller".into(),
+            deadline: Instant::now() + Duration::from_secs(30),
+            state_request_id: 20,
+            stage: Stage::Loading(Operation::Get {}),
+            phase: PendingPhase::Waiting,
+        }),
+        ..Default::default()
+    };
+    assert!(
+        !loading
+            .quiesce(|command| match command {
+                Command::TakeResult { request: 20 } => Ok(Response::Accepted { id: 999 }),
+                other => panic!("unconfirmed read must remain owned: {other:?}"),
+            })
+            .unwrap()
+    );
+    assert_eq!(loading.pending.as_ref().unwrap().state_request_id, 20);
+}
+
+#[test]
+fn invalid_save_ack_never_publishes_and_fences_further_writes() {
+    for payload in [
+        json!({"ok":true,"revision":11}),
+        json!({"ok":true,"revision":13}),
+        json!({"ok":true}),
+        json!({"revision":12}),
+    ] {
+        let mut pipeline = waiting_save();
+        pipeline
+            .tick(|command| {
+                Ok(match command {
+                    Command::TakeResult { request: 21 } => Response::Result {
+                        payload: payload.clone(),
+                    },
+                    other => panic!("invalid save ack must be reconciled first: {other:?}"),
+                })
+            })
+            .unwrap();
+        assert!(pipeline.completion.is_none());
+        assert!(pipeline.unconfirmed_write);
+        assert_eq!(pipeline.pending.as_ref().unwrap().state_request_id, 21);
+    }
+}
+
+#[test]
+fn storage_error_after_possible_atomic_replace_fences_later_writes() {
+    let mut pipeline = waiting_save();
+    let failure = error("storage_error", "directory sync failed");
+    pipeline
+        .tick(|command| {
+            Ok(match command {
+                Command::TakeResult { request: 21 } => Response::Result {
+                    payload: failure.clone(),
+                },
+                other => panic!("ambiguous storage result must be reconciled first: {other:?}"),
+            })
+        })
+        .unwrap();
+    assert!(pipeline.completion.is_none());
+    assert!(pipeline.unconfirmed_write);
+    assert!(matches!(
+        &pipeline.pending.as_ref().unwrap().phase,
+        PendingPhase::Releasing(ChildOutcome::Reconcile(_))
+    ));
+}
+
+#[test]
+fn lost_completion_reply_is_retried_before_accepting_more_work() {
+    let mut pipeline = waiting_save();
+    let mut saved = None;
+    pipeline
+        .tick(|command| match command {
+            Command::TakeResult { request: 21 } => Ok(Response::Result {
+                payload: json!({"ok":true,"revision":12}),
+            }),
+            Command::ReleaseResult { request: 21 } | Command::Publish { .. } => Ok(Response::Ok),
+            Command::Complete { request, payload } => {
+                saved = Some((request, payload));
+                Err("lost completion reply".into())
+            }
+            other => panic!("must not poll while completion is uncertain: {other:?}"),
+        })
+        .unwrap();
+    assert!(pipeline.completion.is_some());
+    let mut retried = false;
+    pipeline
+        .tick(|command| {
+            Ok(match command {
+                Command::Complete { request, payload } => {
+                    assert_eq!(Some((request, payload)), saved.clone());
+                    retried = true;
+                    Response::error("request_ended", "already completed")
+                }
+                Command::Poll {} => Response::Pending,
+                other => panic!("unexpected completion retry: {other:?}"),
+            })
+        })
+        .unwrap();
+    assert!(retried);
+    assert!(pipeline.completion.is_none());
 }
 
 #[test]
@@ -264,7 +606,7 @@ fn change_events_wait_for_durable_ack_and_survive_cancelled_completion() {
             Ok(match command {
                 Command::ReleaseResult { .. } => Response::Ok,
                 Command::TakeResult { .. } => Response::Result {
-                    payload: json!({"ok":true,"revision":11}),
+                    payload: json!({"ok":true,"revision":12}),
                 },
                 Command::Publish { topic, payload } => {
                     assert_eq!(topic, crate::CHANGED_TOPIC);
@@ -297,23 +639,17 @@ fn failed_or_cancelled_state_ack_never_publishes_change_events() {
         },
     ] {
         let mut pipeline = waiting_save();
-        let mut completed = false;
         pipeline
             .tick(|command| {
                 Ok(match command {
-                    Command::ReleaseResult { .. } => Response::Ok,
                     Command::TakeResult { .. } => response.clone(),
-                    Command::Complete { payload, .. } => {
-                        assert_eq!(payload["ok"], false);
-                        completed = true;
-                        Response::Ok
-                    }
-                    Command::Poll {} => Response::Pending,
-                    other => panic!("unconfirmed persistence must not publish: {other:?}"),
+                    other => panic!("uncertain persistence must be reconciled first: {other:?}"),
                 })
             })
             .unwrap();
-        assert!(completed);
+        assert!(pipeline.completion.is_none());
+        assert!(pipeline.unconfirmed_write);
+        assert!(pipeline.pending.is_some());
     }
 }
 
@@ -328,7 +664,7 @@ fn publication_failure_never_changes_the_persisted_success() {
         pipeline
             .tick(|command| match command {
                 Command::TakeResult { .. } => Ok(Response::Result {
-                    payload: json!({"ok":true,"revision":11}),
+                    payload: json!({"ok":true,"revision":12}),
                 }),
                 Command::ReleaseResult { .. } => Ok(Response::Ok),
                 Command::Publish { .. } => publication.clone(),
@@ -743,7 +1079,7 @@ fn oversized_product_documents_fail_before_submitting_a_state_write() {
 }
 
 #[test]
-fn lost_product_write_ack_is_not_reported_as_success_and_saved_data_can_be_reloaded() {
+fn lost_product_write_ack_is_reconciled_before_configuration_can_quiesce() {
     let committed = product_document(1, "possibly-committed.local");
     let mut pipeline = Pipeline {
         pending: Some(Pending {
@@ -751,63 +1087,139 @@ fn lost_product_write_ack_is_not_reported_as_success_and_saved_data_can_be_reloa
             key: "product/amaterasu.nvhttp".into(),
             deadline: Instant::now() + Duration::from_secs(30),
             state_request_id: 101,
-            stage: Stage::SavingProduct(committed.clone()),
+            stage: Stage::SavingProduct(committed.clone(), 11),
             phase: PendingPhase::Waiting,
         }),
         ..Default::default()
     };
-    let mut failed = false;
     pipeline
-        .tick(|command| {
+        .quiesce(|command| {
             Ok(match command {
-                Command::ReleaseResult { .. } => Response::Ok,
                 // The state write may have committed even though its result was lost.
                 Command::TakeResult { .. } => Response::error("deadline_exceeded", "ack lost"),
-                Command::Complete { payload, .. } => {
-                    assert_eq!(payload["ok"], false);
-                    assert_eq!(payload["error"]["code"], "deadline_exceeded");
-                    failed = true;
-                    Response::Ok
-                }
-                Command::Poll {} => Response::Pending,
-                other => panic!("lost acknowledgment must not publish success: {other:?}"),
+                other => panic!("first poll must preserve the lost write result: {other:?}"),
             })
         })
         .unwrap();
-    assert!(failed);
+    assert!(pipeline.unconfirmed_write);
+    assert!(pipeline.pending.is_some());
 
-    let mut pipeline = Pipeline {
-        pending: Some(Pending {
-            request_id: 39,
-            key: "product/amaterasu.nvhttp".into(),
-            deadline: Instant::now() + Duration::from_secs(30),
-            state_request_id: 102,
-            stage: Stage::Loading(Operation::ProductGet {}),
-            phase: PendingPhase::Waiting,
-        }),
-        ..Default::default()
-    };
-    let mut observed_commit = false;
-    pipeline
-        .tick(|command| {
-            Ok(match command {
-                Command::ReleaseResult { .. } => Response::Ok,
-                Command::TakeResult { .. } => Response::Result {
-                    payload: json!({"ok":true,"revision":12,"found":true,"value":committed}),
-                },
-                Command::Complete { payload, .. } => {
-                    assert_eq!(payload["ok"], true);
-                    assert_eq!(payload["revision"], 1);
-                    assert_eq!(payload["values"]["hostname"], "possibly-committed.local");
-                    observed_commit = true;
-                    Response::Ok
-                }
-                Command::Poll {} => Response::Pending,
-                other => panic!("expected product reload: {other:?}"),
+    assert!(
+        !pipeline
+            .quiesce(|command| {
+                Ok(match command {
+                    Command::ReleaseResult { request: 101 } => Response::Ok,
+                    Command::Request {
+                        service,
+                        payload,
+                        parent,
+                        operation_id,
+                        ..
+                    } => {
+                        assert_eq!(service, STATE_SERVICE);
+                        assert_eq!(
+                            payload,
+                            json!({"action":"get","key":"product/amaterasu.nvhttp"})
+                        );
+                        assert_eq!(parent, None);
+                        assert!(operation_id.starts_with("configuration.37.reconcile."));
+                        Response::Accepted { id: 102 }
+                    }
+                    Command::TakeResult { request: 102 } => Response::Pending,
+                    other => panic!("unexpected reconciliation command: {other:?}"),
+                })
             })
-        })
-        .unwrap();
+            .unwrap()
+    );
+    let mut observed_commit = false;
+    assert!(
+        pipeline
+            .quiesce(|command| {
+                Ok(match command {
+                    Command::TakeResult { request: 102 } => Response::Result {
+                        payload: json!({"ok":true,"revision":12,"found":true,"value":committed}),
+                    },
+                    Command::ReleaseResult { request: 102 } => Response::Ok,
+                    Command::Publish { payload, .. } => {
+                        assert_eq!(payload["kind"], "product_settings");
+                        Response::Ok
+                    }
+                    Command::Complete { payload, .. } => {
+                        assert_eq!(payload["ok"], true);
+                        assert_eq!(payload["revision"], 1);
+                        assert_eq!(payload["values"]["hostname"], "possibly-committed.local");
+                        observed_commit = true;
+                        Response::Ok
+                    }
+                    other => panic!("unexpected reconciliation release command: {other:?}"),
+                })
+            })
+            .unwrap()
+    );
     assert!(observed_commit);
+    assert!(pipeline.pending.is_none());
+    assert!(!pipeline.unconfirmed_write);
+}
+
+#[test]
+fn cancelled_save_readback_proves_noncommit_before_releasing_the_fence() {
+    let mut pipeline = waiting_save();
+    assert!(
+        !pipeline
+            .quiesce(|command| match command {
+                Command::TakeResult { request: 21 } => {
+                    Ok(Response::error("cancelled", "parent expired"))
+                }
+                other => panic!("unexpected first cancellation command: {other:?}"),
+            })
+            .unwrap()
+    );
+
+    assert!(
+        !pipeline
+            .quiesce(|command| {
+                Ok(match command {
+                    Command::ReleaseResult { request: 21 } => Response::Ok,
+                    Command::Request {
+                        payload, parent, ..
+                    } => {
+                        assert_eq!(
+                            payload,
+                            json!({"action":"get","key":"principal/team/worker"})
+                        );
+                        assert_eq!(parent, None);
+                        Response::Accepted { id: 22 }
+                    }
+                    Command::TakeResult { request: 22 } => Response::Pending,
+                    other => panic!("unexpected readback admission command: {other:?}"),
+                })
+            })
+            .unwrap()
+    );
+
+    let mut failed = false;
+    assert!(
+        pipeline
+            .quiesce(|command| {
+                Ok(match command {
+                    Command::TakeResult { request: 22 } => Response::Result {
+                        payload: json!({"ok":true,"revision":11,"found":false,"value":null}),
+                    },
+                    Command::ReleaseResult { request: 22 } => Response::Ok,
+                    Command::Complete { payload, .. } => {
+                        assert_eq!(payload["ok"], false);
+                        assert_eq!(payload["error"]["code"], "cancelled");
+                        failed = true;
+                        Response::Ok
+                    }
+                    other => panic!("unexpected final reconciliation command: {other:?}"),
+                })
+            })
+            .unwrap()
+    );
+    assert!(failed);
+    assert!(!pipeline.unconfirmed_write);
+    assert!(pipeline.pending.is_none());
 }
 
 #[test]
@@ -819,7 +1231,7 @@ fn release_failures_retry_without_repolling_or_resubmitting_a_committed_write() 
             key: "product/amaterasu.nvhttp".into(),
             deadline: Instant::now() + Duration::from_secs(30),
             state_request_id: 101,
-            stage: Stage::SavingProduct(committed),
+            stage: Stage::SavingProduct(committed, 11),
             phase: PendingPhase::Waiting,
         }),
         ..Default::default()

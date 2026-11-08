@@ -27,8 +27,11 @@ impl ManagedModule for ConfigurationModule {
     }
 
     fn tick(&mut self) -> ModuleResult<()> {
-        self.pipeline
-            .tick(|command| self.runtime.send_ephemeral(command))
+        self.pipeline.tick(|command| self.runtime.send(command))
+    }
+
+    fn quiesce(&mut self) -> ModuleResult<bool> {
+        self.pipeline.quiesce(|command| self.runtime.send(command))
     }
 }
 

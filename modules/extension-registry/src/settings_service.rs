@@ -360,6 +360,10 @@ impl SettingsService {
         Ok(())
     }
 
+    pub fn is_idle(&self) -> bool {
+        self.pending.is_empty() && self.store.is_idle()
+    }
+
     pub fn tick(&mut self, runtime: &RuntimeClient) -> ModuleResult<Vec<(u64, Value)>> {
         let mut completed = Vec::new();
         for (id, payload) in self.store.tick(|command| runtime.send(command))? {

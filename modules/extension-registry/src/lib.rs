@@ -33,6 +33,7 @@ struct Registry {
     runtime: RuntimeClient,
     policy: policy::Settings,
     settings: settings_service::SettingsService,
+    quiescing: bool,
 }
 
 impl ManagedModule for Registry {
@@ -50,12 +51,16 @@ impl ManagedModule for Registry {
             runtime,
             policy,
             settings: settings_service::SettingsService::default(),
+            quiescing: false,
         })
     }
 
     fn tick(&mut self) -> ModuleResult<()> {
         for (id, payload) in self.settings.tick(&self.runtime)? {
             self.complete(id, payload)?;
+        }
+        if self.quiescing {
+            return Ok(());
         }
         match self.runtime.send(Command::Poll {})? {
             Response::Pending => Ok(()),
@@ -101,6 +106,19 @@ impl ManagedModule for Registry {
             }
             other => Err(format!("unexpected registry poll response: {other:?}")),
         }
+    }
+
+    fn prepare_shutdown(&mut self, _remaining_ms: u64) -> ModuleResult<()> {
+        self.quiescing = true;
+        Ok(())
+    }
+
+    fn quiesce(&mut self) -> ModuleResult<bool> {
+        self.quiescing = true;
+        for (id, payload) in self.settings.tick(&self.runtime)? {
+            self.complete(id, payload)?;
+        }
+        Ok(self.settings.is_idle())
     }
 }
 

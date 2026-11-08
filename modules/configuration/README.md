@@ -83,6 +83,10 @@ Existing documents remain readable without conversion. `register`, `get`, and
 migration with its old expected revision fails, so reload after an ambiguous
 mutation timeout rather than blindly retrying.
 
+The caller-scoped `product_get` operation only reads the existing product
+document; it does not create, migrate, or update it. `product_update` performs
+the corresponding revision-checked mutation.
+
 ## Change notifications
 
 The module needs a publish grant for `amaterasu.configuration.changed/1`.

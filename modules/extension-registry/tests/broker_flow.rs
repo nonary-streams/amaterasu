@@ -194,6 +194,26 @@ impl Harness {
         assert_eq!(unsafe { (self.api.tick)(self.instance) }, abi::STATUS_OK);
     }
 
+    fn prepare_shutdown(&mut self) {
+        // SAFETY: the shutdown API belongs to this module and borrows its live instance.
+        let shutdown = unsafe { *amaterasu_extension_registry::amaterasu_module_shutdown_v1() };
+        assert_eq!(
+            unsafe { (shutdown.prepare)(self.instance, 20_000) },
+            abi::STATUS_OK
+        );
+    }
+
+    fn quiesce(&mut self) -> bool {
+        // SAFETY: the quiesce API belongs to this module and borrows its live instance.
+        let quiesce = unsafe { *amaterasu_extension_registry::amaterasu_module_quiesce_v1() };
+        let mut ready = 0;
+        assert_eq!(
+            unsafe { (quiesce.poll)(self.instance, &mut ready) },
+            abi::STATUS_OK
+        );
+        ready == 1
+    }
+
     fn pump_providers(&mut self) {
         let scope_request = self
             .broker
@@ -427,6 +447,87 @@ fn stalled_provider_never_commits_settings_after_request_deadline() {
     assert!(
         !matches!(harness.broker.borrow_mut().dispatch("management", Command::TakeResult {request:id}),Response::Result {payload} if payload["ok"] == true)
     );
+}
+
+#[test]
+fn quiesce_drains_queued_settings_writes_and_stops_new_admission() {
+    let mut harness = Harness::new();
+    let update = json!({"operation":"settings_update","provider":"example.demo","scope":{"kind":"host"},"expected_revision":0,"values":{}});
+    let Response::Accepted { id: update_id } = harness.broker.borrow_mut().dispatch(
+        "management",
+        Command::Request {
+            service: SERVICE.into(),
+            payload: update,
+            timeout_ms: 5_000,
+            operation_id: "shutdown-update".into(),
+            parent: None,
+        },
+    ) else {
+        panic!("settings update was not accepted");
+    };
+    harness.tick();
+    harness.prepare_shutdown();
+
+    let Response::Accepted { id: late_id } = harness.broker.borrow_mut().dispatch(
+        "management",
+        Command::Request {
+            service: SERVICE.into(),
+            payload: json!({"operation":"settings_get","provider":"example.demo","scope":{"kind":"host"},"application":null,"paired_client":null,"session":null}),
+            timeout_ms: 5_000,
+            operation_id: "after-shutdown-announcement".into(),
+            parent: None,
+        },
+    ) else {
+        panic!("late request was not accepted for the sealing check");
+    };
+    harness.tick();
+    assert!(matches!(
+        harness
+            .broker
+            .borrow_mut()
+            .dispatch("management", Command::TakeResult { request: late_id }),
+        Response::Pending
+    ));
+
+    assert!(
+        !harness.quiesce(),
+        "queued state read must keep the module alive"
+    );
+    for _ in 0..16 {
+        harness.pump_providers();
+        if harness.quiesce() {
+            break;
+        }
+    }
+    assert!(
+        harness.quiesce(),
+        "settings validation and CAS write must retire"
+    );
+
+    let Response::Result { payload } = harness
+        .broker
+        .borrow_mut()
+        .dispatch("management", Command::TakeResult { request: update_id })
+    else {
+        panic!("accepted settings update did not complete during quiesce");
+    };
+    assert_eq!(payload["ok"], true);
+    assert_eq!(payload["revision"], 1);
+    assert_eq!(harness.state.as_ref().unwrap()["revision"], 1);
+    assert!(matches!(
+        harness
+            .broker
+            .borrow_mut()
+            .dispatch("management", Command::Cancel { request: late_id }),
+        Response::Ok
+    ));
+    assert!(matches!(
+        harness
+            .broker
+            .borrow_mut()
+            .dispatch("management", Command::ReleaseResult { request: late_id }),
+        Response::Ok
+    ));
 }
 
 #[test]

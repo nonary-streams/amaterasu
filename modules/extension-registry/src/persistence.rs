@@ -36,6 +36,10 @@ pub struct Store {
 }
 
 impl Store {
+    pub fn is_idle(&self) -> bool {
+        self.queue.is_empty() && self.pending.is_none()
+    }
+
     pub fn get(&mut self, parent: u64, key: String, deadline: Instant) -> Result<(), Value> {
         self.enqueue(parent, deadline, json!({"action":"get", "key":key}))
     }

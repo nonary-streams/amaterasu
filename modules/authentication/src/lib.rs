@@ -41,6 +41,16 @@ impl ManagedModule for AuthenticationModule {
         self.pipeline
             .tick(|command| self.runtime.send_ephemeral(command))
     }
+
+    fn prepare_shutdown(&mut self, _remaining_ms: u64) -> ModuleResult<()> {
+        self.pipeline.prepare_shutdown();
+        Ok(())
+    }
+
+    fn quiesce(&mut self) -> ModuleResult<bool> {
+        self.pipeline
+            .quiesce(|command| self.runtime.send_ephemeral(command))
+    }
 }
 
 amaterasu_module_sdk::export_module!(AuthenticationModule);

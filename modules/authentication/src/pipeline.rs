@@ -75,6 +75,7 @@ pub struct Pipeline {
     engine: Engine,
     bootstrap_lifetimes: TokenLifetimes,
     pending: Option<Pending>,
+    quiescing: bool,
 }
 
 impl Pipeline {
@@ -84,6 +85,7 @@ impl Pipeline {
             engine: Engine::new(settings),
             bootstrap_lifetimes,
             pending: None,
+            quiescing: false,
         }
     }
 
@@ -102,6 +104,9 @@ impl Pipeline {
     ) -> ModuleResult<()> {
         if let Some(pending) = self.pending.take() {
             return self.advance(pending, now, &mut send);
+        }
+        if self.quiescing {
+            return Ok(());
         }
         // One request at a time: state CAS operations cannot race internally and
         // plaintext passwords are never accumulated in another application queue.
@@ -220,6 +225,30 @@ impl Pipeline {
                 failure_for_stage(&stage, "invalid_response"),
             ),
         }
+    }
+
+    pub fn prepare_shutdown(&mut self) {
+        self.quiescing = true;
+    }
+
+    pub fn quiesce_at(
+        &mut self,
+        now: u64,
+        mut send: impl FnMut(Command) -> Transport,
+    ) -> ModuleResult<bool> {
+        self.quiescing = true;
+        if let Some(pending) = self.pending.take() {
+            self.advance(pending, now, &mut send)?;
+        }
+        Ok(self.pending.is_none())
+    }
+
+    pub fn quiesce(&mut self, send: impl FnMut(Command) -> Transport) -> ModuleResult<bool> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| "authentication clock failure")?
+            .as_secs();
+        self.quiesce_at(now, send)
     }
 
     fn submit_state_mutation(
