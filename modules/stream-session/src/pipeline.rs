@@ -158,6 +158,13 @@ impl Pipeline {
             && self.recovery_ids.is_empty()
     }
 
+    fn admission_ready(&self) -> bool {
+        // Loading the inventory establishes distinct identities for new work.
+        // Failed cleanup remains owned by its old record; completing it is not
+        // a prerequisite for admitting an independent session.
+        self.journal.loaded && !self.journal.failed && self.recovery_initialized
+    }
+
     /// Unload cannot drive asynchronous provider cleanup. Release native bindings
     /// and settle broker work; active provider resources require their own unload.
     pub fn shutdown(&mut self, runtime: &RuntimeClient) {
@@ -433,9 +440,9 @@ impl Pipeline {
             }
             return Ok(());
         }
-        if !self.recovery_ready || self.recovery_blocked || self.journal.failed {
-            // Keep the module responsive, but never admit new launch state while
-            // durable recovery is unreadable or an owned resource is uncertain.
+        if !self.admission_ready() {
+            // Unreadable or uncertain journal writes cannot record new ownership.
+            // An individual old cleanup failure does not enter this branch.
             match send(Command::Poll {})? {
                 Response::Request {
                     id,

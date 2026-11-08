@@ -77,7 +77,7 @@ fn legacy_effect_intent_is_retained_and_never_reported_as_clean() {
 }
 
 #[test]
-fn uncertain_restart_cleanup_keeps_journal_and_blocks_new_sessions() {
+fn uncertain_restart_cleanup_keeps_journal_without_blocking_new_sessions() {
     const RECORD_ID: u64 = 0xabcd;
     let mut host = Harness::with_restart_state(journal_with_owned_session(RECORD_ID), 7);
     host.broker.seed_session("ss-abcd-session");
@@ -90,9 +90,9 @@ fn uncertain_restart_cleanup_keeps_journal_and_blocks_new_sessions() {
         host.broker.state_value.as_ref().unwrap()["entries"]["43981"]["record_id"],
         RECORD_ID
     );
-    let denied = host.response(1, prepare());
-    assert_eq!(denied["code"], "restart_recovery_unconfirmed");
-    assert!(!host.broker.calls.iter().any(|call| {
+    let admitted = host.response(1, prepare());
+    assert_eq!(admitted["state"], "prepared");
+    assert!(host.broker.calls.iter().any(|call| {
         call.payload["action"] == "create" && call.service == "amaterasu.session/1"
     }));
 }
@@ -268,10 +268,7 @@ fn restart_keeps_virtual_display_reference_when_topology_restore_is_unconfirmed(
             .contains("original-stream-reference")
     );
     assert_eq!(host.broker.state_revision, 7);
-    assert_eq!(
-        host.response(1, prepare())["code"],
-        "restart_recovery_unconfirmed"
-    );
+    assert_eq!(host.response(1, prepare())["state"], "prepared");
     assert!(!host.broker.calls.iter().any(|call| {
         (call.service == "amaterasu.virtual-display/1" && call.payload["action"] == "remove")
             || (call.service == "amaterasu.display/1" && call.payload["action"] == "restore")
@@ -312,7 +309,7 @@ fn restart_retires_native_resources_before_reconciling_external_lifecycle() {
 }
 
 #[test]
-fn rejected_restart_lifecycle_cleanup_keeps_the_original_journal_and_blocks_relaunch() {
+fn rejected_restart_lifecycle_cleanup_keeps_the_original_journal_and_allows_relaunch() {
     let mut document = journal_with_owned_session(0xabcd);
     document["entries"]["43981"]["attempted_resources"] = json!([]);
     document["entries"]["43981"]["lifecycle_recovery"] = json!({"version":1,
@@ -324,8 +321,5 @@ fn rejected_restart_lifecycle_cleanup_keeps_the_original_journal_and_blocks_rela
     host.broker.lifecycle_reject_operation = Some("retire_stream".into());
     host.idle();
     assert_eq!(host.broker.state_value, Some(original));
-    assert_eq!(
-        host.response(1, prepare())["code"],
-        "restart_recovery_unconfirmed"
-    );
+    assert_eq!(host.response(1, prepare())["state"], "prepared");
 }

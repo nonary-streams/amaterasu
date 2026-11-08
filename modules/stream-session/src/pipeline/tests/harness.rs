@@ -63,6 +63,7 @@ pub struct Broker {
     pub fail_cancel: bool,
     pub fail_open: Option<String>,
     pub fail_close: Option<String>,
+    pub cleanup_failure: Option<(String, String)>,
     pub fail_session_stop: bool,
     pub fail_audio_recover: bool,
     pub malformed_audio_recover: bool,
@@ -508,6 +509,15 @@ impl Broker {
         }
         let action = call.payload["action"].as_str().unwrap();
         let service = call.service.as_str();
+        if self
+            .cleanup_failure
+            .as_ref()
+            .is_some_and(|(failed_service, failed_action)| {
+                failed_service == service && failed_action == action
+            })
+        {
+            return error("injected_cleanup_failure");
+        }
         if service == "amaterasu.video/1" && action == "observe_capture" {
             let observation=self.lifecycle_observation_override.clone().unwrap_or_else(|| json!({"protocol":"wayland-wl-output","registry_global":4,"output_name":"Virtual-12"}));
             return json!({"ok":true,"stream":call.payload["stream"],"observed_capture":observation});

@@ -88,13 +88,6 @@
 
 ## Installed stream recovery and package updates
 
-- A previous stream's failed cleanup must never block a new stream. Quarantine
-  failed ownership by session and resource generation, retain its recovery
-  evidence, and admit new work with independent resources. Recovery continues
-  separately and must never report unfinished cleanup as completed or allow
-  an old cleanup operation to mutate a new stream's resources. Cover failed
-  start, disconnect, restart and repeated-failure cases in admission tests.
-
 - A request to install locally authorizes preparing, signing with the existing
   local publisher key, importing and activating that local candidate. Do not
   require a shared repository publication or a separate signing approval for

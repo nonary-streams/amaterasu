@@ -44,12 +44,7 @@ impl Pipeline {
             rpc::complete(send, request, error("host_stopping"));
             return;
         }
-        if opens_session
-            && (!self.journal.loaded
-                || self.journal.failed
-                || !self.recovery_ready
-                || self.recovery_blocked)
-        {
+        if opens_session && !self.admission_ready() {
             rpc::complete(send, request, error("restart_recovery_unconfirmed"));
             return;
         }
@@ -220,7 +215,7 @@ impl Pipeline {
             || self
                 .records
                 .values()
-                .filter(|record| !record.state.terminal())
+                .filter(|record| !record.state.terminal() && record.state != State::CleanupFailed)
                 .count()
                 >= self.settings.max_live_sessions
         {

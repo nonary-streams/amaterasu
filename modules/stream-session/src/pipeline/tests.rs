@@ -1,5 +1,6 @@
 mod armed;
 mod auxiliary;
+mod cleanup_admission;
 mod display;
 mod display_order;
 mod harness;
