@@ -390,9 +390,22 @@ impl Job {
                     .lifecycle
                     .clone()
                     .expect("selected lifecycle service"),
-                json!({"operation":"read_frozen_provider_settings",
-                    "target":record.start.as_ref().expect("start").lifecycle_target,
-                    "provider":record.processing_plan_provider.as_ref().expect("provider").provider}),
+                json!(
+                    amaterasu_module_sdk::requests::frozen_provider_settings_request(
+                        record
+                            .start
+                            .as_ref()
+                            .expect("start")
+                            .lifecycle_target
+                            .clone()
+                            .expect("validated lifecycle target"),
+                        &record
+                            .processing_plan_provider
+                            .as_ref()
+                            .expect("provider")
+                            .provider,
+                    )
+                ),
             ),
             Step::PlanGpuProcessing => {
                 let plan = record.processing_plan_provider.as_ref().expect("provider");

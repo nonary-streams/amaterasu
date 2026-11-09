@@ -151,6 +151,40 @@ pub struct MethodSettings {
     pub schema_revision: u64,
 }
 
+impl From<MethodRef> for MethodSettings {
+    fn from(method: MethodRef) -> Self {
+        Self {
+            service: method.service,
+            method: method.method,
+            interface_major: method.interface_major,
+            interface_minor: method.interface_minor,
+            schema_revision: method.schema_revision,
+        }
+    }
+}
+
+impl From<amaterasu_module_sdk::processing_composition::LifecycleParticipant>
+    for ParticipantSettings
+{
+    fn from(
+        declaration: amaterasu_module_sdk::processing_composition::LifecycleParticipant,
+    ) -> Self {
+        Self {
+            provider: declaration.provider,
+            contract_version: declaration.contract_version,
+            depends_on: declaration.depends_on,
+            plan_method: declaration.plan_method.into(),
+            callback_method: declaration.callback_method.into(),
+            status_method: declaration.status_method.into(),
+            binding_validate_method: declaration.binding_validate_method.map(Into::into),
+            capabilities: declaration.capabilities,
+            cleanup_methods: declaration.cleanup_methods,
+            settings_revision: declaration.settings_revision,
+            settings: declaration.settings,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct ConsumerSettings {
@@ -251,11 +285,7 @@ impl LifecycleSettings {
                 .insert("read_prepared_plans".into());
         }
         for registration in &composition.registrations {
-            let declaration = sdk::lifecycle_participant(registration)?;
-            let participant: ParticipantSettings = serde_json::from_value(
-                serde_json::to_value(declaration).map_err(|error| error.to_string())?,
-            )
-            .map_err(|error| format!("invalid processing participant: {error}"))?;
+            let participant = ParticipantSettings::from(sdk::lifecycle_participant(registration)?);
             if self
                 .participants
                 .iter()

@@ -560,11 +560,7 @@ pub fn processing_intent_payload(
     settings: &Value,
     output_hdr: Option<bool>,
 ) -> ModuleResult<Value> {
-    if revision.is_empty()
-        || revision.len() > 128
-        || revision.chars().any(char::is_control)
-        || !settings.is_object()
-    {
+    if !crate::processing_provider::valid_intent_revision(revision) || !settings.is_object() {
         return Err("invalid processing intent".into());
     }
     let mut payload = serde_json::json!({"target":target,"revision":revision,"settings":settings});
@@ -572,6 +568,19 @@ pub fn processing_intent_payload(
         payload["output_hdr"] = Value::Bool(output_hdr);
     }
     Ok(payload)
+}
+
+/// Build a frozen-settings read for a consumer that dispatches requests from
+/// its own workflow instead of calling `request_frozen_provider_settings`.
+pub fn frozen_provider_settings_request(
+    target: crate::extension_api::LifecycleTarget,
+    provider: &str,
+) -> crate::extension_api::FrozenProviderSettingsRequest {
+    crate::extension_api::FrozenProviderSettingsRequest {
+        operation: "read_frozen_provider_settings".into(),
+        target,
+        provider: provider.into(),
+    }
 }
 
 #[cfg(test)]
@@ -717,14 +726,7 @@ impl RuntimeClient {
         target: crate::extension_api::LifecycleTarget,
         provider: &str,
     ) -> ModuleResult<u64> {
-        self.request_serialized(
-            options,
-            &crate::extension_api::FrozenProviderSettingsRequest {
-                operation: "read_frozen_provider_settings".into(),
-                target,
-                provider: provider.into(),
-            },
-        )
+        self.request_serialized(options, &frozen_provider_settings_request(target, provider))
     }
 
     /// Request a provider's live-adjustable settings for an exact stream.
