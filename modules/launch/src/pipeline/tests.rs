@@ -1497,6 +1497,59 @@ fn signed_principals_attest_frozen_display_policy_and_reject_changed_or_revoked_
 }
 
 #[test]
+fn display_admission_follows_the_selected_owner_and_verifier() {
+    let mut harness = Harness::new();
+    let mut pipeline = Pipeline::new(BTreeMap::new()).unwrap();
+    pipeline.set_display_admission_principals(
+        Some("example.launcher".into()),
+        Some("example.verifier".into()),
+    );
+    let preflight = harness.request(
+        &mut pipeline,
+        "example.launcher",
+        json!({"action":"preflight_export","operation_id":"selected-app",
+            "app_id":"app-0000000000000001"}),
+    );
+    assert_eq!(preflight["ok"], true, "{preflight}");
+    let prepare = json!({
+        "action":"prepare_display_admission",
+        "application_operation_id":"selected-app",
+        "global_revision":null,
+        "global_overrides":{},
+        "catalog_revision":preflight["catalog_revision"],
+        "application_display_overrides":{},
+        "certificate_id":"cd".repeat(32),
+        "client_display_overrides":{},
+        "rtsp_operation_id":"selected-rtsp",
+        "request_sha256":"ab".repeat(32),
+    });
+    assert_eq!(
+        harness.request(&mut pipeline, "amaterasu.nvhttp", prepare.clone())["code"],
+        "display_admission_denied"
+    );
+    let admission = harness.request(&mut pipeline, "example.launcher", prepare);
+    assert_eq!(admission["ok"], true, "{admission}");
+    let verify = json!({
+        "action":"verify_display_admission",
+        "token":admission["display_admission_token"],
+        "application_operation_id":"selected-app",
+        "rtsp_operation_id":"selected-rtsp",
+        "request_sha256":"ab".repeat(32),
+        "display_policy_snapshot":admission["display_policy_snapshot"],
+        "certificate_id":"cd".repeat(32),
+        "catalog_revision":preflight["catalog_revision"],
+    });
+    assert_eq!(
+        harness.request(&mut pipeline, "amaterasu.rtsp", verify.clone())["code"],
+        "display_admission_denied"
+    );
+    assert_eq!(
+        harness.request(&mut pipeline, "example.verifier", verify)["verified"],
+        true
+    );
+}
+
+#[test]
 fn staged_display_admission_expires_or_stops_before_launch() {
     let mut harness = Harness::new();
     let mut pipeline = Pipeline::new(BTreeMap::new()).unwrap();

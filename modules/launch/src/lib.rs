@@ -97,6 +97,10 @@ impl ManagedModule for LaunchModule {
         pipeline.set_provider_routes(settings.provider_routes);
         pipeline.set_library_routes(settings.library_routes);
         pipeline.set_prepared_context_service(settings.prepared_context_service);
+        pipeline.set_display_admission_principals(
+            settings.display_admission_owner,
+            settings.display_admission_verifier,
+        );
         runtime.require_success(Command::Register {
             service: SERVICE.into(),
         })?;

@@ -44,6 +44,9 @@ pub struct Settings {
     pub address_family: Option<AddressFamily>,
     pub bind_address: Option<String>,
     pub allowed_principals: Vec<String>,
+    /// The principal signed startup trusts to configure the listener and bind
+    /// lifecycle, history and display admissions to its launches.
+    pub launch_owner: String,
     /// Installed observers may only read generation-bound transport retirement.
     pub retirement_status_principals: Vec<String>,
     /// Each observer is pinned to an original transport owner by signed startup.
@@ -62,6 +65,7 @@ impl Default for Settings {
             address_family: None,
             bind_address: None,
             allowed_principals: Vec::new(),
+            launch_owner: "amaterasu.nvhttp".into(),
             retirement_status_principals: Vec::new(),
             retirement_status_owners: BTreeMap::new(),
             max_live_tickets: 2,
@@ -76,6 +80,7 @@ impl Settings {
             .is_some_and(|service| !amaterasu_contracts::valid_name(service))
             || self.allowed_principals.len() > 16
             || self.allowed_principals.iter().any(|name| !valid_name(name))
+            || !valid_name(&self.launch_owner)
             || self.retirement_status_principals.len() > 16
             || self
                 .retirement_status_principals

@@ -60,7 +60,7 @@ impl Controller {
                 address_family,
                 bind_address,
             } => {
-                if caller != "amaterasu.nvhttp" {
+                if caller != self.settings.launch_owner {
                     rpc::complete(runtime, request, error("permission_denied"));
                 } else if self.quiescence.is_some() || self.shutdown_deadline.is_some() {
                     rpc::complete(runtime, request, error("module_quiescing"));
@@ -169,7 +169,7 @@ impl Controller {
             rpc::complete(runtime, request, error("lifecycle_provider_not_selected"));
             return;
         }
-        if config.lifecycle_session_target.is_some() && caller != "amaterasu.nvhttp" {
+        if config.lifecycle_session_target.is_some() && caller != self.settings.launch_owner {
             rpc::complete(runtime, request, error("permission_denied"));
             return;
         }
@@ -177,7 +177,7 @@ impl Controller {
             .history_activity_id
             .as_deref()
             .is_some_and(|activity_id| {
-                caller != "amaterasu.nvhttp" || activity_id != config.operation_id
+                caller != self.settings.launch_owner || activity_id != config.operation_id
             })
         {
             rpc::complete(runtime, request, error("history_activity_denied"));
@@ -223,7 +223,7 @@ impl Controller {
                 rpc::complete(runtime, request, error("display_admission_unavailable"));
                 return;
             }
-            if caller != "amaterasu.nvhttp" {
+            if caller != self.settings.launch_owner {
                 rpc::complete(runtime, request, error("permission_denied"));
                 return;
             }

@@ -90,6 +90,8 @@ pub struct Pipeline {
     provider_routes: BTreeMap<String, ProviderRoute>,
     library_routes: BTreeMap<String, crate::library::Route>,
     prepared_context_service: Option<String>,
+    display_admission_owner: String,
+    display_admission_verifier: String,
     quiescing: bool,
     shutdown_deadline: Option<Instant>,
 }
@@ -107,6 +109,8 @@ impl Pipeline {
             provider_routes: BTreeMap::new(),
             library_routes: BTreeMap::new(),
             prepared_context_service: None,
+            display_admission_owner: "amaterasu.nvhttp".into(),
+            display_admission_verifier: "amaterasu.rtsp".into(),
             quiescing: false,
             shutdown_deadline: None,
         })
@@ -125,6 +129,20 @@ impl Pipeline {
 
     pub fn set_prepared_context_service(&mut self, service: Option<String>) {
         self.prepared_context_service = service;
+    }
+
+    /// Absent selections keep the principals of the standard Linux composition.
+    pub fn set_display_admission_principals(
+        &mut self,
+        owner: Option<String>,
+        verifier: Option<String>,
+    ) {
+        if let Some(owner) = owner {
+            self.display_admission_owner = owner;
+        }
+        if let Some(verifier) = verifier {
+            self.display_admission_verifier = verifier;
+        }
     }
 
     fn verify_retirement(
@@ -905,7 +923,7 @@ impl Pipeline {
                 request_sha256,
                 virtual_display_intent,
             } => {
-                if caller != "amaterasu.nvhttp"
+                if caller != self.display_admission_owner
                     || (global_revision.is_none() && !global_overrides.is_empty())
                 {
                     return complete(send, request, error("display_admission_denied"));
@@ -998,12 +1016,12 @@ impl Pipeline {
                 certificate_id,
                 catalog_revision,
             } => {
-                if caller != "amaterasu.rtsp" {
+                if caller != self.display_admission_verifier {
                     return complete(send, request, error("display_admission_denied"));
                 }
                 let now = Instant::now();
                 let remaining_ms = self.records.values.values().find_map(|record| {
-                    let verified = record.owner == "amaterasu.nvhttp"
+                    let verified = record.owner == self.display_admission_owner
                         && record.operation_id == application_operation_id
                         && display_admission_eligible(record, now)
                         && record.catalog_revision == Some(catalog_revision)

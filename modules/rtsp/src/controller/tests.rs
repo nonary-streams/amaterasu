@@ -2389,6 +2389,37 @@ fn network_configuration_is_restricted_to_nvhttp_and_reports_disabled_listener_s
 }
 
 #[test]
+fn network_configuration_follows_the_selected_launch_owner() {
+    let _guard = NETWORK_TEST_LOCK.lock().unwrap();
+    let settings = Settings {
+        enabled: true,
+        bind: "127.0.0.1:0".parse().unwrap(),
+        launch_owner: "example.launcher".into(),
+        ..Settings::default()
+    };
+    let mut controller = Controller::new(settings).expect("listener");
+    let mut endpoint = Endpoint::default();
+    let runtime = client(&mut endpoint);
+    let port = free_base_port();
+    for (request, caller) in [(10, "amaterasu.nvhttp"), (11, "example.launcher")] {
+        controller.receive(
+            request,
+            caller.into(),
+            Operation::NetworkConfigure {
+                port,
+                address_family: None,
+                bind_address: None,
+            },
+            0,
+            5_000,
+            &runtime,
+        );
+    }
+    assert_eq!(endpoint.completions[0].1["code"], "permission_denied");
+    assert_eq!(endpoint.completions[1].1["ok"], true);
+}
+
+#[test]
 fn network_port_update_rejects_occupied_tcp_and_udp_targets_then_retries() {
     let _guard = NETWORK_TEST_LOCK.lock().unwrap();
     for occupied_udp_offset in [None, Some(9), Some(10), Some(11)] {

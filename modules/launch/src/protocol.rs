@@ -2032,6 +2032,10 @@ pub struct Settings {
     pub library_routes: BTreeMap<String, crate::library::Route>,
     /// Trusted startup selection; callers cannot substitute the context provider.
     pub prepared_context_service: Option<String>,
+    /// Trusted startup selection of the display-admission launch owner.
+    pub display_admission_owner: Option<String>,
+    /// Trusted startup selection of the display-admission verifier.
+    pub display_admission_verifier: Option<String>,
 }
 impl Settings {
     pub fn resolved_environment(
@@ -2063,6 +2067,16 @@ impl Settings {
                     .strip_suffix("/1")
                     .is_none_or(|name| !valid_catalog_principal(name))
             })
+        {
+            return Err("invalid_launch_settings");
+        }
+        if [
+            &self.display_admission_owner,
+            &self.display_admission_verifier,
+        ]
+        .into_iter()
+        .flatten()
+        .any(|principal| !valid_catalog_principal(principal))
         {
             return Err("invalid_launch_settings");
         }
