@@ -97,6 +97,10 @@ def configure(harness, custom_capture=False, direct=False, generic_cpu=False):
     settings["amaterasu.stream-session"] = {
         "enabled": True, "enable_input": False,
         "allowed_principals": ["amaterasu.rtsp"],
+        # These trusted fixture callers supply authenticated client features
+        # and own launch history, respectively, as in production composition.
+        "lifecycle_admitters": ["amaterasu.rtsp"],
+        "history_owners": ["amaterasu.nvhttp"],
     }
     settings["amaterasu.capture-source"] = {"custom_service": True} if custom_capture else {}
     settings["amaterasu.software-probe-audio"] = {"enable_video": False}
