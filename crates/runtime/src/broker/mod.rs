@@ -171,6 +171,12 @@ impl Broker {
                 "runtime_endpoint_required",
                 "readiness hints require the runtime endpoint",
             ),
+            Command::TraceBind {} | Command::TraceSnapshot {} | Command::CallDirect { .. } => {
+                Response::error(
+                    "runtime_endpoint_required",
+                    "trace sinks and direct calls require the runtime endpoint",
+                )
+            }
             Command::NativeRegister { .. }
             | Command::NativeBind { .. }
             | Command::NativeRegisterTyped { .. }
@@ -668,6 +674,40 @@ impl Broker {
                     .advance(caller, grants, invocation, now, &mut self.requests)
             }
         }
+    }
+
+    /// Applies the checks of an ordinary `Request` and names the provider a
+    /// direct call would reach. It admits nothing and retains no request.
+    pub(crate) fn direct_call_provider(
+        &self,
+        caller: &str,
+        service: &str,
+        payload_bytes: usize,
+    ) -> Result<String, Response> {
+        let Some(grants) = self.configuration.principals.get(caller) else {
+            return Err(errors::permission_denied());
+        };
+        if caller == HOST_LIFECYCLE_CONTROL_PRINCIPAL
+            || service == HOST_LOG_SERVICE
+            || self.api.owns_service(service)
+            || !grants.call.contains(service)
+        {
+            return Err(errors::permission_denied());
+        }
+        if !errors::payload_size_fits(payload_bytes) {
+            return Err(Response::error("invalid_request", "payload is too large"));
+        }
+        self.requests
+            .provider_of(service)
+            .map(str::to_owned)
+            .ok_or_else(|| Response::error("unavailable", "service is not registered"))
+    }
+
+    /// Recent flow-trace history may name every module, so only the management
+    /// surface and the diagnostics component may read it.
+    pub(crate) fn may_read_trace(&self, caller: &str) -> bool {
+        self.configuration.principals.contains_key(caller)
+            && (caller == "amaterasu.management" || caller == DIAGNOSTICS_COMPONENT)
     }
 
     pub(crate) fn record_diagnostic(&mut self, target: &str, report: String) {

@@ -1,8 +1,10 @@
 //! Library ownership stays here; policy and feature behavior stay in managed libraries.
+use crate::host_trace::{HostTrace, ModuleCall};
 use amaterasu_abi::{
-    AbiHeader, BorrowedBytes, HostApi, ModuleApi, ModuleEntry, ModuleQuiesceApi,
-    ModuleQuiesceEntry, ModuleShutdownApi, ModuleShutdownEntry, RuntimeApi, RuntimeEntry,
-    RuntimeWaitApi, RuntimeWaitEntry, STATUS_OK, Status,
+    AbiHeader, BorrowedBytes, HostApi, ModuleApi, ModuleDirectApi, ModuleDirectEntry, ModuleEntry,
+    ModuleQuiesceApi, ModuleQuiesceEntry, ModuleShutdownApi, ModuleShutdownEntry, RuntimeApi,
+    RuntimeDirectApi, RuntimeDirectEntry, RuntimeEntry, RuntimeWaitApi, RuntimeWaitEntry,
+    STATUS_OK, Status,
 };
 use amaterasu_contracts::{
     Command, HOST_LIFECYCLE_CONTROL_PRINCIPAL, HOST_LOG_SERVICE, HOST_MODULE_SHUTDOWN_TIMEOUT_MS,
@@ -189,6 +191,7 @@ struct LoadedGraph {
     pending_log_policy: Option<HostLogEvent>,
     log_loss: LogLoss,
     lifecycle_endpoint: HostApi,
+    trace: HostTrace,
     runtime: RuntimeLibrary,
 }
 
@@ -317,6 +320,7 @@ impl LoadedComponents {
                     &component.id,
                     component.requires.keys().cloned().collect(),
                     &endpoint,
+                    runtime.direct_calls(),
                 )
             },
             progress,
@@ -344,6 +348,7 @@ impl LoadedComponents {
                 host_logs_enabled,
                 pending_log_policy: None,
                 log_loss: LogLoss::default(),
+                trace: HostTrace::bind(&lifecycle_endpoint),
                 lifecycle_endpoint,
                 runtime,
             })),
@@ -355,7 +360,8 @@ impl LoadedComponents {
         };
         progress(1)?;
         for (index, component) in components.into_iter().enumerate() {
-            let module = load(&mut loaded.graph.runtime, component)?;
+            let mut module = load(&mut loaded.graph.runtime, component)?;
+            module.trace_label = loaded.graph.trace.label(&module.id);
             loaded.graph.modules.push(module);
             progress(index + 2)?;
         }
@@ -529,25 +535,38 @@ impl LoadedComponents {
     }
     pub fn wait_for_work(&self, observed: u64, timeout: std::time::Duration) -> PackageResult<()> {
         self.process.require_usable()?;
+        let started = std::time::Instant::now();
         let Some(api) = self.graph.runtime.wait_api else {
             std::thread::sleep(timeout);
+            self.graph.trace.wait(started);
             return Ok(());
         };
         let micros = timeout.as_micros().min(1_000_000) as u64;
         // SAFETY: the selected runtime is retained until the bounded wait returns.
-        require_success(
-            unsafe { (api.wait)(self.graph.runtime.instance, observed, micros) },
-            "wait for runtime work",
-        )
+        let status = unsafe { (api.wait)(self.graph.runtime.instance, observed, micros) };
+        self.graph.trace.wait(started);
+        require_success(status, "wait for runtime work")
     }
 
     pub fn tick(&mut self) -> PackageResult<()> {
         self.process.require_usable()?;
-        for module in &mut self.graph.modules {
-            module.tick()?;
+        let graph = &mut **self.graph;
+        let pass_started = std::time::Instant::now();
+        let mut call_started = pass_started;
+        for module in &mut graph.modules {
+            let result = module.tick();
+            let call_ended = std::time::Instant::now();
+            graph.trace.module_call(
+                ModuleCall::Tick,
+                module.trace_label,
+                call_ended.saturating_duration_since(call_started),
+            );
+            call_started = call_ended;
+            result?;
         }
         self.drain_log_events();
         self.service_host_logs();
+        self.graph.trace.pass(pass_started);
         Ok(())
     }
 
@@ -721,8 +740,17 @@ impl LoadedComponents {
 
     pub fn health(&self) -> PackageResult<()> {
         self.process.require_usable()?;
+        let mut call_started = std::time::Instant::now();
         for module in &self.graph.modules {
-            module.health()?;
+            let result = module.health();
+            let call_ended = std::time::Instant::now();
+            self.graph.trace.module_call(
+                ModuleCall::Health,
+                module.trace_label,
+                call_ended.saturating_duration_since(call_started),
+            );
+            call_started = call_ended;
+            result?;
         }
         Ok(())
     }
@@ -883,8 +911,17 @@ struct RuntimeLibrary {
     process: Arc<NativeProcessState>,
     api: RuntimeApi,
     wait_api: Option<RuntimeWaitApi>,
+    direct_api: Option<RuntimeDirectApi>,
     instance: *mut c_void,
     _library: Library,
+}
+
+/// The runtime's registry of module direct-call handlers. A copy is kept by
+/// each registered module so it can withdraw its handler before destruction.
+#[derive(Clone, Copy)]
+struct DirectCalls {
+    api: RuntimeDirectApi,
+    runtime: *mut c_void,
 }
 
 impl RuntimeLibrary {
@@ -906,6 +943,13 @@ impl RuntimeLibrary {
                 Err(_) => None,
             }
         };
+        // SAFETY: as for the wait contract, the header is validated before the tail.
+        let direct_api = unsafe {
+            match library.get::<RuntimeDirectEntry>(b"amaterasu_runtime_direct_v1\0") {
+                Ok(entry) => Some(read_api_table(entry())?),
+                Err(_) => None,
+            }
+        };
         let mut instance = std::ptr::null_mut();
         // SAFETY: configuration lives throughout create; output points to writable storage.
         let status = unsafe { (api.create)(BorrowedBytes::new(configuration), &mut instance) };
@@ -917,8 +961,16 @@ impl RuntimeLibrary {
             process: native_process_state(),
             api,
             wait_api,
+            direct_api,
             instance,
             _library: library,
+        })
+    }
+
+    fn direct_calls(&self) -> Option<DirectCalls> {
+        self.direct_api.map(|api| DirectCalls {
+            api,
+            runtime: self.instance,
         })
     }
 
@@ -956,6 +1008,10 @@ struct FeatureLibrary {
     quiesce_api: Option<ModuleQuiesceApi>,
     shutdown_api: Option<ModuleShutdownApi>,
     shutdown_prepared: bool,
+    /// Present while the runtime may route direct calls to this instance.
+    direct_calls: Option<DirectCalls>,
+    /// This module's interned name for host-thread spans; zero when untraced.
+    trace_label: u16,
     instance: *mut c_void,
     _library: Library,
 }
@@ -966,6 +1022,7 @@ impl FeatureLibrary {
         id: &str,
         dependencies: BTreeSet<String>,
         endpoint: &HostApi,
+        direct_calls: Option<DirectCalls>,
     ) -> PackageResult<Self> {
         let library = open_verified_library(path)?;
         // SAFETY: the verified native component promises this symbol and C table layout.
@@ -991,6 +1048,14 @@ impl FeatureLibrary {
                 Err(_) => None,
             }
         };
+        // SAFETY: an optional, separately versioned contract; its header is
+        // validated before the handler address is copied.
+        let direct_api: Option<ModuleDirectApi> = unsafe {
+            match library.get::<ModuleDirectEntry>(b"amaterasu_module_direct_v1\0") {
+                Ok(entry) => Some(read_api_table(entry())?),
+                Err(_) => None,
+            }
+        };
         let mut instance = std::ptr::null_mut();
         // SAFETY: the module borrows the table during creation and copies it if needed later.
         let status = unsafe { (api.create)(endpoint, &mut instance) };
@@ -998,16 +1063,46 @@ impl FeatureLibrary {
         if instance.is_null() {
             return Err(format!("module {id} returned a null instance"));
         }
-        Ok(Self {
+        let mut module = Self {
             id: id.to_owned(),
             dependencies,
             api,
             quiesce_api,
             shutdown_api,
             shutdown_prepared: false,
+            direct_calls: None,
+            trace_label: 0,
             instance,
             _library: library,
-        })
+        };
+        module.offer_direct_calls(direct_api, direct_calls);
+        Ok(module)
+    }
+
+    /// Lets the runtime route direct calls to this instance. The handler comes
+    /// from the verified library's own export, never from a control message.
+    /// A refusal only means consumers keep using queued requests.
+    fn offer_direct_calls(
+        &mut self,
+        module: Option<ModuleDirectApi>,
+        runtime: Option<DirectCalls>,
+    ) {
+        let (Some(module), Some(runtime)) = (module, runtime) else {
+            return;
+        };
+        // SAFETY: the instance and its library stay live until `Drop`
+        // unregisters on this same thread before destroying the instance.
+        let status = unsafe {
+            (runtime.api.register)(
+                runtime.runtime,
+                BorrowedBytes::new(self.id.as_bytes()),
+                self.instance,
+                module.call,
+            )
+        };
+        if status == STATUS_OK {
+            self.direct_calls = Some(runtime);
+        }
     }
 
     fn prepare_shutdown(&mut self, remaining_ms: u64) -> PackageResult<()> {
@@ -1057,6 +1152,13 @@ impl FeatureLibrary {
 
 impl Drop for FeatureLibrary {
     fn drop(&mut self) {
+        if let Some(direct) = self.direct_calls.take() {
+            // SAFETY: the runtime outlives every module. After this returns it
+            // never invokes the handler, so the instance can be destroyed.
+            unsafe {
+                (direct.api.unregister)(direct.runtime, BorrowedBytes::new(self.id.as_bytes()));
+            }
+        }
         // SAFETY: the host relinquishes this instance exactly once before unloading its library.
         unsafe { (self.api.destroy)(self.instance) };
     }

@@ -1,4 +1,5 @@
 use super::*;
+mod direct_and_trace;
 mod display_plugin_smoke;
 mod library_provider_smoke;
 use amaterasu_contracts::Grants;

@@ -9,6 +9,9 @@ pub type Status = i32;
 pub const STATUS_OK: Status = 0;
 pub const STATUS_INVALID_ARGUMENT: Status = 1;
 pub const STATUS_INTERNAL_ERROR: Status = 2;
+/// The callee is live but does not serve this operation here. Nothing happened;
+/// the caller may use another transport for the same operation.
+pub const STATUS_UNAVAILABLE: Status = 3;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -174,6 +177,16 @@ pub struct RuntimeApi {
 pub type ModuleEntry = unsafe extern "C" fn() -> *const ModuleApi;
 pub type RuntimeEntry = unsafe extern "C" fn() -> *const RuntimeApi;
 
+mod direct;
+mod trace;
+pub use direct::{
+    DirectCallHandler, ModuleDirectApi, ModuleDirectEntry, RuntimeDirectApi, RuntimeDirectEntry,
+};
+pub use trace::{
+    MAX_TRACE_NAME_BYTES, MAX_TRACE_RECORDS_PER_CALL, TRACE_END, TRACE_MARK, TRACE_SPAN,
+    TraceRecord, TraceSink, TraceSinkApi,
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -199,6 +212,14 @@ mod tests {
         assert_eq!(size_of::<ModuleQuiesceApi>(), 24);
         assert_eq!(size_of::<ModuleShutdownApi>(), 24);
         assert_eq!(size_of::<RuntimeApi>(), 40);
+        assert_eq!(size_of::<TraceRecord>(), 32);
+        assert_eq!(std::mem::offset_of!(TraceRecord, timestamp_us), 16);
+        assert_eq!(std::mem::offset_of!(TraceRecord, track), 24);
+        assert_eq!(std::mem::offset_of!(TraceRecord, kind), 28);
+        assert_eq!(size_of::<TraceSinkApi>(), 48);
+        assert_eq!(std::mem::offset_of!(TraceSinkApi, record), 40);
+        assert_eq!(size_of::<ModuleDirectApi>(), 24);
+        assert_eq!(size_of::<RuntimeDirectApi>(), 32);
         assert_eq!(size_of::<NativeInterface>(), 32);
         assert_eq!(size_of::<NativeInterfaceQuery>(), 24);
         assert_eq!(size_of::<NativeServiceFactory>(), 32);

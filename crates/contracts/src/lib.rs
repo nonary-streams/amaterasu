@@ -30,6 +30,10 @@ pub const HOST_PACKAGE_BARRIER_SERVICE: &str = "amaterasu.host-package-barrier/1
 /// It does not grant access to package metadata or host lifecycle commands.
 pub const HOST_STATE_CONTEXT_SERVICE: &str = "amaterasu.host-state-context/1";
 
+/// Error code of a direct call the provider did not serve. It proves that no
+/// provider effect happened, unlike a lost or timed-out broker request.
+pub const DIRECT_UNAVAILABLE: &str = "direct_unavailable";
+
 /// Reserved runtime endpoint identity injected by the verified host. Package
 /// component identities cannot use this name because it is not a valid name.
 pub const HOST_LIFECYCLE_CONTROL_PRINCIPAL: &str = "@amaterasu.host-lifecycle";
@@ -289,6 +293,21 @@ pub enum Command {
     GetProcessingComposition {},
     /// A bounded readiness hint; carries no provider data or effect authority.
     NotifyWorkReady {},
+    /// Returns this endpoint's flow trace sink. Older runtimes reject the
+    /// operation, which leaves tracing disabled for the caller.
+    TraceBind {},
+    /// Returns bounded recent flow-trace history: per-step windows, slow flows
+    /// and slow spans. Only management and Diagnostics may read it.
+    TraceSnapshot {},
+    /// Calls the registered provider of `service` synchronously on the calling
+    /// thread. Requires the same `call` grant as `Request`. The reply is
+    /// `Result`, or the `direct_unavailable` error when the provider does not
+    /// serve this operation directly; nothing was done in that case and the
+    /// caller may submit an ordinary request.
+    CallDirect {
+        service: String,
+        payload: Value,
+    },
     /// Returns host-owned context to the state service, and to the Linux audio
     /// module for its restart-safe cleanup journal. This prevents a module
     /// policy from impersonating a host decision through `GetSettings`.
@@ -462,6 +481,10 @@ pub struct ApiApprovalCursor {
 pub enum Response {
     NativeBound {
         binding: u64,
+        address: usize,
+    },
+    /// Process-local address of the caller's `TraceSinkApi` table.
+    TraceBound {
         address: usize,
     },
     Ok,

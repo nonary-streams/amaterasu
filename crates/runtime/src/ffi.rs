@@ -15,11 +15,24 @@ struct Endpoint {
     work: Arc<crate::work_signal::WorkSignal>,
     timing: Mutex<crate::invocation_timing::InvocationTiming>,
     timing_dropped: std::sync::atomic::AtomicU64,
+    trace: Arc<crate::trace::TraceHub>,
+    /// Created on this endpoint's first `trace_bind`; its table address is
+    /// stable until the runtime is destroyed.
+    trace_sink: std::sync::OnceLock<crate::trace::sink::Binding>,
+    direct: Arc<crate::direct::DirectRegistry>,
 }
 struct Runtime {
     endpoints: BTreeMap<String, Box<Endpoint>>,
     work: Arc<crate::work_signal::WorkSignal>,
     broker: Arc<Mutex<Broker>>,
+    trace: Arc<crate::trace::TraceHub>,
+    direct: Arc<crate::direct::DirectRegistry>,
+}
+impl Drop for Runtime {
+    fn drop(&mut self) {
+        // Every module is gone, so no producer can still be recording.
+        self.trace.shutdown();
+    }
 }
 fn guard(f: impl FnOnce() -> Result<(), Status>) -> Status {
     match catch_unwind(AssertUnwindSafe(f)) {
@@ -45,6 +58,8 @@ unsafe extern "C" fn create_runtime(config: BorrowedBytes, output: *mut *mut c_v
             Broker::new(config).map_err(|_| STATUS_INVALID_ARGUMENT)?,
         ));
         let work = Arc::new(crate::work_signal::WorkSignal::default());
+        let trace = Arc::new(crate::trace::TraceHub::new(principals.clone()));
+        let direct = Arc::new(crate::direct::DirectRegistry::default());
         let endpoints = principals
             .into_iter()
             .map(|principal| {
@@ -57,6 +72,9 @@ unsafe extern "C" fn create_runtime(config: BorrowedBytes, output: *mut *mut c_v
                         work: work.clone(),
                         timing: Mutex::new(Default::default()),
                         timing_dropped: std::sync::atomic::AtomicU64::new(0),
+                        trace: trace.clone(),
+                        trace_sink: std::sync::OnceLock::new(),
+                        direct: direct.clone(),
                     }),
                 )
             })
@@ -67,6 +85,8 @@ unsafe extern "C" fn create_runtime(config: BorrowedBytes, output: *mut *mut c_v
                 endpoints,
                 work,
                 broker,
+                trace,
+                direct,
             })) as *mut c_void;
         }
         Ok(())
@@ -128,6 +148,38 @@ unsafe extern "C" fn invoke_command(
                 endpoint.work.notify();
                 Response::Ok
             }
+            Ok(Command::TraceBind {}) => {
+                let sink = endpoint.trace_sink.get_or_init(|| {
+                    crate::trace::sink::Binding::new(endpoint.trace.clone(), &endpoint.principal)
+                });
+                endpoint.trace.ensure_collector(&endpoint.broker);
+                Response::TraceBound {
+                    address: sink.address(),
+                }
+            }
+            Ok(Command::TraceSnapshot {}) => {
+                let permitted = endpoint
+                    .broker
+                    .lock()
+                    .map_err(|_| STATUS_INTERNAL_ERROR)?
+                    .may_read_trace(&endpoint.principal);
+                if permitted {
+                    Response::Result {
+                        payload: endpoint.trace.snapshot(),
+                    }
+                } else {
+                    Response::error(
+                        "permission_denied",
+                        "operation not granted to this endpoint",
+                    )
+                }
+            }
+            Ok(Command::CallDirect { service, payload }) => {
+                let at = Instant::now();
+                let result = call_direct(endpoint, &service, &payload);
+                native_us = Some(micros(at));
+                result
+            }
             Ok(
                 command @ (Command::NativeRegister { .. }
                 | Command::NativeBind { .. }
@@ -188,6 +240,111 @@ unsafe extern "C" fn invoke_command(
         }
         Ok(())
     })
+}
+/// Runs the provider's handler on the calling thread. No runtime lock is held
+/// while provider code runs, so the handler may issue its own runtime calls.
+fn call_direct(endpoint: &Endpoint, service: &str, payload: &serde_json::Value) -> Response {
+    let Ok(request) = serde_json::to_vec(payload) else {
+        return Response::error("invalid_request", "payload cannot be encoded");
+    };
+    let provider = {
+        let Ok(broker) = endpoint.broker.lock() else {
+            return Response::error("runtime_unavailable", "broker unavailable");
+        };
+        match broker.direct_call_provider(&endpoint.principal, service, request.len()) {
+            Ok(provider) => provider,
+            Err(refusal) => return refusal,
+        }
+    };
+    let unavailable = || {
+        Response::error(
+            amaterasu_contracts::DIRECT_UNAVAILABLE,
+            "the provider does not serve this operation directly",
+        )
+    };
+    let Some(handler) = endpoint.direct.for_current_thread(&provider) else {
+        return unavailable();
+    };
+    unsafe extern "C" fn copy(context: *mut c_void, bytes: BorrowedBytes) {
+        // SAFETY: the context is the reply vector below, borrowed for this call.
+        if let Ok(bytes) = unsafe { bytes.read() } {
+            unsafe { &mut *context.cast::<Vec<u8>>() }.extend_from_slice(bytes);
+        }
+    }
+    let mut reply = Vec::new();
+    // SAFETY: the host registered this handler from a verified module library
+    // and keeps the instance live until it unregisters on this same thread.
+    // Every borrowed buffer outlives the synchronous call.
+    let status = unsafe {
+        (handler.call)(
+            handler.instance,
+            BorrowedBytes::new(service.as_bytes()),
+            BorrowedBytes::new(endpoint.principal.as_bytes()),
+            BorrowedBytes::new(&request),
+            ReplySink {
+                context: std::ptr::from_mut(&mut reply).cast(),
+                write: copy,
+            },
+        )
+    };
+    match status {
+        STATUS_OK if reply.len() <= amaterasu_contracts::MAX_BROKER_RESULT_BYTES => {
+            match serde_json::from_slice(&reply) {
+                Ok(payload) => Response::Result { payload },
+                Err(_) => Response::error("direct_failed", "provider reply is not valid"),
+            }
+        }
+        STATUS_OK => Response::error("direct_failed", "provider reply is too large"),
+        STATUS_UNAVAILABLE => unavailable(),
+        _ => Response::error("direct_failed", "provider could not complete the call"),
+    }
+}
+unsafe extern "C" fn register_direct(
+    runtime: *mut c_void,
+    principal: BorrowedBytes,
+    instance: *mut c_void,
+    handler: DirectCallHandler,
+) -> Status {
+    guard(|| {
+        if runtime.is_null() {
+            return Err(STATUS_INVALID_ARGUMENT);
+        }
+        // SAFETY: the host lends readable principal bytes for this call.
+        let principal = std::str::from_utf8(unsafe { principal.read()? })
+            .map_err(|_| STATUS_INVALID_ARGUMENT)?;
+        // SAFETY: the host retains its runtime instance for this call.
+        let runtime = unsafe { &*runtime.cast::<Runtime>() };
+        if !runtime.endpoints.contains_key(principal)
+            || !runtime.direct.register(principal, instance, handler)
+        {
+            return Err(STATUS_INVALID_ARGUMENT);
+        }
+        Ok(())
+    })
+}
+unsafe extern "C" fn unregister_direct(runtime: *mut c_void, principal: BorrowedBytes) -> Status {
+    guard(|| {
+        if runtime.is_null() {
+            return Err(STATUS_INVALID_ARGUMENT);
+        }
+        // SAFETY: the host lends readable principal bytes for this call.
+        let principal = std::str::from_utf8(unsafe { principal.read()? })
+            .map_err(|_| STATUS_INVALID_ARGUMENT)?;
+        // SAFETY: the host retains its runtime instance for this call.
+        unsafe { &*runtime.cast::<Runtime>() }
+            .direct
+            .unregister(principal);
+        Ok(())
+    })
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn amaterasu_runtime_direct_v1() -> *const RuntimeDirectApi {
+    static DIRECT: RuntimeDirectApi = RuntimeDirectApi {
+        header: AbiHeader::of::<RuntimeDirectApi>(),
+        register: register_direct,
+        unregister: unregister_direct,
+    };
+    &DIRECT
 }
 unsafe extern "C" fn destroy_runtime(runtime: *mut c_void) {
     if !runtime.is_null() {

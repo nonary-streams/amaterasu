@@ -19,6 +19,7 @@ pub(crate) struct ModuleTiming {
     tick_thread_cpu_us: LatencyMetric,
     tick_non_cpu_us: LatencyMetric,
     cpu_timing_unknown: u64,
+    direct: LatencyMetric,
 }
 
 impl ModuleTiming {
@@ -35,7 +36,14 @@ impl ModuleTiming {
             tick_thread_cpu_us: LatencyMetric::default(),
             tick_non_cpu_us: LatencyMetric::default(),
             cpu_timing_unknown: 0,
+            direct: LatencyMetric::default(),
         }
+    }
+
+    /// Direct calls run inside another module's tick; they are this module's
+    /// time on the host thread all the same.
+    pub fn observe_direct(&mut self, started: Instant) {
+        self.direct.record_since(started);
     }
 
     pub fn begin(&mut self, now: Instant) {
@@ -94,6 +102,7 @@ impl ModuleTiming {
         let tick_thread_cpu_us = std::mem::take(&mut self.tick_thread_cpu_us);
         let tick_non_cpu_us = std::mem::take(&mut self.tick_non_cpu_us);
         let cpu_timing_unknown = std::mem::take(&mut self.cpu_timing_unknown);
+        let direct = std::mem::take(&mut self.direct);
         let window_start = std::mem::replace(&mut self.started, now);
         let stages = amaterasu_timing_metrics::take_stages();
         let report_required = ticks.calls != 0
@@ -107,6 +116,7 @@ impl ModuleTiming {
             "event":"module_tick_window", "window_us":now.saturating_duration_since(window_start).as_micros().min(u128::from(u64::MAX)) as u64,
             "monotonic_end_us":amaterasu_timing_metrics::monotonic_time_us(),"os_thread_id":amaterasu_timing_metrics::current_thread_id(),"stages":stages,
             "tick_thread_cpu_us":tick_thread_cpu_us,"tick_non_cpu_us":tick_non_cpu_us,"cpu_timing_unknown":cpu_timing_unknown,
+            "direct_call_us":direct,
             "tick_us":ticks,"health_us":health,"tick_interval_us":interval,"failed_ticks":failed_ticks,"failed_health":failed_health,
             "scope":"sdk_module_lifecycle_calls_and_tick_start_interval_not_worker_or_gpu_duration"
         }))

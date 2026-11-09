@@ -82,7 +82,12 @@ impl ExportedFixture {
     fn module(&mut self) -> &mut ShutdownFixture {
         // SAFETY: this fixture owns the instance created through the macro table,
         // and no lifecycle call occurs while this mutable borrow is retained.
-        unsafe { &mut (*self.instance.cast::<Instance<ShutdownFixture>>()).module }
+        unsafe {
+            &mut (*(*self.instance.cast::<Instance<ShutdownFixture>>())
+                .state
+                .get())
+            .module
+        }
     }
 }
 
@@ -198,10 +203,14 @@ fn existing_modules_keep_a_noop_shutdown_preparation() {
 fn unavailable_timing_log_does_not_change_exported_tick_or_lifecycle() {
     let fixture = ExportedFixture::create();
     // SAFETY: the fixture owns the matching create adapter's opaque allocation.
-    let instance = unsafe { &mut *fixture.instance.cast::<Instance<ShutdownFixture>>() };
+    let state = unsafe {
+        &mut *(*fixture.instance.cast::<Instance<ShutdownFixture>>())
+            .state
+            .get()
+    };
     let old = std::time::Instant::now() - std::time::Duration::from_secs(11);
-    instance.timing = crate::diagnostics::ModuleTiming::new(old);
-    instance.timing.begin(old);
+    state.timing = crate::diagnostics::ModuleTiming::new(old);
+    state.timing.begin(old);
     // The delayed interval triggers a log against the unavailable endpoint.
     // SAFETY: this serialized lifecycle call borrows the live fixture.
     assert_eq!(
@@ -212,4 +221,206 @@ fn unavailable_timing_log_does_not_change_exported_tick_or_lifecycle() {
         unsafe { (fixture.lifecycle.health)(fixture.instance) },
         STATUS_OK
     );
+}
+
+/// A provider that serves `echo` directly and can re-enter itself from `tick`.
+#[derive(Default)]
+struct DirectFixture {
+    served: Vec<(String, String)>,
+    reenter: Option<(amaterasu_abi::DirectCallHandler, *mut c_void)>,
+    reentry_status: Option<Status>,
+}
+
+impl ManagedModule for DirectFixture {
+    fn start(_runtime: RuntimeClient) -> ModuleResult<Self> {
+        Ok(Self::default())
+    }
+
+    fn tick(&mut self) -> ModuleResult<()> {
+        if let Some((call, instance)) = self.reenter {
+            let mut reply = Vec::new();
+            // SAFETY: the test supplied this module's own live export and instance.
+            self.reentry_status =
+                Some(unsafe { call_direct_export(call, instance, "echo", &mut reply) });
+        }
+        Ok(())
+    }
+
+    fn call_direct(&mut self, call: DirectCall<'_>) -> Option<serde_json::Value> {
+        if call.payload["action"] == "panic" {
+            panic!("direct handler panicked");
+        }
+        if call.payload["action"] != "echo" {
+            return None;
+        }
+        self.served
+            .push((call.caller.to_owned(), call.service.to_owned()));
+        Some(serde_json::json!({"ok": true, "echo": call.payload["value"]}))
+    }
+}
+
+unsafe extern "C" fn collect_reply(context: *mut c_void, bytes: BorrowedBytes) {
+    // SAFETY: the context is the caller's reply vector for this call.
+    unsafe { &mut *context.cast::<Vec<u8>>() }.extend_from_slice(unsafe { bytes.read() }.unwrap());
+}
+
+/// # Safety
+/// `instance` must be a live `Instance<DirectFixture>` matching `call`.
+unsafe fn call_direct_export(
+    call: amaterasu_abi::DirectCallHandler,
+    instance: *mut c_void,
+    action: &str,
+    reply: &mut Vec<u8>,
+) -> Status {
+    let request = serde_json::to_vec(&serde_json::json!({"action": action, "value": 7})).unwrap();
+    // SAFETY: every borrowed range and the sink outlive this synchronous call.
+    unsafe {
+        call(
+            instance,
+            BorrowedBytes::new(b"fixture/1"),
+            BorrowedBytes::new(b"consumer"),
+            BorrowedBytes::new(&request),
+            ReplySink {
+                context: std::ptr::from_mut(reply).cast(),
+                write: collect_reply,
+            },
+        )
+    }
+}
+
+fn direct_fixture() -> (*mut c_void, amaterasu_abi::DirectCallHandler) {
+    let endpoint = HostApi {
+        header: AbiHeader::of::<HostApi>(),
+        context: std::ptr::null_mut(),
+        invoke: unavailable_runtime,
+    };
+    let mut instance = std::ptr::null_mut();
+    // SAFETY: endpoint and output are valid for this serialized create call.
+    assert_eq!(
+        unsafe { create::<DirectFixture>(&endpoint, &mut instance) },
+        STATUS_OK
+    );
+    (instance, direct::<DirectFixture>)
+}
+
+/// # Safety
+/// `instance` must be a live `Instance<DirectFixture>` with no call active.
+unsafe fn direct_module<'a>(instance: *mut c_void) -> &'a mut DirectFixture {
+    // SAFETY: guaranteed by the caller.
+    unsafe { &mut (*(*instance.cast::<Instance<DirectFixture>>()).state.get()).module }
+}
+
+#[test]
+fn a_direct_call_reaches_the_module_and_returns_its_reply() {
+    let (instance, call) = direct_fixture();
+    let mut reply = Vec::new();
+    // SAFETY: the instance is live and no other call is active.
+    assert_eq!(
+        unsafe { call_direct_export(call, instance, "echo", &mut reply) },
+        STATUS_OK
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&reply).unwrap(),
+        serde_json::json!({"ok": true, "echo": 7})
+    );
+    // SAFETY: the call returned, so no borrow of the module remains.
+    assert_eq!(
+        unsafe { direct_module(instance) }.served,
+        vec![("consumer".to_owned(), "fixture/1".to_owned())]
+    );
+    // SAFETY: the test owns the instance and destroys it once.
+    unsafe { destroy::<DirectFixture>(instance) };
+}
+
+#[test]
+fn a_declined_operation_and_a_module_without_direct_support_are_unavailable() {
+    let (instance, call) = direct_fixture();
+    let mut reply = Vec::new();
+    // SAFETY: the instance is live and no other call is active.
+    assert_eq!(
+        unsafe { call_direct_export(call, instance, "other", &mut reply) },
+        STATUS_UNAVAILABLE
+    );
+    assert!(reply.is_empty());
+    // SAFETY: as above; the module was not changed by the declined call.
+    assert!(unsafe { direct_module(instance) }.served.is_empty());
+    unsafe { destroy::<DirectFixture>(instance) };
+
+    // `ShutdownFixture` keeps the trait's default and never serves directly.
+    let fixture = ExportedFixture::create();
+    // SAFETY: the macro exported this library's table for the same module type.
+    let table = unsafe { *amaterasu_module_direct_v1() };
+    let request = br#"{"action":"echo"}"#;
+    let mut reply = Vec::<u8>::new();
+    // SAFETY: the fixture owns a live instance of the exported module type.
+    let status = unsafe {
+        (table.call)(
+            fixture.instance,
+            BorrowedBytes::new(b"fixture/1"),
+            BorrowedBytes::new(b"consumer"),
+            BorrowedBytes::new(request),
+            ReplySink {
+                context: std::ptr::from_mut(&mut reply).cast(),
+                write: collect_reply,
+            },
+        )
+    };
+    assert_eq!(status, STATUS_UNAVAILABLE);
+}
+
+#[test]
+fn a_reentrant_direct_call_is_refused_instead_of_aliasing_the_module() {
+    let (instance, call) = direct_fixture();
+    // SAFETY: no call is active while the test configures the module.
+    unsafe { direct_module(instance) }.reenter = Some((call, instance));
+    // SAFETY: the instance is live; `tick` calls back into the same instance.
+    assert_eq!(unsafe { tick::<DirectFixture>(instance) }, STATUS_OK);
+    // SAFETY: tick returned.
+    let module = unsafe { direct_module(instance) };
+    assert_eq!(module.reentry_status, Some(STATUS_UNAVAILABLE));
+    assert!(module.served.is_empty());
+
+    // Once the tick has returned the module can be entered again.
+    module.reenter = None;
+    let mut reply = Vec::new();
+    assert_eq!(
+        unsafe { call_direct_export(call, instance, "echo", &mut reply) },
+        STATUS_OK
+    );
+    unsafe { destroy::<DirectFixture>(instance) };
+}
+
+#[test]
+fn another_thread_cannot_enter_the_module_through_a_direct_call() {
+    let (instance, call) = direct_fixture();
+    let address = instance as usize;
+    let status = std::thread::spawn(move || {
+        let mut reply = Vec::new();
+        // SAFETY: the instance outlives this joined thread; the adapter
+        // refuses the call before touching the module's state.
+        unsafe { call_direct_export(call, address as *mut c_void, "echo", &mut reply) }
+    })
+    .join()
+    .unwrap();
+    assert_eq!(status, STATUS_UNAVAILABLE);
+    // SAFETY: the thread has been joined.
+    assert!(unsafe { direct_module(instance) }.served.is_empty());
+    unsafe { destroy::<DirectFixture>(instance) };
+}
+
+#[test]
+fn a_panicking_direct_handler_is_contained_and_the_module_stays_usable() {
+    let (instance, call) = direct_fixture();
+    let mut reply = Vec::new();
+    // SAFETY: the instance is live and no other call is active.
+    assert_eq!(
+        unsafe { call_direct_export(call, instance, "panic", &mut reply) },
+        STATUS_INTERNAL_ERROR
+    );
+    assert!(reply.is_empty());
+    assert_eq!(
+        unsafe { call_direct_export(call, instance, "echo", &mut reply) },
+        STATUS_OK
+    );
+    unsafe { destroy::<DirectFixture>(instance) };
 }

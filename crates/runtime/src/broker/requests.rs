@@ -127,6 +127,11 @@ impl RequestRouter {
         ))
     }
 
+    /// The principal selected to serve `service`, if one has registered.
+    pub fn provider_of(&self, service: &str) -> Option<&str> {
+        self.providers.get(service).map(String::as_str)
+    }
+
     pub fn register_service(&mut self, caller: &str, grants: &Grants, service: String) -> Response {
         if !grants.provide.contains(&service) {
             return permission_denied();

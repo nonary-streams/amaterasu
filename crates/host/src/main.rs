@@ -2,6 +2,7 @@
 mod activation_transaction;
 #[cfg(target_os = "linux")]
 mod capture_authority;
+mod host_trace;
 #[cfg(windows)]
 mod input_companion;
 #[cfg(target_os = "linux")]

@@ -29,6 +29,7 @@ pub mod retirement;
 pub mod service_worker;
 pub mod session_presentation;
 pub mod threading;
+pub mod trace;
 pub mod transport;
 pub mod video;
 mod work;
@@ -193,6 +194,41 @@ impl RuntimeClient {
             .filter(|root| !root.is_empty())
             .ok_or("host did not provide a runtime state root")?;
         Ok(root.into())
+    }
+
+    /// Calls the provider of `service` synchronously on this thread, with the
+    /// same `call` grant an ordinary request needs.
+    ///
+    /// `Unavailable` proves the provider was not entered: the runtime or the
+    /// provider does not support direct calls, this is not the provider's
+    /// thread, or the provider declined this operation. Submit an ordinary
+    /// request instead. An error means the provider was entered and its
+    /// outcome is unknown, exactly like a failed request.
+    pub fn call_direct(
+        &self,
+        service: &str,
+        payload: serde_json::Value,
+    ) -> ModuleResult<DirectReply> {
+        match self.send(Command::CallDirect {
+            service: service.to_owned(),
+            payload,
+        })? {
+            Response::Result { payload } => Ok(DirectReply::Completed(payload)),
+            Response::Error { code, .. }
+                if matches!(
+                    code.as_str(),
+                    amaterasu_contracts::DIRECT_UNAVAILABLE
+                        | "invalid_request"
+                        | "permission_denied"
+                        | "unavailable"
+                        | "runtime_endpoint_required"
+                ) =>
+            {
+                Ok(DirectReply::Unavailable { code })
+            }
+            Response::Error { code, message } => Err(format!("{code}: {message}")),
+            unexpected => Err(format!("unexpected runtime response: {unexpected:?}")),
+        }
     }
 
     /// For internal calls with unique operation IDs that will never be retried
@@ -368,9 +404,41 @@ impl LogQueue {
     }
 }
 
+/// Outcome of [`RuntimeClient::call_direct`].
+#[derive(Clone, Debug, PartialEq)]
+pub enum DirectReply {
+    /// The provider handled the call; this is its reply payload.
+    Completed(serde_json::Value),
+    /// The provider was not entered. `code` says why, for diagnostics only.
+    Unavailable { code: String },
+}
+
+/// One synchronous request delivered to [`ManagedModule::call_direct`].
+pub struct DirectCall<'a> {
+    /// The runtime-authenticated principal of the calling module.
+    pub caller: &'a str,
+    /// The broker service the caller addressed, which this module provides.
+    pub service: &'a str,
+    pub payload: serde_json::Value,
+}
+
 pub trait ManagedModule: Sized {
     fn start(runtime: RuntimeClient) -> ModuleResult<Self>;
     fn tick(&mut self) -> ModuleResult<()>;
+
+    /// Serve one request of a broker service this module provides, on the
+    /// caller's thread and before returning. Use it for short operations where
+    /// a queued request's round trip is the cost, such as delivering input.
+    ///
+    /// Return `None` to decline: the caller then submits an ordinary request,
+    /// so declining must leave no effect behind. A reply follows the service's
+    /// existing wire contract. The call must be bounded and must not wait for
+    /// another module; anything that needs a later tick belongs to the
+    /// request path. It is never invoked while another call into this module
+    /// is active, nor from a thread other than the one that ticks it.
+    fn call_direct(&mut self, _call: DirectCall<'_>) -> Option<serde_json::Value> {
+        None
+    }
 
     /// Announce host shutdown once, before any consumer begins quiescing.
     /// Record the remaining host budget and stop admitting external work only.
@@ -406,6 +474,14 @@ macro_rules! export_module {
                 tick: $crate::exports::tick::<$module>,
                 health: $crate::exports::health::<$module>,
                 destroy: $crate::exports::destroy::<$module>,
+            };
+            &API
+        }
+        #[unsafe(no_mangle)]
+        pub extern "C" fn amaterasu_module_direct_v1() -> *const $crate::abi::ModuleDirectApi {
+            static API: $crate::abi::ModuleDirectApi = $crate::abi::ModuleDirectApi {
+                header: $crate::abi::AbiHeader::of::<$crate::abi::ModuleDirectApi>(),
+                call: $crate::exports::direct::<$module>,
             };
             &API
         }

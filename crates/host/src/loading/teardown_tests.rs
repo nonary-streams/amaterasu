@@ -82,6 +82,7 @@ fn runtime(trace: &DestructionTrace) -> RuntimeLibrary {
     RuntimeLibrary {
         process: Default::default(),
         wait_api: None,
+        direct_api: None,
         api: RuntimeApi {
             header: AbiHeader::of::<RuntimeApi>(),
             create: create_runtime,
@@ -109,6 +110,8 @@ fn feature(name: &'static str, trace: &DestructionTrace) -> FeatureLibrary {
         quiesce_api: None,
         shutdown_api: None,
         shutdown_prepared: false,
+        direct_calls: None,
+        trace_label: 0,
         api: ModuleApi {
             header: AbiHeader::of::<ModuleApi>(),
             create: create_module,
