@@ -115,7 +115,7 @@ pub fn prepare(
     Ok(())
 }
 
-fn contains_grants(
+pub(crate) fn contains_grants(
     existing: &amaterasu_contracts::Grants,
     required: &amaterasu_contracts::Grants,
 ) -> bool {

@@ -105,14 +105,6 @@ pub struct SettingsService {
     lifecycle_service: Option<String>,
 }
 
-impl Default for SettingsService {
-    fn default() -> Self {
-        Self::new(Some(
-            amaterasu_extension_api::SESSION_LIFECYCLE_SERVICE.into(),
-        ))
-    }
-}
-
 impl SettingsService {
     pub fn new(lifecycle_service: Option<String>) -> Self {
         Self {

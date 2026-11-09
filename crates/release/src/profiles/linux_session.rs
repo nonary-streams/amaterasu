@@ -17,6 +17,8 @@ pub mod options;
 #[cfg(test)]
 mod tests;
 
+use crate::processing_policy::contains_grants;
+
 use super::default_extensions::{
     COORDINATOR_COMPONENT as SESSION_LIFECYCLE, PROVIDER_COMPONENT as LINUX_FRAME_LIMITER,
     REGISTRY_COMPONENT as EXTENSION_REGISTRY,
@@ -951,16 +953,6 @@ fn configure_foreground_provider(
         return Err("selected foreground provider does not provide its service".into());
     }
     Ok(())
-}
-
-fn contains_grants(existing: &Grants, required: &Grants) -> bool {
-    required.native_provide.is_subset(&existing.native_provide)
-        && required.native_use.is_subset(&existing.native_use)
-        && required.provide.is_subset(&existing.provide)
-        && required.call.is_subset(&existing.call)
-        && required.publish.is_subset(&existing.publish)
-        && required.subscribe.is_subset(&existing.subscribe)
-        && required.hook.is_subset(&existing.hook)
 }
 
 /// Persistent state locations, each private to the host user (mode 0700).
