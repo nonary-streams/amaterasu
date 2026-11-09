@@ -1402,19 +1402,7 @@ impl Pipeline {
                 Ok(false)
             }
             Step::InputBatch => {
-                if let Some(epoch) = &record.lifecycle_input_epoch
-                    && payload["operation_id"]
-                        != format!("{epoch}:{}", record.lifecycle_input_sequence)
-                {
-                    return Err("input_batch_failed");
-                }
-                accept_input_batch(record, &payload)?;
-                if record.lifecycle_input_epoch.is_some() {
-                    record.lifecycle_input_sequence = record
-                        .lifecycle_input_sequence
-                        .checked_add(1)
-                        .ok_or("lifecycle_sequence_exhausted")?;
-                }
+                accept_acknowledged_input_batch(record, &payload)?;
                 Ok(false)
             }
             Step::FeedbackPeek => {

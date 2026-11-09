@@ -185,7 +185,11 @@ impl ControlTransport {
             Some(network) => network,
             None => Network::from_settings(&runtime, &payload)?,
         };
-        let controller = Arc::new(Mutex::new(Controller::with_network(settings, network)));
+        let mut controller = Controller::with_network(settings, network);
+        controller.trace_flows(diagnostics::FlowTrace::new(
+            amaterasu_module_sdk::trace::Tracer::bind(&runtime),
+        ));
+        let controller = Arc::new(Mutex::new(controller));
         let factory = native::Factory::new(controller.clone());
         runtime.require_success(Command::Register {
             service: SERVICE.into(),

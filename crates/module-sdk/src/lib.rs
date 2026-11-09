@@ -45,9 +45,9 @@ pub use amaterasu_contracts::encoder::{
     validate_software_options,
 };
 pub use amaterasu_contracts::{
-    ApiFieldKind, ApiMethod, ApiPrivilege, ApiSchema, Command, HOST_PACKAGE_BARRIER_SERVICE,
-    HostLifecycleAction, MAX_BROKER_RESULT_BYTES, Response, RunningModuleIdentity,
-    RuntimeHostContext,
+    ApiFieldKind, ApiMethod, ApiPrivilege, ApiSchema, Command, DIRECT_UNAVAILABLE,
+    HOST_PACKAGE_BARRIER_SERVICE, HostLifecycleAction, MAX_BROKER_RESULT_BYTES, Response,
+    RunningModuleIdentity, RuntimeHostContext,
 };
 pub use amaterasu_extension_api as extension_api;
 pub use amaterasu_media as media_abi;
@@ -217,7 +217,7 @@ impl RuntimeClient {
             Response::Error { code, .. }
                 if matches!(
                     code.as_str(),
-                    amaterasu_contracts::DIRECT_UNAVAILABLE
+                    DIRECT_UNAVAILABLE
                         | "invalid_request"
                         | "permission_denied"
                         | "unavailable"

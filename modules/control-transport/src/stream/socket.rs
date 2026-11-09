@@ -35,15 +35,25 @@ impl Stream {
                 self.rejected_datagrams = self.rejected_datagrams.saturating_add(1);
                 continue;
             }
-            if let Some(timestamp) = timestamp.filter(|t| {
-                t.flags & amaterasu_module_sdk::network::abi::KERNEL_RESIDENCE_REALTIME != 0
-            }) {
-                self.timing
-                    .kernel_residence_us
-                    .record(timestamp.kernel_residence_us);
+            let kernel_residence_us = timestamp
+                .filter(|t| {
+                    t.flags & amaterasu_module_sdk::network::abi::KERNEL_RESIDENCE_REALTIME != 0
+                })
+                .map(|timestamp| timestamp.kernel_residence_us);
+            if let Some(residence_us) = kernel_residence_us {
+                self.timing.kernel_residence_us.record(residence_us);
             } else {
                 self.timing.kernel_timing_unknown =
                     self.timing.kernel_timing_unknown.saturating_add(1);
+            }
+            if let Some((_, trace)) = &self.flow_trace {
+                // Messages completed by this tick are traced from the oldest
+                // datagram it read, the longest any of them can have waited.
+                let arrived = trace.arrival(kernel_residence_us);
+                self.tick_arrival = Some(
+                    self.tick_arrival
+                        .map_or(arrived, |oldest| oldest.min(arrived)),
+                );
             }
             let arrived = Instant::now();
             if let Some(previous) = self.previous_datagram.replace(arrived) {

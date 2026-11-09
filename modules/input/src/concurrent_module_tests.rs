@@ -73,6 +73,8 @@ impl Host {
                 }
             }
             Command::Poll {} => Response::Pending,
+            // A runtime without flow tracing: the module must start regardless.
+            Command::TraceBind {} => Response::error("invalid_request", "invalid control message"),
             other => panic!("unexpected module request {other:?}"),
         }
     }
@@ -573,3 +575,5 @@ fn revoked_native_lease_keeps_its_retirement_reply_until_broker_acknowledgement(
         "retired"
     );
 }
+
+mod direct;

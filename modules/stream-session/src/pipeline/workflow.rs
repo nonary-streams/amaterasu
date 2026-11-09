@@ -685,28 +685,10 @@ impl Job {
                 }
                 .payload(),
             ),
-            Step::InputBatch => {
-                let binding = record
-                    .lifecycle_input_token
-                    .as_deref()
-                    .zip(record.lifecycle_input_epoch.as_deref());
-                (
-                    INPUT_SERVICE.into(),
-                    InputRequest::Batch {
-                        lease: record.input_lease.as_deref(),
-                        events: record
-                            .input_events
-                            .iter()
-                            .take(record.input_inflight)
-                            .collect(),
-                        input_binding: binding.map(|(token, _)| token),
-                        operation_id: binding.map(|(_, epoch)| {
-                            format!("{epoch}:{}", record.lifecycle_input_sequence)
-                        }),
-                    }
-                    .payload(),
-                )
-            }
+            Step::InputBatch => (
+                INPUT_SERVICE.into(),
+                super::input::input_batch_payload(record),
+            ),
             Step::FeedbackPeek => (
                 INPUT_SERVICE.into(),
                 InputRequest::FeedbackPeek {

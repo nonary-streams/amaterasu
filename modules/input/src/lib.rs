@@ -7,6 +7,7 @@ mod concurrent_module_tests;
 mod controller;
 mod controllers;
 mod diagnostics;
+mod direct;
 mod feedback;
 #[cfg(any(target_os = "linux", windows, test))]
 mod gamepad;
@@ -27,7 +28,9 @@ mod session_binding;
 mod shutdown;
 
 use amaterasu_input_policy::KeyBindings;
-use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};
+use amaterasu_module_sdk::{
+    Command, DirectCall, ManagedModule, ModuleResult, Response, RuntimeClient,
+};
 use backend::NativeBackend;
 use controllers::Controllers;
 use model::{InputError, MAX_QUEUED_REQUESTS, Operation};
@@ -85,6 +88,7 @@ struct InputModule {
     pending_revoke: Option<(QueuedRequest, session_binding::RevokeRequest)>,
     pending_retirement_acknowledgement: Option<session_binding::PendingRetirementAcknowledgement>,
     shutdown: shutdown::Shutdown,
+    batch_trace: direct::BatchTrace,
 }
 
 #[derive(Clone)]
@@ -227,6 +231,7 @@ impl ManagedModule for InputModule {
         Ok(Self {
             input_boot_epoch,
             shortcut_cache: shortcut_cache::ShortcutCache::default(),
+            batch_trace: direct::BatchTrace::bind(&runtime),
             runtime,
             controller: Controllers::new(backend, settings.allow_injection, move || {
                 settings.backend()
@@ -251,6 +256,9 @@ impl ManagedModule for InputModule {
     }
     fn quiesce(&mut self) -> ModuleResult<bool> {
         self.quiesce_input(Instant::now())
+    }
+    fn call_direct(&mut self, call: DirectCall<'_>) -> Option<Value> {
+        self.direct_batch(call)
     }
     fn tick(&mut self) -> ModuleResult<()> {
         let _priority = amaterasu_module_sdk::threading::ScopedThreadPriority::best_effort(
@@ -907,9 +915,14 @@ impl InputModule {
                     lease: batch.lease.clone(),
                     events: batch.events,
                 };
-                let mut reply =
-                    self.controller
-                        .handle(&request.caller, operation, Instant::now(), &mut guard);
+                let delivery_started = Instant::now();
+                let mut reply = self.controller.handle(
+                    &request.caller,
+                    operation,
+                    delivery_started,
+                    &mut guard,
+                );
+                self.batch_trace.queued_batch(delivery_started);
                 if reply["ok"] == true {
                     reply["operation_id"] = batch.operation_id.into();
                 }
@@ -977,9 +990,17 @@ impl InputModule {
                             ..
                         }
                 );
-                let reply =
-                    self.controller
-                        .handle(&request.caller, operation, Instant::now(), &mut check);
+                let is_batch = matches!(&operation, Operation::Batch { .. });
+                let delivery_started = Instant::now();
+                let reply = self.controller.handle(
+                    &request.caller,
+                    operation,
+                    delivery_started,
+                    &mut check,
+                );
+                if is_batch {
+                    self.batch_trace.queued_batch(delivery_started);
+                }
                 let cleanup = completion_requires_cleanup(cleanup_if_completion_is_lost, &reply);
                 self.complete(request.id, reply, &request.caller, cleanup)
             }

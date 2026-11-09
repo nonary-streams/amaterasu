@@ -7,6 +7,11 @@ pub(super) struct VideoPacket {
 }
 
 impl VideoPacket {
+    /// The frame sequence shared by every fragment, or `None` at end of stream.
+    pub(super) fn frame_sequence(&self) -> Option<u64> {
+        (self.metadata.flags != FLAG_END_OF_STREAM).then_some(self.metadata.sequence)
+    }
+
     /// # Safety
     /// The provider keeps its header and initialized bytes live through this copy.
     pub(super) unsafe fn copy(packet: &EncodedPacket) -> PlaneResult<Self> {

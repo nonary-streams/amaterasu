@@ -1687,3 +1687,193 @@ fn malformed_keybindings_start_cannot_acquire_an_input_lease() {
         }));
     }
 }
+
+fn batch_requests(host: &Harness) -> usize {
+    host.broker
+        .calls
+        .iter()
+        .filter(|call| call.service == "amaterasu.input/1" && call.payload["action"] == "batch")
+        .count()
+}
+
+fn active_input_stream(direct: Option<DirectInput>) -> (Harness, u64) {
+    let mut host = Harness::new();
+    enable_input(&mut host);
+    host.broker.direct_input = direct;
+    let id = host.response(1, prepare())["session"].as_u64().unwrap();
+    assert_eq!(host.response(2, start(id))["state"], "active");
+    (host, id)
+}
+
+#[test]
+fn input_is_injected_in_the_tick_that_received_it_when_the_provider_serves_directly() {
+    let (mut host, id) = active_input_stream(Some(DirectInput::Serve));
+    host.plane.borrow_mut().controls.push(relative(1));
+
+    // One tick: the plane delivers the message and the provider has the event.
+    host.tick();
+
+    assert_eq!(host.broker.input_events.len(), 1);
+    assert_eq!(host.broker.direct_batches.len(), 1);
+    assert_eq!(batch_requests(&host), 0);
+    let record = &host.pipeline.records[&id];
+    assert!(record.input_events.is_empty());
+    assert_eq!(record.input_inflight, 0);
+    assert_eq!((record.input_events_sent, record.input_batches), (1, 1));
+    assert_eq!(record.state, State::Active);
+}
+
+#[test]
+fn the_same_session_falls_back_to_a_queued_request_for_a_provider_without_direct_support() {
+    // Identical session code and input; only the provider differs.
+    let (mut host, id) = active_input_stream(None);
+    host.plane.borrow_mut().controls.push(relative(1));
+    host.tick();
+    assert!(host.broker.input_events.is_empty());
+    host.idle();
+
+    assert_eq!(host.broker.input_events.len(), 1);
+    assert!(host.broker.direct_batches.is_empty());
+    assert_eq!(batch_requests(&host), 1);
+    let record = &host.pipeline.records[&id];
+    assert_eq!((record.input_events_sent, record.input_batches), (1, 1));
+    assert_eq!(record.state, State::Active);
+}
+
+#[test]
+fn a_declined_batch_is_sent_once_as_a_request_and_later_batches_are_direct_again() {
+    let (mut host, id) = active_input_stream(Some(DirectInput::Decline { remaining: 1 }));
+    host.plane.borrow_mut().controls.push(relative(1));
+    host.idle();
+    assert_eq!(host.broker.input_events.len(), 1);
+    assert_eq!(batch_requests(&host), 1);
+    assert!(host.broker.direct_batches.is_empty());
+
+    host.plane.borrow_mut().controls.push(relative(2));
+    host.tick();
+    assert_eq!(host.broker.input_events.len(), 2);
+    assert_eq!(host.broker.direct_batches.len(), 1);
+    assert_eq!(batch_requests(&host), 1);
+    assert_eq!(host.pipeline.records[&id].input_events_sent, 2);
+}
+
+#[test]
+fn direct_delivery_does_not_wait_for_another_workflow_holding_the_job_slot() {
+    let (mut host, id) = active_input_stream(Some(DirectInput::Serve));
+    // A feedback poll is in flight and occupies the pipeline's single job.
+    host.pipeline.records.get_mut(&id).unwrap().feedback_poll_at = 0;
+    host.tick();
+    assert!(
+        host.pipeline
+            .job
+            .as_ref()
+            .is_some_and(|job| job.step != Step::InputBatch)
+    );
+
+    host.plane.borrow_mut().controls.push(relative(1));
+    host.tick();
+
+    assert_eq!(host.broker.input_events.len(), 1);
+    assert_eq!(batch_requests(&host), 0);
+}
+
+#[test]
+fn a_direct_batch_is_never_offered_while_a_queued_batch_is_outstanding() {
+    let (mut host, _) = active_input_stream(Some(DirectInput::Decline { remaining: 1 }));
+    host.plane.borrow_mut().controls.push(relative(1));
+    // Declined, then scheduled as a queued request that has not completed.
+    host.tick();
+    host.tick();
+    host.plane
+        .borrow_mut()
+        .controls
+        .push(vertical_scroll(2, 120));
+    host.tick();
+    assert!(
+        host.broker.direct_batches.is_empty(),
+        "the second event must not overtake the queued first one"
+    );
+
+    host.idle();
+    // Both arrive, in order, whichever transport carried each.
+    let kinds: Vec<_> = host
+        .broker
+        .input_events
+        .iter()
+        .map(|event| event["kind"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(kinds.len(), 2, "{kinds:?}");
+    assert_eq!(kinds[0], "relative");
+    assert_ne!(kinds[1], "relative");
+}
+
+#[test]
+fn a_provider_that_keeps_declining_is_not_offered_every_batch() {
+    let (mut host, _) = active_input_stream(Some(DirectInput::Decline {
+        remaining: usize::MAX,
+    }));
+    for sequence in 1..=6 {
+        host.plane.borrow_mut().controls.push(relative(sequence));
+        host.idle();
+    }
+    assert_eq!(host.broker.input_events.len(), 6);
+    assert_eq!(batch_requests(&host), 6);
+    let Some(DirectInput::Decline { remaining }) = host.broker.direct_input else {
+        panic!("provider mode changed");
+    };
+    // Offered for the first few batches, then only after the backoff.
+    assert!(
+        usize::MAX - remaining <= 4,
+        "offers: {}",
+        usize::MAX - remaining
+    );
+}
+
+#[test]
+fn a_direct_call_with_an_unknown_outcome_stops_the_stream_without_replaying_input() {
+    let (mut host, id) = active_input_stream(Some(DirectInput::Fail));
+    host.plane.borrow_mut().controls.push(relative(1));
+    host.idle();
+
+    assert_eq!(host.pipeline.records[&id].state, State::Failed);
+    assert_eq!(host.pipeline.records[&id].error, Some("input_batch_failed"));
+    assert_eq!(batch_requests(&host), 0);
+    assert!(host.broker.input_lease.is_none());
+}
+
+#[test]
+fn a_rejected_direct_batch_fails_the_stream_like_a_rejected_request() {
+    let (mut host, id) = active_input_stream(Some(DirectInput::Serve));
+    host.broker.fail_input_batch = true;
+    host.plane.borrow_mut().controls.push(relative(1));
+    host.idle();
+
+    assert_eq!(host.pipeline.records[&id].state, State::Failed);
+    assert_eq!(
+        host.pipeline.records[&id].error,
+        Some("dependency_rejected")
+    );
+    assert_eq!(batch_requests(&host), 0);
+}
+
+#[test]
+fn many_queued_events_are_delivered_directly_in_bounded_batches() {
+    let (mut host, id) = active_input_stream(Some(DirectInput::Serve));
+    for sequence in 1..=100 {
+        host.plane
+            .borrow_mut()
+            .controls
+            .push(vertical_scroll(sequence, 120));
+    }
+    host.idle();
+
+    assert_eq!(host.broker.input_events.len(), 100);
+    assert_eq!(batch_requests(&host), 0);
+    assert!(
+        host.broker
+            .direct_batches
+            .iter()
+            .all(|batch| batch["events"].as_array().unwrap().len() <= 64)
+    );
+    assert_eq!(host.pipeline.records[&id].input_events_sent, 100);
+}

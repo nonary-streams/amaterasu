@@ -31,6 +31,16 @@ pub enum Fault {
     Admission,
 }
 
+pub enum DirectInput {
+    Serve,
+    /// Declines this many batches, then serves.
+    Decline {
+        remaining: usize,
+    },
+    /// Enters the provider and then fails without a reply.
+    Fail,
+}
+
 #[derive(Default)]
 pub struct Broker {
     pub lifecycle_success: bool,
@@ -58,6 +68,11 @@ pub struct Broker {
     cancelled: BTreeSet<u64>,
     next: u64,
     pub replies: BTreeMap<u64, Value>,
+    /// How the fake input provider answers direct calls. `None` is a provider
+    /// built without direct support.
+    pub direct_input: Option<DirectInput>,
+    /// Batch payloads the provider served directly, in order.
+    pub direct_batches: Vec<Value>,
     pub calls: Vec<Call>,
     pub timeline: Rc<RefCell<Vec<&'static str>>>,
     pub now: u64,
@@ -180,6 +195,37 @@ impl Broker {
             ]}),
             display_mutation_enabled: true,
             ..Self::default()
+        }
+    }
+
+    /// The fake input provider's direct handler. It shares the queued
+    /// handler's state, so both transports observe one lease and one device.
+    pub fn direct(
+        &mut self,
+        service: &str,
+        payload: Value,
+    ) -> ModuleResult<amaterasu_module_sdk::DirectReply> {
+        let unavailable = || {
+            Ok(amaterasu_module_sdk::DirectReply::Unavailable {
+                code: amaterasu_module_sdk::DIRECT_UNAVAILABLE.into(),
+            })
+        };
+        if service != "amaterasu.input/1" {
+            return unavailable();
+        }
+        match self.direct_input.as_mut() {
+            None => unavailable(),
+            Some(DirectInput::Decline { remaining }) if *remaining > 0 => {
+                *remaining -= 1;
+                unavailable()
+            }
+            Some(DirectInput::Fail) => Err("direct_failed: provider could not complete".into()),
+            Some(DirectInput::Serve | DirectInput::Decline { .. }) => {
+                self.direct_batches.push(payload.clone());
+                Ok(amaterasu_module_sdk::DirectReply::Completed(
+                    self.input("batch", &payload),
+                ))
+            }
         }
     }
 
@@ -1563,11 +1609,14 @@ impl Harness {
         self.now += 1;
         self.broker.now = self.now;
         let state = self.plane.clone();
+        // The pipeline never calls one of these from inside the other.
+        let broker = RefCell::new(&mut self.broker);
         self.pipeline
-            .tick_with(
+            .tick_with_direct(
                 self.now,
-                &mut |command| self.broker.send(command),
+                &mut |command| broker.borrow_mut().send(command),
                 &mut |_, _| Ok(Box::new(FakePlane(state.clone()))),
+                &mut |service, payload| broker.borrow_mut().direct(service, payload),
             )
             .unwrap();
     }

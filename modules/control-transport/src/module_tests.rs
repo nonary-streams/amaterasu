@@ -31,6 +31,12 @@ unsafe extern "C" fn invoke(
         }
         _ => {}
     }
+    if matches!(command, Command::TraceBind {}) {
+        // A runtime without flow tracing: the module must start regardless.
+        let unsupported = Response::error("invalid_request", "invalid control message");
+        unsafe { output.send(&serde_json::to_vec(&unsupported).unwrap()) };
+        return STATUS_OK;
+    }
     if let Command::Complete { payload, .. } = command {
         host.completed.push(payload);
     }

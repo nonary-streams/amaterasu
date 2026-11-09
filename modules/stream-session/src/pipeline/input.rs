@@ -8,8 +8,8 @@ use amaterasu_gamestream::control::{
 };
 use amaterasu_media::CaptureGeometry;
 use amaterasu_module_sdk::input::{
-    InputBatchCapabilities, InputBatchOutcome, MAX_BATCH_EVENTS, decode_batch_outcome,
-    lease_from_reply,
+    InputBatchCapabilities, InputBatchOutcome, InputRequest, MAX_BATCH_EVENTS,
+    decode_batch_outcome, lease_from_reply,
 };
 use serde_json::{Value, json};
 
@@ -545,6 +545,49 @@ pub(super) fn accept_input_batch(record: &mut Record, payload: &Value) -> Result
     record.input_batches = record.input_batches.saturating_add(1);
     record.input_inflight = 0;
     record.input_timing.acknowledge(false);
+    Ok(())
+}
+
+/// The batch request for the first `input_inflight` queued events. Both
+/// transports send exactly this, so a declined direct call can be repeated
+/// as an ordinary request with the same lifecycle operation identity.
+pub(super) fn input_batch_payload(record: &Record) -> Value {
+    let binding = record
+        .lifecycle_input_token
+        .as_deref()
+        .zip(record.lifecycle_input_epoch.as_deref());
+    InputRequest::Batch {
+        lease: record.input_lease.as_deref(),
+        events: record
+            .input_events
+            .iter()
+            .take(record.input_inflight)
+            .collect(),
+        input_binding: binding.map(|(token, _)| token),
+        operation_id: binding
+            .map(|(_, epoch)| format!("{epoch}:{}", record.lifecycle_input_sequence)),
+    }
+    .payload()
+}
+
+/// A successful batch reply, from either transport. A lifecycle-bound batch
+/// must echo the exact operation it answers before the sequence advances.
+pub(super) fn accept_acknowledged_input_batch(
+    record: &mut Record,
+    payload: &Value,
+) -> Result<(), &'static str> {
+    if let Some(epoch) = &record.lifecycle_input_epoch
+        && payload["operation_id"] != format!("{epoch}:{}", record.lifecycle_input_sequence)
+    {
+        return Err("input_batch_failed");
+    }
+    accept_input_batch(record, payload)?;
+    if record.lifecycle_input_epoch.is_some() {
+        record.lifecycle_input_sequence = record
+            .lifecycle_input_sequence
+            .checked_add(1)
+            .ok_or("lifecycle_sequence_exhausted")?;
+    }
     Ok(())
 }
 

@@ -1,5 +1,6 @@
 mod actions;
 mod cleanup;
+mod direct_input;
 mod display;
 mod history;
 mod history_activity;
@@ -85,6 +86,12 @@ impl Drive for Plane {
 type Factory<'a> = dyn FnMut(Handles, &crate::providers::ProviderServices) -> Result<Box<dyn Drive>, &'static str>
     + 'a;
 
+/// Queued events need a batch request only when the direct lane is not
+/// already delivering them.
+fn input_job_due(record: &Record) -> bool {
+    !record.input_events.is_empty() && !record.input_direct_active
+}
+
 pub struct Pipeline {
     settings: Settings,
     service: String,
@@ -111,6 +118,8 @@ pub struct Pipeline {
     package_barrier_next_poll: u64,
     shutdown_deadline: Option<u64>,
     shutdown_announced_deadline: Option<u64>,
+    /// Bound on the first tick; absent in tests and on runtimes without tracing.
+    input_trace: Option<input_timing::InputFlowTrace>,
 }
 
 impl Pipeline {
@@ -143,6 +152,7 @@ impl Pipeline {
             package_barrier_next_poll: 0,
             shutdown_deadline: None,
             shutdown_announced_deadline: None,
+            input_trace: None,
         })
     }
 
@@ -334,6 +344,9 @@ impl Pipeline {
 
     pub fn tick(&mut self, runtime: &RuntimeClient) -> ModuleResult<()> {
         let now = self.elapsed_millis();
+        self.input_trace.get_or_insert_with(|| {
+            input_timing::InputFlowTrace::new(amaterasu_module_sdk::trace::Tracer::bind(runtime))
+        });
         let poll_barrier = self.package_barrier_registered && now >= self.package_barrier_next_poll;
         if poll_barrier {
             match runtime.send(Command::HostPackageBarrierPending {})? {
@@ -345,7 +358,7 @@ impl Pipeline {
             self.package_barrier_next_poll = now.saturating_add(100);
         }
         let journal_requests = self.retained_journal_requests();
-        let result = self.tick_with(
+        let result = self.tick_with_direct(
             now,
             &mut |command| {
                 if matches!(&command, Command::TakeResult { request } if journal_requests.contains(request)) {
@@ -358,6 +371,7 @@ impl Pipeline {
                 Plane::new(runtime, handles, providers)
                     .map(|plane| Box::new(plane) as Box<dyn Drive>)
             },
+            &mut |service, payload| runtime.call_direct(service, payload),
         );
         if poll_barrier {
             let ready =
@@ -389,11 +403,28 @@ impl Pipeline {
         requests
     }
 
+    /// A tick against providers that serve nothing directly, as every
+    /// provider did before direct calls existed.
+    #[cfg(test)]
     fn tick_with(
         &mut self,
         now: u64,
         send: &mut Send<'_>,
         factory: &mut Factory<'_>,
+    ) -> ModuleResult<()> {
+        self.tick_with_direct(now, send, factory, &mut |_, _| {
+            Ok(amaterasu_module_sdk::DirectReply::Unavailable {
+                code: amaterasu_module_sdk::DIRECT_UNAVAILABLE.into(),
+            })
+        })
+    }
+
+    fn tick_with_direct(
+        &mut self,
+        now: u64,
+        send: &mut Send<'_>,
+        factory: &mut Factory<'_>,
+        direct: &mut direct_input::DirectCall<'_>,
     ) -> ModuleResult<()> {
         if !self.journal.loaded {
             match self.journal.progress_load(send, now) {
@@ -414,6 +445,7 @@ impl Pipeline {
             self.start_next_recovery(now);
         }
         self.pump(now);
+        self.deliver_input_directly(now, direct);
         for record in self.records.values_mut() {
             let forwarding = record
                 .plane
@@ -827,7 +859,7 @@ impl Pipeline {
                     && (now >= record.input_renew_at
                         || (record.feedback_ack_through.is_some()
                             && now >= record.feedback_poll_at)
-                        || !record.input_events.is_empty()
+                        || input_job_due(record)
                         || now >= record.feedback_poll_at
                         || (record.input_controller_supported
                             && record.client_haptics_requested
@@ -847,7 +879,7 @@ impl Pipeline {
                             && (now >= record.input_renew_at
                                 || (record.feedback_ack_through.is_some()
                                     && now >= record.feedback_poll_at)
-                                || !record.input_events.is_empty()
+                                || input_job_due(record)
                                 || now >= record.feedback_poll_at
                                 || (record.input_controller_supported
                                     && record.client_haptics_requested
@@ -904,7 +936,7 @@ impl Pipeline {
                 Step::FeedbackAck,
                 record.input_expires_at.min(now.saturating_add(5000)),
             )
-        } else if !record.input_events.is_empty() {
+        } else if input_job_due(record) {
             (
                 Step::InputBatch,
                 record.input_expires_at.min(now.saturating_add(5000)),
@@ -953,7 +985,11 @@ impl Pipeline {
             control::{self, Message, Profile},
             crypto::Direction,
         };
+        let input_trace = self.input_trace;
         for record in self.records.values_mut() {
+            if let Some(trace) = input_trace {
+                record.input_timing.attach_trace(trace);
+            }
             for slot in record
                 .rumble_active_until
                 .iter()
@@ -1091,9 +1127,16 @@ impl Pipeline {
                         progress.accepted_media_payload_bytes,
                         progress.observed_video_sequence_gaps,
                     );
+                    let control_stream = record.resources.get(&Resource::Control).copied();
                     for event in progress.controls {
                         record.control_messages = record.control_messages.saturating_add(1);
                         record.last_control_sequence = Some(event.sequence);
+                        // The control transport starts this flow with the same identity.
+                        record
+                            .input_timing
+                            .begin_message(control_stream.map_or(0, |stream| {
+                                amaterasu_module_sdk::trace::flow_id(stream, event.sequence)
+                            }));
                         let message = match control::decode(
                             Profile::SunshineModern,
                             Direction::ClientToHost,
@@ -1104,6 +1147,7 @@ impl Pipeline {
                             Err(_) => {
                                 record.rejected_controls =
                                     record.rejected_controls.saturating_add(1);
+                                record.input_timing.end_message();
                                 continue;
                             }
                         };
@@ -1127,6 +1171,7 @@ impl Pipeline {
                                     record.unsupported_controls.saturating_add(1)
                             }
                         }
+                        record.input_timing.end_message();
                     }
                 }
                 Err(failure) => {

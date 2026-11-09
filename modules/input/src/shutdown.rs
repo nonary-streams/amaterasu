@@ -52,6 +52,11 @@ impl Shutdown {
 }
 
 impl InputModule {
+    /// Whether shutdown has closed admission for this request.
+    pub(super) fn shutdown_rejects(&self, payload: &Value) -> bool {
+        self.shutdown.rejects(payload)
+    }
+
     pub(super) fn reject_shutdown_request(
         &mut self,
         request: &QueuedRequest,

@@ -23,6 +23,7 @@ pub struct Controller {
     issued_ids: BTreeSet<u64>,
     used_keys: Vec<[u8; 16]>,
     epoch: Instant,
+    flow_trace: Option<crate::diagnostics::FlowTrace>,
 }
 
 impl Controller {
@@ -40,6 +41,7 @@ impl Controller {
             issued_ids: BTreeSet::new(),
             used_keys: Vec::new(),
             epoch: Instant::now(),
+            flow_trace: None,
         }
     }
 
@@ -95,7 +97,11 @@ impl Controller {
         }
         self.admit(owner, &key)?;
         let id = self.new_id()?;
-        let stream = Stream::open_with_network(&self.network, owner, &request, &key, self.now())?;
+        let mut stream =
+            Stream::open_with_network(&self.network, owner, &request, &key, self.now())?;
+        if let Some(trace) = self.flow_trace {
+            stream.trace_flows(id, trace);
+        }
         let payload = stream.metadata(id);
         self.streams.insert(id, stream);
         self.issued_ids.insert(id);
@@ -183,6 +189,11 @@ impl Controller {
 
     fn now(&self) -> u64 {
         self.epoch.elapsed().as_millis().min(u64::MAX.into()) as u64
+    }
+
+    /// Traces the control messages of streams opened from now on.
+    pub(crate) fn trace_flows(&mut self, trace: crate::diagnostics::FlowTrace) {
+        self.flow_trace = Some(trace);
     }
 
     pub fn tick(&mut self) {

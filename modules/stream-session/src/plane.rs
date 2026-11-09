@@ -120,6 +120,10 @@ impl Plane {
         );
         pump.encoded_source = handles.encoded_audio_source;
         pump.processing = handles.audio_processor.is_some();
+        pump.frame_trace = Some(diagnostics::FrameTrace::new(
+            amaterasu_module_sdk::trace::Tracer::bind(runtime),
+            handles.video,
+        ));
         Ok(Self { pump })
     }
 
@@ -230,6 +234,7 @@ struct Pump<B> {
     failure: Option<&'static str>,
     audio_recovery_needed: bool,
     last_accepted_video_sequence: Option<u64>,
+    frame_trace: Option<diagnostics::FrameTrace>,
 }
 
 impl<B: Backend> Pump<B> {
@@ -262,6 +267,7 @@ impl<B: Backend> Pump<B> {
             failure: None,
             audio_recovery_needed: false,
             last_accepted_video_sequence: None,
+            frame_trace: None,
         }
     }
 
@@ -458,6 +464,11 @@ impl<B: Backend> Pump<B> {
             let Some(packet) = self.backend.video()? else {
                 break;
             };
+            if let (Some(trace), Some(sequence)) =
+                (self.frame_trace.as_mut(), packet.frame_sequence())
+            {
+                trace.packet_read(sequence);
+            }
             self.video.push(packet)?;
         }
         // A complete single output sample is forwarded this tick, without waiting
@@ -479,6 +490,9 @@ impl<B: Backend> Pump<B> {
     fn record_video_admission(&mut self, packet: &EncodedPacket, progress: &mut Progress) {
         if packet.flags == FLAG_END_OF_STREAM {
             return;
+        }
+        if let Some(trace) = &self.frame_trace {
+            trace.transport_admitted(packet.sequence);
         }
         progress.accepted_video_access_units =
             progress.accepted_video_access_units.saturating_add(1);

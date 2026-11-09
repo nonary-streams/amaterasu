@@ -1,6 +1,6 @@
 mod socket;
 
-use crate::diagnostics::ControlTiming;
+use crate::diagnostics::{ControlTiming, FlowTrace};
 use crate::model::{ControlResult, Open, validate_ping_timeout_ms};
 use amaterasu_gamestream::{
     crypto::{ControlOpener, ControlOrdering, ControlProfile, ControlSealer, Direction},
@@ -55,6 +55,11 @@ pub struct Stream {
     timing: ControlTiming,
     previous_tick: Option<Instant>,
     previous_datagram: Option<Instant>,
+    /// This stream's handle and the module's tracer, once the controller has
+    /// registered the stream.
+    flow_trace: Option<(u64, FlowTrace)>,
+    /// When the oldest datagram read in the current tick reached the kernel.
+    tick_arrival: Option<amaterasu_module_sdk::trace::TraceTime>,
 }
 
 impl Stream {
@@ -122,7 +127,13 @@ impl Stream {
             timing: ControlTiming::default(),
             previous_tick: None,
             previous_datagram: None,
+            flow_trace: None,
+            tick_arrival: None,
         })
+    }
+
+    pub(crate) fn trace_flows(&mut self, stream: u64, trace: FlowTrace) {
+        self.flow_trace = Some((stream, trace));
     }
 
     pub fn metadata(&self, id: u64) -> Value {
@@ -171,6 +182,7 @@ impl Stream {
         if self.failure.is_some() {
             return;
         }
+        self.tick_arrival = None;
         self.flush_socket();
         self.read_socket(now);
         if self.failure.is_some() {
@@ -253,6 +265,9 @@ impl Stream {
         self.authenticated_at = Some(now);
         self.received_messages = self.received_messages.saturating_add(1);
         self.incoming_bytes += message.payload.len();
+        if let Some((stream, trace)) = &self.flow_trace {
+            trace.authenticated(*stream, message.sequence.into(), self.tick_arrival);
+        }
         self.incoming.push_back(Received {
             queued_at: Instant::now(),
             kind: message.kind,

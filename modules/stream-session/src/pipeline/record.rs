@@ -192,6 +192,13 @@ pub(super) struct Record {
     pub rumble_stop_unconfirmed: bool,
     pub input_events: VecDeque<Value>,
     pub input_inflight: usize,
+    /// The direct lane is delivering this record's queue, so no queued batch
+    /// request may be scheduled for it this tick.
+    pub input_direct_active: bool,
+    /// Consecutive batches the provider declined to serve directly.
+    pub input_direct_declines: u8,
+    /// Do not offer a direct batch before this time.
+    pub input_direct_retry_at: u64,
     pub input_timing: super::input_timing::InputTiming,
     pub input_events_sent: u64,
     pub input_batches: u64,
@@ -359,6 +366,9 @@ impl Record {
             rumble_stop_unconfirmed: false,
             input_events: VecDeque::new(),
             input_inflight: 0,
+            input_direct_active: false,
+            input_direct_declines: 0,
+            input_direct_retry_at: 0,
             input_timing: super::input_timing::InputTiming::default(),
             input_events_sent: 0,
             input_batches: 0,
