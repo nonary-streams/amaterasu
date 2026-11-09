@@ -40,6 +40,7 @@
     "src/updater.ts",
     "src/system_tray.ts",
     "src/host_logs.ts",
+    "src/performance.ts",
     "src/pages.ts",
     "src/permission-management.ts",
     "src/management.ts",

@@ -331,3 +331,58 @@ fn the_collector_thread_retains_history_for_a_management_surface() {
     hub.shutdown();
     assert_eq!(hub.snapshot()["slow_spans"].as_array().unwrap().len(), 1);
 }
+
+#[test]
+fn a_snapshot_keeps_recent_detail_a_compact_trend_and_stays_within_its_budget() {
+    let hub = Arc::new(TraceHub::new(vec!["producer".into()]));
+    let window = |index: u64| Report {
+        target: "trace.window",
+        body: serde_json::json!({
+            "event": "trace_window",
+            "window_us": 10_000_000,
+            "tracks": [{
+                "track": "input", "completed": index, "slow": 1,
+                "total": {"stage":"total","calls":index,"total_us":900,"max_us":700,
+                          "mean_us":300,"p50_upper_us":250,"p95_upper_us":500,"p99_upper_us":700},
+                "steps": [{"stage":"a>b","calls":index,"total_us":900,"max_us":700}],
+            }],
+            "spans": [
+                {"stage":"host.tick:amaterasu.video","calls":3,"total_us":900,"max_us":400},
+                {"stage":"host.tick:amaterasu.state","calls":1,"total_us":800,"max_us":800},
+            ],
+        }),
+    };
+    for index in 1..=200 {
+        hub.record_for_test(&window(index), 1_000 + index);
+    }
+    // Far more slow flows than any budget could hold in full.
+    let padded = "x".repeat(4_000);
+    for index in 0..200 {
+        hub.record_for_test(
+            &Report {
+                target: "trace.slow_flow",
+                body: serde_json::json!({"event":"slow_flow","flow":index,"padding":padded}),
+            },
+            5_000 + index,
+        );
+    }
+
+    let snapshot = hub.snapshot();
+    assert!(snapshot.to_string().len() <= 192 * 1024);
+    // The newest full windows are kept; older ones survive only as trend points.
+    let windows = snapshot["windows"].as_array().unwrap();
+    assert_eq!(windows.len(), 6);
+    assert_eq!(windows.last().unwrap()["tracks"][0]["completed"], 200);
+    assert_eq!(windows.last().unwrap()["observed_unix_ms"], 1_200);
+    let trend = snapshot["trend"].as_array().unwrap();
+    assert!(!trend.is_empty() && trend.len() <= 180);
+    let newest = trend.last().unwrap();
+    assert_eq!(newest["tracks"][0]["track"], "input");
+    assert_eq!(newest["tracks"][0]["p95_upper_us"], 500);
+    assert_eq!(newest["longest_span"]["stage"], "host.tick:amaterasu.state");
+    assert!(newest["tracks"][0].get("steps").is_none());
+    // The newest slow flow is always present.
+    let slow = snapshot["slow_flows"].as_array().unwrap();
+    assert_eq!(slow.last().unwrap()["flow"], 199);
+    assert!(slow.len() <= 40);
+}

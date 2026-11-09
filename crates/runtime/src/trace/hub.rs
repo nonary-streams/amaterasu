@@ -14,24 +14,109 @@ const RING_CAPACITY: usize = 16_384;
 /// The collector sleeps this long after finding work, and longer when idle.
 const BUSY_PAUSE: Duration = Duration::from_millis(5);
 const IDLE_PAUSE: Duration = Duration::from_millis(50);
-const RETAINED_WINDOWS: usize = 30;
-const RETAINED_SLOW_FLOWS: usize = 60;
-const RETAINED_SLOW_SPANS: usize = 60;
+/// Full detail for the last minute; a compact trend for the last half hour.
+const RETAINED_WINDOWS: usize = 6;
+const RETAINED_TREND: usize = 180;
+const RETAINED_SLOW_FLOWS: usize = 40;
+const RETAINED_SLOW_SPANS: usize = 40;
+/// A snapshot travels as one broker result, so it stays well inside that limit.
+const SNAPSHOT_BYTE_BUDGET: usize = 192 * 1024;
 
 /// What a management surface may show: recent windows and recent slow items.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct History {
     windows: VecDeque<Value>,
+    trend: VecDeque<Value>,
     slow_flows: VecDeque<Value>,
     slow_spans: VecDeque<Value>,
 }
 
-fn retain(history: &mut VecDeque<Value>, limit: usize, mut item: Value, wall_ms: u64) {
-    item["observed_unix_ms"] = wall_ms.into();
+fn retain(history: &mut VecDeque<Value>, limit: usize, item: Value) {
     if history.len() >= limit {
         history.pop_front();
     }
     history.push_back(item);
+}
+
+/// The few numbers of a window worth charting over time.
+fn trend_point(window: &Value) -> Value {
+    let tracks: Vec<Value> = window["tracks"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|track| {
+            json!({
+                "track": track["track"],
+                "completed": track["completed"],
+                "slow": track["slow"],
+                "mean_us": track["total"]["mean_us"],
+                "p50_upper_us": track["total"]["p50_upper_us"],
+                "p95_upper_us": track["total"]["p95_upper_us"],
+                "max_us": track["total"]["max_us"],
+            })
+        })
+        .collect();
+    let longest_span = window["spans"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .max_by_key(|span| span["max_us"].as_u64().unwrap_or(0))
+        .map(|span| json!({"stage": span["stage"], "max_us": span["max_us"]}));
+    json!({
+        "observed_unix_ms": window["observed_unix_ms"],
+        "window_us": window["window_us"],
+        "tracks": tracks,
+        "longest_span": longest_span,
+    })
+}
+
+impl History {
+    fn record(&mut self, report: &Report, wall_ms: u64) {
+        let mut item = report.body.clone();
+        item["observed_unix_ms"] = wall_ms.into();
+        match report.target {
+            "trace.window" => {
+                retain(&mut self.trend, RETAINED_TREND, trend_point(&item));
+                retain(&mut self.windows, RETAINED_WINDOWS, item);
+            }
+            "trace.slow_flow" => retain(&mut self.slow_flows, RETAINED_SLOW_FLOWS, item),
+            _ => retain(&mut self.slow_spans, RETAINED_SLOW_SPANS, item),
+        }
+    }
+
+    fn to_json(&self, collecting: bool) -> Value {
+        json!({
+            "schema": 1,
+            "collecting": collecting,
+            "windows": self.windows,
+            "trend": self.trend,
+            "slow_flows": self.slow_flows,
+            "slow_spans": self.slow_spans,
+        })
+    }
+
+    /// Drops the oldest items, least valuable kind first, until the snapshot
+    /// fits. Each list keeps its newest entry.
+    fn bounded_json(mut self, collecting: bool) -> Value {
+        loop {
+            let snapshot = self.to_json(collecting);
+            if snapshot.to_string().len() <= SNAPSHOT_BYTE_BUDGET {
+                return snapshot;
+            }
+            let trimmed = [
+                &mut self.trend,
+                &mut self.slow_spans,
+                &mut self.slow_flows,
+                &mut self.windows,
+            ]
+            .into_iter()
+            .find(|list| list.len() > 1)
+            .and_then(VecDeque::pop_front);
+            if trimmed.is_none() {
+                return snapshot;
+            }
+        }
+    }
 }
 
 pub(crate) struct TraceHub {
@@ -110,6 +195,11 @@ impl TraceHub {
         self.ring.pop()
     }
 
+    #[cfg(test)]
+    pub fn record_for_test(&self, report: &Report, wall_ms: u64) {
+        self.history.lock().unwrap().record(report, wall_ms);
+    }
+
     /// Starts the collector the first time a producer binds a sink, so a
     /// runtime nobody traces owns no thread.
     pub fn ensure_collector(self: &Arc<Self>, broker: &Arc<Mutex<Broker>>) {
@@ -154,26 +244,7 @@ impl TraceHub {
             });
         if let Ok(mut history) = self.history.lock() {
             for report in &reports {
-                match report.target {
-                    "trace.window" => retain(
-                        &mut history.windows,
-                        RETAINED_WINDOWS,
-                        report.body.clone(),
-                        wall_ms,
-                    ),
-                    "trace.slow_flow" => retain(
-                        &mut history.slow_flows,
-                        RETAINED_SLOW_FLOWS,
-                        report.body.clone(),
-                        wall_ms,
-                    ),
-                    _ => retain(
-                        &mut history.slow_spans,
-                        RETAINED_SLOW_SPANS,
-                        report.body.clone(),
-                        wall_ms,
-                    ),
-                }
+                history.record(report, wall_ms);
             }
         }
         // The broker lock is taken once per batch of reports, never per record.
@@ -186,16 +257,14 @@ impl TraceHub {
 
     /// Bounded recent history for a management surface. Oldest first.
     pub fn snapshot(&self) -> Value {
-        let Ok(history) = self.history.lock() else {
-            return json!({"schema": 1, "windows": [], "slow_flows": [], "slow_spans": []});
-        };
-        json!({
-            "schema": 1,
-            "collecting": self.collector.get().is_some(),
-            "windows": history.windows,
-            "slow_flows": history.slow_flows,
-            "slow_spans": history.slow_spans,
-        })
+        let collecting = self.collector.get().is_some();
+        // Serialize outside the lock the collector publishes under.
+        let history = self
+            .history
+            .lock()
+            .map(|history| history.clone())
+            .unwrap_or_default();
+        history.bounded_json(collecting)
     }
 
     /// Stops and joins the collector. Sinks must no longer be in use.

@@ -69,7 +69,7 @@ for (const source of ["src/types.ts", "src/model.ts", "src/ui.ts", "src/pages.ts
   );
   if (source === "src/ui.ts") {
     vm.runInContext(
-      "Object.assign(globalThis, Amaterasu); globalThis.renderExtensionSlot = () => {}; globalThis.renderHostLogs = () => {}; Amaterasu.renderManagedStreamControls = () => {}",
+      "Object.assign(globalThis, Amaterasu); globalThis.renderExtensionSlot = () => {}; globalThis.renderHostLogs = () => {}; globalThis.renderPerformance = () => async () => {}; Amaterasu.renderManagedStreamControls = () => {}",
       pageTestContext,
     );
   }

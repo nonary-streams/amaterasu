@@ -454,6 +454,10 @@ impl ManagedModule for ManagementModule {
                             .unwrap_or_else(package_selection_unavailable),
                         _ => package_selection_unavailable(),
                     }
+                } else if payload == json!({"action":"performance_trace"})
+                    && caller == "amaterasu.management"
+                {
+                    performance_trace(&self.runtime)
                 } else if payload == json!({"action":"status"}) {
                     json!({"ok":true,"enabled":self.server.is_some(),"bound_address":self.server.as_ref().map(Server::address),"tls_address":self.server.as_ref().and_then(Server::tls_address)})
                 } else {
@@ -623,6 +627,18 @@ fn is_sha256(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Recent flow-trace history for the diagnostics page. A runtime without
+/// tracing is reported as unsupported rather than as an empty, healthy host.
+fn performance_trace(runtime: &RuntimeClient) -> serde_json::Value {
+    match runtime.send(Command::TraceSnapshot {}) {
+        Ok(Response::Result { payload }) => json!({"ok":true,"supported":true,"trace":payload}),
+        Ok(Response::Error { code, .. }) if code == "invalid_request" => {
+            json!({"ok":true,"supported":false,"trace":null})
+        }
+        _ => json!({"ok":false,"code":"performance_trace_unavailable"}),
+    }
 }
 
 fn package_selection_unavailable() -> serde_json::Value {

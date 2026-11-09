@@ -357,6 +357,12 @@ pub fn resolve(path: &str) -> Option<Route> {
             "counters",
             Some("diagnostics.read"),
         ),
+        // Recent flow-trace history, read by management from the runtime.
+        ("diagnostics", "performance") => (
+            "amaterasu.management/1",
+            "performance_trace",
+            Some("diagnostics.read"),
+        ),
         ("diagnostics", "record") => (
             "amaterasu.diagnostics/1",
             "record",
@@ -429,7 +435,8 @@ pub fn resolve(path: &str) -> Option<Route> {
             || (domain == "steam" && action == "force_sync")
             || (domain == "host-metrics" && action == "stats_read")
             || domain == "live-streams"
-            || (domain == "package-selection" && action == "package_selection_status"),
+            || (domain == "package-selection" && action == "package_selection_status")
+            || (domain == "diagnostics" && action == "performance_trace"),
     })
 }
 
@@ -686,6 +693,22 @@ mod tests {
         );
         assert!(payload(route, br#"{"package_root":"/unsafe"}"#).is_err());
         assert!(resolve("/v1/package-selection/select").is_none());
+    }
+
+    #[test]
+    fn performance_trace_is_an_empty_diagnostics_read_served_by_management() {
+        let route = resolve("/v1/diagnostics/performance").unwrap();
+        assert_eq!(route.service, "amaterasu.management/1");
+        assert_eq!(route.action, "performance_trace");
+        assert_eq!(route.scope, Some("diagnostics.read"));
+        assert!(route.requires_empty_body);
+        assert_eq!(
+            payload(route, br#"{}"#).unwrap(),
+            serde_json::json!({"action": "performance_trace"})
+        );
+        // The browser cannot ask for another module's raw records or a window.
+        assert!(payload(route, br#"{"principal":"amaterasu.input"}"#).is_err());
+        assert!(resolve("/v1/diagnostics/performance_reset").is_none());
     }
 
     #[test]

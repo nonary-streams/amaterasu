@@ -1042,11 +1042,13 @@ namespace Amaterasu {
 
   export function renderDiagnostics(context: PageContext): void {
     const area = el("div");
+    const performanceArea = el("div");
     const hostLogArea = el("div");
     const sessionsArea = el("div");
     let loadRequest = 0;
     let sessionRequest = 0;
     let refreshHostLogs: (() => Promise<void>) | null = null;
+    let refreshPerformance: (() => Promise<void>) | null = null;
     let currentRecords: DiagnosticRecord[] = [];
     const filter = input("diagnostics_filter", "", "search");
     filter.placeholder = "Search retained records";
@@ -1140,13 +1142,15 @@ namespace Amaterasu {
     context.content.append(
       sectionHeading(
         "Diagnostics",
-        "Host logs, caller-scoped records, and separately recorded stream outcomes.",
+        "Stream performance, host logs, caller-scoped records, and separately recorded stream outcomes.",
         button("Refresh", () => {
+          void refreshPerformance?.();
           void refreshHostLogs?.();
           void loadRecentSessions();
           return load();
         }),
       ),
+      performanceArea,
       hostLogArea,
       area,
       panel("Recent stream outcomes", sessionsArea,
@@ -1247,6 +1251,7 @@ namespace Amaterasu {
         if (isCurrent()) area.replaceChildren(errorPanel(error, load));
       }
     }
+    if (context.api.allows("diagnostics.read")) refreshPerformance = renderPerformance(context, performanceArea);
     if (context.api.allows("host-logs.read")) refreshHostLogs = renderHostLogs(context, hostLogArea);
     void load();
     void loadRecentSessions();
