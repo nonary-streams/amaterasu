@@ -435,6 +435,7 @@ fn build_package_with_library_selection_and_probe(
         "amaterasu.session-lifecycle",
         "amaterasu.extension-registry",
         crate::profiles::linux_session::VIDEO_COMPONENT_ID,
+        STREAM_SESSION_COMPONENT_ID,
     ] {
         if profile
             .components()
@@ -2359,82 +2360,71 @@ mod provision_tests {
         fs::remove_dir_all(base).unwrap();
     }
 
-    #[test]
-    fn signed_rtx_graph_selects_a_replacement_video_contract() {
-        use crate::profiles::linux_session::{
-            CapabilityBinding, VIDEO_COMPONENT_ID, default_rtx_hdr_selection,
-        };
-
-        fn replace_identity(value: &mut serde_json::Value, old: &str, new: &str) {
-            match value {
-                serde_json::Value::String(text) if text == old => *text = new.into(),
-                serde_json::Value::Array(values) => {
-                    for value in values {
-                        replace_identity(value, old, new);
-                    }
+    fn replace_identity(value: &mut serde_json::Value, old: &str, new: &str) {
+        match value {
+            serde_json::Value::String(text) if text == old => *text = new.into(),
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    replace_identity(value, old, new);
                 }
-                serde_json::Value::Object(values) => {
-                    for value in values.values_mut() {
-                        replace_identity(value, old, new);
-                    }
-                }
-                _ => {}
             }
+            serde_json::Value::Object(values) => {
+                for (key, mut value) in std::mem::take(values) {
+                    replace_identity(&mut value, old, new);
+                    values.insert(if key == old { new.into() } else { key }, value);
+                }
+            }
+            _ => {}
         }
+    }
 
-        let base = fixture("rtx-replacement-video");
+    /// Package the RTX profile with one core role served by an external
+    /// component, renaming every policy reference to the role's identities.
+    fn package_role_replacement(
+        name: &str,
+        (original, replacement): (&str, &str),
+        services: &[(&str, &str)],
+        requested: Grants,
+        select: impl FnOnce(&mut amaterasu_contracts::processing_composition::ProcessingSelection),
+    ) -> (PathBuf, BootstrapConfig, PathBuf) {
+        use crate::profiles::linux_session::default_rtx_hdr_selection;
+
+        let base = fixture(name);
         let root = base.join("root");
         let artifacts = base.join("artifacts");
         initialize_linux_session(&root, &LinuxSessionOptions::default()).unwrap();
         let mut bootstrap: BootstrapConfig = read_json(&root.join("bootstrap.json")).unwrap();
-        let mut video_settings = bootstrap
-            .policy
-            .settings
-            .remove(VIDEO_COMPONENT_ID)
-            .unwrap();
-        bootstrap
-            .policy
-            .principals
-            .remove(VIDEO_COMPONENT_ID)
-            .unwrap();
+        let mut role_settings = bootstrap.policy.settings.remove(original).unwrap();
+        bootstrap.policy.principals.remove(original).unwrap();
         for value in bootstrap
             .policy
             .settings
             .values_mut()
-            .chain(std::iter::once(&mut video_settings))
+            .chain(std::iter::once(&mut role_settings))
         {
-            replace_identity(value, VIDEO_COMPONENT_ID, "example.video");
-            replace_identity(value, "amaterasu.video/1", "example.video/1");
+            replace_identity(value, original, replacement);
+            for (old, new) in services {
+                replace_identity(value, old, new);
+            }
         }
         bootstrap
             .policy
             .settings
-            .insert("example.video".into(), video_settings);
+            .insert(replacement.into(), role_settings);
         for approval in &mut bootstrap.policy.api_methods {
-            if approval.provider == VIDEO_COMPONENT_ID {
-                approval.provider = "example.video".into();
+            if approval.provider == original {
+                approval.provider = replacement.into();
             }
-            if approval.callers.remove(VIDEO_COMPONENT_ID) {
-                approval.callers.insert("example.video".into());
+            if approval.callers.remove(original) {
+                approval.callers.insert(replacement.into());
             }
         }
-        let requested = Grants {
-            provide: ["example.video/1".into()].into(),
-            native_provide: ["example.video/1".into()].into(),
-            ..Default::default()
-        };
         bootstrap
             .policy
             .principals
-            .insert("example.video".into(), requested.clone());
+            .insert(replacement.into(), requested.clone());
         let mut selection = default_rtx_hdr_selection();
-        selection.frame_consumer = CapabilityBinding {
-            principal: "example.video".into(),
-            service: "example.video/1".into(),
-            contract: amaterasu_module_sdk::video::CONTRACT.into(),
-            interface_major: 1,
-            interface_minor: 0,
-        };
+        select(&mut selection);
         selection.display_settings = None;
         crate::profiles::linux_session::enable_rtx_hdr_with_selection(
             &mut bootstrap.policy,
@@ -2443,14 +2433,14 @@ mod provision_tests {
         )
         .unwrap();
         write_json_atomically(&root.join("bootstrap.json"), &bootstrap).unwrap();
-        let template = base.join("video.json");
-        let artifact = base.join("video.so");
+        let template = base.join("replacement.json");
+        let artifact = base.join("replacement.so");
         write_json_atomically(
             &template,
             &ComponentManifest {
-                id: "example.video".into(),
+                id: replacement.into(),
                 version: "0.2.0".into(),
-                file: "example_video.so".into(),
+                file: format!("{}.so", replacement.replace('.', "_")),
                 sha256: String::new(),
                 size: 0,
                 abi_major: amaterasu_abi::ABI_MAJOR,
@@ -2460,10 +2450,10 @@ mod provision_tests {
             },
         )
         .unwrap();
-        fs::write(&artifact, b"independently packaged video fixture").unwrap();
+        fs::write(&artifact, b"independently packaged role fixture").unwrap();
         fs::create_dir_all(&artifacts).unwrap();
         for definition in PackageProfile::LinuxSessionRtxHdr.components() {
-            if definition.id != VIDEO_COMPONENT_ID {
+            if definition.id != original {
                 fs::write(
                     artifacts.join(library_filename(definition.library)),
                     definition.id.as_bytes(),
@@ -2491,6 +2481,96 @@ mod provision_tests {
             |_| true,
         )
         .unwrap();
+        (base, bootstrap, output)
+    }
+
+    #[test]
+    fn signed_rtx_graph_selects_a_replacement_stream_owner() {
+        use crate::profiles::linux_session::CapabilityBinding;
+
+        let (base, bootstrap, output) = package_role_replacement(
+            "rtx-replacement-stream",
+            (STREAM_SESSION_COMPONENT_ID, "example.stream"),
+            &[
+                ("amaterasu.stream-session/1", "example.stream/1"),
+                ("nonary.stream-status/1", "example.stream-status/1"),
+            ],
+            Grants {
+                provide: ["example.stream/1".into(), "example.stream-status/1".into()].into(),
+                ..Default::default()
+            },
+            |selection| {
+                selection.stream_owner = Some(CapabilityBinding {
+                    principal: "example.stream".into(),
+                    service: "example.stream/1".into(),
+                    contract: amaterasu_module_sdk::processing_composition::STREAM_OWNER_CONTRACT
+                        .into(),
+                    interface_major: 1,
+                    interface_minor: 0,
+                });
+            },
+        );
+        let package = verify_package(
+            &output,
+            &bootstrap,
+            VerificationPolicy {
+                minimum_sequence: 0,
+                allow_historical: false,
+                now: unix_timestamp(),
+            },
+        )
+        .unwrap();
+        assert!(package.signed);
+        assert!(
+            package
+                .manifest
+                .components
+                .iter()
+                .all(|component| component.id != STREAM_SESSION_COMPONENT_ID)
+        );
+        for client in ["amaterasu.nvhttp", "amaterasu.rtsp"] {
+            let component = package
+                .manifest
+                .components
+                .iter()
+                .find(|component| component.id == client)
+                .unwrap();
+            assert_eq!(
+                component.requires.get("example.stream").map(String::as_str),
+                Some("0.2.0")
+            );
+            assert!(
+                package.runtime_config.principals[client]
+                    .call
+                    .contains("example.stream/1")
+            );
+        }
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn signed_rtx_graph_selects_a_replacement_video_contract() {
+        use crate::profiles::linux_session::{CapabilityBinding, VIDEO_COMPONENT_ID};
+
+        let (base, bootstrap, output) = package_role_replacement(
+            "rtx-replacement-video",
+            (VIDEO_COMPONENT_ID, "example.video"),
+            &[("amaterasu.video/1", "example.video/1")],
+            Grants {
+                provide: ["example.video/1".into()].into(),
+                native_provide: ["example.video/1".into()].into(),
+                ..Default::default()
+            },
+            |selection| {
+                selection.frame_consumer = CapabilityBinding {
+                    principal: "example.video".into(),
+                    service: "example.video/1".into(),
+                    contract: amaterasu_module_sdk::video::CONTRACT.into(),
+                    interface_major: 1,
+                    interface_minor: 0,
+                };
+            },
+        );
         let package = verify_package(
             &output,
             &bootstrap,
@@ -4182,6 +4262,25 @@ fn build_signed_package_with_runtime_probe_and_authority(
                             );
                         }
                     }
+                    if id == STREAM_SESSION_COMPONENT_ID {
+                        let policy = composition_policy
+                            .ok_or("stream owner replacement needs a processing selection")?;
+                        let selected = selected_stream_replacement(policy, external)?;
+                        let has_view = policy
+                            .processing_compositions
+                            .get(&component.id)
+                            .is_some_and(|view| view.stream_owner.as_ref() == Some(selected));
+                        let has_grant = policy
+                            .principals
+                            .get(&component.id)
+                            .is_some_and(|grants| grants.call.contains(&selected.service));
+                        if !has_view || !has_grant {
+                            return Err(
+                                "stream owner dependent lacks its selected contract and grant"
+                                    .into(),
+                            );
+                        }
+                    }
                     let original = profile
                         .components()
                         .iter()
@@ -4658,6 +4757,8 @@ fn validate_unique_service_providers(
     Ok(())
 }
 
+const STREAM_SESSION_COMPONENT_ID: &str = "amaterasu.stream-session";
+
 fn validate_omitted_components(
     profile: PackageProfile,
     external: &[ExternalComponent],
@@ -4689,6 +4790,8 @@ fn validate_omitted_components(
             .ok_or("omitted component is not in the selected profile")?;
         if id == crate::profiles::linux_session::VIDEO_COMPONENT_ID {
             selected_video_replacement(&bootstrap.policy, external)?;
+        } else if id == STREAM_SESSION_COMPONENT_ID {
+            selected_stream_replacement(&bootstrap.policy, external)?;
         } else if !OPTIONAL.contains(&id.as_str()) {
             return Err("only explicitly optional profile providers can be omitted".into());
         }
@@ -4725,10 +4828,10 @@ fn validate_omitted_components(
     Ok(())
 }
 
-fn selected_video_replacement<'a>(
-    policy: &'a amaterasu_contracts::RuntimeConfig,
-    external: &[ExternalComponent],
-) -> PackageResult<&'a amaterasu_contracts::processing_composition::CapabilityBinding> {
+/// A core role can only be replaced through one validated processing graph.
+fn sole_processing_graph(
+    policy: &amaterasu_contracts::RuntimeConfig,
+) -> PackageResult<&amaterasu_contracts::processing_composition::ProcessingComposition> {
     let mut graphs = policy
         .processing_compositions
         .iter()
@@ -4740,11 +4843,46 @@ fn selected_video_replacement<'a>(
         });
     let graph = graphs
         .next()
-        .ok_or("video replacement needs a selected processor")?;
+        .ok_or("role replacement needs a selected processor")?;
     if graphs.next().is_some() {
-        return Err("video replacement requires one processing graph".into());
+        return Err("role replacement requires one processing graph".into());
     }
     amaterasu_module_sdk::processing_composition::validate(graph)?;
+    Ok(graph)
+}
+
+fn selected_stream_replacement<'a>(
+    policy: &'a amaterasu_contracts::RuntimeConfig,
+    external: &[ExternalComponent],
+) -> PackageResult<&'a amaterasu_contracts::processing_composition::CapabilityBinding> {
+    let selected = sole_processing_graph(policy)?
+        .stream_owner
+        .as_ref()
+        .ok_or("stream owner replacement is not selected")?;
+    let packaged = external.iter().any(|provider| {
+        provider.manifest.id == selected.principal
+            && provider
+                .manifest
+                .requested
+                .provide
+                .contains(&selected.service)
+    });
+    if selected.principal == STREAM_SESSION_COMPONENT_ID
+        || selected.contract != amaterasu_module_sdk::processing_composition::STREAM_OWNER_CONTRACT
+        || !packaged
+    {
+        return Err(
+            "selected stream owner replacement is not packaged with the required contract".into(),
+        );
+    }
+    Ok(selected)
+}
+
+fn selected_video_replacement<'a>(
+    policy: &'a amaterasu_contracts::RuntimeConfig,
+    external: &[ExternalComponent],
+) -> PackageResult<&'a amaterasu_contracts::processing_composition::CapabilityBinding> {
+    let graph = sole_processing_graph(policy)?;
     let selected = graph
         .frame_consumer
         .as_ref()
@@ -4941,7 +5079,7 @@ fn validate_component_bindings(
         {
             return Err("invalid or duplicate component binding".into());
         }
-        let consumer = selected(&binding.consumer).ok_or("binding consumer is not selected")?;
+        selected(&binding.consumer).ok_or("binding consumer is not selected")?;
         let provider = selected(&binding.provider).ok_or("binding provider is not selected")?;
         let consumer_policy = bootstrap
             .policy
@@ -4965,7 +5103,6 @@ fn validate_component_bindings(
         if !approved || binding.consumer == RUNTIME_ID || binding.provider == RUNTIME_ID {
             return Err("component binding lacks selected provider or installed approval".into());
         }
-        let _ = consumer;
     }
     Ok(())
 }
