@@ -11,6 +11,16 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::Path;
 
+/// The standard selection for the policy currently installed at `root`.
+pub fn default_selection_for_root(
+    root: &Path,
+) -> PackageResult<crate::profiles::linux_session::ProcessingSelection> {
+    let bootstrap: BootstrapConfig =
+        serde_json::from_slice(&read_bounded(&root.join("bootstrap.json"), 1024 * 1024)?)
+            .map_err(|e| e.to_string())?;
+    Ok(crate::profiles::linux_session::default_rtx_hdr_selection_for(&bootstrap.policy))
+}
+
 /// Creates only an external report; does not provision the host or grant authority.
 pub fn prepare(
     root: &Path,
@@ -65,7 +75,7 @@ pub fn prepare(
     if Path::new(configured) != runtime_parent {
         return Err("RTX HDR runtime parent differs from host state".into());
     }
-    crate::profiles::linux_session::enable_rtx_hdr_with_selection(
+    let legacy_wiring_converted = crate::profiles::linux_session::compose_rtx_hdr_destination(
         &mut optional.policy,
         &runtime_parent.join("runtime"),
         capabilities,
@@ -82,6 +92,7 @@ pub fn prepare(
         "kind": "activation_policy_review_v3",
         "selection": capabilities,
         "source_bootstrap_sha256": expected,
+        "legacy_rtx_wiring_converted": legacy_wiring_converted,
         "note": "Review only; this report does not authorize or modify host policy.",
         "baseline_bootstrap": baseline,
         "optional_bootstrap": optional,
@@ -279,7 +290,7 @@ pub fn provision(root: &Path, report_path: &Path, expected_report: &str) -> Pack
     {
         return Err("runtime path differs from trusted host state".into());
     }
-    crate::profiles::linux_session::enable_rtx_hdr_with_selection(
+    let legacy_wiring_converted = crate::profiles::linux_session::compose_rtx_hdr_destination(
         &mut optional.policy,
         &runtime_parent.join("runtime"),
         &capabilities,
@@ -317,6 +328,11 @@ pub fn provision(root: &Path, report_path: &Path, expected_report: &str) -> Pack
         match fs::hard_link(&allowlist_temp, &allowlist_path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                if legacy_wiring_converted
+                    && allowlist_is_fully_applied(&allowlist_path, uid, publisher, &original)?
+                {
+                    return fs::rename(&allowlist_temp, &allowlist_path).map_err(|e| e.to_string());
+                }
                 let m = fs::symlink_metadata(&allowlist_path).map_err(|e| e.to_string())?;
                 if !m.is_file()
                     || m.file_type().is_symlink()
@@ -369,6 +385,40 @@ pub fn provision(root: &Path, report_path: &Path, expected_report: &str) -> Pack
     result
 }
 
+/// An allowlist from an earlier update can be replaced only when it no longer
+/// authorizes anything: the same publisher wrote it and the bootstrap already
+/// holds every value it approved. Pending authority is never discarded.
+#[cfg(target_os = "linux")]
+fn allowlist_is_fully_applied(
+    path: &Path,
+    uid: u32,
+    publisher: &str,
+    bootstrap: &[u8],
+) -> PackageResult<bool> {
+    use amaterasu_package::policy_approval::{PolicyAllowlist, PolicyValue};
+    use std::os::unix::fs::MetadataExt;
+    let metadata = fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+    if !metadata.is_file() || metadata.uid() != uid || metadata.mode() & 0o077 != 0 {
+        return Ok(false);
+    }
+    let Ok(existing) = serde_json::from_slice::<PolicyAllowlist>(&read_bounded(path, 1024 * 1024)?)
+    else {
+        return Ok(false);
+    };
+    if existing.publisher_fingerprint != publisher {
+        return Ok(false);
+    }
+    let bootstrap: serde_json::Value =
+        serde_json::from_slice(bootstrap).map_err(|e| e.to_string())?;
+    Ok(existing.changes.iter().all(|(pointer, change)| {
+        bootstrap
+            .pointer(pointer)
+            .cloned()
+            .map_or(PolicyValue::Absent, PolicyValue::Present)
+            == change.after
+    }))
+}
+
 /// Prepare the fixed RTX HDR policy for the signer of the installed package.
 /// This is called by user-service installation and never fetches or loads the
 /// optional plugin. It cannot select another publisher or an arbitrary policy.
@@ -377,7 +427,7 @@ pub fn provision_default(root: &Path) -> PackageResult<()> {
     use std::os::unix::fs::DirBuilderExt;
     validate_user_root(root)?;
     let root = root.canonicalize().map_err(|e| e.to_string())?;
-    let (source_digest, publisher) = {
+    let (source_digest, publisher, default_selection) = {
         let _lock = amaterasu_package::RootLock::acquire(&root)?;
         let bytes = read_bounded(&root.join("bootstrap.json"), 1024 * 1024)?;
         let bootstrap: BootstrapConfig =
@@ -449,7 +499,9 @@ pub fn provision_default(root: &Path) -> PackageResult<()> {
             )?;
             return enroll_project_repository(&root, &bootstrap, &publisher);
         }
-        (sha256(&bytes), publisher)
+        let selection =
+            crate::profiles::linux_session::default_rtx_hdr_selection_for(&bootstrap.policy);
+        (sha256(&bytes), publisher, selection)
     };
     // A private, exclusive temporary directory keeps the review proposal out of
     // the installation root and protects it until its digest is verified.
@@ -468,7 +520,7 @@ pub fn provision_default(root: &Path) -> PackageResult<()> {
             &source_digest,
             &publisher,
             &report,
-            &crate::profiles::linux_session::default_rtx_hdr_selection(),
+            &default_selection,
         )?;
         let digest = sha256(&read_bounded(&report, 1024 * 1024)?);
         provision(&root, &report, &digest)
@@ -526,20 +578,9 @@ mod tests {
     use super::*;
     use amaterasu_package::{encode_hex, random_identifier, write_json_atomically};
 
-    #[test]
-    fn review_reports_exact_proposed_grant_without_modifying_host() {
-        let base = std::env::temp_dir().join(format!(
-            "amaterasu-activation-review-{}",
-            random_identifier().unwrap()
-        ));
-        let root = base.join("root");
-        fs::create_dir_all(&root).unwrap();
-        let root = root.canonicalize().unwrap();
-        let options = crate::profiles::linux_session::options::LinuxSessionOptions {
-            frame_helper: Some("/usr/bin/amaterasu-vkms-frame-helper".into()),
-            ..Default::default()
-        };
-        let policy = crate::profiles::linux_session::linux_session_policy(&root, &options).unwrap();
+    /// Writes a production bootstrap and a signed active package under `root`,
+    /// returning the publisher fingerprint.
+    fn install_signed_root(root: &Path, policy: amaterasu_contracts::RuntimeConfig) -> String {
         use ed25519_dalek::{Signer, SigningKey};
         let signer = SigningKey::from_bytes(&[11u8; 32]);
         let key = *signer.verifying_key().as_bytes();
@@ -551,7 +592,6 @@ mod tests {
             policy,
         };
         write_json_atomically(&root.join("bootstrap.json"), &bootstrap).unwrap();
-        let before = fs::read(root.join("bootstrap.json")).unwrap();
         let artifact = b"synthetic signed component";
         let make_component =
             |id: &str, file: &str, runtime, requested| amaterasu_package::ComponentManifest {
@@ -584,7 +624,7 @@ mod tests {
         };
         let raw = serde_json::to_vec(&manifest).unwrap();
         let active_digest = sha256(&raw);
-        let set = amaterasu_package::package_directory(&root, &active_digest).unwrap();
+        let set = amaterasu_package::package_directory(root, &active_digest).unwrap();
         fs::create_dir_all(&set).unwrap();
         fs::write(set.join("runtime.bin"), artifact).unwrap();
         fs::write(set.join("management.bin"), artifact).unwrap();
@@ -606,6 +646,25 @@ mod tests {
             },
         )
         .unwrap();
+        fingerprint
+    }
+
+    #[test]
+    fn review_reports_exact_proposed_grant_without_modifying_host() {
+        let base = std::env::temp_dir().join(format!(
+            "amaterasu-activation-review-{}",
+            random_identifier().unwrap()
+        ));
+        let root = base.join("root");
+        fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let options = crate::profiles::linux_session::options::LinuxSessionOptions {
+            frame_helper: Some("/usr/bin/amaterasu-vkms-frame-helper".into()),
+            ..Default::default()
+        };
+        let policy = crate::profiles::linux_session::linux_session_policy(&root, &options).unwrap();
+        let fingerprint = install_signed_root(&root, policy);
+        let before = fs::read(root.join("bootstrap.json")).unwrap();
         let digest = sha256(&before);
         let report = base.join("review.json");
         let capabilities = crate::profiles::linux_session::default_rtx_hdr_selection();
@@ -721,6 +780,166 @@ mod tests {
             store.revoke(RTX_REPOSITORY_ID).unwrap();
             assert!(provision_default(&root).is_err());
         }
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn conversion_replaces_only_a_fully_applied_allowlist() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!(
+            "amaterasu-conversion-allowlist-{}",
+            random_identifier().unwrap()
+        ));
+        let root = base.join("root");
+        fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let options = crate::profiles::linux_session::options::LinuxSessionOptions {
+            frame_helper: Some("/usr/bin/amaterasu-vkms-frame-helper".into()),
+            rtx_hdr_runtime_directory: Some(root.join("data/state/rtx-hdr/runtime")),
+            ..Default::default()
+        };
+        let mut policy =
+            crate::profiles::linux_session::linux_session_policy(&root, &options).unwrap();
+        policy.processing_compositions.clear();
+        let video = policy
+            .settings
+            .get_mut("amaterasu.linux-session-video")
+            .unwrap()
+            .as_object_mut()
+            .unwrap();
+        video.insert("gpu_processor_service".into(), json!("amaterasu.rtx-hdr/1"));
+        video.insert("gpu_processor_opt_in".into(), json!(true));
+        let fingerprint = install_signed_root(&root, policy);
+        let bootstrap_path = root.join("bootstrap.json");
+        fs::set_permissions(&bootstrap_path, fs::Permissions::from_mode(0o600)).unwrap();
+        let source = fs::read(&bootstrap_path).unwrap();
+        let report = base.join("review.json");
+        let selection = crate::profiles::linux_session::default_rtx_hdr_selection();
+        prepare(&root, &sha256(&source), &fingerprint, &report, &selection).unwrap();
+        let report_bytes = fs::read(&report).unwrap();
+        let reviewed: serde_json::Value = serde_json::from_slice(&report_bytes).unwrap();
+        assert_eq!(reviewed["legacy_rtx_wiring_converted"], true);
+        let report_digest = sha256(&report_bytes);
+
+        let allowlist_path = root.join("package-activation-policy.json");
+        let write_allowlist = |publisher: &str, after: serde_json::Value| {
+            let bytes = serde_json::to_vec(&json!({
+                "publisher_fingerprint": publisher,
+                "changes": {"/policy/settings/amaterasu.stream-session/enabled": {
+                    "before": {"kind": "absent"},
+                    "after": after,
+                }},
+            }))
+            .unwrap();
+            fs::write(&allowlist_path, &bytes).unwrap();
+            fs::set_permissions(&allowlist_path, fs::Permissions::from_mode(0o600)).unwrap();
+            bytes
+        };
+        let current_value = serde_json::from_slice::<serde_json::Value>(&source).unwrap()["policy"]
+            ["settings"]["amaterasu.stream-session"]["enabled"]
+            .clone();
+        let applied = json!({"kind": "present", "value": current_value});
+
+        // An authorization that has not been consumed yet must survive.
+        let pending = write_allowlist(&fingerprint, json!({"kind": "present", "value": "new"}));
+        assert!(provision(&root, &report, &report_digest).is_err());
+        assert_eq!(fs::read(&allowlist_path).unwrap(), pending);
+
+        // So must one issued for a different publisher.
+        let foreign = write_allowlist(&"f".repeat(64), applied.clone());
+        assert!(provision(&root, &report, &report_digest).is_err());
+        assert_eq!(fs::read(&allowlist_path).unwrap(), foreign);
+        assert_eq!(fs::read(&bootstrap_path).unwrap(), source);
+
+        write_allowlist(&fingerprint, applied);
+        provision(&root, &report, &report_digest).unwrap();
+        let installed: serde_json::Value =
+            serde_json::from_slice(&fs::read(&allowlist_path).unwrap()).unwrap();
+        assert_eq!(installed, reviewed["proposed_allowlist"]);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    /// Runs the production review against a copy of a real bootstrap, with its
+    /// installation path rewritten so the original root is never touched.
+    /// `AMATERASU_MIGRATED_REPORT` is written for the provider parser tests.
+    #[test]
+    #[ignore = "needs AMATERASU_INSTALLED_BOOTSTRAP and AMATERASU_MIGRATED_REPORT"]
+    fn installed_bootstrap_converts_through_the_reviewed_flow() {
+        use amaterasu_package::policy_approval::{PolicyAllowlist, candidate_from_allowlist};
+        let source = std::env::var("AMATERASU_INSTALLED_BOOTSTRAP").unwrap();
+        let output = std::env::var("AMATERASU_MIGRATED_REPORT").unwrap();
+        let text = fs::read_to_string(source).unwrap();
+        let installed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let parent = installed
+            .pointer("/policy/settings/amaterasu.management/rtx_hdr_runtime_parent")
+            .and_then(|value| value.as_str())
+            .unwrap();
+        let installed_root = parent.strip_suffix("/data/state/rtx-hdr").unwrap();
+        let base = std::env::temp_dir().join(format!(
+            "amaterasu-installed-review-{}",
+            random_identifier().unwrap()
+        ));
+        let root = base.join("root");
+        fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let copy = text.replace(installed_root, root.to_str().unwrap());
+        fs::write(root.join("bootstrap.json"), &copy).unwrap();
+        let bootstrap: BootstrapConfig = serde_json::from_str(&copy).unwrap();
+        let publisher = bootstrap
+            .trusted_keys
+            .values()
+            .map(|key| sha256(&decode_hex::<32>(key).unwrap()))
+            .next()
+            .unwrap();
+        let selection = default_selection_for_root(&root).unwrap();
+        assert!(selection.foreground.is_some());
+        prepare(
+            &root,
+            &sha256(copy.as_bytes()),
+            &publisher,
+            Path::new(&output),
+            &selection,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join("bootstrap.json")).unwrap(),
+            copy
+        );
+        let report: serde_json::Value =
+            serde_json::from_slice(&fs::read(&output).unwrap()).unwrap();
+        assert_eq!(report["legacy_rtx_wiring_converted"], true);
+        let settings = |id: &str| {
+            report["optional_bootstrap"]["policy"]["settings"][id]
+                .as_object()
+                .unwrap()
+                .clone()
+        };
+        let video = settings("amaterasu.linux-session-video");
+        assert!(!video.contains_key("gpu_processor_service"));
+        assert_eq!(video["require_frame_lease"], true);
+        let capture = settings("amaterasu.capture-vkms");
+        assert_eq!(capture["gpu_snapshot"], true);
+        assert_eq!(capture["require_lease"], true);
+        let session = settings("amaterasu.stream-session");
+        assert!(!session.contains_key("processing_plan"));
+
+        // The host rebuilds the destination from the allowlist, so that exact
+        // reconstruction has to reach the reviewed result.
+        let baseline = serde_json::to_vec_pretty(&report["baseline_bootstrap"]).unwrap();
+        let allowlist: PolicyAllowlist =
+            serde_json::from_value(report["proposed_allowlist"].clone()).unwrap();
+        let placeholder = "0".repeat(64);
+        let context = PolicyCandidateContext {
+            selection_revision: &placeholder,
+            publisher_fingerprint: &publisher,
+            manifest_sha256: &placeholder,
+        };
+        let (candidate, _) = candidate_from_allowlist(&allowlist, &context, &baseline).unwrap();
+        let candidate: serde_json::Value = serde_json::from_slice(&candidate).unwrap();
+        assert_eq!(candidate, report["optional_bootstrap"]);
+        serde_json::from_value::<BootstrapConfig>(candidate).unwrap();
         fs::remove_dir_all(base).unwrap();
     }
 }

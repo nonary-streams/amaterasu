@@ -12,6 +12,7 @@
 //! only reliable way to keep it disabled: the updater has no bootstrap-level
 //! switch and would otherwise check a release feed on start.
 mod display_settings;
+mod legacy_rtx;
 pub mod options;
 #[cfg(test)]
 mod tests;
@@ -28,6 +29,8 @@ use super::{
     RUNTIME_ID, SESSION, SESSION_HISTORY, STATE, STEAM, STREAM_SESSION, VIDEO, VIRTUAL_DISPLAY,
     names,
 };
+pub use legacy_rtx::compose_rtx_hdr_destination;
+
 use amaterasu_contracts::{Grants, RuntimeConfig};
 use amaterasu_package::{PackageResult, create_private_directory};
 use options::{LinuxSessionOptions, NetworkOption};
@@ -99,6 +102,34 @@ pub fn default_rtx_hdr_selection() -> ProcessingSelection {
         lifecycle_admitters: ["amaterasu.rtsp".into()].into(),
         history_owners: ["amaterasu.nvhttp".into()].into(),
     }
+}
+
+/// The standard selection for an installed policy, which may hold fewer
+/// components than the current profile. Optional consumers it does not approve
+/// are left out. Foreground restrictions need the built-in foreground provider,
+/// so it is bound exactly when this policy approves that component; a persisted
+/// foreground-only setting then has a provider to reach instead of failing
+/// stream configuration.
+pub fn default_rtx_hdr_selection_for(policy: &RuntimeConfig) -> ProcessingSelection {
+    let mut selection = default_rtx_hdr_selection();
+    selection
+        .source_preflight_consumers
+        .retain(|principal| policy.principals.contains_key(principal));
+    let service = amaterasu_module_sdk::foreground_context::SERVICE;
+    let approved = policy
+        .principals
+        .get(FOREGROUND_CONTEXT.id)
+        .is_some_and(|grants| grants.provide.contains(service));
+    if approved {
+        selection.foreground = Some(CapabilityBinding {
+            principal: FOREGROUND_CONTEXT.id.into(),
+            service: service.into(),
+            contract: service.into(),
+            interface_major: 1,
+            interface_minor: 0,
+        });
+    }
+    selection
 }
 
 /// Authorization generations are profile-specific and never reused: the

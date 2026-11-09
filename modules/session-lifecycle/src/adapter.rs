@@ -870,6 +870,39 @@ fn resolve_journal_location(
 }
 
 #[cfg(test)]
+mod migrated_policy_tests {
+    use super::*;
+
+    fn migrated_policy() -> serde_json::Value {
+        let path = std::env::var("AMATERASU_MIGRATED_REPORT").unwrap();
+        let report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        report["optional_bootstrap"]["policy"].clone()
+    }
+
+    #[test]
+    #[ignore = "needs AMATERASU_MIGRATED_REPORT from the release review"]
+    fn reviewed_installed_policy_starts_lifecycle() {
+        let policy = migrated_policy();
+        let id = "amaterasu.session-lifecycle";
+        let mut settings: LifecycleSettings =
+            serde_json::from_value(policy["settings"][id].clone()).unwrap();
+        let composition =
+            serde_json::from_value(policy["processing_compositions"][id].clone()).unwrap();
+        settings.add_processing_composition(&composition).unwrap();
+        settings.validate().unwrap();
+        assert_eq!(
+            settings
+                .participants
+                .iter()
+                .filter(|participant| participant.provider == "amaterasu.rtx-hdr")
+                .count(),
+            1
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use amaterasu_module_sdk::abi::{self, AbiHeader, BorrowedBytes, HostApi, ReplySink};

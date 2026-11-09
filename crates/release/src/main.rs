@@ -82,7 +82,7 @@ fn run() -> PackageResult<()> {
                 expected,
                 publisher,
                 Path::new(output),
-                &profiles::linux_session::default_rtx_hdr_selection(),
+                &activation_review::default_selection_for_root(Path::new(root))?,
             )
         }
         [command, root, expected, publisher, output, flag, selection]

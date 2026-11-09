@@ -185,6 +185,34 @@ pub fn approved(
 }
 
 #[cfg(test)]
+mod migrated_policy_tests {
+    use super::*;
+
+    fn migrated_policy() -> serde_json::Value {
+        let path = std::env::var("AMATERASU_MIGRATED_REPORT").unwrap();
+        let report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        report["optional_bootstrap"]["policy"].clone()
+    }
+
+    #[test]
+    #[ignore = "needs AMATERASU_MIGRATED_REPORT from the release review"]
+    fn reviewed_installed_policy_starts_extension_registry() {
+        use amaterasu_module_sdk::processing_composition::ProcessingComposition;
+        let policy = migrated_policy();
+        let id = "amaterasu.extension-registry";
+        let mut settings: Settings =
+            serde_json::from_value(policy["settings"][id].clone()).unwrap();
+        let composition: ProcessingComposition =
+            serde_json::from_value(policy["processing_compositions"][id].clone()).unwrap();
+        settings
+            .add_processing_registrations(&composition.registrations)
+            .unwrap();
+        settings.validate().unwrap();
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use amaterasu_module_sdk::processing_composition::{
