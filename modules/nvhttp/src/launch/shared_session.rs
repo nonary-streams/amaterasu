@@ -70,8 +70,12 @@ impl Controller {
         true
     }
 
-    /// Retire only fully settled client metadata. Keep exact key fingerprints
+    /// Retire only fully settled launch metadata. Keep exact key fingerprints
     /// so eviction cannot turn a replay into a fresh transport admission.
+    ///
+    /// A finished application root is evicted like any client transport once
+    /// nothing refers to it. Otherwise every launch of this runtime would
+    /// keep a slot and the table would refuse streams once it filled.
     pub(super) fn prune_finished_transports(&mut self) {
         while self.records.len() >= MAX_RECORDS
             && self.retired_stream_keys.len() < MAX_RETIRED_STREAM_KEYS
@@ -79,23 +83,38 @@ impl Controller {
             let Some(id) = self
                 .records
                 .values()
-                .find(|record| {
-                    (record.application_session.is_some() || record.auxiliary.is_some())
-                        && record.state.terminal()
-                        && record.source_observations_emitted()
-                        && record.uncertain.is_empty()
-                        && !record.rtsp_requested
-                        && !record.history_release_required
-                        && self.job.as_ref().is_none_or(|job| job.record != record.id)
-                })
+                .find(|record| self.evictable(record))
                 .map(|record| record.id)
             else {
                 break;
             };
-            let retired = self.records.remove(&id).expect("settled client record");
+            let retired = self.records.remove(&id).expect("settled launch record");
             self.retired_stream_keys
                 .insert(Sha256::digest(retired.request.remote_input_key).into());
         }
+    }
+
+    fn evictable(&self, record: &Record) -> bool {
+        let settled = record.source_observations_emitted()
+            && record.uncertain.is_empty()
+            && self.job.as_ref().is_none_or(|job| job.record != record.id);
+        let confirmed = matches!(record.state, State::Stopped | State::Failed)
+            && !record.rtsp_requested
+            && !record.history_release_required;
+        // An abandoned record has already reported what stayed unconfirmed;
+        // keeping it forever would only turn that into a capacity failure.
+        let finished = confirmed || record.state == State::CleanupAbandoned;
+        let referenced = record.application_session.is_none()
+            && record.auxiliary.is_none()
+            && (self
+                .records
+                .values()
+                .any(|member| member.application_session == Some(record.id))
+                || self
+                    .pending_resume
+                    .as_ref()
+                    .is_some_and(|pending| pending.record == record.id));
+        settled && finished && !referenced
     }
 
     pub(super) fn shared_application(&self, app_id: u32) -> Option<u64> {
@@ -354,7 +373,7 @@ impl Controller {
             .filter(|record| record.application_root() == application && !record.state.terminal())
         {
             record.transport_only_cleanup = record.application_session.is_some();
-            if record.state == State::CleanupFailed {
+            if record.state == State::CleanupFailed || record.automatic_retry_in_flight() {
                 match record.retry_cleanup(now) {
                     Ok(Some(pending)) => record.uncertain.push_front(pending),
                     Ok(None) => {}
@@ -395,7 +414,9 @@ impl Controller {
     ) -> Option<Reply> {
         let application = self.records[&member].application_root();
         let root = &self.records[&application];
-        if root.state == State::Stopping || root.cancel_connection.is_some() {
+        if (root.state == State::Stopping && !root.automatic_retry_in_flight())
+            || root.cancel_connection.is_some()
+        {
             return Some(private_error(
                 409,
                 "application cleanup is already in progress",

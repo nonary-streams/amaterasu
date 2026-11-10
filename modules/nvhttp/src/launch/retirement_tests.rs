@@ -107,14 +107,24 @@ fn failed_application_retirement_requires_explicit_retry_with_a_fresh_proof_oper
     }
     assert_eq!(controller.records[&1].state, State::CleanupFailed);
     assert!(!controller.records[&1].application_retirement_verified());
-    let commands_before_retry = broker.commands.len();
-    controller.poll(now + Duration::from_secs(3), &mut |command| {
-        broker.send(command)
-    });
+    let proofs_before_retry = lifecycle_commands(&broker)
+        .iter()
+        .filter(|(operation, _)| *operation == "application_retired")
+        .count();
+    for _ in 0..8 {
+        controller.poll(now + Duration::from_secs(3), &mut |command| {
+            broker.send(command)
+        });
+    }
+    // The automatic pass may read the receipt again; it never asks for a
+    // fresh proof on its own.
     assert_eq!(
-        broker.commands.len(),
-        commands_before_retry,
-        "do not automatically retry proof"
+        lifecycle_commands(&broker)
+            .iter()
+            .filter(|(operation, _)| *operation == "application_retired")
+            .count(),
+        proofs_before_retry,
+        "do not automatically request a new proof"
     );
     broker.lifecycle_replies.extend([
         json!({"status":"pending","target":target}),

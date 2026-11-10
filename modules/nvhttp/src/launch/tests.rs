@@ -2024,6 +2024,14 @@ fn poll_until_stopped(controller: &mut Controller, broker: &mut Broker, now: Ins
     panic!("cleanup did not reach Stopped")
 }
 
+fn application_stop_count(broker: &Broker) -> usize {
+    broker
+        .actions()
+        .iter()
+        .filter(|action| **action == ("amaterasu.launch/1", "stop"))
+        .count()
+}
+
 fn launch_ready(controller: &mut Controller, broker: &mut Broker, now: Instant) {
     assert!(controller.launch(10, request(1), peer(1), now).is_none());
     let (connection, reply) = poll_until_reply(controller, broker, now);
@@ -4853,7 +4861,7 @@ fn cleanup_budget_contract_rejects_missing_malformed_and_out_of_range_preflight(
 }
 
 #[test]
-fn genuine_application_cleanup_failure_requires_explicit_retry() {
+fn explicit_cancel_retries_a_genuine_application_cleanup_failure() {
     let now = Instant::now();
     let mut controller = Controller::new(Some(config())).unwrap();
     let mut broker = Broker::default();
@@ -4866,29 +4874,31 @@ fn genuine_application_cleanup_failure_requires_explicit_retry() {
     assert_eq!(record.state, super::record::State::CleanupFailed);
     assert!(record.application_requested);
     assert!(record.application_cleanup_blocked);
-    let deadline = record.deadline;
     broker.application_terminal_stop_state = None;
+    // Before the first automatic retry is due nothing is sent on its own.
+    let commands = broker.commands.len();
     for _ in 0..8 {
         assert!(
             controller
-                .poll(now + Duration::from_secs(1), &mut |command| broker
+                .poll(now + Duration::from_millis(500), &mut |command| broker
                     .send(command))
                 .is_empty()
         );
     }
-    assert_eq!(
-        controller.records.values().next().unwrap().deadline,
-        deadline
-    );
+    assert_eq!(broker.commands.len(), commands);
     assert!(
         controller
-            .cancel(21, &peer(1), now + Duration::from_secs(1))
+            .cancel(21, &peer(1), now + Duration::from_millis(500))
             .is_none()
     );
-    let (_, completed) =
-        poll_until_reply(&mut controller, &mut broker, now + Duration::from_secs(1));
+    let (_, completed) = poll_until_reply(
+        &mut controller,
+        &mut broker,
+        now + Duration::from_millis(500),
+    );
     assert_eq!(completed.status, 200);
     assert!(controller.records.values().next().unwrap().state.terminal());
+    assert_eq!(application_stop_count(&broker), 2);
 }
 
 #[test]
@@ -5666,10 +5676,23 @@ fn cooperative_shutdown_reconciles_only_retired_history_once_with_a_fixed_deadli
             controller.quiesce(time);
             assert_eq!(controller.records[&application].deadline, deadline);
         }
+        // Shutdown never waits on history that cannot be released: the one
+        // retry either confirms it or the record is abandoned with its error.
+        assert!(controller.quiesce(shutdown_at + Duration::from_secs(60)));
         assert_eq!(
-            controller.quiesce(shutdown_at + Duration::from_secs(60)),
-            recovered
+            controller.records[&application].state,
+            if recovered {
+                State::Stopped
+            } else {
+                State::CleanupAbandoned
+            }
         );
+        if !recovered {
+            assert_eq!(
+                controller.records[&application].cleanup_error,
+                Some("history_release_unconfirmed")
+            );
+        }
         assert_eq!(broker.history_reserved, !recovered);
         let releases: Vec<_> = broker
             .commands
@@ -5700,7 +5723,7 @@ fn cooperative_shutdown_reconciles_only_retired_history_once_with_a_fixed_deadli
 }
 
 #[test]
-fn cooperative_shutdown_preserves_a_genuine_application_cleanup_failure_fence() {
+fn cooperative_shutdown_abandons_a_genuine_application_cleanup_failure_without_replaying_stop() {
     let now = Instant::now();
     let mut controller = Controller::new(Some(config())).unwrap();
     let mut broker = Broker::default();
@@ -5712,24 +5735,22 @@ fn cooperative_shutdown_preserves_a_genuine_application_cleanup_failure_fence() 
         503
     );
     let application = *controller.records.keys().next().unwrap();
-    let deadline = controller.records[&application].deadline;
     assert!(controller.records[&application].application_cleanup_blocked);
+    let mut drained = false;
     for tick in 0..128 {
         let time = now + Duration::from_millis(tick * 100);
-        assert!(!controller.quiesce(time));
+        drained = controller.quiesce(time);
+        if drained {
+            break;
+        }
         controller.poll(time, &mut |command| broker.send(command));
     }
+    // The host must be able to stop. The record says what stayed unconfirmed
+    // instead of holding the whole process past its shutdown budget.
+    assert!(drained);
     let record = &controller.records[&application];
-    assert_eq!(record.state, State::CleanupFailed);
+    assert_eq!(record.state, State::CleanupAbandoned);
+    assert_eq!(record.cleanup_error, Some("application_cleanup_unconfirmed"));
     assert!(record.application_requested);
-    assert!(record.application_cleanup_blocked);
-    assert_eq!(record.deadline, deadline);
-    assert_eq!(
-        broker
-            .actions()
-            .iter()
-            .filter(|action| **action == ("amaterasu.launch/1", "stop"))
-            .count(),
-        1
-    );
+    assert_eq!(application_stop_count(&broker), 1);
 }

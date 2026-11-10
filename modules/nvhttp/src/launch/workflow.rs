@@ -72,6 +72,17 @@ impl Phase {
         matches!(self, Self::MonitorApplication | Self::MonitorRtsp)
     }
 
+    /// Status reads that only observe an existing stream or application.
+    fn status_read(self) -> bool {
+        matches!(
+            self,
+            Self::MonitorApplication
+                | Self::MonitorRtsp
+                | Self::VerifyRtspStopped
+                | Self::VerifyApplicationStopped
+        )
+    }
+
     fn response_reported_failure(self, payload: &Value) -> bool {
         match self {
             Self::BindPresentationTransport | Self::BindPresentationApplication => {
@@ -315,6 +326,10 @@ impl Controller {
             Outcome::Settled => self.settled(job, now, replies),
             Outcome::Uncertain => {
                 self.log_phase(LogLevel::Warning, job.phase, "uncertain");
+                if job.phase.status_read() {
+                    self.status_read_lost(job, now, send, replies);
+                    return;
+                }
                 let record = self.records.get_mut(&job.record).expect("workflow record");
                 let entering_cleanup =
                     !matches!(record.state, State::Stopping | State::CleanupFailed);
@@ -422,6 +437,38 @@ impl Controller {
                 }
                 self.finish_or_retain(job.record, now, replies);
             }
+        }
+    }
+
+    /// A status read owns nothing downstream, so its lost reply is not an
+    /// unsettled mutation. Retaining it would fail the cleanup that follows,
+    /// which is what a client quitting during a status poll used to cause.
+    fn status_read_lost(
+        &mut self,
+        job: &mut Job,
+        now: Instant,
+        send: &mut Send<'_>,
+        replies: &mut Vec<(u64, Reply)>,
+    ) {
+        job.call.abandon_read(send);
+        let record = self.records.get_mut(&job.record).expect("workflow record");
+        if record.state.terminal() || record.state == State::CleanupFailed {
+            return;
+        }
+        if job.phase.routine_monitor() && record.state != State::Stopping {
+            // The stream or application can no longer be observed. Retire the
+            // transport; a retained application stays until its own evidence.
+            if job.phase == Phase::MonitorRtsp && record.lifecycle_session_target.is_some() {
+                record.request_monitored_transport_cleanup(Some("monitor_unavailable"), now);
+            } else {
+                record.request_cleanup(Some("monitor_unavailable"), now);
+            }
+        }
+        if record.state == State::Stopping {
+            // A cleanup verification is read again on a later pass, until the
+            // cleanup deadline decides.
+            record.next_cleanup_poll = now + CLEANUP_POLL_INTERVAL;
+            self.finish_or_retain(job.record, now, replies);
         }
     }
 
@@ -1310,8 +1357,15 @@ impl Controller {
                     {
                         record.next_monitor = now + CLEANUP_POLL_INTERVAL;
                     } else {
-                        record.fail_cleanup("lifecycle_pause_unconfirmed");
-                        reply_failure(record, replies);
+                        // The transport is retired and the application is
+                        // still running. Keep it owned and visible as paused,
+                        // so it can be resumed or quit, instead of turning a
+                        // missing confirmation into a record nothing can end.
+                        log_monitor_problem(logger.as_ref(), job.phase, "pause_unconfirmed");
+                        record.state = State::Paused;
+                        record.stage = Stage::Live;
+                        record.transport_only_cleanup = false;
+                        record.next_monitor = now;
                     }
                 }
             }
@@ -2134,7 +2188,8 @@ impl Controller {
                     || !record.owns_application_cleanup()
                     || record.application_cleanup_blocked)
             {
-                record.state = State::CleanupFailed;
+                let error = record.cleanup_error.unwrap_or("cleanup_unconfirmed");
+                record.fail_cleanup(error);
                 reply_failure(record, replies);
             }
         }

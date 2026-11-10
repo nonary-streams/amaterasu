@@ -153,6 +153,16 @@ impl Call {
         }
     }
 
+    /// Give up on a read whose reply was lost. The request performs no
+    /// mutation, so cancelling it and releasing any result leaves nothing owed.
+    pub fn abandon_read(&mut self, send: &mut Send<'_>) {
+        if let Some(request) = self.request.take() {
+            let _ = send(Command::Cancel { request });
+            let _ = send(Command::ReleaseResult { request });
+        }
+        self.result = None;
+    }
+
     pub fn shutdown(&mut self, send: &mut Send<'_>) {
         self.cancel();
         for _ in 0..4 {

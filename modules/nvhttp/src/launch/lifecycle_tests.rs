@@ -271,7 +271,7 @@ fn failed_lifecycle_with_confirmed_cleanup_allows_another_launch() {
 }
 
 #[test]
-fn pending_extension_lifecycle_deadline_keeps_session_fenced() {
+fn pending_extension_lifecycle_deadline_does_not_block_the_next_launch() {
     let now = Instant::now();
     let mut controller = Controller::new(Some(config())).unwrap();
     controller.set_session_lifecycle_required(true);
@@ -288,8 +288,24 @@ fn pending_extension_lifecycle_deadline_keeps_session_fenced() {
     replies.extend(controller.poll(expiry, &mut |command| broker.send(command)));
     assert_eq!(replies.len(), 1);
     assert_eq!(replies[0].1.status, 503);
-    assert_eq!(controller.records.values().next().unwrap().state, State::CleanupFailed);
-    assert_eq!(controller.launch(12, request(2), peer(2), expiry).unwrap().status, 503);
+    let failed = *controller.records.keys().next().unwrap();
+    assert_eq!(controller.records[&failed].state, State::CleanupFailed);
+    // The next launch waits for the failed one instead of being refused.
+    assert!(controller.launch(12, request(2), peer(2), expiry).is_none());
+    assert!(controller.deferred_launch.is_some());
+    // No session identity exists to retire, so the first automatic pass
+    // abandons the record and the waiting launch is admitted.
+    for tick in 0..40 {
+        let time = expiry + Duration::from_millis(tick * 100);
+        assert!(controller.poll(time, &mut |command| broker.send(command)).is_empty());
+        if controller.deferred_launch.is_none() { break; }
+    }
+    assert_eq!(controller.records[&failed].state, State::CleanupAbandoned);
+    assert_eq!(controller.records[&failed].cleanup_error, Some("lifecycle_retirement_unavailable"));
+    assert!(controller.deferred_launch.is_none());
+    assert!(controller.records.values().any(|record| {
+        record.launch_connection == Some(12) && record.state == State::Starting
+    }));
     assert!(!broker.actions().contains(&("amaterasu.launch/1", "launch_export")));
 }
 

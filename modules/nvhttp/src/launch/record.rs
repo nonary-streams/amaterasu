@@ -3,7 +3,10 @@ use super::{
     VideoEncryptionPolicySnapshot,
 };
 use crate::encoder_snapshot::{CodecOffer, EncoderSnapshot};
-use crate::launch::{DEFAULT_CLEANUP_BUDGET, MONITOR_INTERVAL, STREAM_CLEANUP_MARGIN_MS};
+use crate::launch::{
+    AUTOMATIC_CLEANUP_RETRY_BUDGET, AUTOMATIC_CLEANUP_RETRY_DELAYS, DEFAULT_CLEANUP_BUDGET,
+    MONITOR_INTERVAL, STREAM_CLEANUP_MARGIN_MS,
+};
 use crate::preparation::{LegacyPreparationStep, PreparationStep};
 use amaterasu_contracts::virtual_display::VirtualDisplayIntent;
 use serde_json::Value;
@@ -26,12 +29,25 @@ pub enum State {
     Stopping,
     Stopped,
     Failed,
+    /// Cleanup did not confirm. Automatic retries are still owed, so this
+    /// record continues to hold its application and stream admission.
     CleanupFailed,
+    /// Automatic cleanup retries were exhausted, or no cleanup identity
+    /// exists to retry. `cleanup_error` names what stayed unconfirmed. The
+    /// record no longer blocks admission or host shutdown, and it is never
+    /// reported as stopped.
+    CleanupAbandoned,
 }
 
 impl State {
     pub fn terminal(self) -> bool {
-        matches!(self, Self::Stopped | Self::Failed)
+        matches!(self, Self::Stopped | Self::Failed | Self::CleanupAbandoned)
+    }
+
+    /// Cleanup is in flight or still owes an automatic retry. A new launch
+    /// waits for this instead of being refused.
+    pub fn closing(self) -> bool {
+        matches!(self, Self::Stopping | Self::CleanupFailed)
     }
 }
 
@@ -246,6 +262,17 @@ pub struct Record {
     pub monitor_application_next: bool,
     pub failure: Option<&'static str>,
     pub cleanup_error: Option<&'static str>,
+    /// Automatic retries already spent since the last explicit cleanup request.
+    pub automatic_cleanup_retries: u8,
+    /// The cleanup pass in flight was started by an automatic retry. A client
+    /// or management request may take it over with a full retry.
+    pub automatic_cleanup_retry_active: bool,
+    /// Earliest time the next automatic retry may start; set when the failed
+    /// cleanup is first observed by the recovery pass.
+    pub next_automatic_cleanup_retry: Option<Instant>,
+    /// The failure and cleanup codes last written to the log, so each change
+    /// is reported once.
+    pub reported_outcome: Option<(State, Option<&'static str>, Option<&'static str>)>,
     pub uncertain: VecDeque<(Phase, Call)>,
     pub retrying_uncertainty: bool,
     pub rtsp_reconcile: Option<Phase>,
@@ -444,6 +471,10 @@ impl Record {
             monitor_application_next: true,
             failure: None,
             cleanup_error: None,
+            automatic_cleanup_retries: 0,
+            automatic_cleanup_retry_active: false,
+            next_automatic_cleanup_retry: None,
+            reported_outcome: None,
             uncertain: VecDeque::new(),
             retrying_uncertainty: false,
             rtsp_reconcile: None,
@@ -484,6 +515,7 @@ impl Record {
         let already_stopping = self.state == State::Stopping;
         self.state = State::Stopping;
         self.stage = Stage::Cleanup;
+        self.automatic_cleanup_retry_active = false;
         if !already_stopping {
             self.next_cleanup_poll = now;
             self.deadline = self.cleanup_deadline(now);
@@ -526,6 +558,7 @@ impl Record {
     pub fn fail_cleanup(&mut self, error: &'static str) {
         self.state = State::CleanupFailed;
         self.cleanup_error = Some(error);
+        self.automatic_cleanup_retry_active = false;
     }
 
     /// History release is idempotent for the frozen activity identity. No
@@ -566,11 +599,10 @@ impl Record {
         self.monitor_application_next = !self.monitor_application_next;
     }
 
+    /// An explicit client or management request restores the automatic retry
+    /// budget, because a person asked for this cleanup again. Only this path
+    /// may send a stop a second time.
     pub fn retry_cleanup(&mut self, now: Instant) -> Result<Option<(Phase, Call)>, &'static str> {
-        if self.lifecycle_prepare_dispatched && self.lifecycle_session_target.is_none() {
-            self.fail_cleanup("lifecycle_retirement_unavailable");
-            return Err("lifecycle_retirement_unavailable");
-        }
         if self.lifecycle_application_retirement == ApplicationRetirementState::Failed {
             let Some(attempt) = self.lifecycle_application_retirement_attempt.checked_add(1) else {
                 self.fail_cleanup("application_retirement_attempts_exhausted");
@@ -579,13 +611,117 @@ impl Record {
             self.lifecycle_application_retirement_attempt = attempt;
             self.lifecycle_application_retirement = ApplicationRetirementState::Unreported;
         }
+        let pending = self.restart_cleanup(now, self.cleanup_deadline(now))?;
+        self.automatic_cleanup_retries = 0;
+        Ok(pending)
+    }
+
+    /// Check again, without a client request, whether failed cleanup has since
+    /// completed. A stop that already ran is read back and never sent again:
+    /// an application's undo commands are not safe to replay unasked. The
+    /// first pass had the application's full budget, so this one is short.
+    pub fn retry_cleanup_automatically(
+        &mut self,
+        now: Instant,
+    ) -> Result<Option<(Phase, Call)>, &'static str> {
+        let budget = self.cleanup_budget().min(AUTOMATIC_CLEANUP_RETRY_BUDGET);
+        let pending = self.restart_cleanup(now, now + budget)?;
+        if self.rtsp_requested && self.rtsp_ticket.is_some() {
+            self.rtsp_reconcile = Some(Phase::VerifyRtspStopped);
+        }
+        if self.application_requested
+            && self.application_launch.is_some()
+            && self.owns_application_cleanup()
+        {
+            self.application_reconcile = Some(Phase::VerifyApplicationStopped);
+        }
+        self.automatic_cleanup_retries = self.automatic_cleanup_retries.saturating_add(1);
+        self.automatic_cleanup_retry_active = true;
+        Ok(pending)
+    }
+
+    pub fn automatic_cleanup_retry_delay(&self) -> Option<Duration> {
+        AUTOMATIC_CLEANUP_RETRY_DELAYS
+            .get(usize::from(self.automatic_cleanup_retries))
+            .copied()
+    }
+
+    /// An automatic retry is in flight; an explicit request may replace it.
+    pub fn automatic_retry_in_flight(&self) -> bool {
+        self.state == State::Stopping && self.automatic_cleanup_retry_active
+    }
+
+    /// The failed cleanup was only for this root's own transport. The
+    /// application it launched is meant to stay available for resume.
+    pub fn retains_application(&self) -> bool {
+        self.application_session.is_none()
+            && self.auxiliary.is_none()
+            && self.transport_only_cleanup
+            && !self.stop_application_after_stream_retirement
+    }
+
+    /// Stop holding admission for cleanup that cannot be confirmed. Retained
+    /// broker calls are dropped by the caller after a best-effort settlement;
+    /// the downstream owners keep their own records of what they still hold.
+    pub fn abandon_cleanup(&mut self) {
+        debug_assert_eq!(self.state, State::CleanupFailed);
+        self.state = State::CleanupAbandoned;
+        self.stage = Stage::Terminal;
+        self.next_automatic_cleanup_retry = None;
+        self.retrying_uncertainty = false;
+        self.uncertain.clear();
+    }
+
+    /// Give up on this root's own transport while keeping what it launched.
+    /// A retained application stays owned and visible as paused, so it can be
+    /// resumed or quit. An application that ends with its stream is stopped.
+    pub fn abandon_transport(&mut self, now: Instant) {
+        debug_assert_eq!(self.state, State::CleanupFailed);
+        self.uncertain.clear();
+        self.retrying_uncertainty = false;
+        self.rtsp_requested = false;
+        self.rtsp_ticket = None;
+        self.rtsp_url = None;
+        self.rtsp_cleanup_blocked = false;
+        self.rtsp_reconcile = None;
+        self.rtsp_closing_deadline = None;
+        self.history_release_required = false;
+        self.history_state = "unavailable";
+        self.cleanup_error = None;
+        self.automatic_cleanup_retries = 0;
+        self.next_automatic_cleanup_retry = None;
+        self.transport_only_cleanup = false;
+        if self.stop_application_after_stream_retirement {
+            self.stop_application_after_stream_retirement = false;
+            self.state = State::Stopping;
+            self.stage = Stage::Cleanup;
+            self.deadline = self.cleanup_deadline(now);
+            self.next_cleanup_poll = now;
+        } else {
+            self.state = State::Paused;
+            self.stage = Stage::Live;
+            self.next_monitor = now;
+        }
+    }
+
+    fn restart_cleanup(
+        &mut self,
+        now: Instant,
+        deadline: Instant,
+    ) -> Result<Option<(Phase, Call)>, &'static str> {
+        if self.lifecycle_prepare_dispatched && self.lifecycle_session_target.is_none() {
+            self.fail_cleanup("lifecycle_retirement_unavailable");
+            return Err("lifecycle_retirement_unavailable");
+        }
+        self.automatic_cleanup_retry_active = false;
         self.state = State::Stopping;
         self.stage = Stage::Cleanup;
         self.cleanup_error = None;
         self.rtsp_cleanup_blocked = false;
         self.application_cleanup_blocked = false;
-        self.deadline = self.cleanup_deadline(now);
+        self.deadline = deadline;
         self.next_cleanup_poll = now;
+        self.next_automatic_cleanup_retry = None;
         self.retrying_uncertainty = true;
         Ok(self.uncertain.pop_front().map(|(phase, mut call)| {
             call.retry_settlement();

@@ -8,6 +8,7 @@ use amaterasu_module_sdk::{
 };
 mod auxiliary;
 mod call;
+mod cleanup_recovery;
 mod record;
 mod resume_snapshot;
 mod shared_session;
@@ -22,6 +23,7 @@ mod tests {
     include!("launch/retirement_tests.rs");
     include!("launch/shared_session_tests.rs");
     include!("launch/auxiliary_tests.rs");
+    include!("launch/cleanup_recovery_tests.rs");
 }
 
 use crate::encoder_snapshot::{
@@ -57,6 +59,12 @@ const MAX_APPLICATION_CLEANUP_BUDGET_MS: u64 = 2_745_000;
 // RTSP close 15s, lookup 5s, history release 5s, and 5s for asynchronous polling.
 const STREAM_CLEANUP_MARGIN_MS: u64 = 30_000;
 const CLEANUP_POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// Failed cleanup is retried this many times, after these delays, before the
+/// record is abandoned and stops holding admission. A launch that arrives in
+/// the meantime waits, so the whole window must stay inside `INITIAL_DEADLINE`.
+const AUTOMATIC_CLEANUP_RETRY_DELAYS: [Duration; 2] =
+    [Duration::from_secs(1), Duration::from_secs(5)];
+const AUTOMATIC_CLEANUP_RETRY_BUDGET: Duration = Duration::from_secs(12);
 const MONITOR_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -734,6 +742,7 @@ pub struct Controller {
     records: BTreeMap<u64, Record>,
     retired_stream_keys: BTreeSet<[u8; 32]>,
     pending_resume: Option<PendingResume>,
+    deferred_launch: Option<cleanup_recovery::DeferredLaunch>,
     management_replies: Vec<(u64, Reply)>,
     job: Option<Job>,
     nonce: [u8; 16],
@@ -793,6 +802,7 @@ impl Controller {
             records: BTreeMap::new(),
             retired_stream_keys: BTreeSet::new(),
             pending_resume: None,
+            deferred_launch: None,
             management_replies: Vec::new(),
             job: None,
             nonce,
@@ -999,7 +1009,8 @@ impl Controller {
     }
 
     pub fn busy(&self) -> bool {
-        self.records.values().any(|record| !record.state.terminal())
+        self.deferred_launch.is_some()
+            || self.records.values().any(|record| !record.state.terminal())
     }
 
     /// Management sees only opaque launch identities and cleanup state. This is
@@ -1118,8 +1129,9 @@ impl Controller {
         if record.application_session.is_none() {
             record.transport_only_cleanup = false;
         }
-        let already_stopping = record.state == State::Stopping;
-        if record.state == State::CleanupFailed {
+        let already_stopping =
+            record.state == State::Stopping && !record.automatic_retry_in_flight();
+        if record.state == State::CleanupFailed || record.automatic_retry_in_flight() {
             match record.retry_cleanup(now) {
                 Ok(Some(pending)) => record.uncertain.push_front(pending),
                 Ok(None) => {}
@@ -1339,13 +1351,21 @@ impl Controller {
             }
             return self.join_or_resume(connection, request, peer, response, now);
         }
-        if auxiliary.is_none()
-            && self
-                .records
-                .values()
-                .any(|record| record.auxiliary.is_none() && !record.state.terminal())
-        {
-            return Some(private_error(503, "another application is active"));
+        if auxiliary.is_none() {
+            match self.application_admission() {
+                cleanup_recovery::ApplicationAdmission::Free => {}
+                cleanup_recovery::ApplicationAdmission::Active => {
+                    return Some(private_error(503, "another application is active"));
+                }
+                // The earlier application is on its way out. Borrowed capture
+                // sources are bound to this instant and cannot be held.
+                cleanup_recovery::ApplicationAdmission::Closing if shared_capture.is_some() => {
+                    return Some(private_error(503, "previous application is still closing"));
+                }
+                cleanup_recovery::ApplicationAdmission::Closing => {
+                    return self.defer_launch(connection, request, peer, response, now);
+                }
+            }
         }
         let video_codec_offer = match self.codec_offer(config, &request) {
             Ok(offer) => offer,
@@ -1446,6 +1466,14 @@ impl Controller {
         // configuration metadata populated by the separate launch lookup.
         // Normal application cancellation is host-wide, like GameStream.
         // Auxiliary roles retain their separate ownership policy.
+        // A launch still waiting for the closing application must not start
+        // after the host was asked to quit.
+        if let Some(deferred) = self.deferred_launch.take() {
+            self.management_replies.push((
+                deferred.connection,
+                private_error(409, "launch cancelled before it started"),
+            ));
+        }
         let auxiliary_active = self
             .records
             .values()
@@ -1506,7 +1534,9 @@ impl Controller {
             record.cancel_connection = Some(connection);
             return None;
         }
-        if record.state == State::Stopping || record.cancel_connection.is_some() {
+        if (record.state == State::Stopping && !record.automatic_retry_in_flight())
+            || record.cancel_connection.is_some()
+        {
             return Some(private_error(409, "stream cleanup is already in progress"));
         }
         eprintln!(
@@ -1517,7 +1547,7 @@ impl Controller {
         if record.application_session.is_none() {
             record.transport_only_cleanup = false;
         }
-        let retry = if record.state == State::CleanupFailed {
+        let retry = if record.state == State::CleanupFailed || record.automatic_retry_in_flight() {
             match record.retry_cleanup(now) {
                 Ok(pending) => pending,
                 Err(code) => {
@@ -1732,22 +1762,28 @@ impl Controller {
         if let Some(mut job) = self.job.take() {
             self.advance(&mut job, now, send, &mut replies);
         }
+        self.recover_failed_cleanup(now, send);
         if self.job.is_none() {
             self.schedule(now);
         }
+        // A replaced Desktop record that is still retrying failed cleanup has
+        // not settled; the resume waits for it to stop or be abandoned.
         let resume_ready = self.pending_resume.as_ref().is_some_and(|pending| {
             !pending.retained
-                && self.records.get(&pending.record).is_some_and(|record| {
-                    record.state.terminal() || record.state == State::CleanupFailed
-                })
+                && self
+                    .records
+                    .get(&pending.record)
+                    .is_some_and(|record| record.state.terminal())
                 && self.job.is_none()
         });
         if resume_ready && let Some(pending) = self.pending_resume.take() {
-            if self
-                .records
-                .get(&pending.record)
-                .is_some_and(|record| record.state == State::Stopped)
-            {
+            // An abandoned ticket may still hold its key downstream, so only a
+            // different key may follow it. Confirmed cleanup frees the key.
+            let replaceable = self.records.get(&pending.record).is_some_and(|record| {
+                record.state != State::CleanupAbandoned
+                    || record.request.remote_input_key != pending.request.remote_input_key
+            });
+            if replaceable {
                 let resume_trusted = self.records.get(&pending.record).is_some_and(|record| {
                     !record.revoked
                         && allowed(&pending.peer.certificate, record.delivery_permission)
@@ -1762,6 +1798,7 @@ impl Controller {
                     ));
                 } else {
                     if let Some(old_record) = self.records.get_mut(&pending.record)
+                        && old_record.state != State::CleanupAbandoned
                         && old_record.request.remote_input_key == pending.request.remote_input_key
                     {
                         // A resumed RTSP ticket may legitimately reuse Moonlight's key.
@@ -1800,6 +1837,8 @@ impl Controller {
             self.pending_resume = None;
         }
         self.advance_auxiliary_reconnects(now, &mut allowed, &mut replies);
+        self.admit_deferred_launch(now, &mut allowed, &mut replies);
+        self.report_outcomes();
         replies
     }
 
@@ -1829,6 +1868,7 @@ impl Controller {
     pub fn connection_closed(&mut self, connection: u64, now: Instant) {
         self.pending_auxiliary
             .retain(|_, pending| pending.connection != connection);
+        self.drop_deferred_launch(connection);
         if self
             .pending_resume
             .as_ref()
@@ -1901,6 +1941,12 @@ impl Controller {
         {
             close.push(pending.connection);
         }
+        if self.deferred_launch.as_ref().is_some_and(|deferred| {
+            !allowed(deferred.peer.certificate(), crate::wire::Permission::Launch)
+        }) && let Some(deferred) = self.deferred_launch.take()
+        {
+            close.push(deferred.connection);
+        }
         self.pending_auxiliary.retain(|_, pending| {
             if allowed(pending.peer.certificate(), pending.delivery_permission) {
                 true
@@ -1943,6 +1989,7 @@ impl Controller {
 
     pub fn quiesce(&mut self, now: Instant) -> bool {
         self.pending_resume = None;
+        self.deferred_launch = None;
         self.pending_auxiliary.clear();
         let history_deadline = *self
             .quiesce_history_deadline
@@ -1972,6 +2019,7 @@ impl Controller {
         self.package_activation_pending = pending;
         self.job.is_none()
             && self.pending_resume.is_none()
+            && self.deferred_launch.is_none()
             && self.pending_auxiliary.is_empty()
             && self.records.values().all(|record| record.state.terminal())
     }
@@ -2122,6 +2170,7 @@ fn management_state(state: State) -> &'static str {
         State::Stopping => "stopping",
         State::Stopped | State::Failed => "ended",
         State::CleanupFailed => "cleanup_failed",
+        State::CleanupAbandoned => "cleanup_abandoned",
     }
 }
 
