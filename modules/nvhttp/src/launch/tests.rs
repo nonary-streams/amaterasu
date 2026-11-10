@@ -569,7 +569,7 @@ fn pairing_lookup_identity_must_match_the_certificate_bytes() {
 }
 
 #[test]
-fn disabled_streaming_and_foreign_cancel_fail_without_work() {
+fn disabled_streaming_fails_and_paired_foreign_client_can_cancel() {
     let now = Instant::now();
     let mut disabled = Controller::new(None).unwrap();
     assert_eq!(
@@ -579,7 +579,8 @@ fn disabled_streaming_and_foreign_cancel_fail_without_work() {
 
     let mut controller = Controller::new(Some(config())).unwrap();
     assert!(controller.launch(1, request(1), peer(1), now).is_none());
-    assert_eq!(controller.cancel(2, &peer(2), now).unwrap().status, 403);
+    assert!(controller.cancel(2, &peer(2), now).is_none());
+    assert_eq!(controller.records[&1].state, super::record::State::Stopping);
 }
 
 #[test]

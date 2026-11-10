@@ -454,6 +454,9 @@ impl Router {
                 if !trusted {
                     return Some(xml::error(401, "authenticated paired TLS is required"));
                 }
+                if !peer.terminate_allowed {
+                    return Some(xml::error(403, "termination permission denied"));
+                }
                 if let Err(error) = query.require_only(&["uniqueid", "uuid"]) {
                     return Some(xml::error(400, error));
                 }

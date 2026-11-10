@@ -45,6 +45,13 @@ pub(super) fn apply_response(record: &mut Record, payload: &Value) -> Preparatio
         }
         _ => false,
     };
+    // A failed prepare can have allocated a coordinator stream and already
+    // rolled it back. No consumer was armed; the matching terminal receipt
+    // settles preparation so local transport cleanup can finish.
+    if payload["status"] == "failed" && payload["cleanup_completed"] == true && valid_target {
+        record.lifecycle_prepare_outstanding = false;
+        return PreparationResolution::Rejected;
+    }
     let returned_mode = serde_json::from_value::<amaterasu_extension_api::CaptureBindingMode>(
         payload
             .get("capture_binding_mode")

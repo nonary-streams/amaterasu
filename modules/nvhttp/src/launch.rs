@@ -1441,29 +1441,59 @@ impl Controller {
     }
 
     pub fn cancel(&mut self, connection: u64, peer: &PeerIdentity, now: Instant) -> Option<Reply> {
-        if let Some(member) = self.shared_cancel_member(peer) {
+        // The route has already checked paired TLS and termination permission.
+        // Cancellation needs the authenticated certificate, not launch-only
+        // configuration metadata populated by the separate launch lookup.
+        // Normal application cancellation is host-wide, like GameStream.
+        // Auxiliary roles retain their separate ownership policy.
+        let auxiliary_active = self
+            .records
+            .values()
+            .any(|record| record.auxiliary.is_some() && !record.state.terminal());
+        let normal_application = (!auxiliary_active)
+            .then(|| {
+                self.records
+                    .values()
+                    .find(|record| {
+                        record.auxiliary.is_none()
+                            && record.application_session.is_none()
+                            && !record.state.terminal()
+                    })
+                    .map(|record| record.id)
+            })
+            .flatten();
+        let shared_member = self.shared_cancel_member(peer).or_else(|| {
+            normal_application.filter(|root| {
+                self.records.values().any(|record| {
+                    record.application_session == Some(*root) && !record.state.terminal()
+                })
+            })
+        });
+        if let Some(member) = shared_member {
             return self.cancel_application_group(member, connection, now);
         }
-        if self
-            .pending_resume
-            .as_ref()
-            .is_some_and(|pending| pending.retained && pending.peer.certificate == peer.certificate)
-        {
+        if self.pending_resume.as_ref().is_some_and(|pending| {
+            pending.retained
+                && (pending.peer.certificate == peer.certificate
+                    || normal_application == Some(pending.record))
+        }) {
             self.pending_resume = None;
         }
         let cancel_pending_resume = self.pending_resume.as_ref().is_some_and(|pending| {
             self.records.get(&pending.record).is_some_and(|record| {
-                record.peer.certificate == peer.certificate && record.state == State::Stopping
+                (record.peer.certificate == peer.certificate
+                    || normal_application == Some(record.id))
+                    && record.state == State::Stopping
             })
         });
         if cancel_pending_resume {
             self.pending_resume = None;
         }
-        let Some(record) = self
-            .records
-            .values_mut()
-            .find(|record| record.peer.certificate == peer.certificate && !record.state.terminal())
-        else {
+        let Some(record) = self.records.values_mut().find(|record| {
+            !record.state.terminal()
+                && (record.peer.certificate == peer.certificate
+                    || normal_application == Some(record.id))
+        }) else {
             if self.records.values().any(|record| !record.state.terminal()) {
                 return Some(private_error(403, "stream is owned by another client"));
             }

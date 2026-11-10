@@ -246,4 +246,28 @@ mod tests {
         changed.terminal_dispatch.as_mut().unwrap().state = DispatchState::OutcomeUnknown;
         assert!(!uninvoked(&changed, "admission", &admission));
     }
+    #[test]
+    fn failed_prepare_recovery_requires_complete_scoped_cleanup_proof() {
+        let (mut state, _) = fixture();
+        state.plan.as_mut().unwrap().obligations = vec![serde_json::from_value(json!({
+            "obligation_id":"cleanup-one","provider":"example.provider","resource_id":"one",
+            "mutation_domain":"domain","cleanup_method":{"service":"example.provider/1",
+                "method":"lifecycle_callback","interface_major":1,"interface_minor":0,"schema_revision":1},
+            "payload":{},"depends_on":[]
+        })).unwrap()];
+        let prove = |payload: Value| {
+            super::super::failed_prepare_recovery::cleanup_proven(&state, &payload)
+        };
+        assert!(prove(
+            json!({"status":"cleanup","outcomes":[{"obligation_id":"cleanup-one","state":"released","reason":null}]})
+        ));
+        assert!(!prove(json!({"status":"rejected","reason":"capacity"})));
+        assert!(!prove(json!({"status":"cleanup","outcomes":[]})));
+        assert!(!prove(
+            json!({"status":"cleanup","outcomes":[{"obligation_id":"foreign","state":"released","reason":null}]})
+        ));
+        assert!(!prove(
+            json!({"status":"cleanup","outcomes":[{"obligation_id":"cleanup-one","state":"deferred_restoration","reason":null}]})
+        ));
+    }
 }

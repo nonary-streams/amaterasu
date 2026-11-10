@@ -1498,3 +1498,54 @@ fn denied_launch_permission_blocks_known_ids_and_resume_before_work() {
     }
     assert!(broker.accepted.is_empty());
 }
+
+#[test]
+fn paired_tls_client_can_cancel_another_clients_launch_without_launch_metadata() {
+    let mut router = streaming_router();
+    let mut broker = Broker::default();
+    let now = Instant::now();
+    assert!(
+        router
+            .dispatch_with(
+                19,
+                request(LAUNCH_TARGET),
+                trusted_tls(&[1, 2, 3]),
+                now,
+                &mut |command| broker.send(command)
+            )
+            .is_none()
+    );
+    assert_eq!(
+        poll_until_reply(&mut router, &mut broker, now).1.status,
+        200
+    );
+    router.reply_delivered(19);
+    let denied = RequestContext {
+        terminate_allowed: false,
+        ..trusted_tls(&[4, 5, 6])
+    };
+    assert_eq!(
+        router
+            .dispatch_with(20, request("/cancel"), denied, now, &mut |command| broker
+                .send(command))
+            .unwrap()
+            .status,
+        403
+    );
+    assert!(router.launches.busy());
+    assert!(
+        router
+            .dispatch_with(
+                21,
+                request("/cancel"),
+                trusted_tls(&[4, 5, 6]),
+                now,
+                &mut |command| broker.send(command)
+            )
+            .is_none()
+    );
+    let (connection, reply) = poll_until_reply(&mut router, &mut broker, now);
+    assert_eq!(connection, 21);
+    assert_eq!(reply.status, 200);
+    assert!(!router.launches.busy());
+}

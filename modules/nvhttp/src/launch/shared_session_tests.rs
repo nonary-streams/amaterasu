@@ -779,3 +779,18 @@ fn joined_transport_never_owns_application_cleanup_with_stream_end_policy() {
     assert!(!broker.broker.application_stopped);
     assert_eq!(controller.current_game(&peer(1)), 1);
 }
+
+#[test]
+fn unrelated_paired_client_can_end_all_shared_streams_and_launch_again() {
+    let (mut controller, mut broker, now) = two_client_application();
+    assert!(controller.cancel(80, &peer(9), now).is_none());
+    let (connection, reply) = broker.reply(&mut controller, now);
+    assert_eq!(connection, 80);
+    assert_eq!(reply.status, 200);
+    assert!(controller.records.values().all(|record| record.state.terminal()));
+    assert!(broker.transports.values().all(|transport| transport["state"] == "closed"));
+    assert!(controller.launch(81, request(9), peer(9), now).is_none());
+    let (connection, reply) = broker.reply(&mut controller, now);
+    assert_eq!(connection, 81);
+    assert_eq!(reply.status, 200);
+}

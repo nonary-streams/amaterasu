@@ -35,6 +35,7 @@ mod control_endpoints;
 mod control_history;
 #[allow(dead_code)]
 mod control_settlement;
+mod failed_prepare_recovery;
 mod finalize_backend;
 #[allow(dead_code)]
 mod finalize_dispatch;
@@ -1151,6 +1152,11 @@ pub struct Coordinator {
     work_cursor: usize,
     settings_jobs: BTreeMap<String, settings_snapshot::SettingsSnapshotJob>,
     processing_jobs: BTreeMap<String, processing_preflight::ProcessingPreflightJob>,
+    failed_prepare_recovery: Option<failed_prepare_recovery::Recovery>,
+    failed_prepare_recovery_attempted: BTreeSet<String>,
+    failed_prepare_recovery_polls: u32,
+    failed_prepare_recovery_scanned: bool,
+    failed_prepare_recovery_next_poll: Instant,
     live_settings_jobs: BTreeMap<String, live_settings_read::LiveSettingsJob>,
 }
 
@@ -1242,6 +1248,11 @@ impl Coordinator {
             work_cursor: 0,
             settings_jobs: BTreeMap::new(),
             processing_jobs: BTreeMap::new(),
+            failed_prepare_recovery: None,
+            failed_prepare_recovery_attempted: BTreeSet::new(),
+            failed_prepare_recovery_polls: 0,
+            failed_prepare_recovery_scanned: false,
+            failed_prepare_recovery_next_poll: Instant::now(),
             live_settings_jobs: BTreeMap::new(),
         })
     }

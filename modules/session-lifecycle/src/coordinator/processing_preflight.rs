@@ -18,13 +18,14 @@ pub(super) struct ProcessingDecision {
     pub processor_service: String,
 }
 
-/// A joined SDR consumer can bypass a transform when the already prepared
+/// A joined or resumed SDR consumer can bypass a transform when the already prepared
 /// source is SDR. Other source changes still require a new session.
 pub(super) fn compatible_with_session(
     session: &ProcessingDecision,
     stream: &ProcessingDecision,
     join: Option<&amaterasu_extension_api::StreamJoinContext>,
     requested_video: Option<&VideoMode>,
+    intent: Option<&amaterasu_extension_api::StreamIntent>,
 ) -> bool {
     if session.processor_service != stream.processor_service {
         return false;
@@ -35,9 +36,10 @@ pub(super) fn compatible_with_session(
     {
         return true;
     }
-    let Some(join) = join else {
+    let resumed = intent == Some(&amaterasu_extension_api::StreamIntent::Resume);
+    if join.is_none() && !resumed {
         return false;
-    };
+    }
     session.enabled
         && session
             .source_video_mode
@@ -46,10 +48,11 @@ pub(super) fn compatible_with_session(
         && !stream.enabled
         && stream.source_video_mode.is_none()
         && requested_video.is_some_and(|mode| !mode.hdr)
-        && join
-            .binding
-            .as_ref()
-            .is_none_or(|binding| !binding.mode.hdr)
+        && join.is_none_or(|join| {
+            join.binding
+                .as_ref()
+                .is_none_or(|binding| !binding.mode.hdr)
+        })
 }
 
 #[derive(Deserialize)]
@@ -329,20 +332,30 @@ mod tests {
             &session,
             &stream,
             Some(&join),
-            Some(&requested)
+            Some(&requested),
+            None
         ));
         assert!(!compatible_with_session(
             &session,
             &stream,
             None,
-            Some(&requested)
+            Some(&requested),
+            None
+        ));
+        assert!(compatible_with_session(
+            &session,
+            &stream,
+            None,
+            Some(&requested),
+            Some(&amaterasu_extension_api::StreamIntent::Resume)
         ));
         requested.hdr = true;
         assert!(!compatible_with_session(
             &session,
             &stream,
             Some(&join),
-            Some(&requested)
+            Some(&requested),
+            None
         ));
         requested.hdr = false;
         stream.processor_service = "another/1".into();
@@ -350,7 +363,8 @@ mod tests {
             &session,
             &stream,
             Some(&join),
-            Some(&requested)
+            Some(&requested),
+            None
         ));
         stream.processor_service = session.processor_service.clone();
         let mut incompatible_session = session.clone();
@@ -359,7 +373,8 @@ mod tests {
             &incompatible_session,
             &stream,
             Some(&join),
-            Some(&requested)
+            Some(&requested),
+            None
         ));
     }
 

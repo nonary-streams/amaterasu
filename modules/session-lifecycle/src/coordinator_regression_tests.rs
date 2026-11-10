@@ -2637,3 +2637,45 @@ fn shared_external_deferred_restoration_never_certifies_resource_release() {
 
 #[path = "coordinator/session_recovery_tests.rs"]
 mod session_recovery_tests;
+
+#[test]
+fn processing_preflight_allows_sdr_resume_of_retained_sdr_processing_source() {
+    let mut harness = Harness::with_processing(true, None, true);
+    harness.simulate_stage_refresh = true;
+    harness.verify_finalize = true;
+    let requested = json!({"width":1920,"height":1080,"refresh_millihz":60000,"hdr":true});
+    harness.call("transport", json!({"operation":"prepare","operation_id":"policy-session","application_ref":{"kind":"application","app_id":"app"},"requested_video":requested}));
+    let mut prepared = Value::Null;
+    for _ in 0..180 {
+        prepared = harness.call(
+            "transport",
+            json!({"operation":"lookup","operation_id":"policy-session"}),
+        );
+        if prepared["status"] != "pending" {
+            break;
+        }
+    }
+    assert_eq!(prepared["status"], "succeeded", "{prepared}");
+    let session = prepared["target"].clone();
+    assert_eq!(harness.call("transport",json!({"operation":"bind_application","operation_id":"policy-bind","target":session,"launch_id":42,"application_operation_id":"launch-42"}))["status"],"succeeded");
+    let calls_before = harness.provider_calls.len();
+    harness.stream_processing_enabled = false;
+    harness.call("transport", json!({"operation":"prepare_stream","operation_id":"policy-stream","target":session,"intent":"resume","requested_video":{"width":1920,"height":1080,"refresh_millihz":60000,"hdr":false}}));
+    let mut result = Value::Null;
+    for _ in 0..160 {
+        result = harness.call(
+            "transport",
+            json!({"operation":"lookup","operation_id":"policy-stream"}),
+        );
+        if result["status"] != "pending" {
+            break;
+        }
+    }
+    assert_eq!(result["status"], "succeeded", "{result}");
+    assert_eq!(result["candidate"]["mode"]["hdr"], false);
+    assert!(
+        harness.provider_calls[calls_before..]
+            .iter()
+            .any(|call| { call["arguments"]["phase"] == "stream.prepare" })
+    );
+}

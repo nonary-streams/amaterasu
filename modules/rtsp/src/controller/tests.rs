@@ -4182,3 +4182,34 @@ fn exhausted_stop_cannot_claim_session_cleanup() {
             .all(|command| !matches!(command, Command::Request { .. }))
     );
 }
+
+#[test]
+fn failed_lifecycle_prepare_requires_matching_completed_rollback_before_local_retirement() {
+    for (session, cleanup, settled) in [
+        ("session", true, true),
+        ("session", false, false),
+        ("another-session", true, false),
+    ] {
+        let mut record = record(State::Arming);
+        record.config.lifecycle_session_target = Some(
+            serde_json::from_value(json!({
+                "kind":"session","host_epoch":"epoch","session_id":"session","generation":1
+            }))
+            .unwrap(),
+        );
+        record.lifecycle_prepare_outstanding = true;
+        let payload = json!({
+            "operation_id":format!("{}-lifecycle-prepare",record.operation()),
+            "status":"failed","reason":"processing_source_range_changed",
+            "cleanup_completed":cleanup,
+            "target":{"kind":"stream","host_epoch":"epoch","session_id":session,
+                "stream_id":"failed-stream","generation":1}
+        });
+        let result = super::preparation::apply_response(&mut record, &payload);
+        assert_eq!(
+            matches!(result, super::preparation::PreparationResolution::Rejected),
+            settled
+        );
+        assert_eq!(record.lifecycle_prepare_outstanding, !settled);
+    }
+}

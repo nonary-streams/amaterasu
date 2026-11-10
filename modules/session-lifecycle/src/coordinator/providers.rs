@@ -815,7 +815,7 @@ impl Coordinator {
             })
     }
 
-    fn provider_approvals_complete(&self, provider: &str) -> bool {
+    pub(super) fn provider_approvals_complete(&self, provider: &str) -> bool {
         let Some(selection) = self.selections.get(provider) else {
             return false;
         };
@@ -1350,6 +1350,7 @@ impl Coordinator {
                 &decision,
                 work.join_context.as_ref(),
                 work.video.as_ref(),
+                work.intent.as_ref(),
             ) {
                 return Err("processing_source_range_changed".into());
             }
@@ -1366,6 +1367,7 @@ impl Coordinator {
         &mut self,
         send: &mut dyn FnMut(Command) -> ModuleResult<Response>,
     ) -> ModuleResult<()> {
+        self.advance_failed_prepare_recovery(send)?;
         self.advance_validations(send)?;
         self.complete_retirement_waiters()?;
         // A cancellation or failed transition can retire work while its

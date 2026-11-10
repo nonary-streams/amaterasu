@@ -430,11 +430,16 @@ rather than silently discard necessary evidence. The endpoint and integrated
 recovery path remain subject to qualification.
 
 A failed or rejected preparation callback does not establish that its effects
-were absent or cleaned up. Its admission remains held for recovery. A known
-partial preparation cannot currently settle as a clean failure; that requires
-explicit enrollment of its scoped cleanup obligations. For example, confirming
-a resize after an interrupted stream preparation does not publish a new stream
-or release the preparation's rights.
+were absent or cleaned up. Its admission remains held for recovery. After a
+restart, failed initial application preparation with no admitted application or
+stream can query the selected provider's exact saved receipt. Only a cleanup
+response confirming every obligation in the original plan as released, with no
+materialized outputs or outstanding authority references, releases that
+reservation. Missing receipts, deferred restoration, and unconfirmed effects
+remain fenced. Providers must establish native retirement before publishing
+this proof; rejection alone never qualifies. Confirming a resize after an
+interrupted stream preparation does not publish a new stream or release that
+preparation's rights.
 
 ## Validation
 
