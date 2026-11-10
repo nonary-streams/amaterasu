@@ -6,6 +6,7 @@ mod history;
 mod history_activity;
 mod host_metrics_activity;
 mod input;
+mod input_silence;
 mod input_timing;
 mod journal;
 mod lifecycle;
@@ -1129,6 +1130,7 @@ impl Pipeline {
                     );
                     let control_stream = record.resources.get(&Resource::Control).copied();
                     for event in progress.controls {
+                        record.client_silence.heard(now);
                         record.control_messages = record.control_messages.saturating_add(1);
                         record.last_control_sequence = Some(event.sequence);
                         // The control transport starts this flow with the same identity.
@@ -1172,6 +1174,9 @@ impl Pipeline {
                             }
                         }
                         record.input_timing.end_message();
+                    }
+                    if let Err(code) = input::release_after_client_silence(record, now) {
+                        input::stop_for_input_failure(record, code);
                     }
                 }
                 Err(failure) => {

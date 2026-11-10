@@ -191,6 +191,7 @@ pub(super) struct Record {
     pub rumble_shutdown_deadline: Option<u64>,
     pub rumble_stop_unconfirmed: bool,
     pub input_events: VecDeque<Value>,
+    pub client_silence: super::input_silence::ClientSilence,
     pub input_inflight: usize,
     /// The direct lane is delivering this record's queue, so no queued batch
     /// request may be scheduled for it this tick.
@@ -365,6 +366,7 @@ impl Record {
             rumble_shutdown_deadline: None,
             rumble_stop_unconfirmed: false,
             input_events: VecDeque::new(),
+            client_silence: Default::default(),
             input_inflight: 0,
             input_direct_active: false,
             input_direct_declines: 0,

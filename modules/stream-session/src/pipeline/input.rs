@@ -322,6 +322,42 @@ fn queue_control_input_inner(
         if record.input_events.len() >= MAX_QUEUED_EVENTS {
             return Err(report_input_queue_overflow(record, &event));
         }
+        record.client_silence.forwarded(&event);
+        record.input_events.push_back(event);
+        record.input_timing.queued(record.input_events.len());
+    }
+    Ok(())
+}
+
+/// Send neutral controller states once the client has gone quiet, so a held
+/// stick or button stops acting long before the transport declares the peer
+/// lost. See `input_silence`.
+pub(super) fn release_after_client_silence(
+    record: &mut Record,
+    now: u64,
+) -> Result<(), &'static str> {
+    if record.state != State::Active || record.input_lease.is_none() {
+        return Ok(());
+    }
+    let released = record.client_silence.release_if_silent(now);
+    if released.is_empty() {
+        return Ok(());
+    }
+    eprintln!(
+        "amaterasu input released held controllers after client silence controllers={}",
+        released.len()
+    );
+    for event in released {
+        if let Some(index) =
+            coalesce_controller_sample(&mut record.input_events, record.input_inflight, &event)
+        {
+            record
+                .input_timing
+                .coalesced(index, record.input_events.len());
+        }
+        if record.input_events.len() >= MAX_QUEUED_EVENTS {
+            return Err(report_input_queue_overflow(record, &event));
+        }
         record.input_events.push_back(event);
         record.input_timing.queued(record.input_events.len());
     }

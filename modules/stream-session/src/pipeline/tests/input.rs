@@ -1877,3 +1877,51 @@ fn many_queued_events_are_delivered_directly_in_bounded_batches() {
     );
     assert_eq!(host.pipeline.records[&id].input_events_sent, 100);
 }
+
+/// A client that drops while holding a stick goes silent; Moonlight's
+/// periodic pings stop long before the transport declares the peer lost.
+/// The held controller must be released then, not ten seconds later.
+#[test]
+fn held_controller_is_released_after_client_silence_only_with_live_input() {
+    let held = json!({"kind":"controller","number":0,"active_mask":1,"buttons":0x1000,
+        "left_trigger":0,"right_trigger":0,"left_x":0,"left_y":0,"right_x":20000,"right_y":0});
+    for (active, lease, expect_release) in [
+        (true, true, true),
+        (true, false, false),
+        (false, true, false),
+    ] {
+        let mut payload = prepare();
+        payload.as_object_mut().unwrap().remove("action");
+        let config = serde_json::from_value(payload).unwrap();
+        let mut record = Record::new(42, "owner".into(), config, 30_000);
+        if active {
+            record.state = State::Active;
+        }
+        if lease {
+            record.input_lease = Some("lease".into());
+        }
+        record.client_silence.heard(1_000);
+        record.client_silence.forwarded(&held);
+        crate::pipeline::input::release_after_client_silence(&mut record, 1_499).unwrap();
+        assert!(
+            record.input_events.is_empty(),
+            "jitter below the threshold is ignored"
+        );
+        crate::pipeline::input::release_after_client_silence(&mut record, 1_500).unwrap();
+        if !expect_release {
+            assert!(
+                record.input_events.is_empty(),
+                "active={active} lease={lease}"
+            );
+            continue;
+        }
+        let released: Vec<_> = record.input_events.iter().cloned().collect();
+        assert_eq!(released.len(), 1);
+        assert_eq!(released[0]["number"], 0);
+        assert_eq!(released[0]["active_mask"], 1);
+        assert_eq!(released[0]["buttons"], 0);
+        assert_eq!(released[0]["right_x"], 0);
+        crate::pipeline::input::release_after_client_silence(&mut record, 5_000).unwrap();
+        assert_eq!(record.input_events.len(), 1, "released once per silence");
+    }
+}
