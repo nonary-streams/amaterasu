@@ -35,6 +35,27 @@ pub fn validate(route: Route, object: &Object) -> Result<(), &'static str> {
         "amaterasu.management/1" if route.action == "package_selection_status" => {
             fields(object, &[], &[])
         }
+        "amaterasu.management/1" if route.action == "repository_add" => {
+            fields(
+                object,
+                &["id", "location", "public_key", "fingerprint"],
+                &[],
+            )?;
+            repository_text(object, "id", 128)?;
+            repository_text(object, "location", 256)?;
+            repository_text(object, "public_key", 64)?;
+            repository_text(object, "fingerprint", 64)
+        }
+        "amaterasu.management/1"
+            if route.action == "repository_refresh" || route.action == "repository_remove" =>
+        {
+            fields(object, &["id"], &[])?;
+            repository_text(object, "id", 128)
+        }
+        "amaterasu.management/1" if route.action == "module_describe" => {
+            fields(object, &["id"], &[])?;
+            repository_text(object, "id", 128)
+        }
         "amaterasu.extension-registry/1" => session_extensions(route.action, object),
         "amaterasu.extension-actions/1" => extension_actions(route.action, object),
         "amaterasu.session-lifecycle/1" if route.action == "snapshot" => fields(object, &[], &[]),
@@ -3840,6 +3861,19 @@ fn fields(object: &Object, required: &[&str], optional: &[&str]) -> Result<(), &
         || object
             .keys()
             .any(|key| !required.contains(&key.as_str()) && !optional.contains(&key.as_str()))
+    {
+        return Err(INVALID);
+    }
+    Ok(())
+}
+
+/// A short printable identifier, location or key. The management service
+/// decides whether the value is acceptable; this only bounds what reaches it.
+fn repository_text(object: &Object, key: &str, maximum_bytes: usize) -> Result<(), &'static str> {
+    let value = text(object, key)?;
+    if value.is_empty()
+        || value.len() > maximum_bytes
+        || !value.bytes().all(|byte| byte.is_ascii_graphic())
     {
         return Err(INVALID);
     }

@@ -5,8 +5,11 @@ mod csrf_policy;
 mod extensions;
 mod health_lifecycle;
 mod http;
+mod package_status;
 mod peer_policy;
 mod product_settings;
+mod repository_admin;
+mod repository_transport;
 mod route_payload;
 mod routes;
 #[cfg(target_os = "linux")]
@@ -27,7 +30,6 @@ use serde::Deserialize;
 use serde_json::json;
 use server::Server;
 use std::net::SocketAddr;
-use std::path::Path;
 use std::time::Instant;
 
 const SERVICE: &str = "amaterasu.management/1";
@@ -56,6 +58,7 @@ struct ManagementModule {
     runtime: RuntimeClient,
     server: Option<Server>,
     repositories: Option<RepositoryStore>,
+    repository_administration: Option<repository_admin::RepositoryAdministration>,
     rtx_hdr_installer: Option<rtx_hdr_install::Installer>,
     operational_health: Option<health_lifecycle::OperationalHealth>,
     product_settings: product_settings::ProductSettings,
@@ -97,6 +100,14 @@ impl ManagedModule for ManagementModule {
         } else {
             None
         };
+        let repository_administration = match (&settings.web, &network) {
+            (Some(web), Some(network)) => Some(repository_admin::RepositoryAdministration::new(
+                web.repository_directory()?,
+                web.console_trust(),
+                network.clone(),
+            )),
+            _ => None,
+        };
         let rtx_hdr_installer = match (&settings.rtx_hdr_runtime_parent, &network) {
             (Some(parent), Some(network)) => {
                 let mut installer =
@@ -105,14 +116,7 @@ impl ManagedModule for ManagementModule {
                     .web
                     .as_ref()
                     .and_then(|web| web.repository_directory().ok());
-                let package_root = match runtime.send(Command::GetPackageRoot {}) {
-                    Ok(Response::Result { payload }) => payload
-                        .get("package_root")
-                        .and_then(serde_json::Value::as_str)
-                        .map(std::path::PathBuf::from),
-                    _ => None,
-                };
-                installer.configure_package(repository_directory, package_root);
+                installer.configure_package(repository_directory, package_root(&runtime));
                 Some(installer)
             }
             _ => None,
@@ -201,6 +205,7 @@ impl ManagedModule for ManagementModule {
             runtime,
             server,
             repositories,
+            repository_administration,
             rtx_hdr_installer,
             operational_health: None,
             product_settings: product_settings::ProductSettings::new()?,
@@ -216,6 +221,9 @@ impl ManagedModule for ManagementModule {
         self.shutdown_announced = true;
         if let Some(installer) = &mut self.rtx_hdr_installer {
             installer.prepare_shutdown();
+        }
+        if let Some(administration) = &mut self.repository_administration {
+            administration.prepare_shutdown();
         }
         if let Some(server) = &mut self.server {
             server.prepare_shutdown();
@@ -248,6 +256,10 @@ impl ManagedModule for ManagementModule {
             .rtx_hdr_installer
             .as_mut()
             .is_none_or(rtx_hdr_install::Installer::quiesce);
+        let repositories_ready = self
+            .repository_administration
+            .as_mut()
+            .is_none_or(repository_admin::RepositoryAdministration::quiesce);
         let server_ready = self
             .server
             .as_mut()
@@ -262,7 +274,12 @@ impl ManagedModule for ManagementModule {
         if health_ready {
             self.operational_health = None;
         }
-        Ok(installer_ready && server_ready && settings_ready && tray_ready && health_ready)
+        Ok(installer_ready
+            && repositories_ready
+            && server_ready
+            && settings_ready
+            && tray_ready
+            && health_ready)
     }
 
     fn tick(&mut self) -> ModuleResult<()> {
@@ -271,6 +288,9 @@ impl ManagedModule for ManagementModule {
         }
         if let Some(installer) = &mut self.rtx_hdr_installer {
             installer.advance();
+        }
+        if let Some(administration) = &mut self.repository_administration {
+            administration.advance();
         }
         self.product_settings
             .tick(Instant::now(), &mut |command| self.runtime.send(command))?;
@@ -403,63 +423,28 @@ impl ManagedModule for ManagementModule {
                     };
                     return complete(&self.runtime, id, result);
                 }
-                let payload = if payload.get("action").and_then(serde_json::Value::as_str)
-                    == Some("repository_list")
-                    && caller == "amaterasu.management"
-                {
-                    match &self.repositories {
-                        Some(store) => match store.list(
-                            &amaterasu_package::current_target(),
-                            amaterasu_package::unix_timestamp(),
-                        ) {
-                            Ok(mut repositories) => {
-                                let offset = payload
-                                    .get("offset")
-                                    .and_then(serde_json::Value::as_u64)
-                                    .unwrap_or(0)
-                                    as usize;
-                                let mut seen = 0usize;
-                                let mut included = 0usize;
-                                for repository in &mut repositories {
-                                    repository.candidates.retain(|_| {
-                                        let keep = seen >= offset && included < 32;
-                                        seen += 1;
-                                        if keep {
-                                            included += 1;
-                                        }
-                                        keep
-                                    });
-                                }
-                                let next_offset = (seen > offset.saturating_add(included))
-                                    .then_some(offset.saturating_add(included));
-                                json!({"ok":true,"repositories":repositories,"next_offset":next_offset})
-                            }
-                            Err(_) => json!({"ok":false,"code":"repository_state_unavailable"}),
-                        },
-                        None => json!({"ok":false,"code":"repository_state_unavailable"}),
+                let action = payload.get("action").and_then(serde_json::Value::as_str);
+                let payload = if caller != "amaterasu.management" {
+                    if payload == json!({"action":"status"}) {
+                        self.server_status()
+                    } else {
+                        json!({"ok":false,"code":"invalid_request"})
                     }
-                } else if payload == json!({"action":"package_selection_status"})
-                    && caller == "amaterasu.management"
+                } else if action == Some("repository_list") {
+                    self.repository_list(&payload)
+                } else if let Some(
+                    change @ ("repository_add" | "repository_refresh" | "repository_remove"),
+                ) = action
                 {
-                    match self.runtime.send(Command::GetPackageRoot {}) {
-                        Ok(Response::Result { payload }) => payload
-                            .get("package_root")
-                            .and_then(serde_json::Value::as_str)
-                            .and_then(|root| {
-                                package_selection_status_with_running(
-                                    root,
-                                    running_package_status(&self.runtime),
-                                )
-                            })
-                            .unwrap_or_else(package_selection_unavailable),
-                        _ => package_selection_unavailable(),
-                    }
-                } else if payload == json!({"action":"performance_trace"})
-                    && caller == "amaterasu.management"
-                {
+                    self.change_repository(change, &payload)
+                } else if action == Some("module_describe") {
+                    self.describe_module(&payload)
+                } else if payload == json!({"action":"package_selection_status"}) {
+                    self.package_selection_status()
+                } else if payload == json!({"action":"performance_trace"}) {
                     performance_trace(&self.runtime)
                 } else if payload == json!({"action":"status"}) {
-                    json!({"ok":true,"enabled":self.server.is_some(),"bound_address":self.server.as_ref().map(Server::address),"tls_address":self.server.as_ref().and_then(Server::tls_address)})
+                    self.server_status()
                 } else {
                     json!({"ok":false,"code":"invalid_request"})
                 };
@@ -486,149 +471,6 @@ fn upnp_exposure_payload(
     })
 }
 
-fn package_selection_status(package_root: &str) -> Option<serde_json::Value> {
-    let root = Path::new(package_root);
-    if !root.is_absolute() {
-        return None;
-    }
-    let metadata = std::fs::symlink_metadata(root).ok()?;
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
-        return None;
-    }
-    let canonical = root.canonicalize().ok()?;
-    if canonical != root {
-        return None;
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        if metadata.file_attributes() & 0x400 != 0 {
-            return None;
-        }
-    }
-
-    let selection = amaterasu_package::repository::read_native_selection(root).ok()?;
-    for digest in [
-        Some(selection.revision.as_str()),
-        selection.active.as_deref(),
-        selection.previous.as_deref(),
-        selection.pending.as_deref(),
-        selection.trial.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        if digest.len() != 64
-            || !digest
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        {
-            return None;
-        }
-    }
-
-    Some(json!({
-        "ok": true,
-        "revision": selection.revision,
-        "active": selection.active,
-        "previous": selection.previous,
-        "pending": selection.pending,
-        "trial": selection.trial,
-        "highest_sequence": selection.highest_sequence.to_string(),
-    }))
-}
-
-fn package_selection_status_with_running(
-    package_root: &str,
-    mut running: serde_json::Value,
-) -> Option<serde_json::Value> {
-    let mut status = package_selection_status(package_root)?;
-    if running["available"] == true
-        && let Some(digest) = running["digest"]
-            .as_str()
-            .filter(|digest| is_sha256(digest))
-        && let Some(modules) = running_package_modules(Path::new(package_root), digest)
-    {
-        running["modules"] = modules;
-    }
-    status["running"] = running;
-    Some(status)
-}
-
-fn running_package_status(runtime: &RuntimeClient) -> serde_json::Value {
-    match runtime.send(Command::GetRunningPackageDigest {}) {
-        Ok(Response::Result { payload }) => {
-            running_package_status_value(payload.get("digest").and_then(serde_json::Value::as_str))
-        }
-        _ => running_package_status_value(None),
-    }
-}
-
-fn running_package_modules(root: &Path, digest: &str) -> Option<serde_json::Value> {
-    let path = amaterasu_package::package_directory(root, digest)
-        .ok()?
-        .join("manifest.json");
-    if path.canonicalize().ok()? != path {
-        return None;
-    }
-    let raw = amaterasu_package::read_bounded(&path, 4 * 1024 * 1024).ok()?;
-    // The running digest comes from the host's verified loaded bytes. Never
-    // derive this inventory from persisted active/pending selection or settings.
-    if amaterasu_package::sha256(&raw) != digest {
-        return None;
-    }
-    let manifest: amaterasu_package::ReleaseManifest = serde_json::from_slice(&raw).ok()?;
-    let modules: Vec<_> = manifest
-        .components
-        .iter()
-        .map(|component| amaterasu_module_sdk::RunningModuleIdentity {
-            id: component.id.clone(),
-            version: component.version.clone(),
-            sha256: component.sha256.clone(),
-            runtime: component.runtime,
-        })
-        .collect();
-    let value = serde_json::to_value(modules).ok()?;
-    valid_running_modules(&value).then_some(value)
-}
-
-fn valid_running_modules(value: &serde_json::Value) -> bool {
-    let Ok(modules) =
-        serde_json::from_value::<Vec<amaterasu_module_sdk::RunningModuleIdentity>>(value.clone())
-    else {
-        return false;
-    };
-    let mut ids = std::collections::BTreeSet::new();
-    !modules.is_empty()
-        && modules.len() <= 128
-        && modules.iter().all(|module| {
-            !module.id.is_empty()
-                && module.id.len() <= 128
-                && module.id.bytes().all(|byte| {
-                    byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._-".contains(&byte)
-                })
-                && !module.version.is_empty()
-                && module.version.len() <= 128
-                && !module.version.chars().any(char::is_control)
-                && is_sha256(&module.sha256)
-                && ids.insert(&module.id)
-        })
-}
-
-fn running_package_status_value(digest: Option<&str>) -> serde_json::Value {
-    digest.filter(|digest| is_sha256(digest)).map_or_else(
-        || json!({"available":false}),
-        |digest| json!({"available":true,"digest":digest}),
-    )
-}
-
-fn is_sha256(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
-
 /// Recent flow-trace history for the diagnostics page. A runtime without
 /// tracing is reported as unsupported rather than as an empty, healthy host.
 fn performance_trace(runtime: &RuntimeClient) -> serde_json::Value {
@@ -641,11 +483,81 @@ fn performance_trace(runtime: &RuntimeClient) -> serde_json::Value {
     }
 }
 
-fn package_selection_unavailable() -> serde_json::Value {
-    json!({"ok":false,"code":"package_selection_unavailable"})
+/// The host root that holds the package selection, when the host shares it.
+fn package_root(runtime: &RuntimeClient) -> Option<std::path::PathBuf> {
+    match runtime.send(Command::GetPackageRoot {}) {
+        Ok(Response::Result { payload }) => payload
+            .get("package_root")
+            .and_then(serde_json::Value::as_str)
+            .map(std::path::PathBuf::from),
+        _ => None,
+    }
 }
 
 impl ManagementModule {
+    fn server_status(&self) -> serde_json::Value {
+        json!({
+            "ok": true,
+            "enabled": self.server.is_some(),
+            "bound_address": self.server.as_ref().map(Server::address),
+            "tls_address": self.server.as_ref().and_then(Server::tls_address),
+        })
+    }
+
+    fn repository_list(&self, payload: &serde_json::Value) -> serde_json::Value {
+        match &self.repositories {
+            Some(store) => repository_admin::listing(
+                store,
+                self.repository_administration.as_ref(),
+                payload,
+                amaterasu_package::unix_timestamp(),
+            ),
+            None => json!({"ok":false,"code":"repository_state_unavailable"}),
+        }
+    }
+
+    fn change_repository(
+        &mut self,
+        action: &str,
+        payload: &serde_json::Value,
+    ) -> serde_json::Value {
+        let runtime = &self.runtime;
+        match &mut self.repository_administration {
+            Some(administration) => {
+                administration.begin_change(action, payload, || package_root(runtime))
+            }
+            None => json!({"ok":false,"code":"repository_management_unavailable"}),
+        }
+    }
+
+    fn package_selection_status(&self) -> serde_json::Value {
+        let Some(root) = package_root(&self.runtime) else {
+            return package_status::unavailable();
+        };
+        let Some(root) = root.to_str() else {
+            return package_status::unavailable();
+        };
+        package_status::selection_status(
+            root,
+            package_status::running_digest(&self.runtime).as_deref(),
+        )
+    }
+
+    fn describe_module(&self, payload: &serde_json::Value) -> serde_json::Value {
+        let id = payload.get("id").and_then(serde_json::Value::as_str);
+        let (Some(id), Some(root)) = (id, package_root(&self.runtime)) else {
+            return package_status::unavailable();
+        };
+        let Some(root) = root.to_str() else {
+            return package_status::unavailable();
+        };
+        package_status::module_description(
+            root,
+            package_status::running_digest(&self.runtime).as_deref(),
+            id,
+        )
+    }
+
     fn begin_operational_health(&mut self, request: u64, remaining_ms: u64) -> ModuleResult<()> {
         if self.server.is_none() {
             return complete(
@@ -814,15 +726,6 @@ mod tests {
         }
     }
 
-    fn temporary_package_root() -> std::path::PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "amaterasu-management-selection-{}",
-            amaterasu_package::random_identifier().unwrap()
-        ));
-        std::fs::create_dir(&root).unwrap();
-        root.canonicalize().unwrap()
-    }
-
     #[test]
     fn upnp_exposure_is_internal_and_only_publishes_wan_tls_listener() {
         let tls_address = "0.0.0.0:49999".parse().unwrap();
@@ -964,161 +867,5 @@ mod tests {
                 }
             );
         }
-    }
-
-    #[test]
-    fn package_selection_status_reads_fresh_bounded_phase_fields_only() {
-        let root = temporary_package_root();
-        let active = "a".repeat(64);
-        let pending = "b".repeat(64);
-        let trial = "c".repeat(64);
-        amaterasu_package::write_json_atomically(
-            &root.join("selection.json"),
-            &json!({
-                "active": active.clone(),
-                "previous": null,
-                "pending": pending.clone(),
-                "trial": trial.clone(),
-                "highest_sequence": u64::MAX,
-                "repository_sets": {"set": {"repository_id":"private-publisher", "key_fingerprint":"d".repeat(64)}},
-                "repository_floors": {},
-                "healthy_sets": [],
-            }),
-        )
-        .unwrap();
-
-        let status = package_selection_status_with_running(
-            root.to_str().unwrap(),
-            running_package_status_value(Some(&"e".repeat(64))),
-        )
-        .unwrap();
-        assert_eq!(status["ok"], true);
-        assert!(is_sha256(status["revision"].as_str().unwrap()));
-        assert_eq!(status["active"], active);
-        assert_eq!(status["previous"], serde_json::Value::Null);
-        assert_eq!(status["pending"], pending);
-        assert_eq!(status["trial"], trial);
-        assert_eq!(status["highest_sequence"], u64::MAX.to_string());
-        assert_eq!(status["running"]["available"], true);
-        assert_eq!(status["running"]["digest"], "e".repeat(64));
-        assert!(status.get("package_root").is_none());
-        assert!(status.get("repository_sets").is_none());
-        assert!(!status.to_string().contains("private-publisher"));
-
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn package_selection_status_fails_closed_for_missing_malformed_or_unsafe_state() {
-        let root = temporary_package_root();
-        let empty = package_selection_status(root.to_str().unwrap()).unwrap();
-        assert_eq!(empty["active"], serde_json::Value::Null);
-        assert_eq!(empty["pending"], serde_json::Value::Null);
-        assert_eq!(
-            empty["revision"],
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        );
-
-        std::fs::write(root.join("selection.json"), b"not json").unwrap();
-        assert!(package_selection_status(root.to_str().unwrap()).is_none());
-
-        amaterasu_package::write_json_atomically(
-            &root.join("selection.json"),
-            &json!({
-                "active": "A".repeat(64),
-                "previous": null,
-                "pending": null,
-                "trial": null,
-                "highest_sequence": 1,
-                "repository_sets": {},
-                "repository_floors": {},
-                "healthy_sets": [],
-            }),
-        )
-        .unwrap();
-        assert!(package_selection_status(root.to_str().unwrap()).is_none());
-        assert!(package_selection_status("relative/package-root").is_none());
-        assert_eq!(
-            running_package_status_value(None),
-            json!({"available":false})
-        );
-        assert_eq!(
-            running_package_status_value(Some("not-a-digest")),
-            json!({"available":false})
-        );
-
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn package_selection_status_rejects_symlinked_state_files_and_roots() {
-        use std::os::unix::fs::symlink;
-
-        let root = temporary_package_root();
-        let target = root.join("target.json");
-        std::fs::write(
-            &target,
-            br#"{"active":null,"previous":null,"pending":null,"trial":null,"highest_sequence":0,"repository_sets":{},"repository_floors":{},"healthy_sets":[]}"#,
-        )
-        .unwrap();
-        symlink(&target, root.join("selection.json")).unwrap();
-        assert!(package_selection_status(root.to_str().unwrap()).is_none());
-
-        let alias = root.with_extension("alias");
-        symlink(&root, &alias).unwrap();
-        assert!(package_selection_status(alias.to_str().unwrap()).is_none());
-
-        std::fs::remove_file(alias).unwrap();
-        std::fs::remove_dir_all(root).unwrap();
-    }
-    #[test]
-    fn module_inventory_uses_the_running_manifest_and_rejects_tampered_bytes() {
-        let root = temporary_package_root();
-        let components: Vec<_> = [
-            "amaterasu.runtime",
-            "amaterasu.display",
-            "amaterasu.frame-limiter",
-        ]
-        .iter()
-        .enumerate()
-        .map(|(index, id)| {
-            json!({
-                "id": id,
-                "version": "0.1.0",
-                "file": "private-library.so",
-                "sha256": "b".repeat(64),
-                "size": 1,
-                "abi_major": 1,
-                "runtime": index == 0,
-                "requested": {}
-            })
-        })
-        .collect();
-        let raw = serde_json::to_vec(&json!({
-            "schema": 1,
-            "host_context_schema": 1,
-            "project": "amaterasu",
-            "sequence": 1,
-            "expires_unix": u64::MAX,
-            "target": "test",
-            "components": components
-        }))
-        .unwrap();
-        let digest = amaterasu_package::sha256(&raw);
-        let directory = amaterasu_package::package_directory(&root, &digest).unwrap();
-        std::fs::create_dir_all(&directory).unwrap();
-        std::fs::write(directory.join("manifest.json"), &raw).unwrap();
-        let modules = running_package_modules(&root, &digest).unwrap();
-        assert_eq!(modules[1]["id"], "amaterasu.display");
-        assert_eq!(modules[2]["id"], "amaterasu.frame-limiter");
-        assert!(modules[0].get("file").is_none());
-        assert!(
-            running_package_modules(&root, &"f".repeat(64)).is_none(),
-            "a persisted active digest is never a substitute for the host's running digest"
-        );
-        std::fs::write(directory.join("manifest.json"), b"{}").unwrap();
-        assert!(running_package_modules(&root, &digest).is_none());
-        std::fs::remove_dir_all(root).unwrap();
     }
 }

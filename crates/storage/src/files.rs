@@ -330,6 +330,10 @@ fn replace_file(source: &Path, destination: &Path) -> StorageResult<()> {
     Ok(())
 }
 
+/// Prefix of the error [`RootLock::acquire`] returns while another holder has
+/// the lock, so a caller can wait out a brief holder instead of failing.
+pub const ROOT_BUSY: &str = "host root is busy";
+
 /// Excludes another supervisor or staging operation while this host root is in use.
 /// The operating system releases the lock if the process exits unexpectedly.
 pub struct RootLock {
@@ -347,7 +351,7 @@ impl RootLock {
             .map_err(|error| error.to_string())?;
 
         file.try_lock()
-            .map_err(|error| format!("host root is busy: {error}"))?;
+            .map_err(|error| format!("{ROOT_BUSY}: {error}"))?;
         Ok(Self { _file: file })
     }
 }

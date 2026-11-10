@@ -3,7 +3,7 @@
 mod files;
 
 pub use files::{
-    RootLock, create_machine_private_directory, create_private_directory,
+    ROOT_BUSY, RootLock, create_machine_private_directory, create_private_directory,
     protect_machine_private_file, read_bounded, read_json, seal_machine_private_directory,
     seal_machine_private_file, sync_directory, write_atomically, write_json_atomically,
 };

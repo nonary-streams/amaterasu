@@ -2,28 +2,28 @@
 //!
 //! This only prepares a candidate in the repository cache. The host must check
 //! current approvals and verify the cached set again at the activation boundary.
+use crate::repository_transport::NetworkRepository;
 use amaterasu_module_sdk::network::Network;
 use amaterasu_package::repository::{
-    Candidate, CandidateKind, RepositoryListing, RepositoryStore, RepositoryTransport,
-    download_candidate, refresh_catalog, verify_candidate,
+    Candidate, CandidateKind, RepositoryListing, RepositoryStore, download_candidate,
+    refresh_catalog, verify_candidate,
 };
 use amaterasu_package::{
     BootstrapConfig, PackageResult, current_target, random_identifier, read_json, unix_timestamp,
 };
 use std::{
-    fs,
-    io::{self, Read},
+    fs, io,
     path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::Duration,
 };
 
 const SLOT: &str = "amaterasu.rtx-hdr";
 const IMPLEMENTATION: &str = "amaterasu-linux-session-rtx-hdr";
 const OFFICIAL_REPOSITORY: &str = "amaterasu-rtx-hdr";
+const DOWNLOAD_LIMIT: std::time::Duration = std::time::Duration::from_secs(600);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PreparedCandidate {
@@ -55,6 +55,7 @@ pub(crate) fn prepare(
             network.clone(),
             cancelled.clone(),
             transferred.clone(),
+            DOWNLOAD_LIMIT,
         );
         refresh_catalog(&store, OFFICIAL_REPOSITORY, &transport, &target, now)?;
     }
@@ -89,8 +90,13 @@ pub(crate) fn prepare(
         .ok_or("candidate cache has no parent")?;
     let temporary = TemporaryDirectory::create(parent)?;
     let source = temporary.path.join("package");
-    let transport =
-        NetworkRepository::new(&approved.location, network, cancelled.clone(), transferred);
+    let transport = NetworkRepository::new(
+        &approved.location,
+        network,
+        cancelled.clone(),
+        transferred,
+        DOWNLOAD_LIMIT,
+    );
     download_candidate(
         &transport,
         &approved,
@@ -162,83 +168,6 @@ fn check_cancelled(cancelled: &AtomicBool) -> PackageResult<()> {
     }
 }
 
-struct NetworkRepository {
-    base: String,
-    agent: ureq::Agent,
-    cancelled: Arc<AtomicBool>,
-    transferred: Arc<AtomicU64>,
-}
-impl NetworkRepository {
-    fn new(
-        base: &str,
-        network: Network,
-        cancelled: Arc<AtomicBool>,
-        transferred: Arc<AtomicU64>,
-    ) -> Self {
-        let config = ureq::Agent::config_builder()
-            .https_only(true)
-            .max_redirects(0)
-            .timeout_global(Some(Duration::from_secs(600)))
-            .timeout_resolve(Some(Duration::from_secs(10)))
-            .timeout_connect(Some(Duration::from_secs(10)))
-            .timeout_send_request(Some(Duration::from_secs(10)))
-            .timeout_recv_response(Some(Duration::from_secs(15)))
-            .timeout_recv_body(Some(Duration::from_secs(30)))
-            .max_response_header_size(8192)
-            .build();
-        Self {
-            base: base.trim_end_matches('/').into(),
-            agent: amaterasu_module_sdk::network_http::agent(config, network),
-            cancelled,
-            transferred,
-        }
-    }
-}
-impl RepositoryTransport for NetworkRepository {
-    fn get(&self, relative: &str, maximum: u64) -> PackageResult<Vec<u8>> {
-        check_cancelled(&self.cancelled)?;
-        if maximum > 256 * 1024 * 1024 || !relative.split('/').all(valid_segment) {
-            return Err("invalid repository request".into());
-        }
-        let response = self
-            .agent
-            .get(format!("{}/{relative}", self.base))
-            .call()
-            .map_err(|_| "repository download failed")?;
-        if response.status().as_u16() != 200 {
-            return Err("repository response was not successful".into());
-        }
-        let mut reader = response.into_body();
-        let mut reader = reader.as_reader();
-        let mut bytes = Vec::new();
-        let mut chunk = [0_u8; 65536];
-        loop {
-            check_cancelled(&self.cancelled)?;
-            let count = reader
-                .read(&mut chunk)
-                .map_err(|_| "repository response read failed")?;
-            if count == 0 {
-                break;
-            }
-            if bytes.len() as u64 + count as u64 > maximum {
-                return Err("repository response exceeds byte limit".into());
-            }
-            bytes.extend_from_slice(&chunk[..count]);
-            self.transferred.fetch_add(count as u64, Ordering::Relaxed);
-        }
-        Ok(bytes)
-    }
-}
-fn valid_segment(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 128
-        && value != "."
-        && value != ".."
-        && value.bytes().all(|byte| {
-            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-')
-        })
-}
-
 struct TemporaryDirectory {
     path: PathBuf,
 }
@@ -303,6 +232,7 @@ mod tests {
             fingerprint: "a".repeat(64),
             revoked,
             candidates,
+            catalog: amaterasu_package::repository::CatalogListing::Missing,
         }
     }
     #[test]
@@ -360,11 +290,7 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
     #[test]
-    fn malformed_paths_and_cancelled_requests_fail_before_io() {
-        for segment in ["", ".", "..", "../payload", "UPPER", "%2f"] {
-            assert!(!valid_segment(segment));
-        }
-        assert!(valid_segment("amaterasu-linux-session-rtx-hdr"));
+    fn cancelled_preparation_fails_before_io() {
         assert!(check_cancelled(&AtomicBool::new(true)).is_err());
     }
 }

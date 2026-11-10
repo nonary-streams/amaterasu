@@ -14,6 +14,14 @@ pub struct WebSettings {
 }
 
 impl WebSettings {
+    /// What decides whether the selected console bundle still verifies.
+    pub fn console_trust(&self) -> crate::repository_admin::ConsoleTrust {
+        crate::repository_admin::ConsoleTrust {
+            directory: self.directory.clone(),
+            trusted_keys: self.trusted_keys.clone(),
+        }
+    }
+
     pub fn repository_directory(&self) -> PackageResult<PathBuf> {
         Ok(self
             .directory

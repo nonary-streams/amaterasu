@@ -1724,10 +1724,14 @@ fn role_permits(payload: &Value, request: &http::Request) -> bool {
     {
         return false;
     }
+    // Tokens, sessions and trusted publishers are changed only by a signed-in
+    // administrator, never by an API token however it is scoped.
     let is_session_only_admin = matches!(request.target, RequestTarget::Api(route)
-        if route.service == crate::AUTH_SERVICE
+        if (route.service == crate::AUTH_SERVICE
             && matches!(route.action, "account_tokens_list" | "account_tokens_issue" | "account_tokens_revoke"
-                | "account_sessions_list" | "account_sessions_revoke"));
+                | "account_sessions_list" | "account_sessions_revoke"))
+            || (route.service == crate::SERVICE
+                && matches!(route.action, "repository_add" | "repository_refresh" | "repository_remove")));
     let role = match payload.get("kind").and_then(Value::as_str) {
         Some("api_token") => return !is_session_only_admin,
         Some("administrator_session") => match payload.get("role").and_then(Value::as_str) {
@@ -2250,6 +2254,46 @@ mod tests {
 
         assert!(!allowed("admin", "/v1/pairing/list_clients"));
         assert!(!allowed("", "/v1/launch/status"));
+
+        // Publishers are enrolled and removed only from an administrator's
+        // own session; an API token may read the listing and nothing more.
+        for path in [
+            "/v1/repositories/add",
+            "/v1/repositories/refresh",
+            "/v1/repositories/remove",
+        ] {
+            assert!(allowed("administrator", path));
+            assert!(!allowed("operator", path));
+            assert!(!allowed("viewer", path));
+            let change = http::Request {
+                target: RequestTarget::Api(crate::routes::resolve(path).unwrap()),
+                payload: json!({}),
+                bearer: None,
+                verified_identity: None,
+                origin: None,
+                preflight: false,
+                csrf_exception: false,
+                api_request: None,
+            };
+            assert!(!role_permits(
+                &json!({"kind":"api_token", "subject":"token"}),
+                &change
+            ));
+        }
+        let listing = http::Request {
+            target: RequestTarget::Api(crate::routes::resolve("/v1/repositories/list").unwrap()),
+            payload: json!({}),
+            bearer: None,
+            verified_identity: None,
+            origin: None,
+            preflight: false,
+            csrf_exception: false,
+            api_request: None,
+        };
+        assert!(role_permits(
+            &json!({"kind":"api_token", "subject":"token"}),
+            &listing
+        ));
     }
 
     #[test]

@@ -127,6 +127,23 @@ pub fn resolve(path: &str) -> Option<Route> {
             "repository_list",
             Some("configuration.read"),
         ),
+        // Enrolling or removing a publisher needs an administrator's own
+        // session; `server::role_permits` refuses API tokens for these.
+        ("repositories", action @ ("add" | "refresh" | "remove")) => (
+            "amaterasu.management/1",
+            match action {
+                "add" => "repository_add",
+                "refresh" => "repository_refresh",
+                "remove" => "repository_remove",
+                _ => unreachable!(),
+            },
+            Some("configuration.write"),
+        ),
+        ("modules", "describe") => (
+            "amaterasu.management/1",
+            "module_describe",
+            Some("configuration.read"),
+        ),
         ("rtx-hdr", action @ ("status" | "install" | "cancel" | "activate")) => (
             "amaterasu.management/1",
             match action {
@@ -698,6 +715,63 @@ mod tests {
         );
         assert!(payload(route, br#"{"package_root":"/unsafe"}"#).is_err());
         assert!(resolve("/v1/package-selection/select").is_none());
+    }
+
+    #[test]
+    fn repository_changes_are_bounded_configuration_writes() {
+        let key = "a".repeat(64);
+        let add = resolve("/v1/repositories/add").unwrap();
+        assert_eq!(add.service, "amaterasu.management/1");
+        assert_eq!(add.action, "repository_add");
+        assert_eq!(add.scope, Some("configuration.write"));
+        let body = |location: &str| {
+            format!(
+                r#"{{"id":"example-plugins","location":"{location}","public_key":"{key}","fingerprint":"{key}"}}"#
+            )
+        };
+        let accepted = payload(
+            add,
+            body("https://plugins.example.test/repository").as_bytes(),
+        );
+        assert_eq!(accepted.unwrap()["action"], "repository_add");
+        for rejected in [
+            body(&format!("https://plugins.example.test/{}", "p".repeat(256))),
+            body("https://plugins.example.test/with space"),
+            format!(
+                r#"{{"id":"example-plugins","location":"https://plugins.example.test","public_key":"{key}"}}"#
+            ),
+            format!(
+                r#"{{"id":"","location":"https://plugins.example.test","public_key":"{key}","fingerprint":"{key}"}}"#
+            ),
+            format!(
+                r#"{{"id":"example-plugins","location":"https://plugins.example.test","public_key":"{key}","fingerprint":"{key}","activate":true}}"#
+            ),
+        ] {
+            assert!(payload(add, rejected.as_bytes()).is_err(), "{rejected}");
+        }
+
+        for (path, action) in [
+            ("/v1/repositories/refresh", "repository_refresh"),
+            ("/v1/repositories/remove", "repository_remove"),
+        ] {
+            let route = resolve(path).unwrap();
+            assert_eq!(route.action, action);
+            assert_eq!(route.scope, Some("configuration.write"));
+            assert_eq!(
+                payload(route, br#"{"id":"example-plugins"}"#).unwrap()["id"],
+                "example-plugins"
+            );
+            assert!(payload(route, br#"{}"#).is_err());
+            assert!(payload(route, br#"{"id":"example-plugins","force":true}"#).is_err());
+        }
+        assert!(resolve("/v1/repositories/install").is_none());
+        assert!(resolve("/v1/repositories/activate").is_none());
+
+        let describe = resolve("/v1/modules/describe").unwrap();
+        assert_eq!(describe.action, "module_describe");
+        assert_eq!(describe.scope, Some("configuration.read"));
+        assert!(payload(describe, br#"{"id":"amaterasu.display"}"#).is_ok());
+        assert!(payload(describe, br#"{}"#).is_err());
     }
 
     #[test]

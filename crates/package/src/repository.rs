@@ -75,6 +75,29 @@ pub fn read_native_selection(root: &Path) -> PackageResult<NativeSelectionSnapsh
     Ok(snapshot(&selection, revision))
 }
 
+/// What a running service may show about native activation state.
+#[derive(Clone, Debug)]
+pub struct NativeSelectionObservation {
+    pub selection: NativeSelectionSnapshot,
+    /// The publisher recorded for each repository-supplied set, keyed by the
+    /// set's manifest digest.
+    pub repository_sets: BTreeMap<String, RepositorySet>,
+}
+
+/// Reads activation state without taking the activation lock.
+///
+/// A running service holds that lock for its whole lifetime, so a status view
+/// inside it can never acquire it. The selection file is replaced atomically:
+/// the bytes read here are one committed state, and `revision` names exactly
+/// those bytes. Use [`read_native_selection`] before changing the selection.
+pub fn observe_native_selection(root: &Path) -> PackageResult<NativeSelectionObservation> {
+    let (selection, revision) = read_selection_with_revision(root)?;
+    Ok(NativeSelectionObservation {
+        selection: snapshot(&selection, revision),
+        repository_sets: selection.repository_sets,
+    })
+}
+
 /// Verify a production candidate while holding its repository approval lock.
 ///
 /// The caller must already hold the host root lock and authorize the request.
@@ -478,7 +501,7 @@ fn previous_repository_id(root: &Path, expected_revision: &str) -> PackageResult
         .map(|source| source.repository_id.clone())
         .ok_or_else(|| "previous native set has no approved publisher provenance".into())
 }
-pub use store::{RepositoryListing, RepositoryStore};
+pub use store::{CatalogListing, RepositoryListing, RepositoryStore};
 pub use transport::{HttpsRepository, RepositoryTransport, download_candidate, refresh_catalog};
 
 /// Stage a complete native set for the next development worker trial. Callers
@@ -834,6 +857,25 @@ pub struct ApprovedRepository {
     pub fingerprint: String,
 }
 
+/// The part of a requested approval that was not acceptable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ApprovalRejection {
+    Identity,
+    Location,
+    PublicKey,
+    Fingerprint,
+}
+
+impl fmt::Display for ApprovalRejection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Identity | Self::Location => "invalid repository identity or HTTPS location",
+            Self::PublicKey => "invalid publisher public key",
+            Self::Fingerprint => "publisher fingerprint does not match independent confirmation",
+        })
+    }
+}
+
 impl ApprovedRepository {
     pub fn approve(
         id: String,
@@ -841,14 +883,28 @@ impl ApprovedRepository {
         public_key: String,
         confirmed_fingerprint: String,
     ) -> PackageResult<Self> {
-        if !valid_segment(&id) || !valid_https_location(&location) {
-            return Err("invalid repository identity or HTTPS location".into());
+        Self::check(id, location, public_key, confirmed_fingerprint)
+            .map_err(|rejection| rejection.to_string())
+    }
+
+    /// The same decision as [`Self::approve`], naming the rejected field.
+    pub fn check(
+        id: String,
+        location: String,
+        public_key: String,
+        confirmed_fingerprint: String,
+    ) -> Result<Self, ApprovalRejection> {
+        if !valid_segment(&id) {
+            return Err(ApprovalRejection::Identity);
         }
-        let key = decode_hex::<32>(&public_key)?;
-        VerifyingKey::from_bytes(&key).map_err(|_| "invalid publisher public key")?;
+        if !valid_https_location(&location) {
+            return Err(ApprovalRejection::Location);
+        }
+        let key = decode_hex::<32>(&public_key).map_err(|_| ApprovalRejection::PublicKey)?;
+        VerifyingKey::from_bytes(&key).map_err(|_| ApprovalRejection::PublicKey)?;
         let fingerprint = sha256(&key);
         if confirmed_fingerprint != fingerprint {
-            return Err("publisher fingerprint does not match independent confirmation".into());
+            return Err(ApprovalRejection::Fingerprint);
         }
         Ok(Self {
             id,
@@ -929,6 +985,14 @@ impl VerifiedCatalog {
 
     pub fn digest(&self) -> &str {
         &self.digest
+    }
+
+    pub fn sequence(&self) -> u64 {
+        self.catalog.sequence
+    }
+
+    pub fn expires_unix(&self) -> u64 {
+        self.catalog.expires_unix
     }
 }
 

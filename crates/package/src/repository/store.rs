@@ -50,6 +50,22 @@ pub struct RepositoryListing {
     pub fingerprint: String,
     pub revoked: bool,
     pub candidates: Vec<Candidate>,
+    pub catalog: CatalogListing,
+}
+
+/// Whether a repository's saved catalog can be offered for this host.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum CatalogListing {
+    /// No catalog has been accepted, or the publisher is revoked.
+    Missing,
+    /// The saved catalog verifies under the approved key for this target.
+    /// `sequence` is decimal text so a browser keeps all 64 bits.
+    Current { sequence: String, expires_unix: u64 },
+    /// The saved catalog verified when accepted and has since expired.
+    Expired { expires_unix: u64 },
+    /// The saved catalog no longer verifies for another reason.
+    Unavailable,
 }
 
 /// An administrator-controlled directory with one atomic approval/checkpoint
@@ -59,6 +75,10 @@ pub struct RepositoryStore {
 }
 
 impl RepositoryStore {
+    /// Identities this store can hold. Revoked ones still count: they keep
+    /// their replay checkpoint and can never be enrolled again.
+    pub const CAPACITY: usize = MAX_REPOSITORIES;
+
     pub fn new(directory: PathBuf) -> PackageResult<Self> {
         if !directory.is_absolute() {
             return Err("repository state directory must be absolute".into());
@@ -183,39 +203,25 @@ impl RepositoryStore {
         )
     }
 
+    /// Lists every enrolled repository. A catalog that no longer verifies
+    /// withholds only that repository's choices; it does not hide the others.
     pub fn list(&self, target: &str, now: u64) -> PackageResult<Vec<RepositoryListing>> {
         let state = self.read()?;
-        state
+        Ok(state
             .repositories
             .iter()
             .map(|(id, record)| {
-                let candidates = if !record.revoked {
-                    if let Some(saved) = &record.catalog {
-                        verify_catalog(
-                            &record.approval,
-                            saved.raw.as_bytes(),
-                            &saved.signature,
-                            &record.checkpoint,
-                            target,
-                            now,
-                        )?
-                        .candidates()
-                        .to_vec()
-                    } else {
-                        Vec::new()
-                    }
-                } else {
-                    Vec::new()
-                };
-                Ok(RepositoryListing {
+                let (candidates, catalog) = listed_catalog(record, target, now);
+                RepositoryListing {
                     id: id.clone(),
                     location: record.approval.location.clone(),
                     fingerprint: record.approval.fingerprint.clone(),
                     revoked: record.revoked,
                     candidates,
-                })
+                    catalog,
+                }
             })
-            .collect()
+            .collect())
     }
 
     pub fn active_keys(&self) -> PackageResult<BTreeMap<String, String>> {
@@ -300,6 +306,64 @@ impl RepositoryStore {
 
     fn path(&self) -> PathBuf {
         self.directory.join("approved.json")
+    }
+}
+
+fn listed_catalog(
+    record: &RepositoryRecord,
+    target: &str,
+    now: u64,
+) -> (Vec<Candidate>, CatalogListing) {
+    let Some(saved) = record.catalog.as_ref().filter(|_| !record.revoked) else {
+        return (Vec::new(), CatalogListing::Missing);
+    };
+    match verify_catalog(
+        &record.approval,
+        saved.raw.as_bytes(),
+        &saved.signature,
+        &record.checkpoint,
+        target,
+        now,
+    ) {
+        Ok(verified) => (
+            verified.candidates().to_vec(),
+            CatalogListing::Current {
+                sequence: verified.sequence().to_string(),
+                expires_unix: verified.expires_unix(),
+            },
+        ),
+        Err(_) => (Vec::new(), lapsed_catalog(record, saved, target, now)),
+    }
+}
+
+/// Reports expiry only when it is the sole reason the saved catalog fails:
+/// the same bytes must verify at the last moment before they expired.
+fn lapsed_catalog(
+    record: &RepositoryRecord,
+    saved: &SavedCatalog,
+    target: &str,
+    now: u64,
+) -> CatalogListing {
+    let Ok(catalog) = serde_json::from_str::<super::Catalog>(&saved.raw) else {
+        return CatalogListing::Unavailable;
+    };
+    let before_expiry = catalog.expires_unix.saturating_sub(1);
+    if catalog.expires_unix <= now
+        && verify_catalog(
+            &record.approval,
+            saved.raw.as_bytes(),
+            &saved.signature,
+            &record.checkpoint,
+            target,
+            before_expiry,
+        )
+        .is_ok()
+    {
+        CatalogListing::Expired {
+            expires_unix: catalog.expires_unix,
+        }
+    } else {
+        CatalogListing::Unavailable
     }
 }
 

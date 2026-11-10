@@ -25,7 +25,7 @@ pub use manifest::*;
 pub use privileged::*;
 pub use staging::{package_directory, stage_package};
 pub use storage::{
-    RootLock, create_machine_private_directory, create_private_directory,
+    ROOT_BUSY, RootLock, create_machine_private_directory, create_private_directory,
     protect_machine_private_file, read_bounded, read_json, write_json_atomically,
 };
 pub use verification::{

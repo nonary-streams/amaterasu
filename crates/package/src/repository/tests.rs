@@ -558,6 +558,176 @@ fn approved_store_persists_catalog_checkpoint_and_revocation() {
 }
 
 #[test]
+fn listing_reports_each_catalog_without_hiding_other_repositories() {
+    let fixture = Fixture::new();
+    let store = RepositoryStore::new(fixture.root.join("approvals")).unwrap();
+    store.approve(fixture.approved.clone()).unwrap();
+    let second_signer = SigningKey::from_bytes(&[9; 32]);
+    let second_key = encode_hex(second_signer.verifying_key().as_bytes());
+    let second = ApprovedRepository::approve(
+        "second-publisher".into(),
+        "https://second.example.test/repository".into(),
+        second_key.clone(),
+        sha256(second_signer.verifying_key().as_bytes()),
+    )
+    .unwrap();
+    store.approve(second).unwrap();
+    let listed = |now| store.list(&current_target(), now).unwrap();
+    assert!(
+        listed(100)
+            .iter()
+            .all(|repository| repository.catalog == CatalogListing::Missing)
+    );
+
+    let (_, candidate) = fixture.web_bundle();
+    let (raw, signature) = fixture.signed_catalog(vec![candidate], 7);
+    store
+        .accept_catalog(
+            &fixture.approved.id,
+            &raw,
+            &signature,
+            &current_target(),
+            100,
+        )
+        .unwrap();
+    let current = listed(100);
+    let accepted = current
+        .iter()
+        .find(|repository| repository.id == fixture.approved.id)
+        .unwrap();
+    assert_eq!(
+        accepted.catalog,
+        CatalogListing::Current {
+            sequence: "7".into(),
+            expires_unix: 500
+        }
+    );
+    assert_eq!(accepted.candidates.len(), 1);
+
+    // An expired catalog withholds its own choices and nothing else.
+    let lapsed = listed(500);
+    assert_eq!(lapsed.len(), 2);
+    let expired = lapsed
+        .iter()
+        .find(|repository| repository.id == fixture.approved.id)
+        .unwrap();
+    assert_eq!(
+        expired.catalog,
+        CatalogListing::Expired { expires_unix: 500 }
+    );
+    assert!(expired.candidates.is_empty());
+
+    // A wrong target is not an expiry, before or after the expiry time.
+    for now in [100, 500] {
+        let other_target = store.list("other-target", now).unwrap();
+        let unavailable = other_target
+            .iter()
+            .find(|repository| repository.id == fixture.approved.id)
+            .unwrap();
+        assert_eq!(unavailable.catalog, CatalogListing::Unavailable);
+        assert!(unavailable.candidates.is_empty());
+    }
+
+    store.revoke(&fixture.approved.id).unwrap();
+    let revoked = listed(100);
+    let removed = revoked
+        .iter()
+        .find(|repository| repository.id == fixture.approved.id)
+        .unwrap();
+    assert_eq!(removed.catalog, CatalogListing::Missing);
+    assert!(removed.candidates.is_empty());
+}
+
+#[test]
+fn approval_rejection_names_the_unacceptable_field() {
+    let fixture = Fixture::new();
+    let approved = &fixture.approved;
+    let check = |id: &str, location: &str, key: &str, fingerprint: &str| {
+        ApprovedRepository::check(id.into(), location.into(), key.into(), fingerprint.into())
+            .map(|_| ())
+    };
+    assert_eq!(
+        check(
+            &approved.id,
+            &approved.location,
+            &approved.public_key,
+            &approved.fingerprint
+        ),
+        Ok(())
+    );
+    assert_eq!(
+        check(
+            "Not Valid",
+            &approved.location,
+            &approved.public_key,
+            &approved.fingerprint
+        ),
+        Err(ApprovalRejection::Identity)
+    );
+    assert_eq!(
+        check(
+            &approved.id,
+            "http://plain.example.test",
+            &approved.public_key,
+            &approved.fingerprint
+        ),
+        Err(ApprovalRejection::Location)
+    );
+    assert_eq!(
+        check(
+            &approved.id,
+            &approved.location,
+            "not-a-key",
+            &approved.fingerprint
+        ),
+        Err(ApprovalRejection::PublicKey)
+    );
+    assert_eq!(
+        check(
+            &approved.id,
+            &approved.location,
+            &approved.public_key,
+            &"0".repeat(64)
+        ),
+        Err(ApprovalRejection::Fingerprint)
+    );
+}
+
+#[test]
+fn selection_is_observable_while_the_activation_lock_is_held() {
+    let fixture = Fixture::new();
+    let digest = "a".repeat(64);
+    let selection = ActivationState {
+        active: Some(digest.clone()),
+        highest_sequence: 4,
+        repository_sets: BTreeMap::from([(
+            digest.clone(),
+            RepositorySet {
+                repository_id: fixture.approved.id.clone(),
+                key_fingerprint: fixture.approved.fingerprint.clone(),
+            },
+        )]),
+        ..Default::default()
+    };
+    write_json_atomically(&fixture.root.join("selection.json"), &selection).unwrap();
+    let service_lock = RootLock::acquire(&fixture.root).unwrap();
+    assert!(read_native_selection(&fixture.root).is_err());
+
+    let observed = observe_native_selection(&fixture.root).unwrap();
+    assert_eq!(observed.selection.active.as_deref(), Some(digest.as_str()));
+    assert_eq!(observed.selection.highest_sequence, 4);
+    assert_eq!(
+        observed.repository_sets[&digest].repository_id,
+        fixture.approved.id
+    );
+    drop(service_lock);
+    assert_eq!(
+        read_native_selection(&fixture.root).unwrap().revision,
+        observed.selection.revision
+    );
+}
+
+#[test]
 fn selection_authorization_excludes_concurrent_revocation() {
     let fixture = Fixture::new();
     let store = RepositoryStore::new(fixture.root.join("selection-approvals")).unwrap();
