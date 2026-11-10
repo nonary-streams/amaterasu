@@ -75,37 +75,82 @@ pub fn find_account<'a>(accounts: &'a [Account], username: &str) -> Option<&'a A
         .find(|account| account.username.eq_ignore_ascii_case(username))
 }
 
-/// Role grants are a fixed allowlist, intersected with the host policy. Newly
-/// introduced scopes therefore remain administrator-only until explicitly reviewed.
-pub fn role_scopes(role: Role, allowed: &BTreeSet<String>) -> BTreeSet<String> {
-    const VIEWER: &[&str] = &[
-        "account.self",
-        "application.read",
-        "capture.read",
-        "catalog.read",
-        "configuration.read",
-        "diagnostics.read",
-        "display.read",
-        "lutris.read",
-        "media.read",
-        "session.read",
-        "steam.read",
-    ];
-    const OPERATOR: &[&str] = &[
-        "application.launch",
-        "application.terminate",
-        "session.write",
-        "steam.refresh",
-    ];
-    allowed
+/// Every scope a first-party management route requires, in sorted order.
+///
+/// An administrator holds all of them on every installation. A host policy
+/// written before a scope existed therefore cannot lock the administrator out
+/// of the feature that scope guards. The management route table is tested
+/// against this list, so a route cannot require a scope that is missing here.
+pub const BUILT_IN_SCOPES: &[&str] = &[
+    "account.self",
+    "application.launch",
+    "application.read",
+    "application.terminate",
+    "capture.read",
+    "capture.write",
+    "catalog.read",
+    "catalog.write",
+    "configuration.read",
+    "configuration.write",
+    "diagnostics.read",
+    "diagnostics.write",
+    "display.read",
+    "display.write",
+    "host-logs.read",
+    "lutris.read",
+    "media.read",
+    "pairing.admin",
+    "session.read",
+    "session.write",
+    "steam.read",
+    "steam.refresh",
+    "tokens.manage",
+];
+
+const VIEWER_SCOPES: &[&str] = &[
+    "account.self",
+    "application.read",
+    "capture.read",
+    "catalog.read",
+    "configuration.read",
+    "diagnostics.read",
+    "display.read",
+    "lutris.read",
+    "media.read",
+    "session.read",
+    "steam.read",
+];
+
+const OPERATOR_SCOPES: &[&str] = &[
+    "application.launch",
+    "application.terminate",
+    "session.write",
+    "steam.refresh",
+];
+
+/// Everything an administrator holds: the built-in scopes and whatever the
+/// host policy adds to them. It is also the most any credential can carry.
+pub fn administrator_scopes(host_policy: &BTreeSet<String>) -> BTreeSet<String> {
+    BUILT_IN_SCOPES
         .iter()
-        .filter(|scope| match role {
-            Role::Administrator => true,
-            Role::Operator => {
-                VIEWER.contains(&scope.as_str()) || OPERATOR.contains(&scope.as_str())
-            }
-            Role::Viewer => VIEWER.contains(&scope.as_str()),
-        })
+        .map(|scope| (*scope).to_owned())
+        .chain(host_policy.iter().cloned())
+        .collect()
+}
+
+/// Role grants are fixed allowlists. Host policy decides which of them the
+/// operator and viewer roles receive, so a newly introduced scope remains
+/// administrator-only until both the role list and the host policy name it.
+/// Host policy never reduces what an administrator holds.
+pub fn role_scopes(role: Role, host_policy: &BTreeSet<String>) -> BTreeSet<String> {
+    let granted: &[&[&str]] = match role {
+        Role::Administrator => return administrator_scopes(host_policy),
+        Role::Operator => &[VIEWER_SCOPES, OPERATOR_SCOPES],
+        Role::Viewer => &[VIEWER_SCOPES],
+    };
+    host_policy
+        .iter()
+        .filter(|scope| granted.iter().any(|list| list.contains(&scope.as_str())))
         .cloned()
         .collect()
 }
@@ -303,11 +348,81 @@ mod tests {
             .into_iter()
             .collect()
         );
-        assert_eq!(role_scopes(Role::Administrator, &allowed), allowed);
         assert_eq!(
             serde_json::to_string(&Role::Administrator).unwrap(),
             "\"administrator\""
         );
+    }
+
+    #[test]
+    fn an_administrator_holds_every_built_in_scope_whatever_host_policy_lists() {
+        let older_policy: BTreeSet<String> = ["configuration.read", "plugin.custom"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+
+        let administrator = role_scopes(Role::Administrator, &older_policy);
+
+        for scope in BUILT_IN_SCOPES {
+            assert!(administrator.contains(*scope), "{scope} is missing");
+        }
+        assert!(administrator.contains("plugin.custom"));
+        assert_eq!(administrator.len(), BUILT_IN_SCOPES.len() + 1);
+        assert_eq!(
+            role_scopes(Role::Administrator, &BTreeSet::new()).len(),
+            BUILT_IN_SCOPES.len()
+        );
+        // The lower roles still receive only what host policy names.
+        assert_eq!(
+            role_scopes(Role::Viewer, &older_policy),
+            ["configuration.read".to_owned()].into_iter().collect()
+        );
+        assert!(role_scopes(Role::Operator, &BTreeSet::new()).is_empty());
+    }
+
+    /// Scope names written in the management route table. Service identities
+    /// and operation names never match: they carry a version suffix, the
+    /// `amaterasu.` prefix, or no dot at all.
+    fn scopes_required_by_management_routes() -> BTreeSet<String> {
+        let table = include_str!("../../management/src/routes.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        regex::Regex::new(r#""([a-z][a-z-]*\.[a-z_]+)""#)
+            .unwrap()
+            .captures_iter(table)
+            .map(|found| found[1].to_owned())
+            .filter(|name| !name.starts_with("amaterasu."))
+            .collect()
+    }
+
+    #[test]
+    fn an_administrator_holds_every_scope_a_management_route_requires() {
+        let required = scopes_required_by_management_routes();
+        assert!(required.contains("diagnostics.read") && required.contains("session.write"));
+        let built_in: BTreeSet<String> = BUILT_IN_SCOPES
+            .iter()
+            .map(|scope| (*scope).to_owned())
+            .collect();
+
+        let withheld: Vec<_> = required.difference(&built_in).collect();
+        assert!(
+            withheld.is_empty(),
+            "routes require scopes no administrator holds: {withheld:?}; add them to BUILT_IN_SCOPES"
+        );
+        let unused: Vec<_> = built_in.difference(&required).collect();
+        assert!(unused.is_empty(), "no management route requires {unused:?}");
+    }
+
+    #[test]
+    fn built_in_scopes_are_sorted_valid_and_cover_the_lower_roles() {
+        assert!(BUILT_IN_SCOPES.windows(2).all(|pair| pair[0] < pair[1]));
+        for scope in BUILT_IN_SCOPES {
+            assert!(crate::protocol::valid_scope_name(scope), "{scope}");
+        }
+        for scope in VIEWER_SCOPES.iter().chain(OPERATOR_SCOPES) {
+            assert!(BUILT_IN_SCOPES.contains(scope), "{scope} is not built in");
+        }
         assert!(serde_json::from_str::<Role>("\"superuser\"").is_err());
     }
 

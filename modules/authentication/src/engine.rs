@@ -93,6 +93,9 @@ struct Attempts {
 
 pub struct Engine {
     settings: Settings,
+    /// The built-in scopes plus the host policy's. An administrator holds all
+    /// of them, and no session or token may carry a scope outside this set.
+    administrator_scopes: BTreeSet<String>,
     sessions: BTreeMap<String, Session>,
     refresh_index: BTreeMap<String, String>,
     attempts: BTreeMap<String, Attempts>,
@@ -104,6 +107,7 @@ pub struct Engine {
 impl Engine {
     pub fn new(settings: Settings) -> Self {
         Self {
+            administrator_scopes: accounts::administrator_scopes(&settings.allowed_scopes),
             settings,
             sessions: BTreeMap::new(),
             refresh_index: BTreeMap::new(),
@@ -146,8 +150,7 @@ impl Engine {
             Operation::AccountTokensList { .. }
                 | Operation::AccountTokensIssue { .. }
                 | Operation::AccountTokensRevoke { .. }
-        ) && (caller != "amaterasu.management"
-            || !self.settings.allowed_scopes.contains("tokens.manage"))
+        ) && caller != "amaterasu.management"
         {
             return Err("forbidden");
         }
@@ -1118,7 +1121,7 @@ impl Engine {
         granted: &BTreeSet<String>,
         required: &BTreeSet<String>,
     ) -> Result<(), &'static str> {
-        if !required.is_subset(granted) || !granted.is_subset(&self.settings.allowed_scopes) {
+        if !required.is_subset(granted) || !granted.is_subset(&self.administrator_scopes) {
             return Err("unauthorized");
         }
         Ok(())
@@ -1127,13 +1130,11 @@ impl Engine {
     fn token_is_active(&self, token: &ApiToken, now: u64) -> bool {
         token.expires_at > now
             && token.policy_generation == Some(self.settings.authorization_policy_generation)
-            && if token.owner == BROWSER_TOKEN_OWNER {
-                self.settings.allowed_scopes.contains("tokens.manage")
-            } else {
-                self.settings
+            && (token.owner == BROWSER_TOKEN_OWNER
+                || self
+                    .settings
                     .administrator_principals
-                    .contains(&token.owner)
-            }
+                    .contains(&token.owner))
     }
 
     fn write(document: Document, response: Value) -> Result<Change, &'static str> {

@@ -9,6 +9,11 @@ pub struct Route {
     pub requires_empty_body: bool,
 }
 
+/// Maps a request path to the service operation and the scope it requires.
+///
+/// Every scope named here must also be listed in the authentication module's
+/// `BUILT_IN_SCOPES`, which is what gives it to administrators. That module's
+/// tests read this file and fail when a scope is missing from the list.
 pub fn resolve(path: &str) -> Option<Route> {
     let (domain, action) = path.strip_prefix("/v1/")?.split_once('/')?;
     let (service, action, scope) = match (domain, action) {

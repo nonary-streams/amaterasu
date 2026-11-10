@@ -21,6 +21,9 @@ pub struct Settings {
     pub administrator_principals: BTreeSet<String>,
     pub legacy_verifier_principals: BTreeSet<String>,
     pub scope_minimum_roles: BTreeMap<String, crate::accounts::Role>,
+    /// The scopes host policy lets the operator and viewer roles hold, and any
+    /// it adds to the built-in ones. An administrator always holds every
+    /// built-in scope, so an older list never withholds a newer feature.
     pub allowed_scopes: BTreeSet<String>,
     /// Advance for every authentication-policy edit, including restoring old values.
     #[serde(default)]
@@ -63,7 +66,7 @@ impl Settings {
             || self
                 .allowed_scopes
                 .iter()
-                .any(|value| !identifier(value, 64))
+                .any(|value| !valid_scope_name(value))
             || !(1..=MAX_CONFIGURED_TTL_SECONDS).contains(&self.session_token_ttl_seconds)
             || !(1..=MAX_CONFIGURED_TTL_SECONDS)
                 .contains(&self.remember_me_refresh_token_ttl_seconds)
@@ -556,8 +559,11 @@ fn identifier(value: &str, max: usize) -> bool {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || b"._-:/".contains(&byte))
 }
+pub fn valid_scope_name(scope: &str) -> bool {
+    identifier(scope, 64)
+}
 fn valid_scopes(scopes: &BTreeSet<String>) -> bool {
-    scopes.len() <= MAX_SCOPES && scopes.iter().all(|scope| identifier(scope, 64))
+    scopes.len() <= MAX_SCOPES && scopes.iter().all(|scope| valid_scope_name(scope))
 }
 pub fn valid_digest(value: &str) -> bool {
     value.len() == 64

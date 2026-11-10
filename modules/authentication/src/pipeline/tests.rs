@@ -10,6 +10,14 @@ fn settings() -> Settings {
     }
 }
 
+/// What an administrator's session lists under `policy`: every built-in
+/// scope and the scopes the host policy adds.
+fn administrator_scopes(policy: &Settings) -> Value {
+    json!(crate::accounts::administrator_scopes(
+        &policy.allowed_scopes
+    ))
+}
+
 fn settings_with_ttls(session_ttl: u64, remembered_refresh_ttl: u64) -> Settings {
     Settings {
         session_token_ttl_seconds: session_ttl,
@@ -1205,7 +1213,7 @@ fn administrator_session_and_refresh_rotation_survive_restart() {
         100,
     );
     assert_eq!(login["ok"], true);
-    assert_eq!(login["scopes"], json!(["lutris.read"]));
+    assert_eq!(login["scopes"], administrator_scopes(&lutris_settings));
     assert_eq!(state.revision, 3);
     assert!(state.stored.as_ref().unwrap()["credential"].is_null());
     let credential_document = state.stored.clone();
@@ -1260,7 +1268,7 @@ fn administrator_session_and_refresh_rotation_survive_restart() {
         220,
     );
     assert_eq!(rotated["ok"], true);
-    assert_eq!(rotated["scopes"], json!(["lutris.read"]));
+    assert_eq!(rotated["scopes"], administrator_scopes(&lutris_settings));
     assert_eq!(rotated["refresh_expires_at"], 500);
     assert_eq!(state.revision, 4);
     assert_eq!(state.stored, credential_document);
@@ -1857,7 +1865,7 @@ fn policy_generation_prunes_sessions_after_unobserved_revert_and_restart() {
     assert_eq!(restored_login["ok"], true);
     assert_eq!(
         restored_login["scopes"],
-        json!(["catalog.read", "catalog.write"])
+        administrator_scopes(&restored_settings)
     );
     assert_eq!(
         state.session_stored.as_ref().unwrap()["sessions"][0]["policy_generation"],
@@ -3106,11 +3114,77 @@ fn management_login_backstop_recovers_rapidly_and_preserves_other_caller_limits(
 }
 
 #[test]
+fn administrator_is_authorized_for_built_in_scopes_an_older_host_policy_never_listed() {
+    let mut state = StateHarness::new();
+    // This policy predates diagnostics, host logs and token management.
+    let mut pipeline = Pipeline::new(settings());
+    state.setup(&mut pipeline);
+    let admin = state.request(
+        &mut pipeline,
+        "amaterasu.management",
+        json!({"action":"login", "username":"admin", "password":"correct horse battery staple"}),
+        100,
+    );
+    assert_eq!(admin["scopes"], administrator_scopes(&settings()));
+    let verify = |bearer: &Value, scopes: Value| json!({"action":"verify", "bearer":bearer, "required_scopes":scopes});
+
+    assert_eq!(
+        state.request(
+            &mut pipeline,
+            "frontend",
+            verify(
+                &admin["bearer"],
+                json!(["diagnostics.read", "host-logs.read"])
+            ),
+            101,
+        )["ok"],
+        true
+    );
+    assert_eq!(
+        state.request(
+            &mut pipeline,
+            "frontend",
+            verify(&admin["bearer"], json!(["not.defined"])),
+            101,
+        )["code"],
+        "unauthorized"
+    );
+
+    // Host policy still decides what the lower roles hold.
+    assert_eq!(
+        state.request(
+            &mut pipeline,
+            "amaterasu.management",
+            json!({"action":"create_account", "bearer":admin["bearer"], "username":"viewer",
+                "password":"viewer secret password", "role":"viewer"}),
+            102,
+        )["ok"],
+        true
+    );
+    let viewer = state.request(
+        &mut pipeline,
+        "amaterasu.management",
+        json!({"action":"login", "username":"viewer", "password":"viewer secret password"}),
+        103,
+    );
+    assert_eq!(viewer["scopes"], json!(["catalog.read"]));
+    assert_eq!(
+        state.request(
+            &mut pipeline,
+            "frontend",
+            verify(&viewer["bearer"], json!(["diagnostics.read"])),
+            104,
+        )["code"],
+        "unauthorized"
+    );
+}
+
+#[test]
 fn browser_token_management_requires_live_admin_session_and_preserves_owner_boundaries() {
     let mut state = StateHarness::new();
-    let mut token_settings = settings();
-    token_settings.allowed_scopes.insert("tokens.manage".into());
-    let mut pipeline = Pipeline::new(token_settings);
+    // Host policy does not name tokens.manage. Managing tokens is an
+    // administrator permission on every installation.
+    let mut pipeline = Pipeline::new(settings());
     state.setup(&mut pipeline);
     let login = state.request(
         &mut pipeline,
@@ -3119,6 +3193,12 @@ fn browser_token_management_requires_live_admin_session_and_preserves_owner_boun
             "action":"login", "username":"admin", "password":"correct horse battery staple"
         }),
         100,
+    );
+    assert!(
+        login["scopes"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("tokens.manage"))
     );
     let admin = login["bearer"].clone();
     let console_token = state.request(
@@ -3188,33 +3268,6 @@ fn browser_token_management_requires_live_admin_session_and_preserves_owner_boun
             "frontend",
             json!({
                 "action":"verify", "bearer":secret, "required_scopes":["catalog.write"]
-            }),
-            101
-        )["code"],
-        "unauthorized"
-    );
-    let mut disabled = Pipeline::new(settings());
-    let mut disabled_state = StateHarness::new();
-    disabled_state.stored = state.stored.clone();
-    disabled_state.session_stored = state.session_stored.clone();
-    disabled_state.revision = state.revision;
-    assert_eq!(
-        disabled_state.request(
-            &mut disabled,
-            "amaterasu.management",
-            json!({
-                "action":"account_tokens_list", "bearer":admin
-            }),
-            101
-        )["code"],
-        "forbidden"
-    );
-    assert_eq!(
-        disabled_state.request(
-            &mut disabled,
-            "frontend",
-            json!({
-                "action":"verify", "bearer":secret, "required_scopes":["catalog.read"]
             }),
             101
         )["code"],
