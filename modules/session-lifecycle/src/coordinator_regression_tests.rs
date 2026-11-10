@@ -198,6 +198,12 @@ impl Harness {
             }
             if external {
                 configuration["settings"][COORDINATOR]["capture_binding_mode"] = json!("external");
+                if processing {
+                    // External capture proves its source range at the frame
+                    // boundary, as installed; no provider applies source modes.
+                    configuration["settings"][COORDINATOR]["processing_policy"]["source_mode_providers"] =
+                        json!([]);
+                }
                 configuration["settings"][COORDINATOR]["consumer_requirements"] =
                     json!({"execution_domain":"seat","capture_providers":[],"selector_schemas":[]});
                 configuration["settings"][COORDINATOR]["control_policies"] = json!([]);
@@ -721,7 +727,7 @@ impl Harness {
                         .unwrap()
                 };
                 serde_json::to_value(response).unwrap()
-            } else if self.external {
+            } else if self.external && payload["method"] != "processing_intent" {
                 external_policy_response(&payload, "settings", false)
             } else if payload["method"] == "processing_intent" {
                 assert!(self.processing);
@@ -3027,7 +3033,7 @@ fn a_plan_refused_at_admission_fails_cleanly_and_does_not_block_the_next_session
     let refused = prepare_session(&mut harness, "refused");
     assert_eq!(refused["status"], "failed", "{refused}");
     assert_eq!(refused["cleanup_completed"], true, "{refused}");
-    assert_eq!(refused["reason"], "provider_plan_not_admitted", "{refused}");
+    assert_eq!(refused["reason"], "provider_plan_rejected", "{refused}");
     let refused_id = refused["target"]["session_id"].as_str().unwrap().to_owned();
     let journal = journal_snapshot(&harness);
     assert_eq!(
@@ -3051,4 +3057,54 @@ fn a_plan_refused_at_admission_fails_cleanly_and_does_not_block_the_next_session
     harness.policy_domain_revision = Some(2);
     let next = prepare_session(&mut harness, "next");
     assert_eq!(next["status"], "succeeded", "{next}");
+}
+
+/// A second client whose request is incompatible with the source's GPU
+/// transform is refused at preflight, before any provider is asked to
+/// prepare. That refusal must release its subscription so the source and
+/// application can still retire; otherwise every later launch is refused.
+#[test]
+fn join_refused_at_processing_preflight_releases_the_shared_source() {
+    let harness = Harness::with_processing_mode(true, None, true, true);
+    let (mut harness, session, source) = prepare_hdr_shared_source(harness);
+    let admitted = harness.call("transport",json!({"operation":"prepare_stream","operation_id":"sdr.join",
+        "target":session,"intent":"join","requested_video":{"width":1920,"height":1080,"refresh_millihz":60000,"hdr":false},
+        "consumer_requirements":["capture"]}));
+    assert_eq!(admitted["status"], "pending", "{admitted}");
+    let refused = wait_shared_operation(&mut harness, "sdr.join");
+    assert_eq!(refused["status"], "failed", "{refused}");
+    assert_eq!(refused["reason"], "processing_output_range_mismatch");
+    assert_eq!(refused["cleanup_completed"], true, "{refused}");
+    let retired = retire_shared_client(&mut harness, &source["target"], "hdr.source.retire");
+    assert_eq!(retired["status"], "succeeded", "{retired}");
+    assert_eq!(
+        retired["resources_released"], true,
+        "a refused join must not pin the source: {retired}"
+    );
+    end_shared_application(&mut harness, &session, "hdr-refused-join");
+}
+
+fn prepare_hdr_shared_source(mut harness: Harness) -> (Harness, Value, Value) {
+    for participant in &mut harness.settings.participants {
+        participant
+            .capabilities
+            .insert(amaterasu_module_sdk::extension_api::STREAM_JOIN_CAPABILITY.into());
+    }
+    harness
+        .coordinator
+        .as_mut()
+        .unwrap()
+        .configure_for_test(harness.settings.clone());
+    let video = json!({"width":1920,"height":1080,"refresh_millihz":60000,"hdr":true});
+    let started=harness.call("transport",json!({"operation":"prepare","operation_id":"shared.session","application_ref":{"kind":"application","app_id":"app"},"requested_video":video}));
+    assert_eq!(started["status"], "pending", "{started}");
+    let session = wait_shared_operation(&mut harness, "shared.session");
+    assert_eq!(session["status"], "succeeded", "{session}");
+    let session = session["target"].clone();
+    assert_eq!(harness.call("transport",json!({"operation":"bind_application","operation_id":"shared.app","target":session,"launch_id":42,"application_operation_id":"launch-42"}))["status"],"succeeded");
+    let started=harness.call("transport",json!({"operation":"prepare_stream","operation_id":"shared.source","target":session,"intent":"initial","requested_video":video,"consumer_requirements":["capture"]}));
+    assert_eq!(started["status"], "pending", "{started}");
+    let source = wait_shared_operation(&mut harness, "shared.source");
+    assert_eq!(source["status"], "succeeded", "{source}");
+    (harness, session, source)
 }

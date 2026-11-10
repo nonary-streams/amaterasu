@@ -627,19 +627,6 @@ fn frozen_settings_mut<'a>(
     }
 }
 
-/// Whether a provider's outcome is unknown after its preparation stopped.
-///
-/// A provider that has only answered a planning call holds nothing: no plan
-/// was admitted for it, no domain was reserved and no callback was sent. Its
-/// outcome is known, so a refused plan must not fence the session for recovery.
-fn effect_uncertain(state: &PrepareState) -> bool {
-    match state.phase {
-        PreparePhase::Prepared | PreparePhase::Rejected => false,
-        PreparePhase::Plan | PreparePhase::PlanStatus => state.admission_id.is_some(),
-        _ => true,
-    }
-}
-
 impl Coordinator {
     pub(super) fn effective_settings(&self, work: &Work) -> ModuleResult<LifecycleSettings> {
         let shared = self.shared.borrow();
@@ -1416,6 +1403,7 @@ impl Coordinator {
             .participants
             .iter()
             .all(|participant| self.provider_approvals_complete(&participant.provider));
+        self.reconcile_uncertain_preparation();
         let mut keys: Vec<_> = self
             .shared
             .borrow()
@@ -2073,20 +2061,19 @@ impl Coordinator {
                     work.phase
                 );
                 // The dispatcher records whether submission crossed its durable
-                // effect boundary. An uncertain call is fenced, never replayed.
+                // effect boundary. An uncertain call is fenced, never replayed;
+                // a refused read-only plan is an ordinary rejection.
+                let reason = if self.provider_effect_unsettled(&key, provider) {
+                    "provider_outcome_unknown"
+                } else {
+                    "provider_plan_rejected"
+                };
                 if matches!(
                     work.phase,
                     LifecyclePhase::StreamRelease | LifecyclePhase::SessionRelease
                 ) {
-                    self.cleanup_failure(&key, "provider_outcome_unknown")?;
+                    self.cleanup_failure(&key, reason)?;
                 } else {
-                    let admitted = self.drivers[&runtime_key].state().admission_id.is_some();
-                    let reason = if admitted || effect_uncertain(self.drivers[&runtime_key].state())
-                    {
-                        "provider_outcome_unknown"
-                    } else {
-                        "provider_plan_not_admitted"
-                    };
                     self.fail_work(&key, reason)?;
                 }
                 self.drivers.remove(&runtime_key);
@@ -2567,8 +2554,8 @@ impl Coordinator {
                     // while its unresolved effects are already fenced by this
                     // cleanup work. Independent branches can then proceed.
                     && !(receipt.response["status"] == "recovery_required"
-                        && other.states.iter().any(|(_, state)| !matches!(state.phase, PreparePhase::Prepared | PreparePhase::Rejected))
-                        && other.states.iter().filter(|(_, state)| !matches!(state.phase, PreparePhase::Prepared | PreparePhase::Rejected))
+                        && other.states.values().any(PrepareState::effect_unsettled)
+                        && other.states.iter().filter(|(_, state)| state.effect_unsettled())
                             .all(|(provider, _)| work.cleanup_blockers.contains(provider)))
                     && matches!(
                         other.phase,
@@ -2846,6 +2833,16 @@ impl Coordinator {
                 response["execution_domain"] =
                     json!(self.settings.consumer_requirements.execution_domain);
                 response["capture_binding_mode"] = json!(session.capture_binding_mode);
+                // A selected GPU transform may require a different capture
+                // range than the client output, e.g. RTX HDR renders SDR. The
+                // owner applies it to the display it configures for capture.
+                if let Some(source) = session
+                    .processing_decision
+                    .as_ref()
+                    .and_then(|decision| decision.source_video_mode.as_ref())
+                {
+                    response["source_video_mode"] = json!(source);
+                }
             }
             LifecyclePhase::StreamPrepare => {
                 if session.capture_binding_mode.is_external() {
@@ -3061,6 +3058,18 @@ impl Coordinator {
         save(&self.shared, next)
     }
 
+    /// Read the participant's durable state; an absent state stays uncertain.
+    fn provider_effect_unsettled(&self, key: &str, provider: &str) -> bool {
+        self.shared
+            .borrow()
+            .value
+            .receipts
+            .get(key)
+            .and_then(|receipt| receipt.work.as_ref())
+            .and_then(|work| work.states.get(provider))
+            .is_none_or(PrepareState::effect_unsettled)
+    }
+
     fn cleanup_failure(&self, key: &str, reason: &str) -> ModuleResult<()> {
         let mut next = self.shared.borrow().value.clone();
         let work = next
@@ -3095,7 +3104,7 @@ impl Coordinator {
             // the session for recovery instead.
             && work.reprepare.is_none()
         {
-            let uncertain = work.states.values().any(effect_uncertain);
+            let uncertain = work.states.values().any(PrepareState::effect_unsettled);
             let mut providers: Vec<_> = work
                 .providers
                 .iter()
@@ -3142,7 +3151,7 @@ impl Coordinator {
                     .states
                     .iter()
                     .filter_map(|(provider, state)| {
-                        effect_uncertain(state).then_some(provider.clone())
+                        state.effect_unsettled().then_some(provider.clone())
                     })
                     .collect();
                 for (other_key, other) in &mut next.receipts {
@@ -3190,7 +3199,7 @@ impl Coordinator {
                         .states
                         .iter()
                         .filter_map(|(provider, state)| {
-                            effect_uncertain(state).then_some(provider.clone())
+                            state.effect_unsettled().then_some(provider.clone())
                         })
                         .collect(),
                     index: 0,

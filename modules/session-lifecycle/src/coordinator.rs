@@ -83,6 +83,7 @@ mod stream_closure_lookup;
 mod stream_release;
 #[allow(dead_code, reason = "awaits the atomic ended-session transaction")]
 mod terminal_root;
+mod uncertain_preparation;
 
 use crate::adapter::LifecycleSettings;
 use crate::prepare_authority::{AuthorityState, ProviderSelection};
@@ -1168,6 +1169,8 @@ pub struct Coordinator {
     application_cursor: usize,
     ephemeral: BTreeMap<String, (Receipt, Instant)>,
     work_cursor: usize,
+    /// Fenced receipts whose reconciliation failed; retried after restart.
+    unreconcilable: BTreeSet<String>,
     settings_jobs: BTreeMap<String, settings_snapshot::SettingsSnapshotJob>,
     processing_jobs: BTreeMap<String, processing_preflight::ProcessingPreflightJob>,
     failed_prepare_recovery: Option<failed_prepare_recovery::Recovery>,
@@ -1264,6 +1267,7 @@ impl Coordinator {
             application_cursor: 0,
             ephemeral: BTreeMap::new(),
             work_cursor: 0,
+            unreconcilable: BTreeSet::new(),
             settings_jobs: BTreeMap::new(),
             processing_jobs: BTreeMap::new(),
             failed_prepare_recovery: None,

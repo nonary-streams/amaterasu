@@ -10,6 +10,10 @@ struct Harness {
     callbacks: Vec<(String, String)>,
     uncertain_phase: String,
     unavailable_approval: Option<(String, String)>,
+    /// Cleanup state "b" reports for its owed obligation in mode `owed`.
+    owed_cleanup: &'static str,
+    /// Number of "b" release plans to refuse before planning normally.
+    refused_release_plans: usize,
 }
 
 impl Harness {
@@ -43,7 +47,32 @@ impl Harness {
             callbacks: vec![],
             uncertain_phase: uncertain_phase.into(),
             unavailable_approval: None,
+            owed_cleanup: "released",
+            refused_release_plans: 0,
         }
+    }
+
+    /// Reopen the same journal as a restarted host with a new epoch.
+    fn restart(&mut self) {
+        let settings = self.coordinator.settings.clone();
+        let placeholder = std::env::temp_dir().join(format!(
+            "lifecycle-cleanup-placeholder-{}",
+            identifier().unwrap()
+        ));
+        std::fs::create_dir(&placeholder).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&placeholder, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        drop(std::mem::replace(
+            &mut self.coordinator,
+            Coordinator::open(&placeholder.join("journal.json")).unwrap(),
+        ));
+        self.coordinator = Coordinator::open(&self.dir.join("journal.json")).unwrap();
+        self.coordinator.configured = true;
+        self.coordinator.settings = settings;
+        let _ = std::fs::remove_dir_all(&placeholder);
     }
 
     fn tick(&mut self) {
@@ -54,6 +83,8 @@ impl Harness {
             callbacks,
             uncertain_phase,
             unavailable_approval,
+            owed_cleanup,
+            refused_release_plans,
             ..
         } = self;
         let mut send = |command| -> ModuleResult<Response> {
@@ -86,10 +117,21 @@ impl Harness {
                     ..
                 } => {
                     let provider = service.strip_suffix("/1").unwrap().to_owned();
-                    let result = if method == "plan" {
-                        let deferred = *uncertain_phase == "deferred"
+                    let refuse = method == "plan"
+                        && provider == "b"
+                        && payload["phase"] == "session.release"
+                        && *refused_release_plans > 0;
+                    if refuse {
+                        *refused_release_plans -= 1;
+                    }
+                    let result = if refuse {
+                        json!({"status":"rejected","reason":"domain_busy"})
+                    } else if method == "plan" {
+                        let deferred = (*uncertain_phase == "deferred"
                             && provider == "b"
-                            && payload["phase"] == "session.release";
+                            && payload["phase"] == "session.release")
+                            // Prepare admits the obligation; release plans its cleanup.
+                            || (*uncertain_phase == "owed" && provider == "b");
                         let resources = if deferred {
                             json!([{"provider":"b","resource_id":"output","incarnation":null,"expected_revision":null,"execution_domain":"seat","mutation_domains":[],"access":"read"}])
                         } else {
@@ -109,8 +151,16 @@ impl Harness {
                     } else if method == "callback" {
                         let phase = payload["phase"].as_str().unwrap().to_owned();
                         callbacks.push((provider.clone(), phase.clone()));
-                        if provider == "b" && phase == *uncertain_phase {
+                        if provider == "b"
+                            && (phase == *uncertain_phase
+                                || (*uncertain_phase == "owed" && phase == "session.prepare"))
+                        {
                             json!({"status":"recovery_required","reason":"unknown_effect"})
+                        } else if provider == "b"
+                            && phase == "session.release"
+                            && *uncertain_phase == "owed"
+                        {
+                            json!({"status":"cleanup","outcomes":[{"obligation_id":"restore","state":*owed_cleanup,"reason":null}]})
                         } else if provider == "b"
                             && phase == "session.release"
                             && *uncertain_phase == "deferred"
@@ -254,6 +304,128 @@ fn uncertain_dependent_prepare_never_releases_its_prerequisite() {
         .map(|(provider, _)| provider.as_str())
         .collect();
     assert_eq!(releases, ["c"]);
+}
+
+/// Prepare a session whose dependent "b" received its admitted callback but
+/// whose outcome was never recorded, then restart the host.
+fn restarted_with_unsettled_callback(owed_cleanup: &'static str) -> Harness {
+    let mut h = Harness::new("owed");
+    h.owed_cleanup = owed_cleanup;
+    h.coordinator.handle(
+        "caller",
+        "initiator",
+        json!({"operation":"prepare","operation_id":"prepare"}),
+    );
+    assert_eq!(h.run("prepare")["status"], "recovery_required");
+    {
+        let journal = &h.coordinator.shared.borrow().value;
+        assert!(
+            journal
+                .authority
+                .admissions
+                .values()
+                .any(|admission| admission.provider == "b"),
+            "the unsettled callback keeps its admission"
+        );
+    }
+    h.restart();
+    // The restarted host's background loop drives reconciliation.
+    for _ in 0..50 {
+        h.tick();
+    }
+    h
+}
+
+#[test]
+fn restart_reconciles_unsettled_callback_through_provider_cleanup() {
+    let mut h = restarted_with_unsettled_callback("released");
+    let outcome = h.run("prepare");
+    assert_eq!(outcome["status"], "failed", "{outcome}");
+    assert_eq!(outcome["cleanup_completed"], true);
+    let releases: Vec<_> = h
+        .callbacks
+        .iter()
+        .filter(|(_, phase)| phase == "session.release")
+        .map(|(provider, _)| provider.as_str())
+        .collect();
+    // "c" was released before restart. The reconciled dependent "b" is then
+    // cleaned before "a", the prerequisite whose release it had blocked.
+    assert_eq!(releases, ["c", "b", "a"]);
+    let prepares = h
+        .callbacks
+        .iter()
+        .filter(|(provider, phase)| provider == "b" && phase == "session.prepare")
+        .count();
+    assert_eq!(prepares, 1, "the uncertain preparation is never replayed");
+    let journal = &h.coordinator.shared.borrow().value;
+    assert!(journal.authority.admissions.is_empty());
+    assert!(journal.authority.settled.is_empty());
+}
+
+#[test]
+fn restart_keeps_unsettled_callback_fenced_when_cleanup_is_unproven() {
+    let mut h = restarted_with_unsettled_callback("effect_unknown");
+    assert_eq!(h.run("prepare")["status"], "recovery_required");
+    for _ in 0..5 {
+        h.tick();
+    }
+    let journal = &h.coordinator.shared.borrow().value;
+    assert!(
+        journal
+            .authority
+            .settled
+            .values()
+            .any(|admission| admission.provider == "b"),
+        "an unproven cleanup keeps the owed obligation"
+    );
+    // The provider answered, so nothing is in flight: its lock is released
+    // and other targets in its domain are no longer fenced by this one.
+    assert!(
+        journal
+            .authority
+            .admissions
+            .values()
+            .all(|admission| admission.provider != "b")
+    );
+}
+
+#[test]
+fn refused_release_plan_is_planned_again_without_replaying_effects() {
+    let mut h = Harness::new("none");
+    h.refused_release_plans = 1;
+    let started = h.coordinator.handle(
+        "caller",
+        "initiator",
+        json!({"operation":"prepare","operation_id":"prepare"}),
+    );
+    assert_eq!(h.run("prepare")["status"], "succeeded");
+    h.coordinator
+        .shared
+        .borrow_mut()
+        .value
+        .sessions
+        .get_mut(started["session_id"].as_str().unwrap())
+        .unwrap()
+        .application_retired = true;
+    h.coordinator.handle(
+        "caller",
+        "initiator",
+        json!({"operation":"end_session","operation_id":"end","target":started["target"]}),
+    );
+    for _ in 0..50 {
+        h.tick();
+    }
+    let ended = h.run("end");
+    assert_eq!(ended["status"], "succeeded", "{ended}");
+    let releases = h
+        .callbacks
+        .iter()
+        .filter(|(provider, phase)| provider == "b" && phase == "session.release")
+        .count();
+    assert_eq!(
+        releases, 1,
+        "only the re-planned release reaches the provider"
+    );
 }
 
 #[test]
@@ -477,7 +649,7 @@ fn unsupported_control_proposal_is_rejected_before_admission_or_callback() {
     let result = h.run("prepare");
     assert_eq!(result["status"], "failed", "{result}");
     assert_eq!(result["cleanup_completed"], true, "{result}");
-    assert_eq!(result["reason"], "provider_plan_not_admitted", "{result}");
+    assert_eq!(result["reason"], "provider_plan_rejected", "{result}");
     assert!(h.callbacks.is_empty());
     assert!(
         h.coordinator

@@ -61,6 +61,18 @@ pub struct PrepareState {
     pub response: Option<ProviderResponse>,
 }
 
+impl PrepareState {
+    /// Whether this participant may hold an unsettled provider effect.
+    /// Planning is read-only and an effect callback is persisted before it is
+    /// dispatched, so a durable unadmitted planning state proves no effect.
+    pub fn effect_unsettled(&self) -> bool {
+        let unadmitted_plan = self.admission_id.is_none()
+            && self.request.operation == amaterasu_extension_api::ProviderOperation::ResourcePlan
+            && matches!(self.phase, PreparePhase::Plan | PreparePhase::PlanStatus);
+        !matches!(self.phase, PreparePhase::Prepared | PreparePhase::Rejected) && !unadmitted_plan
+    }
+}
+
 /// The owner must atomically commit the entire state with all cleanup obligations.
 pub trait PrepareJournal {
     fn persist(&mut self, state: &PrepareState) -> ModuleResult<()>;

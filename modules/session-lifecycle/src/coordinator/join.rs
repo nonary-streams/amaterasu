@@ -115,6 +115,57 @@ fn rejected_plan_valid(
         )
 }
 
+/// Providers a failed join prepared, in preparation order, when its failure
+/// evidence is exact: every attempted provider but the last prepared, and the
+/// last rejected its read-only plan. A join refused before any provider was
+/// attempted, e.g. by processing preflight, prepared nothing. `None` means the
+/// evidence cannot prove the join is closed.
+fn failed_join_cleanup(
+    failed: &FailedPreparation,
+    order: &[String],
+    lease: &SharedSourceLease,
+    target: &LifecycleTarget,
+) -> Option<Vec<String>> {
+    if failed.uncertain || failed.states.len() > order.len() {
+        return None;
+    }
+    if failed.states.is_empty() {
+        return Some(Vec::new());
+    }
+    let attempted = &order[..failed.states.len()];
+    if failed
+        .states
+        .keys()
+        .any(|provider| !attempted.contains(provider))
+    {
+        return None;
+    }
+    for (index, provider) in attempted.iter().enumerate() {
+        let state = failed.states.get(provider)?;
+        if state.provider != *provider || state.participant.provider != *provider {
+            return None;
+        }
+        if index + 1 == attempted.len() {
+            if !rejected_plan_valid(state, &lease.context, target) {
+                return None;
+            }
+        } else if state.phase != crate::prepare_driver::PreparePhase::Prepared
+            || state
+                .admission_id
+                .as_ref()
+                .and_then(|id| lease.callbacks.get(id))
+                .is_none_or(|proof| {
+                    proof.callback.request.target != *target
+                        || proof.callback.request.phase != LifecyclePhase::StreamPrepare
+                        || proof.callback.request != state.request
+                })
+        {
+            return None;
+        }
+    }
+    Some(attempted[..attempted.len() - 1].to_vec())
+}
+
 fn closed_join_valid(
     lease: &SharedSourceLease,
     stream_id: &str,
@@ -127,46 +178,13 @@ fn closed_join_valid(
     let Some(graph) = &stream.provider_graph else {
         return false;
     };
-    let mut expected = graph.order.clone();
-    if let Some(failed) = &closed.failed {
-        if failed.uncertain || failed.states.is_empty() || failed.states.len() > expected.len() {
-            return false;
-        }
-        let attempted = &graph.order[..failed.states.len()];
-        if failed
-            .states
-            .keys()
-            .any(|provider| !attempted.contains(provider))
-        {
-            return false;
-        }
-        for (index, provider) in attempted.iter().enumerate() {
-            let Some(state) = failed.states.get(provider) else {
-                return false;
-            };
-            if state.provider != *provider || state.participant.provider != *provider {
-                return false;
-            }
-            if index + 1 == attempted.len() {
-                if !rejected_plan_valid(state, &lease.context, target) {
-                    return false;
-                }
-            } else if state.phase != crate::prepare_driver::PreparePhase::Prepared
-                || state
-                    .admission_id
-                    .as_ref()
-                    .and_then(|id| lease.callbacks.get(id))
-                    .is_none_or(|proof| {
-                        proof.callback.request.target != *target
-                            || proof.callback.request.phase != LifecyclePhase::StreamPrepare
-                            || proof.callback.request != state.request
-                    })
-            {
-                return false;
-            }
-        }
-        expected = attempted[..attempted.len() - 1].to_vec();
-    }
+    let mut expected = match &closed.failed {
+        Some(failed) => match failed_join_cleanup(failed, &graph.order, lease, target) {
+            Some(prepared) => prepared,
+            None => return false,
+        },
+        None => graph.order.clone(),
+    };
     expected.reverse();
     if expected != closed.cleanup_providers {
         return false;

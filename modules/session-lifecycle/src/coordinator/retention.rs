@@ -396,35 +396,53 @@ fn receipt_targets_match(
     )
 }
 
-/// Compact only closed records. The caller persists this journal atomically
-/// before admitting further work; any write failure fences later admission.
-pub(super) fn compact(journal: &mut Journal) {
-    // An admission without a journaled owning work item is ambiguous and must
-    // fence all pruning. Once ownership is known, unrelated sessions may retire.
-    let authority_quiet = journal
-        .authority
+/// A receipt's live or failed preparation names the admissions it still owns.
+fn work_owns_admission(journal: &Journal, admission_id: &str) -> bool {
+    journal.receipts.values().any(|receipt| {
+        receipt.work.as_ref().is_some_and(|work| {
+            work.states
+                .values()
+                .chain(
+                    work.failed_preparation
+                        .iter()
+                        .flat_map(|failed| failed.states.values()),
+                )
+                .any(|state| state.admission_id.as_deref() == Some(admission_id))
+        })
+    })
+}
+
+/// An admission whose cleanup owner is unknown is ambiguous and must fence
+/// all pruning. Every cleanup obligation must be held by a session or by the
+/// receipt work that prepared it. A settled plan without obligations retains
+/// only agreed constraints or release history, so it owns no cleanup.
+fn admission_ownership_known(journal: &Journal) -> bool {
+    let authority = &journal.authority;
+    authority
         .domain_locks
         .values()
-        .all(|id| journal.authority.admissions.contains_key(id))
-        && journal.authority.admissions.keys().all(|id| {
-            journal.receipts.values().any(|receipt| {
-                receipt.work.as_ref().is_some_and(|work| {
-                    work.states
-                        .values()
-                        .any(|state| state.admission_id.as_deref() == Some(id.as_str()))
-                })
-            })
-        })
-        && journal.authority.settled.values().all(|admission| {
-            !admission.plan.obligations.is_empty()
-                && admission.plan.obligations.iter().all(|obligation| {
+        .all(|id| authority.admissions.contains_key(id))
+        && authority
+            .admissions
+            .keys()
+            .all(|id| work_owns_admission(journal, id))
+        && authority.settled.iter().all(|(id, admission)| {
+            work_owns_admission(journal, id)
+                || admission.plan.obligations.iter().all(|obligation| {
                     journal
                         .sessions
                         .values()
                         .any(|session| session.obligations.contains(obligation))
                 })
-        });
-    if authority_quiet {
+        })
+}
+
+/// Compact only closed records. The caller persists this journal atomically
+/// before admitting further work; any write failure fences later admission.
+pub(super) fn compact(journal: &mut Journal) {
+    // Once ownership is known, unrelated sessions may retire. Sessions that
+    // still own unresolved work are skipped individually below.
+    if admission_ownership_known(journal) {
         let sessions: Vec<_> = journal
             .sessions
             .iter()
@@ -993,6 +1011,92 @@ mod tests {
             &journal,
             &receipt_key("transport", "client", "create-0")
         ));
+    }
+
+    fn settle_frame_limiter_admission(journal: &mut Journal, id: &str, obligations: Value) {
+        let method = json!({"service":"example.limiter/1","method":"cleanup","interface_major":1,"interface_minor":0,"schema_revision":1});
+        let selection = json!({"participant":{"provider":"limiter","plan_method":method,"callback_method":method,"status_method":method,"binding_validate_method":null,"capabilities":[],"cleanup_methods":[],"settings_revision":"one","settings":{}},"approvals":[],"capabilities":[],"cleanup_methods":[],"authorized_borrowers":[]});
+        let plan = json!({"plan_id":id,"revision":1,"resources":[],"mutation_domains":[],"required_capabilities":[],"constraints":{"processing_requirement":null},"obligations":obligations,"affected_consumers":[],"consumer_change":"live","candidate_constraint":null,"allowed_degradation":[]});
+        journal.authority.settled.insert(
+            id.into(),
+            serde_json::from_value(
+                json!({"provider":"limiter","selection":selection,"plan":plan,"rights":[]}),
+            )
+            .unwrap(),
+        );
+    }
+
+    fn limiter_obligation(id: &str) -> Value {
+        let method = json!({"service":"example.limiter/1","method":"cleanup","interface_major":1,"interface_minor":0,"schema_revision":1});
+        json!([{"obligation_id":id,"provider":"limiter","resource_id":"policy","mutation_domain":"limiter/policy","depends_on":[],"cleanup_method":method,"payload":{}}])
+    }
+
+    /// A preparation that failed before its obligation reached a session keeps
+    /// the admission on the receipt's failed-preparation work.
+    fn insert_failed_preparation(journal: &mut Journal, admission_id: &str) {
+        let method = json!({"service":"example.limiter/1","method":"cleanup","interface_major":1,"interface_minor":0,"schema_revision":1});
+        let target =
+            json!({"kind":"session","host_epoch":"epoch","session_id":"failed","generation":1});
+        let state = json!({"provider":"limiter",
+            "participant":{"provider":"limiter","plan_method":method,"callback_method":method,"status_method":method,"binding_validate_method":null,"capabilities":[],"cleanup_methods":[],"settings_revision":"one","settings":{}},
+            "request":{"provider_sequence":1,"operation":"resource_plan","version":1,"transition_id":"failed","operation_id":"failed-plan","target":target,"phase":"session.release","settings_revision":"one","settings":{},"intent":null,"reason":null,"requested_video":null,"consumer_requirements":{"execution_domain":"seat","capture_providers":[],"selector_schemas":[]},"remaining_ms":0,"plan_revision":null,"admission_id":null,"approved_plan":null},
+            "phase":"recovery_required","plan":null,"admission_id":admission_id,"pending_receipt":null,
+            "status_polls":0,"last_sequence":1,"dispatch":null,"response":null});
+        let work = json!({"phase":"session.release","target":target,"intent":null,"reason":null,"video":null,
+            "transition_id":"failed","providers":[],"index":0,"states":{},"candidate":null,"waiting_retirement":false,
+            "failed_preparation":{"reason":"cleanup_unconfirmed","uncertain":true,"states":{"limiter":state}}});
+        journal.receipts.insert(
+            receipt_key("transport", "client", "failed-prepare"),
+            Receipt {
+                caller: "transport".into(),
+                initiator: "client".into(),
+                request: json!({"operation":"prepare","operation_id":"failed-prepare"}),
+                response: Value::Null,
+                work: Some(serde_json::from_value(work).unwrap()),
+                wait_target: None,
+            },
+        );
+    }
+
+    #[test]
+    fn constraint_only_settled_admission_does_not_fence_pruning() {
+        let mut journal = journal();
+        settle_frame_limiter_admission(&mut journal, "constraints", json!([]));
+        for id in 0..80 {
+            insert_ended(&mut journal, id, "succeeded");
+            compact(&mut journal);
+        }
+        assert_eq!(journal.sessions.len(), KEEP_ENDED_SESSIONS);
+        assert!(journal.authority.settled.contains_key("constraints"));
+    }
+
+    #[test]
+    fn failed_preparation_owns_its_admission_without_fencing_unrelated_sessions() {
+        let mut journal = journal();
+        settle_frame_limiter_admission(&mut journal, "failed", limiter_obligation("pending"));
+        insert_failed_preparation(&mut journal, "failed");
+        for id in 0..80 {
+            insert_ended(&mut journal, id, "succeeded");
+            compact(&mut journal);
+        }
+        assert_eq!(journal.sessions.len(), KEEP_ENDED_SESSIONS);
+        assert!(journal.authority.settled.contains_key("failed"));
+        assert!(journal.receipts.contains_key(&receipt_key(
+            "transport",
+            "client",
+            "failed-prepare"
+        )));
+    }
+
+    #[test]
+    fn unowned_settled_obligation_still_fences_all_pruning() {
+        let mut journal = journal();
+        settle_frame_limiter_admission(&mut journal, "orphan", limiter_obligation("orphan"));
+        for id in 0..80 {
+            insert_ended(&mut journal, id, "succeeded");
+            compact(&mut journal);
+        }
+        assert_eq!(journal.sessions.len(), 80);
     }
 
     #[test]

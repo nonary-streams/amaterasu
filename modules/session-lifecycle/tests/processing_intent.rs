@@ -438,6 +438,12 @@ fn installed_processing_context_and_replacement_pass_unchanged_coordinator_prefl
             assert_eq!(admitted["status"], "pending", "{admitted}");
             let session = fixture.settled("desktop");
             assert_eq!(session["status"], "succeeded", "{session}");
+            // An enabled transform reports the SDR capture range it needs.
+            assert_eq!(
+                session["source_video_mode"]["hdr"].as_bool(),
+                enabled.then_some(false),
+                "{session}"
+            );
             let stream=fixture.call(json!({"operation":"prepare_stream","operation_id":"stream","target":session["target"],
             "intent":"initial","requested_video":video,"consumer_requirements":["capture"]}));
             assert_eq!(stream["status"], "pending", "{stream}");
