@@ -232,9 +232,36 @@ impl RuntimeClient {
         service: &str,
         payload: serde_json::Value,
     ) -> ModuleResult<DirectReply> {
+        self.direct_call(service, payload, false)
+    }
+
+    /// Pass the direct call this layer is serving to the next hop beneath it,
+    /// which is shown that call's caller. Use it from
+    /// [`ManagedModule::serve_direct`] in a module that
+    /// [wraps](Self::wrap) `service`; the result is what to return.
+    ///
+    /// The three outcomes stay apart. `Declined` proves the next hop was not
+    /// entered, so the consumer's ordinary request is safe. `Failed` means it
+    /// was entered and its outcome is unknown, and the consumer is told the
+    /// same instead of being invited to repeat the call.
+    pub fn forward_direct(&self, service: &str, payload: serde_json::Value) -> DirectService {
+        match self.direct_call(service, payload, true) {
+            Ok(DirectReply::Completed(reply)) => DirectService::Replied(reply),
+            Ok(DirectReply::Unavailable { .. }) => DirectService::Declined,
+            Err(_) => DirectService::Failed,
+        }
+    }
+
+    fn direct_call(
+        &self,
+        service: &str,
+        payload: serde_json::Value,
+        forward: bool,
+    ) -> ModuleResult<DirectReply> {
         match self.send(Command::CallDirect {
             service: service.to_owned(),
             payload,
+            forward,
         })? {
             Response::Result { payload } => Ok(DirectReply::Completed(payload)),
             Response::Error { code, .. }
@@ -263,9 +290,12 @@ impl RuntimeClient {
             _ => None,
         };
         let response = self.send(command)?;
+        // A serving principal's refusal is as final as a cancellation.
         let terminal = matches!(&response, Response::Result { .. })
             || matches!(&response, Response::Error { code, .. }
-                if code == "cancelled" || code == "deadline_exceeded");
+                if code == "cancelled"
+                    || code == "deadline_exceeded"
+                    || code.starts_with(REFUSED_PREFIX));
         if terminal && let Some(request) = result_request {
             self.require_success(Command::ReleaseResult { request })?;
         }
@@ -436,6 +466,18 @@ pub enum DirectReply {
     Unavailable { code: String },
 }
 
+/// What a module did with a direct call it was offered.
+#[derive(Clone, Debug, PartialEq)]
+pub enum DirectService {
+    /// The reply, which follows the service's existing wire contract.
+    Replied(serde_json::Value),
+    /// Declined before any effect. The caller submits an ordinary request.
+    Declined,
+    /// The call was taken and its outcome is unknown. The caller is told the
+    /// call failed and must not assume that nothing happened.
+    Failed,
+}
+
 /// One synchronous request delivered to [`ManagedModule::call_direct`].
 pub struct DirectCall<'a> {
     /// The runtime-authenticated principal of the calling module.
@@ -461,6 +503,18 @@ pub trait ManagedModule: Sized {
     /// is active, nor from a thread other than the one that ticks it.
     fn call_direct(&mut self, _call: DirectCall<'_>) -> Option<serde_json::Value> {
         None
+    }
+
+    /// Serve a direct call with all three outcomes. Implement this instead of
+    /// [`call_direct`](Self::call_direct) when the module can take a call and
+    /// then not know how it ended, as a layer that passes the call on with
+    /// [`RuntimeClient::forward_direct`] can. The rules of `call_direct`
+    /// apply. The default serves `call_direct`.
+    fn serve_direct(&mut self, call: DirectCall<'_>) -> DirectService {
+        match self.call_direct(call) {
+            Some(reply) => DirectService::Replied(reply),
+            None => DirectService::Declined,
+        }
     }
 
     /// Announce host shutdown once, before any consumer begins quiescing.

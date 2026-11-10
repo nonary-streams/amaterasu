@@ -4,7 +4,8 @@ use amaterasu_module_sdk::requests::{
     CallOutcome, OutboundCall, RequestOptions, unique_operation_id,
 };
 use amaterasu_module_sdk::{
-    DirectCall, DirectReply, ErrorCode, ErrorOrigin, ManagedModule, ModuleResult, RuntimeClient,
+    DirectCall, DirectReply, DirectService, ErrorCode, ErrorOrigin, ManagedModule, ModuleResult,
+    RuntimeClient,
 };
 use amaterasu_module_testkit::{TestHost, grants, settle};
 use example_service_guard::ServiceGuard;
@@ -43,8 +44,13 @@ impl ManagedModule for Notes {
         Ok(())
     }
 
-    fn call_direct(&mut self, call: DirectCall<'_>) -> Option<Value> {
-        Some(self.write(call.caller, call.payload))
+    fn serve_direct(&mut self, call: DirectCall<'_>) -> DirectService {
+        let reply = self.write(call.caller, call.payload.clone());
+        // Stands in for a provider that took the call and then broke.
+        if call.payload["text"] == "fail after writing" {
+            return DirectService::Failed;
+        }
+        DirectService::Replied(reply)
     }
 }
 
@@ -156,6 +162,24 @@ fn direct_calls_obey_the_same_rule() {
         tray.call_direct(NOTES, json!({"text": "hello"})).unwrap(),
         DirectReply::Unavailable { .. }
     ));
+}
+
+#[test]
+fn a_direct_call_the_provider_took_and_failed_is_not_reported_as_declined() {
+    let host = host(json!({}));
+    let _notes = host.load::<Notes>("example.notes");
+    let _guard = host.load::<ServiceGuard>(GUARD);
+    let console = host.client("console");
+    // "Declined" would invite the consumer to repeat a note already written.
+    assert!(
+        console
+            .call_direct(NOTES, json!({"text": "fail after writing"}))
+            .is_err()
+    );
+    assert_eq!(
+        console.call_direct(NOTES, json!({"text": "next"})).unwrap(),
+        DirectReply::Completed(json!({"ok": true, "author": "console", "count": 2}))
+    );
 }
 
 #[test]

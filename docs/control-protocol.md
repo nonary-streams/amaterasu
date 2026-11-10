@@ -39,18 +39,19 @@ no wildcards or caller-supplied identity fields.
 | `next_event` / `unsubscribe` | Only the subscription owner can use its handle |
 | `register_hook` | Requires a hook grant and inclusion in its participant list |
 | `run_hook` | Only the configured hook owner can initiate it |
-| `run_hook_operation` | Owner-scoped, idempotent `run_hook` with a retained result. `cleanup` attempts and reports every participant; `chain` gives each participant the previous result |
+| `run_hook_operation` | Owner-scoped, idempotent `run_hook` with a retained result. `cleanup` attempts and reports every participant; `chain` gives each participant the previous result; `transient` gives the operation identifier up when the invocation is released or expires |
 | `hook_result` | Owner advances participants in configured order and collects proposals |
-| `lookup_hook` / `cancel_hook` / `release_hook` | Only the owner can find, end or discard its invocation. `release_hook` with `forget` also relinquishes the operation identifier |
+| `lookup_hook` / `cancel_hook` / `release_hook` | Only the owner can find, end or discard its invocation |
 
 Trusted composition can stack principals on a service's provider
 (`service_layers`, outermost first). A call is delivered to the first layer;
 a layer's own call to the service is delivered to the next one, and the last
-layer's call reaches the provider. A request, or a direct call, that a layer
-forwards on behalf of one it received for the same service is shown to the
-next hop with that received request's caller. Calls are refused as
-`unavailable` until every layer and the provider have registered. See
-[stacking and extension points](stacking-and-extension-points.md).
+layer's call reaches the provider. A request that a layer forwards on behalf
+of one it received for the same service is shown to the next hop with that
+received request's caller, and keeps its delegated authority. A direct call
+does the same when the layer sets `forward` while serving one. Calls are
+refused as `unavailable` until every layer and the provider have registered.
+See [stacking and extension points](stacking-and-extension-points.md).
 
 Requests include a deadline, operation ID, service, and payload. Delegated calls
 include a parent request ID; the provider must have received that live request.
@@ -85,7 +86,8 @@ filling the 512-record budget with already consumed internal HTTP/service calls.
   ordered invocation. Missing participants and timed-out hooks fail closed,
   and the error names the participant that ended a required invocation.
 - The broker keeps 512 hook operation identifiers fenced for its lifetime.
-  Releasing an invocation with `forget` returns its identifier.
+  A `transient` operation returns its identifier when its invocation is
+  released or expires.
 - A service has at most 8 layers, and 64 services can be layered.
 - Hook proposals are not automatically merged. The domain owner must validate them
   and resolve or reject conflicts. Optional fallback policy belongs to that owner.

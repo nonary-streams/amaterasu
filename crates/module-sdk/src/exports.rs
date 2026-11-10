@@ -9,7 +9,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::ThreadId;
 
-use crate::{DirectCall, ManagedModule, ModuleResult, RuntimeClient};
+use crate::{DirectCall, DirectService, ManagedModule, ModuleResult, RuntimeClient};
 
 // The public ABI owns an opaque instance. Keep lifecycle diagnostics here so
 // third-party SDK modules receive the same observations as built-in modules.
@@ -197,7 +197,7 @@ pub unsafe extern "C" fn direct<M: ManagedModule>(
     let state = entered.state();
     let started = std::time::Instant::now();
     let outcome = catch_unwind(AssertUnwindSafe(|| {
-        state.module.call_direct(DirectCall {
+        state.module.serve_direct(DirectCall {
             caller,
             service,
             payload,
@@ -205,7 +205,7 @@ pub unsafe extern "C" fn direct<M: ManagedModule>(
     }));
     state.timing.observe_direct(started);
     match outcome {
-        Ok(Some(payload)) => match serde_json::to_vec(&payload) {
+        Ok(DirectService::Replied(payload)) => match serde_json::to_vec(&payload) {
             Ok(bytes) => {
                 // SAFETY: the sink is valid for this call and copies the bytes.
                 unsafe { reply.send(&bytes) };
@@ -213,8 +213,9 @@ pub unsafe extern "C" fn direct<M: ManagedModule>(
             }
             Err(_) => STATUS_INTERNAL_ERROR,
         },
-        Ok(None) => STATUS_UNAVAILABLE,
-        Err(_) => STATUS_INTERNAL_ERROR,
+        Ok(DirectService::Declined) => STATUS_UNAVAILABLE,
+        // Only "declined" may claim that nothing happened.
+        Ok(DirectService::Failed) | Err(_) => STATUS_INTERNAL_ERROR,
     }
 }
 

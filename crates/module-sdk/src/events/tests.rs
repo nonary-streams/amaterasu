@@ -135,7 +135,7 @@ fn an_overflowed_subscription_reports_a_gap_and_is_renewed() {
 }
 
 #[test]
-fn a_failed_renewal_is_retried_on_the_next_read_and_the_gap_is_reported_once() {
+fn a_gap_is_reported_only_once_a_new_subscription_is_in_place() {
     let mut script = Script::new([
         Ok(Response::Accepted { id: 3 }),
         Ok(Response::ResyncRequired {
@@ -151,14 +151,48 @@ fn a_failed_renewal_is_retried_on_the_next_read_and_the_gap_is_reported_once() {
     ]);
     let mut changes =
         Subscription::open_with(&mut script.send(), &CHANGED, Backlog::Complete(2)).unwrap();
+    // The old queue is freed but no new one could be opened: no gap yet,
+    // because nothing would deliver the events that follow it.
+    let failed = changes.next_with(&mut script.send()).unwrap_err();
+    assert!(failed.is(&ErrorCode::ResourceExhausted));
+    // The next read subscribes again and reports everything missed since.
     assert_eq!(
         changes.next_with(&mut script.send()).unwrap(),
         Some(Delivery::Gap)
     );
-    // The retry subscribes again and delivers nothing by itself.
-    assert_eq!(changes.next_with(&mut script.send()).unwrap(), None);
     assert_eq!(changes.next_with(&mut script.send()).unwrap(), None);
     assert_eq!(script.sent.last().unwrap()["subscription"], 5);
+}
+
+#[test]
+fn an_overflowed_queue_that_could_not_be_freed_is_not_forgotten() {
+    let mut script = Script::new([
+        Ok(Response::Accepted { id: 3 }),
+        Ok(Response::ResyncRequired {
+            topic: CHANGED.name().into(),
+        }),
+        Err("reply lost".into()),
+        Ok(Response::ResyncRequired {
+            topic: CHANGED.name().into(),
+        }),
+        Ok(Response::Ok),
+        Ok(Response::Accepted { id: 4 }),
+    ]);
+    let mut changes =
+        Subscription::open_with(&mut script.send(), &CHANGED, Backlog::Complete(2)).unwrap();
+    assert!(changes.next_with(&mut script.send()).is_err());
+    // The same queue is read and freed on the next attempt.
+    assert_eq!(
+        changes.next_with(&mut script.send()).unwrap(),
+        Some(Delivery::Gap)
+    );
+    let freed: Vec<_> = script
+        .sent
+        .iter()
+        .filter(|command| command["op"] == "unsubscribe")
+        .map(|command| command["subscription"].clone())
+        .collect();
+    assert_eq!(freed, [json!(3), json!(3)]);
 }
 
 #[test]

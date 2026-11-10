@@ -64,6 +64,12 @@ module, a later tick or a durable write belongs to the request path, where its
 jobs and cleanup rules already live. Decline whenever a request of the same
 service is already waiting, so a direct call cannot overtake it.
 
+A module that can take a call and then not know how it ended implements
+`ManagedModule::serve_direct` instead, which adds a third outcome:
+`DirectService::Failed` tells the caller the call failed without claiming that
+nothing happened. A [layer](stacking-and-extension-points.md#direct-calls)
+that passes a direct call on needs it; `call_direct` is enough otherwise.
+
 `export_module!` exports the handler as `amaterasu_module_direct_v1`. The host
 reads it from the verified library and registers it with the runtime. No module
 passes a function address through a control message, so serving direct calls

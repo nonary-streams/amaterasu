@@ -240,10 +240,16 @@ impl RequestRouter {
     /// the parent; a call the layer makes on its own behalf shows the layer.
     fn forwarded_caller(&self, caller: &str, options: &RequestOptions) -> Option<String> {
         let parent = self.requests.get(&options.parent?)?;
-        (self.layers.is_layer(&options.service, caller)
-            && parent.provider == caller
-            && parent.options.service == options.service)
+        self.forwards(caller, options, parent)
             .then(|| parent.presented_caller().to_owned())
+    }
+
+    /// Whether `caller` is a layer passing on `parent`, a request it received
+    /// for the service it now calls.
+    fn forwards(&self, caller: &str, options: &RequestOptions, parent: &RequestRecord) -> bool {
+        self.layers.is_layer(&options.service, caller)
+            && parent.provider == caller
+            && parent.options.service == options.service
     }
 
     fn resolve_authority(
@@ -274,11 +280,18 @@ impl RequestRouter {
             return Err(permission_denied());
         }
 
-        let allowed_services = grants
-            .call
-            .intersection(&parent.authority.allowed_services)
-            .cloned()
-            .collect();
+        // A layer passing a request on is transparent: the next hop may
+        // delegate exactly what it could for the consumer's own request. Any
+        // other delegated call is narrowed by the delegating caller's grants.
+        let allowed_services = if self.forwards(caller, options, parent) {
+            parent.authority.allowed_services.clone()
+        } else {
+            grants
+                .call
+                .intersection(&parent.authority.allowed_services)
+                .cloned()
+                .collect()
+        };
 
         Ok(CallAuthority {
             initiator: parent.authority.initiator.clone(),

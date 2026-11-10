@@ -300,8 +300,9 @@ fn resolve_runtime_grants(
 }
 
 /// A layer stands in the path of every call to its service. A package that
-/// leaves a listed layer out is rejected here, with the layer named, instead
-/// of failing when the runtime starts or running with the layer bypassed.
+/// leaves a listed layer out, or lists one the runtime would refuse to start
+/// with, is rejected here with the reason, instead of failing when the
+/// runtime starts or running with the layer bypassed.
 fn validate_service_layers(runtime: &RuntimeConfig) -> PackageResult<()> {
     for (service, layers) in &runtime.service_layers {
         if let Some(missing) = layers
@@ -313,7 +314,7 @@ fn validate_service_layers(runtime: &RuntimeConfig) -> PackageResult<()> {
             ));
         }
     }
-    Ok(())
+    runtime.validate_service_layers()
 }
 
 fn validate_processing_compositions(runtime: &RuntimeConfig) -> PackageResult<()> {
@@ -972,6 +973,22 @@ mod tests {
         assert_eq!(partial.service_layers[service].len(), 2);
         let error = validate_service_layers(&partial).unwrap_err();
         assert!(error.contains("example.cache"), "{error}");
+
+        // A listing the runtime would refuse to start with is rejected too.
+        let mut repeated = complete.clone();
+        repeated.service_layers.insert(
+            service.into(),
+            vec!["example.audit".into(), "example.audit".into()],
+        );
+        assert!(validate_service_layers(&repeated).is_err());
+        let mut provider_as_layer = complete;
+        provider_as_layer
+            .principals
+            .get_mut("example.audit")
+            .unwrap()
+            .provide
+            .insert(service.into());
+        assert!(validate_service_layers(&provider_as_layer).is_err());
     }
 
     #[test]

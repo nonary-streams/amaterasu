@@ -7,7 +7,8 @@ use amaterasu_module_sdk::requests::{
     CallOutcome, OutboundCall, Relay, RequestOptions, unique_operation_id,
 };
 use amaterasu_module_sdk::{
-    DirectCall, DirectReply, ErrorCode, ErrorOrigin, ManagedModule, ModuleResult, RuntimeClient,
+    Command, DirectCall, DirectReply, DirectService, ErrorCode, ErrorOrigin, ManagedModule,
+    ModuleResult, Response, RuntimeClient,
 };
 use amaterasu_module_testkit::{TestHost, TestHostBuilder, grants, settle, settle_hook};
 use serde::{Deserialize, Serialize};
@@ -74,6 +75,8 @@ struct LayerSettings {
     signature: String,
     blocked_name: Option<String>,
     serves_direct_calls: bool,
+    /// Makes its own direct call instead of forwarding the one it serves.
+    calls_directly_for_itself: bool,
 }
 
 impl Capitalizer {
@@ -122,18 +125,25 @@ impl ManagedModule for Capitalizer {
         Ok(())
     }
 
-    fn call_direct(&mut self, call: DirectCall<'_>) -> Option<Value> {
+    fn serve_direct(&mut self, call: DirectCall<'_>) -> DirectService {
         if !self.settings.serves_direct_calls || self.blocks(&call.payload) {
-            return None;
+            return DirectService::Declined;
         }
-        match self
-            .runtime
-            .call_direct(call.service, Self::rewritten(&call.payload))
-        {
-            Ok(DirectReply::Completed(reply)) => {
-                Some(Self::signed(&self.settings.signature, reply))
+        let rewritten = Self::rewritten(&call.payload);
+        let passed_on = if self.settings.calls_directly_for_itself {
+            match self.runtime.call_direct(call.service, rewritten) {
+                Ok(DirectReply::Completed(reply)) => DirectService::Replied(reply),
+                Ok(DirectReply::Unavailable { .. }) => DirectService::Declined,
+                Err(_) => DirectService::Failed,
             }
-            _ => None,
+        } else {
+            self.runtime.forward_direct(call.service, rewritten)
+        };
+        match passed_on {
+            DirectService::Replied(reply) => {
+                DirectService::Replied(Self::signed(&self.settings.signature, reply))
+            }
+            other => other,
         }
     }
 }
@@ -343,6 +353,82 @@ fn a_layer_that_declines_direct_calls_is_not_bypassed() {
         panic!("{queued:?}");
     };
     assert_eq!(reply["signed_by"], json!(["caps"]));
+}
+
+#[test]
+fn only_an_explicit_forward_lends_the_consumers_identity_to_a_direct_call() {
+    // The layer calls the service for itself while it serves the consumer.
+    let host = greeter_host(&[(
+        "example.capitalizer",
+        json!({
+            "signature": "caps",
+            "serves_direct_calls": true,
+            "calls_directly_for_itself": true,
+        }),
+    )])
+    .build();
+    let _greeter = host.load::<Greeter>("example.greeter");
+    let _layer = host.load::<Capitalizer>("example.capitalizer");
+    let console = host.client("console");
+    let DirectReply::Completed(reply) = console
+        .call_direct(GREETER, json!({"name": "ada"}))
+        .unwrap()
+    else {
+        panic!("the layer served the call");
+    };
+    // The provider saw the layer, which it does not allow.
+    assert_eq!(reply["caller"], "example.capitalizer");
+    assert_eq!(reply["code"], "forbidden");
+
+    // Outside a direct call it is serving, a layer has nothing to forward.
+    let layer = host.client("example.capitalizer");
+    assert_eq!(
+        layer.forward_direct(GREETER, json!({"name": "ada"})),
+        DirectService::Declined
+    );
+    // Nor does a principal that is not a layer of the service.
+    assert_eq!(
+        console.forward_direct(GREETER, json!({"name": "ada"})),
+        DirectService::Declined
+    );
+}
+
+#[test]
+fn a_consumer_that_releases_results_itself_also_releases_a_refusal() {
+    let host = greeter_host(&[(
+        "example.capitalizer",
+        json!({"signature": "caps", "blocked_name": "mallory"}),
+    )])
+    .build();
+    let _greeter = host.load::<Greeter>("example.greeter");
+    let mut layer = host.load::<Capitalizer>("example.capitalizer");
+    let console = host.client("console");
+    let Response::Accepted { id: request } = console
+        .send(Command::Request {
+            service: GREETER.into(),
+            payload: json!({"name": "mallory"}),
+            timeout_ms: 5_000,
+            operation_id: unique_operation_id("test.raw"),
+            parent: None,
+        })
+        .unwrap()
+    else {
+        panic!("the request was not admitted");
+    };
+    layer.tick_times(1);
+
+    let ended = console
+        .send_ephemeral(Command::TakeResult { request })
+        .unwrap();
+    assert!(matches!(
+        ended,
+        Response::Error { code, .. } if code == "refused.permission_denied"
+    ));
+    // The record is gone, so refusals cannot fill the broker's request table.
+    assert!(matches!(
+        console.send(Command::TakeResult { request }).unwrap(),
+        Response::Error { code, .. } if code == "not_found"
+    ));
 }
 
 const ENVIRONMENT: &str = "example.launch.environment/1";

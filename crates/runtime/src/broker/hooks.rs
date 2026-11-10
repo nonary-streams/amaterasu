@@ -24,6 +24,9 @@ pub(super) struct HookRunMode {
     pub cleanup: bool,
     /// Give each participant the previous participant's result as its input.
     pub chain: bool,
+    /// Give the operation identifier up when the invocation is released or
+    /// expires, instead of fencing it for the broker's lifetime.
+    pub transient: bool,
 }
 
 struct OperationIdentity {
@@ -244,6 +247,7 @@ impl HookRegistry {
         let mode = HookRunMode {
             cleanup: false,
             chain: false,
+            transient: false,
         };
         self.begin_inner(caller, hook_name, input, mode, false, now)
     }
@@ -295,7 +299,7 @@ impl HookRegistry {
         retained: bool,
         now: Instant,
     ) -> Response {
-        let HookRunMode { cleanup, chain } = mode;
+        let HookRunMode { cleanup, chain, .. } = mode;
         let Some(specification) = self.specifications.get(&hook_name) else {
             return not_found();
         };
@@ -411,10 +415,10 @@ impl HookRegistry {
         }
         Response::Ok
     }
-    /// Discards a finished invocation. With `forget` the owner also gives up
-    /// the operation identifier's retry protection, which lets an extension
-    /// point run more often than the fenced identities would allow.
-    pub fn release(&mut self, caller: &str, invocation_id: u64, forget: bool) -> Response {
+    /// Discards a finished invocation. A transient operation gives its
+    /// identifier up with it, which lets an extension point run more often
+    /// than the fenced identities would allow.
+    pub fn release(&mut self, caller: &str, invocation_id: u64) -> Response {
         let Some(invocation) = self.invocations.get(&invocation_id) else {
             return not_found();
         };
@@ -425,14 +429,11 @@ impl HookRegistry {
             return Response::error("request_pending", "unfinished hooks cannot be released");
         }
         self.invocations.remove(&invocation_id);
-        if forget {
-            self.operations.retain(|(owner, _), identity| {
-                owner != caller || identity.invocation != invocation_id
-            });
-        }
+        self.forget_transient_identities();
         Response::Ok
     }
     pub fn expire(&mut self, now: Instant) {
+        let held = self.invocations.len();
         self.invocations
             .retain(|_, invocation| match &invocation.terminal {
                 Some((_, completed)) => {
@@ -440,5 +441,19 @@ impl HookRegistry {
                 }
                 None => now.saturating_duration_since(invocation.deadline) < RESULT_RETENTION,
             });
+        // This runs on every dispatch, so scan identities only after a change.
+        if self.invocations.len() != held {
+            self.forget_transient_identities();
+        }
+    }
+
+    /// A transient identifier protects a retry only while its invocation is
+    /// held. Once that is released or has expired, the identifier is free, so
+    /// an owner that never collected a run does not fence one for good.
+    fn forget_transient_identities(&mut self) {
+        let invocations = &self.invocations;
+        self.operations.retain(|_, identity| {
+            !identity.mode.transient || invocations.contains_key(&identity.invocation)
+        });
     }
 }

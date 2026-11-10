@@ -138,6 +138,84 @@ fn a_request_for_another_service_does_not_lend_its_caller() {
 }
 
 #[test]
+fn the_provider_delegates_behind_a_layer_exactly_as_it_would_without_one() {
+    const STORE: &str = "example.store/1";
+    let delegate = |operation: &str, parent| Command::Request {
+        service: STORE.into(),
+        payload: json!({}),
+        timeout_ms: 1_000,
+        operation_id: operation.into(),
+        parent: Some(parent),
+    };
+    // The provider keeps its state in another service. The guard in front of
+    // it is granted the wrapped service alone.
+    let stack = |consumer_may_reach_the_store: bool| {
+        let mut config = layered_config(&["guard"]);
+        let consumer = if consumer_may_reach_the_store {
+            caller_of(&[ECHO, STORE])
+        } else {
+            caller_of(&[ECHO])
+        };
+        config.principals.insert("consumer".into(), consumer);
+        config.principals.insert(
+            "provider".into(),
+            Grants {
+                provide: names(&[ECHO]),
+                call: names(&[STORE]),
+                ..Default::default()
+            },
+        );
+        config
+            .principals
+            .insert("store".into(), provider_of(&[STORE]));
+        let mut broker = Broker::new(config).unwrap();
+        for (principal, service) in [("provider", ECHO), ("guard", ECHO), ("store", STORE)] {
+            assert!(matches!(
+                register(&mut broker, principal, service),
+                Response::Ok
+            ));
+        }
+        broker
+    };
+    let now = Instant::now();
+
+    let mut broker = stack(true);
+    accepted(broker.dispatch_at("consumer", request("call.1", echoed("x"), None), now));
+    let received = poll(&mut broker, "guard", now).unwrap();
+    accepted(broker.dispatch_at(
+        "guard",
+        request("forward.1", echoed("x"), Some(received.id)),
+        now,
+    ));
+    let served = poll(&mut broker, "provider", now).unwrap();
+    // The guard's narrower grants do not shrink what the consumer authorized.
+    accepted(broker.dispatch_at("provider", delegate("store.1", served.id), now));
+    let stored = poll(&mut broker, "store", now).unwrap();
+    assert_eq!(stored.caller, "provider");
+    assert_eq!(stored.initiator, "consumer");
+    // The guard itself gains nothing: it still cannot reach the store.
+    assert_eq!(
+        error_code(broker.dispatch_at("guard", delegate("store.2", received.id), now)),
+        "permission_denied"
+    );
+
+    // The consumer's own authority is still the limit behind the layer.
+    let mut broker = stack(false);
+    accepted(broker.dispatch_at("consumer", request("call.1", echoed("x"), None), now));
+    let received = poll(&mut broker, "guard", now).unwrap();
+    accepted(broker.dispatch_at(
+        "guard",
+        request("forward.1", echoed("x"), Some(received.id)),
+        now,
+    ));
+    let served = poll(&mut broker, "provider", now).unwrap();
+    assert_eq!(
+        error_code(broker.dispatch_at("provider", delegate("store.1", served.id), now)),
+        "permission_denied"
+    );
+}
+
+#[test]
 fn a_call_is_refused_until_the_whole_stack_has_registered() {
     let mut broker = Broker::new(layered_config(&["outer", "inner"])).unwrap();
     let now = Instant::now();

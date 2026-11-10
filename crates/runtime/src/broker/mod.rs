@@ -664,12 +664,17 @@ impl Broker {
                 operation_id,
                 cleanup,
                 chain,
+                transient,
             } => self.hooks.begin_operation(
                 caller,
                 hook,
                 payload,
                 operation_id,
-                HookRunMode { cleanup, chain },
+                HookRunMode {
+                    cleanup,
+                    chain,
+                    transient,
+                },
                 now,
             ),
             Command::ListApiApprovals {
@@ -692,9 +697,7 @@ impl Broker {
                 self.hooks
                     .cancel(caller, invocation, now, &mut self.requests)
             }
-            Command::ReleaseHook { invocation, forget } => {
-                self.hooks.release(caller, invocation, forget)
-            }
+            Command::ReleaseHook { invocation } => self.hooks.release(caller, invocation),
             Command::HookResult { invocation } => {
                 self.hooks
                     .advance(caller, grants, invocation, now, &mut self.requests)

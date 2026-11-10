@@ -145,8 +145,9 @@ enum Stage {
 /// }
 /// ```
 ///
-/// Give each run its own operation identifier. A run that settles also gives
-/// the identifier up, unless it is [`fenced`](Self::fenced).
+/// Give each run its own operation identifier. The broker gives the
+/// identifier up when the run is released or its record expires, unless the
+/// run is [`fenced`](Self::fenced).
 pub struct HookRun {
     hook: String,
     input: Value,
@@ -190,11 +191,11 @@ impl HookRun {
         self
     }
 
-    /// Keep the operation identifier fenced after the run settles: a repeat
-    /// of the same identifier then reports `operation_expired` and never asks
-    /// the participants again. The broker holds a bounded number of fenced
-    /// identifiers for its whole lifetime, so reserve this for effects that
-    /// must not repeat.
+    /// Keep the operation identifier fenced for the broker's lifetime: once
+    /// the run's record is gone, a repeat of the same identifier reports
+    /// `operation_expired` and never asks the participants again. The broker
+    /// holds a bounded number of fenced identifiers, so reserve this for
+    /// effects that must not repeat.
     pub fn fenced(mut self) -> Self {
         self.fenced = true;
         self
@@ -248,6 +249,7 @@ impl HookRun {
             operation_id: self.operation_id.clone(),
             cleanup: self.best_effort,
             chain: self.chained,
+            transient: !self.fenced,
         }
     }
 
@@ -393,11 +395,7 @@ impl HookRun {
         outcome: HookOutcome,
         send: &mut impl FnMut(Command) -> ModuleResult<Response>,
     ) -> Poll<HookOutcome> {
-        let release = Command::ReleaseHook {
-            invocation,
-            forget: !self.fenced,
-        };
-        let released = match checked(send(release)) {
+        let released = match checked(send(Command::ReleaseHook { invocation })) {
             Ok(Response::Ok) => true,
             // A lost reply may still have released it.
             Err(error) => error.is(&ErrorCode::NotFound),

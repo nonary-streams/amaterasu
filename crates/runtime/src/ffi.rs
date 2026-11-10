@@ -174,9 +174,13 @@ unsafe extern "C" fn invoke_command(
                     )
                 }
             }
-            Ok(Command::CallDirect { service, payload }) => {
+            Ok(Command::CallDirect {
+                service,
+                payload,
+                forward,
+            }) => {
                 let at = Instant::now();
-                let result = call_direct(endpoint, &service, &payload);
+                let result = call_direct(endpoint, &service, &payload, forward);
                 native_us = Some(micros(at));
                 result
             }
@@ -243,7 +247,12 @@ unsafe extern "C" fn invoke_command(
 }
 /// Runs the provider's handler on the calling thread. No runtime lock is held
 /// while provider code runs, so the handler may issue its own runtime calls.
-fn call_direct(endpoint: &Endpoint, service: &str, payload: &serde_json::Value) -> Response {
+fn call_direct(
+    endpoint: &Endpoint,
+    service: &str,
+    payload: &serde_json::Value,
+    forward: bool,
+) -> Response {
     let Ok(request) = serde_json::to_vec(payload) else {
         return Response::error("invalid_request", "payload cannot be encoded");
     };
@@ -265,17 +274,27 @@ fn call_direct(endpoint: &Endpoint, service: &str, payload: &serde_json::Value) 
     let Some(handler) = endpoint.direct.for_current_thread(&route.provider) else {
         return unavailable();
     };
-    // A layer passing on the direct call it is serving keeps that call's
-    // caller, so the next hop authorizes the consumer and not the layer.
-    let caller = route
-        .caller_is_layer
-        .then(|| {
+    let caller = if forward {
+        // A layer passing on the direct call it is serving keeps that call's
+        // caller, so the next hop authorizes the consumer and not the layer.
+        // Nothing else can be forwarded, and the refusal precedes any effect.
+        let served = route.caller_is_layer.then(|| {
             endpoint
                 .direct
                 .caller_being_served(&endpoint.principal, service)
-        })
-        .flatten()
-        .unwrap_or_else(|| endpoint.principal.clone());
+        });
+        match served.flatten() {
+            Some(caller) => caller,
+            None => {
+                return Response::error(
+                    "invalid_request",
+                    "no direct call for this service is being served to forward",
+                );
+            }
+        }
+    } else {
+        endpoint.principal.clone()
+    };
     let _serving = endpoint.direct.serve(&route.provider, service, &caller);
     unsafe extern "C" fn copy(context: *mut c_void, bytes: BorrowedBytes) {
         // SAFETY: the context is the reply vector below, borrowed for this call.

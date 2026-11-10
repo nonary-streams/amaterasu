@@ -45,7 +45,24 @@ fn run(operation: &str, payload: Value, cleanup: bool, chain: bool) -> Command {
         operation_id: operation.into(),
         cleanup,
         chain,
+        transient: false,
     }
+}
+
+/// A run whose identifier is given up when its invocation is released or expires.
+fn transient_run(operation: &str, cleanup: bool) -> Command {
+    Command::RunHookOperation {
+        hook: HOOK.into(),
+        payload: json!({}),
+        operation_id: operation.into(),
+        cleanup,
+        chain: false,
+        transient: true,
+    }
+}
+
+fn release(broker: &mut Broker, principal: &str, invocation: u64, now: Instant) -> Response {
+    broker.dispatch_at(principal, Command::ReleaseHook { invocation }, now)
 }
 
 fn advance(broker: &mut Broker, invocation: u64, now: Instant) -> Response {
@@ -240,31 +257,29 @@ fn the_same_operation_cannot_change_between_chained_and_unchained() {
     );
 }
 
+/// Runs `command` to completion with both participants answering.
+fn finish(broker: &mut Broker, command: Command, now: Instant) -> u64 {
+    let invocation = accepted(broker.dispatch_at("owner", command, now));
+    for participant in ["first", "second"] {
+        let offered = offered_to(broker, invocation, participant, now);
+        complete(broker, participant, offered.id, json!({}));
+    }
+    assert!(matches!(
+        advance(broker, invocation, now),
+        Response::HookResult { .. } | Response::HookCleanupResult { .. }
+    ));
+    invocation
+}
+
 #[test]
-fn forgetting_a_released_operation_lets_its_identifier_run_again() {
+fn a_transient_operation_gives_up_its_identifier_when_released() {
     let mut broker = hook_broker(&["first", "second"]);
     let now = Instant::now();
-    let finish = |broker: &mut Broker, operation: &str| {
-        let invocation =
-            accepted(broker.dispatch_at("owner", run(operation, json!({}), false, false), now));
-        for participant in ["first", "second"] {
-            let offered = offered_to(broker, invocation, participant, now);
-            complete(broker, participant, offered.id, json!({}));
-        }
-        assert!(matches!(
-            advance(broker, invocation, now),
-            Response::HookResult { .. }
-        ));
-        invocation
-    };
-    let release = |broker: &mut Broker, principal: &str, invocation: u64, forget: bool| {
-        broker.dispatch_at(principal, Command::ReleaseHook { invocation, forget }, now)
-    };
 
-    // Without `forget` the identifier stays fenced, as before.
-    let kept = finish(&mut broker, "kept.1");
+    // A fenced identifier stays fenced after release, as before.
+    let fenced = finish(&mut broker, run("kept.1", json!({}), false, false), now);
     assert!(matches!(
-        release(&mut broker, "owner", kept, false),
+        release(&mut broker, "owner", fenced, now),
         Response::Ok
     ));
     assert_eq!(
@@ -272,28 +287,71 @@ fn forgetting_a_released_operation_lets_its_identifier_run_again() {
         "operation_expired"
     );
 
-    let forgotten = finish(&mut broker, "forgotten.1");
+    let transient = finish(&mut broker, transient_run("launch.1", false), now);
+    // While the invocation is held, the identifier still finds it.
     assert_eq!(
-        error_code(release(&mut broker, "outsider", forgotten, true)),
+        accepted(broker.dispatch_at("owner", transient_run("launch.1", false), now)),
+        transient
+    );
+    assert_eq!(
+        error_code(release(&mut broker, "outsider", transient, now)),
         "permission_denied"
     );
     assert!(matches!(
-        release(&mut broker, "owner", forgotten, true),
+        release(&mut broker, "owner", transient, now),
         Response::Ok
     ));
     assert_eq!(
         error_code(broker.dispatch_at(
             "owner",
             Command::LookupHook {
-                operation_id: "forgotten.1".into()
+                operation_id: "launch.1".into()
             },
             now
         )),
         "not_found"
     );
-    let again =
-        accepted(broker.dispatch_at("owner", run("forgotten.1", json!({}), false, false), now));
-    assert_ne!(again, forgotten);
+    let again = accepted(broker.dispatch_at("owner", transient_run("launch.1", false), now));
+    assert_ne!(again, transient);
+}
+
+#[test]
+fn the_same_operation_cannot_change_between_transient_and_fenced() {
+    let mut broker = hook_broker(&["first", "second"]);
+    let now = Instant::now();
+    accepted(broker.dispatch_at("owner", transient_run("launch.1", false), now));
+    assert_eq!(
+        error_code(broker.dispatch_at("owner", run("launch.1", json!({}), false, false), now)),
+        "conflict"
+    );
+}
+
+#[test]
+fn a_transient_operation_nobody_collected_frees_its_identifier_when_it_expires() {
+    let mut broker = hook_broker(&["first", "second"]);
+    let start = Instant::now();
+    // The owner starts both runs and never polls or releases them.
+    accepted(broker.dispatch_at("owner", transient_run("dropped.1", true), start));
+    accepted(broker.dispatch_at("owner", run("fenced.1", json!({}), true, false), start));
+
+    // Past the hook deadline and the retention of an unfinished invocation.
+    let later = start + std::time::Duration::from_secs(302);
+    assert_eq!(
+        error_code(broker.dispatch_at(
+            "owner",
+            Command::LookupHook {
+                operation_id: "dropped.1".into()
+            },
+            later
+        )),
+        "not_found"
+    );
+    accepted(broker.dispatch_at("owner", transient_run("dropped.1", true), later));
+    // The fenced identifier is still protected from running again.
+    assert_eq!(
+        error_code(broker.dispatch_at("owner", run("fenced.1", json!({}), true, false), later)),
+        "operation_expired"
+    );
 }
 
 #[test]
@@ -302,28 +360,10 @@ fn a_recurring_extension_point_outlives_the_fenced_identity_budget() {
     let now = Instant::now();
     // More runs than the broker retains fenced operation identities.
     for run_number in 0..600 {
-        let invocation = accepted(broker.dispatch_at(
-            "owner",
-            run(&format!("launch.{run_number}"), json!({}), true, false),
-            now,
-        ));
-        for participant in ["first", "second"] {
-            let offered = offered_to(&mut broker, invocation, participant, now);
-            complete(&mut broker, participant, offered.id, json!({}));
-        }
+        let command = transient_run(&format!("launch.{run_number}"), true);
+        let invocation = finish(&mut broker, command, now);
         assert!(matches!(
-            advance(&mut broker, invocation, now),
-            Response::HookCleanupResult { .. }
-        ));
-        assert!(matches!(
-            broker.dispatch_at(
-                "owner",
-                Command::ReleaseHook {
-                    invocation,
-                    forget: true
-                },
-                now
-            ),
+            release(&mut broker, "owner", invocation, now),
             Response::Ok
         ));
     }

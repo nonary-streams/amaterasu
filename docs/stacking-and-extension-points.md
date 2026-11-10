@@ -106,6 +106,12 @@ This is why a layer is approved like a replacement provider: it can read,
 change and answer every call to the service it wraps, as any of that
 service's callers.
 
+The provider can also delegate behind a layer exactly as it could without
+one. A call the provider makes on behalf of the forwarded request is limited
+by what the consumer may call, not by the layer's narrower grants. The layer
+gains nothing from this: its own calls are still checked against its own
+grants.
+
 The forwarded call also cannot outlive the request it forwards, and it is
 cancelled when that request ends.
 
@@ -120,18 +126,35 @@ the consumer against its response schema.
 
 ### Direct calls
 
-A [direct call](direct-calls.md) follows the same stack. It enters the
-outermost layer's `call_direct`. The layer can pass it on with
-`runtime.call_direct(call.service, payload)`, and the next hop then sees the
-consumer as its caller, as it does for a forwarded request.
+A [direct call](direct-calls.md) follows the same stack and enters the
+outermost layer. A layer implements `serve_direct` and passes the call on
+with `forward_direct`:
 
-A layer that returns `None` declines the call. The consumer then submits an
-ordinary request, which arrives in the layer's `tick`. The provider is never
-entered around a layer that declined.
+```rust
+fn serve_direct(&mut self, call: DirectCall<'_>) -> DirectService {
+    if call.caller == "example.untrusted" {
+        return DirectService::Declined;
+    }
+    self.runtime.forward_direct(call.service, call.payload)
+}
+```
 
-Only a direct call made while serving a direct call keeps the consumer's
-identity. Pass a queued request on with the relay: a direct call made from
-`tick` shows the layer as its caller.
+The next hop then sees the consumer as its caller, as it does for a forwarded
+request. `forward_direct` returns what the layer should return, and keeps
+three outcomes apart:
+
+- `Replied`: the reply, which the layer may change before returning it.
+- `Declined`: the next hop was not entered. The consumer submits an ordinary
+  request, which arrives in the layer's `tick`. The provider is never entered
+  around a layer that declined.
+- `Failed`: the next hop took the call and its outcome is unknown. The
+  consumer is told the call failed. Never turn this into `Declined`, which
+  would invite the consumer to repeat a call that may have had its effect.
+
+Only `forward_direct`, used while serving a direct call for the same service,
+lends the consumer's identity. A layer's ordinary `call_direct` is its own
+call and shows the layer, and so does anything it sends from `tick`: pass a
+queued request on with the relay.
 
 ### When a layer is missing
 
@@ -250,12 +273,14 @@ A hook that policy does not declare refuses the run with `not_found`. An owner
 can therefore offer an extension point unconditionally and carry on with its
 own behavior when nobody is composed into it.
 
-Give each run its own operation identifier. A run that settles also gives the
-identifier up, so an extension point can run as often as its owner needs.
-`fenced()` keeps the identifier instead: a repeat then reports
-`operation_expired` and never asks the participants again. The broker holds
-512 fenced identifiers for its whole lifetime, so reserve it for effects that
-must not repeat.
+Give each run its own operation identifier. While the broker holds the run,
+the identifier finds it, so a lost start is repeated safely. The identifier
+is given up when the run is released or its record expires, so an extension
+point can run as often as its owner needs, and a run that was never collected
+does not hold one for good. `fenced()` keeps the identifier instead: once the
+run's record is gone, a repeat reports `operation_expired` and never asks the
+participants again. The broker holds 512 fenced identifiers for its whole
+lifetime, so reserve it for effects that must not repeat.
 
 ### A participant
 
@@ -287,7 +312,9 @@ recorded against the participant in a best-effort one.
 - The hook's deadline is 1 to 30,000 ms for the whole run.
 - The input, and every value passed along a chain, is at most 16 KiB. A
   chained value over the limit counts as that participant's failure.
-- Chained runs and giving up an identifier need a runtime built with them.
+- Chained runs and runs that give their identifier up need a runtime built
+  with them. An older runtime refuses such a run as `invalid_request`; a
+  `fenced()` broadcast run works on it.
 
 ## Events
 

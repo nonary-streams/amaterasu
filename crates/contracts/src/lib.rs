@@ -314,6 +314,11 @@ pub enum Command {
     CallDirect {
         service: String,
         payload: Value,
+        /// Set by a layer to pass on the direct call it is serving for this
+        /// service. The next hop is then shown that call's caller. Without it
+        /// the call is the caller's own.
+        #[serde(default, skip_serializing_if = "is_false")]
+        forward: bool,
     },
     /// Returns host-owned context to the state service, and to the Linux audio
     /// module for its restart-safe cleanup journal. This prevents a module
@@ -462,6 +467,9 @@ pub enum Command {
     /// `cleanup`, every participant is attempted and reported; otherwise the
     /// first absent or failed participant ends the invocation. With `chain`,
     /// each participant receives the previous participant's result as input.
+    /// A `transient` operation gives its identifier up when the invocation
+    /// is released or expires, so a later use starts new work; otherwise the
+    /// identifier stays fenced for the broker's lifetime.
     RunHookOperation {
         hook: String,
         payload: Value,
@@ -469,6 +477,8 @@ pub enum Command {
         cleanup: bool,
         #[serde(default, skip_serializing_if = "is_false")]
         chain: bool,
+        #[serde(default, skip_serializing_if = "is_false")]
+        transient: bool,
     },
     ListApiApprovals {
         parent: Option<u64>,
@@ -481,13 +491,8 @@ pub enum Command {
     CancelHook {
         invocation: u64,
     },
-    /// Discards a finished invocation. With `forget`, its operation identifier
-    /// is relinquished as well, so a later use of that identifier starts new
-    /// work; without it the identifier stays fenced for the broker's lifetime.
     ReleaseHook {
         invocation: u64,
-        #[serde(default, skip_serializing_if = "is_false")]
-        forget: bool,
     },
 }
 
@@ -616,6 +621,60 @@ impl Response {
     }
     pub fn is_error(&self) -> bool {
         matches!(self, Self::Error { .. })
+    }
+}
+
+/// At most this many services can carry layers.
+pub const MAX_LAYERED_SERVICES: usize = 64;
+/// At most this many layers can be stacked on one service.
+pub const MAX_LAYERS_PER_SERVICE: usize = 8;
+
+impl RuntimeConfig {
+    /// Checks the layer listing on its own terms. A layer stands in the path
+    /// of every call to its service, so policy must name real principals,
+    /// name each one once, and keep the roles apart: a service's provider
+    /// cannot also be one of its layers. The runtime and package verification
+    /// apply the same rules, so a package the runtime would refuse to start
+    /// with is rejected before it is activated.
+    pub fn validate_service_layers(&self) -> Result<(), String> {
+        if self.service_layers.len() > MAX_LAYERED_SERVICES {
+            return Err("too many layered services".into());
+        }
+        for (service, layers) in &self.service_layers {
+            self.validate_layers_of(service, layers)?;
+        }
+        Ok(())
+    }
+
+    fn validate_layers_of(&self, service: &str, layers: &[String]) -> Result<(), String> {
+        let host_owned = matches!(
+            service,
+            HOST_LIFECYCLE_SERVICE
+                | HOST_LOG_SERVICE
+                | HOST_PACKAGE_ACTIVATION_SERVICE
+                | HOST_PACKAGE_BARRIER_SERVICE
+                | HOST_STATE_CONTEXT_SERVICE
+        );
+        if !valid_name(service) || host_owned || service.starts_with("hooks/") {
+            return Err(format!("service cannot be layered: {service}"));
+        }
+        let unique_layers: BTreeSet<_> = layers.iter().collect();
+        if layers.len() > MAX_LAYERS_PER_SERVICE || unique_layers.len() != layers.len() {
+            return Err(format!(
+                "too many or duplicate layers for service {service}"
+            ));
+        }
+        for layer in layers {
+            let Some(grants) = self.principals.get(layer) else {
+                return Err(format!("unknown layer {layer} for service {service}"));
+            };
+            if layer == HOST_LIFECYCLE_CONTROL_PRINCIPAL || grants.provide.contains(service) {
+                return Err(format!(
+                    "layer {layer} cannot also provide service {service}"
+                ));
+            }
+        }
+        Ok(())
     }
 }
 

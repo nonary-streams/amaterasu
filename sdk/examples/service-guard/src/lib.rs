@@ -10,7 +10,7 @@
 //! and small enough to copy.
 use amaterasu_module_sdk::requests::{Answer, CallOutcome, IncomingRequest, Relay};
 use amaterasu_module_sdk::{
-    DirectCall, DirectReply, ErrorCode, LogLevel, ManagedModule, ModuleResult, RuntimeClient,
+    DirectCall, DirectService, ErrorCode, LogLevel, ManagedModule, ModuleResult, RuntimeClient,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -95,15 +95,13 @@ impl ManagedModule for ServiceGuard {
 
     /// A direct call is passed on when its caller is admitted. Declining
     /// sends the consumer to an ordinary request, which `tick` then refuses
-    /// with a reason; a declined direct call must leave no effect behind.
-    fn call_direct(&mut self, call: DirectCall<'_>) -> Option<Value> {
+    /// with a reason. Forwarding keeps the three outcomes apart, so a call
+    /// the provider took and then failed is never reported as declined.
+    fn serve_direct(&mut self, call: DirectCall<'_>) -> DirectService {
         if !self.settings.admits(call.service, call.caller) {
-            return None;
+            return DirectService::Declined;
         }
-        match self.runtime.call_direct(call.service, call.payload) {
-            Ok(DirectReply::Completed(reply)) => Some(reply),
-            _ => None,
-        }
+        self.runtime.forward_direct(call.service, call.payload)
     }
 }
 

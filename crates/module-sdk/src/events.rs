@@ -191,9 +191,11 @@ impl<T: DeserializeOwned> Subscription<T> {
         send: &mut impl FnMut(Command) -> ModuleResult<Response>,
     ) -> ControlResult<Option<Delivery<T>>> {
         let Some(subscription) = self.handle else {
-            // An earlier renewal failed. The gap was already reported.
+            // An earlier renewal stopped after the old queue was freed.
+            // Events published since then were missed, so the gap is reported
+            // now that a subscription exists to deliver what follows.
             self.subscribe(send)?;
-            return Ok(None);
+            return Ok(Some(Delivery::Gap));
         };
         match checked(send(Command::NextEvent { subscription }))? {
             Response::Pending => Ok(None),
@@ -215,7 +217,7 @@ impl<T: DeserializeOwned> Subscription<T> {
                 },
             })),
             Response::ResyncRequired { .. } => {
-                self.renew(send);
+                self.renew(send)?;
                 Ok(Some(Delivery::Gap))
             }
             response => Err(ControlError::unexpected(&response)),
@@ -256,14 +258,21 @@ impl<T: DeserializeOwned> Subscription<T> {
         }
     }
 
-    /// A subscription that overflowed delivers nothing more. Replace it. The
-    /// caller reports the gap either way; a failed renewal is tried again on
-    /// the next read.
-    fn renew(&mut self, send: &mut impl FnMut(Command) -> ModuleResult<Response>) {
-        if let Some(overflowed) = self.handle.take() {
-            let _ = unsubscribe(send, overflowed);
+    /// A subscription that overflowed delivers nothing more. Replace it.
+    ///
+    /// A failure is returned and the next read carries on from where this
+    /// stopped: the overflowed queue stays known until it is freed, and the
+    /// gap is reported only once a new subscription is in place, so reading
+    /// the owner's state after a gap never misses a later event.
+    fn renew(
+        &mut self,
+        send: &mut impl FnMut(Command) -> ModuleResult<Response>,
+    ) -> ControlResult<()> {
+        if let Some(overflowed) = self.handle {
+            unsubscribe(send, overflowed)?;
+            self.handle = None;
         }
-        let _ = self.subscribe(send);
+        self.subscribe(send)
     }
 }
 

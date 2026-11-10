@@ -73,7 +73,7 @@ fn completed(outcome: Poll<HookOutcome>) -> HookReport {
 }
 
 #[test]
-fn a_required_run_reports_every_answer_and_gives_up_its_identifier() {
+fn a_required_run_reports_every_answer_and_declares_its_identifier_transient() {
     let mut run = run();
     let mut script = Script::new([
         accepted(),
@@ -104,12 +104,11 @@ fn a_required_run_reports_every_answer_and_gives_up_its_identifier() {
             "payload": {"path": ["base"]},
             "operation_id": "launch.1",
             "cleanup": false,
+            // The identifier is given up with the run's record.
+            "transient": true,
         })
     );
-    assert_eq!(
-        script.sent[3],
-        json!({"op":"release_hook","invocation":6,"forget":true})
-    );
+    assert_eq!(script.sent[3], json!({"op":"release_hook","invocation":6}));
 }
 
 #[test]
@@ -124,7 +123,8 @@ fn the_run_options_reach_the_broker() {
     completed(script.poll(&mut run));
     assert_eq!(script.sent[0]["cleanup"], true);
     assert_eq!(script.sent[0]["chain"], true);
-    // A fenced run keeps its identifier: the release does not forget it.
+    // A fenced run keeps its identifier for the broker's lifetime.
+    assert!(script.sent[0].get("transient").is_none());
     assert_eq!(script.sent[2], json!({"op":"release_hook","invocation":6}));
 }
 
