@@ -88,3 +88,53 @@ fn full_replay_ledger_allows_existing_operation_retry_but_rejects_new_admission(
             .contains(&("owner".into(), next))
     );
 }
+
+/// Mark a started launch as cleanly finished with its retirement preserved.
+fn finish(records: &mut Records, id: u64) {
+    let record = records.values.get_mut(&id).unwrap();
+    record.launch_started = true;
+    record.state = State::Stopped;
+    record.native_retirement_confirmed = true;
+    records.record_native_retirement(id);
+}
+
+#[test]
+fn finished_launches_do_not_use_up_launch_capacity() {
+    let mut records = Records::new().unwrap();
+    let mut operations = Vec::new();
+    for index in 0..(MAX_OWNER_LAUNCHES * 3) {
+        let operation = format!("ale1:{}:launch-{index}", records.operation_epoch());
+        let (id, fresh) = start(&mut records, "owner", &operation)
+            .unwrap_or_else(|code| panic!("launch {index} was refused: {code}"));
+        assert!(fresh);
+        finish(&mut records, id);
+        operations.push(operation);
+    }
+    assert!(records.values.len() <= MAX_OWNER_LAUNCHES);
+    // A pruned launch still proves its retirement and cannot be replayed.
+    assert!(records.owned_operation("owner", &operations[0]).is_err());
+    assert!(records.native_retired("owner", &operations[0]));
+    assert_eq!(
+        start(&mut records, "owner", &operations[0]),
+        Err("operation_retired")
+    );
+}
+
+#[test]
+fn unfinished_or_failed_launches_keep_their_slot() {
+    let mut records = Records::new().unwrap();
+    for index in 0..MAX_OWNER_LAUNCHES {
+        let operation = format!("ale1:{}:launch-{index}", records.operation_epoch());
+        let (id, _) = start(&mut records, "owner", &operation).unwrap();
+        let record = records.values.get_mut(&id).unwrap();
+        record.launch_started = true;
+        // Terminal, but native retirement was never confirmed.
+        record.state = State::Stopped;
+    }
+    let operation = format!("ale1:{}:one-more", records.operation_epoch());
+    assert_eq!(
+        start(&mut records, "owner", &operation),
+        Err("launch_limit")
+    );
+    assert_eq!(records.values.len(), MAX_OWNER_LAUNCHES);
+}

@@ -170,6 +170,9 @@ impl Record {
         json!({"ok":true,"preflight_token":self.preflight_token,"stop_on_stream_end":self.stop_on_stream_end(),"app_id":self.app_id,"catalog_revision":self.catalog_revision,"config_overrides":self.config_overrides.clone().unwrap_or_default(),"application_display_overrides":self.application_display_overrides,"application_display_settings":self.application_display_settings,"executable_path":self.executable_path,"cleanup_budget_ms":self.cleanup_budget_ms})
     }
 }
+const MAX_LAUNCHES: usize = 32;
+const MAX_OWNER_LAUNCHES: usize = 16;
+
 pub struct Records {
     pub values: BTreeMap<u64, Record>,
     nonce: String,
@@ -271,14 +274,8 @@ impl Records {
                 Err("operation_conflict")
             };
         }
-        if self.values.len() >= 32
-            || self
-                .values
-                .values()
-                .filter(|record| record.owner == caller)
-                .count()
-                >= 16
-        {
+        self.evict_retired_launches(caller);
+        if self.values.len() >= MAX_LAUNCHES || self.owned_count(caller) >= MAX_OWNER_LAUNCHES {
             return Err("launch_limit");
         }
         let id = self.next_id.checked_add(1).ok_or("launch_limit")?;
@@ -367,6 +364,46 @@ impl Records {
 
     pub fn current_epoch_operation(&self, operation_id: &str) -> bool {
         tracked_operation_epoch(operation_id) == Some(self.operation_epoch.as_str())
+    }
+
+    fn owned_count(&self, caller: &str) -> usize {
+        self.values
+            .values()
+            .filter(|record| record.owner == caller)
+            .count()
+    }
+
+    /// Make room for a new launch by dropping finished launches whose
+    /// retirement proof is already preserved in the operation ledger. Without
+    /// this every launch of a runtime kept its slot and the seventeenth launch
+    /// by one owner was refused. A launch that has not confirmed native
+    /// retirement, or whose cleanup failed, keeps its record.
+    fn evict_retired_launches(&mut self, caller: &str) {
+        while self.values.len() >= MAX_LAUNCHES || self.owned_count(caller) >= MAX_OWNER_LAUNCHES {
+            let over_total = self.values.len() >= MAX_LAUNCHES;
+            let Some(id) = self
+                .values
+                .values()
+                .find(|record| {
+                    (over_total || record.owner == caller) && self.retirement_preserved(record)
+                })
+                .map(|record| record.launch_id)
+            else {
+                return;
+            };
+            self.values.remove(&id);
+        }
+    }
+
+    fn retirement_preserved(&self, record: &Record) -> bool {
+        record.launch_started
+            && record.state.terminal()
+            && record.cleanup_error.is_none()
+            && record.outstanding_request.is_none()
+            && record.outstanding_admission.is_none()
+            && self
+                .cleaned_operations
+                .contains(&(record.owner.clone(), record.operation_id.clone()))
     }
 
     /// Preserve same-runtime terminal proof after bounded launch records are

@@ -174,6 +174,12 @@ impl Pipeline {
         };
         let record = match record {
             Ok(record) => record,
+            // The record was pruned after its native retirement was preserved
+            // in the operation ledger; that proof still answers for it.
+            Err(_) if self.records.native_retired(owner, operation_id) => {
+                return serde_json::json!({"ok":true,"retired":true,"owner":owner,
+                    "launch_id":launch_id,"operation_id":operation_id});
+            }
             Err(_) if launch_id.is_none() => {
                 return match self.records.tombstone_absent(owner, operation_id) {
                     Ok(()) => serde_json::json!({"ok":true,"retired":true,"never_admitted":true,
