@@ -30,10 +30,15 @@ namespace Amaterasu {
     hostPassMaxUs: (number | null)[];
   }
   export interface PerformanceHold { span: string; label: string | null; us: number }
-  /** Something that exceeded its limit, or a call that held a thread too long. */
+  /**
+   * Something that exceeded its limit, or a call that held a thread too long.
+   * A run of them with one cause is a single moment from `observedUnixMs` to
+   * `untilUnixMs`; `us` is the worst of its `count` members.
+   */
   export interface PerformanceMoment {
     kind: "flow" | "span";
     observedUnixMs: number;
+    untilUnixMs: number;
     count: number;
     us: number;
     track: string;
@@ -185,6 +190,7 @@ namespace Amaterasu {
     return {
       kind: moment.kind === "span" ? "span" : "flow",
       observedUnixMs: reportNumber(moment.observed_unix_ms),
+      untilUnixMs: Math.max(reportNumber(moment.observed_unix_ms), reportNumber(moment.until_unix_ms)),
       count: Math.max(1, reportNumber(moment.count)),
       us: reportNumber(moment.us),
       track: reportText(moment.track),
@@ -266,9 +272,10 @@ namespace Amaterasu {
   export function performanceMomentText(moment: PerformanceMoment): string {
     if (moment.kind === "span") {
       const plugin = moment.label ? performancePluginName(moment.label) : "A plugin";
+      const times = moment.count > 1 ? ` ${formatCount(moment.count)} times` : "";
       return holdsHostLoop(moment.span)
-        ? `${plugin} held the host loop, delaying every other plugin.`
-        : `${plugin} spent this long in ${moment.span}.`;
+        ? `${plugin} held the host loop${times}, delaying every other plugin.`
+        : `${plugin} spent this long in ${moment.span}${times}.`;
     }
     const words = trackWords(moment.track);
     const subject = moment.count > 1 ? `${formatCount(moment.count)} ${words.many}` : `One ${words.one}`;
@@ -462,10 +469,13 @@ namespace Amaterasu {
     if (!moments.length) return el("p", "muted", "Nothing exceeded its limit in the retained history.");
     const rows = moments.map((moment) => {
       const time = el("td", "perf-time");
-      time.textContent = formatClock(moment.observedUnixMs);
+      // A run that lasted is shown from its first member to its last.
+      time.textContent = moment.untilUnixMs - moment.observedUnixMs >= 1_000
+        ? `${formatClock(moment.observedUnixMs)} to ${formatClock(moment.untilUnixMs)}`
+        : formatClock(moment.observedUnixMs);
       return el("tr", "", time, durationCell(moment.us), el("td", "", performanceMomentText(moment)));
     });
-    return dataTable([["Time", false], ["Took", true], ["What happened", false]], rows);
+    return dataTable([["Time", false], ["Longest", true], ["What happened", false]], rows);
   }
 
   /** The panel body for one report. */

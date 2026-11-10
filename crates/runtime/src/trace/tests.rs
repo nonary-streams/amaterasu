@@ -491,12 +491,59 @@ fn slow_flows_behind_one_pause_are_one_moment_naming_what_held_the_thread() {
     assert_eq!(slow[1]["count"], 1);
     let burst = &slow[2];
     assert_eq!(burst["count"], 18);
+    assert_eq!(burst["observed_unix_ms"], 5_000);
+    assert_eq!(burst["until_unix_ms"], 5_017);
     assert_eq!(burst["us"], 100_017);
     assert_eq!(burst["step"], "a>b");
     assert_eq!(burst["budget_us"], 8_000);
     // The longest overlap that is not the host's own pass.
     assert_eq!(burst["held_by"]["span"], "host.tick");
     assert_eq!(burst["held_by"]["label"], "amaterasu.lifecycle");
+}
+
+#[test]
+fn a_long_run_of_slow_frames_is_one_moment_and_a_brief_call_is_not_blamed_for_it() {
+    let hub = Arc::new(TraceHub::new(vec!["producer".into()]));
+    // The encoder runs slow for twelve seconds. Each frame overlaps some
+    // short plugin call, a different one each time, and a pairing call is
+    // reported in the middle of the run.
+    let frame = |index: u64| {
+        let mut report = slow_flow_report(13_000 + index, "unused");
+        report.body["track"] = "video".into();
+        report.body["slowest_step"]["during"] = serde_json::json!([
+            {"span":"host.tick","label":format!("amaterasu.module{index}"),"us":1_700,"overlap_us":1_700},
+        ]);
+        report
+    };
+    for index in 0..12_u64 {
+        hub.record_for_test(&frame(index), 100_000 + index * 1_000);
+        if index == 5 {
+            hub.record_for_test(
+                &Report {
+                    target: "trace.slow_span",
+                    body: serde_json::json!({"event":"slow_span","span":"host.tick","label":"amaterasu.pairing","us":9_000,"by":"@host"}),
+                },
+                105_500,
+            );
+        }
+    }
+    // After a quiet gap the same cause starts a new moment.
+    hub.record_for_test(&frame(50), 130_000);
+
+    let slow = hub.snapshot()["slow"].clone();
+    let slow = slow.as_array().unwrap();
+    assert_eq!(slow.len(), 3);
+    assert_eq!(slow[0]["count"], 1);
+    assert_eq!(slow[0]["observed_unix_ms"], 130_000);
+    let run = &slow[1];
+    assert_eq!(run["track"], "video");
+    assert_eq!(run["count"], 12);
+    assert_eq!(run["observed_unix_ms"], 100_000);
+    assert_eq!(run["until_unix_ms"], 111_000);
+    assert_eq!(run["us"], 13_011);
+    // A 1.7 ms call did not make a 13 ms step slow.
+    assert_eq!(run["held_by"], serde_json::Value::Null);
+    assert_eq!(slow[2]["label"], "amaterasu.pairing");
 }
 
 #[test]

@@ -170,11 +170,14 @@ HTTP response with room to spare:
 | `trend` | half an hour as columns of numbers, one value per ten-second window: each track's worst and 95th percentile, and the longest host pass |
 | `slow` | the thirty most recent slow moments, newest first |
 
-A burst of slow flows behind one cause, such as every input event that waited
-for the same pause, is one moment that counts its members and keeps the worst.
-A moment names the plugin call that overlapped its slowest step longest. When
-a report would exceed its size, the oldest trend points go first, then the
-oldest moments, then the shortest spans.
+Slow reports that share a cause and follow each other within two seconds are
+one moment: every input event that waited for the same pause, or every frame of
+a minute in which the encoder ran slow. A moment counts its members, keeps the
+worst and records when the run began and was last seen. It names the call that
+overlapped its slowest step longest, provided that call covered at least half
+of the step; a short call that merely happened during a slow step is not
+blamed. When a report would exceed its size, the oldest trend points go first,
+then the oldest moments, then the shortest spans.
 
 The web UI's Diagnostics page shows the report as the Performance panel through
 `/v1/diagnostics/performance`, which requires `diagnostics.read`. Only

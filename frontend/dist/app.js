@@ -16330,6 +16330,7 @@ var Amaterasu;
         return {
             kind: moment.kind === "span" ? "span" : "flow",
             observedUnixMs: reportNumber(moment.observed_unix_ms),
+            untilUnixMs: Math.max(reportNumber(moment.observed_unix_ms), reportNumber(moment.until_unix_ms)),
             count: Math.max(1, reportNumber(moment.count)),
             us: reportNumber(moment.us),
             track: reportText(moment.track),
@@ -16409,9 +16410,10 @@ var Amaterasu;
     function performanceMomentText(moment) {
         if (moment.kind === "span") {
             const plugin = moment.label ? performancePluginName(moment.label) : "A plugin";
+            const times = moment.count > 1 ? ` ${formatCount(moment.count)} times` : "";
             return holdsHostLoop(moment.span)
-                ? `${plugin} held the host loop, delaying every other plugin.`
-                : `${plugin} spent this long in ${moment.span}.`;
+                ? `${plugin} held the host loop${times}, delaying every other plugin.`
+                : `${plugin} spent this long in ${moment.span}${times}.`;
         }
         const words = trackWords(moment.track);
         const subject = moment.count > 1 ? `${formatCount(moment.count)} ${words.many}` : `One ${words.one}`;
@@ -16574,10 +16576,12 @@ var Amaterasu;
             return Amaterasu.el("p", "muted", "Nothing exceeded its limit in the retained history.");
         const rows = moments.map((moment) => {
             const time = Amaterasu.el("td", "perf-time");
-            time.textContent = formatClock(moment.observedUnixMs);
+            time.textContent = moment.untilUnixMs - moment.observedUnixMs >= 1_000
+                ? `${formatClock(moment.observedUnixMs)} to ${formatClock(moment.untilUnixMs)}`
+                : formatClock(moment.observedUnixMs);
             return Amaterasu.el("tr", "", time, durationCell(moment.us), Amaterasu.el("td", "", performanceMomentText(moment)));
         });
-        return dataTable([["Time", false], ["Took", true], ["What happened", false]], rows);
+        return dataTable([["Time", false], ["Longest", true], ["What happened", false]], rows);
     }
     function performanceContent(report) {
         if (report.periodUs === 0) {

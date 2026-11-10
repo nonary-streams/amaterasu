@@ -16,8 +16,12 @@ const LISTED_TRACKS: usize = 6;
 const LISTED_STEPS: usize = 8;
 const LISTED_SPANS: usize = 16;
 const TREND_TRACKS: usize = 4;
-/// Slow flows that share a cause within this time are one moment.
-const SAME_MOMENT_MS: u64 = 1_000;
+/// Slow reports that share a cause and follow each other within this time are
+/// one moment, however long the run lasts.
+const SAME_MOMENT_MS: u64 = 2_000;
+/// How far back a slow report looks for the moment it continues. Other causes
+/// may have been reported in between.
+const MOMENTS_SEARCHED: usize = 4;
 /// The host's own bookkeeping spans. They are summarized, never listed as the
 /// reason something was slow: a pass is always running.
 const HOST_PASS: &str = "host.pass";
@@ -264,11 +268,14 @@ pub(super) fn trend(points: &VecDeque<TrendPoint>) -> Value {
     })
 }
 
-/// The span that most plausibly made a step slow: the one that overlapped it
-/// longest, leaving out the host's own pass and wait.
+/// The call that made a step slow: the one that overlapped it longest, if it
+/// covered at least half of the step. A short call that merely happened during
+/// a slow step explains nothing, and neither does the host's own pass or wait.
 fn held_by(slowest_step: &Value) -> Value {
+    let step_us = count(&slowest_step["us"]);
     items(&slowest_step["during"])
         .filter(|span| span["span"] != HOST_PASS && span["span"] != HOST_WAIT)
+        .filter(|span| count(&span["overlap_us"]).saturating_mul(2) >= step_us)
         .max_by_key(|span| count(&span["overlap_us"]))
         .map_or(
             Value::Null,
@@ -281,6 +288,7 @@ fn slow_flow(body: &Value, observed_unix_ms: u64) -> Value {
     json!({
         "kind": "flow",
         "observed_unix_ms": observed_unix_ms,
+        "until_unix_ms": observed_unix_ms,
         "count": 1,
         "track": body["track"],
         "us": body["total_us"],
@@ -299,6 +307,7 @@ fn slow_span(body: &Value, observed_unix_ms: u64) -> Value {
     json!({
         "kind": "span",
         "observed_unix_ms": observed_unix_ms,
+        "until_unix_ms": observed_unix_ms,
         "count": 1,
         "span": body["span"],
         "label": body["label"],
@@ -314,9 +323,11 @@ fn same_cause(left: &Value, right: &Value) -> bool {
         && left["held_by"]["label"] == right["held_by"]["label"]
 }
 
-/// Adds one slow report to the retained moments. A burst behind one cause,
-/// such as every input event that waited for the same pause, is one moment
-/// that counts its members and keeps the worst of them.
+/// Adds one slow report to the retained moments. Reports that share a cause
+/// and follow each other closely are one moment: every input event that waited
+/// for the same pause, or every frame of a minute in which the encoder ran
+/// slow. The moment counts its members, keeps the worst of them and records
+/// when the run began and when it was last seen.
 pub(super) fn retain_slow(
     moments: &mut VecDeque<Value>,
     limit: usize,
@@ -333,22 +344,30 @@ pub(super) fn retain_slow(
     } else {
         slow_span(body, observed_unix_ms)
     };
-    if let Some(latest) = moments.back_mut()
-        && same_cause(latest, &moment)
-        && observed_unix_ms.saturating_sub(count(&latest["observed_unix_ms"])) <= SAME_MOMENT_MS
-    {
-        latest["count"] = (count(&latest["count"]) + 1).into();
-        if count(&moment["us"]) > count(&latest["us"]) {
-            for field in ["us", "step_us", "held_by"] {
-                latest[field] = moment[field].clone();
-            }
+    let continued = moments
+        .iter()
+        .rposition(|earlier| same_cause(earlier, &moment))
+        .filter(|index| moments.len() - index <= MOMENTS_SEARCHED)
+        .filter(|index| {
+            observed_unix_ms.saturating_sub(count(&moments[*index]["until_unix_ms"]))
+                <= SAME_MOMENT_MS
+        });
+    let Some(mut run) = continued.and_then(|index| moments.remove(index)) else {
+        if moments.len() >= limit {
+            moments.pop_front();
         }
+        moments.push_back(moment);
         return;
+    };
+    run["count"] = (count(&run["count"]) + 1).into();
+    run["until_unix_ms"] = observed_unix_ms.into();
+    if count(&moment["us"]) > count(&run["us"]) {
+        for field in ["us", "step_us", "held_by"] {
+            run[field] = moment[field].clone();
+        }
     }
-    if moments.len() >= limit {
-        moments.pop_front();
-    }
-    moments.push_back(moment);
+    // The run is the most recent activity again.
+    moments.push_back(run);
 }
 
 fn compose(collecting: bool, recent: &Value, trend: &Value, slow: &VecDeque<Value>) -> Value {

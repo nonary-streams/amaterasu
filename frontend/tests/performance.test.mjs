@@ -96,11 +96,12 @@ function report(overrides = {}) {
       host_pass_max_us: [2_000, 2_100, 121_000, 9_100, 2_000],
     },
     slow: [
-      { kind: "span", observed_unix_ms: NOW - 5_000, count: 1, span: "host.tick", label: "amaterasu.pairing", by: "@amaterasu.host-lifecycle", us: 9_100 },
-      { kind: "flow", observed_unix_ms: NOW - 21_000, count: 18, track: "input", us: 141_000, budget_us: 8_000,
+      { kind: "span", observed_unix_ms: NOW - 5_000, until_unix_ms: NOW - 5_000, count: 1, span: "host.tick", label: "amaterasu.pairing",
+        by: "@amaterasu.host-lifecycle", us: 9_100 },
+      { kind: "flow", observed_unix_ms: NOW - 21_000, until_unix_ms: NOW - 20_990, count: 18, track: "input", us: 141_000, budget_us: 8_000,
         step: "control.authenticated>session.dequeued", step_us: 122_000,
         held_by: { span: "host.tick", label: "amaterasu.session-lifecycle", us: 119_000 } },
-      { kind: "flow", observed_unix_ms: NOW - 30_000, count: 1, track: "video", us: 12_400, budget_us: 12_000,
+      { kind: "flow", observed_unix_ms: NOW - 90_000, until_unix_ms: NOW - 30_000, count: 1, track: "video", us: 12_400, budget_us: 12_000,
         step: "video.encoder_submitted>video.packet_queued", step_us: 11_900, held_by: null },
     ],
     ...overrides,
@@ -150,6 +151,7 @@ test("a slow moment says what was slow, where, and what held the host loop", () 
   assert.equal(performanceMomentText(moments[1]),
     "18 input events: slowest at reaching the stream session (122 ms), during a 119 ms call by Session lifecycle.");
   assert.equal(performanceMomentText(moments[2]), "One video frame: slowest at encoding (11.9 ms).");
+  assert.equal(performanceMomentText({ ...moments[0], count: 4 }), "Pairing held the host loop 4 times, delaying every other plugin.");
 });
 
 test("the summary states each track and the host loop, marking values at their limit", () => {
@@ -204,6 +206,9 @@ test("stages list their share of the time, and plugin calls only what ran on the
   assert.deepEqual(byClass(calls, "perf-over").map((cell) => cell.textContent), ["119 ms", "9.1 ms"]);
   assert.equal(rowsOf(moments).length, 3);
   assert.equal(rowsOf(moments)[1][1], "141 ms");
+  // A burst within a second shows one time; a run that lasted shows when it began and ended.
+  assert.doesNotMatch(rowsOf(moments)[1][0], / to /);
+  assert.match(rowsOf(moments)[2][0], /^.+ to .+$/);
 });
 
 test("an idle host reports its loop and says that nothing is streaming", () => {
