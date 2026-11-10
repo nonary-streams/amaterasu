@@ -422,3 +422,33 @@ fn generated_operation_identifiers_do_not_repeat() {
     assert!(first.starts_with("example.read."));
     assert!(amaterasu_contracts::valid_name(&first));
 }
+
+#[test]
+fn a_serving_principals_refusal_settles_as_refused_and_releases_the_record() {
+    let mut call = write_call();
+    let mut script = Script::new([accepted(), refused("refused.not_found"), Ok(Response::Ok)]);
+    assert!(script.poll(&mut call).is_pending());
+    let Poll::Ready(CallOutcome::Refused(refusal)) = script.poll(&mut call) else {
+        panic!("a refusal means the operation was not performed");
+    };
+    // The provider's `not_found` is its own answer, not a lost broker record.
+    assert_eq!(refusal.code, ErrorCode::NotFound);
+    assert!(refusal.is_refusal());
+    assert_eq!(
+        script.sent_operations(),
+        ["request", "take_result", "release_result"]
+    );
+}
+
+#[test]
+fn a_refusal_is_still_returned_when_its_record_cannot_be_released() {
+    let mut call = write_call();
+    let mut script = Script::new([accepted(), refused("refused.busy"), lost(), lost(), lost()]);
+    assert!(script.poll(&mut call).is_pending());
+    assert!(script.poll(&mut call).is_pending());
+    assert!(script.poll(&mut call).is_pending());
+    assert!(matches!(
+        script.poll(&mut call),
+        Poll::Ready(CallOutcome::Refused(refusal)) if refusal.code == ErrorCode::Busy
+    ));
+}

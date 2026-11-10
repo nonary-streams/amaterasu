@@ -84,7 +84,7 @@ impl HookInvocation {
                         payload,
                     });
                 } else {
-                    return result;
+                    return attributed(result, &participant.name);
                 }
             }
         }
@@ -149,7 +149,7 @@ impl HookInvocation {
                 return Response::Pending;
             }
             if !self.cleanup {
-                return response;
+                return attributed(response, &participant);
             }
             self.outcomes.push(HookOutcome {
                 participant,
@@ -188,6 +188,17 @@ impl HookInvocation {
             requests.cancel(&self.owner, participant.request_id, now);
             requests.release(&self.owner, participant.request_id);
         }
+    }
+}
+
+/// A required hook ends at the first participant that fails. Name it in the
+/// message, so the owner can say who stopped the operation.
+fn attributed(response: Response, participant: &str) -> Response {
+    match response {
+        Response::Error { code, message } => {
+            Response::error(&code, format!("{participant}: {message}"))
+        }
+        other => other,
     }
 }
 

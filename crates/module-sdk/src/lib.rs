@@ -8,9 +8,11 @@ pub mod diagnostics;
 pub mod display;
 pub mod display_settings;
 pub mod encode;
+pub mod events;
 pub mod exports;
 pub mod foreground_context;
 pub mod frame_processing;
+pub mod hooks;
 pub mod input;
 pub mod media;
 mod native;
@@ -47,12 +49,12 @@ pub use amaterasu_contracts::encoder::{
 };
 pub use amaterasu_contracts::{
     ApiFieldKind, ApiMethod, ApiPrivilege, ApiSchema, Command, DIRECT_UNAVAILABLE,
-    HOST_PACKAGE_BARRIER_SERVICE, HostLifecycleAction, MAX_BROKER_RESULT_BYTES, Response,
-    RunningModuleIdentity, RuntimeHostContext,
+    HOST_PACKAGE_BARRIER_SERVICE, HostLifecycleAction, MAX_BROKER_RESULT_BYTES, REFUSED_PREFIX,
+    Response, RunningModuleIdentity, RuntimeHostContext,
 };
 pub use amaterasu_extension_api as extension_api;
 pub use amaterasu_media as media_abi;
-pub use control_error::{BrokerError, ControlError, ControlResult, ErrorCode};
+pub use control_error::{BrokerError, ControlError, ControlResult, ErrorCode, ErrorOrigin};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::{
     Arc,

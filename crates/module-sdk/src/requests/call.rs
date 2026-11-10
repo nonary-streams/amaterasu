@@ -26,8 +26,9 @@ const MAX_CONSECUTIVE_FAILURES: u8 = 3;
 pub enum CallOutcome<T = Value> {
     /// The provider replied. The broker's record of the call has been released.
     Completed(T),
-    /// The broker never admitted the request, so no provider saw it. Starting
-    /// a new call is safe.
+    /// The operation was not performed: the broker never admitted the request,
+    /// or the provider or a layer stacked on it declined it. Starting a new
+    /// call is safe. [`BrokerError::origin`] says who decided.
     Refused(BrokerError),
     /// The request was, or may have been, admitted and ended without a usable
     /// reply. The provider may have acted on it. For a mutating call the
@@ -120,10 +121,8 @@ enum Stage {
     AdmissionUnknown,
     /// The broker admitted the request under this identifier.
     Admitted { request: u64, cancel_sent: bool },
-    /// The provider's reply is held until its broker record is released.
-    Releasing { request: u64, reply: Value },
-    /// A read-only request ended without a reply; its record is being released.
-    Discarding { request: u64, ending: ControlError },
+    /// The outcome is known and held until the broker's record is released.
+    Releasing { request: u64, outcome: CallOutcome },
     /// The outcome has been returned.
     Settled,
 }
@@ -210,9 +209,7 @@ impl OutboundCall {
     /// The broker's identifier, once the request is known to be admitted.
     pub fn request_id(&self) -> Option<u64> {
         match self.stage {
-            Stage::Admitted { request, .. }
-            | Stage::Releasing { request, .. }
-            | Stage::Discarding { request, .. } => Some(request),
+            Stage::Admitted { request, .. } | Stage::Releasing { request, .. } => Some(request),
             Stage::Unsent | Stage::AdmissionUnknown | Stage::Settled => None,
         }
     }
@@ -250,8 +247,7 @@ impl OutboundCall {
                 request,
                 cancel_sent,
             } => self.collect(request, cancel_sent, send),
-            Stage::Releasing { request, reply } => self.release_reply(request, reply, send),
-            Stage::Discarding { request, ending } => self.discard(request, ending, send),
+            Stage::Releasing { request, outcome } => self.release_then(request, outcome, send),
             Stage::Settled => Poll::Ready(CallOutcome::Unconfirmed(ControlError::UnexpectedReply(
                 "the call was polled after it settled".into(),
             ))),
@@ -350,7 +346,14 @@ impl OutboundCall {
                 self.stage = waiting;
                 Poll::Pending
             }
-            Ok(Response::Result { payload }) => self.release_reply(request, payload, send),
+            Ok(Response::Result { payload }) => {
+                self.release_then(request, CallOutcome::Completed(payload), send)
+            }
+            // The serving principal states that it did not perform the
+            // operation, so nothing needs protecting from a repeat.
+            Err(ControlError::Broker(refusal)) if refusal.is_refusal() => {
+                self.release_then(request, CallOutcome::Refused(refusal), send)
+            }
             Err(ControlError::Broker(ending)) => self.ended_without_reply(request, ending, send),
             Ok(response) => self.exchange_lost(ControlError::unexpected(&response), waiting),
             Err(error) => self.exchange_lost(error, waiting),
@@ -364,48 +367,32 @@ impl OutboundCall {
         send: &mut impl FnMut(Command) -> ModuleResult<Response>,
     ) -> Poll<CallOutcome> {
         let record_is_gone = ending.code == ErrorCode::NotFound;
-        let ending = ControlError::Broker(ending);
+        let ending = CallOutcome::Unconfirmed(ControlError::Broker(ending));
         if self.read_only && !record_is_gone {
-            return self.discard(request, ending, send);
+            return self.release_then(request, ending, send);
         }
         // A mutating request keeps its record: until it expires, the same
         // operation identity resolves to this ended request, not a new one.
-        Poll::Ready(CallOutcome::Unconfirmed(ending))
+        Poll::Ready(ending)
     }
 
-    fn release_reply(
+    /// Release the broker's record, then return the outcome it held.
+    fn release_then(
         &mut self,
         request: u64,
-        reply: Value,
+        outcome: CallOutcome,
         send: &mut impl FnMut(Command) -> ModuleResult<Response>,
     ) -> Poll<CallOutcome> {
         if self.record_released(request, send) {
-            return Poll::Ready(CallOutcome::Completed(reply));
+            return Poll::Ready(outcome);
         }
         self.consecutive_failures += 1;
         if self.consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
-            // The reply is known. Its record expires on its own; failing to
-            // release it must not hide what the provider said.
-            return Poll::Ready(CallOutcome::Completed(reply));
+            // The outcome is known. Its record expires on its own; failing to
+            // release it must not hide what happened.
+            return Poll::Ready(outcome);
         }
-        self.stage = Stage::Releasing { request, reply };
-        Poll::Pending
-    }
-
-    fn discard(
-        &mut self,
-        request: u64,
-        ending: ControlError,
-        send: &mut impl FnMut(Command) -> ModuleResult<Response>,
-    ) -> Poll<CallOutcome> {
-        if self.record_released(request, send) {
-            return Poll::Ready(CallOutcome::Unconfirmed(ending));
-        }
-        self.consecutive_failures += 1;
-        if self.consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
-            return Poll::Ready(CallOutcome::Unconfirmed(ending));
-        }
-        self.stage = Stage::Discarding { request, ending };
+        self.stage = Stage::Releasing { request, outcome };
         Poll::Pending
     }
 

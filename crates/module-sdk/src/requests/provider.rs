@@ -29,6 +29,21 @@ pub struct MalformedRequest {
     pub reason: String,
 }
 
+impl MalformedRequest {
+    /// Decline the request as `invalid_request`, with the decoding error as
+    /// its message. See [`RuntimeClient::refuse`].
+    pub fn refuse(&self, runtime: &RuntimeClient) -> ControlResult<ReplyDelivery> {
+        runtime.refuse(
+            self.request.id,
+            ErrorCode::InvalidRequest.as_str(),
+            &self.reason,
+        )
+    }
+}
+
+/// The broker accepts one bounded line of text with a refusal.
+const MAX_REFUSAL_MESSAGE_BYTES: usize = 512;
+
 /// Take the next request delivered to this provider through `send`.
 pub fn next_request_with(
     send: &mut impl FnMut(Command) -> ModuleResult<Response>,
@@ -67,6 +82,44 @@ pub fn reply_with<T: Serialize>(
         Err(error) if request_has_ended(&error) => Ok(ReplyDelivery::RequestEnded),
         Err(error) => Err(error),
     }
+}
+
+/// Decline a delivered request through `send`. See [`RuntimeClient::refuse`].
+pub fn refuse_with(
+    send: &mut impl FnMut(Command) -> ModuleResult<Response>,
+    request: u64,
+    code: &str,
+    message: &str,
+) -> ControlResult<ReplyDelivery> {
+    let refusal = Command::Refuse {
+        request,
+        code: code.to_owned(),
+        message: refusal_message(message),
+    };
+    match checked(send(refusal)) {
+        Ok(Response::Ok) => Ok(ReplyDelivery::Recorded),
+        Ok(response) => Err(ControlError::unexpected(&response)),
+        Err(error) if request_has_ended(&error) => Ok(ReplyDelivery::RequestEnded),
+        Err(error) => Err(error),
+    }
+}
+
+/// Fit an arbitrary error string into the refusal's one bounded line, so a
+/// long or multi-line reason never turns a refusal into a failed command.
+fn refusal_message(message: &str) -> String {
+    let mut line = String::with_capacity(message.len().min(MAX_REFUSAL_MESSAGE_BYTES));
+    for character in message.chars() {
+        let character = if character.is_control() {
+            ' '
+        } else {
+            character
+        };
+        if line.len() + character.len_utf8() > MAX_REFUSAL_MESSAGE_BYTES {
+            break;
+        }
+        line.push(character);
+    }
+    line
 }
 
 /// Ask through `send` whether a delivered request can still take a reply.
@@ -125,6 +178,20 @@ impl RuntimeClient {
         reply_with(&mut |command| self.send(command), request, payload)
     }
 
+    /// Decline a delivered request: this module did not perform the operation
+    /// and will not. The caller's [`OutboundCall`](super::OutboundCall)
+    /// settles as [`Refused`](super::CallOutcome::Refused) with this code, so
+    /// it knows a new call is safe.
+    ///
+    /// `code` is a short lowercase name such as `permission_denied`, `busy`
+    /// or one this service defines. Never refuse after an effect happened or
+    /// when the outcome is unknown: reply in the service's own terms, or let
+    /// the request reach its deadline. A runtime older than refusals reports
+    /// `invalid_request` and leaves the request live.
+    pub fn refuse(&self, request: u64, code: &str, message: &str) -> ControlResult<ReplyDelivery> {
+        refuse_with(&mut |command| self.send(command), request, code, message)
+    }
+
     /// Whether a delivered request can still take a reply. Check immediately
     /// before a side effect that should not happen for an abandoned request.
     /// This is an observation, not a lock: the request can still end before
@@ -142,6 +209,17 @@ impl<T> IncomingRequest<T> {
         payload: &R,
     ) -> ControlResult<ReplyDelivery> {
         runtime.reply(self.id, payload)
+    }
+
+    /// Decline this request without performing it. See
+    /// [`RuntimeClient::refuse`].
+    pub fn refuse(
+        &self,
+        runtime: &RuntimeClient,
+        code: &str,
+        message: &str,
+    ) -> ControlResult<ReplyDelivery> {
+        runtime.refuse(self.id, code, message)
     }
 
     /// Whether this request can still take a reply. See

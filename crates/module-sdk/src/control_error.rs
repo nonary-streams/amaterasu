@@ -98,25 +98,62 @@ impl fmt::Display for ErrorCode {
     }
 }
 
-/// An error reply: the broker's own refusal, or the terminal error it recorded
-/// for a request.
+/// Who decided an error reply.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ErrorOrigin {
+    /// The broker itself: a missing grant, a full table, an ended request.
+    Broker,
+    /// The principal serving the request, a provider or a layer stacked on
+    /// it, declined with [`refuse`](crate::RuntimeClient::refuse). It states
+    /// that it did not perform the operation.
+    Provider,
+}
+
+/// An error reply: the broker's own refusal, the terminal error it recorded
+/// for a request, or a serving principal's refusal.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BrokerError {
     pub code: ErrorCode,
     pub message: String,
+    pub origin: ErrorOrigin,
 }
 
 impl BrokerError {
+    /// An error the broker itself decided.
     pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
         Self {
             code,
             message: message.into(),
+            origin: ErrorOrigin::Broker,
         }
+    }
+
+    /// Classify an error reply as it appears on the wire. A serving
+    /// principal's refusal arrives as `refused.<code>`; the prefix becomes the
+    /// origin and `<code>` is classified like any other.
+    pub fn from_wire(code: &str, message: impl Into<String>) -> Self {
+        let (origin, code) = match code.strip_prefix(crate::REFUSED_PREFIX) {
+            Some(code) => (ErrorOrigin::Provider, code),
+            None => (ErrorOrigin::Broker, code),
+        };
+        Self {
+            code: ErrorCode::parse(code),
+            message: message.into(),
+            origin,
+        }
+    }
+
+    /// Whether the serving provider or a layer declined the request.
+    pub fn is_refusal(&self) -> bool {
+        self.origin == ErrorOrigin::Provider
     }
 }
 
 impl fmt::Display for BrokerError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.is_refusal() {
+            formatter.write_str(crate::REFUSED_PREFIX)?;
+        }
         write!(formatter, "{}: {}", self.code, self.message)
     }
 }
@@ -136,7 +173,7 @@ pub enum ControlError {
 }
 
 impl ControlError {
-    /// The broker's code, when the broker answered.
+    /// The code of the error reply, whoever decided it.
     pub fn code(&self) -> Option<&ErrorCode> {
         match self {
             Self::Broker(error) => Some(&error.code),
@@ -144,9 +181,19 @@ impl ControlError {
         }
     }
 
-    /// Whether the broker answered with exactly this code.
+    /// Whether the broker itself answered with exactly this code. A serving
+    /// principal's refusal never matches, so a provider that refuses with
+    /// `not_found` is not mistaken for a handle the broker no longer holds.
     pub fn is(&self, code: &ErrorCode) -> bool {
-        self.code() == Some(code)
+        matches!(self, Self::Broker(error) if !error.is_refusal() && error.code == *code)
+    }
+
+    /// The serving principal's refusal, when that is what this error is.
+    pub fn refusal(&self) -> Option<&BrokerError> {
+        match self {
+            Self::Broker(error) if error.is_refusal() => Some(error),
+            _ => None,
+        }
     }
 
     pub(crate) fn unexpected(response: &Response) -> Self {
@@ -192,10 +239,9 @@ pub type ControlResult<T> = Result<T, ControlError>;
 pub fn checked(exchange: ModuleResult<Response>) -> ControlResult<Response> {
     match exchange {
         Err(message) => Err(ControlError::Transport(message)),
-        Ok(Response::Error { code, message }) => Err(ControlError::Broker(BrokerError::new(
-            ErrorCode::parse(&code),
-            message,
-        ))),
+        Ok(Response::Error { code, message }) => {
+            Err(ControlError::Broker(BrokerError::from_wire(&code, message)))
+        }
         Ok(response) => Ok(response),
     }
 }
@@ -251,5 +297,28 @@ mod tests {
             checked(Ok(Response::Pending)),
             Ok(Response::Pending)
         ));
+    }
+
+    #[test]
+    fn a_serving_principals_refusal_is_told_apart_from_the_brokers_own_code() {
+        let refusal =
+            checked(Ok(Response::error("refused.not_found", "no such session"))).unwrap_err();
+        // The code is classified like any other, so a caller can match on it.
+        assert_eq!(refusal.code(), Some(&ErrorCode::NotFound));
+        assert_eq!(
+            refusal.refusal().map(|refusal| refusal.origin),
+            Some(ErrorOrigin::Provider)
+        );
+        // It is not the broker saying a handle is unknown.
+        assert!(!refusal.is(&ErrorCode::NotFound));
+        assert_eq!(refusal.to_string(), "refused.not_found: no such session");
+
+        let broker = checked(Ok(Response::error("not_found", "unknown handle"))).unwrap_err();
+        assert!(broker.is(&ErrorCode::NotFound));
+        assert!(broker.refusal().is_none());
+
+        let custom = BrokerError::from_wire("refused.stream_active", "a stream is running");
+        assert_eq!(custom.code, ErrorCode::Other("stream_active".into()));
+        assert!(custom.is_refusal());
     }
 }

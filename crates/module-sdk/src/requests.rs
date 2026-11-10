@@ -3,11 +3,14 @@
 //! Payloads are serialized across the ABI; no Rust object crosses the module
 //! boundary. The runtime derives caller and initiator identities itself.
 mod call;
+mod layer;
 mod provider;
 
 pub use call::{CallOutcome, OutboundCall, unique_operation_id};
+pub use layer::{Answer, Relay};
 pub use provider::{
-    MalformedRequest, ReplyDelivery, next_request_with, reply_with, request_active_with,
+    MalformedRequest, ReplyDelivery, next_request_with, refuse_with, reply_with,
+    request_active_with,
 };
 
 use crate::{Command, ModuleResult, Response, RuntimeClient};

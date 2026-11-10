@@ -21,6 +21,10 @@
 //! This exercises routing and authority. It does not load a signed package,
 //! verify a manifest or start a worker process.
 //!
+//! The builder also composes what trusted policy composes on an installed
+//! host: [`layers`](TestHostBuilder::layers) stacked on a service and the
+//! [`extension_point`](TestHostBuilder::extension_point)s an owner runs.
+//!
 //! [`ScriptedHost`] is the alternative for faults the real runtime will not
 //! produce on request, such as a reply lost in transport.
 mod scripted;
@@ -30,6 +34,7 @@ pub use scripted::ScriptedHost;
 use amaterasu_module_sdk::abi::{
     AbiHeader, BorrowedBytes, HostApi, RuntimeApi, RuntimeDirectApi, STATUS_OK, Status,
 };
+use amaterasu_module_sdk::hooks::{HookOutcome, HookRun};
 use amaterasu_module_sdk::requests::{CallOutcome, OutboundCall};
 use amaterasu_module_sdk::{ManagedModule, RuntimeClient, exports};
 use amaterasu_runtime::{Broker, amaterasu_runtime_direct_v1, amaterasu_runtime_v1};
@@ -143,6 +148,30 @@ impl TestHostBuilder {
         self.configuration
             .hooks
             .insert(name.to_owned(), specification);
+        self
+    }
+
+    /// Declare a hook that `owner` runs and `participants` answer in this
+    /// order, with a one-second deadline for the whole run. Each participant
+    /// also needs the hook's grant: `grants().hook(name)`.
+    pub fn extension_point(self, name: &str, owner: &str, participants: &[&str]) -> Self {
+        let specification = HookSpec {
+            owner: owner.to_owned(),
+            participants: participants.iter().map(|name| (*name).to_owned()).collect(),
+            timeout_ms: 1_000,
+        };
+        self.hook(name, specification)
+    }
+
+    /// Stack `layers` on `service`, outermost first. A consumer's call reaches
+    /// the first layer, and each layer's own call to the service reaches the
+    /// next one, then the provider. A layer needs the service's `call` grant
+    /// to pass a request on.
+    pub fn layers(mut self, service: &str, layers: &[&str]) -> Self {
+        self.configuration.service_layers.insert(
+            service.to_owned(),
+            layers.iter().map(|layer| (*layer).to_owned()).collect(),
+        );
         self
     }
 
@@ -359,5 +388,26 @@ pub fn settle(
     panic!(
         "call {} did not settle; is its provider being ticked?",
         call.operation_id()
+    );
+}
+
+/// Poll a hook run through its owner's `runtime` until it settles, running
+/// `advance` between polls. `advance` normally ticks the participants.
+pub fn settle_hook(
+    runtime: &RuntimeClient,
+    run: &mut HookRun,
+    mut advance: impl FnMut(),
+) -> HookOutcome {
+    let started = Instant::now();
+    while started.elapsed() < SETTLE_LIMIT {
+        if let Poll::Ready(outcome) = run.poll(runtime) {
+            return outcome;
+        }
+        advance();
+        std::thread::yield_now();
+    }
+    panic!(
+        "hook run {} did not settle; are its participants being ticked?",
+        run.operation_id()
     );
 }

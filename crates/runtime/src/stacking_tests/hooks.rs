@@ -213,10 +213,14 @@ fn a_participants_refusal_stops_a_required_hook() {
         ),
         Response::Ok
     ));
-    assert_eq!(
-        error_code(advance(&mut broker, invocation, now)),
-        "refused.stream_active"
-    );
+    match advance(&mut broker, invocation, now) {
+        Response::Error { code, message } => {
+            assert_eq!(code, "refused.stream_active");
+            // The owner can say which participant stopped the operation.
+            assert_eq!(message, "first: a stream is running");
+        }
+        other => panic!("{other:?}"),
+    }
     assert!(poll(&mut broker, "second", now).is_none());
 }
 
