@@ -4213,3 +4213,53 @@ fn failed_lifecycle_prepare_requires_matching_completed_rollback_before_local_re
         assert_eq!(record.lifecycle_prepare_outstanding, !settled);
     }
 }
+
+/// A refused join admits nothing, so its record must not keep waiting for a
+/// lifecycle stream that never existed: that kept every later cleanup of the
+/// record polling for the whole cleanup budget while holding the single job.
+#[test]
+fn rejected_lifecycle_join_leaves_no_outstanding_preparation() {
+    for (reply, outstanding) in [
+        (
+            json!({"status":"rejected","reason":"join_source_unavailable"}),
+            false,
+        ),
+        (
+            json!({"status":"recovery_required","reason":"journal_write_failed"}),
+            true,
+        ),
+    ] {
+        let (mut record, announce) = announced_profile_record();
+        assert!(record.accept_announce(&announce));
+        record.config.lifecycle_session_target = Some(
+            serde_json::from_value(
+                json!({"kind":"session","host_epoch":"epoch","session_id":"session","generation":1}),
+            )
+            .unwrap(),
+        );
+        record.config.lifecycle_settings_revision = Some("7".into());
+        record.config.lifecycle_intent = Some("join".into());
+        record.lifecycle_input_required = Some(false);
+        let mut controller = Controller::new(Settings::default()).unwrap();
+        let start = record.authenticated_start_payload(23).unwrap();
+        controller.schedule_arm(&mut record, start, 8, 9, 0);
+        assert!(record.lifecycle_prepare_outstanding);
+        controller.records.insert(record.id, record);
+        let mut endpoint = Endpoint {
+            verifier_reply: Some(reply.clone()),
+            ..Endpoint::default()
+        };
+        let runtime = client(&mut endpoint);
+        controller.advance_job(&runtime, 1);
+        controller.advance_job(&runtime, 2);
+        let record = &controller.records[&5];
+        assert_eq!(record.lifecycle_prepare_outstanding, outstanding, "{reply}");
+        let stopped =
+            json!({"ok":true,"session":record.session,"state":"stopped","cleanup_error":null});
+        assert_eq!(
+            super::retirement::clean_terminal(record, &stopped),
+            !outstanding && record.lifecycle_target.is_none(),
+            "{reply}"
+        );
+    }
+}

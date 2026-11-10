@@ -9,6 +9,14 @@ pub(super) enum PreparationResolution {
 }
 
 pub(super) fn apply_response(record: &mut Record, payload: &Value) -> PreparationResolution {
+    if refused_without_admission(payload) {
+        // The coordinator keeps no receipt or work for a refused admission,
+        // so no lifecycle stream exists to wait for. Leaving the preparation
+        // outstanding made every later cleanup of this record poll for the
+        // whole cleanup budget while holding the controller's only job.
+        record.lifecycle_prepare_outstanding = false;
+        return PreparationResolution::Rejected;
+    }
     let operation = format!("{}-lifecycle-prepare", record.operation());
     if payload["operation_id"] != operation {
         return PreparationResolution::Unconfirmed;
@@ -108,4 +116,13 @@ pub(super) fn apply_response(record: &mut Record, payload: &Value) -> Preparatio
     record.lifecycle_source_target = Some(source);
     record.lifecycle_prepare_outstanding = false;
     PreparationResolution::Admitted
+}
+
+/// A coordinator refusal carries neither an operation ID nor a target: it
+/// admitted nothing. A refusal that names a target, or a recovery-required
+/// reply, may follow an admitted effect and stays outstanding.
+fn refused_without_admission(payload: &Value) -> bool {
+    payload["status"] == "rejected"
+        && payload.get("operation_id").is_none()
+        && payload.get("target").is_none()
 }

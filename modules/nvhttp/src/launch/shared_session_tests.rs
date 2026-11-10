@@ -794,3 +794,30 @@ fn unrelated_paired_client_can_end_all_shared_streams_and_launch_again() {
     assert_eq!(connection, 81);
     assert_eq!(reply.status, 200);
 }
+
+#[test]
+fn host_shutdown_drains_a_paused_application_before_the_host_deadline() {
+    let (mut controller, mut broker, now) = one_client_application();
+    // The client vanished: its stream failed and the application is paused.
+    let stream = broker.transports.get_mut(&71).unwrap();
+    stream["state"] = json!("failed");
+    stream["failure"] = json!("peer_disconnected");
+    for tick in 1..=200 {
+        controller.poll(now + Duration::from_millis(tick * 50), &mut |command| broker.send(command));
+    }
+    let paused = now + Duration::from_secs(10);
+    assert!(controller.records.values().any(|record| record.state == State::Paused), "{:?}", controller.records.values().map(|record| (record.state, record.stage)).collect::<Vec<_>>());
+    let mut drained_at = None;
+    for tick in 0..=400 {
+        let at = paused + Duration::from_millis(tick * 50);
+        controller.poll(at, &mut |command| broker.send(command));
+        if controller.quiesce(at) {
+            drained_at = Some(tick * 50);
+            break;
+        }
+    }
+    let states: Vec<_> = controller.records.values().map(|record| (record.state, record.stage)).collect();
+    let drained_at = drained_at.unwrap_or_else(|| panic!("shutdown never drained: {states:?}"));
+    assert!(drained_at < 15_000, "drain took {drained_at} ms");
+    assert!(broker.broker.application_stopped);
+}
