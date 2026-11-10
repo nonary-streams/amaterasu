@@ -22,13 +22,14 @@ no wildcards or caller-supplied identity fields.
 | Operation | Authority and result |
 | --- | --- |
 | `get_settings` | Returns this endpoint's startup settings; other principals' settings are inaccessible |
-| `register` | Requires `provide`; a service has one selected provider |
+| `register` | Requires `provide`; a service has one selected provider. A principal that policy lists as a layer of the service registers with the same operation and needs no `provide` grant |
 | `native_register` | Unsafe trusted-provider operation; requires separate `native_provide` grant |
 | `native_bind` | Requires separate `native_use`; binds a versioned table to the authenticated module principal |
 | `native_release` | Only the binding owner can release its native interface |
 | `request` | Requires `call`; queues work and returns a request ID |
 | `poll` | Delivers the next request belonging to this provider |
 | `complete` | Only the provider of a delivered, live request can complete it |
+| `refuse` | The same principal ends the request without a result, stating that it did not perform the operation; the requester reads the error code `refused.<code>` |
 | `check_request` | Provider checks that its delivered request is still active before a native side effect; this is not a lock against later cancellation |
 | `take_result` | Only the requester can read the result |
 | `release_result` | Only the requester can discard a completed/cancelled result and its retry record |
@@ -38,7 +39,18 @@ no wildcards or caller-supplied identity fields.
 | `next_event` / `unsubscribe` | Only the subscription owner can use its handle |
 | `register_hook` | Requires a hook grant and inclusion in its participant list |
 | `run_hook` | Only the configured hook owner can initiate it |
+| `run_hook_operation` | Owner-scoped, idempotent `run_hook` with a retained result. `cleanup` attempts and reports every participant; `chain` gives each participant the previous result |
 | `hook_result` | Owner advances participants in configured order and collects proposals |
+| `lookup_hook` / `cancel_hook` / `release_hook` | Only the owner can find, end or discard its invocation. `release_hook` with `forget` also relinquishes the operation identifier |
+
+Trusted composition can stack principals on a service's provider
+(`service_layers`, outermost first). A call is delivered to the first layer;
+a layer's own call to the service is delivered to the next one, and the last
+layer's call reaches the provider. A request, or a direct call, that a layer
+forwards on behalf of one it received for the same service is shown to the
+next hop with that received request's caller. Calls are refused as
+`unavailable` until every layer and the provider have registered. See
+[stacking and extension points](stacking-and-extension-points.md).
 
 Requests include a deadline, operation ID, service, and payload. Delegated calls
 include a parent request ID; the provider must have received that live request.
@@ -70,13 +82,17 @@ filling the 512-record budget with already consumed internal HTTP/service calls.
 - Recovery requires a new subscription and a revisioned snapshot from the domain
   owner. Snapshot services are not implemented in the fixture.
 - Up to 64 hook invocations can run. One absolute deadline covers the complete
-  ordered invocation. Missing participants and timed-out hooks fail closed.
+  ordered invocation. Missing participants and timed-out hooks fail closed,
+  and the error names the participant that ended a required invocation.
+- The broker keeps 512 hook operation identifiers fenced for its lifetime.
+  Releasing an invocation with `forget` returns its identifier.
+- A service has at most 8 layers, and 64 services can be layered.
 - Hook proposals are not automatically merged. The domain owner must validate them
   and resolve or reject conflicts. Optional fallback policy belongs to that owner.
 
 These conservative development limits need workload validation before production.
 Requests, events, and hooks have Rust envelope types; generic domain payload schema
-registration, generated TypeScript types, per-principal quotas, hook cancellation,
+registration, generated TypeScript types, per-principal quotas,
 and interface adapters remain unfinished. Domain payloads are currently opaque
 JSON with a size bound. Media transport must use dedicated interfaces, not this
 control queue.

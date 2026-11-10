@@ -156,9 +156,11 @@ documented in the module READMEs.
 | `modules/media-transport` | Owner-scoped UDP delivery, bounded audio/video queues, FEC and optional media encryption |
 | `fixtures/media-probe` | Signed-library native binding integration without opening hardware |
 | `fixtures/echo` | Replaceable module and failure-injection fixture |
+| `sdk/examples/service-guard` | Example layer stacked on another module's service, with its policy fragment |
 
 See [architecture](docs/architecture.md), [protocol](docs/control-protocol.md),
 [writing and testing a module](docs/control-plane-sdk.md),
+[stacking on another module](docs/stacking-and-extension-points.md),
 [parity status](docs/parity.md), and [dependency decisions](docs/dependencies.md).
 
 The [frontend](frontend/README.md) builds without a runtime framework.

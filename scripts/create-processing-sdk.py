@@ -24,6 +24,9 @@ def main():
         shutil.copytree(ROOT / "sdk" / "include", destination / "sdk" / "include")
         shutil.copytree(ROOT / "sdk" / "examples" / "frame-processor",
                         destination / "modules" / "example-frame-processor")
+        # A layer stacked on another module's service, with tests on the test kit.
+        shutil.copytree(ROOT / "sdk" / "examples" / "service-guard",
+                        destination / "modules" / "example-service-guard")
         helper = destination / "crates" / "rtx-runtime"
         helper.mkdir()
         shutil.copytree(ROOT / "crates" / "rtx-runtime" / "src", helper / "src")
@@ -70,6 +73,8 @@ This workspace contains the Rust SDK, its contract crates, C headers, and an
 independently buildable CPU pass-through processor in `modules/example-frame-processor`.
 `crates/module-testkit` runs a module against the control runtime in
 `crates/runtime` inside an ordinary `cargo test`.
+`modules/example-service-guard` is a layer stacked on another module's
+service; `cargo test -p example-service-guard` runs it on that test kit.
 `crates/rtx-runtime` is a separate Cargo workspace: it is an NVIDIA-specific
 helper, not a dependency of the generic SDK. A separately cloned RTX HDR
 checkout can be placed in `modules/rtx-hdr` and built from this workspace.

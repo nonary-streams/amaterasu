@@ -34,6 +34,7 @@ members = [
     "fixtures/echo",
     "fixtures/data-plane",
     "fixtures/extension-example",
+    "sdk/examples/service-guard",
     "fixtures/media-probe",
     "fixtures/autonomous-video-probe",
     "fixtures/stream-source",

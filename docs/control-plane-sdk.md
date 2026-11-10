@@ -13,6 +13,10 @@ These helpers cover queued requests. Media and other per-frame data use
 microseconds uses a [direct call](direct-calls.md). Native modules are trusted
 code: grants decide what the broker routes, they are not a sandbox.
 
+A module that builds on another one, by wrapping its service, taking part in
+its hooks or following its events, uses the same helpers; see
+[stacking and extension points](stacking-and-extension-points.md).
+
 ## A provider
 
 ```rust
@@ -91,6 +95,11 @@ amaterasu_module_sdk::export_module!(Counter);
 - `request_active` (or `request.is_active`) checks, immediately before a side
   effect, that the request can still take a reply. It is an observation, not a
   lock.
+- `refuse` (or `request.refuse`) ends a request the provider did not perform,
+  with a short code and one line of text. The caller's call settles as
+  `Refused`, so it knows a new call is safe. `malformed.refuse(&runtime)`
+  declines an undecodable payload as `invalid_request`. Refuse only when
+  nothing happened; after an effect, reply in the service's own terms.
 
 Reply on a later tick by keeping `request.id` and calling
 `runtime.reply(id, &payload)` when the work finishes. Never block in `tick`.
@@ -118,7 +127,7 @@ let mut call = OutboundCall::request(
 if let Poll::Ready(outcome) = call.poll(&runtime) {
     match outcome.decode::<Total>() {
         CallOutcome::Completed(total) => { /* the provider's reply */ }
-        CallOutcome::Refused(refusal) => { /* no provider saw the request */ }
+        CallOutcome::Refused(refusal) => { /* the operation was not performed */ }
         CallOutcome::Unconfirmed(error) => { /* the provider may have acted */ }
     }
 }
@@ -127,8 +136,8 @@ if let Poll::Ready(outcome) = call.poll(&runtime) {
 | Outcome | What is known | Broker record |
 | --- | --- | --- |
 | `Completed` | The provider replied. | Released. |
-| `Refused` | The broker never admitted the request: no grant, no provider, invalid input, a full table, or cancellation before admission. Starting a new call is safe. | None was created. |
-| `Unconfirmed` | The request was or may have been admitted and ended without a usable reply: deadline, cancellation, repeated transport failure, or a reply of the wrong shape. | Kept for a mutating call, released for a read-only one. |
+| `Refused` | The operation was not performed. Either the broker never admitted the request (no grant, no provider, invalid input, a full table, cancellation before admission), or the provider or a layer in front of it declined it with `refuse`. Starting a new call is safe. | None was created, or released. |
+| `Unconfirmed` | The request was or may have been admitted and ended without a usable reply: deadline, cancellation, repeated transport failure, or a reply of the wrong shape. | Kept for a mutating call, released for a read-only or single-use one. |
 
 The operation identifier is the retry identity. The broker returns the
 original request for an identical submission while it retains the operation,
@@ -141,6 +150,9 @@ input.
 
 Declare a call `read_only()` when the provider changes no state for it. A
 read-only call that ends without a reply releases its record at once.
+Declare it `single_use()` when its operation identifier will never be
+submitted again: no repeat can need the record, so it is released the same
+way, and the outcome is still `Unconfirmed`.
 
 `cancel()` asks for the request to end; keep polling. A reply the provider
 recorded first is still returned. A call whose admission is unknown is looked
@@ -162,13 +174,16 @@ and a module that needs to decide matches on the type:
 | `ControlError` | Meaning |
 | --- | --- |
 | `Transport` | The command or its reply was lost. The broker may have acted. |
-| `Broker(BrokerError)` | The broker answered with an error; `code` is an `ErrorCode`. |
+| `Broker(BrokerError)` | The reply was an error; `code` is an `ErrorCode` and `origin` says whether the broker or the serving module decided it. |
 | `UnexpectedReply` | The broker answered with a reply the operation does not define. |
 | `Payload` | A payload could not be encoded or decoded. |
 
 `ErrorCode` names the codes the runtime produces. A code a provider defines
 for its own service arrives as `ErrorCode::Other`. Use `error.is(&code)` to
-test for one.
+test for a code the broker itself decided; it never matches a provider's
+refusal, so a provider that refuses with `not_found` is not mistaken for a
+handle the broker no longer holds. `error.refusal()` returns the provider's
+refusal when that is what the error is.
 
 ## Testing a module
 
@@ -206,11 +221,16 @@ step. It replaces a hand-written `extern "C"` endpoint.
 Neither loads a signed package, verifies a manifest, or starts a worker
 process. Platform effects and hardware behavior need their own tests.
 
+The builder also stacks layers on a service and declares hooks, and
+`settle_hook` drives a hook run; see
+[stacking and extension points](stacking-and-extension-points.md#testing).
+
 `crates/module-sdk/tests/control_plane.rs` is a complete provider and its
 tests. The session, foreground-context and updater modules use these helpers.
 
 ## Not covered yet
 
-Events and hooks still use the raw `subscribe`, `publish` and hook commands.
 Session-lifecycle participation is hand-written by each provider against the
 types in `extension_api`; see [the session extension API](session-extension-api.md).
+No built-in module runs a hook yet, and the default profiles compose no
+layers: both exist once an operator's policy declares them.

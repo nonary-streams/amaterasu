@@ -1,0 +1,16 @@
+[package]
+name = "example-service-guard"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+amaterasu-module-sdk.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+amaterasu-module-testkit.workspace = true

@@ -1,0 +1,15 @@
+{
+  "principals": {
+    "example.service-guard": { "call": ["example.notes/1"] }
+  },
+  "service_layers": {
+    "example.notes/1": ["example.service-guard"]
+  },
+  "settings": {
+    "example.service-guard": {
+      "services": {
+        "example.notes/1": { "deny": ["example.untrusted"] }
+      }
+    }
+  }
+}
