@@ -100,7 +100,7 @@ fn registration_waits_for_persistence_and_preserves_parent_authority() {
             },
             Command::Publish { topic, payload } => {
                 assert_eq!(stage, 4);
-                assert_eq!(topic, crate::CHANGED_TOPIC);
+                assert_eq!(topic, CONFIGURATION_CHANGED.name());
                 assert_eq!(payload, json!({"owner":"caller.one","revision":1}));
                 Response::Ok
             }
@@ -609,7 +609,7 @@ fn change_events_wait_for_durable_ack_and_survive_cancelled_completion() {
                     payload: json!({"ok":true,"revision":12}),
                 },
                 Command::Publish { topic, payload } => {
-                    assert_eq!(topic, crate::CHANGED_TOPIC);
+                    assert_eq!(topic, CONFIGURATION_CHANGED.name());
                     assert_eq!(payload, json!({"owner":"team/worker","revision":4}));
                     published = true;
                     Response::Ok
@@ -922,7 +922,7 @@ fn product_update_uses_state_cas_and_returns_the_committed_document() {
                     payload: json!({"ok":true,"revision":12}),
                 },
                 Command::Publish { topic, payload } => {
-                    assert_eq!(topic, crate::CHANGED_TOPIC);
+                    assert_eq!(topic, CONFIGURATION_CHANGED.name());
                     assert_eq!(
                         payload,
                         json!({

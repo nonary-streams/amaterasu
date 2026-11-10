@@ -191,12 +191,17 @@ fn an_unknown_inner_outcome_is_never_reported_as_a_refusal() {
             "deadline_exceeded",
             "request deadline elapsed",
         )),
+        Ok(Response::Ok),
     ]);
     let mut relayed = |_: &IncomingRequest<Value>, outcome: CallOutcome| Answer::relay(outcome);
     assert_eq!(script.poll(&mut relay, &mut relayed).unwrap(), 0);
     assert_eq!(script.poll(&mut relay, &mut relayed).unwrap(), 1);
     // Nothing is said to the consumer: its own deadline reports the unknown.
-    assert_eq!(script.operations(), ["request", "take_result"]);
+    // The forward is never repeated, so its ended record is released.
+    assert_eq!(
+        script.operations(),
+        ["request", "take_result", "release_result"]
+    );
     assert!(relay.is_empty());
 }
 

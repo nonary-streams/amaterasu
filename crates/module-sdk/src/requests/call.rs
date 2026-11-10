@@ -147,7 +147,8 @@ enum Stage {
 /// and keep polling to end it sooner.
 pub struct OutboundCall {
     submission: Submission,
-    read_only: bool,
+    /// Whether a record that ends without a reply is released at once.
+    releases_ended_record: bool,
     cancel_requested: bool,
     stage: Stage,
     first_sent: Option<Instant>,
@@ -184,7 +185,7 @@ impl OutboundCall {
                 operation_id: options.operation_id.to_owned(),
                 parent: options.parent,
             },
-            read_only: false,
+            releases_ended_record: false,
             cancel_requested: false,
             stage: Stage::Unsent,
             first_sent: None,
@@ -196,7 +197,18 @@ impl OutboundCall {
     /// call that ends without a reply has its broker record released at once,
     /// because nothing needs protecting from a repeat.
     pub fn read_only(mut self) -> Self {
-        self.read_only = true;
+        self.releases_ended_record = true;
+        self
+    }
+
+    /// Declare that this operation identifier is never submitted again, as
+    /// when it came from [`unique_operation_id`] and the caller does not
+    /// retry. A record kept for a repeat that cannot come only occupies one
+    /// of the broker's bounded slots, so a call that ends without a reply
+    /// releases its record at once. The outcome is still
+    /// [`CallOutcome::Unconfirmed`]: the provider may have acted.
+    pub fn single_use(mut self) -> Self {
+        self.releases_ended_record = true;
         self
     }
 
@@ -368,7 +380,7 @@ impl OutboundCall {
     ) -> Poll<CallOutcome> {
         let record_is_gone = ending.code == ErrorCode::NotFound;
         let ending = CallOutcome::Unconfirmed(ControlError::Broker(ending));
-        if self.read_only && !record_is_gone {
+        if self.releases_ended_record && !record_is_gone {
             return self.release_then(request, ending, send);
         }
         // A mutating request keeps its record: until it expires, the same

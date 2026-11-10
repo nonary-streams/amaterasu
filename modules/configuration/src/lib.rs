@@ -7,7 +7,6 @@ use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, RuntimeClient};
 use pipeline::Pipeline;
 
 const SERVICE: &str = "amaterasu.configuration/1";
-const CHANGED_TOPIC: &str = "amaterasu.configuration.changed/1";
 const STATE_SERVICE: &str = "amaterasu.state/1";
 
 struct ConfigurationModule {

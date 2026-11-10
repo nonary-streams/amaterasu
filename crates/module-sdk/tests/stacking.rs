@@ -530,6 +530,25 @@ fn an_extension_point_can_run_far_more_often_than_the_fenced_identifiers_allow()
 }
 
 #[test]
+fn a_hook_policy_does_not_declare_tells_its_owner_nobody_extends_it() {
+    let host = hook_host(json!({"entry": "one"}), json!({"entry": "two"}));
+    let launcher = host.client("example.launcher");
+    let mut run = HookRun::new(
+        "example.launch.finished/1",
+        &unique_operation_id("test.undeclared"),
+        &json!({}),
+    )
+    .unwrap();
+    let outcome = settle_hook(&launcher, &mut run, || {});
+    assert!(outcome.is_undeclared(), "{outcome:?}");
+
+    // A declared hook that cannot run is a different answer.
+    let absent = settle_hook(&launcher, &mut environment_run(), || {});
+    assert!(matches!(absent, HookOutcome::Refused(_)));
+    assert!(!absent.is_undeclared());
+}
+
+#[test]
 fn only_the_hooks_owner_can_run_it() {
     let host = hook_host(json!({"entry": "one"}), json!({"entry": "two"}));
     let _first = host.load::<PathContributor>("example.first");

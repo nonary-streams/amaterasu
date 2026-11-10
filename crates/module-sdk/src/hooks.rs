@@ -52,6 +52,18 @@ pub enum HookOutcome {
     Unconfirmed(ControlError),
 }
 
+impl HookOutcome {
+    /// Policy declares no such hook, so no module is composed into this
+    /// extension point. That holds until the runtime restarts, and the owner
+    /// carries on with its own behavior.
+    pub fn is_undeclared(&self) -> bool {
+        matches!(
+            self,
+            Self::Refused(refusal) if !refusal.is_refusal() && refusal.code == ErrorCode::NotFound
+        )
+    }
+}
+
 /// One participant's part in a run.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Contribution {

@@ -1,5 +1,6 @@
 use super::*;
 use serde_json::Value;
+use serde_json::json;
 
 fn create(coordinator: &mut Coordinator, caller: &str, key: &str) -> u64 {
     let response = coordinator.handle(caller, json!({"action":"create","key":key}));

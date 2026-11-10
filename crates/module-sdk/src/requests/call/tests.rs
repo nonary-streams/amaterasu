@@ -452,3 +452,19 @@ fn a_refusal_is_still_returned_when_its_record_cannot_be_released() {
         Poll::Ready(CallOutcome::Refused(refusal)) if refusal.code == ErrorCode::Busy
     ));
 }
+
+#[test]
+fn a_single_use_call_releases_a_record_no_repeat_will_need() {
+    let mut call = write_call().single_use();
+    let mut script = Script::new([accepted(), refused("cancelled"), Ok(Response::Ok)]);
+    assert!(script.poll(&mut call).is_pending());
+    // The provider may still have acted, so the outcome stays unconfirmed.
+    assert!(matches!(
+        script.poll(&mut call),
+        Poll::Ready(CallOutcome::Unconfirmed(_))
+    ));
+    assert_eq!(
+        script.sent_operations(),
+        ["request", "take_result", "release_result"]
+    );
+}

@@ -4,6 +4,10 @@ use crate::protocol::{
     product_success, success,
 };
 use amaterasu_configuration_schema::{defaults, validate_values};
+use amaterasu_module_sdk::events::publish_with;
+use amaterasu_module_sdk::events::topics::{
+    CONFIGURATION_CHANGED, ConfigurationChanged, ConfigurationKind,
+};
 use amaterasu_module_sdk::{Command, ModuleResult, Response};
 use serde_json::{Value, json};
 use std::collections::VecDeque;
@@ -889,10 +893,12 @@ fn publish_change(send: &mut impl FnMut(Command) -> TransportResult, key: &str, 
         .expect("caller-scoped state key");
     // Persistence is already durable: an unavailable event grant, full queue, or
     // transport error must not turn a committed mutation into an apparent failure.
-    let _ = send(Command::Publish {
-        topic: crate::CHANGED_TOPIC.into(),
-        payload: json!({"owner": owner, "revision": revision}),
-    });
+    let change = ConfigurationChanged {
+        owner: owner.to_owned(),
+        revision,
+        kind: None,
+    };
+    let _ = publish_with(send, &CONFIGURATION_CHANGED, &change);
 }
 
 fn publish_product_change(
@@ -903,10 +909,12 @@ fn publish_product_change(
     let owner = key
         .strip_prefix("product/")
         .expect("product settings state key");
-    let _ = send(Command::Publish {
-        topic: crate::CHANGED_TOPIC.into(),
-        payload: json!({"owner": owner, "revision": revision, "kind":"product_settings"}),
-    });
+    let change = ConfigurationChanged {
+        owner: owner.to_owned(),
+        revision,
+        kind: Some(ConfigurationKind::ProductSettings),
+    };
+    let _ = publish_with(send, &CONFIGURATION_CHANGED, &change);
 }
 
 fn runtime_failure(response: Response) -> Value {

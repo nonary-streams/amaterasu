@@ -4,11 +4,11 @@ mod leases;
 mod protocol;
 pub use coordinator::Coordinator;
 
-use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, RuntimeClient};
-use serde_json::json;
+use amaterasu_module_sdk::events::topics::{SESSION_CHANGED, SessionChanged};
+use amaterasu_module_sdk::{ManagedModule, ModuleResult, RuntimeClient};
 
 pub const SERVICE: &str = "amaterasu.session/1";
-pub const CHANGED_TOPIC: &str = "amaterasu.session.changed/1";
+pub const CHANGED_TOPIC: &str = SESSION_CHANGED.name();
 
 pub struct SessionModule {
     runtime: RuntimeClient,
@@ -33,10 +33,10 @@ impl ManagedModule for SessionModule {
         if self.coordinator.revision() != previous_revision {
             // Notifications are advisory. State is committed even if publication fails;
             // clients recover through revisioned snapshots and caller-scoped lists.
-            let _ = self.runtime.send(Command::Publish {
-                topic: CHANGED_TOPIC.into(),
-                payload: json!({"revision": self.coordinator.revision()}),
-            });
+            let change = SessionChanged {
+                revision: self.coordinator.revision(),
+            };
+            let _ = self.runtime.publish(&SESSION_CHANGED, &change);
         }
         // A caller can cancel its request after dispatch. Committed state stands
         // and an idempotent retry recovers it when the reply is discarded.

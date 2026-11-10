@@ -75,7 +75,9 @@ impl IncomingRequest<Value> {
     /// this request as `parent` to make further calls for it.
     pub fn forward_with<P: Serialize>(&self, payload: &P) -> ControlResult<OutboundCall> {
         let operation_id = self.forward_operation_id();
+        // A request is forwarded once, so no repeat needs the ended record.
         OutboundCall::request(self.forward_options(&operation_id), payload)
+            .map(OutboundCall::single_use)
     }
 
     /// Like [`forward`](Self::forward), for a service whose methods are
@@ -108,6 +110,7 @@ impl IncomingRequest<Value> {
             },
             arguments,
         )
+        .map(OutboundCall::single_use)
     }
 
     fn api_envelope(&self) -> ControlResult<ApiEnvelope> {

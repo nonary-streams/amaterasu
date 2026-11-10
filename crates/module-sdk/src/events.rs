@@ -11,14 +11,18 @@
 //! publisher and its subscribers share one definition:
 //!
 //! ```ignore
-//! pub const SESSION_CHANGED: Topic<SessionChanged> = Topic::new("amaterasu.session.changed/1");
+//! pub const LIBRARY_CHANGED: Topic<LibraryChanged> = Topic::new("example.library.changed/1");
 //!
-//! runtime.publish(&SESSION_CHANGED, &SessionChanged { revision })?;
+//! runtime.publish(&LIBRARY_CHANGED, &LibraryChanged { revision })?;
 //!
-//! let mut changes = Subscription::open(&runtime, &SESSION_CHANGED, Backlog::Latest(1))?;
+//! let mut changes = Subscription::open(&runtime, &LIBRARY_CHANGED, Backlog::Latest(1))?;
 //! // each tick:
 //! while let Some(delivery) = changes.next(&runtime)? { ... }
 //! ```
+//!
+//! The topics the built-in modules publish are defined in [`topics`].
+pub mod topics;
+
 use crate::control_error::{ControlError, ControlResult, ErrorCode, checked};
 use crate::{Command, ModuleResult, Response, RuntimeClient};
 use serde::{Serialize, de::DeserializeOwned};
