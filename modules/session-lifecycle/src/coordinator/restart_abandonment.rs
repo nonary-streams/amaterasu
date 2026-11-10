@@ -3,8 +3,10 @@
 //! A session owner may keep its application records only in memory. After a
 //! restart it can never report that application retired, so the session would
 //! remain `RecoveryRequired` forever. Abandonment records the application as
-//! untracked (not retired) and resumes the session's exact, undispatched
-//! release work through the normal scheduler. Provider cleanup results remain
+//! untracked (not retired) and runs the session's release through the normal
+//! scheduler: the exact undispatched work when the owner had already asked the
+//! session to end, or the same frozen-graph work when the host stopped while
+//! the session was still live or paused. Provider cleanup results remain
 //! authoritative: nothing here settles an obligation or claims retirement.
 use super::*;
 
@@ -99,9 +101,12 @@ impl Coordinator {
         require_abandonable_session(&next, session, generation)?;
         require_no_live_session_state(&next, session)?;
         require_known_obligation_owners(&next, session)?;
-        let release_key = retained_release_key(&next, session)?;
         let abandoned_target = session_target(session);
-        let mut work = supersede_release_receipt(&mut next, &release_key)?;
+        let release_graph = session.provider_graph.clone();
+        let mut work = match retained_release_key(&next, session)? {
+            Some(release_key) => supersede_release_receipt(&mut next, &release_key)?,
+            None => self.unrequested_release_work(&abandoned_target, release_graph)?,
+        };
         work.recovery_authorized_epoch = Some(next.host_epoch.clone());
         record_untracked_application(&mut next, session_id)?;
         let response = json!({"status":"pending","operation_id":payload["operation_id"],
@@ -120,6 +125,23 @@ impl Coordinator {
         );
         save(&self.shared, next)?;
         Ok(response)
+    }
+}
+
+impl Coordinator {
+    /// The release `end_session` would have created had the owner asked before
+    /// the host stopped: the session's own frozen provider graph, in reverse
+    /// order, with no provider called yet.
+    fn unrequested_release_work(
+        &self,
+        target: &LifecycleTarget,
+        graph: Option<ProviderGraph>,
+    ) -> ModuleResult<Work> {
+        let mut work = self.new_work(LifecyclePhase::SessionRelease, target.clone(), &json!({}))?;
+        work.use_release_graph(graph);
+        work.reason = Some(ReleaseReason::End);
+        work.waiting_retirement = true;
+        Ok(work)
     }
 }
 
@@ -241,17 +263,23 @@ fn require_known_obligation_owners(journal: &Journal, session: &SessionRecord) -
     Ok(())
 }
 
-/// The only retained work for the session must be its own undispatched
-/// release, fenced while waiting for application retirement. Any provider
-/// progress or failed-start evidence means the restart's effect is unknown.
-fn retained_release_key(journal: &Journal, session: &SessionRecord) -> ModuleResult<String> {
+/// Any retained work for the session must be its own undispatched release,
+/// fenced while waiting for application retirement. Provider progress or
+/// failed-start evidence means the restart's effect is unknown. A session with
+/// no retained work was never asked to end before the host stopped.
+fn retained_release_key(
+    journal: &Journal,
+    session: &SessionRecord,
+) -> ModuleResult<Option<String>> {
     let mut retained = journal.receipts.iter().filter(|(_, receipt)| {
         receipt.work.as_ref().is_some_and(|work| {
             operations::target_parts(&work.target)
                 .is_ok_and(|(epoch, id, _, _)| epoch == session.host_epoch && id == session.id)
         })
     });
-    let (key, receipt) = retained.next().ok_or("release_work_unavailable")?;
+    let Some((key, receipt)) = retained.next() else {
+        return Ok(None);
+    };
     if retained.next().is_some() {
         return Err("session_work_retained".into());
     }
@@ -262,7 +290,7 @@ fn retained_release_key(journal: &Journal, session: &SessionRecord) -> ModuleRes
     if !undispatched_release(work) {
         return Err("restart_effect_unknown".into());
     }
-    Ok(key.clone())
+    Ok(Some(key.clone()))
 }
 
 fn owner_release_receipt(receipt: &Receipt, work: &Work, session: &SessionRecord) -> bool {
@@ -440,6 +468,74 @@ pub(super) mod tests {
         json!({"obligation_id":id,"provider":"display","resource_id":id,"mutation_domain":null,
             "depends_on":[],"payload":{},"cleanup_method":{"service":"display/1",
                 "method":"lifecycle_callback","interface_major":1,"interface_minor":0,"schema_revision":1}})
+    }
+
+    /// Replays the owner's startup sweep against a copy of an installed
+    /// journal and reports which stranded sessions abandonment accepts. The
+    /// copy is opened in a private directory; the original is only read.
+    #[test]
+    #[ignore = "needs AMATERASU_JOURNAL_COPY pointing at a copied lifecycle journal"]
+    fn installed_journal_stranded_sessions_are_accepted_for_abandonment() {
+        let source = std::env::var("AMATERASU_JOURNAL_COPY").expect("AMATERASU_JOURNAL_COPY");
+        let root = std::env::temp_dir().join(format!("journal-replay-{}", identifier().unwrap()));
+        std::fs::create_dir(&root).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let journal_path = root.join("journal.json");
+        std::fs::copy(&source, &journal_path).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&journal_path, std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+        }
+        let mut coordinator = Coordinator::open(&journal_path).unwrap();
+        coordinator.configure_for_test(LifecycleSettings::default());
+        let epoch = coordinator.shared.borrow().value.host_epoch.clone();
+        let mut outcomes = std::collections::BTreeMap::<String, usize>::new();
+        let mut stranded = 0;
+        loop {
+            let listing = coordinator.handle(
+                OWNER,
+                OWNER,
+                json!({"operation":"snapshot","restart_stranded":true}),
+            );
+            assert_eq!(listing["status"], "ok", "{listing}");
+            let sessions = listing["sessions"].as_array().unwrap().clone();
+            let mut accepted = 0;
+            for session in &sessions {
+                let id = session["session_id"].as_str().unwrap();
+                let response = coordinator.handle(
+                    OWNER,
+                    OWNER,
+                    json!({"operation":"recover_session","restart_abandonment":true,
+                        "operation_id":format!("replay-{id}"),
+                        "target":{"kind":"session","host_epoch":epoch,"session_id":id,
+                            "generation":session["generation"]}}),
+                );
+                let outcome = if response["status"] == "pending" {
+                    accepted += 1;
+                    "accepted".to_owned()
+                } else {
+                    response["reason"].as_str().unwrap_or("unknown").to_owned()
+                };
+                *outcomes.entry(outcome).or_default() += 1;
+            }
+            stranded += sessions.len();
+            if listing["truncated"] != true || accepted == 0 {
+                break;
+            }
+        }
+        println!("stranded={stranded} outcomes={outcomes:?}");
+        // Accepting every request must leave a journal the coordinator can
+        // still validate and reopen.
+        validate_journal(&coordinator.shared.borrow().value).unwrap();
+        drop(coordinator);
+        Coordinator::open(&journal_path).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// The startup sweep must find stranded sessions even when retained

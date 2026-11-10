@@ -101,6 +101,28 @@ pub trait PrepareAuthority {
         plan: &ResourcePlan,
         admission_id: &str,
     ) -> ModuleResult<()>;
+    /// Whether another admitted operation still holds a mutation domain this
+    /// plan needs. The driver waits for it instead of failing the operation.
+    fn domains_reserved(&self, _plan: &ResourcePlan) -> bool {
+        false
+    }
+}
+
+/// `admit_plan` reports this when another admitted operation holds a domain.
+/// It is contention between two valid operations, never a provider failure.
+pub(crate) const MUTATION_DOMAIN_RESERVED: &str = "mutation domain is reserved";
+
+/// How long one provider step waits for a reserved mutation domain. A release
+/// callback normally completes well inside this; past it the contention is
+/// reported like any other admission failure.
+const DOMAIN_WAIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// A plan that could not be admitted because its mutation domain was reserved.
+/// Nothing was admitted or sent for it, so it is discarded and planned again
+/// once the domain frees; the provider's revision will have moved by then.
+struct DomainWait {
+    plan: ResourcePlan,
+    since: std::time::Instant,
 }
 
 pub struct PrepareDriver {
@@ -108,6 +130,8 @@ pub struct PrepareDriver {
     dispatcher: Option<ProviderDispatcher>,
     journal_failed: bool,
     allow_controls: bool,
+    domain_wait: Option<DomainWait>,
+    domain_wait_limit: std::time::Duration,
 }
 
 impl PrepareDriver {
@@ -291,7 +315,20 @@ impl PrepareDriver {
             dispatcher,
             journal_failed: false,
             allow_controls: composed,
+            domain_wait: None,
+            domain_wait_limit: DOMAIN_WAIT_LIMIT,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_domain_wait_limit(&mut self, limit: std::time::Duration) {
+        self.domain_wait_limit = limit;
+    }
+
+    /// True while this step is only waiting for another operation's domain.
+    #[cfg(test)]
+    pub(crate) fn waiting_for_domain(&self) -> bool {
+        self.domain_wait.is_some()
     }
     pub fn state(&self) -> &PrepareState {
         &self.state
@@ -322,6 +359,16 @@ impl PrepareDriver {
                 | PreparePhase::RecoveryRequired
         ) {
             return Ok(());
+        }
+        // Once the domain is free the provider is asked to plan again. The
+        // first contention time is kept so repeated contention shares a bound.
+        if let Some(wait) = &self.domain_wait
+            && authority.domains_reserved(&wait.plan)
+        {
+            if wait.since.elapsed() < self.domain_wait_limit {
+                return Ok(());
+            }
+            return Err(MUTATION_DOMAIN_RESERVED.into());
         }
         if matches!(
             self.state.phase,
@@ -416,6 +463,36 @@ impl PrepareDriver {
             }
             DispatchState::Ready => Ok(()),
         }
+    }
+
+    /// Discard a plan whose domain is held by another admitted operation and
+    /// return to planning. No admission exists and no effect was sent, so the
+    /// state is the same as before the plan was requested.
+    fn wait_for_domain(
+        &mut self,
+        plan: ResourcePlan,
+        journal: &mut impl PrepareJournal,
+    ) -> ModuleResult<()> {
+        let since = self
+            .domain_wait
+            .as_ref()
+            .map_or_else(std::time::Instant::now, |wait| wait.since);
+        if since.elapsed() >= self.domain_wait_limit {
+            return Err(MUTATION_DOMAIN_RESERVED.into());
+        }
+        let mut next = self.state.clone();
+        next.phase = PreparePhase::Plan;
+        next.dispatch = None;
+        next.pending_receipt = None;
+        next.status_polls = 0;
+        if let Err(error) = journal.persist(&next) {
+            self.journal_failed = true;
+            return Err(error);
+        }
+        self.state = next;
+        self.dispatcher = None;
+        self.domain_wait = Some(DomainWait { plan, since });
+        Ok(())
     }
 
     fn make_call(
@@ -541,10 +618,17 @@ impl PrepareDriver {
                 if !plan.control_proposals.is_empty() && !self.allow_controls {
                     return Err("resource control proposals are not supported".into());
                 }
-                let admission = authority.admit_plan(participant, plan)?;
+                let admission = match authority.admit_plan(participant, plan) {
+                    Ok(admission) => admission,
+                    Err(error) if error == MUTATION_DOMAIN_RESERVED => {
+                        return self.wait_for_domain(plan.clone(), journal);
+                    }
+                    Err(error) => return Err(error),
+                };
                 if admission.is_empty() {
                     return Err("empty admission ID".into());
                 }
+                self.domain_wait = None;
                 next.plan = Some(plan.clone());
                 next.admission_id = Some(admission);
                 next.phase = if next.request.operation == ProviderOperation::ResourceFinalizePlan {
@@ -857,6 +941,182 @@ mod tests {
         assert_eq!(authority.polls, 2);
         assert_eq!(authority.sequence, 3);
         assert_eq!(driver.state.last_sequence, 3);
+    }
+
+    /// Refuses admission while another operation holds the domain.
+    struct ContendedAuthority {
+        inner: Authority,
+        reserved: bool,
+        refused: usize,
+    }
+    impl PrepareAuthority for ContendedAuthority {
+        fn allocate(&mut self, provider: &str) -> ModuleResult<(u64, String)> {
+            self.inner.allocate(provider)
+        }
+        fn allocate_poll_id(&mut self, provider: &str) -> ModuleResult<String> {
+            self.inner.allocate_poll_id(provider)
+        }
+        fn approved_call(
+            &mut self,
+            participant: &ParticipantSettings,
+            method: &MethodSettings,
+            arguments: Value,
+            operation_id: String,
+        ) -> ModuleResult<ProviderCall> {
+            self.inner
+                .approved_call(participant, method, arguments, operation_id)
+        }
+        fn admit_plan(
+            &mut self,
+            participant: &ParticipantSettings,
+            plan: &ResourcePlan,
+        ) -> ModuleResult<String> {
+            if self.reserved {
+                self.refused += 1;
+                return Err(MUTATION_DOMAIN_RESERVED.into());
+            }
+            self.inner.admit_plan(participant, plan)
+        }
+        fn validate_rights(
+            &mut self,
+            participant: &ParticipantSettings,
+            plan: &ResourcePlan,
+            admission_id: &str,
+        ) -> ModuleResult<()> {
+            self.inner.validate_rights(participant, plan, admission_id)
+        }
+        fn domains_reserved(&self, _: &ResourcePlan) -> bool {
+            self.reserved
+        }
+    }
+
+    /// Answers every plan and callback immediately and records plan sequences.
+    fn immediate_provider(
+        plans: &mut Vec<u64>,
+        callbacks: &mut usize,
+        method_in_flight: &mut String,
+        command: Command,
+    ) -> ModuleResult<Response> {
+        match command {
+            Command::QueryApiApproval {
+                service,
+                method,
+                interface_major,
+                min_minor,
+            } => Ok(Response::Result {
+                payload: json!({"provider":"provider","method":{"service":service,"method":method,"interface_major":interface_major,"interface_minor":min_minor}}),
+            }),
+            Command::CallApi {
+                method, payload, ..
+            } => {
+                match method.as_str() {
+                    "plan" => plans.push(payload["provider_sequence"].as_u64().unwrap()),
+                    "callback" => *callbacks += 1,
+                    other => panic!("unexpected method {other}"),
+                }
+                *method_in_flight = method;
+                Ok(Response::Accepted { id: 5 })
+            }
+            Command::TakeResult { .. } => Ok(Response::Result {
+                payload: if method_in_flight == "plan" {
+                    json!({"status":"planned","plan":{"plan_id":"plan","revision":1,"resources":[],"mutation_domains":[],"required_capabilities":[],"constraints":{},"obligations":[],"affected_consumers":[],"consumer_change":"live","candidate_constraint":null,"allowed_degradation":[]}})
+                } else {
+                    json!({"status":"prepared","candidate":null,"obligations":[]})
+                },
+            }),
+            Command::ReleaseResult { .. } => Ok(Response::Ok),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_reserved_domain_is_waited_out_and_planned_again_instead_of_failing() {
+        let (settings, state) = fixture();
+        let mut driver = PrepareDriver::new(state, &settings).unwrap();
+        let mut authority = ContendedAuthority {
+            inner: Authority {
+                sequence: 1,
+                rights: false,
+                polls: 0,
+            },
+            reserved: true,
+            refused: 0,
+        };
+        let mut journal = Journal::default();
+        let (mut plans, mut callbacks, mut method) = (Vec::new(), 0, String::new());
+        let mut send =
+            |command: Command| immediate_provider(&mut plans, &mut callbacks, &mut method, command);
+        for _ in 0..16 {
+            driver
+                .advance(&settings, &mut authority, &mut journal, &mut send)
+                .unwrap();
+            if driver.waiting_for_domain() {
+                break;
+            }
+        }
+        // Contention leaves the step exactly as it was before planning.
+        assert!(driver.waiting_for_domain());
+        assert_eq!(driver.state().phase, PreparePhase::Plan);
+        assert!(driver.state().admission_id.is_none());
+        assert!(driver.state().dispatch.is_none());
+        assert_eq!(authority.refused, 1);
+        let persisted = journal.states.len();
+        // While the domain is held nothing is sent and nothing is written.
+        for _ in 0..8 {
+            driver
+                .advance(&settings, &mut authority, &mut journal, &mut send)
+                .unwrap();
+        }
+        assert_eq!(journal.states.len(), persisted);
+        authority.reserved = false;
+        for _ in 0..32 {
+            driver
+                .advance(&settings, &mut authority, &mut journal, &mut send)
+                .unwrap();
+            if driver.state().phase == PreparePhase::Prepared {
+                break;
+            }
+        }
+        drop(send);
+        assert_eq!(driver.state().phase, PreparePhase::Prepared);
+        assert!(!driver.waiting_for_domain());
+        // The provider planned again, so its plan reflects the freed domain.
+        assert_eq!(plans.len(), 2);
+        assert!(plans[1] > plans[0]);
+        assert_eq!(callbacks, 1);
+    }
+
+    #[test]
+    fn a_domain_reserved_past_the_wait_limit_reports_contention_with_no_effect() {
+        let (settings, state) = fixture();
+        let mut driver = PrepareDriver::new(state, &settings).unwrap();
+        driver.set_domain_wait_limit(std::time::Duration::ZERO);
+        let mut authority = ContendedAuthority {
+            inner: Authority {
+                sequence: 1,
+                rights: false,
+                polls: 0,
+            },
+            reserved: true,
+            refused: 0,
+        };
+        let mut journal = Journal::default();
+        let (mut plans, mut callbacks, mut method) = (Vec::new(), 0, String::new());
+        let mut send =
+            |command: Command| immediate_provider(&mut plans, &mut callbacks, &mut method, command);
+        let mut error = None;
+        for _ in 0..16 {
+            if let Err(reason) = driver.advance(&settings, &mut authority, &mut journal, &mut send)
+            {
+                error = Some(reason);
+                break;
+            }
+        }
+        drop(send);
+        assert_eq!(error.as_deref(), Some(MUTATION_DOMAIN_RESERVED));
+        assert!(driver.state().admission_id.is_none());
+        assert_eq!(driver.state().phase, PreparePhase::Plan);
+        assert_eq!(callbacks, 0);
     }
 
     #[test]

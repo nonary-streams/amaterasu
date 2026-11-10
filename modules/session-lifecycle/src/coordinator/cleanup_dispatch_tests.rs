@@ -472,7 +472,12 @@ fn unsupported_control_proposal_is_rejected_before_admission_or_callback() {
         "initiator",
         json!({"operation":"prepare","operation_id":"prepare"}),
     );
-    assert_eq!(h.run("prepare")["status"], "recovery_required");
+    // Nothing was admitted or sent, so the outcome is known: the prepare
+    // fails cleanly instead of fencing the session for recovery.
+    let result = h.run("prepare");
+    assert_eq!(result["status"], "failed", "{result}");
+    assert_eq!(result["cleanup_completed"], true, "{result}");
+    assert_eq!(result["reason"], "provider_plan_not_admitted", "{result}");
     assert!(h.callbacks.is_empty());
     assert!(
         h.coordinator

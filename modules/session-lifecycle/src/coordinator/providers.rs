@@ -627,6 +627,19 @@ fn frozen_settings_mut<'a>(
     }
 }
 
+/// Whether a provider's outcome is unknown after its preparation stopped.
+///
+/// A provider that has only answered a planning call holds nothing: no plan
+/// was admitted for it, no domain was reserved and no callback was sent. Its
+/// outcome is known, so a refused plan must not fence the session for recovery.
+fn effect_uncertain(state: &PrepareState) -> bool {
+    match state.phase {
+        PreparePhase::Prepared | PreparePhase::Rejected => false,
+        PreparePhase::Plan | PreparePhase::PlanStatus => state.admission_id.is_some(),
+        _ => true,
+    }
+}
+
 impl Coordinator {
     pub(super) fn effective_settings(&self, work: &Work) -> ModuleResult<LifecycleSettings> {
         let shared = self.shared.borrow();
@@ -2067,7 +2080,14 @@ impl Coordinator {
                 ) {
                     self.cleanup_failure(&key, "provider_outcome_unknown")?;
                 } else {
-                    self.fail_work(&key, "provider_outcome_unknown")?;
+                    let admitted = self.drivers[&runtime_key].state().admission_id.is_some();
+                    let reason = if admitted || effect_uncertain(self.drivers[&runtime_key].state())
+                    {
+                        "provider_outcome_unknown"
+                    } else {
+                        "provider_plan_not_admitted"
+                    };
+                    self.fail_work(&key, reason)?;
                 }
                 self.drivers.remove(&runtime_key);
                 continue;
@@ -3075,9 +3095,7 @@ impl Coordinator {
             // the session for recovery instead.
             && work.reprepare.is_none()
         {
-            let uncertain = work.states.values().any(|state| {
-                !matches!(state.phase, PreparePhase::Prepared | PreparePhase::Rejected)
-            });
+            let uncertain = work.states.values().any(effect_uncertain);
             let mut providers: Vec<_> = work
                 .providers
                 .iter()
@@ -3124,8 +3142,7 @@ impl Coordinator {
                     .states
                     .iter()
                     .filter_map(|(provider, state)| {
-                        (!matches!(state.phase, PreparePhase::Prepared | PreparePhase::Rejected))
-                            .then_some(provider.clone())
+                        effect_uncertain(state).then_some(provider.clone())
                     })
                     .collect();
                 for (other_key, other) in &mut next.receipts {
@@ -3173,11 +3190,7 @@ impl Coordinator {
                         .states
                         .iter()
                         .filter_map(|(provider, state)| {
-                            (!matches!(
-                                state.phase,
-                                PreparePhase::Prepared | PreparePhase::Rejected
-                            ))
-                            .then_some(provider.clone())
+                            effect_uncertain(state).then_some(provider.clone())
                         })
                         .collect(),
                     index: 0,

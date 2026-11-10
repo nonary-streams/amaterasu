@@ -1836,6 +1836,12 @@ impl<J: AuthorityJournal> PrepareAuthority for CoordinatorPrepareAuthority<J> {
         })
     }
 
+    fn domains_reserved(&self, plan: &ResourcePlan) -> bool {
+        plan.mutation_domains
+            .iter()
+            .any(|domain| self.state.domain_locks.contains_key(&domain.domain))
+    }
+
     fn admit_plan(
         &mut self,
         participant: &ParticipantSettings,
@@ -1853,7 +1859,7 @@ impl<J: AuthorityJournal> PrepareAuthority for CoordinatorPrepareAuthority<J> {
         let refreshable = next.refresh_required.clone();
         for domain in &plan.mutation_domains {
             if next.domain_locks.contains_key(&domain.domain) {
-                return Err("mutation domain is reserved".into());
+                return Err(crate::prepare_driver::MUTATION_DOMAIN_RESERVED.into());
             }
             // Version 2 effects require a separate authenticated native
             // observation after each previous admission releases its domain.

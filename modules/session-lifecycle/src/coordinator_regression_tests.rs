@@ -58,6 +58,8 @@ struct Harness {
     /// Simulates a v1 policy provider with session and stream obligations.
     policy_obligations: bool,
     policy_session_release_deferred: bool,
+    /// Revision the policy provider reports for its shared mutation domain.
+    policy_domain_revision: Option<u64>,
 }
 
 impl Harness {
@@ -343,6 +345,7 @@ impl Harness {
             retirement_result: None,
             policy_obligations: false,
             policy_session_release_deferred: false,
+            policy_domain_revision: None,
         };
         harness.start();
         harness
@@ -454,7 +457,9 @@ impl Harness {
                         Response::Ok
                     ));
                 } else if self.external {
-                    let response = if self.policy_obligations {
+                    let response = if let Some(revision) = self.policy_domain_revision {
+                        domain_policy_response(&payload, revision)
+                    } else if self.policy_obligations {
                         obligation_policy_response(&payload, self.policy_session_release_deferred)
                     } else {
                         external_policy_response(&payload, "display", self.cleanup_deferred)
@@ -2725,6 +2730,42 @@ fn obligation_policy_response(payload: &Value, session_release_deferred: bool) -
     json!({"status":"cleanup","outcomes":outcomes})
 }
 
+/// A v1 provider whose every plan mutates one shared domain, like the frame
+/// limiter's policy domain. The coordinator admits a plan only when the
+/// reported revision matches what it last observed.
+fn domain_policy_response(payload: &Value, revision: u64) -> Value {
+    let args = &payload["arguments"];
+    let phase = args["phase"].as_str().unwrap_or_default();
+    let scope = args["target"]["session_id"].as_str().unwrap_or("session");
+    let obligation = json!({"obligation_id":format!("cleanup-{scope}"),"provider":"display",
+        "resource_id":format!("policy-{scope}"),"mutation_domain":"example.display/policy",
+        "depends_on":[],"cleanup_method":{"service":"example.display/1","method":"lifecycle_callback",
+            "interface_major":1,"interface_minor":0,"schema_revision":1},"payload":{}});
+    if payload["method"] == "resource_plan" {
+        return json!({"status":"planned","plan":{"plan_id":format!("policy-{scope}"),"revision":1,
+            "resources":[{"provider":"display","resource_id":format!("policy-{scope}"),"incarnation":null,
+                "expected_revision":null,"execution_domain":"seat",
+                "mutation_domains":["example.display/policy"],"access":"exclusive"}],
+            "mutation_domains":[{"domain":"example.display/policy","expected_revision":revision,
+                "borrowers":{},"access":"exclusive"}],
+            "required_capabilities":[],"constraints":{},"obligations":[obligation],
+            "affected_consumers":[],"consumer_change":"live","candidate_constraint":null,"allowed_degradation":[]}});
+    }
+    let approved = args["approved_plan"]["obligations"].clone();
+    if matches!(phase, "session.prepare" | "stream.prepare") {
+        return json!({"status":"prepared","candidate":null,"obligations":approved});
+    }
+    let outcomes: Vec<Value> = approved
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|obligation| {
+            json!({"obligation_id":obligation["obligation_id"],"state":"released","reason":null})
+        })
+        .collect();
+    json!({"status":"cleanup","outcomes":outcomes})
+}
+
 fn journal_snapshot(harness: &Harness) -> Value {
     serde_json::from_slice(&std::fs::read(harness.root.join("journal.json")).unwrap()).unwrap()
 }
@@ -2744,6 +2785,16 @@ fn session_release_callbacks(harness: &Harness) -> usize {
 /// Prepare an application session with a released stream, fence its end, and
 /// restart before the owner can report application retirement.
 fn restart_before_application_retired(session_release_deferred: bool) -> (Harness, Value) {
+    restart_with_stranded_session(session_release_deferred, true)
+}
+
+/// Prepare an application session with a released stream and restart. With
+/// `end_requested` the owner fenced the session's end first; without it the
+/// host stopped while the application was still retained for resume.
+fn restart_with_stranded_session(
+    session_release_deferred: bool,
+    end_requested: bool,
+) -> (Harness, Value) {
     let mut harness = Harness::with_processing_mode(true, None, false, true);
     harness.policy_obligations = true;
     harness.policy_session_release_deferred = session_release_deferred;
@@ -2784,11 +2835,13 @@ fn restart_before_application_retired(session_release_deferred: bool) -> (Harnes
     activate_external_consumer(&mut harness, &stream["target"], "stranded");
     let retired = retire_shared_client(&mut harness, &stream["target"], "stranded.close");
     assert_eq!(retired["status"], "succeeded", "{retired}");
-    let end = harness.call(
-        "transport",
-        json!({"operation":"end_session","operation_id":"stranded.end","target":session}),
-    );
-    assert_eq!(end["status"], "pending", "{end}");
+    if end_requested {
+        let end = harness.call(
+            "transport",
+            json!({"operation":"end_session","operation_id":"stranded.end","target":session}),
+        );
+        assert_eq!(end["status"], "pending", "{end}");
+    }
     for _ in 0..20 {
         harness.tick();
     }
@@ -2904,4 +2957,98 @@ fn deferred_abandoned_release_stays_fenced_for_recovery() {
         "{snapshot}"
     );
     assert_eq!(session_release_callbacks(&harness), 1);
+}
+
+/// The host stopped while the application was paused for resume: its stream
+/// had retired, but nobody had asked the session to end. No release work
+/// exists to resume, so abandonment creates the one `end_session` would have.
+#[test]
+fn abandonment_releases_a_session_that_was_never_asked_to_end() {
+    let (mut harness, session) = restart_with_stranded_session(false, false);
+    let journal = journal_snapshot(&harness);
+    let id = session["session_id"].as_str().unwrap();
+    assert_eq!(journal["sessions"][id]["phase"], "recovery_required");
+    let result = abandon(&mut harness, &session);
+    assert_eq!(result["status"], "succeeded", "{result}");
+    assert_eq!(result["application_retired"], false);
+    assert_eq!(result["application"], "untracked_after_restart");
+    // The provider released its own state through the ordinary callback.
+    assert_eq!(session_release_callbacks(&harness), 1);
+    let journal = journal_snapshot(&harness);
+    let record = &journal["sessions"][id];
+    assert_eq!(record["phase"], "ended", "{record}");
+    assert_eq!(record["application_retired"], false);
+    assert_eq!(
+        record["application_disposition"]["kind"],
+        "untracked_after_restart"
+    );
+    assert_eq!(record["obligations"], json!([]));
+    assert_eq!(journal["authority"]["settled"], json!({}));
+    assert_eq!(journal["authority"]["admissions"], json!({}));
+    harness.coordinator.take();
+    harness.start();
+    let snapshot = harness.call("transport", json!({"operation":"snapshot"}));
+    assert_eq!(snapshot["sessions"][0]["phase"], "ended", "{snapshot}");
+}
+
+fn prepare_session(harness: &mut Harness, operation_id: &str) -> Value {
+    harness.call(
+        "transport",
+        json!({"operation":"prepare","operation_id":operation_id,
+        "application_ref":{"kind":"application","app_id":"app"},
+        "requested_video":{"width":1920,"height":1080,"refresh_millihz":60000,"hdr":false}}),
+    );
+    let mut result = Value::Null;
+    for _ in 0..180 {
+        result = harness.call(
+            "transport",
+            json!({"operation":"lookup","operation_id":operation_id}),
+        );
+        if result["status"] != "pending" {
+            break;
+        }
+    }
+    result
+}
+
+/// A plan the coordinator itself refuses has changed nothing. The prepare must
+/// end as a definite failure with cleanup complete, leave no session fenced
+/// for recovery, and not stand in the way of the next session.
+#[test]
+fn a_plan_refused_at_admission_fails_cleanly_and_does_not_block_the_next_session() {
+    let mut harness = Harness::with_processing_mode(true, None, false, true);
+    harness.policy_domain_revision = Some(1);
+    let first = prepare_session(&mut harness, "first");
+    assert_eq!(first["status"], "succeeded", "{first}");
+
+    // The provider now reports a revision older than the one the coordinator
+    // already observed, which no admission may be based on.
+    harness.policy_domain_revision = Some(0);
+    let refused = prepare_session(&mut harness, "refused");
+    assert_eq!(refused["status"], "failed", "{refused}");
+    assert_eq!(refused["cleanup_completed"], true, "{refused}");
+    assert_eq!(refused["reason"], "provider_plan_not_admitted", "{refused}");
+    let refused_id = refused["target"]["session_id"].as_str().unwrap().to_owned();
+    let journal = journal_snapshot(&harness);
+    assert_eq!(
+        journal["sessions"][&refused_id]["phase"], "ended",
+        "{journal}"
+    );
+    assert!(
+        journal["sessions"]
+            .as_object()
+            .unwrap()
+            .values()
+            .all(|session| session["phase"] != "recovery_required")
+    );
+    assert!(
+        journal["authority"]["domain_locks"]
+            .as_object()
+            .unwrap()
+            .is_empty()
+    );
+
+    harness.policy_domain_revision = Some(2);
+    let next = prepare_session(&mut harness, "next");
+    assert_eq!(next["status"], "succeeded", "{next}");
 }
