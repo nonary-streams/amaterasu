@@ -128,6 +128,7 @@ documented in the module READMEs.
 | `crates/runtime/src/broker` | Separate request, event, hook, and configuration subsystems |
 | `crates/runtime/src/ffi.rs` | Runtime ABI boundary |
 | `crates/module-sdk` | Ordinary Rust module lifecycle and shared ABI adapters |
+| `crates/module-testkit` | Runs a module against the real control runtime, or a scripted one, inside a test |
 | `crates/host` | Native loading and bounded development supervision |
 | `crates/package` | Metadata, signatures, artifact verification, staging, atomic records |
 | `crates/storage` | Shared durable-file primitives without release-signing dependencies |
@@ -157,6 +158,7 @@ documented in the module READMEs.
 | `fixtures/echo` | Replaceable module and failure-injection fixture |
 
 See [architecture](docs/architecture.md), [protocol](docs/control-protocol.md),
+[writing and testing a module](docs/control-plane-sdk.md),
 [parity status](docs/parity.md), and [dependency decisions](docs/dependencies.md).
 
 The [frontend](frontend/README.md) builds without a runtime framework.

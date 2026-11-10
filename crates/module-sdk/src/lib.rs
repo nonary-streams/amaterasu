@@ -2,6 +2,7 @@
 pub mod application_library;
 pub mod audio;
 pub mod capture;
+pub mod control_error;
 pub mod data_plane;
 pub mod diagnostics;
 pub mod display;
@@ -51,6 +52,7 @@ pub use amaterasu_contracts::{
 };
 pub use amaterasu_extension_api as extension_api;
 pub use amaterasu_media as media_abi;
+pub use control_error::{BrokerError, ControlError, ControlResult, ErrorCode};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::{
     Arc,
@@ -113,6 +115,25 @@ impl RuntimeClient {
         let output = unsafe { self.endpoint.call(&input) }
             .map_err(|status| format!("runtime transport failed with status {status}"))?;
         serde_json::from_slice(&output).map_err(|error| error.to_string())
+    }
+
+    /// Send a command and separate the three ways it can go wrong: a lost
+    /// exchange, a broker refusal, and (left to the caller) an unexpected reply.
+    /// Prefer the typed helpers in [`requests`] where one fits.
+    pub fn send_checked(&self, command: Command) -> ControlResult<Response> {
+        control_error::checked(self.send(command))
+    }
+
+    /// Decode the startup settings trusted composition selected for this
+    /// module. A module without configured settings receives an empty object,
+    /// so give every field of `T` a default.
+    pub fn settings<T: serde::de::DeserializeOwned>(&self) -> ControlResult<T> {
+        match self.send_checked(Command::GetSettings {})? {
+            Response::Result { payload } => {
+                serde_json::from_value(payload).map_err(ControlError::payload)
+            }
+            response => Err(ControlError::unexpected(&response)),
+        }
     }
 
     pub fn require_success(&self, command: Command) -> ModuleResult<()> {

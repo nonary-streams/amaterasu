@@ -9,6 +9,9 @@ broker uses a mutex and releases it before invoking the reply callback. Optional
 [native service bindings](native-interfaces.md) call providers outside runtime locks;
 the product interface defines its own threading and buffer-lifetime requirements.
 
+Rust modules normally use the typed helpers in the
+[control-plane SDK](control-plane-sdk.md) instead of building these envelopes.
+
 ## Operations
 
 Every input is an internally tagged JSON object using `op`. Unknown fields in

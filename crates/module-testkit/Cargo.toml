@@ -1,0 +1,14 @@
+[package]
+name = "amaterasu-module-testkit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+amaterasu-contracts.workspace = true
+amaterasu-module-sdk.workspace = true
+amaterasu-runtime = { path = "../runtime" }
+serde_json.workspace = true
+
+[lints]
+workspace = true

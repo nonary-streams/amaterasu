@@ -8,6 +8,8 @@ ROOT = Path(__file__).resolve().parent.parent
 CRATES = (
     "abi", "timing-metrics", "data-plane", "configuration-schema", "extension-api", "media",
     "contracts", "network-api", "process-api", "network-sockets", "module-sdk",
+    # The test kit runs a module against the real control runtime in a test.
+    "runtime", "module-testkit",
 )
 
 
@@ -57,6 +59,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 getrandom = "0.3"
+libloading = "0.8"
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 ''')
@@ -65,6 +68,8 @@ unsafe_op_in_unsafe_fn = "deny"
 
 This workspace contains the Rust SDK, its contract crates, C headers, and an
 independently buildable CPU pass-through processor in `modules/example-frame-processor`.
+`crates/module-testkit` runs a module against the control runtime in
+`crates/runtime` inside an ordinary `cargo test`.
 `crates/rtx-runtime` is a separate Cargo workspace: it is an NVIDIA-specific
 helper, not a dependency of the generic SDK. A separately cloned RTX HDR
 checkout can be placed in `modules/rtx-hdr` and built from this workspace.

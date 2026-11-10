@@ -2,6 +2,14 @@
 //!
 //! Payloads are serialized across the ABI; no Rust object crosses the module
 //! boundary. The runtime derives caller and initiator identities itself.
+mod call;
+mod provider;
+
+pub use call::{CallOutcome, OutboundCall, unique_operation_id};
+pub use provider::{
+    MalformedRequest, ReplyDelivery, next_request_with, reply_with, request_active_with,
+};
+
 use crate::{Command, ModuleResult, Response, RuntimeClient};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -803,29 +811,15 @@ impl RuntimeClient {
     }
 
     /// Poll for one provider request. `None` means no request is ready.
+    /// [`next_request`](Self::next_request) is the same operation with a
+    /// typed error.
     pub fn poll_serialized(&self) -> ModuleResult<Option<IncomingRequest<Value>>> {
-        match self.send(Command::Poll {})? {
-            Response::Pending => Ok(None),
-            Response::Request {
-                id,
-                caller,
-                initiator,
-                service,
-                payload,
-                remaining_ms,
-            } => Ok(Some(IncomingRequest {
-                id,
-                caller,
-                initiator,
-                service,
-                payload,
-                remaining_ms,
-            })),
-            response => Err(unexpected_response(response)),
-        }
+        Ok(self.next_request()?)
     }
 
-    /// Complete an inbound request with a serialized response.
+    /// Complete an inbound request with a serialized response. A request that
+    /// already ended is an error here; use [`reply`](Self::reply) to treat
+    /// that as the ordinary outcome it is.
     pub fn complete_serialized<T: Serialize>(&self, request: u64, payload: &T) -> ModuleResult<()> {
         let payload = serde_json::to_value(payload).map_err(|error| error.to_string())?;
         self.require_success(Command::Complete { request, payload })

@@ -31,3 +31,6 @@ workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+amaterasu-module-testkit.workspace = true

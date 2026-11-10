@@ -654,6 +654,7 @@ dependencies = [
  "amaterasu-data-plane",
  "amaterasu-extension-api",
  "amaterasu-media",
+ "amaterasu-module-testkit",
  "amaterasu-network-api",
  "amaterasu-network-sockets",
  "amaterasu-process-api",
@@ -665,6 +666,16 @@ dependencies = [
  "serde_json",
  "sha2",
  "ureq",
+]
+
+[[package]]
+name = "amaterasu-module-testkit"
+version = "0.1.0"
+dependencies = [
+ "amaterasu-contracts",
+ "amaterasu-module-sdk",
+ "amaterasu-runtime",
+ "serde_json",
 ]
 
 [[package]]
@@ -888,6 +899,7 @@ name = "amaterasu-session"
 version = "0.1.0"
 dependencies = [
  "amaterasu-module-sdk",
+ "amaterasu-module-testkit",
  "serde",
  "serde_json",
 ]

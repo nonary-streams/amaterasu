@@ -12,5 +12,8 @@ amaterasu-module-sdk.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
+[dev-dependencies]
+amaterasu-module-testkit.workspace = true
+
 [lints]
 workspace = true

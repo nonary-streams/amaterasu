@@ -27,6 +27,7 @@ members = [
     "crates/capture-authority",
     "crates/storage",
     "crates/module-sdk",
+    "crates/module-testkit",
     "crates/host",
     "crates/release",
     "crates/vkms-frame-helper",
@@ -112,6 +113,7 @@ amaterasu-contracts = { path = "crates/contracts" }
 amaterasu-input-companion = { path = "crates/input-companion" }
 amaterasu-package = { path = "crates/package" }
 amaterasu-module-sdk = { path = "crates/module-sdk" }
+amaterasu-module-testkit = { path = "crates/module-testkit" }
 amaterasu-storage = { path = "crates/storage" }
 amaterasu-updater = { path = "modules/updater" }
 amaterasu-system-tray = { path = "modules/system-tray" }
