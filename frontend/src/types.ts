@@ -5,7 +5,7 @@ namespace Amaterasu {
     | "catalog"
     | "settings"
     | "integrations"
-    | "updates"
+    | "plugins"
     | "sessions"
     | "applications"
     | "steam"
@@ -14,7 +14,8 @@ namespace Amaterasu {
     | "tokens"
     | "maintenance";
   export type SettingsCategory = "general" | "streaming" | "integrations" | "devices" | "access";
-  export type PageRoute = Page | `settings/${SettingsCategory}`;
+  export type PluginsView = "installed" | "available" | "repositories";
+  export type PageRoute = Page | `settings/${SettingsCategory}` | `plugins/${PluginsView}`;
   export type Payload = Record<string, unknown>;
   export interface LoginReply {
     ok: boolean;
@@ -580,6 +581,8 @@ namespace Amaterasu {
     navigate: (page: PageRoute) => void;
     initialSettingsCategory?: SettingsCategory;
     replaceSettingsCategory?: (category: SettingsCategory) => void;
+    initialPluginsView?: PluginsView;
+    replacePluginsView?: (view: PluginsView) => void;
     registerDraftGuard?: (isDirty: () => boolean, dispose: () => void) => () => void;
   }
 }

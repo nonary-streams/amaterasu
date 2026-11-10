@@ -1488,6 +1488,10 @@ namespace Amaterasu {
           "A plugin activation is already in progress.",
         not_registered:
           "No settings schema has been registered for this console.",
+        package_selection_unavailable:
+          "The host could not report the package it is running.",
+        repository_state_unavailable:
+          "The host could not read its repository list.",
       };
       return new ApiError(
         messages[code] ??

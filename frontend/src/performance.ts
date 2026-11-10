@@ -84,50 +84,6 @@ namespace Amaterasu {
     "video.packet_queued>session.packet_read": "Waiting for the stream session",
     "session.packet_read>transport.admitted": "Packetizing and sending",
   };
-  const PLUGINS: Record<string, string> = {
-    "@amaterasu.host-lifecycle": "Host",
-    "amaterasu.application": "Applications",
-    "amaterasu.audio": "Audio capture",
-    "amaterasu.audio-encode": "Audio encoder",
-    "amaterasu.authentication": "Sign-in",
-    "amaterasu.capture-kms": "Screen capture (KMS)",
-    "amaterasu.capture-pipewire": "Screen capture (PipeWire)",
-    "amaterasu.capture-vkms": "Screen capture (VKMS)",
-    "amaterasu.catalog": "App catalog",
-    "amaterasu.configuration": "Configuration",
-    "amaterasu.control-transport": "Control channel",
-    "amaterasu.diagnostics": "Diagnostics",
-    "amaterasu.display": "Display",
-    "amaterasu.display-settings": "Display settings",
-    "amaterasu.encode": "Video encoder",
-    "amaterasu.extension-registry": "Extensions",
-    "amaterasu.foreground-context": "Foreground app",
-    "amaterasu.frame-limiter": "Frame limiter",
-    "amaterasu.host-metrics": "Host metrics",
-    "amaterasu.input": "Input",
-    "amaterasu.launch": "App launcher",
-    "amaterasu.library": "Library",
-    "amaterasu.linux-session-video": "Video pipeline",
-    "amaterasu.lutris": "Lutris library",
-    "amaterasu.management": "Web interface",
-    "amaterasu.media-transport": "Media transport",
-    "amaterasu.network": "Network",
-    "amaterasu.nvhttp": "Moonlight server",
-    "amaterasu.pairing": "Pairing",
-    "amaterasu.playnite": "Playnite library",
-    "amaterasu.rtsp": "Stream setup",
-    "amaterasu.rtx-hdr": "RTX HDR",
-    "amaterasu.session": "Sessions",
-    "amaterasu.session-history": "Session history",
-    "amaterasu.session-lifecycle": "Session lifecycle",
-    "amaterasu.state": "Saved state",
-    "amaterasu.steam": "Steam library",
-    "amaterasu.stream-session": "Stream session",
-    "amaterasu.updater": "Updater",
-    "amaterasu.video": "Video pipeline",
-    "amaterasu.virtual-display": "Virtual display",
-  };
-
   // Reading the report. Anything missing reads as zero or absent, so a newer
   // host that adds fields never breaks an older page.
 
@@ -247,11 +203,11 @@ namespace Amaterasu {
   function formatClock(unixMs: number): string {
     return new Date(unixMs).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
   }
+  /// The plugin manager owns the names, so every page calls a module the
+  /// same thing. The host's own lifecycle work is not a module.
   export function performancePluginName(id: string): string {
-    const known = PLUGINS[id];
-    if (known) return known;
-    const bare = id.replace(/^@?amaterasu\./, "").replace(/[-_.]+/g, " ").trim();
-    return bare ? bare.charAt(0).toUpperCase() + bare.slice(1) : "Unknown plugin";
+    if (id === "@amaterasu.host-lifecycle") return "Host";
+    return id ? pluginPresentation(id.replace(/^@/, "")).name : "Unknown plugin";
   }
   function stageName(id: string): string {
     return STAGES[id] ?? id.replace(">", " to ");

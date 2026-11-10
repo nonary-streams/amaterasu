@@ -35,10 +35,10 @@ const window = {
   setTimeout(callback, delay) { const id = nextTimer++; timers.set(id, { callback, delay }); return id; },
   clearTimeout(id) { timers.delete(id); },
 };
-const sandbox = vm.createContext({ document, window, Date, Math, Error, Map, Set, Number, String, Array, Object });
-for (const source of ["src/ui.ts", "src/performance.ts"]) {
+const sandbox = vm.createContext({ document, window, Date, Math, Error, Map, Set, Number, String, Array, Object, TextEncoder });
+for (const source of ["src/ui.ts", "src/plugin_catalog.ts", "src/performance.ts"]) {
   vm.runInContext(ts.transpile(readFileSync(source, "utf8"), { target: ts.ScriptTarget.ES2022 }), sandbox);
-  if (source === "src/ui.ts")
+  if (source !== "src/performance.ts")
     vm.runInContext("Object.assign(globalThis, Amaterasu); globalThis.literalText = (value) => value; globalThis.messageOf = (error) => error.message", sandbox);
 }
 const {
@@ -141,17 +141,21 @@ test("durations and plugin names are written for a reader", () => {
   assert.equal(formatPerformanceDuration(12_400), "12.4 ms");
   assert.equal(formatPerformanceDuration(141_000), "141 ms");
   assert.equal(formatPerformanceDuration(2_500_000), "2.5 s");
+  // The names are the plugin manager's, so both pages agree on them.
   assert.equal(performancePluginName("amaterasu.session-lifecycle"), "Session lifecycle");
-  assert.equal(performancePluginName("vendor.overlay-plugin"), "Vendor overlay plugin");
+  assert.equal(performancePluginName("amaterasu.nvhttp"), sandbox.Amaterasu.pluginPresentation("amaterasu.nvhttp").name);
+  assert.equal(performancePluginName("@amaterasu.host-lifecycle"), "Host");
+  assert.equal(performancePluginName("vendor.overlay-plugin"), "Overlay plugin");
+  assert.equal(performancePluginName(""), "Unknown plugin");
 });
 
 test("a slow moment says what was slow, where, and what held the host loop", () => {
   const moments = parsePerformanceReply(reply()).moments;
-  assert.equal(performanceMomentText(moments[0]), "Pairing held the host loop, delaying every other plugin.");
+  assert.equal(performanceMomentText(moments[0]), "Device pairing held the host loop, delaying every other plugin.");
   assert.equal(performanceMomentText(moments[1]),
     "18 input events: slowest at reaching the stream session (122 ms), during a 119 ms call by Session lifecycle.");
   assert.equal(performanceMomentText(moments[2]), "One video frame: slowest at encoding (11.9 ms).");
-  assert.equal(performanceMomentText({ ...moments[0], count: 4 }), "Pairing held the host loop 4 times, delaying every other plugin.");
+  assert.equal(performanceMomentText({ ...moments[0], count: 4 }), "Device pairing held the host loop 4 times, delaying every other plugin.");
 });
 
 test("the summary states each track and the host loop, marking values at their limit", () => {
@@ -198,9 +202,9 @@ test("stages list their share of the time, and plugin calls only what ran on the
   // Longest first. The input batch span ran inside a plugin's turn and is not a turn itself.
   assert.deepEqual(rowsOf(calls), [
     ["Session lifecycleamaterasu.session-lifecycle", "", "119 ms", "0.40 ms", "30"],
-    ["Pairingamaterasu.pairing", "", "9.1 ms", "4.3 ms", "40"],
-    ["Vendor overlayvendor.overlay", "", "0.51 ms", "0.30 ms", "5"],
-    ["Saved state (health check)amaterasu.state", "", "0.42 ms", "0.30 ms", "6"],
+    ["Device pairingamaterasu.pairing", "", "9.1 ms", "4.3 ms", "40"],
+    ["Overlayvendor.overlay", "", "0.51 ms", "0.30 ms", "5"],
+    ["State store (health check)amaterasu.state", "", "0.42 ms", "0.30 ms", "6"],
   ]);
   // Only calls of 8 ms or more are marked.
   assert.deepEqual(byClass(calls, "perf-over").map((cell) => cell.textContent), ["119 ms", "9.1 ms"]);

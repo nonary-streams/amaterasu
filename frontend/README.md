@@ -189,12 +189,15 @@ browser API calls.
   permissions and an expiry, create and revoke browser-issued credentials, and
   copy the secret once. It does not display native-caller or legacy tokens, and
   never stores the secret in browser storage. An uncertain issuance is not retried.
-- Modules & UI reads verified publisher catalogs with `configuration.read`, separating
-  approved, revoked, and currently available choices. A separate status request
-  shows persisted native package selection phases and the host-reported package
-  digest loaded in the worker; this does not establish individual module health.
-  Approval, refresh, installation, staging, activation, and recovery remain explicit
-  CLI workflows; the page shows the host recovery/status commands without invoking them.
+- Plugins has three views, each addressable as `#plugins`, `#plugins/available` and
+  `#plugins/repositories`. Installed lists the modules in the package the host reports
+  as loaded, with each module's declared dependencies and services; this does not
+  establish individual module health. Available compares what the approved repositories
+  offer with what is loaded. Repositories lists publishers and their catalog status, and
+  lets an administrator session add one (publisher key plus a separately confirmed
+  fingerprint), check one for updates, or remove one. The page does not install, stage
+  or activate anything: see `docs/approved-repositories.md`. The old `#updates` address
+  still opens it.
 - Host logging settings confirm the saved revision and separately read signed
   diagnostics status. The editor distinguishes pending application from healthy,
   disabled, and failed disk delivery; older status replies leave delivery unverified.

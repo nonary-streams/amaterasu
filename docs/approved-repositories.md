@@ -4,7 +4,7 @@
 
 Amaterasu's native release unit is a complete component set with one runtime and up to 64 feature libraries. The host verifies it before loading, stages a content-addressed copy, and trials it in a disposable worker at restart. UI assets are an independently signed web bundle selected without replacing the native set. The Windows service launches the worker in the active user's session. There is no general elevated broker yet.
 
-The development administrator CLI supports `repository-approve`, `repository-revoke`, `repository-refresh`, `repository-list`, `repository-download`, `repository-install-ui`, `repository-stage-native`, `repository-activate-native`, and `repository-restore-ui`. Run `amaterasu-release` without arguments for exact syntax. Mutations require a development bootstrap. The management console's **Modules & UI** page lists approved sources and verified choices with repository, slot, and implementation dropdowns. It gives the explicit CLI action for the selected choice. The management-owned `/recovery` page remains available independently of the selected UI. The fixed host shell also owns `web-recovery-status`, `web-recover`, and `native-recover ROOT [DIGEST]` commands. A specific retained, previously healthy digest can be recovered if the previous publisher was revoked; a merely staged set cannot be recovered directly to active. These recovery commands do not load selected native code; mutations are development-only until installed-service authorization and protected state exist. Native download and staging verify bytes without loading them. Only `repository-activate-native ROOT DIGEST` explicitly authorizes a future worker trial; a subsequent development `amaterasu probe ROOT` or worker startup executes that publisher's native code and promotes the set only if healthy.
+The development administrator CLI supports `repository-approve`, `repository-revoke`, `repository-refresh`, `repository-list`, `repository-download`, `repository-install-ui`, `repository-stage-native`, `repository-activate-native`, and `repository-restore-ui`. Run `amaterasu-release` without arguments for exact syntax. These CLI mutations require a development bootstrap. The management console's **Plugins** page lists the modules the host loaded, the choices its repositories offer and the repositories themselves, and lets a signed-in administrator add, refresh and remove repositories on any host (see [Managing repositories from the console](#managing-repositories-from-the-console)). The management-owned `/recovery` page remains available independently of the selected UI. The fixed host shell also owns `web-recovery-status`, `web-recover`, and `native-recover ROOT [DIGEST]` commands. A specific retained, previously healthy digest can be recovered if the previous publisher was revoked; a merely staged set cannot be recovered directly to active. These recovery commands do not load selected native code; mutations are development-only until installed-service authorization and protected state exist. Native download and staging verify bytes without loading them. Only `repository-activate-native ROOT DIGEST` explicitly authorizes a future worker trial; a subsequent development `amaterasu probe ROOT` or worker startup executes that publisher's native code and promotes the set only if healthy.
 
 Approval requires an ID, HTTPS location, Ed25519 public key, and its lowercase SHA-256 fingerprint confirmed through a separate trusted channel. The URL is only a byte location. Approval lets the publisher supply **any native component slot, including management or the runtime, and the UI**. This is broad publisher authority, not an add-on-only or cosmetic permission. A signature establishes provenance, not benign behavior or elevation. Native code shares the worker's user token and can use ordinary user process facilities; runtime grants are routing permissions, not a native code sandbox.
 
@@ -33,10 +33,38 @@ connected to an authenticated service/grant route.
 - Host recovery exists as development CLI commands outside replaceable modules, but a production recovery surface needs installed-service authorization, protected state and a usable route when the user worker fails. Recovery requires a retained signed set whose manifest has not expired and whose signer remains trusted; production needs a durable trusted recovery artifact or renewal plan. The management `/recovery` page alone cannot serve that role.
 - Composition of independently sourced components needs a whole-set dependency solver, interface/API negotiation, cross-platform platform requirements (including Linux libc), and health-tested activation. The present target string covers OS and architecture only.
 - Installed user-process API registration, method schemas and grant checks are implemented. Browser access to those methods, grant review UI, privileged handler installation and authenticated elevated broker IPC are not. The browser HTTP router has a fixed route table.
-- Production approval needs installed-service authorization, machine-protected state/ACLs, a trusted administrative approval UI, key compromise response, revocation distribution, and a refresh/freeze policy with reliable time. The development CLI is not a production trust manager.
-- The dropdown displays explicit commands; an authenticated browser install flow and compatibility diagnostics are future work. A stale catalog currently makes listing fail closed until refreshed.
+- The console approves, refreshes and revokes a publisher under an administrator's session, on production hosts too. Production still needs machine-protected state/ACLs, key compromise response, revocation distribution, a refresh/freeze policy with reliable time, and closing the browser sessions of a revoked interface publisher. The development CLI is not a production trust manager.
+- The console does not install what a repository offers. An authenticated browser install flow needs a review of the grants a set's new components request, because the host activates only policy changes its protected allowlist names; that review and compatibility diagnostics are future work.
 
 No real publisher key was enrolled, no downloaded third-party code was run, and no installed service permissions or persistent production trust were changed.
+
+## Managing repositories from the console
+
+The Plugins page reads `POST /v1/repositories/list` and `POST /v1/package-selection/status` with `configuration.read`. Three more routes change the approved repositories:
+
+| Route | Body | Effect |
+|---|---|---|
+| `/v1/repositories/add` | `id`, `location`, `public_key`, `fingerprint` | Enrolls a publisher |
+| `/v1/repositories/refresh` | `id` | Fetches and accepts the publisher's current catalog |
+| `/v1/repositories/remove` | `id` | Revokes the publisher |
+
+Each needs `configuration.write` and an administrator's own signed-in session. An API token is refused whatever its scopes, as it is for token and session management. The management module performs the change with its Network SDK provider on one worker thread; a second change is refused with `repository_busy` until the first finishes. The request returns an operation number at once, and the listing's `operation` field reports that change as `running`, `succeeded` or `failed` with a code until the next change starts.
+
+Adding keeps the release tool's rule: the administrator supplies the public key **and** its fingerprint, and a fingerprint that does not belong to the key is refused before any network request. The console then fetches `catalog.json` and `catalog.sig` and records the approval only when that catalog verifies under the key for this host's target. A repository ID can never be enrolled twice, so a mistyped key or ID must not consume it. Enrolling lists a publisher's choices and adds its key to those that may sign a selected interface bundle. It does not download, stage or activate anything.
+
+Removal is revocation and is permanent for the ID. It is refused with `repository_in_use` while the selection attributes the active, pending or trial native set to that repository, and with `repository_serves_console` while the selected interface bundle verifies only under that publisher's key. Either removal would stop the host or lock out its administrator at the next start.
+
+The listing reports each repository's saved catalog as `current` (with its sequence and expiry), `expired`, `missing` or `unavailable`. A catalog that no longer verifies withholds that repository's choices only; the other repositories stay listed. `manageable` is false on a host whose management module has no network provider or web state, and absent on a host that predates these routes; the page then lists repositories without offering changes.
+
+A publisher can hand out its details as one JSON object, which the Add dialog accepts when pasted into any field:
+
+```json
+{"id":"example-plugins","location":"https://plugins.example.org/amaterasu","public_key":"<64 hex characters>"}
+```
+
+The dialog fills in the ID, address and key from it. It never takes the fingerprint from pasted details: the administrator enters that separately, from a channel other than the repository address.
+
+`POST /v1/modules/describe` with `{"id": "<component id>"}` returns one loaded component's declared dependencies, the components that require it, and the services it asked to provide and call, read from the running set's signed manifest. These are requests; host policy decides what is granted. Library file names are not returned.
 
 ## Including an independently built library in a local set
 

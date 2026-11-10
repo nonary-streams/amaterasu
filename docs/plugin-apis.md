@@ -48,7 +48,8 @@ a raw legacy service or another implementation. The release profile imports the
 module-owned schemas and grants only matching existing callers. The public
 browser UI uses signed method aliases and its authenticated user's permissions.
 
-The generic Modules & UI inventory projects bounded identities from the exact
+The Plugins page inventory projects bounded identities from the exact
 verified manifest selected by the running worker's digest. Missing or changed
 manifest bytes leave inventory unavailable; the persisted selection is never
-presented as proof of a running component's health.
+presented as proof of a running component's health. The status is read without
+the activation lock, which the running service holds for its whole lifetime.
