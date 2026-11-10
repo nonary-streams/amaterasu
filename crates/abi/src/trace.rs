@@ -15,6 +15,9 @@ pub const TRACE_END: u8 = 2;
 /// A completed span of work on one thread. `track` names the span, `stage` is
 /// an optional label, `value` its duration and `timestamp_us` its end.
 pub const TRACE_SPAN: u8 = 3;
+/// The flow turned out not to belong to its track, such as a control message
+/// that carried no input. It is forgotten: no statistics and no report.
+pub const TRACE_DISCARD: u8 = 4;
 
 pub const MAX_TRACE_NAME_BYTES: usize = 96;
 pub const MAX_TRACE_RECORDS_PER_CALL: usize = 64;

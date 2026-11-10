@@ -28,7 +28,7 @@
 //! // ... later, when the provider acknowledged the event ...
 //! trace.tracer.finish(trace.track, flow, trace.accepted, Duration::from_millis(8));
 //! ```
-use crate::abi::{TRACE_END, TRACE_MARK, TRACE_SPAN, TraceRecord, TraceSink};
+use crate::abi::{TRACE_DISCARD, TRACE_END, TRACE_MARK, TRACE_SPAN, TraceRecord, TraceSink};
 use crate::{Command, Response, RuntimeClient};
 use std::time::{Duration, Instant};
 
@@ -50,8 +50,6 @@ pub mod names {
     pub const SESSION_SUBMITTED: &str = "session.submitted";
     /// The input provider accepted (injected or suppressed) the event.
     pub const INPUT_ACCEPTED: &str = "input.accepted";
-    /// The session consumed the message without producing input.
-    pub const SESSION_CONSUMED: &str = "session.consumed";
     /// A newer controller sample replaced this one before it was sent.
     pub const SESSION_COALESCED: &str = "session.coalesced";
 
@@ -214,6 +212,13 @@ impl Tracer {
     pub fn finish(&self, track: Track, flow: u64, stage: Stage, budget: Duration) {
         let budget_us = u64::try_from(budget.as_micros()).unwrap_or(u64::MAX);
         self.record(TRACE_END, track.0, stage.0, flow, budget_us, 0);
+    }
+
+    /// The flow turned out not to be an instance of its track, such as a
+    /// control message that carried no input. It is forgotten rather than
+    /// counted, so it cannot distort the track's timing or be reported as slow.
+    pub fn discard(&self, track: Track, flow: u64) {
+        self.record(TRACE_DISCARD, track.0, 0, flow, 0, 0);
     }
 
     /// Work of `kind` that just ended took `duration` on this thread.

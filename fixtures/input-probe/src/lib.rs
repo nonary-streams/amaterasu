@@ -2,7 +2,9 @@
 mod controller;
 mod model;
 
-use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};
+use amaterasu_module_sdk::{
+    Command, DirectCall, ManagedModule, ModuleResult, Response, RuntimeClient,
+};
 use controller::Controller;
 use model::{FixtureError, Operation, Settings};
 use serde_json::{Value, json};
@@ -15,6 +17,8 @@ struct InputProbe {
     runtime: RuntimeClient,
     controller: Controller,
     settings: Settings,
+    /// Batches delivered through a direct call rather than a queued request.
+    direct_batches: u64,
 }
 
 impl ManagedModule for InputProbe {
@@ -33,7 +37,24 @@ impl ManagedModule for InputProbe {
             runtime,
             controller: Controller::new(settings.enabled),
             settings,
+            direct_batches: 0,
         })
+    }
+
+    fn call_direct(&mut self, call: DirectCall<'_>) -> Option<Value> {
+        if !self.settings.direct_batches
+            || call.service != INPUT_SERVICE
+            || call.payload.get("action").and_then(Value::as_str) != Some("batch")
+        {
+            return None;
+        }
+        // An unreadable batch is declined untouched; the queued path reports it.
+        let operation = serde_json::from_value::<Operation>(call.payload).ok()?;
+        self.direct_batches += 1;
+        Some(
+            self.controller
+                .handle(call.caller, operation, Instant::now()),
+        )
     }
 
     fn tick(&mut self) -> ModuleResult<()> {
@@ -85,7 +106,9 @@ impl InputProbe {
     fn dispatch(&mut self, caller: &str, service: &str, payload: Value) -> (Value, bool) {
         if service == METRICS_SERVICE {
             return if payload == json!({"action": "status"}) {
-                (self.controller.metrics(Instant::now()), false)
+                let mut metrics = self.controller.metrics(Instant::now());
+                metrics["direct_batches"] = self.direct_batches.into();
+                (metrics, false)
             } else {
                 (
                     FixtureError::new("invalid_request", "metrics supports only status").payload(),

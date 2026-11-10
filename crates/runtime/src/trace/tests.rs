@@ -2,7 +2,7 @@ use super::collector::{Collector, DEFAULT_FLOW_BUDGET_US, Report, Resolver, SLOW
 use super::hub::TraceHub;
 use super::ring::Observation;
 use super::sink::Binding;
-use amaterasu_abi::{TRACE_END, TRACE_MARK, TRACE_SPAN, TraceRecord, TraceSink};
+use amaterasu_abi::{TRACE_DISCARD, TRACE_END, TRACE_MARK, TRACE_SPAN, TraceRecord, TraceSink};
 use std::sync::Arc;
 
 const INPUT: u16 = 1;
@@ -173,6 +173,48 @@ fn a_long_span_is_reported_once_and_summarized_with_its_label() {
     assert_eq!(window["spans"][0]["stage"], "host.tick:amaterasu.state");
     assert_eq!(window["spans"][0]["calls"], 2);
     assert_eq!(window["spans"][0]["max_us"], SLOW_SPAN_US + 1_000);
+}
+
+#[test]
+fn a_discarded_flow_leaves_no_statistics_and_raises_no_report() {
+    let mut collector = Collector::default();
+    // A control message waited a long time, then turned out to carry no input.
+    collector.observe(mark(1, ARRIVED, 1_000), &Names);
+    collector.observe(mark(1, DEQUEUED, 161_000), &Names);
+    collector.observe(
+        Observation {
+            kind: TRACE_DISCARD,
+            stage: 0,
+            ..mark(1, 0, 161_010)
+        },
+        &Names,
+    );
+    // A real input event on the same track is unaffected.
+    collector.observe(mark(2, ARRIVED, 200_000), &Names);
+    collector.observe(end(2, INJECTED, 200_400, 0), &Names);
+    // Discarding an unknown flow changes nothing.
+    collector.observe(
+        Observation {
+            kind: TRACE_DISCARD,
+            stage: 0,
+            ..mark(77, 0, 200_500)
+        },
+        &Names,
+    );
+
+    let reports = collector.poll(10_001_000, 0, &Names);
+    assert!(
+        reports
+            .iter()
+            .all(|report| report.target != "trace.slow_flow")
+    );
+    let window = only(&reports, "trace.window");
+    let track = &window["tracks"][0];
+    assert_eq!(track["completed"], 1);
+    assert_eq!(track["discarded"], 1);
+    assert_eq!(track["abandoned"], 0);
+    assert_eq!(track["total"]["max_us"], 400);
+    assert_eq!(window["open_flows"], 0);
 }
 
 #[test]

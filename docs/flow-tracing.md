@@ -81,8 +81,10 @@ trace.tracer.finish(trace.track, flow, trace.admitted, Duration::from_millis(12)
   batch size. Never record user data, key values or coordinates.
 - `span` returns a guard that records the work's duration when dropped;
   `record_span` records a duration measured some other way.
-- A flow that never reaches `finish` is counted as abandoned after five
-  seconds. End flows you start, including the paths that discard an item.
+- `discard` forgets a flow that turned out not to belong to its track, such as
+  a control message that carried no input. It leaves no statistics and no report.
+- A flow that never reaches `finish` or `discard` is counted as abandoned after
+  five seconds. End flows you start, including the paths that drop an item.
 
 `Tracer` is `Copy`, `Send` and `Sync`. Keep the handles in the struct that does
 the work; no global or macro is involved.
@@ -110,7 +112,7 @@ first one after.
 | --- | --- | --- |
 | `input` | `socket.arrived`, `control.authenticated` | control transport |
 | `input` | `session.dequeued`, `session.submitted`, `input.accepted` | stream session |
-| `input` | `session.consumed` (not input), `session.coalesced` (replaced sample) | stream session |
+| `input` | `session.coalesced` (a newer sample replaced this one) | stream session |
 | `video` | `video.capture_started`, `video.encoder_submitted`, `video.packet_queued` | video |
 | `video` | `session.packet_read`, `transport.admitted` | stream session |
 
@@ -125,6 +127,10 @@ The video pipeline starts each frame's flow and the consumer ends it. A consumer
 that records nothing leaves those flows to be counted as abandoned, so a
 replacement consumer of the video service should mark `transport.admitted` or
 its own final stage.
+
+The control transport starts a flow for every authenticated message. The
+session discards the ones that carry no input: pings, IDR requests, and input
+rejected because the stream is not active.
 
 `socket.arrived` is the oldest datagram a control stream read in the tick that
 completed the message, which is the longest the message can have waited.

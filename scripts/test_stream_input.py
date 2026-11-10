@@ -125,7 +125,7 @@ def end_session(console, session, geometry):
         time.sleep(0.01)
 
 
-def exercise(console, oracle, directory, geometry=False):
+def exercise(console, oracle, directory, geometry=False, direct=False):
     key = secrets.token_bytes(16)
     connect_data = secrets.randbits(32) or 1
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as video, socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as audio:
@@ -165,6 +165,8 @@ def exercise(console, oracle, directory, geometry=False):
             ]
             metrics = wait_metrics(console, lambda value: len(value["events"]) >= 3)
             assert metrics["events"] == expected, metrics
+            # The same events in the same order, whichever transport carried them.
+            assert (metrics["direct_batches"] > 0) is direct, metrics
             check_absolute_input(console, client, key, session, expected, geometry)
             # The one-second lease must renew while keys remain held.
             metrics = wait_metrics(console, lambda value: value["renewed"] >= 2)
@@ -178,7 +180,7 @@ def exercise(console, oracle, directory, geometry=False):
             stop_client(client)
 
 
-def run_case(oracle, geometry):
+def run_case(oracle, geometry, direct=False):
     with tempfile.TemporaryDirectory(prefix="amaterasu-stream-input-") as temporary:
         directory = Path(temporary)
         harness = ComponentHarness(directory)
@@ -186,7 +188,7 @@ def run_case(oracle, geometry):
         bootstrap = json.loads(path.read_text())
         settings = bootstrap["policy"]["settings"]
         settings["amaterasu.audio-encode"] = {"enabled": True}
-        settings["amaterasu.input-probe"] = {"enabled": True}
+        settings["amaterasu.input-probe"] = {"enabled": True, "direct_batches": direct}
         settings["amaterasu.stream-source"] = {"desktop_geometry": geometry}
         settings["amaterasu.stream-session"] = {
             "enabled": True, "allowed_principals": ["amaterasu.console"],
@@ -202,7 +204,7 @@ def run_case(oracle, geometry):
         harness.stage(package)
         console = Console(harness)
         try:
-            exercise(console, oracle, directory, geometry)
+            exercise(console, oracle, directory, geometry, direct)
             console.eof()
         finally:
             console.close()
@@ -216,7 +218,9 @@ def main():
     run(CARGO, "build", "--workspace", "--offline", "--locked")
     for geometry in (False, True):
         run_case(oracle, geometry)
-    print("Passed: signed authenticated input dispatch, pre-active/replay rejection, captured-monitor absolute mapping, missing-geometry rejection, lease renewal and held-input cleanup after geometry failure. In-memory fixtures do not qualify native OS delivery.")
+    # The unchanged session against a provider that serves batches directly.
+    run_case(oracle, False, direct=True)
+    print("Passed: signed authenticated input dispatch through queued and direct batches, pre-active/replay rejection, captured-monitor absolute mapping, missing-geometry rejection, lease renewal and held-input cleanup after geometry failure. In-memory fixtures do not qualify native OS delivery.")
 
 
 if __name__ == "__main__":

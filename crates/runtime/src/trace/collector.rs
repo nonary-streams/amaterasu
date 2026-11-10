@@ -3,7 +3,7 @@
 //! This runs on the collector thread only. Producers pay for one queue push;
 //! every map, sort and string here is off their path.
 use super::ring::Observation;
-use amaterasu_abi::{TRACE_END, TRACE_MARK, TRACE_SPAN};
+use amaterasu_abi::{TRACE_DISCARD, TRACE_END, TRACE_MARK, TRACE_SPAN};
 use amaterasu_timing_metrics::LatencyMetric;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -92,6 +92,7 @@ struct TrackStats {
     completed: u64,
     slow: u64,
     abandoned: u64,
+    discarded: u64,
     truncated: u64,
     total: LatencyMetric,
     steps: BTreeMap<(u16, u16), LatencyMetric>,
@@ -156,6 +157,7 @@ impl Collector {
         }
         match observation.kind {
             TRACE_MARK | TRACE_END if observation.stage != 0 => self.observe_mark(observation),
+            TRACE_DISCARD => self.discard(observation),
             TRACE_SPAN => self.observe_span(observation, resolver),
             _ => self.ignored_records = self.ignored_records.saturating_add(1),
         }
@@ -192,6 +194,19 @@ impl Collector {
                 observation.value
             };
             self.complete(key.0, key.1, &flow, budget_us);
+        }
+    }
+
+    /// The producer learned that this flow is not an instance of its track.
+    /// Its marks must not shape the track's statistics or raise a report.
+    fn discard(&mut self, observation: Observation) {
+        if self
+            .flows
+            .remove(&(observation.track, observation.flow))
+            .is_some()
+        {
+            let stats = self.tracks.entry(observation.track).or_default();
+            stats.discarded = stats.discarded.saturating_add(1);
         }
     }
 
@@ -420,6 +435,7 @@ impl Collector {
                     "slow_reports_suppressed": stats.slow_suppressed,
                     "worst_suppressed_us": (stats.slow_suppressed != 0).then_some(stats.worst_suppressed_us),
                     "abandoned": stats.abandoned,
+                    "discarded": stats.discarded,
                     "stages_truncated": stats.truncated,
                     "unrecorded_steps": stats.unrecorded_steps,
                     "total": summary("total", &stats.total),

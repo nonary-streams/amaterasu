@@ -183,8 +183,8 @@ pub use direct::{
     DirectCallHandler, ModuleDirectApi, ModuleDirectEntry, RuntimeDirectApi, RuntimeDirectEntry,
 };
 pub use trace::{
-    MAX_TRACE_NAME_BYTES, MAX_TRACE_RECORDS_PER_CALL, TRACE_END, TRACE_MARK, TRACE_SPAN,
-    TraceRecord, TraceSink, TraceSinkApi,
+    MAX_TRACE_NAME_BYTES, MAX_TRACE_RECORDS_PER_CALL, TRACE_DISCARD, TRACE_END, TRACE_MARK,
+    TRACE_SPAN, TraceRecord, TraceSink, TraceSinkApi,
 };
 
 #[cfg(test)]

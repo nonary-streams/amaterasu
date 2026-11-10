@@ -110,6 +110,22 @@ fn an_unchanged_consumer_records_through_a_replacement_sink() {
 }
 
 #[test]
+fn discarding_a_flow_names_only_the_track_and_the_flow() {
+    let sink = RecordingSink::default();
+    let mut api = None;
+    let tracer = tracer_for(&sink, &mut api);
+    let track = tracer.track(names::INPUT_TRACK);
+    tracer.mark(track, 9, tracer.stage(names::SESSION_DEQUEUED));
+    tracer.discard(track, 9);
+
+    let records = sink.records.lock().unwrap().clone();
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[1].kind, crate::abi::TRACE_DISCARD);
+    assert_eq!((records[1].track, records[1].flow), (records[0].track, 9));
+    assert_eq!((records[1].stage, records[1].value), (0, 0));
+}
+
+#[test]
 fn a_disabled_tracer_accepts_the_same_calls_and_records_nothing() {
     let tracer = Tracer::disabled();
     assert!(!tracer.is_enabled());

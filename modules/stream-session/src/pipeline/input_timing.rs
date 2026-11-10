@@ -18,7 +18,6 @@ pub(super) struct InputFlowTrace {
     dequeued: Stage,
     submitted: Stage,
     accepted: Stage,
-    consumed: Stage,
     coalesced: Stage,
 }
 
@@ -29,7 +28,6 @@ impl InputFlowTrace {
             dequeued: tracer.stage(names::SESSION_DEQUEUED),
             submitted: tracer.stage(names::SESSION_SUBMITTED),
             accepted: tracer.stage(names::INPUT_ACCEPTED),
-            consumed: tracer.stage(names::SESSION_CONSUMED),
             coalesced: tracer.stage(names::SESSION_COALESCED),
             tracer,
         }
@@ -75,17 +73,13 @@ impl InputTiming {
     }
 
     /// A message that queued no input (a ping, an IDR request, rejected or
-    /// unsupported input) is finished here; nothing else will end its flow.
+    /// unsupported input) is not an input event. Its flow is discarded, so a
+    /// key sent before the stream was active cannot read as slow input.
     pub fn end_message(&mut self) {
         if !self.message_queued_events
             && let Some(trace) = &self.trace
         {
-            trace.tracer.finish(
-                trace.track,
-                self.message_flow,
-                trace.consumed,
-                INPUT_FLOW_BUDGET,
-            );
+            trace.tracer.discard(trace.track, self.message_flow);
         }
         self.message_flow = 0;
     }

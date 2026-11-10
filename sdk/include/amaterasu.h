@@ -125,6 +125,7 @@ typedef struct {
 #define AMATERASU_TRACE_MARK 1 /* the flow reached a stage; the first record starts it */
 #define AMATERASU_TRACE_END 2  /* final stage; value is the slow budget in us, 0 = default */
 #define AMATERASU_TRACE_SPAN 3 /* completed work on one thread; value is its duration in us */
+#define AMATERASU_TRACE_DISCARD 4 /* the flow does not belong to its track; forget it */
 #define AMATERASU_MAX_TRACE_NAME_BYTES 96
 #define AMATERASU_MAX_TRACE_RECORDS_PER_CALL 64
 

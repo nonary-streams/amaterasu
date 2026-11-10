@@ -10,6 +10,9 @@ pub struct Settings {
     pub enabled: bool,
     #[serde(default = "default_proton_dualsense_compatibility")]
     pub proton_dualsense_compatibility: bool,
+    /// Serve batches as direct calls. Off by default so the fixture also
+    /// stands in for a provider built without direct support.
+    pub direct_batches: bool,
 }
 
 impl Default for Settings {
@@ -17,6 +20,7 @@ impl Default for Settings {
         Self {
             enabled: false,
             proton_dualsense_compatibility: true,
+            direct_batches: false,
         }
     }
 }

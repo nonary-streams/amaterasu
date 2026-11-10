@@ -16220,7 +16220,6 @@ var Amaterasu;
             ["control.authenticated>session.dequeued", "Reaching the stream session"],
             ["session.dequeued>session.submitted", "Waiting for the input plugin"],
             ["session.submitted>input.accepted", "Injecting into the system"],
-            ["session.dequeued>session.consumed", "Handled by the session"],
             ["session.dequeued>session.coalesced", "Replaced by a newer sample"],
         ],
         video: [
