@@ -282,10 +282,7 @@ impl Controller {
     ) -> Vec<(u64, crate::stream::ProcessingLatency)> {
         self.streams
             .iter_mut()
-            .filter_map(|(id, stream)| {
-                let sample = stream.take_processing_latency();
-                (sample.samples > 0).then_some((*id, sample))
-            })
+            .map(|(id, stream)| (*id, stream.take_processing_latency()))
             .collect()
     }
 

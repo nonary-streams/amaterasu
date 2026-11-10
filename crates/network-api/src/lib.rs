@@ -142,6 +142,61 @@ pub struct NetworkApi {
     pub close: unsafe extern "C" fn(*mut c_void, u64) -> Status,
 }
 
+/// Optional v1.1 tail. The v1 prefix remains valid for replacement providers.
+pub const DIAGNOSTICS_MINOR: u32 = 1;
+pub const DATAGRAM_DIAGNOSTICS: u64 = 64;
+pub const KERNEL_RESIDENCE_REALTIME: u64 = 1;
+pub const SOCKET_MEMORY: u64 = 2;
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ReceiveTiming {
+    pub size: u32,
+    pub version: u32,
+    pub flags: u64,
+    /// Kernel receive timestamp to userspace return, correlated in CLOCK_REALTIME.
+    /// Unknown if timestamping is unavailable or the clock moved backwards.
+    pub kernel_residence_us: u64,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SocketDiagnostics {
+    pub size: u32,
+    pub version: u32,
+    pub flags: u64,
+    /// OS memory charged to the receive queue; includes packet overhead.
+    pub receive_memory_bytes: u64,
+    pub receive_buffer_bytes: u64,
+    pub send_memory_bytes: u64,
+    pub send_buffer_bytes: u64,
+    pub receive_drops: u64,
+}
+#[repr(C)]
+pub struct NetworkApiV1_1 {
+    pub v1: NetworkApi,
+    pub recv_from_timed: unsafe extern "C" fn(
+        *mut c_void,
+        u64,
+        *mut u8,
+        usize,
+        *mut usize,
+        *mut Address,
+        *mut ReceiveTiming,
+    ) -> Status,
+    pub socket_diagnostics:
+        unsafe extern "C" fn(*mut c_void, u64, *mut SocketDiagnostics) -> Status,
+}
+impl std::ops::Deref for NetworkApiV1_1 {
+    type Target = NetworkApi;
+    fn deref(&self) -> &Self::Target {
+        &self.v1
+    }
+}
+impl std::ops::DerefMut for NetworkApiV1_1 {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.v1
+    }
+}
+
 #[cfg(all(test, target_pointer_width = "64"))]
 mod tests {
     use super::*;
@@ -160,6 +215,10 @@ mod tests {
         assert_eq!(size_of::<ListenOptions>(), 16);
         assert_eq!(size_of::<Datagram>(), 16);
         assert_eq!(size_of::<NetworkApi>(), 200);
+        assert_eq!(size_of::<ReceiveTiming>(), 24);
+        assert_eq!(size_of::<SocketDiagnostics>(), 56);
+        assert_eq!(size_of::<NetworkApiV1_1>(), 216);
+        assert_eq!(std::mem::offset_of!(NetworkApiV1_1, recv_from_timed), 200);
         assert_eq!(std::mem::offset_of!(NetworkApi, capabilities), 32);
         assert_eq!(std::mem::offset_of!(NetworkApi, tcp_listen), 56);
         assert_eq!(std::mem::offset_of!(NetworkApi, read), 104);

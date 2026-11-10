@@ -1392,6 +1392,7 @@ fn cancelled_open_completion_rolls_back_only_newly_created_streams() {
         controller: shared.clone(),
         _factory: Factory::new(shared.clone()),
         platform_started: false,
+        last_timing_log: std::time::Instant::now(),
     };
     let request = |payload| Response::Request {
         id: 1,

@@ -56,6 +56,22 @@ impl<B: Backend> Controllers<B> {
         }
     }
 
+    pub(crate) fn timing_summaries(&mut self, now: Instant) -> Vec<Value> {
+        std::iter::once(&mut self.defaults)
+            .chain(
+                self.contexts
+                    .values_mut()
+                    .map(|context| &mut context.controller),
+            )
+            .enumerate()
+            .filter_map(|(index, controller)| {
+                let mut summary = controller.timing.take_if_due(now)?;
+                summary["context_index"] = index.into();
+                Some(summary)
+            })
+            .collect()
+    }
+
     pub(crate) fn select_default(&mut self) {
         self.selected = None;
     }

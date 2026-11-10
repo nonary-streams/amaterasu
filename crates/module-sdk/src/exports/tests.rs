@@ -82,7 +82,7 @@ impl ExportedFixture {
     fn module(&mut self) -> &mut ShutdownFixture {
         // SAFETY: this fixture owns the instance created through the macro table,
         // and no lifecycle call occurs while this mutable borrow is retained.
-        unsafe { &mut *self.instance.cast::<ShutdownFixture>() }
+        unsafe { &mut (*self.instance.cast::<Instance<ShutdownFixture>>()).module }
     }
 }
 
@@ -172,18 +172,44 @@ impl ManagedModule for DefaultShutdown {
 
 #[test]
 fn existing_modules_keep_a_noop_shutdown_preparation() {
-    let mut module = DefaultShutdown;
+    let endpoint = HostApi {
+        header: AbiHeader::of::<HostApi>(),
+        context: std::ptr::null_mut(),
+        invoke: unavailable_runtime,
+    };
+    let mut instance = std::ptr::null_mut();
+    // SAFETY: the static stub outlives the exclusively owned instance.
+    assert_eq!(
+        unsafe { super::create::<DefaultShutdown>(&endpoint, &mut instance) },
+        STATUS_OK
+    );
     for remaining_ms in [0, 731] {
-        // SAFETY: the adapter borrows this stack instance only for the call and
-        // does not take allocation ownership; destruction remains local.
+        // SAFETY: the live instance belongs to the matching create adapter.
         assert_eq!(
-            unsafe {
-                super::prepare_shutdown::<DefaultShutdown>(
-                    (&mut module as *mut DefaultShutdown).cast(),
-                    remaining_ms,
-                )
-            },
+            unsafe { super::prepare_shutdown::<DefaultShutdown>(instance, remaining_ms,) },
             STATUS_OK
         );
     }
+    // SAFETY: all calls finished and ownership is relinquished exactly once.
+    unsafe { super::destroy::<DefaultShutdown>(instance) };
+}
+
+#[test]
+fn unavailable_timing_log_does_not_change_exported_tick_or_lifecycle() {
+    let fixture = ExportedFixture::create();
+    // SAFETY: the fixture owns the matching create adapter's opaque allocation.
+    let instance = unsafe { &mut *fixture.instance.cast::<Instance<ShutdownFixture>>() };
+    let old = std::time::Instant::now() - std::time::Duration::from_secs(11);
+    instance.timing = crate::diagnostics::ModuleTiming::new(old);
+    instance.timing.begin(old);
+    // The delayed interval triggers a log against the unavailable endpoint.
+    // SAFETY: this serialized lifecycle call borrows the live fixture.
+    assert_eq!(
+        unsafe { (fixture.lifecycle.tick)(fixture.instance) },
+        STATUS_OK
+    );
+    assert_eq!(
+        unsafe { (fixture.lifecycle.health)(fixture.instance) },
+        STATUS_OK
+    );
 }

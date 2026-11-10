@@ -1,5 +1,6 @@
 //! Owned, encrypted GameStream control transport. No product code in the shell.
 mod controller;
+mod diagnostics;
 mod model;
 mod native;
 mod stream;
@@ -11,6 +12,7 @@ use controller::{Controller, Reply};
 use model::{Operation, Settings};
 use serde_json::json;
 use std::sync::{Arc, Mutex, TryLockError};
+use std::time::{Duration, Instant};
 
 const SERVICE: &str = "amaterasu.control-transport/1";
 
@@ -19,6 +21,7 @@ struct ControlTransport {
     controller: native::Shared,
     _factory: Box<native::Factory>,
     shutdown_announced: bool,
+    last_timing_log: Instant,
 }
 
 impl ManagedModule for ControlTransport {
@@ -36,6 +39,28 @@ impl ManagedModule for ControlTransport {
             Err(TryLockError::Poisoned(_)) => return Err("control state unavailable".into()),
         };
         controller.tick();
+        let now = Instant::now();
+        if now.saturating_duration_since(self.last_timing_log) >= Duration::from_secs(10) {
+            let elapsed = now
+                .saturating_duration_since(self.last_timing_log)
+                .as_micros();
+            let summaries = controller.timing_summaries();
+            drop(controller);
+            self.last_timing_log = now;
+            for mut summary in summaries {
+                summary["window_us"] = serde_json::json!(elapsed.min(u128::from(u64::MAX)) as u64);
+                amaterasu_module_sdk::diagnostics::log_window(
+                    &self.runtime,
+                    "control.timing",
+                    &summary,
+                );
+            }
+            controller = match self.controller.try_lock() {
+                Ok(controller) => controller,
+                Err(TryLockError::WouldBlock) => return Ok(()),
+                Err(TryLockError::Poisoned(_)) => return Err("control state unavailable".into()),
+            };
+        }
         match self.runtime.send(Command::Poll {})? {
             Response::Pending => Ok(()),
             Response::Request {
@@ -175,6 +200,7 @@ impl ControlTransport {
             controller,
             _factory: factory,
             shutdown_announced: false,
+            last_timing_log: Instant::now(),
         })
     }
 }

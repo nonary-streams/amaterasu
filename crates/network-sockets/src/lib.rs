@@ -2,6 +2,7 @@
 //! Resources are confined to their runtime-bound native binding. No socket or
 //! allocator crosses the ABI; callbacks borrow buffers only synchronously.
 mod batch;
+mod diagnostics;
 mod interfaces;
 mod resolver;
 use amaterasu_abi::*;
@@ -48,7 +49,7 @@ struct Resource {
 }
 #[repr(C)]
 struct Binding {
-    api: net::NetworkApi,
+    api: net::NetworkApiV1_1,
     shared: Arc<Shared>,
     resources: Mutex<BTreeMap<u64, Arc<Resource>>>,
     next: AtomicU64,
@@ -126,8 +127,8 @@ unsafe extern "C" fn bind(
         };
         if !query.header.supports::<NativeInterfaceQuery>()
             || query.interface_major != net::MAJOR
-            || query.min_minor > net::MINOR
-            || query.min_size > size_of::<net::NetworkApi>() as u32
+            || query.min_minor > net::DIAGNOSTICS_MINOR
+            || query.min_size > size_of::<net::NetworkApiV1_1>() as u32
         {
             return Err(net::UNSUPPORTED);
         }
@@ -141,37 +142,41 @@ unsafe extern "C" fn bind(
             return Err(STATUS_INVALID_ARGUMENT);
         }
         let mut binding = Box::new(Binding {
-            api: net::NetworkApi {
-                base: NativeInterface {
-                    header: AbiHeader {
-                        size: size_of::<net::NetworkApi>() as u32,
-                        major: net::MAJOR,
-                        minor: net::MINOR,
+            api: net::NetworkApiV1_1 {
+                v1: net::NetworkApi {
+                    base: NativeInterface {
+                        header: AbiHeader {
+                            size: size_of::<net::NetworkApiV1_1>() as u32,
+                            major: net::MAJOR,
+                            minor: net::DIAGNOSTICS_MINOR,
+                        },
+                        context: std::ptr::null_mut(),
+                        release: Some(release),
                     },
-                    context: std::ptr::null_mut(),
-                    release: Some(release),
+                    capabilities,
+                    resolve,
+                    interfaces,
+                    tcp_listen,
+                    tcp_connect,
+                    udp_bind,
+                    accept,
+                    local_addr,
+                    peer_addr,
+                    read,
+                    peek,
+                    write,
+                    recv_from,
+                    send_to,
+                    connect_udp,
+                    set_option,
+                    get_option,
+                    join_multicast,
+                    send_batch,
+                    shutdown,
+                    close,
                 },
-                capabilities,
-                resolve,
-                interfaces,
-                tcp_listen,
-                tcp_connect,
-                udp_bind,
-                accept,
-                local_addr,
-                peer_addr,
-                read,
-                peek,
-                write,
-                recv_from,
-                send_to,
-                connect_udp,
-                set_option,
-                get_option,
-                join_multicast,
-                send_batch,
-                shutdown,
-                close,
+                recv_from_timed: diagnostics::recv_from_timed,
+                socket_diagnostics: diagnostics::socket_diagnostics,
             },
             shared: factory.shared.clone(),
             resources: Mutex::new(BTreeMap::new()),
@@ -403,7 +408,8 @@ unsafe extern "C" fn capabilities(context: *mut c_void, out: *mut net::Capabilit
                         | net::DNS
                         | net::BATCH
                         | net::MULTICAST
-                        | net::INTERFACES,
+                        | net::INTERFACES
+                        | net::DATAGRAM_DIAGNOSTICS,
                     max_io_bytes: net::MAX_IO_BYTES as u64,
                     max_handles: binding.shared.max_handles,
                     max_batch: net::MAX_BATCH as u32,
@@ -563,6 +569,7 @@ unsafe extern "C" fn udp_bind(
         socket.bind(&address.into()).map_err(io_status)?;
         socket.set_nonblocking(true).map_err(io_status)?;
         request_udp_send_buffer(&socket);
+        diagnostics::enable_timestamps(&socket);
         let id = insert(binding, SocketResource::Udp(socket.into()), permit)?;
         unsafe { output(out, id) }
     })

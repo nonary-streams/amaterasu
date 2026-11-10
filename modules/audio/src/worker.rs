@@ -33,6 +33,9 @@ pub trait Source: Send {
     /// the error here even if health has already marked the source failed.
     fn read(&mut self) -> AudioResult<Option<Packet>>;
     fn health(&self) -> Health;
+    fn take_timing(&mut self) -> Option<serde_json::Value> {
+        None
+    }
 }
 
 trait CaptureDevice {
@@ -110,6 +113,7 @@ pub struct Worker {
     health: Arc<Mutex<Health>>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+    unobserved_queue_samples: usize,
 }
 
 impl Worker {
@@ -201,6 +205,7 @@ impl Worker {
                     health,
                     stop,
                     thread: Some(thread),
+                    unobserved_queue_samples: 0,
                 },
                 endpoint,
                 format,
@@ -217,7 +222,29 @@ impl Worker {
 impl Source for Worker {
     fn read(&mut self) -> AudioResult<Option<Packet>> {
         match self.packets.try_recv() {
-            Ok(packet) => Ok(Some(packet)),
+            Ok(packet) => {
+                if let Ok(mut health) = self.health.try_lock() {
+                    for _ in 0..self.unobserved_queue_samples.min(QUEUE_PACKETS) {
+                        health.queued_at.pop_front();
+                    }
+                    health.queue_timing_unknown = health
+                        .queue_timing_unknown
+                        .saturating_add(self.unobserved_queue_samples as u64);
+                    self.unobserved_queue_samples = 0;
+                    if let Some(queued_at) = health
+                        .queued_at
+                        .pop_front()
+                        .filter(|_| !health.queue_clock_lost)
+                    {
+                        health.queue_wait_us.record_since(queued_at);
+                    } else {
+                        health.queue_timing_unknown = health.queue_timing_unknown.saturating_add(1);
+                    }
+                } else {
+                    self.unobserved_queue_samples = self.unobserved_queue_samples.saturating_add(1);
+                }
+                Ok(Some(packet))
+            }
             Err(state) => {
                 // Capture may fail after it has already queued valid PCM. Drain
                 // those packets in order before exposing the terminal failure.
@@ -240,6 +267,29 @@ impl Source for Worker {
                 failure: Some("audio_worker_failed"),
                 ..Health::default()
             })
+    }
+    fn take_timing(&mut self) -> Option<serde_json::Value> {
+        let mut health = self.health.try_lock().ok()?;
+        for _ in 0..self.unobserved_queue_samples.min(QUEUE_PACKETS) {
+            health.queued_at.pop_front();
+        }
+        health.queue_timing_unknown = health
+            .queue_timing_unknown
+            .saturating_add(self.unobserved_queue_samples as u64);
+        self.unobserved_queue_samples = 0;
+        let capture = std::mem::take(&mut health.capture_read_us);
+        let queue = std::mem::take(&mut health.queue_wait_us);
+        let pending = health.queued_at.len();
+        let high_water = std::mem::replace(&mut health.queue_high_water, pending);
+        Some(serde_json::json!({"event":"audio_capture_window",
+            "capture_read_us":capture,"worker_queue_us":queue,
+            "queue_timing_unknown":health.queue_timing_unknown,
+            "queue_clock_lost":health.queue_clock_lost,
+            "queued_packets":(!health.queue_clock_lost).then_some(pending),"queue_high_water":(!health.queue_clock_lost).then_some(high_water),
+            "oldest_queued_us":health.queued_at.front().map(|at|amaterasu_module_sdk::diagnostics::elapsed_us(*at)),
+            "recovering":health.recovering,"failure":health.failure,
+            "dropped_packets_cumulative":health.dropped_packets,"discontinuities_cumulative":health.discontinuities,
+            "scope":"audio_backend_read_and_worker_pcm_queue_not_audio_device_or_client_playout"}))
     }
 }
 
@@ -292,7 +342,12 @@ fn run_capture_loop<F>(
     let mut recovery_without_packet = false;
     set_active_endpoint(health, capture.endpoint());
     while !stop.load(Ordering::Acquire) {
-        match capture.read() {
+        let read_started = Instant::now();
+        let result = capture.read();
+        if let Ok(mut health) = health.lock() {
+            health.capture_read_us.record_since(read_started);
+        }
+        match result {
             Ok(Some(mut packet)) => {
                 if let Err(error) = continuity.normalize(&mut packet) {
                     fail(health, error);
@@ -396,16 +451,29 @@ fn wait_for_retry(stop: &AtomicBool, delay: Duration) -> bool {
 
 fn enqueue(sender: &SyncSender<Packet>, health: &Mutex<Health>, packet: Packet) -> bool {
     let discontinuity = packet.flags & AUDIO_DISCONTINUITY != 0;
+    // Keep the nonblocking send and its timestamp ordered with the consumer.
+    let mut queue_health = health.lock().ok();
+    let queued_at = Instant::now();
     match sender.try_send(packet) {
         Ok(()) => {
-            if discontinuity && let Ok(mut health) = health.lock() {
-                health.discontinuities = health.discontinuities.saturating_add(1);
+            if let Some(health) = queue_health.as_mut() {
+                if health.queued_at.len() >= QUEUE_PACKETS {
+                    health.queue_clock_lost = true;
+                    health.queued_at.clear();
+                }
+                if !health.queue_clock_lost {
+                    health.queued_at.push_back(queued_at);
+                }
+                health.queue_high_water = health.queue_high_water.max(health.queued_at.len());
+                health.discontinuities = health
+                    .discontinuities
+                    .saturating_add(u64::from(discontinuity));
             }
             true
         }
         Err(TrySendError::Full(_)) => {
             eprintln!("amaterasu audio capture failed code=audio_queue_overflow");
-            if let Ok(mut health) = health.lock() {
+            if let Some(health) = queue_health.as_mut() {
                 health.failure = Some("audio_queue_overflow");
                 health.recovering = false;
                 health.dropped_packets = health.dropped_packets.saturating_add(1);
@@ -598,6 +666,7 @@ mod tests {
             health,
             stop,
             thread: Some(thread),
+            unobserved_queue_samples: 0,
         };
         let deadline = Instant::now() + Duration::from_secs(1);
         while worker.health().failure.is_none() && Instant::now() < deadline {
@@ -692,6 +761,7 @@ mod tests {
             health,
             stop,
             thread: Some(thread),
+            unobserved_queue_samples: 0,
         };
         let deadline = Instant::now() + Duration::from_secs(1);
         while worker.health().failure.is_none() && Instant::now() < deadline {

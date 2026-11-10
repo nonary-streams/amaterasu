@@ -84,6 +84,11 @@ impl Broker {
 
     pub(crate) fn dispatch_at(&mut self, caller: &str, command: Command, now: Instant) -> Response {
         self.requests.expire(now);
+        if let Some(reports) = self.requests.take_timing(now) {
+            for report in reports {
+                self.record_diagnostic("broker.timing", report);
+            }
+        }
         self.hooks.expire(now);
 
         if matches!(command, Command::HostLifecycleDrain {}) {
@@ -144,7 +149,7 @@ impl Broker {
                     self.requests.select_delivery_mode(caller, reliable)
                 }
                 Command::AcceptRequest { request, receiver } => {
-                    self.requests.accept(caller, request, &receiver)
+                    self.requests.accept_at(caller, request, &receiver, now)
                 }
                 Command::RetireRequestDelivery { request, receiver } => {
                     self.requests.retire_delivery(caller, request, &receiver)
@@ -603,7 +608,7 @@ impl Broker {
                 self.requests.select_delivery_mode(caller, reliable)
             }
             Command::AcceptRequest { request, receiver } => {
-                self.requests.accept(caller, request, &receiver)
+                self.requests.accept_at(caller, request, &receiver, now)
             }
             Command::RetireRequestDelivery { request, receiver } => {
                 self.requests.retire_delivery(caller, request, &receiver)
@@ -612,7 +617,7 @@ impl Broker {
             Command::Complete { request, payload } => {
                 self.requests.complete(caller, request, payload, now)
             }
-            Command::TakeResult { request } => self.requests.result(caller, request),
+            Command::TakeResult { request } => self.requests.result_at(caller, request, now),
             Command::ReleaseResult { request } => self.requests.release(caller, request),
             Command::Cancel { request } => self.requests.cancel(caller, request, now),
             Command::Subscribe {
@@ -661,6 +666,14 @@ impl Broker {
             Command::HookResult { invocation } => {
                 self.hooks
                     .advance(caller, grants, invocation, now, &mut self.requests)
+            }
+        }
+    }
+
+    pub(crate) fn record_diagnostic(&mut self, target: &str, report: String) {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&report) {
+            for part in amaterasu_timing_metrics::window_parts(&value) {
+                let _ = self.enqueue_log("amaterasu.runtime", 2, target.into(), part.to_string());
             }
         }
     }

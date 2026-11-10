@@ -334,6 +334,13 @@ fn prepared_batch_has_no_effect_until_delivered_once() {
     assert_eq!(response["ok"], true);
     assert_eq!(*controller.backend.trace.borrow(), events);
     assert!(controller.pressed.is_empty());
+    assert_eq!(controller.timing.window.event_injection_us.calls, 2);
+    let summary = controller
+        .timing
+        .take_if_due(Instant::now() + Duration::from_secs(11))
+        .unwrap();
+    assert_eq!(summary["timing_us"]["event_injection_us"]["calls"], 2);
+    assert_eq!(controller.timing.window.event_injection_us.calls, 0);
 }
 
 #[test]

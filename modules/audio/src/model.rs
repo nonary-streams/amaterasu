@@ -86,6 +86,18 @@ pub struct Health {
     pub active_endpoint: Option<String>,
     pub discontinuities: u64,
     pub dropped_packets: u64,
+    #[serde(skip)]
+    pub capture_read_us: amaterasu_module_sdk::diagnostics::LatencyMetric,
+    #[serde(skip)]
+    pub queue_wait_us: amaterasu_module_sdk::diagnostics::LatencyMetric,
+    #[serde(skip)]
+    pub queue_high_water: usize,
+    #[serde(skip)]
+    pub queue_timing_unknown: u64,
+    #[serde(skip)]
+    pub queue_clock_lost: bool,
+    #[serde(skip)]
+    pub queued_at: std::collections::VecDeque<std::time::Instant>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

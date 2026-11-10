@@ -5,6 +5,7 @@
 
 mod broker;
 mod ffi;
+mod invocation_timing;
 mod native;
 mod tick_holds;
 mod work_signal;

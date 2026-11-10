@@ -173,3 +173,27 @@ TCP read/write, UDP and batching, resource budgets, per-binding ownership, final
 release and zero-length datagrams. Source/test qualification is separate from
 installation, real-client playback, physical-network throughput, Windows socket
 offload validation and live provider replacement during an active stream.
+
+## Optional receive diagnostics (v1.1)
+
+The original `NetworkApi` remains a v1.0 prefix. The default provider also offers
+`NetworkApiV1_1` under the same immutable interface identity. Consumers check the
+`DATAGRAM_DIAGNOSTICS` capability, minor version and complete tail size before
+using `recv_from_timed` or `socket_diagnostics`. The SDK uses the **selected v1
+provider's** ordinary receive call when the tail is absent and returns unknown
+timing; it never substitutes the default provider. All handles and allocations
+remain owned by that binding.
+
+Linux enables software receive timestamps before binding. `recv_from_timed`
+returns kernel timestamp-to-userspace age when `KERNEL_RESIDENCE_REALTIME` is set.
+This observation uses the kernel's realtime timestamp and a userspace realtime
+sample; it includes kernel queue residence and return overhead. It is **not** a
+client-to-host network measurement. Negative/invalid or missing timestamps are
+unknown. A realtime clock step can affect this observation; the host's monotonic
+spike timestamps and OS sample clock correlation are independent.
+
+`SOCKET_MEMORY` establishes receive/send queue memory charges, buffer limits and
+cumulative receive drops. Memory charges include OS packet overhead, and are not
+payload byte counts. Other platforms or replacement providers may expose the
+tail with flags zero; consumers retain unknown values. No IO outcome depends on
+diagnostic availability. See [Linux socket timestamp semantics](https://man7.org/linux/man-pages/man7/socket.7.html).

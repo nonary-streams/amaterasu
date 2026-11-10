@@ -105,6 +105,7 @@ impl Pipeline {
             ) {
                 record.plane = None;
                 record.input_events.clear();
+                record.input_timing.clear_queue();
             }
             job.fail(record, "operation_deadline", now);
         }
@@ -210,6 +211,7 @@ impl Pipeline {
                     ) {
                         record.plane = None;
                         record.input_events.clear();
+                        record.input_timing.clear_queue();
                         record.lifecycle_invalid_reason = Some("capture_validation_unavailable");
                         job.lifecycle_lookup = false;
                         job.step = Step::NotifyCaptureInvalidated;
@@ -451,6 +453,9 @@ impl Pipeline {
         }
         if job.step == Step::InputBatch {
             record.input_inflight = next_input_batch_size(record);
+            record
+                .input_timing
+                .begin_batch(record.input_events.len(), record.input_inflight);
         }
         if job.step != Step::PersistJournal
             && (transferred_display_restore
@@ -601,6 +606,7 @@ impl Pipeline {
                 record.lifecycle_invalid_reason = Some("capture_binding_invalid");
                 record.plane = None;
                 record.input_events.clear();
+                record.input_timing.clear_queue();
                 job.step = Step::NotifyCaptureInvalidated;
             } else {
                 job.step = Step::ValidateActiveBinding;
@@ -623,6 +629,7 @@ impl Pipeline {
                 record.lifecycle_invalid_reason = Some("capture_binding_invalid");
                 record.plane = None;
                 record.input_events.clear();
+                record.input_timing.clear_queue();
                 job.lifecycle_lookup = false;
                 job.step = Step::NotifyCaptureInvalidated;
             } else {
@@ -1365,6 +1372,7 @@ impl Pipeline {
                     record.input_events.push_front(json!({"kind":"absolute",
                         "x":(u32::from(bounds.left)+u32::from(bounds.right))/2,
                         "y":(u32::from(bounds.top)+u32::from(bounds.bottom))/2}));
+                    record.input_timing.queued_front(record.input_events.len());
                 }
                 if record
                     .start

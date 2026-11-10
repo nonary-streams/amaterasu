@@ -1,5 +1,6 @@
 //! Bounded, synchronous native media forwarding. Provider resources belong to the
 //! pipeline; this plane owns only bindings and bounded copied pending output.
+mod diagnostics;
 mod native;
 mod packets;
 
@@ -11,6 +12,7 @@ use amaterasu_media::*;
 use amaterasu_module_sdk::RuntimeClient;
 use packets::{AudioPacket, PcmPacket, VideoAssembly, VideoPacket};
 use std::collections::VecDeque;
+use std::time::Instant;
 
 pub type PlaneResult<T> = Result<T, &'static str>;
 const READ_BUDGET: usize = 4;
@@ -121,6 +123,15 @@ impl Plane {
         Ok(Self { pump })
     }
 
+    pub fn timing_summary(&mut self) -> Option<serde_json::Value> {
+        let mut summary = self.pump.timing.take_if_due(Instant::now())?;
+        summary["pending_pcm"] = self.pump.pending_pcm.is_some().into();
+        summary["pending_processed_pcm"] = self.pump.pending_processed.is_some().into();
+        summary["pending_audio"] = self.pump.pending_audio.is_some().into();
+        summary["pending_feedback_messages"] = self.pump.pending_feedback.len().into();
+        Some(summary)
+    }
+
     pub fn tick(&mut self, media_active: bool) -> Result<Progress, TickFailure> {
         self.pump.tick(media_active)
     }
@@ -197,6 +208,7 @@ trait Backend {
 }
 
 struct Pump<B> {
+    timing: diagnostics::ForwardingTiming,
     backend: B,
     stream_audio: bool,
     encoded_source: bool,
@@ -228,6 +240,7 @@ impl<B: Backend> Pump<B> {
 
     fn with_media(backend: B, stream_audio: bool, audio_channels: u32, video_codec: u32) -> Self {
         Self {
+            timing: diagnostics::ForwardingTiming::default(),
             backend,
             stream_audio,
             encoded_source: false,
@@ -253,6 +266,7 @@ impl<B: Backend> Pump<B> {
     }
 
     fn tick(&mut self, media_active: bool) -> Result<Progress, TickFailure> {
+        self.timing.cadence.observe(Instant::now());
         if let Some(code) = self.failure {
             return Err(TickFailure {
                 code,
@@ -283,6 +297,7 @@ impl<B: Backend> Pump<B> {
                     code,
                     progress: Box::default(),
                 })?;
+        let control_started = Instant::now();
         for _ in 0..CONTROL_READ_BUDGET {
             let message = match self.backend.control() {
                 Ok(message) => message,
@@ -298,6 +313,15 @@ impl<B: Backend> Pump<B> {
             };
             progress.controls.push(message);
         }
+        self.timing
+            .window
+            .control_read_us
+            .record_since(control_started);
+        self.timing.window.control_budget_exhausted = self
+            .timing
+            .window
+            .control_budget_exhausted
+            .saturating_add(u64::from(progress.controls.len() == CONTROL_READ_BUDGET));
         if let Err(code) = self.pump_feedback() {
             return Err(TickFailure {
                 code,
@@ -307,19 +331,31 @@ impl<B: Backend> Pump<B> {
         if !media_active {
             return Ok(progress);
         }
-        if let Err(code) = self.pump_video(&mut progress) {
+        let video_started = Instant::now();
+        let video_result = self.pump_video(&mut progress);
+        self.timing
+            .window
+            .video_forward_us
+            .record_since(video_started);
+        if let Err(code) = video_result {
             return Err(TickFailure {
                 code,
                 progress: Box::new(progress),
             });
         }
-        if !self.audio_recovery_needed
-            && let Err(code) = self.pump_audio(&mut progress)
-        {
-            return Err(TickFailure {
-                code,
-                progress: Box::new(progress),
-            });
+        if !self.audio_recovery_needed {
+            let audio_started = Instant::now();
+            let audio_result = self.pump_audio(&mut progress);
+            self.timing
+                .window
+                .audio_forward_us
+                .record_since(audio_started);
+            if let Err(code) = audio_result {
+                return Err(TickFailure {
+                    code,
+                    progress: Box::new(progress),
+                });
+            }
         }
         if self.video_ended && self.audio_ended && !self.transport_draining {
             self.transport_draining = match self.backend.drain_transport() {
@@ -485,7 +521,12 @@ impl<B: Backend> Pump<B> {
                     timestamp_us: 0,
                     sequence: 0,
                 };
-                if !self.backend.submit_audio(&end)? {
+                if !self
+                    .timing
+                    .window
+                    .audio_transport_admission_us
+                    .measure(|| self.backend.submit_audio(&end))?
+                {
                     return Ok(());
                 }
                 self.audio_ended = true;
@@ -503,7 +544,12 @@ impl<B: Backend> Pump<B> {
             for _ in 0..READ_BUDGET {
                 if let Some(packet) = &self.pending_audio {
                     let header = packet.unit_header();
-                    if !self.backend.submit_audio(&header)? {
+                    if !self
+                        .timing
+                        .window
+                        .audio_transport_admission_us
+                        .measure(|| self.backend.submit_audio(&header))?
+                    {
                         return Ok(());
                     }
                     self.record_audio_admission(&header, progress);
@@ -513,7 +559,12 @@ impl<B: Backend> Pump<B> {
                 if self.audio_ended {
                     return Ok(());
                 }
-                let Some(packet) = self.backend.audio()? else {
+                let Some(packet) = self
+                    .timing
+                    .window
+                    .audio_encoded_read_us
+                    .measure(|| self.backend.audio())?
+                else {
                     break;
                 };
                 self.pending_audio = Some(packet);
@@ -524,7 +575,12 @@ impl<B: Backend> Pump<B> {
             if self.processing {
                 let mut advanced = false;
                 if self.pending_processed.is_none() && !self.processor_ended {
-                    match self.backend.processor_output()? {
+                    match self
+                        .timing
+                        .window
+                        .audio_processor_read_us
+                        .measure(|| self.backend.processor_output())?
+                    {
                         ProcessorOutput::Frame(packet) => self.pending_processed = Some(packet),
                         ProcessorOutput::Pending => {}
                         ProcessorOutput::End if self.processor_draining => {
@@ -534,20 +590,34 @@ impl<B: Backend> Pump<B> {
                     }
                 }
                 if let Some(packet) = &self.pending_processed {
-                    if !self.backend.submit_pcm(&packet.header())? {
+                    if !self
+                        .timing
+                        .window
+                        .audio_encoder_submit_us
+                        .measure(|| self.backend.submit_pcm(&packet.header()))?
+                    {
                         return Ok(());
                     }
                     self.pending_processed = None;
                     advanced = true;
                 }
                 if self.pending_pcm.is_none() && !self.stopping {
-                    self.pending_pcm = self.backend.pcm()?;
+                    self.pending_pcm = self
+                        .timing
+                        .window
+                        .audio_capture_us
+                        .measure(|| self.backend.pcm())?;
                 }
                 if let Some(packet) = &self.pending_pcm {
                     if packet.header().channels != self.audio_channels {
                         return Err("unsupported_audio_channels");
                     }
-                    if !self.backend.submit_processor(&packet.header())? {
+                    if !self
+                        .timing
+                        .window
+                        .audio_processor_submit_us
+                        .measure(|| self.backend.submit_processor(&packet.header()))?
+                    {
                         return Ok(());
                     }
                     self.pending_pcm = None;
@@ -562,7 +632,11 @@ impl<B: Backend> Pump<B> {
                 continue;
             }
             if self.pending_pcm.is_none() && !self.stopping {
-                self.pending_pcm = self.backend.pcm()?;
+                self.pending_pcm = self
+                    .timing
+                    .window
+                    .audio_capture_us
+                    .measure(|| self.backend.pcm())?;
             }
             let Some(packet) = &self.pending_pcm else {
                 break;
@@ -570,7 +644,12 @@ impl<B: Backend> Pump<B> {
             if packet.header().channels != self.audio_channels {
                 return Err("unsupported_audio_channels");
             }
-            if !self.backend.submit_pcm(&packet.header())? {
+            if !self
+                .timing
+                .window
+                .audio_encoder_submit_us
+                .measure(|| self.backend.submit_pcm(&packet.header()))?
+            {
                 return Ok(());
             }
             self.pending_pcm = None;

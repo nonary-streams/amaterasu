@@ -221,7 +221,7 @@ impl Peer {
             return Err(PeerError::Busy);
         }
         self.datagram_bytes += bytes.len();
-        self.datagrams.push_back(bytes);
+        self.datagrams.push_back((bytes, self.now));
         self.last_sent = self.now;
         Ok(())
     }
@@ -238,9 +238,14 @@ impl Peer {
                 .any(|assembly| now - assembly.created_at >= 5000)
         });
         for channel in &mut self.channels {
+            let previous = channel.unreliable.len();
             channel
                 .unreliable
                 .retain(|_, assembly| now - assembly.created_at < 5000);
+            self.timing.expired_assemblies = self
+                .timing
+                .expired_assemblies
+                .saturating_add((previous - channel.unreliable.len()) as u64);
         }
         let expired = match self.state {
             State::Listening | State::AwaitingVerifyAck => {
@@ -277,12 +282,17 @@ impl Peer {
             if pending.attempts >= 16 {
                 return self.terminal(State::TimedOut, Event::TimedOut);
             }
+            let retransmission = pending.attempts != 0;
             let command = pending.command.clone();
             match self.transmit(&command) {
                 Ok(()) => {}
                 Err(PeerError::Busy) => break,
                 Err(error) => return Err(error),
             }
+            self.timing.retransmitted_commands = self
+                .timing
+                .retransmitted_commands
+                .saturating_add(u64::from(retransmission));
             let pending = &mut self.pending[index];
             pending.last_sent = now;
             pending.attempts += 1;

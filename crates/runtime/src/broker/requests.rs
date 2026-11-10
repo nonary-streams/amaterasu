@@ -1,7 +1,9 @@
+mod timing;
 use amaterasu_contracts::{ApiSchema, Grants, Response, valid_name};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
+use timing::RequestTiming;
 
 use super::errors::{capacity_exhausted, not_found, payload_fits, permission_denied, result_fits};
 
@@ -28,6 +30,9 @@ struct RequestRecord {
     provider: String,
     options: RequestOptions,
     authority: CallAuthority,
+    enqueued_at: Instant,
+    accepted_at: Option<Instant>,
+    result_observed: bool,
     completed_at: Option<Instant>,
     result: Option<Response>,
     delivered: bool,
@@ -74,6 +79,7 @@ pub(super) struct RequestRouter {
     legacy_tainted: BTreeSet<String>,
     next_request_id: u64,
     last_capacity_report: Option<Instant>,
+    timing: RequestTiming,
 }
 
 impl RequestRouter {
@@ -166,7 +172,7 @@ impl RequestRouter {
         let Some(provider) = self.providers.get(&options.service).cloned() else {
             return Response::error("unavailable", "service is not registered");
         };
-        self.enqueue(caller, provider, options, authority, false)
+        self.enqueue(caller, provider, options, authority, false, now)
     }
 
     fn resolve_authority(
@@ -260,6 +266,7 @@ impl RequestRouter {
         options: RequestOptions,
         authority: CallAuthority,
         internal_hook: bool,
+        now: Instant,
     ) -> Response {
         if self.requests.len() >= MAX_RETAINED_REQUESTS {
             let now = Instant::now();
@@ -300,6 +307,9 @@ impl RequestRouter {
                 provider,
                 options,
                 authority,
+                enqueued_at: now,
+                accepted_at: None,
+                result_observed: false,
                 completed_at: None,
                 result: None,
                 delivered: false,
@@ -308,6 +318,9 @@ impl RequestRouter {
             },
         );
 
+        let record = &self.requests[&request_id];
+        self.timing.started.get_or_insert(now);
+        self.timing.service(record);
         Response::Accepted { id: request_id }
     }
 
@@ -375,6 +388,8 @@ impl RequestRouter {
             } else {
                 queue.pop_front();
                 request.delivered = true;
+                request.accepted_at = Some(now);
+                self.timing.accepted(request, now);
             }
             return request.offer_response(request_id, now);
         }
@@ -408,7 +423,7 @@ impl RequestRouter {
         }
     }
 
-    pub fn accept(&mut self, provider: &str, id: u64, receiver: &str) -> Response {
+    pub fn accept_at(&mut self, provider: &str, id: u64, receiver: &str, now: Instant) -> Response {
         if !valid_name(receiver) {
             return Response::error("invalid_request", "invalid receiver identifier");
         }
@@ -446,6 +461,8 @@ impl RequestRouter {
         }
         request.delivered = true;
         request.accepted_receiver = Some(receiver.to_owned());
+        request.accepted_at = Some(now);
+        self.timing.accepted(request, now);
         self.unretired
             .insert(id, (provider.to_owned(), receiver.to_owned()));
         self.offers.remove(provider);
@@ -512,6 +529,7 @@ impl RequestRouter {
         }
 
         request.finish(Response::Result { payload }, now);
+        self.timing.finished(request, now);
         Response::Ok
     }
 
@@ -528,12 +546,20 @@ impl RequestRouter {
         Response::Ok
     }
 
-    pub fn result(&self, caller: &str, request_id: u64) -> Response {
-        let Some(request) = self.requests.get(&request_id) else {
+    pub fn result(&mut self, caller: &str, request_id: u64) -> Response {
+        self.result_at(caller, request_id, Instant::now())
+    }
+
+    pub fn result_at(&mut self, caller: &str, request_id: u64, now: Instant) -> Response {
+        let Some(request) = self.requests.get_mut(&request_id) else {
             return not_found();
         };
         if request.caller != caller {
             return permission_denied();
+        }
+        if request.result.is_some() && !request.result_observed {
+            self.timing.observed(request, now);
+            request.result_observed = true;
         }
         request.result.clone().unwrap_or(Response::Pending)
     }
@@ -553,6 +579,7 @@ impl RequestRouter {
                 Response::error("cancelled", "cancelled by the request owner"),
                 now,
             );
+            self.timing.finished(request, now);
         }
         // Hook cancellation releases its participant immediately. End delegated
         // work while the parent's terminal record still identifies its children.
@@ -608,6 +635,7 @@ impl RequestRouter {
                     Response::error("deadline_exceeded", "request deadline elapsed"),
                     now,
                 );
+                self.timing.finished(request, now);
             }
         }
     }
@@ -634,6 +662,7 @@ impl RequestRouter {
                         self.legacy_tainted.insert(request.provider.clone());
                     }
                     request.finish(Response::error("cancelled", "parent request ended"), now);
+                    self.timing.finished(request, now);
                     cancelled_any = true;
                 }
             }
@@ -671,7 +700,7 @@ impl RequestRouter {
             allowed_services: grants.call.clone(),
             deadline,
         };
-        self.enqueue(owner, participant, options, authority, true)
+        self.enqueue(owner, participant, options, authority, true, Instant::now())
     }
 }
 

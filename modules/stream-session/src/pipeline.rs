@@ -5,6 +5,7 @@ mod history;
 mod history_activity;
 mod host_metrics_activity;
 mod input;
+mod input_timing;
 mod journal;
 mod lifecycle;
 mod quiescence;
@@ -40,6 +41,9 @@ use std::{
 use workflow::{Job, Step};
 
 trait Drive {
+    fn timing_summary(&mut self) -> Option<Value> {
+        None
+    }
     fn tick(&mut self, media_active: bool) -> Result<PlaneProgress, PlaneFailure>;
     fn send_rumble(&mut self, command: crate::plane::RumbleCommand) -> Result<bool, &'static str>;
     fn stop(&mut self);
@@ -52,6 +56,9 @@ trait Drive {
 }
 
 impl Drive for Plane {
+    fn timing_summary(&mut self) -> Option<Value> {
+        Plane::timing_summary(self)
+    }
     fn tick(&mut self, media_active: bool) -> Result<PlaneProgress, PlaneFailure> {
         Plane::tick(self, media_active)
     }
@@ -407,6 +414,35 @@ impl Pipeline {
             self.start_next_recovery(now);
         }
         self.pump(now);
+        for record in self.records.values_mut() {
+            let forwarding = record
+                .plane
+                .as_mut()
+                .and_then(|plane| plane.timing_summary());
+            let input = record.input_timing.take_if_due(
+                record.id,
+                record.input_events.len(),
+                record.input_inflight,
+            );
+            for mut summary in forwarding.into_iter().chain(input) {
+                summary["stream"] = record.id.into();
+                summary["resources"] = serde_json::to_value(
+                    record
+                        .resources
+                        .iter()
+                        .map(|(resource, id)| (resource.name(), *id))
+                        .collect::<std::collections::BTreeMap<_, _>>(),
+                )
+                .unwrap_or_default();
+                for part in amaterasu_module_sdk::diagnostics::window_parts(&summary) {
+                    let _ = send(Command::Log {
+                        level: amaterasu_module_sdk::LogLevel::Info as u8,
+                        target: "stream.timing".into(),
+                        message: part.to_string(),
+                    });
+                }
+            }
+        }
         self.progress_shutdown_observations(now, send);
         self.history_activities.progress(now, &self.records, send);
         if let Some(job) = self.job.as_mut()
@@ -958,6 +994,7 @@ impl Pipeline {
             {
                 record.plane = None;
                 record.input_events.clear();
+                record.input_timing.clear_queue();
                 continue;
             }
             if record.state == State::Active

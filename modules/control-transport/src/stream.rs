@@ -1,5 +1,6 @@
 mod socket;
 
+use crate::diagnostics::ControlTiming;
 use crate::model::{ControlResult, Open, validate_ping_timeout_ms};
 use amaterasu_gamestream::{
     crypto::{ControlOpener, ControlOrdering, ControlProfile, ControlSealer, Direction},
@@ -14,12 +15,14 @@ use serde_json::{Value, json};
 use std::{
     collections::VecDeque,
     net::{IpAddr, SocketAddr},
+    time::Instant,
 };
 
 const MAX_MESSAGES: usize = 256;
 const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 
 struct Received {
+    queued_at: Instant,
     kind: u16,
     channel: u8,
     delivery: Delivery,
@@ -49,6 +52,9 @@ pub struct Stream {
     rejected_datagrams: u64,
     rejected_messages: u64,
     sent_datagrams: u64,
+    timing: ControlTiming,
+    previous_tick: Option<Instant>,
+    previous_datagram: Option<Instant>,
 }
 
 impl Stream {
@@ -113,6 +119,9 @@ impl Stream {
             rejected_datagrams: 0,
             rejected_messages: 0,
             sent_datagrams: 0,
+            timing: ControlTiming::default(),
+            previous_tick: None,
+            previous_datagram: None,
         })
     }
 
@@ -153,6 +162,12 @@ impl Stream {
     }
 
     pub fn tick(&mut self, now: u64) {
+        let tick = Instant::now();
+        if let Some(previous) = self.previous_tick.replace(tick) {
+            self.timing
+                .tick_gap_us
+                .record(amaterasu_module_sdk::diagnostics::elapsed_us(previous));
+        }
         if self.failure.is_some() {
             return;
         }
@@ -222,7 +237,10 @@ impl Stream {
     }
 
     fn accept_control(&mut self, channel: u8, delivery: Delivery, data: &[u8], now: u64) {
-        let Ok(message) = self.opener.open(data) else {
+        let started = Instant::now();
+        let opened = self.opener.open(data);
+        self.timing.decrypt_us.record_since(started);
+        let Ok(message) = opened else {
             self.rejected_messages = self.rejected_messages.saturating_add(1);
             return;
         };
@@ -236,12 +254,14 @@ impl Stream {
         self.received_messages = self.received_messages.saturating_add(1);
         self.incoming_bytes += message.payload.len();
         self.incoming.push_back(Received {
+            queued_at: Instant::now(),
             kind: message.kind,
             channel,
             delivery,
             sequence: message.sequence,
             bytes: message.payload,
         });
+        self.timing.queue_high_water = self.timing.queue_high_water.max(self.incoming.len());
     }
 
     /// # Safety
@@ -309,16 +329,42 @@ impl Stream {
         };
         // SAFETY: local header and queue allocation stay live and immutable while
         // the synchronous sink borrows them. Reentrant native calls return BUSY.
+        let started = Instant::now();
         let result = unsafe { write(sink.context, &message) };
+        self.timing.consumer_callback_us.record_since(started);
         if result == STATUS_OK {
-            self.incoming_bytes -= self
-                .incoming
-                .pop_front()
-                .expect("borrowed front")
-                .bytes
-                .len();
+            let received = self.incoming.pop_front().expect("borrowed front");
+            self.incoming_bytes -= received.bytes.len();
+            // End at callback entry: callback duration is a separate metric.
+            self.timing.queue_wait_us.record(
+                u64::try_from(
+                    started
+                        .saturating_duration_since(received.queued_at)
+                        .as_micros(),
+                )
+                .unwrap_or(u64::MAX),
+            );
+        } else {
+            self.timing.consumer_retries = self.timing.consumer_retries.saturating_add(1);
         }
         result
+    }
+
+    pub(crate) fn take_timing(&mut self, id: u64) -> Value {
+        let queued_age_us = self
+            .incoming
+            .front()
+            .map(|received| amaterasu_module_sdk::diagnostics::elapsed_us(received.queued_at));
+        let protocol = self.peer.take_timing();
+        let socket = self.socket.as_ref().and_then(|socket| socket.diagnostics().ok()).map(|d| json!({
+            "supported":d.flags & amaterasu_module_sdk::network::abi::SOCKET_MEMORY != 0,
+            "receive_memory_bytes":(d.flags & amaterasu_module_sdk::network::abi::SOCKET_MEMORY != 0).then_some(d.receive_memory_bytes),"receive_buffer_bytes":(d.flags & amaterasu_module_sdk::network::abi::SOCKET_MEMORY != 0).then_some(d.receive_buffer_bytes),
+            "send_memory_bytes":(d.flags & amaterasu_module_sdk::network::abi::SOCKET_MEMORY != 0).then_some(d.send_memory_bytes),"send_buffer_bytes":(d.flags & amaterasu_module_sdk::network::abi::SOCKET_MEMORY != 0).then_some(d.send_buffer_bytes),"receive_drops_cumulative":(d.flags & amaterasu_module_sdk::network::abi::SOCKET_MEMORY != 0).then_some(d.receive_drops)}));
+        let timing = std::mem::take(&mut self.timing);
+        self.timing.queue_high_water = self.incoming.len();
+        json!({"event":"control_timing_window", "stream":id,
+            "protocol":protocol, "socket":socket, "timing_us":timing, "queued_messages":self.incoming.len(), "oldest_queued_us":queued_age_us,
+            "scope":"socket_receive_kernel_age_protocol_wait_authentication_and_consumer_queue_not_client_to_host"})
     }
 
     fn fail(&mut self, code: &'static str) {

@@ -4,6 +4,7 @@ use super::*;
 pub(super) struct Assembly {
     slots: u16,
     pub(super) created_at: u64,
+    pub(super) ready_at: Option<u64>,
     total: usize,
     pieces: Vec<Option<(usize, Vec<u8>)>>,
 }
@@ -13,6 +14,7 @@ impl Assembly {
         Self {
             slots: 1,
             created_at: now,
+            ready_at: Some(now),
             total: data.len(),
             pieces: vec![Some((0, data))],
         }
@@ -26,6 +28,7 @@ impl Assembly {
                 1
             },
             created_at: now,
+            ready_at: None,
             total: fragment.total_length as usize,
             pieces: vec![None; fragment.fragment_count as usize],
         }
@@ -62,7 +65,7 @@ impl Assembly {
         Ok(())
     }
 
-    fn ready(&self) -> bool {
+    pub(super) fn ready(&self) -> bool {
         self.pieces.iter().all(Option::is_some)
             && self
                 .pieces
@@ -192,6 +195,18 @@ impl Peer {
             return Ok(());
         };
         let pending = self.pending.remove(index);
+        self.timing.reliable_ack_us.record(
+            self.now
+                .saturating_sub(pending.first_sent)
+                .saturating_mul(1000),
+        );
+        if pending.attempts == 1 {
+            self.timing.unretransmitted_ack_us.record(
+                self.now
+                    .saturating_sub(pending.last_sent)
+                    .saturating_mul(1000),
+            );
+        }
         match pending.command.body {
             CommandBody::VerifyConnect(_) if self.state == State::AwaitingVerifyAck => {
                 self.state = State::Connected;
@@ -343,17 +358,23 @@ impl Peer {
                     return Err(PeerError::InvalidPacket);
                 }
             }
-            state
+            let assembly = state
                 .reliable
                 .entry(start)
-                .or_insert_with(|| Assembly::fragment(&fragment, true, self.now))
-                .insert(fragment)?;
+                .or_insert_with(|| Assembly::fragment(&fragment, true, self.now));
+            assembly.insert(fragment)?;
+            if assembly.ready() {
+                assembly.ready_at.get_or_insert(self.now);
+            }
         } else {
-            state
+            let assembly = state
                 .unreliable
                 .entry((baseline, start))
-                .or_insert_with(|| Assembly::fragment(&fragment, false, self.now))
-                .insert(fragment)?;
+                .or_insert_with(|| Assembly::fragment(&fragment, false, self.now));
+            assembly.insert(fragment)?;
+            if assembly.ready() {
+                assembly.ready_at.get_or_insert(self.now);
+            }
         }
         self.flush(channel)
     }
@@ -390,6 +411,7 @@ impl Peer {
             let assembly = state.reliable.remove(&next).unwrap();
             state.received_reliable = next.wrapping_add(assembly.slots - 1);
             state.received_unreliable = 0;
+            self.observe_assembly(&assembly);
             self.event(Event::Receive {
                 channel,
                 delivery: Delivery::Reliable,
@@ -413,6 +435,7 @@ impl Peer {
             let state = &mut self.channels[channel as usize];
             let assembly = state.unreliable.remove(&key).unwrap();
             state.received_unreliable = key.1;
+            self.observe_assembly(&assembly);
             self.event(Event::Receive {
                 channel,
                 delivery: Delivery::Unreliable,

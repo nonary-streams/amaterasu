@@ -2,6 +2,7 @@ use crate::model::{
     DISCOVERY_TOKEN_BYTES, DiscoveryTokens, MAX_DATAGRAMS, MAX_QUEUE_BYTES, SENDS_PER_STREAM,
 };
 mod udp_batch;
+use crate::diagnostics::DeliveryTiming;
 use amaterasu_module_sdk::audio::ClientAudioChannel;
 use amaterasu_module_sdk::network::{Network, UdpSocket};
 use std::{
@@ -25,6 +26,7 @@ pub enum Medium {
 }
 
 struct Datagram {
+    queued_at: Instant,
     medium: Medium,
     video_frame: Option<u32>,
     bytes: Vec<u8>,
@@ -138,6 +140,7 @@ pub struct Delivery {
     pub sent_datagrams: u64,
     pub discarded_datagrams: u64,
     pub failure: Option<&'static str>,
+    timing: DeliveryTiming,
 }
 
 impl Delivery {
@@ -228,6 +231,7 @@ impl Delivery {
             sent_datagrams: 0,
             discarded_datagrams: 0,
             failure: None,
+            timing: DeliveryTiming::default(),
         }
     }
 
@@ -289,14 +293,50 @@ impl Delivery {
         if self.queue.is_empty() {
             self.last_progress = Instant::now();
         }
+        let queued_at = Instant::now();
         for bytes in packets {
             self.bytes += bytes.len();
             self.queue.push_back(Datagram {
+                queued_at,
                 medium,
                 video_frame,
                 bytes,
             });
         }
+        self.timing.queue_high_water_datagrams =
+            self.timing.queue_high_water_datagrams.max(self.queue.len());
+        self.timing.queue_high_water_bytes = self.timing.queue_high_water_bytes.max(self.bytes);
+    }
+
+    pub(crate) fn take_timing(&mut self) -> serde_json::Value {
+        let timing = std::mem::take(&mut self.timing);
+        self.timing.queue_high_water_datagrams = self.queue.len();
+        self.timing.queue_high_water_bytes = self.bytes;
+        let socket_pressure = |socket: &UdpSocket| {
+            socket.diagnostics().ok().map(|d| serde_json::json!({
+            "supported":d.flags & amaterasu_module_sdk::network::abi::SOCKET_MEMORY != 0,
+            "receive_memory_bytes":(d.flags & amaterasu_module_sdk::network::abi::SOCKET_MEMORY != 0).then_some(d.receive_memory_bytes),"receive_buffer_bytes":(d.flags & amaterasu_module_sdk::network::abi::SOCKET_MEMORY != 0).then_some(d.receive_buffer_bytes),
+            "send_memory_bytes":(d.flags & amaterasu_module_sdk::network::abi::SOCKET_MEMORY != 0).then_some(d.send_memory_bytes),"send_buffer_bytes":(d.flags & amaterasu_module_sdk::network::abi::SOCKET_MEMORY != 0).then_some(d.send_buffer_bytes),
+            "receive_drops_cumulative":(d.flags & amaterasu_module_sdk::network::abi::SOCKET_MEMORY != 0).then_some(d.receive_drops)}))
+        };
+        serde_json::json!({"sockets":{"video":socket_pressure(&self.video.socket),"audio":socket_pressure(&self.audio.socket)},"timing_us":timing, "queued_datagrams":self.queue.len(), "queued_bytes":self.bytes,
+            "oldest_queued_us":self.queue.front().map(|packet| amaterasu_module_sdk::diagnostics::elapsed_us(packet.queued_at)),
+            "scope":"enqueue_to_network_provider_acceptance_not_remote_delivery"})
+    }
+
+    fn record_queue_wait(&mut self, packet: &Datagram, accepted_at: Instant) {
+        let metric = match packet.medium {
+            Medium::Video => &mut self.timing.video_queue_wait_us,
+            Medium::Audio => &mut self.timing.audio_queue_wait_us,
+        };
+        metric.record(
+            u64::try_from(
+                accepted_at
+                    .saturating_duration_since(packet.queued_at)
+                    .as_micros(),
+            )
+            .unwrap_or(u64::MAX),
+        );
     }
 
     pub fn queued(&self) -> usize {
@@ -407,6 +447,8 @@ impl Delivery {
                                 self.video_batch_support = VideoBatchSupport::Available;
                                 sent += accepted;
                                 if accepted < group_count {
+                                    self.timing.partial_batch_sends =
+                                        self.timing.partial_batch_sends.saturating_add(1);
                                     break;
                                 }
                                 continue;
@@ -414,7 +456,11 @@ impl Delivery {
                             Err(BatchError::Unsupported) => {
                                 self.video_batch_support = VideoBatchSupport::Unavailable;
                             }
-                            Err(BatchError::Retry) => break,
+                            Err(BatchError::Retry) => {
+                                self.timing.send_retries =
+                                    self.timing.send_retries.saturating_add(1);
+                                break;
+                            }
                             Err(BatchError::Failed(_error)) => {
                                 self.fail("udp_send_failed");
                                 break;
@@ -502,7 +548,10 @@ impl Delivery {
                     .front()
                     .is_some_and(|packet| packet.bytes.len() == bytes) =>
             {
-                self.bytes -= self.queue.pop_front().unwrap().bytes.len();
+                let accepted_at = Instant::now();
+                let packet = self.queue.pop_front().unwrap();
+                self.bytes -= packet.bytes.len();
+                self.record_queue_wait(&packet, accepted_at);
                 self.sent_datagrams = self.sent_datagrams.saturating_add(1);
                 self.last_progress = Instant::now();
                 true
@@ -513,6 +562,7 @@ impl Delivery {
                     io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
                 ) =>
             {
+                self.timing.send_retries = self.timing.send_retries.saturating_add(1);
                 false
             }
             _ => {
@@ -530,12 +580,14 @@ impl Delivery {
     ) -> bool {
         match result {
             Ok(bytes) if bytes == expected_bytes => {
+                let accepted_at = Instant::now();
                 for _ in 0..count {
                     let Some(packet) = self.queue.pop_front() else {
                         self.fail("udp_send_failed");
                         return false;
                     };
                     self.bytes -= packet.bytes.len();
+                    self.record_queue_wait(&packet, accepted_at);
                 }
                 self.sent_datagrams = self.sent_datagrams.saturating_add(count as u64);
                 self.last_progress = Instant::now();
@@ -547,6 +599,7 @@ impl Delivery {
                     io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
                 ) =>
             {
+                self.timing.send_retries = self.timing.send_retries.saturating_add(1);
                 false
             }
             _ => {

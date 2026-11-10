@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/abi",
+    "crates/timing-metrics",
     "crates/data-plane",
     "crates/detached-process",
     "crates/configuration-schema",
@@ -92,6 +93,7 @@ rust-version = "1.89"
 version = "0.1.0"
 
 [workspace.dependencies]
+amaterasu-timing-metrics = { path = "crates/timing-metrics" }
 amaterasu-network-api = { path = "crates/network-api" }
 amaterasu-process-api = { path = "crates/process-api" }
 amaterasu-network-sockets = { path = "crates/network-sockets" }

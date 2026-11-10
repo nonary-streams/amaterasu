@@ -55,6 +55,53 @@ fn client() -> ControlSealer {
 }
 
 #[test]
+fn timing_preserves_rejected_messages_and_resets_only_observations() {
+    unsafe extern "C" fn busy(_: *mut c_void, _: *const ControlMessage) -> Status {
+        MEDIA_BUSY
+    }
+    unsafe extern "C" fn accept(_: *mut c_void, _: *const ControlMessage) -> Status {
+        STATUS_OK
+    }
+    let mut stream = stream();
+    let encrypted = client().seal(9, b"private-input").unwrap();
+    stream.accept_control(2, Delivery::Reliable, &encrypted, 1);
+    stream.incoming.front_mut().unwrap().queued_at =
+        Instant::now() - std::time::Duration::from_millis(25);
+    let sink = ControlMessageSink {
+        context: std::ptr::null_mut(),
+        write: Some(busy),
+    };
+    assert_eq!(unsafe { stream.receive(sink) }, MEDIA_BUSY);
+    let pending = stream.take_timing(1);
+    assert_eq!(pending["timing_us"]["queue_wait_us"]["calls"], 0);
+    assert_eq!(pending["timing_us"]["consumer_retries"], 1);
+    assert!(pending["oldest_queued_us"].as_u64().unwrap() >= 25_000);
+    assert!(!pending.to_string().contains("private-input"));
+    assert_eq!(
+        unsafe {
+            stream.receive(ControlMessageSink {
+                write: Some(accept),
+                ..sink
+            })
+        },
+        STATUS_OK
+    );
+    let accepted = stream.take_timing(1);
+    assert_eq!(accepted["timing_us"]["queue_wait_us"]["calls"], 1);
+    assert!(
+        accepted["timing_us"]["queue_wait_us"]["max_us"]
+            .as_u64()
+            .unwrap()
+            >= 25_000
+    );
+    assert!(stream.incoming.is_empty());
+    assert_eq!(
+        stream.take_timing(1)["timing_us"]["queue_wait_us"]["calls"],
+        0
+    );
+}
+
+#[test]
 fn rejected_ciphertext_and_replays_never_refresh_authentication_or_deliver_messages() {
     let mut stream = stream();
     let mut client = client();

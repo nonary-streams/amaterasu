@@ -29,6 +29,38 @@ fn delivery() -> Delivery {
 }
 
 #[test]
+fn timing_counts_only_accepted_datagrams_and_preserves_pending_age() {
+    let mut delivery = delivery();
+    delivery.push(Medium::Video, vec![vec![1; 8], vec![2; 8]]);
+    delivery.push(Medium::Audio, vec![vec![3; 4]]);
+    for packet in &mut delivery.queue {
+        packet.queued_at = Instant::now() - Duration::from_millis(20);
+    }
+    assert!(!delivery.record_batch_send(2, 16, Err(io::ErrorKind::WouldBlock.into())));
+    let pending = delivery.take_timing();
+    assert_eq!(pending["timing_us"]["video_queue_wait_us"]["calls"], 0);
+    assert_eq!(pending["timing_us"]["send_retries"], 1);
+    assert_eq!(pending["timing_us"]["queue_high_water_datagrams"], 3);
+    assert!(pending["oldest_queued_us"].as_u64().unwrap() >= 20_000);
+    assert!(delivery.record_batch_send(2, 16, Ok(16)));
+    assert!(delivery.record_send(Ok(4)));
+    let accepted = delivery.take_timing();
+    assert_eq!(accepted["timing_us"]["video_queue_wait_us"]["calls"], 2);
+    assert_eq!(accepted["timing_us"]["audio_queue_wait_us"]["calls"], 1);
+    assert!(
+        accepted["timing_us"]["video_queue_wait_us"]["max_us"]
+            .as_u64()
+            .unwrap()
+            >= 20_000
+    );
+    assert_eq!(accepted["queued_datagrams"], 0);
+    assert_eq!(
+        delivery.take_timing()["timing_us"]["video_queue_wait_us"]["calls"],
+        0
+    );
+}
+
+#[test]
 fn would_block_and_interrupt_retain_exact_datagram_then_fatal_error_clears_visible_queue() {
     let mut delivery = delivery();
     delivery.push(Medium::Video, vec![vec![1, 2, 3], vec![4, 5]]);
@@ -132,6 +164,7 @@ fn transient_batch_send_failure_retains_the_entire_confirmed_ordered_group() {
     assert_eq!(delivery.queued_bytes(), queued_bytes);
     assert_eq!(delivery.sent_datagrams, 0);
     assert_eq!(delivery.failure, None);
+    assert_eq!(delivery.take_timing()["timing_us"]["send_retries"], 1);
 }
 
 #[test]
@@ -448,6 +481,10 @@ fn provider_partial_batch_acceptance_retries_only_unsent_suffix() {
     assert_eq!(delivery.queued(), 2);
     assert_eq!(delivery.queued_bytes(), 8);
     assert_eq!(delivery.failure, None);
+    assert_eq!(
+        delivery.take_timing()["timing_us"]["partial_batch_sends"],
+        1
+    );
     let sent = delivery.tick_with_batch_sender(64, |_, payload, _| {
         assert_eq!(payload, [vec![2; 4], vec![3; 4]].concat());
         Ok(payload.len())

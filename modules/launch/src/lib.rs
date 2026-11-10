@@ -133,7 +133,9 @@ impl ManagedModule for LaunchModule {
             .tick(|command| results.send(command, |command| runtime.send(command)))
     }
 }
-amaterasu_module_sdk::export_module!(LaunchModule);
+amaterasu_module_sdk::export_module!(
+    amaterasu_module_sdk::service_worker::ServiceWorker<LaunchModule>
+);
 
 #[cfg(test)]
 mod child_result_tests {

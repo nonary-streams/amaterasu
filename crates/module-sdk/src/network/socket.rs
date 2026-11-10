@@ -307,6 +307,68 @@ impl UdpSocket {
         })?;
         Ok((checked_count(count, size)?, address_from_native(address)?))
     }
+    /// Optional provider diagnostics. A v1 replacement uses the ordinary receive
+    /// operation and reports unknown timing; it never selects a different provider.
+    pub fn recv_from_timed(
+        &self,
+        buffer: &mut [u8],
+    ) -> io::Result<(usize, SocketAddr, Option<abi::ReceiveTiming>)> {
+        let Some(table) = self.diagnostic_table() else {
+            return self
+                .recv_from(buffer)
+                .map(|(n, address)| (n, address, None));
+        };
+        let net = &self.0.network;
+        let size = buffer.len().min(net.maximum_io());
+        let mut count = 0;
+        let mut address = abi::Address::default();
+        let mut timing = abi::ReceiveTiming::default();
+        // SAFETY: negotiated tail retains the same binding; all outputs are live
+        // writable borrows and the buffer is bounded by provider capabilities.
+        check(unsafe {
+            (table.recv_from_timed)(
+                net.context(),
+                self.0.id,
+                buffer.as_mut_ptr(),
+                size,
+                &mut count,
+                &mut address,
+                &mut timing,
+            )
+        })?;
+        let timing = (timing.version == 1 && timing.size >= size_of::<abi::ReceiveTiming>() as u32)
+            .then_some(timing);
+        Ok((
+            checked_count(count, size)?,
+            address_from_native(address)?,
+            timing,
+        ))
+    }
+    pub fn diagnostics(&self) -> io::Result<abi::SocketDiagnostics> {
+        let table = self.diagnostic_table().ok_or(io::ErrorKind::Unsupported)?;
+        let mut out = abi::SocketDiagnostics::default();
+        // SAFETY: table/binding/handle are retained and output is a writable value.
+        check(unsafe {
+            (table.socket_diagnostics)(self.0.network.context(), self.0.id, &mut out)
+        })?;
+        if out.version != 1 || out.size < size_of::<abi::SocketDiagnostics>() as u32 {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        Ok(out)
+    }
+    fn diagnostic_table(&self) -> Option<&abi::NetworkApiV1_1> {
+        let net = &self.0.network;
+        let base = &net.table().base.header;
+        if !net.supports(abi::DATAGRAM_DIAGNOSTICS)
+            || base.minor < abi::DIAGNOSTICS_MINOR
+            || base.size < size_of::<abi::NetworkApiV1_1>() as u32
+        {
+            return None;
+        }
+        // SAFETY: family identity was checked at binding; size, minor and feature
+        // establish this optional tail and the binding owns its entire lifetime.
+        Some(unsafe { &*std::ptr::from_ref(net.table()).cast::<abi::NetworkApiV1_1>() })
+    }
     pub fn send_batch(&self, datagrams: &[&[u8]]) -> io::Result<usize> {
         let net = &self.0.network;
         net.require(abi::BATCH)?;

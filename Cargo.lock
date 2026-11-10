@@ -453,6 +453,7 @@ version = "0.1.0"
 dependencies = [
  "aes",
  "amaterasu-contracts",
+ "amaterasu-timing-metrics",
  "cbc",
  "ring",
  "serde",
@@ -656,6 +657,7 @@ dependencies = [
  "amaterasu-network-api",
  "amaterasu-network-sockets",
  "amaterasu-process-api",
+ "amaterasu-timing-metrics",
  "base64 0.22.1",
  "getrandom 0.3.4",
  "libc",
@@ -876,6 +878,7 @@ dependencies = [
  "amaterasu-abi",
  "amaterasu-contracts",
  "amaterasu-module-sdk",
+ "amaterasu-timing-metrics",
  "libloading",
  "serde_json",
 ]
@@ -945,6 +948,7 @@ dependencies = [
 name = "amaterasu-storage"
 version = "0.1.0"
 dependencies = [
+ "amaterasu-timing-metrics",
  "getrandom 0.3.4",
  "serde",
  "serde_json",
@@ -987,6 +991,15 @@ dependencies = [
  "serde",
  "serde_json",
  "url",
+]
+
+[[package]]
+name = "amaterasu-timing-metrics"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

@@ -75,7 +75,7 @@ impl TouchPort {
     }
 }
 
-const MAX_QUEUED_EVENTS: usize = 128;
+pub(super) const MAX_QUEUED_EVENTS: usize = 128;
 const FEEDBACK_POLL_INTERVAL_MS: u64 = 20;
 const MAX_FEEDBACK_PEEK: usize = 16;
 
@@ -214,6 +214,18 @@ pub(super) fn queue_control_input(
     enabled: bool,
     now: u64,
 ) -> Result<(), &'static str> {
+    let started = std::time::Instant::now();
+    let result = queue_control_input_inner(record, input, enabled, now);
+    record.input_timing.translated(started, result.is_err());
+    result
+}
+
+fn queue_control_input_inner(
+    record: &mut Record,
+    input: Input<'_>,
+    enabled: bool,
+    now: u64,
+) -> Result<(), &'static str> {
     if !enabled {
         record.unsupported_controls = record.unsupported_controls.saturating_add(1);
         return Ok(());
@@ -244,11 +256,18 @@ pub(super) fn queue_control_input(
         return Ok(());
     }
     if let Some(event) = controller_payload(&input) {
-        coalesce_controller_sample(&mut record.input_events, record.input_inflight, &event);
+        if let Some(index) =
+            coalesce_controller_sample(&mut record.input_events, record.input_inflight, &event)
+        {
+            record
+                .input_timing
+                .coalesced(index, record.input_events.len());
+        }
         if record.input_events.len() >= MAX_QUEUED_EVENTS {
             return Err(report_input_queue_overflow(record, &event));
         }
         record.input_events.push_back(event);
+        record.input_timing.queued(record.input_events.len());
         return Ok(());
     }
     if let Input::PenTouch(packet) = input {
@@ -269,6 +288,7 @@ pub(super) fn queue_control_input(
             return Err(report_input_queue_overflow(record, &event));
         }
         record.input_events.push_back(event);
+        record.input_timing.queued(record.input_events.len());
         return Ok(());
     }
     let batch = match record.input_translator.translate(input) {
@@ -292,11 +312,18 @@ pub(super) fn queue_control_input(
         }
     };
     for event in batch.into_events().into_iter().map(event_payload) {
-        coalesce_controller_sample(&mut record.input_events, record.input_inflight, &event);
+        if let Some(index) =
+            coalesce_controller_sample(&mut record.input_events, record.input_inflight, &event)
+        {
+            record
+                .input_timing
+                .coalesced(index, record.input_events.len());
+        }
         if record.input_events.len() >= MAX_QUEUED_EVENTS {
             return Err(report_input_queue_overflow(record, &event));
         }
         record.input_events.push_back(event);
+        record.input_timing.queued(record.input_events.len());
     }
     Ok(())
 }
@@ -340,13 +367,13 @@ fn coalesce_controller_sample(
     events: &mut std::collections::VecDeque<Value>,
     inflight: usize,
     next: &Value,
-) {
+) -> Option<usize> {
     let kind = next["kind"].as_str();
     if !matches!(
         kind,
         Some("controller" | "controller_motion" | "controller_battery")
     ) {
-        return;
+        return None;
     }
     for index in (inflight..events.len()).rev() {
         let previous = &events[index];
@@ -371,9 +398,10 @@ fn coalesce_controller_sample(
             && (kind != Some("controller_motion") || previous["motion_type"] == next["motion_type"])
         {
             events.remove(index);
-            break;
+            return Some(index);
         }
     }
+    None
 }
 
 pub(super) fn stop_for_input_failure(record: &mut Record, code: &'static str) {
@@ -509,12 +537,14 @@ pub(super) fn accept_input_batch(record: &mut Record, payload: &Value) -> Result
     }
     for _ in 0..record.input_inflight {
         record.input_events.pop_front();
+        record.input_timing.pop_front();
     }
     record.input_events_sent = record
         .input_events_sent
         .saturating_add(record.input_inflight as u64);
     record.input_batches = record.input_batches.saturating_add(1);
     record.input_inflight = 0;
+    record.input_timing.acknowledge(false);
     Ok(())
 }
 
@@ -545,14 +575,17 @@ pub(super) fn accept_controller_batch_failure(
 
     for _ in 0..accepted {
         record.input_events.pop_front();
+        record.input_timing.pop_front();
     }
     record.input_events.pop_front();
+    record.input_timing.pop_front();
     record.input_events_sent = record.input_events_sent.saturating_add(accepted as u64);
     if accepted != 0 {
         record.input_batches = record.input_batches.saturating_add(1);
     }
     record.unsupported_controls = record.unsupported_controls.saturating_add(1);
     record.input_inflight = 0;
+    record.input_timing.acknowledge(true);
     Ok(())
 }
 
@@ -604,6 +637,7 @@ pub(super) fn clear_input(record: &mut Record) {
     record.input_native_pen_touch = false;
     record.touch_port = None;
     record.input_events.clear();
+    record.input_timing.clear_queue();
     record.input_inflight = 0;
     record.input_translator = Default::default();
 }

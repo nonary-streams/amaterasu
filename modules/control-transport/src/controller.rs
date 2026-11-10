@@ -192,6 +192,13 @@ impl Controller {
         }
     }
 
+    pub(crate) fn timing_summaries(&mut self) -> Vec<serde_json::Value> {
+        self.streams
+            .iter_mut()
+            .map(|(id, stream)| stream.take_timing(*id))
+            .collect()
+    }
+
     pub fn shutdown(&mut self) {
         self.settings.enabled = false;
         self.streams.clear();

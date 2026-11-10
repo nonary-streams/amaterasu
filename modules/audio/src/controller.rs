@@ -662,6 +662,17 @@ impl Controller {
             .ok_or("stream_not_found")
     }
 
+    pub(crate) fn take_timing(&mut self) -> Vec<Value> {
+        self.streams
+            .iter_mut()
+            .filter_map(|(id, stream)| {
+                let mut value = stream.source.take_timing()?;
+                value["stream"] = json!(id);
+                Some(value)
+            })
+            .collect()
+    }
+
     fn status(&self, owner: &str, requested: Option<u64>) -> Value {
         let streams: Vec<_> = self.streams.iter().filter(|(id,stream)| stream.owner == owner && requested.is_none_or(|requested| requested == **id)).map(|(id,stream)| {
             let health = stream.source.health();

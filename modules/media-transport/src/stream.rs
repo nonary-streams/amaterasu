@@ -9,6 +9,7 @@ use amaterasu_gamestream::{
     video::{VideoCodec as WireVideoCodec, VideoConfig, VideoPacketizer},
 };
 use amaterasu_media::*;
+use amaterasu_module_sdk::diagnostics::LatencyMetric;
 use amaterasu_module_sdk::{
     abi::{STATUS_INVALID_ARGUMENT, STATUS_OK, Status},
     network::Network,
@@ -58,6 +59,9 @@ pub(crate) const LATENCY_BUCKET_BOUNDS_TENTHS_MS: [u16; 10] =
 #[derive(Default)]
 pub(crate) struct ProcessingLatency {
     pub samples: u64,
+    pub packetize_fec_encrypt_us: LatencyMetric,
+    pub socket_flush_us: LatencyMetric,
+    pub delivery: serde_json::Value,
     pub total_tenths_ms: u64,
     pub max_tenths_ms: u16,
     pub zero_samples: u64,
@@ -90,6 +94,7 @@ impl ProcessingLatency {
     }
 
     fn record_flush(&mut self, elapsed_us: u64, deferred_datagrams: usize) {
+        self.socket_flush_us.record(elapsed_us);
         self.flush_total_us = self.flush_total_us.saturating_add(elapsed_us);
         self.flush_max_us = self.flush_max_us.max(elapsed_us);
         self.flush_deferred_datagrams = self
@@ -481,6 +486,7 @@ impl Stream {
         } else {
             None
         };
+        let packetize_started = Instant::now();
         let datagrams = match self.video.packetize_with_latency(
             access_unit,
             keyframe,
@@ -496,6 +502,9 @@ impl Stream {
             Err(code) => return self.fail(code),
         };
         self.delivery.push_video(frame_index, datagrams);
+        self.processing_latency
+            .packetize_fec_encrypt_us
+            .record_since(packetize_started);
         self.processing_latency.record(latency);
         self.video_sequence = Some(sequence);
         self.video_timestamp = Some(timestamp_us);
@@ -513,7 +522,9 @@ impl Stream {
     }
 
     pub(crate) fn take_processing_latency(&mut self) -> ProcessingLatency {
-        std::mem::take(&mut self.processing_latency)
+        let mut sample = std::mem::take(&mut self.processing_latency);
+        sample.delivery = self.delivery.take_timing();
+        sample
     }
 
     /// # Safety

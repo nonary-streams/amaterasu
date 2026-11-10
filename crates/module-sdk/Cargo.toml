@@ -10,6 +10,7 @@ network-http = ["dep:ureq"]
 process = ["dep:amaterasu-process-api"]
 
 [dependencies]
+amaterasu-timing-metrics.workspace = true
 base64 = "0.22"
 amaterasu-abi.workspace = true
 amaterasu-network-api.workspace = true

@@ -240,6 +240,7 @@ pub struct Controller<B: Backend> {
     feedback: FeedbackQueue,
     retry_at: Instant,
     terminal_acquires: VecDeque<TerminalAcquire>,
+    pub(crate) timing: crate::diagnostics::InjectionTiming,
 }
 impl<B: Backend> Controller<B> {
     pub fn new(mut backend: B, enabled: bool) -> Self {
@@ -277,6 +278,7 @@ impl<B: Backend> Controller<B> {
             feedback,
             retry_at: Instant::now(),
             terminal_acquires: VecDeque::new(),
+            timing: crate::diagnostics::InjectionTiming::default(),
         }
     }
     pub fn handle(
@@ -1361,10 +1363,25 @@ impl<B: Backend> Controller<B> {
                     ));
                 }
                 if self.event_enabled(event, policy) {
-                    self.inject_batch_event(event)
-                        .and_then(|()| self.update_repeat_after_event(event, now))
+                    let started = Instant::now();
+                    self.timing.begin(started);
+                    let result = self
+                        .inject_batch_event(event)
+                        .and_then(|()| self.update_repeat_after_event(event, now));
+                    let elapsed = amaterasu_module_sdk::diagnostics::elapsed_us(started);
+                    self.timing.window.event_injection_us.record(elapsed);
+                    self.timing.window.record_kind(event, elapsed);
+                    self.timing.window.failed_events = self
+                        .timing
+                        .window
+                        .failed_events
+                        .saturating_add(u64::from(result.is_err()));
+                    result
                 } else {
                     suppressed += 1;
+                    self.timing.begin(Instant::now());
+                    self.timing.window.suppressed_events =
+                        self.timing.window.suppressed_events.saturating_add(1);
                     Ok(())
                 }
             });

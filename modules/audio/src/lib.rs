@@ -35,6 +35,7 @@ struct AudioModule {
     controller: native::Shared,
     _factory: Box<native::Factory>,
     platform_started: bool,
+    last_timing_log: std::time::Instant,
 }
 
 impl ManagedModule for AudioModule {
@@ -72,10 +73,32 @@ impl ManagedModule for AudioModule {
             controller,
             _factory: factory,
             platform_started: true,
+            last_timing_log: std::time::Instant::now(),
         })
     }
 
     fn tick(&mut self) -> ModuleResult<()> {
+        let now = std::time::Instant::now();
+        if now.saturating_duration_since(self.last_timing_log) >= std::time::Duration::from_secs(10)
+        {
+            let reports = self.controller.try_lock().ok().map(|mut c| c.take_timing());
+            if let Some(reports) = reports {
+                let elapsed = now
+                    .saturating_duration_since(self.last_timing_log)
+                    .as_micros()
+                    .min(u128::from(u64::MAX)) as u64;
+                self.last_timing_log = now;
+                for mut report in reports {
+                    report["window_us"] = json!(elapsed);
+                    amaterasu_module_sdk::diagnostics::log_window(
+                        &self.runtime,
+                        "audio.timing",
+                        &report,
+                    );
+                }
+            }
+        }
+
         match self.runtime.send(Command::Poll {})? {
             Response::Pending => Ok(()),
             Response::Request {

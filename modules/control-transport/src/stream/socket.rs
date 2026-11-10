@@ -11,7 +11,8 @@ impl Stream {
             let Some(socket) = self.socket.as_ref() else {
                 return;
             };
-            let (length, sender) = match socket.recv_from(&mut buffer) {
+            let receive_started = Instant::now();
+            let (length, sender, timestamp) = match socket.recv_from_timed(&mut buffer) {
                 Ok(received) => received,
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => return,
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
@@ -24,6 +25,7 @@ impl Stream {
                     return;
                 }
             };
+            self.timing.socket_receive_us.record_since(receive_started);
             if sender.ip() != self.authorized_ip
                 || self
                     .authorized_port
@@ -32,6 +34,22 @@ impl Stream {
             {
                 self.rejected_datagrams = self.rejected_datagrams.saturating_add(1);
                 continue;
+            }
+            if let Some(timestamp) = timestamp.filter(|t| {
+                t.flags & amaterasu_module_sdk::network::abi::KERNEL_RESIDENCE_REALTIME != 0
+            }) {
+                self.timing
+                    .kernel_residence_us
+                    .record(timestamp.kernel_residence_us);
+            } else {
+                self.timing.kernel_timing_unknown =
+                    self.timing.kernel_timing_unknown.saturating_add(1);
+            }
+            let arrived = Instant::now();
+            if let Some(previous) = self.previous_datagram.replace(arrived) {
+                self.timing
+                    .datagram_arrival_gap_us
+                    .record(amaterasu_module_sdk::diagnostics::elapsed_us(previous));
             }
             match self.peer.receive(&buffer[..length], now) {
                 Ok(status) if status.associated => {
@@ -44,6 +62,8 @@ impl Stream {
                 }
             }
         }
+        self.timing.receive_budget_exhausted =
+            self.timing.receive_budget_exhausted.saturating_add(1);
     }
 
     pub(super) fn flush_socket(&mut self) {
@@ -71,6 +91,8 @@ impl Stream {
                         io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
                     ) =>
                 {
+                    self.timing.socket_send_retries =
+                        self.timing.socket_send_retries.saturating_add(1);
                     return;
                 }
                 _ => {

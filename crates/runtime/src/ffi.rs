@@ -13,6 +13,8 @@ struct Endpoint {
     broker: Arc<Mutex<Broker>>,
     native: Arc<crate::native::NativeServices>,
     work: Arc<crate::work_signal::WorkSignal>,
+    timing: Mutex<crate::invocation_timing::InvocationTiming>,
+    timing_dropped: std::sync::atomic::AtomicU64,
 }
 struct Runtime {
     endpoints: BTreeMap<String, Box<Endpoint>>,
@@ -53,6 +55,8 @@ unsafe extern "C" fn create_runtime(config: BorrowedBytes, output: *mut *mut c_v
                         broker: broker.clone(),
                         native: native.clone(),
                         work: work.clone(),
+                        timing: Mutex::new(Default::default()),
+                        timing_dropped: std::sync::atomic::AtomicU64::new(0),
                     }),
                 )
             })
@@ -110,8 +114,16 @@ unsafe extern "C" fn invoke_command(
             std::ptr::from_ref(endpoint) as usize,
             &endpoint.principal,
         );
+        use crate::invocation_timing::{InvocationSample, micros};
+        use std::{sync::atomic::Ordering, time::Instant};
+        let started = Instant::now();
+        let mut lock_us = None;
+        let mut dispatch_us = None;
+        let mut native_us = None;
         // SAFETY: Input bytes remain readable until this synchronous invocation returns.
-        let response = match serde_json::from_slice::<Command>(unsafe { input.read()? }) {
+        let command = serde_json::from_slice::<Command>(unsafe { input.read()? });
+        let decode_us = micros(started);
+        let response = match command {
             Ok(Command::NotifyWorkReady {}) => {
                 endpoint.work.notify();
                 Response::Ok
@@ -125,19 +137,55 @@ unsafe extern "C" fn invoke_command(
             ) => {
                 // SAFETY: only explicitly native-granted endpoints may supply pointers;
                 // provider allocations/callbacks obey the native ABI lifetime contract.
-                unsafe { endpoint.native.dispatch(&endpoint.principal, command) }
+                let at = Instant::now();
+                let result = unsafe { endpoint.native.dispatch(&endpoint.principal, command) };
+                native_us = Some(micros(at));
+                result
             }
-            Ok(command) => endpoint
-                .broker
-                .lock()
-                .map_err(|_| STATUS_INTERNAL_ERROR)?
-                .dispatch(&endpoint.principal, command),
+            Ok(command) => {
+                let lock_started = Instant::now();
+                let mut broker = endpoint.broker.lock().map_err(|_| STATUS_INTERNAL_ERROR)?;
+                lock_us = Some(micros(lock_started));
+                let dispatch_started = Instant::now();
+                let result = broker.dispatch(&endpoint.principal, command);
+                dispatch_us = Some(micros(dispatch_started));
+                result
+            }
             Err(_) => Response::error("invalid_request", "invalid control message"),
         };
         // The broker lock is gone before calling the host-owned reply callback.
+        let serialize_started = Instant::now();
         let bytes = serde_json::to_vec(&response).map_err(|_| STATUS_INTERNAL_ERROR)?;
+        let serialize_us = micros(serialize_started);
+        let reply_started = Instant::now();
         // SAFETY: The host keeps the callback/context alive; bytes are borrowed only by send.
         unsafe { reply.send(&bytes) };
+        let sample = InvocationSample {
+            decode_us,
+            lock_us,
+            dispatch_us,
+            native_us,
+            serialize_us,
+            reply_us: micros(reply_started),
+            total_us: micros(started),
+        };
+        // Diagnostics never wait for another observer or reenter the native endpoint.
+        if let Ok(mut timing) = endpoint.timing.try_lock() {
+            let dropped = endpoint.timing_dropped.swap(0, Ordering::Relaxed);
+            if let Some(report) = timing.record(&endpoint.principal, sample, dropped) {
+                if let Ok(mut broker) = endpoint.broker.try_lock() {
+                    broker.record_diagnostic("runtime.invocation", report);
+                } else {
+                    endpoint.timing_dropped.fetch_add(1, Ordering::Relaxed);
+                }
+            } else if dropped != 0 {
+                endpoint
+                    .timing_dropped
+                    .fetch_add(dropped, Ordering::Relaxed);
+            }
+        } else {
+            endpoint.timing_dropped.fetch_add(1, Ordering::Relaxed);
+        }
         Ok(())
     })
 }

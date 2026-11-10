@@ -256,15 +256,19 @@ fn write_and_replace_with_sync(
     // recovery attempt), and deleting it would destroy that writer's work.
     let mut file = options.open(temporary).map_err(|error| error.to_string())?;
     let result = (|| {
-        file.write_all(bytes).map_err(|error| error.to_string())?;
-        file.sync_all().map_err(|error| error.to_string())
+        amaterasu_timing_metrics::measure_stage("storage.write", || file.write_all(bytes))
+            .map_err(|error| error.to_string())?;
+        amaterasu_timing_metrics::measure_stage("storage.file_sync", || file.sync_all())
+            .map_err(|error| error.to_string())
     })();
     drop(file);
     if result.is_err() {
         let _ = fs::remove_file(temporary);
     }
     result?;
-    if let Err(error) = replace_file(temporary, destination) {
+    if let Err(error) = amaterasu_timing_metrics::measure_stage("storage.replace", || {
+        replace_file(temporary, destination)
+    }) {
         let _ = fs::remove_file(temporary);
         return Err(error);
     }
@@ -276,7 +280,11 @@ fn write_and_replace_with_sync(
 pub fn sync_directory(path: &Path) -> StorageResult<()> {
     #[cfg(unix)]
     File::open(path)
-        .and_then(|directory| directory.sync_all())
+        .and_then(|directory| {
+            amaterasu_timing_metrics::measure_stage("storage.directory_sync", || {
+                directory.sync_all()
+            })
+        })
         .map_err(|error| error.to_string())?;
 
     #[cfg(not(unix))]

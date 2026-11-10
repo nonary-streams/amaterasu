@@ -6,6 +6,7 @@ pub mod companion_client;
 mod concurrent_module_tests;
 mod controller;
 mod controllers;
+mod diagnostics;
 mod feedback;
 #[cfg(any(target_os = "linux", windows, test))]
 mod gamepad;
@@ -255,6 +256,9 @@ impl ManagedModule for InputModule {
         let _priority = amaterasu_module_sdk::threading::ScopedThreadPriority::best_effort(
             amaterasu_module_sdk::threading::ThreadPriority::Critical,
         );
+        for summary in self.controller.timing_summaries(Instant::now()) {
+            amaterasu_module_sdk::diagnostics::log_window(&self.runtime, "input.timing", &summary);
+        }
         self.controller.expire_all(Instant::now());
         self.controller.select_default();
         self.advance_retirement_acknowledgement()?;

@@ -1,6 +1,8 @@
 //! Bounded, socket-independent ENet server peer for an explicitly authorized endpoint.
 mod incoming;
 mod outgoing;
+mod timing;
+pub use timing::{ChannelBacklog, ProtocolTiming, ProtocolWindow};
 #[cfg(test)]
 mod qualification;
 #[cfg(test)]
@@ -144,9 +146,10 @@ pub struct Peer {
     unsequenced_seen: VecDeque<u16>,
     pending: Vec<Pending>,
     retry_cursor: usize,
-    datagrams: VecDeque<Vec<u8>>,
+    datagrams: VecDeque<(Vec<u8>, u64)>,
     datagram_bytes: usize,
-    events: VecDeque<Event>,
+    events: VecDeque<(Event, u64)>,
+    timing: ProtocolTiming,
     event_bytes: usize,
 }
 
@@ -187,6 +190,7 @@ impl Peer {
             datagram_bytes: 0,
             events: VecDeque::new(),
             event_bytes: 0,
+            timing: ProtocolTiming::default(),
         })
     }
 
@@ -195,13 +199,19 @@ impl Peer {
     }
 
     pub fn pop_datagram(&mut self) -> Option<Vec<u8>> {
-        let bytes = self.datagrams.pop_front()?;
+        let (bytes, queued_at) = self.datagrams.pop_front()?;
+        self.timing
+            .datagram_queue_us
+            .record(self.now.saturating_sub(queued_at).saturating_mul(1000));
         self.datagram_bytes -= bytes.len();
         Some(bytes)
     }
 
     pub fn pop_event(&mut self) -> Option<Event> {
-        let event = self.events.pop_front()?;
+        let (event, queued_at) = self.events.pop_front()?;
+        self.timing
+            .event_queue_us
+            .record(self.now.saturating_sub(queued_at).saturating_mul(1000));
         if let Event::Receive { data, .. } = &event {
             self.event_bytes -= data.len();
         }
@@ -235,7 +245,7 @@ impl Peer {
             return Err(PeerError::Busy);
         }
         self.event_bytes += bytes;
-        self.events.push_back(event);
+        self.events.push_back((event, self.now));
         Ok(())
     }
 

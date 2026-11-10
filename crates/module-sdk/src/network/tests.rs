@@ -151,3 +151,46 @@ fn connected_udp_preserves_zero_length_datagrams() {
         io::ErrorKind::WouldBlock
     );
 }
+
+#[test]
+fn timed_receive_preserves_datagrams_for_modern_and_prefix_only_providers() {
+    for prefix_only in [false, true] {
+        let table = standalone();
+        if prefix_only {
+            // SAFETY: exclusive standalone ownership, before binding it into the SDK.
+            // This simulates the unchanged v1 provider contract without exposing its tail.
+            unsafe {
+                let prefix = table.cast_mut().cast::<NativeInterface>();
+                (*prefix).header.minor = 0;
+                (*prefix).header.size = size_of::<abi::NetworkApi>() as u32;
+            }
+        }
+        // SAFETY: standalone transfers exactly one owned live provider table.
+        let network = unsafe { Network::from_native_table(table).unwrap() };
+        let receiver = network.bind_udp("127.0.0.1:0".parse().unwrap()).unwrap();
+        receiver.set_nonblocking(false).unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        sender
+            .send_to(b"one whole datagram", receiver.local_addr().unwrap())
+            .unwrap();
+        if !prefix_only {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let mut payload = [0u8; 64];
+        let (count, peer, timing) = receiver.recv_from_timed(&mut payload).unwrap();
+        assert_eq!(&payload[..count], b"one whole datagram");
+        assert_eq!(peer, sender.local_addr().unwrap());
+        assert_eq!(timing.is_none(), prefix_only);
+        if !prefix_only && cfg!(target_os = "linux") {
+            let timing = timing.unwrap();
+            assert_ne!(timing.flags & abi::KERNEL_RESIDENCE_REALTIME, 0);
+            assert!(timing.kernel_residence_us >= 10_000);
+            let pressure = receiver.diagnostics().unwrap();
+            assert_ne!(pressure.flags & abi::SOCKET_MEMORY, 0);
+            assert!(pressure.receive_buffer_bytes > 0);
+        }
+    }
+}

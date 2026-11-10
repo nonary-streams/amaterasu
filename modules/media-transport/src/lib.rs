@@ -1,13 +1,14 @@
 //! Bounded caller-owned UDP transport through borrowed native media admission.
 mod controller;
 mod datagrams;
+mod diagnostics;
 mod model;
 mod native;
 mod opus_packet;
 mod stream;
 
 use amaterasu_module_sdk::{
-    Command, LogLevel, ManagedModule, ModuleResult, Response, RuntimeClient, network::Network,
+    Command, ManagedModule, ModuleResult, Response, RuntimeClient, network::Network,
 };
 use controller::{ControlReply, Controller};
 use model::{Operation, Settings};
@@ -74,23 +75,20 @@ impl ManagedModule for MediaTransportModule {
         if due {
             self.latency_window_started = now;
             for (stream, sample) in summaries {
-                let message = format!(
-                    "stream={stream} window_ms={} samples={} known_samples={} unknown_samples={} total_tenths_ms={} max_tenths_ms={} zero_known={} histogram={} flush_total_us={} flush_max_us={} flush_deferred_datagrams={} scope=capture_start_to_media_admission_not_delivery",
-                    elapsed.as_millis(),
-                    sample.samples,
-                    sample.samples.saturating_sub(sample.unknown_samples),
-                    sample.unknown_samples,
-                    sample.total_tenths_ms,
-                    sample.max_tenths_ms,
-                    sample.zero_samples,
-                    sample.histogram(),
-                    sample.flush_total_us,
-                    sample.flush_max_us,
-                    sample.flush_deferred_datagrams
+                let message = serde_json::json!({"event":"media_processing_window","stream":stream,
+                    "window_ms":elapsed.as_millis(),"samples":sample.samples,
+                    "known_samples":sample.samples.saturating_sub(sample.unknown_samples),"unknown_samples":sample.unknown_samples,
+                    "total_tenths_ms":sample.total_tenths_ms,"max_tenths_ms":sample.max_tenths_ms,
+                    "zero_known":sample.zero_samples,"histogram":sample.histogram(),
+                    "flush_total_us":sample.flush_total_us,"flush_max_us":sample.flush_max_us,
+                    "flush_deferred_datagrams":sample.flush_deferred_datagrams,
+                    "packetize_fec_encrypt_us":sample.packetize_fec_encrypt_us,"socket_flush_us":sample.socket_flush_us,
+                    "delivery_timing":sample.delivery,"scope":"capture_start_to_media_admission_not_delivery"});
+                amaterasu_module_sdk::diagnostics::log_window(
+                    &self.runtime,
+                    "media.processing_latency",
+                    &message,
                 );
-                let _ = self
-                    .runtime
-                    .log(LogLevel::Info, "media.processing_latency", &message);
             }
         }
         // Acquire before polling so a contended native call cannot strand an

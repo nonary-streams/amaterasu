@@ -53,4 +53,6 @@ impl ManagedModule for AuthenticationModule {
     }
 }
 
-amaterasu_module_sdk::export_module!(AuthenticationModule);
+amaterasu_module_sdk::export_module!(
+    amaterasu_module_sdk::service_worker::ServiceWorker<AuthenticationModule>
+);

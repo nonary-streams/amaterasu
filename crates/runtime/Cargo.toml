@@ -6,6 +6,7 @@ rust-version.workspace = true
 [lib]
 crate-type = ["cdylib", "rlib"]
 [dependencies]
+amaterasu-timing-metrics.workspace = true
 amaterasu-abi.workspace = true
 amaterasu-contracts.workspace = true
 serde_json.workspace = true

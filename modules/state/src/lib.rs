@@ -2,10 +2,10 @@
 mod collection;
 mod draft;
 mod protocol;
-mod snapshot;
-mod store;
 #[cfg(test)]
 mod reliable_broker_tests;
+mod snapshot;
+mod store;
 
 /// Minimal in-process State interface for cross-module integration tests.
 /// The feature is disabled in production builds.
@@ -485,4 +485,6 @@ mod tests {
     }
 }
 
-amaterasu_module_sdk::export_module!(StateModule);
+amaterasu_module_sdk::export_module!(
+    amaterasu_module_sdk::service_worker::ServiceWorker<StateModule>
+);

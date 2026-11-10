@@ -6,7 +6,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parent.parent
 CRATES = (
-    "abi", "data-plane", "configuration-schema", "extension-api", "media",
+    "abi", "timing-metrics", "data-plane", "configuration-schema", "extension-api", "media",
     "contracts", "network-api", "process-api", "network-sockets", "module-sdk",
 )
 

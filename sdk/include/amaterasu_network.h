@@ -150,6 +150,36 @@ typedef struct {
 
 #define AMATERASU_NETWORK_API_V1_0_SIZE ((uint32_t)sizeof(AmaterasuNetworkApi))
 
+/* Optional v1.1 diagnostics tail. Bind the same immutable contract and retain the
+ * v1 prefix; use only when size, minor and capability all advertise the tail.
+ * Unknown timing has flags=0 and must never be represented as measured zero. */
+#define AMATERASU_NETWORK_DIAGNOSTICS_MINOR 1u
+#define AMATERASU_NETWORK_CAP_DATAGRAM_DIAGNOSTICS UINT64_C(64)
+#define AMATERASU_NETWORK_KERNEL_RESIDENCE_REALTIME UINT64_C(1)
+#define AMATERASU_NETWORK_SOCKET_MEMORY UINT64_C(2)
+typedef struct {
+    uint32_t size;
+    uint32_t version;
+    uint64_t flags;
+    uint64_t kernel_residence_us;
+} AmaterasuNetworkReceiveTiming;
+typedef struct {
+    uint32_t size;
+    uint32_t version;
+    uint64_t flags;
+    uint64_t receive_memory_bytes;
+    uint64_t receive_buffer_bytes;
+    uint64_t send_memory_bytes;
+    uint64_t send_buffer_bytes;
+    uint64_t receive_drops;
+} AmaterasuNetworkSocketDiagnostics;
+typedef struct {
+    AmaterasuNetworkApi v1;
+    AmaterasuStatus (*recv_from_timed)(void *, uint64_t, uint8_t *, size_t,
+        size_t *, AmaterasuNetworkAddress *, AmaterasuNetworkReceiveTiming *);
+    AmaterasuStatus (*socket_diagnostics)(void *, uint64_t, AmaterasuNetworkSocketDiagnostics *);
+} AmaterasuNetworkApiV1_1;
+
 #ifdef __cplusplus
 }
 #endif
