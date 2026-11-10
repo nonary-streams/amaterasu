@@ -1,7 +1,9 @@
 //! Per-thread streaming priorities. Linux uses ordinary nice levels, never a
 //! real-time scheduling class. Windows uses the corresponding Win32 levels.
 //! Scheduling is best effort: permission failures are reported, not mistaken
-//! for a successfully raised priority.
+//! for a successfully raised priority. On Linux a request the installation does
+//! not permit falls back to the strongest level RLIMIT_NICE allows, and that
+//! reduced level is reported once.
 use std::{cell::Cell, io, marker::PhantomData, rc::Rc};
 
 #[cfg(target_os = "linux")]
@@ -57,7 +59,10 @@ impl ThreadScheduler for PlatformThreadScheduler {
         let previous = platform::current()?;
         let desired = priority.native();
         if previous != desired {
-            platform::set(desired)?;
+            let applied = platform::raise_toward(desired)?;
+            if applied != desired {
+                report_limited_once(priority, applied);
+            }
         }
         Ok(SavedPriority(previous))
     }
@@ -117,7 +122,11 @@ impl<S: ThreadScheduler> Drop for ScopedThreadPriority<S> {
 /// Set a dedicated worker's priority before opening its backend. OS permissions
 /// remain controlled by installation; this function grants no capability.
 pub fn set_current_thread_priority(priority: ThreadPriority) -> io::Result<()> {
-    platform::set(priority.native())
+    let applied = platform::raise_toward(priority.native())?;
+    if applied != priority.native() {
+        report_limited_once(priority, applied);
+    }
+    Ok(())
 }
 pub fn configure_worker_priority(priority: ThreadPriority) {
     if let Err(error) = set_current_thread_priority(priority) {
@@ -125,20 +134,33 @@ pub fn configure_worker_priority(priority: ThreadPriority) {
     }
 }
 fn report_once(priority: ThreadPriority, error: &io::Error) {
+    if first_report(priority, 0) {
+        eprintln!(
+            "streaming thread {:?} priority {priority:?} unavailable: {error}",
+            std::thread::current().name()
+        );
+    }
+}
+fn report_limited_once(priority: ThreadPriority, applied: i32) {
+    if first_report(priority, 2) {
+        eprintln!(
+            "streaming thread {:?} priority {priority:?} limited to level {applied} by the installation's scheduling limit",
+            std::thread::current().name()
+        );
+    }
+}
+/// Each priority/outcome pair is reported once per thread.
+fn first_report(priority: ThreadPriority, outcome_shift: u8) -> bool {
     thread_local! { static REPORTED: Cell<u8> = const { Cell::new(0) }; }
     let bit = match priority {
         ThreadPriority::High => 1,
         ThreadPriority::Critical => 2,
-    };
+    } << outcome_shift;
     REPORTED.with(|reported| {
-        if reported.get() & bit == 0 {
-            reported.set(reported.get() | bit);
-            eprintln!(
-                "streaming thread {:?} priority {priority:?} unavailable: {error}",
-                std::thread::current().name()
-            );
-        }
-    });
+        let first = reported.get() & bit == 0;
+        reported.set(reported.get() | bit);
+        first
+    })
 }
 
 #[cfg(not(any(target_os = "linux", windows)))]
@@ -148,6 +170,9 @@ mod platform {
         Err(io::ErrorKind::Unsupported.into())
     }
     pub fn set(_: i32) -> io::Result<()> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+    pub fn raise_toward(_: i32) -> io::Result<i32> {
         Err(io::ErrorKind::Unsupported.into())
     }
 }

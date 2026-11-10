@@ -22,3 +22,7 @@ pub(super) fn set(priority: i32) -> io::Result<()> {
         Ok(())
     }
 }
+/// Windows thread levels need no privilege; the request is applied exactly.
+pub(super) fn raise_toward(priority: i32) -> io::Result<i32> {
+    set(priority).map(|()| priority)
+}
