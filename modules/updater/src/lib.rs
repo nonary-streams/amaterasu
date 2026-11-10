@@ -5,6 +5,7 @@ mod release;
 mod worker;
 
 use amaterasu_module_sdk::network::{Network, abi as network_abi};
+use amaterasu_module_sdk::requests::{CallOutcome, OutboundCall, RequestOptions, reply_with};
 use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};
 use model::Settings;
 use product_settings::{Completion, ProductSettings};
@@ -16,6 +17,7 @@ use semver::Version;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::{BTreeSet, VecDeque};
+use std::task::Poll;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use worker::ReleaseWorker;
 
@@ -60,79 +62,55 @@ struct UpdaterStatusData<'a> {
     notification: Option<&'a NotificationStatus>,
 }
 
-enum TrayCallState {
-    Submit,
-    Waiting(u64),
-    // Broker expiry or cancellation does not prove the provider stopped.
-    Unconfirmed,
-    Release { request: u64, outcome: Value },
-}
-
+/// A notification handed to the system tray, and what is known of it.
 struct TrayCall {
     update: AvailableUpdate,
-    state: TrayCallState,
-    operation_id: String,
-    first_attempt: Option<Instant>,
-    uncertain_admission: bool,
+    /// `None` once the request ended without the tray's reply. Broker expiry
+    /// or cancellation does not prove the provider stopped, so the
+    /// notification is neither repeated nor reported as settled.
+    call: Option<OutboundCall>,
 }
 
 impl TrayCall {
-    /// Retain the operation on lost admission so a retry cannot notify twice.
+    fn new(update: AvailableUpdate, operation_id: &str) -> ModuleResult<Self> {
+        let call = OutboundCall::request(
+            RequestOptions {
+                service: SYSTEM_TRAY,
+                timeout_ms: NETWORK_TIMEOUT_MS,
+                operation_id,
+                parent: None,
+            },
+            &json!({"action":"notify_update", "version":update.tag, "release_url":update.url}),
+        )?;
+        Ok(Self {
+            update,
+            call: Some(call),
+        })
+    }
+
+    /// Whether the tray may already have been asked to notify.
+    fn was_submitted(&self) -> bool {
+        self.call.as_ref().is_none_or(OutboundCall::was_submitted)
+    }
+
+    /// The call keeps its operation identity across a lost admission, so a
+    /// retry cannot notify twice.
     fn advance(
         &mut self,
         now: Instant,
         send: &mut impl FnMut(Command) -> ModuleResult<Response>,
     ) -> Option<NotificationDelivery> {
-        let state = std::mem::replace(&mut self.state, TrayCallState::Submit);
-        match state {
-            TrayCallState::Submit => {
-                // The broker retains completed operation IDs for five minutes.
-                // Past that horizon a replay could become a second notification.
-                if self.first_attempt.is_some_and(|first| {
-                    now.saturating_duration_since(first) >= Duration::from_secs(300)
-                }) {
-                    return None;
-                }
-                self.first_attempt.get_or_insert(now);
-                match send(Command::Request {
-                    service: SYSTEM_TRAY.into(),
-                    payload: json!({"action":"notify_update", "version":self.update.tag,
-                        "release_url":self.update.url}),
-                    timeout_ms: NETWORK_TIMEOUT_MS,
-                    operation_id: self.operation_id.clone(),
-                    parent: None,
-                }) {
-                    Ok(Response::Accepted { id }) => self.state = TrayCallState::Waiting(id),
-                    Ok(Response::Error { .. }) if !self.uncertain_admission => {
-                        return Some(NotificationDelivery::Unavailable);
-                    }
-                    _ => self.uncertain_admission = true,
-                }
-            }
-            TrayCallState::Waiting(request) => match send(Command::TakeResult { request }) {
-                Ok(Response::Pending) | Err(_) => self.state = TrayCallState::Waiting(request),
-                Ok(Response::Result { payload }) => {
-                    self.state = TrayCallState::Release {
-                        request,
-                        outcome: payload,
-                    };
-                }
-                Ok(_) => self.state = TrayCallState::Unconfirmed,
-            },
-            TrayCallState::Unconfirmed => self.state = TrayCallState::Unconfirmed,
-            TrayCallState::Release { request, outcome } => {
-                match send(Command::ReleaseResult { request }) {
-                    Ok(Response::Ok) => {
-                        return Some(notification_delivery(&outcome));
-                    }
-                    Ok(Response::Error { code, .. }) if code == "not_found" => {
-                        return Some(notification_delivery(&outcome));
-                    }
-                    _ => self.state = TrayCallState::Release { request, outcome },
-                }
+        let call = self.call.as_mut()?;
+        match call.poll_at(now, send) {
+            Poll::Pending => None,
+            Poll::Ready(CallOutcome::Completed(outcome)) => Some(notification_delivery(&outcome)),
+            // The broker never admitted the request, so the tray never saw it.
+            Poll::Ready(CallOutcome::Refused(_)) => Some(NotificationDelivery::Unavailable),
+            Poll::Ready(CallOutcome::Unconfirmed(_)) => {
+                self.call = None;
+                None
             }
         }
-        None
     }
 }
 
@@ -165,9 +143,9 @@ struct UpdaterModule {
 
 impl ManagedModule for UpdaterModule {
     fn start(runtime: RuntimeClient) -> ModuleResult<Self> {
-        let Response::Result { payload: settings } = runtime.send(Command::GetSettings {})? else {
-            return Err("updater settings unavailable".into());
-        };
+        let settings: Value = runtime
+            .settings()
+            .map_err(|error| format!("updater settings unavailable: {error}"))?;
         let network = Network::from_settings(&runtime, &settings)?;
         if !network.supports(network_abi::TCP | network_abi::DNS) {
             return Err("updater requires network TCP and DNS capabilities".into());
@@ -181,9 +159,7 @@ impl ManagedModule for UpdaterModule {
             .collect();
         let installed_version = Version::parse(env!("CARGO_PKG_VERSION"))
             .map_err(|_| "updater package version is invalid")?;
-        runtime.require_success(Command::Register {
-            service: SERVICE.into(),
-        })?;
+        runtime.provide(SERVICE)?;
         Ok(Self {
             runtime,
             product_settings: ProductSettings::new(&startup_id),
@@ -246,25 +222,18 @@ impl ManagedModule for UpdaterModule {
     fn tick(&mut self) -> ModuleResult<()> {
         // Keep bounded ownership of a response whose broker acknowledgement
         // was lost; do not admit another request until it has settled.
-        if self.flush_completions() {
-            match self.runtime.send(Command::Poll {})? {
-                Response::Pending => {}
-                Response::Request {
-                    id,
-                    caller,
-                    payload,
-                    ..
-                } => match serde_json::from_value::<Operation>(payload) {
-                    Ok(operation) => self.handle_request(id, &caller, operation)?,
-                    Err(_) => self.complete(
-                        id,
-                        failure(
-                            "invalid_request",
-                            "request does not match the updater schema",
-                        ),
-                    )?,
-                },
-                response => return Err(format!("unexpected updater poll response: {response:?}")),
+        if self.flush_completions()
+            && let Some(request) = self.runtime.next_request()?
+        {
+            match request.parse::<Operation>() {
+                Ok(request) => self.handle_request(request.id, &request.caller, request.payload)?,
+                Err(malformed) => self.complete(
+                    malformed.request.id,
+                    failure(
+                        "invalid_request",
+                        "request does not match the updater schema",
+                    ),
+                )?,
             }
         }
 
@@ -542,20 +511,18 @@ impl UpdaterModule {
                 return Ok(());
             };
             self.operation_sequence = sequence;
-            self.tray_call = Some(TrayCall {
-                update,
-                state: TrayCallState::Submit,
-                operation_id: format!(
-                    "updater.notification.{}.{sequence}",
-                    self.notification_generation
-                ),
-                first_attempt: None,
-                uncertain_admission: false,
-            });
+            let operation_id = format!(
+                "updater.notification.{}.{sequence}",
+                self.notification_generation
+            );
+            match TrayCall::new(update.clone(), &operation_id) {
+                Ok(call) => self.tray_call = Some(call),
+                Err(_) => self.finish_notification(&update, NotificationDelivery::Unavailable),
+            }
             return Ok(());
         }
         let mut call = self.tray_call.take().expect("tray call exists");
-        if self.shutdown_announced && call.first_attempt.is_none() {
+        if self.shutdown_announced && !call.was_submitted() {
             return Ok(());
         }
         let result = call.advance(Instant::now(), &mut |command| self.runtime.send(command));
@@ -622,19 +589,11 @@ fn flush_queued_completions(
     send: &mut impl FnMut(Command) -> ModuleResult<Response>,
 ) -> bool {
     while let Some((request, payload)) = completions.front() {
-        match send(Command::Complete {
-            request: *request,
-            payload: payload.clone(),
-        }) {
-            Ok(Response::Ok) => {}
-            Ok(Response::Error { code, .. })
-                if matches!(
-                    code.as_str(),
-                    "cancelled" | "deadline_exceeded" | "request_ended" | "not_found"
-                ) => {}
-            // Neither a transport failure nor an unexpected broker response
-            // confirms completion; retain the same request and payload.
-            _ => return false,
+        // A reply to a request that already ended is settled. Neither a
+        // transport failure nor any other broker response confirms
+        // completion; retain the same request and payload.
+        if reply_with(send, *request, payload).is_err() {
+            return false;
         }
         completions.pop_front();
     }
@@ -762,20 +721,22 @@ mod tests {
         assert_eq!(pending.len(), 2);
     }
 
-    #[test]
-    fn lost_notification_admission_retries_exact_operation_and_releases_result() {
-        let now = Instant::now();
-        let mut call = TrayCall {
-            update: AvailableUpdate {
+    fn tray_call() -> TrayCall {
+        TrayCall::new(
+            AvailableUpdate {
                 tag: "v2".into(),
                 url: "https://example.test/v2".into(),
                 prerelease: false,
             },
-            state: TrayCallState::Submit,
-            operation_id: "updater.notification.test.1".into(),
-            first_attempt: None,
-            uncertain_admission: false,
-        };
+            "updater.notification.test.1",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn lost_notification_admission_retries_exact_operation_and_releases_result() {
+        let now = Instant::now();
+        let mut call = tray_call();
         let mut commands = Vec::new();
         assert!(
             call.advance(now, &mut |command| {
@@ -793,59 +754,66 @@ mod tests {
         );
         assert!(matches!((&commands[0], &commands[1]),
             (Command::Request { operation_id: first, .. }, Command::Request { operation_id: second, .. }) if first == second));
-        assert!(
-            call.advance(now, &mut |command| {
-                assert!(matches!(command, Command::TakeResult { request: 7 }));
-                Ok(Response::Result {
-                    payload: json!({"ok":true,"delivery":"notified"}),
-                })
-            })
-            .is_none()
-        );
+        let mut settlement = Vec::new();
         assert_eq!(
             call.advance(now, &mut |command| {
-                assert!(matches!(command, Command::ReleaseResult { request: 7 }));
-                Ok(Response::Ok)
+                let response = match &command {
+                    Command::TakeResult { request: 7 } => Response::Result {
+                        payload: json!({"ok":true,"delivery":"notified"}),
+                    },
+                    Command::ReleaseResult { request: 7 } => Response::Ok,
+                    unexpected => panic!("unexpected command {unexpected:?}"),
+                };
+                settlement.push(command);
+                Ok(response)
             }),
             Some(NotificationDelivery::Notified)
+        );
+        assert!(matches!(
+            settlement.as_slice(),
+            [Command::TakeResult { .. }, Command::ReleaseResult { .. }]
+        ));
+    }
+
+    #[test]
+    fn a_refused_notification_is_reported_unavailable() {
+        let mut call = tray_call();
+        assert_eq!(
+            call.advance(Instant::now(), &mut |_| Ok(Response::error(
+                "unavailable",
+                "no tray provider"
+            ))),
+            Some(NotificationDelivery::Unavailable)
         );
     }
 
     #[test]
     fn uncertain_notification_does_not_replay_after_broker_retention() {
         let now = Instant::now();
-        let mut call = TrayCall {
-            update: AvailableUpdate {
-                tag: "v2".into(),
-                url: "https://example.test/v2".into(),
-                prerelease: false,
-            },
-            state: TrayCallState::Submit,
-            operation_id: "updater.notification.test.1".into(),
-            first_attempt: Some(now),
-            uncertain_admission: true,
-        };
+        let mut call = tray_call();
         assert!(
-            call.advance(now + Duration::from_secs(300), &mut |_| panic!(
-                "must not replay expired operation"
-            ))
-            .is_none()
+            call.advance(now, &mut |_| Err("lost reply".into()))
+                .is_none()
         );
+        for elapsed in [300, 301] {
+            assert!(
+                call.advance(now + Duration::from_secs(elapsed), &mut |_| panic!(
+                    "must not replay expired operation"
+                ))
+                .is_none()
+            );
+        }
+        assert!(call.call.is_none());
+        assert!(call.was_submitted());
     }
 
     #[test]
     fn broker_expiry_does_not_prove_notification_retired() {
-        let mut call = TrayCall {
-            update: AvailableUpdate {
-                tag: "v2".into(),
-                url: "https://example.test/v2".into(),
-                prerelease: false,
-            },
-            state: TrayCallState::Waiting(7),
-            operation_id: "updater.notification.test.1".into(),
-            first_attempt: Some(Instant::now()),
-            uncertain_admission: false,
-        };
+        let mut call = tray_call();
+        assert!(
+            call.advance(Instant::now(), &mut |_| Ok(Response::Accepted { id: 7 }))
+                .is_none()
+        );
         assert!(
             call.advance(Instant::now(), &mut |_| Ok(Response::error(
                 "deadline_exceeded",
@@ -859,7 +827,8 @@ mod tests {
             ))
             .is_none()
         );
-        assert!(matches!(call.state, TrayCallState::Unconfirmed));
+        assert!(call.call.is_none());
+        assert!(call.was_submitted());
     }
 
     #[test]

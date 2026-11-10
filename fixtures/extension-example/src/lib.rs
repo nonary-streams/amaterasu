@@ -1,6 +1,6 @@
 //! Read-only integration fixture for a third-party registered API provider.
 use amaterasu_contracts::{ApiFieldKind, ApiMethod, ApiPrivilege, ApiSchema};
-use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};
+use amaterasu_module_sdk::{ManagedModule, ModuleResult, RuntimeClient};
 use serde_json::{Value, json};
 
 fn method() -> ApiMethod {
@@ -46,16 +46,13 @@ struct ExtensionExample {
 
 impl ManagedModule for ExtensionExample {
     fn start(runtime: RuntimeClient) -> ModuleResult<Self> {
-        runtime.require_success(Command::RegisterApi { method: method() })?;
+        runtime.provide_api(method())?;
         Ok(Self { runtime })
     }
 
     fn tick(&mut self) -> ModuleResult<()> {
-        if let Response::Request { id, payload, .. } = self.runtime.send(Command::Poll {})? {
-            self.runtime.require_success(Command::Complete {
-                request: id,
-                payload: greet(&payload),
-            })?;
+        if let Some(request) = self.runtime.next_request()? {
+            request.reply(&self.runtime, &greet(&request.payload))?;
         }
         Ok(())
     }

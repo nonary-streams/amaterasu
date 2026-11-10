@@ -2,7 +2,7 @@
 //! the source owner's retained reference; it does not change pixel values.
 use amaterasu_media::*;
 use amaterasu_module_sdk::{
-    Command, ManagedModule, ModuleResult, Response, RuntimeClient,
+    ManagedModule, ModuleResult, RuntimeClient,
     abi::{STATUS_INVALID_ARGUMENT, Status},
     frame_processing::{
         FrameProcessor, FrameProcessorFactory, FrameResourceSelection, ProcessingFrame,
@@ -215,9 +215,7 @@ impl ManagedModule for Example {
         }
         let create: CreateProcessor = |_| Ok(Passthrough::new());
         let factory = FrameProcessorFactory::new(create);
-        runtime.require_success(Command::Register {
-            service: SERVICE.into(),
-        })?;
+        runtime.provide(SERVICE)?;
         // SAFETY: the factory remains owned by the module until all consumers retire.
         unsafe { factory.register(&runtime, SERVICE) }?;
         Ok(Self {
@@ -226,11 +224,11 @@ impl ManagedModule for Example {
         })
     }
     fn tick(&mut self) -> ModuleResult<()> {
-        if let Response::Request { id, .. } = self.runtime.send(Command::Poll {})? {
-            self.runtime.require_success(Command::Complete {
-                request: id,
-                payload: serde_json::json!({"ok":false,"code":"unsupported"}),
-            })?;
+        if let Some(request) = self.runtime.next_request()? {
+            request.reply(
+                &self.runtime,
+                &serde_json::json!({"ok":false,"code":"unsupported"}),
+            )?;
         }
         Ok(())
     }

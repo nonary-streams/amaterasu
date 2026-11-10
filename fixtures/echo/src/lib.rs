@@ -1,5 +1,5 @@
 //! Integration fixture, not an implementation of a streaming feature.
-use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};
+use amaterasu_module_sdk::{ManagedModule, ModuleResult, RuntimeClient};
 use serde_json::json;
 
 struct EchoModule {
@@ -8,9 +8,7 @@ struct EchoModule {
 
 impl ManagedModule for EchoModule {
     fn start(runtime: RuntimeClient) -> ModuleResult<Self> {
-        runtime.require_success(Command::Register {
-            service: "example.echo/1".into(),
-        })?;
+        runtime.provide("example.echo/1")?;
         Ok(Self { runtime })
     }
 
@@ -19,17 +17,12 @@ impl ManagedModule for EchoModule {
             std::thread::sleep(std::time::Duration::from_secs(60));
         }
 
-        if let Response::Request {
-            id: request_id,
-            payload,
-            ..
-        } = self.runtime.send(Command::Poll {})?
-        {
+        if let Some(request) = self.runtime.next_request()? {
             let revision = if cfg!(feature = "revision-two") { 2 } else { 1 };
-            self.runtime.require_success(Command::Complete {
-                request: request_id,
-                payload: json!({"revision": revision, "echo": payload}),
-            })?;
+            request.reply(
+                &self.runtime,
+                &json!({"revision": revision, "echo": request.payload}),
+            )?;
         }
         Ok(())
     }

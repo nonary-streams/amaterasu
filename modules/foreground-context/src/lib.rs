@@ -3,7 +3,7 @@ mod observer;
 mod platform;
 
 use amaterasu_module_sdk::foreground_context::{Request as Operation, SERVICE, Snapshot};
-use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};
+use amaterasu_module_sdk::{ManagedModule, ModuleResult, RuntimeClient};
 use observer::Observer;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -78,16 +78,12 @@ fn handle(
 
 impl ManagedModule for ForegroundModule {
     fn start(runtime: RuntimeClient) -> ModuleResult<Self> {
-        let Response::Result { payload } = runtime.send(Command::GetSettings {})? else {
-            return Err("foreground settings unavailable".into());
-        };
-        let settings: Settings =
-            serde_json::from_value(payload).map_err(|_| "invalid foreground settings")?;
+        let settings: Settings = runtime
+            .settings()
+            .map_err(|error| format!("invalid foreground settings: {error}"))?;
         settings.validate()?;
         platform::reconcile();
-        runtime.require_success(Command::Register {
-            service: SERVICE.into(),
-        })?;
+        runtime.provide(SERVICE)?;
         Ok(Self {
             runtime,
             settings,
@@ -106,31 +102,20 @@ impl ManagedModule for ForegroundModule {
         if self.observer.busy() {
             return Ok(());
         }
-        match self.runtime.send(Command::Poll {})? {
-            Response::Pending => Ok(()),
-            Response::Request {
-                id,
-                caller,
-                service,
-                payload,
-                ..
-            } => {
-                if !matches!(
-                    self.runtime.send(Command::CheckRequest { request: id })?,
-                    Response::Ok
-                ) {
-                    return Ok(());
-                }
-                if service != SERVICE {
-                    return self.complete(id, json!({"ok":false,"code":"invalid_service"}));
-                }
-                match authorize(&self.settings, &caller, payload) {
-                    Ok(()) if self.observer.submit(id) => Ok(()),
-                    Ok(()) => self.complete(id, snapshot_response(None)),
-                    Err(response) => self.complete(id, response),
-                }
-            }
-            _ => Err("foreground poll failed".into()),
+        let Some(request) = self.runtime.next_request()? else {
+            return Ok(());
+        };
+        // An observation is not worth starting for a caller that already left.
+        if !request.is_active(&self.runtime)? {
+            return Ok(());
+        }
+        if request.service != SERVICE {
+            return self.complete(request.id, json!({"ok":false,"code":"invalid_service"}));
+        }
+        match authorize(&self.settings, &request.caller, request.payload) {
+            Ok(()) if self.observer.submit(request.id) => Ok(()),
+            Ok(()) => self.complete(request.id, snapshot_response(None)),
+            Err(response) => self.complete(request.id, response),
         }
     }
 }
@@ -146,13 +131,8 @@ impl ForegroundModule {
     }
 
     fn complete(&mut self, request: u64, payload: Value) -> ModuleResult<()> {
-        match self.runtime.send(Command::Complete { request, payload })? {
-            Response::Ok => Ok(()),
-            Response::Error { code, .. } if code == "request_ended" || code == "not_found" => {
-                Ok(())
-            }
-            _ => Err("foreground completion failed".into()),
-        }
+        self.runtime.reply(request, &payload)?;
+        Ok(())
     }
 }
 

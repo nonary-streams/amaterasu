@@ -4,7 +4,7 @@ mod leases;
 mod protocol;
 pub use coordinator::Coordinator;
 
-use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};
+use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, RuntimeClient};
 use serde_json::json;
 
 pub const SERVICE: &str = "amaterasu.session/1";
@@ -17,9 +17,7 @@ pub struct SessionModule {
 
 impl ManagedModule for SessionModule {
     fn start(runtime: RuntimeClient) -> ModuleResult<Self> {
-        runtime.require_success(Command::Register {
-            service: SERVICE.into(),
-        })?;
+        runtime.provide(SERVICE)?;
         Ok(Self {
             runtime,
             coordinator: Coordinator::default(),
@@ -27,43 +25,23 @@ impl ManagedModule for SessionModule {
     }
 
     fn tick(&mut self) -> ModuleResult<()> {
-        match self.runtime.send(Command::Poll {})? {
-            Response::Request {
-                id,
-                caller,
-                payload,
-                ..
-            } => {
-                let previous_revision = self.coordinator.revision();
-                let response = self.coordinator.handle(&caller, payload);
-                if self.coordinator.revision() != previous_revision {
-                    // Notifications are advisory. State is committed even if publication fails;
-                    // clients recover through revisioned snapshots and caller-scoped lists.
-                    let _ = self.runtime.send(Command::Publish {
-                        topic: CHANGED_TOPIC.into(),
-                        payload: json!({"revision": self.coordinator.revision()}),
-                    });
-                }
-                // A caller can cancel its request after dispatch. Keep committed state and
-                // let an idempotent retry recover it even when completion is rejected.
-                match self.runtime.send(Command::Complete {
-                    request: id,
-                    payload: response,
-                })? {
-                    Response::Ok => Ok(()),
-                    Response::Error { code, .. }
-                        if code == "request_ended" || code == "not_found" =>
-                    {
-                        Ok(())
-                    }
-                    response => Err(format!(
-                        "unexpected session completion response: {response:?}"
-                    )),
-                }
-            }
-            Response::Pending => Ok(()),
-            response => Err(format!("unexpected session poll response: {response:?}")),
+        let Some(request) = self.runtime.next_request()? else {
+            return Ok(());
+        };
+        let previous_revision = self.coordinator.revision();
+        let response = self.coordinator.handle(&request.caller, request.payload);
+        if self.coordinator.revision() != previous_revision {
+            // Notifications are advisory. State is committed even if publication fails;
+            // clients recover through revisioned snapshots and caller-scoped lists.
+            let _ = self.runtime.send(Command::Publish {
+                topic: CHANGED_TOPIC.into(),
+                payload: json!({"revision": self.coordinator.revision()}),
+            });
         }
+        // A caller can cancel its request after dispatch. Committed state stands
+        // and an idempotent retry recovers it when the reply is discarded.
+        self.runtime.reply(request.id, &response)?;
+        Ok(())
     }
 }
 
