@@ -1294,6 +1294,18 @@ impl Ds5Transport {
         }
     }
 
+    /// Sends a report the host must observe before this device is destroyed.
+    /// UHID injects synchronously; the USB gadget waits for host polling.
+    fn send_final_report(&mut self, report: &Arc<Mutex<Ds5ReportState>>) -> InputResult<()> {
+        match self {
+            #[cfg(not(test))]
+            Self::Gadget(device) => device.send_final_report(),
+            #[cfg(test)]
+            Self::FakeGadget(device) => device.send_report(report),
+            Self::Uhid(device) => device.send_report(report),
+        }
+    }
+
     fn check_failure(&self) -> InputResult<()> {
         match self {
             #[cfg(not(test))]
@@ -1448,7 +1460,7 @@ impl GamepadDevice for Ds5Gamepad {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .neutralize();
             if let Some(device) = self.device.as_mut() {
-                let _ = device.send_report(&self.report);
+                let _ = device.send_final_report(&self.report);
             }
         }
         let result = self.device.as_mut().expect("device is present").destroy();

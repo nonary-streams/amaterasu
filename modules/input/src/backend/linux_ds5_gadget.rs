@@ -244,6 +244,11 @@ impl GadgetDevice {
         write_input_report(self.slot.handle().file(), &report)
     }
 
+    /// Sends the current report so the host observes it before teardown.
+    pub(super) fn send_final_report(&mut self) -> InputResult<()> {
+        deliver_final_report(|| self.send_report(), std::thread::sleep)
+    }
+
     pub(super) fn check_failure(&self) -> InputResult<()> {
         if let Some(error) = self
             .failure
@@ -449,6 +454,34 @@ fn write_input_report(
     }
 }
 
+/// The host polls the DS5 interrupt-IN endpoint every 4 ms (`bInterval` 6 at
+/// high speed). The driver queues a write only when the previous report has
+/// completed; otherwise it keeps the bytes for the next write to queue.
+const ENDPOINT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(4);
+/// Spacing just beyond one poll lets an in-flight report complete between writes.
+const FINAL_REPORT_SPACING: std::time::Duration = std::time::Duration::from_millis(5);
+const FINAL_REPORT_WRITES: usize = 3;
+
+/// Delivers the final (normally neutral) report before teardown. A single write
+/// while the previous report is still in flight is stored but never sent, so
+/// the host keeps the last stick and button state after the controller is
+/// removed: games and Steam Input then see a held input. Repeat the write
+/// past the polling interval, then wait for the last queued report to drain.
+fn deliver_final_report<E>(
+    mut send: impl FnMut() -> Result<(), E>,
+    mut sleep: impl FnMut(std::time::Duration),
+) -> Result<(), E> {
+    debug_assert!(FINAL_REPORT_SPACING > ENDPOINT_POLL_INTERVAL);
+    for write in 0..FINAL_REPORT_WRITES {
+        if write > 0 {
+            sleep(FINAL_REPORT_SPACING);
+        }
+        send()?;
+    }
+    sleep(FINAL_REPORT_SPACING);
+    Ok(())
+}
+
 #[cfg(not(test))]
 fn gadget_error(error: std::io::Error) -> InputError {
     InputError::new(
@@ -461,6 +494,77 @@ fn gadget_error(error: std::io::Error) -> InputError {
 mod tests {
     use super::*;
     use amaterasu_gamestream::control::HostFeedback;
+
+    /// Models `ds5_write`: a write queues only when the endpoint is idle, and
+    /// the host completes one queued report per polling interval.
+    struct ModelEndpoint {
+        stored: u8,
+        in_flight: Option<(u8, std::time::Duration)>,
+        delivered: Vec<u8>,
+        now: std::time::Duration,
+    }
+
+    impl ModelEndpoint {
+        fn advance(&mut self, elapsed: std::time::Duration) {
+            self.now += elapsed;
+            if let Some((report, completes)) = self.in_flight
+                && self.now >= completes
+            {
+                self.delivered.push(report);
+                self.in_flight = None;
+            }
+        }
+
+        fn write(&mut self, report: u8) {
+            self.stored = report;
+            if self.in_flight.is_none() {
+                self.in_flight = Some((report, self.now + ENDPOINT_POLL_INTERVAL));
+            }
+        }
+    }
+
+    #[test]
+    fn final_report_reaches_the_host_while_a_held_report_is_in_flight() {
+        const HELD: u8 = 1;
+        const NEUTRAL: u8 = 0;
+        let endpoint = std::cell::RefCell::new(ModelEndpoint {
+            stored: HELD,
+            in_flight: None,
+            delivered: Vec::new(),
+            now: std::time::Duration::ZERO,
+        });
+        // A held stick was just queued, so the neutral write finds the
+        // endpoint busy. One write alone would never send neutral.
+        endpoint.borrow_mut().write(HELD);
+        deliver_final_report::<()>(
+            || {
+                endpoint.borrow_mut().write(NEUTRAL);
+                Ok(())
+            },
+            |elapsed| endpoint.borrow_mut().advance(elapsed),
+        )
+        .unwrap();
+        let endpoint = endpoint.into_inner();
+        assert_eq!(endpoint.stored, NEUTRAL);
+        assert_eq!(endpoint.delivered.last(), Some(&NEUTRAL));
+        assert!(
+            endpoint.in_flight.is_none(),
+            "teardown must not cut a report"
+        );
+    }
+
+    #[test]
+    fn final_report_stops_on_a_failed_write() {
+        let mut writes = 0;
+        let result = deliver_final_report(
+            || {
+                writes += 1;
+                Err("gone")
+            },
+            |_| {},
+        );
+        assert_eq!((result, writes), (Err("gone"), 1));
+    }
 
     #[test]
     fn uapi_struct_layout_and_ioctl_numbers_match_the_pinned_header() {
