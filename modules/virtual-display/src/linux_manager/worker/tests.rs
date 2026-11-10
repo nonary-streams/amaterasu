@@ -1,3 +1,4 @@
+use super::super::connectors::ConnectedDisplays;
 use super::*;
 use std::{
     collections::BTreeMap,
@@ -5,6 +6,7 @@ use std::{
     os::unix::fs::DirBuilderExt,
     path::PathBuf,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 type RequestedMode = (String, u32, u32, u32);
@@ -72,19 +74,37 @@ impl Broker for FakeBroker {
         Ok(())
     }
 }
-/// Connector names the fake vibeshine card exposes, or a discovery failure.
+/// Connector names the fake vibeshine card exposes, or a discovery failure,
+/// and which connectors report an attached display.
 #[derive(Clone)]
-struct FakeConnectors(Arc<Mutex<Result<Vec<String>, String>>>);
+struct FakeConnectors(
+    Arc<Mutex<Result<Vec<String>, String>>>,
+    Arc<Mutex<Result<ConnectedDisplays, String>>>,
+);
 impl FakeConnectors {
     fn named(range: std::ops::RangeInclusive<u32>) -> Self {
-        Self(Arc::new(Mutex::new(Ok(range
-            .map(|index| format!("Virtual-{index}"))
-            .collect()))))
+        Self(
+            Arc::new(Mutex::new(Ok(range
+                .map(|index| format!("Virtual-{index}"))
+                .collect()))),
+            Arc::new(Mutex::new(Err("connector status is unavailable".into()))),
+        )
+    }
+    /// Reports `virtual_outputs` and `other` as the connectors with a display.
+    fn attach(&self, virtual_outputs: &[&str], other: &[&str]) {
+        let names = |names: &[&str]| names.iter().map(|name| (*name).to_owned()).collect();
+        *self.1.lock().unwrap() = Ok(ConnectedDisplays {
+            virtual_outputs: names(virtual_outputs),
+            other: names(other),
+        });
     }
 }
 impl ConnectorInventory for FakeConnectors {
     fn connectors(&self) -> Result<Vec<String>, String> {
         self.0.lock().unwrap().clone()
+    }
+    fn connected_displays(&self) -> Result<ConnectedDisplays, String> {
+        self.1.lock().unwrap().clone()
     }
 }
 struct FakeCompositor {
@@ -94,6 +114,8 @@ struct FakeCompositor {
     snapshot_x: i64,
     fail_restore_after: Option<usize>,
     guard_available: bool,
+    /// Overrides `guard_available` from outside the worker thread.
+    guard_signal: Option<Arc<std::sync::atomic::AtomicBool>>,
     parked_observable: bool,
     placements: Vec<(String, Placement)>,
     restored: Vec<bool>,
@@ -110,6 +132,7 @@ impl FakeCompositor {
             snapshot_x: 0,
             fail_restore_after: None,
             guard_available: true,
+            guard_signal: None,
             parked_observable: true,
             placements: Vec::new(),
             restored: Vec::new(),
@@ -166,7 +189,10 @@ impl Compositor for FakeCompositor {
         }
     }
     fn verify_removal_guard(&mut self, _: &str) -> Result<bool, String> {
-        Ok(self.guard_available)
+        Ok(match &self.guard_signal {
+            Some(signal) => signal.load(std::sync::atomic::Ordering::Acquire),
+            None => self.guard_available,
+        })
     }
     fn verify_parked(&mut self, _: &str) -> Result<(), String> {
         if self.parked_observable {
@@ -954,7 +980,10 @@ fn removal_preserves_connector_and_journal_until_a_survivor_is_available() {
 }
 
 #[test]
-fn failed_restore_parks_the_released_display_for_a_new_stream() {
+fn unconfirmed_restore_still_unplugs_the_stream_display_beside_a_surviving_monitor() {
+    // The installed host kept the stream output connected whenever the saved
+    // layout did not read back, although the monitor was on again. The stream
+    // output then stayed lit over the desktop until the next stream or restart.
     let (root, mut controller) = fixture();
     let old = controller
         .create_with_references(
@@ -967,11 +996,13 @@ fn failed_restore_parks_the_released_display_for_a_new_stream() {
         .unwrap();
     controller.compositor.fail_restore = true;
     assert!(controller.remove(&old.key()).unwrap());
+    assert!(!controller.broker.connected(&old.output).unwrap());
+    // The saved desktop is still owed, so its record is kept for another try.
     assert_eq!(
         controller.journal.records[0].park_reason.as_deref(),
         Some("restore_failed")
     );
-    assert!(controller.broker.connected(&old.output).unwrap());
+    assert!(controller.journal.records[0].layout.is_some());
     controller.compositor.fail_restore = false;
     let next = controller
         .create_with_references(
@@ -984,6 +1015,209 @@ fn failed_restore_parks_the_released_display_for_a_new_stream() {
         .unwrap();
     assert_eq!(next.output, old.output);
     assert!(!controller.remove(&next.key()).unwrap());
+    drop(controller);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn failed_restore_without_a_surviving_monitor_keeps_the_stream_display_lit() {
+    let (root, mut controller) = fixture();
+    let old = controller
+        .create_with_references(
+            "owner".into(),
+            specification(FIRST),
+            ScaleSetting::Automatic,
+            Some(Default::default()),
+            VirtualDisplayLayout::Exclusive,
+        )
+        .unwrap();
+    controller.compositor.fail_restore = true;
+    controller.compositor.guard_available = false;
+    assert!(controller.remove(&old.key()).unwrap());
+    assert_eq!(
+        controller.journal.records[0].park_reason.as_deref(),
+        Some("restore_failed")
+    );
+    assert!(controller.broker.connected(&old.output).unwrap());
+    controller.compositor.fail_restore = false;
+    controller.compositor.guard_available = true;
+    let next = controller
+        .create_with_references(
+            "owner".into(),
+            specification(SECOND),
+            ScaleSetting::Automatic,
+            Some(Default::default()),
+            VirtualDisplayLayout::Exclusive,
+        )
+        .unwrap();
+    assert_eq!(next.output, old.output);
+    assert!(!controller.remove(&next.key()).unwrap());
+    drop(controller);
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// Leaves `FIRST` parked and connected, as when its stream ended with every
+/// monitor off.
+fn park_connected(
+    controller: &mut Controller<FakeBroker, FakeCompositor, FakeConnectors>,
+) -> Record {
+    let record = controller
+        .create_with_references(
+            "owner".into(),
+            specification(FIRST),
+            ScaleSetting::Automatic,
+            Some(Default::default()),
+            VirtualDisplayLayout::Exclusive,
+        )
+        .unwrap();
+    controller.compositor.guard_available = false;
+    assert!(controller.remove(&record.key()).unwrap());
+    assert!(controller.broker.connected(&record.output).unwrap());
+    record
+}
+
+#[test]
+fn provider_retires_its_parked_output_once_a_monitor_can_take_the_desktop() {
+    let (root, mut controller) = fixture();
+    let record = park_connected(&mut controller);
+    let start = Instant::now();
+    let mut retirement = controller.pace_retirement(None, start).unwrap();
+    let native_effects = |controller: &Controller<FakeBroker, FakeCompositor, FakeConnectors>| {
+        (
+            controller.broker.effects.lock().unwrap().len(),
+            controller.compositor.restored.len(),
+        )
+    };
+
+    // Every monitor is off. However long that lasts, polling reads connector
+    // status only: no broker request and no compositor command.
+    controller.connectors.attach(&[&record.output], &[]);
+    let idle = native_effects(&controller);
+    for hours in 1..=3 {
+        let outcome =
+            controller.retire_parked(&mut retirement, start + Duration::from_secs(3600 * hours));
+        assert!(outcome.retired.is_empty());
+        assert!(!outcome.finished);
+    }
+    assert_eq!(native_effects(&controller), idle);
+
+    // The monitor is switched on: the next poll restores and unplugs.
+    controller
+        .connectors
+        .attach(&[&record.output], &["card1-HDMI-A-1"]);
+    controller.compositor.guard_available = true;
+    let later = start + Duration::from_secs(4 * 3600);
+    let outcome = controller.retire_parked(&mut retirement, later);
+    assert_eq!(outcome.retired, [record.key()]);
+    assert!(outcome.finished);
+    assert!(!controller.broker.connected(&record.output).unwrap());
+    assert!(controller.journal.records.is_empty());
+    assert!(
+        controller
+            .pace_retirement(Some(retirement), later)
+            .is_none()
+    );
+    drop(controller);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn retirement_backs_off_while_a_connected_monitor_cannot_take_the_desktop() {
+    let (root, mut controller) = fixture();
+    let record = park_connected(&mut controller);
+    controller
+        .connectors
+        .attach(&[&record.output], &["card1-HDMI-A-1"]);
+    let start = Instant::now();
+    let mut retirement = controller.pace_retirement(None, start).unwrap();
+    let mut attempts = Vec::new();
+    for second in 0..=120 {
+        let before = controller.compositor.restored.len();
+        let outcome =
+            controller.retire_parked(&mut retirement, start + Duration::from_secs(second));
+        assert!(outcome.retired.is_empty());
+        assert!(!outcome.finished);
+        if controller.compositor.restored.len() != before {
+            attempts.push(second);
+        }
+    }
+    assert_eq!(attempts, [1, 3, 8, 18, 48, 108]);
+    assert!(controller.journal.records[0].parked);
+    assert!(controller.broker.connected(&record.output).unwrap());
+    drop(controller);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn retirement_never_replaces_the_layout_of_an_active_stream() {
+    let (root, mut controller) = fixture();
+    let parked = park_connected(&mut controller);
+    // A second parked output cannot exist beside an active stream through
+    // creation, which reuses the parked one. Recovery can leave that state.
+    let mut active = parked.clone();
+    active.owner = "active".into();
+    active.specification = specification(SECOND);
+    active.output = "Virtual-3".into();
+    active.references = Some(["live-stream".to_owned()].into());
+    controller.journal.insert(active).unwrap();
+    controller
+        .connectors
+        .attach(&[&parked.output, "Virtual-3"], &["card1-HDMI-A-1"]);
+    controller.compositor.guard_available = true;
+    let start = Instant::now();
+    let mut retirement = controller.pace_retirement(None, start).unwrap();
+    let restores = controller.compositor.restored.len();
+    let outcome = controller.retire_parked(&mut retirement, start + Duration::from_secs(60));
+    assert!(outcome.retired.is_empty());
+    assert!(outcome.finished);
+    assert_eq!(controller.compositor.restored.len(), restores);
+    assert!(controller.broker.connected(&parked.output).unwrap());
+    drop(controller);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn unplugged_parked_output_stops_reapplying_its_saved_layout() {
+    let (root, mut controller) = fixture();
+    let record = controller
+        .create_with_references(
+            "owner".into(),
+            specification(FIRST),
+            ScaleSetting::Automatic,
+            Some(Default::default()),
+            VirtualDisplayLayout::Exclusive,
+        )
+        .unwrap();
+    // A monitor survives, so the stream output is unplugged, but the saved
+    // layout keeps failing to read back.
+    controller.compositor.fail_restore = true;
+    assert!(controller.remove(&record.key()).unwrap());
+    assert!(!controller.broker.connected(&record.output).unwrap());
+    controller.connectors.attach(&[], &["card1-HDMI-A-1"]);
+    let start = Instant::now();
+    let mut retirement = controller.pace_retirement(None, start).unwrap();
+    let mut attempts = 0;
+    let mut finished_at = None;
+    for second in 0..=600 {
+        let before = controller.compositor.restored.len();
+        let outcome =
+            controller.retire_parked(&mut retirement, start + Duration::from_secs(second));
+        if controller.compositor.restored.len() != before {
+            attempts += 1;
+        }
+        if outcome.finished {
+            finished_at = Some(second);
+            break;
+        }
+    }
+    assert_eq!(attempts, 4);
+    assert_eq!(finished_at, Some(19));
+    // The desktop the user has arranged since is left alone; a restart or the
+    // next stream still restores the saved layout.
+    assert!(controller.journal.records[0].parked);
+    controller.compositor.fail_restore = false;
+    assert!(controller.recover().is_none());
+    assert!(controller.journal.records.is_empty());
     drop(controller);
     fs::remove_dir_all(root).unwrap();
 }
@@ -1093,11 +1327,13 @@ fn failed_restore_without_output_proof_keeps_cleanup_unresolved() {
         )
         .unwrap();
     controller.compositor.fail_restore = true;
+    controller.compositor.guard_available = false;
     controller.compositor.parked_observable = false;
     assert!(controller.remove(&record.key()).is_err());
     assert!(!controller.journal.records[0].parked);
     assert!(controller.broker.connected(&record.output).unwrap());
     controller.compositor.fail_restore = false;
+    controller.compositor.guard_available = true;
     controller.compositor.parked_observable = true;
     controller.remove(&record.key()).unwrap();
     drop(controller);
@@ -1542,6 +1778,57 @@ fn manager_releases_parks_and_reuses_output_through_public_operations() {
     fs::remove_dir_all(root).unwrap();
 }
 
+#[test]
+fn manager_reports_a_parked_output_gone_after_the_worker_retires_it() {
+    let (root, mut controller) = fixture();
+    let monitor_on = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    controller.compositor.guard_signal = Some(monitor_on.clone());
+    let broker = controller.broker.clone();
+    let mut manager = manager_with_fake_worker(controller);
+    let operation = crate::model::Operation::Create {
+        hdr_enabled: false,
+        identity: FIRST.into(),
+        width: 1920,
+        height: 1080,
+        refresh_millihz: 60000,
+        name: "Amaterasu".into(),
+        reference_id: Some("stream".into()),
+        dd_virtual_display_scale: None,
+        virtual_display_layout: None,
+        expected_topology_revision: None,
+        expected_topology_domain_id: None,
+    };
+    assert_eq!(manager.admit("session", operation).0["ok"], true);
+    wait_for_fake_worker(&mut manager, |manager| manager.pending_mutations == 0);
+    let output = manager.monitors[&("session".into(), FIRST.into())]
+        .output
+        .clone()
+        .unwrap();
+    assert_eq!(
+        manager.remove("session", FIRST, Some("stream"))["monitor"]["state"],
+        "removing"
+    );
+    wait_for_fake_worker(&mut manager, |manager| manager.pending_mutations == 0);
+    assert_eq!(
+        manager.status("session", Some(FIRST.into()), None)["parked"],
+        true
+    );
+    assert!(broker.connected(&output).unwrap());
+    let revision = manager.topology_revision;
+
+    // Nobody calls the provider again. It notices the monitor by itself.
+    monitor_on.store(true, std::sync::atomic::Ordering::Release);
+    wait_for_fake_worker(&mut manager, |manager| manager.parked.is_empty());
+    assert!(!broker.connected(&output).unwrap());
+    let status = manager.status("session", Some(FIRST.into()), None);
+    assert_eq!(status["parked"], false);
+    assert_eq!(status["parked_outputs"], serde_json::json!([]));
+    assert!(manager.topology_revision > revision);
+    assert_eq!(manager.pending_mutations, 0);
+    drop(manager);
+    fs::remove_dir_all(root).unwrap();
+}
+
 fn manager_with_fake_worker(
     controller: Controller<FakeBroker, FakeCompositor, FakeConnectors>,
 ) -> super::super::Manager {
@@ -1699,7 +1986,8 @@ fn manager_failed_creation_keeps_parked_connector_visible_after_reference_releas
         let broker = controller.broker.clone();
         let mut manager = manager_with_fake_worker(controller);
         admit_failed_creation(&mut manager);
-        assert!(broker.connected("Virtual-2").unwrap());
+        // The failed stream's output stays lit only while no monitor survives.
+        assert_eq!(broker.connected("Virtual-2").unwrap(), !guard_available);
         assert!(
             manager.monitors[&("session".into(), FIRST.into())]
                 .output
@@ -1716,7 +2004,7 @@ fn manager_failed_creation_keeps_parked_connector_visible_after_reference_releas
         let removal = manager.remove("session", FIRST, Some("failed-stream"));
         assert_eq!(removal["parked"], true);
         assert_eq!(removal["removed"], false);
-        assert!(broker.connected("Virtual-2").unwrap());
+        assert_eq!(broker.connected("Virtual-2").unwrap(), !guard_available);
         assert!(broker.connected("Virtual-1").unwrap());
 
         drop(manager);

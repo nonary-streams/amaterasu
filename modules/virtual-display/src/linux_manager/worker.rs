@@ -4,13 +4,17 @@ use super::{
     compositor::{Compositor, Placement},
     connectors::ConnectorInventory,
     journal::Journal,
+    retirement::{Retirement, UNPLUGGED_ATTEMPTS},
 };
 use crate::{
     linux_control::LinuxControlClient,
     model::{Specification, VirtualDisplayLayout},
     scale::ScaleSetting,
 };
-use std::sync::mpsc::{Receiver, SyncSender};
+use std::{
+    sync::mpsc::{Receiver, RecvTimeoutError, SyncSender},
+    time::Instant,
+};
 
 pub(super) trait Broker: Send {
     fn connected(&self, output: &str) -> Result<bool, String>;
@@ -54,6 +58,22 @@ struct PreparedCreation {
     record: Record,
     parked_key: Option<(String, String)>,
     placement: Placement,
+}
+/// What one retirement poll achieved.
+struct ParkedRetirement {
+    /// Owners whose parked output is gone from the journal.
+    retired: Vec<(String, String)>,
+    /// Nothing is left that the provider can usefully retry on its own.
+    finished: bool,
+}
+
+/// Records why a saved desktop could not be confirmed. The provider's caller
+/// only learns that its output was parked or removed.
+fn report_unconfirmed_restore(output: &str, stage: &str, error: &str) {
+    let detail: String = error.chars().take(480).collect();
+    eprintln!(
+        "amaterasu virtual display desktop restoration unconfirmed: output={output} stage={stage} error={detail:?}"
+    );
 }
 
 impl<B: Broker, C: Compositor, I: ConnectorInventory> Controller<B, C, I> {
@@ -145,11 +165,90 @@ impl<B: Broker, C: Compositor, I: ConnectorInventory> Controller<B, C, I> {
         {
             return Err("cannot park an unresolved display owner".into());
         }
+        // A retried retirement parks the same output again; record it once.
+        if !record.parked || record.park_reason.as_deref() != Some(reason) {
+            eprintln!(
+                "amaterasu virtual display parked: output={} reason={reason}",
+                record.output
+            );
+        }
         record.transition = None;
         record.parked = true;
         record.park_reason = Some(reason.into());
         self.journal.update(record)?;
         Ok(true)
+    }
+    /// The provider's own attempt to finish releasing outputs it parked, made
+    /// only while no stream owns a display: an active stream's layout must not
+    /// be replaced by an earlier desktop, and its creation reuses the parked
+    /// output anyway. Returns the owners whose parked output is now retired.
+    fn retire_parked(&mut self, retirement: &mut Retirement, now: Instant) -> ParkedRetirement {
+        let parked: Vec<Record> = self
+            .journal
+            .records
+            .iter()
+            .filter(|record| record.parked)
+            .cloned()
+            .collect();
+        let mut outcome = ParkedRetirement {
+            retired: Vec::new(),
+            finished: true,
+        };
+        if parked.is_empty() || parked.len() != self.journal.records.len() {
+            // The active stream's own removal starts the pacing again.
+            return outcome;
+        }
+        let displays = self.connectors.connected_displays().ok();
+        let unplugged: Vec<bool> = parked
+            .iter()
+            .map(|record| {
+                displays
+                    .as_ref()
+                    .is_some_and(|displays| !displays.virtual_outputs.contains(&record.output))
+            })
+            .collect();
+        // An unplugged output is left to the next stream or restart once its
+        // saved layout has been tried often enough.
+        if retirement.attempts() >= UNPLUGGED_ATTEMPTS && unplugged.iter().all(|gone| *gone) {
+            return outcome;
+        }
+        outcome.finished = false;
+        if !retirement.due(now, displays.as_ref()) {
+            return outcome;
+        }
+        let saved_layout_exhausted = retirement.attempts() >= UNPLUGGED_ATTEMPTS;
+        for (record, unplugged) in parked.iter().zip(unplugged) {
+            if unplugged && saved_layout_exhausted {
+                continue;
+            }
+            let attempt = retirement.attempts() + 1;
+            let result = match self.remove(&record.key()) {
+                Ok(false) => {
+                    outcome.retired.push(record.key());
+                    "retired".to_owned()
+                }
+                Ok(true) => "still parked".to_owned(),
+                Err(error) => format!("failed: {error}"),
+            };
+            if retirement.outcome_changed(&format!("{} {result}", record.output)) {
+                eprintln!(
+                    "amaterasu virtual display parked output retirement: output={} attempt={attempt} result={:?}",
+                    record.output,
+                    result.chars().take(480).collect::<String>()
+                );
+            }
+        }
+        retirement.attempted(now);
+        outcome.finished = self.journal.records.iter().all(|record| !record.parked);
+        outcome
+    }
+    /// Starts pacing retirement when an output is parked and stops when none is.
+    fn pace_retirement(&self, retirement: Option<Retirement>, now: Instant) -> Option<Retirement> {
+        if self.journal.records.iter().any(|record| record.parked) {
+            Some(retirement.unwrap_or_else(|| Retirement::begin(now)))
+        } else {
+            None
+        }
     }
     fn reconfigure(
         &mut self,
@@ -292,25 +391,33 @@ impl<B: Broker, C: Compositor, I: ConnectorInventory> Controller<B, C, I> {
             self.journal.update(record.clone())?;
         }
         if connected {
-            // Restore and independently observe a surviving desktop before
-            // unplugging the stream output. Keep the journal on uncertainty.
+            // Unplugging depends on an independently observed surviving
+            // desktop, not on an exact readback of the saved layout. A monitor
+            // that is on can take the desktop while one of its properties still
+            // differs, and the layout is applied again once the stream output
+            // is gone. Leaving the stream output lit beside that monitor is
+            // what the user sees as a screen that never went away. Without a
+            // survivor the stream output stays as the desktop's only screen.
             let restored = self.compositor.restore(record.layout.as_ref());
-            let (can_remove, park_reason) = match restored {
-                Ok(()) => (
-                    self.compositor.verify_removal_guard(&record.output)?,
-                    "no_survivor",
-                ),
-                Err(_) => {
+            if let Err(error) = &restored {
+                report_unconfirmed_restore(&record.output, "before_unplug", error);
+            }
+            match (
+                restored,
+                self.compositor.verify_removal_guard(&record.output),
+            ) {
+                (_, Ok(true)) => {}
+                (Ok(()), Ok(false)) => return self.park(record, "no_survivor"),
+                (Ok(()), Err(error)) => return Err(error),
+                (Err(_), _) => {
                     self.compositor.verify_parked(&record.output)?;
-                    (false, "restore_failed")
+                    return self.park(record, "restore_failed");
                 }
-            };
-            if !can_remove {
-                return self.park(record, park_reason);
             }
             self.broker.set_connected(&record.output, false)?;
         }
         if let Err(error) = self.compositor.restore(record.layout.as_ref()) {
+            report_unconfirmed_restore(&record.output, "after_unplug", &error);
             if !self.broker.connected(&record.output)?
                 && self.compositor.verify_removal_guard(&record.output)?
             {
@@ -545,7 +652,34 @@ pub(super) fn run<B: Broker, C: Compositor, I: ConnectorInventory>(
     {
         return error.map_or(Ok(()), Err);
     }
-    while let Ok(work) = jobs.recv() {
+    let mut retirement = controller.pace_retirement(None, Instant::now());
+    'jobs: loop {
+        let received = match retirement.as_mut() {
+            None => jobs.recv().map_err(|_| RecvTimeoutError::Disconnected),
+            Some(pacing) => jobs.recv_timeout(pacing.wait(Instant::now())),
+        };
+        let work = match received {
+            Ok(work) => work,
+            Err(RecvTimeoutError::Disconnected) => break,
+            Err(RecvTimeoutError::Timeout) => {
+                if stopped.load(std::sync::atomic::Ordering::Acquire) {
+                    break;
+                }
+                let Some(pacing) = retirement.as_mut() else {
+                    continue;
+                };
+                let outcome = controller.retire_parked(pacing, Instant::now());
+                for key in outcome.retired {
+                    if events.send(Event::ParkedRetired { key }).is_err() {
+                        break 'jobs;
+                    }
+                }
+                if outcome.finished {
+                    retirement = None;
+                }
+                continue;
+            }
+        };
         if stopped.load(std::sync::atomic::Ordering::Acquire) {
             break;
         }
@@ -641,12 +775,17 @@ pub(super) fn run<B: Broker, C: Compositor, I: ConnectorInventory>(
                         .map(|record| Some(record.output.clone()))
                         .ok_or_else(|| "parked display ownership record missing".into())
                 });
+                if let Err(error) = &result {
+                    let detail: String = error.chars().take(480).collect();
+                    eprintln!("amaterasu virtual display removal failed: {detail:?}");
+                }
                 Event::Removed { key, result }
             }
         };
         if events.send(event).is_err() {
             break;
         }
+        retirement = controller.pace_retirement(retirement, Instant::now());
     }
     // Only journaled Amaterasu connectors are eligible; the broker rechecks UID.
     controller.recover().map_or(Ok(()), Err)

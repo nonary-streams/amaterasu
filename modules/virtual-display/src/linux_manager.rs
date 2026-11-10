@@ -4,7 +4,9 @@ pub(crate) mod connectors;
 mod journal;
 mod layout;
 mod observer;
+mod restore;
 mod retained_mode;
+mod retirement;
 mod worker;
 use crate::{
     model::{
@@ -285,6 +287,8 @@ enum Event {
         /// The worker reports the durable parked output, or exact retirement.
         result: Result<Option<String>, String>,
     },
+    /// The provider retired a parked output on its own; no caller asked.
+    ParkedRetired { key: (String, String) },
 }
 
 pub struct Manager {
@@ -537,6 +541,12 @@ impl Manager {
                             }
                         }
                     }
+                }
+                Event::ParkedRetired { key } => {
+                    // No admitted mutation is pending for this change, but the
+                    // topology a caller last observed is no longer current.
+                    self.parked.remove(&key);
+                    self.topology_revision = self.topology_revision.saturating_add(1);
                 }
             }
         }

@@ -139,18 +139,48 @@ eight. Status polling never retries failed native cleanup; an explicit owning
 are removed or safely parked. Legacy records without reference metadata retain
 their existing best-effort startup cleanup behavior. Failed cleanup retains ownership intent.
 When the final reference is released, Linux restores the saved layout before
-disconnecting. If restoration fails or there is no distinct active Wayland
-output to guard the disconnect, an independently observed owned output can be
-parked as a provider-owned desktop anchor. Its released reference is no longer
-active; the connector and restoration intent remain journaled and can be reused
-by a later create, including after restart. If restoration fails after a confirmed
-disconnect, a separately observed surviving output permits the disconnected
-connector and restoration intent to be reserved for reuse. Unknown output state
-or an unresolved reference is not treated as a successful park.
+disconnecting. A monitor that was just enabled does not report its final state
+at once, so the layout is read back every 50 ms for up to three seconds and a
+difference that outlives 750 ms is applied again, at most three times in all.
+A restoration that needed more than one readback writes the output and property
+that were late to the service journal.
+
+The disconnect depends on a distinct active output, observed through KScreen
+and independently through Wayland for up to two seconds, not on that readback.
+With such a survivor the stream output is unplugged even when the saved layout
+could not be confirmed, and the layout is applied again afterwards. Only when
+no distinct active output can guard the disconnect is an independently observed
+owned output parked as a provider-owned desktop anchor that stays connected.
+Its released reference is no longer active; the connector and restoration
+intent remain journaled and can be reused by a later create, including after
+restart. If restoration fails after a confirmed disconnect, a separately
+observed surviving output permits the disconnected connector and restoration
+intent to be reserved for reuse. Unknown output state or an unresolved
+reference is not treated as a successful park.
 Reuse configures the new stream from the current desktop rather than requiring
 the previously failed restoration to succeed first; the saved recovery layout
 remains journaled. If the driver pool was replaced and the old connector no
 longer exists, its recovery intent transfers to a free connector in the new pool.
+
+No caller owns a parked output, so the provider retires it itself while no
+stream owns a display. Every two seconds it reads connector status from sysfs
+alone. When a display outside the virtual pool is attached it repeats the same
+restoration and guarded disconnect: one second after parking, at once when the
+set of attached displays changes, and otherwise after 2, 5, 10, 30 and then
+every 60 seconds. With no such display attached a poll makes no broker request
+and runs no compositor command. A parked output that is already unplugged only
+awaits its saved layout; that layout is applied at most four more times, after
+which it is left to the next stream or a provider restart so that a desktop the
+user has since arranged is not replaced. Retirement advances the topology
+revision and is recorded in the service journal. This applies to parked outputs
+only: a `cleanup_failed` monitor still belongs to its caller and is retried
+only by that caller's `remove`.
+
+Vibeshine, the behavioural reference, also requires the surviving monitor to be
+listed by its capture backend, requires three consecutive matching readbacks
+for its final check, reacts to monitor power events rather than polling
+connector status, and offers a manual action that unplugs every virtual output
+at once. None of these four is implemented here.
 
 KScreen activates only the new connector, selects the requested mode, sets 100%
 scale and SDR, and places it to the right of enabled outputs. Readback must match
@@ -184,7 +214,11 @@ drop-in. Do not replace the broker, unload the driver, or steal Vibeshine's outp
 Tests cover sysfs connector discovery against a fake tree (reloaded ids,
 non-vibeshine and stock vkms cards, malformed names, ambiguity), free-connector
 allocation past Virtual-8, caller identity, durable intent before
-effects, bounded cleanup, process exclusion and interrupted recovery. Native
+effects, bounded cleanup, process exclusion and interrupted recovery. They also
+cover a layout that reads back late or must be applied twice, the disconnect
+beside a surviving monitor whose layout is unconfirmed, and retirement of a
+parked output: its pacing, its silence while no display is attached, its refusal
+while a stream is active and its report through the manager. Native
 qualification must separately exercise actual display creation, capture, input,
 playback and restoration. Private DRM frame export / GPU zero-copy interop and
 HDR capture are not implemented by this integration.

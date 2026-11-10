@@ -1,6 +1,9 @@
 //! Configure the newly owned connector in the current KDE session, either
 //! beside the existing desktop or as its only enabled display.
-use super::layout::Layout;
+use super::{
+    layout::Layout,
+    restore::{Desktop, READBACK_INTERVAL, restore_layout},
+};
 use crate::{model::Specification, scale::ScaleSetting};
 use serde_json::Value;
 use std::{
@@ -140,50 +143,46 @@ impl Compositor for KScreen {
         Layout::capture(&query()?, changing).map(Some)
     }
     fn restore(&mut self, layout: Option<&Layout>) -> Result<(), String> {
-        if let Some(layout) = layout {
-            let arguments = layout.arguments(&query()?)?;
-            if !arguments.is_empty() {
-                run(&arguments)?;
-            }
-            if !layout.matches(&query()?) {
-                return Err("existing desktop restoration readback differs".into());
-            }
+        let Some(layout) = layout else {
+            return Ok(());
+        };
+        let mut desktop = KScreenDesktop {
+            started: Instant::now(),
+        };
+        let settled = restore_layout(&mut desktop, layout)?;
+        if let Some(difference) = settled.last_difference {
+            // Names the output and property that needed time, so a recurring
+            // slow restoration can be traced to its cause from the journal.
+            eprintln!(
+                "amaterasu virtual display desktop restoration settled late: applications={} differing_readbacks={} waited_ms={} last_difference={:?}",
+                settled.applications,
+                settled.differing_readbacks,
+                settled.waited.as_millis(),
+                bounded_detail(&difference)
+            );
         }
         Ok(())
     }
     fn verify_removal_guard(&mut self, output: &str) -> Result<bool, String> {
-        let configuration = query()?;
-        let outputs = configuration["outputs"]
-            .as_array()
-            .ok_or("missing KScreen outputs")?;
-        let mut observer =
-            super::observer::Observer::open().ok_or("cannot observe surviving Wayland output")?;
-        let guarded = outputs.iter().any(|candidate| {
-            candidate["connected"] == true
-                && candidate["enabled"] == true
-                && candidate["name"].as_str().is_some_and(|name| {
-                    name != output
-                        && observer.read(name).is_some_and(|seen| {
-                            seen.width > 0 && seen.height > 0 && seen.refresh > 0
-                        })
-                })
-        });
-        if guarded {
-            return Ok(true);
-        }
-        let owned_active = outputs.iter().any(|candidate| {
-            candidate["name"] == output
-                && candidate["connected"] == true
-                && candidate["enabled"] == true
-        });
-        if owned_active
-            && observer
-                .read(output)
-                .is_some_and(|seen| seen.width > 0 && seen.height > 0 && seen.refresh > 0)
-        {
-            Ok(false)
-        } else {
-            Err("neither a surviving output nor the owned output can be observed".into())
+        let started = Instant::now();
+        loop {
+            let observation = observe_removal_guard(output);
+            let settling = match &observation {
+                Ok((RemovalGuard::Survivor, _)) => return Ok(true),
+                Ok((_, awaiting_survivor)) => *awaiting_survivor,
+                // The compositor answers neither protocol during a modeset.
+                Err(_) => true,
+            };
+            if !settling || started.elapsed() >= GUARD_SETTLE_DEADLINE {
+                return match observation?.0 {
+                    RemovalGuard::Survivor => Ok(true),
+                    RemovalGuard::OwnedOnly => Ok(false),
+                    RemovalGuard::Unobserved => Err(
+                        "neither a surviving output nor the owned output can be observed".into(),
+                    ),
+                };
+            }
+            thread::sleep(READBACK_INTERVAL);
         }
     }
     fn verify_parked(&mut self, output: &str) -> Result<(), String> {
@@ -263,6 +262,100 @@ impl Compositor for KScreen {
         }
         Ok(())
     }
+}
+
+/// A just-enabled output is published to Wayland clients moments after KScreen
+/// lists it; wait this long for it before deciding that nothing survives.
+const GUARD_SETTLE_DEADLINE: Duration = Duration::from_secs(2);
+
+/// The live KDE session, timed from the start of one restoration.
+struct KScreenDesktop {
+    started: Instant,
+}
+impl Desktop for KScreenDesktop {
+    fn query(&mut self) -> Result<Value, String> {
+        query()
+    }
+    fn apply(&mut self, arguments: &[String]) -> Result<(), String> {
+        run(arguments).map(drop)
+    }
+    fn elapsed(&self) -> Duration {
+        self.started.elapsed()
+    }
+    fn pause(&mut self, duration: Duration) {
+        thread::sleep(duration);
+    }
+}
+
+/// What can keep the desktop alive once the owned output is unplugged.
+#[derive(Debug, PartialEq, Eq)]
+enum RemovalGuard {
+    /// A distinct active output is independently observed.
+    Survivor,
+    /// Only the owned output is observed; unplugging it leaves no desktop.
+    OwnedOnly,
+    /// Neither a distinct output nor the owned output is observed.
+    Unobserved,
+}
+
+fn observe_removal_guard(output: &str) -> Result<(RemovalGuard, bool), String> {
+    let configuration = query()?;
+    let mut observer =
+        super::observer::Observer::open().ok_or("cannot observe surviving Wayland output")?;
+    classify_removal_guard(&configuration, output, |name| {
+        observer
+            .read(name)
+            .is_some_and(|seen| seen.width > 0 && seen.height > 0 && seen.refresh > 0)
+    })
+}
+
+/// Classifies the desktop from KScreen's output list and an independent
+/// per-output observation. The flag is true while KScreen lists a distinct
+/// enabled output that the observation has not confirmed yet.
+fn classify_removal_guard(
+    configuration: &Value,
+    output: &str,
+    mut observed: impl FnMut(&str) -> bool,
+) -> Result<(RemovalGuard, bool), String> {
+    let outputs = configuration["outputs"]
+        .as_array()
+        .ok_or("missing KScreen outputs")?;
+    let active = |candidate: &Value| candidate["connected"] == true && candidate["enabled"] == true;
+    let mut awaiting_survivor = false;
+    for candidate in outputs.iter().filter(|candidate| active(candidate)) {
+        let Some(name) = candidate["name"].as_str().filter(|name| *name != output) else {
+            continue;
+        };
+        if observed(name) {
+            return Ok((RemovalGuard::Survivor, false));
+        }
+        awaiting_survivor = true;
+    }
+    let owned_active = outputs
+        .iter()
+        .any(|candidate| candidate["name"] == output && active(candidate));
+    let guard = if owned_active && observed(output) {
+        RemovalGuard::OwnedOnly
+    } else {
+        RemovalGuard::Unobserved
+    };
+    Ok((guard, awaiting_survivor))
+}
+
+/// Printable, length-bounded text for a journal line.
+fn bounded_detail(text: &str) -> String {
+    text.chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .take(480)
+        .collect::<String>()
+        .trim()
+        .to_owned()
 }
 
 fn mode_only_arguments(output: &str, mode: &str) -> Result<Vec<String>, String> {
@@ -741,7 +834,13 @@ fn collect_output(child: Child, timeout: Duration) -> Result<Vec<u8>, String> {
                 if status.success() && bytes.len() <= MAX_STDOUT && errors.len() <= MAX_STDERR {
                     return Ok(bytes);
                 }
-                return Err("KScreen command failed or exceeded its bound".into());
+                // The command's own explanation otherwise never reaches the journal.
+                let detail = bounded_detail(&String::from_utf8_lossy(&errors));
+                return Err(if detail.is_empty() {
+                    "KScreen command failed or exceeded its bound".into()
+                } else {
+                    format!("KScreen command failed or exceeded its bound: {detail}")
+                });
             }
             if output_state == PipeProgress::Pending || error_state == PipeProgress::Pending {
                 return Err("KScreen output pipe remained open after command exit".into());
@@ -814,6 +913,45 @@ mod tests {
         let child = test_command("head -c 70000 /dev/zero >&2; printf done");
         let result = collect_output(child, Duration::from_secs(2));
         assert!(result.unwrap_err().contains("exceeded its bound"));
+    }
+
+    #[test]
+    fn failed_command_reports_its_own_explanation() {
+        let child = test_command("printf 'Applying config failed\\n' >&2; exit 1");
+        let error = collect_output(child, Duration::from_secs(2)).unwrap_err();
+        assert!(error.ends_with(": Applying config failed"), "{error}");
+    }
+
+    #[test]
+    fn removal_guard_needs_an_independently_observed_distinct_output() {
+        let desktop = json!({"outputs":[
+            {"name":"HDMI-A-1","connected":true,"enabled":true},
+            {"name":"DP-1","connected":true,"enabled":false},
+            {"name":"Virtual-9","connected":true,"enabled":true}]});
+        // The restored monitor is published: the stream output can go.
+        assert_eq!(
+            classify_removal_guard(&desktop, "Virtual-9", |_| true).unwrap(),
+            (RemovalGuard::Survivor, false)
+        );
+        // KScreen lists the monitor before Wayland clients can see it. That is
+        // a reason to look again, not proof that nothing survives.
+        assert_eq!(
+            classify_removal_guard(&desktop, "Virtual-9", |name| name == "Virtual-9").unwrap(),
+            (RemovalGuard::OwnedOnly, true)
+        );
+        assert_eq!(
+            classify_removal_guard(&desktop, "Virtual-9", |_| false).unwrap(),
+            (RemovalGuard::Unobserved, true)
+        );
+        // A monitor that is off cannot guard and is not worth waiting for.
+        let alone = json!({"outputs":[
+            {"name":"HDMI-A-1","connected":true,"enabled":false},
+            {"name":"Virtual-9","connected":true,"enabled":true}]});
+        assert_eq!(
+            classify_removal_guard(&alone, "Virtual-9", |_| true).unwrap(),
+            (RemovalGuard::OwnedOnly, false)
+        );
+        assert!(classify_removal_guard(&json!({}), "Virtual-9", |_| true).is_err());
     }
 
     #[test]

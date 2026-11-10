@@ -16,9 +16,21 @@ const MAX_DRM_ENTRIES: usize = 4096;
 /// More connectors than any vibeshine pool provides indicates a misread tree.
 const MAX_CONNECTORS: usize = 64;
 
+/// DRM connectors that currently report a connected display, both sorted.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct ConnectedDisplays {
+    /// Vibeshine virtual connector names, such as `Virtual-9`.
+    pub virtual_outputs: Vec<String>,
+    /// Every connector outside the vibeshine pool, by its `card<N>-<name>` entry.
+    pub other: Vec<String>,
+}
+
 pub(super) trait ConnectorInventory: Send {
     /// Every vibeshine virtual connector name, in ascending connector id order.
     fn connectors(&self) -> Result<Vec<String>, String>;
+    /// Which connectors have a display attached. Reads sysfs only, so it can be
+    /// polled without a broker request or a compositor query.
+    fn connected_displays(&self) -> Result<ConnectedDisplays, String>;
 }
 
 /// Reads `<root>/card<N>-Virtual-<M>` entries whose card belongs to vibeshine.
@@ -84,6 +96,39 @@ impl ConnectorInventory for SysfsConnectors {
         }
         Ok(connectors.into_values().collect())
     }
+
+    fn connected_displays(&self) -> Result<ConnectedDisplays, String> {
+        let entries = fs::read_dir(&self.root)
+            .map_err(|error| format!("DRM sysfs is unavailable: {error}"))?;
+        let mut cards = BTreeMap::new();
+        let mut displays = ConnectedDisplays::default();
+        for (count, entry) in entries.enumerate() {
+            if count >= MAX_DRM_ENTRIES {
+                return Err("DRM sysfs has too many entries".into());
+            }
+            let entry = entry.map_err(|error| format!("DRM sysfs read failed: {error}"))?;
+            let file_name = entry.file_name();
+            let Some((name, card, connector)) = file_name.to_str().and_then(|name| {
+                split_card_entry(name).map(|(card, connector)| (name, card, connector))
+            }) else {
+                continue;
+            };
+            // A connector without a readable status has no display attached.
+            let connected = fs::read_to_string(entry.path().join("status"))
+                .is_ok_and(|status| status.trim() == "connected");
+            if !connected {
+                continue;
+            }
+            if !self.card_is_vibeshine(&mut cards, card)? {
+                displays.other.push(name.to_owned());
+            } else if connector_id(connector).is_some() {
+                displays.virtual_outputs.push(connector.to_owned());
+            }
+        }
+        displays.virtual_outputs.sort();
+        displays.other.sort();
+        Ok(displays)
+    }
 }
 
 /// The DRM connector type id of a public `Virtual-<id>` name: a positive
@@ -103,12 +148,21 @@ pub(crate) fn connector_id(name: &str) -> Option<u32> {
 
 /// Splits `card<N>-Virtual-<M>` into its card entry, connector name and id.
 fn split_connector_entry(name: &str) -> Option<(&str, &str, u32)> {
+    let (card, connector) = split_card_entry(name)?;
+    Some((card, connector, connector_id(connector)?))
+}
+
+/// Splits `card<N>-<connector>` into its card entry and connector name.
+fn split_card_entry(name: &str) -> Option<(&str, &str)> {
     let (card, connector) = name.split_once('-')?;
     let card_index = card.strip_prefix("card")?;
-    if card_index.is_empty() || !card_index.bytes().all(|byte| byte.is_ascii_digit()) {
+    if card_index.is_empty()
+        || !card_index.bytes().all(|byte| byte.is_ascii_digit())
+        || connector.is_empty()
+    {
         return None;
     }
-    Some((card, connector, connector_id(connector)?))
+    Some((card, connector))
 }
 
 /// A card belongs to vibeshine when its device is bound to a vibeshine driver,

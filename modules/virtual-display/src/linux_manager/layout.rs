@@ -138,10 +138,16 @@ impl Layout {
         Ok(arguments)
     }
     pub fn matches(&self, current: &Value) -> bool {
-        let Ok(outputs) = self.normalized_outputs(current) else {
-            return false;
+        self.difference(current).is_none()
+    }
+    /// The first saved output the current desktop does not reproduce, with
+    /// each differing property, for the journal. `None` when it matches.
+    pub fn difference(&self, current: &Value) -> Option<String> {
+        let outputs = match self.normalized_outputs(current) {
+            Ok(outputs) => outputs,
+            Err(error) => return Some(error),
         };
-        outputs.iter().all(|expected| {
+        outputs.iter().find_map(|expected| {
             // An independently unplugged monitor is never reconnected by us.
             current["outputs"]
                 .as_array()
@@ -150,7 +156,7 @@ impl Layout {
                         .iter()
                         .find(|o| o["connected"] == true && o["name"] == expected.name)
                 })
-                .is_none_or(|actual| expected.matches(actual))
+                .and_then(|actual| expected.difference(actual))
         })
     }
 }
@@ -226,17 +232,49 @@ impl Output {
             && self.priority <= 99
     }
     fn matches(&self, actual: &Value) -> bool {
-        Self::capture(actual).is_ok_and(|other| {
-            self.enabled == other.enabled
-                && self.mode == other.mode
-                && self.x == other.x
-                && self.y == other.y
-                && self.scale == other.scale
-                && self.rotation == other.rotation
-                && self.hdr == other.hdr
-                && self.wcg == other.wcg
-                && (!self.enabled || self.priority == other.priority)
-        })
+        self.difference(actual).is_none()
+    }
+    /// Names every property of `actual` that differs from this saved output.
+    fn difference(&self, actual: &Value) -> Option<String> {
+        let other = match Self::capture(actual) {
+            Ok(other) => other,
+            Err(error) => return Some(format!("{}: {error}", self.name)),
+        };
+        let mut properties = Vec::new();
+        let mut compare = |property: &str, expected: String, observed: String| {
+            if expected != observed {
+                properties.push(format!(
+                    "{property} expected {expected} observed {observed}"
+                ));
+            }
+        };
+        compare(
+            "enabled",
+            self.enabled.to_string(),
+            other.enabled.to_string(),
+        );
+        compare("mode", self.mode.clone(), other.mode.clone());
+        compare(
+            "position",
+            format!("{},{}", self.x, self.y),
+            format!("{},{}", other.x, other.y),
+        );
+        compare("scale", self.scale.to_string(), other.scale.to_string());
+        compare(
+            "rotation",
+            self.rotation.to_string(),
+            other.rotation.to_string(),
+        );
+        compare("hdr", self.hdr.to_string(), other.hdr.to_string());
+        compare("wcg", self.wcg.to_string(), other.wcg.to_string());
+        if self.enabled {
+            compare(
+                "priority",
+                self.priority.to_string(),
+                other.priority.to_string(),
+            );
+        }
+        (!properties.is_empty()).then(|| format!("{}: {}", self.name, properties.join(", ")))
     }
     fn arguments(&self, actual: &Value) -> Result<Vec<String>, String> {
         // Resolve the semantic mode to the current numeric ID. Decimal refresh

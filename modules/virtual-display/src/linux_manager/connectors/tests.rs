@@ -48,6 +48,17 @@ impl FakeSysfs {
     fn connectors(&self) -> Result<Vec<String>, String> {
         SysfsConnectors::new(self.root()).connectors()
     }
+
+    /// Writes the `status` attribute of `card<card>-<connector>`.
+    fn status(&self, card: u32, connector: &str, status: &str) {
+        fs::write(
+            self.root()
+                .join(format!("card{card}-{connector}"))
+                .join("status"),
+            format!("{status}\n"),
+        )
+        .unwrap();
+    }
 }
 
 impl Drop for FakeSysfs {
@@ -129,6 +140,43 @@ fn duplicate_connector_ids_across_vibeshine_cards_are_ambiguous() {
     sysfs.card(3, "faux/vibeshine", "faux_driver", &["Virtual-9"]);
     sysfs.card(6, "platform/vibeshine.1", "vibeshine", &["Virtual-9"]);
     assert!(sysfs.connectors().unwrap_err().contains("ambiguous"));
+}
+
+#[test]
+fn connected_displays_separate_the_virtual_pool_from_other_connectors() {
+    let sysfs = FakeSysfs::new();
+    sysfs.card(
+        1,
+        "pci0000:00/0000:01:00.0",
+        "nvidia",
+        &["HDMI-A-1", "DP-1", "DP-2"],
+    );
+    sysfs.card(
+        3,
+        "faux/vibeshine",
+        "faux_driver",
+        &["Virtual-10", "Virtual-9"],
+    );
+    fs::write(sysfs.root().join("version"), "drm 1.1.0").unwrap();
+    sysfs.status(1, "HDMI-A-1", "connected");
+    sysfs.status(1, "DP-1", "disconnected");
+    sysfs.status(3, "Virtual-9", "connected");
+    sysfs.status(3, "Virtual-10", "disconnected");
+    let inventory = SysfsConnectors::new(sysfs.root());
+    assert_eq!(
+        inventory.connected_displays().unwrap(),
+        ConnectedDisplays {
+            virtual_outputs: vec!["Virtual-9".into()],
+            other: vec!["card1-HDMI-A-1".into()],
+        }
+    );
+
+    // The monitor is switched off: nothing but the stream output remains.
+    sysfs.status(1, "HDMI-A-1", "disconnected");
+    assert!(inventory.connected_displays().unwrap().other.is_empty());
+
+    let missing = SysfsConnectors::new(sysfs.base.join("absent"));
+    assert!(missing.connected_displays().is_err());
 }
 
 #[test]
