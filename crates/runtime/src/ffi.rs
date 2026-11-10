@@ -247,12 +247,12 @@ fn call_direct(endpoint: &Endpoint, service: &str, payload: &serde_json::Value) 
     let Ok(request) = serde_json::to_vec(payload) else {
         return Response::error("invalid_request", "payload cannot be encoded");
     };
-    let provider = {
+    let route = {
         let Ok(broker) = endpoint.broker.lock() else {
             return Response::error("runtime_unavailable", "broker unavailable");
         };
-        match broker.direct_call_provider(&endpoint.principal, service, request.len()) {
-            Ok(provider) => provider,
+        match broker.direct_call_route(&endpoint.principal, service, request.len()) {
+            Ok(route) => route,
             Err(refusal) => return refusal,
         }
     };
@@ -262,9 +262,21 @@ fn call_direct(endpoint: &Endpoint, service: &str, payload: &serde_json::Value) 
             "the provider does not serve this operation directly",
         )
     };
-    let Some(handler) = endpoint.direct.for_current_thread(&provider) else {
+    let Some(handler) = endpoint.direct.for_current_thread(&route.provider) else {
         return unavailable();
     };
+    // A layer passing on the direct call it is serving keeps that call's
+    // caller, so the next hop authorizes the consumer and not the layer.
+    let caller = route
+        .caller_is_layer
+        .then(|| {
+            endpoint
+                .direct
+                .caller_being_served(&endpoint.principal, service)
+        })
+        .flatten()
+        .unwrap_or_else(|| endpoint.principal.clone());
+    let _serving = endpoint.direct.serve(&route.provider, service, &caller);
     unsafe extern "C" fn copy(context: *mut c_void, bytes: BorrowedBytes) {
         // SAFETY: the context is the reply vector below, borrowed for this call.
         if let Ok(bytes) = unsafe { bytes.read() } {
@@ -279,7 +291,7 @@ fn call_direct(endpoint: &Endpoint, service: &str, payload: &serde_json::Value) 
         (handler.call)(
             handler.instance,
             BorrowedBytes::new(service.as_bytes()),
-            BorrowedBytes::new(endpoint.principal.as_bytes()),
+            BorrowedBytes::new(caller.as_bytes()),
             BorrowedBytes::new(&request),
             ReplySink {
                 context: std::ptr::from_mut(&mut reply).cast(),

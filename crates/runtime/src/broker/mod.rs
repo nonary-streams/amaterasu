@@ -3,6 +3,7 @@ mod configuration;
 mod errors;
 mod events;
 mod hooks;
+mod layers;
 mod requests;
 
 use amaterasu_contracts::{
@@ -16,7 +17,7 @@ use std::time::Instant;
 
 use api::{ApiInvocation, ApiQuery, ApiRegistry};
 use events::EventBus;
-use hooks::HookRegistry;
+use hooks::{HookRegistry, HookRunMode};
 use requests::{RequestOptions, RequestRouter};
 
 pub struct Broker {
@@ -35,6 +36,13 @@ pub struct Broker {
     api: ApiRegistry,
 }
 
+/// Where a direct call goes, and whether its caller is a layer of the service
+/// that may be forwarding the call it is currently serving.
+pub(crate) struct DirectRoute {
+    pub provider: String,
+    pub caller_is_layer: bool,
+}
+
 const HOST_LIFECYCLE_QUEUE_CAPACITY: usize = 8;
 const LOG_EVENT_QUEUE_CAPACITY: usize = 512;
 const LOG_DRAIN_BATCH_CAPACITY: usize = 16;
@@ -46,7 +54,7 @@ impl Broker {
     pub fn new(configuration: RuntimeConfig) -> Result<Self, String> {
         configuration::validate(&configuration)?;
 
-        let mut requests = RequestRouter::default();
+        let mut requests = RequestRouter::with_layers(configuration.service_layers.clone());
         if configuration.host_lifecycle_control {
             let grants = Grants {
                 provide: [HOST_LOG_SERVICE.to_owned()].into(),
@@ -400,8 +408,13 @@ impl Broker {
                     HOST_LOG_SERVICE
                         | HOST_PACKAGE_ACTIVATION_SERVICE
                         | HOST_PACKAGE_BARRIER_SERVICE
-                ) || self.api.owns_service(&service)
-                {
+                ) {
+                    errors::permission_denied()
+                } else if self.requests.register_layer(caller, &service) {
+                    // A layer also wraps a service whose methods are installed
+                    // API contracts; it forwards with `CallApi` as an approved caller.
+                    Response::Ok
+                } else if self.api.owns_service(&service) {
                     errors::permission_denied()
                 } else {
                     self.requests.register_service(caller, grants, service)
@@ -623,6 +636,11 @@ impl Broker {
             Command::Complete { request, payload } => {
                 self.requests.complete(caller, request, payload, now)
             }
+            Command::Refuse {
+                request,
+                code,
+                message,
+            } => self.requests.refuse(caller, request, &code, message, now),
             Command::TakeResult { request } => self.requests.result_at(caller, request, now),
             Command::ReleaseResult { request } => self.requests.release(caller, request),
             Command::Cancel { request } => self.requests.cancel(caller, request, now),
@@ -645,9 +663,15 @@ impl Broker {
                 payload,
                 operation_id,
                 cleanup,
-            } => self
-                .hooks
-                .begin_operation(caller, hook, payload, operation_id, cleanup, now),
+                chain,
+            } => self.hooks.begin_operation(
+                caller,
+                hook,
+                payload,
+                operation_id,
+                HookRunMode { cleanup, chain },
+                now,
+            ),
             Command::ListApiApprovals {
                 parent,
                 after,
@@ -668,7 +692,9 @@ impl Broker {
                 self.hooks
                     .cancel(caller, invocation, now, &mut self.requests)
             }
-            Command::ReleaseHook { invocation } => self.hooks.release(caller, invocation),
+            Command::ReleaseHook { invocation, forget } => {
+                self.hooks.release(caller, invocation, forget)
+            }
             Command::HookResult { invocation } => {
                 self.hooks
                     .advance(caller, grants, invocation, now, &mut self.requests)
@@ -676,14 +702,15 @@ impl Broker {
         }
     }
 
-    /// Applies the checks of an ordinary `Request` and names the provider a
-    /// direct call would reach. It admits nothing and retains no request.
-    pub(crate) fn direct_call_provider(
+    /// Applies the checks of an ordinary `Request` and names the principal a
+    /// direct call would reach: the next layer stacked on the service, or its
+    /// provider. It admits nothing and retains no request.
+    pub(crate) fn direct_call_route(
         &self,
         caller: &str,
         service: &str,
         payload_bytes: usize,
-    ) -> Result<String, Response> {
+    ) -> Result<DirectRoute, Response> {
         let Some(grants) = self.configuration.principals.get(caller) else {
             return Err(errors::permission_denied());
         };
@@ -697,10 +724,10 @@ impl Broker {
         if !errors::payload_size_fits(payload_bytes) {
             return Err(Response::error("invalid_request", "payload is too large"));
         }
-        self.requests
-            .provider_of(service)
-            .map(str::to_owned)
-            .ok_or_else(|| Response::error("unavailable", "service is not registered"))
+        Ok(DirectRoute {
+            provider: self.requests.route(caller, service)?,
+            caller_is_layer: self.requests.is_layer(service, caller),
+        })
     }
 
     /// Recent flow-trace history may name every module, so only the management

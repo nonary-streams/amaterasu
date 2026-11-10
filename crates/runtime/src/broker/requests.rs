@@ -1,14 +1,17 @@
 mod timing;
-use amaterasu_contracts::{ApiSchema, Grants, Response, valid_name};
+use amaterasu_contracts::{ApiSchema, Grants, REFUSED_PREFIX, Response, valid_name};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
 use timing::RequestTiming;
 
 use super::errors::{capacity_exhausted, not_found, payload_fits, permission_denied, result_fits};
+use super::layers::{NextHop, ServiceLayers};
 
 const MAX_RETAINED_REQUESTS: usize = 512;
 const RESULT_RETENTION: Duration = Duration::from_secs(300);
+const MAX_REFUSAL_CODE_BYTES: usize = 64;
+const MAX_REFUSAL_MESSAGE_BYTES: usize = 512;
 
 pub(super) struct RequestOptions {
     pub service: String,
@@ -25,8 +28,18 @@ struct CallAuthority {
     deadline: Instant,
 }
 
+/// Who serves an admitted request and whose identity it is shown.
+struct Delivery {
+    provider: String,
+    /// The original caller a layer forwards for. `None` shows the requester.
+    on_behalf_of: Option<String>,
+    internal_hook: bool,
+}
+
 struct RequestRecord {
+    /// Owns the result: only this principal may read, cancel or release it.
     caller: String,
+    on_behalf_of: Option<String>,
     provider: String,
     options: RequestOptions,
     authority: CallAuthority,
@@ -41,10 +54,16 @@ struct RequestRecord {
 }
 
 impl RequestRecord {
+    /// The identity the serving principal authorizes. A layer's forwarded
+    /// call keeps the caller of the request it forwards.
+    fn presented_caller(&self) -> &str {
+        self.on_behalf_of.as_deref().unwrap_or(&self.caller)
+    }
+
     fn offer_response(&self, id: u64, now: Instant) -> Response {
         Response::Request {
             id,
-            caller: self.caller.clone(),
+            caller: self.presented_caller().to_owned(),
             initiator: self.authority.initiator.clone(),
             service: self.options.service.clone(),
             payload: self.options.payload.clone(),
@@ -71,6 +90,7 @@ impl RequestRecord {
 #[derive(Default)]
 pub(super) struct RequestRouter {
     providers: BTreeMap<String, String>,
+    layers: ServiceLayers,
     requests: BTreeMap<u64, RequestRecord>,
     provider_queues: BTreeMap<String, VecDeque<u64>>,
     delivery_modes: BTreeMap<String, bool>,
@@ -83,6 +103,13 @@ pub(super) struct RequestRouter {
 }
 
 impl RequestRouter {
+    pub fn with_layers(layers: BTreeMap<String, Vec<String>>) -> Self {
+        Self {
+            layers: ServiceLayers::new(layers),
+            ..Self::default()
+        }
+    }
+
     /// The initiator is inherited from a broker-owned request, never supplied
     /// as a module-controlled identity field in the command payload.
     pub fn initiator_for_parent(&self, caller: &str, parent_id: u64) -> Result<&str, Response> {
@@ -127,9 +154,30 @@ impl RequestRouter {
         ))
     }
 
-    /// The principal selected to serve `service`, if one has registered.
-    pub fn provider_of(&self, service: &str) -> Option<&str> {
-        self.providers.get(service).map(String::as_str)
+    /// The principal that serves `caller`'s call to `service`: the next layer
+    /// stacked on the service, or its provider. The provider must have
+    /// registered even when a layer answers first, so a call is refused at
+    /// admission instead of failing halfway down the stack.
+    pub fn route(&self, caller: &str, service: &str) -> Result<String, Response> {
+        let next = self.layers.next_hop(service, caller)?;
+        let provider = self
+            .providers
+            .get(service)
+            .ok_or_else(|| Response::error("unavailable", "service is not registered"))?;
+        Ok(match next {
+            NextHop::Layer(layer) => layer.to_owned(),
+            NextHop::Provider => provider.clone(),
+        })
+    }
+
+    pub fn is_layer(&self, service: &str, principal: &str) -> bool {
+        self.layers.is_layer(service, principal)
+    }
+
+    /// Registers `caller` as a layer of `service` when trusted composition
+    /// lists it as one. The listing is the authority; no `provide` grant applies.
+    pub fn register_layer(&mut self, caller: &str, service: &str) -> bool {
+        self.layers.register(service, caller)
     }
 
     pub fn register_service(&mut self, caller: &str, grants: &Grants, service: String) -> Response {
@@ -174,10 +222,28 @@ impl RequestRouter {
             Err(error) => return error,
         };
 
-        let Some(provider) = self.providers.get(&options.service).cloned() else {
-            return Response::error("unavailable", "service is not registered");
+        let provider = match self.route(caller, &options.service) {
+            Ok(provider) => provider,
+            Err(error) => return error,
         };
-        self.enqueue(caller, provider, options, authority, false, now)
+        let delivery = Delivery {
+            provider,
+            on_behalf_of: self.forwarded_caller(caller, &options),
+            internal_hook: false,
+        };
+        self.enqueue(caller, delivery, options, authority, now)
+    }
+
+    /// A layer that forwards a request it received for the wrapped service
+    /// keeps that request's caller, so the next hop authorizes the consumer
+    /// and not the layer. The identity comes from the broker's own record of
+    /// the parent; a call the layer makes on its own behalf shows the layer.
+    fn forwarded_caller(&self, caller: &str, options: &RequestOptions) -> Option<String> {
+        let parent = self.requests.get(&options.parent?)?;
+        (self.layers.is_layer(&options.service, caller)
+            && parent.provider == caller
+            && parent.options.service == options.service)
+            .then(|| parent.presented_caller().to_owned())
     }
 
     fn resolve_authority(
@@ -267,10 +333,9 @@ impl RequestRouter {
     fn enqueue(
         &mut self,
         caller: &str,
-        provider: String,
+        delivery: Delivery,
         options: RequestOptions,
         authority: CallAuthority,
-        internal_hook: bool,
         now: Instant,
     ) -> Response {
         if self.requests.len() >= MAX_RETAINED_REQUESTS {
@@ -301,6 +366,11 @@ impl RequestRouter {
             return capacity_exhausted();
         };
         self.next_request_id = request_id;
+        let Delivery {
+            provider,
+            on_behalf_of,
+            internal_hook,
+        } = delivery;
         self.provider_queues
             .entry(provider.clone())
             .or_default()
@@ -309,6 +379,7 @@ impl RequestRouter {
             request_id,
             RequestRecord {
                 caller: caller.to_owned(),
+                on_behalf_of,
                 provider,
                 options,
                 authority,
@@ -538,6 +609,38 @@ impl RequestRouter {
         Response::Ok
     }
 
+    /// Ends a delivered request with the provider's statement that it did not
+    /// perform the operation. The requester reads `refused.<code>`, which no
+    /// broker-issued code can be mistaken for.
+    pub fn refuse(
+        &mut self,
+        provider: &str,
+        request_id: u64,
+        code: &str,
+        message: String,
+        now: Instant,
+    ) -> Response {
+        let Some(request) = self.requests.get_mut(&request_id) else {
+            return not_found();
+        };
+        if request.provider != provider || !request.delivered {
+            return permission_denied();
+        }
+        if request.result.is_some() {
+            return Response::error("request_ended", "refusal arrived after the request ended");
+        }
+        if !valid_refusal(code, &message) {
+            return Response::error("invalid_request", "invalid refusal code or message");
+        }
+
+        request.finish(
+            Response::error(&format!("{REFUSED_PREFIX}{code}"), message),
+            now,
+        );
+        self.timing.finished(request, now);
+        Response::Ok
+    }
+
     pub fn check_active(&self, provider: &str, request_id: u64) -> Response {
         let Some(request) = self.requests.get(&request_id) else {
             return not_found();
@@ -705,8 +808,23 @@ impl RequestRouter {
             allowed_services: grants.call.clone(),
             deadline,
         };
-        self.enqueue(owner, participant, options, authority, true, Instant::now())
+        let delivery = Delivery {
+            provider: participant,
+            on_behalf_of: None,
+            internal_hook: true,
+        };
+        self.enqueue(owner, delivery, options, authority, Instant::now())
     }
+}
+
+/// A refusal carries a short machine-readable code and one bounded line of
+/// text. `refused.` is the broker's own prefix and cannot be nested.
+fn valid_refusal(code: &str, message: &str) -> bool {
+    valid_name(code)
+        && code.len() <= MAX_REFUSAL_CODE_BYTES
+        && !code.starts_with(REFUSED_PREFIX)
+        && message.len() <= MAX_REFUSAL_MESSAGE_BYTES
+        && !message.chars().any(char::is_control)
 }
 
 fn validate_options(options: &RequestOptions) -> Result<(), Response> {

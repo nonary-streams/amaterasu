@@ -2779,6 +2779,7 @@ fn cancelling_a_hook_cancels_delegated_children_before_releasing_the_participant
                 payload: json!({}),
                 operation_id: "cancel.delegated.hook".into(),
                 cleanup,
+                chain: false,
             },
             now,
         ));
@@ -2997,6 +2998,7 @@ fn hook_operation_lookup_cancel_and_expired_identity_are_owner_scoped() {
         payload: json!({"x":1}),
         operation_id: "op.1".into(),
         cleanup: false,
+        chain: false,
     };
     let id = accepted_id(broker.dispatch_at("client", operation(), start));
     assert_eq!(
@@ -3011,6 +3013,7 @@ fn hook_operation_lookup_cancel_and_expired_identity_are_owner_scoped() {
                 payload: json!({"x":2}),
                 operation_id: "op.1".into(),
                 cleanup: false,
+                chain: false,
             },
         ),
         "conflict",
@@ -3057,7 +3060,14 @@ fn hook_operation_lookup_cancel_and_expired_identity_are_owner_scoped() {
         "cancelled",
     );
     assert!(matches!(
-        broker.dispatch_at("client", Command::ReleaseHook { invocation: id }, start),
+        broker.dispatch_at(
+            "client",
+            Command::ReleaseHook {
+                invocation: id,
+                forget: false,
+            },
+            start
+        ),
         Response::Ok
     ));
     assert_error_code(
@@ -3101,6 +3111,7 @@ fn cleanup_hook_continues_after_absent_participant() {
             payload: json!({}),
             operation_id: "cleanup.1".into(),
             cleanup: true,
+            chain: false,
         },
     ));
     assert!(matches!(
@@ -3264,6 +3275,7 @@ fn cleanup_deadline_reports_unknown_and_unattempted_participants() {
             payload: json!({}),
             operation_id: "cleanup.2".into(),
             cleanup: true,
+            chain: false,
         },
         now,
     ));
@@ -3304,6 +3316,7 @@ fn completed_hook_result_survives_a_poll_after_the_deadline() {
             payload: json!({}),
             operation_id: "delayed.poll".into(),
             cleanup: true,
+            chain: false,
         },
         now,
     ));

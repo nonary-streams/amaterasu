@@ -28,4 +28,6 @@ mod scoped_display_contract_tests;
 #[cfg(test)]
 mod session_presentation_tests;
 #[cfg(test)]
+mod stacking_tests;
+#[cfg(test)]
 mod tests;

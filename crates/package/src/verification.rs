@@ -50,6 +50,7 @@ pub fn verify_package_with_progress(
         signer_fingerprint.as_deref(),
     )?;
     let runtime_config = resolve_runtime_grants(bootstrap, &manifest.components);
+    validate_service_layers(&runtime_config)?;
     validate_processing_compositions(&runtime_config)?;
     validate_processing_lifetimes(&runtime_config, &manifest.components)?;
 
@@ -222,6 +223,9 @@ fn resolve_runtime_grants(
         legacy_native_contracts: BTreeMap::new(),
         api_methods: Vec::new(),
         hooks: bootstrap.policy.hooks.clone(),
+        // Layers are kept whole: dropping one whose component is missing
+        // would let calls bypass it. The runtime rejects an unknown layer.
+        service_layers: bootstrap.policy.service_layers.clone(),
         settings: BTreeMap::new(),
         processing_compositions: BTreeMap::new(),
         // A package policy is deliberately unable to specify process-local
@@ -293,6 +297,23 @@ fn resolve_runtime_grants(
         .cloned()
         .collect();
     runtime
+}
+
+/// A layer stands in the path of every call to its service. A package that
+/// leaves a listed layer out is rejected here, with the layer named, instead
+/// of failing when the runtime starts or running with the layer bypassed.
+fn validate_service_layers(runtime: &RuntimeConfig) -> PackageResult<()> {
+    for (service, layers) in &runtime.service_layers {
+        if let Some(missing) = layers
+            .iter()
+            .find(|layer| !runtime.principals.contains_key(*layer))
+        {
+            return Err(format!(
+                "service layer {missing} for {service} is not a packaged component"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_processing_compositions(runtime: &RuntimeConfig) -> PackageResult<()> {
@@ -688,6 +709,7 @@ fn validate_processing_lifetimes(
 mod tests {
     use super::{
         resolve_runtime_grants, validate_processing_compositions, validate_processing_lifetimes,
+        validate_service_layers,
     };
     use crate::BootstrapConfig;
     use amaterasu_contracts::{HOST_LIFECYCLE_CONTROL_PRINCIPAL, RuntimeConfig};
@@ -897,6 +919,59 @@ mod tests {
             },
         );
         assert!(validate_processing_compositions(&bad).is_err());
+    }
+
+    #[test]
+    fn service_layers_reach_the_runtime_whole_and_a_missing_layer_is_rejected() {
+        use amaterasu_contracts::Grants;
+        let service = "example.echo/1";
+        let mut bootstrap = BootstrapConfig {
+            development: false,
+            allow_unsigned: false,
+            trusted_keys: BTreeMap::new(),
+            policy: RuntimeConfig::default(),
+        };
+        let caller = Grants {
+            call: [service.into()].into(),
+            ..Default::default()
+        };
+        for layer in ["example.audit", "example.cache"] {
+            bootstrap
+                .policy
+                .principals
+                .insert(layer.into(), caller.clone());
+        }
+        bootstrap.policy.service_layers.insert(
+            service.into(),
+            vec!["example.audit".into(), "example.cache".into()],
+        );
+        let component = |id: &str| crate::ComponentManifest {
+            id: id.into(),
+            version: "1".into(),
+            file: format!("{id}.so"),
+            sha256: "fixture".into(),
+            size: 0,
+            abi_major: 1,
+            runtime: false,
+            requires: BTreeMap::new(),
+            requested: caller.clone(),
+        };
+
+        let complete = resolve_runtime_grants(
+            &bootstrap,
+            &[component("example.audit"), component("example.cache")],
+        );
+        assert_eq!(
+            complete.service_layers[service],
+            ["example.audit", "example.cache"]
+        );
+        assert!(validate_service_layers(&complete).is_ok());
+
+        // Leaving a layer out must not quietly shorten the stack.
+        let partial = resolve_runtime_grants(&bootstrap, &[component("example.audit")]);
+        assert_eq!(partial.service_layers[service].len(), 2);
+        let error = validate_service_layers(&partial).unwrap_err();
+        assert!(error.contains("example.cache"), "{error}");
     }
 
     #[test]

@@ -267,6 +267,7 @@ fn policy_diff(
             "api_methods",
             "legacy_native_contracts",
             "hooks",
+            "service_layers",
         ]
         .contains(&key.as_str())
         {
@@ -362,6 +363,25 @@ mod tests {
         let bytes = serde_json::to_vec(&after).unwrap();
         let approval = propose_policy_approval(&source, &bytes, &context(&observed)).unwrap();
         assert!(approval.changes.contains_key("/policy/api_methods"));
+        let (candidate, _) =
+            candidate_from_allowlist(&allowlist(&approval), &context(&approval), &source).unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&candidate).unwrap(), after);
+    }
+    #[test]
+    fn a_service_layer_change_is_an_approvable_policy_change() {
+        let (source, _, observed) = inputs();
+        let mut after: Value = serde_json::from_slice(&source).unwrap();
+        after["policy"]["service_layers"] = json!({"example.echo/1": ["video"]});
+        let bytes = serde_json::to_vec(&after).unwrap();
+        let approval = propose_policy_approval(&source, &bytes, &context(&observed)).unwrap();
+        assert!(
+            approval
+                .changes
+                .keys()
+                .any(|path| path.starts_with("/policy/service_layers")),
+            "{:?}",
+            approval.changes.keys()
+        );
         let (candidate, _) =
             candidate_from_allowlist(&allowlist(&approval), &context(&approval), &source).unwrap();
         assert_eq!(serde_json::from_slice::<Value>(&candidate).unwrap(), after);

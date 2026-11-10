@@ -1,11 +1,15 @@
 use amaterasu_contracts::{
-    Grants, HOST_LIFECYCLE_CONTROL_PRINCIPAL, HookSpec, RuntimeConfig, valid_name,
+    Grants, HOST_LIFECYCLE_CONTROL_PRINCIPAL, HOST_LIFECYCLE_SERVICE, HOST_LOG_SERVICE,
+    HOST_PACKAGE_ACTIVATION_SERVICE, HOST_PACKAGE_BARRIER_SERVICE, HOST_STATE_CONTEXT_SERVICE,
+    HookSpec, RuntimeConfig, valid_name,
 };
 use std::collections::BTreeSet;
 
 const MAX_PRINCIPALS: usize = 128;
 const MAX_GRANTS_PER_KIND: usize = 256;
 const MAX_HOOK_PARTICIPANTS: usize = 32;
+const MAX_LAYERED_SERVICES: usize = 64;
+const MAX_LAYERS_PER_SERVICE: usize = 8;
 
 pub(super) fn validate(configuration: &RuntimeConfig) -> Result<(), String> {
     if configuration.host_package_activation_control && !configuration.host_lifecycle_control {
@@ -175,6 +179,12 @@ pub(super) fn validate(configuration: &RuntimeConfig) -> Result<(), String> {
     for (name, hook) in &configuration.hooks {
         validate_hook(name, hook, configuration)?;
     }
+    if configuration.service_layers.len() > MAX_LAYERED_SERVICES {
+        return Err("too many layered services".into());
+    }
+    for (service, layers) in &configuration.service_layers {
+        validate_service_layers(service, layers, configuration)?;
+    }
     super::api::validate_approvals(configuration)?;
     Ok(())
 }
@@ -206,6 +216,44 @@ fn validate_grants(grants: &Grants) -> Result<(), String> {
         }
         if names.iter().any(|name| !valid_name(name)) {
             return Err("invalid interface name in permission grant".into());
+        }
+    }
+    Ok(())
+}
+
+/// A layer stands in the path of every call to its service, so policy must
+/// name real principals, name each one once, and keep the roles apart: the
+/// service's provider cannot also be one of its layers.
+fn validate_service_layers(
+    service: &str,
+    layers: &[String],
+    configuration: &RuntimeConfig,
+) -> Result<(), String> {
+    let host_owned = matches!(
+        service,
+        HOST_LIFECYCLE_SERVICE
+            | HOST_LOG_SERVICE
+            | HOST_PACKAGE_ACTIVATION_SERVICE
+            | HOST_PACKAGE_BARRIER_SERVICE
+            | HOST_STATE_CONTEXT_SERVICE
+    );
+    if !valid_name(service) || host_owned || service.starts_with("hooks/") {
+        return Err(format!("service cannot be layered: {service}"));
+    }
+    let unique_layers: BTreeSet<_> = layers.iter().collect();
+    if layers.len() > MAX_LAYERS_PER_SERVICE || unique_layers.len() != layers.len() {
+        return Err(format!(
+            "too many or duplicate layers for service {service}"
+        ));
+    }
+    for layer in layers {
+        let Some(grants) = configuration.principals.get(layer) else {
+            return Err(format!("unknown layer {layer} for service {service}"));
+        };
+        if layer == HOST_LIFECYCLE_CONTROL_PRINCIPAL || grants.provide.contains(service) {
+            return Err(format!(
+                "layer {layer} cannot also provide service {service}"
+            ));
         }
     }
     Ok(())

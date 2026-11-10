@@ -116,6 +116,13 @@ pub struct RuntimeConfig {
     pub api_methods: Vec<ApiMethodApproval>,
     #[serde(default)]
     pub hooks: BTreeMap<String, HookSpec>,
+    /// Principals that trusted composition stacks on a service's provider,
+    /// keyed by exact service and listed outermost first. A consumer's call
+    /// reaches the first layer; a layer's own call to that service reaches
+    /// the next one, and the last layer's call reaches the provider. A layer
+    /// acts with the authority of every caller of the service it wraps.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub service_layers: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     pub settings: BTreeMap<String, Value>,
     /// Per-principal processing selections approved by trusted composition.
@@ -405,6 +412,14 @@ pub enum Command {
         request: u64,
         payload: Value,
     },
+    /// Ends a delivered, live request without a result. The provider asserts
+    /// that it did not perform the operation; the requester reads the error
+    /// code `refused.<code>`. The broker's own terminal codes are not accepted.
+    Refuse {
+        request: u64,
+        code: String,
+        message: String,
+    },
     CheckRequest {
         request: u64,
     },
@@ -443,12 +458,17 @@ pub enum Command {
     HookResult {
         invocation: u64,
     },
-    /// Idempotent, owner-scoped invocation with retained results.
+    /// Idempotent, owner-scoped invocation with retained results. With
+    /// `cleanup`, every participant is attempted and reported; otherwise the
+    /// first absent or failed participant ends the invocation. With `chain`,
+    /// each participant receives the previous participant's result as input.
     RunHookOperation {
         hook: String,
         payload: Value,
         operation_id: String,
         cleanup: bool,
+        #[serde(default, skip_serializing_if = "is_false")]
+        chain: bool,
     },
     ListApiApprovals {
         parent: Option<u64>,
@@ -461,10 +481,23 @@ pub enum Command {
     CancelHook {
         invocation: u64,
     },
+    /// Discards a finished invocation. With `forget`, its operation identifier
+    /// is relinquished as well, so a later use of that identifier starts new
+    /// work; without it the identifier stays fenced for the broker's lifetime.
     ReleaseHook {
         invocation: u64,
+        #[serde(default, skip_serializing_if = "is_false")]
+        forget: bool,
     },
 }
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// Prefix of the error code a requester reads after a provider refused its
+/// request with `Command::Refuse`. No broker-issued code starts with it.
+pub const REFUSED_PREFIX: &str = "refused.";
 
 /// Exclusive, stable ordering key for approved API discovery.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

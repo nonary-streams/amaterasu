@@ -16,11 +16,21 @@ struct ActiveParticipant {
     name: String,
     request_id: u64,
 }
+/// How an owner runs one invocation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct HookRunMode {
+    /// Attempt and report every participant instead of stopping at the first
+    /// absent or failed one.
+    pub cleanup: bool,
+    /// Give each participant the previous participant's result as its input.
+    pub chain: bool,
+}
+
 struct OperationIdentity {
     invocation: u64,
     hook: String,
     input: Value,
-    cleanup: bool,
+    mode: HookRunMode,
 }
 struct HookInvocation {
     owner: String,
@@ -32,6 +42,7 @@ struct HookInvocation {
     proposals: Vec<Proposal>,
     outcomes: Vec<HookOutcome>,
     cleanup: bool,
+    chain: bool,
     retained: bool,
     terminal: Option<(Response, Instant)>,
 }
@@ -54,6 +65,9 @@ impl HookInvocation {
                 }
             } else {
                 requests.release(&self.owner, participant.request_id);
+                if self.chain {
+                    result = self.adopt_chained_value(result);
+                }
                 if self.cleanup {
                     if matches!(&result, Response::Error { code, .. } if code == "deadline_exceeded")
                     {
@@ -153,6 +167,22 @@ impl HookInvocation {
         }
     }
 
+    /// In a chained invocation a participant's result is the next
+    /// participant's input. A value too large to deliver counts as that
+    /// participant's failure, and the value it received stays in effect.
+    fn adopt_chained_value(&mut self, result: Response) -> Response {
+        match result {
+            Response::Result { payload } if payload_fits(&payload) => {
+                self.input = payload.clone();
+                Response::Result { payload }
+            }
+            Response::Result { .. } => {
+                Response::error("invalid_request", "chained hook value is too large")
+            }
+            failure => failure,
+        }
+    }
+
     fn cancel_active(&mut self, now: Instant, requests: &mut RequestRouter) {
         if let Some(participant) = self.active_participant.take() {
             requests.cancel(&self.owner, participant.request_id, now);
@@ -200,7 +230,11 @@ impl HookRegistry {
         input: Value,
         now: Instant,
     ) -> Response {
-        self.begin_inner(caller, hook_name, input, false, false, now)
+        let mode = HookRunMode {
+            cleanup: false,
+            chain: false,
+        };
+        self.begin_inner(caller, hook_name, input, mode, false, now)
     }
     pub fn begin_operation(
         &mut self,
@@ -208,7 +242,7 @@ impl HookRegistry {
         hook: String,
         input: Value,
         operation_id: String,
-        cleanup: bool,
+        mode: HookRunMode,
         now: Instant,
     ) -> Response {
         if !valid_name(&operation_id) {
@@ -216,7 +250,7 @@ impl HookRegistry {
         }
         let key = (caller.to_owned(), operation_id);
         if let Some(previous) = self.operations.get(&key) {
-            if previous.hook != hook || previous.input != input || previous.cleanup != cleanup {
+            if previous.hook != hook || previous.input != input || previous.mode != mode {
                 return Response::error(
                     "conflict",
                     "operation identifier was already used for a different hook",
@@ -227,7 +261,7 @@ impl HookRegistry {
         if self.operations.len() >= MAX_OPERATION_IDENTITIES {
             return capacity_exhausted();
         }
-        let response = self.begin_inner(caller, hook.clone(), input.clone(), cleanup, true, now);
+        let response = self.begin_inner(caller, hook.clone(), input.clone(), mode, true, now);
         if let Response::Accepted { id } = response {
             self.operations.insert(
                 key,
@@ -235,7 +269,7 @@ impl HookRegistry {
                     invocation: id,
                     hook,
                     input,
-                    cleanup,
+                    mode,
                 },
             );
         }
@@ -246,10 +280,11 @@ impl HookRegistry {
         caller: &str,
         hook_name: String,
         input: Value,
-        cleanup: bool,
+        mode: HookRunMode,
         retained: bool,
         now: Instant,
     ) -> Response {
+        let HookRunMode { cleanup, chain } = mode;
         let Some(specification) = self.specifications.get(&hook_name) else {
             return not_found();
         };
@@ -286,6 +321,7 @@ impl HookRegistry {
                 proposals: Vec::new(),
                 outcomes: Vec::new(),
                 cleanup,
+                chain,
                 retained,
                 terminal: None,
             },
@@ -364,7 +400,10 @@ impl HookRegistry {
         }
         Response::Ok
     }
-    pub fn release(&mut self, caller: &str, invocation_id: u64) -> Response {
+    /// Discards a finished invocation. With `forget` the owner also gives up
+    /// the operation identifier's retry protection, which lets an extension
+    /// point run more often than the fenced identities would allow.
+    pub fn release(&mut self, caller: &str, invocation_id: u64, forget: bool) -> Response {
         let Some(invocation) = self.invocations.get(&invocation_id) else {
             return not_found();
         };
@@ -375,6 +414,11 @@ impl HookRegistry {
             return Response::error("request_pending", "unfinished hooks cannot be released");
         }
         self.invocations.remove(&invocation_id);
+        if forget {
+            self.operations.retain(|(owner, _), identity| {
+                owner != caller || identity.invocation != invocation_id
+            });
+        }
         Response::Ok
     }
     pub fn expire(&mut self, now: Instant) {
