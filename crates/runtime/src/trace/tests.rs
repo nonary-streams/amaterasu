@@ -386,3 +386,52 @@ fn a_snapshot_keeps_recent_detail_a_compact_trend_and_stays_within_its_budget() 
     assert_eq!(slow.last().unwrap()["flow"], 199);
     assert!(slow.len() <= 40);
 }
+
+/// Prints what one observation costs its producer. Run with
+/// `cargo test --release -p amaterasu-runtime recording_cost -- --ignored --nocapture`.
+#[test]
+#[ignore = "a measurement, meaningful only in a release build"]
+fn recording_cost_per_observation_stays_far_below_a_microsecond() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    const RECORDS: u64 = 4_000_000;
+    let hub = Arc::new(TraceHub::new(vec!["producer".into()]));
+    let binding = Binding::new(hub.clone(), "producer");
+    // SAFETY: the binding outlives the sink within this test.
+    let sink = unsafe { TraceSink::from_address(binding.address()) }.unwrap();
+    let (track, stage) = (sink.intern("input"), sink.intern("session.dequeued"));
+    // Stand in for the collector so the queue never fills.
+    let stop = Arc::new(AtomicBool::new(false));
+    let drainer = {
+        let (hub, stop) = (hub.clone(), stop.clone());
+        std::thread::spawn(move || {
+            let mut drained = 0_u64;
+            while !stop.load(Ordering::Acquire) {
+                while hub.pop_for_test().is_some() {
+                    drained += 1;
+                }
+                std::thread::yield_now();
+            }
+            while hub.pop_for_test().is_some() {
+                drained += 1;
+            }
+            drained
+        })
+    };
+    let started = std::time::Instant::now();
+    for flow in 0..RECORDS {
+        sink.record(&TraceRecord {
+            flow,
+            track,
+            stage,
+            kind: TRACE_MARK,
+            ..Default::default()
+        });
+    }
+    let nanoseconds = started.elapsed().as_nanos() / u128::from(RECORDS);
+    stop.store(true, Ordering::Release);
+    let drained = drainer.join().unwrap();
+    println!(
+        "{nanoseconds} ns per record on the producer; {drained} of {RECORDS} reached the collector"
+    );
+    assert!(nanoseconds < 1_000);
+}

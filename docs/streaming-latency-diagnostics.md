@@ -7,6 +7,14 @@ encryption keys or lease tokens. Logging failure never changes stream outcomes.
 No new setting is required. Optional network diagnostics use the public,
 versioned provider contract and SDK adapter; existing v1 providers remain usable.
 
+These records are per-module aggregates. To follow one input event or frame
+across modules, and to see which module held the host thread while it waited,
+use [flow tracing](flow-tracing.md); the web UI's Diagnostics page presents it
+as the Performance panel. `runtime.tick_holds` attributes host-thread time to
+whichever module made the last broker call, so it can name the module ticked
+just before the one that was slow. The `host.tick` spans of flow tracing time
+each module call directly and should be preferred when the two disagree.
+
 ## Reading a capture
 
 Run the same game, scene, stream format, resolution, frame rate, bitrate and client
@@ -33,7 +41,7 @@ log filtering or log loss. They do not establish zero latency.
 
 | Record | What it measures | What to inspect |
 | --- | --- | --- |
-| `module.timing` | SDK module lifecycle tick/health duration and tick start-to-start interval, for every module rebuilt with this SDK, including replacements | Names a module holding the cooperative host thread; a long interval with short calls instead indicates delayed scheduling |
+| `module.timing` | SDK module lifecycle tick/health duration and tick start-to-start interval, plus `direct_call_us` for [direct calls](direct-calls.md) the module served, for every module rebuilt with this SDK, including replacements | Names a module holding the cooperative host thread; a long interval with short calls instead indicates delayed scheduling |
 | `service.worker` | Dedicated broker-service worker tick/health calls, reported separately from host-loop timing | Authentication, durable State, session history and launch coordination retain serialized service state while blocking CPU and storage work stays off the streaming host thread |
 | `control.timing` | Socket receive calls and kernel timestamp age, protocol ordering/reassembly and event queues, reliable acknowledgements/retransmissions, decryption and authenticated queue residence | Pending assemblies and ages, receive budgets, socket memory/drop counters and unknown kernel timestamps; receive gaps are cadence, not proof of network lag |
 | `stream.timing`, `input_batch_window` | Translated-event queue residence until batch scheduling; scheduled batch through provider acknowledgement, including journal and broker work | Queued/inflight events, high water, unknown associations, partial and cancelled batches, unacknowledged batch age |

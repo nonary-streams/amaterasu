@@ -11,7 +11,7 @@ import sys
 
 TARGET = re.compile(
     r"(?:^|: |::)(module\.timing|input\.timing|control\.timing|stream\.timing|"
-    r"video\.pipeline|encoder\.timing|media\.processing_latency|capture\.presentation|service\.worker|broker\.timing|runtime\.invocation|audio\.timing|host\.timing|rtx-hdr): (.*)$"
+    r"video\.pipeline|encoder\.timing|media\.processing_latency|capture\.presentation|service\.worker|broker\.timing|runtime\.invocation|audio\.timing|host\.timing|trace\.window|trace\.slow_flow|trace\.slow_span|rtx-hdr): (.*)$"
 )
 FIELD = re.compile(r"([a-zA-Z_][a-zA-Z_0-9]*)=")
 DECODER = json.JSONDecoder()
@@ -82,7 +82,8 @@ def metrics(value: dict, path: str = ""):
     if isinstance(value, list):
         for index, child in enumerate(value):
             if isinstance(child, dict):
-                name = child.get("stage", str(index))
+                # Flow-trace windows name their tracks; other lists name stages.
+                name = child.get("stage") or child.get("track") or str(index)
                 yield from metrics(child, f"{path}.{name}")
         return
     if not isinstance(value, dict):
@@ -133,6 +134,33 @@ def summarize(records: list[dict]) -> list[dict]:
     return sorted(rows.values(), key=lambda row: row["max_us"], reverse=True)
 
 
+def slow_moments(records: list[dict], limit: int = 10) -> list[str]:
+    """One line per recorded slow flow or span: what was slow, where, and why."""
+    lines = []
+    for record in records:
+        payload = record["payload"]
+        # The prefix also carries the level and the reporting component.
+        stamp = re.match(r"\[([^\]]+)\]", record["timestamp"])
+        when = stamp[1] if stamp else record["timestamp"]
+        if record["target"] == "trace.slow_flow":
+            line = (f"{when} {payload.get('track')} flow took "
+                    f"{payload.get('total_us', 0) / 1000:.1f} ms (budget {payload.get('budget_us', 0) / 1000:.1f} ms)")
+            step = payload.get("slowest_step") or {}
+            if step:
+                line += (f"; slowest step {step.get('from')}>{step.get('to')} "
+                         f"{step.get('us', 0) / 1000:.1f} ms ({step.get('percent')}%)")
+                during = (step.get("during") or [None])[0]
+                if during:
+                    label = f" {during['label']}" if during.get("label") else ""
+                    line += f" during {during.get('span')}{label} {during.get('us', 0) / 1000:.1f} ms"
+            lines.append(line)
+        elif record["target"] == "trace.slow_span":
+            label = f" {payload['label']}" if payload.get("label") else ""
+            lines.append(f"{when} span {payload.get('span')}{label} "
+                         f"took {payload.get('us', 0) / 1000:.1f} ms")
+    return lines[-limit:]
+
+
 def coverage(records: list[dict]) -> dict:
     """Coverage is established only by actual records, never by a package name."""
     targets = {record["target"] for record in records}
@@ -142,6 +170,7 @@ def coverage(records: list[dict]) -> dict:
               for r in records if r["target"] == "encoder.timing")
     return {
         "module_host_calls": "observed" if "module.timing" in targets else "missing",
+        "cross_module_flow_steps": "observed" if "trace.window" in targets else "missing",
         "runtime_mutex_and_calls": "observed" if "runtime.invocation" in targets else "missing",
         "broker_queue_and_handler": "observed" if "broker.timing" in targets else "missing",
         "protocol_reordering_and_reassembly": "observed" if any("protocol" in d for d in controls) else "missing",
@@ -185,7 +214,8 @@ def main() -> int:
     rows = summarize(list(records))
     if args.json:
         json.dump({"schema_version": 1, "malformed_records": malformed,
-                   "coverage": coverage(list(records)), "metrics": rows, "records": list(records)}, sys.stdout, indent=2)
+                   "coverage": coverage(list(records)), "metrics": rows,
+                   "slow_moments": slow_moments(list(records)), "records": list(records)}, sys.stdout, indent=2)
         print()
     else:
         print(f"Host diagnostics: {len(records)} records; {malformed} malformed records skipped.")
@@ -197,6 +227,11 @@ def main() -> int:
             tail = f"{p95 / 1000:.3f}" if p95 is not None else "unknown"
             print(f"{row['mean_us'] / 1000:7.3f} | {tail:>12} | {row['max_us'] / 1000:7.3f} | "
                   f"{row['calls']:5} | {row['target']} / {row['identity']} / {row['stage']}")
+        moments = slow_moments(list(records))
+        if moments:
+            print("Recent slow flows and spans (flow tracing):")
+            for line in moments:
+                print("  " + line)
         missing = [name for name, state in coverage(list(records)).items()
                    if state in ("missing", "unavailable_or_missing")]
         if missing:

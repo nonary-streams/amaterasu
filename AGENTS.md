@@ -44,6 +44,21 @@
 - Keep dependencies small and justified; use vetted cryptographic implementations.
 - Native modules are trusted code. Never describe API grants as a native-code sandbox.
 
+## Latency-sensitive paths
+
+- Mark the stages of an input event or frame with `amaterasu_module_sdk::trace`
+  and reuse the shared names in `trace::names`; see `docs/flow-tracing.md`. End
+  every flow you start, including the paths that discard the item.
+- Diagnose a stall from `trace.slow_flow`, `trace.slow_span` or the web UI's
+  Performance panel before changing code. `runtime.tick_holds` can name the
+  module ticked before the slow one; `host.tick` spans time each call directly.
+- An operation that completes in microseconds belongs on a direct call
+  (`ManagedModule::call_direct`, `docs/direct-calls.md`), not a queued request.
+  Decline before any effect when the work needs a later tick, and keep the
+  consumer working against a provider that serves nothing directly.
+- Never block in `tick`: every module shares the host thread with input and
+  video. Work that can take a millisecond belongs on a worker.
+
 ## Network tests
 
 - Default tests that open sockets must bind only loopback addresses (`127.0.0.1`

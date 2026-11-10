@@ -13,6 +13,9 @@ extern "C" {
 #define AMATERASU_STATUS_OK 0
 #define AMATERASU_STATUS_INVALID_ARGUMENT 1
 #define AMATERASU_STATUS_INTERNAL_ERROR 2
+/* The callee is live but does not serve this operation here. Nothing happened;
+ * the caller may use another transport for the same operation. */
+#define AMATERASU_STATUS_UNAVAILABLE 3
 
 typedef int32_t AmaterasuStatus;
 
@@ -115,11 +118,71 @@ typedef struct {
         const AmaterasuNativeInterface **output);
 } AmaterasuNativeServiceFactory;
 
+/* Flow tracing. Send {"op":"trace_bind"} through HostApi; a supporting runtime
+ * replies {"kind":"trace_bound","address":N} where N is the address of this
+ * endpoint's AmaterasuTraceSinkApi, valid until the runtime is destroyed. Any
+ * other reply means tracing is unavailable and the module records nothing. */
+#define AMATERASU_TRACE_MARK 1 /* the flow reached a stage; the first record starts it */
+#define AMATERASU_TRACE_END 2  /* final stage; value is the slow budget in us, 0 = default */
+#define AMATERASU_TRACE_SPAN 3 /* completed work on one thread; value is its duration in us */
+#define AMATERASU_MAX_TRACE_NAME_BYTES 96
+#define AMATERASU_MAX_TRACE_RECORDS_PER_CALL 64
+
+/* One observation. No pointers; it can be copied between threads. */
+typedef struct {
+    uint64_t flow;         /* identity of the traced item within its track */
+    uint64_t value;        /* kind-specific, see the kinds above */
+    uint64_t timestamp_us; /* from now(); 0 asks the sink to stamp on arrival */
+    uint16_t track;        /* interned flow family, or the span's name */
+    uint16_t stage;        /* interned stage, or the span's label (0 = none) */
+    uint8_t kind;
+    uint8_t reserved[3];
+} AmaterasuTraceRecord;
+
+/* Every function is thread-safe. record() never blocks or allocates; a full
+ * buffer drops and counts records. intern() is a cold path that writes a stable
+ * nonzero id for a name of letters, digits and . _ - / @ : characters. */
+typedef struct {
+    AmaterasuAbiHeader header;
+    void *context;
+    uint64_t (*now)(void *context);
+    AmaterasuStatus (*intern)(void *context, AmaterasuBorrowedBytes name, uint16_t *id);
+    AmaterasuStatus (*record)(void *context, const AmaterasuTraceRecord *records, size_t count);
+} AmaterasuTraceSinkApi;
+
+/* Optional amaterasu_module_direct_v1() export, using the ModuleApi instance.
+ * Serves one request of a broker service this module provides, synchronously
+ * on the caller's thread. STATUS_OK means exactly one reply was written;
+ * STATUS_UNAVAILABLE means nothing was done and the caller will submit an
+ * ordinary request. The runtime has already checked the caller's call grant.
+ * It is invoked only on the thread that makes this module's lifecycle calls.
+ * A module must refuse a call that arrives while another call into the same
+ * instance is active. The call must be bounded and must not block. */
+typedef struct {
+    AmaterasuAbiHeader header;
+    AmaterasuStatus (*call)(void *instance, AmaterasuBorrowedBytes service,
+        AmaterasuBorrowedBytes caller, AmaterasuBorrowedBytes request, AmaterasuReplySink reply);
+} AmaterasuModuleDirectApi;
+
+/* Optional amaterasu_runtime_direct_v1() export, called only by the host with
+ * handlers read from verified module libraries. register binds the calling
+ * thread as the only thread that may reach the instance; after unregister
+ * returns the handler is never invoked. */
+typedef struct {
+    AmaterasuAbiHeader header;
+    AmaterasuStatus (*register_handler)(void *runtime, AmaterasuBorrowedBytes principal, void *instance,
+        AmaterasuStatus (*call)(void *instance, AmaterasuBorrowedBytes service,
+            AmaterasuBorrowedBytes caller, AmaterasuBorrowedBytes request, AmaterasuReplySink reply));
+    AmaterasuStatus (*unregister_handler)(void *runtime, AmaterasuBorrowedBytes principal);
+} AmaterasuRuntimeDirectApi;
+
 const AmaterasuModuleApi *amaterasu_module_v1(void);
 const AmaterasuModuleQuiesceApi *amaterasu_module_quiesce_v1(void);
 const AmaterasuModuleShutdownApi *amaterasu_module_shutdown_v1(void);
+const AmaterasuModuleDirectApi *amaterasu_module_direct_v1(void);
 const AmaterasuRuntimeApi *amaterasu_runtime_v1(void);
 const AmaterasuRuntimeWaitApi *amaterasu_runtime_wait_v1(void);
+const AmaterasuRuntimeDirectApi *amaterasu_runtime_direct_v1(void);
 
 #ifdef __cplusplus
 }

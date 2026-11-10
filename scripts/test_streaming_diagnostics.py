@@ -6,10 +6,37 @@ import sys
 import tempfile
 import unittest
 
-from streaming_diagnostics import parse_line, summarize, coverage
+from streaming_diagnostics import parse_line, summarize, coverage, slow_moments
 
 
 class StreamingDiagnosticsTests(unittest.TestCase):
+    def test_flow_trace_windows_name_their_track_and_slow_flows_say_why(self):
+        step = {"stage": "socket.arrived>control.authenticated", "calls": 900,
+                "total_us": 684000, "max_us": 19810, "p95_upper_us": 2000}
+        window = parse_line('[2026-11-09 18:00:00]: Info: amaterasu.runtime::trace.window: ' + json.dumps({
+            "event": "trace_window", "window_us": 10000000,
+            "tracks": [{"track": "input", "completed": 900, "slow": 1,
+                        "total": {"stage": "total", "calls": 900, "total_us": 882000, "max_us": 23412},
+                        "steps": [step]}],
+            "spans": [{"stage": "host.tick:amaterasu.state", "calls": 1, "total_us": 21438, "max_us": 21438}]}))
+        slow = parse_line('[2026-11-09 18:00:01]: Info: amaterasu.runtime::trace.slow_flow: ' + json.dumps({
+            "event": "slow_flow", "track": "input", "total_us": 23412, "budget_us": 8000,
+            "slowest_step": {"from": "socket.arrived", "to": "control.authenticated", "us": 19810, "percent": 84,
+                             "during": [{"span": "host.tick", "label": "amaterasu.state", "us": 21438}]}}))
+        span = parse_line('[2026-11-09 18:00:01]: Info: amaterasu.runtime::trace.slow_span: ' + json.dumps({
+            "event": "slow_span", "span": "host.tick", "label": "amaterasu.state", "us": 21438}))
+        rows = {row["stage"]: row for row in summarize([window])}
+        self.assertEqual(rows["tracks.input.steps.socket.arrived>control.authenticated"]["max_us"], 19810)
+        self.assertEqual(rows["tracks.input.total"]["calls"], 900)
+        self.assertEqual(rows["spans.host.tick:amaterasu.state"]["max_us"], 21438)
+        self.assertEqual(coverage([window])["cross_module_flow_steps"], "observed")
+        self.assertEqual(coverage([span])["cross_module_flow_steps"], "missing")
+        self.assertEqual(slow_moments([window, slow, span]), [
+            "2026-11-09 18:00:01 input flow took 23.4 ms (budget 8.0 ms); slowest step "
+            "socket.arrived>control.authenticated 19.8 ms (84%) during host.tick amaterasu.state 21.4 ms",
+            "2026-11-09 18:00:01 span host.tick amaterasu.state took 21.4 ms",
+        ])
+
     def test_dedicated_worker_cost_is_separate_from_host_loop_cost(self):
         records = [parse_line('Info: example::' + target + ': ' + json.dumps({
             "module_type": "example::Service", "tick_us": {
