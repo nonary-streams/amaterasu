@@ -123,10 +123,15 @@ impl ModuleTiming {
     }
 }
 
+/// The level of a periodic timing window. A window describes every interval
+/// whether or not anything happened in it, so it is a debug record: the
+/// default log keeps events, and a slow flow or span is reported as one.
+pub const WINDOW_LOG_LEVEL: crate::LogLevel = crate::LogLevel::Debug;
+
 /// Emit complete structured observations within the host logger's record budget.
 pub fn log_window(runtime: &crate::RuntimeClient, target: &str, payload: &serde_json::Value) {
     for part in window_parts(payload) {
-        let _ = runtime.log(crate::LogLevel::Info, target, &part.to_string());
+        let _ = runtime.log(WINDOW_LOG_LEVEL, target, &part.to_string());
     }
 }
 pub use amaterasu_timing_metrics::window_parts;

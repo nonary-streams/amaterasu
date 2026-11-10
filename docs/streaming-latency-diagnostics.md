@@ -1,11 +1,20 @@
 # Streaming latency diagnostics
 
 Streaming providers and consumers emit bounded summaries through the normal SDK
-host logger at Info level, approximately every ten seconds while they have work.
+host logger, approximately every ten seconds while they have work.
 There are no per-input payload logs, key values, coordinates, controller states,
 encryption keys or lease tokens. Logging failure never changes stream outcomes.
-No new setting is required. Optional network diagnostics use the public,
-versioned provider contract and SDK adapter; existing v1 providers remain usable.
+Optional network diagnostics use the public, versioned provider contract and SDK
+adapter; existing v1 providers remain usable.
+
+These summaries are debug records. A window is written every ten seconds
+whether or not anything happened, and a full set of them is about a megabyte a
+minute, which would push real events out of the rolled host log within
+minutes. A host records them when its minimum log level is `debug`: set
+`min_log_level` to `debug` in the bootstrap's `global` settings, or run a
+prerelease build, whose default it is. The default log keeps events, including
+the slow flows and spans of [flow tracing](flow-tracing.md). A module emits a
+window with `diagnostics::log_window`, which applies this level.
 
 These records are per-module aggregates. To follow one input event or frame
 across modules, and to see which module held the host thread while it waited,

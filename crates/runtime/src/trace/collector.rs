@@ -91,6 +91,8 @@ impl Flow {
 struct TrackStats {
     completed: u64,
     slow: u64,
+    /// The largest budget a completed flow carried in this window.
+    budget_us: u64,
     abandoned: u64,
     discarded: u64,
     truncated: u64,
@@ -218,6 +220,7 @@ impl Collector {
         let total_us = last.at_us.saturating_sub(first.at_us);
         let stats = self.tracks.entry(track).or_default();
         stats.completed = stats.completed.saturating_add(1);
+        stats.budget_us = stats.budget_us.max(budget_us);
         stats.truncated = stats.truncated.saturating_add(u64::from(flow.truncated));
         stats.total.record(total_us);
         for pair in marks.windows(2) {
@@ -432,6 +435,7 @@ impl Collector {
                     "track": resolver.name(track),
                     "completed": stats.completed,
                     "slow": stats.slow,
+                    "budget_us": stats.budget_us,
                     "slow_reports_suppressed": stats.slow_suppressed,
                     "worst_suppressed_us": (stats.slow_suppressed != 0).then_some(stats.worst_suppressed_us),
                     "abandoned": stats.abandoned,

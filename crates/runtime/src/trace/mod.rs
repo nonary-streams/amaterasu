@@ -7,6 +7,7 @@
 mod collector;
 mod hub;
 mod names;
+mod report;
 mod ring;
 pub(crate) mod sink;
 

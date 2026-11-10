@@ -1248,7 +1248,16 @@ namespace Amaterasu {
           panel("Counters", countersContent),
         );
       } catch (error) {
-        if (isCurrent()) area.replaceChildren(errorPanel(error, load));
+        if (!isCurrent()) return;
+        // A host assembled without the diagnostics recorder keeps no records.
+        // That is how the host was built, not a request that failed.
+        const absent = (error as { code?: unknown } | null)?.code === "service_unavailable";
+        area.replaceChildren(panel(
+          "Recent records",
+          absent
+            ? el("p", "muted", "This host does not include the diagnostics recorder, so there are no retained records to list. The host log has the full detail.")
+            : errorPanel(error, load),
+        ));
       }
     }
     if (context.api.allows("diagnostics.read")) refreshPerformance = renderPerformance(context, performanceArea);

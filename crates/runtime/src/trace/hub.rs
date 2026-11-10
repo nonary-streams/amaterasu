@@ -1,9 +1,10 @@
 //! Owns the queue, the name table and the collector thread.
 use super::collector::{Collector, Report, Resolver};
 use super::names::Names;
+use super::report::{self, TrendPoint};
 use super::ring::{Observation, Ring};
 use crate::Broker;
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -14,107 +15,45 @@ const RING_CAPACITY: usize = 16_384;
 /// The collector sleeps this long after finding work, and longer when idle.
 const BUSY_PAUSE: Duration = Duration::from_millis(5);
 const IDLE_PAUSE: Duration = Duration::from_millis(50);
-/// Full detail for the last minute; a compact trend for the last half hour.
+/// Full detail for the last minute, a trend for the last half hour, and the
+/// most recent slow moments.
 const RETAINED_WINDOWS: usize = 6;
 const RETAINED_TREND: usize = 180;
-const RETAINED_SLOW_FLOWS: usize = 40;
-const RETAINED_SLOW_SPANS: usize = 40;
-/// A snapshot travels as one broker result, so it stays well inside that limit.
-const SNAPSHOT_BYTE_BUDGET: usize = 192 * 1024;
+const RETAINED_SLOW: usize = 30;
 
-/// What a management surface may show: recent windows and recent slow items.
+/// What a management surface may show. The report module reduces it to one
+/// bounded response.
 #[derive(Clone, Default)]
 struct History {
     windows: VecDeque<Value>,
-    trend: VecDeque<Value>,
-    slow_flows: VecDeque<Value>,
-    slow_spans: VecDeque<Value>,
+    trend: VecDeque<TrendPoint>,
+    slow: VecDeque<Value>,
 }
 
-fn retain(history: &mut VecDeque<Value>, limit: usize, item: Value) {
+fn retain<T>(history: &mut VecDeque<T>, limit: usize, item: T) {
     if history.len() >= limit {
         history.pop_front();
     }
     history.push_back(item);
 }
 
-/// The few numbers of a window worth charting over time.
-fn trend_point(window: &Value) -> Value {
-    let tracks: Vec<Value> = window["tracks"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .map(|track| {
-            json!({
-                "track": track["track"],
-                "completed": track["completed"],
-                "slow": track["slow"],
-                "mean_us": track["total"]["mean_us"],
-                "p50_upper_us": track["total"]["p50_upper_us"],
-                "p95_upper_us": track["total"]["p95_upper_us"],
-                "max_us": track["total"]["max_us"],
-            })
-        })
-        .collect();
-    let longest_span = window["spans"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .max_by_key(|span| span["max_us"].as_u64().unwrap_or(0))
-        .map(|span| json!({"stage": span["stage"], "max_us": span["max_us"]}));
-    json!({
-        "observed_unix_ms": window["observed_unix_ms"],
-        "window_us": window["window_us"],
-        "tracks": tracks,
-        "longest_span": longest_span,
-    })
-}
-
 impl History {
-    fn record(&mut self, report: &Report, wall_ms: u64) {
-        let mut item = report.body.clone();
-        item["observed_unix_ms"] = wall_ms.into();
-        match report.target {
-            "trace.window" => {
-                retain(&mut self.trend, RETAINED_TREND, trend_point(&item));
-                retain(&mut self.windows, RETAINED_WINDOWS, item);
-            }
-            "trace.slow_flow" => retain(&mut self.slow_flows, RETAINED_SLOW_FLOWS, item),
-            _ => retain(&mut self.slow_spans, RETAINED_SLOW_SPANS, item),
-        }
-    }
-
-    fn to_json(&self, collecting: bool) -> Value {
-        json!({
-            "schema": 1,
-            "collecting": collecting,
-            "windows": self.windows,
-            "trend": self.trend,
-            "slow_flows": self.slow_flows,
-            "slow_spans": self.slow_spans,
-        })
-    }
-
-    /// Drops the oldest items, least valuable kind first, until the snapshot
-    /// fits. Each list keeps its newest entry.
-    fn bounded_json(mut self, collecting: bool) -> Value {
-        loop {
-            let snapshot = self.to_json(collecting);
-            if snapshot.to_string().len() <= SNAPSHOT_BYTE_BUDGET {
-                return snapshot;
-            }
-            let trimmed = [
+    fn record(&mut self, collected: &Report, wall_ms: u64) {
+        if collected.target == "trace.window" {
+            retain(
                 &mut self.trend,
-                &mut self.slow_spans,
-                &mut self.slow_flows,
-                &mut self.windows,
-            ]
-            .into_iter()
-            .find(|list| list.len() > 1)
-            .and_then(VecDeque::pop_front);
-            if trimmed.is_none() {
-                return snapshot;
-            }
+                RETAINED_TREND,
+                report::trend_point(&collected.body, wall_ms),
+            );
+            retain(&mut self.windows, RETAINED_WINDOWS, collected.body.clone());
+        } else {
+            report::retain_slow(
+                &mut self.slow,
+                RETAINED_SLOW,
+                collected.target,
+                &collected.body,
+                wall_ms,
+            );
         }
     }
 }
@@ -250,21 +189,24 @@ impl TraceHub {
         // The broker lock is taken once per batch of reports, never per record.
         if let Ok(mut broker) = broker.lock() {
             for report in reports {
-                broker.record_diagnostic(report.target, report.body.to_string());
+                let notable = report::is_notable(report.target, &report.body);
+                broker.record_diagnostic(notable, report.target, report.body.to_string());
             }
         }
     }
 
-    /// Bounded recent history for a management surface. Oldest first.
+    /// The performance report for a management surface: the last minute as
+    /// one summary, a half-hour trend and the recent slow moments, within
+    /// `report::REPORT_BYTE_BUDGET`.
     pub fn snapshot(&self) -> Value {
         let collecting = self.collector.get().is_some();
-        // Serialize outside the lock the collector publishes under.
+        // Build the report outside the lock the collector publishes under.
         let history = self
             .history
             .lock()
             .map(|history| history.clone())
             .unwrap_or_default();
-        history.bounded_json(collecting)
+        report::bounded(collecting, &history.windows, history.trend, history.slow)
     }
 
     /// Stops and joins the collector. Sinks must no longer be in use.

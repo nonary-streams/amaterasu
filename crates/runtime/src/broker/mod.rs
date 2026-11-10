@@ -86,7 +86,7 @@ impl Broker {
         self.requests.expire(now);
         if let Some(reports) = self.requests.take_timing(now) {
             for report in reports {
-                self.record_diagnostic("broker.timing", report);
+                self.record_diagnostic(false, "broker.timing", report);
             }
         }
         self.hooks.expire(now);
@@ -710,20 +710,28 @@ impl Broker {
             && (caller == "amaterasu.management" || caller == DIAGNOSTICS_COMPONENT)
     }
 
-    pub(crate) fn record_diagnostic(&mut self, target: &str, report: String) {
+    /// Records one of the runtime's own diagnostics. A periodic window is
+    /// written whether or not anything happened, so it is a debug record; only
+    /// an event a person would notice belongs in the default log.
+    pub(crate) fn record_diagnostic(&mut self, notable: bool, target: &str, report: String) {
+        const DEBUG_LEVEL: u8 = 1;
+        const INFO_LEVEL: u8 = 2;
+        let level = if notable { INFO_LEVEL } else { DEBUG_LEVEL };
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(&report) {
             for part in amaterasu_timing_metrics::window_parts(&value) {
-                let _ = self.enqueue_log("amaterasu.runtime", 2, target.into(), part.to_string());
+                let _ =
+                    self.enqueue_log("amaterasu.runtime", level, target.into(), part.to_string());
             }
         }
     }
 
     /// The runtime's own diagnostic; bounded and dropped like any other record.
     pub(crate) fn record_tick_holds(&mut self, report: String) {
-        const INFO_LEVEL: u8 = 2;
+        // A periodic window, like the other timing diagnostics.
+        const DEBUG_LEVEL: u8 = 1;
         let _ = self.enqueue_log(
             "amaterasu.runtime",
-            INFO_LEVEL,
+            DEBUG_LEVEL,
             "runtime.tick_holds".to_owned(),
             report,
         );

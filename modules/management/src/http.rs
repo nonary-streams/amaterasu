@@ -999,6 +999,22 @@ mod tests {
         assert!(reply.starts_with(b"HTTP/1.1 502"));
         assert!(reply.len() < 1024);
     }
+
+    #[test]
+    fn a_full_performance_report_fits_one_response() {
+        // The runtime bounds its report at 14 KiB (trace/report.rs). A report
+        // of that size, even one made of characters JSON must escape, has to
+        // pass through this server whole.
+        const RUNTIME_REPORT_BUDGET: usize = 14 * 1024;
+        let report = json!({"schema":2,"filler":"x".repeat(RUNTIME_REPORT_BUDGET)});
+        let reply = response(
+            200,
+            &json!({"ok":true,"supported":true,"trace":report}),
+            None,
+        );
+        assert!(reply.starts_with(b"HTTP/1.1 200"));
+        const { assert!(RUNTIME_REPORT_BUDGET + 1024 < MAX_RESPONSE) };
+    }
 }
 
 /// Authenticated artwork is private and never stored by shared caches.

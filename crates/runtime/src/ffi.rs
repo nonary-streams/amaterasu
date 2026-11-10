@@ -226,7 +226,7 @@ unsafe extern "C" fn invoke_command(
             let dropped = endpoint.timing_dropped.swap(0, Ordering::Relaxed);
             if let Some(report) = timing.record(&endpoint.principal, sample, dropped) {
                 if let Ok(mut broker) = endpoint.broker.try_lock() {
-                    broker.record_diagnostic("runtime.invocation", report);
+                    broker.record_diagnostic(false, "runtime.invocation", report);
                 } else {
                     endpoint.timing_dropped.fetch_add(1, Ordering::Relaxed);
                 }

@@ -350,7 +350,13 @@ fn every_endpoint_can_trace_and_only_management_reads_the_history() {
         else {
             panic!("management may read trace history");
         };
-        if !payload["slow_flows"].as_array().unwrap().is_empty() {
+        let flows = payload["slow"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|moment| moment["kind"] == "flow")
+            .count();
+        if flows != 0 {
             break payload;
         }
         assert!(
@@ -359,15 +365,22 @@ fn every_endpoint_can_trace_and_only_management_reads_the_history() {
         );
         std::thread::sleep(Duration::from_millis(10));
     };
-    let slow = &history["slow_flows"][0];
+    assert_eq!(history["schema"], 2);
+    let moments = history["slow"].as_array().unwrap();
+    let slow = moments
+        .iter()
+        .find(|moment| moment["kind"] == "flow")
+        .unwrap();
     assert_eq!(slow["track"], "input");
-    assert_eq!(slow["begun_by"], "producer");
-    assert!(slow["total_us"].as_u64().unwrap() >= 30_000);
-    assert_eq!(
-        slow["slowest_step"]["during"][0]["label"],
-        "amaterasu.state"
-    );
-    assert_eq!(history["slow_spans"][0]["span"], "host.tick");
+    assert!(slow["us"].as_u64().unwrap() >= 30_000);
+    assert_eq!(slow["step"], "socket.arrived>input.accepted");
+    assert_eq!(slow["held_by"]["label"], "amaterasu.state");
+    let span = moments
+        .iter()
+        .find(|moment| moment["kind"] == "span")
+        .unwrap();
+    assert_eq!(span["span"], "host.tick");
+    assert_eq!(span["label"], "amaterasu.state");
 
     // Destruction joins the collector thread.
     unsafe { destroy_runtime(runtime) };

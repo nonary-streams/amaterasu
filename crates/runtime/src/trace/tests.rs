@@ -351,7 +351,7 @@ fn the_collector_thread_retains_history_for_a_management_surface() {
         ..Default::default()
     });
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while hub.snapshot()["slow_spans"].as_array().unwrap().is_empty() {
+    while hub.snapshot()["slow"].as_array().unwrap().is_empty() {
         assert!(
             std::time::Instant::now() < deadline,
             "collector never reported"
@@ -359,74 +359,204 @@ fn the_collector_thread_retains_history_for_a_management_surface() {
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
     let snapshot = hub.snapshot();
-    assert_eq!(snapshot["schema"], 1);
-    assert_eq!(snapshot["slow_spans"][0]["span"], "host.tick");
-    assert_eq!(snapshot["slow_spans"][0]["by"], "producer");
-    assert!(
-        snapshot["slow_spans"][0]["observed_unix_ms"]
-            .as_u64()
-            .unwrap()
-            > 0
-    );
+    assert_eq!(snapshot["schema"], 2);
+    assert_eq!(snapshot["slow"][0]["kind"], "span");
+    assert_eq!(snapshot["slow"][0]["span"], "host.tick");
+    assert_eq!(snapshot["slow"][0]["by"], "producer");
+    assert!(snapshot["slow"][0]["observed_unix_ms"].as_u64().unwrap() > 0);
     hub.shutdown();
     // Shutdown is idempotent and leaves history readable.
     hub.shutdown();
-    assert_eq!(hub.snapshot()["slow_spans"].as_array().unwrap().len(), 1);
+    assert_eq!(hub.snapshot()["slow"].as_array().unwrap().len(), 1);
 }
 
-#[test]
-fn a_snapshot_keeps_recent_detail_a_compact_trend_and_stays_within_its_budget() {
-    let hub = Arc::new(TraceHub::new(vec!["producer".into()]));
-    let window = |index: u64| Report {
+fn window_report(completed: u64, pass_max_us: u64) -> Report {
+    Report {
         target: "trace.window",
         body: serde_json::json!({
             "event": "trace_window",
             "window_us": 10_000_000,
+            "dropped_records": 1,
             "tracks": [{
-                "track": "input", "completed": index, "slow": 1,
-                "total": {"stage":"total","calls":index,"total_us":900,"max_us":700,
-                          "mean_us":300,"p50_upper_us":250,"p95_upper_us":500,"p99_upper_us":700},
-                "steps": [{"stage":"a>b","calls":index,"total_us":900,"max_us":700}],
+                "track": "input", "completed": completed, "slow": 1, "abandoned": 0, "budget_us": 8_000,
+                "total": {"stage":"total","calls":completed,"total_us":900 * completed,"max_us":700 + completed,
+                          "mean_us":900,"p50_upper_us":250,"p95_upper_us":500 + completed,"p99_upper_us":700},
+                "steps": [
+                    {"stage":"a>b","calls":completed,"total_us":600 * completed,"max_us":500,"p95_upper_us":400},
+                    {"stage":"b>c","calls":completed,"total_us":300 * completed,"max_us":200,"p95_upper_us":150},
+                ],
             }],
             "spans": [
-                {"stage":"host.tick:amaterasu.video","calls":3,"total_us":900,"max_us":400},
-                {"stage":"host.tick:amaterasu.state","calls":1,"total_us":800,"max_us":800},
+                {"stage":"host.pass","calls":5_000,"total_us":3_000_000,"max_us":pass_max_us,"p95_upper_us":1_000},
+                {"stage":"host.wait","calls":5_000,"total_us":6_000_000,"max_us":1_900,"p95_upper_us":1_900},
+                {"stage":"host.tick:amaterasu.video","calls":3,"total_us":900,"max_us":400,"p95_upper_us":400},
+                {"stage":"host.tick:amaterasu.state","calls":1,"total_us":800,"max_us":800,"p95_upper_us":800},
             ],
         }),
-    };
-    for index in 1..=200 {
-        hub.record_for_test(&window(index), 1_000 + index);
     }
-    // Far more slow flows than any budget could hold in full.
-    let padded = "x".repeat(4_000);
-    for index in 0..200 {
+}
+
+fn slow_flow_report(total_us: u64, held_label: &str) -> Report {
+    Report {
+        target: "trace.slow_flow",
+        body: serde_json::json!({
+            "event": "slow_flow", "track": "input", "total_us": total_us, "budget_us": 8_000,
+            "steps": [{"from":"a","to":"b","us":total_us - 10,"by":"amaterasu.x"}],
+            "slowest_step": {"from":"a","to":"b","us":total_us - 10,"percent":99,"by":"amaterasu.x",
+                "during": [
+                    {"span":"host.pass","label":null,"us":total_us,"overlap_us":total_us},
+                    {"span":"host.tick","label":held_label,"us":total_us - 20,"overlap_us":total_us - 30},
+                    {"span":"host.tick","label":"amaterasu.other","us":40,"overlap_us":40},
+                ]},
+        }),
+    }
+}
+
+#[test]
+fn a_report_merges_the_last_minute_and_charts_the_last_half_hour() {
+    let hub = Arc::new(TraceHub::new(vec!["producer".into()]));
+    for index in 1..=200_u64 {
         hub.record_for_test(
-            &Report {
-                target: "trace.slow_flow",
-                body: serde_json::json!({"event":"slow_flow","flow":index,"padding":padded}),
-            },
-            5_000 + index,
+            &window_report(index, 2_000 + index),
+            1_000_000 + index * 10_000,
         );
     }
 
-    let snapshot = hub.snapshot();
-    assert!(snapshot.to_string().len() <= 192 * 1024);
-    // The newest full windows are kept; older ones survive only as trend points.
-    let windows = snapshot["windows"].as_array().unwrap();
-    assert_eq!(windows.len(), 6);
-    assert_eq!(windows.last().unwrap()["tracks"][0]["completed"], 200);
-    assert_eq!(windows.last().unwrap()["observed_unix_ms"], 1_200);
-    let trend = snapshot["trend"].as_array().unwrap();
-    assert!(!trend.is_empty() && trend.len() <= 180);
-    let newest = trend.last().unwrap();
-    assert_eq!(newest["tracks"][0]["track"], "input");
-    assert_eq!(newest["tracks"][0]["p95_upper_us"], 500);
-    assert_eq!(newest["longest_span"]["stage"], "host.tick:amaterasu.state");
-    assert!(newest["tracks"][0].get("steps").is_none());
-    // The newest slow flow is always present.
-    let slow = snapshot["slow_flows"].as_array().unwrap();
-    assert_eq!(slow.last().unwrap()["flow"], 199);
-    assert!(slow.len() <= 40);
+    let report = hub.snapshot();
+    assert_eq!(report["schema"], 2);
+    // The six newest windows are one summary: counts add up, the worst stays the worst.
+    let recent = &report["recent"];
+    assert_eq!(recent["window_us"], 60_000_000);
+    assert_eq!(recent["dropped_records"], 6);
+    let input = &recent["tracks"][0];
+    assert_eq!(input["track"], "input");
+    assert_eq!(input["completed"], 195 + 196 + 197 + 198 + 199 + 200);
+    assert_eq!(input["slow"], 6);
+    assert_eq!(input["budget_us"], 8_000);
+    assert_eq!(input["total"]["mean_us"], 900);
+    assert_eq!(input["total"]["max_us"], 900);
+    assert_eq!(input["total"]["p95_upper_us"], 700);
+    assert_eq!(input["steps"][0]["stage"], "a>b");
+    assert_eq!(input["steps"][1]["mean_us"], 300);
+    // The host's own spans are reported apart from the plugin calls.
+    assert_eq!(recent["host"]["pass"]["max_us"], 2_200);
+    assert_eq!(recent["host"]["pass"]["calls"], 30_000);
+    assert_eq!(recent["spans"][0]["stage"], "host.tick:amaterasu.state");
+    assert_eq!(recent["spans"].as_array().unwrap().len(), 2);
+    // The trend is columns of numbers, oldest first, ending at the newest window.
+    let trend = &report["trend"];
+    let ages = trend["age_s"].as_array().unwrap();
+    assert_eq!(ages.len(), 180);
+    assert_eq!(ages[0], 1_790);
+    assert_eq!(ages[179], 0);
+    assert_eq!(trend["newest_unix_ms"], 3_000_000);
+    assert_eq!(trend["tracks"]["input"]["max_us"][179], 900);
+    assert_eq!(trend["tracks"]["input"]["budget_us"], 8_000);
+    assert_eq!(trend["tracks"]["input"]["p95_upper_us"][0], 521);
+    assert_eq!(trend["host_pass_max_us"][179], 2_200);
+}
+
+#[test]
+fn slow_flows_behind_one_pause_are_one_moment_naming_what_held_the_thread() {
+    let hub = Arc::new(TraceHub::new(vec!["producer".into()]));
+    for burst in 0..18_u64 {
+        hub.record_for_test(
+            &slow_flow_report(100_000 + burst, "amaterasu.lifecycle"),
+            5_000 + burst,
+        );
+    }
+    hub.record_for_test(&slow_flow_report(9_000, "amaterasu.pairing"), 9_000);
+    hub.record_for_test(
+        &Report {
+            target: "trace.slow_span",
+            body: serde_json::json!({"event":"slow_span","span":"host.pass","label":null,"us":12_000,"by":"@host"}),
+        },
+        9_001,
+    );
+    hub.record_for_test(
+        &Report {
+            target: "trace.slow_span",
+            body: serde_json::json!({"event":"slow_span","span":"host.tick","label":"amaterasu.pairing","us":9_100,"by":"@host"}),
+        },
+        9_002,
+    );
+
+    let slow = hub.snapshot()["slow"].clone();
+    let slow = slow.as_array().unwrap();
+    // Newest first; the bare host pass is not a moment of its own.
+    assert_eq!(slow.len(), 3);
+    assert_eq!(slow[0]["kind"], "span");
+    assert_eq!(slow[0]["label"], "amaterasu.pairing");
+    assert_eq!(slow[1]["held_by"]["label"], "amaterasu.pairing");
+    assert_eq!(slow[1]["count"], 1);
+    let burst = &slow[2];
+    assert_eq!(burst["count"], 18);
+    assert_eq!(burst["us"], 100_017);
+    assert_eq!(burst["step"], "a>b");
+    assert_eq!(burst["budget_us"], 8_000);
+    // The longest overlap that is not the host's own pass.
+    assert_eq!(burst["held_by"]["span"], "host.tick");
+    assert_eq!(burst["held_by"]["label"], "amaterasu.lifecycle");
+}
+
+#[test]
+fn only_a_pause_a_person_would_notice_reaches_the_default_log() {
+    use super::report::is_notable;
+    let flow = |total_us: u64| serde_json::json!({"total_us": total_us, "budget_us": 12_000});
+    // A frame just over its limit is routine; one twice over is an event.
+    assert!(!is_notable("trace.slow_flow", &flow(12_100)));
+    assert!(is_notable("trace.slow_flow", &flow(24_000)));
+    let span = |us: u64| serde_json::json!({"span": "host.tick", "us": us});
+    assert!(!is_notable("trace.slow_span", &span(SLOW_SPAN_US + 1_000)));
+    assert!(is_notable("trace.slow_span", &span(SLOW_SPAN_US * 2)));
+    // A window is written every ten seconds whatever happened.
+    assert!(!is_notable(
+        "trace.window",
+        &serde_json::json!({"records": 10_000})
+    ));
+}
+
+#[test]
+fn a_report_fits_one_management_response_whatever_was_recorded() {
+    let hub = Arc::new(TraceHub::new(vec!["producer".into()]));
+    // The longest names a producer may intern, on every track, step and span.
+    let name = |prefix: &str, index: usize| format!("{prefix}{index:02}.{}", "n".repeat(90));
+    let metric = |stage: String| {
+        serde_json::json!({"stage":stage,"calls":u32::MAX,"total_us":u64::MAX / 8,"max_us":u32::MAX,
+            "mean_us":u32::MAX,"p50_upper_us":u32::MAX,"p95_upper_us":u32::MAX,"p99_upper_us":u32::MAX})
+    };
+    let tracks: Vec<_> = (0..12)
+        .map(|track| {
+            serde_json::json!({
+                "track": name("track", track), "completed": u32::MAX, "slow": u32::MAX, "abandoned": u32::MAX,
+                "total": metric("total".into()),
+                "steps": (0..11).map(|step| metric(format!("{}>{}", name("a", step), name("b", step)))).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    let spans: Vec<_> = (0..64).map(|span| metric(name("span", span))).collect();
+    for index in 0..200_u64 {
+        hub.record_for_test(
+            &Report {
+                target: "trace.window",
+                body: serde_json::json!({"event":"trace_window","window_us":10_000_000,"tracks":tracks,"spans":spans}),
+            },
+            1_000_000 + index * 10_000,
+        );
+        let mut flow = slow_flow_report(u64::from(u32::MAX), &name("module", index as usize % 50));
+        flow.body["track"] = name("track", index as usize % 12).into();
+        hub.record_for_test(&flow, 1_000_000 + index * 10_000);
+    }
+
+    let report = hub.snapshot();
+    assert!(
+        report.to_string().len() <= 14 * 1024,
+        "{} bytes",
+        report.to_string().len()
+    );
+    assert_eq!(report["schema"], 2);
+    // What just happened survives the squeeze.
+    assert!(!report["slow"].as_array().unwrap().is_empty());
 }
 
 /// Prints what one observation costs its producer. Run with

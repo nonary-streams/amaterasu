@@ -146,18 +146,39 @@ All reports reach the host log under `amaterasu.runtime`:
 | --- | --- | --- |
 | `trace.slow_flow` | a flow reached its budget | every step, the slowest one, the spans during it |
 | `trace.slow_span` | a span lasted 8 ms or more | the span, its label and its recorder |
-| `trace.window` | every ten seconds with activity | per track: completed, slow and abandoned flows, total and per-step timing; the spans with the most time |
+| `trace.window` | every ten seconds with activity | per track: completed, slow and abandoned flows, the budget, total and per-step timing; the spans with the most time |
+
+The default log holds only what a person would notice: a flow or span at least
+twice over its limit. A flow or span nearer its limit is routine on a busy
+host, and a window is written whatever happened, so those are debug records
+(see [latency diagnostics](streaming-latency-diagnostics.md) for the level).
+Every one of them still counts in the report below.
 
 Slow reports are limited to twenty per track and twenty spans per window; the
 window states how many were suppressed and the worst one. Percentiles are
 histogram upper bounds, as in the other diagnostics.
 
-Management reads the same history with `{"op":"trace_snapshot"}`: the last
-minute of windows in full, a compact half-hour trend, and the recent slow flows
-and spans, within one broker result. The web UI's Diagnostics page shows it as
-the Performance panel through `/v1/diagnostics/performance`, which requires
-`diagnostics.read`. Only management and Diagnostics may read the snapshot,
-because it names every module.
+## The performance report
+
+Management reads recent history with `{"op":"trace_snapshot"}`. The reply is
+one compact report, at most 14 KiB, so it fits a broker result and a management
+HTTP response with room to spare:
+
+| Field | Content |
+| --- | --- |
+| `recent` | the last minute as one summary: each track's flows, budget and steps; the host loop's pass and wait; the sixteen spans that held a thread longest |
+| `trend` | half an hour as columns of numbers, one value per ten-second window: each track's worst and 95th percentile, and the longest host pass |
+| `slow` | the thirty most recent slow moments, newest first |
+
+A burst of slow flows behind one cause, such as every input event that waited
+for the same pause, is one moment that counts its members and keeps the worst.
+A moment names the plugin call that overlapped its slowest step longest. When
+a report would exceed its size, the oldest trend points go first, then the
+oldest moments, then the shortest spans.
+
+The web UI's Diagnostics page shows the report as the Performance panel through
+`/v1/diagnostics/performance`, which requires `diagnostics.read`. Only
+management and Diagnostics may read it, because it names every module.
 
 ## Contract
 

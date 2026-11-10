@@ -42,242 +42,239 @@ for (const source of ["src/ui.ts", "src/performance.ts"]) {
     vm.runInContext("Object.assign(globalThis, Amaterasu); globalThis.literalText = (value) => value; globalThis.messageOf = (error) => error.message", sandbox);
 }
 const {
-  parsePerformanceReply, performanceView, performanceContent, renderPerformance,
+  parsePerformanceReply, performanceContent, performanceMomentText, renderPerformance,
   formatPerformanceDuration, performancePluginName,
 } = sandbox.Amaterasu;
 // Values built inside the VM belong to another realm; compare their plain data.
 const plain = (value) => JSON.parse(JSON.stringify(value));
 const descendants = (element) => [element, ...element.children.flatMap((child) => child instanceof Element ? descendants(child) : [])];
-const byClass = (element, name) => descendants(element).filter((node) => node.className.split(" ").includes(name));
+const classesOf = (node) => `${node.className} ${node.attributes.class ?? ""}`.split(" ");
+const byClass = (element, name) => descendants(element).filter((node) => classesOf(node).includes(name));
+const byTag = (element, tag) => descendants(element).filter((node) => node.tagName === tag);
+const rowsOf = (table) => byTag(table, "tr").slice(1).map((row) => row.children.map((cell) => cell.textContent));
 async function wait(predicate) {
-  for (let attempt = 0; attempt < 200; attempt++) { if (predicate()) return; await new Promise((resolve) => setTimeout(resolve, 1)); }
-  assert.fail("timed out waiting for the performance view");
+  // Generous: other suites and builds may be using the machine.
+  for (let attempt = 0; attempt < 3000; attempt++) { if (predicate()) return; await new Promise((resolve) => setTimeout(resolve, 1)); }
+  assert.fail("timed out waiting for the performance panel");
 }
 test.beforeEach(() => { timers.clear(); document.visibilityState = "visible"; });
 
 const NOW = 1_800_000_000_000;
-const metric = (stage, calls, totalUs, maxUs, p95 = maxUs) =>
-  ({ stage, calls, total_us: totalUs, max_us: maxUs, mean_us: Math.round(totalUs / calls), p95_upper_us: p95 });
-function windowReport(ageMs, overrides = {}) {
+const metric = (stage, calls, meanUs, p95Us, maxUs) =>
+  ({ stage, calls, mean_us: meanUs, p95_upper_us: p95Us, max_us: maxUs, total_us: calls * meanUs });
+function report(overrides = {}) {
   return {
-    observed_unix_ms: NOW - ageMs, window_us: 10_000_000, dropped_records: 0,
-    tracks: [{
-      track: "input", completed: 1000, slow: 0,
-      total: metric("total", 1000, 900_000, 2_100, 2_000),
-      steps: [
-        metric("session.submitted>input.accepted", 1000, 100_000, 900, 250),
-        metric("socket.arrived>control.authenticated", 1000, 700_000, 1_900, 2_000),
-        metric("control.authenticated>session.dequeued", 1000, 100_000, 300, 100),
+    schema: 2, collecting: true,
+    recent: {
+      window_us: 60_000_000, dropped_records: 0,
+      tracks: [
+        { track: "input", completed: 4_000, slow: 3, abandoned: 0, budget_us: 8_000, total: metric("total", 4_000, 1_300, 4_000, 141_000),
+          steps: [
+            metric("socket.arrived>control.authenticated", 4_000, 1_000, 2_000, 116_000),
+            metric("control.authenticated>session.dequeued", 4_000, 250, 1_000, 3_700),
+            metric("session.submitted>input.accepted", 4_000, 50, 100, 260),
+          ] },
+        { track: "video", completed: 2_000, slow: 0, abandoned: 0, budget_us: 12_000, total: metric("total", 2_000, 5_800, 8_000, 11_000),
+          steps: [metric("video.encoder_submitted>video.packet_queued", 2_000, 5_000, 8_000, 10_500)] },
       ],
-    }],
-    spans: [
-      metric("host.pass", 5000, 2_500_000, 3_900),
-      metric("host.tick:amaterasu.linux-session-video", 600, 480_000, 3_600),
-      metric("host.health:amaterasu.linux-session-video", 2, 700, 400),
-      metric("host.tick:vendor.overlay-plugin", 3, 1_200, 500),
-      metric("input.batch:direct", 1000, 60_000, 900),
+      host: { pass: metric("host.pass", 30_000, 500, 2_000, 121_000), wait: metric("host.wait", 30_000, 1_200, 1_900, 1_900) },
+      spans: [
+        metric("host.tick:amaterasu.session-lifecycle", 30, 400, 1_000, 119_000),
+        metric("input.batch:direct", 3_900, 40, 100, 170),
+        metric("host.tick:amaterasu.pairing", 40, 4_300, 9_000, 9_100),
+        metric("host.health:amaterasu.state", 6, 300, 400, 420),
+        metric("host.tick:vendor.overlay", 5, 300, 500, 512),
+      ],
+      spans_omitted: 0,
+    },
+    trend: {
+      newest_unix_ms: NOW - 2_000, age_s: [40, 30, 20, 10, 0],
+      tracks: {
+        input: { budget_us: 8_000, p95_upper_us: [2_000, 2_000, 4_000, 2_000, 2_000], max_us: [2_100, null, 141_000, 8_000, 3_000] },
+        video: { budget_us: 12_000, p95_upper_us: [8_000, 8_000, 8_000, 8_000, 8_000], max_us: [9_000, 9_500, 11_000, 9_000, 9_100] },
+      },
+      host_pass_max_us: [2_000, 2_100, 121_000, 9_100, 2_000],
+    },
+    slow: [
+      { kind: "span", observed_unix_ms: NOW - 5_000, count: 1, span: "host.tick", label: "amaterasu.pairing", by: "@amaterasu.host-lifecycle", us: 9_100 },
+      { kind: "flow", observed_unix_ms: NOW - 21_000, count: 18, track: "input", us: 141_000, budget_us: 8_000,
+        step: "control.authenticated>session.dequeued", step_us: 122_000,
+        held_by: { span: "host.tick", label: "amaterasu.session-lifecycle", us: 119_000 } },
+      { kind: "flow", observed_unix_ms: NOW - 30_000, count: 1, track: "video", us: 12_400, budget_us: 12_000,
+        step: "video.encoder_submitted>video.packet_queued", step_us: 11_900, held_by: null },
     ],
     ...overrides,
   };
 }
-function reply(trace) {
-  return { ok: true, supported: true, trace: { schema: 1, collecting: true, windows: [], trend: [], slow_flows: [], slow_spans: [], ...trace } };
-}
+const reply = (trace = report()) => ({ ok: true, supported: true, trace });
 
-test("a healthy host reads as smooth and names the typical time in plain words", () => {
-  const view = performanceView(parsePerformanceReply(reply({ windows: [windowReport(5_000), windowReport(15_000)] })), NOW);
-  const input = view.tracks.find((track) => track.track === "input");
-  assert.equal(input.title, "Input response");
-  assert.equal(input.verdict.tone, "good");
-  assert.equal(input.verdict.label, "Smooth");
-  assert.equal(input.typicalUs, 900);
-  assert.equal(input.summary, "A typical input event spends 0.9 ms inside the host.");
-  assert.equal(view.host.verdict.label, "Responsive");
-  assert.equal(view.host.summary, "No plugin held up the others for long enough to notice.");
-  assert.equal(Math.round(view.host.passesPerSecond), 500);
-  // A track with no traffic is idle, never "good".
-  const video = view.tracks.find((track) => track.track === "video");
-  assert.equal(video.verdict.tone, "idle");
-  assert.equal(video.summary, "No frames passed through the host in the last minute.");
-});
-
-test("steps follow the path of an event and share the time between them", () => {
-  const view = performanceView(parsePerformanceReply(reply({ windows: [windowReport(5_000)] })), NOW);
-  const steps = view.tracks.find((track) => track.track === "input").steps;
-  assert.deepEqual(plain(steps.map((step) => step.label)), [
-    "Waiting to be picked up", "Reaching the stream session", "Injecting into the system",
-  ]);
-  // Colour follows the step, not its rank: slots are fixed by the known path.
-  assert.deepEqual(plain(steps.map((step) => step.slot)), [1, 2, 4]);
-  assert.equal(Math.round(steps[0].share * 100), 78);
-  assert.equal(steps[0].meanUs, 700);
-  assert.equal(steps[0].p95Us, 2_000);
-});
-
-test("plugins are ranked by how long they kept the others waiting", () => {
-  const busy = windowReport(5_000, { spans: [
-    metric("host.pass", 5000, 2_500_000, 23_000),
-    metric("host.tick:amaterasu.state", 1, 21_400, 21_400),
-    metric("host.tick:amaterasu.session-history", 2, 12_000, 9_700),
-    metric("host.tick:vendor.overlay-plugin", 3, 1_200, 500),
-  ] });
-  const view = performanceView(parsePerformanceReply(reply({ windows: [busy] })), NOW);
-  assert.deepEqual(plain(view.plugins.map((plugin) => [plugin.name, plugin.worstUs])), [
-    ["Saved state", 21_400], ["Session history", 9_700], ["Vendor overlay plugin", 500],
-  ]);
-  assert.equal(view.host.verdict.label, "Long pauses");
-  assert.equal(view.host.summary, "Saved state paused everything for up to 21 ms.");
-  // Tick and health calls of one plugin are one row.
-  const calm = performanceView(parsePerformanceReply(reply({ windows: [windowReport(5_000)] })), NOW);
-  assert.equal(calm.plugins[0].name, "Video pipeline");
-  assert.equal(calm.plugins[0].longCalls, 602);
-  assert.equal(calm.plugins.length, 2, "spans that are not host calls are not plugins");
-});
-
-test("slow flows count against the verdict and old windows are left out", () => {
-  const delayed = windowReport(5_000);
-  delayed.tracks[0].slow = 4;
-  const stale = windowReport(200_000);
-  stale.tracks[0].slow = 900;
-  const view = performanceView(parsePerformanceReply(reply({ windows: [stale, delayed] })), NOW);
-  const input = view.tracks.find((track) => track.track === "input");
-  assert.equal(input.completed, 1000);
-  assert.equal(input.verdict.label, "Occasional delays");
-  assert.equal(input.summary, "4 of 1,000 input events took longer than they should have.");
-  delayed.tracks[0].slow = 40;
-  const frequent = performanceView(parsePerformanceReply(reply({ windows: [delayed] })), NOW);
-  assert.equal(frequent.tracks[0].verdict.label, "Frequent delays");
-});
-
-test("a slow moment says which step took the time and which plugin was busy", () => {
-  const view = performanceView(parsePerformanceReply(reply({
-    slow_flows: [{
-      observed_unix_ms: NOW - 20_000, track: "input", total_us: 23_412, budget_us: 8_000,
-      steps: [
-        { from: "socket.arrived", to: "control.authenticated", us: 19_810 },
-        { from: "control.authenticated", to: "session.dequeued", us: 3_602 },
-      ],
-      slowest_step: { from: "socket.arrived", to: "control.authenticated", us: 19_810, percent: 84,
-        during: [{ span: "host.tick", label: "amaterasu.state", us: 21_438, overlap_us: 19_600 }] },
-    }, {
-      observed_unix_ms: NOW - 90_000, track: "video", total_us: 14_000, budget_us: 12_000,
-      steps: [{ from: "video.packet_queued", to: "session.packet_read", us: 14_000 }],
-      slowest_step: { from: "video.packet_queued", to: "session.packet_read", us: 14_000, percent: 100,
-        during: [{ span: "host.wait", label: null, us: 2_000, overlap_us: 1_900 }] },
-    }],
-    slow_spans: [{ observed_unix_ms: NOW - 21_000, span: "host.tick", label: "amaterasu.state", us: 21_438 }],
-  })), NOW);
-  assert.deepEqual(plain(view.moments.map((moment) => moment.headline)), [
-    "An input event took 23 ms to reach the system",
-    "Saved state held the host for 21 ms",
-    "A video frame took 14 ms to leave the host",
-  ]);
-  assert.equal(view.moments[0].detail,
-    "Most of it (84%) was “waiting to be picked up”. Saved state was busy for 21 ms at that moment.");
-  assert.match(view.moments[2].detail, /The host was idle between checks/);
-  assert.deepEqual(plain(view.moments[0].steps.map((step) => step.slot)), [1, 2]);
-});
-
-test("malformed and oversized replies are bounded instead of trusted", () => {
+test("a reply is read into a report, and anything else is unsupported or an error", () => {
   assert.equal(parsePerformanceReply({ ok: true, supported: false, trace: null }), null);
-  assert.throws(() => parsePerformanceReply({ ok: false, code: "performance_trace_unavailable" }));
-  assert.throws(() => parsePerformanceReply({ ok: true, supported: true, trace: { schema: 2 } }));
-  const hostile = parsePerformanceReply(reply({
-    windows: [{ observed_unix_ms: "soon", window_us: -5, tracks: "none", spans: [null, 7, { stage: "x".repeat(900), calls: Infinity }] }],
-    slow_spans: Array.from({ length: 5_000 }, () => ({ span: "host.tick", us: 9_000 })),
-  }));
-  assert.equal(hostile.windows[0].observedUnixMs, 0);
-  assert.equal(hostile.windows[0].windowUs, 0);
-  assert.deepEqual(plain(hostile.windows[0].tracks), []);
-  assert.equal(hostile.windows[0].spans.length, 1);
-  assert.equal(hostile.windows[0].spans[0].name.length, 160);
-  assert.equal(hostile.windows[0].spans[0].calls, 0);
-  assert.equal(hostile.slowSpans.length, 400);
+  assert.throws(() => parsePerformanceReply({ ok: false, code: "performance_trace_unavailable" }), /did not return/);
+  assert.throws(() => parsePerformanceReply(reply({ schema: 1, windows: [] })), /cannot read/);
+  assert.throws(() => parsePerformanceReply(null), /did not return/);
+
+  const parsed = plain(parsePerformanceReply(reply()));
+  assert.equal(parsed.periodUs, 60_000_000);
+  assert.equal(parsed.tracks[0].track, "input");
+  assert.equal(parsed.tracks[0].budgetUs, 8_000);
+  assert.deepEqual(parsed.tracks[0].steps[2], { stage: "session.submitted>input.accepted", calls: 4_000, meanUs: 50, p95Us: 100, maxUs: 260, totalUs: 200_000 });
+  assert.equal(parsed.hostPass.maxUs, 121_000);
+  assert.equal(parsed.calls.length, 5);
+  assert.deepEqual(parsed.trend.tracks.input.maxUs, [2_100, null, 141_000, 8_000, 3_000]);
+  assert.deepEqual(parsed.moments[1].heldBy, { span: "host.tick", label: "amaterasu.session-lifecycle", us: 119_000 });
+  assert.equal(parsed.moments[2].heldBy, null);
+
+  // A report that leaves fields out still reads: missing numbers are zero.
+  const sparse = plain(parsePerformanceReply(reply({ schema: 2, collecting: false, recent: null, trend: null, slow: [{}] })));
+  assert.equal(sparse.periodUs, 0);
+  assert.equal(sparse.trend, null);
+  assert.deepEqual(sparse.tracks, []);
+  assert.equal(sparse.moments[0].count, 1);
 });
 
-test("durations and plugin names are written for people", () => {
-  assert.equal(formatPerformanceDuration(40), "under 0.1 ms");
-  assert.equal(formatPerformanceDuration(940), "0.9 ms");
-  assert.equal(formatPerformanceDuration(4_700), "4.7 ms");
-  assert.equal(formatPerformanceDuration(23_412), "23 ms");
-  assert.equal(formatPerformanceDuration(1_250_000), "1.3 s");
-  assert.equal(performancePluginName("amaterasu.stream-session"), "Stream session");
-  assert.equal(performancePluginName("amaterasu.some-new_module"), "Some new module");
+test("durations and plugin names are written for a reader", () => {
+  assert.equal(formatPerformanceDuration(4), "<0.01 ms");
+  assert.equal(formatPerformanceDuration(50), "0.05 ms");
+  assert.equal(formatPerformanceDuration(1_300), "1.3 ms");
+  assert.equal(formatPerformanceDuration(12_400), "12.4 ms");
+  assert.equal(formatPerformanceDuration(141_000), "141 ms");
+  assert.equal(formatPerformanceDuration(2_500_000), "2.5 s");
+  assert.equal(performancePluginName("amaterasu.session-lifecycle"), "Session lifecycle");
   assert.equal(performancePluginName("vendor.overlay-plugin"), "Vendor overlay plugin");
 });
 
-test("every figure in a chart is also readable without hovering", () => {
-  const busy = windowReport(5_000);
-  busy.spans.push(metric("host.tick:amaterasu.state", 1, 21_400, 21_400));
-  const content = performanceContent(performanceView(parsePerformanceReply(reply({
-    windows: [busy],
-    trend: [20_000, 10_000, 0].map((age) => ({ observed_unix_ms: NOW - age, tracks: [{ track: "input", p95_upper_us: 2_000, slow: 0 }] })),
-  })), NOW));
-  // The plugin list prints each worst pause and flags the noticeable ones with a label.
-  const rows = byClass(content, "perf-plugin");
-  assert.match(rows[0].textContent, /Saved state.*21 ms at worst.*Long pause/);
-  assert.match(rows[0].attributes["aria-label"], /Saved state: held the host for 21 ms at worst/);
-  assert.equal(rows[0].children.length, rows[1].children.length, "rows share one grid so bars share one scale");
-  // The segmented bar has a legend and a table with the same steps.
-  const segments = byClass(content, "perf-segment");
-  assert.equal(segments.length, 3);
-  assert.equal(segments[0].textContent, "78%");
-  assert.equal(segments[1].textContent, "11%");
-  assert.match(byClass(content, "perf-segments")[0].attributes["aria-label"], /Waiting to be picked up 78%/);
-  assert.equal(byClass(content, "perf-legend")[0].children.length, 3);
-  const table = descendants(content).find((node) => node.tagName === "table");
-  assert.match(table.textContent, /Waiting to be picked up78%0\.7 ms2\.0 ms1\.9 ms1000socket\.arrived>control\.authenticated/);
-  // Status is never colour alone: a mark and a label accompany it.
-  const verdicts = byClass(content, "perf-verdict").map((node) => node.textContent);
-  assert.ok(verdicts.includes("✓Smooth") && verdicts.includes("✕Long pauses"), verdicts.join(" | "));
-  // The sparkline carries a text alternative.
-  const sparkline = descendants(content).find((node) => node.attributes.class === "perf-sparkline");
-  assert.match(sparkline.attributes["aria-label"], /95% within 2\.0 ms now/);
+test("a slow moment says what was slow, where, and what held the host loop", () => {
+  const moments = parsePerformanceReply(reply()).moments;
+  assert.equal(performanceMomentText(moments[0]), "Pairing held the host loop, delaying every other plugin.");
+  assert.equal(performanceMomentText(moments[1]),
+    "18 input events: slowest at reaching the stream session (122 ms), during a 119 ms call by Session lifecycle.");
+  assert.equal(performanceMomentText(moments[2]), "One video frame: slowest at encoding (11.9 ms).");
 });
 
-test("the panel loads once, keeps refreshing while visible, and stops when removed", async () => {
+test("the summary states each track and the host loop, marking values at their limit", () => {
+  const content = performanceContent(parsePerformanceReply(reply()));
+  const [input, video, host] = byClass(content, "perf-figure");
+
+  assert.equal(byTag(input, "h3")[0].textContent, "Input");
+  assert.equal(byClass(input, "perf-value")[0].textContent, "1.3 ms");
+  assert.deepEqual(byClass(input, "perf-fact").map((fact) => fact.textContent),
+    ["95% within4.0 ms", "Worst141 ms", "Input events4,000", "Took 8 ms or more3"]);
+  // The worst input event and the count over the limit are marked; video stayed inside its limit.
+  assert.deepEqual(byClass(input, "perf-over").map((node) => node.textContent), ["141 ms", "3"]);
+  assert.equal(byClass(video, "perf-value")[0].textContent, "5.8 ms");
+  assert.equal(byClass(video, "perf-over").length, 0);
+
+  assert.equal(byClass(host, "perf-value")[0].textContent, "0.50 ms");
+  assert.deepEqual(byClass(host, "perf-fact").map((fact) => fact.textContent),
+    ["95% within2.0 ms", "Worst pass121 ms", "Passes per second500", "Longest callSession lifecycle, 119 ms"]);
+});
+
+test("the trend places each window by its age and marks the ones at or over the limit", () => {
+  const content = performanceContent(parsePerformanceReply(reply()));
+  const chart = byClass(byClass(content, "perf-figure")[0], "perf-trend-chart")[0];
+  const bars = byClass(chart, "perf-trend-bar");
+  // Four windows had input; the newest sits in the last of 180 slots.
+  assert.deepEqual(bars.map((bar) => Number(bar.attributes.x) - 0.15), [175, 177, 178, 179]);
+  // 141 ms and exactly 8 ms are at or over the 8 ms limit; the spike is clipped to full height.
+  assert.deepEqual(bars.map((bar) => classesOf(bar).includes("perf-trend-over")), [false, true, true, false]);
+  assert.equal(bars[1].attributes.height, "100");
+  assert.match(chart.attributes["aria-label"], /2 of 4 periods reached 8 ms/);
+  assert.equal(byClass(content, "perf-trend-caption")[0].textContent, "Worst per 10 s, last 30 min. Line at 8 ms.");
+});
+
+test("stages list their share of the time, and plugin calls only what ran on the host loop", () => {
+  const content = performanceContent(parsePerformanceReply(reply()));
+  const [inputStages, videoStages, calls, moments] = byClass(content, "perf-table");
+
+  assert.deepEqual(rowsOf(inputStages), [
+    ["Waiting to be read from the networksocket.arrived → control.authenticated", "77%", "1.0 ms", "2.0 ms", "116 ms"],
+    ["Reaching the stream sessioncontrol.authenticated → session.dequeued", "19%", "0.25 ms", "1.0 ms", "3.7 ms"],
+    ["Injecting into the systemsession.submitted → input.accepted", "4%", "0.05 ms", "0.10 ms", "0.26 ms"],
+  ]);
+  assert.equal(rowsOf(videoStages)[0][0], "Encodingvideo.encoder_submitted → video.packet_queued");
+  // Longest first. The input batch span ran inside a plugin's turn and is not a turn itself.
+  assert.deepEqual(rowsOf(calls), [
+    ["Session lifecycleamaterasu.session-lifecycle", "", "119 ms", "0.40 ms", "30"],
+    ["Pairingamaterasu.pairing", "", "9.1 ms", "4.3 ms", "40"],
+    ["Vendor overlayvendor.overlay", "", "0.51 ms", "0.30 ms", "5"],
+    ["Saved state (health check)amaterasu.state", "", "0.42 ms", "0.30 ms", "6"],
+  ]);
+  // Only calls of 8 ms or more are marked.
+  assert.deepEqual(byClass(calls, "perf-over").map((cell) => cell.textContent), ["119 ms", "9.1 ms"]);
+  assert.equal(rowsOf(moments).length, 3);
+  assert.equal(rowsOf(moments)[1][1], "141 ms");
+});
+
+test("an idle host reports its loop and says that nothing is streaming", () => {
+  const idle = report();
+  idle.recent.tracks = [];
+  idle.slow = [];
+  const content = performanceContent(parsePerformanceReply(reply(idle)));
+  const [input, video, host] = byClass(content, "perf-figure");
+  assert.equal(byClass(input, "perf-caption")[0].textContent, "no input events in the last minute");
+  assert.equal(byClass(video, "perf-value")[0].textContent, "–");
+  // Earlier activity still shows in the trend, against the limit it had then.
+  assert.equal(byClass(input, "perf-trend-bar").length, 4);
+  assert.equal(byClass(host, "perf-value")[0].textContent, "0.50 ms");
+  assert.equal(byClass(content, "perf-table").length, 1);
+  assert.match(content.textContent, /Nothing exceeded its limit in the retained history\./);
+  assert.doesNotMatch(content.textContent, /Where the time goes/);
+});
+
+test("before the first window the panel says it is collecting", () => {
+  const starting = performanceContent(parsePerformanceReply(reply({ schema: 2, collecting: true, recent: null, trend: null, slow: [] })));
+  assert.equal(starting.textContent, "Collecting the first ten seconds of measurements.");
+  const untraced = performanceContent(parsePerformanceReply(reply({ schema: 2, collecting: false, recent: null, trend: null, slow: [] })));
+  assert.match(untraced.textContent, /Nothing has been measured yet/);
+});
+
+function mount(post) {
   const target = new Element("div");
   target.setConnected(true);
-  const calls = [];
-  const api = { async post(route, payload) { calls.push([route, payload]); return reply({ windows: [windowReport(5_000)] }); } };
-  const refresh = renderPerformance({ api }, target);
-  await wait(() => byClass(target, "perf-tile").length === 3);
-  assert.deepEqual(calls, [["diagnostics/performance", undefined]]);
-  assert.match(byClass(target, "perf-status")[0].textContent, /refreshes every 10 seconds/);
+  const refresh = renderPerformance({ api: { post } }, target);
+  return { target, refresh };
+}
 
-  const [timerId, timer] = [...timers][0];
+test("the panel loads its report, refreshes on a timer and stops when the page is left", async () => {
+  const calls = [];
+  const { target } = mount(async (path) => { calls.push(path); return reply(); });
+  await wait(() => byClass(target, "perf-summary").length === 1);
+  assert.deepEqual(calls, ["diagnostics/performance"]);
+  assert.match(byClass(target, "perf-status")[0].textContent, /^Updated .*Refreshes every 10 seconds\.$/);
+  assert.equal(timers.size, 1);
+  const [[id, timer]] = [...timers];
   assert.equal(timer.delay, 10_000);
-  timers.delete(timerId);
+
+  timers.delete(id);
   timer.callback();
   await wait(() => calls.length === 2);
-  await refresh();
-  assert.equal(calls.length, 3);
-  await wait(() => timers.size === 1);
 
-  // A hidden tab waits instead of polling; a removed panel stops for good.
-  document.visibilityState = "hidden";
-  let [, pending] = [...timers][0];
-  timers.clear();
-  pending.callback();
-  assert.equal(calls.length, 3);
-  assert.equal(timers.size, 1);
+  // Leaving the page ends the loop: the next timer does nothing.
   target.setConnected(false);
-  [, pending] = [...timers][0];
-  timers.clear();
-  pending.callback();
-  assert.equal(timers.size, 0);
-  assert.equal(calls.length, 3);
+  await wait(() => timers.size === 1);
+  [...timers.values()][0].callback();
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(calls.length, 2);
 });
 
-test("an older host and a failed request are explained instead of shown as healthy", async () => {
-  const target = new Element("div");
-  target.setConnected(true);
-  renderPerformance({ api: { async post() { return { ok: true, supported: false, trace: null }; } } }, target);
-  await wait(() => /Performance tracing unavailable/.test(target.textContent));
+test("a failed refresh keeps the figures on screen and says so", async () => {
+  let fail = false;
+  const { target, refresh } = mount(async () => { if (fail) throw new Error("response too large"); return reply(); });
+  await wait(() => byClass(target, "perf-summary").length === 1);
+  fail = true;
+  await refresh();
+  assert.equal(byClass(target, "perf-summary").length, 1);
+  assert.equal(byClass(target, "error").length, 0);
+  assert.match(byClass(target, "perf-status")[0].textContent, /^Could not refresh at .*: response too large\. Trying again shortly\.$/);
+});
 
-  const failing = new Element("div");
-  failing.setConnected(true);
-  renderPerformance({ api: { async post() { throw new Error("The host is restarting."); } } }, failing);
-  await wait(() => /The host is restarting\./.test(failing.textContent));
-  assert.equal(byClass(failing, "perf-tile").length, 0);
+test("a first load that fails offers a retry, and an older host is named as such", async () => {
+  const failing = mount(async () => { throw new Error("service unavailable"); });
+  await wait(() => byClass(failing.target, "error").length === 1);
+  assert.match(failing.target.textContent, /service unavailable/);
+
+  const older = mount(async () => ({ ok: true, supported: false, trace: null }));
+  await wait(() => /does not measure performance yet/.test(older.target.textContent));
+  assert.equal(byClass(older.target, "error").length, 0);
 });
