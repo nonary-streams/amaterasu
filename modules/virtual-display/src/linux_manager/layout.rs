@@ -69,6 +69,22 @@ impl Layout {
             .unwrap_or(0)
             .max(0)
     }
+    pub fn bottom_edge(&self) -> i64 {
+        self.outputs
+            .iter()
+            .filter(|output| output.enabled)
+            .map(|output| {
+                let height = if matches!(output.rotation, 2 | 8 | 32 | 128) {
+                    output.width
+                } else {
+                    output.height
+                };
+                output.y + (f64::from(height) / output.scale).ceil() as i64
+            })
+            .max()
+            .unwrap_or(0)
+            .max(0)
+    }
     pub fn next_priority(&self) -> u32 {
         self.outputs.iter().filter(|output| output.enabled).count() as u32 + 1
     }
@@ -121,12 +137,42 @@ impl Layout {
         }
         Ok(outputs)
     }
+    fn expected_outputs(
+        &self,
+        current: &Value,
+        owned: Option<&str>,
+    ) -> Result<Vec<Output>, String> {
+        let mut outputs = self.normalized_outputs(current)?;
+        if let Some(owned) = owned {
+            outputs.retain(|output| output.name != owned);
+            // The owned output occupies priority one. Peer priorities are
+            // checked after this shift, so readback cannot hide a lost primary.
+            for (index, output) in outputs
+                .iter_mut()
+                .filter(|output| output.enabled)
+                .enumerate()
+            {
+                output.priority = index as u32 + 2;
+            }
+        }
+        Ok(outputs)
+    }
+    pub fn arguments_with_primary(
+        &self,
+        current: &Value,
+        owned: &str,
+    ) -> Result<Vec<String>, String> {
+        self.arguments_for(current, Some(owned))
+    }
     pub fn arguments(&self, current: &Value) -> Result<Vec<String>, String> {
+        self.arguments_for(current, None)
+    }
+    fn arguments_for(&self, current: &Value, owned: Option<&str>) -> Result<Vec<String>, String> {
         let outputs = current["outputs"]
             .as_array()
             .ok_or("missing current outputs")?;
         let mut arguments = Vec::new();
-        for expected in self.normalized_outputs(current)? {
+        for expected in self.expected_outputs(current, owned)? {
             if let Some(actual) = outputs
                 .iter()
                 .find(|o| o["connected"] == true && o["name"] == expected.name)
@@ -137,13 +183,19 @@ impl Layout {
         }
         Ok(arguments)
     }
+    pub fn matches_with_primary(&self, current: &Value, owned: &str) -> bool {
+        self.difference_for(current, Some(owned)).is_none()
+    }
     pub fn matches(&self, current: &Value) -> bool {
         self.difference(current).is_none()
     }
     /// The first saved output the current desktop does not reproduce, with
     /// each differing property, for the journal. `None` when it matches.
     pub fn difference(&self, current: &Value) -> Option<String> {
-        let outputs = match self.normalized_outputs(current) {
+        self.difference_for(current, None)
+    }
+    fn difference_for(&self, current: &Value, owned: Option<&str>) -> Option<String> {
+        let outputs = match self.expected_outputs(current, owned) {
             Ok(outputs) => outputs,
             Err(error) => return Some(error),
         };
@@ -378,6 +430,114 @@ mod tests {
     fn desktop() -> Value {
         json!({"outputs":[{"name":"Virtual-1","connected":true,"enabled":true,"currentModeId":"1","modes":[{"id":"1","size":{"width":2560,"height":1440},"refreshRate":120}],"pos":{"x":0,"y":0},"scale":2.5,"rotation":1,"hdr":false,"wcg":true,"priority":1}]})
     }
+    #[test]
+    fn primary_reservation_changes_only_peer_priorities_and_checks_the_shift() {
+        let mut before = desktop();
+        let mut peer = before["outputs"][0].clone();
+        peer["name"] = json!("HDMI-A-1");
+        peer["priority"] = json!(3);
+        peer["pos"] = json!({"x":1024,"y":15});
+        before["outputs"].as_array_mut().unwrap().push(peer);
+        let layout = Layout::capture(&before, "Virtual-2").unwrap();
+        let mut after = before.clone();
+        after["outputs"][0]["priority"] = json!(2);
+        after["outputs"][1]["priority"] = json!(3);
+        assert!(layout.matches_with_primary(&after, "Virtual-2"));
+        assert!(
+            layout
+                .arguments_with_primary(&after, "Virtual-2")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!layout.matches(&after));
+        let commands = layout.arguments_with_primary(&before, "Virtual-2").unwrap();
+        assert!(commands.contains(&"output.Virtual-1.priority.2".into()));
+        assert!(!commands.contains(&"output.HDMI-A-1.priority.4".into()));
+        after["outputs"][0]["priority"] = json!(1);
+        assert!(!layout.matches_with_primary(&after, "Virtual-2"));
+        after["outputs"][0]["priority"] = json!(2);
+        after["outputs"][1]["pos"]["x"] = json!(0);
+        assert!(!layout.matches_with_primary(&after, "Virtual-2"));
+        assert!(
+            layout
+                .arguments_with_primary(&after, "Virtual-2")
+                .unwrap()
+                .contains(&"output.HDMI-A-1.position.1024,15".into())
+        );
+    }
+
+    #[test]
+    fn primary_reservation_excludes_owned_fallback_but_retains_physical_fallback() {
+        let empty = Layout::capture(&json!({"outputs":[]}), "Virtual-1").unwrap();
+        let mut current = desktop();
+        assert!(empty.matches_with_primary(&current, "Virtual-1"));
+        assert!(
+            empty
+                .arguments_with_primary(&current, "Virtual-1")
+                .unwrap()
+                .is_empty()
+        );
+
+        let mut physical = current["outputs"][0].clone();
+        physical["name"] = json!("HDMI-A-1");
+        physical["enabled"] = json!(false);
+        physical["priority"] = json!(0);
+        let layout = Layout::capture(&json!({"outputs":[physical.clone()]}), "Virtual-1").unwrap();
+        physical["enabled"] = json!(true);
+        physical["priority"] = json!(2);
+        current["outputs"].as_array_mut().unwrap().push(physical);
+        assert!(layout.matches_with_primary(&current, "Virtual-1"));
+        assert!(
+            layout
+                .arguments_with_primary(&current, "Virtual-1")
+                .unwrap()
+                .is_empty()
+        );
+        current["outputs"][1]["priority"] = json!(1);
+        assert!(!layout.matches_with_primary(&current, "Virtual-1"));
+        let commands = layout
+            .arguments_with_primary(&current, "Virtual-1")
+            .unwrap();
+        assert!(commands.contains(&"output.HDMI-A-1.priority.2".into()));
+        assert!(
+            commands
+                .iter()
+                .all(|command| !command.starts_with("output.Virtual-1."))
+        );
+    }
+
+    #[test]
+    fn bottom_edge_uses_rotated_scaled_height_and_rounds_up() {
+        for (rotation, bottom) in [
+            (1, 490),
+            (2, 864),
+            (8, 864),
+            (16, 490),
+            (32, 864),
+            (64, 490),
+            (128, 864),
+        ] {
+            let mut before = desktop();
+            before["outputs"][0]["rotation"] = json!(rotation);
+            before["outputs"][0]["scale"] = json!(3.0);
+            before["outputs"][0]["pos"]["y"] = json!(10);
+            let layout = Layout::capture(&before, "Virtual-2").unwrap();
+            assert_eq!(layout.bottom_edge(), bottom);
+        }
+        let mut before = desktop();
+        before["outputs"][0]["pos"]["y"] = json!(-2000);
+        assert_eq!(
+            Layout::capture(&before, "Virtual-2").unwrap().bottom_edge(),
+            0
+        );
+        before["outputs"][0]["enabled"] = json!(false);
+        before["outputs"][0]["pos"]["y"] = json!(5000);
+        assert_eq!(
+            Layout::capture(&before, "Virtual-2").unwrap().bottom_edge(),
+            0
+        );
+    }
+
     #[test]
     fn disabled_connector_without_a_current_mode_is_preserved_and_only_disabled() {
         let mut before = desktop();

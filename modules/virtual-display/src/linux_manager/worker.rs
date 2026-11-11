@@ -319,20 +319,28 @@ impl<B: Broker, C: Compositor, I: ConnectorInventory> Controller<B, C, I> {
         self.journal.update(record.clone())?;
         Ok(record)
     }
-    /// Exclusive placement leaves the outputs of other journaled Amaterasu
-    /// streams enabled; only displays Amaterasu does not own are turned off.
+    /// A peer holds an independent output; like the reference host, an
+    /// exclusive request then extends the current desktop without disabling it.
     fn placement(&self, owned: &str, layout: VirtualDisplayLayout) -> Placement {
         match layout {
             VirtualDisplayLayout::Extended => Placement::Extended,
-            VirtualDisplayLayout::Exclusive => Placement::Exclusive {
-                keep: self
+            VirtualDisplayLayout::ExtendedPrimary => Placement::ExtendedPrimary,
+            VirtualDisplayLayout::ExtendedIsolated => Placement::ExtendedIsolated,
+            VirtualDisplayLayout::ExtendedPrimaryIsolated => Placement::ExtendedPrimaryIsolated,
+            VirtualDisplayLayout::Exclusive => {
+                let keep = self
                     .journal
                     .records
                     .iter()
                     .map(|record| record.output.clone())
                     .filter(|output| output != owned)
-                    .collect(),
-            },
+                    .collect::<Vec<_>>();
+                if keep.is_empty() {
+                    Placement::Exclusive { keep }
+                } else {
+                    Placement::Extended
+                }
+            }
         }
     }
     /// Returns true when the connector remains parked as a desktop anchor.
@@ -622,7 +630,7 @@ impl<B: Broker, C: Compositor, I: ConnectorInventory> Controller<B, C, I> {
             if reused_parked {
                 record.setup_layouts.pop();
                 self.journal.update(record.clone())?;
-            } else if placement == Placement::Extended {
+            } else if matches!(placement, Placement::Extended | Placement::ExtendedIsolated) {
                 record.layout = None;
                 self.journal.update(record.clone())?;
             }

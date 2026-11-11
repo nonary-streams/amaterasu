@@ -20,9 +20,23 @@ use std::{
 pub(super) enum Placement {
     /// Right of the existing desktop, which keeps its current layout.
     Extended,
+    /// Keep the desktop extended while making the owned output primary.
+    ExtendedPrimary,
+    /// Place the owned output near the compositor's far desktop boundary.
+    ExtendedIsolated,
+    /// Combine primary ownership and isolated placement.
+    ExtendedPrimaryIsolated,
     /// The only enabled display apart from `keep`, the outputs of other
     /// Amaterasu streams, which stay on and are never displaced.
     Exclusive { keep: Vec<String> },
+}
+impl Placement {
+    fn primary(&self) -> bool {
+        matches!(self, Self::ExtendedPrimary | Self::ExtendedPrimaryIsolated)
+    }
+    fn isolated(&self) -> bool {
+        matches!(self, Self::ExtendedIsolated | Self::ExtendedPrimaryIsolated)
+    }
 }
 
 pub(super) trait Compositor: Send {
@@ -239,29 +253,34 @@ impl Compositor for KScreen {
         if let Placement::Exclusive { keep } = placement {
             return configure_exclusive(&configuration, output, &target, keep, newly_connected);
         }
-        let right = match layout {
-            Some(layout) => layout.right_edge(),
-            None => right_edge(&configuration, output)?,
-        };
-        let mut arguments = match layout {
-            Some(layout) => layout.arguments(&configuration)?,
-            None => Vec::new(),
-        };
-        let priority = match layout {
-            Some(layout) => layout.next_priority() as usize,
-            None => live_next_priority(&configuration, output)?,
-        };
-        arguments.extend(target.arguments(output, right, priority));
-        configure_target(
+        let (plan, arguments) = extended_configuration(
+            &configuration,
+            output,
+            specification,
+            &target,
+            layout,
+            placement,
+        )?;
+        configure_target_at(
             &mut KScreenDesktop {
                 started: Instant::now(),
             },
             output,
             &target,
-            right,
+            plan,
             arguments,
             newly_connected,
-            |confirmed| Ok(layout.is_none_or(|layout| layout.matches(confirmed))),
+            |confirmed| {
+                Ok(layout.is_none_or(|layout| {
+                    if placement.primary() {
+                        layout.matches_with_primary(confirmed, output)
+                    } else {
+                        layout.matches(confirmed)
+                    }
+                }) && (!placement.primary()
+                    || find_output(confirmed, output)
+                        .is_some_and(|actual| actual["priority"] == 1)))
+            },
         )
     }
 }
@@ -517,6 +536,120 @@ fn configure_target(
     output: &str,
     target: &OwnedTarget,
     x: i64,
+    arguments: Vec<String>,
+    newly_connected: bool,
+    preserved: impl FnMut(&Value) -> Result<bool, String>,
+) -> Result<(), String> {
+    configure_target_at(
+        desktop,
+        output,
+        target,
+        PlacementPlan {
+            position: (x, 0),
+            fallback: None,
+        },
+        arguments,
+        newly_connected,
+        preserved,
+    )
+}
+
+struct PlacementPlan {
+    position: (i64, i64),
+    fallback: Option<(i64, i64)>,
+}
+
+fn extended_configuration(
+    configuration: &Value,
+    output: &str,
+    specification: &Specification,
+    target: &OwnedTarget,
+    layout: Option<&Layout>,
+    placement: &Placement,
+) -> Result<(PlacementPlan, Vec<String>), String> {
+    let right = match layout {
+        Some(layout) => layout.right_edge(),
+        None => right_edge(configuration, output)?,
+    };
+    let mut arguments = match layout {
+        Some(layout) if placement.primary() => {
+            layout.arguments_with_primary(configuration, output)?
+        }
+        Some(layout) => layout.arguments(configuration)?,
+        None if placement.primary() => primary_arguments(configuration, output)?,
+        None => Vec::new(),
+    };
+    let priority = if placement.primary() {
+        1
+    } else {
+        match layout {
+            Some(layout) => layout.next_priority() as usize,
+            None => live_next_priority(configuration, output)?,
+        }
+    };
+    let mut plan = PlacementPlan {
+        position: (right, 0),
+        fallback: None,
+    };
+    if placement.isolated() {
+        let bottom = match layout {
+            Some(layout) => layout.bottom_edge(),
+            None => bottom_edge(configuration, output)?,
+        };
+        let scale = target
+            .scale
+            .or_else(|| find_output(configuration, output)?["scale"].as_f64())
+            .filter(|scale| scale.is_finite() && (0.25..=5.0).contains(scale))
+            .ok_or("invalid owned display scale")?;
+        let maximum = |axis| {
+            configuration["screen"]["maxSize"][axis]
+                .as_i64()
+                .filter(|value| (1..=65536).contains(value))
+                .unwrap_or(64000)
+        };
+        let max_width = maximum("width");
+        let max_height = maximum("height");
+        let x = right.max(max_width - (f64::from(specification.width) / scale) as i64);
+        let y = bottom.max(max_height - (f64::from(specification.height) / scale) as i64);
+        if (0..=65536).contains(&x) && (0..=65536).contains(&y) {
+            plan.position = (x, y);
+            plan.fallback = Some((right, 0));
+        }
+    }
+    arguments.extend(target.arguments_at(output, plan.position, priority));
+    Ok((plan, arguments))
+}
+
+fn primary_arguments(configuration: &Value, owned: &str) -> Result<Vec<String>, String> {
+    let outputs = configuration["outputs"]
+        .as_array()
+        .filter(|outputs| outputs.len() <= 64)
+        .ok_or("invalid KScreen output list")?;
+    let mut peers = outputs
+        .iter()
+        .filter(|output| {
+            output["name"] != owned && output["connected"] == true && output["enabled"] == true
+        })
+        .collect::<Vec<_>>();
+    peers.sort_by_key(|output| output["priority"].as_u64().unwrap_or(0));
+    peers
+        .iter()
+        .enumerate()
+        .map(|(index, output)| {
+            let name = output["name"]
+                .as_str()
+                .filter(|name| valid_output_name(name))
+                .ok_or("invalid KScreen output name")?;
+            Ok(format!("output.{name}.priority.{}", index + 2))
+        })
+        .collect()
+}
+
+fn configure_target_at(
+    desktop: &mut impl Desktop,
+    output: &str,
+    target: &OwnedTarget,
+    mut plan: PlacementPlan,
     mut arguments: Vec<String>,
     newly_connected: bool,
     mut preserved: impl FnMut(&Value) -> Result<bool, String>,
@@ -533,11 +666,23 @@ fn configure_target(
             arguments.push(format!("{prefix}wcg.disable"));
         }
     }
-    desktop.apply(&arguments)?;
+    if let Err(error) = desktop.apply(&arguments) {
+        let Some(fallback) = plan.fallback else {
+            return Err(error);
+        };
+        // Retry the rejected isolated placement while preserving every other
+        // setting and the durable pre-effect desktop baseline.
+        let prefix = format!("output.{output}.position.");
+        arguments.retain(|argument| !argument.starts_with(&prefix));
+        arguments.push(format!("{prefix}{},{}", fallback.0, fallback.1));
+        desktop.apply(&arguments)?;
+        plan.position = fallback;
+    }
     if target.hdr {
         wait_for_configuration(desktop, 1, |configuration| {
             Ok(find_output(configuration, output).is_some_and(|actual| {
-                target.base_matches(actual, x) && (!rearm_hdr || actual["hdr"] == false)
+                target.base_matches_at(actual, plan.position)
+                    && (!rearm_hdr || actual["hdr"] == false)
             }) && preserved(configuration)?)
         })?;
         desktop.apply(&[
@@ -546,10 +691,9 @@ fn configure_target(
         ])?;
     }
     wait_for_configuration(desktop, if rearm_hdr { 3 } else { 1 }, |configuration| {
-        Ok(
-            find_output(configuration, output).is_some_and(|actual| target.matches(actual, x))
-                && preserved(configuration)?,
-        )
+        Ok(find_output(configuration, output)
+            .is_some_and(|actual| target.matches_at(actual, plan.position))
+            && preserved(configuration)?)
     })
 }
 
@@ -617,11 +761,14 @@ impl OwnedTarget {
     /// content's rate. It is not read back: a compositor without VRR support
     /// for this output keeps streaming at the fixed mode rate.
     fn arguments(&self, output: &str, x: i64, priority: usize) -> Vec<String> {
+        self.arguments_at(output, (x, 0), priority)
+    }
+    fn arguments_at(&self, output: &str, position: (i64, i64), priority: usize) -> Vec<String> {
         let mut arguments = vec![
             format!("output.{output}.enable"),
             format!("output.{output}.mode.{}", self.mode),
             format!("output.{output}.rotation.none"),
-            format!("output.{output}.position.{x},0"),
+            format!("output.{output}.position.{},{}", position.0, position.1),
             format!(
                 "output.{output}.hdr.{}",
                 if self.hdr { "enable" } else { "disable" }
@@ -638,10 +785,16 @@ impl OwnedTarget {
         }
         arguments
     }
+    #[cfg(test)]
     fn matches(&self, actual: &Value, x: i64) -> bool {
-        self.base_matches(actual, x) && actual["hdr"] == self.hdr && actual["wcg"] == self.hdr
+        self.matches_at(actual, (x, 0))
     }
-    fn base_matches(&self, actual: &Value, x: i64) -> bool {
+    fn matches_at(&self, actual: &Value, position: (i64, i64)) -> bool {
+        self.base_matches_at(actual, position)
+            && actual["hdr"] == self.hdr
+            && actual["wcg"] == self.hdr
+    }
+    fn base_matches_at(&self, actual: &Value, position: (i64, i64)) -> bool {
         let scale_matches = match self.scale {
             Some(scale) => actual["scale"]
                 .as_f64()
@@ -650,8 +803,8 @@ impl OwnedTarget {
         };
         actual["enabled"] == true
             && scale_matches
-            && actual["pos"]["x"].as_i64() == Some(x)
-            && actual["pos"]["y"].as_i64() == Some(0)
+            && actual["pos"]["x"].as_i64() == Some(position.0)
+            && actual["pos"]["y"].as_i64() == Some(position.1)
             && actual["currentModeId"].as_str() == Some(&self.mode)
             && actual["rotation"] == 1
     }
@@ -751,6 +904,16 @@ fn right_edge(configuration: &Value, owned: &str) -> Result<i64, String> {
 /// Right edge, in logical pixels, of the connected and enabled outputs that
 /// `included` selects; zero when it selects none.
 fn right_edge_of(configuration: &Value, included: impl Fn(&str) -> bool) -> Result<i64, String> {
+    desktop_edge_of(configuration, included, true)
+}
+fn bottom_edge(configuration: &Value, owned: &str) -> Result<i64, String> {
+    desktop_edge_of(configuration, |name| name != owned, false)
+}
+fn desktop_edge_of(
+    configuration: &Value,
+    included: impl Fn(&str) -> bool,
+    horizontal: bool,
+) -> Result<i64, String> {
     let outputs = configuration["outputs"]
         .as_array()
         .filter(|outputs| outputs.len() <= 64)
@@ -761,14 +924,16 @@ fn right_edge_of(configuration: &Value, included: impl Fn(&str) -> bool) -> Resu
             && output["connected"] == true
             && output["enabled"] == true
     }) {
-        let x = output["pos"]["x"]
+        let position = output["pos"][if horizontal { "x" } else { "y" }]
             .as_i64()
+            .filter(|position| position.unsigned_abs() <= 65536)
             .ok_or("invalid KScreen position")?;
         let scale = output["scale"]
             .as_f64()
             .filter(|v| v.is_finite() && (0.25..=5.0).contains(v))
             .ok_or("invalid KScreen scale")?;
-        let size = if matches!(output["rotation"].as_u64(), Some(2 | 8 | 32 | 128)) {
+        let rotated = matches!(output["rotation"].as_u64(), Some(2 | 8 | 32 | 128));
+        let size = if horizontal == rotated {
             &output["size"]["height"]
         } else {
             &output["size"]["width"]
@@ -777,7 +942,7 @@ fn right_edge_of(configuration: &Value, included: impl Fn(&str) -> bool) -> Resu
             .as_u64()
             .filter(|v| *v <= 8192)
             .ok_or("invalid KScreen width")?;
-        right = right.max(x + (width as f64 / scale).ceil() as i64);
+        right = right.max(position + (width as f64 / scale).ceil() as i64);
     }
     if !(0..=65536).contains(&right) {
         return Err("desktop bounds exceed supported coordinates".into());
@@ -1033,6 +1198,7 @@ mod tests {
         applications: Vec<Vec<String>>,
         queries: usize,
         elapsed: Duration,
+        reject_applications: usize,
     }
     impl SequenceDesktop {
         fn new(observations: Vec<Value>) -> Self {
@@ -1042,6 +1208,7 @@ mod tests {
                 applications: Vec::new(),
                 queries: 0,
                 elapsed: Duration::ZERO,
+                reject_applications: 0,
             }
         }
     }
@@ -1055,7 +1222,12 @@ mod tests {
         }
         fn apply(&mut self, arguments: &[String]) -> Result<(), String> {
             self.applications.push(arguments.to_vec());
-            Ok(())
+            if self.reject_applications > 0 {
+                self.reject_applications -= 1;
+                Err("compositor rejected placement".into())
+            } else {
+                Ok(())
+            }
         }
         fn elapsed(&self) -> Duration {
             self.elapsed
@@ -1066,6 +1238,98 @@ mod tests {
     }
     fn owned_state(mode: &str, hdr: bool) -> Value {
         json!({"outputs":[{"name":"Virtual-2","connected":true,"enabled":true,"scale":1.5,"pos":{"x":0,"y":0},"currentModeId":mode,"rotation":1,"hdr":hdr,"wcg":hdr}]})
+    }
+    #[test]
+    fn extended_layouts_resolve_primary_and_isolated_positions_without_disabling_peers() {
+        let configuration = json!({"screen":{"maxSize":{"width":64000,"height":64000}},"outputs":[
+            {"name":"HDMI-A-1","connected":true,"enabled":true,"size":{"width":1920,"height":1080},"pos":{"x":0,"y":0},"rotation":1,"scale":1.0,"priority":1,"currentModeId":"1","modes":[{"id":"1","size":{"width":1920,"height":1080},"refreshRate":60.0}]},
+            {"name":"Virtual-2","connected":true,"enabled":true,"scale":1.5,"pos":{"x":0,"y":0},"currentModeId":"7","rotation":1,"hdr":false,"wcg":false,"priority":2}
+        ]});
+        let layout = Layout::capture(&configuration, "Virtual-2").unwrap();
+        let specification = Specification {
+            identity: "11111111-1111-4111-8111-111111111111".into(),
+            name: "Display".into(),
+            width: 1280,
+            height: 720,
+            refresh_millihz: 60000,
+            hdr_enabled: false,
+        };
+        let target = OwnedTarget {
+            mode: "7".into(),
+            scale: Some(1.5),
+            hdr: false,
+        };
+        for (placement, expected_position, expected_priority) in [
+            (Placement::Extended, (1920, 0), 2),
+            (Placement::ExtendedPrimary, (1920, 0), 1),
+            (Placement::ExtendedIsolated, (63147, 63520), 2),
+            (Placement::ExtendedPrimaryIsolated, (63147, 63520), 1),
+        ] {
+            let (plan, arguments) = extended_configuration(
+                &configuration,
+                "Virtual-2",
+                &specification,
+                &target,
+                Some(&layout),
+                &placement,
+            )
+            .unwrap();
+            assert_eq!(plan.position, expected_position);
+            assert_eq!(plan.fallback, placement.isolated().then_some((1920, 0)));
+            assert!(arguments.contains(&format!("output.Virtual-2.priority.{expected_priority}")));
+            assert!(arguments.contains(&format!(
+                "output.Virtual-2.position.{},{}",
+                expected_position.0, expected_position.1
+            )));
+            assert!(!arguments.contains(&"output.HDMI-A-1.disable".into()));
+            if placement.primary() {
+                assert!(arguments.contains(&"output.HDMI-A-1.priority.2".into()));
+            }
+        }
+    }
+    #[test]
+    fn rejected_isolated_placement_retries_adjacent_and_verifies_that_position() {
+        let target = OwnedTarget {
+            mode: "7".into(),
+            scale: Some(1.5),
+            hdr: false,
+        };
+        let mut desktop = SequenceDesktop::new(vec![owned_state("7", false)]);
+        desktop.reject_applications = 1;
+        configure_target_at(
+            &mut desktop,
+            "Virtual-2",
+            &target,
+            PlacementPlan {
+                position: (63000, 63000),
+                fallback: Some((0, 0)),
+            },
+            target.arguments_at("Virtual-2", (63000, 63000), 1),
+            true,
+            |_| Ok(true),
+        )
+        .unwrap();
+        assert_eq!(desktop.applications.len(), 2);
+        assert!(desktop.applications[0].contains(&"output.Virtual-2.position.63000,63000".into()));
+        assert!(desktop.applications[1].contains(&"output.Virtual-2.position.0,0".into()));
+        assert!(!desktop.applications[1].contains(&"output.Virtual-2.position.63000,63000".into()));
+        assert_eq!(desktop.queries, 1);
+        let mut desktop = SequenceDesktop::new(vec![owned_state("7", false)]);
+        desktop.reject_applications = 1;
+        assert!(
+            configure_target(
+                &mut desktop,
+                "Virtual-2",
+                &target,
+                0,
+                target.arguments("Virtual-2", 0, 1),
+                true,
+                |_| Ok(true)
+            )
+            .is_err()
+        );
+        assert_eq!(desktop.applications.len(), 1);
+        assert_eq!(desktop.queries, 0);
     }
     #[test]
     fn hdr_activation_follows_settled_mode_and_rearm_then_stable_color_readbacks() {

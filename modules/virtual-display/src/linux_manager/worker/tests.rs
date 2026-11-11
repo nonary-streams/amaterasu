@@ -835,7 +835,7 @@ fn connector_discovery_failure_or_exhaustion_admits_no_effect() {
 }
 
 #[test]
-fn exclusive_streams_keep_peer_outputs_and_restore_the_pre_stream_desktop() {
+fn exclusive_streams_extend_when_a_peer_already_owns_an_output() {
     let (root, mut controller) = fixture();
     controller.layout = VirtualDisplayLayout::Exclusive;
     let first = controller
@@ -856,29 +856,69 @@ fn exclusive_streams_keep_peer_outputs_and_restore_the_pre_stream_desktop() {
         controller.compositor.placements,
         [
             ("Virtual-2".into(), Placement::Exclusive { keep: vec![] }),
-            (
-                "Virtual-3".into(),
-                Placement::Exclusive {
-                    keep: vec!["Virtual-2".into()]
-                }
-            ),
+            ("Virtual-3".into(), Placement::Extended),
         ]
     );
     // The snapshot taken before the effect stays journaled, so removal
     // re-enables the displays this stream turned off.
-    assert!(
-        controller
-            .journal
-            .records
-            .iter()
-            .all(|record| record.layout.is_some())
-    );
+    assert!(controller.journal.records[0].layout.is_some());
+    // The second stream changed no peer layout and keeps later user choices.
+    assert!(controller.journal.records[1].layout.is_none());
     controller.remove(&first.key()).unwrap();
     controller.remove(&second.key()).unwrap();
     assert_eq!(controller.compositor.restored, [true, true, true, true]);
     assert!(controller.journal.records.is_empty());
     drop(controller);
     fs::remove_dir_all(root).unwrap();
+}
+#[test]
+fn all_layout_variants_reach_the_compositor_and_only_primary_keeps_its_baseline() {
+    for (layout, placement, retains_baseline) in [
+        (
+            VirtualDisplayLayout::Exclusive,
+            Placement::Exclusive { keep: vec![] },
+            true,
+        ),
+        (VirtualDisplayLayout::Extended, Placement::Extended, false),
+        (
+            VirtualDisplayLayout::ExtendedPrimary,
+            Placement::ExtendedPrimary,
+            true,
+        ),
+        (
+            VirtualDisplayLayout::ExtendedIsolated,
+            Placement::ExtendedIsolated,
+            false,
+        ),
+        (
+            VirtualDisplayLayout::ExtendedPrimaryIsolated,
+            Placement::ExtendedPrimaryIsolated,
+            true,
+        ),
+    ] {
+        let (root, mut controller) = fixture();
+        let record = controller
+            .create_with_references(
+                "session".into(),
+                specification(FIRST),
+                ScaleSetting::Retain,
+                None,
+                layout,
+            )
+            .unwrap();
+        assert_eq!(
+            controller.compositor.placements,
+            [("Virtual-2".into(), placement)]
+        );
+        assert_eq!(
+            controller.journal.records[0].layout.is_some(),
+            retains_baseline
+        );
+        controller.remove(&record.key()).unwrap();
+        assert!(controller.journal.records.is_empty());
+        drop(controller);
+        fs::remove_dir_all(root).unwrap();
+    }
 }
 #[test]
 fn per_request_layout_is_used_without_changing_the_controller_default() {
