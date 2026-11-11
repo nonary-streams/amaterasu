@@ -390,6 +390,33 @@ Replay and closed-stream scope fences have finite limits, including 8,192-entry
 bounds. Exhaustion fences further admission; it does not make old operation IDs
 safe to reuse.
 
+### Ended holders
+
+An admission holds its mutation domains until its provider confirms the work
+it admitted. A holder whose owner has ended does not keep a later session
+waiting on that indefinitely:
+
+- An admission made by an earlier host run is displaced as soon as a later
+  plan needs one of its domains, and is set aside before a plan is refused for
+  admission capacity. Nothing of that run is still executing.
+- An admission of this run whose session or stream was asked to end is waited
+  for ten seconds and then displaced, provided trusted composition granted its
+  provider `amaterasu.lifecycle/domain-takeover`. A provider with that grant
+  stops changing a domain for an earlier admission once a request arrives
+  under a newer one, and reports the earlier work's outcome as it ended.
+- Without the grant the plan waits the full 20 seconds and fails with the
+  domain and holder named, for example `mutation domain is reserved:
+  amaterasu.frame-limiter/policy is held by ended session ... whose provider
+  cannot hand it over`.
+- A holder whose owner is still open is never displaced.
+
+A displaced admission stays on record with its plan and cleanup obligations.
+It holds no domain and counts against no bound, and the rights check before
+every callback refuses it, so nothing more is dispatched under it. A late
+outcome closes its own record and cannot release, refresh or publish anything
+of its successor. `docs/lifecycle-admission-and-retirement.md` describes the
+same rule across the other lifecycle layers.
+
 Restart creates a new host epoch and fences old live bindings. Explicit
 `recover_session` can query a known, persisted provider receipt using its original
 resource identity under fresh owner authorization. It never replays an unknown
@@ -452,7 +479,9 @@ rather than silently discard necessary evidence. The endpoint and integrated
 recovery path remain subject to qualification.
 
 A failed or rejected preparation callback does not establish that its effects
-were absent or cleaned up. Its admission remains held for recovery. After a
+were absent or cleaned up. Its admission remains held for recovery, until a
+later session needs one of its mutation domains and the holder's owner has
+ended; see "Ended holders" below. After a
 restart, failed initial application preparation with no admitted application or
 stream can query the selected provider's exact saved receipt. Only a cleanup
 response confirming every obligation in the original plan as released, with no

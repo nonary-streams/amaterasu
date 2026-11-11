@@ -6,6 +6,12 @@ request, changed host epoch or empty local list does not prove a native effect
 has retired. Consumers use the selected versioned provider contracts and retain
 unresolved ownership until those contracts establish retirement.
 
+Retaining ownership is not the same as holding admission. A record keeps its
+cleanup identity and what it still owes for as long as it exists, and reports
+that honestly. It stops counting against any limit, slot or lock the moment
+its owner is asked to end. `lifecycle-admission-and-retirement.md` states that
+rule and where each layer applies it.
+
 ## Shutdown order
 
 A consumer closes admission, fences startup, and drains owned work while its
