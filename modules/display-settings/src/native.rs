@@ -5,50 +5,13 @@ use amaterasu_module_sdk::display_settings::{
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::{
-    io::Read,
-    process::{Command, Stdio},
-    thread,
-    time::{Duration, Instant},
-};
+use std::time::Duration;
+
+mod command;
 
 pub struct NativeBackend;
 fn run(arguments: &[String]) -> Result<Vec<u8>> {
-    let mut child = Command::new("kscreen-doctor")
-        .args(arguments)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|_| "display_backend_unavailable")?;
-    let mut pipe = child.stdout.take().ok_or("display_backend_unavailable")?;
-    let reader = thread::spawn(move || {
-        let mut bytes = Vec::new();
-        pipe.by_ref()
-            .take(1024 * 1024 + 1)
-            .read_to_end(&mut bytes)
-            .map(|_| bytes)
-    });
-    let deadline = Instant::now() + Duration::from_secs(3);
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(5)),
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                break None;
-            }
-        }
-    };
-    let bytes = reader
-        .join()
-        .map_err(|_| "display_backend_failed")?
-        .map_err(|_| "display_backend_failed")?;
-    if !status.is_some_and(|s| s.success()) || bytes.len() > 1024 * 1024 {
-        return Err("display_backend_failed".into());
-    }
-    Ok(bytes)
+    command::run(arguments, Duration::from_secs(3))
 }
 fn query() -> Result<Value> {
     serde_json::from_slice(&run(&["-j".into()])?).map_err(|_| "display_inventory_invalid".into())

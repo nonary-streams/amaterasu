@@ -11,6 +11,9 @@ amaterasu-storage.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [lints]
 workspace = true
 

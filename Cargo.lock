@@ -338,6 +338,7 @@ dependencies = [
  "amaterasu-module-sdk",
  "amaterasu-runtime",
  "amaterasu-storage",
+ "libc",
  "serde",
  "serde_json",
  "sha2",
