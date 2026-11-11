@@ -24,6 +24,11 @@ impl<D: Driver> Manager<D> {
         let Some(monitor) = self.monitors.get(&key) else {
             return failure("owned_target_unavailable");
         };
+        if monitor.specification.requested_resolution_only
+            && (width != monitor.specification.width || height != monitor.specification.height)
+        {
+            return failure("catalog_recreation_required");
+        }
         let mut desired = monitor.specification.clone();
         desired.width = width;
         desired.height = height;

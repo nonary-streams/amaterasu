@@ -21,6 +21,20 @@ observed count and any driver error. A failure leaves temporary creation availab
 Count confirmation does not establish output activation or capture readiness.
 This setting does not change the eight-record limit for temporary leased
 monitors.
+
+Windows Create may set `requested_resolution_only:true` to request the driver's
+private mode catalog for that exact resolution. The actual opened producer must
+advertise control protocol 3.8 or later before this flag is sent. Older producers
+continue to support ordinary full-catalog requests and reject an explicit private
+catalog without issuing a native Create. Independent driver-state readback must
+confirm both the catalog policy and the descriptor dimensions. The policy is
+part of the persisted allocation identity; changing its resolution requires owned
+removal and recreation rather than retained mode reconfiguration. The caller's
+authenticated session policy remains responsible for admitting a private output.
+Status exposes `requested_resolution_catalog_supported` as null until a producer
+handshake is known, then reports that producer's capability. A source build alone
+does not establish driver support or native playback qualification.
+
 `enabled` remains the module's service gate and is independent of the stable
 configuration setting names. When it is false, create returns `disabled` without
 touching the driver. When the module is enabled, create may manage a temporary

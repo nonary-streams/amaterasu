@@ -29,6 +29,19 @@ pub struct Observation {
 }
 
 pub trait Driver {
+    /// `None` means no compatible producer handshake has been observed yet.
+    fn requested_resolution_catalog_supported(&self) -> Option<bool> {
+        None
+    }
+    /// Read-only capability validation before a durable allocation intent.
+    fn validate_create(&mut self, specification: &Specification) -> Result<(), &'static str> {
+        if specification.requested_resolution_only
+            && self.requested_resolution_catalog_supported() != Some(true)
+        {
+            return Err("unsupported_requested_resolution_catalog");
+        }
+        Ok(())
+    }
     /// Permanent displays are configured only from the trusted startup settings.
     fn permanent_count_supported(&self) -> bool {
         false

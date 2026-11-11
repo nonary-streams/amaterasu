@@ -159,11 +159,17 @@ impl Default for Settings {
 pub struct Specification {
     #[serde(default)]
     pub hdr_enabled: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub requested_resolution_only: bool,
     pub identity: String,
     pub width: u32,
     pub height: u32,
     pub refresh_millihz: u32,
     pub name: String,
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 impl Specification {

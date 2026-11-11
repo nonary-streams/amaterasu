@@ -7,6 +7,8 @@ pub const NAMESPACE: [u8; 16] = [
 ];
 pub const LEASE_TIMEOUT_MS: u32 = 10_000;
 pub const STATE_BYTES: usize = 1696;
+const REQUESTED_RESOLUTION_CREATE_FLAG: u32 = 0x2;
+const REQUESTED_RESOLUTION_STATE_FLAG: u32 = 0x4;
 
 pub const fn ioctl(function: u32, access: u32) -> u32 {
     (0x22 << 16) | (access << 14) | (function << 2)
@@ -38,7 +40,28 @@ pub fn check_version(bytes: &[u8]) -> Result<(), &'static str> {
     Ok(())
 }
 
-pub fn create(spec: &Specification, lease: u64, display: u64, capability: &[u8; 32]) -> Vec<u8> {
+pub fn minor_version(bytes: &[u8]) -> Result<u16, &'static str> {
+    check_version(bytes)?;
+    Ok(u16::from_le_bytes(bytes[18..20].try_into().unwrap()))
+}
+
+pub fn requested_resolution_catalog_supported(driver_minor: u16) -> bool {
+    driver_minor >= 8
+}
+
+pub fn create(
+    spec: &Specification,
+    lease: u64,
+    display: u64,
+    capability: &[u8; 32],
+    driver_minor: u16,
+) -> Result<Vec<u8>, &'static str> {
+    if driver_minor < 6 {
+        return Err("incompatible_driver");
+    }
+    if spec.requested_resolution_only && !requested_resolution_catalog_supported(driver_minor) {
+        return Err("unsupported_requested_resolution_catalog");
+    }
     let mut bytes = packet(128);
     put_u64(&mut bytes, 16, lease);
     put_u64(&mut bytes, 24, display);
@@ -53,9 +76,12 @@ pub fn create(spec: &Specification, lease: u64, display: u64, capability: &[u8; 
         put_u32(&mut bytes, offset, value);
     }
     bytes[56..56 + spec.name.len()].copy_from_slice(spec.name.as_bytes());
+    if spec.requested_resolution_only {
+        put_u32(&mut bytes, 88, REQUESTED_RESOLUTION_CREATE_FLAG);
+    }
     // Retain stable identity, default driver HDR luminance. No global manifest edits.
     bytes[96..128].copy_from_slice(capability);
-    bytes
+    Ok(bytes)
 }
 
 pub fn permanent_count_request(count: u8) -> Result<Vec<u8>, &'static str> {
@@ -207,7 +233,14 @@ pub fn matches_specification(
     lease: u64,
     display: u64,
     spec: &Specification,
+    driver_minor: u16,
 ) -> Result<bool, &'static str> {
+    if driver_minor < 6 {
+        return Err("incompatible_driver");
+    }
+    if spec.requested_resolution_only && !requested_resolution_catalog_supported(driver_minor) {
+        return Err("unsupported_requested_resolution_catalog");
+    }
     check(bytes, STATE_BYTES)?;
     let count = read_u32(bytes, 24) as usize;
     if count > 16 || read_u32(bytes, 16) > 16 || read_u32(bytes, 20) > 16 {
@@ -225,6 +258,9 @@ pub fn matches_specification(
                 .position(|byte| *byte == 0)
                 .ok_or("invalid_driver_response")?;
             return Ok(read_u32(bytes, offset + 52) == spec.width
+                && (!requested_resolution_catalog_supported(driver_minor)
+                    || (read_u32(bytes, offset + 4) & REQUESTED_RESOLUTION_STATE_FLAG != 0)
+                        == spec.requested_resolution_only)
                 && read_u32(bytes, offset + 56) == spec.height
                 && read_u32(bytes, offset + 60) == 600
                 && read_u32(bytes, offset + 64) == 340
@@ -297,6 +333,7 @@ mod tests {
     #[test]
     fn fixed_wire_layout_uses_documented_offsets_and_owned_capability() {
         let spec = Specification {
+            requested_resolution_only: false,
             hdr_enabled: false,
             identity: "00000000-0000-0000-0000-000000000001".into(),
             width: 1920,
@@ -304,7 +341,7 @@ mod tests {
             refresh_millihz: 59940,
             name: "Example".into(),
         };
-        let encoded = create(&spec, 0x6000000000000001, 42, &[0x7c; 32]);
+        let encoded = create(&spec, 0x6000000000000001, 42, &[0x7c; 32], 7).unwrap();
         assert_eq!(encoded.len(), 128);
         assert_eq!(&encoded[..16], &NAMESPACE);
         assert_eq!(read_u64(&encoded, 16), 0x6000000000000001);
@@ -373,8 +410,40 @@ mod tests {
     }
 
     #[test]
+    fn private_catalog_create_requires_actual_producer_support() {
+        let mut specification = Specification {
+            requested_resolution_only: false,
+            hdr_enabled: false,
+            identity: "00000000-0000-0000-0000-000000000001".into(),
+            width: 1920,
+            height: 1080,
+            refresh_millihz: 60_000,
+            name: "Private display".into(),
+        };
+        for minor in [6, 7, 8, 9] {
+            let request = create(&specification, 7, 8, &[0x7c; 32], minor).unwrap();
+            assert_eq!(read_u32(&request, 88), 0);
+        }
+        specification.requested_resolution_only = true;
+        for minor in [6, 7] {
+            assert_eq!(
+                create(&specification, 7, 8, &[0x7c; 32], minor),
+                Err("unsupported_requested_resolution_catalog")
+            );
+        }
+        for minor in [8, 9] {
+            let request = create(&specification, 7, 8, &[0x7c; 32], minor).unwrap();
+            assert_eq!(read_u32(&request, 88), REQUESTED_RESOLUTION_CREATE_FLAG);
+            assert_eq!(read_u32(&request, 32), 1920);
+            assert_eq!(read_u32(&request, 36), 1080);
+            assert_eq!(&request[96..], &[0x7c; 32]);
+        }
+    }
+
+    #[test]
     fn state_requires_unique_exact_specification() {
         let spec = Specification {
+            requested_resolution_only: false,
             hdr_enabled: false,
             identity: "00000000-0000-0000-0000-000000000001".into(),
             width: 1920,
@@ -396,9 +465,24 @@ mod tests {
         assert!(present(&state, 7, 8).unwrap());
         assert!(occupied_by_other_lease(&state, 9, 8).unwrap());
         assert!(!occupied_by_other_lease(&state, 7, 8).unwrap());
-        assert!(matches_specification(&state, 7, 8, &spec).unwrap());
+        assert!(matches_specification(&state, 7, 8, &spec, 8).unwrap());
+        let private = Specification {
+            requested_resolution_only: true,
+            ..spec.clone()
+        };
+        assert!(!matches_specification(&state, 7, 8, &private, 8).unwrap());
+        put_u32(&mut state, 36, REQUESTED_RESOLUTION_STATE_FLAG);
+        assert!(matches_specification(&state, 7, 8, &private, 8).unwrap());
+        assert!(!matches_specification(&state, 7, 8, &spec, 8).unwrap());
+        // Older producers do not define the additive catalog state bit.
+        assert!(matches_specification(&state, 7, 8, &spec, 7).unwrap());
+        assert!(matches_specification(&state, 7, 8, &private, 7).is_err());
+        put_u32(&mut state, 84, 1280);
+        assert!(!matches_specification(&state, 7, 8, &private, 8).unwrap());
+        put_u32(&mut state, 84, spec.width);
+        put_u32(&mut state, 36, 0);
         state[104] = b'X';
-        assert!(!matches_specification(&state, 7, 8, &spec).unwrap());
+        assert!(!matches_specification(&state, 7, 8, &spec, 8).unwrap());
         put_u32(&mut state, 24, 2);
         put_u32(&mut state, 136, 2);
         put_u64(&mut state, 152, 8);

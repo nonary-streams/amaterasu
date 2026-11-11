@@ -24,20 +24,28 @@ const IO_TIMEOUT_MS: u32 = 200;
 #[derive(Default)]
 pub struct NativeDriver {
     handle: Option<OwnedHandle>,
+    protocol_minor: Option<u16>,
 }
 
 impl NativeDriver {
+    fn ensure_connected(&mut self) -> Result<(), &'static str> {
+        if self.handle.is_none() {
+            let handle = open_driver()?;
+            let version = ioctl(&handle, protocol::VERSION, &[], 24)?;
+            let minor = protocol::minor_version(&version)?;
+            self.handle = Some(handle);
+            self.protocol_minor = Some(minor);
+        }
+        Ok(())
+    }
+
     fn exchange(
         &mut self,
         code: u32,
         input: &[u8],
         output_size: usize,
     ) -> Result<Vec<u8>, &'static str> {
-        if self.handle.is_none() {
-            let handle = open_driver()?;
-            protocol::check_version(&ioctl(&handle, protocol::VERSION, &[], 24)?)?;
-            self.handle = Some(handle);
-        }
+        self.ensure_connected()?;
         let result = ioctl(
             self.handle.as_ref().expect("connected driver"),
             code,
@@ -46,12 +54,26 @@ impl NativeDriver {
         );
         if result.is_err() {
             self.handle = None;
+            self.protocol_minor = None;
         }
         result
     }
 }
 
 impl Driver for NativeDriver {
+    fn requested_resolution_catalog_supported(&self) -> Option<bool> {
+        self.protocol_minor
+            .map(protocol::requested_resolution_catalog_supported)
+    }
+    fn validate_create(&mut self, specification: &Specification) -> Result<(), &'static str> {
+        if specification.requested_resolution_only {
+            self.ensure_connected()?;
+            if self.requested_resolution_catalog_supported() != Some(true) {
+                return Err("unsupported_requested_resolution_catalog");
+            }
+        }
+        Ok(())
+    }
     fn permanent_count_supported(&self) -> bool {
         true
     }
@@ -88,7 +110,14 @@ impl Driver for NativeDriver {
         display: u64,
         capability: &[u8; 32],
     ) -> Result<Binding, &'static str> {
-        let request = protocol::create(spec, lease, display, capability);
+        self.ensure_connected()?;
+        let request = protocol::create(
+            spec,
+            lease,
+            display,
+            capability,
+            self.protocol_minor.expect("connected producer version"),
+        )?;
         protocol::created(
             &self.exchange(protocol::CREATE_OWNED, &request, 56)?,
             lease,
@@ -130,8 +159,14 @@ impl Driver for NativeDriver {
         let state = self.exchange(protocol::QUERY_STATE, &[], protocol::STATE_BYTES)?;
         let exists = protocol::present(&state, lease, display)?;
         let occupied_by_other_lease = protocol::occupied_by_other_lease(&state, lease, display)?;
-        let specification_matches =
-            !exists || protocol::matches_specification(&state, lease, display, specification)?;
+        let specification_matches = !exists
+            || protocol::matches_specification(
+                &state,
+                lease,
+                display,
+                specification,
+                self.protocol_minor.expect("connected producer version"),
+            )?;
         let lease_state =
             self.exchange(protocol::QUERY_LEASE, &protocol::lease_request(lease), 48)?;
         let pending_departure = protocol::pending_departure(&lease_state, lease)?;

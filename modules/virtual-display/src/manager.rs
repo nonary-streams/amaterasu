@@ -526,6 +526,7 @@ impl<D: Driver> Manager<D> {
             } => self.status(caller, identity, reference_id),
             Operation::Create {
                 hdr_enabled,
+                requested_resolution_only,
                 identity,
                 width,
                 height,
@@ -574,6 +575,7 @@ impl<D: Driver> Manager<D> {
                     caller,
                     Specification {
                         hdr_enabled,
+                        requested_resolution_only,
                         identity,
                         width,
                         height,
@@ -698,6 +700,7 @@ impl<D: Driver> Manager<D> {
             "permanent_monitor_runtime_error":self.permanent.error,
             "permanent_monitor_runtime_count":self.permanent.observed_count,
             "supported_platform":self.driver.supported(),
+            "requested_resolution_catalog_supported":self.driver.requested_resolution_catalog_supported(),
             "driver":driver,
             "activation_supported":false,
             "activation_state":activation_state,
@@ -781,6 +784,9 @@ impl<D: Driver> Manager<D> {
             .any(|monitor| monitor.display_id == display_id)
         {
             return failure("identity_collision");
+        }
+        if let Err(error) = self.driver.validate_create(&specification) {
+            return failure(error);
         }
         let mut secrets = [0u8; 40];
         if getrandom::fill(&mut secrets).is_err() {

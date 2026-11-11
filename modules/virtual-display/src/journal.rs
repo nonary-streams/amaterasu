@@ -254,6 +254,7 @@ mod tests {
         ));
         let path = root.join("leases.jsonl");
         let specification = Specification {
+            requested_resolution_only: false,
             hdr_enabled: false,
             identity: "00000000-0000-0000-0000-000000000001".into(),
             width: 1920,
@@ -280,6 +281,7 @@ mod tests {
         assert_eq!(journal.records().next().unwrap().lease, record.lease);
         assert_eq!(journal.records().next().unwrap().references, None);
         let mut referenced_record = record.clone();
+        referenced_record.specification.requested_resolution_only = true;
         referenced_record.references = Some(BTreeSet::from(["stream-a".into()]));
         journal.upsert(referenced_record.clone()).unwrap();
         drop(journal);
@@ -287,6 +289,14 @@ mod tests {
         assert_eq!(
             journal.records().next().unwrap().references,
             referenced_record.references
+        );
+        assert!(
+            journal
+                .records()
+                .next()
+                .unwrap()
+                .specification
+                .requested_resolution_only
         );
         drop(journal);
         OpenOptions::new()

@@ -11,6 +11,7 @@ const CAPTURE_OUTPUT: &str =
     "exact-target:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 #[derive(Default)]
 struct Calls {
+    catalog_supported: Option<bool>,
     unsupported: bool,
     permanent_supported: bool,
     permanent_queries: VecDeque<Result<u32, &'static str>>,
@@ -34,6 +35,9 @@ struct Calls {
 }
 struct Fake(Rc<RefCell<Calls>>);
 impl Driver for Fake {
+    fn requested_resolution_catalog_supported(&self) -> Option<bool> {
+        self.0.borrow().catalog_supported
+    }
     fn permanent_count_supported(&self) -> bool {
         self.0.borrow().permanent_supported
     }
@@ -77,6 +81,9 @@ impl Driver for Fake {
         _: &[u8; 32],
     ) -> Result<Binding, &'static str> {
         let mut calls = self.0.borrow_mut();
+        if specification.requested_resolution_only && calls.catalog_supported != Some(true) {
+            return Err("unsupported_requested_resolution_catalog");
+        }
         calls.creates.push((lease, display));
         calls.allocation = Some(specification.clone());
         calls.exists = true;
@@ -144,6 +151,7 @@ fn setup(enabled: bool) -> (Manager<Fake>, Rc<RefCell<Calls>>) {
 }
 fn create() -> Operation {
     Operation::Create {
+        requested_resolution_only: false,
         hdr_enabled: false,
         identity: ID.into(),
         width: 1920,
@@ -159,6 +167,7 @@ fn create() -> Operation {
 }
 fn create_with_scale(dd_virtual_display_scale: i32) -> Operation {
     Operation::Create {
+        requested_resolution_only: false,
         hdr_enabled: false,
         identity: ID.into(),
         width: 1920,
@@ -174,6 +183,7 @@ fn create_with_scale(dd_virtual_display_scale: i32) -> Operation {
 }
 fn create_with_reference(reference_id: &str) -> Operation {
     Operation::Create {
+        requested_resolution_only: false,
         hdr_enabled: false,
         identity: ID.into(),
         width: 1920,
@@ -186,6 +196,92 @@ fn create_with_reference(reference_id: &str) -> Operation {
         expected_topology_revision: None,
         expected_topology_domain_id: None,
     }
+}
+
+fn create_with_private_catalog(reference_id: &str) -> Operation {
+    let mut operation = create_with_reference(reference_id);
+    if let Operation::Create {
+        requested_resolution_only,
+        ..
+    } = &mut operation
+    {
+        *requested_resolution_only = true;
+    }
+    operation
+}
+
+#[test]
+fn private_catalog_identity_preserves_policy_and_requires_recreation_for_new_resolution() {
+    let (mut manager, calls) = setup(true);
+    calls.borrow_mut().catalog_supported = Some(true);
+    let request = create_with_private_catalog("private-session");
+    let response = manager.handle("alice", request.clone());
+    assert_eq!(response["ok"], true);
+    assert_eq!(
+        response["monitor"]["specification"]["requested_resolution_only"],
+        true
+    );
+    assert_eq!(manager.handle("alice", request)["ok"], true);
+    assert_eq!(calls.borrow().creates.len(), 1);
+    assert_eq!(
+        manager.handle("alice", create_with_reference("private-session"))["code"],
+        "identity_conflict"
+    );
+    calls.borrow_mut().ready = true;
+    tick(&mut manager);
+    let changed_resolution = Operation::PrepareRetainedMode {
+        operation_id: "private-mode-change".into(),
+        identity: ID.into(),
+        reference_id: "private-session".into(),
+        expected_reference_ids: vec!["private-session".into()],
+        expected_mode_revision: 0,
+        width: 1280,
+        height: 720,
+        refresh_millihz: 60_000,
+        hdr_enabled: false,
+    };
+    assert_eq!(
+        manager.handle("alice", changed_resolution)["code"],
+        "catalog_recreation_required"
+    );
+    assert_eq!(calls.borrow().creates.len(), 1);
+    assert!(calls.borrow().removes.is_empty());
+}
+
+#[test]
+fn unsupported_private_catalog_has_no_native_create_and_capability_stays_observed() {
+    let (mut manager, calls) = setup(true);
+    assert!(global_status(&mut manager)["requested_resolution_catalog_supported"].is_null());
+    calls.borrow_mut().catalog_supported = Some(false);
+    let reply = manager.handle("alice", create_with_private_catalog("private-session"));
+    assert_eq!(reply["ok"], false);
+    assert_eq!(reply["code"], "unsupported_requested_resolution_catalog");
+    assert!(calls.borrow().creates.is_empty());
+    assert_eq!(
+        global_status(&mut manager)["requested_resolution_catalog_supported"],
+        false
+    );
+    drop(manager);
+    assert!(calls.borrow().removes.is_empty());
+}
+
+#[test]
+fn private_catalog_specification_preserves_legacy_journals_and_explicit_policy() {
+    let mut specification = recovery_record(None).specification;
+    let legacy = serde_json::to_value(&specification).unwrap();
+    assert!(legacy.get("requested_resolution_only").is_none());
+    assert!(
+        !serde_json::from_value::<Specification>(legacy)
+            .unwrap()
+            .requested_resolution_only
+    );
+    specification.requested_resolution_only = true;
+    let encoded = serde_json::to_value(&specification).unwrap();
+    assert_eq!(encoded["requested_resolution_only"], true);
+    assert_eq!(
+        serde_json::from_value::<Specification>(encoded).unwrap(),
+        specification
+    );
 }
 fn tick(manager: &mut Manager<Fake>) {
     for monitor in manager.monitors.values_mut() {
@@ -424,6 +520,7 @@ fn recovery_record(prospective_lease: Option<u64>) -> Record {
             name,
             ..
         } => Specification {
+            requested_resolution_only: false,
             hdr_enabled: false,
             identity,
             width,

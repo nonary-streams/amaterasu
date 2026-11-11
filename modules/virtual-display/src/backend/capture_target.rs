@@ -41,6 +41,7 @@ mod tests {
 
     fn specification() -> Specification {
         Specification {
+            requested_resolution_only: false,
             identity: "00000000-0000-0000-0000-000000000001".into(),
             name: "Remote monitor".into(),
             width: 1920,
@@ -104,6 +105,7 @@ mod tests {
             );
         }
         let sdr = Specification {
+            requested_resolution_only: false,
             hdr_enabled: false,
             ..expected
         };
