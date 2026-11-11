@@ -97,7 +97,7 @@ impl Controller {
     fn evictable(&self, record: &Record) -> bool {
         let settled = record.source_observations_emitted()
             && record.uncertain.is_empty()
-            && self.job.as_ref().is_none_or(|job| job.record != record.id);
+            && !self.has_job(record.id);
         let confirmed = matches!(record.state, State::Stopped | State::Failed)
             && !record.rtsp_requested
             && !record.history_release_required;
@@ -329,10 +329,7 @@ impl Controller {
         let complete: Vec<_> = self
             .records
             .values()
-            .filter(|record| {
-                record.state == State::Stopping
-                    && self.job.as_ref().is_none_or(|job| job.record != record.id)
-            })
+            .filter(|record| record.state == State::Stopping && !self.has_job(record.id))
             .map(|record| record.id)
             .collect();
         let mut replies = Vec::new();
@@ -359,13 +356,16 @@ impl Controller {
         }) {
             self.pending_resume = None;
         }
-        let cancel_job = self.job.as_ref().is_some_and(|job| {
-            self.records
-                .get(&job.record)
-                .is_some_and(|record| record.application_root() == application)
-        });
-        if cancel_job && let Some(job) = self.job.as_mut() {
-            job.call.cancel();
+        let members: Vec<u64> = self
+            .records
+            .values()
+            .filter(|record| record.application_root() == application)
+            .map(|record| record.id)
+            .collect();
+        for job in self.jobs_mut() {
+            if members.contains(&job.record) {
+                job.call.cancel();
+            }
         }
         for record in self
             .records

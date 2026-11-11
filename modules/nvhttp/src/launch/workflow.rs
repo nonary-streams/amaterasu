@@ -182,9 +182,16 @@ fn log_monitor_problem(
 }
 
 impl Controller {
+    /// Whether a step of this record's workflow can start now.
+    pub(super) fn has_schedulable_work(&self, record: &Record, now: Instant) -> bool {
+        needs_work(record, now) && !self.application_cleanup_waits_for_clients(record)
+    }
+
+    /// Start the next step of one record that holds an application. They
+    /// share the job slot and take turns.
     pub(super) fn schedule(&mut self, now: Instant) {
         let eligible = |record: &&Record| {
-            needs_work(record, now) && !self.application_cleanup_waits_for_clients(record)
+            self.served_by_job_slot(record) && self.has_schedulable_work(record, now)
         };
         let Some(id) = self
             .records
@@ -197,6 +204,11 @@ impl Controller {
             return;
         };
         self.last_scheduled_record = id;
+        self.schedule_record(id, now);
+    }
+
+    /// Start the next step of `id` in the job slot.
+    pub(super) fn schedule_record(&mut self, id: u64, now: Instant) {
         let Some(mut record) = self.records.remove(&id) else {
             return;
         };

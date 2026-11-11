@@ -9,6 +9,7 @@ use crate::launch::{
 };
 use crate::preparation::{LegacyPreparationStep, PreparationStep};
 use amaterasu_contracts::virtual_display::VirtualDisplayIntent;
+use amaterasu_module_sdk::lifecycle_ledger::{Admission, Owner, Retirement};
 use serde_json::Value;
 use std::{
     collections::VecDeque,
@@ -44,10 +45,41 @@ impl State {
         matches!(self, Self::Stopped | Self::Failed | Self::CleanupAbandoned)
     }
 
-    /// Cleanup is in flight or still owes an automatic retry. A new launch
-    /// waits for this instead of being refused.
+    /// Cleanup is in flight or still owes an automatic retry.
     pub fn closing(self) -> bool {
         matches!(self, Self::Stopping | Self::CleanupFailed)
+    }
+}
+
+impl Owner for Record {
+    /// A record is open while it holds the application: from launch until
+    /// the application is asked to end. A root that is only retiring its own
+    /// transport still holds the application it will be resumed into.
+    fn admission(&self) -> Admission {
+        match self.state {
+            State::Starting | State::AwaitingDelivery | State::Ready | State::Paused => {
+                Admission::Open
+            }
+            State::Stopping | State::CleanupFailed if self.retains_application() => Admission::Open,
+            State::Stopping
+            | State::CleanupFailed
+            | State::Stopped
+            | State::Failed
+            | State::CleanupAbandoned => Admission::Ended,
+        }
+    }
+
+    fn retirement(&self) -> Retirement {
+        match self.state {
+            State::Stopped | State::Failed => Retirement::Confirmed,
+            State::CleanupAbandoned => Retirement::Abandoned,
+            State::CleanupFailed => Retirement::Unconfirmed,
+            State::Starting
+            | State::AwaitingDelivery
+            | State::Ready
+            | State::Paused
+            | State::Stopping => Retirement::Pending,
+        }
     }
 }
 
@@ -273,6 +305,9 @@ pub struct Record {
     /// The failure and cleanup codes last written to the log, so each change
     /// is reported once.
     pub reported_outcome: Option<(State, Option<&'static str>, Option<&'static str>)>,
+    /// When this record stopped holding the application, as first observed.
+    /// A later launch waits a bounded time past this for cleanup to finish.
+    pub ended_at: Option<Instant>,
     pub uncertain: VecDeque<(Phase, Call)>,
     pub retrying_uncertainty: bool,
     pub rtsp_reconcile: Option<Phase>,
@@ -475,6 +510,7 @@ impl Record {
             automatic_cleanup_retry_active: false,
             next_automatic_cleanup_retry: None,
             reported_outcome: None,
+            ended_at: None,
             uncertain: VecDeque::new(),
             retrying_uncertainty: false,
             rtsp_reconcile: None,

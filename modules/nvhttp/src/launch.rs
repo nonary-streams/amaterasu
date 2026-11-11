@@ -32,6 +32,7 @@ use crate::encoder_snapshot::{
 };
 use crate::preparation::{LegacyPreparationStep, PreparationStep};
 use crate::wire::{ClientConfigOverrides, Reply, xml};
+use amaterasu_module_sdk::lifecycle_ledger::{Admission, Owner};
 use amaterasu_module_sdk::{Command, LogEmitter, LogLevel, ModuleResult, Response};
 use record::{Record, Stage, State};
 use serde::{Deserialize, Serialize};
@@ -744,12 +745,22 @@ pub struct Controller {
     retired_stream_keys: BTreeSet<[u8; 32]>,
     pending_resume: Option<PendingResume>,
     deferred_launch: Option<cleanup_recovery::DeferredLaunch>,
+    /// Set while a held launch is admitted, so it is not held a second time.
+    admitting_deferred: bool,
     management_replies: Vec<(u64, Reply)>,
     job: Option<Job>,
     nonce: [u8; 16],
     next_id: u64,
     sequence: u64,
     last_scheduled_record: u64,
+    /// One job per record that no longer holds an application. Each ended
+    /// record's cleanup runs on its own, so a stop that never returns cannot
+    /// hold back a later launch or another record's cleanup.
+    retiring_jobs: BTreeMap<u64, Job>,
+    /// The job slot's own job while an ended record's job occupies it.
+    parked_job: Option<Job>,
+    /// Set while an ended record's job occupies the job slot.
+    retiring_lane: bool,
     auxiliary_black_capture_provider: Option<CaptureProvider>,
     auxiliary_black_capture_route_key: Option<String>,
     auxiliary_exact_capture_provider: Option<CaptureProvider>,
@@ -805,12 +816,16 @@ impl Controller {
             retired_stream_keys: BTreeSet::new(),
             pending_resume: None,
             deferred_launch: None,
+            admitting_deferred: false,
             management_replies: Vec::new(),
             job: None,
             nonce,
             next_id: 0,
             sequence: 0,
             last_scheduled_record: 0,
+            retiring_jobs: BTreeMap::new(),
+            parked_job: None,
+            retiring_lane: false,
             auxiliary_black_capture_provider: None,
             auxiliary_black_capture_route_key: Some("synthetic_black".into()),
             auxiliary_exact_capture_provider: None,
@@ -1039,10 +1054,7 @@ impl Controller {
                 .records
                 .values()
                 .find(|record| management_reference(record) == reference),
-            None => self
-                .records
-                .values()
-                .find(|record| !record.state.terminal()),
+            None => self.current_record(|_| true),
         };
         match record {
             Some(record) => json!({"ok":true,"launch":{
@@ -1158,7 +1170,7 @@ impl Controller {
         } else if record.state != State::Stopping {
             record.request_cleanup(None, now);
         }
-        if !already_stopping && let Some(job) = self.job.as_mut().filter(|job| job.record == id) {
+        if !already_stopping && let Some(job) = self.job_mut(|record| record == id) {
             job.call.cancel();
         }
         json!({"ok":true,"accepted":true,"reference":reference})
@@ -1244,6 +1256,7 @@ impl Controller {
             shared_capture,
             response,
         } = source;
+        self.stamp_ended(now);
         if peer.paired() {
             self.prune_finished_transports();
             if self.retired_stream_key(&request) {
@@ -1370,17 +1383,21 @@ impl Controller {
             return self.join_or_resume(connection, request, peer, response, now);
         }
         if auxiliary.is_none() {
-            match self.application_admission() {
-                cleanup_recovery::ApplicationAdmission::Free => {}
-                cleanup_recovery::ApplicationAdmission::Active => {
-                    return Some(private_error(503, "another application is active"));
-                }
-                // The earlier application is on its way out. Borrowed capture
-                // sources are bound to this instant and cannot be held.
-                cleanup_recovery::ApplicationAdmission::Closing if shared_capture.is_some() => {
+            if self.application_admission() == cleanup_recovery::ApplicationAdmission::Active {
+                return Some(private_error(503, "another application is active"));
+            }
+            match self.launch_hold(now) {
+                None => {}
+                // Borrowed capture sources are bound to this instant and
+                // cannot be held while a retained application settles.
+                Some(cleanup_recovery::LaunchHold::Settling) if shared_capture.is_some() => {
                     return Some(private_error(503, "previous application is still closing"));
                 }
-                cleanup_recovery::ApplicationAdmission::Closing => {
+                // An ended application never refuses a launch: one that
+                // cannot wait for its cleanup starts beside it.
+                Some(cleanup_recovery::LaunchHold::Predecessor(_))
+                    if shared_capture.is_some() || self.admitting_deferred => {}
+                Some(_) => {
                     return self.defer_launch(connection, request, peer, response, now);
                 }
             }
@@ -1498,14 +1515,10 @@ impl Controller {
             .any(|record| record.auxiliary.is_some() && !record.state.terminal());
         let normal_application = (!auxiliary_active)
             .then(|| {
-                self.records
-                    .values()
-                    .find(|record| {
-                        record.auxiliary.is_none()
-                            && record.application_session.is_none()
-                            && !record.state.terminal()
-                    })
-                    .map(|record| record.id)
+                self.current_record(|record| {
+                    record.auxiliary.is_none() && record.application_session.is_none()
+                })
+                .map(|record| record.id)
             })
             .flatten();
         let shared_member = self.shared_cancel_member(peer).or_else(|| {
@@ -1535,11 +1548,12 @@ impl Controller {
         if cancel_pending_resume {
             self.pending_resume = None;
         }
-        let Some(record) = self.records.values_mut().find(|record| {
-            !record.state.terminal()
-                && (record.peer.certificate == peer.certificate
-                    || normal_application == Some(record.id))
-        }) else {
+        let target = self
+            .current_record(|record| {
+                record.peer.certificate == peer.certificate || normal_application == Some(record.id)
+            })
+            .map(|record| record.id);
+        let Some(record) = target.and_then(|id| self.records.get_mut(&id)) else {
             if self.records.values().any(|record| !record.state.terminal()) {
                 return Some(private_error(403, "stream is owned by another client"));
             }
@@ -1580,7 +1594,8 @@ impl Controller {
         if let Some(pending) = retry {
             record.uncertain.push_front(pending);
         }
-        if let Some(job) = self.job.as_mut().filter(|job| job.record == record.id) {
+        let id = record.id;
+        if let Some(job) = self.job_mut(|record| record == id) {
             job.call.cancel();
         }
         None
@@ -1778,10 +1793,25 @@ impl Controller {
         let mut replies = std::mem::take(&mut self.management_replies);
         self.advance_restart_sweep(now, send);
         self.synchronize_application_cleanup(now);
+        self.move_ended_job_to_its_own_lane();
         if let Some(mut job) = self.job.take() {
             self.advance(&mut job, now, send, &mut replies);
         }
+        for record in self.retiring_jobs.keys().copied().collect::<Vec<_>>() {
+            self.with_retiring_job(record, |controller| {
+                if let Some(mut job) = controller.job.take() {
+                    controller.advance(&mut job, now, send, &mut replies);
+                }
+            });
+        }
         self.recover_failed_cleanup(now, send);
+        self.stamp_ended(now);
+        self.keep_launch_capacity(send);
+        // Ended records are scheduled first: one that ends while the job
+        // slot is scheduled has its cleanup planned on the next tick.
+        for record in self.retiring_records_with_work(now) {
+            self.with_retiring_job(record, |controller| controller.schedule_record(record, now));
+        }
         if self.job.is_none() {
             self.schedule(now);
         }
@@ -1793,7 +1823,7 @@ impl Controller {
                     .records
                     .get(&pending.record)
                     .is_some_and(|record| record.state.terminal())
-                && self.job.is_none()
+                && self.no_jobs()
         });
         if resume_ready && let Some(pending) = self.pending_resume.take() {
             // An abandoned ticket may still hold its key downstream, so only a
@@ -1923,7 +1953,7 @@ impl Controller {
                 record.cancel_connection = None;
             }
         }
-        if let Some(job) = self.job.as_mut().filter(|job| Some(job.record) == affected) {
+        if let Some(job) = self.job_mut(|record| Some(record) == affected) {
             job.call.cancel();
         } else if let Some(record) = affected.and_then(|id| self.records.get_mut(&id))
             && record.resume_abandoned
@@ -1996,12 +2026,10 @@ impl Controller {
                 }
             }
         }
-        if let Some(job) = self
-            .job
-            .as_mut()
-            .filter(|job| affected.contains(&job.record))
-        {
-            job.call.cancel();
+        for job in self.jobs_mut() {
+            if affected.contains(&job.record) {
+                job.call.cancel();
+            }
         }
         close
     }
@@ -2031,12 +2059,100 @@ impl Controller {
                 record.request_cleanup(Some("host_stopping"), now);
             }
         }
-        self.job.is_none() && self.records.values().all(|record| record.state.terminal())
+        self.no_jobs() && self.records.values().all(|record| record.state.terminal())
+    }
+
+    /// The record a host-wide request means: the application that is still
+    /// held when there is one, otherwise the oldest unfinished record. An
+    /// application left closing must not hide the one that replaced it.
+    fn current_record(&self, mut candidate: impl FnMut(&Record) -> bool) -> Option<&Record> {
+        let mut oldest = None;
+        for record in self.records.values() {
+            if record.state.terminal() || !candidate(record) {
+                continue;
+            }
+            if record.auxiliary.is_none() && record.admission() == Admission::Open {
+                return Some(record);
+            }
+            oldest.get_or_insert(record);
+        }
+        oldest
+    }
+
+    /// Work on one ended record with its job in the job slot. The workflow
+    /// reads and writes that one slot; which record it serves is the lane.
+    fn with_retiring_job(&mut self, record: u64, work: impl FnOnce(&mut Self)) {
+        debug_assert!(!self.retiring_lane);
+        self.parked_job = self.job.take();
+        self.job = self.retiring_jobs.remove(&record);
+        self.retiring_lane = true;
+        work(self);
+        self.retiring_lane = false;
+        if let Some(job) = self.job.take() {
+            self.retiring_jobs.insert(job.record, job);
+        }
+        self.job = self.parked_job.take();
+    }
+
+    /// A record can end while its job is in flight. Its job then leaves the
+    /// job slot, which serves records that still hold an application.
+    fn move_ended_job_to_its_own_lane(&mut self) {
+        let ended = self.job.as_ref().is_some_and(|job| {
+            self.records
+                .get(&job.record)
+                .is_some_and(|record| record.admission() == Admission::Ended)
+        });
+        if ended && let Some(job) = self.job.take() {
+            self.retiring_jobs.insert(job.record, job);
+        }
+    }
+
+    /// Ended records that have a cleanup step to start.
+    fn retiring_records_with_work(&self, now: Instant) -> Vec<u64> {
+        self.records
+            .values()
+            .filter(|record| {
+                record.admission() == Admission::Ended
+                    && !self.has_job(record.id)
+                    && self.has_schedulable_work(record, now)
+            })
+            .map(|record| record.id)
+            .collect()
+    }
+
+    /// Whether the job slot serves this record: it still holds an
+    /// application and none of its work is in flight elsewhere.
+    fn served_by_job_slot(&self, record: &Record) -> bool {
+        record.admission() == Admission::Open && !self.retiring_jobs.contains_key(&record.id)
+    }
+
+    fn has_job(&self, record: u64) -> bool {
+        self.retiring_jobs.contains_key(&record)
+            || self
+                .job
+                .iter()
+                .chain(self.parked_job.iter())
+                .any(|job| job.record == record)
+    }
+
+    fn no_jobs(&self) -> bool {
+        self.job.is_none() && self.parked_job.is_none() && self.retiring_jobs.is_empty()
+    }
+
+    fn jobs_mut(&mut self) -> impl Iterator<Item = &mut Job> {
+        self.job
+            .iter_mut()
+            .chain(self.parked_job.iter_mut())
+            .chain(self.retiring_jobs.values_mut())
+    }
+
+    fn job_mut(&mut self, mut selected: impl FnMut(u64) -> bool) -> Option<&mut Job> {
+        self.jobs_mut().find(|job| selected(job.record))
     }
 
     pub fn package_activation_barrier(&mut self, pending: bool) -> bool {
         self.package_activation_pending = pending;
-        self.job.is_none()
+        self.no_jobs()
             && self.pending_resume.is_none()
             && self.deferred_launch.is_none()
             && self.pending_auxiliary.is_empty()
@@ -2044,7 +2160,7 @@ impl Controller {
     }
 
     pub fn shutdown(&mut self, send: &mut Send<'_>) {
-        if let Some(job) = self.job.as_mut() {
+        for job in self.jobs_mut() {
             job.call.shutdown(send);
         }
         self.restart_sweep.shutdown(send);

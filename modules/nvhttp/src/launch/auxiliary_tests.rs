@@ -865,7 +865,8 @@ fn auxiliary_retired_records_do_not_exhaust_future_admissions() {
         controller.take_auxiliary_events();
         assert!(controller.records.len() <= MAX_RECORDS);
     }
-    assert_eq!(controller.retired_stream_keys.len(), 1);
+    // Each tick keeps one slot free, so the last launch retired one more.
+    assert_eq!(controller.retired_stream_keys.len(), 2);
 }
 
 fn assert_stream_response(reply: &Reply, expected: StreamResponse) {
@@ -1819,10 +1820,9 @@ fn cleanup_retries_preserve_another_streams_admitted_broker_call() {
             Command::TakeResult { request } if *request == admitted_request)));
         assert!(commands.iter().any(|command| matches!(command,
             Command::ReleaseResult { request } if *request == admitted_request)));
-        assert_eq!(
-            controller.job.as_ref().unwrap().record,
-            application,
-            "the queued cleanup retry runs after the existing request settles"
+        assert!(
+            controller.retiring_jobs.contains_key(&application),
+            "the cleanup retry runs in its own lane beside the other stream"
         );
         assert_eq!(controller.records[&application].state, State::Stopping);
     }
