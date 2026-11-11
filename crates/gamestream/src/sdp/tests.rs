@@ -390,3 +390,22 @@ fn omitted_parity_policy_is_distinct_from_explicit_zero_and_input_encryption_is_
     support.fec = false;
     zero.check_support(&support).unwrap();
 }
+
+#[test]
+fn configured_bandwidth_can_exceed_the_capped_encoder_bitrate() {
+    let announcement =
+        changed("x-ml-video.configuredBitrateKbps", "150000").replace(":16000 ", ":100000 ");
+    let parsed = parse_announce(announcement.as_bytes()).unwrap();
+    assert_eq!(parsed.video.configured_bitrate_kbps, Some(150000));
+    assert_eq!(parsed.video.bitrate_kbps, 100000);
+    // Metadata does not increase the permitted encoder bitrate.
+    let over_limit = announcement.replace(":100000 ", ":100001 ");
+    assert!(parse_announce(over_limit.as_bytes()).is_err());
+    assert!(
+        parse_announce(changed("x-ml-video.configuredBitrateKbps", "15999").as_bytes()).is_err()
+    );
+    assert!(
+        parse_announce(changed("x-ml-video.configuredBitrateKbps", "4294967296").as_bytes())
+            .is_err()
+    );
+}

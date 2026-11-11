@@ -163,7 +163,10 @@ fn bitrate(attributes: &mut Attributes<'_>) -> Result<(u32, Option<u32>), Error>
     }
     let configured = attributes.optional("x-ml-video.configuredBitrateKbps")?;
     if let Some(value) = configured {
-        bounded(value, maximum, 100_000, "configured bitrate")?;
+        // Moonlight reports the user's original bandwidth setting here, even
+        // when its encoder request above is capped at 100 Mbps. This metadata
+        // does not choose the encoder bitrate or authorize extra bandwidth.
+        bounded(value, maximum, u32::MAX, "configured bitrate")?;
     }
     Ok((maximum, configured))
 }
