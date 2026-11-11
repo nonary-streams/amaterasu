@@ -57,6 +57,14 @@ the broker process. Global policy updates reach every context, while scoped
 settings, held input, controller slots and feedback remain independent. Legacy
 unbound input and Windows input retain exclusive behavior.
 
+External capture also uses lifecycle-bound input. After capture acknowledgement,
+the coordinator issues an input token fenced by the immutable stream generation,
+without manufacturing a managed capture candidate. Native input acquisition is
+verified before starting the stream, and its exact retirement remains required
+before shared cleanup. Existing installations need the input/coordinator call
+grants and the `issue_input_binding`, `ack_binding`, and `validate_input_binding`
+operation grants from the current default profile.
+
 The first transport reserves configured UDP endpoints at base +9 through +11.
 The second transport on that admitted local address uses base +12 through +14
 through the selected Network provider. RTSP advertises the actual provider
@@ -65,8 +73,10 @@ and uncertain teardown retain their reservations; a third admission fails until
 a slot is available, and socket reuse does not route client traffic.
 
 Named PipeWire CPU frames can be resized and letterboxed independently for each
-client. Video and absolute input share the exact fitted rectangle, including
-uneven pixel borders. This does not enable resizing for other frame types.
+client. The NVENC/CUDA encoder can also fit DMA-BUF and negotiated CUDA sources
+to each client's output dimensions on its worker. Providers that cannot scale
+decline mismatched source dimensions before accepting input. Video and absolute
+input share the exact fitted rectangle, including uneven pixel borders.
 
 Settled joining-record metadata is bounded and can be retired. Exact SHA-256 key
 fingerprints preserve replay rejection after eviction; exhausting the bounded

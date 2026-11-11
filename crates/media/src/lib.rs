@@ -491,6 +491,9 @@ pub struct EncoderApiV1_1 {
     pub submit: unsafe extern "C" fn(*mut c_void, u64, *const CpuFrame, u32) -> Status,
     pub receive: unsafe extern "C" fn(*mut c_void, u64, PacketSink) -> Status,
     pub drain: unsafe extern "C" fn(*mut c_void, u64) -> Status,
+    /// The descriptor describes the source size. A provider may fit that source
+    /// into its independently configured output size, or decline it before any
+    /// effect with MEDIA_UNSUPPORTED. Consumers preserve source dimensions.
     pub submit_dmabuf: unsafe extern "C" fn(*mut c_void, u64, *const DmaBufFrame, u32) -> Status,
 }
 
