@@ -414,7 +414,9 @@ impl Controller {
     ) -> Option<Reply> {
         let application = self.records[&member].application_root();
         let root = &self.records[&application];
-        if (root.state == State::Stopping && !root.automatic_retry_in_flight())
+        if (root.state == State::Stopping
+            && !root.automatic_retry_in_flight()
+            && !root.retains_application())
             || root.cancel_connection.is_some()
         {
             return Some(private_error(

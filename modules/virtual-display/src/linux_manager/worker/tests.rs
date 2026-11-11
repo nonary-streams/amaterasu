@@ -1056,6 +1056,48 @@ fn failed_restore_without_a_surviving_monitor_keeps_the_stream_display_lit() {
     fs::remove_dir_all(root).unwrap();
 }
 
+#[test]
+fn failed_setup_restore_unplugs_only_with_a_surviving_desktop() {
+    for survivor in [false, true] {
+        let (root, mut controller) = fixture();
+        let record = controller
+            .create_with_references(
+                "owner".into(),
+                specification(FIRST),
+                ScaleSetting::Automatic,
+                Some(Default::default()),
+                VirtualDisplayLayout::Exclusive,
+            )
+            .unwrap();
+        let mut retained = record.clone();
+        retained
+            .setup_layouts
+            .push(retained.layout.clone().unwrap());
+        controller.journal.update(retained).unwrap();
+        controller.compositor.fail_restore = true;
+        controller.compositor.guard_available = survivor;
+
+        assert!(controller.remove(&record.key()).unwrap());
+        assert_eq!(
+            controller.broker.connected(&record.output).unwrap(),
+            !survivor
+        );
+        let parked = &controller.journal.records[0];
+        assert!(parked.parked);
+        assert_eq!(parked.park_reason.as_deref(), Some("restore_failed"));
+        assert_eq!(parked.setup_layouts.len(), 1);
+        assert!(parked.layout.is_some());
+
+        controller.compositor.fail_restore = false;
+        controller.compositor.guard_available = true;
+        assert!(!controller.remove(&record.key()).unwrap());
+        assert!(!controller.broker.connected(&record.output).unwrap());
+        assert!(controller.journal.records.is_empty());
+        drop(controller);
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
 /// Leaves `FIRST` parked and connected, as when its stream ended with every
 /// monitor off.
 fn park_connected(

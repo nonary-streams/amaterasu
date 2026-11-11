@@ -23,6 +23,7 @@ mod tests {
     include!("launch/lifecycle_tests.rs");
     include!("launch/retirement_tests.rs");
     include!("launch/shared_session_tests.rs");
+    include!("launch/quit_tests.rs");
     include!("launch/auxiliary_tests.rs");
     include!("launch/cleanup_recovery_tests.rs");
 }
@@ -1562,11 +1563,10 @@ impl Controller {
         if record.lifecycle_prepare_dispatched && record.lifecycle_session_target.is_none() {
             return Some(private_error(503, "lifecycle cleanup is not yet available"));
         }
-        if cancel_pending_resume && record.state == State::Stopping {
-            record.cancel_connection = Some(connection);
-            return None;
-        }
-        if (record.state == State::Stopping && !record.automatic_retry_in_flight())
+        if (record.state == State::Stopping
+            && !record.automatic_retry_in_flight()
+            && !record.retains_application()
+            && !cancel_pending_resume)
             || record.cancel_connection.is_some()
         {
             return Some(private_error(409, "stream cleanup is already in progress"));
@@ -1576,6 +1576,9 @@ impl Controller {
             record.state, record.stage
         );
         record.cancel_connection = Some(connection);
+        // A client disconnect can start transport retirement before its Quit
+        // request arrives. Escalate that same cleanup to end the application;
+        // request_cleanup preserves the deadline of work already stopping.
         if record.application_session.is_none() {
             record.transport_only_cleanup = false;
         }

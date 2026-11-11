@@ -382,6 +382,17 @@ impl<B: Broker, C: Compositor, I: ConnectorInventory> Controller<B, C, I> {
         }
         while let Some(layout) = record.setup_layouts.last() {
             if let Err(error) = self.compositor.restore(Some(layout)) {
+                report_unconfirmed_restore(&record.output, "setup_before_unplug", &error);
+                // Reused outputs can owe an intermediate setup snapshot as
+                // well as the original desktop. A readback mismatch in either
+                // must not keep an idle stream display lit beside a survivor.
+                // Preserve both snapshots until restoration is confirmed.
+                if self.compositor.verify_removal_guard(&record.output) == Ok(true) {
+                    if connected {
+                        self.broker.set_connected(&record.output, false)?;
+                    }
+                    return self.park(record, "restore_failed");
+                }
                 if connected && self.compositor.verify_parked(&record.output).is_ok() {
                     return self.park(record, "restore_failed");
                 }

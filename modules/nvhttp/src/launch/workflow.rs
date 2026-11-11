@@ -1180,10 +1180,13 @@ impl Controller {
             reject_resume(record, replies);
             return;
         }
+        // A monitor started before Quit cannot choose pause after cleanup has
+        // acquired application-ending authority. Cleanup obtains its own proof.
         if record.state == State::Stopping
             && matches!(
                 job.phase,
-                Phase::VerifyPaused
+                Phase::MonitorRtsp
+                    | Phase::VerifyPaused
                     | Phase::VerifyResumeSession
                     | Phase::VerifyResumeApplication
                     | Phase::RefreshResumePolicy
@@ -1885,7 +1888,8 @@ impl Controller {
         if record.state == State::Stopping
             && matches!(
                 job.phase,
-                Phase::VerifyPaused
+                Phase::MonitorRtsp
+                    | Phase::VerifyPaused
                     | Phase::VerifyResumeSession
                     | Phase::VerifyResumeApplication
                     | Phase::RefreshResumePolicy
@@ -2025,7 +2029,8 @@ impl Controller {
         if record.state == State::Stopping
             && matches!(
                 job.phase,
-                Phase::VerifyPaused
+                Phase::MonitorRtsp
+                    | Phase::VerifyPaused
                     | Phase::VerifyResumeSession
                     | Phase::VerifyResumeApplication
                     | Phase::RefreshResumePolicy

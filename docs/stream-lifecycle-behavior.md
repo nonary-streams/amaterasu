@@ -51,10 +51,17 @@ transports before application cleanup; a configured stream-end lifetime policy
 can request that same end behavior. A joined transport never acquires the
 application owner's cleanup authority.
 
+Quit can arrive after disconnect has already started transport cleanup. It
+upgrades that cleanup to end the application within the existing deadline;
+late transport status replies cannot downgrade Quit back to pause.
+
 Capture and input retirement precede topology restoration. Pending display
 removal remains pending until the provider observes disappearance. A safely
 parked display may release active stream admission while retaining its durable
 native recovery record and reporting the actual parked output.
+The same removal guard applies when an intermediate setup layout fails to
+restore: an observed surviving output permits unplugging the idle display,
+while all unconfirmed snapshots remain retained for recovery.
 
 ## Preparation and restart
 
