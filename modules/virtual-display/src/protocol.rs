@@ -18,6 +18,8 @@ pub const REMOVE: u32 = ioctl(0x902, 3);
 pub const FEED: u32 = ioctl(0x903, 3);
 pub const QUERY_LEASE: u32 = ioctl(0x905, 1);
 pub const QUERY_STATE: u32 = ioctl(0x908, 1);
+pub const SET_PERMANENT_COUNT: u32 = ioctl(0x906, 3);
+pub const QUERY_PERMANENT_COUNT: u32 = ioctl(0x907, 1);
 
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Binding {
@@ -54,6 +56,36 @@ pub fn create(spec: &Specification, lease: u64, display: u64, capability: &[u8; 
     // Retain stable identity, default driver HDR luminance. No global manifest edits.
     bytes[96..128].copy_from_slice(capability);
     bytes
+}
+
+pub fn permanent_count_request(count: u8) -> Result<Vec<u8>, &'static str> {
+    if count > 4 {
+        return Err("invalid_permanent_count");
+    }
+    let mut bytes = packet(76);
+    for (offset, value) in [
+        (16, u32::from(count)),
+        (24, 1920),
+        (28, 1080),
+        (32, 600),
+        (36, 340),
+        (40, 60_000),
+    ] {
+        put_u32(&mut bytes, offset, value);
+    }
+    bytes[44..61].copy_from_slice(b"Amaterasu Display");
+    Ok(bytes)
+}
+
+pub fn permanent_count(bytes: &[u8]) -> Result<u32, &'static str> {
+    check(bytes, 80)?;
+    let current = read_u32(bytes, 16);
+    let maximum = read_u32(bytes, 20);
+    let temporary = read_u32(bytes, 24);
+    if maximum == 0 || maximum > 16 || current > maximum || temporary > 16 {
+        return Err("invalid_driver_response");
+    }
+    Ok(current)
 }
 
 pub fn created(bytes: &[u8], lease: u64, display: u64) -> Result<Binding, &'static str> {
@@ -231,6 +263,37 @@ fn read_u64(bytes: &[u8], offset: usize) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn permanent_count_codec_is_bounded_and_validates_independent_readback() {
+        let request = permanent_count_request(2).unwrap();
+        assert_eq!(request.len(), 76);
+        assert_eq!(&request[..16], &NAMESPACE);
+        assert_eq!(read_u32(&request, 16), 2);
+        assert_eq!(read_u32(&request, 20), 0);
+        assert_eq!(read_u32(&request, 24), 1920);
+        assert_eq!(read_u32(&request, 28), 1080);
+        assert_eq!(read_u32(&request, 40), 60_000);
+        assert_eq!(&request[44..62], b"Amaterasu Display\0");
+        assert!(permanent_count_request(5).is_err());
+        assert_eq!(read_u32(&permanent_count_request(0).unwrap(), 16), 0);
+
+        let mut observed = packet(80);
+        put_u32(&mut observed, 16, 2);
+        put_u32(&mut observed, 20, 4);
+        assert_eq!(permanent_count(&observed), Ok(2));
+        put_u32(&mut observed, 16, 5);
+        assert!(permanent_count(&observed).is_err());
+        put_u32(&mut observed, 16, 2);
+        put_u32(&mut observed, 24, 17);
+        assert!(permanent_count(&observed).is_err());
+        put_u32(&mut observed, 24, 0);
+        observed[0] ^= 1;
+        assert!(permanent_count(&observed).is_err());
+        for length in [0, 16, 79, 81] {
+            assert!(permanent_count(&vec![0; length]).is_err());
+        }
+    }
+
     #[test]
     fn fixed_wire_layout_uses_documented_offsets_and_owned_capability() {
         let spec = Specification {

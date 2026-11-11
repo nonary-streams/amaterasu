@@ -5,6 +5,7 @@ use crate::model::{
 };
 use crate::protocol::Binding;
 use crate::scale::ScaleSetting;
+mod permanent;
 mod retained_mode;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -115,16 +116,21 @@ pub struct Manager<D: Driver> {
     monitors: BTreeMap<(String, String), Monitor>,
     journal: Option<Journal>,
     cursor: usize,
+    permanent: permanent::RuntimeState,
 }
 
 impl<D: Driver> Manager<D> {
-    pub fn new(settings: Settings, driver: D) -> Self {
+    pub fn new(settings: Settings, mut driver: D) -> Self {
+        // Startup may perform bounded device I/O. Tick and public requests never
+        // retry this global configuration effect.
+        let permanent = permanent::synchronize(&settings, &mut driver);
         Self {
             settings,
             driver,
             monitors: BTreeMap::new(),
             journal: None,
             cursor: 0,
+            permanent,
         }
     }
 
@@ -687,8 +693,10 @@ impl<D: Driver> Manager<D> {
             "dd_use_sunshine_virtual_display_driver":self.settings.dd_use_sunshine_virtual_display_driver,
             "dd_virtual_display_permanent_count":self.settings.dd_virtual_display_permanent_count.unwrap_or_default(),
             "dd_virtual_display_permanent_count_configured":self.settings.dd_virtual_display_permanent_count.is_some(),
-            "permanent_monitor_runtime_supported":false,
-            "permanent_monitor_runtime_state":"unsupported",
+            "permanent_monitor_runtime_supported":self.permanent.supported,
+            "permanent_monitor_runtime_state":self.permanent.state,
+            "permanent_monitor_runtime_error":self.permanent.error,
+            "permanent_monitor_runtime_count":self.permanent.observed_count,
             "supported_platform":self.driver.supported(),
             "driver":driver,
             "activation_supported":false,

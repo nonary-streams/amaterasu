@@ -52,6 +52,25 @@ impl NativeDriver {
 }
 
 impl Driver for NativeDriver {
+    fn permanent_count_supported(&self) -> bool {
+        true
+    }
+    fn query_permanent_count(&mut self) -> Result<u32, &'static str> {
+        protocol::permanent_count(&self.exchange(protocol::QUERY_PERMANENT_COUNT, &[], 80)?)
+    }
+    fn set_permanent_count(&mut self, count: u8) -> Result<(), &'static str> {
+        let request = protocol::permanent_count_request(count)?;
+        let actual = protocol::permanent_count(&self.exchange(
+            protocol::SET_PERMANENT_COUNT,
+            &request,
+            80,
+        )?)?;
+        if actual == u32::from(count) {
+            Ok(())
+        } else {
+            Err("permanent_count_mismatch")
+        }
+    }
     fn capture_target(
         &mut self,
         binding: Option<Binding>,

@@ -29,6 +29,16 @@ pub struct Observation {
 }
 
 pub trait Driver {
+    /// Permanent displays are configured only from the trusted startup settings.
+    fn permanent_count_supported(&self) -> bool {
+        false
+    }
+    fn query_permanent_count(&mut self) -> Result<u32, &'static str> {
+        Err("unsupported_permanent_monitors")
+    }
+    fn set_permanent_count(&mut self, _count: u8) -> Result<(), &'static str> {
+        Err("unsupported_permanent_monitors")
+    }
     /// Independently observe a requested effective mode. This never changes the
     /// native allocation and cannot stand in for ownership inspection.
     fn capture_target(

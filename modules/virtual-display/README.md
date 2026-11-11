@@ -12,6 +12,13 @@ outside the range normalize to zero while remaining configured, matching
 Vibeshine. Non-integer and null values are rejected. Status reports numeric zero
 for an unset value and uses a separate configured flag to distinguish it from
 explicit zero.
+On Windows, an enabled provider using the Sunshine driver applies an explicitly
+configured count once during startup. An omitted count leaves the driver alone.
+It observes the current count first, skips unchanged values, and independently
+reads back a changed count, including after an uncertain acknowledgement.
+Status distinguishes applied, failed and unverified effects and exposes the
+observed count and any driver error. A failure leaves temporary creation available.
+Count confirmation does not establish output activation or capture readiness.
 This setting does not change the eight-record limit for temporary leased
 monitors.
 `enabled` remains the module's service gate and is independent of the stable
@@ -388,9 +395,9 @@ ambiguous creation, bounded exact cleanup, departure confirmation, and malformed
 lengths/counts/UTF-16. Persistent global configuration projection and per-client
 behavior remain pending; the defaults and module settings payload do not provide
 that configuration plumbing. The `dd_activate_virtual_display` stream-time
-topology behavior also remains pending. Permanent-monitor creation is unsupported:
-status reports the configured count and `permanent_monitor_runtime_supported:false`,
-but this module does not ask the driver to create permanent monitors. Product
+topology behavior also remains pending. Permanent-monitor startup policy uses the
+Windows driver's bounded count operation; other backends report
+`permanent_monitor_runtime_supported:false`. Product
 settings persistence and migration, and management edit authority remain pending.
 Windows driver qualification for permanent monitors has not been run. Run `cargo test -p
 amaterasu-virtual-display` and cross-check with `cargo check -p

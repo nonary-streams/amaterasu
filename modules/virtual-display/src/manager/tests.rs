@@ -2,6 +2,7 @@ use super::*;
 use crate::backend::Observation;
 use crate::scale::SUPPORTED_SCALE_VALUES;
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -10,6 +11,11 @@ const CAPTURE_OUTPUT: &str =
     "exact-target:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 #[derive(Default)]
 struct Calls {
+    permanent_supported: bool,
+    permanent_queries: VecDeque<Result<u32, &'static str>>,
+    permanent_query_calls: usize,
+    permanent_sets: Vec<u8>,
+    permanent_set_error: Option<&'static str>,
     supported_calls: usize,
     creates: Vec<(u64, u64)>,
     removes: Vec<(u64, u64)>,
@@ -27,6 +33,22 @@ struct Calls {
 }
 struct Fake(Rc<RefCell<Calls>>);
 impl Driver for Fake {
+    fn permanent_count_supported(&self) -> bool {
+        self.0.borrow().permanent_supported
+    }
+    fn query_permanent_count(&mut self) -> Result<u32, &'static str> {
+        let mut calls = self.0.borrow_mut();
+        calls.permanent_query_calls += 1;
+        calls
+            .permanent_queries
+            .pop_front()
+            .unwrap_or(Err("unexpected_permanent_query"))
+    }
+    fn set_permanent_count(&mut self, count: u8) -> Result<(), &'static str> {
+        let mut calls = self.0.borrow_mut();
+        calls.permanent_sets.push(count);
+        calls.permanent_set_error.map_or(Ok(()), Err)
+    }
     fn capture_target(
         &mut self,
         _: Option<Binding>,
@@ -1153,6 +1175,155 @@ fn status_reports_permanent_count_and_unsupported_runtime() {
     );
     assert_eq!(status["permanent_monitor_runtime_supported"], false);
     assert_eq!(status["permanent_monitor_runtime_state"], "unsupported");
+}
+
+fn permanent_setup(
+    settings: Settings,
+    observations: impl IntoIterator<Item = Result<u32, &'static str>>,
+    set_error: Option<&'static str>,
+) -> (Manager<Fake>, Rc<RefCell<Calls>>) {
+    let calls = Rc::new(RefCell::new(Calls {
+        permanent_supported: true,
+        permanent_queries: observations.into_iter().collect(),
+        permanent_set_error: set_error,
+        ..Default::default()
+    }));
+    (Manager::new(settings, Fake(calls.clone())), calls)
+}
+
+fn global_status(manager: &mut Manager<Fake>) -> Value {
+    manager.handle(
+        "alice",
+        Operation::Status {
+            identity: None,
+            reference_id: None,
+        },
+    )
+}
+
+#[test]
+fn permanent_policy_requires_explicit_enabled_supported_startup_settings() {
+    for settings in [
+        Settings {
+            enabled: true,
+            ..Default::default()
+        },
+        Settings {
+            dd_virtual_display_permanent_count: Some(0),
+            ..Default::default()
+        },
+        Settings {
+            enabled: true,
+            dd_use_sunshine_virtual_display_driver: false,
+            dd_virtual_display_permanent_count: Some(2),
+            ..Default::default()
+        },
+    ] {
+        let (mut manager, calls) = permanent_setup(settings, [], None);
+        assert_eq!(
+            global_status(&mut manager)["permanent_monitor_runtime_supported"],
+            true
+        );
+        manager.tick();
+        assert_eq!(calls.borrow().permanent_query_calls, 0);
+        assert!(calls.borrow().permanent_sets.is_empty());
+    }
+    let (mut unsupported, calls) = setup_with(Settings {
+        enabled: true,
+        dd_virtual_display_permanent_count: Some(2),
+        ..Default::default()
+    });
+    assert_eq!(
+        global_status(&mut unsupported)["permanent_monitor_runtime_state"],
+        "unsupported"
+    );
+    assert!(calls.borrow().permanent_sets.is_empty());
+}
+
+#[test]
+fn permanent_explicit_zero_is_applied_once_and_independently_observed() {
+    let (mut manager, calls) = permanent_setup(
+        Settings {
+            enabled: true,
+            dd_virtual_display_permanent_count: Some(0),
+            ..Default::default()
+        },
+        [Ok(2), Ok(0)],
+        None,
+    );
+    let status = global_status(&mut manager);
+    assert_eq!(status["permanent_monitor_runtime_state"], "applied");
+    assert_eq!(status["permanent_monitor_runtime_count"], 0);
+    assert!(status["permanent_monitor_runtime_error"].is_null());
+    manager.tick();
+    manager.tick();
+    assert_eq!(calls.borrow().permanent_sets, vec![0]);
+    assert_eq!(calls.borrow().permanent_query_calls, 2);
+}
+
+#[test]
+fn matching_permanent_count_needs_no_mutation() {
+    let (mut manager, calls) = permanent_setup(
+        Settings {
+            enabled: true,
+            dd_virtual_display_permanent_count: Some(2),
+            ..Default::default()
+        },
+        [Ok(2)],
+        None,
+    );
+    assert_eq!(
+        global_status(&mut manager)["permanent_monitor_runtime_state"],
+        "applied"
+    );
+    assert!(calls.borrow().permanent_sets.is_empty());
+    assert_eq!(calls.borrow().permanent_query_calls, 1);
+}
+
+#[test]
+fn permanent_lost_acknowledgement_uses_readback_without_replaying_mutation() {
+    let (mut manager, calls) = permanent_setup(
+        Settings {
+            enabled: true,
+            dd_virtual_display_permanent_count: Some(2),
+            ..Default::default()
+        },
+        [Ok(0), Ok(2)],
+        Some("driver_io_timeout"),
+    );
+    let status = global_status(&mut manager);
+    assert_eq!(status["permanent_monitor_runtime_state"], "applied");
+    assert_eq!(
+        status["permanent_monitor_runtime_error"],
+        "driver_io_timeout"
+    );
+    assert_eq!(calls.borrow().permanent_sets, vec![2]);
+}
+
+#[test]
+fn permanent_failure_and_unverified_readback_preserve_temporary_creation() {
+    for (observations, expected_state) in [
+        (vec![Ok(0), Ok(1)], "failed"),
+        (vec![Ok(0), Err("driver_io_timeout")], "unverified"),
+        (vec![Err("driver_unavailable")], "failed"),
+    ] {
+        let (mut manager, calls) = permanent_setup(
+            Settings {
+                enabled: true,
+                dd_virtual_display_permanent_count: Some(2),
+                ..Default::default()
+            },
+            observations,
+            None,
+        );
+        let status = global_status(&mut manager);
+        assert_eq!(status["permanent_monitor_runtime_state"], expected_state);
+        assert!(!status["permanent_monitor_runtime_error"].is_null());
+        assert_eq!(manager.handle("alice", create())["ok"], true);
+        assert_eq!(calls.borrow().creates.len(), 1);
+        manager.tick();
+        assert!(calls.borrow().permanent_sets.len() <= 1);
+    }
 }
 
 #[test]
