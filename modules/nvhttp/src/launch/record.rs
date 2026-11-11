@@ -9,7 +9,6 @@ use crate::launch::{
 };
 use crate::preparation::{LegacyPreparationStep, PreparationStep};
 use amaterasu_contracts::virtual_display::VirtualDisplayIntent;
-use amaterasu_module_sdk::lifecycle_ledger::{Admission, Owner, Retirement};
 use serde_json::Value;
 use std::{
     collections::VecDeque,
@@ -48,38 +47,6 @@ impl State {
     /// Cleanup is in flight or still owes an automatic retry.
     pub fn closing(self) -> bool {
         matches!(self, Self::Stopping | Self::CleanupFailed)
-    }
-}
-
-impl Owner for Record {
-    /// A record is open while it holds the application: from launch until
-    /// the application is asked to end. A root that is only retiring its own
-    /// transport still holds the application it will be resumed into.
-    fn admission(&self) -> Admission {
-        match self.state {
-            State::Starting | State::AwaitingDelivery | State::Ready | State::Paused => {
-                Admission::Open
-            }
-            State::Stopping | State::CleanupFailed if self.retains_application() => Admission::Open,
-            State::Stopping
-            | State::CleanupFailed
-            | State::Stopped
-            | State::Failed
-            | State::CleanupAbandoned => Admission::Ended,
-        }
-    }
-
-    fn retirement(&self) -> Retirement {
-        match self.state {
-            State::Stopped | State::Failed => Retirement::Confirmed,
-            State::CleanupAbandoned => Retirement::Abandoned,
-            State::CleanupFailed => Retirement::Unconfirmed,
-            State::Starting
-            | State::AwaitingDelivery
-            | State::Ready
-            | State::Paused
-            | State::Stopping => Retirement::Pending,
-        }
     }
 }
 

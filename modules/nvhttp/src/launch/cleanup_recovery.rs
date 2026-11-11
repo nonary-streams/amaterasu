@@ -11,10 +11,42 @@ use super::{
     record::{Record, State},
 };
 use amaterasu_module_sdk::LogLevel;
-use amaterasu_module_sdk::lifecycle_ledger::{Admission, Live, Owner, make_room};
+use amaterasu_module_sdk::lifecycle_ledger::{Admission, Live, Owner, Retirement, make_room};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
+
+impl Owner for Record {
+    /// A record is open while it holds the application: from launch until
+    /// the application is asked to end. A root that is only retiring its own
+    /// transport still holds the application it will be resumed into.
+    fn admission(&self) -> Admission {
+        match self.state {
+            State::Starting | State::AwaitingDelivery | State::Ready | State::Paused => {
+                Admission::Open
+            }
+            State::Stopping | State::CleanupFailed if self.retains_application() => Admission::Open,
+            State::Stopping
+            | State::CleanupFailed
+            | State::Stopped
+            | State::Failed
+            | State::CleanupAbandoned => Admission::Ended,
+        }
+    }
+
+    fn retirement(&self) -> Retirement {
+        match self.state {
+            State::Stopped | State::Failed => Retirement::Confirmed,
+            State::CleanupAbandoned => Retirement::Abandoned,
+            State::CleanupFailed => Retirement::Unconfirmed,
+            State::Starting
+            | State::AwaitingDelivery
+            | State::Ready
+            | State::Paused
+            | State::Stopping => Retirement::Pending,
+        }
+    }
+}
 
 /// How long a launch waits for an application that was asked to end. Normal
 /// cleanup and its automatic retries finish inside this. Past it the earlier
