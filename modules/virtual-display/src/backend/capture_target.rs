@@ -1,6 +1,13 @@
 //! Pure validation of independently observed capture readiness.
 use crate::model::Specification;
 
+/// `QDC_ALL_PATHS` includes inactive source/target combinations. A virtual
+/// adapter can therefore expose hundreds of valid paths for a few outputs.
+/// Bound allocation rather than imposing an active-monitor count on that set.
+pub(super) fn display_config_sizes_valid(paths: u32, modes: u32) -> bool {
+    paths <= 8192 && modes <= 32768
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct CaptureReadback {
     pub active: bool,
@@ -41,6 +48,15 @@ mod tests {
             refresh_millihz: 59940,
             hdr_enabled: true,
         }
+    }
+
+    #[test]
+    fn all_path_enumeration_accepts_virtual_adapter_combinations() {
+        assert!(display_config_sizes_valid(289, 578));
+        assert!(display_config_sizes_valid(8192, 32768));
+        assert!(!display_config_sizes_valid(8193, 32768));
+        assert!(!display_config_sizes_valid(8192, 32769));
+        assert!(!display_config_sizes_valid(u32::MAX, 1));
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! Original byte codec for the published Sunshine control ABI (3.6/3.7).
+//! Original byte codec for the backward-compatible Sunshine control ABI (3.6+).
 //! Encode fields explicitly: no Rust/C++ padding or pointers cross the wire.
 use crate::model::Specification;
 
@@ -29,7 +29,7 @@ pub struct Binding {
 pub fn check_version(bytes: &[u8]) -> Result<(), &'static str> {
     check(bytes, 24)?;
     if u16::from_le_bytes(bytes[16..18].try_into().unwrap()) != 3
-        || !(6..=7).contains(&u16::from_le_bytes(bytes[18..20].try_into().unwrap()))
+        || u16::from_le_bytes(bytes[18..20].try_into().unwrap()) < 6
     {
         return Err("incompatible_driver");
     }
@@ -260,6 +260,23 @@ mod tests {
         assert_eq!(remove_request(9, 42).len(), 32);
         assert_eq!(read_u64(&remove_request(9, 42), 24), 42);
     }
+    #[test]
+    fn additive_driver_minor_versions_preserve_the_owned_display_contract() {
+        let mut version = packet(24);
+        version[16..18].copy_from_slice(&3u16.to_le_bytes());
+        for minor in [6u16, 7, 8, 9, u16::MAX] {
+            version[18..20].copy_from_slice(&minor.to_le_bytes());
+            assert!(check_version(&version).is_ok(), "rejected 3.{minor}");
+        }
+        for major in [0u16, 2, 4] {
+            version[16..18].copy_from_slice(&major.to_le_bytes());
+            assert!(check_version(&version).is_err());
+        }
+        version[16..18].copy_from_slice(&3u16.to_le_bytes());
+        version[0] ^= 1;
+        assert!(check_version(&version).is_err());
+    }
+
     #[test]
     fn malformed_and_incompatible_responses_fail_closed() {
         let mut version = packet(24);

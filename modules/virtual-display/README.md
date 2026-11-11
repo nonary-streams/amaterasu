@@ -322,7 +322,11 @@ Behavior and ABI were inspected at Vibeshine commit
 `src/driver/include/virtual_display/driver/control_protocol.h`. This adapter is an
 original implementation; it does not copy or translate the reference implementation.
 
-Supported protocol versions are exactly major 3, minor 6 or 7. Device interface is
+Supported protocol versions are major 3, minor 6 or later. Additive driver
+releases preserve the owned display request and response layouts; accepting a
+newer minor does not enable its optional operations. This compatibility rule
+was checked against Vibeshine `43cf27252a205221a295126a5fcd9ad87ba9c914` and its
+driver 3.8 control client. Device interface is
 `5f894d6c-3a69-48a2-86ef-e4c671932d63`; protocol namespace is
 `a2864284-77fe-4336-a828-00feec89ebac`. IOCTLs use buffered FILE_DEVICE_UNKNOWN
 control codes with these function numbers and byte layouts:
@@ -341,7 +345,8 @@ The byte codec explicitly encodes little-endian fields instead of relying on Rus
 layout. Reply size, namespace, version, IDs and counts are checked before use.
 Device and monitor paths require valid terminated UTF-16. Interface enumeration is
 bounded and fails on ambiguous multiple driver interfaces. CCD enumeration allows
-at most 256 paths/modes and does not retry a changing topology indefinitely.
+at most 8192 paths and 32768 modes, including inactive source/target combinations
+reported for virtual adapters, and does not retry a changing topology indefinitely.
 
 IOCTLs use overlapped I/O with a 200 ms event timeout and exact-operation
 cancellation. Cancellation is drained before releasing native buffers. A defective

@@ -1,5 +1,5 @@
 //! Win32 handle, overlapped-I/O and CCD boundaries. No driver code is bundled.
-use super::capture_target::CaptureReadback;
+use super::capture_target::{CaptureReadback, display_config_sizes_valid};
 use super::{Driver, Observation, Ready};
 use crate::model::Specification;
 use crate::protocol::{self, Binding};
@@ -283,7 +283,7 @@ fn display_paths()
     {
         return Err("display_query_failed");
     }
-    if path_count > 256 || mode_count > 256 {
+    if !display_config_sizes_valid(path_count, mode_count) {
         return Err("display_query_limit");
     }
     let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); path_count as usize];
