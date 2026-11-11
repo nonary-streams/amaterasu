@@ -158,6 +158,11 @@ pub(super) fn accept_status(record: &mut Record, response: &Value) -> ReferenceS
     record.virtual_display_status_verified = true;
     match monitor["state"].as_str() {
         Some("ready") => {
+            if monitor["ready"]["active"] != true {
+                record.virtual_display_device_path = None;
+                record.virtual_display_state = "ready_inactive".into();
+                return ReferenceStatus::Failed;
+            }
             let Some(device_path) = monitor["ready"]["device_path"].as_str().filter(|path| {
                 !path.is_empty() && path.len() <= 4096 && !path.chars().any(char::is_control)
             }) else {

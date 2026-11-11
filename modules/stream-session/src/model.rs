@@ -285,6 +285,8 @@ struct DisplayRefresh {
 struct DisplayModePolicy {
     display_id: String,
     configuration_option: Option<String>,
+    #[serde(rename = "client_fps")]
+    _client_fps: Option<u32>,
     #[serde(rename = "remapping")]
     _remapping: DisplayRemapping,
     #[serde(rename = "context")]

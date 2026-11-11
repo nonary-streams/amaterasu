@@ -38,6 +38,36 @@ fn inactive_broker(host: &mut Harness) {
 }
 
 #[test]
+fn original_client_fps_survives_a_promoted_display_refresh() {
+    for client_fps in [0, 60] {
+        let mut host = Harness::new();
+        inactive_broker(&mut host);
+        let mut request = prepare();
+        request["display_request"] = inactive_ensure_active_request();
+        request["display_request"]["configuration"]["displays"][2]["refresh"] =
+            json!({"numerator":120,"denominator":1});
+        request["display_request"]["mode_policy"]["client_fps"] = json!(client_fps);
+        let prepared = host.response(1, request.clone());
+        assert_eq!(prepared["state"], "prepared", "{prepared}");
+        let apply = host
+            .broker
+            .calls
+            .iter()
+            .find(|call| call.service == "amaterasu.display/1" && call.payload["action"] == "apply")
+            .unwrap();
+        assert_eq!(apply.payload["mode_policy"]["client_fps"], client_fps);
+        assert_eq!(
+            apply.payload["configuration"]["displays"][2]["refresh"]["numerator"],
+            120
+        );
+        assert_eq!(
+            prepared["display_request"]["mode_policy"],
+            request["display_request"]["mode_policy"]
+        );
+    }
+}
+
+#[test]
 fn inactive_ensure_active_preserves_full_request_and_owned_lease_lifecycle() {
     let mut host = Harness::new();
     inactive_broker(&mut host);

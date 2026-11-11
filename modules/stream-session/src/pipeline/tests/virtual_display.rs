@@ -164,6 +164,44 @@ fn direct_parked_removal_requires_the_matching_identity() {
 }
 
 #[test]
+fn ready_virtual_display_requires_observed_active_output() {
+    let mut host = Harness::new();
+    let prepared = host.response(
+        1,
+        prepare_with_intent(
+            "inactive-readiness",
+            intent(
+                "inactive-reference",
+                VirtualDisplayMode::PerClient,
+                VirtualDisplayLayout::Extended,
+            ),
+        ),
+    );
+    let record = host
+        .pipeline
+        .records
+        .get_mut(&prepared["session"].as_u64().unwrap())
+        .unwrap();
+    let specification = json!({
+        "identity":"00000000-0000-0000-0000-000000000001",
+        "name":"Amaterasu","width":1920,"height":1080,"refresh_millihz":60000
+    });
+    for active in [json!(false), Value::Null] {
+        let status = json!({"ok":true,"reference_owned":true,
+            "monitors":[{"specification":specification,"state":"ready",
+                "ready":{"device_path":"\\\\.\\DISPLAYVDD","active":active}}]});
+        assert!(matches!(
+            super::super::virtual_display::accept_status(record, &status),
+            super::super::virtual_display::ReferenceStatus::Failed
+        ));
+        assert!(record.virtual_display_reference_owned);
+        assert!(record.virtual_display_status_verified);
+        assert!(record.virtual_display_device_path.is_none());
+        assert_eq!(record.virtual_display_state, "ready_inactive");
+    }
+}
+
+#[test]
 fn ready_monitor_applies_snapshot_and_restores_before_releasing_reference() {
     let mut host = Harness::new();
     let original_topology = host.broker.display_topology.clone();
