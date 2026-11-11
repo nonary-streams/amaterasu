@@ -118,6 +118,21 @@ pub trait PrepareAuthority {
     fn domains_reserved(&self, _plan: &ResourcePlan) -> bool {
         false
     }
+    /// Take over the mutation domains this plan needs from holders whose
+    /// owners have ended, where that is allowed after waiting this long.
+    /// Returns whether the plan's domains are now free.
+    fn supersede_ended_holders(
+        &mut self,
+        _plan: &ResourcePlan,
+        _waited: std::time::Duration,
+    ) -> ModuleResult<bool> {
+        Ok(false)
+    }
+    /// The error once the wait for a reserved domain is over: which domain
+    /// is held and by whom, so the failure names one resource.
+    fn reserved_domain_error(&self, _plan: &ResourcePlan) -> String {
+        MUTATION_DOMAIN_RESERVED.into()
+    }
 }
 
 /// `admit_plan` reports this when another admitted operation holds a domain.
@@ -377,10 +392,16 @@ impl PrepareDriver {
         if let Some(wait) = &self.domain_wait
             && authority.domains_reserved(&wait.plan)
         {
-            if wait.since.elapsed() < self.domain_wait_limit {
-                return Ok(());
+            // A holder whose owner has ended is waited for and then
+            // displaced. Only a holder that is still open, or whose provider
+            // cannot hand the domain over, keeps this step waiting.
+            let waited = wait.since.elapsed();
+            if !authority.supersede_ended_holders(&wait.plan, waited)? {
+                if waited < self.domain_wait_limit {
+                    return Ok(());
+                }
+                return Err(authority.reserved_domain_error(&wait.plan));
             }
-            return Err(MUTATION_DOMAIN_RESERVED.into());
         }
         if matches!(
             self.state.phase,
@@ -480,9 +501,12 @@ impl PrepareDriver {
     /// Discard a plan whose domain is held by another admitted operation and
     /// return to planning. No admission exists and no effect was sent, so the
     /// state is the same as before the plan was requested.
+    /// Wait for a reserved domain, or report `held` once the wait is over:
+    /// which domain is held and by whom.
     fn wait_for_domain(
         &mut self,
         plan: ResourcePlan,
+        held: String,
         journal: &mut impl PrepareJournal,
     ) -> ModuleResult<()> {
         let since = self
@@ -490,7 +514,7 @@ impl PrepareDriver {
             .as_ref()
             .map_or_else(std::time::Instant::now, |wait| wait.since);
         if since.elapsed() >= self.domain_wait_limit {
-            return Err(MUTATION_DOMAIN_RESERVED.into());
+            return Err(held);
         }
         let mut next = self.state.clone();
         next.phase = PreparePhase::Plan;
@@ -633,7 +657,8 @@ impl PrepareDriver {
                 let admission = match authority.admit_plan(participant, plan) {
                     Ok(admission) => admission,
                     Err(error) if error == MUTATION_DOMAIN_RESERVED => {
-                        return self.wait_for_domain(plan.clone(), journal);
+                        let held = authority.reserved_domain_error(plan);
+                        return self.wait_for_domain(plan.clone(), held, journal);
                     }
                     Err(error) => return Err(error),
                 };
@@ -1128,6 +1153,138 @@ mod tests {
         assert_eq!(error.as_deref(), Some(MUTATION_DOMAIN_RESERVED));
         assert!(driver.state().admission_id.is_none());
         assert_eq!(driver.state().phase, PreparePhase::Plan);
+        assert_eq!(callbacks, 0);
+    }
+
+    /// A contended domain whose holder's owner has ended.
+    struct EndedHolderAuthority {
+        contended: ContendedAuthority,
+        /// Whether the holder's domains may be handed to a successor.
+        hands_over: bool,
+        takeovers: usize,
+    }
+    impl PrepareAuthority for EndedHolderAuthority {
+        fn allocate(&mut self, provider: &str) -> ModuleResult<(u64, String)> {
+            self.contended.allocate(provider)
+        }
+        fn allocate_poll_id(&mut self, provider: &str) -> ModuleResult<String> {
+            self.contended.allocate_poll_id(provider)
+        }
+        fn approved_call(
+            &mut self,
+            participant: &ParticipantSettings,
+            method: &MethodSettings,
+            arguments: Value,
+            operation_id: String,
+        ) -> ModuleResult<ProviderCall> {
+            self.contended
+                .approved_call(participant, method, arguments, operation_id)
+        }
+        fn admit_plan(
+            &mut self,
+            participant: &ParticipantSettings,
+            plan: &ResourcePlan,
+        ) -> ModuleResult<String> {
+            self.contended.admit_plan(participant, plan)
+        }
+        fn validate_rights(
+            &mut self,
+            participant: &ParticipantSettings,
+            plan: &ResourcePlan,
+            admission_id: &str,
+        ) -> ModuleResult<()> {
+            self.contended
+                .validate_rights(participant, plan, admission_id)
+        }
+        fn domains_reserved(&self, plan: &ResourcePlan) -> bool {
+            self.contended.domains_reserved(plan)
+        }
+        fn supersede_ended_holders(
+            &mut self,
+            _: &ResourcePlan,
+            _: std::time::Duration,
+        ) -> ModuleResult<bool> {
+            if self.hands_over {
+                self.contended.reserved = false;
+                self.takeovers += 1;
+            }
+            Ok(self.hands_over)
+        }
+        fn reserved_domain_error(&self, _: &ResourcePlan) -> String {
+            format!("{MUTATION_DOMAIN_RESERVED}: topology is held by ended session old")
+        }
+    }
+
+    fn ended_holder_authority(hands_over: bool) -> EndedHolderAuthority {
+        EndedHolderAuthority {
+            contended: ContendedAuthority {
+                inner: Authority {
+                    sequence: 1,
+                    rights: false,
+                    polls: 0,
+                },
+                reserved: true,
+                refused: 0,
+            },
+            hands_over,
+            takeovers: 0,
+        }
+    }
+
+    #[test]
+    fn a_domain_held_by_an_ended_owner_is_taken_over_and_planned_again() {
+        let (settings, state) = fixture();
+        let mut driver = PrepareDriver::new(state, &settings).unwrap();
+        let mut authority = ended_holder_authority(true);
+        let mut journal = Journal::default();
+        let (mut plans, mut callbacks, mut method) = (Vec::new(), 0, String::new());
+        let mut send =
+            |command: Command| immediate_provider(&mut plans, &mut callbacks, &mut method, command);
+        // Nothing ever releases the domain. The holder's owner has ended, so
+        // the step does not wait out its limit: it takes the domain over.
+        for _ in 0..48 {
+            driver
+                .advance(&settings, &mut authority, &mut journal, &mut send)
+                .unwrap();
+            if driver.state().phase == PreparePhase::Prepared {
+                break;
+            }
+        }
+        drop(send);
+        assert_eq!(driver.state().phase, PreparePhase::Prepared);
+        assert!(!driver.waiting_for_domain());
+        assert_eq!(authority.contended.refused, 1);
+        assert_eq!(authority.takeovers, 1);
+        // The provider planned again against the domain as it now stands.
+        assert_eq!(plans.len(), 2);
+        assert!(plans[1] > plans[0]);
+        assert_eq!(callbacks, 1);
+    }
+
+    #[test]
+    fn a_domain_that_cannot_be_handed_over_is_named_when_the_wait_ends() {
+        let (settings, state) = fixture();
+        let mut driver = PrepareDriver::new(state, &settings).unwrap();
+        driver.set_domain_wait_limit(std::time::Duration::ZERO);
+        let mut authority = ended_holder_authority(false);
+        let mut journal = Journal::default();
+        let (mut plans, mut callbacks, mut method) = (Vec::new(), 0, String::new());
+        let mut send =
+            |command: Command| immediate_provider(&mut plans, &mut callbacks, &mut method, command);
+        let mut error = None;
+        for _ in 0..16 {
+            if let Err(reason) = driver.advance(&settings, &mut authority, &mut journal, &mut send)
+            {
+                error = Some(reason);
+                break;
+            }
+        }
+        drop(send);
+        assert_eq!(
+            error.as_deref(),
+            Some("mutation domain is reserved: topology is held by ended session old")
+        );
+        assert!(driver.state().admission_id.is_none());
         assert_eq!(callbacks, 0);
     }
 

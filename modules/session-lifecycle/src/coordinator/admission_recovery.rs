@@ -113,10 +113,7 @@ pub(super) fn release_undispatched(journal: &mut Journal) {
             .admissions
             .remove(&id)
             .expect("selected admission");
-        for (domain, _) in admission.rights {
-            journal.authority.domain_locks.remove(&domain);
-            journal.authority.refresh_required.insert(domain);
-        }
+        journal.authority.release_domains(&id, &admission.rights);
         journal.admission_transitions.remove(&id);
         for session in journal.sessions.values_mut() {
             session.admission_ids.remove(&id);

@@ -908,11 +908,16 @@ impl Coordinator {
         work: &Work,
     ) -> ModuleResult<CoordinatorPrepareAuthority<AuthorityWriter>> {
         let selections = self.work_selections(work)?;
-        CoordinatorPrepareAuthority::new(
-            self.shared.borrow().value.authority.clone(),
+        let journal = &self.shared.borrow().value;
+        // A holder whose owner has ended may be displaced by this work; the
+        // journal's session and stream phases are what say which have.
+        let ended = super::ended_holders::ended_holders(journal);
+        Ok(CoordinatorPrepareAuthority::new(
+            journal.authority.clone(),
             selections,
             AuthorityWriter(self.shared.clone()),
-        )
+        )?
+        .with_ended_holders(ended))
     }
 
     pub(super) fn work_selections(&self, work: &Work) -> ModuleResult<Vec<ProviderSelection>> {

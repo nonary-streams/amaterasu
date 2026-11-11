@@ -35,6 +35,7 @@ mod control_endpoints;
 mod control_history;
 #[allow(dead_code)]
 mod control_settlement;
+mod ended_holders;
 mod failed_prepare_recovery;
 mod finalize_backend;
 #[allow(dead_code)]

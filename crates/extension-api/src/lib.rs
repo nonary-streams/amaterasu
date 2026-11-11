@@ -513,6 +513,21 @@ pub enum StreamIntent {
 /// startup composition must grant this capability to every participating provider.
 pub const STREAM_JOIN_CAPABILITY: &str = "amaterasu.stream/join";
 
+/// A provider granted this capability lets a later owner take over a mutation
+/// domain that an ended owner never released.
+///
+/// The coordinator stops dispatching under an admission once a successor has
+/// its domains, so the provider's part is its own work in flight: when a
+/// request arrives under a newer admission for a domain, the provider no
+/// longer changes that domain for the earlier one, and it reports the earlier
+/// work's outcome as it actually ended. A provider that cannot promise this
+/// is not granted the capability; a successor then waits for its release and
+/// is told which domain is held.
+///
+/// The capability is not needed for holders from an earlier host run. None of
+/// their work can still be in flight, so their domains are always taken over.
+pub const DOMAIN_TAKEOVER_CAPABILITY: &str = "amaterasu.lifecycle/domain-takeover";
+
 mod stream_preparation;
 pub use stream_preparation::*;
 mod stream_retirement;

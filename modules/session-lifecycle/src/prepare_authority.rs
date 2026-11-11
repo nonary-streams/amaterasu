@@ -22,6 +22,54 @@ use crate::provider_dispatch::ProviderCall;
 
 const MAX_ADMISSIONS: usize = 128;
 const MAX_PROVIDERS: usize = 128;
+/// Admissions kept for the record after a successor took their domains.
+const MAX_SUPERSEDED: usize = 128;
+/// How long a plan waits for an ended holder of a domain it needs before the
+/// domain is taken over. A release callback normally finishes well inside it.
+const ENDED_HOLDER_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Admissions made by this process, newest last.
+///
+/// The journal outlives the process and so do the admissions in it. One that
+/// is in the journal but not in this record was made by an earlier run of the
+/// host. None of that run's work can still be in flight, which is what lets a
+/// successor take its domains without waiting.
+static RUN_ADMISSIONS: std::sync::Mutex<std::collections::VecDeque<String>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+/// Far more than can be unsettled at once. An admission older than this many
+/// later ones is treated as an earlier run's, which only matters if it still
+/// holds a domain by then.
+const MAX_RUN_ADMISSIONS: usize = 4096;
+
+pub(crate) fn note_admitted_this_run(id: &str) {
+    if let Ok(mut admitted) = RUN_ADMISSIONS.lock() {
+        if admitted.len() >= MAX_RUN_ADMISSIONS {
+            admitted.pop_front();
+        }
+        admitted.push_back(id.to_owned());
+    }
+}
+
+/// Whether this process made the admission. An unreadable record answers
+/// yes, so that nothing is displaced on a guess.
+pub fn admitted_this_run(id: &str) -> bool {
+    RUN_ADMISSIONS
+        .lock()
+        .map_or(true, |admitted| admitted.iter().any(|known| known == id))
+}
+
+/// The holder of an admission whose owner has ended: a session or stream
+/// that was asked to end, or one that belongs to an earlier host run. The
+/// coordinator supplies these from its journal; nothing in a provider's reply
+/// or a caller's request can name one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EndedHolder {
+    /// The owner belongs to an earlier host run, so none of its work can
+    /// still be in flight and its domains are taken over without waiting.
+    pub earlier_run: bool,
+    /// Who the owner was, for the error a successor reports.
+    pub owner: String,
+}
 
 /// Construct only from verified installed descriptor/schema and broker query
 /// results, never from the requested operation or provider's plan.
@@ -182,6 +230,54 @@ pub struct AuthorityState {
     pub control_permits: BTreeMap<String, ControlPermit>,
     #[serde(default)]
     pub finalize_permits: BTreeMap<String, FinalizePermit>,
+    /// Admissions whose mutation domains a successor took over because
+    /// their owner had ended without releasing them. Each stays in
+    /// `admissions` with its plan and cleanup obligations, so what was never
+    /// confirmed stays visible and its own records still resolve. It holds
+    /// no domain, may dispatch nothing and does not count against the
+    /// admission bound.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub superseded: BTreeSet<String>,
+}
+
+impl AuthorityState {
+    /// Release the mutation domains `admission_id` still holds, as the last
+    /// step before the admission itself is removed or settled. A domain a
+    /// successor took over is the successor's and is left alone.
+    pub fn release_domains(&mut self, admission_id: &str, rights: &[(String, Access)]) {
+        for (domain, _) in rights {
+            if self.domain_locks.get(domain).map(String::as_str) == Some(admission_id) {
+                self.domain_locks.remove(domain);
+                self.refresh_required.insert(domain.clone());
+            }
+        }
+        self.superseded.remove(admission_id);
+    }
+
+    /// Hand an ended owner's domains to a successor. Returns false when the
+    /// record of superseded admissions is full; the successor then waits as
+    /// it would for any holder.
+    fn supersede(&mut self, admission_id: &str) -> bool {
+        if self.superseded.len() >= MAX_SUPERSEDED {
+            return false;
+        }
+        let Some(rights) = self
+            .admissions
+            .get(admission_id)
+            .map(|admission| admission.rights.clone())
+        else {
+            return false;
+        };
+        self.release_domains(admission_id, &rights);
+        self.superseded.insert(admission_id.to_owned());
+        true
+    }
+
+    /// Admissions that count against the bound: those still held and those
+    /// kept after release. A superseded admission is neither.
+    fn occupancy(&self) -> usize {
+        self.admissions.len() + self.settled.len() - self.superseded.len()
+    }
 }
 
 pub trait AuthorityJournal {
@@ -193,6 +289,8 @@ pub struct CoordinatorPrepareAuthority<J> {
     selections: BTreeMap<String, ProviderSelection>,
     journal: J,
     poisoned: bool,
+    /// Admissions whose owners have ended, by admission ID.
+    ended_holders: BTreeMap<String, EndedHolder>,
 }
 
 fn valid_id(value: &str) -> bool {
@@ -683,6 +781,36 @@ fn validate_materialized_resource(
 }
 
 impl<J: AuthorityJournal> CoordinatorPrepareAuthority<J> {
+    /// Name the admissions whose owners have ended. Only the coordinator
+    /// knows this, from the session and stream phases in its journal.
+    pub fn with_ended_holders(mut self, ended: BTreeMap<String, EndedHolder>) -> Self {
+        self.ended_holders = ended;
+        self
+    }
+
+    /// Whether a successor may take the domains `holder` still has. An owner
+    /// from an earlier host run is displaced at once. One that ended in this
+    /// run is waited for first, and only a provider that was granted the
+    /// takeover capability hands its domains over.
+    fn may_supersede(&self, holder: &str, waited: std::time::Duration) -> bool {
+        let Some(ended) = self.ended_holders.get(holder) else {
+            return false;
+        };
+        if ended.earlier_run {
+            return true;
+        }
+        waited >= ENDED_HOLDER_GRACE
+            && self.state.admissions.get(holder).is_some_and(|admission| {
+                self.selections
+                    .get(&admission.provider)
+                    .is_some_and(|selection| {
+                        selection
+                            .capabilities
+                            .contains(amaterasu_extension_api::DOMAIN_TAKEOVER_CAPABILITY)
+                    })
+            })
+    }
+
     /// `selections` and all recovered coordinator state must originate from
     /// verified installed metadata and the private durable journal respectively.
     pub fn new(
@@ -692,7 +820,12 @@ impl<J: AuthorityJournal> CoordinatorPrepareAuthority<J> {
     ) -> ModuleResult<Self> {
         if selections.len() > MAX_PROVIDERS
             || state.sequences.len() > MAX_PROVIDERS
-            || state.admissions.len() + state.settled.len() > MAX_ADMISSIONS
+            || state.superseded.len() > MAX_SUPERSEDED
+            || state.superseded.iter().any(|id| {
+                !state.admissions.contains_key(id)
+                    || state.domain_locks.values().any(|holder| holder == id)
+            })
+            || state.occupancy() > MAX_ADMISSIONS
             || state.issued_operation_ids.len() > 4096
             || state.control_permits.len() > MAX_ADMISSIONS
             || state.finalize_permits.len() > MAX_ADMISSIONS
@@ -715,6 +848,12 @@ impl<J: AuthorityJournal> CoordinatorPrepareAuthority<J> {
                 return Err("invalid recovered admission".into());
             }
             validate_selection(&admission.selection)?;
+            if state.superseded.contains(id) {
+                // Its domains belong to a successor and the observations it
+                // was admitted under have moved on. It may dispatch nothing,
+                // so there are no rights left to check.
+                continue;
+            }
             let context = AdmissionContext {
                 provider: &admission.provider,
                 approved_control_bindings: &admission.selection.approved_control_bindings,
@@ -879,6 +1018,7 @@ impl<J: AuthorityJournal> CoordinatorPrepareAuthority<J> {
             selections: selected,
             journal,
             poisoned: false,
+            ended_holders: BTreeMap::new(),
         })
     }
 
@@ -952,6 +1092,13 @@ impl<J: AuthorityJournal> CoordinatorPrepareAuthority<J> {
         {
             return Err("finalize outcome remains unsettled".into());
         }
+        let superseded = self.state.superseded.contains(admission_id);
+        if superseded && (retain_output || resource.is_some()) {
+            // A successor holds this admission's domains. Its late outcome
+            // can close its own record and nothing else: it publishes no
+            // output and refreshes no observation.
+            return Err("admission was superseded".into());
+        }
         if let Some(settled) = self.state.settled.get(admission_id) {
             if settled.provider != provider {
                 return Err("admission provider mismatch".into());
@@ -981,9 +1128,10 @@ impl<J: AuthorityJournal> CoordinatorPrepareAuthority<J> {
             .ok_or("unknown admission")?
             .clone();
         if admission.provider != provider
-            || admission.rights.iter().any(|(domain, _)| {
-                self.state.domain_locks.get(domain).map(String::as_str) != Some(admission_id)
-            })
+            || (!superseded
+                && admission.rights.iter().any(|(domain, _)| {
+                    self.state.domain_locks.get(domain).map(String::as_str) != Some(admission_id)
+                }))
         {
             return Err("admission provider or rights mismatch".into());
         }
@@ -1008,10 +1156,7 @@ impl<J: AuthorityJournal> CoordinatorPrepareAuthority<J> {
                 .or_default()
                 .insert(resource.resource_id.clone(), resource);
         }
-        for (domain, _) in &admission.rights {
-            next.domain_locks.remove(domain);
-            next.refresh_required.insert(domain.clone());
-        }
+        next.release_domains(admission_id, &admission.rights);
         next.admissions.remove(admission_id);
         next.control_permits.retain(|_, permit| {
             permit.request.admission_id != admission_id || (retain_history && permit.settled)
@@ -1734,6 +1879,7 @@ impl<J: AuthorityJournal> CoordinatorPrepareAuthority<J> {
             selections: self.selections.clone(),
             journal: Staged,
             poisoned: false,
+            ended_holders: BTreeMap::new(),
         };
         staged.settle_finalize_permit(request)?;
         // The result journal and future owner verification require the exact
@@ -1842,6 +1988,56 @@ impl<J: AuthorityJournal> PrepareAuthority for CoordinatorPrepareAuthority<J> {
             .any(|domain| self.state.domain_locks.contains_key(&domain.domain))
     }
 
+    fn supersede_ended_holders(
+        &mut self,
+        plan: &ResourcePlan,
+        waited: std::time::Duration,
+    ) -> ModuleResult<bool> {
+        if self.poisoned {
+            return Err("authority journal requires recovery".into());
+        }
+        let displaced: BTreeSet<String> = plan
+            .mutation_domains
+            .iter()
+            .filter_map(|domain| self.state.domain_locks.get(&domain.domain))
+            .filter(|holder| self.may_supersede(holder, waited))
+            .cloned()
+            .collect();
+        if !displaced.is_empty() {
+            let mut next = self.state.clone();
+            for holder in &displaced {
+                if next.supersede(holder) {
+                    eprintln!(
+                        "lifecycle mutation domains taken over from ended owner={} \
+                         admission={holder}",
+                        self.ended_holders[holder].owner
+                    );
+                }
+            }
+            self.persist(next)?;
+        }
+        Ok(!self.domains_reserved(plan))
+    }
+
+    fn reserved_domain_error(&self, plan: &ResourcePlan) -> String {
+        let held = plan.mutation_domains.iter().find_map(|domain| {
+            let holder = self.state.domain_locks.get(&domain.domain)?;
+            Some((domain.domain.as_str(), self.ended_holders.get(holder)))
+        });
+        match held {
+            Some((domain, Some(ended))) => format!(
+                "{}: {domain} is held by ended {} whose provider cannot hand it over",
+                crate::prepare_driver::MUTATION_DOMAIN_RESERVED,
+                ended.owner
+            ),
+            Some((domain, None)) => format!(
+                "{}: {domain} is in use",
+                crate::prepare_driver::MUTATION_DOMAIN_RESERVED
+            ),
+            None => crate::prepare_driver::MUTATION_DOMAIN_RESERVED.into(),
+        }
+    }
+
     fn admit_plan(
         &mut self,
         participant: &ParticipantSettings,
@@ -1852,8 +2048,28 @@ impl<J: AuthorityJournal> PrepareAuthority for CoordinatorPrepareAuthority<J> {
         }
         let selection = self.selected(participant)?.clone();
         amaterasu_extension_api::validate_resource_plan(plan)?;
-        if self.state.admissions.len() + self.state.settled.len() >= MAX_ADMISSIONS {
-            return Err("admission capacity exhausted".into());
+        if self.state.occupancy() >= MAX_ADMISSIONS {
+            // Admissions of owners from an earlier host run cannot have work
+            // in flight. They are set aside before a new plan is refused.
+            let earlier: Vec<String> = self
+                .state
+                .admissions
+                .keys()
+                .filter(|id| {
+                    !self.state.superseded.contains(*id)
+                        && self
+                            .ended_holders
+                            .get(*id)
+                            .is_some_and(|ended| ended.earlier_run)
+                })
+                .cloned()
+                .collect();
+            let mut next = self.state.clone();
+            let set_aside = earlier.iter().filter(|id| next.supersede(id)).count();
+            if set_aside == 0 || next.occupancy() >= MAX_ADMISSIONS {
+                return Err("admission capacity exhausted".into());
+            }
+            self.persist(next)?;
         }
         let mut next = self.state.clone();
         let refreshable = next.refresh_required.clone();
@@ -1969,6 +2185,7 @@ impl<J: AuthorityJournal> PrepareAuthority for CoordinatorPrepareAuthority<J> {
             },
         );
         self.persist(next)?;
+        note_admitted_this_run(&id);
         Ok(id)
     }
 
@@ -3109,6 +3326,183 @@ mod tests {
                 .refresh_observations("display", &[("topology".into(), domain)], &[],)
                 .is_err()
         );
+    }
+
+    fn ended(earlier_run: bool) -> EndedHolder {
+        EndedHolder {
+            earlier_run,
+            owner: "session old".into(),
+        }
+    }
+
+    /// An authority restored from a journal in which one admission holds the
+    /// topology domain, and the ID of that admission.
+    fn holding_topology(
+        selected: &ProviderSelection,
+    ) -> (CoordinatorPrepareAuthority<Journal>, String) {
+        let mut holder = CoordinatorPrepareAuthority::new(
+            AuthorityState::default(),
+            vec![selected.clone()],
+            Journal::default(),
+        )
+        .unwrap();
+        let admission = holder.admit_plan(&selected.participant, &plan()).unwrap();
+        let restored = CoordinatorPrepareAuthority::new(
+            holder.state.clone(),
+            vec![selected.clone()],
+            Journal::default(),
+        )
+        .unwrap();
+        (restored, admission)
+    }
+
+    #[test]
+    fn an_open_holder_keeps_its_domains_however_long_a_successor_waits() {
+        let selected = selection();
+        let (mut authority, _) = holding_topology(&selected);
+        assert!(
+            !authority
+                .supersede_ended_holders(&plan(), std::time::Duration::from_secs(86_400))
+                .unwrap()
+        );
+        assert!(authority.domains_reserved(&plan()));
+        assert!(authority.state.superseded.is_empty());
+        assert_eq!(
+            authority.reserved_domain_error(&plan()),
+            "mutation domain is reserved: topology is in use"
+        );
+    }
+
+    #[test]
+    fn an_earlier_runs_holder_is_displaced_at_once_and_can_touch_nothing_afterwards() {
+        let selected = selection();
+        let (authority, earlier) = holding_topology(&selected);
+        let mut authority = authority.with_ended_holders([(earlier.clone(), ended(true))].into());
+        assert!(
+            authority
+                .supersede_ended_holders(&plan(), std::time::Duration::ZERO)
+                .unwrap()
+        );
+        assert!(!authority.state.domain_locks.contains_key("topology"));
+        // The earlier admission keeps its plan and obligations for the record.
+        assert!(authority.state.superseded.contains(&earlier));
+        assert_eq!(authority.state.admissions[&earlier].plan, plan());
+        // Ending revoked its authority: it may dispatch nothing more.
+        assert!(
+            authority
+                .validate_rights(&selected.participant, &plan(), &earlier)
+                .is_err()
+        );
+
+        let successor = authority
+            .admit_plan(&selected.participant, &plan())
+            .unwrap();
+        assert_eq!(authority.state.domain_locks["topology"], successor);
+        // The journal with a superseded admission in it loads again.
+        let mut restored = CoordinatorPrepareAuthority::new(
+            authority.state.clone(),
+            vec![selected.clone()],
+            Journal::default(),
+        )
+        .unwrap();
+
+        // A late outcome of the earlier work closes its own record. The
+        // successor keeps the domain and its rights.
+        restored
+            .finish_admission_retained("display", &earlier)
+            .unwrap();
+        assert!(!restored.state.superseded.contains(&earlier));
+        assert!(!restored.state.admissions.contains_key(&earlier));
+        assert_eq!(restored.state.domain_locks["topology"], successor);
+        restored
+            .validate_rights(&selected.participant, &plan(), &successor)
+            .unwrap();
+    }
+
+    #[test]
+    fn a_holder_that_ended_in_this_run_is_displaced_after_the_grace_if_its_provider_hands_over() {
+        for granted in [false, true] {
+            let mut selected = selection();
+            if granted {
+                let capability = amaterasu_extension_api::DOMAIN_TAKEOVER_CAPABILITY;
+                selected.capabilities.insert(capability.into());
+                selected.participant.capabilities.insert(capability.into());
+            }
+            let (authority, holder) = holding_topology(&selected);
+            let mut authority =
+                authority.with_ended_holders([(holder.clone(), ended(false))].into());
+            let early = ENDED_HOLDER_GRACE - std::time::Duration::from_millis(1);
+            assert!(!authority.supersede_ended_holders(&plan(), early).unwrap());
+            assert_eq!(
+                authority
+                    .supersede_ended_holders(&plan(), ENDED_HOLDER_GRACE)
+                    .unwrap(),
+                granted
+            );
+            assert_eq!(authority.state.superseded.contains(&holder), granted);
+            if !granted {
+                // The successor is told which domain is held and by whom.
+                assert_eq!(
+                    authority.reserved_domain_error(&plan()),
+                    "mutation domain is reserved: topology is held by ended session old whose \
+                     provider cannot hand it over"
+                );
+            }
+        }
+    }
+
+    /// A plan that needs its own domain, so many of them can be admitted.
+    fn plan_on(domain: &str) -> ResourcePlan {
+        let text = serde_json::to_string(&plan())
+            .unwrap()
+            .replace("topology", domain)
+            .replace("\"output\"", &format!("\"output-{domain}\""));
+        serde_json::from_str(&text).unwrap()
+    }
+
+    #[test]
+    fn admissions_left_by_an_earlier_run_do_not_use_up_the_admission_bound() {
+        let selected = selection();
+        let mut holder = CoordinatorPrepareAuthority::new(
+            AuthorityState::default(),
+            vec![selected.clone()],
+            Journal::default(),
+        )
+        .unwrap();
+        let mut earlier = BTreeMap::new();
+        for index in 0..MAX_ADMISSIONS {
+            let admission = holder
+                .admit_plan(&selected.participant, &plan_on(&format!("domain-{index}")))
+                .unwrap();
+            earlier.insert(admission, ended(true));
+        }
+        assert_eq!(
+            holder
+                .admit_plan(&selected.participant, &plan_on("fresh"))
+                .unwrap_err(),
+            "admission capacity exhausted"
+        );
+
+        let mut authority = CoordinatorPrepareAuthority::new(
+            holder.state.clone(),
+            vec![selected.clone()],
+            Journal::default(),
+        )
+        .unwrap()
+        .with_ended_holders(earlier);
+        let fresh = authority
+            .admit_plan(&selected.participant, &plan_on("fresh"))
+            .unwrap();
+        assert_eq!(authority.state.domain_locks["fresh"], fresh);
+        assert_eq!(authority.state.superseded.len(), MAX_ADMISSIONS);
+        // The earlier admissions are still on record and the journal loads.
+        assert_eq!(authority.state.admissions.len(), MAX_ADMISSIONS + 1);
+        CoordinatorPrepareAuthority::new(
+            authority.state.clone(),
+            vec![selected],
+            Journal::default(),
+        )
+        .unwrap();
     }
 }
 

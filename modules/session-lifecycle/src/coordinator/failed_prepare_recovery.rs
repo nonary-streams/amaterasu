@@ -244,10 +244,7 @@ impl Coordinator {
             .admissions
             .remove(&id)
             .expect("checked admission");
-        for (domain, _) in admission.rights {
-            next.authority.domain_locks.remove(&domain);
-            next.authority.refresh_required.insert(domain);
-        }
+        next.authority.release_domains(&id, &admission.rights);
         next.admission_transitions.remove(&id);
         for session in next.sessions.values_mut() {
             session.admission_ids.remove(&id);
