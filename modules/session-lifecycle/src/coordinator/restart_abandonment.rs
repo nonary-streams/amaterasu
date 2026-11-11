@@ -100,6 +100,38 @@ impl Coordinator {
         }
         require_abandonable_session(&next, session, generation)?;
         require_no_live_session_state(&next, session)?;
+        if let Some(release_key) = resumable_abandoned_release(&next, session) {
+            let mut work = supersede_release_receipt(&mut next, &release_key)?;
+            work.recovery_authorized_epoch = Some(next.host_epoch.clone());
+            if let Some(state) = work
+                .providers
+                .get(work.index)
+                .and_then(|provider| work.states.get_mut(provider))
+                && state.phase == crate::prepare_driver::PreparePhase::CallbackStatus
+            {
+                // Status is read-only; retire the old broker transport and
+                // query the same saved provider receipt in the new epoch.
+                state.dispatch = None;
+                state.status_polls = 0;
+            }
+            record_untracked_application(&mut next, session_id)?;
+            let response = json!({"status":"pending","operation_id":payload["operation_id"],
+                "target":target,"abandoned_target":work.target,"transition_id":work.transition_id,
+                "application_retired":false,"application":UNTRACKED_APPLICATION});
+            next.receipts.insert(
+                key,
+                Receipt {
+                    caller: caller.into(),
+                    initiator: initiator.into(),
+                    request: payload,
+                    response: response.clone(),
+                    work: Some(work),
+                    wait_target: None,
+                },
+            );
+            save(&self.shared, next)?;
+            return Ok(response);
+        }
         require_known_obligation_owners(&next, session)?;
         let abandoned_target = session_target(session);
         let release_graph = session.provider_graph.clone();
@@ -209,6 +241,108 @@ fn require_no_live_session_state(journal: &Journal, session: &SessionRecord) -> 
         return Err("session_resources_retained".into());
     }
     Ok(())
+}
+
+/// Resume only a previously owner-authorized abandonment whose callback has
+/// already completed with a durable Pending receipt. The driver consumes that
+/// saved response and polls the receipt; it never repeats the effect callback.
+fn resumable_abandoned_release(journal: &Journal, session: &SessionRecord) -> Option<String> {
+    use crate::prepare_driver::PreparePhase;
+    use crate::provider_dispatch::DispatchState;
+    session
+        .application_disposition
+        .as_ref()?
+        .valid_for(session, &journal.host_epoch)
+        .then_some(())?;
+    let mut retained = journal.receipts.iter().filter(|(_, receipt)| {
+        receipt
+            .work
+            .as_ref()
+            .is_some_and(|work| work.target == session_target(session))
+    });
+    let (key, receipt) = retained.next()?;
+    if retained.next().is_some() {
+        return None;
+    }
+    let work = receipt.work.as_ref()?;
+    if !owner_release_receipt(receipt, work, session)
+        || receipt.request["restart_abandonment"] != true
+        || work.waiting_retirement
+        || work.compacted_release
+        || work.candidate.is_some()
+        || work.composition_progress.is_some()
+        || !work.owner_observations.is_empty()
+        || work.reprepare.is_some()
+        || work.failure.is_some()
+        || work.failed_preparation.is_some()
+        || work.action_transfer.is_some()
+        || !work.cleanup_blockers.is_empty()
+    {
+        return None;
+    }
+    let provider = work.providers.get(work.index)?;
+    let state = work.states.get(provider)?;
+    if state.request.operation != amaterasu_extension_api::ProviderOperation::LifecycleCallback
+        || state.request.phase != LifecyclePhase::SessionRelease
+        || state.request.target != work.target
+        || state.request.transition_id != work.transition_id
+    {
+        return None;
+    }
+    match state.phase {
+        PreparePhase::Callback if state.pending_receipt.is_none() => {
+            let dispatch = state.dispatch.as_ref()?;
+            let DispatchState::Completed { payload } = &dispatch.state else {
+                return None;
+            };
+            let response: amaterasu_extension_api::ProviderResponse =
+                serde_json::from_value(payload.clone()).ok()?;
+            amaterasu_extension_api::validate_provider_response(&state.request, &response).ok()?;
+            if !matches!(
+                response,
+                amaterasu_extension_api::ProviderResponse::Pending { .. }
+            ) || dispatch.call.arguments != serde_json::to_value(&state.request).ok()?
+                || dispatch.call.operation_id != state.request.operation_id
+                || dispatch.call.service != state.participant.callback_method.service
+                || dispatch.call.method != state.participant.callback_method.method
+            {
+                return None;
+            }
+        }
+        PreparePhase::CallbackStatus => {
+            let receipt_id = state.pending_receipt.as_ref().filter(|id| !id.is_empty())?;
+            let expected = json!({"receipt_id":receipt_id,"operation_id":state.request.operation_id,
+                "transition_id":work.transition_id,"provider_sequence":state.request.provider_sequence});
+            if state.dispatch.as_ref().is_some_and(|dispatch| {
+                dispatch.call.arguments != expected
+                    || dispatch.call.service != state.participant.status_method.service
+                    || dispatch.call.method != state.participant.status_method.method
+            }) {
+                return None;
+            }
+        }
+        _ => return None,
+    }
+    let admission_id = state.admission_id.as_ref()?;
+    let admission = journal.authority.admissions.get(admission_id)?;
+    if admission.provider != *provider
+        || state.plan.as_ref() != Some(&admission.plan)
+        || !session.admission_ids.contains(admission_id)
+        || journal.admission_transitions.get(admission_id) != Some(&work.transition_id)
+    {
+        return None;
+    }
+    // No other unresolved effect may be hidden by resuming this release.
+    if work.states.iter().any(|(name, other)| {
+        name != provider && !matches!(other.phase, PreparePhase::CleanupSettled)
+    }) || session
+        .admission_ids
+        .iter()
+        .any(|id| id != admission_id && journal.authority.admissions.contains_key(id))
+    {
+        return None;
+    }
+    Some(key.clone())
 }
 
 /// Every retained admission must be settled and owned by this exact session
@@ -680,6 +814,156 @@ pub(super) mod tests {
             coordinator.shared.borrow().value.receipts[&receipt_key(OWNER, OWNER, "session-end")]
                 .work
                 .is_some()
+        );
+        drop(coordinator);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn completed_pending_abandonment_resumes_without_replaying_effect() {
+        use crate::provider_dispatch::{DispatchRecord, DispatchState, ProviderCall};
+        let (mut coordinator, path) = open_coordinator("restart-pending-release");
+        insert_stranded(&coordinator, "session");
+        edit_journal(&coordinator, |journal| {
+            let session = journal.sessions.get_mut("session").unwrap();
+            session.application_disposition = Some(ApplicationDisposition::UntrackedAfterRestart {
+                abandoned_epoch: OLD_EPOCH.into(),
+                recorded_epoch: "prior-recovery".into(),
+                application_operation_id: session.application_operation_id.clone(),
+            });
+            session.admission_ids.insert("admission".into());
+            let method = json!({"service":"provider/1","method":"callback","interface_major":1,"interface_minor":0,"schema_revision":1});
+            let participant: crate::adapter::ParticipantSettings = serde_json::from_value(json!({
+                "provider":"provider", "plan_method":method,"callback_method":method,"status_method":method,
+                "capabilities":[],"cleanup_methods":[],"settings_revision":"one","settings":{}
+            })).unwrap();
+            let work = release_work(journal, "session");
+            work.waiting_retirement = false;
+            work.providers = vec!["provider".into()];
+            let plan: amaterasu_extension_api::ResourcePlan = serde_json::from_value(json!({
+                "plan_id":"plan","revision":1,"resources":[],"mutation_domains":[],"required_capabilities":[],
+                "constraints":{},"obligations":[],"affected_consumers":[],"consumer_change":"live",
+                "candidate_constraint":null,"allowed_degradation":[]
+            })).unwrap();
+            let request: amaterasu_extension_api::ProviderRequest = serde_json::from_value(json!({
+                "version":1,"operation":"lifecycle_callback","operation_id":"effect","transition_id":work.transition_id,
+                "target":work.target,"phase":"session.release","settings_revision":"one","settings":{},
+                "intent":null,"reason":"end","requested_video":null,"remaining_ms":30000,
+                "provider_sequence":1,"plan_revision":1,"admission_id":"admission","approved_plan":plan,
+                "consumer_requirements":{"execution_domain":"desktop","capture_providers":[],"selector_schemas":[]}
+            })).unwrap();
+            let dispatch = DispatchRecord {
+                call: ProviderCall {
+                    service: "provider/1".into(),
+                    method: "callback".into(),
+                    interface_major: 1,
+                    interface_minor: 0,
+                    approval: json!({}),
+                    arguments: json!(request),
+                    timeout_ms: 5000,
+                    operation_id: "effect".into(),
+                },
+                state: DispatchState::Completed {
+                    payload: json!({"status":"pending","receipt_id":"exact-receipt"}),
+                },
+            };
+            work.states.insert(
+                "provider".into(),
+                PrepareState {
+                    provider: "provider".into(),
+                    participant: participant.clone(),
+                    request,
+                    phase: crate::prepare_driver::PreparePhase::Callback,
+                    plan: Some(plan.clone()),
+                    admission_id: Some("admission".into()),
+                    pending_receipt: None,
+                    pending_dispatch: None,
+                    status_polls: 0,
+                    last_sequence: 1,
+                    dispatch: Some(dispatch),
+                    terminal_dispatch: None,
+                    response: None,
+                },
+            );
+            let transition = work.transition_id.clone();
+            let receipt = journal
+                .receipts
+                .get_mut(&receipt_key(OWNER, OWNER, "session-end"))
+                .unwrap();
+            receipt.request["operation"] = json!("recover_session");
+            receipt.request["restart_abandonment"] = json!(true);
+            journal
+                .admission_transitions
+                .insert("admission".into(), transition);
+            journal.authority.admissions.insert(
+                "admission".into(),
+                crate::prepare_authority::Admission {
+                    provider: "provider".into(),
+                    plan,
+                    rights: vec![],
+                    selection: crate::prepare_authority::ProviderSelection {
+                        participant,
+                        approvals: vec![],
+                        capabilities: Default::default(),
+                        cleanup_methods: vec![],
+                        authorized_borrowers: Default::default(),
+                        approved_control_bindings: vec![],
+                    },
+                },
+            );
+        });
+        let original = coordinator.shared.borrow().value.clone();
+        assert!(resumable_abandoned_release(&original, &original.sessions["session"]).is_some());
+        let mut uncertain = original.clone();
+        release_work(&mut uncertain, "session")
+            .states
+            .get_mut("provider")
+            .unwrap()
+            .dispatch
+            .as_mut()
+            .unwrap()
+            .state = DispatchState::OutcomeUnknown;
+        assert!(resumable_abandoned_release(&uncertain, &uncertain.sessions["session"]).is_none());
+        let mut polling = original.clone();
+        let state = release_work(&mut polling, "session")
+            .states
+            .get_mut("provider")
+            .unwrap();
+        state.phase = crate::prepare_driver::PreparePhase::CallbackStatus;
+        state.pending_receipt = Some("exact-receipt".into());
+        let dispatch = state.dispatch.as_mut().unwrap();
+        dispatch.call.arguments = json!({"receipt_id":"exact-receipt","operation_id":"effect",
+            "transition_id":state.request.transition_id,"provider_sequence":1});
+        dispatch.state = DispatchState::Ready;
+        assert!(resumable_abandoned_release(&polling, &polling.sessions["session"]).is_some());
+        release_work(&mut polling, "session")
+            .states
+            .get_mut("provider")
+            .unwrap()
+            .dispatch
+            .as_mut()
+            .unwrap()
+            .call
+            .arguments["receipt_id"] = json!("foreign-receipt");
+        assert!(resumable_abandoned_release(&polling, &polling.sessions["session"]).is_none());
+        let request = abandon_request(&coordinator, "session");
+        let response = coordinator.handle(OWNER, OWNER, request);
+        assert_eq!(response["status"], "pending", "{response}");
+        let journal = coordinator.shared.borrow().value.clone();
+        assert!(!journal.sessions["session"].application_retired);
+        assert!(journal.authority.admissions.contains_key("admission"));
+        let work = journal.receipts[&receipt_key(OWNER, OWNER, "session-abandon")]
+            .work
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            work.states["provider"].dispatch,
+            original.receipts[&receipt_key(OWNER, OWNER, "session-end")]
+                .work
+                .as_ref()
+                .unwrap()
+                .states["provider"]
+                .dispatch
         );
         drop(coordinator);
         std::fs::remove_dir_all(path).unwrap();
