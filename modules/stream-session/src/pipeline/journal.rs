@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub(super) const KEY: &str = "stream-session/lifecycle/v1";
 const FORMAT_VERSION: u32 = 1;
-const MAX_ENTRIES: usize = 32;
+pub(super) const MAX_ENTRIES: usize = 32;
 
 fn is_false(value: &bool) -> bool {
     !*value
@@ -356,6 +356,10 @@ pub(super) struct LifecycleJournal {
     load: Option<rpc::Pending>,
     load_validated: bool,
     load_next_poll: u64,
+    /// Entries that may be forgotten when the journal is full, the most
+    /// expendable first. The pipeline lists ended sessions only; the entry
+    /// of an open session is never listed.
+    pub forgettable: Vec<u64>,
 }
 
 pub(super) enum LoadProgress {
@@ -377,6 +381,7 @@ impl LifecycleJournal {
             load: None,
             load_validated: false,
             load_next_poll: 0,
+            forgettable: Vec::new(),
         })
     }
 
@@ -391,6 +396,7 @@ impl LifecycleJournal {
             load: None,
             load_validated: false,
             load_next_poll: 0,
+            forgettable: Vec::new(),
         }
     }
 
@@ -419,9 +425,25 @@ impl LifecycleJournal {
         })
     }
 
+    /// The journal with `record` added. A cleanup that never confirms keeps
+    /// its entry, and the journal is bounded: once it filled, every later
+    /// stream failed to record its ownership and could not start. Room is
+    /// made by forgetting entries of ended sessions instead. Their cleanup is
+    /// then no longer recovered after a restart, which the log records.
     pub fn with_record(&self, record: &Record) -> Result<Document, &'static str> {
         let mut next = self.document.clone();
         next.entries.insert(record.id, Entry::from_record(record));
+        for id in &self.forgettable {
+            if next.entries.len() <= MAX_ENTRIES {
+                break;
+            }
+            if *id != record.id && next.entries.remove(id).is_some() {
+                eprintln!(
+                    "stream session journal is full: the cleanup identity of ended session \
+                     {id} is no longer recorded"
+                );
+            }
+        }
         validate_document(&next)?;
         Ok(next)
     }

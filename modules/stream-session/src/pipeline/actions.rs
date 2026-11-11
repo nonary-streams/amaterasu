@@ -1,5 +1,7 @@
+use super::admission::{MAX_RECORDS, session_admitted};
 use super::*;
 use crate::model::{PrepareConfig, StartConfig, valid_name};
+use amaterasu_module_sdk::lifecycle_ledger::Live;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum StartMode {
@@ -274,13 +276,12 @@ impl Pipeline {
                 return;
             }
         }
-        if self.records.len() >= 128
-            || self
-                .records
-                .values()
-                .filter(|record| !record.state.terminal() && record.state != State::CleanupFailed)
-                .count()
-                >= self.settings.max_live_sessions
+        self.keep_session_capacity();
+        if self.records.len() >= MAX_RECORDS
+            || !session_admitted(
+                &Live::of(self.records.values()),
+                self.settings.max_live_sessions,
+            )
         {
             rpc::complete(send, request, error("capacity_exceeded"));
             return;

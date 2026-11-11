@@ -7,6 +7,7 @@ use crate::{
 };
 use amaterasu_gamestream::control::InputTranslator;
 use amaterasu_media::CaptureGeometry;
+use amaterasu_module_sdk::lifecycle_ledger::{Admission, Owner, Retirement};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -29,6 +30,42 @@ pub(super) enum State {
 impl State {
     pub fn terminal(self) -> bool {
         matches!(self, Self::Stopped | Self::Failed | Self::Cancelled)
+    }
+}
+
+impl Owner for Record {
+    /// A session is open from preparation until it is asked to stop. From
+    /// then on it only retires what it held.
+    fn admission(&self) -> Admission {
+        match self.state {
+            State::Preparing | State::Prepared | State::Armed | State::Starting | State::Active => {
+                Admission::Open
+            }
+            State::Stopping
+            | State::Stopped
+            | State::Failed
+            | State::Cancelled
+            | State::CleanupFailed => Admission::Ended,
+        }
+    }
+
+    fn retirement(&self) -> Retirement {
+        match self.state {
+            State::Stopped | State::Failed | State::Cancelled => {
+                if self.cleanup_error.is_none() {
+                    Retirement::Confirmed
+                } else {
+                    Retirement::Abandoned
+                }
+            }
+            State::CleanupFailed => Retirement::Unconfirmed,
+            State::Preparing
+            | State::Prepared
+            | State::Armed
+            | State::Starting
+            | State::Active
+            | State::Stopping => Retirement::Pending,
+        }
     }
 }
 

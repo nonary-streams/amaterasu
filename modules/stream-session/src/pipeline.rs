@@ -1,4 +1,5 @@
 mod actions;
+mod admission;
 mod cleanup;
 mod direct_input;
 mod display;
@@ -439,6 +440,7 @@ impl Pipeline {
         if self.journal.loaded && !self.recovery_initialized {
             self.initialize_recovery(now)?;
         }
+        self.refresh_forgettable_journal_entries();
         if self.job.is_none() {
             self.progress_uncertain_journal(now, send);
         }

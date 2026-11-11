@@ -108,3 +108,74 @@ fn generic_cleanup_failure_never_blocks_a_new_stream() {
         }
     }
 }
+
+#[test]
+fn only_open_sessions_count_against_the_session_limit() {
+    use amaterasu_module_sdk::lifecycle_ledger::Live;
+
+    let mut host = Harness::new();
+    let limit = host.pipeline.settings.max_live_sessions;
+    let mut first = None;
+    for generation in 1..=limit as u64 {
+        first.get_or_insert(start_fresh(&mut host, generation));
+    }
+    let first = first.unwrap();
+    let admitted = |host: &Harness| {
+        admission::session_admitted(&Live::of(host.pipeline.records.values()), limit)
+    };
+    assert!(!admitted(&host));
+    // A session that was asked to stop is no longer open, however far its
+    // cleanup got and whether or not it succeeded.
+    for ended in [
+        State::Stopping,
+        State::CleanupFailed,
+        State::Stopped,
+        State::Failed,
+        State::Cancelled,
+    ] {
+        let record = host.pipeline.records.get_mut(&first).unwrap();
+        let open = std::mem::replace(&mut record.state, ended);
+        assert!(admitted(&host), "{ended:?} still held a session slot");
+        host.pipeline.records.get_mut(&first).unwrap().state = open;
+    }
+    assert!(!admitted(&host));
+}
+
+#[test]
+fn finished_sessions_do_not_use_up_the_record_table() {
+    let mut host = Harness::new();
+    for generation in 1..=(admission::MAX_RECORDS as u64 + 12) {
+        let session = start_fresh(&mut host, generation);
+        assert_eq!(
+            host.response(
+                generation * 10 + 3,
+                json!({"action":"stop", "session":session}),
+            )["state"],
+            "stopped"
+        );
+        assert!(host.pipeline.records.len() <= admission::MAX_RECORDS);
+    }
+}
+
+#[test]
+fn failed_cleanups_never_fill_the_record_table() {
+    let fault = cleanup_operations().into_iter().next().unwrap();
+    let mut host = Harness::new();
+    host.broker.cleanup_failure = Some(fault);
+    for generation in 1..=(admission::MAX_RECORDS as u64 + 12) {
+        let session = start_fresh(&mut host, generation);
+        assert_eq!(
+            host.response(
+                generation * 10 + 3,
+                json!({"action":"stop", "session":session}),
+            )["state"],
+            "cleanup_failed"
+        );
+        assert!(host.pipeline.records.len() <= admission::MAX_RECORDS);
+        // The durable journal stays inside its bound and always holds the
+        // newest session: the oldest unconfirmed cleanups are what it forgets.
+        let entries = &host.pipeline.journal.document.entries;
+        assert!(entries.len() <= journal::MAX_ENTRIES);
+        assert!(entries.contains_key(&session));
+    }
+}
