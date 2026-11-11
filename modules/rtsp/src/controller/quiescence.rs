@@ -28,17 +28,16 @@ impl Controller {
         let Some(deadline) = self.shutdown_deadline else {
             return;
         };
-        let Some(job) = self.job.as_mut() else {
-            return;
-        };
-        let cleanup = matches!(job.phase, Phase::Stop | Phase::Find)
-            || self.records.get(&job.ticket).is_some_and(|record| {
-                matches!(record.state, State::Closing | State::CleanupFailed)
-            });
-        if cleanup {
-            // An owner may request cleanup while its provider waits for DAG
-            // quiescence. That cleanup still shares the host's original bound.
-            job.deadline = job.deadline.min(deadline);
+        for job in self.job.iter_mut().chain(self.retiring_jobs.values_mut()) {
+            let cleanup = matches!(job.phase, Phase::Stop | Phase::Find)
+                || self.records.get(&job.ticket).is_some_and(|record| {
+                    matches!(record.state, State::Closing | State::CleanupFailed)
+                });
+            if cleanup {
+                // An owner may request cleanup while its provider waits for DAG
+                // quiescence. That cleanup still shares the host's original bound.
+                job.deadline = job.deadline.min(deadline);
+            }
         }
     }
 
@@ -136,27 +135,34 @@ impl Controller {
         }
 
         self.advance_startup_recovery(runtime, now);
+        self.move_ended_job_to_its_own_lane();
         self.advance_job(runtime, now);
+        self.move_ended_job_to_its_own_lane();
+        self.advance_retiring_jobs(runtime, now);
         self.close_quiescing_records();
         self.advance_display_cleanup(runtime);
         self.advance_shutdown_settlement(runtime);
-        if self.job.is_none()
-            && let Some(ticket) = self
-                .records
-                .values()
-                .find(|record| record.state == State::Closing)
-                .map(|record| record.id)
-        {
-            let mut record = self
-                .records
-                .remove(&ticket)
-                .expect("selected closing record");
-            self.schedule_cleanup(&mut record, None, now);
-            self.records.insert(ticket, record);
+        // Every closing ticket retires on its own; none waits for another.
+        let closing: Vec<u64> = self
+            .records
+            .values()
+            .filter(|record| record.state == State::Closing && !self.has_job(record.id))
+            .map(|record| record.id)
+            .collect();
+        for ticket in closing {
+            self.with_retiring_job(ticket, |controller| {
+                let mut record = controller
+                    .records
+                    .remove(&ticket)
+                    .expect("selected closing record");
+                controller.schedule_cleanup(&mut record, None, now);
+                controller.records.insert(ticket, record);
+            });
         }
         if self.job.is_none() {
             self.poll_caller(runtime, now)?;
         }
+        self.move_ended_job_to_its_own_lane();
         // Existing response handlers may schedule a following lookup/stop.
         // They all consume the original aggregate deadline during shutdown.
         self.cap_quiescence_deadlines();
@@ -210,16 +216,22 @@ impl Controller {
             .as_ref()
             .expect("quiescence started")
             .deadline;
-        if let Some(job) = self.job.as_mut() {
+        for job in self.job.iter_mut().chain(self.retiring_jobs.values_mut()) {
             job.deadline = job.deadline.min(deadline);
         }
         self.startup_recovery.deadline = self.startup_recovery.deadline.min(deadline);
     }
 
     fn expire_quiescence(&mut self, runtime: &RuntimeClient) {
-        let mut caller = None;
-        if let Some(mut job) = self.job.take() {
-            caller = job.caller.map(|caller| (job.ticket, caller));
+        let mut callers = Vec::new();
+        let jobs: Vec<Job> = self
+            .job
+            .take()
+            .into_iter()
+            .chain(std::mem::take(&mut self.retiring_jobs).into_values())
+            .collect();
+        for mut job in jobs {
+            callers.extend(job.caller.map(|caller| (job.ticket, caller)));
             job.call.cancel();
             if let Some(record) = self.records.get_mut(&job.ticket) {
                 if job.call.proven_not_dispatched() {
@@ -256,15 +268,15 @@ impl Controller {
                 record.cleanup_error = Some("quiescence_deadline");
             }
         }
-        if let Some((ticket, caller)) = caller
-            && let Some(record) = self.records.get(&ticket)
-        {
-            complete_caller(record, Some(caller), runtime);
+        for (ticket, caller) in callers {
+            if let Some(record) = self.records.get(&ticket) {
+                complete_caller(record, Some(caller), runtime);
+            }
         }
     }
 
     fn quiescence_ready(&self) -> bool {
-        self.job.is_none()
+        self.no_jobs()
             && self.display_admission.is_none()
             && self.display_cleanup.is_empty()
             && self.shutdown_settlement.is_empty()

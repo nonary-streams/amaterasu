@@ -153,10 +153,13 @@ fn command(
     })
 }
 
-/// Validate the fixed epoch response. Transport must finish old-runtime native
-/// recovery before a new operation can bind it. Other current-epoch operations
-/// may still have admissions or cleanup pending; reading admission identity
-/// neither waits for them nor proves their resources have retired.
+/// Validate the fixed epoch response. Transport reports `ready` once a new
+/// operation may bind it: it waits a bounded time after start for the
+/// previous runtime's sessions and is not held back by them after that.
+/// `startup_reconciled` is the separate statement that those sessions were
+/// retired, and other current-epoch operations may still have admissions or
+/// cleanup pending; reading admission identity neither waits for any of this
+/// nor proves resources have retired.
 /// Launch's epoch is admission identity only, with no cross-restart proof.
 pub fn parse_epoch(contract: Contract, value: &Value) -> ModuleResult<String> {
     validate_response_size(value)?;
@@ -165,7 +168,10 @@ pub fn parse_epoch(contract: Contract, value: &Value) -> ModuleResult<String> {
     }
     let field = match contract {
         Contract::Transport => {
-            if value.get("startup_reconciled") != Some(&Value::Bool(true))
+            if value
+                .get("startup_reconciled")
+                .and_then(Value::as_bool)
+                .is_none()
                 || value.get("state").and_then(Value::as_str) != Some("ready")
                 || value.get("retired") != Some(&Value::Bool(false))
                 || value.get("operation_id") != Some(&Value::Null)

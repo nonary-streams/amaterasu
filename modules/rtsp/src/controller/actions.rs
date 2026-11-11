@@ -129,16 +129,11 @@ impl Controller {
             rpc::complete(runtime, request, error("runtime_epoch_changed"));
             return;
         }
-        if !self.startup_recovery.ready() {
-            rpc::complete(
-                runtime,
-                request,
-                error(if self.startup_recovery.blocked() {
-                    self.startup_recovery.blocked_code()
-                } else {
-                    "startup_reconciliation_pending"
-                }),
-            );
+        // Reconciling the previous runtime's sessions is cleanup of ended
+        // work. A ticket waits for it briefly after start, because those
+        // sessions may still hold the media ports; it is never refused by it.
+        if !self.startup_admission_open(now) {
+            rpc::complete(runtime, request, error("startup_reconciliation_pending"));
             return;
         }
         if !self.settings.enabled {
@@ -207,13 +202,13 @@ impl Controller {
             rpc::complete(runtime, request, response);
             return;
         }
+        self.stamp_ended(now);
+        self.keep_ticket_capacity();
         if self.records.len() >= MAX_RECORDS
-            || self
-                .records
-                .values()
-                .filter(|record| !record.state.terminal())
-                .count()
-                >= self.settings.max_live_tickets
+            || !lanes::ticket_admitted(
+                &Live::of(self.records.values()),
+                self.settings.max_live_tickets,
+            )
         {
             rpc::complete(runtime, request, error("capacity_exceeded"));
             return;
@@ -331,6 +326,7 @@ impl Controller {
             display_prepare_timeout_ms: None,
             revoke_after: None,
             cleanup_confirmed: false,
+            ended_at: None,
         };
         let mut payload = record.config.prepare_with_media_binds(
             &record.operation(),
@@ -508,6 +504,17 @@ impl Controller {
         }
         if record.state.terminal() {
             rpc::complete(runtime, request, record.response());
+            self.records.insert(ticket, record);
+            return;
+        }
+        if let Some(job) = self.retiring_jobs.get_mut(&ticket) {
+            // Cleanup is already running for this ticket. The first caller
+            // to ask is answered when it finishes; others see it closing.
+            if job.caller.is_none() {
+                job.caller = Some(request);
+            } else {
+                rpc::complete(runtime, request, record.response());
+            }
             self.records.insert(ticket, record);
             return;
         }

@@ -1,6 +1,9 @@
 mod actions;
 #[cfg(test)]
 mod concurrent_ports_tests;
+mod lanes;
+#[cfg(test)]
+mod lanes_tests;
 mod lifecycle_binding;
 mod network;
 #[cfg(test)]
@@ -28,6 +31,7 @@ use amaterasu_gamestream::rtsp::{
     },
     serialize_response,
 };
+use amaterasu_module_sdk::lifecycle_ledger::{Admission, Live, Owner, Retirement, make_room};
 use amaterasu_module_sdk::{Command, ModuleResult, Response, RuntimeClient, network::Network};
 use record::{Job, Phase, Record, State};
 use retirement::{clean_terminal, confirm_terminal, preparation_source};
@@ -51,6 +55,11 @@ const MAX_STARTUP_RECOVERY_SESSIONS: usize = 32;
 const MAX_PENDING_NETWORK: usize = 16;
 const MAX_DISPLAY_CLEANUP: usize = 16;
 const STARTUP_RECONCILIATION_TIMEOUT_MS: u64 = 45_000;
+/// How long after start a new ticket waits for the previous runtime's
+/// sessions to be retired. They may still hold the media ports and normally
+/// stop within a second. Past this, or once reconciliation has given up,
+/// tickets are admitted while that cleanup carries on.
+const STARTUP_ADMISSION_GRACE_MS: u64 = 10_000;
 // Legacy synchronous unload shares one bounded budget across all known streams.
 // The managed host instead announces its cooperative shutdown deadline.
 const ORDERLY_SESSION_CLEANUP_BUDGET: Duration = Duration::from_secs(15);
@@ -108,6 +117,16 @@ struct StartupRecovery {
     attempted_sessions: BTreeSet<u64>,
     current_session: Option<u64>,
     error: Option<&'static str>,
+    blocked_reported: bool,
+}
+
+/// This runtime's own tickets. Startup reconciliation retires what an
+/// earlier runtime left behind and must never stop one of these.
+struct CurrentTickets {
+    operations: BTreeSet<String>,
+    sessions: BTreeSet<u64>,
+    /// A ticket whose stream session has not been reported back yet.
+    preparing: bool,
 }
 
 impl StartupRecovery {
@@ -123,6 +142,7 @@ impl StartupRecovery {
             attempted_sessions: BTreeSet::new(),
             current_session: None,
             error: None,
+            blocked_reported: false,
         }
     }
 
@@ -143,6 +163,18 @@ impl StartupRecovery {
 
     fn blocked_code(&self) -> &'static str {
         self.error.unwrap_or("startup_reconciliation_unavailable")
+    }
+
+    /// Say once why reconciliation stopped. It no longer answers an open, so
+    /// the log is where its reason is found.
+    fn report_blocked(&mut self) {
+        if self.blocked() && !self.blocked_reported {
+            self.blocked_reported = true;
+            eprintln!(
+                "rtsp startup reconciliation blocked code={}; new tickets are still admitted",
+                self.blocked_code()
+            );
+        }
     }
 
     fn operation_id(&mut self, step: &str, session: Option<u64>) -> String {
@@ -181,13 +213,21 @@ pub struct Controller {
     locals: Vec<SocketAddr>,
     records: BTreeMap<u64, Record>,
     pending_network: VecDeque<PendingNetwork>,
+    /// The job of an open ticket or an incoming request. While it is busy
+    /// no further request is read, so only open tickets may occupy it.
     job: Option<Job>,
+    /// One cleanup job per ended ticket, each advancing on its own.
+    retiring_jobs: BTreeMap<u64, Job>,
+    /// The job slot's own job while an ended ticket's job occupies it.
+    parked_job: Option<Job>,
     quiescence: Option<quiescence::Quiescence>,
     shutdown_deadline: Option<u64>,
     shutdown_settlement: Vec<Call>,
     display_admission: Option<DisplayAdmission>,
     display_cleanup: Vec<DisplayCleanup>,
     startup_recovery: StartupRecovery,
+    /// Set once tickets are admitted; it does not close again.
+    startup_admission_opened: bool,
     runtime_epoch: String,
     retired_operations: BTreeSet<(String, String)>,
     sequence: u64,
@@ -246,12 +286,15 @@ impl Controller {
             records: BTreeMap::new(),
             pending_network: VecDeque::new(),
             job: None,
+            retiring_jobs: BTreeMap::new(),
+            parked_job: None,
             quiescence: None,
             shutdown_deadline: None,
             shutdown_settlement: Vec::new(),
             display_admission: None,
             display_cleanup: Vec::new(),
             startup_recovery,
+            startup_admission_opened: false,
             runtime_epoch,
             retired_operations: BTreeSet::new(),
             sequence: 0,
@@ -268,18 +311,26 @@ impl Controller {
         self.advance_shutdown_settlement(runtime);
         self.cap_announced_cleanup_deadline();
         self.advance_startup_recovery(runtime, now);
+        self.move_ended_job_to_its_own_lane();
         self.advance_job(runtime, now);
+        self.move_ended_job_to_its_own_lane();
+        self.advance_retiring_jobs(runtime, now);
         self.advance_display_admission(runtime, now);
         self.advance_display_cleanup(runtime);
+        self.stamp_ended(now);
+        self.keep_ticket_capacity();
         if self.job.is_none() {
             self.process_pending_network(now);
         }
+        self.move_ended_job_to_its_own_lane();
+        self.schedule_retiring(now);
         if self.job.is_none() {
             self.schedule_background(now);
         }
         if self.job.is_none() && self.display_admission.is_none() {
             self.poll_caller(runtime, now)?;
         }
+        self.move_ended_job_to_its_own_lane();
         self.cap_announced_cleanup_deadline();
         self.reconcile_network_port(now);
         Ok(())
@@ -301,7 +352,13 @@ impl Controller {
         if let Some(call) = self.startup_recovery.call.as_mut() {
             call.shutdown(runtime);
         }
-        if let Some(mut job) = self.job.take() {
+        let jobs: Vec<Job> = self
+            .job
+            .take()
+            .into_iter()
+            .chain(std::mem::take(&mut self.retiring_jobs).into_values())
+            .collect();
+        for mut job in jobs {
             if matches!(
                 job.phase,
                 Phase::Observe | Phase::Status | Phase::Find | Phase::LifecycleLookup
@@ -498,6 +555,37 @@ impl Controller {
     }
 
     fn advance_startup_recovery(&mut self, runtime: &RuntimeClient, now: u64) {
+        self.advance_startup_recovery_step(runtime, now);
+        self.startup_recovery.report_blocked();
+        self.startup_admission_open(now);
+    }
+
+    /// Whether tickets are admitted yet. Reconciliation is waited for
+    /// briefly and never decides admission beyond that.
+    pub(super) fn startup_admission_open(&mut self, now: u64) -> bool {
+        self.startup_admission_opened |= self.startup_recovery.ready()
+            || self.startup_recovery.blocked()
+            || now >= STARTUP_ADMISSION_GRACE_MS;
+        self.startup_admission_opened
+    }
+
+    fn current_tickets(&self) -> CurrentTickets {
+        CurrentTickets {
+            operations: self.records.values().map(Record::operation).collect(),
+            sessions: self
+                .records
+                .values()
+                .filter_map(|record| record.session)
+                .collect(),
+            preparing: self
+                .records
+                .values()
+                .any(|record| record.session.is_none() && !record.state.terminal()),
+        }
+    }
+
+    fn advance_startup_recovery_step(&mut self, runtime: &RuntimeClient, now: u64) {
+        let current = self.current_tickets();
         let recovery = &mut self.startup_recovery;
         if recovery.phase == RecoveryPhase::Complete {
             return;
@@ -595,7 +683,7 @@ impl Controller {
             Outcome::Result(payload) => {
                 recovery.call = None;
                 let result = match phase {
-                    RecoveryPhase::List => accept_recovery_list(recovery, &payload, now),
+                    RecoveryPhase::List => accept_recovery_list(recovery, &payload, &current, now),
                     RecoveryPhase::Stop => {
                         let Some(session) = recovery.current_session else {
                             recovery.error = Some("startup_reconciliation_state_invalid");
@@ -702,8 +790,11 @@ impl Controller {
             .and_then(|port| self.settings.media_binds_on(port, local_address).ok())?;
         // Reserve predictable ports for the signed concurrent-client bound so
         // administrators can permit a bounded UDP range through the firewall.
-        // Keep a slot occupied until cleanup is confirmed, including pending
-        // opens and failed or uncertain retirement.
+        // An open ticket holds its slot. A slot whose ticket ended without
+        // confirming cleanup is used only when no slot is free, and then the
+        // one that ended longest ago: its ports are the likeliest to have
+        // been released, and a ticket that never confirms cannot keep them.
+        let mut releasing: Option<(u64, crate::model::MediaBinds)> = None;
         for slot in 0..self.settings.max_live_tickets {
             let offset = u16::try_from(slot).ok()?.checked_mul(3)?;
             let mut candidate = binds;
@@ -716,15 +807,32 @@ impl Controller {
             candidate
                 .audio
                 .set_port(binds.audio.port().checked_add(offset)?);
-            let occupied = self.records.values().any(|record| {
-                record.media_binds == Some(candidate)
-                    && (!record.state.terminal() || !record.cleanup_confirmed)
-            });
-            if !occupied {
+            let mut held = false;
+            let mut last_ended = None;
+            for record in self
+                .records
+                .values()
+                .filter(|record| record.media_binds == Some(candidate))
+            {
+                match record.admission() {
+                    Admission::Open => held = true,
+                    Admission::Ended if record.retirement() == Retirement::Confirmed => {}
+                    Admission::Ended => {
+                        last_ended = last_ended.max(Some(record.ended_at.unwrap_or(u64::MAX)));
+                    }
+                }
+            }
+            if held {
+                continue;
+            }
+            let Some(ended) = last_ended else {
                 return Some(candidate);
+            };
+            if releasing.is_none_or(|(earliest, _)| ended < earliest) {
+                releasing = Some((ended, candidate));
             }
         }
-        None
+        releasing.map(|(_, candidate)| candidate)
     }
 
     pub(super) fn advertised_local_for_peer(
@@ -866,13 +974,19 @@ impl Controller {
 fn accept_recovery_list(
     recovery: &mut StartupRecovery,
     payload: &Value,
+    current: &CurrentTickets,
     now: u64,
 ) -> Result<(), &'static str> {
     let reconciled = payload["startup_reconciled"]
         .as_bool()
         .ok_or("startup_reconciliation_response_invalid")?;
     // Validate the complete owner-scoped page before choosing any mutations.
-    let mut stale_sessions = recovery_list(payload)?;
+    let Some(mut stale_sessions) = recovery_list(payload, current)? else {
+        // A session could not be told apart from a ticket that is being
+        // prepared right now. Look again once that ticket knows its session.
+        recovery.retry_status_at = now.saturating_add(STATUS_INTERVAL_MS);
+        return Ok(());
+    };
     if stale_sessions
         .iter()
         .any(|session| recovery.attempted_sessions.contains(session))
@@ -913,7 +1027,12 @@ fn accept_recovery_list(
     Ok(())
 }
 
-fn recovery_list(payload: &Value) -> Result<VecDeque<u64>, &'static str> {
+/// The sessions an earlier runtime left behind. `None` means one of them
+/// could not be told apart from a ticket this runtime is preparing.
+fn recovery_list(
+    payload: &Value,
+    current: &CurrentTickets,
+) -> Result<Option<VecDeque<u64>>, &'static str> {
     let sessions = payload["sessions"]
         .as_array()
         .ok_or("startup_reconciliation_response_invalid")?;
@@ -934,9 +1053,12 @@ fn recovery_list(payload: &Value) -> Result<VecDeque<u64>, &'static str> {
 
     // Stream-session status is broker-scoped to this RTSP module principal and
     // places all nonterminal records before retained terminal history. Its live
-    // record limit is at most 32, so this page includes every orphan.
+    // record limit is at most 32, so this page includes every orphan. It also
+    // includes the sessions of tickets admitted since this runtime started;
+    // those are recognized by their operation or session and left alone.
     let mut stale = VecDeque::new();
     let mut seen = BTreeSet::new();
+    let mut ambiguous = false;
     for session in sessions {
         let id = session["session"]
             .as_u64()
@@ -950,11 +1072,21 @@ fn recovery_list(payload: &Value) -> Result<VecDeque<u64>, &'static str> {
         }
         let cleanup_clear = session["cleanup_error"].is_null();
         let terminal = matches!(state, "stopped" | "failed" | "cancelled") && cleanup_clear;
-        if !terminal {
-            stale.push_back(id);
+        if terminal {
+            continue;
         }
+        let operation = session["operation_id"].as_str();
+        if current.sessions.contains(&id)
+            || operation.is_some_and(|operation| current.operations.contains(operation))
+        {
+            continue;
+        }
+        // A provider that does not report the operation leaves a session
+        // unidentified while one of this runtime's tickets is still preparing.
+        ambiguous |= operation.is_none() && current.preparing;
+        stale.push_back(id);
     }
-    Ok(stale)
+    Ok((!ambiguous).then_some(stale))
 }
 
 fn recovery_stop_response(payload: &Value, expected_session: u64) -> Result<bool, &'static str> {

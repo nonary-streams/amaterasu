@@ -87,8 +87,16 @@ existing stream-session cancellation and release workflow settles.
 Replies expose an opaque ticket, bound address, RTSP URL, protocol `state`,
 downstream `stream_state`, and fixed failure/cleanup codes. `playing` means PLAY
 was accepted; `stream_state: active` separately indicates media startup completed.
-Two live tickets and 128 retained operation records bound allocations. Lists show
-at most 16 owned records and report truncation. Identical open retries preserve the
+Two open tickets and 128 retained operation records bound allocations. A ticket
+is open from admission until it is asked to close; one that is closing or failed
+to close counts against neither bound. When the record table is full, ended
+tickets are dropped to make room, the most settled first, and their broker calls
+are handed to settlement. Each open ticket holds one media port slot. A slot
+whose ticket ended without confirming cleanup is reused only when no slot is
+free, starting with the ticket that ended longest ago. Each ended ticket runs
+its cleanup in a job of its own, so a stop that is slow or never answered does
+not delay reading requests, preparing the next ticket or another ticket's
+cleanup. Lists show at most 16 owned records and report truncation. Identical open retries preserve the
 original ticket; changed input conflicts, including after the ticket closes.
 
 The initial profile is H.264 SDR with limited-range BT.709, stereo 48 kHz PCM and
@@ -217,11 +225,23 @@ ordinary interrupted workflows keep their existing automatic cleanup owner.
 Each owner is attempted at most once in a bounded reconciliation pass. Failed
 cleanup or a later contradictory live observation blocks the pass until an
 authorized owner requests another reconciliation. Successful Stops are followed
-by a fresh global snapshot: admission and epoch retirement remain fenced until
-the durable startup barrier is reconciled and no owned live record remains.
+by a fresh global snapshot: epoch retirement remains fenced until the durable
+startup barrier is reconciled and no session of an earlier runtime remains.
 Retained broker settlement continues using its exact request identity after
 transient transport failures; settling that bookkeeping alone leaves the pass
 blocked and requires an explicit reconciliation retry.
+
+Reconciliation is cleanup of an earlier runtime's work and does not decide
+admission. A new ticket waits for it for at most ten seconds after start,
+because those sessions may still hold the media ports, and is answered
+`startup_reconciliation_pending` during that wait. Once the pass completes,
+blocks or the ten seconds pass, tickets are admitted and the startup snapshot
+reports `state: ready`; `startup_reconciled` separately keeps saying whether
+the earlier sessions were retired, and a blocked pass logs its reason once.
+Sessions that belong to this runtime's tickets are recognized by their
+operation or session identifier and are never stopped by the pass. If the
+stream-session provider does not report the operation and a ticket is still
+being prepared, the pass looks again instead of guessing.
 
 Signed startup `max_live_tickets` and downstream `max_live_sessions` are bounded
 from 1 to 32 and default to 2. Configured media endpoints reserve three UDP

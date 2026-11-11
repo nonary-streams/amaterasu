@@ -330,9 +330,13 @@ impl Controller {
             self.records.insert(ticket, record);
             return;
         }
-        let pending_mutation = self.job.as_mut().filter(|job| {
-            job.ticket == ticket && job.network.is_some_and(|value| value.0 == connection)
-        });
+        let pending_mutation = self
+            .job
+            .iter_mut()
+            .chain(self.retiring_jobs.values_mut())
+            .find(|job| {
+                job.ticket == ticket && job.network.is_some_and(|value| value.0 == connection)
+            });
         if let Some(job) = pending_mutation {
             job.call.cancel();
             job.network = None;

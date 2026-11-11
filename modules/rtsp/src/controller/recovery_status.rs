@@ -85,8 +85,11 @@ impl Controller {
                 ("unknown", false)
             }
         } else {
+            // A snapshot answers whether a new operation may bind this
+            // runtime. `startup_reconciled` stays the separate statement
+            // about the previous runtime's sessions.
             (
-                if reconciled {
+                if reconciled || self.startup_admission_opened {
                     "ready"
                 } else {
                     self.recovery_observation_state()
@@ -210,7 +213,8 @@ impl Controller {
                     && !retirement_confirmed(record)
             })
             .map(|record| record.id);
-        if let Some(ticket) = ticket {
+        // A ticket whose cleanup is already running keeps that cleanup.
+        if let Some(ticket) = ticket.filter(|ticket| !self.has_job(*ticket)) {
             let mut record = self
                 .records
                 .remove(&ticket)

@@ -248,7 +248,7 @@ fn quiesce_uses_one_deadline_and_does_not_retry_failed_cleanup() {
         controller.tick(&runtime, now).unwrap();
         assert!(!controller.quiesce(&runtime, now));
     }
-    assert_eq!(controller.job.as_ref().unwrap().deadline, 15_100);
+    assert_eq!(controller.retiring_jobs[&5].deadline, 15_100);
     controller.tick(&runtime, 15_100).unwrap();
     assert_eq!(controller.records[&5].state, State::CleanupFailed);
     assert!(controller.records[&5].uncertain.is_some());
@@ -453,10 +453,10 @@ fn shutdown_announcement_budget_is_not_reset_by_later_quiescence_or_reannounceme
 
     assert!(!controller.quiesce(&runtime, 19_000));
     controller.tick(&runtime, 19_001).unwrap();
-    assert_eq!(controller.job.as_ref().unwrap().deadline, 20_100);
+    assert_eq!(controller.retiring_jobs[&5].deadline, 20_100);
     assert!(!controller.quiesce(&runtime, 20_000));
     controller.prepare_shutdown(20_000, 50_000);
-    assert_eq!(controller.job.as_ref().unwrap().deadline, 20_100);
+    assert_eq!(controller.retiring_jobs[&5].deadline, 20_100);
     controller.tick(&runtime, 20_100).unwrap();
     assert_eq!(controller.records[&5].state, State::CleanupFailed);
     assert!(!controller.quiesce(&runtime, 20_101));

@@ -607,46 +607,8 @@ impl Controller {
             record.close(Some("prepare_expired"));
             self.revoke_ticket(ticket);
         }
-        let retry_ticket = self.records.iter_mut().find_map(|(ticket, record)| {
-            if record.state != State::CleanupFailed {
-                return None;
-            }
-            if let Some(retry_at) = record.cleanup_retry_at {
-                if now < retry_at {
-                    return None;
-                }
-                record.cleanup_retry_at = None;
-                record.cleanup_error = None;
-                record.state = State::Closing;
-                return Some(*ticket);
-            }
-
-            if record.cleanup_retry_count >= MAX_CLEANUP_RETRIES {
-                return None;
-            }
-
-            let delay = CLEANUP_RETRY_DELAYS_MS[usize::from(record.cleanup_retry_count)];
-            record.cleanup_retry_count += 1;
-            record.cleanup_retry_at = Some(now.saturating_add(delay));
-            None
-        });
-        if let Some(ticket) = retry_ticket {
-            let mut record = self.records.remove(&ticket).expect("selected retry record");
-            self.schedule_cleanup(&mut record, None, now);
-            self.records.insert(ticket, record);
-            return;
-        }
-        if let Some(ticket) = self
-            .records
-            .values()
-            .find(|record| record.state == State::Closing)
-            .map(|record| record.id)
-        {
-            let mut record = self.records.remove(&ticket).expect("selected record");
-            self.schedule_cleanup(&mut record, None, now);
-            self.records.insert(ticket, record);
-            return;
-        }
+        // Cleanup of ended tickets is scheduled by `schedule_retiring`; the
+        // job slot is left for open tickets.
         // Each detached observation belongs to a distinct record that has
         // left Playing, and RTSP records remain resident for this runtime.
         // Thus a full ledger cannot coexist with another Playing record.

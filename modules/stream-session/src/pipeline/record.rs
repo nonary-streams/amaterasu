@@ -560,6 +560,7 @@ impl Record {
         let mut response = json!({
             "ok": true,
             "session": self.id,
+            "operation_id": self.config.operation_id,
             "lifecycle_session_target": self.config.lifecycle_session_target,
             "lifecycle_capture_mode": self.config.lifecycle_capture_mode,
             "lifecycle_input_required": self.lifecycle_input_required,

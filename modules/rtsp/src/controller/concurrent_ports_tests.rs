@@ -11,13 +11,17 @@ use std::{
     net::{Ipv4Addr, Ipv6Addr},
 };
 
-struct Endpoint {
+pub(super) struct Endpoint {
     network: Network,
     next: u64,
     replies: BTreeMap<u64, Value>,
     lanes: BTreeMap<u64, Vec<UdpSocket>>,
-    prepares: Vec<Value>,
-    completed: Vec<Value>,
+    pub(super) prepares: Vec<Value>,
+    pub(super) completed: Vec<Value>,
+    /// Accept every stop and never answer it.
+    pub(super) hold_stops: bool,
+    pub(super) stops: Vec<u64>,
+    held: BTreeSet<u64>,
 }
 
 impl Endpoint {
@@ -51,7 +55,12 @@ impl Endpoint {
                     }
                     Some("stop") => {
                         let session = payload["session"].as_u64().unwrap();
-                        self.lanes.remove(&session).expect("owned session lanes");
+                        self.stops.push(session);
+                        if self.hold_stops {
+                            self.held.insert(id);
+                        } else {
+                            self.lanes.remove(&session).expect("owned session lanes");
+                        }
                         json!({"ok":true,"session":session,"state":"stopped","cleanup_error":null})
                     }
                     action => panic!("unexpected downstream action {action:?}"),
@@ -59,6 +68,7 @@ impl Endpoint {
                 self.replies.insert(id, response);
                 Response::Accepted { id }
             }
+            Command::TakeResult { request } if self.held.contains(&request) => Response::Pending,
             Command::TakeResult { request } => Response::Result {
                 payload: self.replies[&request].clone(),
             },
@@ -89,7 +99,7 @@ unsafe extern "C" fn invoke(
     abi::STATUS_OK
 }
 
-fn fixture(address: IpAddr) -> (Controller, Box<Endpoint>, RuntimeClient) {
+pub(super) fn fixture(address: IpAddr) -> (Controller, Box<Endpoint>, RuntimeClient) {
     let network = Network::test_provider();
     let settings = serde_json::from_value(json!({"enabled":true,
         "bind":SocketAddr::new(address, 0),"bind_address":address.to_string(),
@@ -108,6 +118,9 @@ fn fixture(address: IpAddr) -> (Controller, Box<Endpoint>, RuntimeClient) {
         lanes: BTreeMap::new(),
         prepares: Vec::new(),
         completed: Vec::new(),
+        hold_stops: false,
+        stops: Vec::new(),
+        held: BTreeSet::new(),
     });
     let api = HostApi {
         header: AbiHeader::of::<HostApi>(),
@@ -119,14 +132,19 @@ fn fixture(address: IpAddr) -> (Controller, Box<Endpoint>, RuntimeClient) {
     (controller, endpoint, runtime)
 }
 
-fn request(address: IpAddr, client: u8) -> Open {
+pub(super) fn request(address: IpAddr, client: u8) -> Open {
     serde_json::from_value(json!({"operation_id":format!("client-{client}"),
         "peer_ip":address,"video_port":50000,"audio_port":50002,
         "key_hex":format!("{client:02x}").repeat(16),"key_id":client,"connect_data":client,
         "capture":{"capture_provider":"dxgi","output":"display","encoder":1,"audio_endpoint":"default"}})).unwrap()
 }
 
-fn admit(controller: &mut Controller, runtime: &RuntimeClient, address: IpAddr, client: u8) -> u64 {
+pub(super) fn admit(
+    controller: &mut Controller,
+    runtime: &RuntimeClient,
+    address: IpAddr,
+    client: u8,
+) -> u64 {
     controller.open(
         OpenRequest {
             request: u64::from(client),
@@ -147,7 +165,7 @@ fn admit(controller: &mut Controller, runtime: &RuntimeClient, address: IpAddr, 
         .id
 }
 
-fn settle(controller: &mut Controller, runtime: &RuntimeClient) {
+pub(super) fn settle(controller: &mut Controller, runtime: &RuntimeClient) {
     for now in 1..16 {
         controller.advance_job(runtime, now);
         if controller.job.is_none() {
@@ -309,7 +327,7 @@ fn concurrent_clients_negotiate_distinct_provider_ports_and_survive_peer_teardow
 }
 
 #[test]
-fn pending_and_uncertain_transport_reservations_keep_distinct_bounded_ports() {
+fn open_tickets_hold_their_ports_and_an_unconfirmed_ticket_cannot_keep_them() {
     let _guard = super::tests::NETWORK_TEST_LOCK.lock().unwrap();
     let address = IpAddr::V4(Ipv4Addr::LOCALHOST);
     let (mut controller, endpoint, runtime) = fixture(address);
@@ -355,45 +373,30 @@ fn pending_and_uncertain_transport_reservations_keep_distinct_bounded_ports() {
         "capacity_exceeded"
     );
     assert_eq!(controller.records.len(), 2);
-    controller.records.get_mut(&first).unwrap().state = State::Failed;
-    controller.records.get_mut(&second).unwrap().state = State::Closed;
-    let prepare_count = endpoint.prepares.len();
-    controller.open(
-        OpenRequest {
-            request: 4,
-            caller: "amaterasu.nvhttp".into(),
-            config: request(address, 4),
-            deadline: 5_000,
-            display_preflight_deadline: None,
-        },
-        0,
-        &runtime,
-        false,
-    );
-    assert_eq!(
-        endpoint.completed.last().unwrap()["code"],
-        "media_port_capacity_exhausted"
-    );
-    assert_eq!(controller.records.len(), 2);
-    assert_eq!(endpoint.prepares.len(), prepare_count);
+    // Both tickets end and neither confirms its cleanup. The next ticket is
+    // still admitted, on the ports of the one that ended longest ago.
+    let second_binds = controller.records[&second].media_binds.unwrap();
+    for (ticket, state, ended_at) in [(first, State::Failed, 20), (second, State::Closed, 10)] {
+        let record = controller.records.get_mut(&ticket).unwrap();
+        record.state = state;
+        record.ended_at = Some(ended_at);
+    }
+    let third = admit(&mut controller, &runtime, address, 4);
+    assert_eq!(controller.records[&third].media_binds, Some(second_binds));
+    // Confirmed cleanup frees a slot outright, and a free slot is preferred.
     controller
         .records
         .get_mut(&first)
         .unwrap()
         .cleanup_confirmed = true;
-    let replacement = admit(&mut controller, &runtime, address, 5);
-    assert_eq!(controller.records[&replacement].media_binds, Some(fixed));
-    controller
-        .records
-        .get_mut(&second)
-        .unwrap()
-        .cleanup_confirmed = true;
-    let second_slot = controller.media_binds_for_open(address).unwrap();
-    assert_eq!(second_slot.video.port(), fixed.video.port() + 3);
+    assert_eq!(controller.media_binds_for_open(address), Some(fixed));
+    // With every slot held by an open ticket the limit is real.
+    admit(&mut controller, &runtime, address, 5);
+    assert!(controller.media_binds_for_open(address).is_none());
 }
 
 #[test]
-fn signed_client_capacity_reserves_distinct_slots_until_cleanup_is_confirmed() {
+fn signed_client_capacity_reserves_distinct_slots_for_open_tickets() {
     let _guard = super::tests::NETWORK_TEST_LOCK.lock().unwrap();
     let address = IpAddr::V4(Ipv4Addr::LOCALHOST);
     let (mut controller, endpoint, runtime) = fixture(address);
@@ -428,8 +431,10 @@ fn signed_client_capacity_reserves_distinct_slots_until_cleanup_is_confirmed() {
         endpoint.completed.last().unwrap()["code"],
         "capacity_exceeded"
     );
+    // A ticket that ended gives its slot up whether or not its cleanup was
+    // confirmed; only open tickets count against the signed capacity.
     controller.records.get_mut(&first).unwrap().state = State::Failed;
-    assert!(controller.media_binds_for_open(address).is_none());
+    assert_eq!(controller.media_binds_for_open(address), Some(first_binds));
     controller
         .records
         .get_mut(&first)

@@ -1006,10 +1006,17 @@ fn restart_reconciliation_stops_old_lease_before_fresh_resume_open() {
 }
 
 #[test]
-fn startup_reconciliation_timeout_after_partial_stop_keeps_launch_fail_closed() {
-    let mut controller = Controller::new(Settings::default()).unwrap();
+fn startup_reconciliation_that_times_out_stays_reported_and_stops_refusing_tickets() {
+    let settings: Settings = serde_json::from_value(json!({
+        "enabled":true,
+        "bind":"127.0.0.1:0",
+        "allowed_principals":["amaterasu.nvhttp"]
+    }))
+    .unwrap();
+    let mut controller = Controller::new(settings).unwrap();
     startup_recovery_pending(&mut controller, 300);
     let mut endpoint = Endpoint {
+        active_request: true,
         recovery_results: VecDeque::from([
             Some(listed_stream_sessions(
                 json!([{"session":23,"state":"active","cleanup_error":null}]),
@@ -1028,6 +1035,10 @@ fn startup_reconciliation_timeout_after_partial_stop_keeps_launch_fail_closed() 
 
     assert!(controller.startup_recovery.blocked());
     assert!(!controller.startup_recovery.ready());
+    assert_eq!(
+        controller.startup_recovery.blocked_code(),
+        "startup_reconciliation_timeout"
+    );
     let mut config = open();
     config.operation_id = "new-launch".into();
     controller.open(
@@ -1042,13 +1053,21 @@ fn startup_reconciliation_timeout_after_partial_stop_keeps_launch_fail_closed() 
         &runtime,
         false,
     );
+    controller.advance_job(&runtime, 302);
+    // The old session's cleanup is still unconfirmed, and says so.
+    assert!(!controller.startup_recovery.ready());
+    controller.retirement_status(1, "amaterasu.nvhttp", None, None, &runtime);
+    let snapshot = &endpoint.completions.last().unwrap().1;
+    assert_eq!(snapshot["startup_reconciled"], false);
+    assert_eq!(snapshot["state"], "ready");
+    // The new ticket was prepared all the same.
     assert!(
-        endpoint
+        !endpoint
             .completions
             .iter()
-            .any(|(_, reply)| { reply["code"] == "startup_reconciliation_timeout" })
+            .any(|(_, reply)| reply["code"] == "startup_reconciliation_timeout")
     );
-    assert!(!endpoint.commands.iter().any(|command| matches!(command,
+    assert!(endpoint.commands.iter().any(|command| matches!(command,
         Command::Request { payload, .. } if payload["action"] == "prepare")));
 }
 
@@ -1094,6 +1113,7 @@ pub(super) fn record(state: State) -> Record {
         display_prepare_timeout_ms: None,
         revoke_after: None,
         cleanup_confirmed: false,
+        ended_at: None,
     }
 }
 
@@ -1803,6 +1823,7 @@ fn cancelled_parent_reaches_cleanup_failed_when_settlement_stays_unavailable() {
         display_prepare_timeout_ms: None,
         revoke_after: None,
         cleanup_confirmed: false,
+        ended_at: None,
     };
     let payload = record.config.prepare(&record.operation(), None);
     controller.records.insert(record.id, record);
@@ -3851,10 +3872,8 @@ fn disconnect_does_not_wait_for_an_inflight_background_status_before_stop() {
         controller.disconnected(8, Some(5), "peer_disconnected");
         for now in 3..=15 {
             controller.advance_shutdown_settlement(&runtime);
-            controller.advance_job(&runtime, now);
-            if controller.job.is_none() {
-                controller.schedule_background(now);
-            }
+            controller.advance_work(&runtime, now);
+            controller.schedule_work(now);
         }
         assert!(endpoint.commands.iter().any(|command| matches!(command,
         Command::Request { payload, .. } if payload["action"] == "stop" && payload["session"] == 23)),
@@ -3929,9 +3948,9 @@ fn detached_observation_capacity_leaves_room_for_every_playing_record() {
         controller.disconnected(8, Some(ticket), "peer_disconnected");
         controller.advance_job(&runtime, 3);
         assert_eq!(controller.shutdown_settlement.len(), index + 1);
-        controller.schedule_background(4);
-        controller.advance_job(&runtime, 5);
-        controller.advance_job(&runtime, 6);
+        controller.schedule_work(4);
+        controller.advance_work(&runtime, 5);
+        controller.advance_work(&runtime, 6);
         assert!(controller.records[&ticket].cleanup_confirmed);
     }
     assert_eq!(controller.shutdown_settlement.len(), MAX_RECORDS);

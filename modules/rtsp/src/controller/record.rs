@@ -19,6 +19,33 @@ impl State {
     }
 }
 
+impl Owner for Record {
+    /// A ticket is open from admission until it is asked to close. From then
+    /// on it only retires what it held.
+    fn admission(&self) -> Admission {
+        match self.state {
+            State::Preparing | State::Ready | State::Arming | State::Playing => Admission::Open,
+            State::Closing | State::Closed | State::Failed | State::CleanupFailed => {
+                Admission::Ended
+            }
+        }
+    }
+
+    fn retirement(&self) -> Retirement {
+        match self.state {
+            State::Closed | State::Failed if self.cleanup_confirmed => Retirement::Confirmed,
+            State::Closed | State::Failed => Retirement::Abandoned,
+            State::CleanupFailed if self.cleanup_retry_count >= MAX_CLEANUP_RETRIES => {
+                Retirement::Abandoned
+            }
+            State::CleanupFailed => Retirement::Unconfirmed,
+            State::Preparing | State::Ready | State::Arming | State::Playing | State::Closing => {
+                Retirement::Pending
+            }
+        }
+    }
+}
+
 pub(super) struct Record {
     pub id: u64,
     pub owner: String,
@@ -68,6 +95,9 @@ pub(super) struct Record {
     pub display_prepare_timeout_ms: Option<u32>,
     pub revoke_after: Option<u64>,
     pub cleanup_confirmed: bool,
+    /// When this ticket was first seen ended. A later ticket prefers the
+    /// media ports of the ticket that ended longest ago.
+    pub ended_at: Option<u64>,
 }
 
 impl Record {
