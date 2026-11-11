@@ -19,8 +19,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 pub const SERVICE: &str = "amaterasu.virtual-display/1";
 
 /// How an owned virtual output joins the desktop, named after Vibeshine's
-/// `virtual_display_layout`. Its isolated and primary-only variants are not
-/// implemented and are refused when settings are parsed.
+/// `virtual_display_layout`. Providers must reject unsupported layouts before
+/// native effects; parsing a layout is not a capability assertion.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum VirtualDisplayLayout {
@@ -29,6 +29,12 @@ pub enum VirtualDisplayLayout {
     Exclusive,
     /// The other displays stay on and the owned output extends the desktop.
     Extended,
+    /// Extend the desktop and make the owned output primary.
+    ExtendedPrimary,
+    /// Extend the desktop with the owned output separated from other outputs.
+    ExtendedIsolated,
+    /// Isolate the owned output and make it primary.
+    ExtendedPrimaryIsolated,
 }
 
 fn present_integer<'de, D>(deserializer: D) -> Result<Option<i32>, D::Error>

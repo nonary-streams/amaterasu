@@ -991,7 +991,7 @@ fn settings_default_to_reference_values_and_accept_stable_names() {
 }
 
 #[test]
-fn virtual_display_layout_defaults_to_exclusive_and_refuses_unimplemented_variants() {
+fn virtual_display_layout_defaults_to_exclusive_and_parses_all_reference_layouts() {
     use crate::model::VirtualDisplayLayout;
     let defaults = serde_json::from_value::<Settings>(json!({})).unwrap();
     assert_eq!(
@@ -1004,16 +1004,31 @@ fn virtual_display_layout_defaults_to_exclusive_and_refuses_unimplemented_varian
         extended.virtual_display_layout,
         VirtualDisplayLayout::Extended
     );
-    for unimplemented in [
-        "extended_primary",
-        "extended_isolated",
-        "extended_primary_isolated",
+    for (token, expected) in [
+        ("extended_primary", VirtualDisplayLayout::ExtendedPrimary),
+        ("extended_isolated", VirtualDisplayLayout::ExtendedIsolated),
+        (
+            "extended_primary_isolated",
+            VirtualDisplayLayout::ExtendedPrimaryIsolated,
+        ),
     ] {
-        assert!(
-            serde_json::from_value::<Settings>(json!({"virtual_display_layout": unimplemented}))
-                .is_err(),
-            "{unimplemented}"
+        let settings =
+            serde_json::from_value::<Settings>(json!({"virtual_display_layout": token})).unwrap();
+        assert_eq!(settings.virtual_display_layout, expected);
+        let (mut manager, calls) = setup(true);
+        let mut request = create();
+        if let Operation::Create {
+            virtual_display_layout,
+            ..
+        } = &mut request
+        {
+            *virtual_display_layout = Some(expected);
+        }
+        assert_eq!(
+            manager.handle("caller", request)["code"],
+            "unsupported_topology_domain"
         );
+        assert!(calls.borrow().creates.is_empty());
     }
 }
 

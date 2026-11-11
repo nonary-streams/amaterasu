@@ -71,6 +71,9 @@ pub struct VirtualDisplayModePolicy {
     pub configuration_option: Option<VirtualDisplayConfigurationOption>,
     #[serde(default)]
     pub remapping: VirtualDisplayModeRemapping,
+    /// Negotiated stream FPS used for remapping, independent of display refresh.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_fps: Option<u32>,
     pub context: VirtualDisplayResolverContext,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolution_option: Option<VirtualDisplayResolutionOption>,
@@ -104,8 +107,8 @@ impl VirtualDisplayModePolicy {
                     .manual_refresh_rate
                     .as_deref()
                     .is_none_or(|value| value.trim().is_empty()))
-            || (self.context.optimize_game_settings
-                && !self.context.client_display_mode_override
+            || self.client_fps == Some(0)
+            || (!self.context.client_display_mode_override
                 && self.resolution_option == Some(VirtualDisplayResolutionOption::Manual)
                 && self
                     .manual_resolution
@@ -486,6 +489,7 @@ mod tests {
         let mut request = intent();
         request.display_policy = Some(VirtualDisplayModePolicy {
             configuration_option: Some(VirtualDisplayConfigurationOption::EnsurePrimary),
+            client_fps: Some(60),
             remapping: VirtualDisplayModeRemapping {
                 mixed: vec![VirtualDisplayModeRemappingEntry {
                     requested_fps: "60".into(),
@@ -553,6 +557,7 @@ mod tests {
         let mut request = intent();
         request.display_policy = Some(VirtualDisplayModePolicy {
             configuration_option: None,
+            client_fps: None,
             remapping: VirtualDisplayModeRemapping::default(),
             context: VirtualDisplayResolverContext {
                 resolution_is_automatic: false,
@@ -574,5 +579,36 @@ mod tests {
         policy.effective_client_hdr_request = Some(false);
         policy.manual_resolution = Some("1920 by 1080".into());
         assert_eq!(request.validate(), Err("invalid_virtual_display_policy"));
+    }
+
+    #[test]
+    fn manual_resolution_is_required_without_optimize_and_stream_fps_round_trips() {
+        let mut request = intent();
+        let mut policy: VirtualDisplayModePolicy = serde_json::from_value(serde_json::json!({
+            "context": {
+                "resolution_is_automatic":false,
+                "refresh_rate_is_automatic":true,
+                "client_display_mode_override":false,
+                "optimize_game_settings":false
+            },
+            "resolution_option":"manual",
+            "client_fps":60
+        }))
+        .unwrap();
+        assert_eq!(policy.validate(), Err("invalid_virtual_display_policy"));
+        policy.manual_resolution = Some("1920x1080".into());
+        request.display_policy = Some(policy);
+        let encoded = serde_json::to_value(&request).unwrap();
+        assert_eq!(encoded["display_policy"]["client_fps"], 60);
+        assert_eq!(request.validate(), Ok(()));
+        let decoded: VirtualDisplayIntent = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, request);
+
+        request.display_policy.as_mut().unwrap().client_fps = Some(0);
+        assert_eq!(request.validate(), Err("invalid_virtual_display_policy"));
+        request.display_policy.as_mut().unwrap().client_fps = None;
+        let encoded = serde_json::to_value(&request).unwrap();
+        assert!(encoded["display_policy"].get("client_fps").is_none());
+        assert_eq!(request.validate(), Ok(()));
     }
 }
