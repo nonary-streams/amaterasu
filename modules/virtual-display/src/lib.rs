@@ -107,4 +107,11 @@ impl ManagedModule for VirtualDisplayModule {
     }
 }
 
-amaterasu_module_sdk::export_module!(VirtualDisplayModule);
+// Driver and compositor operations belong to the service thread. The host's
+// shared tick only wakes it; retirement joins it before the module can unload.
+type VirtualDisplayService =
+    amaterasu_module_sdk::service_worker::ServiceWorker<VirtualDisplayModule>;
+amaterasu_module_sdk::export_module!(VirtualDisplayService);
+
+#[cfg(test)]
+mod worker_tests;

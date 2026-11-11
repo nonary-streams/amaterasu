@@ -386,6 +386,12 @@ CreateFile/device enumeration/CCD calls likewise have no module-level interrupt.
 The isolated host worker watchdog is the final recovery boundary for these hangs.
 No background thread can outlive this DLL. These limits are not a real-time promise.
 
+The broker-only service runs through the SDK's dedicated service worker. Native
+driver requests, readiness checks and cleanup do not execute on the shared host
+tick. Request admission is still checked immediately before effects, and service
+retirement joins the worker after provider shutdown and destruction complete.
+Unconfirmed native cleanup remains journaled for recovery.
+
 A ten-second lease is fed once per second while healthy. One monitor is maintained
 per tick, with 200 ms polling. Ambiguous creation is never replayed: it enters exact
 lease/display cleanup. Cleanup makes at most three native removal attempts per
