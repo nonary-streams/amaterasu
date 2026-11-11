@@ -150,15 +150,12 @@ fn inactive_stream_mode_fallback_requires_static_refresh_policy() {
 #[test]
 fn inactive_route_fails_closed_on_drift_ambiguity_and_other_options() {
     for case in [
-        "ensure_primary",
-        "ensure_only_display",
         "verify_only",
         "revision",
         "bytes",
         "ambiguous",
         "duplicate_id",
         "missing",
-        "auto_without_mode",
         "position_out_of_range",
     ] {
         let now = Instant::now();
@@ -169,7 +166,6 @@ fn inactive_route_fails_closed_on_drift_ambiguity_and_other_options() {
                 | "ambiguous"
                 | "duplicate_id"
                 | "missing"
-                | "auto_without_mode"
                 | "position_out_of_range"
         ) {
             "ensure_active"
@@ -859,6 +855,35 @@ fn private_resolution_catalog_requires_an_owned_bundled_per_client_display() {
         } else {
             assert!(!broker.actions().contains(&("amaterasu.rtsp/1", "open")));
             assert!(!broker.actions().contains(&("amaterasu.launch/1", "launch_export")));
+        }
+    }
+}
+
+#[test]
+fn inactive_activation_modes_and_automatic_refresh_reach_attested_provider_transaction() {
+    for option in ["ensure_active", "ensure_primary", "ensure_only_display"] {
+        for refresh in ["auto", "prefer_highest"] {
+            let now = Instant::now();
+            let (mut controller, mut broker) = inactive_display_fixture(option);
+            controller.set_global_display_policy(9, json!({
+                "dd_configuration_option":option,
+                "dd_resolution_option":"auto",
+                "dd_refresh_rate_option":refresh,
+                "dd_hdr_option":"disabled",
+            }));
+            assert!(controller.launch(10, request(76), peer(76), now).is_none());
+            let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+            assert_eq!(reply.status, 200, "{option}/{refresh}");
+            let open = opened_rtsp_payload(&broker);
+            let request = &open["display_request"];
+            assert_eq!(request["configuration"]["displays"].as_array().unwrap().len(), 2);
+            assert_eq!(request["configuration"]["displays"][0]["id"], "monitor.one");
+            assert_eq!(request["configuration"]["displays"][1]["id"], "Monitor.Two");
+            assert_eq!(request["expected_topology_revision"], "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+            assert_eq!(request["mode_policy"]["configuration_option"], option);
+            assert_eq!(request["mode_policy"]["refresh_rate_option"], refresh);
+            assert_eq!(request["mode_policy"]["context"]["client_display_mode_override"], false);
+            assert_eq!(open["display_admission_token"], "ab".repeat(32));
         }
     }
 }

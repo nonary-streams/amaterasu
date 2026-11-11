@@ -2796,10 +2796,10 @@ fn build_display_request(record: &Record) -> Result<Option<Value>, &'static str>
         .get("dd_refresh_rate_option")
         .and_then(Value::as_str);
     if record.display_match_inactive {
-        if option != "ensure_active"
-            || displays.len() >= 16
-            || !client_mode_override
-                && matches!(refresh_rate_option, Some("auto" | "prefer_highest"))
+        if !matches!(
+            option,
+            "ensure_active" | "ensure_primary" | "ensure_only_display"
+        ) || displays.len() >= 16
             || !(320..=16_384).contains(&record.physical_display_mode.width)
             || !(200..=16_384).contains(&record.physical_display_mode.height)
             || displays.iter().any(|display| {
@@ -3310,7 +3310,11 @@ fn display_enumeration(
                     .and_then(|snapshot| {
                         snapshot["effective_overrides"]["dd_configuration_option"].as_str()
                     });
-                if option != Some("ensure_active") || snapshot_id.is_some() {
+                if !matches!(
+                    option,
+                    Some("ensure_active" | "ensure_primary" | "ensure_only_display")
+                ) || snapshot_id.is_some()
+                {
                     return Err("inactive_capture_output");
                 }
                 match_id = Some(id.to_owned());

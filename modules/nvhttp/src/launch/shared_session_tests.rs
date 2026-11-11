@@ -825,7 +825,7 @@ fn host_shutdown_drains_a_paused_application_before_the_host_deadline() {
 #[test]
 fn private_catalog_cannot_be_shared_by_clients_with_either_preference() {
     for (retained_private, joining_private) in [(true, false), (true, true), (false, true)] {
-        let (mut controller, mut broker, now) = one_client_application();
+        let (mut controller, broker, now) = one_client_application();
         controller.records.values_mut().next().unwrap().peer.client_properties["requested_resolution_only"] = json!(retained_private);
         let mut joining = peer(2);
         joining.client_properties["requested_resolution_only"] = json!(joining_private);
@@ -841,7 +841,7 @@ fn private_catalog_cannot_be_shared_by_clients_with_either_preference() {
 #[test]
 fn paused_private_catalog_rejects_other_owners_and_catalog_changes_before_effects() {
     for case in ["other_owner", "opt_out", "mode_change", "opt_in"] {
-        let (mut controller, mut broker, now) = one_client_application();
+        let (mut controller, broker, now) = one_client_application();
         let root = controller.records.values_mut().next().unwrap();
         root.state = State::Paused;
         root.peer.client_properties["requested_resolution_only"] = json!(case != "opt_in");
