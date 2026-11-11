@@ -11,7 +11,7 @@ pub(super) struct RuntimeState {
 
 pub(super) fn synchronize(settings: &Settings, driver: &mut impl Driver) -> RuntimeState {
     let mut result = RuntimeState {
-        supported: driver.permanent_count_supported(),
+        supported: driver.permanent_count_supported() && driver.supported(),
         state: "unsupported",
         error: None,
         observed_count: None,

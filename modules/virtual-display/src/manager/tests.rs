@@ -11,6 +11,7 @@ const CAPTURE_OUTPUT: &str =
     "exact-target:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 #[derive(Default)]
 struct Calls {
+    unsupported: bool,
     permanent_supported: bool,
     permanent_queries: VecDeque<Result<u32, &'static str>>,
     permanent_query_calls: usize,
@@ -64,8 +65,9 @@ impl Driver for Fake {
         }))
     }
     fn supported(&self) -> bool {
-        self.0.borrow_mut().supported_calls += 1;
-        true
+        let mut calls = self.0.borrow_mut();
+        calls.supported_calls += 1;
+        !calls.unsupported
     }
     fn create(
         &mut self,
@@ -1278,6 +1280,29 @@ fn matching_permanent_count_needs_no_mutation() {
     );
     assert!(calls.borrow().permanent_sets.is_empty());
     assert_eq!(calls.borrow().permanent_query_calls, 1);
+}
+
+#[test]
+fn permanent_capability_does_not_override_unsupported_driver() {
+    let calls = Rc::new(RefCell::new(Calls {
+        unsupported: true,
+        permanent_supported: true,
+        ..Default::default()
+    }));
+    let mut manager = Manager::new(
+        Settings {
+            enabled: true,
+            dd_virtual_display_permanent_count: Some(2),
+            ..Default::default()
+        },
+        Fake(calls.clone()),
+    );
+    assert_eq!(
+        global_status(&mut manager)["permanent_monitor_runtime_supported"],
+        false
+    );
+    assert_eq!(calls.borrow().permanent_query_calls, 0);
+    assert!(calls.borrow().permanent_sets.is_empty());
 }
 
 #[test]
