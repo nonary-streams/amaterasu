@@ -397,8 +397,18 @@ fn retirement_contract_epoch_reads_bind_before_effects_without_claiming_retireme
         retirement::parse_epoch(Contract::Transport, &ready).unwrap(),
         EPOCH
     );
+    // A ready transport may be bound although the sessions of an earlier
+    // runtime were never confirmed retired. That is a separate statement.
+    let mut unreconciled = ready.clone();
+    unreconciled["startup_reconciled"] = json!(false);
+    assert_eq!(
+        retirement::parse_epoch(Contract::Transport, &unreconciled).unwrap(),
+        EPOCH
+    );
     for (field, value) in [
-        ("startup_reconciled", json!(false)),
+        ("startup_reconciled", json!("false")),
+        ("state", json!("recovery_pending")),
+        ("state", json!("recovery_blocked")),
         ("cleanup_pending", json!("false")),
         ("pending_admissions", json!("0")),
         ("active_operations", json!(null)),
@@ -487,12 +497,22 @@ fn retirement_contract_epoch_binding_does_not_wait_for_unrelated_current_operati
         };
         assert_eq!(retirement::parse_epoch(contract, &payload).unwrap(), EPOCH);
         assert_ok(broker.dispatch(CONSUMER, Command::ReleaseResult { request: id }));
-        // Current work cannot excuse missing or unfinished old-runtime cleanup.
-        for state in ["ready", "recovery_pending", "recovery_blocked"] {
+        // The transport decides when it may be bound and says so with
+        // `ready`. While it still waits for an earlier runtime's sessions it
+        // may not be; once it is ready their cleanup no longer holds it back.
+        for (state, bound) in [
+            ("ready", true),
+            ("recovery_pending", false),
+            ("recovery_blocked", false),
+        ] {
             let mut unreconciled = busy.clone();
             unreconciled["startup_reconciled"] = json!(false);
             unreconciled["state"] = json!(state);
-            assert!(retirement::parse_epoch(contract, &unreconciled).is_err());
+            assert_eq!(
+                retirement::parse_epoch(contract, &unreconciled).is_ok(),
+                bound,
+                "{state}"
+            );
         }
         // The admission snapshot remains unsuitable as any exact retirement proof.
         assert!(retirement::parse_status(contract, &reference(contract), &busy).is_err());
