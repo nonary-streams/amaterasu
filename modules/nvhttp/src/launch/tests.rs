@@ -4000,10 +4000,9 @@ fn paired_client_display_policy_overrides_application_fields_without_global_defa
     );
     assert_eq!(snapshot["global_overrides"], json!({}));
     assert!(snapshot["global_revision"].is_null());
-    assert!(
-        opened_rtsp_payload(&broker)
-            .get("display_request")
-            .is_none()
+    assert_eq!(
+        opened_rtsp_payload(&broker)["display_request"]["mode_policy"]["configuration_option"],
+        "verify_only"
     );
 }
 
@@ -4028,7 +4027,7 @@ fn pipewire_display_topology_mapping_stays_explicitly_unsupported() {
 }
 
 #[test]
-fn verify_only_freezes_unique_active_monitor_without_mutation_and_retries_exactly() {
+fn verify_only_freezes_active_monitor_and_projects_mode_policy_on_exact_retries() {
     let now = Instant::now();
     let mut streaming = config();
     streaming.capture.capture_provider = CaptureProvider::Wgc;
@@ -4073,10 +4072,9 @@ fn verify_only_freezes_unique_active_monitor_without_mutation_and_retries_exactl
             .iter()
             .any(|(service, action)| *service == "amaterasu.display/1" && *action == "apply")
     );
-    assert!(
-        opened_rtsp_payload(&broker)
-            .get("display_request")
-            .is_none()
+    assert_eq!(
+        opened_rtsp_payload(&broker)["display_request"]["mode_policy"]["configuration_option"],
+        "verify_only"
     );
     controller.reply_delivered(10, now);
     let retry = controller
@@ -5753,4 +5751,30 @@ fn cooperative_shutdown_abandons_a_genuine_application_cleanup_failure_without_r
     assert_eq!(record.cleanup_error, Some("application_cleanup_unconfirmed"));
     assert!(record.application_requested);
     assert_eq!(application_stop_count(&broker), 1);
+}
+
+#[test]
+fn virtual_display_allocation_uses_paired_physical_mode_without_changing_stream_mode() {
+    let now = Instant::now();
+    let mut streaming = config();
+    streaming.profile.max_fps = 120;
+    let mut controller = Controller::new(Some(streaming)).unwrap();
+    controller.set_encoder_snapshot(hardware_h264());
+    controller.set_global_display_policy(7, json!({"virtual_display_mode":"per_client"}));
+    let mut broker = Broker::default();
+    let paired = peer_with_display_mode(73, "2560x1440x59.94").unwrap();
+    let mut stream = request(73);
+    stream.fps = 120;
+    assert!(controller.launch(10, stream, paired, now).is_none());
+    let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+    assert_eq!(reply.status, 200);
+    let open = opened_rtsp_payload(&broker);
+    let intent = &open["virtual_display_intent"];
+    assert_eq!(intent["width"], 2560);
+    assert_eq!(intent["height"], 1440);
+    assert_eq!(intent["refresh_millihz"], 59940);
+    assert_eq!(intent["display_policy"]["context"]["client_display_mode_override"], true);
+    assert_eq!(open["profile"]["width"], 1280);
+    assert_eq!(open["profile"]["height"], 720);
+    assert_eq!(open["profile"]["fps"], 120);
 }

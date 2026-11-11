@@ -71,6 +71,7 @@ fn inactive_ensure_active_attests_appended_target_without_changing_active_displa
     let open = opened_rtsp_payload(&broker);
     let request = &open["display_request"];
     assert_eq!(open["profile"]["fps"], 120);
+    assert_eq!(request["mode_policy"]["client_fps"], 120);
     assert_eq!(
         request["configuration"]["displays"]
             .as_array()
@@ -393,7 +394,7 @@ fn signed_display_option_precedence_is_frozen_through_launch_and_rtsp() {
             Some("verify_only"),
             None,
             "verify_only",
-            false,
+            true,
         ),
     ] {
         let now = Instant::now();
@@ -500,8 +501,10 @@ fn signed_display_option_precedence_is_frozen_through_launch_and_rtsp() {
 #[test]
 fn active_target_allows_active_and_primary_options_in_full_topology() {
     for (option, two_displays) in [
+        ("verify_only", false),
         ("ensure_active", false),
         ("ensure_primary", false),
+        ("verify_only", true),
         ("ensure_active", true),
         ("ensure_primary", true),
     ] {
@@ -532,7 +535,6 @@ fn unsupported_or_changed_display_facts_fail_before_application_success() {
         "inactive_target",
         "rotation_null",
         "topology_bytes",
-        "optimize_unknown",
         "catalog_revision",
         "admission_reject",
         "admission_hash",
@@ -543,7 +545,6 @@ fn unsupported_or_changed_display_facts_fail_before_application_success() {
             "inactive_target" => broker.display_entries[1]["active"] = json!(false),
             "rotation_null" => broker.display_snapshot_configuration.as_mut().unwrap()["displays"][1]["rotation"] = Value::Null,
             "topology_bytes" => broker.display_configuration_drift = true,
-            "optimize_unknown" => controller.set_global_display_policy(9, json!({"dd_configuration_option":"ensure_only_display","dd_resolution_option":"auto"})),
             "catalog_revision" => broker.application_catalog_revision = 2,
             "admission_reject" => broker.reject_display_admission = true,
             "admission_hash" => broker.forge_display_admission_hash = true,
@@ -572,7 +573,6 @@ fn unsupported_or_changed_display_facts_fail_before_application_success() {
                 | "rotation_null"
                 | "topology_bytes"
                 | "hdr_auto"
-                | "optimize_unknown"
         ) {
             assert!(
                 !broker
@@ -721,4 +721,62 @@ fn lost_prelaunch_export_result_at_deadline_restores_display_and_reconciles_appl
             .status,
         409
     );
+}
+
+#[test]
+fn display_modes_project_without_optimize_game_settings_fact() {
+    for overrides in [
+        json!({"dd_resolution_option":"auto"}),
+        json!({"dd_resolution_option":"manual","dd_manual_resolution":"2560x1440"}),
+        json!({"dd_refresh_rate_option":"manual","dd_manual_refresh_rate":"59.94"}),
+        json!({"dd_resolution_option":"auto","dd_mode_remapping":{"mixed":[{
+            "requested_resolution":"1280x720","requested_fps":"60",
+            "final_resolution":"1920x1080","final_refresh_rate":"120"
+        }]}}),
+    ] {
+        let now = Instant::now();
+        let (mut controller, mut broker) = mutating_display_fixture("ensure_active", true);
+        let mut global = json!({
+            "dd_configuration_option":"ensure_active",
+            "dd_resolution_option":"auto",
+            "dd_refresh_rate_option":"auto",
+            "dd_hdr_option":"disabled",
+        });
+        global.as_object_mut().unwrap().extend(overrides.as_object().unwrap().clone());
+        controller.set_global_display_policy(9, global);
+        assert!(controller.launch(10, request(71), peer(71), now).is_none());
+        let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+        assert_eq!(reply.status, 200, "{overrides}");
+        let open = opened_rtsp_payload(&broker);
+        let policy = &open["display_request"]["mode_policy"];
+        assert_eq!(policy["client_fps"], 60);
+        assert_eq!(policy["context"]["optimize_game_settings"], false);
+        for (key, value) in overrides.as_object().unwrap() {
+            let projected = key.strip_prefix("dd_").unwrap();
+            let projected = if projected == "mode_remapping" { "remapping" } else { projected };
+            assert_eq!(&policy[projected], value, "{key}");
+        }
+    }
+}
+
+#[test]
+fn disabled_display_mode_options_preserve_observed_desktop_mode() {
+    let now = Instant::now();
+    let (mut controller, mut broker) = mutating_display_fixture("ensure_active", true);
+    controller.set_global_display_policy(9, json!({
+        "dd_configuration_option":"ensure_active",
+        "dd_resolution_option":"disabled",
+        "dd_refresh_rate_option":"disabled",
+        "dd_hdr_option":"disabled",
+    }));
+    assert!(controller.launch(10, request(72), peer(72), now).is_none());
+    let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+    assert_eq!(reply.status, 200);
+    let open = opened_rtsp_payload(&broker);
+    let display = &open["display_request"]["configuration"]["displays"][1];
+    assert_eq!(display["width"], 1920);
+    assert_eq!(display["height"], 1080);
+    assert_eq!(display["refresh"], json!({"numerator":60,"denominator":1}));
+    assert_eq!(open["profile"]["width"], 1280);
+    assert_eq!(open["profile"]["height"], 720);
 }

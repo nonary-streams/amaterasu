@@ -8,9 +8,7 @@ use crate::launch::{
     MONITOR_INTERVAL, STREAM_CLEANUP_MARGIN_MS,
 };
 use crate::preparation::{LegacyPreparationStep, PreparationStep};
-use amaterasu_contracts::{
-    display_color_profile::HdrProfileDescriptor, virtual_display::VirtualDisplayIntent,
-};
+use amaterasu_contracts::virtual_display::VirtualDisplayIntent;
 use serde_json::Value;
 use std::{
     collections::VecDeque,

@@ -2728,12 +2728,9 @@ fn build_display_request(record: &Record) -> Result<Option<Value>, &'static str>
         .get("dd_configuration_option")
         .and_then(Value::as_str)
         .ok_or("display_policy_unavailable")?;
-    if option == "verify_only" {
-        return Ok(None);
-    }
     if !matches!(
         option,
-        "ensure_active" | "ensure_primary" | "ensure_only_display"
+        "verify_only" | "ensure_active" | "ensure_primary" | "ensure_only_display"
     ) {
         return Err("display_mutation_unavailable");
     }
@@ -2757,34 +2754,12 @@ fn build_display_request(record: &Record) -> Result<Option<Value>, &'static str>
         .get("dd_mode_remapping")
         .cloned()
         .unwrap_or_else(|| json!({}));
-    let has_remapping_rules = remapping.as_object().is_some_and(|rules| {
-        rules.values().any(|entries| {
-            entries
-                .as_array()
-                .is_some_and(|entries| !entries.is_empty())
-        })
-    });
     let resolution_option = effective
         .get("dd_resolution_option")
         .and_then(Value::as_str);
     let refresh_rate_option = effective
         .get("dd_refresh_rate_option")
         .and_then(Value::as_str);
-    // The current authenticated launch request carries no optimize-game-settings
-    // choice. Only policies that cannot observe that choice are projected.
-    if !client_mode_override
-        && (has_remapping_rules
-            || matches!(resolution_option, Some("auto" | "manual"))
-            || effective.contains_key("dd_manual_resolution"))
-    {
-        return Err("display_optimize_fact_unavailable");
-    }
-    if !client_mode_override
-        && (refresh_rate_option == Some("manual")
-            || effective.contains_key("dd_manual_refresh_rate"))
-    {
-        return Err("display_mutation_unavailable");
-    }
     if record.display_match_inactive {
         if option != "ensure_active"
             || displays.len() >= 16
@@ -2830,14 +2805,21 @@ fn build_display_request(record: &Record) -> Result<Option<Value>, &'static str>
         .iter_mut()
         .find(|display| display["id"].as_str() == Some(selected))
         .ok_or("display_selection_unavailable")?;
-    selected_display["width"] = json!(record.physical_display_mode.width);
-    selected_display["height"] = json!(record.physical_display_mode.height);
-    selected_display["refresh"] = json!({
-        "numerator":record.physical_display_mode.refresh_millihz,
-        "denominator":1000,
-    });
+    // Disabled properties retain their observed value. An explicit paired-client
+    // mode has priority over these options, as it does in the reference policy.
+    if client_mode_override || resolution_option != Some("disabled") {
+        selected_display["width"] = json!(record.physical_display_mode.width);
+        selected_display["height"] = json!(record.physical_display_mode.height);
+    }
+    if client_mode_override || refresh_rate_option != Some("disabled") {
+        selected_display["refresh"] = json!({
+            "numerator":record.physical_display_mode.refresh_millihz,
+            "denominator":1000,
+        });
+    }
     let mut policy = json!({
         "display_id":selected,
+        "client_fps":record.request.fps,
         "effective_client_hdr_request":record.request.hdr,
         "configuration_option":option,
         "remapping":remapping,
@@ -4043,13 +4025,9 @@ pub(super) fn virtual_display_intent(
     }
 
     let policy = virtual_display_mode_policy(record, &effective)?;
-    let width = record.request.width;
-    let height = record.request.height;
-    let refresh_millihz = record
-        .request
-        .fps
-        .checked_mul(1_000)
-        .ok_or("invalid_virtual_display_intent")?;
+    let width = record.physical_display_mode.width;
+    let height = record.physical_display_mode.height;
+    let refresh_millihz = record.physical_display_mode.refresh_millihz;
     let scale = effective
         .get("dd_virtual_display_scale")
         .and_then(Value::as_i64)
