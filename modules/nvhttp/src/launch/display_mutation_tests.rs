@@ -832,3 +832,33 @@ fn frozen_hdr_override_drives_display_and_negotiation_without_rewriting_client_r
         assert_eq!(controller.launch(11, stream, paired, now).unwrap().status, 200);
     }
 }
+
+#[test]
+fn private_resolution_catalog_requires_an_owned_bundled_per_client_display() {
+    for (mode, bundled, valid) in [
+        ("disabled", true, false),
+        ("shared", true, false),
+        ("per_client", false, false),
+        ("per_client", true, true),
+    ] {
+        let now = Instant::now();
+        let mut controller = Controller::new(Some(config())).unwrap();
+        controller.set_global_display_policy(9, json!({
+            "virtual_display_mode":mode,
+            "dd_use_sunshine_virtual_display_driver":bundled,
+        }));
+        let mut paired = peer(75);
+        paired.client_properties["requested_resolution_only"] = json!(true);
+        let mut broker = Broker::default();
+        assert!(controller.launch(10, request(75), paired, now).is_none());
+        let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+        assert_eq!(reply.status == 200, valid, "{mode}/{bundled}");
+        if valid {
+            let open = opened_rtsp_payload(&broker);
+            assert_eq!(open["virtual_display_intent"]["requested_resolution_only"], true);
+        } else {
+            assert!(!broker.actions().contains(&("amaterasu.rtsp/1", "open")));
+            assert!(!broker.actions().contains(&("amaterasu.launch/1", "launch_export")));
+        }
+    }
+}

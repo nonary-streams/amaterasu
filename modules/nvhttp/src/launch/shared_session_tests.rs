@@ -821,3 +821,39 @@ fn host_shutdown_drains_a_paused_application_before_the_host_deadline() {
     assert!(drained_at < 15_000, "drain took {drained_at} ms");
     assert!(broker.broker.application_stopped);
 }
+
+#[test]
+fn private_catalog_cannot_be_shared_by_clients_with_either_preference() {
+    for (retained_private, joining_private) in [(true, false), (true, true), (false, true)] {
+        let (mut controller, mut broker, now) = one_client_application();
+        controller.records.values_mut().next().unwrap().peer.client_properties["requested_resolution_only"] = json!(retained_private);
+        let mut joining = peer(2);
+        joining.client_properties["requested_resolution_only"] = json!(joining_private);
+        let command_count = broker.broker.commands.len();
+        let reply = controller.resume(11, request(2), &joining, now).unwrap();
+        assert_eq!(reply.status, 409);
+        assert_eq!(controller.records.len(), 1);
+        assert_eq!(broker.broker.commands.len(), command_count);
+        assert!(!broker.broker.application_stopped);
+    }
+}
+
+#[test]
+fn paused_private_catalog_rejects_other_owners_and_catalog_changes_before_effects() {
+    for case in ["other_owner", "opt_out", "mode_change", "opt_in"] {
+        let (mut controller, mut broker, now) = one_client_application();
+        let root = controller.records.values_mut().next().unwrap();
+        root.state = State::Paused;
+        root.peer.client_properties["requested_resolution_only"] = json!(case != "opt_in");
+        let mut joining = peer(if case == "other_owner" { 2 } else { 1 });
+        joining.client_properties["requested_resolution_only"] = json!(case != "opt_out");
+        let mut stream = request(3);
+        if case == "mode_change" { stream.width = 1920; }
+        let command_count = broker.broker.commands.len();
+        let reply = controller.resume(11, stream, &joining, now).unwrap();
+        assert_eq!(reply.status, 409, "{case}");
+        assert_eq!(controller.records.values().next().unwrap().state, State::Paused);
+        assert_eq!(broker.broker.commands.len(), command_count);
+        assert!(!broker.broker.application_stopped);
+    }
+}

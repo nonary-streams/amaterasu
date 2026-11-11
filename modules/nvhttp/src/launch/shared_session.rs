@@ -10,6 +10,13 @@ use super::{
 use sha2::{Digest, Sha256};
 use std::time::Instant;
 
+/// This preference is bound to the authenticated paired identity.
+pub(super) fn requested_resolution_only(peer: &PeerIdentity) -> bool {
+    peer.client_properties["requested_resolution_only"]
+        .as_bool()
+        .unwrap_or(false)
+}
+
 const MAX_CONCURRENT_CLIENTS: usize = 2;
 const MAX_RETIRED_STREAM_KEYS: usize = 32_768;
 
@@ -207,6 +214,14 @@ impl Controller {
         let Some(application) = self.shared_application(request.app_id) else {
             return Some(private_error(404, "running application was not found"));
         };
+        if requested_resolution_only(&peer)
+            || requested_resolution_only(&self.records[&application].peer)
+        {
+            return Some(private_error(
+                409,
+                "a private requested-resolution catalog cannot be shared",
+            ));
+        }
         if self.pending_resume.is_some() {
             return Some(private_error(
                 409,

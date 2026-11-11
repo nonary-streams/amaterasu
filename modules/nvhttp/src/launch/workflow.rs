@@ -1464,7 +1464,11 @@ impl Controller {
                     ));
                     record.application_display_settings = application_display_settings;
                     record.virtual_display_intent = match if record.shared_capture.is_some() {
-                        Ok(None)
+                        if super::shared_session::requested_resolution_only(&record.peer) {
+                            Err("private_catalog_requires_owned_virtual_display")
+                        } else {
+                            Ok(None)
+                        }
                     } else {
                         virtual_display_intent(record)
                     } {
@@ -3945,6 +3949,18 @@ pub(super) fn display_policy_snapshot(record: &Record) -> Value {
 pub(super) fn virtual_display_intent(
     record: &Record,
 ) -> Result<Option<VirtualDisplayIntent>, &'static str> {
+    let requested_resolution_only = super::shared_session::requested_resolution_only(&record.peer);
+    let no_intent = || {
+        if requested_resolution_only {
+            Err("private_catalog_requires_owned_virtual_display")
+        } else {
+            Ok(None)
+        }
+    };
+    if requested_resolution_only && (record.auxiliary.is_some() || record.shared_capture.is_some())
+    {
+        return Err("private_catalog_requires_owned_virtual_display");
+    }
     let global = record
         .global_display_policy
         .as_object()
@@ -4036,7 +4052,7 @@ pub(super) fn virtual_display_intent(
         && !mode_is_explicit
         && !activate_virtual_display
     {
-        return Ok(None);
+        return no_intent();
     }
     if virtual_bootstrap
         && app_requests_virtual == Some(false)
@@ -4044,7 +4060,7 @@ pub(super) fn virtual_display_intent(
         && app_mode.is_none()
         && client.get("virtual_display_mode").is_none()
     {
-        return Ok(None);
+        return no_intent();
     }
     let request_virtual_display = resolve_virtual_display_request(
         mode,
@@ -4054,9 +4070,16 @@ pub(super) fn virtual_display_intent(
         driver_enabled,
     );
     if !request_virtual_display {
-        return Ok(None);
+        return no_intent();
     }
 
+    if requested_resolution_only
+        && (mode != VirtualDisplayMode::PerClient
+            || !driver_enabled
+            || record.peer.client_id.as_deref().is_none_or(str::is_empty))
+    {
+        return Err("private_catalog_requires_owned_virtual_display");
+    }
     let policy = virtual_display_mode_policy(record, &effective)?;
     let width = record.physical_display_mode.width;
     let height = record.physical_display_mode.height;
@@ -4066,7 +4089,7 @@ pub(super) fn virtual_display_intent(
         .and_then(Value::as_i64)
         .and_then(|scale| i32::try_from(scale).ok())
         .unwrap_or(0);
-    let identity_material = if mode == VirtualDisplayMode::Shared {
+    let mut identity_material = if mode == VirtualDisplayMode::Shared {
         json!([
             "shared",
             "Amaterasu",
@@ -4102,6 +4125,12 @@ pub(super) fn virtual_display_intent(
             policy
         ])
     };
+    if requested_resolution_only {
+        identity_material
+            .as_array_mut()
+            .expect("display identity material is an array")
+            .push(json!("requested_resolution_only"));
+    }
     let encoded_identity =
         serde_json::to_vec(&identity_material).map_err(|_| "invalid_virtual_display_intent")?;
     let identity = deterministic_display_identity(&encoded_identity);
@@ -4118,6 +4147,7 @@ pub(super) fn virtual_display_intent(
         virtual_display_mode: mode,
         virtual_display_layout: layout,
         request_virtual_display: Some(true),
+        requested_resolution_only,
         display_policy: Some(policy),
     };
     intent

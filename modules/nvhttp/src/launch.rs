@@ -1225,6 +1225,12 @@ impl Controller {
         if !peer.paired() {
             return Err(private_error(401, "authenticated paired TLS is required"));
         }
+        if auxiliary_audio.is_some() && shared_session::requested_resolution_only(peer) {
+            return Err(private_error(
+                409,
+                "a private requested-resolution catalog requires an owned game display",
+            ));
+        }
         let desktop = auxiliary_audio.is_some() || request.app_id == DESKTOP_APP_ID;
         if (request.app_id == 0 && auxiliary_audio.is_none())
             || request.app_id > i32::MAX as u32
@@ -1691,6 +1697,37 @@ impl Controller {
             ));
         }
         if retained {
+            let root = self
+                .records
+                .values()
+                .find(|record| {
+                    record.lifecycle_required
+                        && record.state == State::Paused
+                        && record.request.app_id == request.app_id
+                        && record.application_session.is_none()
+                })
+                .expect("retained session remains available");
+            let private_catalog = shared_session::requested_resolution_only(&root.peer);
+            let requested_private = shared_session::requested_resolution_only(peer);
+            if private_catalog || requested_private {
+                let same_owner =
+                    root.peer.client_id.is_some() && root.peer.client_id == peer.client_id;
+                let requested_mode = peer.client_display_mode.unwrap_or(PhysicalDisplayMode {
+                    width: request.width,
+                    height: request.height,
+                    refresh_millihz: request.fps.saturating_mul(1000),
+                });
+                if !private_catalog
+                    || !requested_private
+                    || !same_owner
+                    || root.physical_display_mode != requested_mode
+                {
+                    return Some(private_error(
+                        409,
+                        "the retained private catalog requires its owner and unchanged output mode",
+                    ));
+                }
+            }
             let id = match self.allocate_id() {
                 Ok(id) => id,
                 Err(_) => return Some(private_error(503, "resume capacity exhausted")),
