@@ -1249,7 +1249,7 @@ namespace Amaterasu {
     "nvenc_opengl_vulkan_on_dxgi", "nvenc_latency_over_power", "vaapi_strict_rc_buffer",
     "high_resolution_scrolling", "capture",
     "always_send_scancodes", "key_rightalt_to_key_win", "key_repeat_delay",
-    "key_repeat_frequency", "keybindings", "display_policy",
+    "key_repeat_frequency", "keybindings", "display_policy", "requested_resolution_only",
   ];
 
   export function unsupportedPairingOverrideFields(client: PairingClient): string[] {
@@ -1271,7 +1271,7 @@ namespace Amaterasu {
     }
     if (value === null)
       return ["motion_as_ds4", "touchpad_as_ds4", "ds5_inputtino_randomize_mac",
-        "proton_dualsense_compatibility"].includes(field);
+        "proton_dualsense_compatibility", "requested_resolution_only"].includes(field);
     if (value === undefined) return false;
     if (["stream_audio", "audio_sink_capture_only", "controller", "keyboard", "mouse",
       "native_pen_touch", "ds4_back_as_touchpad_click",
@@ -1280,7 +1280,7 @@ namespace Amaterasu {
       "nvenc_spatial_aq", "nvenc_h264_cavlc", "nvenc_realtime_hags",
       "nvenc_opengl_vulkan_on_dxgi", "nvenc_latency_over_power", "vaapi_strict_rc_buffer",
       "high_resolution_scrolling", "always_send_scancodes",
-      "key_rightalt_to_key_win"].includes(field)) return typeof value === "boolean";
+      "key_rightalt_to_key_win", "requested_resolution_only"].includes(field)) return typeof value === "boolean";
     if (field === "audio_sink" || field === "virtual_sink")
       return typeof value === "string" && new TextEncoder().encode(value).length <= 4096 &&
         !/[\u0000-\u001f\u007f-\u009f]/.test(value);
@@ -2684,6 +2684,11 @@ namespace Amaterasu {
             ? ""
             : String(client.config_overrides.audio_sink_capture_only);
           const capture = sparseCaptureOverrideSelect(client.config_overrides?.capture);
+          const requestedResolutionOnly = sparseInputOverrideSelect(
+            "requested_resolution_only", client.config_overrides?.requested_resolution_only,
+            "Only advertise requested resolution",
+          );
+          settingsClientOverrideAttribute(requestedResolutionOnly, "Only advertise requested resolution", client.name);
           const displayPolicy = el("textarea");
           displayPolicy.rows = 12;
           displayPolicy.spellcheck = false;
@@ -2702,6 +2707,9 @@ namespace Amaterasu {
             audio_sink_capture_only: parseAudioSinkCaptureOnlyOverride(captureOnly.value),
             capture: parseClientCaptureOverride(capture.value),
             display_policy: parseDisplayPolicyOverrideMap(displayPolicy.value, "client"),
+            requested_resolution_only: parseInputBooleanOverride(
+              requestedResolutionOnly.value, "Only advertise requested resolution",
+            ),
             controller: parseInputBooleanOverride(controller.value, "Controller input"),
             gamepad: parseGamepadProfileOverride(
               gamepad.value,
@@ -2858,7 +2866,9 @@ namespace Amaterasu {
               el("div", "form-grid",
                 field("FEC percentage", fec),
                 field("Back button timeout (milliseconds)", backButtonTimeout, "Use -1 to disable the timeout."),
-                field("Capture provider", capture)),
+                field("Capture provider", capture),
+                field("Only advertise requested resolution", requestedResolutionOnly,
+                  "Limit this client's private virtual display to the requested resolution. Requires a compatible Windows virtual display provider.")),
               field("Display and adapter policy (JSON)", displayPolicy,
                 "Sparse per-client overrides. Use null or empty values to inherit; global-only keys are rejected."),
               audioSettings, inputSettings, advancedSettings,

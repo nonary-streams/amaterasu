@@ -163,7 +163,9 @@ impl Harness {
             Command::TakeResult { request: 70 } => Response::Result {
                 payload: json!({"ok":true}),
             },
-            Command::ReleaseResult { request: 70 } => Response::Ok,
+            Command::ReleaseResult {
+                request: 50 | 51 | 70,
+            } => Response::Ok,
             Command::Complete {
                 request: 7,
                 payload,
@@ -175,7 +177,7 @@ impl Harness {
                     Response::Ok
                 }
             }
-            _ => panic!("unexpected pairing command"),
+            other => panic!("unexpected pairing command: {other:?}"),
         })
     }
     fn enqueue(&mut self, caller: &str, payload: Value) {
@@ -821,6 +823,7 @@ fn client_config_update_is_durable_and_stale_admin_revision_cannot_overwrite_it(
             "expected_revision": initial_revision,
             "config_overrides": {
                 "fec_percentage":47,
+                "requested_resolution_only":true,
                 "max_bitrate":-15000,
                 "minimum_fps_target":0.0,
                 "video_max_batch_size_kb":0,
@@ -849,6 +852,10 @@ fn client_config_update_is_durable_and_stale_admin_revision_cannot_overwrite_it(
         now(),
     );
     assert_eq!(certificate_readback["paired"], 1);
+    assert_eq!(
+        certificate_readback["config_overrides"]["requested_resolution_only"],
+        true
+    );
     assert_eq!(
         certificate_readback["config_overrides"]["fec_percentage"],
         47

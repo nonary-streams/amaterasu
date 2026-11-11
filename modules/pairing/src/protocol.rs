@@ -308,6 +308,10 @@ pub struct ClientConfigOverrides {
     /// Physical presentation mode; the streamed viewport and cadence are separate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_mode: Option<String>,
+    /// Restrict an owned per-client virtual display to the requested resolution.
+    /// Omission retains the normal driver catalog; this is never a wire override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_resolution_only: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fec_percentage: Option<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -536,6 +540,7 @@ impl ClientConfigOverrides {
             && self.min_threads.is_none()
             && self.qp.is_none()
             && self.display_mode.is_none()
+            && self.requested_resolution_only.is_none()
             && self.fec_percentage.is_none()
             && self.max_bitrate.is_none()
             && self.minimum_fps_target.is_none()
@@ -1370,6 +1375,32 @@ mod tests {
             json!({"key_repeat_frequency": "24.9"}),
         ] {
             assert!(serde_json::from_value::<ClientConfigOverrides>(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn requested_resolution_only_is_sparse_typed_and_certificate_configuration() {
+        for value in [json!({}), json!({"requested_resolution_only":null})] {
+            let configured: ClientConfigOverrides = serde_json::from_value(value).unwrap();
+            configured.validate().unwrap();
+            assert!(configured.is_empty());
+            assert_eq!(serde_json::to_value(configured).unwrap(), json!({}));
+        }
+        for selected in [false, true] {
+            let value = json!({"requested_resolution_only":selected});
+            let configured: ClientConfigOverrides = serde_json::from_value(value.clone()).unwrap();
+            configured.validate().unwrap();
+            assert!(!configured.is_empty());
+            assert_eq!(configured.requested_resolution_only, Some(selected));
+            assert_eq!(serde_json::to_value(configured).unwrap(), value);
+        }
+        for selected in [json!(0), json!("true"), json!([]), json!({})] {
+            assert!(
+                serde_json::from_value::<ClientConfigOverrides>(
+                    json!({"requested_resolution_only":selected})
+                )
+                .is_err()
+            );
         }
     }
 

@@ -1592,6 +1592,40 @@ const pairedClients = () => ({
   ],
 });
 
+test("requested resolution catalog preference saves by certificate and preserves false versus inheritance", async () => {
+  const id="a".repeat(64);
+  for (const selection of [true,false,null]) {
+    const current=pairedClients();
+    current.clients[0].config_overrides.requested_resolution_only=true;
+    let written;
+    const api={async post(route,body) {
+      if (route === "pairing/update_client_config_overrides") {
+        assert.equal(body.certificate_id,id);
+        assert.equal(body.expected_revision,7);
+        written=ordinary(body.config_overrides);
+        return {ok:true,certificate_id:id};
+      }
+      return {...current,revision:8,clients:[
+        {...current.clients[0],config_overrides:written},current.clients[1]
+      ]};
+    }};
+    const result=await context.Amaterasu.savePairingClientOverrides(api,current,id,{requested_resolution_only:selection});
+    if (selection === null) assert.equal(Object.hasOwn(written,"requested_resolution_only"),false);
+    else assert.equal(written.requested_resolution_only,selection);
+    assert.deepEqual(ordinary(result.clients[1]),current.clients[1]);
+  }
+  for (const value of [true,false,null]) {
+    assert.deepEqual(ordinary(context.Amaterasu.unsupportedPairingOverrideFields({
+      ...pairedClients().clients[0],config_overrides:{requested_resolution_only:value}
+    })),[]);
+  }
+  for (const value of [1,"false",[],{}]) {
+    assert.deepEqual(ordinary(context.Amaterasu.unsupportedPairingOverrideFields({
+      ...pairedClients().clients[0],config_overrides:{requested_resolution_only:value}
+    })),["requested_resolution_only"]);
+  }
+});
+
 test("paired-client input overrides preserve explicit false and allow inherited null", () => {
   const client = {
     certificate_id: "a".repeat(64),

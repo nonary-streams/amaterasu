@@ -372,6 +372,7 @@ namespace Amaterasu {
       fec_percentage?: number;
       capture?: CaptureSelection;
       display_policy?: Record<string, unknown> | null;
+      requested_resolution_only?: boolean;
       stream_audio?: boolean;
       audio_sink?: string;
       virtual_sink?: string;

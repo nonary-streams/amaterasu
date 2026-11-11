@@ -10831,7 +10831,7 @@ var Amaterasu;
         "nvenc_opengl_vulkan_on_dxgi", "nvenc_latency_over_power", "vaapi_strict_rc_buffer",
         "high_resolution_scrolling", "capture",
         "always_send_scancodes", "key_rightalt_to_key_win", "key_repeat_delay",
-        "key_repeat_frequency", "keybindings", "display_policy",
+        "key_repeat_frequency", "keybindings", "display_policy", "requested_resolution_only",
     ];
     function unsupportedPairingOverrideFields(client) {
         const overrides = client.config_overrides ?? {};
@@ -10866,7 +10866,7 @@ var Amaterasu;
         }
         if (value === null)
             return ["motion_as_ds4", "touchpad_as_ds4", "ds5_inputtino_randomize_mac",
-                "proton_dualsense_compatibility"].includes(field);
+                "proton_dualsense_compatibility", "requested_resolution_only"].includes(field);
         if (value === undefined)
             return false;
         if (["stream_audio", "audio_sink_capture_only", "controller", "keyboard", "mouse",
@@ -10876,7 +10876,7 @@ var Amaterasu;
             "nvenc_spatial_aq", "nvenc_h264_cavlc", "nvenc_realtime_hags",
             "nvenc_opengl_vulkan_on_dxgi", "nvenc_latency_over_power", "vaapi_strict_rc_buffer",
             "high_resolution_scrolling", "always_send_scancodes",
-            "key_rightalt_to_key_win"].includes(field))
+            "key_rightalt_to_key_win", "requested_resolution_only"].includes(field))
             return typeof value === "boolean";
         if (field === "audio_sink" || field === "virtual_sink")
             return typeof value === "string" && new TextEncoder().encode(value).length <= 4096 &&
@@ -12084,6 +12084,8 @@ var Amaterasu;
                         ? ""
                         : String(client.config_overrides.audio_sink_capture_only);
                     const capture = sparseCaptureOverrideSelect(client.config_overrides?.capture);
+                    const requestedResolutionOnly = sparseInputOverrideSelect("requested_resolution_only", client.config_overrides?.requested_resolution_only, "Only advertise requested resolution");
+                    settingsClientOverrideAttribute(requestedResolutionOnly, "Only advertise requested resolution", client.name);
                     const displayPolicy = Amaterasu.el("textarea");
                     displayPolicy.rows = 12;
                     displayPolicy.spellcheck = false;
@@ -12102,6 +12104,7 @@ var Amaterasu;
                         audio_sink_capture_only: Amaterasu.parseAudioSinkCaptureOnlyOverride(captureOnly.value),
                         capture: parseClientCaptureOverride(capture.value),
                         display_policy: Amaterasu.parseDisplayPolicyOverrideMap(displayPolicy.value, "client"),
+                        requested_resolution_only: Amaterasu.parseInputBooleanOverride(requestedResolutionOnly.value, "Only advertise requested resolution"),
                         controller: Amaterasu.parseInputBooleanOverride(controller.value, "Controller input"),
                         gamepad: Amaterasu.parseGamepadProfileOverride(gamepad.value, inputStatus?.recognized_profiles ?? ["auto", ...(client.config_overrides?.gamepad ? [client.config_overrides.gamepad] : [])]),
                         keyboard: Amaterasu.parseInputBooleanOverride(keyboard.value, "Keyboard input"),
@@ -12226,7 +12229,7 @@ var Amaterasu;
                     const audioSettings = Amaterasu.el("details", "client-settings-group", Amaterasu.el("summary", "", "Audio"), Amaterasu.el("div", "form-grid", Amaterasu.field("Audio streaming", streamAudio), Amaterasu.field("Audio capture endpoint", audioSinkMode), Amaterasu.field("Specific endpoint ID", audioSinkId), Amaterasu.field("Virtual audio sink", virtualSinkMode), Amaterasu.field("Virtual sink ID or name", virtualSinkSelector), Amaterasu.field("Capture audio without changing default outputs", captureOnly)));
                     const inputSettings = Amaterasu.el("details", "client-settings-group", Amaterasu.el("summary", "", "Input"), Amaterasu.el("div", "form-grid", Amaterasu.field("Controller input", controller), Amaterasu.field("Gamepad profile", gamepad), Amaterasu.field("Keyboard input", keyboard), Amaterasu.field("Mouse input", mouse), Amaterasu.field("Native pen and touch", nativePenTouch), Amaterasu.field("DS4 Back as touchpad click", ds4BackAsTouchpadClick), Amaterasu.field("Motion selects DS4", motionAsDs4), Amaterasu.field("Touchpad selects DS4", touchpadAsDs4), Amaterasu.field("DS5 random MAC", ds5InputtinoRandomizeMac), Amaterasu.field("Proton DualSense compatibility", protonDualsenseCompatibility)));
                     const advancedSettings = Amaterasu.el("details", "client-settings-group", Amaterasu.el("summary", "", "Advanced input and encoding"), Amaterasu.el("div", "form-grid", ...advancedInput.fields, ...softwareEncoder.fields, ...nvencSettings.fields));
-                    const clientCard = Amaterasu.el("details", "client-settings-card", identity, Amaterasu.el("div", "client-settings-body", Amaterasu.el("p", "muted", "Blank values inherit the application or host setting."), Amaterasu.el("div", "form-grid", Amaterasu.field("FEC percentage", fec), Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "Use -1 to disable the timeout."), Amaterasu.field("Capture provider", capture)), Amaterasu.field("Display and adapter policy (JSON)", displayPolicy, "Sparse per-client overrides. Use null or empty values to inherit; global-only keys are rejected."), audioSettings, inputSettings, advancedSettings, Amaterasu.el("div", "client-settings-save", save, remove, status)));
+                    const clientCard = Amaterasu.el("details", "client-settings-card", identity, Amaterasu.el("div", "client-settings-body", Amaterasu.el("p", "muted", "Blank values inherit the application or host setting."), Amaterasu.el("div", "form-grid", Amaterasu.field("FEC percentage", fec), Amaterasu.field("Back button timeout (milliseconds)", backButtonTimeout, "Use -1 to disable the timeout."), Amaterasu.field("Capture provider", capture), Amaterasu.field("Only advertise requested resolution", requestedResolutionOnly, "Limit this client's private virtual display to the requested resolution. Requires a compatible Windows virtual display provider.")), Amaterasu.field("Display and adapter policy (JSON)", displayPolicy, "Sparse per-client overrides. Use null or empty values to inherit; global-only keys are rejected."), audioSettings, inputSettings, advancedSettings, Amaterasu.el("div", "client-settings-save", save, remove, status)));
                     const pluginSettings = Amaterasu.button("Plugin settings", () => Amaterasu.showSessionExtensionSettings(context, { kind: "paired_client", id: client.client_id }, `${client.name} plugin settings`));
                     pluginSettings.disabled = !client.client_id || !context.api.allows("configuration.read");
                     clientCard.append(pluginSettings);
