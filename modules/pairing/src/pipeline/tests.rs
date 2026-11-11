@@ -1743,6 +1743,7 @@ impl HostConfigurationHarness {
             Command::TakeResult { request: 73 } => Response::Result {
                 payload: json!({"ok":true,"revision":self.state_revision}),
             },
+            Command::ReleaseResult { request: 70..=75 } => Response::Ok,
             Command::CheckRequest { request: 8 } => Response::Ok,
             Command::Poll {} => {
                 self.polls += 1;
