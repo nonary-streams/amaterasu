@@ -5773,6 +5773,7 @@ fn virtual_display_allocation_uses_paired_physical_mode_without_changing_stream_
     assert_eq!(intent["width"], 2560);
     assert_eq!(intent["height"], 1440);
     assert_eq!(intent["refresh_millihz"], 59940);
+    assert_eq!(intent["display_policy"]["client_fps"], 120);
     assert_eq!(intent["display_policy"]["context"]["client_display_mode_override"], true);
     assert_eq!(open["profile"]["width"], 1280);
     assert_eq!(open["profile"]["height"], 720);

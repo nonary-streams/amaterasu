@@ -4229,6 +4229,7 @@ fn virtual_display_mode_policy(
         .map_err(|_| "invalid_virtual_display_policy")?
         .unwrap_or_default();
     let policy = VirtualDisplayModePolicy {
+        client_fps: Some(record.request.fps),
         configuration_option: Some(configuration_option),
         remapping,
         context: VirtualDisplayResolverContext {
