@@ -1,4 +1,5 @@
 //! Catalog-backed application launch and session ownership.
+mod display_policy;
 mod library;
 mod pipeline;
 mod protocol;

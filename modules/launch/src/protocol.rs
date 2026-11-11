@@ -203,7 +203,7 @@ impl Operation {
                     || !valid_operation_id(rtsp_operation_id)
                     || !valid_sha256(certificate_id)
                     || !valid_sha256(request_sha256)
-                    || !valid_application_display_overrides(global_overrides)
+                    || !valid_global_display_overrides(global_overrides)
                     || !valid_application_display_overrides(application_display_overrides)
                     || !valid_application_display_overrides(client_display_overrides)
                 {
@@ -1445,6 +1445,8 @@ impl Executable {
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct ApplicationConfigOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_policy: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sw_preset: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sw_tune: Option<String>,
@@ -1551,7 +1553,20 @@ impl ApplicationConfigOverrides {
         if self.fec_percentage == Some(0) {
             return Err("invalid_catalog_response");
         }
-        if !valid_application_display_overrides(&self.display_overrides()) {
+        if self.display_policy.as_ref().is_some_and(|policy| {
+            policy.as_object().is_none_or(|fields| {
+                fields.keys().any(|key| {
+                    !is_display_override_key(key) || crate::display_policy::is_global_only_key(key)
+                }) || !valid_application_display_overrides(
+                    &fields
+                        .iter()
+                        .filter(|(_, value)| !value.is_null())
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect(),
+                )
+            })
+        }) || !valid_application_display_overrides(&self.display_overrides())
+        {
             return Err("invalid_catalog_response");
         }
         if self
@@ -1612,6 +1627,7 @@ impl ApplicationConfigOverrides {
 
     pub fn is_empty(&self) -> bool {
         self.retained_options.is_empty()
+            && self.display_policy.is_none()
             && self.sw_preset.is_none()
             && self.sw_tune.is_none()
             && self.encoder.is_none()
@@ -1660,15 +1676,29 @@ impl ApplicationConfigOverrides {
     pub fn display_overrides(&self) -> BTreeMap<String, Value> {
         let value = serde_json::to_value(self).expect("serializable application overrides");
         let object = value.as_object().expect("application overrides object");
-        object
+        let mut overrides: BTreeMap<_, _> = object
             .iter()
             .filter(|(key, _)| is_display_override_key(key))
             .map(|(key, value)| (key.clone(), value.clone()))
-            .collect()
+            .collect();
+        if let Some(fields) = self.display_policy.as_ref().and_then(Value::as_object) {
+            overrides.extend(
+                fields
+                    .iter()
+                    .filter(|(_, value)| !value.is_null())
+                    .map(|(key, value)| (key.clone(), value.clone())),
+            );
+        }
+        overrides
     }
 }
 
 fn is_display_override_key(key: &str) -> bool {
+    is_core_display_override_key(key)
+        || crate::display_policy::valid_additional_field(key, &Value::Null).is_some()
+}
+
+fn is_core_display_override_key(key: &str) -> bool {
     matches!(
         key,
         "dd_mode_remapping"
@@ -1683,12 +1713,26 @@ fn is_display_override_key(key: &str) -> bool {
 }
 
 pub fn valid_application_display_overrides(overrides: &BTreeMap<String, Value>) -> bool {
+    !overrides
+        .keys()
+        .any(|key| crate::display_policy::is_global_only_key(key))
+        && valid_global_display_overrides(overrides)
+}
+
+fn valid_global_display_overrides(overrides: &BTreeMap<String, Value>) -> bool {
     if overrides.keys().any(|key| !is_display_override_key(key))
         || overrides.values().any(Value::is_null)
+        || overrides.iter().any(|(key, value)| {
+            crate::display_policy::valid_additional_field(key, value) == Some(false)
+        })
     {
         return false;
     }
-    let value = serde_json::to_value(overrides).expect("serializable display map");
+    let core: BTreeMap<_, _> = overrides
+        .iter()
+        .filter(|(key, _)| is_core_display_override_key(key))
+        .collect();
+    let value = serde_json::to_value(core).expect("serializable display map");
     let Ok(fields) = serde_json::from_value::<ApplicationConfigOverrides>(value) else {
         return false;
     };
@@ -2302,6 +2346,55 @@ mod tests {
                 .resolved_environment(|_| Some("x".repeat(1025)))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn scoped_display_policy_is_preserved_and_validated_before_admission() {
+        let configured = json!({
+            "dd_hdr_option":"disabled",
+            "display_policy":{
+                "dd_hdr_option":"auto",
+                "dd_virtual_display_scale":125,
+                "virtual_display_layout":"extended_primary",
+                "adapter_name":null
+            }
+        });
+        let parsed: ApplicationConfigOverrides =
+            serde_json::from_value(configured.clone()).unwrap();
+        parsed.validate().unwrap();
+        assert!(!parsed.is_empty());
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), configured);
+        assert_eq!(
+            parsed.display_overrides(),
+            BTreeMap::from([
+                ("dd_hdr_option".into(), json!("auto")),
+                ("dd_virtual_display_scale".into(), json!(125)),
+                ("virtual_display_layout".into(), json!("extended_primary"))
+            ])
+        );
+        for policy in [
+            json!([]),
+            json!({"unknown":null}),
+            json!({"dd_virtual_display_scale":275}),
+            json!({"dd_config_revert_delay":-1}),
+            json!({"dd_snapshot_exclude_devices":[""]}),
+            json!({"virtual_display_layout":"auto"}),
+            json!({"dd_remove_virtual_display_after_restore":false}),
+            json!({"vulkan_hdr_layer":null}),
+        ] {
+            let parsed: ApplicationConfigOverrides =
+                serde_json::from_value(json!({"display_policy":policy})).unwrap();
+            assert!(parsed.validate().is_err(), "{policy}");
+        }
+        for (key, value) in [
+            ("dd_remove_virtual_display_after_restore", json!(false)),
+            ("vulkan_hdr_layer", json!(true)),
+            ("dd_wa_hdr_toggle_delay", json!(500)),
+        ] {
+            let map = BTreeMap::from([(key.into(), value)]);
+            assert!(valid_global_display_overrides(&map));
+            assert!(!valid_application_display_overrides(&map));
+        }
     }
 
     #[test]

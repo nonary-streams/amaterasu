@@ -1331,6 +1331,79 @@ fn per_application_display_settings_are_frozen_and_admission_bound() {
 }
 
 #[test]
+fn complete_display_policy_survives_catalog_preflight_and_signed_admission() {
+    let mut harness = Harness::new();
+    let mut pipeline = pipeline();
+    let scoped = json!({
+        "dd_virtual_display_scale":125,
+        "virtual_display_layout":"extended_primary_isolated",
+        "dd_snapshot_exclude_devices":["DISPLAY\\Desk"],
+        "dd_config_revert_delay":500,
+        "dd_always_restore_from_golden":false,
+        "dd_refresh_rate_option":"manual",
+        "dd_manual_refresh_rate":"59.94"
+    });
+    harness.catalog_config_overrides = Some(json!({
+        "dd_refresh_rate_option":"auto",
+        "display_policy":scoped
+    }));
+    let preflight = harness.request(
+        &mut pipeline,
+        "amaterasu.nvhttp",
+        json!({
+            "action":"preflight_export","operation_id":"complete-display-policy",
+            "app_id":"app-0000000000000001"
+        }),
+    );
+    assert_eq!(
+        preflight["application_display_overrides"], scoped,
+        "{preflight}"
+    );
+    assert_eq!(preflight["config_overrides"]["display_policy"], scoped);
+    let certificate_id = "cd".repeat(32);
+    let admission = harness.request(
+        &mut pipeline,
+        "amaterasu.nvhttp",
+        json!({
+            "action":"prepare_display_admission",
+            "application_operation_id":"complete-display-policy",
+            "global_revision":9,
+            "global_overrides":{
+                "adapter_name":"GPU-0",
+                "adapter_pnp_id":"PCI\\GPU-0",
+                "dd_remove_virtual_display_after_restore":false,
+                "vulkan_hdr_layer":true,
+                "dd_virtual_display_scale":200
+            },
+            "catalog_revision":preflight["catalog_revision"],
+            "application_display_overrides":scoped,
+            "certificate_id":certificate_id,
+            "client_display_overrides":{"dd_virtual_display_scale":150},
+            "rtsp_operation_id":"complete-display-rtsp",
+            "request_sha256":"ab".repeat(32),
+        }),
+    );
+    assert_eq!(admission["ok"], true, "{admission}");
+    let snapshot = &admission["display_policy_snapshot"];
+    assert_eq!(snapshot["application_overrides"], scoped);
+    assert_eq!(
+        snapshot["effective_overrides"]["dd_virtual_display_scale"],
+        150
+    );
+    assert_eq!(
+        snapshot["effective_overrides"]["dd_remove_virtual_display_after_restore"],
+        false
+    );
+    assert_eq!(snapshot["effective_overrides"]["adapter_name"], "GPU-0");
+    let mut launch = launch_export("complete-display-policy");
+    launch["preflight_token"] = preflight["preflight_token"].clone();
+    launch["application_display_overrides"] = scoped;
+    launch["display_admission_token"] = admission["display_admission_token"].clone();
+    let started = harness.request(&mut pipeline, "amaterasu.nvhttp", launch);
+    assert_eq!(started["launch"]["state"], "active", "{started}");
+}
+
+#[test]
 fn signed_principals_attest_frozen_display_policy_and_reject_changed_or_revoked_use() {
     let mut harness = Harness::new();
     let mut pipeline = pipeline();
