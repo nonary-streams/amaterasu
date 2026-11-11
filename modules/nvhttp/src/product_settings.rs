@@ -51,7 +51,8 @@ const STEAM_AUDIO_DRIVER_SETTINGS_VERSION: u64 = 25;
 const FULL_DISPLAY_POLICY_SETTINGS_VERSION: u64 = 26;
 const LEGACY_PERMANENT_MONITOR_COUNT_KEY: &str = "dd_vdd_static_monitor_count";
 const RETAINED_OPTIONS_SETTINGS_VERSION: u64 = 27;
-const SETTINGS_VERSION: u64 = RETAINED_OPTIONS_SETTINGS_VERSION;
+const REMOVE_VIRTUAL_DISPLAY_SETTINGS_VERSION: u64 = 28;
+const SETTINGS_VERSION: u64 = REMOVE_VIRTUAL_DISPLAY_SETTINGS_VERSION;
 const LEGACY_DISPLAY_POLICY_KEYS: [&str; 8] = [
     "dd_mode_remapping",
     "dd_resolution_option",
@@ -62,7 +63,7 @@ const LEGACY_DISPLAY_POLICY_KEYS: [&str; 8] = [
     "dd_configuration_option",
     "dd_hdr_request_override",
 ];
-const DISPLAY_POLICY_KEYS: [&str; 30] = [
+const DISPLAY_POLICY_KEYS: [&str; 31] = [
     "adapter_name",
     "adapter_pnp_id",
     "virtual_display_mode",
@@ -76,6 +77,7 @@ const DISPLAY_POLICY_KEYS: [&str; 30] = [
     "dd_configuration_option",
     "dd_hdr_request_override",
     "dd_config_revert_delay",
+    "dd_remove_virtual_display_after_restore",
     "dd_config_revert_on_disconnect",
     "dd_paused_virtual_display_timeout_secs",
     "dd_always_restore_from_golden",
@@ -671,6 +673,8 @@ pub(crate) fn validate_display_policy_values(policy: &Value) -> Result<(), &'sta
             && !valid_string_list(&fields["virtual_display_outputs"], 32, 512))
         || (!fields["dd_snapshot_exclude_devices"].is_null()
             && !valid_string_list(&fields["dd_snapshot_exclude_devices"], 256, 1024))
+        || (!fields["dd_remove_virtual_display_after_restore"].is_null()
+            && !fields["dd_remove_virtual_display_after_restore"].is_boolean())
         || (!fields["dd_config_revert_on_disconnect"].is_null()
             && !fields["dd_config_revert_on_disconnect"].is_boolean())
         || (!fields["dd_always_restore_from_golden"].is_null()
@@ -3083,6 +3087,7 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
             | STEAM_AUDIO_DRIVER_SETTINGS_VERSION
             | FULL_DISPLAY_POLICY_SETTINGS_VERSION
             | RETAINED_OPTIONS_SETTINGS_VERSION
+            | REMOVE_VIRTUAL_DISPLAY_SETTINGS_VERSION
     ) || revision == 0
     {
         return Err(invalid_state(
@@ -3128,6 +3133,7 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
         NVENC_SETTINGS_VERSION => 45,
         STEAM_AUDIO_DRIVER_SETTINGS_VERSION => 46,
         FULL_DISPLAY_POLICY_SETTINGS_VERSION | RETAINED_OPTIONS_SETTINGS_VERSION => 68,
+        REMOVE_VIRTUAL_DISPLAY_SETTINGS_VERSION => 69,
         _ => unreachable!(),
     };
     let matches_expected_value_count = values.len() >= expected_value_count
@@ -3177,6 +3183,10 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
         || (version >= FULL_DISPLAY_POLICY_SETTINGS_VERSION
             && DISPLAY_POLICY_KEYS
                 .iter()
+                .filter(|key| {
+                    **key != "dd_remove_virtual_display_after_restore"
+                        || version >= REMOVE_VIRTUAL_DISPLAY_SETTINGS_VERSION
+                })
                 .any(|key| !values.contains_key(*key)))
         || (version >= UPNP_SETTINGS_VERSION && !values.contains_key("upnp"))
         || (version >= STEAM_AUDIO_DRIVER_SETTINGS_VERSION
@@ -3894,10 +3904,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn public_document_helpers_use_canonical_v26_defaults_and_legacy_migration() {
+    fn public_document_helpers_use_current_defaults_and_legacy_migration() {
         let mut current = default_document(&Settings::default()).unwrap();
         assert_eq!(current["version"], SETTINGS_VERSION);
-        assert_eq!(current["values"].as_object().unwrap().len(), 68);
+        assert_eq!(current["values"].as_object().unwrap().len(), 69);
         assert_eq!(current["values"]["install_steam_audio_drivers"], true);
         assert_eq!(current["values"]["nvenc_preset"], 1);
         assert_eq!(current["values"]["vaapi_strict_rc_buffer"], false);
@@ -4024,7 +4034,7 @@ mod tests {
         product.start_next();
         let pending = product.pending.take().expect("Steam driver policy update");
         assert_eq!(pending.payload["version"], SETTINGS_VERSION);
-        assert_eq!(pending.payload["values"].as_object().unwrap().len(), 68);
+        assert_eq!(pending.payload["values"].as_object().unwrap().len(), 69);
         assert_eq!(
             pending.payload["values"]["install_steam_audio_drivers"],
             false
@@ -4184,6 +4194,65 @@ mod tests {
     }
 
     #[test]
+    fn virtual_display_removal_policy_migrates_and_preserves_explicit_choices() {
+        for previous_version in [
+            FULL_DISPLAY_POLICY_SETTINGS_VERSION,
+            RETAINED_OPTIONS_SETTINGS_VERSION,
+        ] {
+            let mut previous = default_document(&Settings::default()).unwrap();
+            previous["version"] = json!(previous_version);
+            previous["values"]
+                .as_object_mut()
+                .unwrap()
+                .remove("dd_remove_virtual_display_after_restore");
+            previous["values"]["provider_extension"] = json!({"retained":true});
+            let document = parse_document(&previous).unwrap();
+            assert!(document.display_policy["dd_remove_virtual_display_after_restore"].is_null());
+            assert_eq!(
+                document.retained_values["provider_extension"],
+                json!({"retained":true})
+            );
+        }
+
+        for value in [Value::Null, json!(false), json!(true)] {
+            let mut current = default_document(&Settings::default()).unwrap();
+            current["values"]["dd_remove_virtual_display_after_restore"] = value.clone();
+            let mut product = ProductSettings::new("Bootstrap".into(), settings::DEFAULT_PORT);
+            product.apply_document(parse_document(&current).unwrap());
+            product
+                .enqueue(
+                    91,
+                    5_000,
+                    display_update_action(DisplayPolicyUpdate::default(), 1),
+                )
+                .unwrap();
+            product.start_next();
+            let pending = product.pending.take().unwrap();
+            assert_eq!(
+                pending.payload["values"]["dd_remove_virtual_display_after_restore"],
+                value
+            );
+            let persisted = json!({"ok":true,"found":true,"version":SETTINGS_VERSION,"revision":2,"values":pending.payload["values"]});
+            assert_eq!(
+                parse_document(&persisted).unwrap().display_policy["dd_remove_virtual_display_after_restore"],
+                value
+            );
+        }
+
+        let mut current = default_document(&Settings::default()).unwrap();
+        current["values"]
+            .as_object_mut()
+            .unwrap()
+            .remove("dd_remove_virtual_display_after_restore");
+        assert!(parse_document(&current).is_err());
+        for invalid in [json!(0), json!("false"), json!({}), json!([])] {
+            let mut current = default_document(&Settings::default()).unwrap();
+            current["values"]["dd_remove_virtual_display_after_restore"] = invalid;
+            assert!(parse_document(&current).is_err());
+        }
+    }
+
+    #[test]
     fn legacy_static_monitor_alias_migrates_to_canonical_without_losing_zero_or_precedence() {
         let absent = display_v18_document(7);
         assert!(
@@ -4247,6 +4316,7 @@ mod tests {
                             "virtual_display_mode":"disabled",
                             "virtual_display_layout":"exclusive",
                             "dd_virtual_display_scale":-1,
+                            "dd_remove_virtual_display_after_restore":true,
                             "dd_virtual_display_permanent_count":2,
                             "virtual_display_outputs":["Vibeshine-1"],
                             "dd_snapshot_exclude_devices":["DISPLAY\\VIBESHINE"],
@@ -4262,7 +4332,7 @@ mod tests {
         let pending = product.pending.take().unwrap();
         assert_eq!(pending.payload["version"], SETTINGS_VERSION);
         assert_eq!(pending.payload["expected_revision"], 7);
-        assert_eq!(pending.payload["values"].as_object().unwrap().len(), 68);
+        assert_eq!(pending.payload["values"].as_object().unwrap().len(), 69);
         let write = pending.payload["values"].clone();
         let response =
             json!({"ok":true,"found":true,"version":SETTINGS_VERSION,"revision":8,"values":write});
@@ -4275,6 +4345,10 @@ mod tests {
         assert_eq!(
             product.settings_payload()["configured_display_policy"]["adapter_name"],
             "/dev/dri/renderD128"
+        );
+        assert_eq!(
+            product.settings_payload()["configured_display_policy"]["dd_remove_virtual_display_after_restore"],
+            true
         );
         let mut restarted = ProductSettings::new("Bootstrap".into(), settings::DEFAULT_PORT);
         restarted.apply_document(parse_document(&response).unwrap());
@@ -6026,7 +6100,7 @@ mod tests {
             },
         );
         assert_eq!(update["version"], SETTINGS_VERSION);
-        assert_eq!(update["values"].as_object().unwrap().len(), 68);
+        assert_eq!(update["values"].as_object().unwrap().len(), 69);
         assert_eq!(update["values"]["nvenc_spatial_aq"], false);
         assert_eq!(
             update["values"]["global_preparation"]
@@ -7909,7 +7983,7 @@ mod tests {
         product.start_next();
         let pending = product.pending.take().expect("NVENC settings update");
         assert_eq!(pending.payload["version"], SETTINGS_VERSION);
-        assert_eq!(pending.payload["values"].as_object().unwrap().len(), 68);
+        assert_eq!(pending.payload["values"].as_object().unwrap().len(), 69);
         assert_eq!(pending.payload["values"]["nvenc_preset"], 7);
         assert_eq!(pending.payload["values"]["nvenc_twopass"], "full_res");
         assert_eq!(pending.payload["values"]["nvenc_split_encode"], "disabled");

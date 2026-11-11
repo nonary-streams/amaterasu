@@ -1599,6 +1599,16 @@ fn valid_display_policy_snapshot(snapshot: &serde_json::Value) -> bool {
     let application_settings_are_valid = snapshot
         .get("application_display_settings")
         .is_none_or(|value| value.is_null() || valid_application_display_settings(value));
+    // Removal after restoration is host policy, never a client/application override.
+    let removal_key = "dd_remove_virtual_display_after_restore";
+    if application.contains_key(removal_key)
+        || client.contains_key(removal_key)
+        || snapshot["global_overrides"]
+            .get(removal_key)
+            .is_some_and(|value| !value.is_null() && !value.is_boolean())
+    {
+        return false;
+    }
     if !matches!(base_field_count, 5 | 7)
         || !intent_is_valid
         || !application_settings_are_valid
@@ -1649,6 +1659,7 @@ fn valid_display_policy_snapshot(snapshot: &serde_json::Value) -> bool {
                         | "dd_configuration_option"
                         | "dd_hdr_request_override"
                         | "dd_config_revert_delay"
+                        | "dd_remove_virtual_display_after_restore"
                         | "dd_config_revert_on_disconnect"
                         | "dd_paused_virtual_display_timeout_secs"
                         | "dd_always_restore_from_golden"
@@ -2217,6 +2228,35 @@ mod tests {
             forged.validate(false),
             Err("invalid_display_policy_snapshot")
         );
+    }
+
+    #[test]
+    fn virtual_display_removal_policy_is_carried_only_by_global_snapshot() {
+        for value in [serde_json::Value::Null, json!(false), json!(true)] {
+            let snapshot = json!({
+                "global_revision":1,"global_overrides":{"dd_remove_virtual_display_after_restore":value},
+                "catalog_revision":7,"certificate_id":"ab".repeat(32),
+                "application_overrides":{},"client_overrides":{},
+                "effective_overrides":{"dd_remove_virtual_display_after_restore":value}
+            });
+            assert!(valid_display_policy_snapshot(&snapshot));
+            let mut forged = snapshot.clone();
+            forged["effective_overrides"]["dd_remove_virtual_display_after_restore"] =
+                json!("false");
+            assert!(!valid_display_policy_snapshot(&forged));
+            for scope in ["application_overrides", "client_overrides"] {
+                let mut scoped = snapshot.clone();
+                scoped[scope]["dd_remove_virtual_display_after_restore"] = value.clone();
+                assert!(!valid_display_policy_snapshot(&scoped));
+            }
+        }
+        let invalid = json!({
+            "global_revision":1,"global_overrides":{"dd_remove_virtual_display_after_restore":"false"},
+            "catalog_revision":7,"certificate_id":"ab".repeat(32),
+            "application_overrides":{},"client_overrides":{},
+            "effective_overrides":{"dd_remove_virtual_display_after_restore":"false"}
+        });
+        assert!(!valid_display_policy_snapshot(&invalid));
     }
 
     #[test]

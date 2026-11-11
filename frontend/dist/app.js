@@ -64,6 +64,7 @@ var Amaterasu;
         "dd_mode_remapping", "dd_resolution_option", "dd_manual_resolution",
         "dd_refresh_rate_option", "dd_manual_refresh_rate", "dd_hdr_option",
         "dd_configuration_option", "dd_hdr_request_override", "dd_config_revert_delay",
+        "dd_remove_virtual_display_after_restore",
         "dd_config_revert_on_disconnect", "dd_paused_virtual_display_timeout_secs",
         "dd_always_restore_from_golden", "dd_display_helper_engine",
         "dd_snapshot_restore_hotkey", "dd_snapshot_restore_hotkey_modifiers",
@@ -107,7 +108,7 @@ var Amaterasu;
             return ["auto", "force_on", "force_off"].includes(value);
         if (key === "dd_display_helper_engine")
             return ["auto", "v2", "legacy"].includes(value);
-        if (["dd_config_revert_on_disconnect", "dd_always_restore_from_golden", "dd_use_sunshine_virtual_display_driver", "dd_activate_virtual_display", "dd_wa_dummy_plug_hdr10", "dd_wa_hdr_toggle", "vulkan_hdr_layer", "wayland_hdr_compatibility"].includes(key))
+        if (["dd_remove_virtual_display_after_restore", "dd_config_revert_on_disconnect", "dd_always_restore_from_golden", "dd_use_sunshine_virtual_display_driver", "dd_activate_virtual_display", "dd_wa_dummy_plug_hdr10", "dd_wa_hdr_toggle", "vulkan_hdr_layer", "wayland_hdr_compatibility"].includes(key))
             return typeof value === "boolean";
         if (["dd_config_revert_delay", "dd_paused_virtual_display_timeout_secs", "dd_virtual_display_permanent_count", "dd_wa_hdr_toggle_delay"].includes(key))
             return Number.isSafeInteger(value) && value >= 0 && value <= (key === "dd_virtual_display_permanent_count" ? 4 : key === "dd_wa_hdr_toggle_delay" ? 3000 : 0x7fff_ffff);

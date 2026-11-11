@@ -89,6 +89,19 @@ test("display policy editor keeps platform-specific inheritance and scoped stati
   ), /unavailable/);
 });
 
+test("virtual display removal policy remains a global nullable boolean", () => {
+  const parseDisplayPolicy = context.Amaterasu.parseDisplayPolicyOverrideMap;
+  for (const value of [null, false, true]) {
+    const policy = JSON.stringify({ dd_remove_virtual_display_after_restore: value });
+    assert.equal(parseDisplayPolicy(policy, "global").dd_remove_virtual_display_after_restore, value);
+    for (const scope of ["application", "client"])
+      assert.throws(() => parseDisplayPolicy(policy, scope), /unavailable/);
+  }
+  for (const value of [0, "false", [], {}])
+    assert.throws(() => parseDisplayPolicy(
+      JSON.stringify({ dd_remove_virtual_display_after_restore: value }), "global"), /invalid/);
+});
+
 test("authentication lifetime editor accepts bounded whole seconds", () => {
   const parseAuth = context.Amaterasu.parseAuthTokenLifetimes;
   assert.deepEqual(ordinary(parseAuth(7200, 604800)), {
