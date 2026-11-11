@@ -74,6 +74,7 @@ pub(super) trait Compositor: Send {
         layout: Option<&Layout>,
         placement: &Placement,
         scale: ScaleSetting,
+        newly_connected: bool,
     ) -> Result<(), String>;
 }
 pub(super) struct KScreen;
@@ -210,6 +211,7 @@ impl Compositor for KScreen {
         layout: Option<&Layout>,
         placement: &Placement,
         scale: ScaleSetting,
+        newly_connected: bool,
     ) -> Result<(), String> {
         let deadline = Instant::now() + Duration::from_secs(5);
         let configuration = loop {
@@ -235,7 +237,7 @@ impl Compositor for KScreen {
             scale: scale.factor(specification.width, specification.height),
         };
         if let Placement::Exclusive { keep } = placement {
-            return configure_exclusive(&configuration, output, &target, keep);
+            return configure_exclusive(&configuration, output, &target, keep, newly_connected);
         }
         let right = match layout {
             Some(layout) => layout.right_edge(),
@@ -250,17 +252,17 @@ impl Compositor for KScreen {
             None => live_next_priority(&configuration, output)?,
         };
         arguments.extend(target.arguments(output, right, priority));
-        run(&arguments)?;
-        let confirmed = query()?;
-        if layout.is_some_and(|layout| !layout.matches(&confirmed)) {
-            return Err("existing desktop changed during hotplug".into());
-        }
-        let actual = find_output(&confirmed, output)
-            .ok_or("owned display disappeared after configuration")?;
-        if !target.matches(actual, right) {
-            return Err("owned display configuration readback differs".into());
-        }
-        Ok(())
+        configure_target(
+            &mut KScreenDesktop {
+                started: Instant::now(),
+            },
+            output,
+            &target,
+            right,
+            arguments,
+            newly_connected,
+            |confirmed| Ok(layout.is_none_or(|layout| layout.matches(confirmed))),
+        )
     }
 }
 
@@ -454,7 +456,7 @@ fn preservation_state(configuration: &Value, owned: &str) -> Result<Value, Strin
             .ok_or("missing scale")?;
         let rotation = output["rotation"]
             .as_u64()
-            .filter(|v| matches!(v, 1 | 2 | 4 | 8))
+            .filter(|v| matches!(v, 1 | 2 | 4 | 8 | 16 | 32 | 64 | 128))
             .ok_or("missing rotation")?;
         let priority = output["priority"]
             .as_u64()
@@ -488,22 +490,89 @@ fn configure_exclusive(
     output: &str,
     target: &OwnedTarget,
     keep: &[String],
+    newly_connected: bool,
 ) -> Result<(), String> {
     let right = right_edge_of(configuration, |name| keep.iter().any(|kept| kept == name))?;
     // Kept peer outputs retain their order; this stream's output follows them.
     let priority = keep.len() + 1;
     let mut arguments = exclusive_disable_arguments(configuration, output, keep)?;
     arguments.extend(target.arguments(output, right, priority));
-    run(&arguments)?;
-    let confirmed = query()?;
-    let actual =
-        find_output(&confirmed, output).ok_or("owned display disappeared after configuration")?;
-    if !target.matches(actual, right)
-        || !exclusive_disable_arguments(&confirmed, output, keep)?.is_empty()
-    {
-        return Err("exclusive owned display configuration readback differs".into());
+    configure_target(
+        &mut KScreenDesktop {
+            started: Instant::now(),
+        },
+        output,
+        target,
+        right,
+        arguments,
+        newly_connected,
+        |confirmed| Ok(exclusive_disable_arguments(confirmed, output, keep)?.is_empty()),
+    )
+}
+
+/// Commit the mode before enabling HDR. KWin can publish a stale HDR bit during
+/// hotplug, or lose a color change submitted in the same transaction as a mode.
+fn configure_target(
+    desktop: &mut impl Desktop,
+    output: &str,
+    target: &OwnedTarget,
+    x: i64,
+    mut arguments: Vec<String>,
+    newly_connected: bool,
+    mut preserved: impl FnMut(&Value) -> Result<bool, String>,
+) -> Result<(), String> {
+    let rearm_hdr = target.hdr && newly_connected;
+    if target.hdr {
+        let prefix = format!("output.{output}.");
+        arguments.retain(|argument| {
+            !argument.starts_with(&format!("{prefix}hdr."))
+                && !argument.starts_with(&format!("{prefix}wcg."))
+        });
+        if rearm_hdr {
+            arguments.push(format!("{prefix}hdr.disable"));
+            arguments.push(format!("{prefix}wcg.disable"));
+        }
     }
-    Ok(())
+    desktop.apply(&arguments)?;
+    if target.hdr {
+        wait_for_configuration(desktop, 1, |configuration| {
+            Ok(find_output(configuration, output).is_some_and(|actual| {
+                target.base_matches(actual, x) && (!rearm_hdr || actual["hdr"] == false)
+            }) && preserved(configuration)?)
+        })?;
+        desktop.apply(&[
+            format!("output.{output}.hdr.enable"),
+            format!("output.{output}.wcg.enable"),
+        ])?;
+    }
+    wait_for_configuration(desktop, if rearm_hdr { 3 } else { 1 }, |configuration| {
+        Ok(
+            find_output(configuration, output).is_some_and(|actual| target.matches(actual, x))
+                && preserved(configuration)?,
+        )
+    })
+}
+
+fn wait_for_configuration(
+    desktop: &mut impl Desktop,
+    required_observations: u32,
+    mut matches: impl FnMut(&Value) -> Result<bool, String>,
+) -> Result<(), String> {
+    let deadline = desktop.elapsed() + Duration::from_secs(5);
+    let mut observations = 0;
+    loop {
+        let matching = desktop
+            .query()
+            .is_ok_and(|configuration| matches(&configuration).unwrap_or(false));
+        observations = if matching { observations + 1 } else { 0 };
+        if observations >= required_observations {
+            return Ok(());
+        }
+        if desktop.elapsed() >= deadline {
+            return Err("owned display configuration did not settle before its deadline".into());
+        }
+        desktop.pause(READBACK_INTERVAL);
+    }
 }
 /// `disable` for every connected, enabled display that is neither the owned
 /// output nor kept. Empty once the desktop is exclusive.
@@ -570,6 +639,9 @@ impl OwnedTarget {
         arguments
     }
     fn matches(&self, actual: &Value, x: i64) -> bool {
+        self.base_matches(actual, x) && actual["hdr"] == self.hdr && actual["wcg"] == self.hdr
+    }
+    fn base_matches(&self, actual: &Value, x: i64) -> bool {
         let scale_matches = match self.scale {
             Some(scale) => actual["scale"]
                 .as_f64()
@@ -582,8 +654,6 @@ impl OwnedTarget {
             && actual["pos"]["y"].as_i64() == Some(0)
             && actual["currentModeId"].as_str() == Some(&self.mode)
             && actual["rotation"] == 1
-            && actual["hdr"] == self.hdr
-            && actual["wcg"] == self.hdr
     }
 }
 fn query() -> Result<Value, String> {
@@ -698,7 +768,7 @@ fn right_edge_of(configuration: &Value, included: impl Fn(&str) -> bool) -> Resu
             .as_f64()
             .filter(|v| v.is_finite() && (0.25..=5.0).contains(v))
             .ok_or("invalid KScreen scale")?;
-        let size = if matches!(output["rotation"].as_u64(), Some(2 | 8)) {
+        let size = if matches!(output["rotation"].as_u64(), Some(2 | 8 | 32 | 128)) {
             &output["size"]["height"]
         } else {
             &output["size"]["width"]
@@ -707,7 +777,7 @@ fn right_edge_of(configuration: &Value, included: impl Fn(&str) -> bool) -> Resu
             .as_u64()
             .filter(|v| *v <= 8192)
             .ok_or("invalid KScreen width")?;
-        right = right.max(x + (width as f64 / scale).round() as i64);
+        right = right.max(x + (width as f64 / scale).ceil() as i64);
     }
     if !(0..=65536).contains(&right) {
         return Err("desktop bounds exceed supported coordinates".into());
@@ -831,11 +901,21 @@ fn collect_output(child: Child, timeout: Duration) -> Result<Vec<u8>, String> {
         if let Some(status) = owner.status {
             if output_state == PipeProgress::Closed && error_state == PipeProgress::Closed {
                 owner.output_complete = true;
-                if status.success() && bytes.len() <= MAX_STDOUT && errors.len() <= MAX_STDERR {
+                let reported_failure =
+                    doctor_reported_failure(&bytes) || doctor_reported_failure(&errors);
+                if status.success()
+                    && bytes.len() <= MAX_STDOUT
+                    && errors.len() <= MAX_STDERR
+                    && !reported_failure
+                {
                     return Ok(bytes);
                 }
                 // The command's own explanation otherwise never reaches the journal.
-                let detail = bounded_detail(&String::from_utf8_lossy(&errors));
+                let detail = bounded_detail(&format!(
+                    "{} {}",
+                    String::from_utf8_lossy(&errors),
+                    String::from_utf8_lossy(&bytes)
+                ));
                 return Err(if detail.is_empty() {
                     "KScreen command failed or exceeded its bound".into()
                 } else {
@@ -853,6 +933,16 @@ fn collect_output(child: Child, timeout: Duration) -> Result<Vec<u8>, String> {
             thread::sleep(Duration::from_millis(10));
         }
     }
+}
+fn doctor_reported_failure(output: &[u8]) -> bool {
+    let output = String::from_utf8_lossy(output);
+    [
+        "Unable to parse arguments:",
+        "applying config failed!",
+        "Invalid config.",
+    ]
+    .iter()
+    .any(|marker| output.contains(marker))
 }
 #[cfg(test)]
 mod tests {
@@ -920,6 +1010,163 @@ mod tests {
         let child = test_command("printf 'Applying config failed\\n' >&2; exit 1");
         let error = collect_output(child, Duration::from_secs(2)).unwrap_err();
         assert!(error.ends_with(": Applying config failed"), "{error}");
+    }
+
+    #[test]
+    fn command_rejects_kscreen_failure_messages_even_with_successful_exit() {
+        for script in [
+            "printf 'Unable to parse arguments: output.Virtual-1.mode.bad'",
+            "printf 'applying config failed!' >&2",
+            "printf 'Invalid config.'",
+        ] {
+            assert!(collect_output(test_command(script), Duration::from_secs(2)).is_err());
+        }
+        assert_eq!(
+            collect_output(test_command("printf applied"), Duration::from_secs(2)).unwrap(),
+            b"applied"
+        );
+    }
+
+    struct SequenceDesktop {
+        observations: std::collections::VecDeque<Value>,
+        fallback: Value,
+        applications: Vec<Vec<String>>,
+        queries: usize,
+        elapsed: Duration,
+    }
+    impl SequenceDesktop {
+        fn new(observations: Vec<Value>) -> Self {
+            Self {
+                fallback: observations.last().unwrap().clone(),
+                observations: observations.into(),
+                applications: Vec::new(),
+                queries: 0,
+                elapsed: Duration::ZERO,
+            }
+        }
+    }
+    impl Desktop for SequenceDesktop {
+        fn query(&mut self) -> Result<Value, String> {
+            self.queries += 1;
+            Ok(self
+                .observations
+                .pop_front()
+                .unwrap_or_else(|| self.fallback.clone()))
+        }
+        fn apply(&mut self, arguments: &[String]) -> Result<(), String> {
+            self.applications.push(arguments.to_vec());
+            Ok(())
+        }
+        fn elapsed(&self) -> Duration {
+            self.elapsed
+        }
+        fn pause(&mut self, duration: Duration) {
+            self.elapsed += duration;
+        }
+    }
+    fn owned_state(mode: &str, hdr: bool) -> Value {
+        json!({"outputs":[{"name":"Virtual-2","connected":true,"enabled":true,"scale":1.5,"pos":{"x":0,"y":0},"currentModeId":mode,"rotation":1,"hdr":hdr,"wcg":hdr}]})
+    }
+    #[test]
+    fn hdr_activation_follows_settled_mode_and_rearm_then_stable_color_readbacks() {
+        let target = OwnedTarget {
+            mode: "7".into(),
+            scale: Some(1.5),
+            hdr: true,
+        };
+        let mut desktop = SequenceDesktop::new(vec![
+            owned_state("1", true),
+            owned_state("7", false),
+            owned_state("7", true),
+            owned_state("7", false),
+            owned_state("7", true),
+            owned_state("7", true),
+            owned_state("7", true),
+        ]);
+        configure_target(
+            &mut desktop,
+            "Virtual-2",
+            &target,
+            0,
+            target.arguments("Virtual-2", 0, 1),
+            true,
+            |_| Ok(true),
+        )
+        .unwrap();
+        assert_eq!(desktop.applications.len(), 2);
+        assert!(desktop.applications[0].contains(&"output.Virtual-2.hdr.disable".into()));
+        assert!(!desktop.applications[0].contains(&"output.Virtual-2.hdr.enable".into()));
+        assert_eq!(
+            desktop.applications[1],
+            ["output.Virtual-2.hdr.enable", "output.Virtual-2.wcg.enable"]
+        );
+        assert_eq!(desktop.queries, 7);
+        assert_eq!(desktop.elapsed, READBACK_INTERVAL * 5);
+    }
+    #[test]
+    fn hdr_is_not_enabled_before_the_mode_and_desktop_settle() {
+        let target = OwnedTarget {
+            mode: "7".into(),
+            scale: Some(1.5),
+            hdr: true,
+        };
+        let mut desktop = SequenceDesktop::new(vec![owned_state("7", false)]);
+        let result = configure_target(
+            &mut desktop,
+            "Virtual-2",
+            &target,
+            0,
+            target.arguments("Virtual-2", 0, 1),
+            true,
+            |_| Ok(false),
+        );
+        assert!(result.unwrap_err().contains("deadline"));
+        assert_eq!(desktop.applications.len(), 1);
+        assert_eq!(desktop.elapsed, Duration::from_secs(5));
+    }
+    #[test]
+    fn retained_hdr_does_not_rearm_and_sdr_waits_for_fresh_readback() {
+        let target = OwnedTarget {
+            mode: "7".into(),
+            scale: Some(1.5),
+            hdr: true,
+        };
+        let mut desktop = SequenceDesktop::new(vec![owned_state("7", true)]);
+        configure_target(
+            &mut desktop,
+            "Virtual-2",
+            &target,
+            0,
+            target.arguments("Virtual-2", 0, 1),
+            false,
+            |_| Ok(true),
+        )
+        .unwrap();
+        assert!(
+            desktop.applications[0]
+                .iter()
+                .all(|argument| !argument.contains(".hdr.") && !argument.contains(".wcg."))
+        );
+        assert_eq!(desktop.queries, 2);
+        let target = OwnedTarget {
+            hdr: false,
+            ..target
+        };
+        let mut desktop =
+            SequenceDesktop::new(vec![owned_state("1", true), owned_state("7", false)]);
+        configure_target(
+            &mut desktop,
+            "Virtual-2",
+            &target,
+            0,
+            target.arguments("Virtual-2", 0, 1),
+            true,
+            |_| Ok(true),
+        )
+        .unwrap();
+        assert_eq!(desktop.applications.len(), 1);
+        assert_eq!(desktop.queries, 2);
+        assert_eq!(desktop.elapsed, READBACK_INTERVAL);
     }
 
     #[test]
@@ -1033,6 +1280,14 @@ mod tests {
         assert_eq!(live_next_priority(&configuration, "Virtual-2").unwrap(), 2);
         let no_survivor = json!({"outputs":[{"name":"Virtual-2","connected":true,"enabled":true}]});
         assert_eq!(live_next_priority(&no_survivor, "Virtual-2").unwrap(), 1);
+    }
+    #[test]
+    fn placement_uses_the_full_logical_width_of_flipped_rotated_outputs() {
+        let configuration = json!({"outputs":[{"name":"HDMI-A-1","connected":true,"enabled":true,"pos":{"x":0},"size":{"width":1920,"height":1081},"scale":1.5,"rotation":32}]});
+        assert_eq!(right_edge(&configuration, "Virtual-2").unwrap(), 721);
+        let mut reversed = configuration;
+        reversed["outputs"][0]["rotation"] = json!(128);
+        assert_eq!(right_edge(&reversed, "Virtual-2").unwrap(), 721);
     }
     #[test]
     fn exclusive_turns_off_only_other_enabled_displays_amaterasu_does_not_own() {

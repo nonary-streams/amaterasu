@@ -208,6 +208,7 @@ impl Compositor for FakeCompositor {
         layout: Option<&super::super::layout::Layout>,
         placement: &Placement,
         _: ScaleSetting,
+        _: bool,
     ) -> Result<(), String> {
         if let Some(path) = &self.setup_journal {
             let document: serde_json::Value =

@@ -58,12 +58,12 @@ impl Layout {
             .iter()
             .filter(|o| o.enabled)
             .map(|o| {
-                let width = if matches!(o.rotation, 2 | 8) {
+                let width = if matches!(o.rotation, 2 | 8 | 32 | 128) {
                     o.height
                 } else {
                     o.width
                 };
-                o.x + (f64::from(width) / o.scale).round() as i64
+                o.x + (f64::from(width) / o.scale).ceil() as i64
             })
             .max()
             .unwrap_or(0)
@@ -166,29 +166,37 @@ impl Output {
             .as_str()
             .ok_or("missing output name")?
             .to_owned();
-        let mode_id = output["currentModeId"]
-            .as_str()
-            .ok_or("missing current mode")?;
-        let mode = output["modes"]
-            .as_array()
-            .and_then(|modes| modes.iter().find(|m| m["id"] == mode_id))
-            .ok_or("missing current mode description")?;
-        let width = mode["size"]["width"]
-            .as_u64()
-            .and_then(|v| u32::try_from(v).ok())
-            .ok_or("invalid output width")?;
-        let height = mode["size"]["height"]
-            .as_u64()
-            .and_then(|v| u32::try_from(v).ok())
-            .ok_or("invalid output height")?;
-        let rate = mode["refreshRate"]
-            .as_f64()
-            .filter(|v| v.is_finite() && *v > 0.0 && *v <= 1000.0)
-            .ok_or("invalid output rate")?;
+        let enabled = output["enabled"].as_bool().ok_or("invalid output state")?;
+        // A disabled connector need not have an active mode. Its restoration
+        // obligation is to remain disabled, without inventing a pixel mode.
+        let (mode, width, height) = if enabled {
+            let mode_id = output["currentModeId"]
+                .as_str()
+                .ok_or("missing current mode")?;
+            let mode = output["modes"]
+                .as_array()
+                .and_then(|modes| modes.iter().find(|mode| mode["id"] == mode_id))
+                .ok_or("missing current mode description")?;
+            let width = mode["size"]["width"]
+                .as_u64()
+                .and_then(|value| u32::try_from(value).ok())
+                .ok_or("invalid output width")?;
+            let height = mode["size"]["height"]
+                .as_u64()
+                .and_then(|value| u32::try_from(value).ok())
+                .ok_or("invalid output height")?;
+            let rate = mode["refreshRate"]
+                .as_f64()
+                .filter(|rate| rate.is_finite() && *rate > 0.0 && *rate <= 1000.0)
+                .ok_or("invalid output rate")?;
+            (format!("{width}x{height}@{rate}"), width, height)
+        } else {
+            (String::new(), 0, 0)
+        };
         Ok(Self {
             name,
-            enabled: output["enabled"].as_bool().ok_or("invalid output state")?,
-            mode: format!("{width}x{height}@{rate}"),
+            enabled,
+            mode,
             width,
             height,
             x: output["pos"]["x"]
@@ -222,20 +230,47 @@ impl Output {
                 .mode
                 .bytes()
                 .all(|b| b.is_ascii_digit() || matches!(b, b'x' | b'@' | b'.'))
-            && (1..=32768).contains(&self.width)
-            && (1..=32768).contains(&self.height)
+            && ((!self.enabled && self.mode.is_empty() && self.width == 0 && self.height == 0)
+                || ((1..=32768).contains(&self.width)
+                    && (1..=32768).contains(&self.height)
+                    && self.refresh().is_some()))
             && self.x.unsigned_abs() <= 65536
             && self.y.unsigned_abs() <= 65536
             && self.scale.is_finite()
             && (0.25..=5.0).contains(&self.scale)
-            && matches!(self.rotation, 1 | 2 | 4 | 8)
+            && matches!(self.rotation, 1 | 2 | 4 | 8 | 16 | 32 | 64 | 128)
             && self.priority <= 99
+    }
+    fn refresh(&self) -> Option<f64> {
+        self.mode
+            .strip_prefix(&format!("{}x{}@", self.width, self.height))?
+            .parse::<f64>()
+            .ok()
+            .filter(|rate| rate.is_finite() && *rate > 0.0 && *rate <= 1000.0)
+    }
+    fn mode_matches(&self, width: u64, height: u64, rate: f64) -> bool {
+        width == u64::from(self.width)
+            && height == u64::from(self.height)
+            && rate.is_finite()
+            && self
+                .refresh()
+                .is_some_and(|saved| (saved - rate).abs() < 0.2)
     }
     fn matches(&self, actual: &Value) -> bool {
         self.difference(actual).is_none()
     }
     /// Names every property of `actual` that differs from this saved output.
     fn difference(&self, actual: &Value) -> Option<String> {
+        if !self.enabled {
+            return match actual["enabled"].as_bool() {
+                Some(false) => None,
+                Some(true) => Some(format!(
+                    "{}: enabled expected false observed true",
+                    self.name
+                )),
+                None => Some(format!("{}: invalid output state", self.name)),
+            };
+        }
         let other = match Self::capture(actual) {
             Ok(other) => other,
             Err(error) => return Some(format!("{}: {error}", self.name)),
@@ -253,13 +288,19 @@ impl Output {
             self.enabled.to_string(),
             other.enabled.to_string(),
         );
-        compare("mode", self.mode.clone(), other.mode.clone());
+        if !other.refresh().is_some_and(|rate| {
+            self.mode_matches(u64::from(other.width), u64::from(other.height), rate)
+        }) {
+            compare("mode", self.mode.clone(), other.mode.clone());
+        }
         compare(
             "position",
             format!("{},{}", self.x, self.y),
             format!("{},{}", other.x, other.y),
         );
-        compare("scale", self.scale.to_string(), other.scale.to_string());
+        if (self.scale - other.scale).abs() >= 0.01 {
+            compare("scale", self.scale.to_string(), other.scale.to_string());
+        }
         compare(
             "rotation",
             self.rotation.to_string(),
@@ -277,17 +318,22 @@ impl Output {
         (!properties.is_empty()).then(|| format!("{}: {}", self.name, properties.join(", ")))
     }
     fn arguments(&self, actual: &Value) -> Result<Vec<String>, String> {
+        if !self.enabled {
+            return Ok(vec![format!("output.{}.disable", self.name)]);
+        }
         // Resolve the semantic mode to the current numeric ID. Decimal refresh
         // rates contain dots, which kscreen-doctor uses as argument separators.
         let mode_id = actual["modes"]
             .as_array()
             .and_then(|modes| {
                 modes.iter().find(|mode| {
-                    mode["size"]["width"].as_u64() == Some(u64::from(self.width))
-                        && mode["size"]["height"].as_u64() == Some(u64::from(self.height))
-                        && mode["refreshRate"].as_f64().is_some_and(|rate| {
-                            format!("{}x{}@{rate}", self.width, self.height) == self.mode
+                    mode["size"]["width"].as_u64().is_some_and(|width| {
+                        mode["size"]["height"].as_u64().is_some_and(|height| {
+                            mode["refreshRate"]
+                                .as_f64()
+                                .is_some_and(|rate| self.mode_matches(width, height, rate))
                         })
+                    })
                 })
             })
             .and_then(|mode| mode["id"].as_str())
@@ -298,6 +344,10 @@ impl Output {
             2 => "left",
             4 => "inverted",
             8 => "right",
+            16 => "flipped",
+            32 => "flipped90",
+            64 => "flipped180",
+            128 => "flipped270",
             _ => "none",
         };
         Ok(vec![
@@ -328,6 +378,91 @@ mod tests {
     fn desktop() -> Value {
         json!({"outputs":[{"name":"Virtual-1","connected":true,"enabled":true,"currentModeId":"1","modes":[{"id":"1","size":{"width":2560,"height":1440},"refreshRate":120}],"pos":{"x":0,"y":0},"scale":2.5,"rotation":1,"hdr":false,"wcg":true,"priority":1}]})
     }
+    #[test]
+    fn disabled_connector_without_a_current_mode_is_preserved_and_only_disabled() {
+        let mut before = desktop();
+        let mut disabled = before["outputs"][0].clone();
+        disabled["name"] = json!("HDMI-A-1");
+        disabled["enabled"] = json!(false);
+        disabled["currentModeId"] = Value::Null;
+        disabled["modes"] = json!([]);
+        disabled["priority"] = json!(0);
+        before["outputs"].as_array_mut().unwrap().push(disabled);
+        let layout = Layout::capture(&before, "Virtual-2").unwrap();
+        let durable = serde_json::to_vec(&layout).unwrap();
+        let layout: Layout = serde_json::from_slice(&durable).unwrap();
+        assert!(layout.valid());
+        assert!(layout.matches(&before));
+        let mut after = before.clone();
+        after["outputs"][1]["enabled"] = json!(true);
+        assert_eq!(
+            layout.arguments(&after).unwrap(),
+            vec!["output.HDMI-A-1.disable"]
+        );
+        after["outputs"][1]["enabled"] = json!(false);
+        after["outputs"][1]["scale"] = json!(1.0);
+        assert!(layout.matches(&after));
+    }
+
+    #[test]
+    fn reflected_rotations_round_trip_and_use_the_rotated_logical_width() {
+        for (rotation, token, right_edge) in [
+            (16, "flipped", 1024),
+            (32, "flipped90", 576),
+            (64, "flipped180", 1024),
+            (128, "flipped270", 576),
+        ] {
+            let mut before = desktop();
+            before["outputs"][0]["rotation"] = json!(rotation);
+            let layout = Layout::capture(&before, "Virtual-2").unwrap();
+            assert_eq!(layout.right_edge(), right_edge);
+            let mut after = before.clone();
+            after["outputs"][0]["rotation"] = json!(1);
+            assert!(
+                layout
+                    .arguments(&after)
+                    .unwrap()
+                    .contains(&format!("output.Virtual-1.rotation.{token}"))
+            );
+            assert!(layout.matches(&before));
+        }
+        let mut fractional = desktop();
+        fractional["outputs"][0]["scale"] = json!(3.0);
+        assert_eq!(
+            Layout::capture(&fractional, "Virtual-2")
+                .unwrap()
+                .right_edge(),
+            854
+        );
+    }
+
+    #[test]
+    fn equivalent_refresh_and_scale_readbacks_do_not_block_restoration() {
+        let mut before = desktop();
+        before["outputs"][0]["modes"][0]["refreshRate"] = json!(59.94);
+        let layout = Layout::capture(&before, "Virtual-2").unwrap();
+        let mut after = before.clone();
+        after["outputs"][0]["currentModeId"] = json!("9");
+        after["outputs"][0]["modes"][0]["id"] = json!("9");
+        after["outputs"][0]["modes"][0]["refreshRate"] = json!(60.0);
+        after["outputs"][0]["scale"] = json!(2.499999);
+        assert!(layout.matches(&after));
+        assert!(layout.arguments(&after).unwrap().is_empty());
+        after["outputs"][0]["pos"]["x"] = json!(10);
+        assert!(
+            layout
+                .arguments(&after)
+                .unwrap()
+                .contains(&"output.Virtual-1.mode.9".into())
+        );
+        after["outputs"][0]["modes"][0]["refreshRate"] = json!(60.3);
+        assert!(!layout.matches(&after));
+        assert!(layout.arguments(&after).is_err());
+        after["outputs"][0]["modes"][0]["refreshRate"] = json!(59.94);
+        after["outputs"][0]["modes"][0]["size"]["width"] = json!(1920);
+        assert!(layout.arguments(&after).is_err());
+    }
+
     #[test]
     fn disappearing_original_display_preserves_the_active_physical_fallback() {
         let mut before = desktop();

@@ -304,6 +304,7 @@ impl<B: Broker, C: Compositor, I: ConnectorInventory> Controller<B, C, I> {
                 None,
                 &placement,
                 scale,
+                false,
             )?;
         }
         if !self.broker.connected(&record.output)? {
@@ -586,6 +587,7 @@ impl<B: Broker, C: Compositor, I: ConnectorInventory> Controller<B, C, I> {
             cleanup_complete: false,
         })?;
         let result = (|| {
+            let newly_connected = !self.broker.connected(&record.output)?;
             // Even an already connected parked output must be checked by the
             // broker: status alone does not prove that this UID still owns it.
             self.broker.set_connected(&record.output, true)?;
@@ -606,6 +608,7 @@ impl<B: Broker, C: Compositor, I: ConnectorInventory> Controller<B, C, I> {
                 },
                 &placement,
                 scale,
+                newly_connected,
             )?;
             if !self.broker.connected(&record.output)? {
                 return Err("owned connector disappeared".into());
