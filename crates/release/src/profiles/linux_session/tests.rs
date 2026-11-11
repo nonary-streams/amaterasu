@@ -7,6 +7,29 @@ fn default_extension_metadata_builds_a_disabled_generic_lifecycle() {
     let policy = linux_session_policy(root.path(), &LinuxSessionOptions::default()).unwrap();
     let settings = &policy.settings["amaterasu.session-lifecycle"];
     assert_eq!(settings["capture_binding_mode"], "external");
+    assert_eq!(settings["input_provider"], "amaterasu.input");
+    for (caller, operation) in [
+        ("amaterasu.stream-session", "issue_input_binding"),
+        ("amaterasu.stream-session", "ack_binding"),
+        ("amaterasu.input", "validate_input_binding"),
+    ] {
+        assert!(
+            settings["operation_grants"][caller]
+                .as_array()
+                .unwrap()
+                .contains(&json!(operation))
+        );
+    }
+    assert!(
+        policy.principals["amaterasu.input"]
+            .call
+            .contains("amaterasu.session-lifecycle/1")
+    );
+    assert!(
+        policy.principals["amaterasu.session-lifecycle"]
+            .call
+            .contains("amaterasu.input/1")
+    );
     assert_eq!(settings["participants"].as_array().unwrap().len(), 1);
     assert_eq!(
         settings["participants"][0]["settings"]["frame_limiter_enable"],

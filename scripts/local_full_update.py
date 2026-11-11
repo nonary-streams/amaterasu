@@ -66,16 +66,17 @@ def compiled_from(artifact: Path) -> Path | None:
     return Path(match.group(1)) if match else None
 
 
-def artifact_path(tree: Path, component: dict) -> Path:
-    build = SEPARATELY_BUILT.get(component["id"], Path("target/release"))
-    return tree / build / component["file"]
+def artifact_path(tree: Path, component: dict, target: Path | None = None) -> Path:
+    if component["id"] in SEPARATELY_BUILT:
+        return tree / SEPARATELY_BUILT[component["id"]] / component["file"]
+    return (target or tree / "target") / "release" / component["file"]
 
 
-def foreign_artifacts(tree: Path, components: list[dict]) -> list[str]:
+def foreign_artifacts(tree: Path, components: list[dict], target: Path | None = None) -> list[str]:
     """Every component that is missing or was compiled from another tree."""
     problems = []
     for component in components:
-        artifact = artifact_path(tree, component)
+        artifact = artifact_path(tree, component, target)
         if not artifact.is_file():
             problems.append(f"{component['id']}: {artifact} is missing")
             continue
@@ -140,8 +141,13 @@ def prepare(arguments) -> None:
         raise SystemExit("local updates target a signed production bootstrap")
     active = root / "sets" / selection["active"]
     manifest = read_json(active / "manifest.json")
+    target = Path(arguments.target_dir).resolve() if arguments.target_dir else None
+    if arguments.bound_input:
+        from local_bound_input import prepare_bound_input
+        allowlist = prepare_bound_input(bootstrap, manifest, read_json(root / "package-activation-policy.json"))
+        (work / "package-activation-policy.json").write_bytes(compact(allowlist))
 
-    problems = foreign_artifacts(tree, manifest["components"])
+    problems = foreign_artifacts(tree, manifest["components"], target)
     if compiled_from(host) != tree:
         problems.append(f"host: compiled from {compiled_from(host)}, not {tree}")
     if problems:
@@ -150,7 +156,7 @@ def prepare(arguments) -> None:
     package = work / "bundle/native" / IMPLEMENTATION / "0.1.0"
     package.mkdir(parents=True, mode=0o700)
     for component in manifest["components"]:
-        artifact = artifact_path(tree, component)
+        artifact = artifact_path(tree, component, target)
         shutil.copy2(artifact, package / component["file"])
         component["sha256"] = sha256(artifact)
         component["size"] = artifact.stat().st_size
@@ -189,6 +195,7 @@ def prepare(arguments) -> None:
         "digest": digest,
         "catalog_digest": sha256(work / "bundle/catalog.json"),
         "repository": REPOSITORY,
+        "activation_policy_candidate_sha256": sha256(work / "package-activation-policy.json") if arguments.bound_input else None,
     }))
     (work / PROVENANCE).write_text(json.dumps({
         "tree": str(tree),
@@ -247,6 +254,8 @@ def activate(arguments) -> None:
                       ("package-activation-policy.json", "activation_policy_revision")]:
         if sha256(root / name) != metadata[key]:
             raise SystemExit(f"{name} changed since this update was prepared")
+    if metadata.get("activation_policy_candidate_sha256") and sha256(work / "package-activation-policy.json") != metadata["activation_policy_candidate_sha256"]:
+        raise SystemExit("the reviewed input policy changed; the host was left untouched")
     if live_sessions(root):
         raise SystemExit("a stream is active; the host was left untouched")
 
@@ -263,7 +272,35 @@ def activate(arguments) -> None:
                     str(work / "bundle"), metadata["digest"]], check=True)
     if live_sessions(root):
         raise SystemExit("a stream started during import; the update is cached but not active")
+    for name, key in [("selection.json", "selection_revision"), ("bootstrap.json", "bootstrap_revision"),
+                      ("package-activation-policy.json", "activation_policy_revision")]:
+        if sha256(root / name) != metadata[key]:
+            raise SystemExit(f"{name} changed during import; the host was left running")
+    if metadata.get("activation_policy_candidate_sha256") and sha256(work / "package-activation-policy.json") != metadata["activation_policy_candidate_sha256"]:
+        raise SystemExit("the reviewed input policy changed; the host was left running")
     subprocess.run(["systemctl", "--user", "stop", SERVICE], check=True)
+    if metadata.get("activation_policy_candidate_sha256"):
+        candidate = work / "package-activation-policy.json"
+        path = root / "package-activation-policy.json"
+        descriptor, temporary = tempfile.mkstemp(prefix=".activation-policy-", dir=root)
+        try:
+            with os.fdopen(descriptor, "wb") as output:
+                original = path.stat()
+                if os.fstat(output.fileno()).st_gid != original.st_gid:
+                    os.fchown(output.fileno(), -1, original.st_gid)
+                os.fchmod(output.fileno(), original.st_mode & 0o7777)
+                output.write(candidate.read_bytes())
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temporary, path)
+            directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
     subprocess.run([str(old_host), "activate-package-offline", str(root), metadata["repository"],
                     metadata["catalog_digest"], metadata["digest"], metadata["previous"],
                     metadata["selection_revision"]], check=True)
@@ -354,6 +391,8 @@ def main() -> None:
     prepare_parser = commands.add_parser("prepare")
     for name in ("root", "tree", "work", "host"):
         prepare_parser.add_argument(name)
+    prepare_parser.add_argument("--target-dir")
+    prepare_parser.add_argument("--bound-input", action="store_true", help="prepare exact external-capture input grants for review and activation")
     prepare_parser.set_defaults(run=prepare)
     activate_parser = commands.add_parser("activate")
     activate_parser.add_argument("root")

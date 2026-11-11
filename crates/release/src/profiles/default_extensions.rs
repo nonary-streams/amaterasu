@@ -15,6 +15,7 @@ pub(super) const COORDINATOR_COMPONENT: ComponentDefinition = ComponentDefinitio
     provides: &["amaterasu.session-lifecycle/1"],
     calls: &[
         "amaterasu.launch/1",
+        "amaterasu.input/1",
         "amaterasu.state/1",
         "amaterasu.extension-registry/1",
         "nonary.frame-limiter/1",
@@ -22,6 +23,7 @@ pub(super) const COORDINATOR_COMPONENT: ComponentDefinition = ComponentDefinitio
     publishes: &[],
     dependencies: &[
         RUNTIME_ID,
+        "amaterasu.input",
         "amaterasu.extension-registry",
         "amaterasu.frame-limiter",
     ],
@@ -110,11 +112,14 @@ fn configure(
                 "pause_stream",
                 "retire_stream",
                 "resolve_stream_preparation",
+                "issue_input_binding",
+                "ack_binding",
                 "lookup",
                 "snapshot",
             ],
         ),
         ("amaterasu.launch", vec!["read_prepared_plans"]),
+        ("amaterasu.input", vec!["validate_input_binding"]),
         (REGISTRY, vec!["resolve_settings_scope"]),
     ]);
     let mut plugin_operations = BTreeMap::new();
@@ -219,7 +224,8 @@ fn configure(
         "trusted_callers":operation_grants.keys().collect::<Vec<_>>(),"operation_grants":operation_grants,
         "session_delegates":["amaterasu.rtsp","amaterasu.stream-session"],
         "settings_registry_caller":REGISTRY,"settings_registry_service":REGISTRY_SERVICE,
-        "consumers":{"capture":["amaterasu.stream-session"]},
+        "consumers":{"capture":["amaterasu.stream-session"],"input":["amaterasu.stream-session","amaterasu.input"]},
+        "input_provider":"amaterasu.input",
         "consumer_requirements":{"execution_domain":"desktop","capture_providers":[],"selector_schemas":[]},
         "participants":participants,
     }));

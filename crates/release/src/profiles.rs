@@ -463,7 +463,11 @@ const INPUT: ComponentDefinition = ComponentDefinition {
     id: "amaterasu.input",
     library: "amaterasu_input",
     provides: &["amaterasu.input/1"],
-    calls: &["amaterasu.configuration/1", "amaterasu.state/1"],
+    calls: &[
+        "amaterasu.configuration/1",
+        "amaterasu.state/1",
+        "amaterasu.session-lifecycle/1",
+    ],
     publishes: &[],
     native_provides: &[],
     native_uses: &[],

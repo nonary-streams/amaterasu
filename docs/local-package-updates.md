@@ -40,6 +40,15 @@ loads and then fails while streaming. `scripts/local_full_update.py prepare`
 refuses any library or host not compiled from the named tree and records what it
 installed; `scripts/local_full_update.py check ROOT` reports later drift.
 
+For an existing default Linux installation that used exclusive external-capture
+input, `prepare --bound-input` includes the exact input/coordinator grants in the
+candidate manifest and emits a proposed protected activation allowlist. It
+preserves prior approved destinations and rejects independent input providers
+or unapplied earlier approvals. Preparation changes no installed policy;
+activation snapshots the original state and installs the reviewed allowlist
+only after checking activity and stopping the service. `--target-dir PATH`
+supports build output on a separate volume while retaining source checks.
+
 An install request authorizes these routine local steps and an idle service
 restart. Interrupting an active stream and publishing a shared release are
 separate actions. Report real client playback only after it is observed.

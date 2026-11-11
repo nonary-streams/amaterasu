@@ -366,8 +366,42 @@ fn external_lifecycle_keeps_capture_and_input_and_retires_after_native_close() {
         );
         assert!(!calls.iter().any(|call| matches!(
             call.payload["operation"].as_str(),
-            Some("validate_candidate" | "ack_binding" | "binding_validate" | "issue_input_binding")
+            Some("validate_candidate" | "binding_validate")
         )));
+        let binding = calls
+            .iter()
+            .position(|call| call.payload["operation"] == "issue_input_binding");
+        assert_eq!(binding.is_some(), input);
+        if let Some(binding) = binding {
+            let capture = calls
+                .iter()
+                .position(|call| call.payload["operation"] == "ack_stream")
+                .unwrap();
+            let acquire = calls
+                .iter()
+                .position(|call| {
+                    call.payload["action"] == "acquire" && call.service == "amaterasu.input/1"
+                })
+                .unwrap();
+            let active = calls
+                .iter()
+                .position(|call| call.payload["operation"] == "start_stream")
+                .unwrap();
+            let acknowledged = calls
+                .iter()
+                .position(|call| call.payload["operation"] == "ack_binding")
+                .unwrap();
+            assert!(
+                capture < binding
+                    && binding < acquire
+                    && acquire < acknowledged
+                    && acknowledged < active
+            );
+            assert_eq!(
+                calls[acquire].payload["lifecycle_binding_token"],
+                "binding-token"
+            );
+        }
         assert!(
             !calls
                 .iter()

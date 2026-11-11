@@ -792,13 +792,21 @@ impl Pipeline {
                         job.fail(record, "input_binding_unavailable", now);
                         return true;
                     };
-                    if revision
-                        != start
+                    let expected_revision = if start.lifecycle_capture_mode.is_external() {
+                        match &start.lifecycle_target {
+                            Some(amaterasu_extension_api::LifecycleTarget::Stream {
+                                generation,
+                                ..
+                            }) => *generation,
+                            _ => 0,
+                        }
+                    } else {
+                        start
                             .lifecycle_candidate
                             .as_ref()
-                            .unwrap()
-                            .geometry_revision
-                    {
+                            .map_or(0, |candidate| candidate.geometry_revision)
+                    };
+                    if revision != expected_revision {
                         job.fail(record, "input_binding_unavailable", now);
                         return true;
                     }
@@ -810,7 +818,11 @@ impl Pipeline {
                     job.step = Step::StartLifecycle;
                 }
                 Step::AckLifecycleStream => {
-                    job.step = Step::StartLifecycle;
+                    job.step = if record.lifecycle_input_required == Some(true) {
+                        Step::IssueLifecycleInputBinding
+                    } else {
+                        Step::StartLifecycle
+                    };
                 }
                 Step::StartLifecycle => {
                     record.state = State::Active;
@@ -1300,14 +1312,12 @@ impl Pipeline {
                     .lifecycle_input_required
                     .unwrap_or(self.settings.enable_input)
                 {
-                    job.step = if record
-                        .start
-                        .as_ref()
-                        .is_some_and(|start| start.manages_lifecycle_capture())
-                    {
-                        Step::IssueLifecycleInputBinding
-                    } else {
-                        Step::AcquireInput
+                    job.step = match record.start.as_ref() {
+                        Some(start) if start.manages_lifecycle_capture() => {
+                            Step::IssueLifecycleInputBinding
+                        }
+                        Some(start) if start.lifecycle_target.is_some() => Step::AckLifecycleStream,
+                        _ => Step::AcquireInput,
                     };
                     Ok(true)
                 } else if record
@@ -1379,15 +1389,7 @@ impl Pipeline {
                     .as_ref()
                     .is_some_and(|start| start.lifecycle_target.is_some())
                 {
-                    job.step = if record
-                        .start
-                        .as_ref()
-                        .is_some_and(|start| start.lifecycle_capture_mode.is_external())
-                    {
-                        Step::AckLifecycleStream
-                    } else {
-                        Step::AckLifecycleInput
-                    };
+                    job.step = Step::AckLifecycleInput;
                     return Ok(true);
                 }
                 record.state = State::Active;

@@ -1,4 +1,7 @@
 use super::*;
+
+#[cfg(test)]
+mod external_input_tests;
 use crate::input_authority::{ActiveBinding, Outcome, ReservationResult};
 use sha2::{Digest, Sha256};
 use std::time::{Duration, Instant};
@@ -6,7 +9,8 @@ use std::time::{Duration, Instant};
 pub(super) struct ValidationJob {
     key: String,
     target: LifecycleTarget,
-    binding: CaptureBinding,
+    binding: Option<CaptureBinding>,
+    geometry_revision: u64,
     observation: Value,
     consumer: Option<String>,
     provider: String,
@@ -520,14 +524,19 @@ impl Coordinator {
         {
             return Err("stream_not_ready".into());
         }
-        let binding = stream
-            .candidate
+        let external_input =
+            session.capture_binding_mode.is_external() && ack && payload["consumer"] == "input";
+        let binding = stream.candidate.clone();
+        if binding.is_none() && !external_input {
+            return Err("candidate_missing".into());
+        }
+        let geometry_revision = binding
             .as_ref()
-            .ok_or("candidate_missing")?
-            .clone();
+            .map_or(stream.generation, |binding| binding.geometry_revision);
+        let plan_revision = binding.as_ref().map(|binding| binding.plan_revision);
         let candidate_field = if ack { "candidate" } else { "binding" };
         if payload.get(candidate_field) != Some(&json!(binding))
-            || payload["plan_revision"] != binding.plan_revision
+            || payload["plan_revision"] != json!(plan_revision)
         {
             return Err("candidate_mismatch".into());
         }
@@ -559,7 +568,13 @@ impl Coordinator {
             Some(
                 next.input_bindings
                     .iter()
-                    .find(|(_, b)| target_for(b) == target)
+                    .find(|(token, b)| {
+                        target_for(b) == target
+                            && (!external_input
+                                || (payload["token"] == token.as_str()
+                                    && payload["geometry_revision"] == b.geometry_revision))
+                            && !next.revoked_inputs.contains(*token)
+                    })
                     .map(|(token, _)| token.clone())
                     .ok_or("input_binding_not_issued")?,
             )
@@ -569,6 +584,7 @@ impl Coordinator {
         let observation = if input_ack {
             Value::Null
         } else {
+            let binding = binding.as_ref().ok_or("candidate_missing")?;
             let raw = if ack {
                 &payload["observed_capture"]
             } else {
@@ -584,7 +600,7 @@ impl Coordinator {
             observed
         };
         let provider = stream.binding_owner.clone();
-        let response = json!({"status":"pending","operation_id":payload["operation_id"],"target":target,"plan_revision":binding.plan_revision});
+        let response = json!({"status":"pending","operation_id":payload["operation_id"],"target":target,"plan_revision":plan_revision});
         if self.validations.len() >= 128 {
             return Err("validation_capacity_exhausted".into());
         }
@@ -622,6 +638,7 @@ impl Coordinator {
                 key,
                 target,
                 binding,
+                geometry_revision,
                 observation,
                 consumer,
                 provider,
@@ -707,7 +724,7 @@ impl Coordinator {
                 let source = super::join::validation_source(
                     &self.shared.borrow().value,
                     &job.target,
-                    &job.binding,
+                    job.binding.as_ref().ok_or("candidate_missing")?,
                     &job.provider,
                 );
                 let Ok((provider_target, provider_binding, transition)) = source else {
@@ -721,7 +738,7 @@ impl Coordinator {
                     let generation = binding_resource_generation(
                         &self.shared.borrow().value,
                         &job.target,
-                        &job.binding,
+                        job.binding.as_ref().ok_or("candidate_missing")?,
                         &job.provider,
                     );
                     let Ok(generation) = generation else {
@@ -760,11 +777,15 @@ impl Coordinator {
     ) -> ModuleResult<()> {
         let mut next = self.shared.borrow().value.clone();
         let generation_current = job.resource_generation.is_none_or(|expected| {
-            binding_resource_generation(&next, &job.target, &job.binding, &job.provider)
-                == Ok(expected)
+            job.binding.as_ref().is_some_and(|binding| {
+                binding_resource_generation(&next, &job.target, binding, &job.provider)
+                    == Ok(expected)
+            })
         });
-        let provider_source =
-            super::join::validation_source(&next, &job.target, &job.binding, &job.provider).ok();
+        let provider_source = job.binding.as_ref().and_then(|binding| {
+            super::join::validation_source(&next, &job.target, binding, &job.provider).ok()
+        });
+        let plan_revision = job.binding.as_ref().map(|binding| binding.plan_revision);
         let (_, session_id, stream_id, generation) = super::operations::target_parts(&job.target)?;
         let stream = next
             .sessions
@@ -777,7 +798,8 @@ impl Coordinator {
                     && r["status"] == "bound"
                     && r["token"] == *token
                     && r["target"] == json!(job.target)
-                    && r["geometry_revision"] == job.binding.geometry_revision
+                    && r["geometry_revision"] == job.geometry_revision
+                    && !next.revoked_inputs.contains(token)
                     && r["lease"].as_str().is_some_and(|s| !s.is_empty())
             } else {
                 r["status"] == "succeeded"
@@ -787,11 +809,11 @@ impl Coordinator {
                             r["target"] == json!(target) && r["binding"] == json!(binding)
                         })
                     && r["observation"] == job.observation
-                    && r["plan_revision"] == job.binding.plan_revision
+                    && r["plan_revision"] == json!(plan_revision)
             }
         }) && generation_current
             && stream.generation == generation
-            && stream.candidate.as_ref() == Some(&job.binding)
+            && stream.candidate == job.binding
             && if job.consumer.is_some() {
                 stream.phase == StreamPhase::Ready
             } else {
@@ -812,7 +834,7 @@ impl Coordinator {
                 .0
         };
         receipt.response = if valid {
-            json!({"status":"succeeded","operation_id":receipt.request["operation_id"],"target":job.target,"plan_revision":job.binding.plan_revision,"binding":job.binding,"observation":job.observation})
+            json!({"status":"succeeded","operation_id":receipt.request["operation_id"],"target":job.target,"plan_revision":plan_revision,"binding":job.binding,"observation":job.observation})
         } else {
             json!({"status":"rejected","operation_id":receipt.request["operation_id"],"reason":"binding_validation_failed"})
         };
@@ -1109,8 +1131,29 @@ impl Coordinator {
             {
                 return Err("capture_not_acknowledged".into());
             }
-            let binding = stream.candidate.as_ref().ok_or("candidate_missing")?;
-            let plan_revision = binding.plan_revision;
+            if session.capture_binding_mode.is_external() && stream.phase != StreamPhase::Ready {
+                return Err("stream_not_ready".into());
+            }
+            if session.capture_binding_mode.is_external()
+                && next
+                    .input_bindings
+                    .values()
+                    .any(|binding| target_for(binding) == target)
+            {
+                return Err("input_binding_already_issued".into());
+            }
+            let (geometry_revision, plan_revision) = if session.capture_binding_mode.is_external() {
+                // External capture has no coordinator-owned topology candidate.
+                // Its immutable stream generation fences this input context;
+                // this grants no authority over the external display geometry.
+                if stream.candidate.is_some() {
+                    return Err("external_capture_candidate_not_allowed".into());
+                }
+                (stream.generation, None)
+            } else {
+                let binding = stream.candidate.as_ref().ok_or("candidate_missing")?;
+                (binding.geometry_revision, Some(binding.plan_revision))
+            };
             // The installed policy selects the broker identity, never the request.
             let input_consumer = match self.settings.input_provider.as_ref() {
                 Some(provider) if self.settings.consumers.input.contains(provider) => provider,
@@ -1132,7 +1175,7 @@ impl Coordinator {
                 session_id: session.id.clone(),
                 stream_id,
                 generation: stream.generation,
-                geometry_revision: binding.geometry_revision,
+                geometry_revision,
                 input_consumer: input_consumer.clone(),
                 allowed_actions: self.settings.input_actions.clone(),
             };
@@ -1141,6 +1184,21 @@ impl Coordinator {
                 .issue_input_binding(&active)
                 .map_err(|_| "input_binding_unavailable")?;
             next.input_bindings.insert(token.clone(), active.clone());
+            if next.sessions[&active.session_id]
+                .capture_binding_mode
+                .is_external()
+            {
+                // Even without a topology candidate, native input retirement
+                // remains part of this stream's exact cleanup barrier.
+                next.sessions
+                    .get_mut(&active.session_id)
+                    .unwrap()
+                    .streams
+                    .get_mut(&active.stream_id)
+                    .unwrap()
+                    .required
+                    .insert("input".into());
+            }
             let result = json!({"status":"succeeded","operation_id":id,"token":token,"target":target,"geometry_revision":active.geometry_revision,"plan_revision":plan_revision});
             next.receipts.insert(
                 key,
