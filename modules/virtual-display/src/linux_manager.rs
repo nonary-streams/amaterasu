@@ -735,6 +735,7 @@ impl Manager {
                 None,
             ),
             Operation::Create {
+                requested_resolution_only,
                 hdr_enabled,
                 identity,
                 width,
@@ -747,6 +748,11 @@ impl Manager {
                 expected_topology_revision,
                 expected_topology_domain_id,
             } => {
+                // The Linux mode broker admits a timing, but cannot restrict
+                // its advertised catalog to that timing like the Windows API.
+                if requested_resolution_only {
+                    return (failure("unsupported_requested_resolution_catalog"), None);
+                }
                 if self
                     .reconfigurations
                     .values()
@@ -783,6 +789,7 @@ impl Manager {
                     return (failure("startup_reconciliation_pending"), None);
                 }
                 let specification = Specification {
+                    requested_resolution_only: false,
                     hdr_enabled,
                     identity,
                     width,
@@ -1843,7 +1850,7 @@ impl Manager {
         json!({"reference_owned":reference_id.map(|_|reference_owned),"parked":parked,"parked_outputs":parked_outputs,"ok":true,"enabled":self.settings.enabled,"native_supported":true,"driver":"libvirtualdisplay","mode_only_preservation":"kscreen-strict-v1",
             "ownership_authority":"unix_uid_broker","mutation_domain":self.domain(),"settings":{"virtual_display_layout":self.settings.virtual_display_layout,"dd_virtual_display_scale":Self::scale_value(self.settings.dd_virtual_display_scale),"dd_activate_virtual_display":self.settings.dd_activate_virtual_display,"dd_use_sunshine_virtual_display_driver":self.settings.dd_use_sunshine_virtual_display_driver},"recovery_ready":self.ready && self.reconfigurations.values().all(|change| change.state == "succeeded"),"recovery_error":self.recovery_error,"monitors":monitors,
             "activation_requested":self.settings.dd_activate_virtual_display,
-            "configured_permanent_monitor_count":self.settings.dd_virtual_display_permanent_count,"permanent_monitor_runtime_supported":false})
+            "configured_permanent_monitor_count":self.settings.dd_virtual_display_permanent_count,"permanent_monitor_runtime_supported":false,"requested_resolution_catalog_supported":false})
     }
 }
 
@@ -1925,6 +1932,7 @@ mod owner_target_tests {
                 retained_mode_durable: false,
                 creation_cleanup_complete: false,
                 specification: Specification {
+                    requested_resolution_only: false,
                     hdr_enabled: false,
                     identity: identity.into(),
                     width: 1920,

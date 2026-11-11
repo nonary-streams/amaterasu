@@ -1247,6 +1247,7 @@ mod tests {
         ]});
         let layout = Layout::capture(&configuration, "Virtual-2").unwrap();
         let specification = Specification {
+            requested_resolution_only: false,
             identity: "11111111-1111-4111-8111-111111111111".into(),
             name: "Display".into(),
             width: 1280,
@@ -1483,6 +1484,7 @@ mod tests {
     fn mode_only_status_rejects_fresh_desktop_or_mode_drift() {
         let mut configuration = json!({"outputs":[{"id":1,"name":"Virtual-1","connected":true,"enabled":true,"pos":{"x":0,"y":0},"scale":1.5,"rotation":1,"priority":1,"hdr":false,"wcg":false,"vrrPolicy":0,"currentModeId":"2","modes":[{"id":"2","size":{"width":1280,"height":720},"refreshRate":60.0}]}]});
         let desired = Specification {
+            requested_resolution_only: false,
             identity: "11111111-1111-4111-8111-111111111111".into(),
             name: "Amaterasu".into(),
             width: 1280,
@@ -1625,6 +1627,7 @@ mod retained_mode_tests {
     fn retained_readback_checks_connected_active_mode_and_color() {
         let configuration = json!({"outputs":[{"name":"Virtual-2","connected":true,"enabled":true,"hdr":true,"currentModeId":"7","modes":[{"id":"7","size":{"width":1280,"height":720},"refreshRate":119.88}]}]});
         let desired = Specification {
+            requested_resolution_only: false,
             identity: "11111111-1111-4111-8111-111111111111".into(),
             name: "Monitor".into(),
             width: 1280,
@@ -1665,6 +1668,7 @@ mod retained_mode_tests {
             {"id":"3","size":{"width":2560,"height":1440},"refreshRate":144.0}
         ]}]});
         let desired = Specification {
+            requested_resolution_only: false,
             identity: "11111111-1111-4111-8111-111111111111".into(),
             name: "Monitor".into(),
             width: 2560,

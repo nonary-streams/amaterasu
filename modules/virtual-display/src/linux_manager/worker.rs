@@ -489,6 +489,9 @@ impl<B: Broker, C: Compositor, I: ConnectorInventory> Controller<B, C, I> {
         references: Option<std::collections::BTreeSet<String>>,
         layout: VirtualDisplayLayout,
     ) -> Result<PreparedCreation, String> {
+        if specification.requested_resolution_only {
+            return Err("unsupported_requested_resolution_catalog".into());
+        }
         if self.stopped.load(std::sync::atomic::Ordering::Acquire) {
             return Err("display manager stopping".into());
         }

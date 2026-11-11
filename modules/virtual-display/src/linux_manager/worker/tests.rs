@@ -273,6 +273,7 @@ fn fixture() -> (
 }
 fn specification(identity: &str) -> Specification {
     Specification {
+        requested_resolution_only: false,
         hdr_enabled: false,
         identity: identity.into(),
         width: 1920,
@@ -1815,6 +1816,7 @@ fn manager_releases_parks_and_reuses_output_through_public_operations() {
     };
     wait(&mut manager, &|manager| manager.ready);
     let create = |identity: &str, reference: &str| crate::model::Operation::Create {
+        requested_resolution_only: false,
         hdr_enabled: false,
         identity: identity.into(),
         width: 1920,
@@ -1869,6 +1871,7 @@ fn manager_reports_a_parked_output_gone_after_the_worker_retires_it() {
     let broker = controller.broker.clone();
     let mut manager = manager_with_fake_worker(controller);
     let operation = crate::model::Operation::Create {
+        requested_resolution_only: false,
         hdr_enabled: false,
         identity: FIRST.into(),
         width: 1920,
@@ -1957,6 +1960,51 @@ fn manager_with_fake_worker(
     manager
 }
 
+#[test]
+fn requested_only_catalog_is_refused_before_linux_allocation_or_journaling() {
+    let (root, mut controller) = fixture();
+    let mut requested = specification(FIRST);
+    requested.requested_resolution_only = true;
+    assert_eq!(
+        controller
+            .create("session".into(), requested, ScaleSetting::Retain)
+            .err()
+            .as_deref(),
+        Some("unsupported_requested_resolution_catalog")
+    );
+    assert!(controller.journal.records.is_empty());
+    assert!(controller.compositor.placements.is_empty());
+    let broker = controller.broker.clone();
+    let mut manager = manager_with_fake_worker(controller);
+    let operation = crate::model::Operation::Create {
+        requested_resolution_only: true,
+        hdr_enabled: false,
+        identity: FIRST.into(),
+        width: 1920,
+        height: 1080,
+        refresh_millihz: 60000,
+        name: "Amaterasu".into(),
+        reference_id: Some("stream".into()),
+        dd_virtual_display_scale: None,
+        virtual_display_layout: None,
+        expected_topology_revision: None,
+        expected_topology_domain_id: None,
+    };
+    let (response, admission) = manager.admit("session", operation);
+    assert_eq!(response["code"], "unsupported_requested_resolution_catalog");
+    assert!(admission.is_none());
+    assert!(manager.monitors.is_empty());
+    assert_eq!(manager.pending_mutations, 0);
+    assert_eq!(
+        manager.status("session", None, None)["requested_resolution_catalog_supported"],
+        false
+    );
+    assert!(broker.effects.lock().unwrap().is_empty());
+    assert!(broker.modes.lock().unwrap().is_empty());
+    drop(manager);
+    fs::remove_dir_all(root).unwrap();
+}
+
 fn wait_for_fake_worker(
     manager: &mut super::super::Manager,
     settled: impl Fn(&super::super::Manager) -> bool,
@@ -1974,6 +2022,7 @@ fn wait_for_fake_worker(
 
 fn admit_failed_creation(manager: &mut super::super::Manager) {
     let operation = crate::model::Operation::Create {
+        requested_resolution_only: false,
         hdr_enabled: false,
         identity: FIRST.into(),
         width: 1920,
@@ -2177,6 +2226,7 @@ fn linux_shared_references_persist_and_release_only_the_last_connector_owner() {
         stopped,
     };
     let create = |reference: Option<&str>| crate::model::Operation::Create {
+        requested_resolution_only: false,
         hdr_enabled: false,
         identity: FIRST.into(),
         width: 1920,
