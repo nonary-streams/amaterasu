@@ -168,18 +168,16 @@ impl Backend for NativeBackend {
         let name = output["id"].as_u64().ok_or("display_inventory_invalid")?;
         let prefix = format!("output.{name}");
         let mut args = Vec::new();
+        let mut hdr_activation = Vec::new();
         if let Some(hdr) = patch.hdr {
             if current.settings.hdr.is_none() {
                 return Err("unsupported_display_setting".into());
             }
-            args.push(format!(
-                "{prefix}.hdr.{}",
-                if hdr == HdrMode::Enabled {
-                    "enable"
-                } else {
-                    "disable"
-                }
-            ));
+            if hdr == HdrMode::Enabled {
+                hdr_activation.push(format!("{prefix}.hdr.enable"));
+            } else {
+                args.push(format!("{prefix}.hdr.disable"));
+            }
         }
         if let Some(enabled) = patch.wide_color_gamut {
             if current.settings.wide_color_gamut.is_none() {
@@ -211,22 +209,120 @@ impl Backend for NativeBackend {
         if let Some(pos) = patch.position {
             args.push(format!("{prefix}.position.{},{}", pos.x, pos.y));
         }
-        run(&args)?;
-        let after = self
-            .enumerate()?
-            .into_iter()
-            .find(|o| &o.target == expected)
-            .ok_or("display_target_unavailable")?;
-        if !crate::engine::matches_patch(&after.settings, patch) {
+        let mut before_hdr = patch.clone();
+        before_hdr.hdr = current.settings.hdr;
+        apply_transaction(
+            &args,
+            &hdr_activation,
+            &before_hdr,
+            patch,
+            |args| run(args).map(|_| ()),
+            || {
+                self.enumerate()?
+                    .into_iter()
+                    .find(|observation| &observation.target == expected)
+                    .map(|observation| observation.settings)
+                    .ok_or_else(|| "display_target_unavailable".into())
+            },
+        )
+    }
+}
+
+/// HDR activation must follow observed mode/scale changes so KWin cannot lose
+/// it behind the modeset. Failed intermediate readback leaves the engine's
+/// durable adjustment intent in place for reconciliation.
+fn apply_transaction(
+    geometry: &[String],
+    hdr_activation: &[String],
+    before_hdr: &Adjustment,
+    requested: &Adjustment,
+    mut configure: impl FnMut(&[String]) -> Result<()>,
+    mut observe: impl FnMut() -> Result<Adjustment>,
+) -> Result<()> {
+    if !geometry.is_empty() {
+        configure(geometry)?;
+    }
+    if !hdr_activation.is_empty() {
+        if !crate::engine::matches_patch(&observe()?, before_hdr) {
             return Err("display_adjustment_unverified".into());
         }
-        Ok(())
+        configure(hdr_activation)?;
     }
+    if !crate::engine::matches_patch(&observe()?, requested) {
+        return Err("display_adjustment_unverified".into());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn hdr_adjustment_requires_verified_geometry_before_separate_activation() {
+        let old = Adjustment::new()
+            .resolution(1920, 1080)
+            .hdr(HdrMode::Disabled);
+        let geometry = Adjustment::new()
+            .resolution(1280, 720)
+            .hdr(HdrMode::Disabled);
+        let requested = Adjustment::new()
+            .resolution(1280, 720)
+            .hdr(HdrMode::Enabled);
+        for settles in [false, true] {
+            let mut observations = std::collections::VecDeque::from([
+                if settles {
+                    geometry.clone()
+                } else {
+                    old.clone()
+                },
+                requested.clone(),
+            ]);
+            let mut transactions = Vec::new();
+            let result = apply_transaction(
+                &["output.1.mode.720".into()],
+                &["output.1.hdr.enable".into()],
+                &geometry,
+                &requested,
+                |args| {
+                    transactions.push(args.to_vec());
+                    Ok(())
+                },
+                || {
+                    observations
+                        .pop_front()
+                        .ok_or_else(|| "missing_readback".into())
+                },
+            );
+            assert_eq!(result.is_ok(), settles);
+            assert_eq!(transactions.len(), if settles { 2 } else { 1 });
+            assert_eq!(transactions[0], vec!["output.1.mode.720"]);
+            if settles {
+                assert_eq!(transactions[1], vec!["output.1.hdr.enable"]);
+            }
+        }
+    }
+
+    #[test]
+    fn hdr_activation_needs_final_color_readback_and_never_runs_an_empty_command() {
+        let old = Adjustment::new().hdr(HdrMode::Disabled);
+        let requested = Adjustment::new().hdr(HdrMode::Enabled);
+        let mut transactions = Vec::new();
+        let result = apply_transaction(
+            &[],
+            &["output.1.hdr.enable".into()],
+            &old,
+            &requested,
+            |args| {
+                assert!(!args.is_empty());
+                transactions.push(args.to_vec());
+                Ok(())
+            },
+            || Ok(old.clone()),
+        );
+        assert_eq!(result.unwrap_err(), "display_adjustment_unverified");
+        assert_eq!(transactions, vec![vec!["output.1.hdr.enable"]]);
+    }
+
     #[test]
     #[ignore = "requires a running Wayland KScreen session; reads inventory only"]
     fn current_wayland_inventory_is_readable() {
