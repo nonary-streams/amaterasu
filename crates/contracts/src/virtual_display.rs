@@ -152,6 +152,9 @@ pub enum VirtualDisplayLayout {
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct VirtualDisplayIntent {
+    /// A Windows 3.8+ catalog private to the owning client's resolution.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub requested_resolution_only: bool,
     pub identity: String,
     pub reference_id: String,
     pub name: String,
@@ -175,6 +178,10 @@ pub struct VirtualDisplayIntent {
 impl VirtualDisplayIntent {
     pub fn validate(&self) -> Result<(), &'static str> {
         if !valid_identity(&self.identity)
+            || (self.requested_resolution_only
+                && (!self.active()
+                    || self.virtual_display_mode != VirtualDisplayMode::PerClient
+                    || !self.dd_use_sunshine_virtual_display_driver))
             || !valid_reference_id(&self.reference_id)
             || self.name.is_empty()
             || self.name.len() > 31
@@ -210,6 +217,10 @@ impl VirtualDisplayIntent {
                 || self.virtual_display_mode != VirtualDisplayMode::Disabled
         })
     }
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 pub fn valid_identity(identity: &str) -> bool {
@@ -377,6 +388,7 @@ mod tests {
 
     fn intent() -> VirtualDisplayIntent {
         VirtualDisplayIntent {
+            requested_resolution_only: false,
             identity: "00000000-0000-0000-0000-000000000001".into(),
             reference_id: "stream-session-42".into(),
             name: "Amaterasu".into(),
@@ -391,6 +403,34 @@ mod tests {
             request_virtual_display: None,
             display_policy: None,
         }
+    }
+
+    #[test]
+    fn requested_resolution_catalog_requires_an_active_private_driver_intent() {
+        let mut request = intent();
+        let legacy = serde_json::to_value(&request).unwrap();
+        assert!(legacy.get("requested_resolution_only").is_none());
+        assert!(
+            !serde_json::from_value::<VirtualDisplayIntent>(legacy)
+                .unwrap()
+                .requested_resolution_only
+        );
+        request.requested_resolution_only = true;
+        assert_eq!(request.validate(), Ok(()));
+        let private = serde_json::to_value(&request).unwrap();
+        assert_eq!(private["requested_resolution_only"], true);
+        assert_eq!(
+            serde_json::from_value::<VirtualDisplayIntent>(private).unwrap(),
+            request
+        );
+        request.virtual_display_mode = VirtualDisplayMode::Shared;
+        assert_eq!(request.validate(), Err("invalid_virtual_display_intent"));
+        request.virtual_display_mode = VirtualDisplayMode::PerClient;
+        request.request_virtual_display = Some(false);
+        assert_eq!(request.validate(), Err("invalid_virtual_display_intent"));
+        request.request_virtual_display = Some(true);
+        request.dd_use_sunshine_virtual_display_driver = false;
+        assert_eq!(request.validate(), Err("invalid_virtual_display_intent"));
     }
 
     #[test]
