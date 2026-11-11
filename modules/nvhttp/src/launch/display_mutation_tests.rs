@@ -780,3 +780,55 @@ fn disabled_display_mode_options_preserve_observed_desktop_mode() {
     assert_eq!(open["profile"]["width"], 1280);
     assert_eq!(open["profile"]["height"], 720);
 }
+
+#[test]
+fn frozen_hdr_override_drives_display_and_negotiation_without_rewriting_client_request() {
+    for (raw_hdr, global, application, client, expected) in [
+        (false, "force_on", None, None, true),
+        (true, "force_off", None, None, false),
+        (false, "force_on", Some("force_off"), None, false),
+        (false, "force_off", Some("force_off"), Some("force_on"), true),
+        (true, "force_off", Some("force_off"), Some("auto"), true),
+    ] {
+        let now = Instant::now();
+        let (mut controller, mut broker) = mutating_display_fixture("verify_only", true);
+        let mut entry = encoder_entry("test.hevc.hdr", "hevc", true);
+        entry["hdr10"] = json!(true);
+        controller.set_encoder_snapshot(encoders(vec![entry]));
+        controller.config.as_mut().unwrap().capture.encoder = EncoderSelection::Backend(
+            amaterasu_module_sdk::EncoderBackend::Auto,
+        );
+        controller.set_global_display_policy(9, json!({
+            "dd_configuration_option":"verify_only",
+            "dd_hdr_option":"auto",
+            "dd_hdr_request_override":global,
+        }));
+        broker.application_input_overrides = application.map(|value| json!({
+            "dd_hdr_request_override":value,
+        }));
+        let certificate = vec![74; 32];
+        let paired = PeerIdentity::new("127.0.0.1".parse().unwrap(), certificate.clone())
+            .unwrap()
+            .with_paired_identity(
+                "client-74".into(), fingerprint(&certificate),
+                ClientConfigOverrides {
+                    dd_hdr_request_override:client.map(str::to_owned),
+                    ..Default::default()
+                },
+            ).unwrap();
+        let mut stream = request(74);
+        stream.hdr = raw_hdr;
+        assert!(controller.launch(10, stream.clone(), paired.clone(), now).is_none());
+        let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+        assert_eq!(reply.status, 200, "{global}/{application:?}/{client:?}");
+        let open = opened_rtsp_payload(&broker);
+        assert_eq!(open["profile"]["hdr"].as_bool().unwrap_or(false), expected);
+        assert_eq!(open["display_request"]["mode_policy"]["effective_client_hdr_request"], expected);
+        assert_eq!(controller.records.values().next().unwrap().request.hdr, raw_hdr);
+        // An output request never substitutes for the processor's independent
+        // SDR/HDR capture-source requirement.
+        assert!(open["display_request"]["mode_policy"].get("source_hdr_required").is_none());
+        controller.reply_delivered(10, now);
+        assert_eq!(controller.launch(11, stream, paired, now).unwrap().status, 200);
+    }
+}

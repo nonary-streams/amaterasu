@@ -697,7 +697,7 @@ impl Controller {
                             "display_mode":record.peer.client_display_mode.map(|mode| json!({"width":mode.width,"height":mode.height,"refresh_millihz":mode.refresh_millihz}))})),
                         "settings_revision":record.global_display_revision.expect("validated revision").to_string(),
                         "requested_video":{"width":record.request.width,"height":record.request.height,
-                            "refresh_millihz":record.request.fps * 1000,"hdr":record.request.hdr}}),
+                            "refresh_millihz":record.request.fps * 1000,"hdr":effective_hdr_request(record)}}),
                     5_000,
                 )
             }
@@ -876,7 +876,7 @@ impl Controller {
                     "encrypt_audio": config.profile.encrypt_audio,
                     "permit_legacy_audio_iv_wrap": config.profile.permit_legacy_audio_iv_wrap,
                 });
-                if record.request.hdr {
+                if effective_hdr_request(record) {
                     profile["hdr"] = json!(true);
                 }
                 let offer = &record.video_codec_offer;
@@ -2716,6 +2716,37 @@ fn display_snapshot(payload: &Value) -> Result<(String, Value, Vec<String>), &'s
     Ok((revision.to_owned(), configuration.clone(), ids))
 }
 
+/// Resolve the frozen color request without rewriting the authenticated launch.
+/// Capture-source requirements are supplied separately by the selected processor;
+/// HDR output can deliberately use an SDR source (for example RTX HDR).
+fn effective_hdr_request(record: &Record) -> bool {
+    if record.auxiliary.is_some() {
+        return record.request.hdr;
+    }
+    let client = application_display_overrides(Some(&record.peer.client_display_overrides));
+    let override_value = client
+        .get("dd_hdr_request_override")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            record
+                .application_display_overrides
+                .as_ref()
+                .and_then(|overrides| overrides.get("dd_hdr_request_override"))
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            record
+                .global_display_policy
+                .get("dd_hdr_request_override")
+                .and_then(Value::as_str)
+        });
+    match override_value {
+        Some("force_on") => true,
+        Some("force_off") => false,
+        _ => record.request.hdr,
+    }
+}
+
 fn build_display_request(record: &Record) -> Result<Option<Value>, &'static str> {
     let snapshot = record
         .display_policy_snapshot
@@ -2820,7 +2851,7 @@ fn build_display_request(record: &Record) -> Result<Option<Value>, &'static str>
     let mut policy = json!({
         "display_id":selected,
         "client_fps":record.request.fps,
-        "effective_client_hdr_request":record.request.hdr,
+        "effective_client_hdr_request":effective_hdr_request(record),
         "configuration_option":option,
         "remapping":remapping,
         "context":{
@@ -3453,11 +3484,13 @@ pub(super) fn project_application_policy(
         fps: record.request.fps,
     };
     record.video_codec_offer = match &record.encoder_snapshot {
-        Some(snapshot) if record.request.hdr => {
+        Some(snapshot) if effective_hdr_request(record) => {
             snapshot.hdr_offer(record.selected_encoder.clone(), mode)?
         }
         Some(snapshot) => snapshot.offer(record.selected_encoder.clone(), mode)?,
-        None if record.request.hdr => return Err("HDR encoder capabilities are not known yet"),
+        None if effective_hdr_request(record) => {
+            return Err("HDR encoder capabilities are not known yet");
+        }
         None => crate::encoder_snapshot::unknown_encoders_offer(mode)?,
     };
     record.scoped_ds4_back_as_touchpad_click = record
@@ -4249,7 +4282,7 @@ fn virtual_display_mode_policy(
             .and_then(Value::as_str)
             .map(str::to_owned),
         hdr_option: Some(hdr_option),
-        effective_client_hdr_request: Some(record.request.hdr),
+        effective_client_hdr_request: Some(effective_hdr_request(record)),
         source_hdr_required: None,
     };
     policy
