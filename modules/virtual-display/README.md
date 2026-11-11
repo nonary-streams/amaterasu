@@ -185,13 +185,22 @@ only by that caller's `remove`.
 
 Vibeshine, the behavioural reference, also requires the surviving monitor to be
 listed by its capture backend, requires three consecutive matching readbacks
-for its final check, reacts to monitor power events rather than polling
+for final restoration, reacts to monitor power events rather than polling
 connector status, and offers a manual action that unplugs every virtual output
-at once. None of these four is implemented here.
+at once. These restoration and operator behaviours remain unimplemented here.
 
-KScreen activates only the new connector, selects the requested mode, sets 100%
-scale and SDR, and places it to the right of enabled outputs. Readback must match
-before status reports `ready`. KDE can apply a cached single-output layout when a
+KScreen activates the owned connector and selects the requested mode and scale.
+Scale can preserve the compositor's choice, use the automatic short-edge
+recommendation, or select a supported fixed percentage. All five layouts are
+accepted: exclusive, extended, extended primary, and both isolated extended
+variants. An exclusive request preserves other owned stream outputs by extending
+the desktop. Rejected isolated placement retries adjacent placement while
+retaining its mode, scale, HDR and primary choices.
+
+HDR activation first settles the mode and topology with HDR off, then activates
+HDR and verifies repeated color and geometry readbacks before publishing
+readiness. Restoration has its own bounded verification described above; the
+activation checks do not establish restoration stability. KDE can apply a cached single-output layout when a
 connector appears. A bounded layout snapshot is synced before each hotplug, and
 values displaced by that transition are restored in the same atomic KScreen
 operation that configures the new output. Active streams discard the initial
@@ -199,7 +208,8 @@ snapshot; removal snapshots the current layout so later user choices are retaine
 Interrupted hotplug recovery retains the pending snapshot. Independently
 unplugged monitors are never reconnected. Unsupported modes may require KScreen's custom-mode support. Connector disconnection removes
 the temporary display; compositor preferences for that connector may persist.
-Nonzero scale requests and permanent monitors remain unsupported on this backend.
+Permanent monitors remain unsupported on this Linux backend. Native KScreen,
+driver, display and client qualification remain separate from fixture coverage.
 
 The Linux session profile's `--enable-virtual-display` selects
 `amaterasu-owned-display`. The stream coordinator derives an owned identity,
