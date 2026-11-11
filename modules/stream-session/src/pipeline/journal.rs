@@ -107,6 +107,8 @@ pub(super) struct VirtualDisplayRecovery {
     width: u32,
     height: u32,
     refresh_millihz: u32,
+    #[serde(default, skip_serializing_if = "is_false")]
+    requested_resolution_only: bool,
 }
 
 impl VirtualDisplayRecovery {
@@ -118,6 +120,7 @@ impl VirtualDisplayRecovery {
             width: intent.width,
             height: intent.height,
             refresh_millihz: intent.refresh_millihz,
+            requested_resolution_only: intent.requested_resolution_only,
         }
     }
 
@@ -129,9 +132,10 @@ impl VirtualDisplayRecovery {
             width: self.width,
             height: self.height,
             refresh_millihz: self.refresh_millihz,
+            requested_resolution_only: self.requested_resolution_only,
             dd_virtual_display_scale: 0,
             dd_activate_virtual_display: true,
-            dd_use_sunshine_virtual_display_driver: false,
+            dd_use_sunshine_virtual_display_driver: self.requested_resolution_only,
             virtual_display_mode: VirtualDisplayMode::PerClient,
             virtual_display_layout: VirtualDisplayLayout::Extended,
             request_virtual_display: Some(true),

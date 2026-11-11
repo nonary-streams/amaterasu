@@ -1075,6 +1075,7 @@ impl Broker {
                     "width":payload["width"],
                     "height":payload["height"],
                     "refresh_millihz":payload["refresh_millihz"],
+                    "requested_resolution_only":payload["requested_resolution_only"].as_bool().unwrap_or(false),
                 });
                 if self
                     .virtual_display_specification

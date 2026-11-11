@@ -23,6 +23,7 @@ pub(super) fn create(record: &Record) -> Value {
         width: intent.width,
         height: intent.height,
         refresh_millihz: intent.refresh_millihz,
+        requested_resolution_only: intent.requested_resolution_only,
         hdr_enabled: intent
             .display_policy
             .as_ref()
@@ -143,6 +144,10 @@ pub(super) fn accept_status(record: &mut Record, response: &Value) -> ReferenceS
                 && monitor["specification"]["height"] == intent.height
                 && monitor["specification"]["refresh_millihz"] == intent.refresh_millihz
                 && monitor["specification"]["name"] == intent.name
+                && monitor["specification"]["requested_resolution_only"]
+                    .as_bool()
+                    .unwrap_or(false)
+                    == intent.requested_resolution_only
         })
     }) else {
         // The provider confirms this reference exists independently of the
@@ -257,6 +262,7 @@ pub(super) fn same_shared_specification(left: &Record, right: &Record) -> bool {
         && left.width == right.width
         && left.height == right.height
         && left.refresh_millihz == right.refresh_millihz
+        && left.requested_resolution_only == right.requested_resolution_only
         && left.dd_virtual_display_scale == right.dd_virtual_display_scale
         && left.dd_activate_virtual_display == right.dd_activate_virtual_display
         && left.dd_use_sunshine_virtual_display_driver

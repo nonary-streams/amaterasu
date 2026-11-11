@@ -92,6 +92,7 @@ impl Source {
             width: self.width,
             height: self.height,
             refresh_millihz: self.refresh_millihz,
+            requested_resolution_only: false,
             hdr_enabled: self.hdr_enabled,
             dd_virtual_display_scale: None,
             virtual_display_layout: None,

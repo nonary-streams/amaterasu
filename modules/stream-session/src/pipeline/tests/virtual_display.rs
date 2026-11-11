@@ -57,6 +57,63 @@ fn actions(host: &Harness, service: &str) -> Vec<String> {
 }
 
 #[test]
+fn private_requested_resolution_catalog_is_forwarded_and_retained_for_recovery() {
+    for private_catalog in [false, true] {
+        let mut host = Harness::new();
+        let mut requested = intent(
+            "private-catalog-reference",
+            VirtualDisplayMode::PerClient,
+            VirtualDisplayLayout::Extended,
+        );
+        if private_catalog {
+            requested["requested_resolution_only"] = json!(true);
+        }
+        let prepared = host.response(1, prepare_with_intent("private-catalog", requested));
+        assert_eq!(prepared["state"], "prepared", "{prepared}");
+        let create = host
+            .broker
+            .calls
+            .iter()
+            .find(|call| {
+                call.service == "amaterasu.virtual-display/1" && call.payload["action"] == "create"
+            })
+            .unwrap();
+        assert_eq!(
+            create.payload["requested_resolution_only"]
+                .as_bool()
+                .unwrap_or(false),
+            private_catalog
+        );
+        let id = prepared["session"].as_u64().unwrap();
+        let entry = super::super::journal::Entry::from_record(&host.pipeline.records[&id]);
+        let restored = entry.recovery_record().unwrap();
+        assert_eq!(
+            restored
+                .config
+                .virtual_display_intent
+                .unwrap()
+                .requested_resolution_only,
+            private_catalog
+        );
+
+        let record = host.pipeline.records.get_mut(&id).unwrap();
+        let status = json!({"ok":true,"reference_owned":true,"monitors":[{
+            "state":"ready","ready":{"active":true,"device_path":"\\\\.\\DISPLAYVDD"},
+            "specification":{"identity":"00000000-0000-0000-0000-000000000001",
+                "name":"Amaterasu","width":1920,"height":1080,"refresh_millihz":60000,
+                "requested_resolution_only":!private_catalog}
+        }]});
+        assert!(matches!(
+            super::super::virtual_display::accept_status(record, &status),
+            super::super::virtual_display::ReferenceStatus::Failed
+        ));
+        assert_eq!(record.virtual_display_state, "specification_mismatch");
+        assert!(record.virtual_display_reference_owned);
+        assert!(record.virtual_display_device_path.is_none());
+    }
+}
+
+#[test]
 fn stop_waits_for_final_virtual_display_removal() {
     let mut host = Harness::new();
     let prepared = host.response(
