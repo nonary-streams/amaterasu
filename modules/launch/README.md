@@ -307,8 +307,12 @@ yields `operation_conflict`. Exported retries must also retain the original
 immutable runtime initiator, even when two initiators map to the same catalog
 owner. Catalog edits
 do not change an already accepted operation. A new operation ID intentionally
-creates a new launch. At most 32 records total and 16 per caller are retained;
-terminal records are not evicted. Lists contain up to 16 caller-owned records
+creates a new launch. At most 32 launches, and 16 per caller, may be starting or
+running at once; a launch that was asked to stop counts against neither limit,
+whether or not its stop was confirmed. The record table holds 32 records. When
+it is full, retired launches are evicted first and other ended launches are then
+dropped, the most settled first, except one that still owns a broker request or
+admission. Lists contain up to 16 caller-owned records
 and `next_offset`. Foreign/missing IDs both return `launch_not_found`.
 `lookup {operation_id}` follows the same ownership rule and returns the retained
 record, allowing a caller to reconcile a lost launch response without scanning.
@@ -374,12 +378,15 @@ The merged resolved plan also freezes `cleanup_budget_ms` before effects. Prefli
 status, lookup, and retained terminal records report the same 20,000..2,745,000 ms
 scalar even after target ownership is released. NVHTTP consumes that scalar for
 its outer cleanup deadline, so a long configured ordered undo does not encounter
-a fixed 20-second session deadline. While cleanup runs, each tick admits at most
-one owner-authorized status/lookup/list readback before advancing the active
-cleanup work. An owned stop for that active record acknowledges `stopping`
-without restarting undo or extending its deadline. Other mutations return
-`workflow_busy`. Readback transport failure retains the pending cleanup request,
-and list pages obey the 16,384-byte response bound as well as their count limit.
+a fixed 20-second session deadline. Each launch that was asked to stop runs its
+cleanup in a workflow of its own, beside the one slot that serves requests and
+launches that are starting or running. A stop or undo that takes minutes
+therefore delays neither the next launch nor another launch's cleanup, and
+requests are answered normally while it runs; they used to be answered
+`workflow_busy` until it finished. An owned stop for a launch whose cleanup is
+already running acknowledges `stopping` without restarting undo or extending its
+deadline. A request transport failure retains every pending cleanup request, and
+list pages obey the 16,384-byte response bound as well as their count limit.
 A timeout retains ownership and the session lease for an explicit retry. This slice does not
 implement the reference helper's focus policy or process watchdog verification.
 

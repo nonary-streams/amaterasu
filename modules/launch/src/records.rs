@@ -3,6 +3,7 @@ use crate::protocol::{
     Outcome, PreparationStep, State,
 };
 use amaterasu_contracts::virtual_display::VirtualDisplayIntent;
+use amaterasu_module_sdk::lifecycle_ledger::{Admission, Live, Owner, Retirement, make_room};
 use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -173,6 +174,41 @@ impl Record {
 const MAX_LAUNCHES: usize = 32;
 const MAX_OWNER_LAUNCHES: usize = 16;
 
+impl Owner for Record {
+    /// A launch is open while it is starting or running. One that was asked
+    /// to stop only retires what it started.
+    fn admission(&self) -> Admission {
+        match self.state {
+            State::Starting | State::Active => Admission::Open,
+            State::Stopping
+            | State::Stopped
+            | State::Cancelled
+            | State::Failed
+            | State::CleanupFailed => Admission::Ended,
+        }
+    }
+
+    fn retirement(&self) -> Retirement {
+        match self.state {
+            State::Stopped | State::Cancelled | State::Failed => {
+                if self.cleanup_error.is_none() {
+                    Retirement::Confirmed
+                } else {
+                    Retirement::Abandoned
+                }
+            }
+            State::CleanupFailed => Retirement::Unconfirmed,
+            State::Starting | State::Active | State::Stopping => Retirement::Pending,
+        }
+    }
+}
+
+/// Whether `caller` may start one more launch. It receives open launches
+/// only, so one whose stop is unfinished or failed cannot use up the limit.
+fn launch_admitted(live: &Live<'_, Record>, caller: &str) -> bool {
+    live.admits(MAX_LAUNCHES) && live.count(|record| record.owner == caller) < MAX_OWNER_LAUNCHES
+}
+
 pub struct Records {
     pub values: BTreeMap<u64, Record>,
     nonce: String,
@@ -275,7 +311,10 @@ impl Records {
             };
         }
         self.evict_retired_launches(caller);
-        if self.values.len() >= MAX_LAUNCHES || self.owned_count(caller) >= MAX_OWNER_LAUNCHES {
+        self.make_room_for_launch();
+        if self.values.len() >= MAX_LAUNCHES
+            || !launch_admitted(&Live::of(self.values.values()), caller)
+        {
             return Err("launch_limit");
         }
         let id = self.next_id.checked_add(1).ok_or("launch_limit")?;
@@ -393,6 +432,30 @@ impl Records {
             };
             self.values.remove(&id);
         }
+    }
+
+    /// Keep the record table from refusing a launch because launches that
+    /// ended are still recorded. Retired launches were evicted first; what
+    /// remains is dropped the most settled first. A record with a broker
+    /// request or admission still outstanding stays, as it owns that work.
+    /// A dropped launch whose stop never confirmed is no longer tracked
+    /// here, and the log says so.
+    fn make_room_for_launch(&mut self) {
+        make_room(
+            &mut self.values,
+            MAX_LAUNCHES,
+            |_, record| {
+                record.outstanding_request.is_none() && record.outstanding_admission.is_none()
+            },
+            |id, record| {
+                eprintln!(
+                    "launch record dropped for capacity launch={id} retirement={:?} \
+                     cleanup_error={}",
+                    record.retirement(),
+                    record.cleanup_error.unwrap_or("none")
+                );
+            },
+        );
     }
 
     fn retirement_preserved(&self, record: &Record) -> bool {

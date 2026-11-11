@@ -78,7 +78,7 @@ fn quiesce_settles_a_queued_spawn_before_lookup_and_cancels_the_original_caller(
     assert!(harness.output.is_none());
     assert!(!pipeline.quiesce());
     assert_eq!(pipeline.records.values[&1].outstanding_request, Some(50));
-    assert!(pipeline.job.as_ref().unwrap().pending.is_none());
+    assert!(pipeline.only_job().unwrap().pending.is_none());
 
     harness.drop_spawn_result = false;
     for _ in 0..3 {
@@ -117,7 +117,7 @@ fn quiesce_reconciles_a_committed_spawn_without_replaying_startup() {
     }
     assert_eq!(harness.processes.len(), 1);
     assert!(pipeline.records.values[&1].process_id.is_none());
-    assert!(pipeline.job.as_ref().unwrap().pending.is_some());
+    assert!(pipeline.only_job().unwrap().pending.is_some());
 
     drain(&mut pipeline, &mut harness);
 
@@ -140,13 +140,13 @@ fn repeated_quiesce_preserves_a_pending_cleanup_and_its_deadline() {
     harness.request(&mut pipeline, "alice", launch("existing-cleanup"));
     assert!(!pipeline.quiesce());
     pipeline.tick(|command| harness.send(command)).unwrap();
-    let job = pipeline.job.as_ref().unwrap();
+    let job = pipeline.only_job().unwrap();
     let deadline = job.deadline;
     let pending = job.pending;
     assert!(pending.is_some());
     for _ in 0..10 {
         assert!(!pipeline.quiesce());
-        let job = pipeline.job.as_ref().unwrap();
+        let job = pipeline.only_job().unwrap();
         assert_eq!(job.deadline, deadline);
         assert_eq!(job.pending, pending);
     }
@@ -296,7 +296,7 @@ fn expired_pending_cleanup_is_settled_and_reports_unresolved_retirement() {
     harness.request(&mut pipeline, "alice", launch("cleanup-deadline"));
     assert!(!pipeline.quiesce());
     pipeline.tick(|command| harness.send(command)).unwrap();
-    let job = pipeline.job.as_mut().unwrap();
+    let job = pipeline.only_job_mut().unwrap();
     assert_eq!(job.step, Step::StopSession);
     assert!(job.pending.is_some());
     job.deadline = Instant::now();
@@ -327,7 +327,7 @@ fn shutdown_announcement_gates_admission_without_stopping_an_active_sdk_launch()
     pipeline.prepare_shutdown(1_000);
 
     assert!(!pipeline.quiescing);
-    assert!(pipeline.job.is_none());
+    assert!(pipeline.only_job().is_none());
     assert!(pipeline.records.values[&1].state == State::Active);
     assert!(harness.processes[0].child.is_some());
     assert!(harness.sessions[0].lease.is_some());
@@ -363,14 +363,14 @@ fn later_quiesce_caps_long_application_cleanup_to_the_original_host_deadline() {
     assert_eq!(pipeline.shutdown_deadline, Some(announced_deadline));
 
     assert!(!pipeline.quiesce());
-    assert_eq!(pipeline.job.as_ref().unwrap().deadline, announced_deadline);
+    assert_eq!(pipeline.only_job().unwrap().deadline, announced_deadline);
     pipeline.tick(|command| harness.send(command)).unwrap();
-    let pending = pipeline.job.as_ref().unwrap().pending;
+    let pending = pipeline.only_job().unwrap().pending;
     assert!(pending.is_some());
-    assert_eq!(pipeline.job.as_ref().unwrap().deadline, announced_deadline);
+    assert_eq!(pipeline.only_job().unwrap().deadline, announced_deadline);
     assert!(!pipeline.quiesce());
-    assert_eq!(pipeline.job.as_ref().unwrap().deadline, announced_deadline);
-    assert_eq!(pipeline.job.as_ref().unwrap().pending, pending);
+    assert_eq!(pipeline.only_job().unwrap().deadline, announced_deadline);
+    assert_eq!(pipeline.only_job().unwrap().pending, pending);
     drain(&mut pipeline, &mut harness);
 }
 
@@ -396,11 +396,11 @@ fn host_deadline_bounds_consumer_requested_cleanup_before_provider_quiesce() {
     });
     pipeline.tick(|command| harness.send(command)).unwrap();
     assert!(!pipeline.quiescing);
-    assert_eq!(pipeline.job.as_ref().unwrap().deadline, deadline);
+    assert_eq!(pipeline.only_job().unwrap().deadline, deadline);
     // The consumer may still retire its owned launch while the host waits to
     // quiesce this provider, but the resulting cleanup shares the host budget.
     pipeline.tick(|command| harness.send(command)).unwrap();
-    let job = pipeline.job.as_ref().unwrap();
+    let job = pipeline.only_job().unwrap();
     assert!(job.cleanup);
     assert_eq!(job.deadline, deadline);
     assert!(job.pending.is_some());
@@ -414,13 +414,13 @@ fn expired_host_deadline_preserves_a_pending_request_and_unresolved_lease() {
     harness.request(&mut pipeline, "alice", launch("host-expired-pending"));
     assert!(!pipeline.quiesce());
     pipeline.tick(|command| harness.send(command)).unwrap();
-    assert!(pipeline.job.as_ref().unwrap().pending.is_some());
+    assert!(pipeline.only_job().unwrap().pending.is_some());
     harness.reply = None;
 
     pipeline.prepare_shutdown(0);
     assert!(!pipeline.quiesce());
     assert_eq!(
-        pipeline.job.as_ref().unwrap().deadline,
+        pipeline.only_job().unwrap().deadline,
         pipeline.shutdown_deadline.unwrap()
     );
     pipeline.tick(|command| harness.send(command)).unwrap();
@@ -450,13 +450,13 @@ fn shutdown_announcement_preserves_pending_startup_until_its_consumer_drains() {
         pipeline.tick(|command| harness.send(command)).unwrap();
     }
     assert!(harness.queued_spawn.is_some());
-    let before = pipeline.job.as_ref().unwrap().clone();
+    let before = pipeline.only_job().unwrap().clone();
     let commands = harness.commands.len();
     pipeline.prepare_shutdown(1_000);
     let announced = pipeline.shutdown_deadline.unwrap();
     pipeline.prepare_shutdown(20_000);
     assert_eq!(pipeline.shutdown_deadline, Some(announced));
-    let after = pipeline.job.as_ref().unwrap();
+    let after = pipeline.only_job().unwrap();
     assert_eq!(after.step, before.step);
     assert_eq!(after.pending, before.pending);
     assert_eq!(after.deadline, before.deadline);
@@ -471,7 +471,7 @@ fn shutdown_announcement_preserves_pending_startup_until_its_consumer_drains() {
     let tightened = pipeline.shutdown_deadline.unwrap();
     assert!(tightened < announced);
     assert!(!pipeline.quiesce());
-    assert_eq!(pipeline.job.as_ref().unwrap().deadline, tightened);
+    assert_eq!(pipeline.only_job().unwrap().deadline, tightened);
     harness.complete_queued_spawn();
     drain(&mut pipeline, &mut harness);
 }

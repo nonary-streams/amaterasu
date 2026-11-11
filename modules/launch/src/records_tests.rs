@@ -121,15 +121,39 @@ fn finished_launches_do_not_use_up_launch_capacity() {
 }
 
 #[test]
-fn unfinished_or_failed_launches_keep_their_slot() {
+fn unfinished_or_failed_launches_do_not_use_up_launch_capacity() {
+    let mut records = Records::new().unwrap();
+    // More launches than the table holds are asked to stop, and none of the
+    // stops is ever confirmed: some still running, some failed, some ended
+    // without proof.
+    for index in 0..(MAX_LAUNCHES * 2) {
+        let operation = format!("ale1:{}:launch-{index}", records.operation_epoch());
+        let (id, fresh) = start(&mut records, "owner", &operation)
+            .unwrap_or_else(|code| panic!("launch {index} was refused: {code}"));
+        assert!(fresh);
+        let record = records.values.get_mut(&id).unwrap();
+        record.launch_started = true;
+        record.state = match index % 3 {
+            0 => State::Stopping,
+            1 => State::CleanupFailed,
+            _ => State::Stopped,
+        };
+        if record.state == State::CleanupFailed {
+            record.cleanup_error = Some("termination_unconfirmed");
+        }
+        assert!(records.values.len() <= MAX_LAUNCHES);
+    }
+}
+
+#[test]
+fn launches_that_are_starting_or_running_still_use_the_limit() {
     let mut records = Records::new().unwrap();
     for index in 0..MAX_OWNER_LAUNCHES {
         let operation = format!("ale1:{}:launch-{index}", records.operation_epoch());
         let (id, _) = start(&mut records, "owner", &operation).unwrap();
-        let record = records.values.get_mut(&id).unwrap();
-        record.launch_started = true;
-        // Terminal, but native retirement was never confirmed.
-        record.state = State::Stopped;
+        if index % 2 == 0 {
+            records.values.get_mut(&id).unwrap().state = State::Active;
+        }
     }
     let operation = format!("ale1:{}:one-more", records.operation_epoch());
     assert_eq!(
@@ -137,4 +161,29 @@ fn unfinished_or_failed_launches_keep_their_slot() {
         Err("launch_limit")
     );
     assert_eq!(records.values.len(), MAX_OWNER_LAUNCHES);
+    // Another owner has its own allowance.
+    assert!(start(&mut records, "other", &operation).is_ok());
+}
+
+#[test]
+fn a_launch_with_outstanding_broker_work_is_not_dropped_for_capacity() {
+    let mut records = Records::new().unwrap();
+    for index in 0..MAX_LAUNCHES {
+        let owner = format!("owner-{}", index % 4);
+        let operation = format!("ale1:{}:launch-{index}", records.operation_epoch());
+        let (id, _) = start(&mut records, &owner, &operation).unwrap();
+        let record = records.values.get_mut(&id).unwrap();
+        record.launch_started = true;
+        record.state = State::CleanupFailed;
+        record.outstanding_request = Some(900 + id);
+    }
+    // Every record still owns a broker request, so none can be given up.
+    let operation = format!("ale1:{}:one-more", records.operation_epoch());
+    assert_eq!(
+        start(&mut records, "owner-0", &operation),
+        Err("launch_limit")
+    );
+    records.values.get_mut(&1).unwrap().outstanding_request = None;
+    assert!(start(&mut records, "owner-0", &operation).is_ok());
+    assert!(!records.values.contains_key(&1));
 }

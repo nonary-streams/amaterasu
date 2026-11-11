@@ -91,7 +91,7 @@ fn cancelled_admission_retires_all_three_routes_without_replay() {
                         harness.send(command)
                     })
                     .unwrap();
-                if rejected && pipeline.job.is_none() {
+                if rejected && pipeline.only_job().is_none() {
                     break;
                 }
             }
@@ -153,7 +153,7 @@ fn ambiguous_admission_keeps_owned_effects_stoppable_without_replay() {
                 panic!("unexpected transport failure");
             }
             if transport_lost
-                && (ended_seen || pipeline.job.as_ref().is_some_and(|j| j.request.is_none()))
+                && (ended_seen || pipeline.only_job().is_some_and(|j| j.request.is_none()))
             {
                 break;
             }
@@ -161,7 +161,7 @@ fn ambiguous_admission_keeps_owned_effects_stoppable_without_replay() {
         assert!(transport_lost, "{route:?}");
         assert_eq!(effect_count(&harness, route), 1, "{route:?}");
         assert!(
-            pipeline.job.is_some(),
+            pipeline.only_job().is_some(),
             "{route:?}: lost the in-flight workflow"
         );
         assert!(harness.sessions[0].lease.is_some(), "{route:?}");
@@ -217,7 +217,7 @@ fn generic_provider_starting_acknowledges_admission_before_running() {
             .any(|(service, payload, _)| service == "example.provider/1"
                 && payload["action"] == "lookup")
     );
-    assert!(pipeline.job.is_some());
+    assert!(pipeline.only_job().is_some());
     let stopped = harness.request_as(
         &mut pipeline,
         "amaterasu.nvhttp",
@@ -301,7 +301,7 @@ fn explicitly_rejected_active_completion_retires_launch() {
                 harness.send(command)
             })
             .unwrap();
-        if rejected && pipeline.job.is_none() {
+        if rejected && pipeline.only_job().is_none() {
             break;
         }
     }
@@ -396,7 +396,7 @@ fn real_broker_distinguishes_first_rejection_from_lost_admission_acknowledgement
                     }
                     harness.send(command)
                 }).unwrap();
-                if completions > 0 && (cancelled && pipeline.job.is_none() || !cancelled) {
+                if completions > 0 && (cancelled && pipeline.only_job().is_none() || !cancelled) {
                     break;
                 }
             }
@@ -409,10 +409,10 @@ fn real_broker_distinguishes_first_rejection_from_lost_admission_acknowledgement
                 assert!(
                     matches!(broker.dispatch("caller", Command::TakeResult { request: request_id }), Response::Result { payload } if payload["launch"]["state"] == "starting")
                 );
-                assert!(pipeline.job.is_some());
+                assert!(pipeline.only_job().is_some());
                 assert!(harness.sessions[0].lease.is_some());
                 for _ in 0..100 {
-                    if pipeline.job.is_none() {
+                    if pipeline.only_job().is_none() {
                         break;
                     }
                     pipeline

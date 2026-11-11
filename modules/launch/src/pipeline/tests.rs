@@ -1978,11 +1978,11 @@ fn launch_export_can_acknowledge_admission_while_owned_startup_remains_stoppable
     let admitted = harness.request_as(&mut pipeline, "amaterasu.nvhttp", "management", launch);
     assert_eq!(admitted["launch"]["state"], "starting", "{admitted}");
     assert!(
-        pipeline.job.is_some(),
+        pipeline.only_job().is_some(),
         "startup remains owned after acknowledgement"
     );
     for failure in ["poll", "complete"] {
-        let retained_pending = pipeline.job.as_ref().unwrap().pending;
+        let retained_pending = pipeline.only_job().unwrap().pending;
         let mut incoming = Some(Response::Request {
             id: 42,
             caller: "amaterasu.nvhttp".into(),
@@ -2002,8 +2002,8 @@ fn launch_export_can_acknowledge_admission_while_owned_startup_remains_stoppable
             other => panic!("failed detached readback must not advance dependencies: {other:?}"),
         });
         assert!(readback_error.is_err());
-        assert_eq!(pipeline.job.as_ref().unwrap().pending, retained_pending);
-        assert_eq!(pipeline.job.as_ref().unwrap().request, None);
+        assert_eq!(pipeline.only_job().unwrap().pending, retained_pending);
+        assert_eq!(pipeline.only_job().unwrap().request, None);
     }
     let application_launch = harness
         .commands
@@ -2030,7 +2030,7 @@ fn launch_export_can_acknowledge_admission_while_owned_startup_remains_stoppable
     assert_eq!(stopped["launch"]["state"], "stopped", "{stopped}");
     assert!(harness.sessions[0].lease.is_none());
     assert!(harness.processes[0].child.is_none());
-    assert!(pipeline.job.is_none());
+    assert!(pipeline.only_job().is_none());
 }
 
 #[test]
@@ -2052,15 +2052,15 @@ fn detached_launch_activation_does_not_complete_the_admission_request_twice() {
     let admitted = harness.request_as(&mut pipeline, "amaterasu.nvhttp", "management", launch);
     assert_eq!(admitted["launch"]["state"], "starting", "{admitted}");
     assert_eq!(
-        pipeline.job.as_ref().unwrap().step,
+        pipeline.only_job().unwrap().step,
         crate::workflow::Step::Activate
     );
-    assert_eq!(pipeline.job.as_ref().unwrap().request, None);
+    assert_eq!(pipeline.only_job().unwrap().request, None);
 
     pipeline.tick(|command| harness.send(command)).unwrap();
     pipeline.tick(|command| harness.send(command)).unwrap();
 
-    assert!(pipeline.job.is_none());
+    assert!(pipeline.only_job().is_none());
     assert!(pipeline.records.values.values().next().unwrap().state == State::Active);
     assert!(
         harness.output.is_none(),
@@ -3514,7 +3514,7 @@ fn lost_result_does_not_retire_a_delivered_spawn_before_provider_completion() {
     harness.complete_queued_spawn();
     for _ in 0..100 {
         pipeline.tick(|command| harness.send(command)).unwrap();
-        if pipeline.job.is_none() {
+        if pipeline.only_job().is_none() {
             break;
         }
     }
@@ -3591,7 +3591,7 @@ fn lost_spawn_admission_looks_up_the_exact_broker_operation_before_cleanup() {
     harness.complete_queued_spawn();
     for _ in 0..100 {
         pipeline.tick(|command| harness.send(command)).unwrap();
-        if pipeline.job.is_none() {
+        if pipeline.only_job().is_none() {
             break;
         }
     }
@@ -3661,9 +3661,9 @@ fn pending_spawn_cannot_extend_launch_deadline_or_retire_its_lease() {
         }
     }
     harness.drop_spawn_result = false;
-    pipeline.job.as_mut().unwrap().deadline = Instant::now();
+    pipeline.only_job_mut().unwrap().deadline = Instant::now();
     pipeline.tick(|command| harness.send(command)).unwrap();
-    assert!(pipeline.job.as_ref().unwrap().cleanup);
+    assert!(pipeline.only_job().unwrap().cleanup);
     assert_eq!(pipeline.records.values[&1].outstanding_request, Some(50));
     assert!(harness.sessions[0].lease.is_some());
     assert!(!pipeline.records.values[&1].native_retirement_confirmed);
@@ -3685,8 +3685,7 @@ fn failed_read_only_settlement_keeps_request_until_stop_retries() {
         for _ in 0..10 {
             pipeline.tick(|command| harness.send(command)).unwrap();
             if pipeline
-                .job
-                .as_ref()
+                .only_job()
                 .is_some_and(|job| job.step == Step::Catalog && job.pending.is_some())
             {
                 break;
@@ -4209,7 +4208,7 @@ fn cleanup_budget_is_snapshotted_at_preflight_and_survives_terminal_target_relea
 }
 
 #[test]
-fn owned_readback_during_cleanup_preserves_deadline_and_rejects_other_mutations() {
+fn owned_readback_during_cleanup_preserves_deadline_and_admits_another_launch() {
     let mut pipeline = Pipeline::new(BTreeMap::new()).unwrap();
     let (id, _) = pipeline
         .records
@@ -4258,11 +4257,6 @@ fn owned_readback_during_cleanup_preserves_deadline_and_rejects_other_mutations(
             json!({"action":"stop","launch_id":id}),
             "launch_not_found",
         ),
-        (
-            "alice",
-            json!({"action":"launch","operation_id":"another","app_id":"app-0000000000000001"}),
-            "workflow_busy",
-        ),
     ] {
         let mut incoming = Some(Response::Request {
             id: 42,
@@ -4296,10 +4290,42 @@ fn owned_readback_during_cleanup_preserves_deadline_and_rejects_other_mutations(
         } else {
             assert_eq!(response["code"], expected);
         }
-        assert_eq!(pipeline.job.as_ref().unwrap().deadline, deadline);
-        assert_eq!(pipeline.job.as_ref().unwrap().pending, Some(50));
+        assert_eq!(pipeline.only_job().unwrap().deadline, deadline);
+        assert_eq!(pipeline.only_job().unwrap().pending, Some(50));
         assert_eq!(pipeline.records.values.len(), 1);
     }
+
+    // Another launch is admitted while this one is still stopping. It used
+    // to be answered `workflow_busy` for as long as the cleanup ran.
+    let mut incoming = Some(Response::Request {
+        id: 43,
+        caller: "alice".into(),
+        initiator: "alice".into(),
+        service: SERVICE.into(),
+        payload: json!({"action":"launch","operation_id":"another",
+            "app_id":"app-0000000000000001"}),
+        remaining_ms: 5_000,
+    });
+    pipeline
+        .tick(|command| {
+            Ok(match command {
+                Command::Poll {} => incoming.take().unwrap_or(Response::Pending),
+                Command::TakeResult { request: 50 } => Response::Pending,
+                other => panic!("admission must not answer or issue effects yet: {other:?}"),
+            })
+        })
+        .unwrap();
+    assert_eq!(pipeline.records.values.len(), 2);
+    let admitted = pipeline
+        .job
+        .as_ref()
+        .expect("the new launch has the job slot");
+    assert_ne!(admitted.launch_id, id);
+    assert!(!admitted.cleanup);
+    let cleanup = &pipeline.retiring_jobs[&id];
+    assert_eq!(cleanup.deadline, deadline);
+    assert_eq!(cleanup.pending, Some(50));
+    assert!(pipeline.records.values[&id].state == State::Stopping);
 }
 
 #[test]
@@ -4339,10 +4365,12 @@ fn cleanup_readback_transport_failure_retains_pending_work_then_settles() {
                 remaining_ms: 5_000,
             }),
             Command::Complete { request: 42, .. } => Ok(Response::Pending),
+            // The cleanup advances on its own and its result is not ready.
+            Command::TakeResult { request: 50 } => Ok(Response::Pending),
             other => panic!("failed ingress must retain dependency: {other:?}"),
         });
         assert!(failure.is_err());
-        let retained = pipeline.job.as_ref().unwrap();
+        let retained = pipeline.only_job().unwrap();
         assert_eq!(retained.launch_id, id);
         assert_eq!(retained.deadline, deadline);
         assert_eq!(retained.step, Step::AwaitTermination);
@@ -4359,13 +4387,13 @@ fn cleanup_readback_transport_failure_retains_pending_work_then_settles() {
                 Ok(response)
             }).unwrap();
         }
-        assert!(pipeline.job.is_none());
+        assert!(pipeline.only_job().is_none());
         assert!(pipeline.records.values[&id].state == State::Stopped);
     }
 }
 
 #[test]
-fn cleanup_readback_list_paginates_by_bytes_and_preserves_owner() {
+fn list_during_cleanup_paginates_by_bytes_and_preserves_owner() {
     let mut pipeline = Pipeline::new(BTreeMap::new()).unwrap();
     let mut expected = Vec::new();
     for owner in ["alice", "bob"] {
@@ -4410,7 +4438,7 @@ fn cleanup_readback_list_paginates_by_bytes_and_preserves_owner() {
             remaining_ms: 5_000,
         });
         pipeline
-            .poll_cleanup_readback(expected[0], &mut |command| {
+            .tick(|command| {
                 Ok(match command {
                     Command::Poll {} => incoming.take().unwrap_or(Response::Pending),
                     Command::Complete {

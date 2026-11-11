@@ -80,7 +80,15 @@ fn virtual_display_intent_sha256(intent: &VirtualDisplayIntent) -> Option<String
 /// Owns admitted launches and consumes only generic preparation contributions.
 pub struct Pipeline {
     records: Records,
+    /// The workflow of a launch that is starting or running, or the request
+    /// being answered. While it is busy other requests are refused as busy.
     job: Option<Workflow>,
+    /// One cleanup workflow per launch that was asked to stop. Each advances
+    /// on its own, so a stop or undo command that runs for minutes cannot
+    /// make the next launch wait or be refused.
+    retiring_jobs: BTreeMap<u64, Workflow>,
+    /// The job slot's own workflow while a cleanup occupies the slot.
+    parked_job: Option<Workflow>,
     sequence: u64,
     monitor_after: u64,
     ingress_since_monitor: u8,
@@ -100,6 +108,8 @@ impl Pipeline {
         Ok(Self {
             records: Records::new()?,
             job: None,
+            retiring_jobs: BTreeMap::new(),
+            parked_job: None,
             sequence: 0,
             monitor_after: 0,
             ingress_since_monitor: 0,
@@ -214,7 +224,7 @@ impl Pipeline {
     pub fn quiesce(&mut self) -> bool {
         self.quiescing = true;
         self.schedule_shutdown_cleanup();
-        self.job.is_none()
+        self.no_jobs()
             && self.records.values.values().all(|record| {
                 record.state.terminal()
                     && record.cleanup_error.is_none()
@@ -223,9 +233,65 @@ impl Pipeline {
             })
     }
 
+    /// Work on one launch's cleanup with its workflow in the job slot. The
+    /// pipeline reads and writes that one slot; which launch it serves is
+    /// the lane.
+    fn with_retiring_job(
+        &mut self,
+        launch: u64,
+        work: impl FnOnce(&mut Self) -> ModuleResult<()>,
+    ) -> ModuleResult<()> {
+        debug_assert!(self.parked_job.is_none());
+        self.parked_job = self.job.take();
+        self.job = self.retiring_jobs.remove(&launch);
+        let result = work(self);
+        if let Some(job) = self.job.take() {
+            self.retiring_jobs.insert(job.launch_id, job);
+        }
+        self.job = self.parked_job.take();
+        result
+    }
+
+    /// Cleanup starts in the job slot, from a stop request or a failed step.
+    /// It then leaves the slot, which serves launches that are starting or
+    /// running and incoming requests.
+    fn move_ended_job_to_its_own_lane(&mut self) {
+        if self.job.as_ref().is_some_and(|job| job.cleanup)
+            && let Some(job) = self.job.take()
+        {
+            self.retiring_jobs.insert(job.launch_id, job);
+        }
+    }
+
+    fn no_jobs(&self) -> bool {
+        self.job.is_none() && self.parked_job.is_none() && self.retiring_jobs.is_empty()
+    }
+
+    /// The one workflow in flight, wherever it runs. Tests that drive a
+    /// single launch read its workflow through this.
+    #[cfg(test)]
+    pub(crate) fn only_job(&self) -> Option<&Workflow> {
+        self.job
+            .as_ref()
+            .or_else(|| self.retiring_jobs.values().next())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn only_job_mut(&mut self) -> Option<&mut Workflow> {
+        self.job
+            .as_mut()
+            .or_else(|| self.retiring_jobs.values_mut().next())
+    }
+
     fn schedule_shutdown_cleanup(&mut self) {
         if !self.quiescing {
             return;
+        }
+        // Polling shutdown cannot restart an undo or extend its deadline.
+        if let Some(deadline) = self.shutdown_deadline {
+            for job in self.retiring_jobs.values_mut() {
+                job.deadline = job.deadline.min(deadline);
+            }
         }
         let mut job = match self.job.take() {
             Some(mut job) if job.cleanup => {
@@ -236,8 +302,11 @@ impl Pipeline {
             }
             Some(job) => job,
             None => {
+                // A launch whose cleanup already runs in its own lane keeps it.
                 let Some(record) = self.records.values.values().find(|record| {
-                    !record.state.terminal() && record.state != State::CleanupFailed
+                    !record.state.terminal()
+                        && record.state != State::CleanupFailed
+                        && !self.retiring_jobs.contains_key(&record.launch_id)
                 }) else {
                     return;
                 };
@@ -280,116 +349,13 @@ impl Pipeline {
 
     pub fn tick(&mut self, mut send: impl FnMut(Command) -> Transport) -> ModuleResult<()> {
         self.schedule_shutdown_cleanup();
-        if let Some(mut job) = self.job.take() {
-            self.bound_cleanup_deadline(&mut job);
-            if !job.cleanup && job.request.is_none() {
-                let has_readback = match self.poll_detached_readback(&mut job, &mut send) {
-                    Ok(has_readback) => has_readback,
-                    Err(error) => {
-                        // A detached startup owns all pending dependency state even
-                        // when ingress polling or reply delivery temporarily fails.
-                        self.job = Some(job);
-                        return Err(error);
-                    }
-                };
-                if has_readback {
-                    self.ingress_since_monitor = self.ingress_since_monitor.saturating_add(1);
-                    if !job.cleanup && self.ingress_since_monitor < 8 {
-                        self.job = Some(job);
-                        return Ok(());
-                    }
-                    self.ingress_since_monitor = 0;
-                }
-            }
-            if job.cleanup
-                && let Err(error) = self.poll_cleanup_readback(job.launch_id, &mut send)
-            {
-                // Readback delivery cannot discard the owned cleanup workflow or
-                // its outstanding dependency request when ingress transport fails.
-                self.job = Some(job);
-                return Err(error);
-            }
-            if let Some(request) = job.pending.take() {
-                if !job.cleanup && job.request.is_some() && Instant::now() >= job.deadline {
-                    let record = self
-                        .records
-                        .values
-                        .get_mut(&job.launch_id)
-                        .expect("workflow record");
-                    record.outstanding_request = Some(request);
-                    record.outstanding_mutation = job.step.mutates_resources();
-                    self.dependency_failed(&mut job, "deadline_exceeded", &mut send)?;
-                    return Ok(());
-                }
-                if job.cleanup && Instant::now() >= job.deadline {
-                    self.records
-                        .values
-                        .get_mut(&job.launch_id)
-                        .expect("workflow record")
-                        .outstanding_request = Some(request);
-                    self.records
-                        .values
-                        .get_mut(&job.launch_id)
-                        .expect("workflow record")
-                        .outstanding_mutation = job.step.mutates_resources();
-                    match self.settle_outstanding(job.launch_id, &mut send) {
-                        Settlement::Ready => {
-                            self.dependency_failed(&mut job, "deadline_exceeded", &mut send)?
-                        }
-                        _ => self.cleanup_failed(
-                            &job,
-                            "request_cancellation_unconfirmed",
-                            &mut send,
-                        )?,
-                    }
-                    return Ok(());
-                }
-                match send(Command::TakeResult { request }) {
-                    Ok(Response::Pending) => {
-                        job.pending = Some(request);
-                        self.job = Some(job);
-                        return Ok(());
-                    }
-                    Ok(Response::Result { payload }) => {
-                        self.consume(&mut job, payload, &mut send)?
-                    }
-                    _ => {
-                        let record = self
-                            .records
-                            .values
-                            .get_mut(&job.launch_id)
-                            .expect("workflow record");
-                        record.outstanding_request = Some(request);
-                        record.outstanding_mutation = job.step.mutates_resources();
-                        if !job.cleanup {
-                            record.cleanup_outcome = Outcome::Failed;
-                        }
-                        if job.step.mutates_resources() {
-                            // Reconcile from the cleanup workflow after the
-                            // provider confirms this exact mutation completed.
-                            self.dependency_failed(&mut job, "dependency_unavailable", &mut send)?;
-                            return Ok(());
-                        }
-                        match self.settle_outstanding(job.launch_id, &mut send) {
-                            Settlement::Ready => self.dependency_failed(
-                                &mut job,
-                                "dependency_unavailable",
-                                &mut send,
-                            )?,
-                            Settlement::Waiting if Instant::now() < job.deadline => {
-                                self.retain(&mut job)?
-                            }
-                            _ => self.cleanup_failed(
-                                &job,
-                                "request_cancellation_unconfirmed",
-                                &mut send,
-                            )?,
-                        }
-                    }
-                }
-            } else {
-                self.dispatch(&mut job, &mut send)?;
-            }
+        self.move_ended_job_to_its_own_lane();
+        for launch in self.retiring_jobs.keys().copied().collect::<Vec<_>>() {
+            self.with_retiring_job(launch, |pipeline| {
+                pipeline.advance_job(&mut send).map(|_| ())
+            })?;
+        }
+        if self.advance_job(&mut send)? {
             return Ok(());
         }
         // Background exit cleanup gets a turn even under continuous ingress.
@@ -425,76 +391,107 @@ impl Pipeline {
             _ => Err("launch poll failed".into()),
         }
     }
-    /// Cleanup advances independently of the initiating request. Keep bounded
-    /// owner-authorized readback available while its native undo is still running.
-    fn poll_cleanup_readback(
-        &mut self,
-        active_launch: u64,
-        send: &mut impl FnMut(Command) -> Transport,
-    ) -> ModuleResult<()> {
-        let Response::Request {
-            id,
-            caller,
-            initiator,
-            service,
-            payload,
-            ..
-        } = send(Command::Poll {})?
-        else {
-            return Ok(());
+    /// Advance the job in the job slot by one step. Returns whether there
+    /// was one.
+    fn advance_job(&mut self, send: &mut impl FnMut(Command) -> Transport) -> ModuleResult<bool> {
+        let Some(mut job) = self.job.take() else {
+            return Ok(false);
         };
-        let operation = self.decode_operation(&service, payload, &caller, &initiator);
-        let response = match operation {
-            Ok(Operation::EpochRead {}) => {
-                serde_json::json!({"ok":true,"operation_epoch":self.records.operation_epoch()})
-            }
-            Ok(Operation::ApplicationRetirementStatus {
-                operation_id,
-                expected_runtime_epoch,
-            }) => {
-                self.application_retirement_status(&caller, &operation_id, &expected_runtime_epoch)
-            }
-            Ok(Operation::RetireOwned {
-                operation_id,
-                expected_runtime_epoch,
-            }) => match self.retire_operation(&caller, &operation_id, &expected_runtime_epoch) {
-                Ok(retirement::RetirementAction::Fenced(response)) => response,
-                Ok(retirement::RetirementAction::Stop(launch_id)) if launch_id == active_launch => {
-                    self.records
-                        .owned(&caller, launch_id)
-                        .map(|record| record.response())
-                        .unwrap_or_else(error)
+        {
+            self.bound_cleanup_deadline(&mut job);
+            if !job.cleanup && job.request.is_none() {
+                let has_readback = match self.poll_detached_readback(&mut job, send) {
+                    Ok(has_readback) => has_readback,
+                    Err(error) => {
+                        // A detached startup owns all pending dependency state even
+                        // when ingress polling or reply delivery temporarily fails.
+                        self.job = Some(job);
+                        return Err(error);
+                    }
+                };
+                if has_readback {
+                    self.ingress_since_monitor = self.ingress_since_monitor.saturating_add(1);
+                    if !job.cleanup && self.ingress_since_monitor < 8 {
+                        self.job = Some(job);
+                        return Ok(true);
+                    }
+                    self.ingress_since_monitor = 0;
                 }
-                Ok(_) => error("workflow_busy"),
-                Err(code) => error(code),
-            },
-            Ok(Operation::VerifyRetirement {
-                owner,
-                launch_id,
-                operation_id,
-            }) => self.verify_retirement(&caller, &owner, launch_id, &operation_id),
-            Ok(Operation::Status { launch_id }) => self
-                .records
-                .owned(&caller, launch_id)
-                .map(|record| record.response())
-                .unwrap_or_else(error),
-            Ok(Operation::Lookup { operation_id }) => self
-                .records
-                .owned_operation(&caller, &operation_id)
-                .map(|record| record.response())
-                .unwrap_or_else(error),
-            Ok(Operation::List { offset, limit }) => self.records.list(&caller, offset, limit),
-            Ok(Operation::Stop { launch_id }) if launch_id == active_launch => self
-                .records
-                .owned(&caller, launch_id)
-                .map(|record| record.response())
-                .unwrap_or_else(error),
-            Ok(_) => error("workflow_busy"),
-            Err(code) => error(code),
-        };
-        complete(send, id, response)
+            }
+            if let Some(request) = job.pending.take() {
+                if !job.cleanup && job.request.is_some() && Instant::now() >= job.deadline {
+                    let record = self
+                        .records
+                        .values
+                        .get_mut(&job.launch_id)
+                        .expect("workflow record");
+                    record.outstanding_request = Some(request);
+                    record.outstanding_mutation = job.step.mutates_resources();
+                    self.dependency_failed(&mut job, "deadline_exceeded", send)?;
+                    return Ok(true);
+                }
+                if job.cleanup && Instant::now() >= job.deadline {
+                    self.records
+                        .values
+                        .get_mut(&job.launch_id)
+                        .expect("workflow record")
+                        .outstanding_request = Some(request);
+                    self.records
+                        .values
+                        .get_mut(&job.launch_id)
+                        .expect("workflow record")
+                        .outstanding_mutation = job.step.mutates_resources();
+                    match self.settle_outstanding(job.launch_id, send) {
+                        Settlement::Ready => {
+                            self.dependency_failed(&mut job, "deadline_exceeded", send)?
+                        }
+                        _ => self.cleanup_failed(&job, "request_cancellation_unconfirmed", send)?,
+                    }
+                    return Ok(true);
+                }
+                match send(Command::TakeResult { request }) {
+                    Ok(Response::Pending) => {
+                        job.pending = Some(request);
+                        self.job = Some(job);
+                        return Ok(true);
+                    }
+                    Ok(Response::Result { payload }) => self.consume(&mut job, payload, send)?,
+                    _ => {
+                        let record = self
+                            .records
+                            .values
+                            .get_mut(&job.launch_id)
+                            .expect("workflow record");
+                        record.outstanding_request = Some(request);
+                        record.outstanding_mutation = job.step.mutates_resources();
+                        if !job.cleanup {
+                            record.cleanup_outcome = Outcome::Failed;
+                        }
+                        if job.step.mutates_resources() {
+                            // Reconcile from the cleanup workflow after the
+                            // provider confirms this exact mutation completed.
+                            self.dependency_failed(&mut job, "dependency_unavailable", send)?;
+                            return Ok(true);
+                        }
+                        match self.settle_outstanding(job.launch_id, send) {
+                            Settlement::Ready => {
+                                self.dependency_failed(&mut job, "dependency_unavailable", send)?
+                            }
+                            Settlement::Waiting if Instant::now() < job.deadline => {
+                                self.retain(&mut job)?
+                            }
+                            _ => {
+                                self.cleanup_failed(&job, "request_cancellation_unconfirmed", send)?
+                            }
+                        }
+                    }
+                }
+            } else {
+                self.dispatch(&mut job, send)?;
+            }
+        }
+        Ok(true)
     }
-
     /// A launch acknowledged at admission remains owned while startup continues.
     /// Serve safe readback and turn an owner Stop into cleanup without abandoning
     /// the outstanding dependency call.
@@ -1081,7 +1078,9 @@ impl Pipeline {
                     Ok(record) => record,
                     Err(code) => return complete(send, request, error(code)),
                 };
-                if record.state.terminal() {
+                if record.state.terminal() || self.retiring_jobs.contains_key(&launch_id) {
+                    // Finished, or its cleanup is already running in its own
+                    // lane: report where it stands instead of stopping twice.
                     return complete(send, request, record.response());
                 }
                 let outcome = if record.state == State::CleanupFailed {
