@@ -10,6 +10,8 @@ extern "C" {
 #define AMATERASU_IDENTITY_UNSUPPORTED 22
 #define AMATERASU_IDENTITY_UNTRUSTED 23
 #define AMATERASU_IDENTITY_MINOR_PERMISSIONS 1
+#define AMATERASU_IDENTITY_MINOR_ENTITLEMENTS 2
+#define AMATERASU_IDENTITY_MAX_ENTITLEMENT_BYTES 128
 #define AMATERASU_IDENTITY_PERMISSION_LIST 1
 #define AMATERASU_IDENTITY_PERMISSION_LAUNCH 2
 #define AMATERASU_IDENTITY_PERMISSION_VIEW 3
@@ -42,6 +44,15 @@ typedef struct {
     AmaterasuIdentityApi v1_0;
     AmaterasuStatus (*check_permission)(void *context, AmaterasuBorrowedBytes certificate_der, uint32_t permission);
 } AmaterasuIdentityApiV1_1;
+
+/* Bind minor 2 and full size. Exact administrator-approved names have a
+ * lower-case reverse-DNS namespace, slash and operation identifier. Only OK
+ * grants access. TLS possession and mapping operations to names are the caller's
+ * responsibility; recheck before effects/delivery. This is not a reservation. */
+typedef struct {
+    AmaterasuIdentityApiV1_1 v1_1;
+    AmaterasuStatus (*check_entitlement)(void *context, AmaterasuBorrowedBytes certificate_der, AmaterasuBorrowedBytes name);
+} AmaterasuIdentityApiV1_2;
 
 #ifdef __cplusplus
 }

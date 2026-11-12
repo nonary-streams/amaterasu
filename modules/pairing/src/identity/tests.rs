@@ -37,6 +37,7 @@ fn document() -> Document {
             certificate_pem: CLIENT_CERT.into(),
             paired_at: 0,
             permissions: crate::protocol::ClientPermissions::default(),
+            entitlements: Vec::new(),
             config_overrides: crate::protocol::ClientConfigOverrides::default(),
         }],
     }
@@ -696,4 +697,373 @@ fn permission_api_reads_current_committed_certificate_policy() {
     assert_eq!(check(PERMISSION_LAUNCH), IDENTITY_UNAVAILABLE);
     assert_eq!(check(PERMISSION_TERMINATE), IDENTITY_UNAVAILABLE);
     unsafe { (api.v1_0.base.release.unwrap())(context) };
+}
+
+#[test]
+fn entitlement_checks_committed_client_policy_and_revocation() {
+    let shared = Arc::new(Shared::default());
+    let factory = Factory::new(shared.clone(), ["transport".into()].into());
+    let query = NativeInterfaceQuery {
+        header: AbiHeader::of::<NativeInterfaceQuery>(),
+        interface_major: INTERFACE_MAJOR,
+        min_minor: INTERFACE_MINOR_ENTITLEMENTS,
+        min_size: size_of::<IdentityApiV1_2>() as u32,
+    };
+    let mut output = std::ptr::null();
+    assert_eq!(
+        unsafe {
+            bind(
+                factory.api.context,
+                BorrowedBytes::new(b"transport"),
+                &query,
+                &mut output,
+            )
+        },
+        STATUS_OK
+    );
+    let api = unsafe { &*output.cast::<IdentityApiV1_2>() };
+    let context = api.v1_1.v1_0.base.context;
+    let client = crypto_certificate_der(CLIENT_CERT);
+    let check = |certificate: &[u8], name: &str| unsafe {
+        (api.check_entitlement)(
+            context,
+            BorrowedBytes::new(certificate),
+            BorrowedBytes::new(name.as_bytes()),
+        )
+    };
+    assert_eq!(check(&client, "org.alpha/read"), IDENTITY_UNAVAILABLE);
+    let mut document = document();
+    shared
+        .publish(1, Snapshot::prepare(&document, time()).unwrap())
+        .unwrap();
+    // The transport's module binding grant is not a client entitlement, even
+    // with legacy permission mode disabled.
+    assert_eq!(check(&client, "org.alpha/read"), IDENTITY_FORBIDDEN);
+    document.clients[0].entitlements = vec!["org.alpha/read".into(), "net.beta/write".into()];
+    shared
+        .publish(2, Snapshot::prepare(&document, time()).unwrap())
+        .unwrap();
+    assert_eq!(check(&client, "org.alpha/read"), STATUS_OK);
+    assert_eq!(check(&client, "net.beta/write"), STATUS_OK);
+    assert_eq!(check(&client, "org.alpha/write"), IDENTITY_FORBIDDEN);
+    assert_eq!(check(&client, "INVALID"), STATUS_INVALID_ARGUMENT);
+    assert_eq!(
+        check(&crypto_certificate_der(HOST_CERT), "org.alpha/read"),
+        IDENTITY_UNTRUSTED
+    );
+    document.clients[0].entitlements.remove(0);
+    shared
+        .publish(3, Snapshot::prepare(&document, time()).unwrap())
+        .unwrap();
+    assert_eq!(check(&client, "org.alpha/read"), IDENTITY_FORBIDDEN);
+    assert_eq!(check(&client, "net.beta/write"), STATUS_OK);
+    shared.invalidate();
+    assert_eq!(check(&client, "net.beta/write"), IDENTITY_UNAVAILABLE);
+    unsafe { (api.v1_1.v1_0.base.release.unwrap())(context) };
+}
+
+// A minimal independent identity provider used only to exercise the same native
+// consumer against an implementation that does not use pairing's snapshot.
+struct AlternativeAuthority {
+    api: IdentityApiV1_2,
+    client: Vec<u8>,
+    policy: std::sync::Mutex<Option<BTreeSet<String>>>,
+}
+unsafe extern "C" fn alternative_unused_certificate(_: *mut c_void, _: ReplySink) -> Status {
+    IDENTITY_UNSUPPORTED
+}
+unsafe extern "C" fn alternative_unused_sign(
+    _: *mut c_void,
+    _: u32,
+    _: BorrowedBytes,
+    _: ReplySink,
+) -> Status {
+    IDENTITY_UNSUPPORTED
+}
+unsafe extern "C" fn alternative_unused_verify(_: *mut c_void, _: BorrowedBytes) -> Status {
+    IDENTITY_UNSUPPORTED
+}
+unsafe extern "C" fn alternative_unused_permission(
+    _: *mut c_void,
+    _: BorrowedBytes,
+    _: u32,
+) -> Status {
+    IDENTITY_UNSUPPORTED
+}
+unsafe extern "C" fn alternative_release(_: *mut c_void) {}
+unsafe extern "C" fn alternative_check(
+    context: *mut c_void,
+    certificate: BorrowedBytes,
+    name: BorrowedBytes,
+) -> Status {
+    // SAFETY: fixture retains the authority and both buffers for the call.
+    let authority = unsafe { &*context.cast::<AlternativeAuthority>() };
+    let (Ok(certificate), Ok(name)) = (unsafe { certificate.read() }, unsafe { name.read() })
+    else {
+        return STATUS_INVALID_ARGUMENT;
+    };
+    let Ok(name) = std::str::from_utf8(name) else {
+        return STATUS_INVALID_ARGUMENT;
+    };
+    if !valid_entitlement(name) {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    let policy = authority.policy.lock().unwrap();
+    let Some(policy) = policy.as_ref() else {
+        return IDENTITY_UNAVAILABLE;
+    };
+    if certificate != authority.client {
+        return IDENTITY_UNTRUSTED;
+    }
+    if policy.contains(name) {
+        STATUS_OK
+    } else {
+        IDENTITY_FORBIDDEN
+    }
+}
+unsafe extern "C" fn alternative_bind(
+    context: *mut c_void,
+    caller: BorrowedBytes,
+    query: *const NativeInterfaceQuery,
+    output: *mut *const NativeInterface,
+) -> Status {
+    // SAFETY: the fixture retains the authority and the consumer provides live arguments.
+    let authority = unsafe { &*context.cast::<AlternativeAuthority>() };
+    let caller = unsafe { caller.read() }.unwrap();
+    let query = unsafe { &*query };
+    unsafe { *output = std::ptr::null() };
+    if caller != b"transport" {
+        return IDENTITY_FORBIDDEN;
+    }
+    if query.interface_major != INTERFACE_MAJOR
+        || query.min_minor > INTERFACE_MINOR_ENTITLEMENTS
+        || query.min_size as usize > size_of::<IdentityApiV1_2>()
+    {
+        return IDENTITY_UNSUPPORTED;
+    }
+    unsafe { *output = &authority.api.v1_1.v1_0.base };
+    STATUS_OK
+}
+impl AlternativeAuthority {
+    fn new(client: Vec<u8>) -> Box<Self> {
+        let mut authority = Box::new(Self {
+            api: IdentityApiV1_2 {
+                v1_1: IdentityApiV1_1 {
+                    v1_0: IdentityApi {
+                        base: NativeInterface {
+                            header: AbiHeader {
+                                minor: INTERFACE_MINOR_ENTITLEMENTS,
+                                ..AbiHeader::of::<IdentityApiV1_2>()
+                            },
+                            context: std::ptr::null_mut(),
+                            release: Some(alternative_release),
+                        },
+                        certificate: alternative_unused_certificate,
+                        sign: alternative_unused_sign,
+                        verify_client: alternative_unused_verify,
+                    },
+                    check_permission: alternative_unused_permission,
+                },
+                check_entitlement: alternative_check,
+            },
+            client,
+            policy: std::sync::Mutex::new(None),
+        });
+        authority.api.v1_1.v1_0.base.context = (&mut *authority as *mut Self).cast();
+        authority
+    }
+    fn factory(&mut self) -> NativeServiceFactory {
+        NativeServiceFactory {
+            header: AbiHeader::of::<NativeServiceFactory>(),
+            context: (self as *mut Self).cast(),
+            bind: Some(alternative_bind),
+        }
+    }
+}
+
+// This consumer uses only the published table and never knows which provider it
+// is bound to. Each call is a new point-in-time check, not a retained lease.
+struct EntitlementConsumer(*const IdentityApiV1_2);
+impl EntitlementConsumer {
+    fn bind(factory: &NativeServiceFactory, caller: &str) -> Result<Self, Status> {
+        let query = NativeInterfaceQuery {
+            header: AbiHeader::of::<NativeInterfaceQuery>(),
+            interface_major: INTERFACE_MAJOR,
+            min_minor: INTERFACE_MINOR_ENTITLEMENTS,
+            min_size: size_of::<IdentityApiV1_2>() as u32,
+        };
+        let mut output = std::ptr::null();
+        // SAFETY: factory and query live through the synchronous bind.
+        let result = unsafe {
+            factory.bind.unwrap()(
+                factory.context,
+                BorrowedBytes::new(caller.as_bytes()),
+                &query,
+                &mut output,
+            )
+        };
+        if result != STATUS_OK {
+            return Err(result);
+        }
+        assert!(!output.is_null());
+        // SAFETY: provider returned a live interface header for this binding.
+        let header = unsafe { (*output).header };
+        assert_eq!(header.major, INTERFACE_MAJOR);
+        assert!(
+            header.minor >= INTERFACE_MINOR_ENTITLEMENTS
+                && header.size as usize >= size_of::<IdentityApiV1_2>()
+        );
+        Ok(Self(output.cast()))
+    }
+    fn check(&self, client: &[u8], name: &str) -> Status {
+        // SAFETY: the bound provider and input bytes remain live for the call.
+        let api = unsafe { &*self.0 };
+        unsafe {
+            (api.check_entitlement)(
+                api.v1_1.v1_0.base.context,
+                BorrowedBytes::new(client),
+                BorrowedBytes::new(name.as_bytes()),
+            )
+        }
+    }
+}
+impl Drop for EntitlementConsumer {
+    fn drop(&mut self) {
+        // SAFETY: one release after all calls, while the provider is live.
+        let base = unsafe { &(*self.0).v1_1.v1_0.base };
+        unsafe { base.release.unwrap()(base.context) };
+    }
+}
+
+#[test]
+fn unchanged_entitlement_consumer_works_with_replacement_authority() {
+    let client = crypto_certificate_der(CLIENT_CERT);
+    let shared = Arc::new(Shared::default());
+    let selected = Factory::new(shared.clone(), ["transport".into()].into());
+    let mut alternative = AlternativeAuthority::new(client.clone());
+    let replacement = alternative.factory();
+    for factory in [&selected.api, &replacement] {
+        assert!(matches!(
+            EntitlementConsumer::bind(factory, "other-module"),
+            Err(IDENTITY_FORBIDDEN)
+        ));
+    }
+    let consumers = [
+        EntitlementConsumer::bind(&selected.api, "transport").unwrap(),
+        EntitlementConsumer::bind(&replacement, "transport").unwrap(),
+    ];
+    for consumer in &consumers {
+        assert_eq!(
+            consumer.check(&client, "org.alpha/read"),
+            IDENTITY_UNAVAILABLE
+        );
+    }
+    let mut doc = document();
+    shared
+        .publish(1, Snapshot::prepare(&doc, time()).unwrap())
+        .unwrap();
+    *alternative.policy.lock().unwrap() = Some(BTreeSet::new());
+    for consumer in &consumers {
+        // Binding permission for the module does not grant its remote client.
+        assert_eq!(
+            consumer.check(&client, "org.alpha/read"),
+            IDENTITY_FORBIDDEN
+        );
+        assert_eq!(
+            consumer.check(&client, "net.unknown/act"),
+            IDENTITY_FORBIDDEN
+        );
+    }
+    doc.clients[0].entitlements = vec!["org.alpha/read".into(), "net.beta/write".into()];
+    shared
+        .publish(2, Snapshot::prepare(&doc, time()).unwrap())
+        .unwrap();
+    *alternative.policy.lock().unwrap() =
+        Some(doc.clients[0].entitlements.iter().cloned().collect());
+    for consumer in &consumers {
+        for _ in 0..2 {
+            assert_eq!(consumer.check(&client, "org.alpha/read"), STATUS_OK);
+            assert_eq!(consumer.check(&client, "net.beta/write"), STATUS_OK);
+            assert_eq!(
+                consumer.check(&client, "net.unknown/act"),
+                IDENTITY_FORBIDDEN
+            );
+        }
+    }
+    doc.clients[0].entitlements.remove(0);
+    shared
+        .publish(3, Snapshot::prepare(&doc, time()).unwrap())
+        .unwrap();
+    *alternative.policy.lock().unwrap() =
+        Some(doc.clients[0].entitlements.iter().cloned().collect());
+    for consumer in &consumers {
+        assert_eq!(
+            consumer.check(&client, "org.alpha/read"),
+            IDENTITY_FORBIDDEN
+        );
+        assert_eq!(consumer.check(&client, "net.beta/write"), STATUS_OK);
+    }
+    shared.invalidate();
+    *alternative.policy.lock().unwrap() = None;
+    for consumer in &consumers {
+        assert_eq!(
+            consumer.check(&client, "net.beta/write"),
+            IDENTITY_UNAVAILABLE
+        );
+    }
+}
+
+#[test]
+fn entitlement_check_revalidates_client_time_and_snapshot() {
+    let client = crypto_certificate_der(CLIENT_CERT);
+    let mut doc = document();
+    doc.clients[0].entitlements = vec!["org.alpha/read".into()];
+    let initial = time();
+    let mut snapshot = Snapshot::prepare(&doc, initial).unwrap().unwrap();
+    Arc::get_mut(&mut snapshot)
+        .unwrap()
+        .set_client_expiry_for_test(initial + 1);
+    let shared = Shared::default();
+    shared.publish(1, Some(snapshot)).unwrap();
+    assert_eq!(
+        check_entitlement_current(&shared, &client, "org.alpha/read", initial, || Ok(initial)),
+        Ok(())
+    );
+    assert_eq!(
+        check_entitlement_current(&shared, &client, "org.alpha/read", initial, || Ok(
+            initial + 1
+        )),
+        Err(IDENTITY_UNTRUSTED)
+    );
+    assert_eq!(
+        check_entitlement_current(&shared, &client, "org.alpha/read", initial, || {
+            shared.invalidate();
+            Ok(initial)
+        }),
+        Err(IDENTITY_UNAVAILABLE)
+    );
+}
+
+unsafe extern "C" fn old_provider_bind(
+    _: *mut c_void,
+    _: BorrowedBytes,
+    _: *const NativeInterfaceQuery,
+    output: *mut *const NativeInterface,
+) -> Status {
+    // SAFETY: consumer supplies a live output pointer.
+    unsafe { *output = std::ptr::null() };
+    IDENTITY_UNSUPPORTED
+}
+
+#[test]
+fn entitlement_consumer_denies_provider_without_version_1_2() {
+    let old = NativeServiceFactory {
+        header: AbiHeader::of::<NativeServiceFactory>(),
+        context: std::ptr::null_mut(),
+        bind: Some(old_provider_bind),
+    };
+    assert!(matches!(
+        EntitlementConsumer::bind(&old, "transport"),
+        Err(IDENTITY_UNSUPPORTED)
+    ));
 }

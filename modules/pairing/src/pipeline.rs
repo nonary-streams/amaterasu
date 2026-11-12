@@ -135,6 +135,10 @@ enum HostConfigurationState {
         paths: EffectiveIdentityPaths,
         expected_revision: u64,
     },
+    #[expect(
+        dead_code,
+        reason = "Exact mutation identity retained when expiry cannot prove provider retirement"
+    )]
     UncertainMigrationMarkerDelete {
         request: u64,
         paths: EffectiveIdentityPaths,
@@ -349,9 +353,6 @@ impl Pipeline {
         now: u64,
         send: &mut impl FnMut(Command) -> Transport,
     ) -> ModuleResult<bool> {
-        if self.host_result.is_some() {
-            return self.release_host_result(now, send);
-        }
         if self.shutdown_announced {
             // A ready identity remains available to draining consumers, but
             // refresh and provisioning cannot start more background work.
@@ -359,6 +360,9 @@ impl Pipeline {
                 self.host_configuration,
                 HostConfigurationState::Disabled | HostConfigurationState::Ready { .. }
             ));
+        }
+        if self.host_result.is_some() {
+            return self.release_host_result(now, send);
         }
         if matches!(
             self.host_configuration,
@@ -524,10 +528,7 @@ impl Pipeline {
                     request,
                     paths,
                     expected_revision,
-                } = std::mem::replace(
-                    &mut self.host_configuration,
-                    HostConfigurationState::Start,
-                )
+                } = std::mem::replace(&mut self.host_configuration, HostConfigurationState::Start)
                 else {
                     return Ok(false);
                 };
@@ -677,30 +678,25 @@ impl Pipeline {
         now: u64,
         send: &mut impl FnMut(Command) -> Transport,
     ) -> ModuleResult<bool> {
-        let (request, deleting_marker) = match &self.host_configuration {
-            HostConfigurationState::WaitingPairingState { request, .. } => (*request, false),
+        let (request, action) = match &self.host_configuration {
+            HostConfigurationState::WaitingPairingState { request, .. } => {
+                (*request, HostResultAction::PairingState)
+            }
             HostConfigurationState::WaitingMigrationMarkerDelete { request, .. } => {
-                (*request, true)
+                (*request, HostResultAction::MarkerDelete)
             }
             _ => return Ok(false),
         };
         match send(Command::TakeResult { request }) {
-            Ok(Response::Pending) => Ok(false),
-            Ok(Response::Result { payload }) if deleting_marker => {
-                self.finish_imported_identity_marker_delete(payload, now)
+            Ok(result @ Response::Result { .. }) | Ok(result @ Response::Error { .. }) => {
+                self.host_result = Some(RetainedHostResult {
+                    request,
+                    response: result,
+                    action,
+                });
+                self.release_host_result(now, send)
             }
-            Ok(Response::Result { payload }) => {
-                self.consume_pairing_state_snapshot_page(payload, now, send)
-            }
-            _ if deleting_marker => {
-                // A broker failure or expiry cannot prove that a delivered
-                // delete has stopped executing. Preserve its exact identity.
-                Ok(false)
-            }
-            _ => {
-                self.fail_host_configuration(now);
-                Ok(false)
-            }
+            _ => Ok(false),
         }
     }
 
@@ -1514,6 +1510,9 @@ impl Pipeline {
             }
             | Operation::SetPermissionMode {
                 expected_revision, ..
+            }
+            | Operation::UpdateClientEntitlements {
+                expected_revision, ..
             } => Some(*expected_revision),
             Operation::Unpair {
                 expected_revision, ..
@@ -1675,7 +1674,24 @@ impl Pipeline {
         send: &mut impl FnMut(Command) -> Transport,
     ) -> ModuleResult<()> {
         if let Some((request, stale, configuration_revision)) = self.recovery_request.take() {
-            match send(Command::TakeResult { request })? {
+            let result = match self.recovery_result.take() {
+                Some(result) => result,
+                None => match send(Command::TakeResult { request }) {
+                    Ok(result @ Response::Result { .. }) | Ok(result @ Response::Error { .. }) => {
+                        result
+                    }
+                    _ => {
+                        self.recovery_request = Some((request, stale, configuration_revision));
+                        return Ok(());
+                    }
+                },
+            };
+            if !result_released(send(Command::ReleaseResult { request })) {
+                self.recovery_request = Some((request, stale, configuration_revision));
+                self.recovery_result = Some(result);
+                return Ok(());
+            }
+            match result {
                 Response::Pending => {
                     self.recovery_request = Some((request, stale, configuration_revision));
                     return Ok(());

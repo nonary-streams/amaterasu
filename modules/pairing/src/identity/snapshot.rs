@@ -84,6 +84,7 @@ struct CertificateRecord {
     not_before: u64,
     not_after: u64,
     permissions: crate::protocol::ClientPermissions,
+    entitlements: Vec<String>,
 }
 impl CertificateRecord {
     fn parse(certificate: &Certificate) -> Result<Self, &'static str> {
@@ -94,6 +95,7 @@ impl CertificateRecord {
         Ok(Self {
             der,
             permissions: crate::protocol::ClientPermissions::default(),
+            entitlements: Vec::new(),
             not_before: certificate
                 .tbs_certificate
                 .validity
@@ -189,6 +191,7 @@ impl Snapshot {
                     &crypto::parse_certificate(&client.certificate_pem, None)?.certificate,
                 )?;
                 record.permissions = client.permissions;
+                record.entitlements = client.entitlements.clone();
                 Ok(record)
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -198,6 +201,11 @@ impl Snapshot {
             clients,
             permission_mode_enabled: document.permission_mode_enabled,
         }))
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_client_expiry_for_test(&mut self, expiry: u64) {
+        self.clients[0].not_after = expiry;
     }
 
     pub fn certificate(&self) -> &[u8] {
@@ -226,6 +234,22 @@ impl Snapshot {
                 _ => unreachable!(),
             };
         if allowed {
+            Ok(())
+        } else {
+            Err(IDENTITY_FORBIDDEN)
+        }
+    }
+
+    pub fn check_entitlement(&self, der: &[u8], now: u64, name: &str) -> Result<(), Status> {
+        if !valid_entitlement(name) {
+            return Err(amaterasu_module_sdk::abi::STATUS_INVALID_ARGUMENT);
+        }
+        let client = self
+            .clients
+            .iter()
+            .find(|client| client.der == der && client.valid(now))
+            .ok_or(IDENTITY_UNTRUSTED)?;
+        if client.entitlements.iter().any(|approved| approved == name) {
             Ok(())
         } else {
             Err(IDENTITY_FORBIDDEN)

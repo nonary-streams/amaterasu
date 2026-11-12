@@ -28,6 +28,7 @@ pub mod process;
 pub mod processing;
 pub mod processing_composition;
 pub mod processing_provider;
+pub mod protocol_handler;
 pub mod requests;
 pub mod retained_options;
 pub mod retirement;

@@ -3637,3 +3637,48 @@ fn uncertain_write_recovery_observes_committed_unpair() {
             .verify_client(&client, now())
     );
 }
+
+#[test]
+fn entitlements_require_admin_revision_and_survive_restart() {
+    let mut state = Harness::new();
+    let mut pipeline = Pipeline::new(settings());
+    state.initialize(&mut pipeline);
+    import_client(&mut state, &mut pipeline, "client", CLIENT_CERT);
+    let listed = state.request(
+        &mut pipeline,
+        "console",
+        json!({"action":"list_clients"}),
+        now(),
+    );
+    let certificate_id = listed["clients"][0]["certificate_id"].clone();
+    let revision = listed["revision"].as_u64().unwrap();
+    let update = json!({"action":"update_client_entitlements", "certificate_id":certificate_id, "entitlements":["org.alpha/read", "net.beta/write"], "expected_revision":revision});
+    assert_eq!(
+        state.request(&mut pipeline, "nvhttp", update.clone(), now())["code"],
+        "forbidden"
+    );
+    assert_eq!(
+        state.request(&mut pipeline, "console", update.clone(), now())["ok"],
+        true
+    );
+    assert_eq!(
+        state.request(&mut pipeline, "console", update, now())["code"],
+        "revision_conflict"
+    );
+    let invalid = json!({"action":"update_client_entitlements", "certificate_id":certificate_id, "entitlements":["org.alpha/read", "org.alpha/read"], "expected_revision":state.revision});
+    assert_eq!(
+        state.request(&mut pipeline, "console", invalid, now())["ok"],
+        false
+    );
+    let mut restarted = Pipeline::new(settings());
+    let listed = state.request(
+        &mut restarted,
+        "console",
+        json!({"action":"list_clients"}),
+        now(),
+    );
+    assert_eq!(
+        listed["clients"][0]["entitlements"],
+        json!(["org.alpha/read", "net.beta/write"])
+    );
+}

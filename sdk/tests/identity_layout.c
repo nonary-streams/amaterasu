@@ -8,3 +8,7 @@ _Static_assert(sizeof(AmaterasuIdentityApiV1_1) == 64, "identity 1.1 table layou
 _Static_assert(offsetof(AmaterasuIdentityApiV1_1, v1_0) == 0, "identity 1.0 prefix");
 _Static_assert(offsetof(AmaterasuIdentityApiV1_1, check_permission) == 56, "permission offset");
 #endif
+#if UINTPTR_MAX == UINT64_MAX
+_Static_assert(sizeof(AmaterasuIdentityApiV1_2) == 72, "identity 1.2 table layout");
+_Static_assert(offsetof(AmaterasuIdentityApiV1_2, check_entitlement) == 64, "entitlement offset");
+#endif

@@ -12,64 +12,121 @@ impl Pipeline {
                 self.pending = Some(pending);
                 ready = false;
             } else {
-            match pending.state_request {
-                Some(request) => {
-                    let result = match pending.result.take() {
-                        Some(result) => Some(result),
-                        None => match send(Command::TakeResult { request }) {
-                            Ok(result @ Response::Result { .. })
-                            | Ok(result @ Response::Error { .. }) => Some(result),
-                            _ => None,
-                        },
-                    };
-                    if let Some(result) = result {
-                        if result_released(send(Command::ReleaseResult { request })) {
-                            if mutation && matches!(result, Response::Error { .. }) {
-                                self.identity.invalidate();
-                                self.recovery_needed = true;
-                                pending.provider_retirement_uncertain = true;
+                match pending.state_request {
+                    Some(request) => {
+                        let result = match pending.result.take() {
+                            Some(result) => Some(result),
+                            None => match send(Command::TakeResult { request }) {
+                                Ok(result @ Response::Result { .. })
+                                | Ok(result @ Response::Error { .. }) => Some(result),
+                                _ => None,
+                            },
+                        };
+                        if let Some(result) = result {
+                            if result_released(send(Command::ReleaseResult { request })) {
+                                if mutation && matches!(result, Response::Error { .. }) {
+                                    self.identity.invalidate();
+                                    self.recovery_needed = true;
+                                    pending.provider_retirement_uncertain = true;
+                                    self.pending = Some(pending);
+                                    ready = false;
+                                } else if mutation {
+                                    self.identity.invalidate();
+                                    self.recovery_needed = true;
+                                }
+                            } else {
+                                pending.result = Some(result);
                                 self.pending = Some(pending);
                                 ready = false;
-                            } else if mutation {
-                                self.identity.invalidate();
-                                self.recovery_needed = true;
                             }
                         } else {
-                            pending.result = Some(result);
-                            self.pending = Some(pending);
-                            ready = false;
-                        }
-                    } else {
-                        self.pending = Some(pending);
-                        ready = false;
-                    }
-                }
-                None if mutation && pending.admission_uncertain => {
-                    match lookup(&pending.command, pending.first_sent, &mut send) {
-                        Lookup::Found(id) => {
-                            pending.state_request = Some(id);
-                            self.pending = Some(pending);
-                            ready = false;
-                        }
-                        Lookup::NotAdmitted => {}
-                        Lookup::Unknown => {
                             self.pending = Some(pending);
                             ready = false;
                         }
                     }
+                    None if mutation && pending.admission_uncertain => {
+                        match lookup(&pending.command, pending.first_sent, &mut send) {
+                            Lookup::Found(id) => {
+                                pending.state_request = Some(id);
+                                self.pending = Some(pending);
+                                ready = false;
+                            }
+                            Lookup::NotAdmitted => {}
+                            Lookup::Unknown => {
+                                self.pending = Some(pending);
+                                ready = false;
+                            }
+                        }
+                    }
+                    None => {}
                 }
-                None => {}
-            }
             }
         }
-        if let HostConfigurationState::WaitingMigrationMarkerDelete { request, .. } =
-            &self.host_configuration
-        {
-            match send(Command::TakeResult { request: *request }) {
-                Ok(Response::Result { .. }) => {
-                    self.host_configuration = HostConfigurationState::Disabled;
+        // Retain host results until the broker acknowledges release. Shutdown
+        // must never consume them through normal paths that start migration work.
+        if self.host_result.is_none() {
+            let waiting = match &self.host_configuration {
+                HostConfigurationState::WaitingReadiness(request) => {
+                    Some((*request, HostResultAction::Readiness))
                 }
-                _ => ready = false,
+                HostConfigurationState::WaitingGet(request) => {
+                    Some((*request, HostResultAction::Get))
+                }
+                HostConfigurationState::WaitingPairingState { request, .. } => {
+                    Some((*request, HostResultAction::PairingState))
+                }
+                HostConfigurationState::WaitingMigrationMarkerDelete { request, .. } => {
+                    Some((*request, HostResultAction::MarkerDelete))
+                }
+                HostConfigurationState::UncertainMigrationMarkerDelete { .. } => {
+                    ready = false;
+                    None
+                }
+                _ => None,
+            };
+            if let Some((request, action)) = waiting {
+                match send(Command::TakeResult { request }) {
+                    Ok(response @ Response::Result { .. })
+                    | Ok(response @ Response::Error { .. }) => {
+                        self.host_result = Some(RetainedHostResult {
+                            request,
+                            response,
+                            action,
+                        });
+                    }
+                    _ => ready = false,
+                }
+            }
+        }
+        if let Some(result) = self.host_result.take() {
+            if !result_released(send(Command::ReleaseResult {
+                request: result.request,
+            })) {
+                self.host_result = Some(result);
+                ready = false;
+            } else if matches!(result.action, HostResultAction::MarkerDelete)
+                && matches!(result.response, Response::Error { .. })
+            {
+                let previous = std::mem::replace(
+                    &mut self.host_configuration,
+                    HostConfigurationState::Disabled,
+                );
+                if let HostConfigurationState::WaitingMigrationMarkerDelete {
+                    request,
+                    paths,
+                    expected_revision,
+                } = previous
+                {
+                    self.host_configuration =
+                        HostConfigurationState::UncertainMigrationMarkerDelete {
+                            request,
+                            paths,
+                            expected_revision,
+                        };
+                }
+                ready = false;
+            } else {
+                self.host_configuration = HostConfigurationState::Disabled;
             }
         }
         if let HostConfigurationState::SubmittingMigrationMarkerDelete {
@@ -104,11 +161,21 @@ impl Pipeline {
             }
         }
         if let Some((request, _, _)) = self.recovery_request {
-            match send(Command::TakeResult { request }) {
-                Ok(Response::Result { .. } | Response::Error { .. }) => {
-                    self.recovery_request = None;
+            if self.recovery_result.is_none() {
+                match send(Command::TakeResult { request }) {
+                    Ok(result @ Response::Result { .. }) | Ok(result @ Response::Error { .. }) => {
+                        self.recovery_result = Some(result)
+                    }
+                    _ => ready = false,
                 }
-                _ => ready = false,
+            }
+            if self.recovery_result.is_some() {
+                if result_released(send(Command::ReleaseResult { request })) {
+                    self.recovery_request = None;
+                    self.recovery_result = None;
+                } else {
+                    ready = false;
+                }
             }
         }
         if let Some(stage) = self.pairing_notice.take() {
@@ -126,7 +193,13 @@ impl Pipeline {
                 },
                 PairingNoticeStage::Waiting(request) => {
                     match send(Command::TakeResult { request }) {
-                        Ok(Response::Result { .. }) => None,
+                        Ok(Response::Result { .. } | Response::Error { .. }) => {
+                            if result_released(send(Command::ReleaseResult { request })) {
+                                None
+                            } else {
+                                Some(PairingNoticeStage::Releasing(request))
+                            }
+                        }
                         _ => Some(PairingNoticeStage::Waiting(request)),
                     }
                 }
@@ -433,6 +506,57 @@ mod tests {
         assert!(pipeline.quiesce_broker(|command| {
             assert!(matches!(command, Command::LookupRequest { .. }));
             Ok(Response::error("not_found", "not admitted"))
+        }));
+    }
+}
+
+#[cfg(test)]
+mod retained_read_tests {
+    use super::*;
+    #[test]
+    fn recovery_result_release_retries_without_retaking_or_publishing() {
+        let mut pipeline = Pipeline::new(Settings::default());
+        pipeline.recovery_request = Some((91, false, None));
+        let result = Response::Result {
+            payload: json!({"ok":true,"revision":1,"value":{}}),
+        };
+        let mut takes = 0;
+        assert!(!pipeline.quiesce_broker(|command| match command {
+            Command::TakeResult { request: 91 } => {
+                takes += 1;
+                Ok(result.clone())
+            }
+            Command::ReleaseResult { request: 91 } => Err("lost release acknowledgement".into()),
+            _ => panic!("unexpected command"),
+        }));
+        assert_eq!(takes, 1);
+        assert!(pipeline.quiesce_broker(|command| {
+            assert!(matches!(command, Command::ReleaseResult { request: 91 }));
+            Ok(Response::Ok)
+        }));
+        assert!(pipeline.recovery_result.is_none());
+        assert!(pipeline.recovery_request.is_none());
+    }
+    #[test]
+    fn retained_host_result_cannot_start_background_work_after_shutdown_announcement() {
+        let mut pipeline = Pipeline::new(Settings::default());
+        pipeline.host_result = Some(RetainedHostResult {
+            request: 92,
+            response: Response::Result {
+                payload: json!({"ok":true,"ready":true}),
+            },
+            action: HostResultAction::Readiness,
+        });
+        pipeline.host_configuration = HostConfigurationState::WaitingReadiness(92);
+        pipeline.prepare_shutdown();
+        assert!(
+            !pipeline
+                .advance_host_configuration(0, &mut |_| panic!("cannot start work"))
+                .unwrap()
+        );
+        assert!(pipeline.quiesce_broker(|command| {
+            assert!(matches!(command, Command::ReleaseResult { request: 92 }));
+            Ok(Response::Ok)
         }));
     }
 }

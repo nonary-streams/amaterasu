@@ -149,6 +149,24 @@ impl Engine {
                 permissions,
                 ..
             } => Self::update_client_permissions(document, &certificate_id, permissions, now),
+            Operation::UpdateClientEntitlements {
+                certificate_id,
+                entitlements,
+                ..
+            } => {
+                let mut document = document;
+                let client = document
+                    .clients
+                    .iter_mut()
+                    .find(|client| client.certificate_id == certificate_id)
+                    .ok_or("not_paired")?;
+                client.entitlements = entitlements;
+                write(
+                    document,
+                    json!({"ok":true,"certificate_id":certificate_id}),
+                    now,
+                )
+            }
             Operation::SetPermissionMode { enabled, .. } => {
                 let mut document = document;
                 document.permission_mode_enabled = enabled;
@@ -238,6 +256,7 @@ impl Engine {
             certificate_pem,
             paired_at: now,
             permissions: ClientPermissions::default(),
+            entitlements: Vec::new(),
             config_overrides: ClientConfigOverrides::default(),
         });
         write(document, response, now)
@@ -298,6 +317,7 @@ impl Engine {
                     certificate_pem: pem,
                     paired_at: 0,
                     permissions: ClientPermissions::default(),
+                    entitlements: Vec::new(),
                     config_overrides: ClientConfigOverrides::default(),
                 },
                 salt,
@@ -475,6 +495,7 @@ fn client_metadata(document: &Document) -> Value {
                 "name": client.name,
                 "paired_at": client.paired_at,
                 "permissions": client.permissions,
+                "entitlements": client.entitlements,
                 "config_overrides": client.config_overrides
             })
         })
@@ -525,6 +546,7 @@ mod authorization_tests {
                 certificate_pem: pem.into(),
                 paired_at: expires - 1,
                 permissions: ClientPermissions::default(),
+                entitlements: Vec::new(),
                 config_overrides: ClientConfigOverrides::default(),
             }],
             permission_mode_enabled: false,
