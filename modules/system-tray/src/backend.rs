@@ -715,7 +715,7 @@ mod tests {
     fn notice() -> UpdateNotice {
         UpdateNotice::parse(
             "v2.0.0".into(),
-            "https://github.com/Nonary/amaterasu/releases/tag/v2.0.0".into(),
+            "https://github.com/nonary-streams/amaterasu/releases/tag/v2.0.0".into(),
         )
         .unwrap()
     }
@@ -897,7 +897,7 @@ mod tests {
     #[test]
     fn native_menu_and_notification_events_translate_to_typed_values() {
         let release_url = Mutex::new(Some(
-            "https://github.com/Nonary/amaterasu/releases/tag/v2.0.0".into(),
+            "https://github.com/nonary-streams/amaterasu/releases/tag/v2.0.0".into(),
         ));
         assert_eq!(
             translate_event(ldtray::Event::Menu(ldtray::MenuId(3)), &release_url),

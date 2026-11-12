@@ -8,16 +8,12 @@ namespace Amaterasu {
   }
 
   const maximumUpdateCheckIntervalSeconds = 0x7fff_ffff;
-  // Releases are published under the organization the repository moved to. A
-  // host built before the move still reports the address it had then.
-  const releasePagePrefixes = [
-    "https://github.com/nonary-streams/amaterasu/releases/tag/",
-    "https://github.com/Nonary/amaterasu/releases/tag/",
-  ] as const;
+  // The only address a release page is accepted from. The host's updater
+  // and tray hold reported pages to the same one.
+  const releasePagePrefix = "https://github.com/nonary-streams/amaterasu/releases/tag/";
 
   function isReleasePage(value: unknown): value is string {
-    return typeof value === "string" &&
-      releasePagePrefixes.some((prefix) => value.startsWith(prefix)) &&
+    return typeof value === "string" && value.startsWith(releasePagePrefix) &&
       !/[\u0000-\u0020\u007f-\u009f]/u.test(value);
   }
   const updaterRenderGenerations = new WeakMap<HTMLElement, number>();

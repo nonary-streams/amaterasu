@@ -398,12 +398,13 @@ mod tests {
         );
         assert_eq!(
             serde_json::to_value(TrayEvent::OpenRelease {
-                release_url: "https://github.com/Nonary/amaterasu/releases/tag/v2.0.0".into(),
+                release_url: "https://github.com/nonary-streams/amaterasu/releases/tag/v2.0.0"
+                    .into(),
             })
             .unwrap(),
             json!({
                 "kind":"open_release",
-                "release_url":"https://github.com/Nonary/amaterasu/releases/tag/v2.0.0"
+                "release_url":"https://github.com/nonary-streams/amaterasu/releases/tag/v2.0.0"
             })
         );
     }

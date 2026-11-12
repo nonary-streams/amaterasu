@@ -117,6 +117,19 @@ test("updater status accepts selected release and delivery states", () => {
     available_update: null,
     notification: null,
   }));
+  // A release page under the repository's former owner is not the project's.
+  assert.throws(() => updater.parseUpdaterStatusReply({
+    ok: true,
+    settings_ready: true,
+    revision: 4,
+    check_in_progress: false,
+    last_check_unix_ms: null,
+    last_error: null,
+    latest_stable: { version: "v2.0.0", url: "https://github.com/Nonary/amaterasu/releases/tag/v2.0.0" },
+    latest_prerelease: null,
+    available_update: null,
+    notification: null,
+  }));
 });
 
 test("updater status accepts release pages where the repository lives now and where it used to", () => {
@@ -133,8 +146,6 @@ test("updater status accepts release pages where the repository lives now and wh
     notification: null,
   };
   const current = "https://github.com/nonary-streams/amaterasu/releases/tag/v2.1.0";
-  // What a host built before the repository moved still reports.
-  const former = "https://github.com/Nonary/amaterasu/releases/tag/v2.1.0";
   const everywhere = (url) => ({
     ...quiet,
     latest_stable: { version: "v2.1.0", url },
@@ -142,15 +153,14 @@ test("updater status accepts release pages where the repository lives now and wh
     available_update: { version: "v2.1.0", release_url: url, prerelease: false },
     notification: { version: "v2.1.0", prerelease: false, release_url: url, delivery: "pending" },
   });
-  for (const url of [current, former]) {
-    const status = updater.parseUpdaterStatusReply(everywhere(url));
-    assert.equal(status.latest_stable.url, url);
-    assert.equal(status.latest_prerelease.url, url);
-    assert.equal(status.available_update.release_url, url);
-    assert.equal(status.notification.release_url, url);
-  }
+  const status = updater.parseUpdaterStatusReply(everywhere(current));
+  assert.equal(status.latest_stable.url, current);
+  assert.equal(status.latest_prerelease.url, current);
+  assert.equal(status.available_update.release_url, current);
+  assert.equal(status.notification.release_url, current);
   // Each place a release page is reported is held to the same addresses.
   for (const url of [
+    "https://github.com/Nonary/amaterasu/releases/tag/v2.1.0",
     "https://github.com/nonary-streams/amaterasu-input/releases/tag/v2.1.0",
     "https://github.com/someone-else/amaterasu/releases/tag/v2.1.0",
     "https://github.com/nonary-streams/amaterasu/releases/latest",

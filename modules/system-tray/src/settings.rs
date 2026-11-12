@@ -77,7 +77,7 @@ fn validate_release_url(release_url: &str) -> Result<(), &'static str> {
         return Err("invalid_release_url");
     }
 
-    const RELEASE_PREFIX: &str = "https://github.com/Nonary/amaterasu/releases/";
+    const RELEASE_PREFIX: &str = "https://github.com/nonary-streams/amaterasu/releases/";
     let Some(release_path) = release_url.strip_prefix(RELEASE_PREFIX) else {
         return Err("invalid_release_url");
     };
@@ -100,7 +100,7 @@ fn validate_release_url(release_url: &str) -> Result<(), &'static str> {
         || url.query().is_some()
         || url.fragment().is_some()
         || path_segments.len() < 4
-        || path_segments[0] != "Nonary"
+        || path_segments[0] != "nonary-streams"
         || path_segments[1] != "amaterasu"
         || path_segments[2] != "releases"
         || path_segments[3].is_empty()
@@ -124,7 +124,7 @@ mod tests {
     fn accepts_the_updaters_canonical_release_page() {
         let notice = UpdateNotice::parse(
             "v2.0.0-beta.1".into(),
-            "https://github.com/Nonary/amaterasu/releases/tag/v2.0.0-beta.1".into(),
+            "https://github.com/nonary-streams/amaterasu/releases/tag/v2.0.0-beta.1".into(),
         )
         .unwrap();
 
@@ -132,7 +132,7 @@ mod tests {
         assert!(
             UpdateNotice::parse(
                 "v2.0.0 release".into(),
-                "https://github.com/Nonary/amaterasu/releases/tag/v2.0.0".into(),
+                "https://github.com/nonary-streams/amaterasu/releases/tag/v2.0.0".into(),
             )
             .is_ok()
         );
@@ -141,15 +141,17 @@ mod tests {
     #[test]
     fn rejects_untrusted_or_malformed_release_urls() {
         for url in [
-            "http://github.com/Nonary/amaterasu/releases/tag/v2.0.0",
-            "https://github.com.evil.test/Nonary/amaterasu/releases/tag/v2.0.0",
-            "https://evil.test/Nonary/amaterasu/releases/tag/v2.0.0",
-            "https://user@github.com/Nonary/amaterasu/releases/tag/v2.0.0",
+            "http://github.com/nonary-streams/amaterasu/releases/tag/v2.0.0",
+            "https://github.com.evil.test/nonary-streams/amaterasu/releases/tag/v2.0.0",
+            "https://evil.test/nonary-streams/amaterasu/releases/tag/v2.0.0",
+            "https://user@github.com/nonary-streams/amaterasu/releases/tag/v2.0.0",
             "https://github.com/Other/amaterasu/releases/tag/v2.0.0",
-            "https://github.com/Nonary/amaterasu/releases?tag=v2.0.0",
-            "https://github.com/Nonary/amaterasu/releases/tag/v2.0.0#notes",
-            "https://github.com:443/Nonary/amaterasu/releases/tag/v2.0.0",
-            "https://GitHub.com/Nonary/amaterasu/releases/tag/v2.0.0",
+            "https://github.com/Nonary/amaterasu/releases/tag/v2.0.0",
+            "https://github.com/nonary-streams/other/releases/tag/v2.0.0",
+            "https://github.com/nonary-streams/amaterasu/releases?tag=v2.0.0",
+            "https://github.com/nonary-streams/amaterasu/releases/tag/v2.0.0#notes",
+            "https://github.com:443/nonary-streams/amaterasu/releases/tag/v2.0.0",
+            "https://GitHub.com/nonary-streams/amaterasu/releases/tag/v2.0.0",
             "not a url",
         ] {
             assert_eq!(
@@ -165,7 +167,7 @@ mod tests {
         assert_eq!(
             UpdateNotice::parse(
                 "v2.0.0\ntrusted".into(),
-                "https://github.com/Nonary/amaterasu/releases/tag/v2.0.0".into(),
+                "https://github.com/nonary-streams/amaterasu/releases/tag/v2.0.0".into(),
             )
             .unwrap_err(),
             "invalid_version"
@@ -174,7 +176,7 @@ mod tests {
             UpdateNotice::parse(
                 "v2.0.0".into(),
                 format!(
-                    "https://github.com/Nonary/amaterasu/releases/tag/{}",
+                    "https://github.com/nonary-streams/amaterasu/releases/tag/{}",
                     "x".repeat(2048)
                 ),
             )

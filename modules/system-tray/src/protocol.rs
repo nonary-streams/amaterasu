@@ -83,7 +83,7 @@ mod tests {
         let notify: Operation = serde_json::from_value(json!({
             "action":"notify_update",
             "version":"v2.0.0",
-            "release_url":"https://github.com/Nonary/amaterasu/releases/tag/v2.0.0"
+            "release_url":"https://github.com/nonary-streams/amaterasu/releases/tag/v2.0.0"
         }))
         .unwrap();
         assert!(notify.authorized_for(UPDATER_CALLER));

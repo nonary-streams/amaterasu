@@ -7,9 +7,12 @@ use std::io::Read;
 use std::time::Duration;
 use ureq::Agent;
 
+/// The project's releases. GitHub reports each release page under the
+/// repository's current owner, so both constants must name the same one: a
+/// feed whose pages are under another owner yields no release at all.
 const RELEASES_ENDPOINT: &str =
-    "https://api.github.com/repos/Nonary/amaterasu/releases?per_page=100";
-const RELEASE_URL_PREFIX: &str = "https://github.com/Nonary/amaterasu/releases/tag/";
+    "https://api.github.com/repos/nonary-streams/amaterasu/releases?per_page=100";
+const RELEASE_URL_PREFIX: &str = "https://github.com/nonary-streams/amaterasu/releases/tag/";
 const MAX_RESPONSE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_RELEASES: usize = 100;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(8);
@@ -336,7 +339,7 @@ mod tests {
                     .to_ascii_lowercase()
                     .contains("user-agent: amaterasu-updater/1.0")
             );
-            let body = br#"[{"tag_name":"v2.0.0","html_url":"https://github.com/Nonary/amaterasu/releases/tag/v2.0.0","prerelease":false,"draft":false}]"#;
+            let body = br#"[{"tag_name":"v2.0.0","html_url":"https://github.com/nonary-streams/amaterasu/releases/tag/v2.0.0","prerelease":false,"draft":false}]"#;
             write!(
                 stream,
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -354,13 +357,37 @@ mod tests {
     }
 
     #[test]
+    fn the_feed_and_its_release_pages_name_the_same_repository() {
+        let repository = RELEASES_ENDPOINT
+            .strip_prefix("https://api.github.com/repos/")
+            .and_then(|path| path.strip_suffix("/releases?per_page=100"))
+            .unwrap();
+        assert_eq!(repository, "nonary-streams/amaterasu");
+        assert_eq!(
+            RELEASE_URL_PREFIX,
+            format!("https://github.com/{repository}/releases/tag/")
+        );
+        // The page GitHub reports for a release of that repository is accepted.
+        let feed = format!(
+            r#"[{{"tag_name":"v0.2.0","html_url":"https://github.com/{repository}/releases/tag/v0.2.0","draft":false,"prerelease":false}}]"#
+        );
+        let parsed = parse_release_feed(feed.as_bytes()).unwrap();
+        assert_eq!(
+            parsed.stable.unwrap().url,
+            format!("{RELEASE_URL_PREFIX}v0.2.0")
+        );
+    }
+
+    #[test]
     fn parses_latest_non_draft_semantic_releases_and_rejects_foreign_links() {
         let feed = br#"[
-            {"tag_name":"v2.0.0","html_url":"https://github.com/Nonary/amaterasu/releases/tag/v2.0.0","draft":false,"prerelease":false},
-            {"tag_name":"v3.0.0-rc.1","html_url":"https://github.com/Nonary/amaterasu/releases/tag/v3.0.0-rc.1","draft":false,"prerelease":true},
+            {"tag_name":"v2.0.0","html_url":"https://github.com/nonary-streams/amaterasu/releases/tag/v2.0.0","draft":false,"prerelease":false},
+            {"tag_name":"v3.0.0-rc.1","html_url":"https://github.com/nonary-streams/amaterasu/releases/tag/v3.0.0-rc.1","draft":false,"prerelease":true},
             {"tag_name":"v9.0.0","html_url":"https://attacker.invalid/release","draft":false,"prerelease":false},
-            {"tag_name":"v8.0.0","html_url":"https://github.com/Nonary/amaterasu/releases/tag/v8.0.0","draft":true,"prerelease":false},
-            {"tag_name":"preview","html_url":"https://github.com/Nonary/amaterasu/releases/tag/preview","draft":false,"prerelease":false}
+            {"tag_name":"v9.1.0","html_url":"https://github.com/Nonary/amaterasu/releases/tag/v9.1.0","draft":false,"prerelease":false},
+            {"tag_name":"v9.2.0","html_url":"https://github.com/nonary-streams/other/releases/tag/v9.2.0","draft":false,"prerelease":false},
+            {"tag_name":"v8.0.0","html_url":"https://github.com/nonary-streams/amaterasu/releases/tag/v8.0.0","draft":true,"prerelease":false},
+            {"tag_name":"preview","html_url":"https://github.com/nonary-streams/amaterasu/releases/tag/preview","draft":false,"prerelease":false}
         ]"#;
 
         let parsed = parse_release_feed(feed).unwrap();
