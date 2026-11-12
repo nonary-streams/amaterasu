@@ -343,4 +343,5 @@ pub(crate) fn storage_error(error: impl std::fmt::Display) -> StateError {
 }
 
 #[cfg(test)]
+#[path = "store/tests.rs"]
 mod tests;

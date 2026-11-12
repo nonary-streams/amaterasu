@@ -511,4 +511,5 @@ fn corrupt() -> StateError {
     StateError::new("corrupt_storage", "invalid collection manifest or shard")
 }
 #[cfg(test)]
+#[path = "collection/tests.rs"]
 mod tests;

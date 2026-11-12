@@ -42,6 +42,7 @@ members = [
     "fixtures/encoder-source",
     "fixtures/input-probe",
     "modules/state",
+    "modules/state/test-support",
     "modules/session",
     "modules/session-lifecycle",
     "modules/extension-actions",
