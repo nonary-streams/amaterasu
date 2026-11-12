@@ -487,7 +487,10 @@ fn console_requires(
     Ok(verifies_with(&current) && !verifies_with(&remaining))
 }
 
-fn fetch_catalog(transport: &impl RepositoryTransport) -> Result<(Vec<u8>, String), Refusal> {
+/// Fetches a repository's catalog and its detached signature, unverified.
+pub(crate) fn fetch_catalog(
+    transport: &impl RepositoryTransport,
+) -> Result<(Vec<u8>, String), Refusal> {
     let raw = transport
         .get("catalog.json", CATALOG_BYTES)
         .map_err(|_| "catalog_download_failed")?;
@@ -515,7 +518,10 @@ fn catalog_refusal(raw: &[u8], repository: &str, target: &str, now: u64) -> Refu
     }
 }
 
-fn retry_while_locked<T>(mut change: impl FnMut() -> PackageResult<T>) -> PackageResult<T> {
+/// Repeats a store change that met another holder of the approval lock.
+pub(crate) fn retry_while_locked<T>(
+    mut change: impl FnMut() -> PackageResult<T>,
+) -> PackageResult<T> {
     let mut attempt = 1;
     loop {
         match change() {

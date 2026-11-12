@@ -10,6 +10,7 @@ mod health_lifecycle;
 mod host_activation;
 mod http;
 mod package_status;
+mod package_update;
 mod peer_policy;
 mod product_settings;
 mod repository_admin;
@@ -64,6 +65,7 @@ struct ManagementModule {
     repositories: Option<RepositoryStore>,
     repository_administration: Option<repository_admin::RepositoryAdministration>,
     rtx_hdr_installer: Option<rtx_hdr_install::Installer>,
+    package_update: package_update::PackageUpdate,
     operational_health: Option<health_lifecycle::OperationalHealth>,
     product_settings: product_settings::ProductSettings,
     tray_events: tray_events::TrayEventConsumer,
@@ -125,6 +127,14 @@ impl ManagedModule for ManagementModule {
             }
             _ => None,
         };
+        let package_update = package_update::PackageUpdate::start(
+            &runtime,
+            settings
+                .web
+                .as_ref()
+                .and_then(|web| web.repository_directory().ok()),
+            network.as_ref(),
+        );
         let server = if settings.enabled {
             let network = network.ok_or("management network unavailable")?;
             let mut server = Server::bind_with_network(
@@ -211,6 +221,7 @@ impl ManagedModule for ManagementModule {
             repositories,
             repository_administration,
             rtx_hdr_installer,
+            package_update,
             operational_health: None,
             product_settings: product_settings::ProductSettings::new()?,
             tray_events: tray_events::TrayEventConsumer::new()?,
@@ -226,6 +237,7 @@ impl ManagedModule for ManagementModule {
         if let Some(installer) = &mut self.rtx_hdr_installer {
             installer.prepare_shutdown();
         }
+        self.package_update.prepare_shutdown();
         if let Some(administration) = &mut self.repository_administration {
             administration.prepare_shutdown();
         }
@@ -260,6 +272,7 @@ impl ManagedModule for ManagementModule {
             .rtx_hdr_installer
             .as_mut()
             .is_none_or(rtx_hdr_install::Installer::quiesce);
+        let package_update_ready = self.package_update.quiesce();
         let repositories_ready = self
             .repository_administration
             .as_mut()
@@ -279,6 +292,7 @@ impl ManagedModule for ManagementModule {
             self.operational_health = None;
         }
         Ok(installer_ready
+            && package_update_ready
             && repositories_ready
             && server_ready
             && settings_ready
@@ -293,6 +307,7 @@ impl ManagedModule for ManagementModule {
         if let Some(installer) = &mut self.rtx_hdr_installer {
             installer.advance();
         }
+        self.package_update.advance();
         if let Some(administration) = &mut self.repository_administration {
             administration.advance();
         }
@@ -359,7 +374,11 @@ impl ManagedModule for ManagementModule {
                         );
                     }
                     #[cfg(target_os = "linux")]
-                    let result = if let Some(installer) = &mut self.rtx_hdr_installer {
+                    let result = if self.package_update.in_progress() {
+                        // One install at a time owns the repository cache and
+                        // the host's activation request.
+                        json!({"ok":false,"code":"busy"})
+                    } else if let Some(installer) = &mut self.rtx_hdr_installer {
                         match installer.activation_request() {
                             Ok(request) => {
                                 match self.runtime.send(Command::HostPackageActivate { request }) {
@@ -386,6 +405,8 @@ impl ManagedModule for ManagementModule {
                         || payload != json!({"action": action})
                     {
                         json!({"ok":false,"code":"permission_denied"})
+                    } else if action == "rtx_hdr_install" && self.package_update.in_progress() {
+                        json!({"ok":false,"code":"busy"})
                     } else if let Some(installer) = &mut self.rtx_hdr_installer {
                         #[cfg(target_os = "linux")]
                         let cancel_waiting =
@@ -428,6 +449,10 @@ impl ManagedModule for ManagementModule {
                     return complete(&self.runtime, id, result);
                 }
                 let action = payload.get("action").and_then(serde_json::Value::as_str);
+                if let Some(update) = action.and_then(package_update::Action::parse) {
+                    let result = self.package_update_request(&caller, update, &payload);
+                    return complete(&self.runtime, id, result);
+                }
                 let payload = if caller != "amaterasu.management" {
                     if payload == json!({"action":"status"}) {
                         self.server_status()
@@ -532,6 +557,25 @@ impl ManagementModule {
             }
             None => json!({"ok":false,"code":"repository_management_unavailable"}),
         }
+    }
+
+    /// Answers a package-update route. Only this module's own console routes
+    /// reach it, and a request carries nothing but its action.
+    fn package_update_request(
+        &mut self,
+        caller: &str,
+        action: package_update::Action,
+        payload: &serde_json::Value,
+    ) -> serde_json::Value {
+        if caller != "amaterasu.management" || *payload != json!({"action": action.name()}) {
+            return json!({"ok":false,"code":"permission_denied"});
+        }
+        let rtx_hdr_install_active = self
+            .rtx_hdr_installer
+            .as_ref()
+            .is_some_and(rtx_hdr_install::Installer::package_work_in_progress);
+        self.package_update
+            .request(action, &self.runtime, rtx_hdr_install_active)
     }
 
     fn package_selection_status(&self) -> serde_json::Value {
@@ -717,6 +761,161 @@ mod tests {
                 .iter()
                 .any(|c| matches!(c, Command::Complete { request: 17, .. }))
         );
+    }
+
+    /// A runtime that hands a disabled module queued requests, one for each
+    /// poll, and records what the module answers.
+    struct ScriptedRuntime {
+        requests: std::sync::Mutex<std::collections::VecDeque<(&'static str, serde_json::Value)>>,
+        replies: std::sync::Mutex<Vec<serde_json::Value>>,
+    }
+
+    impl ScriptedRuntime {
+        fn new(requests: &[(&'static str, serde_json::Value)]) -> Self {
+            Self {
+                requests: std::sync::Mutex::new(requests.iter().cloned().collect()),
+                replies: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        /// Starts a module on this runtime. The runtime must outlive it.
+        fn start(&self) -> ManagementModule {
+            use amaterasu_module_sdk::abi::{AbiHeader, HostApi};
+            let endpoint = HostApi {
+                header: AbiHeader::of::<HostApi>(),
+                context: std::ptr::from_ref(self).cast_mut().cast(),
+                invoke: Self::invoke,
+            };
+            // SAFETY: each test keeps this runtime alive past its module.
+            let runtime = unsafe { RuntimeClient::from_endpoint(endpoint) };
+            ManagementModule::start(runtime).unwrap()
+        }
+
+        /// Ticks until every queued request has been answered.
+        fn answers(&self, module: &mut ManagementModule) -> Vec<serde_json::Value> {
+            while !self.requests.lock().unwrap().is_empty() {
+                module.tick().unwrap();
+            }
+            std::mem::take(&mut self.replies.lock().unwrap())
+        }
+
+        unsafe extern "C" fn invoke(
+            context: *mut std::ffi::c_void,
+            input: amaterasu_module_sdk::abi::BorrowedBytes,
+            reply: amaterasu_module_sdk::abi::ReplySink,
+        ) -> amaterasu_module_sdk::abi::Status {
+            // SAFETY: the test retains the runtime and the synchronous borrows.
+            let runtime = unsafe { &*context.cast::<Self>() };
+            let command: Command =
+                serde_json::from_slice(unsafe { input.read().unwrap() }).unwrap();
+            let response = match command {
+                Command::GetSettings {} => Response::Result { payload: json!({}) },
+                Command::Register { .. } => Response::Ok,
+                Command::Complete { payload, .. } => {
+                    runtime.replies.lock().unwrap().push(payload);
+                    Response::Ok
+                }
+                Command::Poll {} => match runtime.requests.lock().unwrap().pop_front() {
+                    Some((caller, payload)) => Response::Request {
+                        id: 1,
+                        caller: caller.into(),
+                        initiator: caller.into(),
+                        service: SERVICE.into(),
+                        payload,
+                        remaining_ms: 1000,
+                    },
+                    None => Response::Pending,
+                },
+                // The module's own settings load finds no configuration service.
+                Command::Request { .. } => Response::error("unavailable", "not provided"),
+                command => panic!("unexpected command: {command:?}"),
+            };
+            let bytes = serde_json::to_vec(&response).unwrap();
+            // SAFETY: the sink copies the bytes during this call.
+            unsafe { reply.send(&bytes) };
+            amaterasu_module_sdk::abi::STATUS_OK
+        }
+    }
+
+    #[test]
+    fn package_update_requests_come_only_from_the_console_routes() {
+        let denied = json!({"ok":false,"code":"permission_denied"});
+        let runtime = ScriptedRuntime::new(&[
+            // Another module cannot ask, whatever it sends.
+            (
+                "amaterasu.nvhttp",
+                json!({"action":"package_update_status"}),
+            ),
+            (
+                "amaterasu.nvhttp",
+                json!({"action":"package_update_activate"}),
+            ),
+            // A request carries its action and nothing that names a package.
+            (
+                "amaterasu.management",
+                json!({"action":"package_update_activate","repository":"other"}),
+            ),
+            (
+                "amaterasu.management",
+                json!({"action":"package_update_download","digest":"0".repeat(64)}),
+            ),
+            (
+                "amaterasu.management",
+                json!({"action":"package_update_status"}),
+            ),
+            (
+                "amaterasu.management",
+                json!({"action":"package_update_check"}),
+            ),
+            (
+                "amaterasu.management",
+                json!({"action":"package_update_install"}),
+            ),
+        ]);
+        let mut module = runtime.start();
+        let replies = runtime.answers(&mut module);
+        assert_eq!(
+            replies[..4],
+            [denied.clone(), denied.clone(), denied.clone(), denied]
+        );
+        // A module that serves no console has no network provider to check
+        // with and answers as a host that cannot update.
+        assert_eq!(replies[4]["ok"], true);
+        assert_eq!(replies[4]["supported"], false);
+        assert_eq!(replies[4]["error"], "unsupported_platform");
+        assert_eq!(
+            replies[5],
+            json!({"ok":false,"code":"unsupported_platform"})
+        );
+        assert_eq!(replies[6], json!({"ok":false,"code":"invalid_request"}));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rtx_hdr_install_waits_for_a_package_update_to_finish() {
+        let rtx_requests = [
+            ("amaterasu.management", json!({"action":"rtx_hdr_install"})),
+            ("amaterasu.management", json!({"action":"rtx_hdr_activate"})),
+        ];
+        // This host has no RTX HDR installer, which is what both requests
+        // say when nothing stands in their way.
+        let runtime = ScriptedRuntime::new(&rtx_requests);
+        let mut module = runtime.start();
+        assert_eq!(
+            runtime.answers(&mut module),
+            [
+                json!({"ok":false,"code":"rtx_hdr_install_unavailable"}),
+                json!({"ok":false,"code":"activation_unavailable"}),
+            ]
+        );
+
+        // While the host holds a package update's activation request, a
+        // second install is refused before it reaches the installer.
+        let runtime = ScriptedRuntime::new(&rtx_requests);
+        let mut module = runtime.start();
+        module.package_update = package_update::PackageUpdate::awaiting_activation();
+        let busy = json!({"ok":false,"code":"busy"});
+        assert_eq!(runtime.answers(&mut module), [busy.clone(), busy]);
     }
 
     #[test]

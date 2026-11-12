@@ -159,6 +159,24 @@ pub fn resolve(path: &str) -> Option<Route> {
                 "configuration.write"
             }),
         ),
+        // Activation also needs an administrator's own session;
+        // `server::role_permits` refuses API tokens for it.
+        ("package-update", action @ ("status" | "check" | "download" | "cancel" | "activate")) => (
+            "amaterasu.management/1",
+            match action {
+                "status" => "package_update_status",
+                "check" => "package_update_check",
+                "download" => "package_update_download",
+                "cancel" => "package_update_cancel",
+                "activate" => "package_update_activate",
+                _ => unreachable!(),
+            },
+            Some(if action == "status" {
+                "configuration.read"
+            } else {
+                "configuration.write"
+            }),
+        ),
         ("package-selection", "status") => (
             "amaterasu.management/1",
             "package_selection_status",
@@ -453,6 +471,7 @@ pub fn resolve(path: &str) -> Option<Route> {
         action,
         scope,
         requires_empty_body: domain == "rtx-hdr"
+            || domain == "package-update"
             || domain == "media"
             || (domain == "steam" && action == "force_sync")
             || (domain == "host-metrics" && action == "stats_read")
@@ -700,6 +719,54 @@ mod tests {
                 assert!(payload(route, body).is_err());
             }
         }
+    }
+
+    #[test]
+    fn package_update_routes_require_scoped_empty_requests() {
+        for (name, action, scope) in [
+            ("status", "package_update_status", "configuration.read"),
+            ("check", "package_update_check", "configuration.write"),
+            ("download", "package_update_download", "configuration.write"),
+            ("cancel", "package_update_cancel", "configuration.write"),
+            ("activate", "package_update_activate", "configuration.write"),
+        ] {
+            let route = resolve(&format!("/v1/package-update/{name}")).unwrap();
+            assert_eq!(route.service, "amaterasu.management/1");
+            assert_eq!(route.action, action);
+            assert_eq!(route.scope, Some(scope));
+            assert!(route.requires_empty_body);
+            assert_eq!(
+                payload(route, br#"{}"#).unwrap(),
+                serde_json::json!({"action": action})
+            );
+            // The browser names no repository, publisher, package or path.
+            for body in [
+                br#"{"action":"activate"}"#.as_slice(),
+                br#"{"repository":"amaterasu"}"#,
+                br#"{"digest":"0000000000000000000000000000000000000000000000000000000000000000"}"#,
+                br#"{"fingerprint":"0000000000000000000000000000000000000000000000000000000000000000"}"#,
+                br#"{"path":"/tmp/package"}"#,
+                br#"{"url":"https://example.com/package"}"#,
+                br#"{"force":true}"#,
+            ] {
+                assert!(payload(route, body).is_err());
+            }
+        }
+        for unknown in [
+            "install",
+            "stage",
+            "select",
+            "approve",
+            "rollback",
+            "status/extra",
+            "",
+        ] {
+            assert!(
+                resolve(&format!("/v1/package-update/{unknown}")).is_none(),
+                "{unknown}"
+            );
+        }
+        assert!(resolve("/v1/package-update").is_none());
     }
 
     #[test]

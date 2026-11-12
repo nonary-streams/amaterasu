@@ -1724,14 +1724,16 @@ fn role_permits(payload: &Value, request: &http::Request) -> bool {
     {
         return false;
     }
-    // Tokens, sessions and trusted publishers are changed only by a signed-in
-    // administrator, never by an API token however it is scoped.
+    // Tokens, sessions, trusted publishers and the running native set are
+    // changed only by a signed-in administrator, never by an API token however
+    // it is scoped.
     let is_session_only_admin = matches!(request.target, RequestTarget::Api(route)
         if (route.service == crate::AUTH_SERVICE
             && matches!(route.action, "account_tokens_list" | "account_tokens_issue" | "account_tokens_revoke"
                 | "account_sessions_list" | "account_sessions_revoke"))
             || (route.service == crate::SERVICE
-                && matches!(route.action, "repository_add" | "repository_refresh" | "repository_remove")));
+                && matches!(route.action, "repository_add" | "repository_refresh" | "repository_remove"
+                    | "package_update_activate")));
     let role = match payload.get("kind").and_then(Value::as_str) {
         Some("api_token") => return !is_session_only_admin,
         Some("administrator_session") => match payload.get("role").and_then(Value::as_str) {
@@ -2279,6 +2281,42 @@ mod tests {
                 &json!({"kind":"api_token", "subject":"token"}),
                 &change
             ));
+        }
+        // Replacing the running set is the same kind of decision. Looking for
+        // an update and preparing one are ordinary configuration writes.
+        let token_permits = |path: &str| {
+            let request = http::Request {
+                target: RequestTarget::Api(crate::routes::resolve(path).unwrap()),
+                payload: json!({}),
+                bearer: None,
+                verified_identity: None,
+                origin: None,
+                preflight: false,
+                csrf_exception: false,
+                api_request: None,
+            };
+            role_permits(&json!({"kind":"api_token", "subject":"token"}), &request)
+        };
+        assert!(allowed("administrator", "/v1/package-update/activate"));
+        assert!(!token_permits("/v1/package-update/activate"));
+        for path in [
+            "/v1/package-update/status",
+            "/v1/package-update/check",
+            "/v1/package-update/download",
+            "/v1/package-update/cancel",
+        ] {
+            assert!(allowed("administrator", path));
+            assert!(token_permits(path));
+        }
+        for path in [
+            "/v1/package-update/status",
+            "/v1/package-update/check",
+            "/v1/package-update/download",
+            "/v1/package-update/cancel",
+            "/v1/package-update/activate",
+        ] {
+            assert!(!allowed("operator", path));
+            assert!(!allowed("viewer", path));
         }
         let listing = http::Request {
             target: RequestTarget::Api(crate::routes::resolve("/v1/repositories/list").unwrap()),

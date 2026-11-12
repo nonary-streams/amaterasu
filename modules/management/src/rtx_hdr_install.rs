@@ -242,6 +242,16 @@ impl Installer {
         }
     }
 
+    /// True while this installer is preparing or activating a component set,
+    /// which uses the repository cache and the host's one activation request.
+    pub fn package_work_in_progress(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        let preparing = self.candidate_job.is_some();
+        #[cfg(not(target_os = "linux"))]
+        let preparing = false;
+        preparing || self.install_requested || matches!(self.phase, "waiting_stream" | "activating")
+    }
+
     fn busy(&self) -> bool {
         #[cfg(target_os = "linux")]
         {
@@ -599,6 +609,57 @@ mod tests {
         assert_eq!(ready["package_ready"], true);
         assert_eq!(ready["phase"], "ready");
         assert!(ready["provider_active"].is_null());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn package_work_covers_preparation_and_activation_but_not_runtime_checks() {
+        let mut installer = Installer::new(
+            PathBuf::from("/tmp/rtx-test-nonexistent"),
+            Network::test_provider(),
+        )
+        .unwrap();
+        assert!(!installer.package_work_in_progress());
+
+        // Verifying the NVIDIA runtime touches neither the cache nor the host.
+        let (release, wait) = std::sync::mpsc::sync_channel::<()>(1);
+        installer.phase = "verifying";
+        installer.job = Some(Job {
+            verifying: true,
+            thread: thread::spawn(move || {
+                wait.recv().unwrap();
+                Ok(())
+            }),
+        });
+        assert!(!installer.package_work_in_progress());
+        // An install that will prepare a component set once the runtime is ready does.
+        installer.install_requested = true;
+        assert!(installer.package_work_in_progress());
+        installer.install_requested = false;
+        release.send(()).unwrap();
+        retire(&mut installer);
+
+        let (release, wait) = std::sync::mpsc::sync_channel::<()>(1);
+        installer.candidate_job = Some(thread::spawn(move || {
+            wait.recv().unwrap();
+            Err("cancelled".into())
+        }));
+        assert!(installer.package_work_in_progress());
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while installer.candidate_job.is_some() {
+            installer.advance();
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert!(!installer.package_work_in_progress());
+
+        for phase in ["waiting_stream", "activating"] {
+            installer.phase = phase;
+            assert!(installer.package_work_in_progress());
+        }
+        installer.phase = "ready";
+        assert!(!installer.package_work_in_progress());
     }
 
     #[cfg(target_os = "linux")]

@@ -71,7 +71,7 @@ fn package_selection_status(package_root: &str) -> Option<Value> {
 }
 
 /// A package root is used only when it is the real directory it names.
-fn trusted_root(package_root: &str) -> Option<&Path> {
+pub(crate) fn trusted_root(package_root: &str) -> Option<&Path> {
     let root = Path::new(package_root);
     if !root.is_absolute() {
         return None;
@@ -126,7 +126,8 @@ fn running_package_source(root: &Path, digest: &str) -> Option<Value> {
     })
 }
 
-fn running_manifest(root: &Path, digest: &str) -> Option<ReleaseManifest> {
+/// The signed manifest of the set the host reports it loaded.
+pub(crate) fn running_manifest(root: &Path, digest: &str) -> Option<ReleaseManifest> {
     let path = amaterasu_package::package_directory(root, digest)
         .ok()?
         .join("manifest.json");
@@ -267,7 +268,7 @@ pub(crate) fn is_module_id(value: &str) -> bool {
         })
 }
 
-fn is_repository_id(value: &str) -> bool {
+pub(crate) fn is_repository_id(value: &str) -> bool {
     is_module_id(value) && value != "." && value != ".."
 }
 
