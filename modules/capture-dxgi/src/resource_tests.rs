@@ -293,7 +293,7 @@ fn sdr_and_hdr_keep_ten_bits_through_public_resource_negotiation_and_close() {
                 ),
                 MEDIA_UNSUPPORTED
             );
-            controller.lock().unwrap().close("video", stream).unwrap();
+            crate::tests::finish_retirement(&mut controller.lock().unwrap(), "video", stream);
             assert_eq!(state.drops.load(Ordering::SeqCst), 1);
             assert_eq!(
                 (api.base.read_resource_frame)(c, stream, sink),
@@ -352,5 +352,6 @@ fn explicit_range_mismatch_precedes_effects_and_native_color_loss_retires_source
         unsafe { (binding.api().color_provenance)(binding.context(), stream, &mut flags) },
         MEDIA_CLOSED
     );
+    crate::tests::finish_retirement(&mut controller.lock().unwrap(), "video", stream);
     assert_eq!(state.drops.load(Ordering::SeqCst), 1);
 }

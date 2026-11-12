@@ -54,6 +54,7 @@ struct Settings {
 struct CaptureModule {
     runtime: RuntimeClient,
     controller: SharedController,
+    preflight: Arc<preflight::Provider<NativeBackend>>,
     shutdown_requested: bool,
     quiescing: bool,
     pending_closes: Vec<PendingClose>,
@@ -76,10 +77,13 @@ impl ManagedModule for CaptureModule {
         };
         let settings: Settings =
             serde_json::from_value(payload).map_err(|error| error.to_string())?;
-        let controller = Arc::new(Mutex::new(Controller::new(
+        let controller = Controller::new(
             NativeBackend::new(settings.capture_cursor),
             settings.enabled,
-        )));
+        );
+        let backend = controller.backend();
+        let controller = Arc::new(Mutex::new(controller));
+        let preflight = Arc::new(preflight::Provider::new(controller.clone(), backend)?);
         let factory = amaterasu_module_sdk::capture::CpuSourceFactory::new(Arc::new(
             resource::Provider::new(controller.clone()),
         ));
@@ -89,7 +93,7 @@ impl ManagedModule for CaptureModule {
         let preflight_factory = unsafe {
             amaterasu_module_sdk::capture::SourcePreflightFactory::new(
                 &factory.api,
-                Arc::new(preflight::Provider::new(controller.clone())),
+                preflight.clone(),
             )
         };
         runtime.require_success(Command::Register {
@@ -107,6 +111,7 @@ impl ManagedModule for CaptureModule {
         Ok(Self {
             runtime,
             controller,
+            preflight,
             shutdown_requested: false,
             quiescing: false,
             pending_closes: Vec::new(),
@@ -122,16 +127,31 @@ impl ManagedModule for CaptureModule {
 
     fn prepare_shutdown(&mut self, _remaining_ms: u64) -> ModuleResult<()> {
         self.shutdown_requested = true;
-        self.stop_admission_when_available()?;
-        Ok(())
+        let preflight = self
+            .preflight
+            .stop_admission()
+            .map_err(|status| format!("capture preflight shutdown admission failed: {status:?}"));
+        let capture = self.stop_admission_when_available();
+        preflight.and(capture)
     }
 
     fn quiesce(&mut self) -> ModuleResult<bool> {
         self.shutdown_requested = true;
         self.quiescing = true;
+        let preflight = self
+            .preflight
+            .quiesce()
+            .map_err(|status| format!("capture preflight retirement failed: {status:?}"));
         let open_failure = self.poll_open_requests().err();
         let command_failure = self.poll_commands(true).err();
         let mut failure = self.poll_pending_closes().err();
+        let preflight_retired = match preflight {
+            Ok(retired) => retired,
+            Err(error) => {
+                failure.get_or_insert(error);
+                false
+            }
+        };
         if let Err(error) = self.poll_pending_replies() {
             failure.get_or_insert(error);
         }
@@ -165,7 +185,8 @@ impl ManagedModule for CaptureModule {
             ._factory
             .retirement_ready()
             .map_err(|status| format!("capture resources did not retire: {status}"))?;
-        Ok(retired
+        Ok(preflight_retired
+            && retired
             && resources_retired
             && self.pending_closes.is_empty()
             && self.pending_opens.is_empty()
@@ -322,6 +343,18 @@ impl CaptureModule {
     fn poll_pending_replies(&mut self) -> ModuleResult<()> {
         let mut failure = None;
         self.pending_replies.retain(|reply| {
+            // Completion transport can fail even after the caller has ended
+            // or released a request. Only the broker's terminal observation
+            // is sufficient to reclaim this retained reply without delivery.
+            if matches!(
+                self.runtime.send(Command::CheckRequest {
+                    request: reply.request,
+                }),
+                Ok(Response::Error { ref code, .. })
+                    if code == "request_ended" || code == "not_found"
+            ) {
+                return false;
+            }
             match self.runtime.send(Command::Complete {
                 request: reply.request,
                 payload: reply.payload.clone(),
@@ -492,6 +525,7 @@ impl CaptureModule {
 
 impl Drop for CaptureModule {
     fn drop(&mut self) {
+        let _ = self.preflight.stop_admission();
         if let Ok(mut controller) = self.controller.lock() {
             controller.shutdown();
         }

@@ -307,6 +307,17 @@ pub(crate) fn poll_requests<B: Backend>(
                 }
             }
         }
+        if let Some(reply) = &pending.reply
+            && reply["ok"] == true
+            && let Some(stream) = reply["stream"].as_u64()
+            && let Err(error) = controller.validate_open_publication(
+                &pending.caller,
+                stream,
+                pending.operation_id.as_deref(),
+            )
+        {
+            pending.reply = Some(error.payload());
+        }
         drop(controller);
         if let (Some(request), Some(reply)) = (pending.request, pending.reply.as_ref()) {
             match runtime.send(Command::Complete {

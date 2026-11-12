@@ -11,30 +11,98 @@ use std::sync::{Arc, Mutex};
 
 #[cfg(windows)]
 mod windows;
+#[cfg(any(windows, target_os = "linux"))]
+mod worker;
 
 pub struct Provider<B: Backend> {
     controller: Arc<Mutex<Controller<B>>>,
+    #[cfg(any(windows, target_os = "linux"))]
+    worker: worker::Worker,
 }
-impl<B: Backend> Provider<B> {
-    pub fn new(controller: Arc<Mutex<Controller<B>>>) -> Self {
-        Self { controller }
+impl<B: Backend + 'static> Provider<B> {
+    pub fn new(controller: Arc<Mutex<Controller<B>>>, backend: B) -> Result<Self, String> {
+        #[cfg(any(windows, target_os = "linux"))]
+        let worker = worker::Worker::start(Box::new(move |caller, request| {
+            query(&backend, true, true, caller, request)
+        }))?;
+        #[cfg(not(any(windows, target_os = "linux")))]
+        let _ = backend;
+        Ok(Self {
+            controller,
+            #[cfg(any(windows, target_os = "linux"))]
+            worker,
+        })
+    }
+
+    pub fn stop_admission(&self) -> Result<(), Status> {
+        #[cfg(any(windows, target_os = "linux"))]
+        {
+            self.worker.stop()
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
+        {
+            Ok(())
+        }
+    }
+
+    pub fn quiesce(&self) -> Result<bool, Status> {
+        #[cfg(any(windows, target_os = "linux"))]
+        {
+            self.worker.quiesce()
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
+        {
+            Ok(true)
+        }
     }
 }
-impl<B: Backend> SourcePreflightProvider for Provider<B> {
+impl<B: Backend + 'static> SourcePreflightProvider for Provider<B> {
     fn query(
         &self,
         caller: &str,
         request: &SourcePreflightRequest,
     ) -> Result<SourcePreflightResponse, Status> {
+        request.validate().map_err(|_| STATUS_INVALID_ARGUMENT)?;
+        if caller.is_empty() || caller.len() > 128 || caller.chars().any(char::is_control) {
+            return Err(STATUS_INVALID_ARGUMENT);
+        }
         let controller = match self.controller.try_lock() {
             Ok(controller) => controller,
             Err(std::sync::TryLockError::WouldBlock) => return Err(MEDIA_BUSY),
             Err(_) => return Err(MEDIA_BACKEND_ERROR),
         };
-        controller.source_preflight(caller, request)
+        let (enabled, capacity_available) = controller.preflight_state();
+        drop(controller);
+        if !enabled {
+            return Ok(SourcePreflightResponse::unavailable(
+                request,
+                "capture_disabled",
+            ));
+        }
+        if !capacity_available {
+            return Ok(SourcePreflightResponse::unavailable(
+                request,
+                "capture_capacity_exhausted",
+            ));
+        }
+        if let Some(response) = unsupported_mode(request) {
+            return Ok(response);
+        }
+        #[cfg(any(windows, target_os = "linux"))]
+        {
+            self.worker.query(caller, request)
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
+        {
+            Ok(SourcePreflightResponse::unsupported(
+                request,
+                "unsupported_platform",
+            ))
+        }
     }
 }
 
+#[cfg(any(windows, target_os = "linux"))]
 pub(super) fn query<B: Backend>(
     backend: &B,
     enabled: bool,
@@ -233,7 +301,7 @@ mod tests {
     #[test]
     fn query_binding_reports_disabled_and_busy_without_opening_a_source() {
         let controller = Arc::new(Mutex::new(Controller::new(NoEffectsBackend, false)));
-        let provider = Provider::new(controller.clone());
+        let provider = Provider::new(controller.clone(), NoEffectsBackend).unwrap();
         let request = request();
         assert_eq!(
             provider
@@ -300,10 +368,32 @@ mod tests {
     #[cfg(not(windows))]
     fn an_enabled_non_windows_provider_does_not_claim_source_readiness() {
         let controller = Arc::new(Mutex::new(Controller::new(NoEffectsBackend, true)));
-        let response = Provider::new(controller)
-            .query("consumer", &request())
-            .unwrap();
+        let provider = Provider::new(controller, NoEffectsBackend).unwrap();
+        let response = loop {
+            match provider.query("consumer", &request()) {
+                Ok(response) => break response,
+                Err(MEDIA_BUSY) => std::thread::yield_now(),
+                Err(error) => panic!("unexpected preflight failure: {error:?}"),
+            }
+        };
         assert_eq!(response.state, SourceReadiness::Unsupported);
         assert!(response.capabilities.is_empty());
+    }
+
+    #[cfg(not(any(windows, target_os = "linux")))]
+    #[test]
+    fn unsupported_platform_needs_no_worker_to_quiesce() {
+        let controller = Arc::new(Mutex::new(Controller::new(NoEffectsBackend, true)));
+        let provider = Provider::new(controller, NoEffectsBackend).unwrap();
+        assert_eq!(
+            provider.query("", &request()).unwrap_err(),
+            STATUS_INVALID_ARGUMENT
+        );
+        assert_eq!(
+            provider.query("consumer", &request()).unwrap().state,
+            SourceReadiness::Unsupported
+        );
+        assert!(provider.stop_admission().is_ok());
+        assert!(provider.quiesce().unwrap());
     }
 }

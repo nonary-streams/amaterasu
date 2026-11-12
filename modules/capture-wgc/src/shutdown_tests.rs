@@ -59,16 +59,15 @@ fn module_with_session(session: Box<dyn CaptureSession>) -> CaptureModule {
 }
 
 fn module_with_controller(controller: Controller<NativeBackend>) -> CaptureModule {
+    let backend = controller.backend();
     let controller = Arc::new(Mutex::new(controller));
+    let preflight = Arc::new(crate::preflight::Provider::new(controller.clone(), backend).unwrap());
     let factory = amaterasu_module_sdk::capture::CpuSourceFactory::new(Arc::new(
         crate::resource::Provider::new(controller.clone()),
     ));
     // SAFETY: both boxed factories and their controller remain owned by the module.
     let preflight_factory = unsafe {
-        amaterasu_module_sdk::capture::SourcePreflightFactory::new(
-            &factory.api,
-            Arc::new(crate::preflight::Provider::new(controller.clone())),
-        )
+        amaterasu_module_sdk::capture::SourcePreflightFactory::new(&factory.api, preflight.clone())
     };
     // SAFETY: this stateless endpoint is valid for the entire test; shutdown
     // must not need runtime traffic or native capture initialization.
@@ -82,6 +81,7 @@ fn module_with_controller(controller: Controller<NativeBackend>) -> CaptureModul
     CaptureModule {
         runtime,
         controller,
+        preflight,
         shutdown_requested: false,
         quiescing: false,
         pending_closes: Vec::new(),
@@ -93,6 +93,71 @@ fn module_with_controller(controller: Controller<NativeBackend>) -> CaptureModul
         _factory: factory,
         _preflight_factory: preflight_factory,
     }
+}
+
+fn await_quiescence(module: &mut CaptureModule) {
+    let deadline = Instant::now() + std::time::Duration::from_secs(3);
+    while !module.quiesce().unwrap() {
+        assert!(Instant::now() < deadline, "module failed to quiesce");
+        std::thread::yield_now();
+    }
+}
+
+#[test]
+#[cfg(any(windows, target_os = "linux"))]
+fn held_preflight_does_not_block_capture_retirement_or_acknowledge_shutdown() {
+    use amaterasu_module_sdk::capture::{
+        SourceClass, SourceMode, SourcePreflightProvider, SourcePreflightRequest,
+        SourcePreflightResponse,
+    };
+    let drops = Arc::new(AtomicUsize::new(0));
+    let mut module = module_with_session(Box::new(OwnedSession(drops.clone())));
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let preflight = Arc::new(
+        crate::preflight::Provider::with_observer(module.controller.clone(), move |_, request| {
+            entered_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(std::time::Duration::from_secs(5));
+            Ok(SourcePreflightResponse::unavailable(request, "fixture"))
+        })
+        .unwrap(),
+    );
+    // SAFETY: the existing CPU factory remains owned by the module longer
+    // than this wrapper and its synchronous bindings.
+    module._preflight_factory = unsafe {
+        amaterasu_module_sdk::capture::SourcePreflightFactory::new(
+            &module._factory.api,
+            preflight.clone(),
+        )
+    };
+    module.preflight = preflight.clone();
+    let request = SourcePreflightRequest {
+        source_class: SourceClass::ManagedOutput,
+        route: None,
+        mode: SourceMode {
+            width: 1920,
+            height: 1080,
+            refresh_millihz: 60_000,
+            hdr: false,
+            bit_depth: None,
+        },
+    };
+    assert_eq!(
+        preflight.query("video", &request).unwrap_err(),
+        amaterasu_media::MEDIA_BUSY
+    );
+    entered_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("metadata worker entered query");
+    module.prepare_shutdown(1_000).unwrap();
+    let start = Instant::now();
+    assert!(!module.quiesce().unwrap());
+    assert!(start.elapsed() < std::time::Duration::from_secs(1));
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    assert!(module.controller.lock().unwrap().streams.is_empty());
+    release_tx.send(()).unwrap();
+    await_quiescence(&mut module);
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
 }
 
 fn hold_controller(
@@ -116,14 +181,14 @@ fn hold_controller(
 fn module_quiescence_retires_owned_capture_before_dependencies_can_shutdown() {
     let drops = Arc::new(AtomicUsize::new(0));
     let mut module = module_with_session(Box::new(OwnedSession(drops.clone())));
-    assert!(module.quiesce().unwrap());
+    await_quiescence(&mut module);
     assert_eq!(
         drops.load(Ordering::SeqCst),
         1,
         "ready must prove capture resources were retired"
     );
     assert!(module.controller.lock().unwrap().streams.is_empty());
-    assert!(module.quiesce().unwrap());
+    await_quiescence(&mut module);
     assert_eq!(drops.load(Ordering::SeqCst), 1);
 }
 
@@ -166,7 +231,7 @@ fn quiescence_does_not_wait_for_a_native_read_holding_the_controller() {
     assert_eq!(drops.load(Ordering::SeqCst), 0);
     release.send(()).unwrap();
     held_read.join().unwrap();
-    assert!(module.quiesce().unwrap());
+    await_quiescence(&mut module);
     assert_eq!(drops.load(Ordering::SeqCst), 1);
 }
 
@@ -1194,7 +1259,7 @@ fn global_quiescence_preserves_exact_close_proof_after_removing_the_native_sessi
     broker.lock().unwrap().close(41, "video", 1);
     module.tick().unwrap();
     assert_eq!(polls.load(Ordering::SeqCst), 1);
-    assert!(module.quiesce().unwrap());
+    await_quiescence(&mut module);
     assert_eq!(polls.load(Ordering::SeqCst), 3);
     assert_eq!(drops.load(Ordering::SeqCst), 1);
     assert_eq!(broker.lock().unwrap().completed, [(41, json!({"ok":true}))]);
@@ -1222,7 +1287,7 @@ fn completion_retry_keeps_the_retired_receipt_without_restarting_cleanup() {
 }
 
 #[test]
-fn uncertain_rejection_completion_is_retained_and_retried_after_delivery() {
+fn terminal_request_observation_reclaims_a_delivered_rejection_without_replay() {
     let mut module = module_with_controller(Controller::new(NativeBackend::new(None), true));
     let mut broker = Box::new(Mutex::new(Broker::default()));
     bind_broker(&mut module, &mut broker);
@@ -1242,12 +1307,14 @@ fn uncertain_rejection_completion_is_retained_and_retried_after_delivery() {
     module.tick().unwrap();
     assert_eq!(broker.lock().unwrap().completed.len(), 1);
     broker.lock().unwrap().completion_failures = 1;
-    assert!(module.quiesce().is_err());
+    // The broker's ended observation proves that the uncertain completion was
+    // delivered; do not replay it merely to obtain another acknowledgement.
     assert_eq!(module.pending_replies.len(), 1);
-    module.tick().unwrap();
-    assert!(module.quiesce().unwrap());
+    let _ = module.quiesce().unwrap();
+    assert!(module.pending_replies.is_empty());
+    await_quiescence(&mut module);
     let broker = broker.lock().unwrap();
-    assert_eq!(broker.completion_attempts, [42, 42, 42]);
+    assert_eq!(broker.completion_attempts, [42]);
     assert_eq!(broker.completed.len(), 1);
 }
 
@@ -1293,7 +1360,7 @@ fn uncertain_immediate_replies_apply_bounded_backpressure_and_recover() {
     assert!(module.quiesce().is_err());
     broker.lock().unwrap().completion_failures = 0;
     module.tick().unwrap();
-    assert!(module.quiesce().unwrap());
+    await_quiescence(&mut module);
     let broker = broker.lock().unwrap();
     assert!(broker.requests.is_empty());
     assert_eq!(broker.completed.len(), 40);

@@ -106,20 +106,10 @@ impl<B: Backend> Controller<B> {
     pub(crate) fn backend(&self) -> Arc<B> {
         Arc::clone(&self.backend)
     }
-    pub(crate) fn source_preflight(
-        &self,
-        caller: &str,
-        request: &amaterasu_module_sdk::capture::SourcePreflightRequest,
-    ) -> Result<
-        amaterasu_module_sdk::capture::SourcePreflightResponse,
-        amaterasu_module_sdk::abi::Status,
-    > {
-        crate::preflight::query(
-            self.backend.as_ref(),
+    pub(crate) fn preflight_state(&self) -> (bool, bool) {
+        (
             self.enabled && !self.startup_retirement_uncertain,
             self.streams.len() + self.opening.len() < MAX_STREAMS,
-            caller,
-            request,
         )
     }
     pub fn new(backend: B, enabled: bool) -> Self {
@@ -427,6 +417,27 @@ impl<B: Backend> Controller<B> {
             receipt.0.store(true, Ordering::Release);
         }
         failures
+    }
+
+    pub(crate) fn validate_open_publication(
+        &self,
+        caller: &str,
+        id: u64,
+        operation: Option<&str>,
+    ) -> CaptureResult<()> {
+        self.authorize(caller, id)?;
+        if self
+            .streams
+            .get(&id)
+            .and_then(|stream| stream.operation_id.as_deref())
+            != operation
+        {
+            return Err(CaptureError::new(
+                "operation_conflict",
+                "capture operation no longer identifies this stream",
+            ));
+        }
+        Ok(())
     }
 
     #[cfg(test)]

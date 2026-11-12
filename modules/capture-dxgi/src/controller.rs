@@ -6,11 +6,16 @@ use crate::model::{
 use amaterasu_media::CaptureGeometry;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
+use std::thread::JoinHandle;
 
 #[cfg(test)]
 #[path = "shutdown_tests.rs"]
-mod shutdown_tests;
+pub(crate) mod shutdown_tests;
 
 struct Stream {
     owner: String,
@@ -22,50 +27,379 @@ struct Stream {
     format: crate::format::CaptureFormat,
 }
 
+#[derive(Clone)]
+pub(crate) struct CloseReceipt(Arc<AtomicBool>);
+
+impl CloseReceipt {
+    pub(crate) fn retired(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+struct Retirement {
+    owner: String,
+    operation_id: Option<String>,
+    stream: Arc<Mutex<Option<Stream>>>,
+    worker: Option<JoinHandle<()>>,
+    receipt: CloseReceipt,
+    failure: Option<String>,
+    #[cfg(target_os = "linux")]
+    tid: Arc<std::sync::atomic::AtomicU32>,
+}
+
+struct PreparedCapture {
+    session: Box<dyn CaptureSession>,
+    geometry: Option<CaptureGeometry>,
+    touch_surface: Option<TouchSurface>,
+    failure: Option<CaptureError>,
+}
+
+struct Opening {
+    owner: String,
+    output: String,
+    operation_id: Option<String>,
+    format: crate::format::CaptureFormat,
+    cancelled: bool,
+    worker: JoinHandle<CaptureResult<PreparedCapture>>,
+    #[cfg(target_os = "linux")]
+    tid: Arc<std::sync::atomic::AtomicU32>,
+}
+
+pub(crate) enum OpenStart {
+    Ready(Value),
+    Pending(u64),
+}
+
 pub struct Controller<B: Backend> {
-    backend: B,
+    backend: Arc<B>,
     enabled: bool,
     streams: BTreeMap<u64, Stream>,
+    retiring: BTreeMap<u64, Retirement>,
+    opening: BTreeMap<u64, Opening>,
+    close_id_reservations: BTreeSet<u64>,
+    startup_retirement_uncertain: bool,
+    #[cfg(test)]
+    test_open_observation_failures: usize,
     opened_stream: Option<u64>,
 }
 
 impl<B: Backend> Controller<B> {
-    pub(crate) fn source_preflight(
-        &self,
-        caller: &str,
-        request: &amaterasu_module_sdk::capture::SourcePreflightRequest,
-    ) -> Result<
-        amaterasu_module_sdk::capture::SourcePreflightResponse,
-        amaterasu_module_sdk::abi::Status,
-    > {
-        crate::preflight::query(
-            &self.backend,
-            self.enabled,
-            self.streams.len() < MAX_STREAMS,
-            caller,
-            request,
+    pub(crate) fn preflight_state(&self) -> (bool, bool) {
+        (
+            self.enabled && !self.startup_retirement_uncertain,
+            self.streams.len() + self.retiring.len() + self.opening.len() < MAX_STREAMS,
         )
     }
+
     pub fn new(backend: B, enabled: bool) -> Self {
         Self {
-            backend,
+            backend: Arc::new(backend),
             enabled,
             streams: BTreeMap::new(),
+            retiring: BTreeMap::new(),
+            opening: BTreeMap::new(),
+            close_id_reservations: BTreeSet::new(),
+            startup_retirement_uncertain: false,
+            #[cfg(test)]
+            test_open_observation_failures: 0,
             opened_stream: None,
         }
     }
 
     pub fn shutdown(&mut self) {
         self.stop_admission();
-        self.streams.clear();
+        for (_, job) in std::mem::take(&mut self.opening) {
+            let _ = job.worker.join();
+        }
+        let owners: Vec<_> = self
+            .streams
+            .iter()
+            .map(|(&id, s)| (id, s.owner.clone()))
+            .collect();
+        for (id, owner) in owners {
+            let _ = self.begin_close(&owner, id);
+        }
+        // Final destruction is the mandatory provider-code lifetime barrier.
+        // Unlike quiesce, it may wait for a stuck driver rather than detach it.
+        for (_, mut retirement) in std::mem::take(&mut self.retiring) {
+            if let Some(worker) = retirement.worker.take() {
+                let _ = worker.join();
+            }
+        }
+    }
+
+    pub(crate) fn quiesce(&mut self) -> CaptureResult<bool> {
+        self.stop_admission();
+        let openings: Vec<_> = self.opening.keys().copied().collect();
+        let mut startup_error = None;
+        for id in openings {
+            self.cancel_open(id);
+            if let Err(error) = self.poll_open(id, false) {
+                startup_error.get_or_insert(error);
+            }
+        }
+        let owners: Vec<_> = self
+            .streams
+            .iter()
+            .map(|(&id, s)| (id, s.owner.clone()))
+            .collect();
+        for (id, owner) in owners {
+            self.begin_close(&owner, id)?;
+        }
+        if let Some((_, error)) = self.poll_closing().into_iter().next() {
+            return Err(error);
+        }
+        if let Some(error) = startup_error {
+            return Err(error);
+        }
+        if self.startup_retirement_uncertain {
+            return Err(CaptureError::new(
+                "retirement_failed",
+                "capture startup retirement cannot be proven",
+            ));
+        }
+        Ok(self.streams.is_empty() && self.retiring.is_empty() && self.opening.is_empty())
     }
 
     pub fn stop_admission(&mut self) {
         self.enabled = false;
     }
 
+    pub(crate) fn set_close_id_reservations(&mut self, ids: impl IntoIterator<Item = u64>) {
+        self.close_id_reservations = ids.into_iter().collect();
+    }
+
+    #[cfg(test)]
     pub fn take_opened_stream(&mut self) -> Option<u64> {
         self.opened_stream.take()
+    }
+
+    pub(crate) fn begin_open(
+        &mut self,
+        caller: &str,
+        output: String,
+        operation_id: Option<String>,
+        source_format: Option<amaterasu_module_sdk::capture::SourceFormat>,
+    ) -> CaptureResult<OpenStart> {
+        let format = crate::format::CaptureFormat::requested(source_format.as_ref())?;
+        if !self.enabled {
+            return Err(CaptureError::new(
+                "capture_disabled",
+                "capture requires enabled startup policy",
+            ));
+        }
+        if self.startup_retirement_uncertain {
+            return Err(CaptureError::new(
+                "retirement_failed",
+                "capture startup retirement cannot be proven",
+            ));
+        }
+        if let Some(operation_id) = &operation_id {
+            validate_operation_id(operation_id)?;
+            if let Some((id, stream)) = self.find_operation(caller, operation_id) {
+                if stream.output != output || stream.format != format {
+                    return Err(CaptureError::new(
+                        "operation_conflict",
+                        "operation ID already selected a different output",
+                    ));
+                }
+                return Ok(OpenStart::Ready(open_reply(
+                    id,
+                    &stream.output,
+                    stream.geometry,
+                    stream.touch_surface,
+                )));
+            }
+            if let Some(job) = self
+                .opening
+                .values()
+                .find(|job| job.owner == caller && job.operation_id.as_ref() == Some(operation_id))
+            {
+                if job.output != output || job.format != format {
+                    return Err(CaptureError::new(
+                        "operation_conflict",
+                        "operation ID already selected a different output",
+                    ));
+                }
+                return Err(CaptureError::new(
+                    "cleanup_pending",
+                    "capture operation is still opening",
+                ));
+            }
+            if self.retiring.values().any(|entry| {
+                entry.owner == caller && entry.operation_id.as_ref() == Some(operation_id)
+            }) {
+                return Err(CaptureError::new(
+                    "cleanup_pending",
+                    "capture operation is still retiring",
+                ));
+            }
+        }
+        if !self.backend.supported() {
+            return Err(CaptureError::new(
+                "unsupported_platform",
+                "DXGI capture requires Windows",
+            ));
+        }
+        if self.streams.len() + self.retiring.len() + self.opening.len() >= MAX_STREAMS {
+            return Err(CaptureError::new(
+                "resource_exhausted",
+                "at most four capture streams may be open",
+            ));
+        }
+        let id = self.next_stream_id()?;
+        let backend = self.backend.clone();
+        let selected_output = output.clone();
+        #[cfg(target_os = "linux")]
+        let tid = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        #[cfg(target_os = "linux")]
+        let worker_tid = tid.clone();
+        let worker = std::thread::Builder::new()
+            .name("dxgi-open".into())
+            .spawn(move || {
+                #[cfg(target_os = "linux")]
+                {
+                    let id = std::fs::read_link("/proc/thread-self")
+                        .ok()
+                        .and_then(|path| path.file_name()?.to_str()?.parse::<u32>().ok())
+                        .expect("observe startup thread identity");
+                    worker_tid.store(id, Ordering::Release);
+                }
+                prepare_capture(backend.as_ref(), &selected_output, format)
+            })
+            .map_err(|error| {
+                CaptureError::new(
+                    "capture_unavailable",
+                    format!("unable to start capture worker: {error}"),
+                )
+            })?;
+        self.opening.insert(
+            id,
+            Opening {
+                owner: caller.into(),
+                output,
+                operation_id,
+                format,
+                cancelled: false,
+                worker,
+                #[cfg(target_os = "linux")]
+                tid,
+            },
+        );
+        Ok(OpenStart::Pending(id))
+    }
+
+    pub(crate) fn operation_pending(&self, caller: &str, operation_id: &str) -> bool {
+        self.opening
+            .values()
+            .any(|job| job.owner == caller && job.operation_id.as_deref() == Some(operation_id))
+            || self
+                .retiring
+                .values()
+                .any(|job| job.owner == caller && job.operation_id.as_deref() == Some(operation_id))
+    }
+
+    /// Snapshot the exact operation identity for an owned Close target. The
+    /// outer option distinguishes a missing target from a stream opened
+    /// without an idempotency key.
+    pub(crate) fn close_target(&self, caller: &str, id: u64) -> Option<Option<String>> {
+        if let Some(stream) = self
+            .streams
+            .get(&id)
+            .filter(|stream| stream.owner == caller)
+        {
+            return Some(stream.operation_id.clone());
+        }
+        if let Some(job) = self.opening.get(&id).filter(|job| job.owner == caller) {
+            return Some(job.operation_id.clone());
+        }
+        self.retiring
+            .get(&id)
+            .filter(|job| job.owner == caller)
+            .map(|job| job.operation_id.clone())
+    }
+
+    pub(crate) fn cancel_open(&mut self, id: u64) {
+        if let Some(job) = self.opening.get_mut(&id) {
+            job.cancelled = true;
+        }
+    }
+
+    pub(crate) fn abandon_open(&mut self, caller: &str, id: u64) -> CaptureResult<CloseReceipt> {
+        self.begin_close(caller, id)
+    }
+
+    pub(crate) fn poll_open(
+        &mut self,
+        id: u64,
+        commit_allowed: bool,
+    ) -> CaptureResult<Option<(Value, Option<u64>)>> {
+        #[cfg(test)]
+        if self.test_open_observation_failures > 0 {
+            self.test_open_observation_failures -= 1;
+            return Err(CaptureError::new(
+                "retirement_failed",
+                "injected startup observation failure",
+            ));
+        }
+        let Some(job) = self.opening.get(&id) else {
+            return Ok(Some((
+                CaptureError::new("cancelled", "capture startup no longer exists").payload(),
+                None,
+            )));
+        };
+        match worker_finished(&job.worker, opening_tid(job)) {
+            Ok(false) => return Ok(None),
+            // A failed native wait does not prove termination. Keep this
+            // exact job and its waiter so a later observation can recover.
+            Err(error) => return Err(error),
+            Ok(true) => (),
+        }
+        let job = self.opening.remove(&id).expect("finished startup");
+        let prepared = match job.worker.join() {
+            Ok(Ok(prepared)) => prepared,
+            Ok(Err(error)) => return Ok(Some((error.payload(), None))),
+            Err(_) => {
+                self.startup_retirement_uncertain = true;
+                return Ok(Some((
+                    CaptureError::new("retirement_failed", "capture startup worker panicked")
+                        .payload(),
+                    None,
+                )));
+            }
+        };
+        let reply = open_reply(id, &job.output, prepared.geometry, prepared.touch_surface);
+        let cancelled =
+            job.cancelled || !commit_allowed || !self.enabled || prepared.failure.is_some();
+        let failure = prepared.failure;
+        self.streams.insert(
+            id,
+            Stream {
+                owner: job.owner.clone(),
+                output: job.output,
+                session: prepared.session,
+                geometry: prepared.geometry,
+                touch_surface: prepared.touch_surface,
+                operation_id: job.operation_id,
+                format: job.format,
+            },
+        );
+        if cancelled {
+            let result = self.begin_close(&job.owner, id);
+            if let Err(error) = result {
+                return Ok(Some((error.payload(), None)));
+            }
+            Ok(Some((
+                failure
+                    .unwrap_or_else(|| {
+                        CaptureError::new("cancelled", "capture startup was cancelled")
+                    })
+                    .payload(),
+                None,
+            )))
+        } else {
+            Ok(Some((reply, Some(id))))
+        }
     }
 
     pub fn handle(
@@ -109,6 +443,14 @@ impl<B: Backend> Controller<B> {
         }
         if let Some(operation_id) = &operation_id {
             validate_operation_id(operation_id)?;
+            if self.retiring.values().any(|entry| {
+                entry.owner == caller && entry.operation_id.as_ref() == Some(operation_id)
+            }) {
+                return Err(CaptureError::new(
+                    "cleanup_pending",
+                    "the operation's capture stream is still retiring",
+                ));
+            }
             if let Some((stream_id, existing)) = self.find_operation(caller, operation_id) {
                 if existing.output != output || existing.format != format {
                     return Err(CaptureError::new(
@@ -124,7 +466,7 @@ impl<B: Backend> Controller<B> {
                 ));
             }
         }
-        if self.streams.len() >= MAX_STREAMS {
+        if self.streams.len() + self.retiring.len() + self.opening.len() >= MAX_STREAMS {
             return Err(CaptureError::new(
                 "resource_exhausted",
                 "at most four capture streams may be open",
@@ -178,8 +520,15 @@ impl<B: Backend> Controller<B> {
         let mut random = [0; 8];
         getrandom::fill(&mut random)
             .map_err(|error| CaptureError::new("entropy_error", error.to_string()))?;
-        let id = u64::from_le_bytes(random);
-        if self.streams.contains_key(&id) {
+        self.validate_stream_id(u64::from_le_bytes(random))
+    }
+
+    pub(crate) fn validate_stream_id(&self, id: u64) -> CaptureResult<u64> {
+        if self.streams.contains_key(&id)
+            || self.retiring.contains_key(&id)
+            || self.opening.contains_key(&id)
+            || self.close_id_reservations.contains(&id)
+        {
             return Err(CaptureError::new(
                 "entropy_error",
                 "capture stream ID collision; retry open",
@@ -209,9 +558,119 @@ impl<B: Backend> Controller<B> {
     }
 
     pub fn close(&mut self, caller: &str, id: u64) -> CaptureResult<()> {
+        let receipt = self.begin_close(caller, id)?;
+        if let Some((_, error)) = self
+            .poll_closing()
+            .into_iter()
+            .find(|(stream, _)| *stream == id)
+        {
+            return Err(error);
+        }
+        if receipt.retired() {
+            Ok(())
+        } else {
+            Err(CaptureError::new(
+                "cleanup_pending",
+                "capture session is still retiring",
+            ))
+        }
+    }
+
+    pub(crate) fn begin_close(&mut self, caller: &str, id: u64) -> CaptureResult<CloseReceipt> {
+        if let Some(retirement) = self.retiring.get(&id) {
+            return if retirement.owner == caller {
+                Ok(retirement.receipt.clone())
+            } else {
+                Err(CaptureError::new(
+                    "not_found",
+                    "no capture stream owned by this caller",
+                ))
+            };
+        }
         self.authorize(caller, id)?;
-        self.streams.remove(&id);
+        let stream = self.streams.remove(&id).expect("authorized stream");
+        let receipt = CloseReceipt(Arc::new(AtomicBool::new(false)));
+        self.retiring.insert(
+            id,
+            Retirement {
+                owner: stream.owner.clone(),
+                operation_id: stream.operation_id.clone(),
+                stream: Arc::new(Mutex::new(Some(stream))),
+                worker: None,
+                receipt: receipt.clone(),
+                failure: None,
+                #[cfg(target_os = "linux")]
+                tid: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            },
+        );
+        // Ownership has already transferred to the retained retirement. Even
+        // if thread creation fails, return its exact receipt; later polling
+        // retries startup and reports any failure without losing admission.
+        let _ = self.start_retirement(id);
+        Ok(receipt)
+    }
+
+    fn start_retirement(&mut self, id: u64) -> CaptureResult<()> {
+        let retirement = self.retiring.get_mut(&id).expect("retirement exists");
+        if retirement.worker.is_some() || retirement.failure.is_some() {
+            return Ok(());
+        }
+        let stream = retirement.stream.clone();
+        #[cfg(target_os = "linux")]
+        let tid = retirement.tid.clone();
+        let worker = std::thread::Builder::new()
+            .name("dxgi-retire".into())
+            .spawn(move || {
+                #[cfg(target_os = "linux")]
+                {
+                    let id = std::fs::read_link("/proc/thread-self")
+                        .ok()
+                        .and_then(|path| path.file_name()?.to_str()?.parse::<u32>().ok())
+                        .expect("observe retirement thread identity");
+                    tid.store(id, Ordering::Release);
+                }
+                let owned = stream.lock().expect("retirement ownership poisoned").take();
+                drop(owned);
+            })
+            .map_err(|error| CaptureError::new("retirement_unavailable", error.to_string()))?;
+        retirement.worker = Some(worker);
         Ok(())
+    }
+
+    pub(crate) fn poll_closing(&mut self) -> Vec<(u64, CaptureError)> {
+        let ids: Vec<_> = self.retiring.keys().copied().collect();
+        let mut errors = Vec::new();
+        for id in ids {
+            if let Err(error) = self.start_retirement(id) {
+                errors.push((id, error));
+                continue;
+            }
+            let entry = self.retiring.get_mut(&id).expect("retirement exists");
+            let finished = match entry
+                .worker
+                .as_ref()
+                .map(|worker| worker_finished(worker, retirement_tid(entry)))
+                .transpose()
+            {
+                Ok(finished) => finished.unwrap_or(false),
+                Err(error) => {
+                    errors.push((id, error));
+                    continue;
+                }
+            };
+            if finished {
+                if entry.worker.take().expect("finished worker").join().is_ok() {
+                    entry.receipt.0.store(true, Ordering::Release);
+                    self.retiring.remove(&id);
+                    continue;
+                }
+                entry.failure = Some("capture retirement worker panicked".into());
+            }
+            if let Some(message) = &entry.failure {
+                errors.push((id, CaptureError::new("retirement_failed", message.clone())));
+            }
+        }
+        errors
     }
 
     fn authorize(&self, caller: &str, id: u64) -> CaptureResult<()> {
@@ -248,7 +707,7 @@ impl<B: Backend> Controller<B> {
                     | "unsupported_format"
             )
         }) {
-            self.streams.remove(&id);
+            let _ = self.begin_close(caller, id);
         }
         let frame = result?;
         if frame.is_some()
@@ -295,7 +754,7 @@ impl<B: Backend> Controller<B> {
                     | "unsupported_format"
             )
         }) {
-            self.streams.remove(&id);
+            let _ = self.begin_close(caller, id);
         }
         result
     }
@@ -321,7 +780,7 @@ impl<B: Backend> Controller<B> {
             }
         };
         if geometry_lost {
-            self.streams.remove(&id);
+            let _ = self.begin_close(caller, id);
             return Err(CaptureError::new(
                 "access_lost",
                 "capture desktop geometry changed or became unavailable; enumerate and reopen",
@@ -329,6 +788,132 @@ impl<B: Backend> Controller<B> {
         }
         current
     }
+}
+
+impl<B: Backend> Drop for Controller<B> {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+#[cfg(windows)]
+fn worker_finished<T>(
+    worker: &JoinHandle<T>,
+    _: Option<&std::sync::atomic::AtomicU32>,
+) -> CaptureResult<bool> {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows::Win32::System::Threading::WaitForSingleObject;
+
+    // SAFETY: the JoinHandle owns this live thread handle for the duration of
+    // the zero-time wait. A signaled thread has completed its TLS destructors,
+    // so subsequently joining it cannot wait on provider thread execution.
+    match unsafe { WaitForSingleObject(HANDLE(worker.as_raw_handle()), 0) } {
+        WAIT_OBJECT_0 => Ok(true),
+        WAIT_TIMEOUT => Ok(false),
+        _ => Err(CaptureError::new(
+            "retirement_failed",
+            "could not observe capture retirement thread",
+        )),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn worker_finished<T>(
+    worker: &JoinHandle<T>,
+    tid: Option<&std::sync::atomic::AtomicU32>,
+) -> CaptureResult<bool> {
+    if !worker.is_finished() {
+        return Ok(false);
+    }
+    let tid = tid.expect("Linux thread identity").load(Ordering::Acquire);
+    if tid == 0 {
+        // Initialization can fail before the thread publishes its identity.
+        // The owned stream remains in its slot and retirement must fail closed.
+        return Err(CaptureError::new(
+            "retirement_failed",
+            "capture worker did not publish thread identity",
+        ));
+    }
+    // Verify that procfs and this process's task directory remain observable
+    // before interpreting an absent worker TID as termination. A reused TID
+    // only delays retirement until the unrelated thread also exits.
+    let own_task = std::fs::read_link("/proc/thread-self").map_err(|error| {
+        CaptureError::new(
+            "retirement_failed",
+            format!("cannot observe current task: {error}"),
+        )
+    })?;
+    if !std::path::Path::new("/proc").join(own_task).is_dir() {
+        return Err(CaptureError::new(
+            "retirement_failed",
+            "current task is not observable",
+        ));
+    }
+    std::path::Path::new(&format!("/proc/self/task/{tid}"))
+        .try_exists()
+        .map(|exists| !exists)
+        .map_err(|error| {
+            CaptureError::new(
+                "retirement_failed",
+                format!("could not observe capture retirement thread: {error}"),
+            )
+        })
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn worker_finished<T>(
+    worker: &JoinHandle<T>,
+    _: Option<&std::sync::atomic::AtomicU32>,
+) -> CaptureResult<bool> {
+    // Native DXGI is unsupported here; this supports portable fixtures only.
+    Ok(worker.is_finished())
+}
+
+fn retirement_tid(entry: &Retirement) -> Option<&std::sync::atomic::AtomicU32> {
+    #[cfg(target_os = "linux")]
+    {
+        Some(&entry.tid)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = entry;
+        None
+    }
+}
+
+fn opening_tid(entry: &Opening) -> Option<&std::sync::atomic::AtomicU32> {
+    #[cfg(target_os = "linux")]
+    {
+        Some(&entry.tid)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = entry;
+        None
+    }
+}
+
+fn prepare_capture<B: Backend>(
+    backend: &B,
+    output: &str,
+    format: crate::format::CaptureFormat,
+) -> CaptureResult<PreparedCapture> {
+    backend.verify_source_format(output, format)?;
+    let mut session = backend.open_with_format(output, format)?;
+    let result = initial_geometry(&mut *session).and_then(|geometry| {
+        initial_touch_surface(&mut *session, geometry).map(|surface| (geometry, surface))
+    });
+    let (geometry, touch_surface, failure) = match result {
+        Ok((geometry, surface)) => (geometry, surface, None),
+        Err(error) => (None, None, Some(error)),
+    };
+    Ok(PreparedCapture {
+        session,
+        geometry,
+        touch_surface,
+        failure,
+    })
 }
 
 fn initial_geometry(session: &mut dyn CaptureSession) -> CaptureResult<Option<CaptureGeometry>> {
@@ -383,7 +968,7 @@ fn validate_operation_id(operation_id: &str) -> CaptureResult<()> {
     Ok(())
 }
 
-fn enumeration_reply(
+pub(crate) fn enumeration_reply(
     mut outputs: Vec<Output>,
     offset: Option<usize>,
     limit: Option<usize>,

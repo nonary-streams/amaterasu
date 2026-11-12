@@ -32,7 +32,7 @@ pub trait CaptureSession: Send {
     }
 }
 
-pub trait Backend: Send {
+pub trait Backend: Send + Sync + 'static {
     fn supported(&self) -> bool;
     fn enumerate(&self) -> CaptureResult<Vec<Output>>;
     fn open(&self, output: &str) -> CaptureResult<Box<dyn CaptureSession>>;

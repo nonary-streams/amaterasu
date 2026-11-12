@@ -8,6 +8,23 @@ use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+pub(crate) fn finish_retirement<B: Backend>(
+    controller: &mut Controller<B>,
+    caller: &str,
+    stream: u64,
+) {
+    let receipt = controller.begin_close(caller, stream).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !receipt.retired() {
+        assert!(controller.poll_closing().is_empty());
+        assert!(
+            std::time::Instant::now() < deadline,
+            "capture did not retire"
+        );
+        std::thread::yield_now();
+    }
+}
+
 struct FakeBackend {
     outputs: Vec<Output>,
     events: Arc<Mutex<VecDeque<CaptureResult<Option<Frame>>>>>,
@@ -256,7 +273,7 @@ fn enumeration_pages_all_outputs_without_changing_an_open_stream() {
         controller.handle("owner", Operation::Status, &mut || Ok(()))["streams"][0]["output"],
         "output-000"
     );
-    controller.close("owner", stream).unwrap();
+    finish_retirement(&mut controller, "owner", stream);
     assert_eq!(drops.load(Ordering::SeqCst), 1);
 }
 
@@ -408,8 +425,8 @@ fn frame_read_rechecks_published_geometry_before_delivering_pixels() {
         let mut bytes = Vec::new();
         assert_eq!(binding.read(stream, &mut bytes), expected_status);
         assert_eq!(bytes, expected_bytes);
-        assert_eq!(drops.load(Ordering::SeqCst), usize::from(closes));
         if closes {
+            finish_retirement(&mut controller.lock().unwrap(), "owner", stream);
             assert_eq!(binding.read(stream, &mut bytes), MEDIA_CLOSED);
             let status = controller
                 .lock()
@@ -417,6 +434,7 @@ fn frame_read_rechecks_published_geometry_before_delivering_pixels() {
                 .handle("owner", Operation::Status, &mut || Ok(()));
             assert!(status["streams"].as_array().unwrap().is_empty());
         }
+        assert_eq!(drops.load(Ordering::SeqCst), usize::from(closes));
     }
 }
 
@@ -584,7 +602,7 @@ fn touch_surface_is_published_only_when_provider_proves_valid_mapping() {
             "not_found"
         );
         assert!(controller.read("owner", stream, 0).unwrap().is_none());
-        controller.close("owner", stream).unwrap();
+        finish_retirement(&mut controller, "owner", stream);
         assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 }
@@ -700,7 +718,7 @@ fn native_binding_enforces_owner_and_releases_its_state_reference_once() {
     drop(other);
     drop(owner);
     assert_eq!(Arc::strong_count(&controller), before - 1);
-    controller.lock().unwrap().close("owner", stream).unwrap();
+    finish_retirement(&mut controller.lock().unwrap(), "owner", stream);
     assert_eq!(drops.load(Ordering::SeqCst), 1);
 }
 
@@ -978,6 +996,7 @@ fn native_callback_delivers_pixels_then_reports_pending_and_device_loss() {
     assert_eq!(binding.read(stream, &mut bytes), MEDIA_CLOSED);
     assert_eq!(binding.read(stream, &mut bytes), MEDIA_CLOSED);
     assert_eq!(bytes.len(), 8);
+    finish_retirement(&mut controller.lock().unwrap(), "owner", stream);
     assert_eq!(drops.load(Ordering::SeqCst), 1);
 }
 
@@ -1030,6 +1049,7 @@ fn advertised_geometry_becoming_unavailable_closes_only_its_owner_stream() {
             controller.geometry("owner", id).unwrap_err().code,
             "access_lost"
         );
+        finish_retirement(&mut controller, "owner", id);
         assert_eq!(drops.load(Ordering::SeqCst), 1);
         assert_eq!(
             controller.geometry("owner", id).unwrap_err().code,
@@ -1085,7 +1105,7 @@ fn operation_lookup_recovers_owned_stream_without_marking_replays_as_new() {
         controller.handle("owner", conflict, &mut || Ok(()))["error"]["code"],
         "operation_conflict"
     );
-    controller.close("owner", id).unwrap();
+    finish_retirement(&mut controller, "owner", id);
     assert_eq!(
         controller.handle("owner", lookup(), &mut || Ok(()))["error"]["code"],
         "not_found"
@@ -1146,9 +1166,7 @@ fn identical_operation_ids_are_scoped_to_each_owner() {
         );
         assert_eq!(&lookup, expected);
     }
-    controller
-        .close("first", first["stream"].as_u64().unwrap())
-        .unwrap();
+    finish_retirement(&mut controller, "first", first["stream"].as_u64().unwrap());
     let lookup = controller.handle(
         "second",
         Operation::Lookup {
@@ -1172,7 +1190,7 @@ unsafe extern "C" fn close_during_frame(context: *mut c_void, frame: *const CpuF
     let Ok(mut controller) = sink.controller.try_lock() else {
         return MEDIA_BUSY;
     };
-    if controller.close("owner", sink.stream).is_err() {
+    if controller.begin_close("owner", sink.stream).is_err() {
         return MEDIA_CLOSED;
     }
     drop(controller);
@@ -1230,6 +1248,7 @@ fn callback_can_close_stream_without_invalidating_borrowed_pixels() {
     };
     assert_eq!(result, STATUS_OK);
     assert_eq!(sink.observed, [1, 2, 3, 4]);
+    finish_retirement(&mut sink.controller.lock().unwrap(), "owner", stream);
     assert_eq!(drops.load(Ordering::SeqCst), 1);
     assert_eq!(binding.read(stream, &mut Vec::new()), MEDIA_CLOSED);
 }

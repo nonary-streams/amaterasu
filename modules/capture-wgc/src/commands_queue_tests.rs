@@ -189,7 +189,7 @@ fn tick_after_quiescence_does_not_start_new_enumeration() {
     let mut module = module_with_controller(Controller::new(NativeBackend::new(None), true));
     let mut broker = Box::new(Mutex::new(Broker::default()));
     bind_broker(&mut module, &mut broker);
-    assert!(module.quiesce().unwrap());
+    await_quiescence(&mut module);
     {
         let mut broker = broker.lock().unwrap();
         broker.active.insert(40);
@@ -204,7 +204,7 @@ fn tick_after_quiescence_does_not_start_new_enumeration() {
     }
     module.tick().unwrap();
     assert!(module.pending_commands.is_empty());
-    assert!(module.quiesce().unwrap());
+    await_quiescence(&mut module);
     let broker = broker.lock().unwrap();
     assert_eq!(broker.completed.len(), 1);
     assert_eq!(broker.completed[0].0, 40);
