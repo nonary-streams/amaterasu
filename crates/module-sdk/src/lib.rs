@@ -15,6 +15,7 @@ pub mod foreground_context;
 pub mod frame_processing;
 pub mod hooks;
 pub mod input;
+pub mod launch_options;
 pub mod lifecycle_ledger;
 pub mod media;
 mod native;

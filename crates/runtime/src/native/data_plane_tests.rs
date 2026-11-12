@@ -452,3 +452,81 @@ fn artwork_records_enforce_owner_size_and_binding_retirement() {
             .is_ok()
     );
 }
+
+// Two separately compiled C consumers use the documented public table against
+// the same adapter. This does not exercise broker dispatch or real TLS I/O.
+#[test]
+#[ignore = "requires independently compiled neutral consumer libraries"]
+fn independently_built_neutral_duplex_consumers_use_the_same_owner() {
+    use amaterasu_module_sdk::data_plane::connection_owner::{Binding, BufferLimits, DuplexOwner};
+    type Exchange = unsafe extern "C" fn(*const TransferApi, ChannelId, ChannelId) -> Status;
+    let runtime = Runtime::new();
+    let provider = runtime.client("provider");
+    let consumer = runtime.client("consumer");
+    let hub = Hub::new(2, 8).unwrap();
+    let factory = hub.factory();
+    // SAFETY: the runtime, factory and hub remain alive until all bindings drop.
+    unsafe { register_transfer(&provider, SERVICE, &factory.api).unwrap() };
+    let mut input = config(SOURCE, 4);
+    input.limits.max_metadata_bytes = 0;
+    let mut output = config(SINK, 4);
+    output.limits.max_metadata_bytes = 0;
+    for (variable, expected) in [
+        ("AMATERASU_DUPLEX_IDENTITY", b"OKpre".as_slice()),
+        ("AMATERASU_DUPLEX_REVERSE", b"OKerp".as_slice()),
+    ] {
+        let path = std::env::var(variable).expect("fixture library path");
+        // SAFETY: test fixture is built from the repository and stays loaded
+        // until all its synchronous callbacks and native bindings have retired.
+        let library = unsafe { libloading::Library::new(path).unwrap() };
+        let exchange: libloading::Symbol<Exchange> =
+            unsafe { library.get(b"neutral_exchange\0").unwrap() };
+        let mut owner = DuplexOwner::new(
+            &hub,
+            Binding {
+                connection_id: 1,
+                peer_certificate: vec![1],
+                consumer_principal: "consumer".into(),
+            },
+            input,
+            output,
+            b"OK".to_vec(),
+            b"pre".to_vec(),
+            BufferLimits {
+                response: 4,
+                staging: 4,
+            },
+        )
+        .unwrap();
+        // SAFETY: runtime and provider factory outlive this typed native binding.
+        let binding = unsafe {
+            consumer
+                .bind_native_typed(
+                    SERVICE,
+                    TRANSFER_CONTRACT,
+                    INTERFACE_MAJOR,
+                    INTERFACE_MINOR,
+                    API_SIZE,
+                )
+                .unwrap()
+        };
+        // SAFETY: registration promises this exact transfer contract and layout.
+        let api = unsafe { binding.table::<TransferApi>().unwrap() };
+        owner.flush_input().unwrap();
+        // SAFETY: native table, channel IDs and fixture code remain live for the
+        // call; the C consumer uses only synchronous borrows and copies input.
+        assert_eq!(
+            unsafe { exchange(api, owner.pair().input_id(), owner.pair().output_id()) },
+            STATUS_OK
+        );
+        let mut wire = Vec::new();
+        owner.write_step(&mut wire, |_| true).unwrap();
+        owner.response_flushed().unwrap();
+        owner.write_step(&mut wire, |_| true).unwrap();
+        assert_eq!(wire, expected);
+        owner.signal_cancel();
+        drop(binding);
+        drop(owner);
+        drop(library);
+    }
+}

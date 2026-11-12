@@ -220,6 +220,13 @@ impl Channel {
         self.signal(&mut state);
         Ok(())
     }
+    // Signal cancellation and wake waiters without waiting for callbacks or
+    // releasing payloads. Pair owners signal both directions before barriers.
+    pub(super) fn begin_cancel(&self) {
+        let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.phase = CANCELLED;
+        self.signal(&mut state);
+    }
     /// Synchronous barrier for pending/in-flight payloads and lease destructors.
     /// Producer threads owned by a plugin must additionally be joined by it.
     pub fn cancel(&self) {
