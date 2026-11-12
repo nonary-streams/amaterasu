@@ -177,6 +177,19 @@ impl FrameProcessingSession {
     /// Immediately forwards the current source frame and its dependencies.
     /// BUSY/PENDING consume no queued SDK work; callers retry the latest source.
     pub fn forward(&mut self, flags: u32) -> Result<Status, ConnectionError> {
+        self.forward_source(flags, false)
+    }
+
+    /// Forward across capture offer changes without retiring processor settings
+    /// or downstream readers. The first processor must support repeated input
+    /// configuration while preserving outstanding references. A source change
+    /// defers delivery until a later call negotiates and selects its new offer.
+    /// Unsupported formats and uncertain provider effects still cancel normally.
+    pub fn forward_latest(&mut self, flags: u32) -> Result<Status, ConnectionError> {
+        self.forward_source(flags, true)
+    }
+
+    fn forward_source(&mut self, flags: u32, refresh: bool) -> Result<Status, ConnectionError> {
         if self.retired {
             return Err(ConnectionError::Stale);
         }
@@ -205,7 +218,7 @@ impl FrameProcessingSession {
             )
         }?;
         input.restore_state(self.input);
-        let negotiated = input.negotiate();
+        let negotiated = input.negotiate_source(refresh);
         self.input = input.take_state();
         negotiated?;
         if let Err(error) = self.negotiate_outputs() {
@@ -217,7 +230,11 @@ impl FrameProcessingSession {
             return Err(error);
         }
         input.restore_state(self.input);
-        let result = input.forward(flags);
+        let result = if refresh {
+            input.forward_latest(flags)
+        } else {
+            input.forward(flags)
+        };
         self.input = input.take_state();
         if !matches!(result, Ok(STATUS_OK | MEDIA_BUSY | MEDIA_PENDING)) {
             self.cancel();

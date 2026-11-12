@@ -552,6 +552,73 @@ fn stale_source_generation_retires_downstream_before_processor() {
 }
 
 #[test]
+fn latest_source_change_preserves_readers_and_settings_then_delivers_new_format() {
+    let order = Rc::new(RefCell::new(Vec::new()));
+    let mut source = Source::new(FRAME_RESOURCE_VENDOR_BASE + 10);
+    let capture = capture(&mut source);
+    let processor = processor(order.clone());
+    let mut downstream = Sink {
+        kind: FRAME_RESOURCE_VENDOR_BASE + 30,
+        held: None,
+        busy: false,
+        saw_pending: false,
+        handle: ptr::null(),
+        order: order.clone(),
+    };
+    let sink = sink(&mut downstream);
+    // SAFETY: all fixture tables and stream owners outlive the session.
+    let mut session = unsafe {
+        FrameProcessingSession::new(
+            &capture,
+            2,
+            &[FrameProcessingStage {
+                processor: &(*processor).base,
+                stream: 1,
+            }],
+            &sink,
+            3,
+            FRAME_ACCESS_GPU,
+        )
+    }
+    .unwrap();
+    assert_eq!(session.forward_latest(0), Ok(STATUS_OK));
+    source.selected = false;
+    source.generation += 1;
+    source.kind = FRAME_RESOURCE_VENDOR_BASE + 20;
+    assert_eq!(session.forward_latest(0), Ok(MEDIA_PENDING));
+    assert!(!session.is_retired());
+    assert!(order.borrow().is_empty());
+    assert_eq!(source.references.get(), 1);
+    let mut metadata = HdrMetadata::default();
+    assert_eq!(
+        unsafe {
+            ((*processor).hdr_metadata)((*processor).base.base.base.context, 1, &mut metadata)
+        },
+        STATUS_OK,
+        "the configured processor remains queryable"
+    );
+    let previous = downstream.held.take().unwrap();
+    unsafe { (previous.release)(previous.context, &NONE) };
+    source.sequence += 1;
+    assert_eq!(session.forward_latest(0), Ok(STATUS_OK));
+    assert_eq!(downstream.held.as_ref().unwrap().sequence, source.sequence);
+    // An unsupported new source is terminal, with ordered retirement.
+    source.selected = false;
+    source.generation += 1;
+    source.kind = FRAME_RESOURCE_VENDOR_BASE + 99;
+    assert_eq!(session.forward_latest(0), Ok(MEDIA_PENDING));
+    assert_eq!(
+        session.forward_latest(0),
+        Err(crate::capture::ConnectionError::NoCompatibleOffer)
+    );
+    assert!(session.is_retired());
+    assert_eq!(*order.borrow(), ["consumer", "processor"]);
+    assert_eq!(source.references.get(), 0);
+    drop(session);
+    unsafe { release_processor(processor) };
+}
+
+#[test]
 fn multiple_steps_and_shared_readers_forward_dependencies_without_copies_or_completion_waits() {
     let order = Rc::new(RefCell::new(Vec::new()));
     let observers = Rc::new(RefCell::new(Vec::new()));

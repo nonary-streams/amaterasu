@@ -34,6 +34,16 @@ sequence, timestamp, capture pacing timestamp, both clock identities and freshne
 survive every processing step. Only the final encoder adapter assigns the encoded
 stream's timeline and submission sequence.
 
+Built-in video uses `FrameProcessingSession::forward_latest` to renegotiate
+capture offers when desktop unlock or another format change invalidates the
+selection. The first processor must accept repeated input configuration and
+preserve outstanding readers. Delivery defers to a later pump while the new
+offer is selected; processor settings, HDR metadata and downstream ownership
+remain active. Unsupported formats, malformed frames and uncertain configuration
+still fail and cancel in order. `ResourceConnection::forward_latest` offers the
+same opt-in behavior to direct consumers; ordinary `forward` retains its terminal
+stale-selection behavior.
+
 ## Shared ownership and readiness
 
 `ProcessingFrame::retain` acquires an independent provider reference.

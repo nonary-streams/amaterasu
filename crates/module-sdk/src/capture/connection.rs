@@ -304,6 +304,20 @@ impl<'a> ResourceConnection<'a> {
     /// Select a compatible offer on a fresh consumer stream. Cancellation retires
     /// the stream; after a stale selection, reopen it and create a new connection.
     pub fn negotiate(&mut self) -> Result<(), ConnectionError> {
+        self.negotiate_source(false)
+    }
+
+    fn source_changed(&mut self, refresh: bool) -> ConnectionError {
+        self.selected = None;
+        if refresh {
+            ConnectionError::Native(MEDIA_PENDING)
+        } else {
+            self.cancel();
+            ConnectionError::Stale
+        }
+    }
+
+    pub(crate) fn negotiate_source(&mut self, refresh: bool) -> Result<(), ConnectionError> {
         if self.retired {
             return Err(ConnectionError::Stale);
         }
@@ -386,8 +400,7 @@ impl<'a> ResourceConnection<'a> {
             first.ids.sort_unstable();
             state.ids.ids.sort_unstable();
             if producer_generation != second_generation || first.ids != state.ids.ids {
-                self.cancel();
-                return Err(ConnectionError::Stale);
+                return Err(self.source_changed(refresh));
             }
             let Some(offer) = state.selected else {
                 self.cancel();
@@ -403,8 +416,7 @@ impl<'a> ResourceConnection<'a> {
                 )
             };
             if status == MEDIA_UNSUPPORTED {
-                self.cancel();
-                return Err(ConnectionError::Stale);
+                return Err(self.source_changed(refresh));
             }
             if status != STATUS_OK {
                 return Err(self.negotiation_error(ConnectionError::Native(status)));
@@ -418,9 +430,23 @@ impl<'a> ResourceConnection<'a> {
     /// PENDING and BUSY are returned unchanged. A stale producer selection
     /// retires the consumer stream. A consumer error is never mistaken for stale capture.
     pub fn forward(&mut self, flags: u32) -> Result<Status, ConnectionError> {
+        self.forward_source(flags, false)
+    }
+
+    /// Forward the newest source, renegotiating a changed capture offer on a
+    /// later call. The consumer must accept repeated `configure` calls and keep
+    /// outstanding frame references valid across successful reconfiguration.
+    /// A source change before submission returns PENDING without cancellation.
+    /// Malformed frames and uncertain configuration still retire the connection;
+    /// consumer statuses are preserved, including an UNSUPPORTED reply.
+    pub fn forward_latest(&mut self, flags: u32) -> Result<Status, ConnectionError> {
+        self.forward_source(flags, true)
+    }
+
+    fn forward_source(&mut self, flags: u32, refresh: bool) -> Result<Status, ConnectionError> {
         {
             if self.selected.is_none() {
-                self.negotiate()?;
+                self.negotiate_source(refresh)?;
             }
             let (generation, offer) = self.selected.expect("negotiated selection");
             let mut delivery = Delivery {
@@ -454,8 +480,12 @@ impl<'a> ResourceConnection<'a> {
                 return Err(ConnectionError::Protocol);
             }
             if delivery.calls == 0 && status == MEDIA_UNSUPPORTED {
-                self.cancel();
-                return Err(ConnectionError::Stale);
+                let error = self.source_changed(refresh);
+                return if refresh {
+                    Ok(MEDIA_PENDING)
+                } else {
+                    Err(error)
+                };
             }
             Ok(status)
         }
@@ -1016,6 +1046,103 @@ mod tests {
         drop(connection);
         assert_eq!(consumer.cancelled, 1);
     }
+    #[test]
+    fn latest_source_retries_selection_races_and_reconfigures_without_cancelling() {
+        for generation_changes in [false, true] {
+            let mut producer = Producer {
+                selection_fails: !generation_changes,
+                change_generation: generation_changes,
+                ..Producer::default()
+            };
+            let capture = capture_table(&mut producer);
+            let mut consumer = Consumer::default();
+            let mut api = table(&mut consumer);
+            api.enumerate_resources = consumer_enumerate;
+            // SAFETY: fixture tables and contexts outlive the connection.
+            let mut connection =
+                unsafe { ResourceConnection::new(&capture, 1, &api, 3, FRAME_ACCESS_GPU).unwrap() };
+            assert_eq!(
+                connection.forward_latest(0),
+                Err(ConnectionError::Native(MEDIA_PENDING))
+            );
+            assert_eq!(consumer.cancelled, 0);
+            assert_eq!(consumer.submitted, 0);
+            producer.selection_fails = false;
+            producer.change_generation = false;
+            assert_eq!(connection.forward_latest(0), Ok(STATUS_OK));
+            producer.stale = true;
+            producer.generation = 10;
+            producer.offer_id = 6;
+            assert_eq!(connection.forward_latest(0), Ok(MEDIA_PENDING));
+            assert_eq!(consumer.cancelled, 0);
+            producer.stale = false;
+            assert_eq!(connection.forward_latest(0), Ok(STATUS_OK));
+            assert_eq!(
+                (consumer.producer_generation, consumer.producer_offer),
+                (10, 6)
+            );
+            assert_eq!(consumer.submitted, 2);
+            drop(connection);
+            assert_eq!(consumer.cancelled, 1);
+        }
+    }
+
+    #[test]
+    fn latest_source_does_not_retry_uncertain_consumer_configuration() {
+        for status in [
+            MEDIA_BUSY,
+            MEDIA_PENDING,
+            amaterasu_media::MEDIA_BACKEND_ERROR,
+        ] {
+            let mut producer = Producer::default();
+            let capture = capture_table(&mut producer);
+            let mut consumer = Consumer {
+                configure_error: Some(status),
+                ..Consumer::default()
+            };
+            let mut api = table(&mut consumer);
+            api.enumerate_resources = consumer_enumerate;
+            // SAFETY: fixture tables and contexts outlive the connection.
+            let mut connection =
+                unsafe { ResourceConnection::new(&capture, 1, &api, 3, FRAME_ACCESS_GPU).unwrap() };
+            assert_eq!(
+                connection.forward_latest(0),
+                Err(ConnectionError::Native(status))
+            );
+            assert_eq!(consumer.cancelled, 1);
+            assert_eq!(connection.forward_latest(0), Err(ConnectionError::Stale));
+            drop(connection);
+            assert_eq!(consumer.cancelled, 1);
+        }
+    }
+
+    #[test]
+    fn latest_source_preserves_consumer_refusal_without_renegotiating_capture() {
+        unsafe extern "C" fn refuse(
+            _: *mut c_void,
+            _: u64,
+            _: *const CaptureResourceFrame,
+            _: u32,
+        ) -> Status {
+            MEDIA_UNSUPPORTED
+        }
+        let mut producer = Producer::default();
+        let capture = capture_table(&mut producer);
+        let mut consumer = Consumer::default();
+        let mut api = table(&mut consumer);
+        api.enumerate_resources = consumer_enumerate;
+        api.submit = refuse;
+        // SAFETY: fixture tables and contexts outlive the connection.
+        let mut connection =
+            unsafe { ResourceConnection::new(&capture, 1, &api, 3, FRAME_ACCESS_GPU).unwrap() };
+        assert_eq!(connection.forward_latest(0), Ok(MEDIA_UNSUPPORTED));
+        assert_eq!(connection.forward_latest(0), Ok(MEDIA_UNSUPPORTED));
+        assert_eq!(consumer.configured, 1);
+        assert_eq!(producer.enumerate_calls, 2);
+        drop(connection);
+        assert_eq!(consumer.cancelled, 1);
+    }
+
     #[test]
     fn failed_selection_and_changed_generation_cancel_configured_consumer_once() {
         for generation_changes in [false, true] {
