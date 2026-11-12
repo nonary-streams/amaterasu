@@ -978,6 +978,9 @@ pub struct VideoConfiguration {
     pub width: u32,
     pub height: u32,
     pub fps: u32,
+    /// Optional exact stream cadence; omitted legacy payloads keep integer FPS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fps_milli: Option<u32>,
     pub bitrate: u32,
     /// Zero leaves H.264 reference-frame selection to the encoder; a positive
     /// value requests the exact maximum in the stream's H.264 SPS.
@@ -1449,6 +1452,9 @@ impl VideoConfiguration {
             && self.width.is_multiple_of(2)
             && self.height.is_multiple_of(2)
             && (1..=120).contains(&self.fps)
+            && self.fps_milli.is_none_or(|rate| {
+                (1000..=120_000).contains(&rate) && rate.div_ceil(1000) == self.fps
+            })
             && (100_000..=100_000_000).contains(&self.bitrate)
             && self.slices_per_frame >= 1
             && self.nvenc_settings.validate().is_ok()
@@ -2356,5 +2362,36 @@ mod encoder_source_tests {
                     .is_err()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod fractional_cadence_tests {
+    use super::*;
+
+    #[test]
+    fn video_start_preserves_fractional_rate_and_rejects_conflicting_nominal_fps() {
+        let mut configuration: VideoConfiguration = serde_json::from_value(serde_json::json!({
+            "width": 1920, "height": 1080, "fps": 60,
+            "fps_milli": 59_940, "bitrate": 5_000_000
+        }))
+        .unwrap();
+        assert!(configuration.valid());
+        assert_eq!(
+            serde_json::to_value(&configuration).unwrap()["fps_milli"],
+            59_940
+        );
+        configuration.fps_milli = Some(60_001);
+        assert!(!configuration.valid());
+        configuration.fps_milli = Some(0);
+        assert!(!configuration.valid());
+        configuration.fps_milli = None;
+        assert!(configuration.valid());
+        assert!(
+            serde_json::to_value(configuration)
+                .unwrap()
+                .get("fps_milli")
+                .is_none()
+        );
     }
 }

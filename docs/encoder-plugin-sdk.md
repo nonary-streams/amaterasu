@@ -180,6 +180,14 @@ format; check its version and size. Its output clock is v1 stream-relative with 
 addition. Reject unsupported or unestablished clocks instead of inferring an
 origin.
 
+The Rust SDK exposes `encode::FrameCadence` and `encode::CommonConfigV1` for
+authoring and reading this schema. `FrameCadence::from_fps(60)` preserves the
+legacy `60/1` representation; `FrameCadence::from_millihz(59_940)` represents
+exactly `59_940/1000` FPS. Set the cadence on a validated common config, then
+call `SessionConfig::set_common_config_v1`; providers can read a negotiated
+standard config with `SessionConfig::common_config_v1`. Other option schemas
+remain opaque, and milliHz conversion is reported only when exact.
+
 Optional `EncoderFrameOptionsV1` carries frame identity, source epoch, clock
 and independently negotiated side data. Prepare it through frame-options control
 and wait for `APPLIED` before submission. The nonzero submission ID is unique

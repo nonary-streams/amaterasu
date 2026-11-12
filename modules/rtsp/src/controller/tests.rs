@@ -4282,3 +4282,16 @@ fn rejected_lifecycle_join_leaves_no_outstanding_preparation() {
         );
     }
 }
+
+#[test]
+fn accepted_fractional_announce_reaches_the_video_configuration_without_rounding() {
+    let (mut record, mut announce) = announced_profile_record();
+    announce.video.refresh_rate_x100 = 5_994;
+    assert!(record.accept_announce(&announce));
+    let payload = record.authenticated_start_payload(23).unwrap();
+    assert_eq!(payload["configuration"]["configuration"]["fps"], 60);
+    assert_eq!(
+        payload["configuration"]["configuration"]["fps_milli"],
+        59_940
+    );
+}

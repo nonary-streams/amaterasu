@@ -602,6 +602,7 @@ pub(crate) struct NegotiatedVideo {
     pub width: u32,
     pub height: u32,
     pub fps: u32,
+    pub fps_milli: Option<u32>,
     pub bitrate_kbps: u32,
     pub max_reference_frames: u32,
 }
@@ -1017,6 +1018,18 @@ impl Open {
             width: announce.video.width,
             height: announce.video.height,
             fps: announce.video.fps,
+            // This protocol already restricts the reported rate to the nominal
+            // FPS. Preserve a fractional rate only when it fits that ceiling;
+            // an integer or unrelated display rate keeps legacy scheduling.
+            fps_milli: announce
+                .video
+                .refresh_rate_x100
+                .checked_mul(10)
+                .filter(|rate| {
+                    *rate != announce.video.fps * 1000
+                        && *rate >= 1000
+                        && rate.div_ceil(1000) == announce.video.fps
+                }),
             bitrate_kbps: announce.video.bitrate_kbps,
             max_reference_frames: announce.video.max_reference_frames,
         };
@@ -3599,6 +3612,7 @@ mod tests {
                 width: 1280,
                 height: 720,
                 fps: 30,
+                fps_milli: None,
                 bitrate_kbps: 8_000,
                 max_reference_frames: 0,
             })

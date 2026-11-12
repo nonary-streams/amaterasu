@@ -171,6 +171,9 @@ impl Record {
         payload["configuration"]["configuration"]["width"] = serde_json::json!(video.width);
         payload["configuration"]["configuration"]["height"] = serde_json::json!(video.height);
         payload["configuration"]["configuration"]["fps"] = serde_json::json!(video.fps);
+        if let Some(fps_milli) = video.fps_milli {
+            payload["configuration"]["configuration"]["fps_milli"] = json!(fps_milli);
+        }
         payload["configuration"]["configuration"]["bitrate"] = serde_json::json!(bitrate);
         payload["configuration"]["configuration"]["max_reference_frames"] =
             serde_json::json!(video.max_reference_frames);
