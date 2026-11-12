@@ -30,6 +30,7 @@ pub use storage::{
 };
 pub use verification::{
     VerificationPolicy, verify_detached_signature, verify_package, verify_package_with_progress,
+    verify_signed_manifest,
 };
 
 pub type PackageResult<T> = Result<T, String>;

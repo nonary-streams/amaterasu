@@ -502,7 +502,10 @@ fn previous_repository_id(root: &Path, expected_revision: &str) -> PackageResult
         .ok_or_else(|| "previous native set has no approved publisher provenance".into())
 }
 pub use store::{CatalogListing, RepositoryListing, RepositoryStore};
-pub use transport::{HttpsRepository, RepositoryTransport, download_candidate, refresh_catalog};
+pub use transport::{
+    HttpsRepository, RepositoryTransport, download_candidate, fetch_native_manifest,
+    refresh_catalog,
+};
 
 /// Stage a complete native set for the next development worker trial. Callers
 /// hold the repository approval lock while this acquires the host root lock.
@@ -1085,38 +1088,9 @@ pub fn verify_candidate(
     bootstrap: &BootstrapConfig,
     now: u64,
 ) -> PackageResult<()> {
-    approved.validate()?;
-    if catalog.catalog.repository != approved.id
-        || catalog.publisher_fingerprint != approved.fingerprint
-        || catalog.catalog.expires_unix <= now
-        || !catalog.catalog.candidates.iter().any(|listed| {
-            listed.slot == candidate.slot
-                && listed.implementation == candidate.implementation
-                && listed.version == candidate.version
-                && listed.kind == candidate.kind
-                && listed.manifest_sha256 == candidate.manifest_sha256
-        })
-    {
-        return Err("candidate is not in the current approved catalog".into());
-    }
+    require_listed(approved, catalog, candidate, now)?;
     let raw = read_bounded(&directory.join("manifest.json"), 1_048_576)?;
-    if sha256(&raw) != candidate.manifest_sha256 {
-        return Err("candidate manifest does not match repository catalog".into());
-    }
-    let canonical = match candidate.kind {
-        CandidateKind::NativeSet => serde_json::to_vec(
-            &serde_json::from_slice::<crate::ReleaseManifest>(&raw)
-                .map_err(|error| error.to_string())?,
-        ),
-        CandidateKind::WebBundle => serde_json::to_vec(
-            &serde_json::from_slice::<crate::web::Manifest>(&raw)
-                .map_err(|error| error.to_string())?,
-        ),
-    }
-    .map_err(|error| error.to_string())?;
-    if canonical != raw {
-        return Err("repository candidate manifest is not canonical JSON".into());
-    }
+    require_catalog_manifest(candidate, &raw)?;
     match candidate.kind {
         CandidateKind::NativeSet => {
             let mut restricted = bootstrap.clone();
@@ -1131,11 +1105,7 @@ pub fn verify_candidate(
                     now,
                 },
             )?;
-            if !package.manifest.components.iter().any(|component| {
-                component.id == candidate.slot && component.version == candidate.version
-            }) {
-                return Err("native set does not provide the selected slot and version".into());
-            }
+            require_selected_slot(candidate, &package.manifest)?;
         }
         CandidateKind::WebBundle => {
             let bundle = crate::web::verify_bundle(directory, &approved.keys(), now)?;
@@ -1145,6 +1115,101 @@ pub fn verify_candidate(
                 return Err("web bundle identity or manifest changed".into());
             }
         }
+    }
+    Ok(())
+}
+
+/// Authenticates a native candidate's manifest against the approved publisher
+/// and the signed catalog without its artifacts.
+///
+/// The manifest bytes and signature pass the checks [`verify_candidate`]
+/// applies to them, so the result says what the publisher offers. It does not
+/// make the set installable: only [`verify_candidate`] hashes the artifacts,
+/// checks privileged requests and resolves the set against host policy.
+pub fn verify_native_manifest(
+    approved: &ApprovedRepository,
+    catalog: &VerifiedCatalog,
+    candidate: &Candidate,
+    raw_manifest: &[u8],
+    signature: &ReleaseSignature,
+    now: u64,
+) -> PackageResult<crate::ReleaseManifest> {
+    if candidate.kind != CandidateKind::NativeSet {
+        return Err("candidate is not a native set".into());
+    }
+    require_listed(approved, catalog, candidate, now)?;
+    require_catalog_manifest(candidate, raw_manifest)?;
+    let manifest = crate::verify_signed_manifest(
+        raw_manifest,
+        signature,
+        &approved.keys(),
+        VerificationPolicy {
+            minimum_sequence: 0,
+            allow_historical: false,
+            now,
+        },
+    )?;
+    require_selected_slot(candidate, &manifest)?;
+    Ok(manifest)
+}
+
+/// The candidate must be a choice of the approved publisher's unexpired catalog.
+fn require_listed(
+    approved: &ApprovedRepository,
+    catalog: &VerifiedCatalog,
+    candidate: &Candidate,
+    now: u64,
+) -> PackageResult<()> {
+    approved.validate()?;
+    if catalog.catalog.repository != approved.id
+        || catalog.publisher_fingerprint != approved.fingerprint
+        || catalog.catalog.expires_unix <= now
+        || !catalog.catalog.candidates.iter().any(|listed| {
+            listed.slot == candidate.slot
+                && listed.implementation == candidate.implementation
+                && listed.version == candidate.version
+                && listed.kind == candidate.kind
+                && listed.manifest_sha256 == candidate.manifest_sha256
+        })
+    {
+        return Err("candidate is not in the current approved catalog".into());
+    }
+    Ok(())
+}
+
+/// The manifest must be the exact canonical bytes the catalog choice names.
+fn require_catalog_manifest(candidate: &Candidate, raw: &[u8]) -> PackageResult<()> {
+    if sha256(raw) != candidate.manifest_sha256 {
+        return Err("candidate manifest does not match repository catalog".into());
+    }
+    let canonical = match candidate.kind {
+        CandidateKind::NativeSet => serde_json::to_vec(
+            &serde_json::from_slice::<crate::ReleaseManifest>(raw)
+                .map_err(|error| error.to_string())?,
+        ),
+        CandidateKind::WebBundle => serde_json::to_vec(
+            &serde_json::from_slice::<crate::web::Manifest>(raw)
+                .map_err(|error| error.to_string())?,
+        ),
+    }
+    .map_err(|error| error.to_string())?;
+    if canonical != raw {
+        return Err("repository candidate manifest is not canonical JSON".into());
+    }
+    Ok(())
+}
+
+/// A native set is offered for one slot and must carry that component version.
+fn require_selected_slot(
+    candidate: &Candidate,
+    manifest: &crate::ReleaseManifest,
+) -> PackageResult<()> {
+    if !manifest
+        .components
+        .iter()
+        .any(|component| component.id == candidate.slot && component.version == candidate.version)
+    {
+        return Err("native set does not provide the selected slot and version".into());
     }
     Ok(())
 }

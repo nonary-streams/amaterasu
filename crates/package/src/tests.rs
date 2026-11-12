@@ -305,6 +305,67 @@ fn startup_settings_are_scoped_to_selected_components() {
 }
 
 #[test]
+fn signed_manifest_declarations_are_checked_without_reading_artifacts() {
+    let mut package = TestPackage::new();
+    package.add_feature("amaterasu.feature", &["amaterasu.runtime"]);
+    package.write_signed_manifest();
+    let policy = VerificationPolicy {
+        minimum_sequence: 5,
+        allow_historical: false,
+        now: unix_timestamp(),
+    };
+    let verify = |package: &TestPackage| {
+        let raw = fs::read(package.directory.join("manifest.json")).unwrap();
+        let signature: ReleaseSignature =
+            read_json(&package.directory.join("manifest.sig")).unwrap();
+        verify_signed_manifest(&raw, &signature, &package.bootstrap.trusted_keys, policy)
+    };
+
+    // The manifest alone is authentic while the set is not installable.
+    fs::remove_file(package.directory.join("amaterasu.feature.bin")).unwrap();
+    assert_eq!(verify(&package).unwrap().components.len(), 2);
+    assert!(package.verify().is_err());
+
+    // A signature over other bytes authenticates nothing.
+    let raw = fs::read(package.directory.join("manifest.json")).unwrap();
+    let signature: ReleaseSignature = read_json(&package.directory.join("manifest.sig")).unwrap();
+    let mut altered = raw.clone();
+    altered.push(b' ');
+    assert!(
+        verify_signed_manifest(
+            &altered,
+            &signature,
+            &package.bootstrap.trusted_keys,
+            policy
+        )
+        .is_err()
+    );
+    assert!(verify_signed_manifest(&raw, &signature, &BTreeMap::new(), policy).is_err());
+
+    // Declarations a complete package would be refused for are refused here.
+    package.manifest.components[1].file = "runtime.bin".into();
+    package.write_signed_manifest();
+    assert!(verify(&package).is_err());
+    package.manifest.components[1].file = "../feature.bin".into();
+    package.write_signed_manifest();
+    assert!(verify(&package).is_err());
+    package.manifest.components[1].file = "amaterasu.feature.bin".into();
+    package.manifest.components[1]
+        .requires
+        .insert("amaterasu.absent".into(), "0.1.0".into());
+    package.write_signed_manifest();
+    assert!(verify(&package).is_err());
+    package.manifest.components[1].requires.clear();
+    package.manifest.sequence = 4;
+    package.write_signed_manifest();
+    assert!(verify(&package).is_err());
+    package.manifest.sequence = 5;
+    package.manifest.expires_unix = policy.now;
+    package.write_signed_manifest();
+    assert!(verify(&package).is_err());
+}
+
+#[test]
 fn rejects_path_traversal() {
     let mut package = TestPackage::new();
     package.manifest.components[0].file = "../runtime.bin".into();

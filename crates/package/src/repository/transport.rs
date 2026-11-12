@@ -1,10 +1,11 @@
 //! Bounded retrieval with a deterministic layout and no redirect following.
 use super::{
     ApprovedRepository, Candidate, CandidateKind, RepositoryStore, VerifiedCatalog, valid_segment,
-    verify_candidate,
+    verify_candidate, verify_native_manifest,
 };
 use crate::{
-    BootstrapConfig, PackageResult, ReleaseManifest, create_private_directory, sha256, web,
+    BootstrapConfig, PackageResult, ReleaseManifest, ReleaseSignature, create_private_directory,
+    sha256, web,
 };
 use std::fs;
 use std::io::Read;
@@ -106,19 +107,8 @@ pub fn download_candidate(
     if output.try_exists().map_err(|error| error.to_string())? {
         return Err("candidate output already exists".into());
     }
-    let kind = match candidate.kind {
-        CandidateKind::NativeSet => "native",
-        CandidateKind::WebBundle => "web",
-    };
-    if !valid_segment(&candidate.implementation) || !valid_segment(&candidate.version) {
-        return Err("invalid candidate path segment".into());
-    }
-    let prefix = format!("{kind}/{}/{}", candidate.implementation, candidate.version);
-    let manifest = transport.get(&format!("{prefix}/manifest.json"), 1_048_576)?;
-    if sha256(&manifest) != candidate.manifest_sha256 {
-        return Err("downloaded manifest is not listed in the signed catalog".into());
-    }
-    let signature = transport.get(&format!("{prefix}/manifest.sig"), 4_096)?;
+    let prefix = candidate_prefix(candidate)?;
+    let (manifest, signature) = fetch_listed_manifest(transport, candidate, &prefix)?;
     let files = payload_files(candidate.kind, &manifest)?;
     fs::create_dir(output).map_err(|error| error.to_string())?;
     amaterasu_storage::write_atomically(&output.join("manifest.json"), &manifest)?;
@@ -130,6 +120,59 @@ pub fn download_candidate(
         amaterasu_storage::write_atomically(&path, &bytes)?;
     }
     verify_candidate(approved, catalog, candidate, output, bootstrap, now)
+}
+
+/// Fetches a native candidate's signed manifest and authenticates it against
+/// the approved publisher and catalog without downloading an artifact.
+///
+/// This says what a publisher offers; see [`verify_native_manifest`] for what
+/// it establishes. Installing the set still requires [`download_candidate`].
+pub fn fetch_native_manifest(
+    transport: &impl RepositoryTransport,
+    approved: &ApprovedRepository,
+    catalog: &VerifiedCatalog,
+    candidate: &Candidate,
+    now: u64,
+) -> PackageResult<ReleaseManifest> {
+    approved.validate()?;
+    if candidate.kind != CandidateKind::NativeSet {
+        return Err("candidate is not a native set".into());
+    }
+    let prefix = candidate_prefix(candidate)?;
+    let (manifest, signature) = fetch_listed_manifest(transport, candidate, &prefix)?;
+    let signature: ReleaseSignature =
+        serde_json::from_slice(&signature).map_err(|error| error.to_string())?;
+    verify_native_manifest(approved, catalog, candidate, &manifest, &signature, now)
+}
+
+/// Where a candidate's files are, relative to the repository location.
+fn candidate_prefix(candidate: &Candidate) -> PackageResult<String> {
+    let kind = match candidate.kind {
+        CandidateKind::NativeSet => "native",
+        CandidateKind::WebBundle => "web",
+    };
+    if !valid_segment(&candidate.implementation) || !valid_segment(&candidate.version) {
+        return Err("invalid candidate path segment".into());
+    }
+    Ok(format!(
+        "{kind}/{}/{}",
+        candidate.implementation, candidate.version
+    ))
+}
+
+/// Fetches the manifest a catalog choice names and its detached signature.
+/// The signature is not requested for a manifest the catalog does not list.
+fn fetch_listed_manifest(
+    transport: &impl RepositoryTransport,
+    candidate: &Candidate,
+    prefix: &str,
+) -> PackageResult<(Vec<u8>, Vec<u8>)> {
+    let manifest = transport.get(&format!("{prefix}/manifest.json"), 1_048_576)?;
+    if sha256(&manifest) != candidate.manifest_sha256 {
+        return Err("downloaded manifest is not listed in the signed catalog".into());
+    }
+    let signature = transport.get(&format!("{prefix}/manifest.sig"), 4_096)?;
+    Ok((manifest, signature))
 }
 
 fn payload_files(kind: CandidateKind, raw: &[u8]) -> PackageResult<Vec<(String, u64)>> {

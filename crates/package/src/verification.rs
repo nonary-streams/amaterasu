@@ -64,6 +64,30 @@ pub fn verify_package_with_progress(
     })
 }
 
+/// Authenticates a release manifest and checks everything it declares that
+/// can be judged without its artifacts: the signature, the release metadata
+/// and the component list.
+///
+/// This establishes what a publisher offers. It does not make a set loadable:
+/// only [`verify_package`] hashes the artifacts, checks privileged requests
+/// and resolves the set against host policy.
+pub fn verify_signed_manifest(
+    raw_manifest: &[u8],
+    signature: &ReleaseSignature,
+    trusted_keys: &BTreeMap<String, String>,
+    policy: VerificationPolicy,
+) -> PackageResult<ReleaseManifest> {
+    if raw_manifest.len() as u64 > MAX_MANIFEST_BYTES {
+        return Err("release manifest exceeds size limit".into());
+    }
+    verify_detached_signature(trusted_keys, raw_manifest, signature)?;
+    let manifest: ReleaseManifest =
+        serde_json::from_slice(raw_manifest).map_err(|error| error.to_string())?;
+    validate_release(&manifest, policy)?;
+    validate_component_declarations(&manifest.components, true)?;
+    Ok(manifest)
+}
+
 fn verify_signature(
     directory: &Path,
     bootstrap: &BootstrapConfig,
@@ -139,14 +163,25 @@ fn validate_component_set(
     signed: bool,
     progress: &mut dyn FnMut(usize, usize) -> PackageResult<()>,
 ) -> PackageResult<()> {
+    validate_component_declarations(components, signed)?;
+    for (index, component) in components.iter().enumerate() {
+        verify_artifact(directory, component)?;
+        progress(index + 1, components.len())?;
+    }
+    Ok(())
+}
+
+/// What a component list must satisfy before any artifact is read: valid
+/// identities and filenames, no duplicates, and exact, acyclic dependencies.
+fn validate_component_declarations(
+    components: &[ComponentManifest],
+    signed: bool,
+) -> PackageResult<()> {
     let mut selected_versions = BTreeMap::new();
     let mut artifact_paths = BTreeSet::new();
 
-    for (index, component) in components.iter().enumerate() {
+    for component in components {
         validate_component_identity(component, signed)?;
-        verify_artifact(directory, component)?;
-        progress(index + 1, components.len())?;
-
         let duplicate_id = selected_versions
             .insert(&component.id, &component.version)
             .is_some();

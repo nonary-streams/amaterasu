@@ -1229,6 +1229,116 @@ fn bounded_transport_refreshes_catalog_and_downloads_verified_web_bundle() {
 }
 
 #[test]
+fn native_manifest_is_authenticated_without_downloading_its_artifacts() {
+    let fixture = Fixture::new();
+    let (package, candidate) = fixture.native_set();
+    let (_, web_candidate) = fixture.web_bundle();
+    // The same signed set is also listed under a version it does not carry.
+    let mut mislabelled = candidate.clone();
+    mislabelled.version = "9.9".into();
+    let (raw, signature) = fixture.signed_catalog(
+        vec![
+            candidate.clone(),
+            mislabelled.clone(),
+            web_candidate.clone(),
+        ],
+        9,
+    );
+    let catalog = verify_catalog(
+        &fixture.approved,
+        &raw,
+        &signature,
+        &CatalogCheckpoint::default(),
+        &current_target(),
+        100,
+    )
+    .unwrap();
+    let manifest_bytes = fs::read(package.join("manifest.json")).unwrap();
+    let signature_bytes = fs::read(package.join("manifest.sig")).unwrap();
+    // The repository serves a manifest and its signature and no artifact.
+    let serve = |version: &str, manifest: &[u8], signature: &[u8]| {
+        let prefix = format!("native/fixture-capture/{version}");
+        MemoryTransport(BTreeMap::from([
+            (format!("{prefix}/manifest.json"), manifest.to_vec()),
+            (format!("{prefix}/manifest.sig"), signature.to_vec()),
+        ]))
+    };
+    let fetch = |transport: &MemoryTransport, candidate: &Candidate, now: u64| {
+        fetch_native_manifest(transport, &fixture.approved, &catalog, candidate, now)
+    };
+
+    let transport = serve("1.0", &manifest_bytes, &signature_bytes);
+    let manifest = fetch(&transport, &candidate, 100).unwrap();
+    assert_eq!(manifest.sequence, 4);
+    assert_eq!(manifest.components.len(), 2);
+    // Those bytes still do not make an installable candidate.
+    let partial = fixture.root.join("partial-download");
+    assert!(
+        download_candidate(
+            &transport,
+            &fixture.approved,
+            &catalog,
+            &candidate,
+            &partial,
+            &fixture.bootstrap,
+            100,
+        )
+        .is_err()
+    );
+
+    // A manifest the catalog does not name is refused whatever signs it.
+    let mut altered = manifest_bytes.clone();
+    altered.push(b' ');
+    let resigned = serde_json::to_vec(&ReleaseSignature {
+        key_id: fixture.approved.fingerprint.clone(),
+        signature: encode_hex(&fixture.signer.sign(&altered).to_bytes()),
+    })
+    .unwrap();
+    assert!(fetch(&serve("1.0", &altered, &resigned), &candidate, 100).is_err());
+
+    // The listed manifest must be signed by the approved publisher key.
+    let other_signer = SigningKey::from_bytes(&[62; 32]);
+    let forged = serde_json::to_vec(&ReleaseSignature {
+        key_id: fixture.approved.fingerprint.clone(),
+        signature: encode_hex(&other_signer.sign(&manifest_bytes).to_bytes()),
+    })
+    .unwrap();
+    assert!(fetch(&serve("1.0", &manifest_bytes, &forged), &candidate, 100).is_err());
+    assert!(
+        fetch(
+            &serve("1.0", &manifest_bytes, b"not a signature"),
+            &candidate,
+            100
+        )
+        .is_err()
+    );
+
+    // The set must carry the slot at the version the catalog offers.
+    let relabelled = serve("9.9", &manifest_bytes, &signature_bytes);
+    assert!(fetch(&relabelled, &mislabelled, 100).is_err());
+
+    // An unlisted choice, an expired catalog and a web bundle are not native offers.
+    let mut unlisted = candidate.clone();
+    unlisted.implementation = "other-capture".into();
+    let signature: ReleaseSignature = serde_json::from_slice(&signature_bytes).unwrap();
+    let verify = |candidate: &Candidate, now: u64| {
+        verify_native_manifest(
+            &fixture.approved,
+            &catalog,
+            candidate,
+            &manifest_bytes,
+            &signature,
+            now,
+        )
+    };
+    assert!(verify(&candidate, 100).is_ok());
+    assert!(verify(&unlisted, 100).is_err());
+    assert!(verify(&candidate, 500).is_err());
+    assert!(verify(&web_candidate, 100).is_err());
+    assert!(fetch(&transport, &web_candidate, 100).is_err());
+}
+
+#[test]
 fn production_candidate_verification_is_read_only_and_checks_live_authority() {
     let fixture = Fixture::new();
     let (active_source, active_candidate) =
