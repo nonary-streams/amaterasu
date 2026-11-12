@@ -15,7 +15,7 @@ serde_json.workspace = true
 sha2.workspace = true
 
 [dev-dependencies]
-amaterasu-state = { path = "../state", features = ["test-support"] }
+amaterasu-state = { package = "amaterasu-state-test-support", path = "../state/test-support" }
 
 [lints]
 workspace = true
