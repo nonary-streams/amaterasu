@@ -1,4 +1,5 @@
 //! Version 1 control-plane messages. These types are independent of the bootstrap ABI.
+pub mod display_color_profile;
 pub mod encoder;
 pub mod processing_composition;
 pub mod virtual_display;

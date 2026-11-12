@@ -6,6 +6,7 @@ pub mod control_error;
 pub mod data_plane;
 pub mod diagnostics;
 pub mod display;
+pub mod display_profile;
 pub mod display_settings;
 pub mod encode;
 pub mod events;

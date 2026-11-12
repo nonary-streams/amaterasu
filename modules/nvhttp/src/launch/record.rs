@@ -58,7 +58,6 @@ pub enum Stage {
     ReserveHistory,
     ReadProtonPolicy,
     PreflightApplication,
-    ResolveHdrProfile,
     SnapshotDisplay,
     EnumerateDisplay,
     ConfirmDisplay,

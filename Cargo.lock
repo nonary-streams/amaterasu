@@ -266,6 +266,7 @@ dependencies = [
 name = "amaterasu-contracts"
 version = "0.1.0"
 dependencies = [
+ "amaterasu-extension-api",
  "serde",
  "serde_json",
 ]
@@ -321,6 +322,7 @@ dependencies = [
 name = "amaterasu-display"
 version = "0.1.0"
 dependencies = [
+ "amaterasu-contracts",
  "amaterasu-module-sdk",
  "amaterasu-windows-capture-geometry",
  "getrandom 0.3.4",
