@@ -63,9 +63,11 @@ broker lifetime with a limit of 512. The request broker instead retains normal o
 While a connection is still authorized, a retry with identical operation data
 can recover an accepted ID. After disconnect, retrying an unacknowledged call
 could initiate new work if it was never accepted, so this does not by itself
-provide reliable cancellation of a lost admission reply. An accepted handler
-effect cannot be undone by cancellation; this unresolved lifetime limit must
-be addressed before treating the consumer integration as complete.
+provide immediate cancellation of a lost admission reply. NVHTTP keeps its
+local admission slot until the original deadline, and the broker independently
+expires accepted requests by that deadline. A provider should check its active
+request before an effect and stop persistent work on cancellation or expiry.
+Neither cancellation nor expiry can undo an effect that already began.
 
 The reviewed entitlement candidate `80c4da0f` provides ABI 1.2 `check_entitlement(certificate, name)`.
 Only an OK status authorizes; the caller independently verifies TLS possession
@@ -94,3 +96,25 @@ The proposed inline HTTP envelope permits up to 4 KiB of body data; the
 certificate, and target. This is not evidence of parity for larger fork
 transfers. Large-body support would require a separately justified use of the
 existing binary-transfer primitives, not silently raising broker limits.
+
+## Configuring a handler
+
+The `protocol_handlers` startup setting defaults to an empty list. Each entry
+contains `path`, `http_method`, `service`, `method`, `interface_major`,
+`interface_minor`, `schema`, and `entitlement`. The method and path match
+exactly; `schema` is a versioned identifier selected by composition. The named
+service and method must also have an installed broker API approval authorizing
+NVHTTP as caller, with the request and response fields defined by
+`amaterasu_module_sdk::protocol_handler`. The broker approval binds its
+provider; the HTTP request cannot choose it. Only paired, verified TLS peers
+whose current entitlement is allowed reach a handler.
+
+NVHTTP checks the entitlement before admission, before each attempt to submit
+or recover the call, and before delivering the response. A lost admission reply
+may be retried with the same operation identity and input only while the
+connection remains live and authorized; the retry timeout cannot extend the
+original deadline. After disconnect or denial no retry is issued. If the
+broker accepted work but its ID remains unknown, cancellation cannot target it;
+the local slot remains bounded until the original deadline and the broker's
+request deadline still applies. These checks are observations, not an atomic
+lease for effects in participant code.

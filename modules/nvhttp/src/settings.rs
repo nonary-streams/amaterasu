@@ -42,6 +42,7 @@ pub struct Settings {
     pub streaming: Option<StreamingConfig>,
     pub session_lifecycle_required: bool,
     pub session_lifecycle_capture_mode: amaterasu_module_sdk::extension_api::CaptureBindingMode,
+    pub protocol_handlers: Vec<crate::wire::participants::Binding>,
 }
 
 impl Default for Settings {
@@ -64,6 +65,7 @@ impl Default for Settings {
             streaming: None,
             session_lifecycle_required: false,
             session_lifecycle_capture_mode: Default::default(),
+            protocol_handlers: Vec::new(),
         }
     }
 }
@@ -73,6 +75,7 @@ impl Settings {
         if self.session_lifecycle_capture_mode.is_external() && !self.session_lifecycle_required {
             return Err("external_lifecycle_requires_coordinator");
         }
+        crate::wire::participants::validate(&self.protocol_handlers)?;
         if !amaterasu_module_sdk::network::valid_provider(&self.network_provider) {
             return Err("invalid_network_provider");
         }

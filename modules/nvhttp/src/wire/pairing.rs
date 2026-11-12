@@ -533,7 +533,10 @@ impl Router {
                 }
                 None
             }
-            Purpose::Cleanup | Purpose::Applications { .. } | Purpose::Artwork { .. } => None,
+            Purpose::Participant { .. }
+            | Purpose::Cleanup
+            | Purpose::Applications { .. }
+            | Purpose::Artwork { .. } => None,
         }
     }
 

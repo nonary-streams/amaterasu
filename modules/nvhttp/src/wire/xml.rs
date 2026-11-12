@@ -31,7 +31,7 @@ pub fn response(status: u16, message: &str, fields: &[(&str, &str)]) -> Reply {
     body.push_str("</root>");
     Reply {
         status,
-        content_type: "application/xml; charset=utf-8",
+        content_type: "application/xml; charset=utf-8".into(),
         body: body.into_bytes(),
         requires_paired_tls: false,
         permission: None,

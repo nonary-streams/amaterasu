@@ -254,7 +254,7 @@ impl ManagedModule for NvhttpModule {
             .then(|| amaterasu_module_sdk::network::Network::from_settings(&runtime, &payload))
             .transpose()?;
         let (server, router, identity) = if settings.enabled {
-            let identity = tls::Identity::bind(&runtime)?;
+            let identity = tls::Identity::bind(&runtime, !settings.protocol_handlers.is_empty())?;
             let server = server::Server::bind_with_network(
                 network
                     .as_ref()
@@ -294,6 +294,7 @@ impl ManagedModule for NvhttpModule {
             router.set_auxiliary_exact_capture_routes(
                 settings.auxiliary_exact_capture_routes.clone(),
             );
+            router.set_participants(settings.protocol_handlers.clone());
             (Some(server), Some(router), Some(identity))
         } else {
             (None, None, None)
@@ -588,6 +589,12 @@ impl ManagedModule for NvhttpModule {
                 let launch_allowed = trusted && allowed(wire::Permission::Launch);
                 let view_allowed = trusted && allowed(wire::Permission::View);
                 let terminate_allowed = trusted && allowed(wire::Permission::Terminate);
+                let entitlement_allowed = trusted
+                    && router
+                        .participant_entitlement(&incoming.request)
+                        .is_some_and(|name| {
+                            allowed(wire::Permission::Entitlement(name.to_owned()))
+                        });
                 if incoming.request.target.split('?').next() == Some("/launch") {
                     // Deliberately omit the query: Moonlight sends session keys there.
                     eprintln!(
@@ -607,6 +614,7 @@ impl ManagedModule for NvhttpModule {
                         launch_allowed,
                         view_allowed,
                         terminate_allowed,
+                        entitlement_allowed,
                     },
                     &self.runtime,
                 ) {

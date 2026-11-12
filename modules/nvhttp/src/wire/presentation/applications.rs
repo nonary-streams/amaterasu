@@ -214,7 +214,7 @@ impl CatalogProjection {
                 if matches!(self.purpose, Purpose::Inventory) {
                     return Ok(Some(Reply {
                         status: 200,
-                        content_type: "application/octet-stream",
+                        content_type: "application/octet-stream".into(),
                         body: Vec::new(),
                         requires_paired_tls: true,
                         permission: None,
@@ -223,7 +223,7 @@ impl CatalogProjection {
                 self.body.push_str(SUFFIX);
                 return Ok(Some(Reply {
                     status: 200,
-                    content_type: "application/xml; charset=utf-8",
+                    content_type: "application/xml; charset=utf-8".into(),
                     body: std::mem::take(&mut self.body).into_bytes(),
                     requires_paired_tls: true,
                     permission: Some(Permission::List),

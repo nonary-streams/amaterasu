@@ -720,7 +720,7 @@ impl PresentationRouter {
                     private_reply(
                         Reply {
                             status: 200,
-                            content_type,
+                            content_type: content_type.into(),
                             body: image.bytes,
                             requires_paired_tls: true,
                             permission: Some(Permission::List),
@@ -830,7 +830,7 @@ impl PresentationRouter {
                     }
                     Some(Reply {
                         status: 200,
-                        content_type: "image/png",
+                        content_type: "image/png".into(),
                         body: bytes,
                         requires_paired_tls: true,
                         permission: Some(Permission::List),
@@ -961,7 +961,7 @@ impl PresentationRouter {
                 let permission = auxiliary_permission;
                 let reply = launches
                     .launch_auxiliary_for_route(connection, request, peer, plan, response, now);
-                launches.set_presentation_delivery_permission(connection, permission);
+                launches.set_presentation_delivery_permission(connection, permission.clone());
                 self.handoff_reply(work, reply.map(|reply| private_reply(reply, permission)))
             }
             Decision::StopApplication {

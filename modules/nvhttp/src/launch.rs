@@ -1875,7 +1875,10 @@ impl Controller {
             if replaceable {
                 let resume_trusted = self.records.get(&pending.record).is_some_and(|record| {
                     !record.revoked
-                        && allowed(&pending.peer.certificate, record.delivery_permission)
+                        && allowed(
+                            &pending.peer.certificate,
+                            record.delivery_permission.clone(),
+                        )
                 });
                 if !resume_trusted {
                     if let Some(record) = self.records.get_mut(&pending.record) {
@@ -2023,7 +2026,7 @@ impl Controller {
                 self.records
                     .get(&pending.record)
                     .map_or(crate::wire::Permission::Launch, |record| {
-                        record.delivery_permission
+                        record.delivery_permission.clone()
                     }),
             )
         }) && let Some(pending) = self.pending_resume.take()
@@ -2037,7 +2040,10 @@ impl Controller {
             close.push(deferred.connection);
         }
         self.pending_auxiliary.retain(|_, pending| {
-            if allowed(pending.peer.certificate(), pending.delivery_permission) {
+            if allowed(
+                pending.peer.certificate(),
+                pending.delivery_permission.clone(),
+            ) {
                 true
             } else {
                 close.push(pending.connection);
@@ -2048,7 +2054,7 @@ impl Controller {
         for record in self.records.values_mut() {
             if !record.state.terminal()
                 && !record.revoked
-                && !allowed(&record.peer.certificate, record.delivery_permission)
+                && !allowed(&record.peer.certificate, record.delivery_permission.clone())
             {
                 record.revoked = true;
                 close.extend(record.launch_connection.take());
@@ -2290,7 +2296,7 @@ fn success_reply(record: &Record) -> Reply {
     ];
     let mut reply = xml::response(200, "OK", &fields);
     reply.requires_paired_tls = true;
-    reply.permission = Some(record.delivery_permission);
+    reply.permission = Some(record.delivery_permission.clone());
     reply
 }
 

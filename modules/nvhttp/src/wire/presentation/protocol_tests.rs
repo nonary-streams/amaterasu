@@ -256,6 +256,7 @@ fn peer() -> RequestContext {
         launch_allowed: true,
         view_allowed: true,
         terminate_allowed: true,
+        entitlement_allowed: false,
     }
 }
 

@@ -89,7 +89,7 @@ impl Router {
                         connection,
                         Reply {
                             status: 200,
-                            content_type: mime,
+                            content_type: mime.into(),
                             body: image.bytes,
                             requires_paired_tls: true,
                             permission: Some(Permission::List),
@@ -132,6 +132,7 @@ mod tests {
             launch_allowed: false,
             view_allowed: true,
             terminate_allowed: false,
+            entitlement_allowed: false,
         }
     }
     #[test]

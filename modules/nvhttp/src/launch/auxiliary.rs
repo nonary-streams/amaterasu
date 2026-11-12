@@ -784,14 +784,14 @@ impl Controller {
             .values_mut()
             .find(|record| record.launch_connection == Some(connection))
         {
-            record.delivery_permission = permission;
+            record.delivery_permission = permission.clone();
         }
         for pending in self
             .pending_auxiliary
             .values_mut()
             .filter(|pending| pending.connection == connection)
         {
-            pending.delivery_permission = permission;
+            pending.delivery_permission = permission.clone();
         }
     }
 
@@ -820,7 +820,10 @@ impl Controller {
                 .expect("pending reconnect");
             if let Err(code) = outcome {
                 replies.push((pending.connection, private_error(503, code)));
-            } else if !allowed(pending.peer.certificate(), pending.delivery_permission) {
+            } else if !allowed(
+                pending.peer.certificate(),
+                pending.delivery_permission.clone(),
+            ) {
                 replies.push((
                     pending.connection,
                     private_error(401, "paired client is no longer trusted"),
@@ -838,7 +841,7 @@ impl Controller {
                 }
                 self.set_presentation_delivery_permission(
                     pending.connection,
-                    pending.delivery_permission,
+                    pending.delivery_permission.clone(),
                 );
             }
         }
