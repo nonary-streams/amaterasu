@@ -716,6 +716,7 @@ dependencies = [
  "amaterasu-abi",
  "amaterasu-network-api",
  "libc",
+ "sha2",
  "socket2",
  "windows-sys 0.61.2",
 ]

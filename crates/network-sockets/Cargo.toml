@@ -9,13 +9,25 @@ amaterasu-network-api.workspace = true
 socket2 = {version="0.6",features=["all"]}
 [target.'cfg(unix)'.dependencies]
 libc="0.2"
+[target.'cfg(all(unix, not(target_os = "linux")))'.dependencies]
+sha2.workspace = true
 [lints]
 workspace = true
 
+[dev-dependencies]
+sha2.workspace = true
+
 [target.'cfg(windows)'.dependencies]
+sha2.workspace = true
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_NetworkManagement_Ndis",
     "Win32_NetworkManagement_IpHelper",
     "Win32_Networking_WinSock",
+    "Win32_Storage_FileSystem",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_JobObjects",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
 ] }

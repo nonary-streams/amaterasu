@@ -67,7 +67,7 @@ const NETWORK: ComponentDefinition = ComponentDefinition {
     id: "amaterasu.network",
     library: "amaterasu_network",
     provides: &[],
-    calls: &[],
+    calls: &["amaterasu.host-state-context/1"],
     publishes: &[],
     native_provides: &["amaterasu.network/1"],
     native_uses: &[],

@@ -396,6 +396,37 @@ fn releasing_binding_closes_owned_sockets_and_returns_budget() {
 }
 
 #[test]
+fn shutdown_announcements_preserve_cleanup_and_quiescence_closes_handle_admission() {
+    let factory = Factory::new();
+    let binding = Bound::new(&factory);
+    factory.prepare_shutdown(1_000).unwrap();
+    let existing = binding.udp();
+    let address = binding.local(existing);
+    assert!(factory.quiesce().unwrap());
+    let mut rejected = 0;
+    assert_eq!(
+        unsafe {
+            (binding.api().udp_bind)(
+                binding.context(),
+                to_address("127.0.0.1:0".parse().unwrap()),
+                &mut rejected,
+            )
+        },
+        net::INTERRUPTED
+    );
+    assert_eq!(rejected, 0);
+    assert!(matches!(
+        unsafe { bind_standalone(&factory, "late.consumer") },
+        Err(net::INTERRUPTED)
+    ));
+    assert_eq!(
+        unsafe { (binding.api().close)(binding.context(), existing) },
+        STATUS_OK
+    );
+    assert!(UdpSocket::bind(address).is_ok());
+}
+
+#[test]
 fn dns_numeric_address_and_unsupported_options_are_explicit() {
     let factory = Factory::new();
     let provider = Bound::new(&factory);

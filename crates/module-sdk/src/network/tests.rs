@@ -1,6 +1,73 @@
 use super::*;
 use amaterasu_abi::{AbiHeader, BorrowedBytes, NativeInterface, NativeInterfaceQuery};
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static REPLACEMENT_RESOLVE_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+unsafe extern "C" fn replacement_resolve(
+    _context: *mut std::ffi::c_void,
+    host: BorrowedBytes,
+    port: u16,
+    timeout_ms: u32,
+    output: *mut abi::Address,
+    capacity: usize,
+    count: *mut usize,
+) -> amaterasu_abi::Status {
+    // SAFETY: the unchanged SDK borrows this host only during the callback.
+    let Ok(host) = (unsafe { host.read() }) else {
+        return amaterasu_abi::STATUS_INVALID_ARGUMENT;
+    };
+    if host != b"fixture.local"
+        || timeout_ms == 0
+        || output.is_null()
+        || count.is_null()
+        || capacity == 0
+    {
+        return amaterasu_abi::STATUS_INVALID_ARGUMENT;
+    }
+    let address = address_to_native(std::net::SocketAddr::from(([127, 0, 0, 2], port)));
+    // SAFETY: the SDK provides at least one writable address and one count.
+    unsafe {
+        output.write(address);
+        count.write(1);
+    }
+    REPLACEMENT_RESOLVE_CALLS.fetch_add(1, Ordering::SeqCst);
+    STATUS_OK
+}
+
+#[test]
+fn unchanged_resolve_consumer_uses_the_selected_provider_implementation() {
+    fn consumer(network: &Network, host: &str) -> std::io::Result<Vec<std::net::SocketAddr>> {
+        network.resolve_timeout(host, 4242, Duration::from_secs(1))
+    }
+
+    let default_provider = Network::test_provider();
+    assert_eq!(
+        consumer(&default_provider, "127.0.0.1").unwrap(),
+        ["127.0.0.1:4242".parse().unwrap()]
+    );
+
+    let replacement_table = standalone();
+    // SAFETY: this uniquely owned, valid table has no consumers or calls yet.
+    // The fixture replaces DNS itself; the other callbacks and release continue
+    // to own their original, correctly typed binding. No OS resolver is called.
+    unsafe {
+        (*replacement_table.cast_mut()).resolve = replacement_resolve;
+    }
+    // SAFETY: the well-formed public Network table and release ownership are
+    // transferred exactly once to the same SDK used by the default consumer.
+    let replacement_provider = unsafe { Network::from_native_table(replacement_table) }.unwrap();
+    let calls_before = REPLACEMENT_RESOLVE_CALLS.load(Ordering::SeqCst);
+    assert_eq!(
+        consumer(&replacement_provider, "fixture.local").unwrap(),
+        ["127.0.0.2:4242".parse().unwrap()]
+    );
+    assert_eq!(
+        REPLACEMENT_RESOLVE_CALLS.load(Ordering::SeqCst),
+        calls_before + 1
+    );
+}
 
 fn standalone() -> *const abi::NetworkApi {
     let factory = amaterasu_network_sockets::Factory::new();

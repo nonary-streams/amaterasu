@@ -17,9 +17,10 @@ use std::{
         UdpSocket,
     },
     panic::{AssertUnwindSafe, catch_unwind},
+    path::Path,
     sync::{
-        Arc, Mutex,
-        atomic::{AtomicU32, AtomicU64, Ordering},
+        Arc, Mutex, TryLockError,
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -28,6 +29,8 @@ const DEFAULT_MAX_HANDLES: u32 = 1024;
 struct Shared {
     max_handles: u32,
     handles: AtomicU32,
+    accepting_handles: AtomicBool,
+    admission: Mutex<()>,
     resolver: resolver::Resolver,
 }
 struct Permit(Arc<Shared>);
@@ -55,17 +58,55 @@ struct Binding {
     next: AtomicU64,
 }
 /// Keep this factory alive until runtime registration has ended and every
-/// consumer binding has been released. DNS deadline workers are joined at final
-/// factory teardown before provider code can be unloaded.
+/// consumer binding has been released. OS name-service work runs in bounded,
+/// owned helper processes rather than threads executing inside this library.
 pub struct Factory {
     pub api: NativeServiceFactory,
     shared: Arc<Shared>,
+}
+
+/// A shutdown that has not proved retirement. The actual factory remains owned
+/// by this value so the caller can retain and poll it rather than lose its state.
+pub struct ShutdownFailure {
+    factory: Box<Factory>,
+    reason: io::Error,
+}
+
+impl ShutdownFailure {
+    pub fn reason(&self) -> &io::Error {
+        &self.reason
+    }
+
+    pub fn into_parts(self) -> (Box<Factory>, io::Error) {
+        (self.factory, self.reason)
+    }
+}
+
+impl std::fmt::Debug for ShutdownFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ShutdownFailure")
+            .field("reason", &self.reason)
+            .finish_non_exhaustive()
+    }
 }
 impl Factory {
     pub fn new() -> Box<Self> {
         Self::with_limits(DEFAULT_MAX_HANDLES)
     }
     pub fn with_limits(max_handles: u32) -> Box<Self> {
+        Self::with_resolver(max_handles, resolver::Resolver::new())
+    }
+    /// Uses the verified host-selected private state root for executable helper
+    /// materialization on platforms without sealed in-memory executables.
+    /// Standalone constructors retain a private temporary helper location.
+    pub fn with_runtime_state(max_handles: u32, root: &Path) -> io::Result<Box<Self>> {
+        Ok(Self::with_resolver(
+            max_handles,
+            resolver::Resolver::with_runtime_state(root)?,
+        ))
+    }
+    fn with_resolver(max_handles: u32, resolver: resolver::Resolver) -> Box<Self> {
         let mut factory = Box::new(Self {
             api: NativeServiceFactory {
                 header: AbiHeader::of::<NativeServiceFactory>(),
@@ -75,11 +116,56 @@ impl Factory {
             shared: Arc::new(Shared {
                 max_handles: max_handles.clamp(1, 65536),
                 handles: AtomicU32::new(0),
-                resolver: resolver::Resolver::new(),
+                accepting_handles: AtomicBool::new(true),
+                admission: Mutex::new(()),
+                resolver,
             }),
         });
         factory.api.context = (&mut *factory as *mut Self).cast();
         factory
+    }
+    /// Announces a deadline without closing provider admission before consumers
+    /// have finished their own cleanup calls.
+    pub fn prepare_shutdown(&self, remaining_ms: u64) -> io::Result<()> {
+        self.shared.resolver.prepare_shutdown(remaining_ms)
+    }
+    /// Reaps timed-out helper processes without blocking a host tick.
+    pub fn poll(&self) -> io::Result<()> {
+        self.shared.resolver.poll()
+    }
+    /// Stops new bindings, handles and DNS work, while existing handles retain
+    /// their close/shutdown paths. Confirms helper exit/reap before readiness.
+    pub fn quiesce(&self) -> io::Result<bool> {
+        self.shared
+            .accepting_handles
+            .store(false, Ordering::Release);
+        let resolver_ready = self.shared.resolver.quiesce()?;
+        match self.shared.admission.try_lock() {
+            Ok(_admission) => Ok(resolver_ready),
+            Err(TryLockError::WouldBlock) => Ok(false),
+            Err(TryLockError::Poisoned(_)) => {
+                Err(io::Error::other("network admission unavailable"))
+            }
+        }
+    }
+    /// Performs one nonblocking shutdown step. Pending work and errors return
+    /// the exact owned factory and reason, so the caller can retain it and poll
+    /// again. Keep that owner until shutdown proves actual helper exit/reap.
+    pub fn try_shutdown(self: Box<Self>) -> Result<(), ShutdownFailure> {
+        match self.quiesce() {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(ShutdownFailure {
+                factory: self,
+                reason: io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "network helper retirement is pending",
+                ),
+            }),
+            Err(reason) => Err(ShutdownFailure {
+                factory: self,
+                reason,
+            }),
+        }
     }
 }
 /// # Safety
@@ -141,6 +227,7 @@ unsafe extern "C" fn bind(
         {
             return Err(STATUS_INVALID_ARGUMENT);
         }
+        let _admission = handle_admission(&factory.shared)?;
         let mut binding = Box::new(Binding {
             api: net::NetworkApiV1_1 {
                 v1: net::NetworkApi {
@@ -223,8 +310,19 @@ fn resource(binding: &Binding, id: u64) -> Result<Arc<Resource>, Status> {
         .cloned()
         .ok_or(net::NOT_FOUND)
 }
+fn handle_admission(shared: &Shared) -> Result<std::sync::MutexGuard<'_, ()>, Status> {
+    if !shared.accepting_handles.load(Ordering::Acquire) {
+        return Err(net::INTERRUPTED);
+    }
+    let admission = lock(&shared.admission)?;
+    if !shared.accepting_handles.load(Ordering::Acquire) {
+        return Err(net::INTERRUPTED);
+    }
+    Ok(admission)
+}
 fn permit(binding: &Binding) -> Result<Permit, Status> {
     let shared = &binding.shared;
+    let _admission = handle_admission(shared)?;
     let mut count = shared.handles.load(Ordering::Acquire);
     loop {
         if count >= shared.max_handles {
@@ -251,6 +349,7 @@ fn insert_from_listener(
     permit: Permit,
     listener: Option<(u64, &Arc<Resource>)>,
 ) -> Result<u64, Status> {
+    let _admission = handle_admission(&binding.shared)?;
     let mut resources = lock(&binding.resources)?;
     // The accept call may have held the listener alive while another thread
     // closed its handle. Serialize this check with close so no child can be

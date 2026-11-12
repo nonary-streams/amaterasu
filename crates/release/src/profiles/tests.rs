@@ -1866,6 +1866,7 @@ fn network_consumers_have_an_explicit_provider_dependency_and_native_grant() {
             .find(|component| component.id == NETWORK.id)
             .expect("network provider in composition");
         assert_eq!(provider.native_provides, &["amaterasu.network/1"]);
+        assert!(provider.calls.contains(&"amaterasu.host-state-context/1"));
         for consumer in components.iter().filter(|component| {
             [
                 "amaterasu.management",
