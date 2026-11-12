@@ -1,31 +1,139 @@
 # Amaterasu
 
-A Rust-first streaming host being built around independently updateable libraries.
-The shell loads and supervises components; product behavior belongs in those
-components. Vibeshine is the behavior reference, not a source tree to copy.
+**A gaming and streaming platform built to grow through plugins.**
 
-**Current state: a working development foundation, not a streaming host yet.**
-The runtime supports permission-scoped requests, bounded events, and ordered
-hooks. The shell loads independently built native libraries, verifies signed
-packages, probes their lifecycle in a subprocess, and recovers failed activation.
-Persistent state, schema-validated configuration, session/resource coordination,
-a scalable manual application catalog, tick-driven application preparation and
-process-tree cleanup, diagnostics, local Steam discovery, authentication, and a
-protected management API are implemented as separate libraries. Plain HTTP is
-loopback-only; optional HTTPS supports configured private-network access. The
-echo module remains a test fixture.
-Software Opus encoding and UDP media delivery are independently packaged. A
-shared Rust protocol library handles RTSP/SDP parsing, audio/video packetization,
-FEC, ENet reliability and media/control encryption. An authenticated streaming session coordinator still
-needs to connect capture, encoding, transport and control traffic.
+Amaterasu's goal is simple: install the platform once, then add the features you
+want through plugins. A new capability should be something you can enable from
+a developer you trust, without installing another streaming host, switching
+forks, or waiting for it to be added to the main application.
+
+For gamers, that means choosing the features that suit their setup and having
+them work together in one place. For developers, it means building and sharing
+a feature independently, using the same SDK and APIs as the built-in plugins.
+Game streaming is the starting point; a platform that the community can keep
+extending is the larger purpose.
+
+## One platform, many possibilities
+
+Amaterasu builds on the experience behind Vibeshine and Vibepollo, with the goal
+of bringing the full range of features from those projects, Sunshine, Apollo,
+and the wider streaming ecosystem into one extensible platform. Users should be
+able to combine the features they want through compatible plugins.
+
+Development follows familiar Vibeshine behavior while bringing those
+capabilities into a new Rust-first plugin architecture. Full feature parity
+remains a long-term goal.
+Existing plugins from other hosts need an Amaterasu implementation or an
+appropriate adapter to work here.
+
+The intended experience is straightforward:
+
+- Add a library integration for another game library or launcher.
+- Select a compatible plugin for a different capture method, encoder, or audio
+  backend.
+- Enable HDR processing, frame limiting, or different display behavior within
+  the existing stream and session flow.
+- Build and publish a new capability that others can use alongside their
+  existing setup.
+
+## Plugins are the platform
+
+Plugins are how Amaterasu itself is built. Core features live in independently
+built libraries, and several already have their own repositories and release
+workflows. The small host shell verifies and loads components, manages their
+lifecycle, and handles activation recovery. Streaming behavior belongs in the
+plugins.
+
+A plugin can **add a capability**, **extend another plugin**, or **replace an
+implementation** behind a compatible API. Built-in consumers must use the same
+versioned contracts and SDK adapters available to external developers. Being
+bundled with Amaterasu should not give a feature a private integration path
+that community developers cannot use.
+
+For example, a frame-processing plugin should be invoked by the video pipeline
+through the Processing SDK. It should not need to take over capture, choose the
+encoder, or modify the host shell. The independently built
+[RTX HDR plugin](modules/rtx-hdr/README.md) follows this model. Library, network,
+capture, audio, and other provider contracts serve the same purpose in their
+respective domains; [replacement tests](docs/plugin-substitution.md) check that
+an unchanged consumer can work with another implementation.
+
+Seamless integration is the design target. It still requires compatible
+interfaces, declared capabilities and dependencies, and an approved package
+composition. Independently released plugins do not imply arbitrary live swaps
+or that every combination will work. Some features also need platform drivers
+or vendor runtimes. Native plugins execute trusted code, so users must trust
+their publishers; API grants are not a native-code sandbox.
+
+## Where the project stands
+
+**Amaterasu is in active development. The plugin platform and streaming paths
+are implemented, but the complete feature set and seamless plugin experience
+remain works in progress.**
+
+Amaterasu is currently developed and tested on **Arch Linux**. **Windows support
+is planned soon**; the next major push toward it is waiting for the next
+generation of AI tools, with the aim of speeding up development and testing.
+Existing Windows code and automated checks are groundwork for that support.
+
+The repository includes a signed component loader, shared SDKs, provider
+selection and replacement tests, authentication and management APIs, a web UI
+with signed extensions, and independently built gaming and streaming modules.
+Those modules cover game libraries and launch, Moonlight pairing and stream
+coordination, capture and encoding, audio and input, physical and virtual
+displays, remote sessions, frame limiting, and GPU processing.
+
+An implementation or passing source test does not establish support on every
+operating system, GPU, driver, or client. Some plugin boundaries and feature
+behaviors are still incomplete. Use the focused documentation for scope and
+remaining acceptance work:
+
+- [Plugin substitution](docs/plugin-substitution.md): replacement boundaries,
+  tests, and remaining interoperability work.
+- [Configuration parity](docs/configuration-parity.md) and
+  [execution plan](docs/configuration-execution-plan.md): the reference feature
+  inventory and how behavior is verified.
+- [Display parity](docs/vibeshine-display-parity.md): implemented behavior and
+  known differences from Vibeshine.
+- [Application-library ecosystem](docs/application-library-ecosystem.md):
+  cross-project research and extension requirements.
+- [Linux session acceptance](docs/linux-session-acceptance.md) and
+  [Windows regression gates](docs/windows-regression-gates.md): platform
+  qualification requirements.
+
+The [parity ledger](docs/parity.md) also records earlier implementation
+checkpoints. Read it alongside the focused reports rather than treating an
+older checkpoint as the current support matrix.
+
+## Build a plugin
+
+Start with the [control-plane SDK](docs/control-plane-sdk.md) for module
+lifecycle and services, then [stacking and extension points](docs/stacking-and-extension-points.md)
+for hooks, events, and collaboration between plugins. The
+[public SDK repository](https://github.com/nonary-streams/amaterasu-sdk) provides
+the shared contracts and adapters used by independently built modules.
+
+Use the contract for the capability you want to provide or consume:
+
+| Area | Developer documentation |
+| --- | --- |
+| Capture and video encoding | [Capture SDK](docs/capture-plugin-sdk.md), [Encoder SDK](docs/encoder-plugin-sdk.md) |
+| Frame processing and HDR | [GPU Processing SDK](docs/gpu-processing-sdk.md) |
+| Audio | [Audio SDK](docs/audio-plugin-sdk.md) |
+| Networking | [Network SDK](docs/network-plugin-sdk.md) |
+| Game libraries | [Provider configuration](docs/application-library-provider-configuration.md), [replacement example](crates/module-sdk/examples/application-library-replacement/README.md) |
+| Session behavior | [Session extensions](docs/session-extension-api.md), [remote sessions](docs/remote-session-plugin.md) |
+| Settings and web UI | [Operation APIs](docs/plugin-apis.md), [Web Extension SDK](docs/web-extension-ui-sdk.md), [extension example](examples/web-extension/README.md) |
+
+When an existing contract does not express a feature, extend the contract and
+SDK so other developers can use it too. Keep implementation choices in the
+provider, and verify replacement through an unchanged consumer.
 
 ## Build and verify
 
-Use Rust 1.89 or newer and Python 3.10 or newer. The local implementation was
-validated on macOS ARM64 with Rust 1.98.1. The whole workspace also passes
-`cargo check` for `x86_64-pc-windows-msvc` and `x86_64-unknown-linux-gnu`.
-Windows/Linux CI is configured but has not been executed from this checkout;
-cross-target compilation does not establish runtime or hardware compatibility.
+Use Rust 1.89 or newer and Python 3.10 or newer. Build requirements vary with
+the selected platform plugins. Compilation and automated tests are separate
+from runtime and hardware qualification.
 See [cross-compilation setup](docs/cross-compilation.md) for the target C tools
 needed by TLS cryptography and bundled Opus on a macOS development host. Building
 Opus also requires CMake and a compatible C compiler. The independent Python
@@ -176,57 +284,20 @@ documented in the module READMEs.
 | `fixtures/echo` | Replaceable module and failure-injection fixture |
 | `sdk/examples/service-guard` | Example layer stacked on another module's service, with its policy fragment |
 
-See [architecture](docs/architecture.md), [protocol](docs/control-protocol.md),
-[writing and testing a module](docs/control-plane-sdk.md),
-[stacking on another module](docs/stacking-and-extension-points.md),
-[parity status](docs/parity.md), and [dependency decisions](docs/dependencies.md).
+## Further reading
 
-The [frontend](frontend/README.md) builds without a runtime framework.
-[Signed web bundles](docs/web-bundles.md) activate on page refresh independently of native packages.
+- [Architecture](docs/architecture.md), [control protocol](docs/control-protocol.md),
+  and [dependency decisions](docs/dependencies.md).
+- [Frontend development](frontend/README.md),
+  [signed web bundles](docs/web-bundles.md), and the
+  [web extension example](examples/web-extension/README.md).
+- [Linux session setup](docs/linux-session-profile.md),
+  [installer development](installer/README.md), and
+  [local signed package updates](docs/local-package-updates.md).
+- [Flow tracing](docs/flow-tracing.md) and
+  [streaming latency diagnostics](docs/streaming-latency-diagnostics.md).
 
-Catalog-backed launch coordination lives in [the launch module](modules/launch/README.md).
-Keyboard/mouse injection and temporary driver-owned monitors are separate optional
-[input](modules/input/README.md) and [virtual-display](modules/virtual-display/README.md)
-libraries. Their startup policies default to disabled; local tests do not inject
-input or change displays.
-
-Windows [DXGI capture](modules/capture-dxgi/README.md),
-[hardware H.264 encoding](modules/encode-video/encode/README.md), and
-[video coordination](modules/encode-video/video/README.md) are separate, disabled-by-default
-libraries. They exchange borrowed frames and packets through the draft
-[native media ABI](docs/media-interfaces.md). Signed-library tests cover binding
-and ownership; real Windows capture-to-encode hardware qualification is pending.
-
-[WGC capture](modules/capture-wgc/README.md) is an allowlisted alternative in video
-settings. [WASAPI audio](modules/audio/README.md) captures an explicit endpoint
-without changing system defaults. Both are disabled by default and await physical
-Windows qualification. The management library exposes scoped media discovery;
-video supports owned keyframe requests and graceful output draining.
-
-The [Moonlight HTTP/TLS adapter](modules/nvhttp/README.md) implements Gen7 pairing
-and server information, with disabled-by-default listeners. Its authenticated
-application list reads names and stable IDs from one explicitly authorized catalog;
-the development profile selects the management library. It delegates TLS
-signing to the pairing library through the native identity interface; private keys
-stay in that library. `scripts/test_nvhttp.py` exercises the actual HTTP transcript,
-TLS client proof, durable trust and application lists across restarts. Optional
-streaming configuration enables exported application launch and owned cancellation,
-with encrypted RTSP and UDP discovery delegated to the media libraries.
-`scripts/test_public_launch.py` checks that composition with a controlled child
-and synthetic video. Optional session input policy routes authenticated keyboard
-and mouse packets through the leased input library; `scripts/test_stream_input.py`
-verifies dispatch and release through an in-memory provider. Display optimization,
-broader media negotiation, resume, captured-monitor absolute input and real
-client/hardware playback remain parity gates.
-
-Browser HTTPS for development Linux session roots can be provisioned with the
-[Linux session setup and enrollment tools](docs/linux-session-profile.md#browser-https-on-a-private-network).
-The separate management certificate must be trusted by the browser; this does not
-change Moonlight pairing. Existing roots retain their saved policy and require a
-separate policy upgrade for the new account settings. Installed production
-provisioning and physical network qualification remain release work.
-
-Signed web extensions require explicit local publisher and method approval. They
-run as trusted same-origin JavaScript, not in a sandbox. See the
-[extension example](examples/web-extension/README.md) and
-[withdrawal procedure](docs/linux-session-profile.md#browser-https-on-a-private-network).
+The component probe above is a development example. Installed production
+updates use the signed package and activation flow, with compatible component
+sets and the installation's existing trust policy. See
+[local package updates](docs/local-package-updates.md) for that procedure.
