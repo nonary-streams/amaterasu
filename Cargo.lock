@@ -456,7 +456,9 @@ name = "amaterasu-gamestream"
 version = "0.1.0"
 dependencies = [
  "aes",
+ "amaterasu-abi",
  "amaterasu-contracts",
+ "amaterasu-media",
  "amaterasu-timing-metrics",
  "cbc",
  "ring",
@@ -666,6 +668,7 @@ dependencies = [
  "base64 0.22.1",
  "getrandom 0.3.4",
  "libc",
+ "libloading",
  "serde",
  "serde_json",
  "sha2",
@@ -901,6 +904,7 @@ version = "0.1.0"
 dependencies = [
  "amaterasu-abi",
  "amaterasu-contracts",
+ "amaterasu-gamestream",
  "amaterasu-module-sdk",
  "amaterasu-timing-metrics",
  "libloading",

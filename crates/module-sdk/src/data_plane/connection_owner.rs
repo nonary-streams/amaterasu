@@ -481,14 +481,8 @@ mod tests {
                 .kind(),
             io::ErrorKind::ConnectionReset
         );
-        assert_eq!(
-            input.snapshot().phase,
-            crate::data_plane::abi::CANCELLED
-        );
-        assert_eq!(
-            output.snapshot().phase,
-            crate::data_plane::abi::CANCELLED
-        );
+        assert_eq!(input.snapshot().phase, crate::data_plane::abi::CANCELLED);
+        assert_eq!(output.snapshot().phase, crate::data_plane::abi::CANCELLED);
         let mut connection = owner(b"");
         assert!(connection.response_flushed().is_err());
         assert_eq!(
@@ -518,10 +512,7 @@ mod tests {
         let output = connection.pair().output().clone();
         connection.pair().input().cancel();
         assert_eq!(connection.flush_input(), Err(CLOSED));
-        assert_eq!(
-            output.snapshot().phase,
-            crate::data_plane::abi::CANCELLED
-        );
+        assert_eq!(output.snapshot().phase, crate::data_plane::abi::CANCELLED);
     }
     #[test]
     fn oversized_remainder_and_metadata_profile_fail_before_upgrade() {

@@ -474,12 +474,12 @@ unsafe extern "C" fn bind_timing(
         Arc::new(FirstProvider(factory.counts.clone())),
         "capture-consumer".into(),
     );
-    binding.api.base.base.base.base.base.base.header = AbiHeader {
+    binding.api.base.base.base.base.base.base.base.header = AbiHeader {
         size: CAPTURE_API_V1_12_SIZE,
         major: 1,
         minor: 12,
     };
-    binding.api.frame_timing = fixture_timing;
+    binding.api.base.frame_timing = fixture_timing;
     let pointer = std::ptr::from_ref(&binding.api).cast();
     let _ = Box::into_raw(binding);
     unsafe { output.write(pointer) };
@@ -549,5 +549,91 @@ fn preflight_wrapper_refuses_timing_queries_for_an_old_inner_without_leaking_it(
         MEDIA_UNSUPPORTED
     );
     assert!(output.is_null());
+    assert_eq!(counts.releases.load(Ordering::SeqCst), 1);
+}
+
+unsafe extern "C" fn bind_metadata(
+    context: *mut c_void,
+    caller: BorrowedBytes,
+    query: *const NativeInterfaceQuery,
+    output: *mut *const NativeInterface,
+) -> Status {
+    // SAFETY: fixture forwards live factory arguments and owns the returned box.
+    let status = unsafe { bind_timing(context, caller, query, output) };
+    if status != STATUS_OK {
+        return status;
+    }
+    let table = unsafe { &mut *(*output).cast_mut().cast::<CaptureApiV1_13>() };
+    table.base.base.base.base.base.base.base.header = AbiHeader {
+        size: CAPTURE_API_V1_13_SIZE,
+        major: 1,
+        minor: CAPTURE_METADATA_INTERFACE_MINOR,
+    };
+    table.read_resource_frame_with_metadata = fixture_read_metadata;
+    STATUS_OK
+}
+unsafe extern "C" fn fixture_read_metadata(
+    _: *mut c_void,
+    _: u64,
+    _: FrameResourceMetadataSinkV1,
+) -> Status {
+    MEDIA_PENDING
+}
+unsafe extern "C" fn unused_metadata_sink(
+    _: *mut c_void,
+    _: *const FrameResourceMetadataFrameV1,
+) -> Status {
+    panic!("pending provider cannot publish a frame")
+}
+#[test]
+fn preflight_wrapper_preserves_metadata_timing_and_preflight_prefixes_together() {
+    let counts = Arc::new(Counts::default());
+    let mut inner = OldFactory::new(counts.clone());
+    inner.api.bind = Some(bind_metadata);
+    let factory =
+        unsafe { SourcePreflightFactory::new(&inner.api, Arc::new(FirstProvider(counts.clone()))) };
+    let query = NativeInterfaceQuery {
+        header: AbiHeader::of::<NativeInterfaceQuery>(),
+        interface_major: 1,
+        min_minor: 13,
+        min_size: CAPTURE_API_V1_13_SIZE,
+    };
+    let mut output = std::ptr::null();
+    assert_eq!(
+        unsafe {
+            factory.api.bind.unwrap()(
+                factory.api.context,
+                BorrowedBytes::new(b"capture-consumer"),
+                &query,
+                &mut output,
+            )
+        },
+        STATUS_OK
+    );
+    let binding = OwnedBinding(output);
+    assert!(
+        unsafe { source_preflight(binding.prefix(), &request()) }
+            .unwrap()
+            .is_ready()
+    );
+    assert_eq!(
+        unsafe { super::super::frame_processing_start(binding.prefix(), 1, 7) },
+        Ok(Some(4000))
+    );
+    let api = unsafe { &*output.cast::<CaptureApiV1_13>() };
+    assert_eq!(
+        unsafe {
+            (api.read_resource_frame_with_metadata)(
+                binding.prefix().base.context,
+                1,
+                FrameResourceMetadataSinkV1 {
+                    context: std::ptr::null_mut(),
+                    write: unused_metadata_sink,
+                },
+            )
+        },
+        MEDIA_PENDING
+    );
+    drop(binding);
     assert_eq!(counts.releases.load(Ordering::SeqCst), 1);
 }

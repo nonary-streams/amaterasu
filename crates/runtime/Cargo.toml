@@ -14,5 +14,6 @@ serde_json.workspace = true
 workspace = true
 
 [dev-dependencies]
+amaterasu-gamestream.workspace = true
 amaterasu-module-sdk.workspace = true
 libloading.workspace = true

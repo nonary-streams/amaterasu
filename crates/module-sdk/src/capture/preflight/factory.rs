@@ -91,7 +91,7 @@ impl Drop for Inner {
 }
 
 pub(super) struct Binding<P: SourcePreflightProvider> {
-    pub(super) api: CaptureApiV1_12,
+    pub(super) api: CaptureApiV1_13,
     inner: Inner,
     provider: Arc<P>,
     caller: String,
@@ -101,58 +101,69 @@ impl<P: SourcePreflightProvider + 'static> Binding<P> {
         let timing = inner
             .table::<CaptureApiV1_12>(CAPTURE_FRAME_TIMING_INTERFACE_MINOR)
             .is_some();
+        let metadata = inner
+            .table::<CaptureApiV1_13>(CAPTURE_METADATA_INTERFACE_MINOR)
+            .is_some();
         let mut binding = Box::new(Self {
-            api: CaptureApiV1_12 {
-                base: CaptureApiV1_11 {
-                    base: CaptureApiV1_10 {
-                        base: CaptureApiV1_9 {
-                            base: CaptureApiV1_7 {
-                                base: CaptureApiV1_6 {
-                                    base: NativeInterface {
-                                        header: AbiHeader {
-                                            size: if timing {
-                                                CAPTURE_API_V1_12_SIZE
-                                            } else {
-                                                CAPTURE_API_V1_11_SIZE
+            api: CaptureApiV1_13 {
+                base: CaptureApiV1_12 {
+                    base: CaptureApiV1_11 {
+                        base: CaptureApiV1_10 {
+                            base: CaptureApiV1_9 {
+                                base: CaptureApiV1_7 {
+                                    base: CaptureApiV1_6 {
+                                        base: NativeInterface {
+                                            header: AbiHeader {
+                                                size: if metadata {
+                                                    CAPTURE_API_V1_13_SIZE
+                                                } else if timing {
+                                                    CAPTURE_API_V1_12_SIZE
+                                                } else {
+                                                    CAPTURE_API_V1_11_SIZE
+                                                },
+                                                major: INTERFACE_MAJOR,
+                                                minor: if metadata {
+                                                    CAPTURE_METADATA_INTERFACE_MINOR
+                                                } else if timing {
+                                                    CAPTURE_FRAME_TIMING_INTERFACE_MINOR
+                                                } else {
+                                                    CAPTURE_SOURCE_PREFLIGHT_INTERFACE_MINOR
+                                                },
                                             },
-                                            major: INTERFACE_MAJOR,
-                                            minor: if timing {
-                                                CAPTURE_FRAME_TIMING_INTERFACE_MINOR
-                                            } else {
-                                                CAPTURE_SOURCE_PREFLIGHT_INTERFACE_MINOR
-                                            },
+                                            context: std::ptr::null_mut(),
+                                            release: Some(release::<P>),
                                         },
-                                        context: std::ptr::null_mut(),
-                                        release: Some(release::<P>),
+                                        read_frame: read_frame::<P>,
+                                        geometry: geometry::<P>,
+                                        read_frame_with_freshness: read_fresh::<P>,
+                                        read_frame_with_capture_timestamp: read_timed::<P>,
+                                        read_dmabuf_frame: read_dmabuf::<P>,
+                                        latest_presentation: latest_presentation::<P>,
+                                        read_dmabuf_frame_leased: read_leased::<P>,
                                     },
-                                    read_frame: read_frame::<P>,
-                                    geometry: geometry::<P>,
-                                    read_frame_with_freshness: read_fresh::<P>,
-                                    read_frame_with_capture_timestamp: read_timed::<P>,
-                                    read_dmabuf_frame: read_dmabuf::<P>,
-                                    latest_presentation: latest_presentation::<P>,
-                                    read_dmabuf_frame_leased: read_leased::<P>,
+                                    subscribe_events: subscribe::<P>,
+                                    unsubscribe_events: unsubscribe::<P>,
+                                    resolve_swap: resolve_swap::<P>,
                                 },
-                                subscribe_events: subscribe::<P>,
-                                unsubscribe_events: unsubscribe::<P>,
-                                resolve_swap: resolve_swap::<P>,
+                                enumerate_resources: enumerate_resources::<P>,
+                                select_resource: select_resource::<P>,
+                                read_resource_frame: read_resource::<P>,
+                                hdr_metadata: hdr_metadata::<P>,
                             },
-                            enumerate_resources: enumerate_resources::<P>,
-                            select_resource: select_resource::<P>,
-                            read_resource_frame: read_resource::<P>,
-                            hdr_metadata: hdr_metadata::<P>,
+                            color_provenance: color_provenance::<P>,
                         },
-                        color_provenance: color_provenance::<P>,
+                        source_preflight: query::<P>,
                     },
-                    source_preflight: query::<P>,
+                    frame_timing: frame_timing::<P>,
                 },
-                frame_timing: frame_timing::<P>,
+                read_resource_frame_with_metadata: read_metadata::<P>,
             },
             inner,
             provider,
             caller,
         });
-        binding.api.base.base.base.base.base.base.context = (&mut *binding as *mut Self).cast();
+        binding.api.base.base.base.base.base.base.base.context =
+            (&mut *binding as *mut Self).cast();
         binding
     }
 }
@@ -185,8 +196,8 @@ unsafe extern "C" fn bind<P: SourcePreflightProvider + 'static>(
         let query = unsafe { &*query };
         if !query.header.supports::<NativeInterfaceQuery>()
             || query.interface_major != INTERFACE_MAJOR
-            || query.min_minor > CAPTURE_FRAME_TIMING_INTERFACE_MINOR
-            || query.min_size > CAPTURE_API_V1_12_SIZE
+            || query.min_minor > CAPTURE_METADATA_INTERFACE_MINOR
+            || query.min_size > CAPTURE_API_V1_13_SIZE
         {
             return MEDIA_UNSUPPORTED;
         }
@@ -240,8 +251,16 @@ unsafe extern "C" fn bind<P: SourcePreflightProvider + 'static>(
         {
             return MEDIA_UNSUPPORTED;
         }
+        if (query.min_minor > CAPTURE_FRAME_TIMING_INTERFACE_MINOR
+            || query.min_size > CAPTURE_API_V1_12_SIZE)
+            && inner
+                .table::<CaptureApiV1_13>(CAPTURE_METADATA_INTERFACE_MINOR)
+                .is_none()
+        {
+            return MEDIA_UNSUPPORTED;
+        }
         let binding = Binding::new(inner, factory.provider.clone(), caller_text.into());
-        let pointer = (&binding.api as *const CaptureApiV1_12).cast();
+        let pointer = (&binding.api as *const CaptureApiV1_13).cast();
         let _ = Box::into_raw(binding);
         // SAFETY: broker receives exactly one stable wrapper binding for unique release.
         unsafe { output.write(pointer) };
@@ -341,3 +360,5 @@ unsafe extern "C" fn query<P: SourcePreflightProvider>(
         STATUS_OK
     })
 }
+
+forward!(read_metadata,CaptureApiV1_13,13,read_resource_frame_with_metadata,stream:u64,sink:FrameResourceMetadataSinkV1);

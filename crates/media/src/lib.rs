@@ -31,6 +31,8 @@ mod capture_timing;
 pub use capture_timing::*;
 mod source_preflight;
 pub use source_preflight::*;
+mod frame_metadata;
+pub use frame_metadata::*;
 mod encoder_provider;
 pub use encoder_provider::*;
 mod encoder_input_pool;
@@ -49,6 +51,8 @@ mod geometry;
 pub use geometry::*;
 mod transport;
 pub use transport::*;
+mod video_framing;
+pub use video_framing::*;
 
 pub const INTERFACE_MAJOR: u32 = 1;
 pub const INTERFACE_MINOR: u32 = 0;

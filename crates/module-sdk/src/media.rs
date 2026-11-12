@@ -16,6 +16,7 @@ mod cpu_pixels;
 pub use cpu_pixels::CpuPixels;
 mod generic;
 mod lease;
+pub mod metadata;
 mod readiness;
 mod timing;
 use amaterasu_abi::{STATUS_INVALID_ARGUMENT, Status};

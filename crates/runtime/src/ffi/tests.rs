@@ -217,3 +217,6 @@ fn sdk_work_and_capture_notifications_wake_the_runtime_without_broker_lock() {
     );
     unsafe { destroy_runtime(runtime) };
 }
+
+mod media_profile_smoke;
+mod video_framing_smoke;

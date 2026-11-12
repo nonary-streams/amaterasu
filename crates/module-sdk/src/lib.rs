@@ -18,6 +18,7 @@ pub mod input;
 pub mod launch_options;
 pub mod lifecycle_ledger;
 pub mod media;
+pub mod media_profile;
 mod native;
 pub mod network;
 #[cfg(feature = "network-http")]
@@ -41,6 +42,7 @@ pub mod transport;
 pub mod video;
 mod work;
 pub use work::WorkNotifier;
+pub mod video_framing;
 pub mod virtual_display;
 pub use native::NativeBinding;
 
