@@ -19,3 +19,15 @@
 [submodule "modules/remote-session"]
 	path = modules/remote-session
 	url = https://github.com/nonary-streams/amaterasu-remote-session.git
+[submodule "modules/audio"]
+	path = modules/audio
+	url = https://github.com/nonary-streams/amaterasu-audio.git
+[submodule "modules/audio-encode"]
+	path = modules/audio-encode
+	url = https://github.com/nonary-streams/amaterasu-audio-encode.git
+[submodule "modules/input"]
+	path = modules/input
+	url = https://github.com/nonary-streams/amaterasu-input.git
+[submodule "modules/encode-video"]
+	path = modules/encode-video
+	url = https://github.com/nonary-streams/amaterasu-encode-video.git

@@ -32,14 +32,32 @@ Opus also requires CMake and a compatible C compiler. The independent Python
 cryptographic checks in `test_native_media.py`, `test_control_transport.py` and `test_nvhttp.py` require the
 `cryptography` package in the test environment.
 
-Initialize all core plugin submodules before building the workspace. Display,
-Frame limiting, Stats, RTX HDR and Remote Session have independent source repositories and pinned
-versions. Their browser settings surfaces use the shared SDK and approved APIs.
-See [Display](https://github.com/nonary-streams/amaterasu-display) and
-[Frame limiting](https://github.com/nonary-streams/amaterasu-frame-limiter), and
-[Remote Session](https://github.com/nonary-streams/amaterasu-remote-session) for
-standalone build and UI packaging instructions. Source extraction does not
-activate a package on an installed host.
+Initialize all core module submodules before building the workspace. Each core
+module has its own source repository, pinned here by commit and mounted where
+the workspace builds it:
+
+| Module | Repository | Mounted at |
+| --- | --- | --- |
+| Input | [amaterasu-input](https://github.com/nonary-streams/amaterasu-input) | `modules/input` |
+| Audio capture | [amaterasu-audio](https://github.com/nonary-streams/amaterasu-audio) | `modules/audio` |
+| Audio encoder | [amaterasu-audio-encode](https://github.com/nonary-streams/amaterasu-audio-encode) | `modules/audio-encode` |
+| Video encoder and pipeline | [amaterasu-encode-video](https://github.com/nonary-streams/amaterasu-encode-video) | `modules/encode-video` |
+| Virtual display capture | [amaterasu-capture-vkms](https://github.com/nonary-streams/amaterasu-capture-vkms) | `modules/capture-vkms` |
+| Display | [amaterasu-display](https://github.com/nonary-streams/amaterasu-display) | `modules/display` |
+| Remote session | [amaterasu-remote-session](https://github.com/nonary-streams/amaterasu-remote-session) | `modules/remote-session` |
+| RTX HDR | [amaterasu-rtx-hdr](https://github.com/nonary-streams/amaterasu-rtx-hdr) | `modules/rtx-hdr` |
+| Frame limiter | [amaterasu-frame-limiter](https://github.com/nonary-streams/amaterasu-frame-limiter) | `modules/frame-limiter` |
+| Statistics | [amaterasu-stats](https://github.com/nonary-streams/amaterasu-stats) | `modules/stats` |
+
+The shared crates under `crates/` and the headers under `sdk/` are published to
+[amaterasu-sdk](https://github.com/nonary-streams/amaterasu-sdk) with
+`python3 scripts/export_sdk.py PATH_TO_SDK_CHECKOUT`; each module repository
+names the SDK commit it builds against in its `sdk-revision` file and checks
+itself against that commit in its own continuous integration. Change a module
+in its repository, push it, then advance the pin here. A change that needs a
+new SDK interface lands here first, is exported to the SDK, and only then is
+used by the module. Source extraction does not activate a package on an
+installed host.
 
 The capture provider is also a submodule. It has its own
 lockfile and is validated separately from the parent workspace. Its helper-wire crate also builds the privileged helper; its shared wire
@@ -147,8 +165,8 @@ documented in the module READMEs.
 | `modules/audio` | Windows WASAPI loopback with bounded borrowed PCM delivery |
 | `modules/audio-encode` | Caller-owned software Opus encoding, packet queues and drain |
 | `modules/capture-dxgi` | Caller-owned Windows desktop duplication and CPU readback |
-| `modules/encode` | Windows hardware H.264 encoding and bounded packet delivery |
-| `modules/video` | Asynchronous capture/encoder coordination and owned output queues |
+| `modules/encode-video/encode` | Windows hardware H.264 encoding and bounded packet delivery |
+| `modules/encode-video/video` | Asynchronous capture/encoder coordination and owned output queues |
 | `modules/control-transport` | Owned ENet connections, authenticated control messages and native delivery |
 | `modules/stream-session` | Authenticated media lifecycle, native forwarding, shared capture leases and confirmed cleanup |
 | `modules/rtsp` | Encrypted RTSP tickets, strict negotiation and delegated media lifecycle |
@@ -173,8 +191,8 @@ libraries. Their startup policies default to disabled; local tests do not inject
 input or change displays.
 
 Windows [DXGI capture](modules/capture-dxgi/README.md),
-[hardware H.264 encoding](modules/encode/README.md), and
-[video coordination](modules/video/README.md) are separate, disabled-by-default
+[hardware H.264 encoding](modules/encode-video/encode/README.md), and
+[video coordination](modules/encode-video/video/README.md) are separate, disabled-by-default
 libraries. They exchange borrowed frames and packets through the draft
 [native media ABI](docs/media-interfaces.md). Signed-library tests cover binding
 and ownership; real Windows capture-to-encode hardware qualification is pending.

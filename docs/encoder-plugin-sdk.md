@@ -17,7 +17,7 @@ DMA-BUF path requires compatible advertised input and encoder interfaces. Its
 leased variant pins immutable pixels and requires acquire and completion
 synchronization. Bindings must outlive the leases and their completion fences.
 See [Capture provider SDK](capture-plugin-sdk.md) for the frame contracts and
-`modules/encode/README.md` for built-in backend capabilities and qualification.
+`modules/encode-video/encode/README.md` for built-in backend capabilities and qualification.
 Those capabilities do not automatically apply to a third-party component.
 
 `EncoderProviderApi`, `FrameResourceConsumerApi`, and `EncoderInputPoolApiV1`

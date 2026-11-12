@@ -85,8 +85,8 @@ members = [
     "modules/system-tray",
     "modules/rtsp",
     "modules/upnp",
-    "modules/encode",
-    "modules/video",
+    "modules/encode-video/encode",
+    "modules/encode-video/video",
     "modules/frame-limiter",
     "modules/rtx-hdr",
 ]

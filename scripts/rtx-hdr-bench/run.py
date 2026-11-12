@@ -47,7 +47,7 @@ def main():
     build.mkdir(parents=True, exist_ok=True)
     rtx = ROOT / 'modules/rtx-hdr/src/native'
     snapshot = ROOT / 'modules/capture-vkms/capture/src/platform'
-    encode = ROOT / 'modules/encode/src/platform/nvenc_cuda/native'
+    encode = ROOT / 'modules/encode-video/encode/src/platform/nvenc_cuda/native'
     for source, header, symbol in [(rtx/'cuda/output.ptx', 'rtx_output_ptx.h', 'am_rtx_output_ptx'),
                                     (encode/'cuda/convert.ptx', 'nvenc_convert_ptx.h', 'am_nvenc_convert_ptx')]:
         data = source.read_bytes() + b'\0'

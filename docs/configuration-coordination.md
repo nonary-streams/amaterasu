@@ -68,7 +68,7 @@ Write ownership: `modules/nvhttp/`, `modules/pairing/`, `modules/rtsp/`, `module
 
 ### luna-03
 
-Write ownership: `modules/video/`, `modules/encode/`, `modules/capture-dxgi/`, `modules/capture-wgc/`, `modules/display/`, `modules/virtual-display/`, `modules/frame-limiter/`, `crates/media/`, `crates/windows-capture-geometry/`.
+Write ownership: `modules/encode-video/video/`, `modules/encode-video/encode/`, `modules/capture-dxgi/`, `modules/capture-wgc/`, `modules/display/`, `modules/virtual-display/`, `modules/frame-limiter/`, `crates/media/`, `crates/windows-capture-geometry/`.
 
 | Stable ID | Status |
 | --- | --- |

@@ -7,7 +7,7 @@ nvcc=${NVCC:-/opt/cuda/bin/nvcc}
 root=$(cd "$(dirname "$0")/.." && pwd)
 for kernel in \
     modules/rtx-hdr/src/native/cuda/output \
-    modules/encode/src/platform/nvenc_cuda/native/cuda/convert; do
+    modules/encode-video/encode/src/platform/nvenc_cuda/native/cuda/convert; do
     "$nvcc" --ptx -arch=compute_75 -O3 -ftz=false -prec-div=true -prec-sqrt=true \
         -o "$root/$kernel.ptx" "$root/$kernel.cu"
 done
