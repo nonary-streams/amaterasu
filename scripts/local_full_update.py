@@ -86,6 +86,23 @@ def foreign_artifacts(tree: Path, components: list[dict], target: Path | None = 
     return problems
 
 
+def missing_backend_features(bootstrap: dict, manifest: dict, artifacts: dict[str, Path]) -> list[str]:
+    """An enabled Linux display provider needs its compiled native backend."""
+    if "linux" not in manifest["target"]:
+        return []
+    identifier = "amaterasu.virtual-display"
+    settings = bootstrap["policy"].get("settings", {}).get(identifier, {})
+    if not settings.get("enabled", False):
+        return []
+    artifact = artifacts.get(identifier)
+    if artifact is None or not artifact.is_file():
+        return [f"{identifier}: enabled provider artifact is missing"]
+    if b"AMATERASU_LINUX_VDD=" not in artifact.read_bytes():
+        return [f"{identifier}: enabled Linux virtual displays require the "
+                "amaterasu-virtual-display/linux-libvirtualdisplay build feature"]
+    return []
+
+
 def source_state(tree: Path) -> dict:
     """Identifies the exact source, including uncommitted and untracked files."""
     digest = hashlib.sha256(git(tree, "diff", "HEAD", "--binary"))
@@ -148,6 +165,9 @@ def prepare(arguments) -> None:
         (work / "package-activation-policy.json").write_bytes(compact(allowlist))
 
     problems = foreign_artifacts(tree, manifest["components"], target)
+    problems.extend(missing_backend_features(
+        bootstrap, manifest,
+        {component["id"]: artifact_path(tree, component, target) for component in manifest["components"]}))
     if compiled_from(host) != tree:
         problems.append(f"host: compiled from {compiled_from(host)}, not {tree}")
     if problems:
@@ -377,6 +397,10 @@ def check(arguments) -> None:
     provenance = read_json(record)
     _, running_host = service_host()
     problems = drift(provenance, manifest, running_host)
+    problems.extend(missing_backend_features(
+        read_json(root / "bootstrap.json"), manifest,
+        {component["id"]: root / "sets" / selection["active"] / component["file"]
+         for component in manifest["components"]}))
     if provenance["package_digest"] != selection["active"]:
         problems.append("the selected package is not the one this tool installed")
     if problems:

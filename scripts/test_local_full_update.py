@@ -8,7 +8,7 @@ import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).parent))
-from local_full_update import compiled_from, drift, foreign_artifacts  # noqa: E402
+from local_full_update import compiled_from, drift, foreign_artifacts, missing_backend_features  # noqa: E402
 
 
 def component(identifier: str, file: str) -> dict:
@@ -69,6 +69,30 @@ class DriftTests(unittest.TestCase):
         manifest = self.manifest()
         manifest["components"].append({"id": "three", "sha256": "f" * 64})
         self.assertIn("three", drift(self.PROVENANCE, manifest, "c" * 64)[0])
+
+
+class NativeBackendTests(unittest.TestCase):
+    def test_enabled_linux_display_rejects_same_tree_build_without_native_backend(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tree = Path(directory)
+            artifact = tree / "target/release/libamaterasu_virtual_display.so"
+            artifact.parent.mkdir(parents=True)
+            artifact.write_bytes(b"unsupported platform implementation")
+            artifact.with_suffix(".d").write_text(
+                f"{artifact}: {tree}/modules/virtual-display/src/lib.rs\n")
+            entry = component("amaterasu.virtual-display", artifact.name)
+            self.assertEqual(foreign_artifacts(tree, [entry]), [])
+            bootstrap = {"policy": {"settings": {entry["id"]: {"enabled": True}}}}
+            manifest = {"target": "x86_64-unknown-linux-gnu", "components": [entry]}
+            artifacts = {entry["id"]: artifact}
+            self.assertIn("linux-libvirtualdisplay", missing_backend_features(bootstrap, manifest, artifacts)[0])
+            artifact.write_bytes(b"native library\0AMATERASU_LINUX_VDD=linked-backend\0")
+            self.assertEqual(missing_backend_features(bootstrap, manifest, artifacts), [])
+
+    def test_disabled_or_windows_display_does_not_require_linux_backend(self):
+        for enabled, target in [(False, "x86_64-unknown-linux-gnu"), (True, "x86_64-pc-windows-msvc")]:
+            bootstrap = {"policy": {"settings": {"amaterasu.virtual-display": {"enabled": enabled}}}}
+            self.assertEqual(missing_backend_features(bootstrap, {"target": target}, {}), [])
 
 
 if __name__ == "__main__":
