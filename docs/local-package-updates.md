@@ -55,3 +55,28 @@ supports build output on a separate volume while retaining source checks.
 An install request authorizes these routine local steps and an idle service
 restart. Interrupting an active stream and publishing a shared release are
 separate actions. Report real client playback only after it is observed.
+
+## Updating from the console instead
+
+When the publisher's repository already serves the newer set, a signed-in
+administrator can install it from the management console without the release
+tool: the console checks the running set's own source repository, downloads
+the offered set into the same candidate cache `import-local-native` uses, and
+asks the installed host to activate it. The host applies the same checks as
+for a local candidate, including the protected activation policy and the
+service pin, and waits for streams to end before it stops the running set.
+See [Updating the running set from the console](approved-repositories.md#updating-the-running-set-from-the-console)
+for the routes, the phases and what the host needs provisioned.
+
+The two paths share the repository's replay checkpoint. The console reads the
+catalog from the repository's address at every check, so after a local import
+whose catalog is ahead of the published one the check fails with
+`catalog_rejected` until the repository publishes a catalog at or above it.
+A set imported locally under the catalog the repository also serves is found
+in the cache and verified again rather than downloaded.
+
+The console flow does not replace this procedure. It installs only a complete
+set from the publisher of the running set, cannot approve a policy change the
+host's allowlist does not already name, and has no offline or recovery mode:
+use `activate-package-offline` and `reconcile-package-activation` when the
+managed service cannot run.
