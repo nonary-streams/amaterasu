@@ -1,9 +1,13 @@
 //! Development loopback HTTP management lives in this independently loaded module.
 mod assets;
+#[cfg(target_os = "linux")]
+mod candidate_cache;
 mod capture_management;
 mod csrf_policy;
 mod extensions;
 mod health_lifecycle;
+#[cfg(target_os = "linux")]
+mod host_activation;
 mod http;
 mod package_status;
 mod peer_policy;

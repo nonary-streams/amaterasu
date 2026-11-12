@@ -182,20 +182,11 @@ impl Installer {
         }
         let candidate = self.candidate.as_ref().ok_or("package_not_ready")?;
         let root = &self.package_roots.as_ref().ok_or("package_unavailable")?.1;
-        let bytes = amaterasu_package::read_bounded(&root.join("selection.json"), 1024 * 1024)
-            .map_err(|_| "selection_unavailable")?;
-        let selection: amaterasu_package::ActivationState =
-            serde_json::from_slice(&bytes).map_err(|_| "selection_unavailable")?;
-        let active = selection.active.ok_or("selection_unavailable")?;
-        if selection.pending.is_some() || selection.trial.is_some() {
-            return Err("activation_in_progress");
-        }
-        Ok(amaterasu_contracts::HostPackageActivation {
-            repository_id: candidate.repository_id.clone(),
-            catalog_digest: candidate.catalog_digest.clone(),
-            manifest_digest: candidate.digest.clone(),
-            expected_active: active,
-            expected_revision: amaterasu_package::sha256(&bytes),
+        crate::host_activation::request(root, candidate).map_err(|refusal| match refusal {
+            crate::host_activation::RequestRefusal::SelectionUnavailable => "selection_unavailable",
+            crate::host_activation::RequestRefusal::ActivationInProgress => {
+                "activation_in_progress"
+            }
         })
     }
 
@@ -229,47 +220,19 @@ impl Installer {
     /// The receipt reports progress only; it never authorizes native code.
     #[cfg(target_os = "linux")]
     pub fn reconcile_activation(&self, value: &mut Value, running_digest: Option<&str>) {
-        use std::os::unix::fs::MetadataExt;
+        use crate::host_activation::ReceiptStatus;
         let Some((_, root)) = &self.package_roots else {
             return;
         };
-        let path = root.join("data/state/package-activation-status.json");
-        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+        let Some(receipt) = crate::host_activation::receipt(root) else {
             return;
         };
-        // SAFETY: geteuid has no pointer or lifetime requirements.
-        if !metadata.is_file()
-            || metadata.file_type().is_symlink()
-            || metadata.uid() != unsafe { libc::geteuid() }
-            || metadata.mode() & 0o777 != 0o600
-        {
-            return;
-        }
-        let Ok(bytes) = amaterasu_package::read_bounded(&path, 4096) else {
-            return;
-        };
-        let Ok(receipt) = serde_json::from_slice::<Value>(&bytes) else {
-            return;
-        };
-        if receipt.get("schema").and_then(Value::as_u64) != Some(1) {
-            return;
-        }
-        let Some(digest) = receipt.get("digest").and_then(Value::as_str) else {
-            return;
-        };
-        if digest.len() != 64
-            || !digest
-                .bytes()
-                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
-        {
-            return;
-        }
-        match receipt.get("status").and_then(Value::as_str) {
-            Some("committed") if running_digest == Some(digest) => {
+        match receipt.status {
+            ReceiptStatus::Committed if running_digest == Some(receipt.digest.as_str()) => {
                 value["phase"] = json!("ready");
                 value["package_ready"] = json!(true);
             }
-            Some("failed")
+            ReceiptStatus::Failed
                 if !self.busy() && !matches!(self.phase, "waiting_stream" | "activating") =>
             {
                 value["phase"] = json!("failed");
