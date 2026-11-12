@@ -14683,7 +14683,9 @@ var Amaterasu;
             (typeof checked !== "number" || !Number.isSafeInteger(checked) || checked < 0 || checked > LATEST_UNIX_MS))
             throw new Error("Package update check time is invalid.");
         const running = record(reply.running, "Running package status is invalid.");
-        if (typeof running.digest !== "string" || !DIGEST.test(running.digest) || !releaseSequence(running.sequence))
+        const unreported = running.digest === null && running.sequence === null;
+        if (!unreported &&
+            (typeof running.digest !== "string" || !DIGEST.test(running.digest) || !releaseSequence(running.sequence)))
             throw new Error("Running package status is invalid.");
         if (!byteCount(reply.transferred_bytes))
             throw new Error("Package update progress is invalid.");
@@ -14695,7 +14697,9 @@ var Amaterasu;
             phase: phase,
             checkedUnixMs: checked,
             source: reply.source === null ? null : parsePackageSource(reply.source),
-            running: { digest: running.digest, sequence: running.sequence },
+            running: unreported
+                ? { digest: null, sequence: null }
+                : { digest: running.digest, sequence: running.sequence },
             update: reply.update === null ? null : parsePackageUpdate(reply.update),
             transferredBytes: reply.transferred_bytes,
             error,
@@ -15186,7 +15190,7 @@ var Amaterasu;
         return {
             ...row,
             repository: status.source?.repository ?? row.repository,
-            running: status.running.digest,
+            running: status.running.digest ?? row.running,
             checkedUnixMs: status.checkedUnixMs,
             state: phase,
             headline: UPDATE_HEADLINES[phase],

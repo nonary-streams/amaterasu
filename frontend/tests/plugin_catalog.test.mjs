@@ -385,6 +385,14 @@ test("an update status reply is read whole", () => {
   assert.deepEqual(plain(plugins.parsePackageUpdateStatus({ ...updateReply, supported: false, phase: "nonsense" })), { supported: false });
 });
 
+test("a host that cannot say which package it loaded still reports update status", () => {
+  const status = plugins.parsePackageUpdateStatus({ ...updateReply, running: { digest: null, sequence: null } });
+  assert.deepEqual(plain(status.running), { digest: null, sequence: null });
+  // The row then keeps the digest the package selection reported.
+  const row = plugins.coreUpdateSource({ state: "ready", status }, { digest: digest("e"), repository: "amaterasu" });
+  assert.equal(row.running, digest("e"));
+});
+
 test("each malformed field of an update status reply is rejected", () => {
   const update = (change) => ({ ...updateReply, update: { ...updateOffer, ...change } });
   const modules = (...rows) => update({ modules: rows });
@@ -409,6 +417,8 @@ test("each malformed field of an update status reply is rejected", () => {
     "running digest": { ...updateReply, running: { digest: "/unsafe/path", sequence: "1" } },
     "running sequence a number": { ...updateReply, running: { digest: digest("d"), sequence: 1794169005 } },
     "running sequence padded": { ...updateReply, running: { digest: digest("d"), sequence: "01" } },
+    "running digest without its sequence": { ...updateReply, running: { digest: digest("d"), sequence: null } },
+    "running sequence without its digest": { ...updateReply, running: { digest: null, sequence: "1" } },
     "running sequence too large": { ...updateReply, running: { digest: digest("d"), sequence: "18446744073709551616" } },
     "update missing": { ...updateReply, update: undefined },
     "update not an object": { ...updateReply, update: "0.2.0" },
