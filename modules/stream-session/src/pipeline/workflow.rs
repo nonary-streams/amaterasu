@@ -689,14 +689,26 @@ impl Job {
                 INPUT_SERVICE.into(),
                 super::input::input_batch_payload(record),
             ),
-            Step::FeedbackPeek => (
-                INPUT_SERVICE.into(),
-                InputRequest::FeedbackPeek {
-                    lease: record.input_lease.as_deref(),
-                    limit: 16,
-                }
-                .payload(),
-            ),
+            Step::FeedbackPeek => {
+                let lease = record.input_lease.as_deref();
+                let scoped = !record.feedback_contributions_unsupported
+                    && record
+                        .start
+                        .as_ref()
+                        .is_some_and(|start| start.outbound_agreement.is_some());
+                let payload = if scoped {
+                    amaterasu_module_sdk::input::ScopedFeedbackPeek {
+                        lease,
+                        limit: 16,
+                        session: record.id,
+                        contribution_version: 1,
+                    }
+                    .payload()
+                } else {
+                    InputRequest::FeedbackPeek { lease, limit: 16 }.payload()
+                };
+                (INPUT_SERVICE.into(), payload)
+            }
             Step::FeedbackAck => (
                 INPUT_SERVICE.into(),
                 InputRequest::FeedbackAck {

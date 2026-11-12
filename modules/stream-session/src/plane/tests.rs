@@ -970,3 +970,79 @@ fn timed_fragments_must_agree_on_processing_start_and_survive_busy() {
     assembly.clear();
     assert_eq!(assembly.processing_started_host_us(), 0);
 }
+
+#[test]
+fn contributed_feedback_obeys_shared_queue_busy_and_invalidation_gate() {
+    let mut pump = Pump::new(Fake {
+        feedback_busy: true,
+        ..Fake::default()
+    });
+    let message = HostFeedbackMessage {
+        message_type: 0x6001,
+        channel: 0,
+        delivery: HostFeedbackDelivery::Reliable,
+        payload: vec![7],
+    };
+    assert_eq!(
+        pump.enqueue_message(PendingFeedback {
+            message: message.clone(),
+            contribution: true
+        }),
+        Ok(FeedbackEnqueueOutcome::Queued)
+    );
+    assert_eq!(
+        pump.enqueue_feedback(rumble(0, 3, 4)),
+        Ok(FeedbackEnqueueOutcome::Queued)
+    );
+    pump.tick(false).unwrap();
+    assert!(pump.backend.feedback_sent.is_empty());
+    pump.pump_feedback(true).unwrap();
+    assert!(pump.backend.feedback_sent.is_empty());
+    pump.backend.feedback_busy = false;
+    pump.pump_feedback(false).unwrap();
+    assert!(pump.backend.feedback_sent.is_empty());
+    pump.pump_feedback(true).unwrap();
+    assert_eq!(pump.backend.feedback_sent[0], message);
+    assert_eq!(pump.backend.feedback_sent[1].message_type, 0x010b);
+}
+
+#[test]
+fn contribution_queue_is_bounded_and_stop_discards_unsent_messages() {
+    let mut pump = Pump::new(Fake {
+        feedback_busy: true,
+        ..Fake::default()
+    });
+    for index in 0..MAX_PENDING_FEEDBACK_MESSAGES {
+        let message = HostFeedbackMessage {
+            message_type: 0x6001,
+            channel: 0,
+            delivery: HostFeedbackDelivery::Reliable,
+            payload: vec![index as u8],
+        };
+        assert_eq!(
+            pump.enqueue_message(PendingFeedback {
+                message,
+                contribution: true
+            }),
+            Ok(FeedbackEnqueueOutcome::Queued)
+        );
+    }
+    let message = HostFeedbackMessage {
+        message_type: 0x6001,
+        channel: 0,
+        delivery: HostFeedbackDelivery::Reliable,
+        payload: vec![1],
+    };
+    assert_eq!(
+        pump.enqueue_message(PendingFeedback {
+            message,
+            contribution: true
+        }),
+        Err(FeedbackEnqueueError::QueueFull)
+    );
+    pump.stopping = true;
+    pump.cancel_feedback();
+    pump.backend.feedback_busy = false;
+    pump.pump_feedback(true).unwrap();
+    assert!(pump.backend.feedback_sent.is_empty());
+}

@@ -6,6 +6,8 @@
 //! Batches are bounded by the provider and successful admission is not proof of
 //! operating-system delivery. Native providers remain trusted code.
 
+pub mod outbound;
+
 use serde::Serialize;
 use serde_json::Value;
 
@@ -206,6 +208,24 @@ pub enum InputRequest<'a> {
     },
 }
 
+/// Versioned optional extension to the legacy peek request. The provider binds
+/// session to the broker-attested lease owner and filters stale resources.
+#[derive(Debug, Serialize)]
+pub struct ScopedFeedbackPeek<'a> {
+    pub lease: Option<&'a str>,
+    pub limit: u8,
+    pub session: u64,
+    pub contribution_version: u16,
+}
+impl ScopedFeedbackPeek<'_> {
+    pub fn payload(&self) -> Value {
+        let mut payload =
+            serde_json::to_value(self).expect("feedback peek contains only JSON values");
+        payload["action"] = Value::String("feedback_peek".into());
+        payload
+    }
+}
+
 impl InputRequest<'_> {
     /// Serialize the contract payload for the broker request adapter.
     pub fn payload(&self) -> Value {
@@ -217,6 +237,49 @@ impl InputRequest<'_> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // This exhaustive match intentionally fails to compile if the legacy enum grows.
+    fn original_request_shape(request: &InputRequest<'_>) -> &'static str {
+        match request {
+            InputRequest::Lookup { .. } => "lookup",
+            InputRequest::Renew { .. } => "renew",
+            InputRequest::Release { .. } => "release",
+            InputRequest::AcknowledgeBindingRetirement { .. } => "acknowledge_binding_retirement",
+            InputRequest::Batch { .. } => "batch",
+            InputRequest::FeedbackPeek { .. } => "peek",
+            InputRequest::FeedbackAck { .. } => "ack",
+            InputRequest::PollGamepadFeedback { .. } => "poll",
+        }
+    }
+
+    #[test]
+    fn legacy_and_scoped_peek_keep_distinct_source_and_wire_contracts() {
+        assert_eq!(
+            original_request_shape(&InputRequest::FeedbackPeek {
+                lease: None,
+                limit: 1
+            }),
+            "peek"
+        );
+        assert_eq!(
+            InputRequest::FeedbackPeek {
+                lease: Some("opaque"),
+                limit: 2
+            }
+            .payload(),
+            json!({"action":"feedback_peek","lease":"opaque","limit":2})
+        );
+        assert_eq!(
+            ScopedFeedbackPeek {
+                lease: Some("opaque"),
+                limit: 2,
+                session: 19,
+                contribution_version: 1
+            }
+            .payload(),
+            json!({"action":"feedback_peek","lease":"opaque","limit":2,"session":19,"contribution_version":1})
+        );
+    }
 
     #[test]
     fn bound_batch_preserves_wire_contract() {

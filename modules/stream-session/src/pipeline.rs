@@ -1,6 +1,7 @@
 mod actions;
 mod admission;
 mod cleanup;
+mod contribution_barrier;
 mod direct_input;
 mod display;
 mod history;
@@ -56,11 +57,29 @@ trait Drive {
         &mut self,
         feedback: HostFeedback,
     ) -> Result<FeedbackEnqueueOutcome, FeedbackEnqueueError>;
+    fn enqueue_contribution(
+        &mut self,
+        message: amaterasu_gamestream::control::HostFeedbackMessage,
+    ) -> Result<FeedbackEnqueueOutcome, FeedbackEnqueueError>;
+    fn pump_contributions(&mut self, allowed: bool) -> Result<(), &'static str>;
+    fn discard_contributions(&mut self);
 }
 
 impl Drive for Plane {
     fn timing_summary(&mut self) -> Option<Value> {
         Plane::timing_summary(self)
+    }
+    fn enqueue_contribution(
+        &mut self,
+        message: amaterasu_gamestream::control::HostFeedbackMessage,
+    ) -> Result<FeedbackEnqueueOutcome, FeedbackEnqueueError> {
+        Plane::enqueue_contribution(self, message)
+    }
+    fn pump_contributions(&mut self, allowed: bool) -> Result<(), &'static str> {
+        Plane::pump_contributions(self, allowed)
+    }
+    fn discard_contributions(&mut self) {
+        Plane::discard_contributions(self);
     }
     fn tick(&mut self, media_active: bool) -> Result<PlaneProgress, PlaneFailure> {
         Plane::tick(self, media_active)
@@ -939,6 +958,15 @@ impl Pipeline {
                 Step::FeedbackAck,
                 record.input_expires_at.min(now.saturating_add(5000)),
             )
+        } else if record.input_lease.is_some()
+            && record
+                .start
+                .as_ref()
+                .is_some_and(|start| start.outbound_agreement.is_some())
+            && now >= record.feedback_poll_at
+            && record.contribution_barrier.ready_generation().is_some()
+        {
+            (Step::FeedbackPeek, now.saturating_add(5000))
         } else if input_job_due(record) {
             (
                 Step::InputBatch,
@@ -1160,6 +1188,7 @@ impl Pipeline {
                                 record.force_idr = true
                             }
                             Message::Input(input) => {
+                                let generation = record.contribution_barrier.generation();
                                 if let Err(code) = input::queue_control_input(
                                     record,
                                     input,
@@ -1167,6 +1196,11 @@ impl Pipeline {
                                     now,
                                 ) {
                                     input::stop_for_input_failure(record, code);
+                                }
+                                if record.contribution_barrier.generation() != generation
+                                    && let Some(plane) = record.plane.as_mut()
+                                {
+                                    plane.discard_contributions();
                                 }
                             }
                             Message::Ping { .. } | Message::Start => {}
@@ -1178,6 +1212,14 @@ impl Pipeline {
                         record.input_timing.end_message();
                     }
                     if let Err(code) = input::release_after_client_silence(record, now) {
+                        input::stop_for_input_failure(record, code);
+                    }
+                    let allowed = record.state == State::Active
+                        && record.input_lease.is_some()
+                        && record.contribution_barrier.ready_generation().is_some();
+                    if let Some(plane) = record.plane.as_mut()
+                        && let Err(code) = plane.pump_contributions(allowed)
+                    {
                         input::stop_for_input_failure(record, code);
                     }
                 }

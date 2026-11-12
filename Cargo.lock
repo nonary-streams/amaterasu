@@ -745,6 +745,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "amaterasu-outbound-neutral"
+version = "0.1.0"
+dependencies = [
+ "amaterasu-module-sdk",
+ "serde_json",
+]
+
+[[package]]
 name = "amaterasu-package"
 version = "0.1.0"
 dependencies = [
@@ -992,6 +1000,7 @@ dependencies = [
  "amaterasu-module-sdk",
  "amaterasu-runtime",
  "getrandom 0.3.4",
+ "libloading",
  "serde",
  "serde_json",
  "sha2",

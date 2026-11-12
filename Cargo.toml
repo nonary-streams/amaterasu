@@ -41,6 +41,7 @@ members = [
     "fixtures/capture-source",
     "fixtures/encoder-source",
     "fixtures/input-probe",
+    "fixtures/outbound-neutral",
     "modules/state",
     "modules/state/test-support",
     "modules/session",

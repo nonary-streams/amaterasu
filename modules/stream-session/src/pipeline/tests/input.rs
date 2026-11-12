@@ -91,6 +91,48 @@ fn direct_stream_session_caller_cannot_supply_client_feature_flags() {
     assert_eq!(host.response(2, launch)["code"], "permission_denied");
 }
 
+#[test]
+fn outbound_agreement_requires_selected_authority_and_is_frozen_per_start() {
+    let agreement = json!({"version":1,"schemas":[{"name":"org.example.alpha","version":1,"message_type":24577}]});
+    let mut direct = Harness::new();
+    let id = direct.response(1, prepare())["session"].as_u64().unwrap();
+    let mut request = start(id);
+    request["configuration"]["outbound_agreement"] = agreement.clone();
+    assert_eq!(direct.response(2, request)["code"], "permission_denied");
+
+    let mut host = Harness::new();
+    host.pipeline
+        .settings
+        .allowed_principals
+        .push("test.protocol".into());
+    host.pipeline.settings.outbound_policy = Some(crate::model::OutboundPolicy {
+        authority: "test.protocol".into(),
+        input_service: amaterasu_module_sdk::input::INPUT_SERVICE.into(),
+        approved: serde_json::from_value(agreement.clone()).unwrap(),
+    });
+    let other_id = host.response(20, prepare())["session"].as_u64().unwrap();
+    let mut other_request = start(other_id);
+    other_request["configuration"]["outbound_agreement"] = agreement.clone();
+    assert_eq!(
+        host.response(21, other_request)["code"],
+        "permission_denied"
+    );
+    let id = host.response_from(1, "test.protocol", prepare())["session"]
+        .as_u64()
+        .unwrap();
+    let mut request = start(id);
+    request["configuration"]["outbound_agreement"] = agreement;
+    assert_eq!(
+        host.response_from(2, "test.protocol", request.clone())["state"],
+        "active"
+    );
+    request["configuration"]["outbound_agreement"]["schemas"][0]["message_type"] = json!(24578);
+    assert_eq!(
+        host.response_from(3, "test.protocol", request)["code"],
+        "permission_denied"
+    );
+}
+
 fn enable_client_haptics(host: &mut Harness, session: u64) {
     let record = host.pipeline.records.get_mut(&session).unwrap();
     crate::pipeline::input::queue_control_input(
@@ -1924,4 +1966,465 @@ fn held_controller_is_released_after_client_silence_only_with_live_input() {
         crate::pipeline::input::release_after_client_silence(&mut record, 5_000).unwrap();
         assert_eq!(record.input_events.len(), 1, "released once per silence");
     }
+}
+
+#[test]
+fn neutral_selected_provider_sends_only_negotiated_session_contributions() {
+    let mut host = Harness::new();
+    enable_input(&mut host);
+    host.broker.input_controller_supported = Some(json!(true));
+    host.pipeline
+        .settings
+        .allowed_principals
+        .push("test.protocol".into());
+    let agreement = json!({"version":1,"schemas":[
+        {"name":"org.example.alpha","version":1,"message_type":24577},
+        {"name":"org.example.beta","version":1,"message_type":24578}
+    ]});
+    host.pipeline.settings.outbound_policy = Some(crate::model::OutboundPolicy {
+        authority: "test.protocol".into(),
+        input_service: amaterasu_module_sdk::input::INPUT_SERVICE.into(),
+        approved: serde_json::from_value(agreement.clone()).unwrap(),
+    });
+    let session = host.response_from(1, "test.protocol", prepare())["session"]
+        .as_u64()
+        .unwrap();
+    let mut request = start(session);
+    request["configuration"]["outbound_agreement"] = agreement;
+    assert_eq!(
+        host.response_from(2, "test.protocol", request)["state"],
+        "active"
+    );
+    let lease = host.broker.input_lease.clone().unwrap();
+    let mut provider = NeutralProvider {
+        session,
+        lease,
+        incarnation: 8,
+        events: Default::default(),
+    };
+    assert_eq!(
+        provider.peek(
+            "wrong.owner",
+            &json!({"lease":provider.lease,"session":session,"limit":16,"contribution_version":1})
+        )["error"]["code"],
+        "permission_denied"
+    );
+    assert!(!provider.emit(session + 1, 8, 1, "org.example.alpha", vec![1]));
+    assert!(!provider.emit(session, 7, 1, "org.example.alpha", vec![1]));
+    assert!(provider.emit(session, 8, 1, "org.example.alpha", vec![4, 5]));
+    assert!(provider.emit(session, 8, 2, "org.example.unapproved", vec![9]));
+    assert!(provider.emit(session, 8, 3, "org.example.beta", vec![6]));
+    host.broker.neutral_provider = Some(provider);
+    host.plane.borrow_mut().contribution_busy = true;
+    for _ in 0..80 {
+        host.pipeline
+            .records
+            .get_mut(&session)
+            .unwrap()
+            .input_events
+            .push_back(json!({"kind":"relative","dx":1,"dy":0}));
+        host.tick();
+    }
+    assert_eq!(host.plane.borrow().contribution_queue.len(), 2);
+    assert!(host.plane.borrow().contributions_sent.is_empty());
+    host.plane.borrow_mut().contribution_busy = false;
+    for _ in 0..80 {
+        host.pipeline
+            .records
+            .get_mut(&session)
+            .unwrap()
+            .input_events
+            .push_back(json!({"kind":"relative","dx":1,"dy":0}));
+        host.tick();
+    }
+    let state = host.plane.borrow();
+    assert_eq!(state.contributions_sent.len(), 2);
+    assert_eq!(state.contributions_sent[0].message_type, 0x6001);
+    assert_eq!(state.contributions_sent[0].payload, vec![4, 5]);
+    assert_eq!(state.contributions_sent[1].message_type, 0x6002);
+    assert!(
+        host.broker
+            .neutral_provider
+            .as_ref()
+            .unwrap()
+            .events
+            .is_empty()
+    );
+    drop(state);
+    host.plane.borrow_mut().contribution_busy = true;
+    assert!(host.broker.neutral_provider.as_mut().unwrap().emit(
+        session,
+        8,
+        4,
+        "org.example.alpha",
+        vec![8]
+    ));
+    host.idle();
+    assert_eq!(host.plane.borrow().contribution_queue.len(), 1);
+    host.plane.borrow_mut().controls.push(controller_packet(1));
+    host.plane.borrow_mut().contribution_busy = false;
+    host.tick();
+    assert!(host.plane.borrow().contribution_queue.is_empty());
+    assert_eq!(host.plane.borrow().contributions_sent.len(), 2);
+    host.plane.borrow_mut().contribution_busy = true;
+    assert!(host.broker.neutral_provider.as_mut().unwrap().emit(
+        session,
+        8,
+        5,
+        "org.example.alpha",
+        vec![9]
+    ));
+    host.idle();
+    assert_eq!(host.plane.borrow().contribution_queue.len(), 1);
+    assert_eq!(
+        host.response_from(
+            3,
+            "test.protocol",
+            json!({"action":"stop","session":session})
+        )["state"],
+        "stopped"
+    );
+    assert!(host.plane.borrow().contribution_queue.is_empty());
+    assert_eq!(host.plane.borrow().contributions_sent.len(), 2);
+}
+
+#[test]
+fn absent_agreement_denies_unsolicited_contribution() {
+    let mut host = Harness::new();
+    enable_input(&mut host);
+    let session = host.response(1, prepare())["session"].as_u64().unwrap();
+    assert_eq!(host.response(2, start(session))["state"], "active");
+    host.broker
+        .input_feedback_events
+        .push_back(json!({"sequence":1,"contribution":{
+            "version":1,"schema":"org.example.alpha","schema_version":1,"session":session,
+            "resource":"neutral-resource","incarnation":1,"payload":[2]
+        }}));
+    host.idle();
+    assert!(host.plane.borrow().contributions_sent.is_empty());
+    assert!(host.broker.input_feedback_events.is_empty());
+}
+
+#[test]
+fn provider_without_optional_extension_keeps_legacy_feedback() {
+    let mut host = Harness::new();
+    enable_input(&mut host);
+    host.broker.reject_optional_feedback = true;
+    host.pipeline
+        .settings
+        .allowed_principals
+        .push("test.protocol".into());
+    let agreement = json!({"version":1,"schemas":[{"name":"org.example.alpha","version":1,"message_type":24577}]});
+    host.pipeline.settings.outbound_policy = Some(crate::model::OutboundPolicy {
+        authority: "test.protocol".into(),
+        input_service: amaterasu_module_sdk::input::INPUT_SERVICE.into(),
+        approved: serde_json::from_value(agreement.clone()).unwrap(),
+    });
+    let session = host.response_from(1, "test.protocol", prepare())["session"]
+        .as_u64()
+        .unwrap();
+    let mut request = start(session);
+    request["configuration"]["outbound_agreement"] = agreement;
+    assert_eq!(
+        host.response_from(2, "test.protocol", request)["state"],
+        "active"
+    );
+    let feedback = amaterasu_gamestream::control::HostFeedback::Rumble {
+        controller: 0,
+        low_frequency: 1,
+        high_frequency: 2,
+    };
+    host.broker
+        .input_feedback_events
+        .push_back(json!({"sequence":1,"feedback":feedback}));
+    for _ in 0..250 {
+        host.tick();
+    }
+    assert!(host.pipeline.records[&session].feedback_contributions_unsupported);
+    assert_eq!(host.plane.borrow().feedback, vec![feedback]);
+}
+
+#[test]
+fn neutral_provider_runs_through_session_and_real_feedback_queue() {
+    let mut host = Harness::new();
+    enable_input(&mut host);
+    host.broker.enable_real_input_broker();
+    host.broker.input_controller_supported = Some(json!(true));
+    let transport = std::rc::Rc::new(std::cell::RefCell::new(
+        crate::plane::test_support::TransportState::default(),
+    ));
+    transport.borrow_mut().busy = true;
+    host.real_transport = Some(transport.clone());
+    host.pipeline
+        .settings
+        .allowed_principals
+        .push("test.protocol".into());
+    let agreement = json!({"version":1,"schemas":[
+        {"name":"org.example.alpha","version":1,"message_type":24577},
+        {"name":"org.example.beta","version":1,"message_type":24578}
+    ]});
+    host.pipeline.settings.outbound_policy = Some(crate::model::OutboundPolicy {
+        authority: "test.protocol".into(),
+        input_service: amaterasu_module_sdk::input::INPUT_SERVICE.into(),
+        approved: serde_json::from_value(agreement.clone()).unwrap(),
+    });
+    let session = host.response_from(1, "test.protocol", prepare())["session"]
+        .as_u64()
+        .unwrap();
+    let mut request = start(session);
+    request["configuration"]["outbound_agreement"] = agreement;
+    assert_eq!(
+        host.response_from(2, "test.protocol", request)["state"],
+        "active"
+    );
+    let mut provider = NeutralProvider {
+        session,
+        lease: host.broker.input_lease.clone().unwrap(),
+        incarnation: 8,
+        events: Default::default(),
+    };
+    assert!(provider.emit(session, 8, 1, "org.example.alpha", vec![1]));
+    assert!(provider.emit(session, 8, 2, "org.example.unapproved", vec![9]));
+    assert!(provider.emit(session, 8, 3, "org.example.beta", vec![2]));
+    host.broker.neutral_provider = Some(provider);
+    for _ in 0..100 {
+        host.pipeline
+            .records
+            .get_mut(&session)
+            .unwrap()
+            .input_events
+            .push_back(json!({"kind":"relative","dx":1,"dy":0}));
+        host.tick();
+    }
+    assert!(
+        host.broker
+            .neutral_provider
+            .as_ref()
+            .unwrap()
+            .events
+            .is_empty()
+    );
+    assert!(transport.borrow().sent.is_empty());
+    transport.borrow_mut().busy = false;
+    for _ in 0..100 {
+        host.pipeline
+            .records
+            .get_mut(&session)
+            .unwrap()
+            .input_events
+            .push_back(json!({"kind":"relative","dx":1,"dy":0}));
+        host.tick();
+    }
+    assert_eq!(
+        transport
+            .borrow()
+            .sent
+            .iter()
+            .map(|message| (message.message_type, message.payload.clone()))
+            .collect::<Vec<_>>(),
+        vec![(0x6001, vec![1]), (0x6002, vec![2])]
+    );
+    transport.borrow_mut().busy = true;
+    assert!(host.broker.neutral_provider.as_mut().unwrap().emit(
+        session,
+        8,
+        4,
+        "org.example.alpha",
+        vec![3]
+    ));
+    assert!(host.broker.neutral_provider.as_mut().unwrap().emit(
+        session,
+        8,
+        5,
+        "org.example.beta",
+        vec![8]
+    ));
+    host.idle();
+    assert!(
+        host.broker
+            .neutral_provider
+            .as_ref()
+            .unwrap()
+            .events
+            .is_empty()
+    );
+    transport
+        .borrow_mut()
+        .controls
+        .push_back(controller_packet(1));
+    transport.borrow_mut().busy = false;
+    host.tick();
+    assert_eq!(transport.borrow().sent.len(), 2);
+    transport.borrow_mut().busy = true;
+    assert!(host.broker.neutral_provider.as_mut().unwrap().emit(
+        session,
+        8,
+        6,
+        "org.example.alpha",
+        vec![4]
+    ));
+    host.idle();
+    assert!(
+        host.broker
+            .neutral_provider
+            .as_ref()
+            .unwrap()
+            .events
+            .is_empty()
+    );
+    assert_eq!(
+        host.response_from(
+            3,
+            "test.protocol",
+            json!({"action":"stop","session":session})
+        )["state"],
+        "stopped"
+    );
+    transport.borrow_mut().busy = false;
+    host.idle();
+    assert_eq!(transport.borrow().sent.len(), 2);
+}
+
+#[test]
+fn failed_invalidation_drops_optional_contribution_and_allows_legacy_feedback() {
+    let mut host = Harness::new();
+    enable_input(&mut host);
+    host.broker.input_controller_supported = Some(json!(true));
+    host.pipeline
+        .settings
+        .allowed_principals
+        .push("test.protocol".into());
+    let agreement = json!({"version":1,"schemas":[{"name":"org.example.alpha","version":1,"message_type":24577}]});
+    host.pipeline.settings.outbound_policy = Some(crate::model::OutboundPolicy {
+        authority: "test.protocol".into(),
+        input_service: amaterasu_module_sdk::input::INPUT_SERVICE.into(),
+        approved: serde_json::from_value(agreement.clone()).unwrap(),
+    });
+    let session = host.response_from(1, "test.protocol", prepare())["session"]
+        .as_u64()
+        .unwrap();
+    let mut request = start(session);
+    request["configuration"]["outbound_agreement"] = agreement;
+    assert_eq!(
+        host.response_from(2, "test.protocol", request)["state"],
+        "active"
+    );
+    host.broker.neutral_provider = Some(NeutralProvider {
+        session,
+        lease: host.broker.input_lease.clone().unwrap(),
+        incarnation: 8,
+        events: Default::default(),
+    });
+    host.broker.fail_controller_input = true;
+    host.plane.borrow_mut().controls.push(controller_packet(1));
+    host.idle();
+    assert!(
+        host.pipeline.records[&session]
+            .contribution_barrier
+            .uncertain()
+    );
+    let provider = host.broker.neutral_provider.as_mut().unwrap();
+    assert!(provider.emit(session, 8, 1, "org.example.alpha", vec![1]));
+    let feedback = amaterasu_gamestream::control::HostFeedback::Rumble {
+        controller: 0,
+        low_frequency: 1,
+        high_frequency: 2,
+    };
+    provider
+        .events
+        .push_back(json!({"sequence":2,"feedback":feedback}));
+    host.idle();
+    assert!(
+        host.broker
+            .neutral_provider
+            .as_ref()
+            .unwrap()
+            .events
+            .is_empty()
+    );
+    assert!(host.plane.borrow().contributions_sent.is_empty());
+    assert_eq!(host.plane.borrow().feedback, vec![feedback]);
+}
+
+#[test]
+fn neutral_provider_filters_a_resource_retired_before_peek() {
+    let mut provider = NeutralProvider {
+        session: 19,
+        lease: "lease".into(),
+        incarnation: 8,
+        events: Default::default(),
+    };
+    assert!(provider.emit(19, 8, 1, "org.example.alpha", vec![1]));
+    provider.retire_resource();
+    assert!(!provider.emit(19, 8, 2, "org.example.alpha", vec![2]));
+    let request = json!({"action":"feedback_peek","lease":"lease","session":19,"limit":16,"contribution_version":1});
+    assert_eq!(
+        provider.peek("amaterasu.stream-session", &request)["events"],
+        json!([])
+    );
+    assert!(provider.emit(19, 9, 3, "org.example.alpha", vec![3]));
+    assert_eq!(
+        provider.peek("amaterasu.stream-session", &request)["events"][0]["contribution"]["incarnation"],
+        9
+    );
+}
+
+#[test]
+#[ignore = "requires separately built outbound-neutral module artifact"]
+fn loaded_neutral_provider_crosses_broker_session_and_real_queue() {
+    let artifact = std::env::var_os("AMATERASU_OUTBOUND_NEUTRAL_PLUGIN")
+        .expect("separately built provider path");
+    let mut host = Harness::new();
+    enable_input(&mut host);
+    host.broker.enable_real_input_broker();
+    host.broker
+        .load_neutral_provider(std::path::Path::new(&artifact));
+    let transport = std::rc::Rc::new(std::cell::RefCell::new(
+        crate::plane::test_support::TransportState::default(),
+    ));
+    transport.borrow_mut().busy = true;
+    host.real_transport = Some(transport.clone());
+    host.pipeline
+        .settings
+        .allowed_principals
+        .push("test.protocol".into());
+    let agreement = json!({"version":1,"schemas":[
+        {"name":"org.example.alpha","version":1,"message_type":24577},
+        {"name":"org.example.beta","version":1,"message_type":24578}
+    ]});
+    host.pipeline.settings.outbound_policy = Some(crate::model::OutboundPolicy {
+        authority: "test.protocol".into(),
+        input_service: amaterasu_module_sdk::input::INPUT_SERVICE.into(),
+        approved: serde_json::from_value(agreement.clone()).unwrap(),
+    });
+    let session = host.response_from(1, "test.protocol", prepare())["session"]
+        .as_u64()
+        .unwrap();
+    let mut request = start(session);
+    request["configuration"]["outbound_agreement"] = agreement;
+    assert_eq!(
+        host.response_from(2, "test.protocol", request)["state"],
+        "active"
+    );
+    host.idle();
+    assert!(transport.borrow().sent.is_empty());
+    transport.borrow_mut().busy = false;
+    host.idle();
+    assert_eq!(
+        transport
+            .borrow()
+            .sent
+            .iter()
+            .map(|message| (message.message_type, message.payload.clone()))
+            .collect::<Vec<_>>(),
+        vec![(0x6001, vec![1]), (0x6002, vec![2])]
+    );
+    assert_eq!(
+        host.response_from(
+            3,
+            "test.protocol",
+            json!({"action":"stop","session":session})
+        )["state"],
+        "stopped"
+    );
 }
