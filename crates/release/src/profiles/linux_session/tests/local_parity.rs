@@ -127,6 +127,16 @@ fn every_call_targets_a_provider_the_caller_depends_on() {
     for caller in COMPONENTS {
         let closure = dependency_closure(caller.id);
         for service in caller.calls {
+            // Host-context commands are served by the runtime itself, while
+            // their grant still requires its startup/lifetime dependency.
+            if *service == "amaterasu.host-state-context/1" {
+                assert!(
+                    closure.contains(RUNTIME_ID),
+                    "{} lacks runtime dependency",
+                    caller.id
+                );
+                continue;
+            }
             // This service is supplied by the host, not by a loadable component.
             if matches!(
                 *service,
@@ -155,6 +165,7 @@ fn every_call_targets_a_provider_the_caller_depends_on() {
                     )
                     | ("amaterasu.extension-registry", "nonary.frame-limiter/1")
                     | ("amaterasu.frame-limiter", "amaterasu.session-lifecycle/1")
+                    | ("amaterasu.input", "amaterasu.session-lifecycle/1")
             ) {
                 continue;
             }

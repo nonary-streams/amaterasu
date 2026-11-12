@@ -309,7 +309,7 @@ fn shutdown_retries_connection_request_release_before_retiring() {
 }
 
 #[test]
-fn broker_deadline_does_not_prove_provider_retirement() {
+fn broker_deadline_settles_the_caller_only_after_result_release() {
     let recorder = RuntimeRecorder::default();
     let runtime = runtime(&recorder);
     let mut server = tls_server();
@@ -324,14 +324,19 @@ fn broker_deadline_does_not_prove_provider_retirement() {
     };
     assert!(!server.quiesce(&runtime));
     recorder.expired_take.store(true, Ordering::Release);
-    assert!(!server.quiesce(&runtime));
+    assert!(server.quiesce(&runtime));
+    assert!(server.connections.is_empty());
     assert!(matches!(
         recorder.commands.lock().unwrap().as_slice(),
         [
             Command::TakeResult { request: 47 },
-            Command::TakeResult { request: 47 }
+            Command::TakeResult { request: 47 },
+            Command::ReleaseResult { request: 47 }
         ]
     ));
+    // Caller settlement is not provider retirement. The real broker's
+    // reliable_retirement_survives_cancel_release_and_result_expiry regression
+    // proves that the accepted provider delivery remains fenced independently.
 }
 
 #[test]
@@ -488,15 +493,11 @@ fn deadline_result_is_settled_without_claiming_provider_retirement() {
         capture: None,
     };
     server.tick(&runtime).unwrap();
-    assert!(matches!(
-        server.connections[0].stage,
-        Stage::Retiring {
-            request_id: 53,
-            settled: false,
-            ..
-        }
-    ));
-    assert!(!server.quiesce(&runtime));
+    // A failed release keeps the terminal result and exact active request.
+    // Dispatch can keep its current stage while retrying result settlement.
+    assert_eq!(server.connections[0].active_request(), Some(53));
+    assert!(matches!(server.connections[0].terminal_result,
+        Some((53, Response::Error { ref code, .. })) if code == "deadline_exceeded"));
     assert!(server.quiesce(&runtime));
     assert!(server.connections.is_empty());
     assert!(matches!(
