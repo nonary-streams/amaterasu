@@ -3,6 +3,7 @@
 mod connection;
 mod cpu_lease;
 mod cpu_source;
+mod frame_timing;
 pub mod high_depth;
 mod negotiation;
 mod preflight;
@@ -18,6 +19,7 @@ pub use cpu_source::{
     CpuPresentationReceipt, CpuSourceDescription, CpuSourceFactory, CpuSourceFormat,
     CpuSourcePresentation, CpuSourceProvider,
 };
+pub use frame_timing::{frame_processing_start, select_processing_start};
 pub use negotiation::{
     Accessibility, DeliveryFormat, DeliveryRequirement, DeliverySelection,
     MAX_DELIVERY_CAPABILITY_BYTES, MAX_DELIVERY_OFFERS, MAX_DELIVERY_REQUIREMENTS,

@@ -455,3 +455,99 @@ fn native_binding_requires_exact_capture_family_and_never_retries_untyped() {
     assert!(unsafe { SourcePreflightConnection::bind(&runtime, "third-party.capture/1") }.is_err());
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
+
+unsafe extern "C" fn bind_timing(
+    context: *mut c_void,
+    caller: BorrowedBytes,
+    query: *const NativeInterfaceQuery,
+    output: *mut *const NativeInterface,
+) -> Status {
+    let mut original = std::ptr::null();
+    // SAFETY: the fixture keeps factory context, query and result slots live.
+    let status = unsafe { bind_old(context, caller, query, &mut original) };
+    if status != STATUS_OK {
+        return status;
+    }
+    let factory = unsafe { &*context.cast::<OldFactory>() };
+    let mut binding = factory::Binding::new(
+        factory::Inner(original),
+        Arc::new(FirstProvider(factory.counts.clone())),
+        "capture-consumer".into(),
+    );
+    binding.api.base.base.base.base.base.base.header = AbiHeader {
+        size: CAPTURE_API_V1_12_SIZE,
+        major: 1,
+        minor: 12,
+    };
+    binding.api.frame_timing = fixture_timing;
+    let pointer = std::ptr::from_ref(&binding.api).cast();
+    let _ = Box::into_raw(binding);
+    unsafe { output.write(pointer) };
+    STATUS_OK
+}
+unsafe extern "C" fn fixture_timing(
+    _: *mut c_void,
+    _: u64,
+    sequence: u64,
+    output: *mut CaptureFrameTimingV1,
+) -> Status {
+    // SAFETY: SDK provides initialized aligned writable output for the callback.
+    unsafe {
+        output.write(CaptureFrameTimingV1 {
+            sequence,
+            processing_started_host_us: 4000,
+        })
+    };
+    STATUS_OK
+}
+
+#[test]
+fn preflight_wrapper_preserves_the_timing_tail_and_unique_inner_release() {
+    let counts = Arc::new(Counts::default());
+    let mut inner = OldFactory::new(counts.clone());
+    inner.api.bind = Some(bind_timing);
+    // SAFETY: fixture builds and owns an authentic complete Capture v1.12 table.
+    let factory =
+        unsafe { SourcePreflightFactory::new(&inner.api, Arc::new(FirstProvider(counts.clone()))) };
+    let binding = OwnedBinding::bind(&factory.api);
+    assert_eq!(binding.prefix().base.header.minor, 12);
+    assert!(
+        unsafe { source_preflight(binding.prefix(), &request()) }
+            .unwrap()
+            .is_ready()
+    );
+    assert_eq!(
+        unsafe { super::super::frame_processing_start(binding.prefix(), 1, 7) },
+        Ok(Some(4000))
+    );
+    drop(binding);
+    assert_eq!(counts.releases.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn preflight_wrapper_refuses_timing_queries_for_an_old_inner_without_leaking_it() {
+    let counts = Arc::new(Counts::default());
+    let inner = OldFactory::new(counts.clone());
+    let factory =
+        unsafe { SourcePreflightFactory::new(&inner.api, Arc::new(FirstProvider(counts.clone()))) };
+    let query = NativeInterfaceQuery {
+        header: AbiHeader::of::<NativeInterfaceQuery>(),
+        interface_major: 1,
+        min_minor: 12,
+        min_size: CAPTURE_API_V1_12_SIZE,
+    };
+    let mut output = std::ptr::null();
+    assert_eq!(
+        unsafe {
+            factory.api.bind.unwrap()(
+                factory.api.context,
+                BorrowedBytes::new(b"capture-consumer"),
+                &query,
+                &mut output,
+            )
+        },
+        MEDIA_UNSUPPORTED
+    );
+    assert!(output.is_null());
+    assert_eq!(counts.releases.load(Ordering::SeqCst), 1);
+}

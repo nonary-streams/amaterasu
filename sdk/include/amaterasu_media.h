@@ -740,6 +740,19 @@ typedef struct {
     AmaterasuStatus (*source_preflight)(void *, AmaterasuBorrowedBytes, AmaterasuReplySink);
 } AmaterasuCaptureApiV1_11;
 #define AMATERASU_CAPTURE_API_V1_11_SIZE ((uint32_t)sizeof(AmaterasuCaptureApiV1_11))
+/* Optional per-presentation processing start on the host monotonic clock.
+ * Zero is unknown; every earlier capture prefix, including preflight, is intact. */
+#define AMATERASU_CAPTURE_FRAME_TIMING_INTERFACE_MINOR 12u
+typedef struct {
+    uint64_t sequence;
+    uint64_t processing_started_host_us;
+} AmaterasuCaptureFrameTimingV1;
+typedef struct {
+    AmaterasuCaptureApiV1_11 base;
+    AmaterasuStatus (*frame_timing)(void *, uint64_t, uint64_t, AmaterasuCaptureFrameTimingV1 *);
+} AmaterasuCaptureApiV1_12;
+#define AMATERASU_CAPTURE_API_V1_12_SIZE ((uint32_t)sizeof(AmaterasuCaptureApiV1_12))
+
 typedef struct {
     AmaterasuVideoApiV1_1 base;
     AmaterasuStatus (*hdr_metadata)(void *, uint64_t, AmaterasuHdrMetadata *);

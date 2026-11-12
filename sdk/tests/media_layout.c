@@ -125,3 +125,7 @@ _Static_assert(offsetof(AmaterasuControlTransportApi, receive) == 40, "control r
 
 _Static_assert(offsetof(AmaterasuFrameProcessorApi, base) == 0, "frame processor resource prefix");
 _Static_assert(sizeof(AmaterasuFrameProcessorApi) == sizeof(AmaterasuFrameResourceProcessorApi) + 3 * sizeof(void *), "complete frame processor layout");
+
+_Static_assert(sizeof(AmaterasuCaptureFrameTimingV1) == 16, "capture timing record");
+_Static_assert(offsetof(AmaterasuCaptureApiV1_12, base) == 0, "capture v1.12 prefix");
+_Static_assert(offsetof(AmaterasuCaptureApiV1_12, frame_timing) == sizeof(AmaterasuCaptureApiV1_11), "preflight prefix preserved");

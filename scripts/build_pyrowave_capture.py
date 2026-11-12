@@ -49,7 +49,7 @@ def main():
     environment["CARGO_BUILD_JOBS"] = "1"
     environment["AMATERASU_CAPTURE_TYPED_NATIVE"] = "1"
     command = ["cargo", "test" if args.test else "build", "--offline", "--manifest-path", str(destination / "Cargo.toml"),
-               "--features", "driver-read-leases,linux-kwin-geometry"]
+               "--features", "driver-read-leases,linux-kwin-geometry,linux-gpu-snapshot"]
     subprocess.run(command, check=True, env=environment)
     print(ROOT / "target/capture-sdk/debug/libamaterasu_capture_vkms.so")
 

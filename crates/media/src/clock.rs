@@ -41,13 +41,19 @@ pub fn host_monotonic_micros() -> u64 {
     (counter as u128 * 1_000_000 / frequency as u128) as u64
 }
 
+/// Longest host processing latency accepted as genuine. Older or future
+/// timestamps did not come from the host monotonic clock.
+pub const HOST_PROCESSING_LATENCY_WINDOW_US: u64 = 5_000_000;
+
 /// Host processing latency in Moonlight's 0.1 ms frame-header units, from a
 /// frame stamped on the host clock at capture to `now`. Zero means unknown: a
 /// timestamp from the future or more than five seconds old did not come from
 /// this clock.
 pub fn host_processing_latency_tenths_ms(captured_us: u64, now_us: u64) -> u16 {
     match now_us.checked_sub(captured_us) {
-        Some(elapsed) if elapsed <= 5_000_000 => ((elapsed + 50) / 100) as u16,
+        Some(elapsed) if elapsed <= HOST_PROCESSING_LATENCY_WINDOW_US => {
+            ((elapsed + 50) / 100) as u16
+        }
         _ => 0,
     }
 }

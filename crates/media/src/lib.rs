@@ -27,6 +27,8 @@ mod frame_processing;
 pub use frame_processing::*;
 mod frame_resource;
 pub use frame_resource::*;
+mod capture_timing;
+pub use capture_timing::*;
 mod source_preflight;
 pub use source_preflight::*;
 mod encoder_provider;
