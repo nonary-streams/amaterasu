@@ -28,8 +28,10 @@ function fixture(api) {
   }
   const content = new Element("main");
   let guard = null;
-  sandbox.Amaterasu.renderTokens({content, api, notify() {}, registerDraftGuard(isDirty, dispose) { guard = {isDirty, dispose}; } });
+  const notices = [];
+  sandbox.Amaterasu.renderTokens({content, api, notify(message) { notices.push(message); }, registerDraftGuard(isDirty, dispose) { guard = {isDirty, dispose}; } });
   content.guard = guard;
+  content.notices = notices;
   return content;
 }
 
@@ -78,4 +80,66 @@ test("an uncertain issuance is not silently retried", async () => {
   await wait(() => content.textContent.includes("A change may have completed"));
   assert.equal(issues, 1);
   assert.equal(find(content, (el) => el.tagName === "textarea"), undefined);
+});
+
+
+test("token revoke confirms removal by readback when the response is lost", async () => {
+  const tokenId = "c".repeat(64), secret = `ama_${"d".repeat(64)}`;
+  let issued = false;
+  const calls = [];
+  const api = { scopes: ["catalog.read"], async post(route, body = {}) {
+    calls.push(route);
+    if (route === "tokens/list") return {ok:true,tokens:issued ? [{token_id:tokenId,scopes:["catalog.read"],issued_at:10,expires_at:100}] : []};
+    if (route === "tokens/issue") { issued = true; return {ok:true,bearer:secret,token_id:tokenId,scopes:["catalog.read"],expires_at:100}; }
+    if (route === "tokens/revoke") { issued = false; throw new Error("The request timed out after commit."); }
+    throw new Error("unexpected route");
+  } };
+  const content = fixture(api);
+  await wait(() => content.textContent.includes("No issued tokens"));
+  find(content, (el) => el.name === "token_scope_catalog.read").checked = true;
+  find(content, (el) => el.tagName === "form").listeners.get("submit")({preventDefault(){}});
+  await wait(() => !!find(content, (el) => el.tagName === "button" && el.textContent === "Revoke"));
+  find(content, (el) => el.tagName === "button" && el.textContent === "Revoke").click();
+  await wait(() => content.textContent.includes("No issued tokens"));
+  assert.equal(calls.filter((route) => route === "tokens/revoke").length, 1);
+  assert.ok(calls.lastIndexOf("tokens/list") > calls.lastIndexOf("tokens/revoke"));
+  assert.deepEqual(content.notices, ["The token is no longer listed; its revoke response was interrupted."]);
+});
+
+
+test("token revoke keeps a visible error when the token remains listed", async () => {
+  const tokenId = "e".repeat(64);
+  const api = { scopes: ["catalog.read"], async post(route) {
+    if (route === "tokens/list") return {ok:true,tokens:[{token_id:tokenId,scopes:["catalog.read"],issued_at:10,expires_at:100}]};
+    if (route === "tokens/revoke") throw new Error("The host could not confirm revocation.");
+    throw new Error("unexpected route");
+  } };
+  const content = fixture(api);
+  await wait(() => !!find(content, (el) => el.tagName === "button" && el.textContent === "Revoke"));
+  find(content, (el) => el.tagName === "button" && el.textContent === "Revoke").click();
+  await wait(() => content.textContent.includes("The host could not confirm revocation."));
+  assert.equal(content.textContent.includes("Unable to complete request"), true);
+  assert.equal(content.textContent.includes("The token is no longer listed"), false);
+  assert.deepEqual(content.notices, []);
+});
+
+test("token revoke reports a visible error when list readback fails", async () => {
+  const tokenId = "f".repeat(64);
+  let lists = 0;
+  const api = { scopes: ["catalog.read"], async post(route) {
+    if (route === "tokens/list") {
+      lists++;
+      if (lists > 1) throw new Error("Token readback is unavailable.");
+      return {ok:true,tokens:[{token_id:tokenId,scopes:["catalog.read"],issued_at:10,expires_at:100}]};
+    }
+    if (route === "tokens/revoke") throw new Error("The revoke response was interrupted.");
+    throw new Error("unexpected route");
+  } };
+  const content = fixture(api);
+  await wait(() => !!find(content, (el) => el.tagName === "button" && el.textContent === "Revoke"));
+  find(content, (el) => el.tagName === "button" && el.textContent === "Revoke").click();
+  await wait(() => content.textContent.includes("The revoke response was interrupted."));
+  assert.equal(content.textContent.includes("Unable to complete request"), true);
+  assert.equal(content.textContent.includes("The token is no longer listed"), false);
+  assert.deepEqual(content.notices, []);
 });

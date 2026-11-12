@@ -21,6 +21,7 @@ namespace Amaterasu {
 
   export function renderTokens(context: PageContext): void {
     const listArea = el("div");
+    const listStatus = el("div");
     const secretArea = el("div");
     let secretNode: HTMLTextAreaElement | null = null;
     const createStatus = el("div");
@@ -109,7 +110,7 @@ namespace Amaterasu {
     context.content.append(sectionHeading("API tokens", "Create scoped credentials for tools that access this host."), secretArea,
       panel("Create token", el("p", "muted", "Choose only the permissions this tool needs. Tokens expire automatically."), form),
       panel("Issued tokens", el("p", "muted", "Only tokens created through this management interface are shown. Other native callers manage their own tokens."),
-        el("div", "diagnostics-toolbar", field("Search issued tokens", tokenSearch), button("Refresh tokens", load)), listArea));
+        el("div", "diagnostics-toolbar", field("Search issued tokens", tokenSearch), button("Refresh tokens", () => { void load(); })), listStatus, listArea));
     context.registerDraftGuard?.(
       () => secretNode !== null || checks.some((entry) => entry.checkbox.checked),
       () => { if (secretNode) secretNode.value = ""; secretNode = null; },
@@ -127,10 +128,22 @@ namespace Amaterasu {
         const state = el("div");
         const remove = button("Revoke", () => {
           if (!window.confirm(`Revoke token ${token.token_id.slice(0, 8)}…? Tools using it will lose access.`)) return;
-          void runAction(remove, state, async () => {
-            await context.api.post("tokens/revoke", { token_id: token.token_id });
-            context.notify("Token revoked.");
-            await load();
+          void runAction(remove, listStatus, async () => {
+            let acknowledgement: unknown;
+            let revokeError: unknown;
+            try {
+              acknowledgement = await context.api.post<unknown>("tokens/revoke", { token_id: token.token_id });
+              if (!acknowledgement || typeof acknowledgement !== "object" || Array.isArray(acknowledgement) ||
+                  (acknowledgement as Record<string, unknown>).ok !== true)
+                throw new Error("The host did not confirm token revocation.");
+            } catch (error) {
+              revokeError = error;
+            }
+            const latest = await load();
+            if (!latest) throw revokeError ?? new Error("Token revocation could not be verified. Refresh before retrying.");
+            if (latest.some((candidate) => candidate.token_id === token.token_id))
+              throw revokeError ?? new Error("The token is still active. Refresh before retrying.");
+            context.notify(revokeError ? "The token is no longer listed; its revoke response was interrupted." : "Token revoked.");
           });
         }, "quiet danger-text");
         return el("section", "token-card", el("div", "section-meta",
@@ -141,16 +154,18 @@ namespace Amaterasu {
       listArea.replaceChildren(...rows);
     }
     tokenSearch.addEventListener("input", renderList);
-    async function load(): Promise<void> {
+    async function load(): Promise<ManagedApiToken[] | null> {
       const current = ++generation;
       try {
         const reply = await context.api.post<{ tokens: unknown }>("tokens/list");
-        if (!context.content.isConnected || current !== generation) return;
+        if (!context.content.isConnected || current !== generation) return null;
         if (!Array.isArray(reply.tokens) || reply.tokens.length > 32) throw new Error("The host returned an invalid token list.");
         records = reply.tokens.map(tokenRecord).sort((a, b) => b.issued_at - a.issued_at);
         renderList();
+        return records;
       } catch (error) {
-        if (context.content.isConnected && current === generation) listArea.replaceChildren(errorPanel(error, load));
+        if (context.content.isConnected && current === generation) listArea.replaceChildren(errorPanel(error, () => { void load(); }));
+        return null;
       }
     }
     if (!allowed.length) scopeList.append(el("p", "muted", "No permissions are available for this session."));

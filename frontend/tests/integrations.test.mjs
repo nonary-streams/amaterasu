@@ -27,9 +27,9 @@ test("provider cards describe reported state without inferring readiness", () =>
 
 test("integration cards isolate unavailable providers and respect read scopes", async () => {
   class Element {
-    constructor(tag) { this.tagName = tag; this.children = []; this.listeners = new Map(); this.isConnected = true; }
-    append(...children) { this.children.push(...children.filter((child) => child != null)); }
-    replaceChildren(...children) { this.children = []; this.append(...children); }
+    constructor(tag) { this.tagName = tag; this.children = []; this.listeners = new Map(); this.isConnected = true; this.parentElement = null; }
+    append(...children) { for (const child of children.filter((item) => item != null)) { this.children.push(child); if (typeof child !== "string") child.parentElement = this; } }
+    replaceChildren(...children) { for (const child of this.children) if (typeof child !== "string") child.parentElement = null; this.children = []; this.append(...children); }
     addEventListener(name, callback) { this.listeners.set(name, callback); }
     setAttribute() {}
     click() { this.listeners.get("click")?.(); }
@@ -46,9 +46,12 @@ test("integration cards isolate unavailable providers and respect read scopes", 
   const calls = [];
   const navigation = [];
   dom.Amaterasu.renderIntegrations({ content, navigate: (page) => navigation.push(page), api: {
-    allows: (scope) => scope === "configuration.read",
+    allows: (scope) => ["configuration.read", "steam.read", "steam.refresh"].includes(scope),
     async post(route) {
       calls.push(route);
+      if (route === "steam/status") return { ok: true, settings_ready: true, enabled: true,
+        game_count: 2, warning_count: 0, scanning: false, complete: true };
+      if (route === "steam/refresh") return { ok: true };
       if (route === "playnite/status") throw new Error("provider offline");
       assert.equal(route, "lutris/status");
       return { ok: true, settings_ready: true, enabled: true, platform_supported: true,
@@ -57,11 +60,21 @@ test("integration cards isolate unavailable providers and respect read scopes", 
     },
   } });
   await new Promise(setImmediate);
-  assert.deepEqual(calls.sort(), ["lutris/status", "playnite/status"]);
-  assert.match(content.textContent, /cannot read this provider's status/);
+  assert.deepEqual(calls.sort(), ["lutris/status", "playnite/status", "steam/status"]);
   assert.match(content.textContent, /Discovered games: 3/);
   assert.match(content.textContent, /provider offline/);
   const all = (node) => [node, ...node.children.flatMap((child) => child instanceof Element ? all(child) : [])];
+  const steamCard = all(content).find((node) => node.tagName === "section" && node.textContent.includes("Steam"));
+  const steamRefresh = all(steamCard).find((node) => node.tagName === "button" && node.textContent === "Refresh now");
+  assert.ok(steamRefresh && !steamRefresh.hidden && !steamRefresh.disabled,
+    "steam.refresh should authorize Steam without configuration.write");
+  const otherRefreshButtons = all(content).filter((node) => node.tagName === "button" && node.textContent === "Refresh now" && node !== steamRefresh);
+  assert.ok(otherRefreshButtons.every((node) => node.hidden),
+    "Lutris and Playnite refreshes still require configuration.write");
+  steamRefresh.click();
+  await new Promise(setImmediate);
+  assert.deepEqual(calls.slice(-2), ["steam/refresh", "steam/status"]);
+  assert.match(steamCard.textContent, /Refresh accepted; current provider status was read back/);
   all(content).find((node) => node.tagName === "button" && node.textContent === "Configure").click();
   assert.deepEqual(navigation, ["settings/integrations"]);
 });
@@ -86,6 +99,7 @@ test("dashboard refresh uses shared provider operations and reports provider rea
   dom.renderRtxHdrIntegration = dom.Amaterasu.renderRtxHdrIntegration = () => {};
   const content = new Element("main");
   const calls = [];
+  let steamStatusReads = 0;
   const lutris = { ok: true, settings_ready: true, enabled: true, platform_supported: true,
     database_available: true, executable_available: true, available: true, game_count: 2, refresh_pending: false, last_error: null };
   const playnite = { ok: true, settings_ready: true, enabled: true, playnite_running: true,
@@ -94,7 +108,12 @@ test("dashboard refresh uses shared provider operations and reports provider rea
     allows: () => true,
     async post(route) {
       calls.push(route);
-      if (route === "steam/status") return { ok: true, settings_ready: true, enabled: true, game_count: 0, warning_count: 0, scanning: false, complete: true };
+      if (route === "steam/status") {
+        steamStatusReads += 1;
+        return { ok: true, settings_ready: true, enabled: true, game_count: 0, warning_count: 0,
+          scanning: steamStatusReads > 1, complete: steamStatusReads === 1 };
+      }
+      if (route === "steam/refresh") return { ok: true };
       if (route === "lutris/status") return lutris;
       if (route === "lutris/refresh") return { ...lutris, refresh_pending: true };
       if (route === "playnite/status") return calls.filter((item) => item === route).length === 1
@@ -106,8 +125,13 @@ test("dashboard refresh uses shared provider operations and reports provider rea
   await new Promise(setImmediate);
   const all = (node) => [node, ...node.children.flatMap((child) => child instanceof Element ? all(child) : [])];
   const findButton = (label) => all(content).find((node) => node.tagName === "button" && node.textContent === label);
-  const lutrisButton = findButton("Refresh now");
-  const playniteButton = all(content).filter((node) => node.tagName === "button" && node.textContent === "Refresh now")[1];
+  const lutrisCard = all(content).find((node) => node.tagName === "section" && node.textContent.includes("Lutris"));
+  const playniteCard = all(content).find((node) => node.tagName === "section" && node.textContent.includes("Playnite"));
+  const lutrisButton = all(lutrisCard).find((node) => node.tagName === "button" && node.textContent === "Refresh now");
+  const playniteButton = all(playniteCard).find((node) => node.tagName === "button" && node.textContent === "Refresh now");
+  const steamCard = all(content).find((node) => node.tagName === "section" && node.textContent.includes("Steam"));
+  const steamButton = all(steamCard).find((node) => node.tagName === "button" && node.textContent === "Refresh now");
+  assert.ok(steamButton && !steamButton.disabled);
   assert.ok(lutrisButton && !lutrisButton.disabled);
   assert.ok(playniteButton && !playniteButton.disabled);
   lutrisButton.click();
@@ -118,7 +142,11 @@ test("dashboard refresh uses shared provider operations and reports provider rea
   await new Promise(setImmediate);
   assert.match(content.textContent, /Syncing/);
   assert.equal(playniteButton.disabled, true);
-  assert.deepEqual(calls, ["steam/status", "lutris/status", "playnite/status", "lutris/refresh", "playnite/refresh", "playnite/status"]);
+  steamButton.click();
+  await new Promise(setImmediate);
+  assert.match(content.textContent, /Scanning/);
+  assert.equal(steamButton.disabled, true);
+  assert.deepEqual(calls, ["steam/status", "lutris/status", "playnite/status", "lutris/refresh", "playnite/refresh", "playnite/status", "steam/refresh", "steam/status"]);
 });
 
 
@@ -262,7 +290,10 @@ test("a pending dashboard refresh cannot be duplicated or update a navigated-awa
   } });
   await new Promise(setImmediate);
   const all = (node) => [node, ...node.children.flatMap((child) => child instanceof Element ? all(child) : [])];
-  const refreshButton = () => all(content).find((node) => node.tagName === "button" && node.textContent === "Refresh now");
+  const refreshButton = () => {
+    const card = all(content).find((node) => node.tagName === "section" && node.textContent.includes("Lutris"));
+    return all(card).find((node) => node.tagName === "button" && node.textContent === "Refresh now");
+  };
   const initialButton = refreshButton();
   const initialCard = all(content).find((node) => node.tagName === "section" && node.textContent.includes("Lutris"));
   const oldFeedback = all(initialCard).find((node) => node.className === "integration-action-status");

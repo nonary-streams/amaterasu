@@ -9,6 +9,7 @@ class Element {
   append(...children) { this.children.push(...children); }
   replaceChildren(...children) { this.children = children; }
   addEventListener(type, fn) { this.listeners[type] = fn; }
+  setAttribute(name, value) { this[name] = value; }
   querySelectorAll() { return this.children.flatMap((child) => child instanceof Element ? [...(["input", "button"].includes(child.tag) ? [child] : []), ...child.querySelectorAll()] : []); }
   get textContent() { return this.text + this.children.map((c) => c.textContent ?? c).join(""); }
   set textContent(value) { this.text = value; this.children = []; }
@@ -17,7 +18,7 @@ class Element {
 const context = vm.createContext({ window: { confirm: () => true }, Object, Array, Set, Map, Number, Error, RegExp });
 vm.runInContext(`var Amaterasu = {};
 function el(tag, cls, ...children) { const node = new Element(tag); node.append(...children); return node; }
-function input(name, value, type) { const node = new Element('input'); node.name = name; node.type = type; return node; }
+function input(name, value, type) { const node = new Element('input'); node.name = name; node.type = type; node.value = value; return node; }
 function field(label, control, help) { return el('label', '', label, control, help || ''); }
 function button(label, click) { const node = new Element('button', label); node.addEventListener('click', click); return node; }
 function panel(label, ...children) { return el('section', '', label, ...children); }
@@ -63,4 +64,33 @@ test("saving grants preserves termination and confirms revision via readback", a
 test("invalid or unknown grants fail closed", () => {
   const result = reply(); result.clients[0].permissions.future = true;
   assert.throws(() => context.Amaterasu.parseClientPermissionState(result), /cannot safely preserve/);
+});
+
+
+test("paired-client permission search filters by name or fingerprint without discarding hidden drafts", async () => {
+  const area = new Element("div"), content = new Element("main");
+  const state = reply();
+  state.clients.push({ certificate_id: "b".repeat(64), name: "Desk", permissions: { ...perms } });
+  render({ content, api: { allows: () => true, post: async () => state } }, area);
+  await tick();
+  const search = find(area, "input", "client_permission_search");
+  const allNodes = (node) => [node, ...node.children.flatMap((child) => child instanceof Element ? allNodes(child) : [])];
+  const cards = allNodes(area).filter((node) => node.tag === "section" && node.children.some((child) => child instanceof Element && child.tag === "h3"));
+  assert.equal(cards.length, 2);
+  const hiddenDraft = find(cards[1], "input", `list_apps_${"b".repeat(64)}`);
+  hiddenDraft.checked = true;
+  search.value = "living room";
+  search.listeners.input();
+  assert.equal(cards[0].hidden, false);
+  assert.equal(cards[1].hidden, true);
+  assert.equal(hiddenDraft.checked, true);
+  assert.match(area.textContent, /Showing 1 of 2 paired clients/);
+  search.value = "bbbbbbbbbbbb";
+  search.listeners.input();
+  assert.equal(cards[0].hidden, true);
+  assert.equal(cards[1].hidden, false);
+  search.value = "not a device";
+  search.listeners.input();
+  assert.equal(cards.every((card) => card.hidden), true);
+  assert.equal(area.textContent.includes("No paired clients match this search."), true);
 });

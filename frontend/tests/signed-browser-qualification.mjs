@@ -401,6 +401,32 @@ async function initial(options) {
     document.body.dispatchEvent(new PointerEvent('pointerdown',{bubbles:true}));
     return !menu.open;
   })()`), "native library context actions or focus restoration failed");
+  await evaluate(library, `(() => {
+    const trigger = document.querySelector('[aria-label="Edit UI selection alpha"]');
+    const menu = trigger.closest('.app-card').querySelector('details');
+    menu.querySelector('summary').click();
+    const edit = [...menu.querySelectorAll('.catalog-card-actions button')].find(button => button.textContent.trim() === 'Edit');
+    edit.click();
+    window.__editorFocusTrigger = trigger;
+    document.body.dispatchEvent(new PointerEvent('pointerdown', {bubbles:true}));
+  })()`);
+  await wait(library, `!!document.querySelector('.editor-form textarea[name=description]')`, "mouse action menu opens application editor");
+  await button(library, "Cancel");
+  check(await evaluate(library, `document.activeElement === window.__editorFocusTrigger`), "mouse action-menu cancel did not restore focus to the visible card");
+  await evaluate(library, `(() => {
+    const trigger = document.querySelector('[aria-label="Edit UI selection alpha"]');
+    trigger.focus();
+    trigger.dispatchEvent(new KeyboardEvent('keydown',{key:'F10',shiftKey:true,bubbles:true,cancelable:true}));
+    const menu = trigger.closest('.app-card').querySelector('details');
+    const edit = [...menu.querySelectorAll('.catalog-card-actions button')].find(button => button.textContent.trim() === 'Edit');
+    edit.focus();
+    edit.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));
+    edit.click();
+    window.__editorFocusTrigger = trigger;
+  })()`);
+  await wait(library, `!!document.querySelector('.editor-form textarea[name=description]')`, "keyboard action menu opens application editor");
+  await button(library, "Cancel");
+  check(await evaluate(library, `document.activeElement === window.__editorFocusTrigger`), "keyboard action-menu cancel did not restore focus to the visible card");
   const selected = await evaluate(library, `(() => {
     const first = document.querySelector('[aria-label="Edit UI selection alpha"]');
     first.focus();

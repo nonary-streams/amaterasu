@@ -153,3 +153,24 @@ test("selection remains available to catalog readers without edit permission", a
   find(content,(node)=>node.tagName === "button" && node.textContent === "Clear selection").click();
   assert.equal(find(content,(node)=>node.className === "library-selection").hidden,true);
 });
+
+
+test("application editor focus restoration skips detached openers", () => {
+  const sandbox = vm.createContext({ document: { createElement: tag => new Element(tag) } });
+  vm.runInContext(ts.transpile(readFileSync("src/catalog.ts", "utf8"), { target: ts.ScriptTarget.ES2022 }), sandbox);
+  const restore = sandbox.Amaterasu.restoreCatalogEditorFocus;
+  const stableTrigger = sandbox.Amaterasu.catalogEditorStableTrigger;
+  const card = new Element("button");
+  const actions = new Element("summary");
+  assert.equal(stableTrigger(true, card, actions), card);
+  assert.equal(stableTrigger(false, card, actions), actions);
+  const connected = new Element("button");
+  connected.isConnected = true;
+  restore(connected);
+  assert.equal(connected.focused, true);
+  const detached = new Element("button");
+  detached.isConnected = false;
+  restore(detached);
+  assert.equal(detached.focused, undefined);
+  restore(null);
+});

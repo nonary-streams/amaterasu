@@ -7728,6 +7728,15 @@ var Amaterasu;
             throw new Error("The catalog returned no library revision.");
         return { revision, capabilities, rows, cachedRows };
     }
+    function catalogEditorStableTrigger(canWrite, cardTrigger, actionsSummary) {
+        return canWrite ? cardTrigger : actionsSummary;
+    }
+    Amaterasu.catalogEditorStableTrigger = catalogEditorStableTrigger;
+    function restoreCatalogEditorFocus(opener) {
+        if (opener?.isConnected)
+            opener.focus();
+    }
+    Amaterasu.restoreCatalogEditorFocus = restoreCatalogEditorFocus;
     function renderCatalog(context) {
         const { content, api, notify } = context;
         const search = Amaterasu.input("search");
@@ -7749,6 +7758,7 @@ var Amaterasu;
         const editorDrafts = context.registerDraftGuard ? Amaterasu.trackDrafts(editor) : null;
         let editorSaving = false;
         let editorLifecycle = null;
+        let editorOpener = null;
         const catalogDraftDirty = () => {
             const form = editor.querySelector(".editor-form");
             return !!form && !!editorDrafts?.isDirty(form);
@@ -8096,7 +8106,8 @@ var Amaterasu;
                 row.entry.launch.kind === "playnite_fullscreen" ? "Playnite Fullscreen" :
                     row.entry.steam_id ? "Steam-linked" : row.entry.launch.kind === "executable" ? "Executable" :
                         providerLaunch ? "Playnite" : "Application";
-            const edit = Amaterasu.button(api.allows("catalog.write") ? "Edit" : "Settings", () => showEditor(row, capabilities));
+            let cardTrigger = null;
+            const edit = Amaterasu.button(api.allows("catalog.write") ? "Edit" : "Settings", () => showEditor(row, capabilities, cardTrigger));
             edit.disabled = (!api.allows("catalog.write") && !api.allows("configuration.read")) || providerLaunch;
             if (providerLaunch)
                 catalogLocalizedAttribute(edit, "title", "Playnite launch targets are managed by the provider.");
@@ -8109,7 +8120,7 @@ var Amaterasu;
             launch.disabled = typeof api.allowsLaunchAction !== "function" || !api.allowsLaunchAction("start");
             const actions = [launch, edit];
             if (providerLaunch) {
-                const configure = Amaterasu.button("Streaming settings", () => showProviderOverrideEditor(row, capabilities), "secondary");
+                const configure = Amaterasu.button("Streaming settings", () => showProviderOverrideEditor(row, capabilities, cardTrigger), "secondary");
                 configure.disabled = !api.allows("catalog.write") && !api.allows("configuration.read");
                 actions.unshift(configure);
             }
@@ -8131,9 +8142,9 @@ var Amaterasu;
             showCatalogArtwork(api, row.entry.artwork, art, content, undefined, row.id);
             const open = Amaterasu.button("", () => {
                 if (providerLaunch)
-                    showProviderOverrideEditor(row, capabilities);
+                    showProviderOverrideEditor(row, capabilities, open);
                 else
-                    showEditor(row, capabilities);
+                    showEditor(row, capabilities, open);
             }, "catalog-open");
             open.disabled = !api.allows("catalog.write");
             open.dataset.catalogId = row.id;
@@ -8159,6 +8170,7 @@ var Amaterasu;
             catalogLocalizedAttributeTemplate(open, "aria-label", "Edit {name}", { name: catalogTextLiteral(row.entry.name) });
             open.append(art, Amaterasu.el("span", "catalog-card-title", Amaterasu.el("strong", "", catalogTextLiteral(row.entry.name)), Amaterasu.el("small", "muted", launchLabel)));
             const summary = Amaterasu.el("summary", "catalog-menu-toggle", "Actions");
+            cardTrigger = catalogEditorStableTrigger(api.allows("catalog.write"), open, summary);
             catalogLocalizedAttributeTemplate(summary, "aria-label", "Actions for {name}", { name: catalogTextLiteral(row.entry.name) });
             const menu = Amaterasu.el("details", "catalog-card-menu", summary, Amaterasu.el("div", "catalog-card-menu-content", Amaterasu.el("p", "muted", row.entry.description ? catalogTextLiteral(row.entry.description) : "No description added."), Amaterasu.el("div", "tags", ...(row.entry.tags ?? []).map((tag) => Amaterasu.badge(catalogTextLiteral(tag)))), Amaterasu.el("p", "path", catalogTextLiteral(Amaterasu.launchPath(row.entry))), Amaterasu.el("div", "catalog-card-actions", ...actions)));
             menu.addEventListener("toggle", () => {
@@ -8191,7 +8203,7 @@ var Amaterasu;
             update();
             return article;
         }
-        function closeEditor() {
+        function closeEditor(restoreFocus = true) {
             if (editorSaving) {
                 notify("Wait for the application save to finish.");
                 return false;
@@ -8209,11 +8221,17 @@ var Amaterasu;
             pluginArea = null;
             editorGeneration += 1;
             editor.replaceChildren();
+            const opener = editorOpener;
+            editorOpener = null;
+            if (restoreFocus)
+                restoreCatalogEditorFocus(opener);
             return true;
         }
-        function showProviderOverrideEditor(row, capabilities) {
-            if (!closeEditor())
+        function showProviderOverrideEditor(row, capabilities, stableTrigger) {
+            const active = document.activeElement;
+            if (!closeEditor(false))
                 return;
+            editorOpener = stableTrigger?.isConnected ? stableTrigger : active && typeof active.focus === "function" ? active : null;
             const request = editorGeneration;
             editor.replaceChildren(Amaterasu.el("p", "muted", "Loading input profiles…"));
             void loadInputRuntimeStatus().then((status) => {
@@ -8371,9 +8389,11 @@ var Amaterasu;
             editor.scrollIntoView({ behavior: "smooth", block: "start" });
             fec.focus();
         }
-        function showEditor(row, capabilities) {
-            if (!closeEditor())
+        function showEditor(row, capabilities, stableTrigger) {
+            const active = document.activeElement;
+            if (!closeEditor(false))
                 return;
+            editorOpener = stableTrigger?.isConnected ? stableTrigger : active && typeof active.focus === "function" ? active : null;
             const request = editorGeneration;
             editor.replaceChildren(Amaterasu.el("p", "muted", "Loading input profiles…"));
             void loadInputRuntimeStatus().then((runtimeStatus) => {
@@ -12415,6 +12435,7 @@ var Amaterasu;
         ];
         let selectedCategory = context.initialSettingsCategory ?? categories[0].id;
         const categoryContent = Amaterasu.el("div", "settings-content");
+        categoryContent.id = "settings-category-content";
         const categoryHeading = Amaterasu.el("h2");
         const categoryDescription = Amaterasu.el("p", "muted");
         const categoryStatus = Amaterasu.el("div", "settings-category-heading", categoryHeading, categoryDescription);
@@ -12426,6 +12447,7 @@ var Amaterasu;
         search.setAttribute("aria-label", "Search settings");
         const categoryPicker = Amaterasu.el("select");
         categoryPicker.setAttribute("aria-label", "Settings category");
+        categoryPicker.setAttribute("aria-controls", categoryContent.id);
         const categoryNavigation = Amaterasu.el("nav", "settings-nav");
         categoryNavigation.setAttribute("aria-label", "Settings categories");
         const categoryButtons = new Map();
@@ -12435,7 +12457,13 @@ var Amaterasu;
             const option = Amaterasu.el("option", "", category.label);
             option.value = category.id;
             categoryPicker.append(option);
+            const areaIds = category.areas.map((area, index) => {
+                const id = `settings-${category.id}-area-${index + 1}`;
+                area.id = id;
+                return id;
+            });
             const item = Amaterasu.button(category.label, () => selectCategory(category.id), "settings-nav-item");
+            item.setAttribute("aria-controls", areaIds.join(" "));
             categoryButtons.set(category.id, item);
             categoryNavigation.append(item);
             categoryContent.append(...category.areas);
@@ -14335,13 +14363,20 @@ var Amaterasu;
                 let refreshButton = null;
                 if (provider.name === "steam" && context.api.allows("steam.read")) {
                     actions.append(Amaterasu.button(Amaterasu.localizedMessage("Manage Steam library"), () => context.navigate("steam")));
+                    if (context.api.allows("steam.refresh")) {
+                        refreshButton = Amaterasu.button(Amaterasu.localizedMessage("Refresh now"), () => refreshProvider("steam"));
+                        if (typeof Amaterasu.setLocalizedAttributeTemplate === "function")
+                            Amaterasu.setLocalizedAttributeTemplate(refreshButton, "aria-label", "Request a {provider} refresh", { provider: Amaterasu.literalText(provider.label) });
+                        refreshButton.disabled = true;
+                        actions.append(refreshButton);
+                    }
                 }
                 else if (provider.name !== "steam") {
                     refreshButton = Amaterasu.button(Amaterasu.localizedMessage("Refresh now"), () => refreshProvider(provider.name));
                     if (typeof Amaterasu.setLocalizedAttributeTemplate === "function")
                         Amaterasu.setLocalizedAttributeTemplate(refreshButton, "aria-label", "Request a {provider} refresh", { provider: Amaterasu.literalText(provider.label) });
                     refreshButton.disabled = true;
-                    refreshButton.hidden = !context.api.allows("configuration.write");
+                    refreshButton.hidden = !canRequestRefresh(provider.name);
                     actions.append(refreshButton);
                 }
                 const card = Amaterasu.el("section", "panel integration-card", Amaterasu.el("h2", "", provider.label), Amaterasu.el("p", "muted", Amaterasu.localizedMessage(provider.description)), status, actions, feedback);
@@ -14352,7 +14387,7 @@ var Amaterasu;
                             ? value : null;
                         if (refreshButton)
                             refreshButton.disabled = !canRefresh(provider.name, item.providerStatus) ||
-                                !context.api.allows("configuration.write");
+                                !canRequestRefresh(provider.name);
                     },
                 };
                 return item;
@@ -14416,11 +14451,18 @@ var Amaterasu;
         function currentCard(item) {
             return context.content.isConnected && item.card.parentElement === area;
         }
+        function canRequestRefresh(name) {
+            return name === "steam"
+                ? context.api.allows("steam.refresh")
+                : context.api.allows("configuration.write");
+        }
         function canRefresh(name, status) {
             if (activeRefreshes.has(name))
                 return false;
             if (!status || status.ok !== true || status.settings_ready !== true || status.enabled !== true)
                 return false;
+            if (name === "steam")
+                return status.scanning !== true;
             if (name === "lutris")
                 return status.platform_supported === true && status.available === true && status.refresh_pending !== true;
             if (name === "playnite")
@@ -14445,9 +14487,18 @@ var Amaterasu;
                             item.feedback.replaceChildren(Amaterasu.el("span", "", Amaterasu.localizedMessage("Refresh request accepted. Checking provider status.")));
                     };
                     try {
-                        const updated = name === "lutris"
-                            ? await Amaterasu.refreshLutrisProvider(context.api, accepted)
-                            : await Amaterasu.refreshPlayniteProvider(context.api, accepted);
+                        let updated;
+                        if (name === "steam") {
+                            await context.api.post("steam/refresh");
+                            accepted();
+                            updated = await context.api.post("steam/status");
+                        }
+                        else if (name === "lutris") {
+                            updated = await Amaterasu.refreshLutrisProvider(context.api, accepted);
+                        }
+                        else {
+                            updated = await Amaterasu.refreshPlayniteProvider(context.api, accepted);
+                        }
                         if (!currentCard(item))
                             return;
                         const summary = summarizeProvider(name, updated);
@@ -14469,8 +14520,7 @@ var Amaterasu;
             finally {
                 activeRefreshes.delete(name);
                 if (currentCard(item))
-                    target.disabled = !context.api.allows("configuration.write") ||
-                        !canRefresh(name, item.providerStatus);
+                    target.disabled = !canRequestRefresh(name) || !canRefresh(name, item.providerStatus);
                 else if (context.content.isConnected)
                     void load();
             }
@@ -18700,6 +18750,7 @@ var Amaterasu;
                     return;
                 const body = Amaterasu.el("div"), status = Amaterasu.el("div");
                 const baseline = new Map();
+                const clientCards = [];
                 const mode = Amaterasu.input("permission_mode_enabled", "", "checkbox");
                 mode.checked = state.permission_mode_enabled;
                 baseline.set(mode, mode.checked);
@@ -18707,6 +18758,27 @@ var Amaterasu;
                 body.append(Amaterasu.field("Enforce client permissions", mode, "When enabled, listing and launching applications are controlled by these grants. Disabled by default."), saveMode);
                 if (state.permission_mode_enabled) {
                     body.append(Amaterasu.el("p", "muted", "Launch and the stored view grant also allow listing. The view streams permission currently grants listing, not separate stream viewing. Termination is not enforced yet; its stored grant is preserved."));
+                    const search = Amaterasu.input("client_permission_search", "", "search");
+                    search.setAttribute("data-draft-ignore", "");
+                    const resultCount = Amaterasu.el("p", "muted");
+                    resultCount.setAttribute("role", "status");
+                    resultCount.setAttribute("aria-live", "polite");
+                    resultCount.setAttribute("aria-atomic", "true");
+                    const noMatches = Amaterasu.el("p", "muted", "No paired clients match this search.");
+                    noMatches.hidden = true;
+                    const updateClientFilter = () => {
+                        const query = search.value.trim().toLocaleLowerCase();
+                        let visible = 0;
+                        for (const item of clientCards) {
+                            item.card.hidden = !!query && !item.searchText.includes(query);
+                            if (!item.card.hidden)
+                                visible += 1;
+                        }
+                        resultCount.textContent = `Showing ${visible} of ${clientCards.length} paired clients`;
+                        noMatches.hidden = visible !== 0;
+                    };
+                    search.addEventListener("input", updateClientFilter);
+                    body.append(Amaterasu.field("Search paired clients by name or certificate fingerprint", search), resultCount, noMatches);
                     for (const client of state.clients) {
                         const checks = {};
                         const rows = Amaterasu.el("div", "form-grid");
@@ -18733,8 +18805,11 @@ var Amaterasu;
                         for (const check of Object.values(checks))
                             check.addEventListener("change", updateEffective);
                         updateEffective();
-                        body.append(Amaterasu.el("section", "account-card", Amaterasu.el("h3", "", name), effective, rows, saveClient));
+                        const card = Amaterasu.el("section", "account-card", Amaterasu.el("h3", "", name), effective, rows, saveClient);
+                        clientCards.push({ card, searchText: `${client.name} ${client.certificate_id}`.toLocaleLowerCase() });
+                        body.append(card);
                     }
+                    updateClientFilter();
                     if (!state.clients.length)
                         body.append(Amaterasu.el("p", "muted", "No paired clients."));
                 }
@@ -19479,6 +19554,7 @@ var Amaterasu;
     }
     function renderTokens(context) {
         const listArea = Amaterasu.el("div");
+        const listStatus = Amaterasu.el("div");
         const secretArea = Amaterasu.el("div");
         let secretNode = null;
         const createStatus = Amaterasu.el("div");
@@ -19569,7 +19645,7 @@ var Amaterasu;
                 await load();
             });
         });
-        context.content.append(Amaterasu.sectionHeading("API tokens", "Create scoped credentials for tools that access this host."), secretArea, Amaterasu.panel("Create token", Amaterasu.el("p", "muted", "Choose only the permissions this tool needs. Tokens expire automatically."), form), Amaterasu.panel("Issued tokens", Amaterasu.el("p", "muted", "Only tokens created through this management interface are shown. Other native callers manage their own tokens."), Amaterasu.el("div", "diagnostics-toolbar", Amaterasu.field("Search issued tokens", tokenSearch), Amaterasu.button("Refresh tokens", load)), listArea));
+        context.content.append(Amaterasu.sectionHeading("API tokens", "Create scoped credentials for tools that access this host."), secretArea, Amaterasu.panel("Create token", Amaterasu.el("p", "muted", "Choose only the permissions this tool needs. Tokens expire automatically."), form), Amaterasu.panel("Issued tokens", Amaterasu.el("p", "muted", "Only tokens created through this management interface are shown. Other native callers manage their own tokens."), Amaterasu.el("div", "diagnostics-toolbar", Amaterasu.field("Search issued tokens", tokenSearch), Amaterasu.button("Refresh tokens", () => { void load(); })), listStatus, listArea));
         context.registerDraftGuard?.(() => secretNode !== null || checks.some((entry) => entry.checkbox.checked), () => { if (secretNode)
             secretNode.value = ""; secretNode = null; });
         let generation = 0;
@@ -19586,10 +19662,24 @@ var Amaterasu;
                 const remove = Amaterasu.button("Revoke", () => {
                     if (!window.confirm(`Revoke token ${token.token_id.slice(0, 8)}…? Tools using it will lose access.`))
                         return;
-                    void Amaterasu.runAction(remove, state, async () => {
-                        await context.api.post("tokens/revoke", { token_id: token.token_id });
-                        context.notify("Token revoked.");
-                        await load();
+                    void Amaterasu.runAction(remove, listStatus, async () => {
+                        let acknowledgement;
+                        let revokeError;
+                        try {
+                            acknowledgement = await context.api.post("tokens/revoke", { token_id: token.token_id });
+                            if (!acknowledgement || typeof acknowledgement !== "object" || Array.isArray(acknowledgement) ||
+                                acknowledgement.ok !== true)
+                                throw new Error("The host did not confirm token revocation.");
+                        }
+                        catch (error) {
+                            revokeError = error;
+                        }
+                        const latest = await load();
+                        if (!latest)
+                            throw revokeError ?? new Error("Token revocation could not be verified. Refresh before retrying.");
+                        if (latest.some((candidate) => candidate.token_id === token.token_id))
+                            throw revokeError ?? new Error("The token is still active. Refresh before retrying.");
+                        context.notify(revokeError ? "The token is no longer listed; its revoke response was interrupted." : "Token revoked.");
                     });
                 }, "quiet danger-text");
                 return Amaterasu.el("section", "token-card", Amaterasu.el("div", "section-meta", Amaterasu.el("strong", "", Amaterasu.literalText(`${token.token_id.slice(0, 8)}…${token.token_id.slice(-4)}`)), remove), Amaterasu.el("p", "muted", Amaterasu.literalText(`Created ${new Date(token.issued_at * 1000).toLocaleString()} · Expires ${new Date(token.expires_at * 1000).toLocaleString()}`)), Amaterasu.el("div", "token-badges", ...token.scopes.map((scope) => Amaterasu.badge(Amaterasu.literalText(scope)))), state);
@@ -19602,15 +19692,17 @@ var Amaterasu;
             try {
                 const reply = await context.api.post("tokens/list");
                 if (!context.content.isConnected || current !== generation)
-                    return;
+                    return null;
                 if (!Array.isArray(reply.tokens) || reply.tokens.length > 32)
                     throw new Error("The host returned an invalid token list.");
                 records = reply.tokens.map(tokenRecord).sort((a, b) => b.issued_at - a.issued_at);
                 renderList();
+                return records;
             }
             catch (error) {
                 if (context.content.isConnected && current === generation)
-                    listArea.replaceChildren(Amaterasu.errorPanel(error, load));
+                    listArea.replaceChildren(Amaterasu.errorPanel(error, () => { void load(); }));
+                return null;
             }
         }
         if (!allowed.length)

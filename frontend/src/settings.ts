@@ -3076,6 +3076,7 @@ namespace Amaterasu {
     ];
     let selectedCategory = context.initialSettingsCategory ?? categories[0]!.id;
     const categoryContent = el("div", "settings-content");
+    categoryContent.id = "settings-category-content";
     const categoryHeading = el("h2");
     const categoryDescription = el("p", "muted");
     const categoryStatus = el("div", "settings-category-heading", categoryHeading, categoryDescription);
@@ -3087,6 +3088,7 @@ namespace Amaterasu {
     search.setAttribute("aria-label", "Search settings");
     const categoryPicker = el("select");
     categoryPicker.setAttribute("aria-label", "Settings category");
+    categoryPicker.setAttribute("aria-controls", categoryContent.id);
     const categoryNavigation = el("nav", "settings-nav");
     categoryNavigation.setAttribute("aria-label", "Settings categories");
     const categoryButtons = new Map<string, HTMLButtonElement>();
@@ -3096,7 +3098,13 @@ namespace Amaterasu {
       const option = el("option", "", category.label);
       option.value = category.id;
       categoryPicker.append(option);
+      const areaIds = category.areas.map((area, index) => {
+        const id = `settings-${category.id}-area-${index + 1}`;
+        area.id = id;
+        return id;
+      });
       const item = button(category.label, () => selectCategory(category.id), "settings-nav-item");
+      item.setAttribute("aria-controls", areaIds.join(" "));
       categoryButtons.set(category.id, item);
       categoryNavigation.append(item);
       categoryContent.append(...category.areas);

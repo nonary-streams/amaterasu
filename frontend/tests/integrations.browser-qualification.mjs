@@ -46,6 +46,7 @@ test("real Chromium dashboard qualification (provider APIs are mocked)", {
       snapshot_pending: false, snapshot_game_count: 27, last_error: null,
     };
     const calls = [];
+    let steamStatusReads = 0;
     let playniteStatusReads = 0;
     let playniteRefreshAccepted = false;
     let playniteReadbackFailed = false;
@@ -55,9 +56,12 @@ test("real Chromium dashboard qualification (provider APIs are mocked)", {
       allows: () => true,
       async post(route) {
         calls.push(route);
-        if (route === "steam/status")
+        if (route === "steam/status") {
+          steamStatusReads += 1;
           return { ok:true, settings_ready:true, enabled:true, game_count:1234,
-            warning_count:4, scanning:false, complete:true };
+            warning_count:4, scanning:steamStatusReads > 1, complete:steamStatusReads === 1 };
+        }
+        if (route === "steam/refresh") return { ok:true };
         if (route === "lutris/status") return lutrisStatus;
         if (route === "playnite/status") {
           playniteStatusReads += 1;
@@ -104,11 +108,19 @@ test("real Chromium dashboard qualification (provider APIs are mocked)", {
         Amaterasu.renderIntegrations({ content: main, navigate: () => {}, api });
         await waitFor(() => actionButton("Lutris") && !actionButton("Lutris").disabled, "initial provider status");
 
+        const steamButton = actionButton("Steam");
         const lutrisButton = actionButton("Lutris");
         const playniteButton = actionButton("Playnite");
-        if (lutrisButton.getAttribute("aria-label") !== "Request a Lutris refresh" ||
+        if (steamButton.getAttribute("aria-label") !== "Request a Steam refresh" ||
+            lutrisButton.getAttribute("aria-label") !== "Request a Lutris refresh" ||
             playniteButton.getAttribute("aria-label") !== "Request a Playnite refresh")
           throw new Error("provider refresh buttons lack distinct accessible names");
+        steamButton.focus();
+        steamButton.click();
+        await waitFor(() => statusFeedback("Steam").textContent.includes("current provider status was read back."), "accepted Steam scan readback");
+        if (!statusFeedback("Steam").textContent.includes("Refresh accepted") || !steamButton.disabled)
+          throw new Error("Steam scan did not report readback or disable while scanning");
+        checks.push("Steam scan accepted state, readback and busy gate");
         checks.push("provider-specific accessible names");
 
         const englishCount = card("Steam").querySelector(".integration-status").textContent;
@@ -127,7 +139,8 @@ test("real Chromium dashboard qualification (provider APIs are mocked)", {
         const initialRefreshCalls = calls.filter((route) => route.endsWith("/refresh")).length;
         statusRefresh().click();
         await waitFor(
-          () => statusFeedback("Lutris").textContent.includes("no provider refresh was requested.") &&
+          () => statusFeedback("Steam").textContent.includes("no provider refresh was requested.") &&
+            statusFeedback("Lutris").textContent.includes("no provider refresh was requested.") &&
             statusFeedback("Playnite").textContent.includes("no provider refresh was requested."),
           "read-only status feedback",
         );
@@ -220,7 +233,7 @@ test("real Chromium dashboard qualification (provider APIs are mocked)", {
       pathToFileURL(htmlPath).href,
     ], { encoding: "utf8", maxBuffer: 8 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"] });
     assert.match(output, /data-browser-qualification="passed"/, output.slice(-6000));
-    assert.match(output, /data-browser-checks="7"/);
+    assert.match(output, /data-browser-checks="8"/);
     assert.match(output, /<pre id="qualification-result">.*focus-safe navigation cleanup during pending refresh.*<\/pre>/s);
   } finally {
     rmSync(temporaryDirectory, { recursive: true, force: true });

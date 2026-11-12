@@ -866,6 +866,18 @@ namespace Amaterasu {
     return {revision, capabilities, rows, cachedRows};
   }
 
+  export function catalogEditorStableTrigger(
+    canWrite: boolean,
+    cardTrigger: HTMLElement,
+    actionsSummary: HTMLElement,
+  ): HTMLElement {
+    return canWrite ? cardTrigger : actionsSummary;
+  }
+
+  export function restoreCatalogEditorFocus(opener: HTMLElement | null): void {
+    if (opener?.isConnected) opener.focus();
+  }
+
   export function renderCatalog(context: PageContext): void {
     const { content, api, notify } = context;
     const search = input("search");
@@ -887,6 +899,7 @@ namespace Amaterasu {
     const editorDrafts = context.registerDraftGuard ? trackDrafts(editor) : null;
     let editorSaving = false;
     let editorLifecycle: AbortController | null = null;
+    let editorOpener: HTMLElement | null = null;
     const catalogDraftDirty = () => {
       const form = editor.querySelector<HTMLElement>(".editor-form");
       return !!form && !!editorDrafts?.isDirty(form);
@@ -1232,7 +1245,8 @@ namespace Amaterasu {
         row.entry.launch.kind === "playnite_fullscreen" ? "Playnite Fullscreen" :
         row.entry.steam_id ? "Steam-linked" : row.entry.launch.kind === "executable" ? "Executable" :
         providerLaunch ? "Playnite" : "Application";
-      const edit = button(api.allows("catalog.write") ? "Edit" : "Settings", () => showEditor(row, capabilities));
+      let cardTrigger: HTMLElement | null = null;
+      const edit = button(api.allows("catalog.write") ? "Edit" : "Settings", () => showEditor(row, capabilities, cardTrigger));
       edit.disabled = (!api.allows("catalog.write") && !api.allows("configuration.read")) || providerLaunch;
       if (providerLaunch) catalogLocalizedAttribute(edit, "title", "Playnite launch targets are managed by the provider.");
       const launch = button("Launch", () => void runAction(launch, status, async () => {
@@ -1246,7 +1260,7 @@ namespace Amaterasu {
       if (providerLaunch) {
         const configure = button(
           "Streaming settings",
-          () => showProviderOverrideEditor(row, capabilities),
+          () => showProviderOverrideEditor(row, capabilities, cardTrigger),
           "secondary",
         );
         configure.disabled = !api.allows("catalog.write") && !api.allows("configuration.read");
@@ -1283,8 +1297,8 @@ namespace Amaterasu {
       );
       showCatalogArtwork(api, row.entry.artwork, art, content, undefined, row.id);
       const open = button("", () => {
-        if (providerLaunch) showProviderOverrideEditor(row, capabilities);
-        else showEditor(row, capabilities);
+        if (providerLaunch) showProviderOverrideEditor(row, capabilities, open);
+        else showEditor(row, capabilities, open);
       }, "catalog-open");
       open.disabled = !api.allows("catalog.write");
       open.dataset.catalogId = row.id;
@@ -1309,6 +1323,7 @@ namespace Amaterasu {
         el("strong", "", catalogTextLiteral(row.entry.name)),
         el("small", "muted", launchLabel)));
       const summary = el("summary", "catalog-menu-toggle", "Actions");
+      cardTrigger = catalogEditorStableTrigger(api.allows("catalog.write"), open, summary);
       catalogLocalizedAttributeTemplate(summary, "aria-label", "Actions for {name}", { name: catalogTextLiteral(row.entry.name) });
       const menu = el("details", "catalog-card-menu", summary,
         el("div", "catalog-card-menu-content",
@@ -1346,7 +1361,7 @@ namespace Amaterasu {
       return article;
     }
 
-    function closeEditor(): boolean {
+    function closeEditor(restoreFocus = true): boolean {
       if (editorSaving) {
         notify("Wait for the application save to finish.");
         return false;
@@ -1362,14 +1377,20 @@ namespace Amaterasu {
       pluginArea = null;
       editorGeneration += 1;
       editor.replaceChildren();
+      const opener = editorOpener;
+      editorOpener = null;
+      if (restoreFocus) restoreCatalogEditorFocus(opener);
       return true;
     }
 
     function showProviderOverrideEditor(
       row: CatalogRow,
       capabilities: CatalogConfigOverrideCapabilities,
+      stableTrigger?: HTMLElement | null,
     ): void {
-      if (!closeEditor()) return;
+      const active = document.activeElement as HTMLElement | null;
+      if (!closeEditor(false)) return;
+      editorOpener = stableTrigger?.isConnected ? stableTrigger : active && typeof active.focus === "function" ? active : null;
       const request = editorGeneration;
       editor.replaceChildren(el("p", "muted", "Loading input profiles…"));
       void loadInputRuntimeStatus().then((status) => {
@@ -1634,8 +1655,11 @@ namespace Amaterasu {
     function showEditor(
       row: CatalogRow | undefined,
       capabilities: CatalogConfigOverrideCapabilities,
+      stableTrigger?: HTMLElement | null,
     ): void {
-      if (!closeEditor()) return;
+      const active = document.activeElement as HTMLElement | null;
+      if (!closeEditor(false)) return;
+      editorOpener = stableTrigger?.isConnected ? stableTrigger : active && typeof active.focus === "function" ? active : null;
       const request = editorGeneration;
       editor.replaceChildren(el("p", "muted", "Loading input profiles…"));
       void loadInputRuntimeStatus().then((runtimeStatus) => {

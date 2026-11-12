@@ -499,6 +499,8 @@ test("host logging form refreshes its revision after an ambiguous persisted save
       this.tagName = tagName;
       this.children = [];
       this.listeners = new Map();
+      this.attributes = {};
+      this.id = "";
       this.isConnected = false;
       this.value = "";
     }
@@ -519,7 +521,8 @@ test("host logging form refreshes its revision after an ambiguous persisted save
       this.append(...children);
     }
     addEventListener(name, callback) { this.listeners.set(name, callback); }
-    setAttribute() {}
+    setAttribute(name, value) { this.attributes[name] = String(value); }
+    getAttribute(name) { return this.attributes[name] ?? null; }
     reportValidity() { return true; }
     get textContent() {
       return this.children.map((child) => typeof child === "string" ? child : child.textContent).join("");
@@ -593,6 +596,13 @@ test("host logging form refreshes its revision after an ambiguous persisted save
     },
   } });
   await new Promise(setImmediate);
+  const categoryNavigation = find(content, (node) => node.className === "settings-nav");
+  const generalCategory = find(categoryNavigation, (node) => node.textContent === "General");
+  const controlledAreas = generalCategory.getAttribute("aria-controls").split(" ");
+  assert.ok(controlledAreas.length > 0);
+  for (const id of controlledAreas) assert.ok(find(content, (node) => node.id === id));
+  const categoryPicker = find(content, (node) => String(node.tagName).toUpperCase() === "SELECT" && node.getAttribute("aria-label") === "Settings category");
+  assert.equal(categoryPicker.getAttribute("aria-controls"), "settings-category-content");
   const hostLoggingArea = find(content, (node) => node.className === "settings-area-logging");
   const originalForm = find(hostLoggingArea, (node) => node.tagName === "form");
   assert.match(hostLoggingArea.textContent, /Revision 6/);

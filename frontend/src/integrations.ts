@@ -123,6 +123,18 @@ namespace Amaterasu {
         let refreshButton: HTMLButtonElement | null = null;
         if (provider.name === "steam" && context.api.allows("steam.read")) {
           actions.append(button(localizedMessage("Manage Steam library"), () => context.navigate("steam")));
+          if (context.api.allows("steam.refresh")) {
+            refreshButton = button(localizedMessage("Refresh now"), () => refreshProvider("steam"));
+            if (typeof Amaterasu.setLocalizedAttributeTemplate === "function")
+              Amaterasu.setLocalizedAttributeTemplate(
+                refreshButton,
+                "aria-label",
+                "Request a {provider} refresh",
+                { provider: literalText(provider.label) },
+              );
+            refreshButton.disabled = true;
+            actions.append(refreshButton);
+          }
         } else if (provider.name !== "steam") {
           refreshButton = button(localizedMessage("Refresh now"), () => refreshProvider(provider.name as "lutris" | "playnite"));
           if (typeof Amaterasu.setLocalizedAttributeTemplate === "function")
@@ -133,7 +145,7 @@ namespace Amaterasu {
               { provider: literalText(provider.label) },
             );
           refreshButton.disabled = true;
-          refreshButton.hidden = !context.api.allows("configuration.write");
+          refreshButton.hidden = !canRequestRefresh(provider.name);
           actions.append(refreshButton);
         }
         const card = el("section", "panel integration-card", el("h2", "", provider.label),
@@ -144,7 +156,7 @@ namespace Amaterasu {
             item.providerStatus = value && typeof value === "object" && !Array.isArray(value)
               ? value as Record<string, unknown> : null;
             if (refreshButton) refreshButton.disabled = !canRefresh(provider.name, item.providerStatus) ||
-              !context.api.allows("configuration.write");
+              !canRequestRefresh(provider.name);
           },
         };
         return item;
@@ -213,16 +225,22 @@ namespace Amaterasu {
       return context.content.isConnected && item.card.parentElement === area;
     }
 
+    function canRequestRefresh(name: ProviderName): boolean {
+      return name === "steam"
+        ? context.api.allows("steam.refresh")
+        : context.api.allows("configuration.write");
+    }
     function canRefresh(name: ProviderName, status: Record<string, unknown> | null): boolean {
       if (activeRefreshes.has(name)) return false;
       if (!status || status.ok !== true || status.settings_ready !== true || status.enabled !== true) return false;
+      if (name === "steam") return status.scanning !== true;
       if (name === "lutris")
         return status.platform_supported === true && status.available === true && status.refresh_pending !== true;
       if (name === "playnite")
         return status.playnite_running === true && status.snapshot_pending !== true;
       return false;
     }
-    async function refreshProvider(name: "lutris" | "playnite"): Promise<void> {
+    async function refreshProvider(name: ProviderName): Promise<void> {
       const item = currentCards.find((candidate) => candidate.provider.name === name);
       if (!item?.refreshButton || item.refreshButton.disabled) return;
       const target = item.refreshButton;
@@ -238,9 +256,16 @@ namespace Amaterasu {
               item.feedback.replaceChildren(el("span", "", localizedMessage("Refresh request accepted. Checking provider status.")));
           };
           try {
-            const updated = name === "lutris"
-              ? await refreshLutrisProvider(context.api, accepted)
-              : await refreshPlayniteProvider(context.api, accepted);
+            let updated: unknown;
+            if (name === "steam") {
+              await context.api.post("steam/refresh");
+              accepted();
+              updated = await context.api.post<Record<string, unknown>>("steam/status");
+            } else if (name === "lutris") {
+              updated = await refreshLutrisProvider(context.api, accepted);
+            } else {
+              updated = await refreshPlayniteProvider(context.api, accepted);
+            }
             if (!currentCard(item)) return;
             const summary = summarizeProvider(name, updated);
             showProviderStatus(item.status, summary);
@@ -263,8 +288,7 @@ namespace Amaterasu {
       } finally {
         activeRefreshes.delete(name);
         if (currentCard(item))
-          target.disabled = !context.api.allows("configuration.write") ||
-            !canRefresh(name, item.providerStatus);
+          target.disabled = !canRequestRefresh(name) || !canRefresh(name, item.providerStatus);
         else if (context.content.isConnected) void load();
       }
     }

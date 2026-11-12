@@ -38,6 +38,7 @@ namespace Amaterasu {
         if (!context.content.isConnected || request !== generation) return;
         const body = el("div"), status = el("div");
         const baseline = new Map<HTMLInputElement, boolean>();
+        const clientCards: { card: HTMLElement; searchText: string }[] = [];
         const mode = input("permission_mode_enabled", "", "checkbox");
         mode.checked = state.permission_mode_enabled;
         baseline.set(mode, mode.checked);
@@ -47,6 +48,26 @@ namespace Amaterasu {
           "When enabled, listing and launching applications are controlled by these grants. Disabled by default."), saveMode);
         if (state.permission_mode_enabled) {
           body.append(el("p", "muted", "Launch and the stored view grant also allow listing. The view streams permission currently grants listing, not separate stream viewing. Termination is not enforced yet; its stored grant is preserved."));
+          const search = input("client_permission_search", "", "search");
+          search.setAttribute("data-draft-ignore", "");
+          const resultCount = el("p", "muted");
+          resultCount.setAttribute("role", "status");
+          resultCount.setAttribute("aria-live", "polite");
+          resultCount.setAttribute("aria-atomic", "true");
+          const noMatches = el("p", "muted", "No paired clients match this search.");
+          noMatches.hidden = true;
+          const updateClientFilter = (): void => {
+            const query = search.value.trim().toLocaleLowerCase();
+            let visible = 0;
+            for (const item of clientCards) {
+              item.card.hidden = !!query && !item.searchText.includes(query);
+              if (!item.card.hidden) visible += 1;
+            }
+            resultCount.textContent = `Showing ${visible} of ${clientCards.length} paired clients`;
+            noMatches.hidden = visible !== 0;
+          };
+          search.addEventListener("input", updateClientFilter);
+          body.append(field("Search paired clients by name or certificate fingerprint", search), resultCount, noMatches);
           for (const client of state.clients) {
             const checks = {} as Record<"list_apps" | "view_streams" | "launch_apps", HTMLInputElement>;
             const rows = el("div", "form-grid");
@@ -70,8 +91,11 @@ namespace Amaterasu {
               ? "Effective listing: allowed." : "Effective listing: denied."; };
             for (const check of Object.values(checks)) check.addEventListener("change", updateEffective);
             updateEffective();
-            body.append(el("section", "account-card", el("h3", "", name), effective, rows, saveClient));
+            const card = el("section", "account-card", el("h3", "", name), effective, rows, saveClient);
+            clientCards.push({ card, searchText: `${client.name} ${client.certificate_id}`.toLocaleLowerCase() });
+            body.append(card);
           }
+          updateClientFilter();
           if (!state.clients.length) body.append(el("p", "muted", "No paired clients."));
         }
         const refresh = button("Refresh permissions", () => {
