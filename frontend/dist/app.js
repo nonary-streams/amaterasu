@@ -14531,6 +14531,15 @@ var Amaterasu;
 })(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
 (function (Amaterasu) {
+    Amaterasu.PLUGINS_VIEWS = ["core", "modules", "publishers", "repositories"];
+    Amaterasu.DEFAULT_PLUGINS_VIEW = "core";
+    const FORMER_VIEW_NAMES = { installed: "modules", available: "publishers" };
+    function pluginsViewFromAddress(name) {
+        if (Amaterasu.PLUGINS_VIEWS.includes(name))
+            return name;
+        return Object.hasOwn(FORMER_VIEW_NAMES, name) ? FORMER_VIEW_NAMES[name] ?? null : null;
+    }
+    Amaterasu.pluginsViewFromAddress = pluginsViewFromAddress;
     const DIGEST = /^[a-f0-9]{64}$/;
     const IDENTITY = /^[a-z0-9._-]{1,128}$/;
     function record(value, message) {
@@ -14607,6 +14616,92 @@ var Amaterasu;
         };
     }
     Amaterasu.parsePackageSelectionStatus = parsePackageSelectionStatus;
+    const UPDATE_PHASES = [
+        "idle", "checking", "current", "available", "downloading",
+        "ready", "waiting_stream", "activating", "failed", "cancelled",
+    ];
+    const MODULE_CHANGE_KINDS = ["updated", "rebuilt", "added", "removed", "unchanged"];
+    const LATEST_UNIX_MS = 8_640_000_000_000_000;
+    function releaseSequence(value) {
+        return typeof value === "string" && /^(0|[1-9][0-9]{0,19})$/.test(value) &&
+            !(value.length === 20 && value > "18446744073709551615");
+    }
+    function byteCount(value) {
+        return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+    }
+    function parseUpdateModules(value) {
+        if (!Array.isArray(value) || value.length < 1 || value.length > 128)
+            throw new Error("Update module list is invalid.");
+        const ids = new Set();
+        const version = (candidate) => candidate === null || plainText(candidate);
+        return value.map((entry) => {
+            const row = record(entry, "Update module is invalid.");
+            const change = row.change;
+            if (typeof row.id !== "string" || !IDENTITY.test(row.id) || ids.has(row.id) ||
+                !version(row.from) || !version(row.to) || !byteCount(row.size) ||
+                typeof change !== "string" || !MODULE_CHANGE_KINDS.includes(change) ||
+                (row.from === null) !== (change === "added") || (row.to === null) !== (change === "removed"))
+                throw new Error("Update module is invalid.");
+            ids.add(row.id);
+            return { id: row.id, from: row.from, to: row.to, change: change, size: row.size };
+        });
+    }
+    function parsePackageUpdate(value) {
+        const update = record(value, "Package update is invalid.");
+        if (typeof update.repository !== "string" || !IDENTITY.test(update.repository) ||
+            typeof update.slot !== "string" || !IDENTITY.test(update.slot) ||
+            !plainText(update.implementation) || !plainText(update.version) ||
+            typeof update.digest !== "string" || !DIGEST.test(update.digest) ||
+            !releaseSequence(update.sequence) ||
+            !byteCount(update.download_bytes) || !byteCount(update.total_bytes))
+            throw new Error("Package update is invalid.");
+        return {
+            repository: update.repository,
+            slot: update.slot,
+            implementation: update.implementation,
+            version: update.version,
+            digest: update.digest,
+            sequence: update.sequence,
+            modules: parseUpdateModules(update.modules),
+            downloadBytes: update.download_bytes,
+            totalBytes: update.total_bytes,
+        };
+    }
+    function parsePackageUpdateStatus(value) {
+        const reply = record(value, "Package update response is invalid.");
+        if (reply.ok !== true)
+            throw new Error("Package update status is unavailable.");
+        if (reply.supported === false)
+            return { supported: false };
+        if (reply.supported !== true)
+            throw new Error("Package update support is invalid.");
+        const phase = reply.phase;
+        if (typeof phase !== "string" || !UPDATE_PHASES.includes(phase))
+            throw new Error("Package update phase is invalid.");
+        const checked = reply.checked_unix_ms;
+        if (checked !== null &&
+            (typeof checked !== "number" || !Number.isSafeInteger(checked) || checked < 0 || checked > LATEST_UNIX_MS))
+            throw new Error("Package update check time is invalid.");
+        const running = record(reply.running, "Running package status is invalid.");
+        if (typeof running.digest !== "string" || !DIGEST.test(running.digest) || !releaseSequence(running.sequence))
+            throw new Error("Running package status is invalid.");
+        if (!byteCount(reply.transferred_bytes))
+            throw new Error("Package update progress is invalid.");
+        const error = reply.error;
+        if (error !== null && (typeof error !== "string" || !/^[a-z0-9_]{1,64}$/.test(error)))
+            throw new Error("Package update error is invalid.");
+        return {
+            supported: true,
+            phase: phase,
+            checkedUnixMs: checked,
+            source: reply.source === null ? null : parsePackageSource(reply.source),
+            running: { digest: running.digest, sequence: running.sequence },
+            update: reply.update === null ? null : parsePackageUpdate(reply.update),
+            transferredBytes: reply.transferred_bytes,
+            error,
+        };
+    }
+    Amaterasu.parsePackageUpdateStatus = parsePackageUpdateStatus;
     function parseCatalog(value) {
         if (value === undefined)
             return { state: "unknown" };
@@ -14809,6 +14904,62 @@ var Amaterasu;
         return { name: nameFromIdentity(id), summary: "", category: "Other" };
     }
     Amaterasu.pluginPresentation = pluginPresentation;
+    function sourceRepository(name) {
+        return { name: `nonary-streams/${name}`, url: `https://github.com/nonary-streams/${name}` };
+    }
+    Amaterasu.AMATERASU_SOURCE = sourceRepository("amaterasu");
+    Amaterasu.BUILT_IN_LABEL = "Built into Amaterasu";
+    const FAMILY_TABLE = [
+        ["input", "Input", "Delivers keyboard, mouse, touch and controller input from the client to this host.",
+            [["amaterasu.input", "amaterasu-input"]]],
+        ["audio", "Audio", "Captures this host's sound and encodes it for the stream.",
+            [["amaterasu.audio", "amaterasu-audio"], ["amaterasu.audio-encode", "amaterasu-audio-encode"]]],
+        ["capture", "Screen capture",
+            "Reads the picture to stream from a display, the desktop portal or the stream's own virtual display.",
+            [["amaterasu.capture-kms", "amaterasu-capture"], ["amaterasu.capture-pipewire", "amaterasu-capture"],
+                ["amaterasu.capture-x11", "amaterasu-capture"], ["amaterasu.capture-dxgi", "amaterasu-capture"],
+                ["amaterasu.capture-wgc", "amaterasu-capture"], ["amaterasu.capture-black", "amaterasu-capture"],
+                ["amaterasu.capture-vkms", "amaterasu-capture-vkms"]]],
+        ["video", "Video encoding",
+            "Processes captured frames and encodes them with the host's hardware or software encoders.",
+            [["amaterasu.video", "amaterasu-encode-video"], ["amaterasu.linux-session-video", "amaterasu-encode-video"],
+                ["amaterasu.encode", "amaterasu-encode-video"]]],
+        ["display", "Display", "Lists displays and prepares the right one, at the right mode, for each stream.",
+            [["amaterasu.display", "amaterasu-display"], ["amaterasu.display-settings", "amaterasu"],
+                ["amaterasu.virtual-display", "amaterasu"]]],
+        ["remote-session", "Remote session", "Provides the remote monitor and remote input modes.",
+            [["amaterasu.remote-session", "amaterasu-remote-session"]]],
+        ["rtx-hdr", "RTX HDR", "Converts SDR streams to HDR with NVIDIA RTX.",
+            [["amaterasu.rtx-hdr", "amaterasu-rtx-hdr"]]],
+        ["frame-limiter", "Frame limiter", "Caps a game's frame rate to match the stream.",
+            [["amaterasu.frame-limiter", "amaterasu-frame-limiter"]]],
+        ["statistics", "Statistics", "Samples host and stream statistics and keeps session history.",
+            [["amaterasu.host-metrics", "amaterasu-stats"], ["amaterasu.session-history", "amaterasu-stats"]]],
+        ["runtime", "Runtime and SDK",
+            "Loads every module and carries the calls between them; modules are written against the SDK.",
+            [["amaterasu.runtime", "amaterasu"]], ["amaterasu-sdk"]],
+    ];
+    const MODULE_HOMES = new Map();
+    Amaterasu.MODULE_FAMILIES = FAMILY_TABLE.map(([id, name, summary, members, also = []]) => {
+        const repositories = [...new Set([...members.map(([, repository]) => repository), ...also])];
+        const family = {
+            id, name, summary,
+            members: members.map(([module]) => module),
+            sources: repositories.map(sourceRepository),
+        };
+        for (const [module, repository] of members)
+            MODULE_HOMES.set(module, { family, source: sourceRepository(repository) });
+        return family;
+    });
+    function moduleOrigin(id) {
+        const home = MODULE_HOMES.get(id);
+        if (home)
+            return { family: home.family, label: home.family.name, source: home.source };
+        if (id.startsWith("amaterasu."))
+            return { family: null, label: Amaterasu.BUILT_IN_LABEL, source: Amaterasu.AMATERASU_SOURCE };
+        return { family: null, label: null, source: null };
+    }
+    Amaterasu.moduleOrigin = moduleOrigin;
     function installedPlugins(selection) {
         return (selection?.running.modules ?? [])
             .map((module) => ({ ...pluginPresentation(module.id), ...module }))
@@ -14891,6 +15042,13 @@ var Amaterasu;
         return "Not installed";
     }
     Amaterasu.availabilityLabel = availabilityLabel;
+    function otherPublisherOffers(offers, selection) {
+        const supplier = selection?.running.source?.repository ?? null;
+        const running = new Set((selection?.running.modules ?? []).map((module) => module.id));
+        return offers.filter((offer) => offer.kind !== "native_set" ||
+            !(offer.runningThisPackage || (offer.repository.id === supplier && running.has(offer.slot))));
+    }
+    Amaterasu.otherPublisherOffers = otherPublisherOffers;
     function matchesPluginFilter(plugin, filter) {
         if (filter.category && plugin.category !== filter.category)
             return false;
@@ -14902,6 +15060,168 @@ var Amaterasu;
         return terms.every((term) => text.includes(term));
     }
     Amaterasu.matchesPluginFilter = matchesPluginFilter;
+    const CHANGE_ORDER = ["updated", "rebuilt", "added", "removed"];
+    function moduleChanges(update) {
+        return update.modules.flatMap((module) => module.change === "unchanged" ? [] : [{
+                id: module.id,
+                name: pluginPresentation(module.id).name,
+                change: module.change,
+                detail: module.change === "updated" ? `${module.from ?? ""} → ${module.to ?? ""}` : module.change,
+            }]).sort((a, b) => CHANGE_ORDER.indexOf(a.change) - CHANGE_ORDER.indexOf(b.change) ||
+            a.name.localeCompare(b.name) || a.id.localeCompare(b.id));
+    }
+    Amaterasu.moduleChanges = moduleChanges;
+    function packageUpdateSummary(update, downloaded = false) {
+        const total = update.modules.length;
+        const changed = update.modules.filter((module) => module.change !== "unchanged").length;
+        return `${changed} of ${total} ${total === 1 ? "module" : "modules"} ${changed === 1 ? "changes" : "change"}` +
+            ` · ${formatBytes(update.downloadBytes)} ${downloaded ? "downloaded" : "to download"}`;
+    }
+    Amaterasu.packageUpdateSummary = packageUpdateSummary;
+    const UPDATE_FAILURES = {
+        unsupported_platform: "Updates from the console are not available on this platform yet.",
+        no_source: "This host's package did not come from a repository, so there is nowhere to look for a newer one. Install Amaterasu from a published release to get updates here.",
+        repository_unavailable: "The repository this host's package came from is not available. Open Repositories and check that it is still listed.",
+        catalog_download_failed: "The host could not reach the repository to look for updates. Check the host's internet connection and try again.",
+        catalog_rejected: "The repository's list of releases did not pass its signature check, so the host ignored it. Try again later, and tell the publisher if it keeps happening.",
+        candidate_ambiguous: "The repository lists more than one package that could replace this one, so the host did not choose. Its publisher needs to correct the list; try again later.",
+        manifest_download_failed: "The host found an update but could not download its description. Check the host's internet connection and try again.",
+        manifest_rejected: "The update's description did not pass its signature check, so the host did not use it. Try again later, and tell the publisher if it keeps happening.",
+        download_failed: "The download did not finish. Check the host's internet connection and download the update again.",
+        verification_failed: "The downloaded files did not match what the publisher signed, so the host discarded them. Download the update again.",
+        activation_unavailable: "The host could not begin the install. Nothing was changed. Try again, and restart Amaterasu if it keeps happening.",
+        activation_failed: "The update could not be installed, and the host kept the package it was running. Try again; if it fails again, the host log in Diagnostics says why.",
+        activation_interrupted: "The host stopped before the install finished and is running its previous package. Check for updates to start again.",
+        shutting_down: "The host was shutting down, so the update stopped. Check for updates when it is running again.",
+    };
+    function packageUpdateFailureMessage(code) {
+        return (code !== null && Object.hasOwn(UPDATE_FAILURES, code) && UPDATE_FAILURES[code]) ||
+            "The update did not complete. Check for updates to try again.";
+    }
+    Amaterasu.packageUpdateFailureMessage = packageUpdateFailureMessage;
+    const UPDATE_REFUSALS = {
+        busy: "The host is already working on an update. Wait for it to finish, or cancel it first.",
+        nothing_to_download: "There is no update to download. Check for updates first.",
+        not_ready: "The update has not finished downloading, so it cannot be installed yet.",
+        activation_in_progress: "The host is already installing this update.",
+        shutting_down: "The host is shutting down. Try again when it is running again.",
+        unsupported_platform: "Updates from the console are not available on this platform yet.",
+        permission_denied: "This account is not allowed to do that. Installing an update needs an administrator who is signed in to the console.",
+    };
+    function packageUpdateRefusalMessage(code) {
+        return (code !== null && Object.hasOwn(UPDATE_REFUSALS, code) && UPDATE_REFUSALS[code]) || null;
+    }
+    Amaterasu.packageUpdateRefusalMessage = packageUpdateRefusalMessage;
+    Amaterasu.CORE_UPDATE_SOURCE = "amaterasu-core";
+    const CORE_UPDATE_ABOUT = "Amaterasu Core is every module Amaterasu ships. It updates as one signed package, which can also add new modules, and the host returns to the previous package if the new one does not start.";
+    const UPDATE_STEP_LABELS = ["Download", "Verify", "Wait for idle", "Restart"];
+    const UPDATE_HEADLINES = {
+        idle: "Not checked yet",
+        checking: "Checking for updates",
+        current: "Up to date",
+        available: "Update available",
+        downloading: "Downloading update",
+        ready: "Ready to install",
+        waiting_stream: "Waiting for the stream to end",
+        activating: "Installing",
+        failed: "Update failed",
+        cancelled: "Update cancelled",
+    };
+    const UPDATE_DETAILS = {
+        ready: "Downloaded and verified. Once you choose to install it, the host restarts as soon as no stream is running.",
+        waiting_stream: "The host installs the update and restarts as soon as the stream that is running ends.",
+        activating: "The host is restarting with the new package. This page follows along and reconnects when it is back.",
+        cancelled: "Nothing was installed. The host is still running the same package.",
+    };
+    function updateProgress(phase, received, total) {
+        switch (phase) {
+            case "available": return { done: 0, current: null };
+            case "downloading": return total !== null && received >= total ? { done: 1, current: 1 } : { done: 0, current: 0 };
+            case "ready": return { done: 2, current: null };
+            case "waiting_stream": return { done: 2, current: 2 };
+            case "activating": return { done: 3, current: 3 };
+            default: return null;
+        }
+    }
+    function coreUpdateSource(reading, running) {
+        const row = {
+            id: Amaterasu.CORE_UPDATE_SOURCE,
+            name: "Amaterasu Core",
+            about: CORE_UPDATE_ABOUT,
+            repository: running?.repository ?? null,
+            running: running?.digest ?? null,
+            checkedUnixMs: null,
+            state: "loading",
+            headline: "Loading…",
+            tone: "neutral",
+            detail: null,
+            update: null,
+            summary: null,
+            changes: [],
+            steps: [],
+            transfer: null,
+            actions: [],
+            busy: false,
+        };
+        if (reading.state === "loading")
+            return row;
+        if (reading.state === "failed")
+            return { ...row, state: "unreadable", headline: "Status unavailable", detail: { kind: "literal", value: reading.message } };
+        if (reading.state === "absent" || !reading.status.supported)
+            return {
+                ...row,
+                state: "unavailable",
+                headline: "Updates unavailable",
+                detail: reading.state === "absent"
+                    ? "This host does not install updates from the console yet."
+                    : "Updates from the console are not available on this platform yet.",
+            };
+        const status = reading.status;
+        const phase = status.phase;
+        const update = phase === "idle" || phase === "checking" || phase === "current" ? null : status.update;
+        const total = update && update.downloadBytes > 0 ? update.downloadBytes : null;
+        const received = total === null ? status.transferredBytes : Math.min(status.transferredBytes, total);
+        const progress = updateProgress(phase, received, total);
+        const settled = phase === "failed" || phase === "cancelled";
+        return {
+            ...row,
+            repository: status.source?.repository ?? row.repository,
+            running: status.running.digest,
+            checkedUnixMs: status.checkedUnixMs,
+            state: phase,
+            headline: UPDATE_HEADLINES[phase],
+            tone: phase === "current" ? "good" : phase === "failed" ? "danger"
+                : phase === "idle" || phase === "checking" || phase === "cancelled" ? "neutral" : "attention",
+            detail: phase === "failed" ? packageUpdateFailureMessage(status.error) : UPDATE_DETAILS[phase] ?? null,
+            update: update?.digest ?? null,
+            summary: update
+                ? packageUpdateSummary(update, phase === "ready" || phase === "waiting_stream" || phase === "activating")
+                : null,
+            changes: update ? moduleChanges(update) : [],
+            steps: progress ? UPDATE_STEP_LABELS.map((label, index) => ({
+                label,
+                state: index === progress.current ? "current" : index < progress.done ? "done" : "upcoming",
+            })) : [],
+            transfer: phase === "downloading" ? { received, total } : null,
+            actions: phase === "available" || (settled && update) ? ["download", "check"]
+                : phase === "ready" ? ["activate", "check"]
+                    : phase === "downloading" || phase === "waiting_stream" ? ["cancel"]
+                        : phase === "checking" || phase === "activating" ? []
+                            : ["check"],
+            busy: phase === "checking" || phase === "downloading" || phase === "waiting_stream" || phase === "activating",
+        };
+    }
+    Amaterasu.coreUpdateSource = coreUpdateSource;
+    function elapsedSince(nowMs, thenMs) {
+        const minutes = Math.floor((nowMs - thenMs) / 60_000);
+        if (minutes < 1)
+            return null;
+        if (minutes < 60)
+            return { value: minutes, unit: "minute" };
+        const hours = Math.floor(minutes / 60);
+        return hours < 24 ? { value: hours, unit: "hour" } : { value: Math.floor(hours / 24), unit: "day" };
+    }
+    Amaterasu.elapsedSince = elapsedSince;
     function shortDigest(digest) {
         return digest.length > 12 ? digest.slice(0, 12) : digest;
     }
@@ -15027,26 +15347,64 @@ var Amaterasu;
 })(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
 (function (Amaterasu) {
-    Amaterasu.PLUGINS_VIEWS = ["installed", "available", "repositories"];
     const VIEW_LABELS = {
-        installed: "Installed",
-        available: "Available",
+        core: "Core modules",
+        modules: "All modules",
+        publishers: "Other publishers",
         repositories: "Repositories",
     };
     const CHANGE_POLL_MS = 600;
     const CHANGE_TIMEOUT_MS = 150_000;
     const COLLAPSED_NAMES = 8;
+    const COLLAPSED_CHANGES = 6;
+    const UPDATE_POLL_MS = 1500;
+    const RESTART_PATIENCE_MS = 180_000;
+    const CHECKED_REFRESH_MS = 30_000;
     function lit(value) {
         return typeof Amaterasu.literalText === "function" ? Amaterasu.literalText(value) : value;
     }
+    function intlLocale() {
+        return typeof Amaterasu.activeIntlLocale === "function" ? Amaterasu.activeIntlLocale() : undefined;
+    }
     function formatDate(unixSeconds) {
-        const locale = typeof Amaterasu.activeIntlLocale === "function" ? Amaterasu.activeIntlLocale() : undefined;
         try {
-            return new Intl.DateTimeFormat(locale, { dateStyle: "medium" }).format(new Date(unixSeconds * 1000));
+            return new Intl.DateTimeFormat(intlLocale(), { dateStyle: "medium" }).format(new Date(unixSeconds * 1000));
         }
         catch {
             return new Date(unixSeconds * 1000).toISOString().slice(0, 10);
         }
+    }
+    function formatDateTime(unixMs) {
+        try {
+            return new Intl.DateTimeFormat(intlLocale(), { dateStyle: "medium", timeStyle: "short" }).format(new Date(unixMs));
+        }
+        catch {
+            return new Date(unixMs).toISOString();
+        }
+    }
+    function formatElapsed(elapsed) {
+        try {
+            return new Intl.RelativeTimeFormat(intlLocale(), { numeric: "always" }).format(-elapsed.value, elapsed.unit);
+        }
+        catch {
+            return `${elapsed.value} ${elapsed.unit}${elapsed.value === 1 ? "" : "s"} ago`;
+        }
+    }
+    const shownText = new WeakMap();
+    function setText(node, value) {
+        const key = value === null ? "" : typeof value === "string" ? `message:${value}` : `${value.kind}:${value.value}`;
+        if (shownText.get(node) === key)
+            return;
+        shownText.set(node, key);
+        node.replaceChildren(...(value === null ? [] : Amaterasu.el("span", "", value).childNodes));
+    }
+    function sourceLink(source) {
+        const link = Amaterasu.el("a", "plugin-source-link", lit(source.name));
+        link.href = source.url;
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+        Amaterasu.setLocalizedAttribute(link, "title", "Opens on GitHub in a new tab");
+        return link;
     }
     function factList(rows) {
         const list = Amaterasu.el("dl", "plugin-facts");
@@ -15063,16 +15421,16 @@ var Amaterasu;
     function quietState(title, description, action) {
         return Amaterasu.el("div", "plugin-quiet-state", Amaterasu.el("h3", "", title), Amaterasu.el("p", "muted", description), action);
     }
-    function nameList(names, render) {
-        const list = Amaterasu.el("ul", "plugin-names");
-        const show = (count) => list.replaceChildren(...names.slice(0, count).map((name) => Amaterasu.el("li", "", render(name))));
-        if (names.length <= COLLAPSED_NAMES + 2) {
-            show(names.length);
+    function nameList(items, render, collapsed = COLLAPSED_NAMES, className = "plugin-names") {
+        const list = Amaterasu.el("ul", className);
+        const show = (count) => list.replaceChildren(...items.slice(0, count).map((item) => Amaterasu.el("li", "", render(item))));
+        if (items.length <= collapsed + 2) {
+            show(items.length);
             return list;
         }
-        show(COLLAPSED_NAMES);
-        const more = Amaterasu.button(lit(`Show all ${names.length}`), () => {
-            show(names.length);
+        show(collapsed);
+        const more = Amaterasu.button(lit(`Show all ${items.length}`), () => {
+            show(items.length);
             more.remove();
         }, "link-button plugin-more");
         return Amaterasu.el("div", "", list, more);
@@ -15152,6 +15510,11 @@ var Amaterasu;
         return {
             node,
             select,
+            focus(key) {
+                const control = rows.get(key)?.control;
+                control?.focus({ preventScroll: true });
+                control?.scrollIntoView({ block: isWide() ? "center" : "start" });
+            },
             show(entries, emptyState) {
                 rows.clear();
                 order = entries.map((entry) => entry.key);
@@ -15169,7 +15532,7 @@ var Amaterasu;
                         group = entry.group;
                         items = Amaterasu.el("ul", "plugin-rows");
                         if (options.grouped)
-                            sections.push(Amaterasu.el("h3", "plugin-label plugin-group-heading", entry.group));
+                            sections.push(Amaterasu.el("h2", "plugin-label plugin-group-heading", entry.group));
                         sections.push(items);
                     }
                     const control = Amaterasu.button("", () => activate(entry.key), "plugin-row");
@@ -15187,18 +15550,333 @@ var Amaterasu;
             },
         };
     }
+    function updateSourceRow(options) {
+        const name = Amaterasu.el("h3", "plugin-update-name");
+        name.tabIndex = -1;
+        const mark = Amaterasu.el("span", "plugin-update-mark");
+        mark.setAttribute("aria-hidden", "true");
+        const headline = Amaterasu.el("span", "plugin-update-headline");
+        const state = Amaterasu.el("p", "plugin-update-state", mark, headline);
+        state.setAttribute("aria-live", "polite");
+        const controls = {
+            cancel: Amaterasu.button("Cancel", () => options.onAction("cancel")),
+            download: Amaterasu.button("Download update", () => options.onAction("download"), "primary"),
+            activate: Amaterasu.button("Install when idle", () => options.onAction("activate"), "primary"),
+        };
+        const retry = Amaterasu.button("Try again", options.onRetry);
+        const actions = Amaterasu.el("div", "actions plugin-update-actions", controls.cancel, retry, controls.download, controls.activate);
+        const facts = Amaterasu.el("p", "plugin-update-facts");
+        const checked = Amaterasu.el("time");
+        const detail = Amaterasu.el("p", "plugin-update-detail");
+        detail.setAttribute("aria-live", "polite");
+        const refused = Amaterasu.el("p", "plugin-update-refusal");
+        refused.setAttribute("role", "alert");
+        const permission = Amaterasu.el("p", "muted plugin-update-permission");
+        const steps = Amaterasu.el("ol", "plugin-update-steps");
+        const bar = Amaterasu.el("progress", "plugin-update-bar");
+        Amaterasu.setLocalizedAttribute(bar, "aria-label", "Download progress");
+        const received = Amaterasu.el("span", "plugin-update-received");
+        const transfer = Amaterasu.el("div", "plugin-update-transfer", bar, received);
+        const summary = Amaterasu.el("p", "plugin-update-summary");
+        const changeList = Amaterasu.el("div", "plugin-update-change-list");
+        changeList.setAttribute("role", "group");
+        Amaterasu.setLocalizedAttribute(changeList, "aria-label", "What this update changes");
+        const changes = Amaterasu.el("div", "plugin-update-changes", summary, changeList);
+        const about = Amaterasu.el("p", "muted plugin-update-about");
+        const extras = Amaterasu.el("div", "plugin-update-extra");
+        const node = Amaterasu.el("article", "plugin-update-source", Amaterasu.el("header", "plugin-update-source-head", Amaterasu.el("div", "plugin-update-title", name, state), actions), facts, detail, refused, permission, steps, transfer, changes, Amaterasu.el("div", "plugin-update-foot", about, extras));
+        let shownFacts = "";
+        let shownSteps = "";
+        let shownChanges = "";
+        let shownExtra = null;
+        let checkedAt = null;
+        const permits = (action) => options.canChange && (action !== "activate" || options.canInstall);
+        function tick() {
+            if (checkedAt === null)
+                return;
+            const elapsed = Amaterasu.elapsedSince(Date.now(), checkedAt);
+            setText(checked, elapsed ? lit(formatElapsed(elapsed)) : "just now");
+            checked.title = formatDateTime(checkedAt);
+        }
+        function showFacts(view) {
+            checkedAt = view.checkedUnixMs;
+            const key = `${view.running}\n${view.repository}\n${view.checkedUnixMs}`;
+            if (key !== shownFacts) {
+                shownFacts = key;
+                const fact = (...parts) => Amaterasu.el("span", "plugin-update-fact", ...parts);
+                const shown = [];
+                if (view.running)
+                    shown.push(fact(Amaterasu.el("span", "muted", "Running package"), " ", options.copyable(view.running, Amaterasu.shortDigest(view.running), "package digest")));
+                if (view.repository)
+                    shown.push(fact(Amaterasu.el("span", "muted", "from"), " ", options.repositoryLink(view.repository)));
+                if (view.checkedUnixMs !== null) {
+                    checked.dateTime = new Date(view.checkedUnixMs).toISOString();
+                    shown.push(fact(Amaterasu.el("span", "muted", "Last checked"), " ", checked));
+                }
+                facts.replaceChildren(...shown);
+                facts.hidden = shown.length === 0;
+            }
+            tick();
+        }
+        function showProgress(view) {
+            const key = view.steps.map((step) => step.state).join();
+            if (key !== shownSteps) {
+                shownSteps = key;
+                steps.replaceChildren(...view.steps.map((step) => {
+                    const item = Amaterasu.el("li", `plugin-update-step plugin-update-step--${step.state}`, step.label);
+                    if (step.state === "current")
+                        item.setAttribute("aria-current", "step");
+                    return item;
+                }));
+            }
+            steps.hidden = view.steps.length === 0;
+            transfer.hidden = view.transfer === null;
+            if (!view.transfer)
+                return;
+            if (view.transfer.total === null) {
+                bar.removeAttribute("value");
+                setText(received, lit(`${Amaterasu.formatBytes(view.transfer.received)} received`));
+            }
+            else {
+                bar.max = view.transfer.total;
+                bar.value = view.transfer.received;
+                setText(received, lit(`${Amaterasu.formatBytes(view.transfer.received)} of ${Amaterasu.formatBytes(view.transfer.total)}`));
+            }
+        }
+        function showChanges(view) {
+            changes.hidden = view.summary === null;
+            setText(summary, view.summary === null ? null : lit(view.summary));
+            const key = `${view.update}\n${view.changes.map((change) => `${change.id} ${change.detail}`).join("\n")}`;
+            if (key === shownChanges)
+                return;
+            shownChanges = key;
+            changeList.hidden = view.changes.length === 0;
+            changeList.replaceChildren(nameList(view.changes, (change) => Amaterasu.el("span", `plugin-update-change plugin-update-change--${change.change}`, Amaterasu.el("span", "plugin-update-change-name", lit(change.name)), Amaterasu.el("span", "plugin-update-change-detail", lit(change.detail))), COLLAPSED_CHANGES, "plugin-update-list"));
+        }
+        return {
+            node,
+            tick,
+            focus: () => name.focus(),
+            show(view, working, refusal, extra) {
+                const focused = document.activeElement;
+                node.dataset.state = view.state;
+                node.dataset.tone = view.tone;
+                setText(name, lit(view.name));
+                setText(headline, view.headline);
+                setText(detail, view.detail);
+                detail.hidden = view.detail === null;
+                setText(refused, refusal === null ? null : lit(refusal));
+                refused.hidden = refusal === null;
+                showFacts(view);
+                const offered = Object.keys(controls).filter((action) => view.actions.includes(action));
+                for (const [action, control] of Object.entries(controls)) {
+                    control.hidden = !offered.includes(action);
+                    control.disabled = working || !permits(action);
+                }
+                retry.hidden = view.state !== "unreadable";
+                retry.disabled = working;
+                actions.hidden = offered.length === 0 && retry.hidden;
+                permission.hidden = !(offered.includes("activate") && options.canChange && !options.canInstall);
+                setText(permission, permission.hidden ? null : "Installing an update needs an administrator who is signed in to the console.");
+                showProgress(view);
+                showChanges(view);
+                setText(about, view.about);
+                if (extra !== shownExtra) {
+                    if (extra instanceof HTMLDetailsElement && shownExtra instanceof HTMLDetailsElement)
+                        extra.open = shownExtra.open;
+                    extras.replaceChildren(...(extra ? [extra] : []));
+                    shownExtra = extra;
+                }
+                if (!working && focused instanceof HTMLButtonElement && actions.contains(focused) && (focused.hidden || focused.disabled))
+                    name.focus();
+            },
+        };
+    }
+    function updatesPanel(options) {
+        const entries = options.feeds.map((feed) => {
+            const entry = {
+                feed,
+                acting: null,
+                refusal: null,
+                timer: undefined,
+                row: updateSourceRow({
+                    copyable: options.copyable,
+                    repositoryLink: options.repositoryLink,
+                    canChange: options.canChange,
+                    canInstall: options.canInstall,
+                    onAction: (action) => void perform(entry, action),
+                    onRetry: () => void perform(entry, null),
+                }),
+            };
+            return entry;
+        });
+        const check = Amaterasu.button("Check for updates", () => {
+            if (check.getAttribute("aria-disabled") === "true")
+                return;
+            for (const entry of entries)
+                if (entry.feed.view().actions.includes("check"))
+                    void perform(entry, "check");
+        });
+        const heading = Amaterasu.el("h2", "", "Updates");
+        heading.id = "plugin-updates-heading";
+        const node = Amaterasu.el("section", "plugin-updates", Amaterasu.el("header", "plugin-updates-head", heading, Amaterasu.el("div", "actions", check)), options.canChange ? null : Amaterasu.el("p", "muted plugin-updates-note", "This account can see updates but cannot change them."), Amaterasu.el("div", "plugin-update-sources", ...entries.map((entry) => entry.row.node)));
+        node.setAttribute("aria-labelledby", heading.id);
+        function draw() {
+            let checking = false;
+            let checkable = false;
+            for (const entry of entries) {
+                const view = entry.feed.view();
+                entry.row.show(view, entry.acting !== null, entry.refusal, entry.feed.extra?.() ?? null);
+                checking ||= entry.acting === "check" || view.state === "checking";
+                checkable ||= view.actions.includes("check");
+            }
+            setText(check, checking ? "Checking…" : "Check for updates");
+            check.setAttribute("aria-disabled", String(checking));
+            check.disabled = !checking &&
+                (!checkable || !options.canChange || entries.some((entry) => entry.acting !== null));
+        }
+        function follow(entry) {
+            window.clearTimeout(entry.timer);
+            if (options.signal.aborted || entry.acting !== null || !entry.feed.view().busy)
+                return;
+            entry.timer = window.setTimeout(() => {
+                void entry.feed.read().then(() => {
+                    if (options.signal.aborted || entry.acting !== null)
+                        return;
+                    draw();
+                    options.onChange();
+                    follow(entry);
+                });
+            }, UPDATE_POLL_MS);
+        }
+        async function perform(entry, action) {
+            if (entry.acting !== null || options.signal.aborted)
+                return;
+            const origin = document.activeElement instanceof HTMLButtonElement && node.contains(document.activeElement)
+                ? document.activeElement : null;
+            if (action === "activate") {
+                const confirmed = await Amaterasu.confirmAction(lit(`Install the ${entry.feed.view().name} update?`), "The host restarts with the new package as soon as no stream is running. This console is unavailable for a moment while it does.", "Install when idle");
+                if (!confirmed || options.signal.aborted || entry.acting !== null)
+                    return;
+            }
+            window.clearTimeout(entry.timer);
+            entry.acting = action ?? "read";
+            entry.refusal = null;
+            draw();
+            try {
+                if (action === null)
+                    await entry.feed.read();
+                else
+                    await entry.feed.request(action);
+            }
+            catch (error) {
+                entry.refusal = Amaterasu.messageOf(error);
+                await entry.feed.read();
+            }
+            finally {
+                entry.acting = null;
+            }
+            if (options.signal.aborted)
+                return;
+            draw();
+            if (origin && (document.activeElement === origin || document.activeElement === document.body)) {
+                if (origin.isConnected && !origin.hidden && !origin.disabled)
+                    origin.focus();
+                else
+                    entry.row.focus();
+            }
+            options.onChange();
+            follow(entry);
+        }
+        const clock = window.setInterval(() => { for (const entry of entries)
+            entry.row.tick(); }, CHECKED_REFRESH_MS);
+        options.signal.addEventListener("abort", () => {
+            window.clearInterval(clock);
+            for (const entry of entries)
+                window.clearTimeout(entry.timer);
+        }, { once: true });
+        return {
+            node,
+            read: async () => { await Promise.all(entries.map((entry) => entry.feed.read())); },
+            show() {
+                draw();
+                for (const entry of entries)
+                    follow(entry);
+            },
+        };
+    }
+    function coreUpdateFeed(api, running, extra) {
+        let reading = { state: "loading" };
+        let latest = 0;
+        let silentSince = null;
+        const missing = (error) => error instanceof Amaterasu.ApiError && (error.status === 404 || error.code === "not_found");
+        const installing = () => reading.state === "ready" && reading.status.supported && reading.status.phase === "activating";
+        return {
+            id: Amaterasu.CORE_UPDATE_SOURCE,
+            view: () => Amaterasu.coreUpdateSource(reading, running()),
+            extra,
+            async read() {
+                const ticket = ++latest;
+                try {
+                    const status = Amaterasu.parsePackageUpdateStatus(await api.post("package-update/status", {}));
+                    if (ticket !== latest)
+                        return;
+                    silentSince = null;
+                    reading = { state: "ready", status };
+                }
+                catch (error) {
+                    if (ticket !== latest)
+                        return;
+                    if (missing(error)) {
+                        reading = { state: "absent" };
+                    }
+                    else if (installing()) {
+                        silentSince ??= Date.now();
+                        if (Date.now() - silentSince >= RESTART_PATIENCE_MS)
+                            reading = { state: "failed", message: "The host has not answered since it began installing. It may still be restarting; try again in a moment." };
+                    }
+                    else {
+                        reading = { state: "failed", message: Amaterasu.messageOf(error) };
+                    }
+                }
+            },
+            async request(action) {
+                const ticket = ++latest;
+                try {
+                    const status = Amaterasu.parsePackageUpdateStatus(await api.post(`package-update/${action}`, {}));
+                    if (ticket !== latest)
+                        return;
+                    silentSince = null;
+                    reading = { state: "ready", status };
+                }
+                catch (error) {
+                    if (!missing(error))
+                        throw new Error(error instanceof Amaterasu.ApiError
+                            ? Amaterasu.packageUpdateRefusalMessage(error.code) ?? error.message
+                            : Amaterasu.messageOf(error));
+                    if (ticket === latest)
+                        reading = { state: "absent" };
+                }
+            },
+        };
+    }
     function renderPlugins(context) {
         const page = new AbortController();
         context.registerDraftGuard?.(() => false, () => page.abort());
         const api = context.api;
         const canRead = api.allows("configuration.read");
         const canManage = api.role === "administrator" && api.allows("configuration.write");
-        let view = context.initialPluginsView ?? "installed";
+        let view = Amaterasu.pluginsViewFromAddress(context.initialPluginsView ?? "") ?? Amaterasu.DEFAULT_PLUGINS_VIEW;
         let selection = { state: "loading" };
         let listing = { state: "loading" };
         let loadRequest = 0;
         let selectedInstalled = null;
         let selectedAvailable = null;
+        let revealInstalled = false;
+        let history = null;
+        let lastUpdateState = "loading";
+        let shownUpdate = null;
+        let reloadedFor = null;
         const installedFilter = { query: "", category: "" };
         const availableFilter = { query: "", category: "" };
         const descriptions = new Map();
@@ -15209,7 +15887,7 @@ var Amaterasu;
         const tabs = new Map();
         const tabList = Amaterasu.el("div", "plugin-tabs");
         tabList.setAttribute("role", "tablist");
-        Amaterasu.setLocalizedAttribute(tabList, "aria-label", "Plugin views");
+        Amaterasu.setLocalizedAttribute(tabList, "aria-label", "Module views");
         const viewArea = Amaterasu.el("div", "plugin-view");
         viewArea.setAttribute("role", "tabpanel");
         viewArea.id = "plugin-view";
@@ -15234,11 +15912,24 @@ var Amaterasu;
                 tabs.get(next)?.control.focus();
             }
         });
-        context.content.append(Amaterasu.sectionHeading("Plugins", "The modules this host runs, and the repositories it can get more from.", Amaterasu.button("Refresh", load)), tabList, viewArea);
         const ready = (value) => value.state === "ready" ? value.value : null;
         const repositories = () => ready(listing)?.repositories ?? [];
         const activeRepositories = () => repositories().filter((repository) => !repository.revoked);
-        const offers = () => Amaterasu.availablePlugins(repositories(), ready(selection), consoleDigest);
+        const offers = () => Amaterasu.otherPublisherOffers(Amaterasu.availablePlugins(repositories(), ready(selection), consoleDigest), ready(selection));
+        const core = coreUpdateFeed(api, () => {
+            const status = ready(selection);
+            return status ? { digest: status.running.digest, repository: status.running.source?.repository ?? null } : null;
+        }, () => history);
+        const updates = updatesPanel({
+            feeds: [core],
+            signal: page.signal,
+            canChange: api.allows("configuration.write"),
+            canInstall: canManage,
+            copyable,
+            repositoryLink,
+            onChange: updatesChanged,
+        });
+        context.content.append(Amaterasu.sectionHeading("Modules", "What this host runs, where each part comes from, and how it stays up to date.", Amaterasu.button("Refresh", load)), ...(canRead ? [updates.node] : []), tabList, viewArea);
         function showView(next) {
             if (next === view)
                 return;
@@ -15248,8 +15939,9 @@ var Amaterasu;
         }
         function render() {
             const counts = {
-                installed: ready(selection)?.running.modules?.length ?? null,
-                available: ready(listing) ? offers().length : null,
+                core: null,
+                modules: ready(selection)?.running.modules?.length ?? null,
+                publishers: ready(listing) ? offers().length : null,
                 repositories: ready(listing) ? activeRepositories().length : null,
             };
             for (const [name, tab] of tabs) {
@@ -15260,15 +15952,32 @@ var Amaterasu;
             }
             viewArea.setAttribute("aria-labelledby", `plugin-tab-${view}`);
             if (!canRead) {
-                viewArea.replaceChildren(quietState("Plugins are unavailable", "This account needs permission to read the host's configuration."));
+                viewArea.replaceChildren(quietState("Modules are unavailable", "This account needs permission to read the host's configuration."));
                 return;
             }
-            if (view === "installed")
+            if (view === "core")
+                renderCore();
+            else if (view === "modules")
                 renderInstalled();
-            else if (view === "available")
+            else if (view === "publishers")
                 renderAvailable();
             else
                 renderRepositories();
+        }
+        function updatesChanged() {
+            const row = core.view();
+            const installed = lastUpdateState === "activating" && row.state !== "activating";
+            lastUpdateState = row.state;
+            const known = ready(selection)?.running.digest ?? null;
+            if (row.running && known && row.running !== known && row.running !== reloadedFor) {
+                reloadedFor = row.running;
+                if (installed)
+                    context.notify(lit(`Update installed. The host is running package ${Amaterasu.shortDigest(row.running)}.`));
+                void load();
+                return;
+            }
+            if (row.update !== shownUpdate && view === "core" && viewArea.isConnected)
+                renderCore();
         }
         async function load() {
             const request = ++loadRequest;
@@ -15282,12 +15991,20 @@ var Amaterasu;
             const [nextSelection, nextListing] = await Promise.all([
                 settled(api.post("package-selection/status", {}).then(Amaterasu.parsePackageSelectionStatus)),
                 settled(listRepositories()),
+                updates.read(),
             ]);
             if (request !== loadRequest || !viewArea.isConnected)
                 return;
             selection = nextSelection;
             listing = nextListing;
+            showUpdates();
             render();
+        }
+        function showUpdates() {
+            const status = ready(selection);
+            history = status ? packageHistory(status) : null;
+            lastUpdateState = core.view().state;
+            updates.show();
         }
         async function listRepositories() {
             const byId = new Map();
@@ -15320,8 +16037,10 @@ var Amaterasu;
                 if (request === loadRequest)
                     listing = { state: "failed", error };
             }
-            if (viewArea.isConnected)
-                render();
+            if (!viewArea.isConnected)
+                return;
+            showUpdates();
+            render();
         }
         function copyable(value, shown, what) {
             const text = Amaterasu.el("code", "plugin-digest", lit(shown));
@@ -15366,25 +16085,99 @@ var Amaterasu;
             bar.append(count);
             return bar;
         }
-        function renderInstalled() {
+        function runningModules() {
             if (selection.state === "loading") {
-                viewArea.replaceChildren(Amaterasu.el("p", "muted plugin-loading", "Loading installed plugins…"));
-                return;
+                viewArea.replaceChildren(Amaterasu.el("p", "muted plugin-loading", "Loading modules…"));
+                return null;
             }
             if (selection.state === "failed") {
                 viewArea.replaceChildren(Amaterasu.errorPanel(selection.error, load));
-                return;
+                return null;
             }
-            const status = selection.value;
-            const plugins = Amaterasu.installedPlugins(status);
-            if (!status.running.available || !plugins.length) {
-                viewArea.replaceChildren(packageSummary(status, 0), quietState("The host did not report its modules", "This host version does not list the modules it loaded, or the running package could not be read."));
+            const plugins = Amaterasu.installedPlugins(selection.value);
+            if (selection.value.running.available && plugins.length)
+                return plugins;
+            viewArea.replaceChildren(quietState("The host did not report its modules", "This host version does not list the modules it loaded, or the running package could not be read."));
+            return null;
+        }
+        function renderCore() {
+            const row = core.view();
+            shownUpdate = row.update;
+            const plugins = runningModules();
+            if (!plugins)
                 return;
+            const running = new Map(plugins.map((plugin) => [plugin.id, plugin]));
+            const changes = new Map(row.changes.map((change) => [change.id, change]));
+            const focused = document.activeElement instanceof HTMLElement && viewArea.contains(document.activeElement)
+                ? document.activeElement.dataset.focusKey : undefined;
+            viewArea.replaceChildren(Amaterasu.el("div", "plugin-families", ...Amaterasu.MODULE_FAMILIES.map((family) => familyCard(family, running, changes))));
+            if (focused)
+                Array.from(viewArea.querySelectorAll("[data-focus-key]"))
+                    .find((control) => control.dataset.focusKey === focused)?.focus();
+        }
+        function familyCard(family, running, changes) {
+            const members = Amaterasu.el("ul", "plugin-family-members");
+            for (const id of family.members) {
+                const plugin = running.get(id);
+                const change = changes.get(id);
+                if (plugin) {
+                    const control = Amaterasu.button("", () => openModule(id), "plugin-family-member");
+                    control.replaceChildren(Amaterasu.el("span", "plugin-family-member-name", lit(plugin.name)), Amaterasu.el("span", `plugin-family-member-version${change ? " plugin-family-member-version--changes" : ""}`, lit(!change ? plugin.version : change.change === "updated" ? change.detail : `${plugin.version} · ${change.detail}`)));
+                    control.dataset.focusKey = `member ${id}`;
+                    Amaterasu.setLocalizedAttribute(control, "title", "Show in All modules");
+                    members.append(Amaterasu.el("li", "", control));
+                }
+                else if (change?.change === "added") {
+                    members.append(Amaterasu.el("li", "plugin-family-member plugin-family-member--added", Amaterasu.el("span", "plugin-family-member-name", lit(change.name)), Amaterasu.el("span", "plugin-family-member-version plugin-family-member-version--changes", lit(change.detail))));
+                }
             }
+            const installed = family.members.some((id) => running.has(id));
+            const chip = family.members.some((id) => changes.has(id))
+                ? Amaterasu.el("span", "plugin-chip plugin-chip--changes", "Changes in this update")
+                : installed
+                    ? Amaterasu.el("span", "plugin-chip plugin-chip--running", "Running")
+                    : Amaterasu.el("span", "plugin-chip", "Not installed");
+            const heading = Amaterasu.el("h2", "plugin-family-name", family.name);
+            heading.id = `plugin-family-${family.id}`;
+            const missing = installed || members.childElementCount ? []
+                : family.members.includes("amaterasu.rtx-hdr")
+                    ? [
+                        Amaterasu.el("p", "muted plugin-family-note", "RTX HDR is installed from Integrations, which also downloads the NVIDIA runtime it needs."),
+                        Amaterasu.button("Set up RTX HDR", () => context.navigate("integrations")),
+                    ]
+                    : [Amaterasu.el("p", "muted plugin-family-note", "Not part of the package this host is running.")];
+            const sources = Amaterasu.el("ul", "plugin-family-sources", ...family.sources.map((source, index) => {
+                const link = sourceLink(source);
+                link.dataset.focusKey = `source ${family.id} ${index}`;
+                return Amaterasu.el("li", "", link);
+            }));
+            Amaterasu.setLocalizedAttribute(sources, "aria-label", "Source");
+            const card = Amaterasu.el("article", "plugin-family", Amaterasu.el("header", "plugin-family-header", heading, chip), Amaterasu.el("p", "plugin-family-summary", family.summary), Amaterasu.el("div", "plugin-family-body", members.childElementCount ? members : null, ...missing), Amaterasu.el("footer", "plugin-family-source", Amaterasu.el("p", "plugin-label", "Source"), sources));
+            card.setAttribute("aria-labelledby", heading.id);
+            return card;
+        }
+        function openModule(id) {
+            const plugin = Amaterasu.installedPlugins(ready(selection)).find((candidate) => candidate.id === id);
+            if (!plugin)
+                return;
+            if (!Amaterasu.matchesPluginFilter(plugin, installedFilter)) {
+                installedFilter.query = "";
+                installedFilter.category = "";
+            }
+            selectedInstalled = id;
+            revealInstalled = true;
+            showView("modules");
+        }
+        function renderInstalled() {
+            const status = ready(selection);
+            const loaded = runningModules();
+            if (!loaded || !status)
+                return;
+            const plugins = loaded;
             const byId = new Map(plugins.map((plugin) => [plugin.id, plugin]));
             const count = Amaterasu.el("span", "muted plugin-count");
             const browser = pluginBrowser({
-                label: "Installed plugins",
+                label: "All modules",
                 grouped: true,
                 selected: () => selectedInstalled,
                 onSelect: (key) => { selectedInstalled = key; },
@@ -15395,7 +16188,7 @@ var Amaterasu;
                 signal: page.signal,
             });
             const categories = Amaterasu.PLUGIN_CATEGORIES.filter((category) => plugins.some((plugin) => plugin.category === category));
-            const bar = toolbar(installedFilter, "Search installed plugins", categories, showMatches, count);
+            const bar = toolbar(installedFilter, "Search modules", categories, showMatches, count);
             function showMatches() {
                 const matches = plugins.filter((plugin) => Amaterasu.matchesPluginFilter(plugin, installedFilter));
                 count.textContent = matches.length === plugins.length
@@ -15408,7 +16201,7 @@ var Amaterasu;
                     meta: plugin.version,
                     group: plugin.category,
                     emphasis: false,
-                })), quietState("No plugins match", "Try a different search or category."));
+                })), quietState("No modules match", "Try a different search or category."));
             }
             function focusInstalled(id) {
                 const plugin = byId.get(id);
@@ -15423,22 +16216,14 @@ var Amaterasu;
                 }
                 browser.select(id);
             }
-            viewArea.replaceChildren(packageSummary(status, plugins.length), bar, browser.node);
+            viewArea.replaceChildren(bar, browser.node);
             showMatches();
+            if (revealInstalled && selectedInstalled)
+                browser.focus(selectedInstalled);
+            revealInstalled = false;
         }
-        function packageSummary(status, modules) {
+        function packageHistory(status) {
             const running = status.running;
-            const line = Amaterasu.el("p", "plugin-package-line");
-            if (running.digest) {
-                line.append(Amaterasu.el("span", "muted", "Running package"), " ", copyable(running.digest, Amaterasu.shortDigest(running.digest), "package digest"));
-                if (modules)
-                    line.append(Amaterasu.el("span", "muted", lit(` · ${modules} modules`)));
-                if (running.source)
-                    line.append(Amaterasu.el("span", "muted", " · from "), repositoryLink(running.source.repository));
-            }
-            else {
-                line.append(Amaterasu.el("span", "muted", "The host did not report which package it is running."));
-            }
             const listedAs = (digest) => {
                 if (!digest)
                     return "—";
@@ -15454,19 +16239,19 @@ var Amaterasu;
                 digest ? copyable(digest, Amaterasu.shortDigest(digest), "package digest") : Amaterasu.el("span", "muted", "None"),
                 lit(listedAs(digest)),
             ];
-            const details = Amaterasu.el("details", "plugin-package-details", Amaterasu.el("summary", "", "Package history"), Amaterasu.table(["Recorded as", "Package", "Listed by"], [
+            return Amaterasu.el("details", "plugin-package-details", Amaterasu.el("summary", "", "Package history"), Amaterasu.table(["Recorded as", "Package", "Listed by"], [
                 phase("Running now", running.digest),
                 phase("Active", status.active),
                 phase("Previous", status.previous),
                 phase("Pending", status.pending),
                 phase("On trial", status.trial),
             ]), Amaterasu.el("p", "muted", lit(`Only the running package is loaded. The others are what the host has recorded for its next start or a rollback. Highest release sequence accepted: ${status.highestSequence}.`)));
-            return Amaterasu.el("div", "plugin-package", line, details);
         }
         function installedDetail(plugin, status, installed, focus) {
             const facts = Amaterasu.el("div");
             const relations = Amaterasu.el("div");
             const source = status.running.source;
+            const origin = Amaterasu.moduleOrigin(plugin.id);
             const moduleLink = (id, version) => {
                 const known = installed.get(id);
                 const label = known ? known.name : id;
@@ -15482,6 +16267,8 @@ var Amaterasu;
                     ["Category", plugin.category],
                     ["Type", plugin.runtime ? "Runtime" : "Module"],
                     ["Supplied by", source ? repositoryLink(source.repository) : Amaterasu.el("span", "muted", "Not recorded")],
+                    origin.family ? ["Part of", origin.family.name] : null,
+                    origin.source ? ["Source", Amaterasu.el("span", "plugin-source", sourceLink(origin.source), origin.family || !origin.label ? null : Amaterasu.el("span", "muted", origin.label))] : null,
                     description ? ["Size", lit(Amaterasu.formatBytes(description.size))] : null,
                     ["Library SHA-256", copyable(plugin.sha256, Amaterasu.shortDigest(plugin.sha256), "library digest")],
                 ]));
@@ -15538,7 +16325,7 @@ var Amaterasu;
             const plugins = offers();
             if (!plugins.length) {
                 const empty = activeRepositories().length
-                    ? quietState("Nothing is offered for this host", "None of this host's repositories lists a plugin for its platform right now.", Amaterasu.button("View repositories", () => showView("repositories")))
+                    ? quietState("Nothing from other publishers", "None of this host's repositories offers a module from another publisher right now. Amaterasu Core is kept up to date from Updates, above.", Amaterasu.button("View repositories", () => showView("repositories")))
                     : quietState("No repositories yet", "Add a publisher's repository to browse the plugins it offers.", catalogs.manageable && canManage
                         ? Amaterasu.button("Add repository", () => openAddRepository(), "primary")
                         : Amaterasu.button("View repositories", () => showView("repositories")));
@@ -15549,7 +16336,7 @@ var Amaterasu;
             const count = Amaterasu.el("span", "muted plugin-count");
             const severalSources = new Set(plugins.map((plugin) => plugin.repository.id)).size > 1;
             const browser = pluginBrowser({
-                label: "Available plugins",
+                label: "Modules from other publishers",
                 grouped: severalSources,
                 selected: () => selectedAvailable,
                 onSelect: (key) => { selectedAvailable = key; },
@@ -15572,9 +16359,9 @@ var Amaterasu;
                     meta: `${Amaterasu.availabilityLabel(plugin)} · ${plugin.version}`,
                     group: plugin.repository.id,
                     emphasis: plugin.status !== "installed",
-                })), quietState("No plugins match", "Try a different search or category."));
+                })), quietState("No modules match", "Try a different search or category."));
             };
-            viewArea.replaceChildren(toolbar(availableFilter, "Search available plugins", categories, showMatches, count), browser.node);
+            viewArea.replaceChildren(toolbar(availableFilter, "Search other publishers' modules", categories, showMatches, count), browser.node);
             showMatches();
         }
         function availableDetail(plugin) {
@@ -15584,9 +16371,7 @@ var Amaterasu;
                     ? "In use. You are looking at this interface."
                     : "Not in use."
                 : plugin.status === "installed"
-                    ? plugin.runningThisPackage
-                        ? "Installed. This host is running the package this repository lists."
-                        : `Installed. Version ${plugin.version} is loaded from a different package than the one listed here.`
+                    ? `Installed. Version ${plugin.version} is loaded from a different package than the one listed here.`
                     : plugin.status === "update"
                         ? `Version ${plugin.installedVersion} is installed. This repository offers ${plugin.version}.`
                         : "Not installed.";
@@ -16447,6 +17232,15 @@ var Amaterasu;
         return typeof Amaterasu.localizedMessage === "function" ? Amaterasu.localizedMessage(value) : value;
     }
     const maximumUpdateCheckIntervalSeconds = 0x7fff_ffff;
+    const releasePagePrefixes = [
+        "https://github.com/nonary-streams/amaterasu/releases/tag/",
+        "https://github.com/Nonary/amaterasu/releases/tag/",
+    ];
+    function isReleasePage(value) {
+        return typeof value === "string" &&
+            releasePagePrefixes.some((prefix) => value.startsWith(prefix)) &&
+            !/[\u0000-\u0020\u007f-\u009f]/u.test(value);
+    }
     const updaterRenderGenerations = new WeakMap();
     function updaterSettings(notifyPreReleases, updateCheckInterval) {
         if (typeof notifyPreReleases !== "boolean" ||
@@ -16485,9 +17279,7 @@ var Amaterasu;
         if (!value || typeof value !== "object" || Array.isArray(value))
             throw new Error("Updater release status is invalid.");
         const release = value;
-        if (typeof release.version !== "string" || typeof release.url !== "string" ||
-            !release.url.startsWith("https://github.com/Nonary/amaterasu/releases/tag/") ||
-            /[\u0000-\u0020\u007f-\u009f]/u.test(release.url))
+        if (typeof release.version !== "string" || !isReleasePage(release.url))
             throw new Error("Updater release status is invalid.");
         return { version: release.version, url: release.url };
     }
@@ -16509,9 +17301,7 @@ var Amaterasu;
                 throw new Error("Updater release status is invalid.");
             const update = reply.available_update;
             if (typeof update.version !== "string" || typeof update.prerelease !== "boolean" ||
-                typeof update.release_url !== "string" ||
-                !update.release_url.startsWith("https://github.com/Nonary/amaterasu/releases/tag/") ||
-                /[\u0000-\u0020\u007f-\u009f]/u.test(update.release_url))
+                !isReleasePage(update.release_url))
                 throw new Error("Updater release status is invalid.");
             availableUpdate = {
                 version: update.version,
@@ -16525,9 +17315,7 @@ var Amaterasu;
                 throw new Error("Updater notification status is invalid.");
             const state = reply.notification;
             if (typeof state.version !== "string" || typeof state.prerelease !== "boolean" ||
-                typeof state.release_url !== "string" ||
-                !state.release_url.startsWith("https://github.com/Nonary/amaterasu/releases/tag/") ||
-                /[\u0000-\u0020\u007f-\u009f]/u.test(state.release_url) ||
+                !isReleasePage(state.release_url) ||
                 !["pending", "notified", "disabled", "unavailable"].includes(String(state.delivery)))
                 throw new Error("Updater notification status is invalid.");
             notification = {
@@ -19744,7 +20532,7 @@ var Amaterasu;
         const sessionsArea = Amaterasu.el("div");
         const actionStatus = Amaterasu.el("div");
         let generation = 0;
-        context.content.append(Amaterasu.sectionHeading("Maintenance", "Review signed-in sessions and manage this host's credentials and software.", Amaterasu.button("Refresh sessions", () => { void load(); })), Amaterasu.panel("Signed-in sessions", Amaterasu.el("p", "muted", "Revoke another session to remove its access. Sessions may include other management clients; the host does not record device names or last activity."), actionStatus, sessionsArea), Amaterasu.panel("Credentials", Amaterasu.el("p", "muted", "Manage accounts, passwords, and API tokens for this host."), Amaterasu.el("div", "actions", Amaterasu.button("Manage accounts", () => context.navigate("accounts")), ...(context.api.allows("tokens.manage") ? [Amaterasu.button("Manage API tokens", () => context.navigate("tokens"))] : []))), Amaterasu.panel("Plugins", Amaterasu.el("p", "muted", "Review the running package and this host's repositories."), context.api.allows("configuration.read") ? Amaterasu.button("View plugins", () => context.navigate("plugins")) : Amaterasu.el("p", "muted", "Package details require configuration.read.")));
+        context.content.append(Amaterasu.sectionHeading("Maintenance", "Review signed-in sessions and manage this host's credentials and software.", Amaterasu.button("Refresh sessions", () => { void load(); })), Amaterasu.panel("Signed-in sessions", Amaterasu.el("p", "muted", "Revoke another session to remove its access. Sessions may include other management clients; the host does not record device names or last activity."), actionStatus, sessionsArea), Amaterasu.panel("Credentials", Amaterasu.el("p", "muted", "Manage accounts, passwords, and API tokens for this host."), Amaterasu.el("div", "actions", Amaterasu.button("Manage accounts", () => context.navigate("accounts")), ...(context.api.allows("tokens.manage") ? [Amaterasu.button("Manage API tokens", () => context.navigate("tokens"))] : []))), Amaterasu.panel("Modules", Amaterasu.el("p", "muted", "Review what this host runs, check for updates and manage its repositories."), context.api.allows("configuration.read") ? Amaterasu.button("View modules", () => context.navigate("plugins")) : Amaterasu.el("p", "muted", "Package details require configuration.read.")));
         function render(sessions) {
             const cards = sessions.map((session) => {
                 const title = Amaterasu.el("div", "section-meta", Amaterasu.el("strong", "", Amaterasu.literalText(session.subject)), session.current ? Amaterasu.badge("This session", "good") : session.remembered ? Amaterasu.badge("Remembered") : Amaterasu.badge("Session only"));
@@ -22800,7 +23588,7 @@ var Amaterasu;
         catalog: "Library",
         settings: "Settings",
         integrations: "Integrations",
-        plugins: "Plugins",
+        plugins: "Modules",
         sessions: "Sessions",
         applications: "Applications",
         steam: "Steam",
@@ -22954,7 +23742,7 @@ var Amaterasu;
                 ["general", "streaming", "integrations", "devices", "access"].includes(value.slice(9)) &&
                 this.pageAvailable("settings");
             const pluginsView = value.startsWith("plugins/") &&
-                Amaterasu.PLUGINS_VIEWS.includes(value.slice(8)) &&
+                Amaterasu.pluginsViewFromAddress(value.slice(8)) !== null &&
                 this.pageAvailable("plugins");
             return core || settingsCategory || pluginsView ||
                 (value.startsWith("extension/") && this.extensionIds.has(value.slice(10))) ? value : "overview";
@@ -23260,11 +24048,13 @@ var Amaterasu;
                     history.replaceState(history.state, "", address);
                     this.displayedPage = next;
                 },
-                ...(page.startsWith("plugins/") ? { initialPluginsView: page.slice(8) } : {}),
+                ...(page.startsWith("plugins/")
+                    ? { initialPluginsView: Amaterasu.pluginsViewFromAddress(page.slice(8)) ?? Amaterasu.DEFAULT_PLUGINS_VIEW }
+                    : {}),
                 replacePluginsView: (view) => {
                     if (!fresh.isConnected || !(this.displayedPage === "plugins" || this.displayedPage?.startsWith("plugins/")))
                         return;
-                    const next = view === "installed" ? "plugins" : `plugins/${view}`;
+                    const next = view === Amaterasu.DEFAULT_PLUGINS_VIEW ? "plugins" : `plugins/${view}`;
                     const address = new URL(location.href);
                     address.hash = next;
                     history.replaceState(history.state, "", address);

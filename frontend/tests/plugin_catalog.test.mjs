@@ -293,3 +293,399 @@ test("pasted repository details fill the form but never supply the fingerprint",
   for (const text of ["https://plugins.example.org", "{not json", "[]", "{}", '{"id":7}', `{"id":"${"x".repeat(5000)}"}`])
     assert.equal(plugins.parseRepositoryDescriptor(text), null);
 });
+
+// --- The Modules page: views, families, updates ------------------------------
+
+const digest = (character) => character.repeat(64);
+const updateModule = (id, change, from = "0.1.0", to = "0.2.0") => ({
+  id,
+  from: change === "added" ? null : from,
+  to: change === "removed" ? null : change === "updated" || change === "added" ? to : from,
+  change,
+  size: 3_774_568,
+});
+const updateOffer = {
+  repository: "amaterasu",
+  slot: "amaterasu.runtime",
+  implementation: "amaterasu-linux-session",
+  version: "0.2.0",
+  digest: digest("e"),
+  sequence: "1794200000",
+  modules: [
+    updateModule("amaterasu.runtime", "unchanged"),
+    updateModule("amaterasu.input", "updated"),
+    updateModule("amaterasu.display", "rebuilt"),
+    updateModule("amaterasu.remote-session", "added", null, "0.1.0"),
+    updateModule("amaterasu.upnp", "removed"),
+    updateModule("amaterasu.audio", "updated", "0.1.0", "0.1.1"),
+  ],
+  download_bytes: 18_200_000,
+  total_bytes: 131_000_000,
+};
+const updateReply = {
+  ok: true,
+  supported: true,
+  phase: "available",
+  checked_unix_ms: 1_794_170_000_000,
+  source: { repository: "amaterasu", fingerprint: digest("c") },
+  running: { digest: digest("d"), sequence: "1794169005" },
+  update: updateOffer,
+  transferred_bytes: 0,
+  error: null,
+};
+const reading = (change = {}) => ({ state: "ready", status: plugins.parsePackageUpdateStatus({ ...updateReply, ...change }) });
+
+test("addresses saved under a view's former name open the view that replaced it", () => {
+  assert.deepEqual(plain(plugins.PLUGINS_VIEWS), ["core", "modules", "publishers", "repositories"]);
+  assert.equal(plugins.DEFAULT_PLUGINS_VIEW, "core");
+  for (const view of plugins.PLUGINS_VIEWS) assert.equal(plugins.pluginsViewFromAddress(view), view);
+  assert.equal(plugins.pluginsViewFromAddress("installed"), "modules");
+  assert.equal(plugins.pluginsViewFromAddress("available"), "publishers");
+  for (const name of ["", "Installed", "updates", "constructor", "__proto__", "modules/extra"])
+    assert.equal(plugins.pluginsViewFromAddress(name), null, name);
+});
+
+test("an update status reply is read whole", () => {
+  const status = plugins.parsePackageUpdateStatus({ ...updateReply, package_root: "/private/host/root" });
+  assert.deepEqual(plain(status), {
+    supported: true,
+    phase: "available",
+    checkedUnixMs: 1_794_170_000_000,
+    source: { repository: "amaterasu", fingerprint: digest("c") },
+    running: { digest: digest("d"), sequence: "1794169005" },
+    update: {
+      repository: "amaterasu",
+      slot: "amaterasu.runtime",
+      implementation: "amaterasu-linux-session",
+      version: "0.2.0",
+      digest: digest("e"),
+      sequence: "1794200000",
+      modules: updateOffer.modules,
+      downloadBytes: 18_200_000,
+      totalBytes: 131_000_000,
+    },
+    transferredBytes: 0,
+    error: null,
+  });
+
+  // Everything the contract allows to be null, and every phase.
+  const idle = plugins.parsePackageUpdateStatus(
+    { ...updateReply, phase: "idle", checked_unix_ms: null, source: null, update: null });
+  assert.equal(idle.checkedUnixMs, null);
+  assert.equal(idle.source, null);
+  assert.equal(idle.update, null);
+  for (const phase of ["idle", "checking", "current", "available", "downloading", "ready", "waiting_stream", "activating", "failed", "cancelled"])
+    assert.equal(plugins.parsePackageUpdateStatus({ ...updateReply, phase }).phase, phase);
+  assert.equal(plugins.parsePackageUpdateStatus({ ...updateReply, phase: "failed", error: "download_failed" }).error, "download_failed");
+  assert.equal(plugins.parsePackageUpdateStatus({ ...updateReply, running: { digest: digest("d"), sequence: "18446744073709551615" } })
+    .running.sequence, "18446744073709551615");
+
+  // A host that has the routes but cannot install says only that.
+  assert.deepEqual(plain(plugins.parsePackageUpdateStatus({ ok: true, supported: false })), { supported: false });
+  assert.deepEqual(plain(plugins.parsePackageUpdateStatus({ ...updateReply, supported: false, phase: "nonsense" })), { supported: false });
+});
+
+test("each malformed field of an update status reply is rejected", () => {
+  const update = (change) => ({ ...updateReply, update: { ...updateOffer, ...change } });
+  const modules = (...rows) => update({ modules: rows });
+  const first = updateOffer.modules[1];
+  const malformed = {
+    "not an object": [],
+    "refusal": { ok: false, code: "busy" },
+    "ok missing": { ...updateReply, ok: undefined },
+    "supported missing": { ...updateReply, supported: undefined },
+    "supported not a boolean": { ...updateReply, supported: "true" },
+    "unknown phase": { ...updateReply, phase: "installing" },
+    "phase not a string": { ...updateReply, phase: 3 },
+    "check time missing": { ...updateReply, checked_unix_ms: undefined },
+    "check time a string": { ...updateReply, checked_unix_ms: "1794170000000" },
+    "check time negative": { ...updateReply, checked_unix_ms: -1 },
+    "check time fractional": { ...updateReply, checked_unix_ms: 1.5 },
+    "check time beyond any date": { ...updateReply, checked_unix_ms: 8_640_000_000_000_001 },
+    "source missing": { ...updateReply, source: undefined },
+    "source repository": { ...updateReply, source: { repository: "../escape", fingerprint: digest("c") } },
+    "source fingerprint": { ...updateReply, source: { repository: "amaterasu", fingerprint: "short" } },
+    "running missing": { ...updateReply, running: null },
+    "running digest": { ...updateReply, running: { digest: "/unsafe/path", sequence: "1" } },
+    "running sequence a number": { ...updateReply, running: { digest: digest("d"), sequence: 1794169005 } },
+    "running sequence padded": { ...updateReply, running: { digest: digest("d"), sequence: "01" } },
+    "running sequence too large": { ...updateReply, running: { digest: digest("d"), sequence: "18446744073709551616" } },
+    "update missing": { ...updateReply, update: undefined },
+    "update not an object": { ...updateReply, update: "0.2.0" },
+    "update repository": update({ repository: "Bad Id" }),
+    "update slot": update({ slot: "" }),
+    "update implementation": update({ implementation: "line\nbreak" }),
+    "update version": update({ version: 2 }),
+    "update digest": update({ digest: digest("E") }),
+    "update sequence": update({ sequence: "-1" }),
+    "download size": update({ download_bytes: -1 }),
+    "download size a string": update({ download_bytes: "18200000" }),
+    "total size": update({ total_bytes: 1.5 }),
+    "modules missing": update({ modules: undefined }),
+    "modules empty": modules(),
+    "too many modules": modules(...Array.from({ length: 129 }, (_, index) => updateModule(`amaterasu.module-${index}`, "unchanged"))),
+    "module not an object": modules("amaterasu.input"),
+    "module id": modules({ ...first, id: "../input" }),
+    "module listed twice": modules(first, first),
+    "module version from": modules({ ...first, from: 1 }),
+    "module version to": modules({ ...first, to: "bad\u0000version" }),
+    "unknown change": modules({ ...first, change: "replaced" }),
+    "module size": modules({ ...first, size: -5 }),
+    "module size missing": modules({ ...first, size: undefined }),
+    "added with a previous version": modules({ ...first, change: "added" }),
+    "added without a new version": modules({ ...first, change: "added", from: null, to: null }),
+    "removed with a new version": modules({ ...first, change: "removed" }),
+    "updated without a previous version": modules({ ...first, from: null }),
+    "unchanged without a version": modules({ ...first, change: "unchanged", to: null }),
+    "progress missing": { ...updateReply, transferred_bytes: undefined },
+    "progress negative": { ...updateReply, transferred_bytes: -1 },
+    "progress a string": { ...updateReply, transferred_bytes: "0" },
+    "error missing": { ...updateReply, error: undefined },
+    "error an object": { ...updateReply, error: { code: "download_failed" } },
+    "error not a code": { ...updateReply, error: "The download failed." },
+  };
+  // The parser's own refusal, not an accident further in.
+  for (const [what, reply] of Object.entries(malformed))
+    assert.throws(() => plugins.parsePackageUpdateStatus(reply), (error) => /is (invalid|unavailable)\.$/.test(error.message), what);
+});
+
+test("every core module belongs to its family and names the repository it is built from", () => {
+  const github = (name) => ({ name: `nonary-streams/${name}`, url: `https://github.com/nonary-streams/${name}` });
+  const expected = [
+    ["Input", { "amaterasu.input": "amaterasu-input" }, ["amaterasu-input"]],
+    ["Audio", { "amaterasu.audio": "amaterasu-audio", "amaterasu.audio-encode": "amaterasu-audio-encode" },
+      ["amaterasu-audio", "amaterasu-audio-encode"]],
+    ["Screen capture", {
+      "amaterasu.capture-kms": "amaterasu-capture", "amaterasu.capture-pipewire": "amaterasu-capture",
+      "amaterasu.capture-x11": "amaterasu-capture", "amaterasu.capture-dxgi": "amaterasu-capture",
+      "amaterasu.capture-wgc": "amaterasu-capture", "amaterasu.capture-black": "amaterasu-capture",
+      "amaterasu.capture-vkms": "amaterasu-capture-vkms",
+    }, ["amaterasu-capture", "amaterasu-capture-vkms"]],
+    ["Video encoding", {
+      "amaterasu.video": "amaterasu-encode-video", "amaterasu.linux-session-video": "amaterasu-encode-video",
+      "amaterasu.encode": "amaterasu-encode-video",
+    }, ["amaterasu-encode-video"]],
+    // Two of the display modules are built in Amaterasu's own repository.
+    ["Display", {
+      "amaterasu.display": "amaterasu-display", "amaterasu.display-settings": "amaterasu",
+      "amaterasu.virtual-display": "amaterasu",
+    }, ["amaterasu-display", "amaterasu"]],
+    ["Remote session", { "amaterasu.remote-session": "amaterasu-remote-session" }, ["amaterasu-remote-session"]],
+    ["RTX HDR", { "amaterasu.rtx-hdr": "amaterasu-rtx-hdr" }, ["amaterasu-rtx-hdr"]],
+    ["Frame limiter", { "amaterasu.frame-limiter": "amaterasu-frame-limiter" }, ["amaterasu-frame-limiter"]],
+    ["Statistics", { "amaterasu.host-metrics": "amaterasu-stats", "amaterasu.session-history": "amaterasu-stats" },
+      ["amaterasu-stats"]],
+    // The SDK builds no module of its own; the runtime is written against it.
+    ["Runtime and SDK", { "amaterasu.runtime": "amaterasu" }, ["amaterasu", "amaterasu-sdk"]],
+  ];
+  assert.deepEqual(plain(plugins.MODULE_FAMILIES.map((family) => family.name)), expected.map(([name]) => name));
+  for (const [index, [name, members, sources]] of expected.entries()) {
+    const family = plugins.MODULE_FAMILIES[index];
+    assert.deepEqual(plain(family.members), Object.keys(members), name);
+    assert.deepEqual(plain(family.sources), sources.map(github), name);
+    assert.ok(family.summary.endsWith("."), name);
+    for (const [id, repository] of Object.entries(members)) {
+      const origin = plugins.moduleOrigin(id);
+      assert.equal(origin.family, family, id);
+      assert.equal(origin.label, name, id);
+      assert.deepEqual(plain(origin.source), github(repository), id);
+    }
+  }
+  const members = plain(plugins.MODULE_FAMILIES.flatMap((family) => family.members));
+  assert.equal(new Set(members).size, members.length, "no module is in two families");
+
+  // A module of Amaterasu's outside every family is built into Amaterasu.
+  for (const id of ["amaterasu.network", "amaterasu.management", "amaterasu.not-yet-named"])
+    assert.deepEqual(plain(plugins.moduleOrigin(id)),
+      { family: null, label: "Built into Amaterasu", source: github("amaterasu") }, id);
+  assert.equal(plugins.AMATERASU_SOURCE.url, "https://github.com/nonary-streams/amaterasu");
+  // Nothing is claimed about a module somebody else publishes.
+  for (const id of ["example.overlay", "amaterasu", "notamaterasu.input"])
+    assert.deepEqual(plain(plugins.moduleOrigin(id)), { family: null, label: null, source: null }, id);
+});
+
+test("an update is summed up as the modules it changes", () => {
+  const { update } = plugins.parsePackageUpdateStatus(updateReply);
+  assert.deepEqual(plain(plugins.moduleChanges(update)), [
+    { id: "amaterasu.audio", name: "Audio capture", change: "updated", detail: "0.1.0 → 0.1.1" },
+    { id: "amaterasu.input", name: "Input", change: "updated", detail: "0.1.0 → 0.2.0" },
+    { id: "amaterasu.display", name: "Displays", change: "rebuilt", detail: "rebuilt" },
+    { id: "amaterasu.remote-session", name: "Remote session", change: "added", detail: "added" },
+    { id: "amaterasu.upnp", name: "Port mapping", change: "removed", detail: "removed" },
+  ]);
+  assert.equal(plugins.packageUpdateSummary(update), "5 of 6 modules change · 17.4 MB to download");
+  assert.equal(plugins.packageUpdateSummary(update, true), "5 of 6 modules change · 17.4 MB downloaded");
+
+  const one = { ...update, modules: update.modules.slice(0, 2), downloadBytes: 512 };
+  assert.equal(plugins.packageUpdateSummary(one), "1 of 2 modules changes · 512 B to download");
+  const alone = { ...update, modules: update.modules.slice(1, 2) };
+  assert.equal(plugins.packageUpdateSummary(alone), "1 of 1 module changes · 17.4 MB to download");
+  const untouched = { ...update, modules: update.modules.slice(0, 1) };
+  assert.deepEqual(plain(plugins.moduleChanges(untouched)), []);
+  assert.equal(plugins.packageUpdateSummary(untouched), "0 of 1 module change · 17.4 MB to download");
+});
+
+test("the Amaterasu Core row says where its update stands", () => {
+  const running = { digest: digest("9"), repository: "house" };
+  const row = (change, fallback = running) => plain(plugins.coreUpdateSource(reading(change), fallback));
+  const steps = (view) => view.steps.map((step) => `${step.label}:${step.state}`);
+
+  const current = row({ phase: "current", update: null });
+  assert.equal(current.id, plugins.CORE_UPDATE_SOURCE);
+  assert.equal(current.name, "Amaterasu Core");
+  assert.match(current.about, /^Amaterasu Core is every module Amaterasu ships\./);
+  assert.deepEqual([current.headline, current.tone, current.detail], ["Up to date", "good", null]);
+  // The host's own answer names what it runs; the selection is only a fallback.
+  assert.deepEqual([current.running, current.repository, current.checkedUnixMs],
+    [digest("d"), "amaterasu", 1_794_170_000_000]);
+  assert.deepEqual([current.actions, current.busy, current.steps, current.transfer, current.summary, current.changes, current.update],
+    [["check"], false, [], null, null, [], null]);
+  assert.equal(row({ phase: "current", update: null, source: null }).repository, "house");
+  // A host that still carries the last update once nothing is newer shows none.
+  assert.equal(row({ phase: "current" }).summary, null);
+
+  const idle = row({ phase: "idle", checked_unix_ms: null, update: null });
+  assert.deepEqual([idle.headline, idle.tone, idle.actions, idle.busy], ["Not checked yet", "neutral", ["check"], false]);
+  const checking = row({ phase: "checking", update: null });
+  assert.deepEqual([checking.headline, checking.actions, checking.busy], ["Checking for updates", [], true]);
+
+  const available = row({});
+  assert.deepEqual([available.headline, available.tone, available.detail], ["Update available", "attention", null]);
+  assert.deepEqual([available.actions, available.busy, available.update], [["download", "check"], false, digest("e")]);
+  assert.equal(available.summary, "5 of 6 modules change · 17.4 MB to download");
+  assert.equal(available.changes.length, 5);
+  assert.deepEqual(steps(available), ["Download:upcoming", "Verify:upcoming", "Wait for idle:upcoming", "Restart:upcoming"]);
+  assert.equal(available.transfer, null);
+
+  const downloading = row({ phase: "downloading", transferred_bytes: 4_550_000 });
+  assert.deepEqual([downloading.headline, downloading.actions, downloading.busy], ["Downloading update", ["cancel"], true]);
+  assert.deepEqual(downloading.transfer, { received: 4_550_000, total: 18_200_000 });
+  assert.deepEqual(steps(downloading), ["Download:current", "Verify:upcoming", "Wait for idle:upcoming", "Restart:upcoming"]);
+  // Everything has arrived but the host has not called it ready: it is verifying.
+  const verifying = row({ phase: "downloading", transferred_bytes: 18_200_001 });
+  assert.deepEqual(verifying.transfer, { received: 18_200_000, total: 18_200_000 });
+  assert.deepEqual(steps(verifying), ["Download:done", "Verify:current", "Wait for idle:upcoming", "Restart:upcoming"]);
+  // A download the host gave no size for has no end to measure against.
+  const unsized = row({ phase: "downloading", transferred_bytes: 7, update: { ...updateOffer, download_bytes: 0 } });
+  assert.deepEqual(unsized.transfer, { received: 7, total: null });
+  assert.equal(steps(unsized)[0], "Download:current");
+  assert.deepEqual(row({ phase: "downloading", update: null, transferred_bytes: 7 }).transfer, { received: 7, total: null });
+
+  const ready = row({ phase: "ready", transferred_bytes: 18_200_000 });
+  assert.deepEqual([ready.headline, ready.actions, ready.busy], ["Ready to install", ["activate", "check"], false]);
+  assert.match(ready.detail, /^Downloaded and verified\./);
+  assert.equal(ready.summary, "5 of 6 modules change · 17.4 MB downloaded");
+  assert.deepEqual(steps(ready), ["Download:done", "Verify:done", "Wait for idle:upcoming", "Restart:upcoming"]);
+
+  const waiting = row({ phase: "waiting_stream" });
+  assert.deepEqual([waiting.headline, waiting.tone, waiting.actions, waiting.busy],
+    ["Waiting for the stream to end", "attention", ["cancel"], true]);
+  assert.deepEqual(steps(waiting), ["Download:done", "Verify:done", "Wait for idle:current", "Restart:upcoming"]);
+  const activating = row({ phase: "activating" });
+  assert.deepEqual([activating.headline, activating.actions, activating.busy], ["Installing", [], true]);
+  assert.deepEqual(steps(activating), ["Download:done", "Verify:done", "Wait for idle:done", "Restart:current"]);
+
+  const failed = row({ phase: "failed", error: "verification_failed" });
+  assert.deepEqual([failed.headline, failed.tone, failed.busy], ["Update failed", "danger", false]);
+  assert.equal(failed.detail, plugins.packageUpdateFailureMessage("verification_failed"));
+  assert.deepEqual([failed.actions, failed.steps, failed.changes.length], [["download", "check"], [], 5]);
+  assert.deepEqual(row({ phase: "failed", error: "no_source", update: null }).actions, ["check"]);
+  const cancelled = row({ phase: "cancelled" });
+  assert.deepEqual([cancelled.headline, cancelled.tone, cancelled.actions], ["Update cancelled", "neutral", ["download", "check"]]);
+
+  // What the page shows when the host has no answer to give.
+  const loading = plain(plugins.coreUpdateSource({ state: "loading" }, null));
+  assert.deepEqual([loading.state, loading.running, loading.repository, loading.actions], ["loading", null, null, []]);
+  const absent = plain(plugins.coreUpdateSource({ state: "absent" }, running));
+  assert.deepEqual([absent.state, absent.headline, absent.detail, absent.actions, absent.busy],
+    ["unavailable", "Updates unavailable", "This host does not install updates from the console yet.", [], false]);
+  assert.deepEqual([absent.running, absent.repository], [digest("9"), "house"]);
+  const unsupported = plain(plugins.coreUpdateSource(
+    { state: "ready", status: plugins.parsePackageUpdateStatus({ ok: true, supported: false }) }, running));
+  assert.deepEqual([unsupported.state, unsupported.detail, unsupported.actions],
+    ["unavailable", "Updates from the console are not available on this platform yet.", []]);
+  const unreadable = plain(plugins.coreUpdateSource({ state: "failed", message: "Request timed out." }, running));
+  assert.deepEqual([unreadable.state, unreadable.headline, unreadable.detail, unreadable.actions],
+    ["unreadable", "Status unavailable", { kind: "literal", value: "Request timed out." }, []]);
+});
+
+test("every reason an update can stop, and every refusal, has its own plain sentence", () => {
+  const failures = [
+    "unsupported_platform", "no_source", "repository_unavailable", "catalog_download_failed", "catalog_rejected",
+    "candidate_ambiguous", "manifest_download_failed", "manifest_rejected", "download_failed", "verification_failed",
+    "activation_unavailable", "activation_failed", "activation_interrupted", "shutting_down",
+  ];
+  const generic = plugins.packageUpdateFailureMessage(null);
+  const sentences = failures.map((code) => plugins.packageUpdateFailureMessage(code));
+  assert.equal(new Set(sentences).size, failures.length, "no two failures share a sentence");
+  for (const sentence of [...sentences, generic]) {
+    assert.match(sentence, /^[A-Z].*\.$/);
+    assert.doesNotMatch(sentence, /_|manifest|catalog|sha|digest/i, "written for someone who is not a developer");
+  }
+  assert.ok(!sentences.includes(generic));
+  assert.equal(plugins.packageUpdateFailureMessage("not_a_known_code"), generic);
+  assert.equal(plugins.packageUpdateFailureMessage("constructor"), generic);
+
+  const refusals = ["busy", "nothing_to_download", "not_ready", "activation_in_progress", "shutting_down",
+    "unsupported_platform", "permission_denied"];
+  const refused = refusals.map((code) => plugins.packageUpdateRefusalMessage(code));
+  assert.equal(new Set(refused).size, refusals.length);
+  for (const sentence of refused) assert.match(sentence, /^[A-Z].*\.$/);
+  assert.equal(plugins.packageUpdateRefusalMessage("not_a_known_code"), null);
+  assert.equal(plugins.packageUpdateRefusalMessage(null), null);
+});
+
+test("other publishers' offers leave out what the Updates panel stands for", () => {
+  const selection = plugins.parsePackageSelectionStatus(selectionReply);
+  const native = (slot, implementation, version, manifest) =>
+    ({ slot, implementation, version, kind: "native_set", manifest_sha256: manifest });
+  const listed = plugins.parseRepositoryList({
+    ok: true,
+    repositories: [
+      // The repository that supplied the running package.
+      { ...repository, candidates: [
+        candidate,
+        native("amaterasu.runtime", "amaterasu-linux-session", "0.1.0", digest("d")),
+        native("amaterasu.runtime", "amaterasu-linux-session", "0.2.0", digest("e")),
+        native("amaterasu.rtx-hdr", "amaterasu-rtx-hdr", "0.1.0", digest("5")),
+      ] },
+      { ...repository, id: "studio", candidates: [
+        native("amaterasu.frame-limiter", "studio-frame-pacer", "0.3.0", digest("6")),
+        native("example.overlay", "example-overlay", "1.2.0", digest("7")),
+        native("studio.mirror", "studio-mirror", "1.0.0", digest("d")),
+      ] },
+    ],
+  });
+  const offers = plugins.availablePlugins(listed, selection, null);
+  assert.equal(offers.length, 6);
+  const kept = plain(plugins.otherPublisherOffers(offers, selection).map((offer) => `${offer.repository.id}:${offer.slot}`)).sort();
+  assert.deepEqual(kept, [
+    // A module the host does not run is still an offer, whoever lists it.
+    "publisher:amaterasu.rtx-hdr",
+    // A console interface is not part of the package the panel updates.
+    "publisher:amaterasu.ui",
+    // Another publisher's module is an offer even for a slot the host fills.
+    "studio:amaterasu.frame-limiter",
+    "studio:example.overlay",
+  ]);
+  // Without a recorded source, only an offer of the running package itself is left out.
+  const { source: _source, ...unsourcedRunning } = selectionReply.running;
+  const unsourced = plugins.parsePackageSelectionStatus({ ...selectionReply, running: unsourcedRunning });
+  assert.deepEqual(plain(plugins.otherPublisherOffers(plugins.availablePlugins(listed, unsourced, null), unsourced)
+    .map((offer) => offer.slot)).sort(),
+    ["amaterasu.frame-limiter", "amaterasu.rtx-hdr", "amaterasu.runtime", "amaterasu.ui", "example.overlay"]);
+  assert.equal(plugins.otherPublisherOffers(plugins.availablePlugins(listed, null, null), null).length, 6);
+});
+
+test("how long ago is counted in the largest whole unit", () => {
+  const now = 1_800_000_000_000;
+  const ago = (ms) => plain(plugins.elapsedSince(now, now - ms));
+  assert.equal(ago(0), null);
+  assert.equal(ago(59_999), null);
+  assert.equal(ago(-5_000), null, "a host clock ahead of the browser's is not a negative age");
+  assert.deepEqual(ago(60_000), { value: 1, unit: "minute" });
+  assert.deepEqual(ago(59 * 60_000 + 59_000), { value: 59, unit: "minute" });
+  assert.deepEqual(ago(60 * 60_000), { value: 1, unit: "hour" });
+  assert.deepEqual(ago(23 * 3_600_000), { value: 23, unit: "hour" });
+  assert.deepEqual(ago(49 * 3_600_000), { value: 2, unit: "day" });
+});

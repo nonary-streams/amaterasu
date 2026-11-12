@@ -42,8 +42,8 @@ namespace Amaterasu {
       panel("Credentials", el("p", "muted", "Manage accounts, passwords, and API tokens for this host."),
         el("div", "actions", button("Manage accounts", () => context.navigate("accounts")),
           ...(context.api.allows("tokens.manage") ? [button("Manage API tokens", () => context.navigate("tokens"))] : []))),
-      panel("Plugins", el("p", "muted", "Review the running package and this host's repositories."),
-        context.api.allows("configuration.read") ? button("View plugins", () => context.navigate("plugins")) : el("p", "muted", "Package details require configuration.read.")),
+      panel("Modules", el("p", "muted", "Review what this host runs, check for updates and manage its repositories."),
+        context.api.allows("configuration.read") ? button("View modules", () => context.navigate("plugins")) : el("p", "muted", "Package details require configuration.read.")),
     );
 
     function render(sessions: BrowserSessionView[]): void {

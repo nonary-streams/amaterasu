@@ -1,6 +1,21 @@
 namespace Amaterasu {
-  // What the management API reports about packages, modules and repositories,
-  // and the plugin manager's view of it. Nothing here touches the document.
+  // What the management API reports about packages, modules, updates and
+  // repositories, and the Modules page's view of it. Nothing here touches the
+  // document.
+
+  /// The page's views in tab order. `#plugins` alone opens the first.
+  export const PLUGINS_VIEWS: readonly PluginsView[] = ["core", "modules", "publishers", "repositories"];
+  export const DEFAULT_PLUGINS_VIEW: PluginsView = "core";
+
+  /// What two of the views were called while the page was named Plugins.
+  const FORMER_VIEW_NAMES: Readonly<Record<string, PluginsView>> = { installed: "modules", available: "publishers" };
+
+  /// The view a `#plugins/<name>` address opens, or null when it names none.
+  /// Addresses saved under the former names keep working.
+  export function pluginsViewFromAddress(name: string): PluginsView | null {
+    if ((PLUGINS_VIEWS as readonly string[]).includes(name)) return name as PluginsView;
+    return Object.hasOwn(FORMER_VIEW_NAMES, name) ? FORMER_VIEW_NAMES[name] ?? null : null;
+  }
 
   export interface RepositoryChoice {
     slot: string;
@@ -154,6 +169,142 @@ namespace Amaterasu {
         ...(loaded && Object.hasOwn(running, "modules") ? { modules: parseRunningModules(running.modules) } : {}),
         ...(loaded && Object.hasOwn(running, "source") ? { source: parsePackageSource(running.source) } : {}),
       },
+    };
+  }
+
+  // --- Updating the host's own package ---------------------------------------
+
+  export type PackageUpdatePhase =
+    | "idle" | "checking" | "current" | "available" | "downloading"
+    | "ready" | "waiting_stream" | "activating" | "failed" | "cancelled";
+
+  const UPDATE_PHASES: readonly PackageUpdatePhase[] = [
+    "idle", "checking", "current", "available", "downloading",
+    "ready", "waiting_stream", "activating", "failed", "cancelled",
+  ];
+
+  export type ModuleChangeKind = "updated" | "rebuilt" | "added" | "removed" | "unchanged";
+
+  const MODULE_CHANGE_KINDS: readonly ModuleChangeKind[] = ["updated", "rebuilt", "added", "removed", "unchanged"];
+
+  export interface PackageUpdateModule {
+    id: string;
+    /// Null for a module the update adds.
+    from: string | null;
+    /// Null for a module the update removes.
+    to: string | null;
+    change: ModuleChangeKind;
+    size: number;
+  }
+
+  export interface PackageUpdate {
+    repository: string;
+    slot: string;
+    implementation: string;
+    version: string;
+    digest: string;
+    sequence: string;
+    /// Every module of the new package, and any the update removes.
+    modules: PackageUpdateModule[];
+    downloadBytes: number;
+    totalBytes: number;
+  }
+
+  /// `supported: false` is a host that has the routes but cannot install on
+  /// its platform; nothing else in its reply is read.
+  export type PackageUpdateStatus =
+    | { supported: false }
+    | {
+      supported: true;
+      phase: PackageUpdatePhase;
+      checkedUnixMs: number | null;
+      source: PackageSource | null;
+      running: { digest: string; sequence: string };
+      update: PackageUpdate | null;
+      transferredBytes: number;
+      /// The host's code for why the last update stopped.
+      error: string | null;
+    };
+
+  /// The largest time an ECMAScript date can hold.
+  const LATEST_UNIX_MS = 8_640_000_000_000_000;
+
+  function releaseSequence(value: unknown): value is string {
+    return typeof value === "string" && /^(0|[1-9][0-9]{0,19})$/.test(value) &&
+      !(value.length === 20 && value > "18446744073709551615");
+  }
+
+  function byteCount(value: unknown): value is number {
+    return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+  }
+
+  function parseUpdateModules(value: unknown): PackageUpdateModule[] {
+    if (!Array.isArray(value) || value.length < 1 || value.length > 128) throw new Error("Update module list is invalid.");
+    const ids = new Set<string>();
+    const version = (candidate: unknown): candidate is string | null => candidate === null || plainText(candidate);
+    return value.map((entry: unknown) => {
+      const row = record(entry, "Update module is invalid.");
+      const change = row.change;
+      if (typeof row.id !== "string" || !IDENTITY.test(row.id) || ids.has(row.id) ||
+          !version(row.from) || !version(row.to) || !byteCount(row.size) ||
+          typeof change !== "string" || !(MODULE_CHANGE_KINDS as readonly string[]).includes(change) ||
+          (row.from === null) !== (change === "added") || (row.to === null) !== (change === "removed"))
+        throw new Error("Update module is invalid.");
+      ids.add(row.id);
+      return { id: row.id, from: row.from, to: row.to, change: change as ModuleChangeKind, size: row.size };
+    });
+  }
+
+  function parsePackageUpdate(value: unknown): PackageUpdate {
+    const update = record(value, "Package update is invalid.");
+    if (typeof update.repository !== "string" || !IDENTITY.test(update.repository) ||
+        typeof update.slot !== "string" || !IDENTITY.test(update.slot) ||
+        !plainText(update.implementation) || !plainText(update.version) ||
+        typeof update.digest !== "string" || !DIGEST.test(update.digest) ||
+        !releaseSequence(update.sequence) ||
+        !byteCount(update.download_bytes) || !byteCount(update.total_bytes))
+      throw new Error("Package update is invalid.");
+    return {
+      repository: update.repository,
+      slot: update.slot,
+      implementation: update.implementation,
+      version: update.version,
+      digest: update.digest,
+      sequence: update.sequence,
+      modules: parseUpdateModules(update.modules),
+      downloadBytes: update.download_bytes,
+      totalBytes: update.total_bytes,
+    };
+  }
+
+  export function parsePackageUpdateStatus(value: unknown): PackageUpdateStatus {
+    const reply = record(value, "Package update response is invalid.");
+    if (reply.ok !== true) throw new Error("Package update status is unavailable.");
+    if (reply.supported === false) return { supported: false };
+    if (reply.supported !== true) throw new Error("Package update support is invalid.");
+    const phase = reply.phase;
+    if (typeof phase !== "string" || !(UPDATE_PHASES as readonly string[]).includes(phase))
+      throw new Error("Package update phase is invalid.");
+    const checked = reply.checked_unix_ms;
+    if (checked !== null &&
+        (typeof checked !== "number" || !Number.isSafeInteger(checked) || checked < 0 || checked > LATEST_UNIX_MS))
+      throw new Error("Package update check time is invalid.");
+    const running = record(reply.running, "Running package status is invalid.");
+    if (typeof running.digest !== "string" || !DIGEST.test(running.digest) || !releaseSequence(running.sequence))
+      throw new Error("Running package status is invalid.");
+    if (!byteCount(reply.transferred_bytes)) throw new Error("Package update progress is invalid.");
+    const error = reply.error;
+    if (error !== null && (typeof error !== "string" || !/^[a-z0-9_]{1,64}$/.test(error)))
+      throw new Error("Package update error is invalid.");
+    return {
+      supported: true,
+      phase: phase as PackageUpdatePhase,
+      checkedUnixMs: checked,
+      source: reply.source === null ? null : parsePackageSource(reply.source),
+      running: { digest: running.digest, sequence: running.sequence },
+      update: reply.update === null ? null : parsePackageUpdate(reply.update),
+      transferredBytes: reply.transferred_bytes,
+      error,
     };
   }
 
@@ -368,6 +519,102 @@ namespace Amaterasu {
     return { name: nameFromIdentity(id), summary: "", category: "Other" };
   }
 
+  // --- Families of core modules and where their source lives -----------------
+
+  export interface SourceRepository {
+    /// "owner/name", as its address writes it.
+    name: string;
+    url: string;
+  }
+
+  export interface ModuleFamily {
+    id: string;
+    name: string;
+    summary: string;
+    /// Every module of the family, on any platform. A host runs some of them.
+    members: readonly string[];
+    /// The repositories the family is built from.
+    sources: readonly SourceRepository[];
+  }
+
+  function sourceRepository(name: string): SourceRepository {
+    return { name: `nonary-streams/${name}`, url: `https://github.com/nonary-streams/${name}` };
+  }
+
+  /// Where a module without a repository of its own is built.
+  export const AMATERASU_SOURCE: SourceRepository = sourceRepository("amaterasu");
+
+  /// How a module of Amaterasu's that belongs to no family is described.
+  export const BUILT_IN_LABEL = "Built into Amaterasu";
+
+  // Family, name, summary, each member with the repository it is built from,
+  // and any repository the family draws on that builds none of its modules.
+  const FAMILY_TABLE: readonly (readonly [
+    string, string, string, readonly (readonly [string, string])[], (readonly string[])?,
+  ])[] = [
+    ["input", "Input", "Delivers keyboard, mouse, touch and controller input from the client to this host.",
+      [["amaterasu.input", "amaterasu-input"]]],
+    ["audio", "Audio", "Captures this host's sound and encodes it for the stream.",
+      [["amaterasu.audio", "amaterasu-audio"], ["amaterasu.audio-encode", "amaterasu-audio-encode"]]],
+    ["capture", "Screen capture",
+      "Reads the picture to stream from a display, the desktop portal or the stream's own virtual display.",
+      [["amaterasu.capture-kms", "amaterasu-capture"], ["amaterasu.capture-pipewire", "amaterasu-capture"],
+        ["amaterasu.capture-x11", "amaterasu-capture"], ["amaterasu.capture-dxgi", "amaterasu-capture"],
+        ["amaterasu.capture-wgc", "amaterasu-capture"], ["amaterasu.capture-black", "amaterasu-capture"],
+        ["amaterasu.capture-vkms", "amaterasu-capture-vkms"]]],
+    ["video", "Video encoding",
+      "Processes captured frames and encodes them with the host's hardware or software encoders.",
+      [["amaterasu.video", "amaterasu-encode-video"], ["amaterasu.linux-session-video", "amaterasu-encode-video"],
+        ["amaterasu.encode", "amaterasu-encode-video"]]],
+    ["display", "Display", "Lists displays and prepares the right one, at the right mode, for each stream.",
+      [["amaterasu.display", "amaterasu-display"], ["amaterasu.display-settings", "amaterasu"],
+        ["amaterasu.virtual-display", "amaterasu"]]],
+    ["remote-session", "Remote session", "Provides the remote monitor and remote input modes.",
+      [["amaterasu.remote-session", "amaterasu-remote-session"]]],
+    ["rtx-hdr", "RTX HDR", "Converts SDR streams to HDR with NVIDIA RTX.",
+      [["amaterasu.rtx-hdr", "amaterasu-rtx-hdr"]]],
+    ["frame-limiter", "Frame limiter", "Caps a game's frame rate to match the stream.",
+      [["amaterasu.frame-limiter", "amaterasu-frame-limiter"]]],
+    ["statistics", "Statistics", "Samples host and stream statistics and keeps session history.",
+      [["amaterasu.host-metrics", "amaterasu-stats"], ["amaterasu.session-history", "amaterasu-stats"]]],
+    ["runtime", "Runtime and SDK",
+      "Loads every module and carries the calls between them; modules are written against the SDK.",
+      [["amaterasu.runtime", "amaterasu"]], ["amaterasu-sdk"]],
+  ];
+
+  const MODULE_HOMES = new Map<string, { family: ModuleFamily; source: SourceRepository }>();
+
+  /// The core module families, in the order the page shows them.
+  export const MODULE_FAMILIES: readonly ModuleFamily[] = FAMILY_TABLE.map(([id, name, summary, members, also = []]) => {
+    const repositories = [...new Set([...members.map(([, repository]) => repository), ...also])];
+    const family: ModuleFamily = {
+      id, name, summary,
+      members: members.map(([module]) => module),
+      sources: repositories.map(sourceRepository),
+    };
+    for (const [module, repository] of members) MODULE_HOMES.set(module, { family, source: sourceRepository(repository) });
+    return family;
+  });
+
+  export interface ModuleOrigin {
+    family: ModuleFamily | null;
+    /// The family's name, or how a module of Amaterasu's without one is
+    /// described. Null for a module Amaterasu does not publish.
+    label: string | null;
+    /// Where the module's source is kept, when this console knows.
+    source: SourceRepository | null;
+  }
+
+  /// The family a module belongs to and the repository it is built from. A
+  /// module of Amaterasu's outside every family is built into Amaterasu itself;
+  /// nothing is claimed about a module from another publisher.
+  export function moduleOrigin(id: string): ModuleOrigin {
+    const home = MODULE_HOMES.get(id);
+    if (home) return { family: home.family, label: home.family.name, source: home.source };
+    if (id.startsWith("amaterasu.")) return { family: null, label: BUILT_IN_LABEL, source: AMATERASU_SOURCE };
+    return { family: null, label: null, source: null };
+  }
+
   export interface InstalledPlugin extends PluginPresentation {
     id: string;
     version: string;
@@ -482,6 +729,20 @@ namespace Amaterasu {
     return "Not installed";
   }
 
+  /// The offers the Updates panel does not already stand for. A module set
+  /// that is the running package itself, or that comes from the repository
+  /// which supplied it and fills a slot the host already runs, is Amaterasu's
+  /// own package: it is updated as a whole, not picked from a list.
+  export function otherPublisherOffers(
+    offers: readonly AvailablePlugin[],
+    selection: PackageSelectionStatus | null,
+  ): AvailablePlugin[] {
+    const supplier = selection?.running.source?.repository ?? null;
+    const running = new Set((selection?.running.modules ?? []).map((module) => module.id));
+    return offers.filter((offer) => offer.kind !== "native_set" ||
+      !(offer.runningThisPackage || (offer.repository.id === supplier && running.has(offer.slot))));
+  }
+
   export interface PluginFilter { query: string; category: PluginCategory | "" }
 
   export function matchesPluginFilter(
@@ -494,6 +755,257 @@ namespace Amaterasu {
     const text = [plugin.name, plugin.summary, plugin.category, plugin.id ?? "", plugin.slot ?? "", plugin.repository?.id ?? ""]
       .join(" ").toLowerCase();
     return terms.every((term) => text.includes(term));
+  }
+
+  // --- What an update changes -----------------------------------------------
+
+  export interface ModuleChange {
+    id: string;
+    name: string;
+    change: Exclude<ModuleChangeKind, "unchanged">;
+    /// What is shown beside the name: the two versions, or the kind of change.
+    detail: string;
+  }
+
+  const CHANGE_ORDER: readonly ModuleChangeKind[] = ["updated", "rebuilt", "added", "removed"];
+
+  /// The modules an update touches: new versions first, then rebuilds,
+  /// additions and removals, each by name.
+  export function moduleChanges(update: PackageUpdate): ModuleChange[] {
+    return update.modules.flatMap((module): ModuleChange[] => module.change === "unchanged" ? [] : [{
+      id: module.id,
+      name: pluginPresentation(module.id).name,
+      change: module.change,
+      detail: module.change === "updated" ? `${module.from ?? ""} → ${module.to ?? ""}` : module.change,
+    }]).sort((a, b) => CHANGE_ORDER.indexOf(a.change) - CHANGE_ORDER.indexOf(b.change) ||
+      a.name.localeCompare(b.name) || a.id.localeCompare(b.id));
+  }
+
+  /// One line for an update: how much of the package changes and how large
+  /// the download is.
+  export function packageUpdateSummary(update: PackageUpdate, downloaded = false): string {
+    const total = update.modules.length;
+    const changed = update.modules.filter((module) => module.change !== "unchanged").length;
+    return `${changed} of ${total} ${total === 1 ? "module" : "modules"} ${changed === 1 ? "changes" : "change"}` +
+      ` · ${formatBytes(update.downloadBytes)} ${downloaded ? "downloaded" : "to download"}`;
+  }
+
+  const UPDATE_FAILURES: Readonly<Record<string, string>> = {
+    unsupported_platform: "Updates from the console are not available on this platform yet.",
+    no_source: "This host's package did not come from a repository, so there is nowhere to look for a newer one. Install Amaterasu from a published release to get updates here.",
+    repository_unavailable: "The repository this host's package came from is not available. Open Repositories and check that it is still listed.",
+    catalog_download_failed: "The host could not reach the repository to look for updates. Check the host's internet connection and try again.",
+    catalog_rejected: "The repository's list of releases did not pass its signature check, so the host ignored it. Try again later, and tell the publisher if it keeps happening.",
+    candidate_ambiguous: "The repository lists more than one package that could replace this one, so the host did not choose. Its publisher needs to correct the list; try again later.",
+    manifest_download_failed: "The host found an update but could not download its description. Check the host's internet connection and try again.",
+    manifest_rejected: "The update's description did not pass its signature check, so the host did not use it. Try again later, and tell the publisher if it keeps happening.",
+    download_failed: "The download did not finish. Check the host's internet connection and download the update again.",
+    verification_failed: "The downloaded files did not match what the publisher signed, so the host discarded them. Download the update again.",
+    activation_unavailable: "The host could not begin the install. Nothing was changed. Try again, and restart Amaterasu if it keeps happening.",
+    activation_failed: "The update could not be installed, and the host kept the package it was running. Try again; if it fails again, the host log in Diagnostics says why.",
+    activation_interrupted: "The host stopped before the install finished and is running its previous package. Check for updates to start again.",
+    shutting_down: "The host was shutting down, so the update stopped. Check for updates when it is running again.",
+  };
+
+  /// Why an update stopped, in words someone who is not a developer can act on.
+  export function packageUpdateFailureMessage(code: string | null): string {
+    return (code !== null && Object.hasOwn(UPDATE_FAILURES, code) && UPDATE_FAILURES[code]) ||
+      "The update did not complete. Check for updates to try again.";
+  }
+
+  const UPDATE_REFUSALS: Readonly<Record<string, string>> = {
+    busy: "The host is already working on an update. Wait for it to finish, or cancel it first.",
+    nothing_to_download: "There is no update to download. Check for updates first.",
+    not_ready: "The update has not finished downloading, so it cannot be installed yet.",
+    activation_in_progress: "The host is already installing this update.",
+    shutting_down: "The host is shutting down. Try again when it is running again.",
+    unsupported_platform: "Updates from the console are not available on this platform yet.",
+    permission_denied: "This account is not allowed to do that. Installing an update needs an administrator who is signed in to the console.",
+  };
+
+  /// Why the host refused a request, or null for a code this console does not know.
+  export function packageUpdateRefusalMessage(code: string | null): string | null {
+    return (code !== null && Object.hasOwn(UPDATE_REFUSALS, code) && UPDATE_REFUSALS[code]) || null;
+  }
+
+  // --- The Updates panel's rows ---------------------------------------------
+
+  /// The requests a row can send for its source.
+  export type UpdateAction = "check" | "download" | "activate" | "cancel";
+
+  /// Where a source's update stands. The last three are not phases a host
+  /// reports: its answer has not arrived, could not be read, or says updates
+  /// cannot be installed from the console.
+  export type UpdateSourceState = PackageUpdatePhase | "loading" | "unreadable" | "unavailable";
+
+  export type UpdateTone = "good" | "attention" | "danger" | "neutral";
+
+  export interface UpdateStep { label: string; state: "done" | "current" | "upcoming" }
+
+  /// One row of the Updates panel: something the host can bring up to date,
+  /// and everything the row shows about it. Amaterasu Core is the only source
+  /// a host reports today; a module from another publisher would be one more.
+  export interface UpdateSourceView {
+    id: string;
+    name: string;
+    /// What the source is, for the row's closing sentence.
+    about: string;
+    /// The repository it is published from, when the host knows.
+    repository: string | null;
+    /// The digest of what the host runs now.
+    running: string | null;
+    checkedUnixMs: number | null;
+    state: UpdateSourceState;
+    /// The state in words: the row's answer to "is this up to date?".
+    headline: string;
+    tone: UpdateTone;
+    /// A sentence for a state that needs explaining.
+    detail: TextValue | null;
+    /// The update the row describes, so a redraw can tell a new one from the same one.
+    update: string | null;
+    /// How much the update changes, and the modules it touches.
+    summary: string | null;
+    changes: ModuleChange[];
+    /// The stages of an update under way; empty when none is.
+    steps: UpdateStep[];
+    /// Bytes received while downloading; `total` is null when the host gave none.
+    transfer: { received: number; total: number | null } | null;
+    /// The requests that make sense in this state.
+    actions: UpdateAction[];
+    /// True while the host is working and the row should be read again.
+    busy: boolean;
+  }
+
+  /// What the page has heard about a source: nothing yet, the host's answer,
+  /// no such routes on this host, or a request that failed.
+  export type UpdateReading =
+    | { state: "loading" }
+    | { state: "absent" }
+    | { state: "failed"; message: string }
+    | { state: "ready"; status: PackageUpdateStatus };
+
+  export const CORE_UPDATE_SOURCE = "amaterasu-core";
+
+  const CORE_UPDATE_ABOUT = "Amaterasu Core is every module Amaterasu ships. It updates as one signed package, which can also add new modules, and the host returns to the previous package if the new one does not start.";
+
+  const UPDATE_STEP_LABELS = ["Download", "Verify", "Wait for idle", "Restart"] as const;
+
+  const UPDATE_HEADLINES: Readonly<Record<PackageUpdatePhase, string>> = {
+    idle: "Not checked yet",
+    checking: "Checking for updates",
+    current: "Up to date",
+    available: "Update available",
+    downloading: "Downloading update",
+    ready: "Ready to install",
+    waiting_stream: "Waiting for the stream to end",
+    activating: "Installing",
+    failed: "Update failed",
+    cancelled: "Update cancelled",
+  };
+
+  const UPDATE_DETAILS: Readonly<Partial<Record<PackageUpdatePhase, string>>> = {
+    ready: "Downloaded and verified. Once you choose to install it, the host restarts as soon as no stream is running.",
+    waiting_stream: "The host installs the update and restarts as soon as the stream that is running ends.",
+    activating: "The host is restarting with the new package. This page follows along and reconnects when it is back.",
+    cancelled: "Nothing was installed. The host is still running the same package.",
+  };
+
+  /// How far an update has come: `done` stages finished, and the one in
+  /// progress when there is one. Null outside an update.
+  function updateProgress(phase: PackageUpdatePhase, received: number, total: number | null): { done: number; current: number | null } | null {
+    switch (phase) {
+      case "available": return { done: 0, current: null };
+      // The host verifies what it downloaded before it reports the update ready.
+      case "downloading": return total !== null && received >= total ? { done: 1, current: 1 } : { done: 0, current: 0 };
+      case "ready": return { done: 2, current: null };
+      case "waiting_stream": return { done: 2, current: 2 };
+      case "activating": return { done: 3, current: 3 };
+      default: return null;
+    }
+  }
+
+  /// The Amaterasu Core row. `running` is what the package selection says the
+  /// host runs, used when the host's update status says nothing.
+  export function coreUpdateSource(
+    reading: UpdateReading,
+    running: { digest: string | null; repository: string | null } | null,
+  ): UpdateSourceView {
+    const row: UpdateSourceView = {
+      id: CORE_UPDATE_SOURCE,
+      name: "Amaterasu Core",
+      about: CORE_UPDATE_ABOUT,
+      repository: running?.repository ?? null,
+      running: running?.digest ?? null,
+      checkedUnixMs: null,
+      state: "loading",
+      headline: "Loading…",
+      tone: "neutral",
+      detail: null,
+      update: null,
+      summary: null,
+      changes: [],
+      steps: [],
+      transfer: null,
+      actions: [],
+      busy: false,
+    };
+    if (reading.state === "loading") return row;
+    if (reading.state === "failed")
+      return { ...row, state: "unreadable", headline: "Status unavailable", detail: { kind: "literal", value: reading.message } };
+    if (reading.state === "absent" || !reading.status.supported)
+      return {
+        ...row,
+        state: "unavailable",
+        headline: "Updates unavailable",
+        detail: reading.state === "absent"
+          ? "This host does not install updates from the console yet."
+          : "Updates from the console are not available on this platform yet.",
+      };
+    const status = reading.status;
+    const phase = status.phase;
+    // Before a check has finished, or after one found nothing, there is no update to describe.
+    const update = phase === "idle" || phase === "checking" || phase === "current" ? null : status.update;
+    const total = update && update.downloadBytes > 0 ? update.downloadBytes : null;
+    const received = total === null ? status.transferredBytes : Math.min(status.transferredBytes, total);
+    const progress = updateProgress(phase, received, total);
+    const settled = phase === "failed" || phase === "cancelled";
+    return {
+      ...row,
+      repository: status.source?.repository ?? row.repository,
+      running: status.running.digest,
+      checkedUnixMs: status.checkedUnixMs,
+      state: phase,
+      headline: UPDATE_HEADLINES[phase],
+      tone: phase === "current" ? "good" : phase === "failed" ? "danger"
+        : phase === "idle" || phase === "checking" || phase === "cancelled" ? "neutral" : "attention",
+      detail: phase === "failed" ? packageUpdateFailureMessage(status.error) : UPDATE_DETAILS[phase] ?? null,
+      update: update?.digest ?? null,
+      summary: update
+        ? packageUpdateSummary(update, phase === "ready" || phase === "waiting_stream" || phase === "activating")
+        : null,
+      changes: update ? moduleChanges(update) : [],
+      steps: progress ? UPDATE_STEP_LABELS.map((label, index) => ({
+        label,
+        state: index === progress.current ? "current" : index < progress.done ? "done" : "upcoming",
+      })) : [],
+      transfer: phase === "downloading" ? { received, total } : null,
+      actions: phase === "available" || (settled && update) ? ["download", "check"]
+        : phase === "ready" ? ["activate", "check"]
+        : phase === "downloading" || phase === "waiting_stream" ? ["cancel"]
+        : phase === "checking" || phase === "activating" ? []
+        : ["check"],
+      busy: phase === "checking" || phase === "downloading" || phase === "waiting_stream" || phase === "activating",
+    };
+  }
+
+  /// How long ago something happened, in the largest whole unit that fits.
+  /// Null within the last minute, and for a time the clock has not reached.
+  export function elapsedSince(nowMs: number, thenMs: number): { value: number; unit: "minute" | "hour" | "day" } | null {
+    const minutes = Math.floor((nowMs - thenMs) / 60_000);
+    if (minutes < 1) return null;
+    if (minutes < 60) return { value: minutes, unit: "minute" };
+    const hours = Math.floor(minutes / 60);
+    return hours < 24 ? { value: hours, unit: "hour" } : { value: Math.floor(hours / 24), unit: "day" };
   }
 
   // --- Small formatters -----------------------------------------------------

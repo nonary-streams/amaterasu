@@ -8,6 +8,18 @@ namespace Amaterasu {
   }
 
   const maximumUpdateCheckIntervalSeconds = 0x7fff_ffff;
+  // Releases are published under the organization the repository moved to. A
+  // host built before the move still reports the address it had then.
+  const releasePagePrefixes = [
+    "https://github.com/nonary-streams/amaterasu/releases/tag/",
+    "https://github.com/Nonary/amaterasu/releases/tag/",
+  ] as const;
+
+  function isReleasePage(value: unknown): value is string {
+    return typeof value === "string" &&
+      releasePagePrefixes.some((prefix) => value.startsWith(prefix)) &&
+      !/[\u0000-\u0020\u007f-\u009f]/u.test(value);
+  }
   const updaterRenderGenerations = new WeakMap<HTMLElement, number>();
   type UpdaterNotificationDelivery = "pending" | "notified" | "disabled" | "unavailable";
 
@@ -97,9 +109,7 @@ namespace Amaterasu {
     if (!value || typeof value !== "object" || Array.isArray(value))
       throw new Error("Updater release status is invalid.");
     const release = value as Record<string, unknown>;
-    if (typeof release.version !== "string" || typeof release.url !== "string" ||
-        !release.url.startsWith("https://github.com/Nonary/amaterasu/releases/tag/") ||
-        /[\u0000-\u0020\u007f-\u009f]/u.test(release.url))
+    if (typeof release.version !== "string" || !isReleasePage(release.url))
       throw new Error("Updater release status is invalid.");
     return { version: release.version, url: release.url };
   }
@@ -123,9 +133,7 @@ namespace Amaterasu {
         throw new Error("Updater release status is invalid.");
       const update = reply.available_update as Record<string, unknown>;
       if (typeof update.version !== "string" || typeof update.prerelease !== "boolean" ||
-          typeof update.release_url !== "string" ||
-          !update.release_url.startsWith("https://github.com/Nonary/amaterasu/releases/tag/") ||
-          /[\u0000-\u0020\u007f-\u009f]/u.test(update.release_url))
+          !isReleasePage(update.release_url))
         throw new Error("Updater release status is invalid.");
       availableUpdate = {
         version: update.version,
@@ -140,9 +148,7 @@ namespace Amaterasu {
         throw new Error("Updater notification status is invalid.");
       const state = reply.notification as Record<string, unknown>;
       if (typeof state.version !== "string" || typeof state.prerelease !== "boolean" ||
-          typeof state.release_url !== "string" ||
-          !state.release_url.startsWith("https://github.com/Nonary/amaterasu/releases/tag/") ||
-          /[\u0000-\u0020\u007f-\u009f]/u.test(state.release_url) ||
+          !isReleasePage(state.release_url) ||
           !["pending", "notified", "disabled", "unavailable"].includes(String(state.delivery)))
         throw new Error("Updater notification status is invalid.");
       notification = {

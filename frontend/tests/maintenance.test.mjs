@@ -28,8 +28,9 @@ function fixture(api) {
   }
   const content = new Element("main");
   const notices = [];
-  sandbox.Amaterasu.renderMaintenance({content, api, notify(value) { notices.push(value); }, navigate() {} });
-  return {content, notices};
+  const visited = [];
+  sandbox.Amaterasu.renderMaintenance({content, api, notify(value) { notices.push(value); }, navigate(page) { visited.push(page); } });
+  return {content, notices, visited};
 }
 const current = {session_id:"a".repeat(64),subject:"admin",expires_at:200,refresh_expires_at:300,remember_me:true,current:true};
 const peer = {session_id:"b".repeat(64),subject:"viewer",expires_at:200,refresh_expires_at:300,remember_me:true,current:false};
@@ -75,4 +76,19 @@ test("malformed session lists do not expose revoke controls", async () => {
   const {content} = fixture(api);
   await wait(() => content.textContent.includes("current session could not be identified"));
   assert.equal(find(content, (el) => el.tagName === "button" && el.textContent === "Revoke session"), undefined);
+});
+
+test("maintenance points to the Modules page under the address it has always had", async () => {
+  const api = {allows:()=>true, async post() { return {ok:true,sessions:[current]}; }};
+  const {content,visited} = fixture(api);
+  const panels = descend(content).filter((el) => el.className === "panel");
+  const modules = panels.find((panel) => find(panel, (el) => el.tagName === "h2")?.textContent === "Modules");
+  assert.ok(modules, "the panel is titled Modules");
+  assert.equal(find(content, (el) => el.tagName === "h2" && el.textContent === "Plugins"), undefined);
+  assert.equal(find(content, (el) => el.tagName === "button" && /plugins/i.test(el.textContent)), undefined);
+  find(modules, (el) => el.tagName === "button" && el.textContent === "View modules").click();
+  assert.deepEqual(visited, ["plugins"]);
+
+  const readOnly = fixture({allows:(scope)=>scope !== "configuration.read", async post() { return {ok:true,sessions:[current]}; }});
+  assert.equal(find(readOnly.content, (el) => el.tagName === "button" && el.textContent === "View modules"), undefined);
 });

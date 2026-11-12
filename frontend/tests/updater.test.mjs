@@ -89,17 +89,17 @@ test("updater status accepts selected release and delivery states", () => {
     check_in_progress: false,
     last_check_unix_ms: 1790784000000,
     last_error: null,
-    latest_stable: { version: "v2.0.0", url: "https://github.com/Nonary/amaterasu/releases/tag/v2.0.0" },
+    latest_stable: { version: "v2.0.0", url: "https://github.com/nonary-streams/amaterasu/releases/tag/v2.0.0" },
     latest_prerelease: null,
     available_update: {
       version: "v2.0.0",
-      release_url: "https://github.com/Nonary/amaterasu/releases/tag/v2.0.0",
+      release_url: "https://github.com/nonary-streams/amaterasu/releases/tag/v2.0.0",
       prerelease: false,
     },
     notification: {
       version: "v2.0.0",
       prerelease: false,
-      release_url: "https://github.com/Nonary/amaterasu/releases/tag/v2.0.0",
+      release_url: "https://github.com/nonary-streams/amaterasu/releases/tag/v2.0.0",
       delivery: "notified",
     },
   });
@@ -117,6 +117,55 @@ test("updater status accepts selected release and delivery states", () => {
     available_update: null,
     notification: null,
   }));
+});
+
+test("updater status accepts release pages where the repository lives now and where it used to", () => {
+  const quiet = {
+    ok: true,
+    settings_ready: true,
+    revision: 4,
+    check_in_progress: false,
+    last_check_unix_ms: 1790784000000,
+    last_error: null,
+    latest_stable: null,
+    latest_prerelease: null,
+    available_update: null,
+    notification: null,
+  };
+  const current = "https://github.com/nonary-streams/amaterasu/releases/tag/v2.1.0";
+  // What a host built before the repository moved still reports.
+  const former = "https://github.com/Nonary/amaterasu/releases/tag/v2.1.0";
+  const everywhere = (url) => ({
+    ...quiet,
+    latest_stable: { version: "v2.1.0", url },
+    latest_prerelease: { version: "v2.1.0", url },
+    available_update: { version: "v2.1.0", release_url: url, prerelease: false },
+    notification: { version: "v2.1.0", prerelease: false, release_url: url, delivery: "pending" },
+  });
+  for (const url of [current, former]) {
+    const status = updater.parseUpdaterStatusReply(everywhere(url));
+    assert.equal(status.latest_stable.url, url);
+    assert.equal(status.latest_prerelease.url, url);
+    assert.equal(status.available_update.release_url, url);
+    assert.equal(status.notification.release_url, url);
+  }
+  // Each place a release page is reported is held to the same addresses.
+  for (const url of [
+    "https://github.com/nonary-streams/amaterasu-input/releases/tag/v2.1.0",
+    "https://github.com/someone-else/amaterasu/releases/tag/v2.1.0",
+    "https://github.com/nonary-streams/amaterasu/releases/latest",
+    "https://github.com.example.test/nonary-streams/amaterasu/releases/tag/v2.1.0",
+    "http://github.com/nonary-streams/amaterasu/releases/tag/v2.1.0",
+    "https://github.com/nonary-streams/amaterasu/releases/tag/v2.1.0 javascript:alert(1)",
+    7,
+  ]) {
+    assert.throws(() => updater.parseUpdaterStatusReply({ ...quiet, latest_stable: { version: "v2.1.0", url } }), /release status/);
+    assert.throws(() => updater.parseUpdaterStatusReply({ ...quiet, latest_prerelease: { version: "v2.1.0", url } }), /release status/);
+    assert.throws(() => updater.parseUpdaterStatusReply(
+      { ...quiet, available_update: { version: "v2.1.0", release_url: url, prerelease: false } }), /release status/);
+    assert.throws(() => updater.parseUpdaterStatusReply(
+      { ...quiet, notification: { version: "v2.1.0", prerelease: false, release_url: url, delivery: "pending" } }), /notification status/);
+  }
 });
 
 test("updater settings use a revisioned write and verify persisted readback", async () => {

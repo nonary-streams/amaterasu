@@ -1,8 +1,8 @@
 namespace Amaterasu {
-  // The plugin manager: what this host runs, what its repositories offer, and
-  // the repositories themselves.
-
-  export const PLUGINS_VIEWS: readonly PluginsView[] = ["installed", "available", "repositories"];
+  // The Modules page: whether what the host runs is up to date, the families
+  // of core modules and where their source lives, every module it loaded, what
+  // other publishers offer, and the repositories themselves. The page keeps the
+  // `plugins` address and class names it had when it was called Plugins.
 
   type Loadable<T> =
     | { state: "loading" }
@@ -12,25 +12,71 @@ namespace Amaterasu {
   type Part = Node | TextValue | null | undefined;
 
   const VIEW_LABELS: Readonly<Record<PluginsView, string>> = {
-    installed: "Installed",
-    available: "Available",
+    core: "Core modules",
+    modules: "All modules",
+    publishers: "Other publishers",
     repositories: "Repositories",
   };
   const CHANGE_POLL_MS = 600;
   const CHANGE_TIMEOUT_MS = 150_000;
   const COLLAPSED_NAMES = 8;
+  const COLLAPSED_CHANGES = 6;
+  const UPDATE_POLL_MS = 1500;
+  /// How long a host that is installing may go without answering before the
+  /// page stops waiting for it.
+  const RESTART_PATIENCE_MS = 180_000;
+  const CHECKED_REFRESH_MS = 30_000;
 
   function lit(value: string): TextValue {
     return typeof Amaterasu.literalText === "function" ? Amaterasu.literalText(value) : value;
   }
 
+  function intlLocale(): string | undefined {
+    return typeof Amaterasu.activeIntlLocale === "function" ? Amaterasu.activeIntlLocale() : undefined;
+  }
+
   function formatDate(unixSeconds: number): string {
-    const locale = typeof Amaterasu.activeIntlLocale === "function" ? Amaterasu.activeIntlLocale() : undefined;
     try {
-      return new Intl.DateTimeFormat(locale, { dateStyle: "medium" }).format(new Date(unixSeconds * 1000));
+      return new Intl.DateTimeFormat(intlLocale(), { dateStyle: "medium" }).format(new Date(unixSeconds * 1000));
     } catch {
       return new Date(unixSeconds * 1000).toISOString().slice(0, 10);
     }
+  }
+
+  function formatDateTime(unixMs: number): string {
+    try {
+      return new Intl.DateTimeFormat(intlLocale(), { dateStyle: "medium", timeStyle: "short" }).format(new Date(unixMs));
+    } catch {
+      return new Date(unixMs).toISOString();
+    }
+  }
+
+  function formatElapsed(elapsed: { value: number; unit: "minute" | "hour" | "day" }): string {
+    try {
+      return new Intl.RelativeTimeFormat(intlLocale(), { numeric: "always" }).format(-elapsed.value, elapsed.unit);
+    } catch {
+      return `${elapsed.value} ${elapsed.unit}${elapsed.value === 1 ? "" : "s"} ago`;
+    }
+  }
+
+  const shownText = new WeakMap<Element, string>();
+
+  /// Replaces an element's text only when it differs. A redraw that changed
+  /// nothing then leaves a live region silent and a focused control alone.
+  function setText(node: HTMLElement, value: TextValue | null): void {
+    const key = value === null ? "" : typeof value === "string" ? `message:${value}` : `${value.kind}:${value.value}`;
+    if (shownText.get(node) === key) return;
+    shownText.set(node, key);
+    node.replaceChildren(...(value === null ? [] : el("span", "", value).childNodes));
+  }
+
+  function sourceLink(source: SourceRepository): HTMLAnchorElement {
+    const link = el("a", "plugin-source-link", lit(source.name));
+    link.href = source.url;
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    setLocalizedAttribute(link, "title", "Opens on GitHub in a new tab");
+    return link;
   }
 
   function factList(rows: readonly (readonly [string, Part] | null)[]): HTMLElement {
@@ -50,17 +96,24 @@ namespace Amaterasu {
     return el("div", "plugin-quiet-state", el("h3", "", title), el("p", "muted", description), action);
   }
 
-  /// A list of service or module names that stays short until asked.
-  function nameList(names: readonly string[], render: (name: string) => Part): HTMLElement {
-    const list = el("ul", "plugin-names");
-    const show = (count: number) => list.replaceChildren(...names.slice(0, count).map((name) => el("li", "", render(name))));
-    if (names.length <= COLLAPSED_NAMES + 2) {
-      show(names.length);
+  /// A list that stays short until asked: service or module names, or the
+  /// modules an update changes. One or two more than `collapsed` are shown
+  /// outright rather than hidden behind a control.
+  function nameList<T>(
+    items: readonly T[],
+    render: (item: T) => Part,
+    collapsed = COLLAPSED_NAMES,
+    className = "plugin-names",
+  ): HTMLElement {
+    const list = el("ul", className);
+    const show = (count: number) => list.replaceChildren(...items.slice(0, count).map((item) => el("li", "", render(item))));
+    if (items.length <= collapsed + 2) {
+      show(items.length);
       return list;
     }
-    show(COLLAPSED_NAMES);
-    const more = button(lit(`Show all ${names.length}`), () => {
-      show(names.length);
+    show(collapsed);
+    const more = button(lit(`Show all ${items.length}`), () => {
+      show(items.length);
       more.remove();
     }, "link-button plugin-more");
     return el("div", "", list, more);
@@ -79,6 +132,8 @@ namespace Amaterasu {
     node: HTMLElement;
     show(entries: readonly BrowserEntry[], emptyState: HTMLElement): void;
     select(key: string | null): void;
+    /// Moves the keyboard to a row, for a reader sent here from another view.
+    focus(key: string): void;
   }
 
   /// A list of plugins with the selected one's details beside it. On a narrow
@@ -157,6 +212,12 @@ namespace Amaterasu {
     return {
       node,
       select,
+      focus(key) {
+        const control = rows.get(key)?.control;
+        control?.focus({ preventScroll: true });
+        // On a narrow screen the details open under the row, so it goes to the top.
+        control?.scrollIntoView({ block: isWide() ? "center" : "start" });
+      },
       show(entries, emptyState) {
         rows.clear();
         order = entries.map((entry) => entry.key);
@@ -173,7 +234,7 @@ namespace Amaterasu {
           if (!items || (options.grouped && entry.group !== group)) {
             group = entry.group;
             items = el("ul", "plugin-rows");
-            if (options.grouped) sections.push(el("h3", "plugin-label plugin-group-heading", entry.group));
+            if (options.grouped) sections.push(el("h2", "plugin-label plugin-group-heading", entry.group));
             sections.push(items);
           }
           const control = button("", () => activate(entry.key), "plugin-row");
@@ -195,6 +256,397 @@ namespace Amaterasu {
     };
   }
 
+  // --- Updates ---------------------------------------------------------------
+
+  /// Something the Updates panel keeps up to date: how its state is read, how
+  /// a request is sent, and the row that state makes. Amaterasu Core is the
+  /// only one a host has routes for today; a module from another publisher
+  /// would be one more feed, with nothing else in the panel changing.
+  interface UpdateFeed {
+    id: string;
+    /// Reads the source's state from the host. A failure becomes the row's
+    /// state rather than a rejection.
+    read(): Promise<void>;
+    /// Sends one request. Rejects with the host's refusal in plain words.
+    request(action: UpdateAction): Promise<void>;
+    /// The row for what was last read.
+    view(): UpdateSourceView;
+    /// More to show under the row, such as the history of its packages.
+    extra?(): HTMLElement | null;
+  }
+
+  type RowAction = Exclude<UpdateAction, "check">;
+
+  interface UpdateRow {
+    node: HTMLElement;
+    show(view: UpdateSourceView, working: boolean, refusal: string | null, extra: HTMLElement | null): void;
+    /// Brings "Last checked" up to the present.
+    tick(): void;
+    /// Puts the keyboard on the row's name, when the control it was on has gone.
+    focus(): void;
+  }
+
+  /// One source's row: its name with its state beside it, what it runs, and
+  /// whatever its update needs shown. The row is built once and then changed
+  /// in place, so reading the host again does not move the keyboard.
+  function updateSourceRow(options: {
+    copyable: (value: string, shown: string, what: string) => HTMLElement;
+    repositoryLink: (id: string) => HTMLElement;
+    /// Whether this account may send requests at all, and whether it may install.
+    canChange: boolean;
+    canInstall: boolean;
+    onAction: (action: RowAction) => void;
+    onRetry: () => void;
+  }): UpdateRow {
+    const name = el("h3", "plugin-update-name");
+    name.tabIndex = -1;
+    const mark = el("span", "plugin-update-mark");
+    mark.setAttribute("aria-hidden", "true");
+    const headline = el("span", "plugin-update-headline");
+    const state = el("p", "plugin-update-state", mark, headline);
+    state.setAttribute("aria-live", "polite");
+    const controls: Readonly<Record<RowAction, HTMLButtonElement>> = {
+      cancel: button("Cancel", () => options.onAction("cancel")),
+      download: button("Download update", () => options.onAction("download"), "primary"),
+      activate: button("Install when idle", () => options.onAction("activate"), "primary"),
+    };
+    const retry = button("Try again", options.onRetry);
+    const actions = el("div", "actions plugin-update-actions", controls.cancel, retry, controls.download, controls.activate);
+    const facts = el("p", "plugin-update-facts");
+    const checked = el("time");
+    const detail = el("p", "plugin-update-detail");
+    detail.setAttribute("aria-live", "polite");
+    const refused = el("p", "plugin-update-refusal");
+    refused.setAttribute("role", "alert");
+    const permission = el("p", "muted plugin-update-permission");
+    const steps = el("ol", "plugin-update-steps");
+    const bar = el("progress", "plugin-update-bar");
+    setLocalizedAttribute(bar, "aria-label", "Download progress");
+    const received = el("span", "plugin-update-received");
+    const transfer = el("div", "plugin-update-transfer", bar, received);
+    const summary = el("p", "plugin-update-summary");
+    const changeList = el("div", "plugin-update-change-list");
+    changeList.setAttribute("role", "group");
+    setLocalizedAttribute(changeList, "aria-label", "What this update changes");
+    const changes = el("div", "plugin-update-changes", summary, changeList);
+    const about = el("p", "muted plugin-update-about");
+    const extras = el("div", "plugin-update-extra");
+    const node = el("article", "plugin-update-source",
+      el("header", "plugin-update-source-head", el("div", "plugin-update-title", name, state), actions),
+      facts, detail, refused, permission, steps, transfer, changes,
+      el("div", "plugin-update-foot", about, extras));
+    let shownFacts = "";
+    let shownSteps = "";
+    let shownChanges = "";
+    let shownExtra: HTMLElement | null = null;
+    let checkedAt: number | null = null;
+    const permits = (action: RowAction): boolean => options.canChange && (action !== "activate" || options.canInstall);
+
+    function tick(): void {
+      if (checkedAt === null) return;
+      const elapsed = elapsedSince(Date.now(), checkedAt);
+      setText(checked, elapsed ? lit(formatElapsed(elapsed)) : "just now");
+      checked.title = formatDateTime(checkedAt);
+    }
+
+    function showFacts(view: UpdateSourceView): void {
+      checkedAt = view.checkedUnixMs;
+      const key = `${view.running}\n${view.repository}\n${view.checkedUnixMs}`;
+      if (key !== shownFacts) {
+        shownFacts = key;
+        const fact = (...parts: Part[]): HTMLElement => el("span", "plugin-update-fact", ...parts);
+        const shown: HTMLElement[] = [];
+        if (view.running)
+          shown.push(fact(el("span", "muted", "Running package"), " ",
+            options.copyable(view.running, shortDigest(view.running), "package digest")));
+        if (view.repository) shown.push(fact(el("span", "muted", "from"), " ", options.repositoryLink(view.repository)));
+        if (view.checkedUnixMs !== null) {
+          checked.dateTime = new Date(view.checkedUnixMs).toISOString();
+          shown.push(fact(el("span", "muted", "Last checked"), " ", checked));
+        }
+        facts.replaceChildren(...shown);
+        facts.hidden = shown.length === 0;
+      }
+      tick();
+    }
+
+    function showProgress(view: UpdateSourceView): void {
+      const key = view.steps.map((step) => step.state).join();
+      if (key !== shownSteps) {
+        shownSteps = key;
+        steps.replaceChildren(...view.steps.map((step) => {
+          const item = el("li", `plugin-update-step plugin-update-step--${step.state}`, step.label);
+          if (step.state === "current") item.setAttribute("aria-current", "step");
+          return item;
+        }));
+      }
+      steps.hidden = view.steps.length === 0;
+      transfer.hidden = view.transfer === null;
+      if (!view.transfer) return;
+      if (view.transfer.total === null) {
+        bar.removeAttribute("value");
+        setText(received, lit(`${formatBytes(view.transfer.received)} received`));
+      } else {
+        bar.max = view.transfer.total;
+        bar.value = view.transfer.received;
+        setText(received, lit(`${formatBytes(view.transfer.received)} of ${formatBytes(view.transfer.total)}`));
+      }
+    }
+
+    function showChanges(view: UpdateSourceView): void {
+      changes.hidden = view.summary === null;
+      setText(summary, view.summary === null ? null : lit(view.summary));
+      // The same update keeps its list, and with it a reader's "Show all".
+      const key = `${view.update}\n${view.changes.map((change) => `${change.id} ${change.detail}`).join("\n")}`;
+      if (key === shownChanges) return;
+      shownChanges = key;
+      changeList.hidden = view.changes.length === 0;
+      changeList.replaceChildren(nameList(view.changes, (change) => el("span", `plugin-update-change plugin-update-change--${change.change}`,
+        el("span", "plugin-update-change-name", lit(change.name)),
+        el("span", "plugin-update-change-detail", lit(change.detail))), COLLAPSED_CHANGES, "plugin-update-list"));
+    }
+
+    return {
+      node,
+      tick,
+      focus: () => name.focus(),
+      show(view, working, refusal, extra) {
+        const focused = document.activeElement;
+        node.dataset.state = view.state;
+        node.dataset.tone = view.tone;
+        setText(name, lit(view.name));
+        setText(headline, view.headline);
+        setText(detail, view.detail);
+        detail.hidden = view.detail === null;
+        setText(refused, refusal === null ? null : lit(refusal));
+        refused.hidden = refusal === null;
+        showFacts(view);
+        const offered = (Object.keys(controls) as RowAction[]).filter((action) => view.actions.includes(action));
+        for (const [action, control] of Object.entries(controls) as [RowAction, HTMLButtonElement][]) {
+          control.hidden = !offered.includes(action);
+          control.disabled = working || !permits(action);
+        }
+        retry.hidden = view.state !== "unreadable";
+        retry.disabled = working;
+        actions.hidden = offered.length === 0 && retry.hidden;
+        // An account that can change nothing is told so once, by the panel.
+        permission.hidden = !(offered.includes("activate") && options.canChange && !options.canInstall);
+        setText(permission, permission.hidden ? null : "Installing an update needs an administrator who is signed in to the console.");
+        showProgress(view);
+        showChanges(view);
+        setText(about, view.about);
+        if (extra !== shownExtra) {
+          // A history the reader had open stays open when it is drawn again.
+          if (extra instanceof HTMLDetailsElement && shownExtra instanceof HTMLDetailsElement) extra.open = shownExtra.open;
+          extras.replaceChildren(...(extra ? [extra] : []));
+          shownExtra = extra;
+        }
+        // A control the host's progress took away hands the keyboard to the row.
+        if (!working && focused instanceof HTMLButtonElement && actions.contains(focused) && (focused.hidden || focused.disabled))
+          name.focus();
+      },
+    };
+  }
+
+  interface UpdatesPanel {
+    node: HTMLElement;
+    /// Reads every source without drawing, so the page can show all it loaded at once.
+    read(): Promise<void>;
+    /// Draws what was read and follows any source the host is working on.
+    show(): void;
+  }
+
+  /// The Updates panel: one row per source, and the request that checks them all.
+  function updatesPanel(options: {
+    feeds: readonly UpdateFeed[];
+    signal: AbortSignal;
+    canChange: boolean;
+    canInstall: boolean;
+    copyable: (value: string, shown: string, what: string) => HTMLElement;
+    repositoryLink: (id: string) => HTMLElement;
+    /// Called after a source changed on its own: a request finished, or the host moved on.
+    onChange: () => void;
+  }): UpdatesPanel {
+    interface Entry {
+      feed: UpdateFeed;
+      row: UpdateRow;
+      /// The request in flight, or "read" while the row is only being read again.
+      acting: UpdateAction | "read" | null;
+      refusal: string | null;
+      timer: number | undefined;
+    }
+    const entries: Entry[] = options.feeds.map((feed) => {
+      const entry: Entry = {
+        feed,
+        acting: null,
+        refusal: null,
+        timer: undefined,
+        row: updateSourceRow({
+          copyable: options.copyable,
+          repositoryLink: options.repositoryLink,
+          canChange: options.canChange,
+          canInstall: options.canInstall,
+          onAction: (action) => void perform(entry, action),
+          onRetry: () => void perform(entry, null),
+        }),
+      };
+      return entry;
+    });
+    // While a check runs the control stays in place and focusable, saying so,
+    // rather than being disabled out from under the keyboard.
+    const check = button("Check for updates", () => {
+      if (check.getAttribute("aria-disabled") === "true") return;
+      for (const entry of entries) if (entry.feed.view().actions.includes("check")) void perform(entry, "check");
+    });
+    const heading = el("h2", "", "Updates");
+    heading.id = "plugin-updates-heading";
+    const node = el("section", "plugin-updates",
+      el("header", "plugin-updates-head", heading, el("div", "actions", check)),
+      options.canChange ? null : el("p", "muted plugin-updates-note", "This account can see updates but cannot change them."),
+      el("div", "plugin-update-sources", ...entries.map((entry) => entry.row.node)));
+    node.setAttribute("aria-labelledby", heading.id);
+
+    function draw(): void {
+      let checking = false;
+      let checkable = false;
+      for (const entry of entries) {
+        const view = entry.feed.view();
+        entry.row.show(view, entry.acting !== null, entry.refusal, entry.feed.extra?.() ?? null);
+        checking ||= entry.acting === "check" || view.state === "checking";
+        checkable ||= view.actions.includes("check");
+      }
+      setText(check, checking ? "Checking…" : "Check for updates");
+      check.setAttribute("aria-disabled", String(checking));
+      check.disabled = !checking &&
+        (!checkable || !options.canChange || entries.some((entry) => entry.acting !== null));
+    }
+
+    function follow(entry: Entry): void {
+      window.clearTimeout(entry.timer);
+      if (options.signal.aborted || entry.acting !== null || !entry.feed.view().busy) return;
+      entry.timer = window.setTimeout(() => {
+        void entry.feed.read().then(() => {
+          if (options.signal.aborted || entry.acting !== null) return;
+          draw();
+          options.onChange();
+          follow(entry);
+        });
+      }, UPDATE_POLL_MS);
+    }
+
+    /// Sends a request for one source, or reads it again when there is none to send.
+    async function perform(entry: Entry, action: UpdateAction | null): Promise<void> {
+      if (entry.acting !== null || options.signal.aborted) return;
+      const origin = document.activeElement instanceof HTMLButtonElement && node.contains(document.activeElement)
+        ? document.activeElement : null;
+      if (action === "activate") {
+        const confirmed = await confirmAction(
+          lit(`Install the ${entry.feed.view().name} update?`),
+          "The host restarts with the new package as soon as no stream is running. This console is unavailable for a moment while it does.",
+          "Install when idle",
+        );
+        if (!confirmed || options.signal.aborted || entry.acting !== null) return;
+      }
+      window.clearTimeout(entry.timer);
+      entry.acting = action ?? "read";
+      entry.refusal = null;
+      draw();
+      try {
+        if (action === null) await entry.feed.read();
+        else await entry.feed.request(action);
+      } catch (error) {
+        entry.refusal = messageOf(error);
+        // A refusal can mean the host has moved on; show where it is now.
+        await entry.feed.read();
+      } finally {
+        entry.acting = null;
+      }
+      if (options.signal.aborted) return;
+      draw();
+      // The keyboard stays where the reader left it, unless that control is gone.
+      if (origin && (document.activeElement === origin || document.activeElement === document.body)) {
+        if (origin.isConnected && !origin.hidden && !origin.disabled) origin.focus();
+        else entry.row.focus();
+      }
+      options.onChange();
+      follow(entry);
+    }
+
+    const clock = window.setInterval(() => { for (const entry of entries) entry.row.tick(); }, CHECKED_REFRESH_MS);
+    options.signal.addEventListener("abort", () => {
+      window.clearInterval(clock);
+      for (const entry of entries) window.clearTimeout(entry.timer);
+    }, { once: true });
+
+    return {
+      node,
+      read: async () => { await Promise.all(entries.map((entry) => entry.feed.read())); },
+      show() {
+        draw();
+        for (const entry of entries) follow(entry);
+      },
+    };
+  }
+
+  /// Amaterasu Core's feed: the host's own package, read and changed through
+  /// the `package-update` routes. `running` is what the package selection says
+  /// the host runs, for a host whose update status says nothing.
+  function coreUpdateFeed(
+    api: Pick<Api, "post">,
+    running: () => { digest: string | null; repository: string | null } | null,
+    extra: () => HTMLElement | null,
+  ): UpdateFeed {
+    let reading: UpdateReading = { state: "loading" };
+    // Replies can arrive out of order; only the newest request's is kept.
+    let latest = 0;
+    let silentSince: number | null = null;
+    const missing = (error: unknown): boolean =>
+      error instanceof ApiError && (error.status === 404 || error.code === "not_found");
+    const installing = (): boolean =>
+      reading.state === "ready" && reading.status.supported && reading.status.phase === "activating";
+    return {
+      id: CORE_UPDATE_SOURCE,
+      view: () => coreUpdateSource(reading, running()),
+      extra,
+      async read() {
+        const ticket = ++latest;
+        try {
+          const status = parsePackageUpdateStatus(await api.post<unknown>("package-update/status", {}));
+          if (ticket !== latest) return;
+          silentSince = null;
+          reading = { state: "ready", status };
+        } catch (error) {
+          if (ticket !== latest) return;
+          if (missing(error)) {
+            reading = { state: "absent" };
+          } else if (installing()) {
+            // A host that is installing stops answering while it restarts.
+            silentSince ??= Date.now();
+            if (Date.now() - silentSince >= RESTART_PATIENCE_MS)
+              reading = { state: "failed", message: "The host has not answered since it began installing. It may still be restarting; try again in a moment." };
+          } else {
+            reading = { state: "failed", message: messageOf(error) };
+          }
+        }
+      },
+      async request(action) {
+        const ticket = ++latest;
+        try {
+          const status = parsePackageUpdateStatus(await api.post<unknown>(`package-update/${action}`, {}));
+          if (ticket !== latest) return;
+          silentSince = null;
+          reading = { state: "ready", status };
+        } catch (error) {
+          if (!missing(error))
+            throw new Error(error instanceof ApiError
+              ? packageUpdateRefusalMessage(error.code) ?? error.message
+              : messageOf(error));
+          if (ticket === latest) reading = { state: "absent" };
+        }
+      },
+    };
+  }
+
   export function renderPlugins(context: PageContext): void {
     const page = new AbortController();
     context.registerDraftGuard?.(() => false, () => page.abort());
@@ -202,12 +654,19 @@ namespace Amaterasu {
     const canRead = api.allows("configuration.read");
     const canManage = api.role === "administrator" && api.allows("configuration.write");
 
-    let view: PluginsView = context.initialPluginsView ?? "installed";
+    // An address saved under a view's former name still opens that view.
+    let view: PluginsView = pluginsViewFromAddress(context.initialPluginsView ?? "") ?? DEFAULT_PLUGINS_VIEW;
     let selection: Loadable<PackageSelectionStatus> = { state: "loading" };
     let listing: Loadable<RepositoryPage> = { state: "loading" };
     let loadRequest = 0;
     let selectedInstalled: string | null = null;
     let selectedAvailable: string | null = null;
+    /// Set when another view sends the reader to a module, so its row takes the keyboard.
+    let revealInstalled = false;
+    let history: HTMLElement | null = null;
+    let lastUpdateState: UpdateSourceState = "loading";
+    let shownUpdate: string | null = null;
+    let reloadedFor: string | null = null;
     const installedFilter: PluginFilter = { query: "", category: "" };
     const availableFilter: PluginFilter = { query: "", category: "" };
     const descriptions = new Map<string, ModuleDescription>();
@@ -221,7 +680,7 @@ namespace Amaterasu {
     const tabs = new Map<PluginsView, { control: HTMLButtonElement; count: HTMLElement }>();
     const tabList = el("div", "plugin-tabs");
     tabList.setAttribute("role", "tablist");
-    setLocalizedAttribute(tabList, "aria-label", "Plugin views");
+    setLocalizedAttribute(tabList, "aria-label", "Module views");
     const viewArea = el("div", "plugin-view");
     viewArea.setAttribute("role", "tabpanel");
     viewArea.id = "plugin-view";
@@ -243,20 +702,36 @@ namespace Amaterasu {
       if (next) { showView(next); tabs.get(next)?.control.focus(); }
     });
 
-    context.content.append(
-      sectionHeading(
-        "Plugins",
-        "The modules this host runs, and the repositories it can get more from.",
-        button("Refresh", load),
-      ),
-      tabList,
-      viewArea,
-    );
-
     const ready = <T>(value: Loadable<T>): T | null => value.state === "ready" ? value.value : null;
     const repositories = (): ApprovedRepositoryView[] => ready(listing)?.repositories ?? [];
     const activeRepositories = (): ApprovedRepositoryView[] => repositories().filter((repository) => !repository.revoked);
-    const offers = (): AvailablePlugin[] => availablePlugins(repositories(), ready(selection), consoleDigest);
+    const offers = (): AvailablePlugin[] =>
+      otherPublisherOffers(availablePlugins(repositories(), ready(selection), consoleDigest), ready(selection));
+
+    const core = coreUpdateFeed(api, () => {
+      const status = ready(selection);
+      return status ? { digest: status.running.digest, repository: status.running.source?.repository ?? null } : null;
+    }, () => history);
+    const updates = updatesPanel({
+      feeds: [core],
+      signal: page.signal,
+      canChange: api.allows("configuration.write"),
+      canInstall: canManage,
+      copyable,
+      repositoryLink,
+      onChange: updatesChanged,
+    });
+
+    context.content.append(
+      sectionHeading(
+        "Modules",
+        "What this host runs, where each part comes from, and how it stays up to date.",
+        button("Refresh", load),
+      ),
+      ...(canRead ? [updates.node] : []),
+      tabList,
+      viewArea,
+    );
 
     function showView(next: PluginsView): void {
       if (next === view) return;
@@ -267,8 +742,9 @@ namespace Amaterasu {
 
     function render(): void {
       const counts: Record<PluginsView, number | null> = {
-        installed: ready(selection)?.running.modules?.length ?? null,
-        available: ready(listing) ? offers().length : null,
+        core: null,
+        modules: ready(selection)?.running.modules?.length ?? null,
+        publishers: ready(listing) ? offers().length : null,
         repositories: ready(listing) ? activeRepositories().length : null,
       };
       for (const [name, tab] of tabs) {
@@ -279,13 +755,31 @@ namespace Amaterasu {
       }
       viewArea.setAttribute("aria-labelledby", `plugin-tab-${view}`);
       if (!canRead) {
-        viewArea.replaceChildren(quietState("Plugins are unavailable",
+        viewArea.replaceChildren(quietState("Modules are unavailable",
           "This account needs permission to read the host's configuration."));
         return;
       }
-      if (view === "installed") renderInstalled();
-      else if (view === "available") renderAvailable();
+      if (view === "core") renderCore();
+      else if (view === "modules") renderInstalled();
+      else if (view === "publishers") renderAvailable();
       else renderRepositories();
+    }
+
+    /// The Updates panel moved on by itself: an update appeared or went, or
+    /// the host came back running another package.
+    function updatesChanged(): void {
+      const row = core.view();
+      const installed = lastUpdateState === "activating" && row.state !== "activating";
+      lastUpdateState = row.state;
+      const known = ready(selection)?.running.digest ?? null;
+      if (row.running && known && row.running !== known && row.running !== reloadedFor) {
+        // Everything on the page describes the package that was replaced.
+        reloadedFor = row.running;
+        if (installed) context.notify(lit(`Update installed. The host is running package ${shortDigest(row.running)}.`));
+        void load();
+        return;
+      }
+      if (row.update !== shownUpdate && view === "core" && viewArea.isConnected) renderCore();
     }
 
     // --- Loading -------------------------------------------------------------
@@ -306,11 +800,21 @@ namespace Amaterasu {
       const [nextSelection, nextListing] = await Promise.all([
         settled(api.post<unknown>("package-selection/status", {}).then(parsePackageSelectionStatus)),
         settled(listRepositories()),
+        updates.read(),
       ]);
       if (request !== loadRequest || !viewArea.isConnected) return;
       selection = nextSelection;
       listing = nextListing;
+      showUpdates();
       render();
+    }
+
+    /// Draws the Updates panel from everything the page has loaded.
+    function showUpdates(): void {
+      const status = ready(selection);
+      history = status ? packageHistory(status) : null;
+      lastUpdateState = core.view().state;
+      updates.show();
     }
 
     /// Reads every page of the listing; a repository's choices can span pages.
@@ -342,7 +846,10 @@ namespace Amaterasu {
       } catch (error) {
         if (request === loadRequest) listing = { state: "failed", error };
       }
-      if (viewArea.isConnected) render();
+      if (!viewArea.isConnected) return;
+      // The package history names the repositories that list each package.
+      showUpdates();
+      render();
     }
 
     function copyable(value: string, shown: string, what: string): HTMLElement {
@@ -396,31 +903,123 @@ namespace Amaterasu {
       return bar;
     }
 
-    // --- Installed -------------------------------------------------------------
+    // --- Core modules -----------------------------------------------------------
 
-    function renderInstalled(): void {
+    /// The modules the host loaded, or the reason there are none to show.
+    function runningModules(): InstalledPlugin[] | null {
       if (selection.state === "loading") {
-        viewArea.replaceChildren(el("p", "muted plugin-loading", "Loading installed plugins…"));
-        return;
+        viewArea.replaceChildren(el("p", "muted plugin-loading", "Loading modules…"));
+        return null;
       }
       if (selection.state === "failed") {
         viewArea.replaceChildren(errorPanel(selection.error, load));
-        return;
+        return null;
       }
-      const status = selection.value;
-      const plugins = installedPlugins(status);
-      if (!status.running.available || !plugins.length) {
-        viewArea.replaceChildren(
-          packageSummary(status, 0),
-          quietState("The host did not report its modules",
-            "This host version does not list the modules it loaded, or the running package could not be read."),
-        );
-        return;
+      const plugins = installedPlugins(selection.value);
+      if (selection.value.running.available && plugins.length) return plugins;
+      viewArea.replaceChildren(quietState("The host did not report its modules",
+        "This host version does not list the modules it loaded, or the running package could not be read."));
+      return null;
+    }
+
+    function renderCore(): void {
+      const row = core.view();
+      shownUpdate = row.update;
+      const plugins = runningModules();
+      if (!plugins) return;
+      const running = new Map(plugins.map((plugin) => [plugin.id, plugin]));
+      const changes = new Map(row.changes.map((change) => [change.id, change]));
+      // Drawing the cards again for a new update keeps the keyboard where it was.
+      const focused = document.activeElement instanceof HTMLElement && viewArea.contains(document.activeElement)
+        ? document.activeElement.dataset.focusKey : undefined;
+      viewArea.replaceChildren(el("div", "plugin-families",
+        ...MODULE_FAMILIES.map((family) => familyCard(family, running, changes))));
+      if (focused)
+        Array.from(viewArea.querySelectorAll<HTMLElement>("[data-focus-key]"))
+          .find((control) => control.dataset.focusKey === focused)?.focus();
+    }
+
+    function familyCard(
+      family: ModuleFamily,
+      running: ReadonlyMap<string, InstalledPlugin>,
+      changes: ReadonlyMap<string, ModuleChange>,
+    ): HTMLElement {
+      const members = el("ul", "plugin-family-members");
+      for (const id of family.members) {
+        const plugin = running.get(id);
+        const change = changes.get(id);
+        if (plugin) {
+          const control = button("", () => openModule(id), "plugin-family-member");
+          control.replaceChildren(
+            el("span", "plugin-family-member-name", lit(plugin.name)),
+            el("span", `plugin-family-member-version${change ? " plugin-family-member-version--changes" : ""}`,
+              lit(!change ? plugin.version : change.change === "updated" ? change.detail : `${plugin.version} · ${change.detail}`)),
+          );
+          control.dataset.focusKey = `member ${id}`;
+          setLocalizedAttribute(control, "title", "Show in All modules");
+          members.append(el("li", "", control));
+        } else if (change?.change === "added") {
+          members.append(el("li", "plugin-family-member plugin-family-member--added",
+            el("span", "plugin-family-member-name", lit(change.name)),
+            el("span", "plugin-family-member-version plugin-family-member-version--changes", lit(change.detail))));
+        }
       }
+      const installed = family.members.some((id) => running.has(id));
+      const chip = family.members.some((id) => changes.has(id))
+        ? el("span", "plugin-chip plugin-chip--changes", "Changes in this update")
+        : installed
+          ? el("span", "plugin-chip plugin-chip--running", "Running")
+          : el("span", "plugin-chip", "Not installed");
+      const heading = el("h2", "plugin-family-name", family.name);
+      heading.id = `plugin-family-${family.id}`;
+      // A family the host does not run says so, unless the update is about to add it.
+      const missing: Part[] = installed || members.childElementCount ? []
+        : family.members.includes("amaterasu.rtx-hdr")
+          ? [
+              el("p", "muted plugin-family-note", "RTX HDR is installed from Integrations, which also downloads the NVIDIA runtime it needs."),
+              button("Set up RTX HDR", () => context.navigate("integrations")),
+            ]
+          : [el("p", "muted plugin-family-note", "Not part of the package this host is running.")];
+      const sources = el("ul", "plugin-family-sources", ...family.sources.map((source, index) => {
+        const link = sourceLink(source);
+        link.dataset.focusKey = `source ${family.id} ${index}`;
+        return el("li", "", link);
+      }));
+      setLocalizedAttribute(sources, "aria-label", "Source");
+      const card = el("article", "plugin-family",
+        el("header", "plugin-family-header", heading, chip),
+        el("p", "plugin-family-summary", family.summary),
+        el("div", "plugin-family-body", members.childElementCount ? members : null, ...missing),
+        el("footer", "plugin-family-source", el("p", "plugin-label", "Source"), sources),
+      );
+      card.setAttribute("aria-labelledby", heading.id);
+      return card;
+    }
+
+    /// Opens a module's details in All modules, clearing a filter that would hide it.
+    function openModule(id: string): void {
+      const plugin = installedPlugins(ready(selection)).find((candidate) => candidate.id === id);
+      if (!plugin) return;
+      if (!matchesPluginFilter(plugin, installedFilter)) {
+        installedFilter.query = "";
+        installedFilter.category = "";
+      }
+      selectedInstalled = id;
+      revealInstalled = true;
+      showView("modules");
+    }
+
+    // --- All modules -------------------------------------------------------------
+
+    function renderInstalled(): void {
+      const status = ready(selection);
+      const loaded = runningModules();
+      if (!loaded || !status) return;
+      const plugins: InstalledPlugin[] = loaded;
       const byId = new Map(plugins.map((plugin) => [plugin.id, plugin]));
       const count = el("span", "muted plugin-count");
       const browser = pluginBrowser({
-        label: "Installed plugins",
+        label: "All modules",
         grouped: true,
         selected: () => selectedInstalled,
         onSelect: (key) => { selectedInstalled = key; },
@@ -431,7 +1030,7 @@ namespace Amaterasu {
         signal: page.signal,
       });
       const categories = PLUGIN_CATEGORIES.filter((category) => plugins.some((plugin) => plugin.category === category));
-      const bar = toolbar(installedFilter, "Search installed plugins", categories, showMatches, count);
+      const bar = toolbar(installedFilter, "Search modules", categories, showMatches, count);
 
       function showMatches(): void {
         const matches = plugins.filter((plugin) => matchesPluginFilter(plugin, installedFilter));
@@ -447,11 +1046,11 @@ namespace Amaterasu {
             group: plugin.category,
             emphasis: false,
           })),
-          quietState("No plugins match", "Try a different search or category."),
+          quietState("No modules match", "Try a different search or category."),
         );
       }
 
-      /// Selects a plugin named in another plugin's details, clearing a
+      /// Selects a module named in another module's details, clearing a
       /// filter that would hide it.
       function focusInstalled(id: string): void {
         const plugin = byId.get(id);
@@ -466,23 +1065,15 @@ namespace Amaterasu {
         browser.select(id);
       }
 
-      viewArea.replaceChildren(packageSummary(status, plugins.length), bar, browser.node);
+      viewArea.replaceChildren(bar, browser.node);
       showMatches();
+      if (revealInstalled && selectedInstalled) browser.focus(selectedInstalled);
+      revealInstalled = false;
     }
 
-    function packageSummary(status: PackageSelectionStatus, modules: number): HTMLElement {
+    /// The packages the host has recorded, for the foot of the Amaterasu Core row.
+    function packageHistory(status: PackageSelectionStatus): HTMLElement {
       const running = status.running;
-      const line = el("p", "plugin-package-line");
-      if (running.digest) {
-        line.append(
-          el("span", "muted", "Running package"), " ",
-          copyable(running.digest, shortDigest(running.digest), "package digest"),
-        );
-        if (modules) line.append(el("span", "muted", lit(` · ${modules} modules`)));
-        if (running.source) line.append(el("span", "muted", " · from "), repositoryLink(running.source.repository));
-      } else {
-        line.append(el("span", "muted", "The host did not report which package it is running."));
-      }
       const listedAs = (digest: string | null): string => {
         if (!digest) return "—";
         if (listing.state !== "ready") return "";
@@ -496,7 +1087,7 @@ namespace Amaterasu {
         digest ? copyable(digest, shortDigest(digest), "package digest") : el("span", "muted", "None"),
         lit(listedAs(digest)),
       ];
-      const details = el("details", "plugin-package-details",
+      return el("details", "plugin-package-details",
         el("summary", "", "Package history"),
         table(["Recorded as", "Package", "Listed by"], [
           phase("Running now", running.digest),
@@ -507,7 +1098,6 @@ namespace Amaterasu {
         ]),
         el("p", "muted", lit(`Only the running package is loaded. The others are what the host has recorded for its next start or a rollback. Highest release sequence accepted: ${status.highestSequence}.`)),
       );
-      return el("div", "plugin-package", line, details);
     }
 
     function installedDetail(
@@ -519,6 +1109,7 @@ namespace Amaterasu {
       const facts = el("div");
       const relations = el("div");
       const source = status.running.source;
+      const origin = moduleOrigin(plugin.id);
       const moduleLink = (id: string, version?: string): Part => {
         const known = installed.get(id);
         const label = known ? known.name : id;
@@ -535,6 +1126,10 @@ namespace Amaterasu {
           ["Category", plugin.category],
           ["Type", plugin.runtime ? "Runtime" : "Module"],
           ["Supplied by", source ? repositoryLink(source.repository) : el("span", "muted", "Not recorded")],
+          origin.family ? ["Part of", origin.family.name] : null,
+          origin.source ? ["Source", el("span", "plugin-source",
+            sourceLink(origin.source),
+            origin.family || !origin.label ? null : el("span", "muted", origin.label))] : null,
           description ? ["Size", lit(formatBytes(description.size))] : null,
           ["Library SHA-256", copyable(plugin.sha256, shortDigest(plugin.sha256), "library digest")],
         ]));
@@ -586,7 +1181,7 @@ namespace Amaterasu {
       return detail;
     }
 
-    // --- Available -------------------------------------------------------------
+    // --- Other publishers ---------------------------------------------------------
 
     function renderAvailable(): void {
       if (listing.state === "loading") {
@@ -601,8 +1196,8 @@ namespace Amaterasu {
       const plugins = offers();
       if (!plugins.length) {
         const empty = activeRepositories().length
-          ? quietState("Nothing is offered for this host",
-              "None of this host's repositories lists a plugin for its platform right now.",
+          ? quietState("Nothing from other publishers",
+              "None of this host's repositories offers a module from another publisher right now. Amaterasu Core is kept up to date from Updates, above.",
               button("View repositories", () => showView("repositories")))
           : quietState("No repositories yet",
               "Add a publisher's repository to browse the plugins it offers.",
@@ -616,7 +1211,7 @@ namespace Amaterasu {
       const count = el("span", "muted plugin-count");
       const severalSources = new Set(plugins.map((plugin) => plugin.repository.id)).size > 1;
       const browser = pluginBrowser({
-        label: "Available plugins",
+        label: "Modules from other publishers",
         grouped: severalSources,
         selected: () => selectedAvailable,
         onSelect: (key) => { selectedAvailable = key; },
@@ -641,11 +1236,11 @@ namespace Amaterasu {
             group: plugin.repository.id,
             emphasis: plugin.status !== "installed",
           })),
-          quietState("No plugins match", "Try a different search or category."),
+          quietState("No modules match", "Try a different search or category."),
         );
       };
       viewArea.replaceChildren(
-        toolbar(availableFilter, "Search available plugins", categories, showMatches, count),
+        toolbar(availableFilter, "Search other publishers' modules", categories, showMatches, count),
         browser.node,
       );
       showMatches();
@@ -658,9 +1253,8 @@ namespace Amaterasu {
           ? "In use. You are looking at this interface."
           : "Not in use."
         : plugin.status === "installed"
-          ? plugin.runningThisPackage
-            ? "Installed. This host is running the package this repository lists."
-            : `Installed. Version ${plugin.version} is loaded from a different package than the one listed here.`
+          // An offer of the very package the host runs is not listed here.
+          ? `Installed. Version ${plugin.version} is loaded from a different package than the one listed here.`
           : plugin.status === "update"
             ? `Version ${plugin.installedVersion} is installed. This repository offers ${plugin.version}.`
             : "Not installed.";

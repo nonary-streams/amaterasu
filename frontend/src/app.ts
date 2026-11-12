@@ -9,7 +9,7 @@ namespace Amaterasu {
     catalog: "Library",
     settings: "Settings",
     integrations: "Integrations",
-    plugins: "Plugins",
+    plugins: "Modules",
     sessions: "Sessions",
     applications: "Applications",
     steam: "Steam",
@@ -183,14 +183,15 @@ namespace Amaterasu {
 
     private currentPage(): string {
       const fragment = location.hash.slice(1);
-      // The plugin manager used to be reached as "updates"; old links still work.
+      // The Modules page keeps the address it had as Plugins, and was reached
+      // as "updates" before that; old links still work.
       const value = fragment.startsWith("catalog?") ? "catalog" : fragment === "updates" ? "plugins" : fragment;
       const core = Object.hasOwn(pageNames, value) && this.pageAvailable(value as Page);
       const settingsCategory = value.startsWith("settings/") &&
         ["general", "streaming", "integrations", "devices", "access"].includes(value.slice(9)) &&
         this.pageAvailable("settings");
       const pluginsView = value.startsWith("plugins/") &&
-        (PLUGINS_VIEWS as readonly string[]).includes(value.slice(8)) &&
+        pluginsViewFromAddress(value.slice(8)) !== null &&
         this.pageAvailable("plugins");
       return core || settingsCategory || pluginsView ||
         (value.startsWith("extension/") && this.extensionIds.has(value.slice(10))) ? value : "overview";
@@ -594,10 +595,12 @@ namespace Amaterasu {
           history.replaceState(history.state, "", address);
           this.displayedPage = next;
         },
-        ...(page.startsWith("plugins/") ? { initialPluginsView: page.slice(8) as PluginsView } : {}),
+        ...(page.startsWith("plugins/")
+          ? { initialPluginsView: pluginsViewFromAddress(page.slice(8)) ?? DEFAULT_PLUGINS_VIEW }
+          : {}),
         replacePluginsView: (view) => {
           if (!fresh.isConnected || !(this.displayedPage === "plugins" || this.displayedPage?.startsWith("plugins/"))) return;
-          const next = view === "installed" ? "plugins" : `plugins/${view}`;
+          const next = view === DEFAULT_PLUGINS_VIEW ? "plugins" : `plugins/${view}`;
           const address = new URL(location.href);
           address.hash = next;
           history.replaceState(history.state, "", address);
