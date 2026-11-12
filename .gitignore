@@ -8,3 +8,6 @@ __pycache__/
 /audit-results/
 /audits/
 /task-output/
+
+# Optional codec sources and development SDK builds.
+/native-deps/

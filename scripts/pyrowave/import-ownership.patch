@@ -1,0 +1,143 @@
+--- a/Granite/vulkan/memory_allocator.cpp
++++ b/Granite/vulkan/memory_allocator.cpp
+@@ -27,6 +27,7 @@
+ 
+ #ifndef _WIN32
+ #include <unistd.h>
++#include <fcntl.h>
+ #else
+ #define WIN32_LEAN_AND_MEAN
+ #include <windows.h>
+@@ -688,6 +689,14 @@
+ #ifdef _WIN32
+ 	VkImportMemoryWin32HandleInfoKHR import_info = { VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR };
+ #else
++	// A failed image import must leave the caller's descriptor owned by it.
++	// Vulkan consumes this private duplicate only after successful allocation.
++	struct DmaBufImportFd
++	{
++		int fd = -1;
++		~DmaBufImportFd() { if (fd >= 0) ::close(fd); }
++		void allocated(VkResult result) { if (result == VK_SUCCESS) fd = -1; }
++	} dma_buf_import;
+ 	VkImportMemoryFdInfoKHR import_info = { VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR };
+ #endif
+ 
+@@ -713,7 +722,15 @@
+ #ifdef _WIN32
+ 			import_info.handle = external->handle;
+ #else
+-			import_info.fd = external->handle;
++			if (external->memory_handle_type == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT)
++			{
++				dma_buf_import.fd = ::fcntl(external->handle, F_DUPFD_CLOEXEC, 0);
++				if (dma_buf_import.fd < 0)
++					return false;
++				import_info.fd = dma_buf_import.fd;
++			}
++			else
++				import_info.fd = external->handle;
+ #endif
+ 		}
+ 		else
+@@ -762,6 +779,9 @@
+ 	{
+ 		GRANITE_SCOPED_TIMELINE_EVENT_FILE(device->get_system_handles().timeline_trace_file, "vkAllocateMemory");
+ 		res = table->vkAllocateMemory(device->get_device(), &info, nullptr, &device_memory);
++#ifndef _WIN32
++            dma_buf_import.allocated(res);
++#endif
+ 	}
+ 
+ 	if (res == VK_SUCCESS)
+@@ -794,6 +814,9 @@
+ 				GRANITE_SCOPED_TIMELINE_EVENT_FILE(device->get_system_handles().timeline_trace_file,
+ 				                                   "vkAllocateMemory");
+ 				res = table->vkAllocateMemory(device->get_device(), &info, nullptr, &device_memory);
++#ifndef _WIN32
++            dma_buf_import.allocated(res);
++#endif
+ 			}
+ 			++block_itr;
+ 		}
+@@ -1626,7 +1649,11 @@
+ 
+ void take_ownership_imported_external_memory_handle(const ExternalHandle &handle)
+ {
+-	if (bool(handle) && ExternalHandle::memory_handle_type_imports_by_reference(handle.memory_handle_type))
++	if (bool(handle) && (ExternalHandle::memory_handle_type_imports_by_reference(handle.memory_handle_type)
++#ifndef _WIN32
++	    || handle.memory_handle_type == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT
++#endif
++	    ))
+ 	{
+ #ifdef _WIN32
+ 		::CloseHandle(handle.handle);
+--- a/pyrowave_c.cpp
++++ b/pyrowave_c.cpp
+@@ -1842,3 +1842,65 @@
+ 	device->next_frame_context();
+ }
+ }
++
++// Amaterasu requires failure-preserving DMA-BUF import ownership semantics.
++extern "C" PYROWAVE_PUBLIC_API uint32_t pyrowave_amaterasu_import_fd_contract_v1()
++{
++	return 1;
++}
++
++// Flush queued library command buffers before proving borrowed input retired.
++extern "C" PYROWAVE_PUBLIC_API void pyrowave_amaterasu_wait_idle_v1(pyrowave_device device)
++{
++	device->device.wait_idle();
++}
++
++// Exercise the GPU conversion and encoder without any CPU pixel upload. This
++// qualifies the device path; importing a particular capture allocation remains
++// a separate operation and may still fail.
++extern "C" PYROWAVE_PUBLIC_API pyrowave_result
++pyrowave_amaterasu_probe_v1(pyrowave_encoder encoder, bool hdr, size_t budget)
++{
++    if (!encoder || !budget)
++        return PYROWAVE_ERROR_INVALID_ARGUMENT;
++    auto *device = encoder->device;
++    auto info = ImageCreateInfo::immutable_2d_image(
++        encoder->width, encoder->height,
++        hdr ? VK_FORMAT_A2B10G10R10_UNORM_PACK32 : VK_FORMAT_R8G8B8A8_UNORM);
++    info.initial_layout = VK_IMAGE_LAYOUT_UNDEFINED;
++    info.layout = ImageLayout::General;
++    info.usage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
++    auto image = device->create_image(info);
++    if (!image)
++        return PYROWAVE_ERROR_OUT_OF_DEVICE_MEMORY;
++    auto cmd = device->request_command_buffer(encoder->pyro_device->queue_type);
++    cmd->image_barrier(*image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
++                      VK_PIPELINE_STAGE_2_NONE, 0,
++                      VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
++    VkClearValue value = {};
++    value.color.float32[0] = value.color.float32[1] = value.color.float32[2] = 0.75f;
++    value.color.float32[3] = 1.0f;
++    cmd->clear_image(*image, value);
++    cmd->image_barrier(*image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
++                      VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
++                      VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
++    device->submit(cmd);
++    pyrowave_scaled_encode_info scaling = {};
++    scaling.view.image = image->get_image();
++    scaling.view.width = encoder->width;
++    scaling.view.height = encoder->height;
++    scaling.view.image_format = scaling.view.view_format = info.format;
++    scaling.view.layout = VK_IMAGE_LAYOUT_GENERAL;
++    scaling.view.aspect = VK_IMAGE_ASPECT_COLOR_BIT;
++    scaling.view.swizzle = VK_COMPONENT_SWIZZLE_IDENTITY;
++    scaling.input_color_space = scaling.output_color_space =
++        hdr ? VK_COLOR_SPACE_HDR10_ST2084_EXT : VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
++    scaling.intermediate_plane_format = hdr ? VK_FORMAT_R16_UNORM : VK_FORMAT_R8_UNORM;
++    scaling.ycbcr_chroma_midpoint = hdr ? 512.0f / 1023.0f : 128.0f / 255.0f;
++    scaling.skip_dither = true;
++    pyrowave_rate_control rate = {};
++    rate.maximum_bitstream_size = budget;
++    auto result = pyrowave_encoder_encode_gpu_scaled_synchronous(encoder, nullptr, nullptr, &scaling, &rate);
++    device->wait_idle();
++    return result;
++}

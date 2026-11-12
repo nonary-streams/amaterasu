@@ -1,0 +1,2 @@
+# Vendor patches must preserve upstream context whitespace.
+scripts/pyrowave/*.patch -whitespace
