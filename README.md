@@ -165,7 +165,8 @@ itself against that commit in its own continuous integration. Change a module
 in its repository, push it, then advance the pin here. A change that needs a
 new SDK interface lands here first, is exported to the SDK, and only then is
 used by the module. Source extraction does not activate a package on an
-installed host.
+installed host; [publishing the repository](docs/repository-publishing.md)
+describes how a built set is signed and offered to hosts.
 
 The capture provider is also a submodule. It has its own
 lockfile and is validated separately from the parent workspace. Its helper-wire crate also builds the privileged helper; its shared wire

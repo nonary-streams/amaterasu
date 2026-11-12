@@ -249,7 +249,7 @@ pub(crate) fn check_composition<'a>(
     Ok(&plugin.version)
 }
 
-fn checked_payload_files(manifest: &ReleaseManifest) -> PackageResult<Vec<&str>> {
+pub(crate) fn checked_payload_files(manifest: &ReleaseManifest) -> PackageResult<Vec<&str>> {
     let mut names = BTreeSet::new();
     let mut total = 0_u64;
     let entries = manifest
