@@ -1,5 +1,5 @@
 //! Host-owned preparation for an approved production package trial.
-use amaterasu_contracts::HostPackageActivation;
+use amaterasu_contracts::{HostPackageActivation, HostPackageRestore};
 use amaterasu_package::policy_approval::{
     PolicyAllowlist, PolicyCandidateContext, candidate_from_allowlist,
 };
@@ -13,7 +13,9 @@ use amaterasu_package::{
 use std::{fs, os::unix::fs::MetadataExt, path::Path};
 
 mod offline;
-pub use offline::activate_stopped;
+mod restore;
+pub use offline::{activate_stopped, restore_stopped};
+pub use restore::restore;
 
 fn read_allowlist(root: &Path) -> PackageResult<PolicyAllowlist> {
     let policy_path = root.join("package-activation-policy.json");
@@ -272,35 +274,42 @@ pub fn validate_transition(
     {
         return Err("previous package is not a signed known selection".into());
     }
-    let new_package = amaterasu_package::verify_package(
-        &amaterasu_package::package_directory(root, new_digest)?,
-        &proposed,
-        amaterasu_package::VerificationPolicy {
-            minimum_sequence: old.highest_sequence,
-            allow_historical: false,
-            now: 0,
-        },
-    )?;
-    if !new_package.signed
-        || new_package.digest != new_digest
-        || new_package.manifest.host_context_schema != 1
-        || new_package.signer_fingerprint.as_deref() != Some(origin.key_fingerprint.as_str())
-    {
-        return Err("trial package is not signed by the authorized publisher".into());
-    }
-    let request = HostPackageActivation {
-        repository_id: origin.repository_id.clone(),
-        catalog_digest: "0".repeat(64),
-        manifest_digest: new_digest.into(),
-        expected_active: old_digest.into(),
-        expected_revision: revision,
+    // An update raises the accepted release; a return to a retained set
+    // leaves it where it is. Each shape must then match its own rules exactly.
+    let expected = if new.highest_sequence == old.highest_sequence {
+        restore::validate_restored_package(root, &old, new_digest, &proposed, origin)?;
+        restore::restored_selection(&old, new_digest)?
+    } else {
+        let new_package = amaterasu_package::verify_package(
+            &amaterasu_package::package_directory(root, new_digest)?,
+            &proposed,
+            amaterasu_package::VerificationPolicy {
+                minimum_sequence: old.highest_sequence,
+                allow_historical: false,
+                now: 0,
+            },
+        )?;
+        if !new_package.signed
+            || new_package.digest != new_digest
+            || new_package.manifest.host_context_schema != 1
+            || new_package.signer_fingerprint.as_deref() != Some(origin.key_fingerprint.as_str())
+        {
+            return Err("trial package is not signed by the authorized publisher".into());
+        }
+        let request = HostPackageActivation {
+            repository_id: origin.repository_id.clone(),
+            catalog_digest: "0".repeat(64),
+            manifest_digest: new_digest.into(),
+            expected_active: old_digest.into(),
+            expected_revision: revision,
+        };
+        next_selection(
+            &old,
+            &request,
+            &origin.key_fingerprint,
+            new_package.manifest.sequence,
+        )?
     };
-    let expected = next_selection(
-        &old,
-        &request,
-        &origin.key_fingerprint,
-        new_package.manifest.sequence,
-    )?;
     if serde_json::to_value(&expected).map_err(|e| e.to_string())?
         != serde_json::to_value(&new).map_err(|e| e.to_string())?
     {
@@ -655,43 +664,7 @@ fn activate_with_unit(
     let (executable, host_hash) = host_executable()?;
     let ((sequence, signer), proposed) =
         prepare_trial(root, request, |path, verified, bootstrap| {
-            let mut package = amaterasu_package::verify_package(
-                path,
-                bootstrap,
-                amaterasu_package::VerificationPolicy {
-                    minimum_sequence: verified.manifest.sequence,
-                    allow_historical: false,
-                    now: unix_timestamp(),
-                },
-            )?;
-            if package.digest != verified.digest
-                || package.signer_fingerprint != verified.signer_fingerprint
-            {
-                return Err("candidate changed before its trial".into());
-            }
-            let logging = crate::logging_config::HostLoggingConfig::from_global(
-                bootstrap.policy.settings.get("global"),
-                state_root,
-            )?;
-            logging.inject(&mut package.runtime_config)?;
-            let mut loaded = crate::loading::LoadedComponents::load(
-                root,
-                path,
-                &package,
-                state_root,
-                logging.start_product_logger(),
-                &mut |_| Ok(()),
-            )?;
-            loaded.tick()?;
-            loaded.health()?;
-            loaded.quiesce(std::time::Duration::from_secs(20))?;
-            drop(loaded);
-            Ok((
-                package.manifest.sequence,
-                package
-                    .signer_fingerprint
-                    .ok_or("candidate signer unavailable")?,
-            ))
+            trial_set(root, state_root, path, verified, bootstrap)
         })?;
     let next = next_selection(&selection, request, &signer, sequence)?;
     let new_unit = amaterasu_package::linux_user_unit::render_service_unit(
@@ -778,6 +751,55 @@ fn activate_with_unit(
             )
         },
     )
+}
+
+/// Verify a set's bytes once more, load it, check its health and retire it.
+/// Returns the release sequence and signer of what was loaded. The caller
+/// keeps the publisher approval locked and has stopped the running set.
+fn trial_set(
+    root: &Path,
+    state_root: &Path,
+    path: &Path,
+    verified: &VerifiedPackage,
+    bootstrap: &BootstrapConfig,
+) -> PackageResult<(u64, String)> {
+    let mut package = amaterasu_package::verify_package(
+        path,
+        bootstrap,
+        amaterasu_package::VerificationPolicy {
+            minimum_sequence: verified.manifest.sequence,
+            allow_historical: false,
+            now: unix_timestamp(),
+        },
+    )?;
+    if package.digest != verified.digest
+        || package.signer_fingerprint != verified.signer_fingerprint
+    {
+        return Err("candidate changed before its trial".into());
+    }
+    let logging = crate::logging_config::HostLoggingConfig::from_global(
+        bootstrap.policy.settings.get("global"),
+        state_root,
+    )?;
+    logging.inject(&mut package.runtime_config)?;
+    let mut loaded = crate::loading::LoadedComponents::load(
+        root,
+        path,
+        &package,
+        state_root,
+        logging.start_product_logger(),
+        &mut |_| Ok(()),
+    )?;
+    loaded.tick()?;
+    loaded.health()?;
+    loaded.quiesce(std::time::Duration::from_secs(20))?;
+    drop(loaded);
+    Ok((
+        package.manifest.sequence,
+        package
+            .signer_fingerprint
+            .ok_or("candidate signer unavailable")?,
+    ))
 }
 
 /// Durable, privacy-limited progress for management after a worker restart.

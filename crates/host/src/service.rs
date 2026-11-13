@@ -472,8 +472,44 @@ fn validate_active_package_pin(expected: &str, active: &str) -> PackageResult<()
 #[cfg(target_os = "linux")]
 enum LinuxUserAction {
     Lifecycle(HostLifecycleAction),
-    Activate(amaterasu_contracts::HostPackageActivation),
+    Package(PackageRequest),
 }
+
+/// A request to replace the running set that the stream barrier released.
+#[cfg(target_os = "linux")]
+enum PackageRequest {
+    /// A newer set from the repository cache.
+    Activate(amaterasu_contracts::HostPackageActivation),
+    /// A retained set this host ran before.
+    Restore(amaterasu_contracts::HostPackageRestore),
+}
+
+#[cfg(target_os = "linux")]
+impl PackageRequest {
+    /// The set the request would make active.
+    fn target(&self) -> &str {
+        match self {
+            Self::Activate(request) => &request.manifest_digest,
+            Self::Restore(request) => &request.manifest_digest,
+        }
+    }
+
+    fn perform(&self, root: &Path, running: &str, state_root: &Path) -> PackageResult<()> {
+        match self {
+            Self::Activate(request) => {
+                crate::package_activation::activate(root, running, state_root, request)
+            }
+            Self::Restore(request) => {
+                crate::package_activation::restore(root, running, state_root, request)
+            }
+        }
+    }
+}
+
+/// A restore is asked for by a person and then waits a quarter of a second
+/// anyway, so the host looks for one far less often than it ticks.
+#[cfg(target_os = "linux")]
+const RESTORE_REQUEST_POLL: Duration = Duration::from_millis(100);
 
 #[cfg(target_os = "linux")]
 fn run_linux_user_service(root: &Path, expected_digest: &str) -> PackageResult<()> {
@@ -553,10 +589,9 @@ fn run_linux_user_service_inner(
 
             // Give management time to deliver its accepted response before
             // stopping its listener for the trial and service restart.
-            let mut pending_activation: Option<(
-                amaterasu_contracts::HostPackageActivation,
-                Instant,
-            )> = None;
+            let mut pending_activation: Option<(PackageRequest, Instant)> = None;
+            // None once the loaded runtime has shown it predates restores.
+            let mut next_restore_poll = Some(Instant::now());
             while !USER_SERVICE_STOP_REQUESTED.load(Ordering::Relaxed) {
                 // Observe before dispatch so a provider notification during
                 // this tick also prevents the following wait from sleeping.
@@ -575,20 +610,38 @@ fn run_linux_user_service_inner(
                     {
                         let _ = crate::package_activation::write_status(
                             &state_root,
-                            &request.manifest_digest,
+                            request.target(),
                             "failed",
                         );
                         return Err(format!(
                             "cannot retire the running package for activation: {error}"
                         ));
                     }
-                    return Ok(Some(LinuxUserAction::Activate(request)));
+                    return Ok(Some(LinuxUserAction::Package(request)));
                 }
                 if pending_activation.is_none()
                     && let Some(request) = components.take_host_package_activation()?
                 {
-                    pending_activation =
-                        Some((request, Instant::now() + Duration::from_millis(250)));
+                    pending_activation = Some((
+                        PackageRequest::Activate(request),
+                        Instant::now() + Duration::from_millis(250),
+                    ));
+                }
+                if pending_activation.is_none()
+                    && next_restore_poll.is_some_and(|due| Instant::now() >= due)
+                {
+                    use crate::loading::HostPackageRestorePoll;
+                    next_restore_poll = Some(Instant::now() + RESTORE_REQUEST_POLL);
+                    match components.take_host_package_restore()? {
+                        HostPackageRestorePoll::Unsupported => next_restore_poll = None,
+                        HostPackageRestorePoll::Idle => {}
+                        HostPackageRestorePoll::Requested(request) => {
+                            pending_activation = Some((
+                                PackageRequest::Restore(request),
+                                Instant::now() + Duration::from_millis(250),
+                            ));
+                        }
+                    }
                 }
                 if let Some(action) = components.take_host_lifecycle_action()? {
                     input.revoke();
@@ -608,16 +661,16 @@ fn run_linux_user_service_inner(
         input.revoke();
         remove_service_readiness(root);
         match outcome {
-            Ok(Some(LinuxUserAction::Activate(request))) => {
+            Ok(Some(LinuxUserAction::Package(request))) => {
                 if let Err(error) = crate::package_activation::write_status(
                     &state_root,
-                    &request.manifest_digest,
+                    request.target(),
                     "activating",
                 ) {
                     eprintln!("package activation receipt unavailable: {error}");
                     continue;
                 }
-                match crate::package_activation::activate(root, &digest, &state_root, &request) {
+                match request.perform(root, &digest, &state_root) {
                     Ok(()) => {
                         break Err(
                             "package activation committed; restart with the updated service pin"
@@ -633,7 +686,7 @@ fn run_linux_user_service_inner(
                         }
                         let _ = crate::package_activation::write_status(
                             &state_root,
-                            &request.manifest_digest,
+                            request.target(),
                             "failed",
                         );
                         eprintln!("package activation failed: {error}");

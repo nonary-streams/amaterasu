@@ -1,6 +1,6 @@
 use amaterasu_package::{
-    ActivationState, BootstrapConfig, PackageResult, RootLock, VerificationPolicy,
-    package_directory, read_json, unix_timestamp, verify_package, write_json_atomically,
+    ActivationState, BootstrapConfig, PackageResult, RootLock, read_json, unix_timestamp,
+    write_json_atomically,
 };
 use std::io::BufReader;
 use std::path::Path;
@@ -49,19 +49,14 @@ pub(crate) fn select_active(root: &Path) -> PackageResult<String> {
         .ok_or("no active or pending component set")?;
     let active = active.clone();
     if !bootstrap.development {
-        let package = verify_package(
-            &package_directory(root, &active)?,
+        // The newest accepted release, or an older healthy set the host was
+        // returned to. The publisher-bound checks follow at worker loading.
+        amaterasu_package::repository::verify_production_active(
+            root,
             &bootstrap,
-            VerificationPolicy {
-                minimum_sequence: selection.highest_sequence,
-                allow_historical: false,
-                now: unix_timestamp(),
-            },
+            &selection,
+            unix_timestamp(),
         )?;
-        if !package.signed || package.digest != active || package.manifest.host_context_schema != 1
-        {
-            return Err("production active package is not an authenticated selection".into());
-        }
     }
     Ok(active)
 }

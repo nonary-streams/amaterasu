@@ -98,6 +98,42 @@ pub fn observe_native_selection(root: &Path) -> PackageResult<NativeSelectionObs
     })
 }
 
+/// Verify the set a production selection names as active: signed, unexpired,
+/// and either the newest release the host accepted or an older set the host
+/// was explicitly returned to. Such a set ran healthy on this host before and
+/// keeps its publisher provenance; returning to it never lowers the accepted
+/// release, so `highest_sequence` and the publisher floors stay where they are.
+pub fn verify_production_active(
+    root: &Path,
+    bootstrap: &BootstrapConfig,
+    selection: &ActivationState,
+    now: u64,
+) -> PackageResult<crate::VerifiedPackage> {
+    let active = selection
+        .active
+        .as_deref()
+        .ok_or("no active production package is selected")?;
+    let package = verify_package(
+        &package_directory(root, active)?,
+        bootstrap,
+        VerificationPolicy {
+            minimum_sequence: 0,
+            allow_historical: true,
+            now,
+        },
+    )?;
+    if !package.signed || package.digest != active || package.manifest.host_context_schema != 1 {
+        return Err("active production selection lost authenticated identity".into());
+    }
+    if package.manifest.sequence < selection.highest_sequence
+        && !(selection.healthy_sets.contains(active)
+            && selection.repository_sets.contains_key(active))
+    {
+        return Err("active production package is older than the accepted release".into());
+    }
+    Ok(package)
+}
+
 /// Verify a production candidate while holding its repository approval lock.
 ///
 /// The caller must already hold the host root lock and authorize the request.
@@ -139,21 +175,7 @@ pub fn with_verified_production_candidate<T>(
         if selection.pending.is_some() || selection.trial.is_some() {
             return Err("native activation already in progress".into());
         }
-        let active = verify_package(
-            &package_directory(root, expected_active)?,
-            bootstrap,
-            VerificationPolicy {
-                minimum_sequence: selection.highest_sequence,
-                allow_historical: false,
-                now,
-            },
-        )?;
-        if !active.signed
-            || active.digest != expected_active
-            || active.manifest.host_context_schema != 1
-        {
-            return Err("active production selection lost authenticated identity".into());
-        }
+        verify_production_active(root, bootstrap, &selection, now)?;
         let source = store.existing_native_candidate_cache_path(repository_id, manifest_digest)?;
         let metadata = std::fs::symlink_metadata(&source)
             .map_err(|error| format!("cached native candidate is unavailable: {error}"))?;

@@ -124,6 +124,18 @@ fn run() -> PackageResult<()> {
                 println!("Candidate passed a disposable trial; active package was not changed.");
             }
         }
+        #[cfg(target_os = "linux")]
+        [command, root, digest, active, revision] if command == "restore-package-offline" => {
+            let request = amaterasu_contracts::HostPackageRestore {
+                manifest_digest: digest.clone(),
+                expected_active: active.clone(),
+                expected_revision: revision.clone(),
+            };
+            package_activation::restore_stopped(Path::new(root), &request)?;
+            println!(
+                "Verified restore prepared; the accepted release is unchanged. Start the managed service to complete its trial."
+            );
+        }
         [command, root] if command == "probe" => {
             supervisor::probe(Path::new(root), None)?;
             println!("Component set passed the development lifecycle probe.");
@@ -141,7 +153,7 @@ fn run() -> PackageResult<()> {
         }
         _ => {
             return Err(
-                "usage: amaterasu probe ROOT [CONTROL_MESSAGE_JSON] | reconcile-package-activation ROOT REPOSITORY CATALOG_DIGEST MANIFEST_DIGEST ACTIVE_DIGEST SELECTION_REVISION | activate-package-offline ROOT REPOSITORY CATALOG_DIGEST MANIFEST_DIGEST ACTIVE_DIGEST SELECTION_REVISION | service-ready ROOT | operational-ready ROOT | web-recovery-status ROOT | web-recover ROOT DIGEST | native-recover ROOT [DIGEST] | serve ROOT | service ROOT | service-user ROOT ACTIVE_DIGEST (Linux user service)"
+                "usage: amaterasu probe ROOT [CONTROL_MESSAGE_JSON] | reconcile-package-activation ROOT REPOSITORY CATALOG_DIGEST MANIFEST_DIGEST ACTIVE_DIGEST SELECTION_REVISION | activate-package-offline ROOT REPOSITORY CATALOG_DIGEST MANIFEST_DIGEST ACTIVE_DIGEST SELECTION_REVISION | restore-package-offline ROOT MANIFEST_DIGEST ACTIVE_DIGEST SELECTION_REVISION | service-ready ROOT | operational-ready ROOT | web-recovery-status ROOT | web-recover ROOT DIGEST | native-recover ROOT [DIGEST] | serve ROOT | service ROOT | service-user ROOT ACTIVE_DIGEST (Linux user service)"
                     .into(),
             );
         }

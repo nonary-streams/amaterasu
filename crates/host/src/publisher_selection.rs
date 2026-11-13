@@ -94,11 +94,19 @@ pub fn with_verified_selected<T>(
             {
                 return Err("selected repository native set lacks accepted provenance".into());
             }
+            // A production host runs the release at its publisher floor, or an
+            // older set it was explicitly returned to: the active selection,
+            // healthy on this host before, as required above. A pending or
+            // trial set must be the floor itself.
+            let returned_to = !bootstrap.development
+                && selection.active.as_deref() == Some(digest)
+                && package.manifest.sequence < floor.sequence;
             if purpose == SelectionPurpose::Worker
                 && (!bootstrap.development
                     || selection.pending.as_deref() == Some(digest)
                     || selection.trial.as_deref() == Some(digest))
                 && (package.manifest.sequence != floor.sequence || package.digest != floor.digest)
+                && !returned_to
             {
                 return Err("pending repository set was superseded by a newer release".into());
             }

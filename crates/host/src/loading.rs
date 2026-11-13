@@ -203,6 +203,15 @@ impl Drop for LoadedGraph {
     }
 }
 
+/// What the runtime answered when asked for a restore request.
+#[cfg(target_os = "linux")]
+pub enum HostPackageRestorePoll {
+    /// The loaded runtime predates restore requests and will never hold one.
+    Unsupported,
+    Idle,
+    Requested(amaterasu_contracts::HostPackageRestore),
+}
+
 pub struct LoadedComponents {
     // Keep the entire graph allocation stable. Failed shutdown intentionally
     // retains instances, endpoint state, host services and every library handle
@@ -774,6 +783,30 @@ impl LoadedComponents {
             Response::HostPackageActivation { request } => Ok(request.map(|value| *value)),
             Response::Error { code, message } => Err(format!("{code}: {message}")),
             response => Err(format!("unexpected host activation response: {response:?}")),
+        }
+    }
+
+    /// Asks the runtime for a restore request the stream barrier has released.
+    /// Asking is also how the runtime learns that this host takes them.
+    #[cfg(target_os = "linux")]
+    pub fn take_host_package_restore(&self) -> PackageResult<HostPackageRestorePoll> {
+        self.process.require_usable()?;
+        let input = serde_json::to_vec(&Command::HostPackageRestoreDrain {})
+            .map_err(|error| error.to_string())?;
+        // SAFETY: the private host endpoint belongs to this live runtime.
+        let output = unsafe { self.graph.lifecycle_endpoint.call(&input) }
+            .map_err(|status| format!("host restore endpoint returned status {status}"))?;
+        match serde_json::from_slice(&output).map_err(|error| error.to_string())? {
+            Response::HostPackageRestore { request } => Ok(request
+                .map_or(HostPackageRestorePoll::Idle, |value| {
+                    HostPackageRestorePoll::Requested(*value)
+                })),
+            // A runtime from before restore requests cannot decode the command.
+            Response::Error { code, .. } if code == "invalid_request" => {
+                Ok(HostPackageRestorePoll::Unsupported)
+            }
+            Response::Error { code, message } => Err(format!("{code}: {message}")),
+            response => Err(format!("unexpected host restore response: {response:?}")),
         }
     }
 

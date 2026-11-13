@@ -6,28 +6,69 @@ use super::*;
 /// authority. No network route calls this entry point. The old package is never
 /// loaded, and recovery evidence is not rewritten to make it readable by it.
 pub fn activate_stopped(root: &Path, request: &HostPackageActivation) -> PackageResult<()> {
-    let root = crate::service::validate_user_service_root(root)?;
-    let _lock = amaterasu_package::RootLock::acquire(&root)?;
-    let state_root = crate::service::validate_user_state_root(&root.join("data/state"))?;
-    let unit = managed_unit_for(UnitOwner::Stopped)?;
-    let metadata = fs::symlink_metadata(&unit).map_err(|e| e.to_string())?;
-    // SAFETY: geteuid has no pointer or ownership requirements.
-    let uid = unsafe { libc::geteuid() };
-    if !metadata.is_file() || metadata.uid() != uid || metadata.mode() & 0o022 != 0 {
-        return Err("offline activation requires a protected user-owned service unit".into());
-    }
-    let (executable, hash) = host_executable()?;
-    validate_unit_identity(
-        &read_bounded(&unit, 1024 * 1024)?,
-        &executable,
-        &root,
-        &request.expected_active,
-        &hash,
-    )?;
+    let service = StoppedService::identify(root, &request.expected_active)?;
     // prepare_trial rechecks the locked selection, installed publisher authority,
     // signed catalog and complete package. The same commit validates the old and
     // new pins, policy, input authorization and host hash before every write.
-    activate_with_unit(&root, &request.expected_active, &state_root, request, &unit)
+    activate_with_unit(
+        &service.root,
+        &request.expected_active,
+        &service.state_root,
+        request,
+        &service.unit,
+    )
+}
+
+/// Return a stopped installation to a retained set it ran before, under the
+/// same checks, trial and transaction as a restore the console asks for. This
+/// is the way back from a set whose own console cannot switch sets.
+pub fn restore_stopped(root: &Path, request: &HostPackageRestore) -> PackageResult<()> {
+    let service = StoppedService::identify(root, &request.expected_active)?;
+    restore::restore_with_unit(
+        &service.root,
+        &request.expected_active,
+        &service.state_root,
+        request,
+        &service.unit,
+    )
+}
+
+/// A stopped managed service whose unit names this host, this root and the
+/// package the caller expects. The root lock is held while this value lives.
+struct StoppedService {
+    root: std::path::PathBuf,
+    state_root: std::path::PathBuf,
+    unit: std::path::PathBuf,
+    _lock: amaterasu_package::RootLock,
+}
+
+impl StoppedService {
+    fn identify(root: &Path, expected_active: &str) -> PackageResult<Self> {
+        let root = crate::service::validate_user_service_root(root)?;
+        let lock = amaterasu_package::RootLock::acquire(&root)?;
+        let state_root = crate::service::validate_user_state_root(&root.join("data/state"))?;
+        let unit = managed_unit_for(UnitOwner::Stopped)?;
+        let metadata = fs::symlink_metadata(&unit).map_err(|e| e.to_string())?;
+        // SAFETY: geteuid has no pointer or ownership requirements.
+        let uid = unsafe { libc::geteuid() };
+        if !metadata.is_file() || metadata.uid() != uid || metadata.mode() & 0o022 != 0 {
+            return Err("offline activation requires a protected user-owned service unit".into());
+        }
+        let (executable, hash) = host_executable()?;
+        validate_unit_identity(
+            &read_bounded(&unit, 1024 * 1024)?,
+            &executable,
+            &root,
+            expected_active,
+            &hash,
+        )?;
+        Ok(Self {
+            root,
+            state_root,
+            unit,
+            _lock: lock,
+        })
+    }
 }
 
 fn validate_unit_identity(
