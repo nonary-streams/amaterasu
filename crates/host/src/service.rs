@@ -5,8 +5,8 @@ use amaterasu_contracts::{
     Command as ControlCommand, HOST_WORKER_SHUTDOWN_TIMEOUT_MS, HostLifecycleAction, Response,
 };
 use amaterasu_package::{
-    ActivationState, BootstrapConfig, PackageResult, RootLock, VerificationPolicy,
-    package_directory, read_json, unix_timestamp, verify_package, write_json_atomically,
+    ActivationState, BootstrapConfig, PackageResult, RootLock, package_directory, read_json,
+    unix_timestamp, write_json_atomically,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -102,21 +102,16 @@ fn selected_runtime_config(root: &Path) -> PackageResult<amaterasu_contracts::Ru
         return Err("operational readiness requires a signed production bootstrap".into());
     }
     let selection: ActivationState = read_json(&root.join("selection.json"))?;
-    let active = selection
-        .active
-        .ok_or("operational readiness has no active package")?;
-    let package = verify_package(
-        &package_directory(root, &active)?,
-        &bootstrap,
-        VerificationPolicy {
-            minimum_sequence: selection.highest_sequence,
-            allow_historical: false,
-            now: unix_timestamp(),
-        },
-    )?;
-    if !package.signed || package.digest != active || package.manifest.host_context_schema != 1 {
-        return Err("operational readiness selected package is not authenticated".into());
+    if selection.active.is_none() {
+        return Err("operational readiness has no active package".into());
     }
+    // The newest accepted release, or an older set the host was returned to.
+    let package = amaterasu_package::repository::verify_production_active(
+        root,
+        &bootstrap,
+        &selection,
+        unix_timestamp(),
+    )?;
     Ok(package.runtime_config)
 }
 

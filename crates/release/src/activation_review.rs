@@ -233,14 +233,12 @@ pub fn provision(root: &Path, report_path: &Path, expected_report: &str) -> Pack
         .active
         .as_deref()
         .ok_or("active package is unavailable")?;
-    let active = amaterasu_package::verify_package(
-        &amaterasu_package::package_directory(root, active_digest)?,
+    // The newest accepted release, or an older set the host was returned to.
+    let active = amaterasu_package::repository::verify_production_active(
+        root,
         &baseline,
-        amaterasu_package::VerificationPolicy {
-            minimum_sequence: selection.highest_sequence,
-            allow_historical: false,
-            now: amaterasu_package::unix_timestamp(),
-        },
+        &selection,
+        amaterasu_package::unix_timestamp(),
     )?;
     if !active.signed
         || active.digest != active_digest
@@ -445,14 +443,11 @@ pub fn provision_default(root: &Path) -> PackageResult<()> {
             .active
             .as_deref()
             .ok_or("active package unavailable")?;
-        let active = amaterasu_package::verify_package(
-            &amaterasu_package::package_directory(&root, digest)?,
+        let active = amaterasu_package::repository::verify_production_active(
+            &root,
             &bootstrap,
-            amaterasu_package::VerificationPolicy {
-                minimum_sequence: selection.highest_sequence,
-                allow_historical: false,
-                now: amaterasu_package::unix_timestamp(),
-            },
+            &selection,
+            amaterasu_package::unix_timestamp(),
         )?;
         if !active.signed || active.digest != digest || active.manifest.host_context_schema != 1 {
             return Err("active package is not a verified production set".into());

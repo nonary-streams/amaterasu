@@ -7,9 +7,8 @@ use crate::profiles::PackageProfile;
 use amaterasu_package::linux_user_unit::systemd_quote;
 use amaterasu_package::linux_user_unit::{render_service_unit, valid_digest};
 use amaterasu_package::{
-    ActivationState, BootstrapConfig, PackageResult, VerificationPolicy, create_private_directory,
-    current_target, package_directory, random_identifier, read_bounded, sha256, sha256_reader,
-    unix_timestamp, verify_package,
+    ActivationState, BootstrapConfig, PackageResult, create_private_directory, current_target,
+    package_directory, random_identifier, read_bounded, sha256, sha256_reader, unix_timestamp,
 };
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
@@ -64,14 +63,12 @@ pub fn prepare(
     if !package_path.starts_with(runtime_root.join("sets")) {
         return Err("active package path escapes the runtime root".into());
     }
-    let verified = verify_package(
-        &package_path,
+    // The newest accepted release, or an older set the host was returned to.
+    let verified = amaterasu_package::repository::verify_production_active(
+        &runtime_root,
         &bootstrap,
-        VerificationPolicy {
-            minimum_sequence: selection.highest_sequence,
-            allow_historical: false,
-            now: unix_timestamp(),
-        },
+        &selection,
+        unix_timestamp(),
     )?;
     if !verified.signed
         || verified.digest != active_digest
@@ -202,14 +199,12 @@ pub fn preflight(
     if !package_path.starts_with(runtime_root.join("sets")) {
         return Err("active package path escapes the runtime root".into());
     }
-    let verified = verify_package(
-        &package_path,
+    // The newest accepted release, or an older set the host was returned to.
+    let verified = amaterasu_package::repository::verify_production_active(
+        &runtime_root,
         &bootstrap,
-        VerificationPolicy {
-            minimum_sequence: selection.highest_sequence,
-            allow_historical: false,
-            now: unix_timestamp(),
-        },
+        &selection,
+        unix_timestamp(),
     )?;
     if !verified.signed
         || verified.digest != active_digest
