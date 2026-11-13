@@ -212,8 +212,10 @@ browser API calls.
   request to `POST /v1/package-update/restore`. Both changes need an administrator's
   signed-in session. A listed package without `switches_back` has not run on this host
   with version switching, so the console could not switch again once it is running;
-  the list says so, and so does the confirmation for such a package. A host that is
-  still reading its packages (`loading`) is asked again a few times.
+  the list says so, and so does the confirmation for such a package. Such a package
+  cannot read the automatic-update setting either, so the page turns that setting off
+  before it asks for the switch, and asks for nothing if that is refused. A host that
+  is still reading its packages (`loading`) is asked again a few times.
   Under Amaterasu Core, Included lists the families of modules that carry a stream with
   the repository each is built from, then the modules built into Amaterasu itself and
   any another developer wrote. Plugins compares what the approved repositories offer

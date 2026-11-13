@@ -988,6 +988,7 @@ namespace Amaterasu {
     unsupported_platform: "Updates from the console are not available on this platform yet.",
     permission_denied: "This account is not allowed to do that. Installing an update needs an administrator who is signed in to the console.",
     not_restorable: "The host can no longer switch to that package. Open the list again to see what it still keeps.",
+    automatic_updates_on: "Turn automatic updates off before switching to that package. It is from before automatic updates and cannot read the setting, which would lock this console out.",
     invalid_mode: "The host did not recognise that setting. Reload the page and try again.",
   };
 

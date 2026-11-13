@@ -837,6 +837,7 @@ test("the packages a host has kept are read whole or not at all", () => {
   for (const unknown of [null, "constructor", "something_new"]) assert.equal(plugins.packageVersionReason(unknown), "Cannot be switched to");
   assert.match(plugins.packageUpdateRefusalMessage("not_restorable"), /can no longer switch to that package/);
   assert.match(plugins.packageUpdateRefusalMessage("invalid_mode"), /did not recognise that setting/);
+  assert.match(plugins.packageUpdateRefusalMessage("automatic_updates_on"), /^Turn automatic updates off before switching to that package\./);
 });
 
 test("the modules no family accounts for are Amaterasu's own or another developer's", () => {

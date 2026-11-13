@@ -962,8 +962,37 @@ test('Amaterasu Core keeps itself up to date and can go back to an earlier packa
     await waitFor(`document.querySelector('dialog.confirmation')?.open === true`);
     assert.match(await evaluate(`document.querySelector('dialog.confirmation').textContent`),
       /This package is from before version switching: once it is running, this console can no longer switch packages/);
-    assert.doesNotMatch(await evaluate(`document.querySelector('dialog.confirmation').textContent`), /will not bring back/);
+    assert.doesNotMatch(await evaluate(`document.querySelector('dialog.confirmation').textContent`), /will not bring back|Automatic updates are turned off/);
     await evaluate(`host.press('Cancel', document.querySelector('dialog.confirmation'))`);
+    // Such a package cannot read the automatic-update setting either, so the
+    // setting is turned off before the switch is asked for, and the dialog says so.
+    await evaluate(`host.pkg = { automatic: { mode: 'install', next_check_unix_ms: Date.now() + 3600000 }, restoring: null };
+      host.act.automatic = body => { host.pkg = { ...host.pkg, automatic: { mode: body.mode, next_check_unix_ms: null } }; };
+      host.act.restore = body => { host.pkg = { ...host.pkg, phase: 'waiting_stream', restoring: { digest: body.digest, sequence: '39' } }; };
+      host.open()`);
+    await waitFor(settle);
+    await evaluate(`document.querySelector('.plugin-versions').open = true`);
+    await waitFor(`document.querySelectorAll('.plugin-versions tbody tr').length === 6`);
+    await evaluate(`host.press('Switch to this version')`);
+    await waitFor(`document.querySelector('dialog.confirmation')?.open === true`);
+    assert.match(await evaluate(`document.querySelector('dialog.confirmation').textContent`),
+      /Automatic updates are turned off first, because this package cannot read that setting\./);
+    await evaluate(`host.press('Switch version', document.querySelector('dialog.confirmation'))`);
+    await waitFor(`host.headline() === 'Waiting for the stream to end'`);
+    assert.deepEqual(await evaluate(`host.calls.filter(([route]) => /automatic|restore/.test(route)).map(([route, body]) => route.split('/')[1] + ':' + (body.mode ?? body.digest.slice(0, 4)))`),
+      ['automatic:off', 'restore:1111']);
+    assert.equal(await evaluate(`${mode}.value`), 'off');
+    // If the setting cannot be turned off, nothing is switched.
+    await evaluate(`host.pkg = { automatic: { mode: 'download', next_check_unix_ms: null }, restoring: null }; host.refuse.automatic = 'settings_busy'; host.open()`);
+    await waitFor(settle);
+    await evaluate(`document.querySelector('.plugin-versions').open = true`);
+    await waitFor(`document.querySelectorAll('.plugin-versions tbody tr').length === 6`);
+    await evaluate(`host.press('Switch to this version')`);
+    await waitFor(`document.querySelector('dialog.confirmation')?.open === true`);
+    await evaluate(`host.press('Switch version', document.querySelector('dialog.confirmation'))`);
+    await waitFor(`document.querySelector('.plugin-update-refusal:not([hidden])') !== null`);
+    assert.equal(await evaluate(`host.calls.some(([route]) => route === 'package-update/restore')`), false, 'the switch is not asked for');
+    await evaluate(`host.refuse = {}; host.pkg = { automatic: { mode: 'off', next_check_unix_ms: null }, restoring: null }`);
 
     // A host that has only just started is still reading its packages, and is asked again.
     await evaluate(`host.reading = 2; host.listedPackages = host.versionsReply;

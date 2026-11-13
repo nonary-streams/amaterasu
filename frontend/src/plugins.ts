@@ -1322,14 +1322,25 @@ namespace Amaterasu {
       }
 
       async function switchTo(version: PackageVersion): Promise<void> {
+        // A package from before automatic updates cannot read that setting,
+        // and a console that cannot read its settings lets nobody in.
+        const automatic = core.view().automatic;
+        const turnOff = !version.switchesBack && automatic !== null && automatic.mode !== "off";
+        const leaving = "The host restarts with this earlier package as soon as no stream is running, and keeps the one it has if the earlier one does not start.";
         const confirmed = await confirmAction(
           lit(`Switch to package ${shortDigest(version.digest)}?`),
           version.switchesBack
-            ? "The host restarts with this earlier package as soon as no stream is running, and keeps the one it has if the earlier one does not start. An automatic update will not bring back the package you are leaving."
-            : "The host restarts with this earlier package as soon as no stream is running, and keeps the one it has if the earlier one does not start. This package is from before version switching: once it is running, this console can no longer switch packages, and the way forward is a newer update or the host's command line.",
+            ? lit(`${leaving} An automatic update will not bring back the package you are leaving.`)
+            : lit(`${leaving} This package is from before version switching: once it is running, this console can no longer switch packages, and the way forward is a newer update or the host's command line.` +
+              (turnOff ? " Automatic updates are turned off first, because this package cannot read that setting." : "")),
           "Switch version",
         );
         if (!confirmed || page.signal.aborted) return;
+        if (turnOff) {
+          await updates.change(CORE_UPDATE_SOURCE, { kind: "automatic", mode: "off" });
+          // A refusal is shown on the row; nothing is switched while the setting stands.
+          if (page.signal.aborted || core.view().automatic?.mode !== "off") return;
+        }
         await updates.change(CORE_UPDATE_SOURCE, { kind: "restore", digest: version.digest });
       }
 

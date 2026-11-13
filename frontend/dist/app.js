@@ -15221,6 +15221,7 @@ var Amaterasu;
         unsupported_platform: "Updates from the console are not available on this platform yet.",
         permission_denied: "This account is not allowed to do that. Installing an update needs an administrator who is signed in to the console.",
         not_restorable: "The host can no longer switch to that package. Open the list again to see what it still keeps.",
+        automatic_updates_on: "Turn automatic updates off before switching to that package. It is from before automatic updates and cannot read the setting, which would lock this console out.",
         invalid_mode: "The host did not recognise that setting. Reload the page and try again.",
     };
     function packageUpdateRefusalMessage(code) {
@@ -16597,11 +16598,20 @@ var Amaterasu;
                     control.disabled = !idle || !canManage;
             }
             async function switchTo(version) {
+                const automatic = core.view().automatic;
+                const turnOff = !version.switchesBack && automatic !== null && automatic.mode !== "off";
+                const leaving = "The host restarts with this earlier package as soon as no stream is running, and keeps the one it has if the earlier one does not start.";
                 const confirmed = await Amaterasu.confirmAction(lit(`Switch to package ${Amaterasu.shortDigest(version.digest)}?`), version.switchesBack
-                    ? "The host restarts with this earlier package as soon as no stream is running, and keeps the one it has if the earlier one does not start. An automatic update will not bring back the package you are leaving."
-                    : "The host restarts with this earlier package as soon as no stream is running, and keeps the one it has if the earlier one does not start. This package is from before version switching: once it is running, this console can no longer switch packages, and the way forward is a newer update or the host's command line.", "Switch version");
+                    ? lit(`${leaving} An automatic update will not bring back the package you are leaving.`)
+                    : lit(`${leaving} This package is from before version switching: once it is running, this console can no longer switch packages, and the way forward is a newer update or the host's command line.` +
+                        (turnOff ? " Automatic updates are turned off first, because this package cannot read that setting." : "")), "Switch version");
                 if (!confirmed || page.signal.aborted)
                     return;
+                if (turnOff) {
+                    await updates.change(Amaterasu.CORE_UPDATE_SOURCE, { kind: "automatic", mode: "off" });
+                    if (page.signal.aborted || core.view().automatic?.mode !== "off")
+                        return;
+                }
                 await updates.change(Amaterasu.CORE_UPDATE_SOURCE, { kind: "restore", digest: version.digest });
             }
             function draw() {
