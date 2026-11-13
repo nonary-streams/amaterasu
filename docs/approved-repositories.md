@@ -208,10 +208,10 @@ An installed Linux host keeps every set it ran healthy and can make one of them 
   "versions": [
     { "digest": "<64 hex characters>", "sequence": "1794169006", "state": "running",
       "installed_unix_ms": 1794529635000, "modules": 37, "differs": 0,
-      "restorable": false, "reason": null },
+      "restorable": false, "reason": null, "switches_back": true },
     { "digest": "<64 hex characters>", "sequence": "1794169005", "state": "previous",
       "installed_unix_ms": 1794443012000, "modules": 37, "differs": 2,
-      "restorable": true, "reason": null }
+      "restorable": true, "reason": null, "switches_back": false }
   ]
 }
 ```
@@ -223,6 +223,17 @@ An installed Linux host keeps every set it ran healthy and can make one of them 
 | `expired` | The set's signed manifest has expired |
 | `publisher_untrusted` | The set was accepted under another key than the running set's, or its repository is no longer approved and trusted |
 | `unavailable` | The selection has no record of who published the set, or the set is not at or below its publisher's accepted release |
+
+`switches_back` says whether the set's own console could switch sets again after a return to it:
+
+| `switches_back` | Meaning |
+|---|---|
+| `true` | The set has run on this host with a management module that serves `versions` and `restore` |
+| `false` | It is not known to have: it last ran before these routes existed, it has never run on a host that takes restores, or the record of it is gone |
+
+This is a fact about what has run, not a reading of the set. Nothing a publisher signs says whether a set's management module serves these routes, so a set that does serve them records its own digest once the host shell has shown that it takes restore requests, which happens within the first seconds after it starts. The running set therefore lists `true` once it has recorded itself, and a retained set lists `true` only if it did so while it ran. The record is `switching-sets.json` in the host's `repositories` directory, where the module already keeps the approved repositories and the candidate cache. It names at most the 256 sets that ran most recently, and it is read and written on the worker thread that reads the manifests.
+
+`switches_back` changes nothing the host accepts. The host never reads the record, `restorable` does not depend on it, and a set that lists `false` is returned to in exactly the same way as one that lists `true`. The console uses it to warn before the switch, because the way forward from such a set is [the command line](#with-the-service-stopped). A record that is missing, cannot be read or is not a record names no set: every set then lists `false` and the listing is otherwise unaffected. A file that is not a record is replaced the next time a set records itself; something that cannot be read as a file is left as it is.
 
 The module reads one manifest for each retained set on a worker thread when it starts, and again when a request finds the list more than 30 seconds old. A request is answered from the last read. A request that arrives before the first read has finished gets an empty list with `"loading": true`. The list is advice: the host decides when a restore is asked for.
 
@@ -255,7 +266,7 @@ At every start the host accepts as its active set the release at its publisher's
 
 `amaterasu restore-package-offline ROOT MANIFEST_DIGEST ACTIVE_DIGEST SELECTION_REVISION` performs the same restore for a stopped managed service, under the checks `activate-package-offline` makes of the unit, the host executable and the root. `SELECTION_REVISION` is the SHA-256 of `selection.json`. Starting the service then completes the trial.
 
-This is also the way forward from a set that predates this feature. Its management module has no `versions` or `restore` route, so its console cannot switch sets, and an update check does not offer a release the host has already accepted. The newer sets are still retained; `restore-package-offline` returns to one.
+This is also the way forward from a set that predates this feature, which the list shows with `switches_back` false. Its management module has no `versions` or `restore` route, so its console cannot switch sets, and an update check does not offer a release the host has already accepted. The newer sets are still retained; `restore-package-offline` returns to one.
 
 ### Compatibility between host and set
 

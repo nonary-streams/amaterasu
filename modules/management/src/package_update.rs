@@ -25,6 +25,8 @@ mod plan;
 #[cfg(target_os = "linux")]
 mod service;
 #[cfg(target_os = "linux")]
+mod switching_record;
+#[cfg(target_os = "linux")]
 mod transport;
 mod versions;
 
@@ -122,6 +124,18 @@ impl PackageUpdate {
         if let Some(service) = &mut self.service {
             service.advance();
         }
+    }
+
+    /// Lets the service learn, shortly after start, whether the host takes
+    /// restore requests. Called on every tick; it asks the runtime a bounded
+    /// number of times and never waits.
+    pub(crate) fn observe_host(&mut self, runtime: &RuntimeClient) {
+        #[cfg(target_os = "linux")]
+        if let Some(service) = &mut self.service {
+            service.observe_host(&mut RuntimeHost(runtime));
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = runtime;
     }
 
     /// Close admission without interrupting a worker that is already running.

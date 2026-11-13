@@ -480,6 +480,8 @@ struct ScriptedHost {
     /// False for a host shell from before restore requests.
     restores: bool,
     restore_requests: Vec<HostPackageRestore>,
+    /// How many times the service asked whether the host takes restores.
+    support_queries: usize,
 }
 
 impl ScriptedHost {
@@ -493,6 +495,7 @@ impl ScriptedHost {
             withdrawals: 0,
             restores: true,
             restore_requests: Vec::new(),
+            support_queries: 0,
         }
     }
 
@@ -526,6 +529,7 @@ impl ActivationHost for ScriptedHost {
     }
 
     fn restore_supported(&mut self) -> bool {
+        self.support_queries += 1;
         self.restores
     }
 

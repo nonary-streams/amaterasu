@@ -51,13 +51,14 @@ impl VersionRequest {
 #[cfg(target_os = "linux")]
 mod listing {
     use super::super::environment::Environment;
+    use super::super::switching_record;
     use super::unsupported;
     use crate::package_status;
     use amaterasu_package::ReleaseManifest;
     use amaterasu_package::repository::RepositoryStore;
     use serde_json::{Value, json};
     use std::{
-        collections::BTreeMap,
+        collections::{BTreeMap, BTreeSet},
         path::{Path, PathBuf},
         thread::{self, JoinHandle},
         time::{Duration, Instant, UNIX_EPOCH},
@@ -104,6 +105,9 @@ mod listing {
         expires_unix: u64,
         /// Why the host would refuse the set whatever the time, when it would.
         blocked: Option<&'static str>,
+        /// The set has run on this host with a management module that serves
+        /// these routes, so its own console can switch sets again.
+        switches_back: bool,
     }
 
     impl Entry {
@@ -128,6 +132,7 @@ mod listing {
                 "differs": self.differs,
                 "restorable": self.restorable(now),
                 "reason": if running { None } else { self.refusal(now) },
+                "switches_back": self.switches_back,
             })
         }
     }
@@ -153,11 +158,24 @@ mod listing {
         running: String,
     }
 
+    /// Whether the running set has put itself in the record of sets that
+    /// switch sets, which it does once the host is known to take restores.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum Recording {
+        /// The host has not said that it takes restore requests.
+        NotAsked,
+        /// It has; the next read records the running set first.
+        Due,
+        /// A read that records it has started.
+        Started,
+    }
+
     pub(crate) struct Versions {
         source: Option<Source>,
         listing: Option<Listing>,
         read_at: Option<Instant>,
         worker: Option<JoinHandle<Option<Listing>>>,
+        recording: Recording,
     }
 
     impl Versions {
@@ -177,6 +195,7 @@ mod listing {
                 listing: None,
                 read_at: None,
                 worker: None,
+                recording: Recording::NotAsked,
             };
             versions.begin_read();
             versions
@@ -193,6 +212,19 @@ mod listing {
                 self.listing = Some(listing);
             }
             self.read_at = Some(Instant::now());
+            if self.recording == Recording::Due {
+                self.begin_read();
+            }
+        }
+
+        /// Notes that the host takes restore requests, which makes the
+        /// running set one whose console can switch sets. It is recorded as
+        /// such once, on the worker, and the listing is read again after it.
+        pub(crate) fn host_switches(&mut self) {
+            if self.recording == Recording::NotAsked {
+                self.recording = Recording::Due;
+                self.begin_read();
+            }
         }
 
         /// The listing as last read. Asking also starts a fresh read when that
@@ -263,13 +295,16 @@ mod listing {
                 return;
             };
             self.read_at = None;
+            let record = self.recording == Recording::Due;
             self.worker = thread::Builder::new()
                 .name("amaterasu-package-versions".into())
-                .spawn(move || read(&source))
+                .spawn(move || read(&source, record))
                 .ok();
             if self.worker.is_none() {
                 // Try again when the console next asks.
                 self.read_at = Some(Instant::now());
+            } else if record {
+                self.recording = Recording::Started;
             }
         }
     }
@@ -278,12 +313,14 @@ mod listing {
     impl Versions {
         /// Starts a read now and waits for it, whatever the listing's age.
         pub(crate) fn reread(&mut self) {
-            while self.worker.is_some() {
-                thread::yield_now();
-                self.advance();
-            }
+            self.settle();
             self.begin_read();
-            while self.worker.is_some() {
+            self.settle();
+        }
+
+        /// Waits for every read that has started or is due.
+        pub(crate) fn settle(&mut self) {
+            while self.worker.is_some() || self.recording == Recording::Due {
                 thread::yield_now();
                 self.advance();
             }
@@ -307,7 +344,22 @@ mod listing {
     }
 
     /// Runs on a worker thread. None when the host root cannot be read at all.
-    fn read(source: &Source) -> Option<Listing> {
+    /// With `record`, the running set first puts itself in the record of sets
+    /// that switch sets.
+    fn read(source: &Source, record: bool) -> Option<Listing> {
+        let switching: BTreeSet<String> = source
+            .repository_directory
+            .as_deref()
+            .map(|directory| {
+                if record {
+                    switching_record::record(directory, &source.running)
+                } else {
+                    switching_record::recorded(directory)
+                }
+            })
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
         let root = package_status::trusted_root(source.package_root.to_str()?)?;
         let selection: amaterasu_package::ActivationState = serde_json::from_slice(
             &amaterasu_package::read_bounded(&root.join("selection.json"), SELECTION_BYTES).ok()?,
@@ -364,6 +416,7 @@ mod listing {
                     State::Retained
                 };
                 Entry {
+                    switches_back: switching.contains(&set.digest),
                     blocked: publishers.blocked(&selection, &set),
                     differs: differing(&running_libraries, &libraries(&set.manifest)),
                     modules: set.manifest.components.len(),

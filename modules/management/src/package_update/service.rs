@@ -19,8 +19,14 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread::{self, JoinHandle},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
+/// How often, and how many times, a freshly started service asks whether the
+/// host takes restore requests. The host shows that it does within its first
+/// few ticks; one that has not after ten seconds is not going to.
+const HOST_PROBE_INTERVAL: Duration = Duration::from_millis(250);
+const HOST_PROBES: u32 = 40;
 
 /// Why a request was refused without changing anything.
 type Refusal = &'static str;
@@ -133,6 +139,9 @@ pub(crate) struct Service<C: Connector> {
     shutdown_announced: bool,
     versions: Versions,
     restoring: Option<Restoring>,
+    /// When to ask the host next whether it takes restores, and how many
+    /// more times. None once it has said yes or the asking has run out.
+    host_probe: Option<(Instant, u32)>,
 }
 
 impl<C: Connector> Service<C> {
@@ -141,6 +150,7 @@ impl<C: Connector> Service<C> {
         Self {
             versions: Versions::start(&environment),
             restoring: None,
+            host_probe: Some((Instant::now(), HOST_PROBES)),
             connector,
             environment,
             phase: if failed { Phase::Failed } else { Phase::Idle },
@@ -204,6 +214,7 @@ impl<C: Connector> Service<C> {
                 }
             };
         }
+        self.host_switches();
         match request {
             VersionRequest::List => self.versions.reply(amaterasu_package::unix_timestamp()),
             VersionRequest::Restore { digest } => {
@@ -216,6 +227,33 @@ impl<C: Connector> Service<C> {
                 }
             }
         }
+    }
+
+    /// Learns, shortly after start, whether the host takes restore requests.
+    /// Called on every tick: it compares two instants, and asks the host at
+    /// most `HOST_PROBES` times in all.
+    pub(crate) fn observe_host(&mut self, host: &mut dyn ActivationHost) {
+        let Some((due, remaining)) = self.host_probe else {
+            return;
+        };
+        let now = Instant::now();
+        if now < due {
+            return;
+        }
+        if host.restore_supported() {
+            self.host_switches();
+        } else {
+            self.host_probe = remaining
+                .checked_sub(1)
+                .map(|remaining| (now + HOST_PROBE_INTERVAL, remaining));
+        }
+    }
+
+    /// The host takes restore requests, so this set's console can switch
+    /// sets. The set records that about itself, once.
+    fn host_switches(&mut self) {
+        self.host_probe = None;
+        self.versions.host_switches();
     }
 
     /// Asks the host to return to a listed set. The request names the set and
@@ -557,6 +595,16 @@ impl<C: Connector> Service<C> {
     /// Reads the retained sets again now, as an aged listing is on request.
     pub(crate) fn reread_versions(&mut self) {
         self.versions.reread();
+    }
+
+    /// Waits for the retained sets to be read and the running set recorded.
+    pub(crate) fn settle_versions(&mut self) {
+        self.versions.settle();
+    }
+
+    /// True while the service still means to ask the host about restores.
+    pub(crate) fn probing_host(&self) -> bool {
+        self.host_probe.is_some()
     }
 }
 

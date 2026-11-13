@@ -308,6 +308,7 @@ impl ManagedModule for ManagementModule {
             installer.advance();
         }
         self.package_update.advance();
+        self.package_update.observe_host(&self.runtime);
         if let Some(administration) = &mut self.repository_administration {
             administration.advance();
         }
@@ -853,6 +854,10 @@ mod tests {
                 },
                 // The module's own settings load finds no configuration service.
                 Command::Request { .. } => Response::error("unavailable", "not provided"),
+                // A started update service asks whether the host takes restores.
+                Command::HostPackageRestoreStatus {} => {
+                    Response::error("restore_unavailable", "not provided")
+                }
                 command => panic!("unexpected command: {command:?}"),
             };
             let bytes = serde_json::to_vec(&response).unwrap();

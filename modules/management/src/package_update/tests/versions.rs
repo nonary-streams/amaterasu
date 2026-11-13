@@ -1,5 +1,6 @@
 //! The retained sets a host lists, and the request to return to one.
-use super::super::versions::VersionRequest;
+use super::super::switching_record;
+use super::super::versions::{VersionRequest, Versions};
 use super::*;
 use amaterasu_package::NativeReleaseFloor;
 
@@ -150,7 +151,8 @@ fn the_listing_names_the_retained_sets_newest_first_with_what_differs() {
         assert!(entry["reason"].is_null(), "{entry}");
         let installed = entry["installed_unix_ms"].as_u64().unwrap();
         assert!(installed <= now && installed > now - 600_000, "{entry}");
-        assert_eq!(entry.as_object().unwrap().len(), 8, "{entry}");
+        assert!(entry["switches_back"].is_boolean(), "{entry}");
+        assert_eq!(entry.as_object().unwrap().len(), 9, "{entry}");
     }
     // Listing changes nothing and asks the host for nothing.
     assert!(shell.restore_requests.is_empty());
@@ -584,4 +586,276 @@ fn the_next_start_reports_how_the_restore_ended() {
         ask(&mut service, &mut shell, Action::Status)["phase"],
         "idle"
     );
+}
+
+/// The service of a set as it runs on a host that takes restores: started,
+/// its retained sets read, and the set recorded as one that switches sets.
+fn switching_service(host: &Host, running: &str, shell: &mut ScriptedHost) -> TestService {
+    let mut service = Service::new(
+        host.connector.clone(),
+        Environment::load(
+            Some(host.repository_directory()),
+            Some(host.root.clone()),
+            Some(running.to_owned()),
+        ),
+    );
+    service.observe_host(shell);
+    service.settle_versions();
+    service
+}
+
+fn record_file(host: &Host) -> PathBuf {
+    host.repository_directory().join(switching_record::FILE)
+}
+
+fn recorded_sets(host: &Host) -> Vec<String> {
+    let record: Value = serde_json::from_slice(&fs::read(record_file(host)).unwrap()).unwrap();
+    assert_eq!(record["schema"], 1);
+    record["sets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|digest| digest.as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// Which listed sets say their own console can switch sets again.
+fn switching_back(listing: &Value) -> Vec<(String, bool)> {
+    listing["versions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| {
+            (
+                entry["digest"].as_str().unwrap().to_owned(),
+                entry["switches_back"].as_bool().unwrap(),
+            )
+        })
+        .collect()
+}
+
+/// What a module lists before any host has told it that it takes restores.
+fn listed_without_recording(host: &Host) -> Value {
+    let mut versions = Versions::start(&host.environment());
+    versions.settle();
+    versions.reply(unix_timestamp())
+}
+
+#[test]
+fn a_set_that_ran_with_switching_says_its_console_can_switch_back() {
+    let retaining = Retaining::new();
+    let host = &retaining.host;
+    let [running, previous, oldest] = [
+        host.running.digest.clone(),
+        retaining.previous.digest.clone(),
+        retaining.oldest.digest.clone(),
+    ];
+    // Nothing has recorded itself: no set is known to switch back.
+    assert!(!record_file(host).exists());
+    assert_eq!(
+        switching_back(&listed_without_recording(host)),
+        [
+            (running.clone(), false),
+            (previous.clone(), false),
+            (oldest.clone(), false)
+        ]
+    );
+    assert!(!record_file(host).exists());
+
+    // The previous set ran here with these routes; the oldest never did.
+    let mut shell = ScriptedHost::accepting();
+    drop(switching_service(host, &previous, &mut shell));
+    assert_eq!(recorded_sets(host), [previous.as_str()]);
+
+    // The running set starts. Until the host has said that it takes
+    // restores, it has not recorded itself.
+    let mut service = host.service();
+    service.settle_versions();
+    assert!(service.probing_host());
+    assert_eq!(recorded_sets(host), [previous.as_str()]);
+    let mut unready = ScriptedHost::accepting();
+    unready.restores = false;
+    service.observe_host(&mut unready);
+    service.settle_versions();
+    assert_eq!(recorded_sets(host), [previous.as_str()]);
+    assert!(service.probing_host());
+    // It asks again later, not on every tick.
+    for _ in 0..100 {
+        service.observe_host(&mut unready);
+    }
+    assert_eq!(unready.support_queries, 1);
+
+    // The console asking is another moment to find out.
+    let reply = listing(&mut service, &mut shell);
+    assert!(!service.probing_host());
+    service.settle_versions();
+    assert_eq!(recorded_sets(host), [previous.clone(), running.clone()]);
+    // That reply was read before the running set recorded itself.
+    assert_eq!(listed(&reply, &previous)["switches_back"], true);
+    assert_eq!(listed(&reply, &oldest)["switches_back"], false);
+    let reply = listing(&mut service, &mut shell);
+    assert_eq!(
+        switching_back(&reply),
+        [
+            (running.clone(), true),
+            (previous.clone(), true),
+            (oldest.clone(), false)
+        ]
+    );
+    // It is a fact about what ran, and changes nothing the host accepts: the
+    // set that cannot switch back is as restorable as the one that can.
+    for digest in [&previous, &oldest] {
+        assert_eq!(listed(&reply, digest)["restorable"], true);
+        assert!(listed(&reply, digest)["reason"].is_null());
+    }
+    let waiting = restore(&mut service, &mut shell, &oldest);
+    assert_eq!(waiting["phase"], "waiting_stream", "{waiting}");
+    // Once recorded, the service asks the host nothing more on its ticks.
+    let asked = shell.support_queries;
+    for _ in 0..100 {
+        service.observe_host(&mut shell);
+    }
+    assert_eq!(shell.support_queries, asked);
+}
+
+#[test]
+fn the_record_outlives_the_service_that_wrote_it() {
+    let retaining = Retaining::new();
+    let host = &retaining.host;
+    let mut shell = ScriptedHost::accepting();
+    drop(switching_service(host, &host.running.digest, &mut shell));
+    assert_eq!(recorded_sets(host), [host.running.digest.as_str()]);
+    let written = fs::metadata(record_file(host)).unwrap().modified().unwrap();
+
+    // The module starts again on the same set: it reads what it wrote, on a
+    // start that has not yet heard from the host.
+    let reply = listed_without_recording(host);
+    assert_eq!(listed(&reply, &host.running.digest)["switches_back"], true);
+    assert_eq!(
+        listed(&reply, &retaining.previous.digest)["switches_back"],
+        false
+    );
+    // Recording itself again changes nothing on disk.
+    drop(switching_service(host, &host.running.digest, &mut shell));
+    assert_eq!(recorded_sets(host), [host.running.digest.as_str()]);
+    assert_eq!(
+        fs::metadata(record_file(host)).unwrap().modified().unwrap(),
+        written
+    );
+
+    // The host moves to another set. The one that recorded itself is still
+    // known to switch back, though its module is no longer loaded.
+    let mut service = switching_service(host, &retaining.previous.digest, &mut shell);
+    assert_eq!(
+        recorded_sets(host),
+        [
+            host.running.digest.clone(),
+            retaining.previous.digest.clone()
+        ]
+    );
+    let reply = listing(&mut service, &mut shell);
+    assert_eq!(listed(&reply, &host.running.digest)["switches_back"], true);
+    assert_eq!(
+        listed(&reply, &retaining.previous.digest)["switches_back"],
+        true
+    );
+    assert_eq!(
+        listed(&reply, &retaining.oldest.digest)["switches_back"],
+        false
+    );
+}
+
+#[test]
+fn the_record_keeps_only_the_sets_that_ran_most_recently() {
+    let retaining = Retaining::new();
+    let host = &retaining.host;
+    let earlier: Vec<String> = (0..switching_record::CAPACITY)
+        .map(|number| format!("{number:064x}"))
+        .collect();
+    fs::create_dir_all(host.repository_directory()).unwrap();
+    write_json_atomically(
+        &record_file(host),
+        &serde_json::json!({"schema": 1, "sets": earlier}),
+    )
+    .unwrap();
+
+    let mut shell = ScriptedHost::accepting();
+    let mut service = switching_service(host, &host.running.digest, &mut shell);
+    let sets = recorded_sets(host);
+    assert_eq!(sets.len(), switching_record::CAPACITY);
+    // The set that ran longest ago made room for the one running now.
+    assert_eq!(sets[..switching_record::CAPACITY - 1], earlier[1..]);
+    assert_eq!(sets.last(), Some(&host.running.digest));
+    assert!(fs::metadata(record_file(host)).unwrap().len() < 32 * 1024);
+    let reply = listing(&mut service, &mut shell);
+    assert_eq!(listed(&reply, &host.running.digest)["switches_back"], true);
+}
+
+#[test]
+fn a_record_that_cannot_be_used_lists_no_set_as_switching_back() {
+    let none_switch = |reply: &Value| {
+        assert_eq!(reply["ok"], true, "{reply}");
+        assert_eq!(reply["supported"], true, "{reply}");
+        assert_eq!(reply["total"], 3, "{reply}");
+        let sets = switching_back(reply);
+        assert_eq!(sets.len(), 3);
+        assert!(sets.iter().all(|(_, switches)| !switches), "{reply}");
+    };
+
+    // A file that is not a record. The listing is whole, and every set says
+    // false. The next set to record itself replaces the file.
+    for contents in [
+        b"{ not a record".as_slice(),
+        br#"{"schema":9,"sets":[]}"#,
+        br#"{"schema":1,"sets":["previous"]}"#,
+        b"",
+    ] {
+        let retaining = Retaining::new();
+        let host = &retaining.host;
+        fs::create_dir_all(host.repository_directory()).unwrap();
+        fs::write(record_file(host), contents).unwrap();
+        none_switch(&listed_without_recording(host));
+        assert_eq!(fs::read(record_file(host)).unwrap(), contents);
+
+        let mut shell = ScriptedHost::accepting();
+        let mut service = switching_service(host, &host.running.digest, &mut shell);
+        assert_eq!(recorded_sets(host), [host.running.digest.as_str()]);
+        let reply = listing(&mut service, &mut shell);
+        assert_eq!(
+            switching_back(&reply),
+            [
+                (host.running.digest.clone(), true),
+                (retaining.previous.digest.clone(), false),
+                (retaining.oldest.digest.clone(), false),
+            ]
+        );
+    }
+
+    // Something that cannot be read as a file. Every set says false, the
+    // running one included, nothing is written over it, and the listing and
+    // a restore work as they would without a record.
+    let retaining = Retaining::new();
+    let host = &retaining.host;
+    fs::create_dir_all(record_file(host)).unwrap();
+    none_switch(&listed_without_recording(host));
+    let mut shell = ScriptedHost::accepting();
+    let mut service = switching_service(host, &host.running.digest, &mut shell);
+    let reply = listing(&mut service, &mut shell);
+    none_switch(&reply);
+    assert!(record_file(host).is_dir());
+    assert_eq!(listed(&reply, &retaining.oldest.digest)["restorable"], true);
+    assert_eq!(
+        restore(&mut service, &mut shell, &retaining.oldest.digest)["phase"],
+        "waiting_stream"
+    );
+
+    // A host with no repository directory keeps no record.
+    let mut versions = Versions::start(&Environment::load(
+        None,
+        Some(host.root.clone()),
+        Some(host.running.digest.clone()),
+    ));
+    versions.host_switches();
+    versions.settle();
+    none_switch(&versions.reply(unix_timestamp()));
 }
