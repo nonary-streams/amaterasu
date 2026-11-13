@@ -251,7 +251,7 @@ fn stored_policy_restores_each_selection_on_restart() {
 fn malformed_or_future_documents_keep_ingress_closed() {
     for payload in [
         json!({"ok":false}),
-        json!({"ok":true,"found":true,"version":3,"revision":1,"values":{}}),
+        json!({"ok":true,"found":true,"version":4,"revision":1,"values":{}}),
         json!({"ok":true,"found":true,"version":1,"revision":0,"values":{}}),
         json!({"ok":true,"found":true,"version":1,"revision":1,"values":{"origin_web_ui_allowed":"WAN"}}),
         json!({"ok":true,"found":true,"version":1,"revision":1,"values":{"owner":"other"}}),
@@ -698,4 +698,360 @@ fn unsuccessful_release_reply_keeps_ingress_closed_and_retries_the_captured_resu
         .tick(Instant::now(), &mut |command| transport.send(command))
         .unwrap();
     assert_eq!(settings.maximum_peer(), Some(PeerTier::Pc));
+}
+
+/// A stored document that admits this PC only, with the choice of automatic
+/// package updates a current document may carry.
+fn stored_with_automatic(revision: u64, mode: Option<&str>) -> Response {
+    let mut values = json!({"origin_web_ui_allowed":"pc","csrf_allowed_origins":null});
+    if let Some(mode) = mode {
+        values["automatic_package_updates"] = json!(mode);
+    }
+    Response::Result {
+        payload: json!({"ok":true,"found":true,"version":if mode.is_some() { 3 } else { 2 },"revision":revision,"values":values}),
+    }
+}
+
+fn select_automatic(
+    settings: &mut ProductSettings,
+    transport: &mut Transport,
+    mode: AutomaticMode,
+) {
+    settings
+        .select_automatic_package_updates(7, 2000, mode, &mut |command| transport.send(command))
+        .unwrap();
+}
+
+#[test]
+fn the_choice_of_automatic_package_updates_is_saved_and_restored_on_restart() {
+    for (mode, name) in [
+        (AutomaticMode::Download, "download"),
+        (AutomaticMode::Install, "install"),
+    ] {
+        let mut settings = ProductSettings::default();
+        let mut transport = Transport::default();
+        load(&mut settings, &mut transport, stored(1, Some(PeerTier::Pc)));
+        assert_eq!(
+            settings.automatic_package_updates(),
+            Some(AutomaticMode::Off)
+        );
+
+        transport.push([Response::Accepted { id: 20 }]);
+        select_automatic(&mut settings, &mut transport, mode);
+        let Command::Request {
+            service,
+            parent,
+            payload,
+            ..
+        } = &transport.commands[3]
+        else {
+            panic!()
+        };
+        assert_eq!(service, CONFIGURATION);
+        assert_eq!(*parent, Some(7));
+        assert_eq!(
+            payload,
+            &json!({"action":"product_update","expected_revision":1,"version":3,"values":{"origin_web_ui_allowed":"pc","csrf_allowed_origins":null,"automatic_package_updates":name}})
+        );
+        // Nothing is in force or answered until the write is confirmed.
+        assert_eq!(
+            settings.automatic_package_updates(),
+            Some(AutomaticMode::Off)
+        );
+        assert_eq!(settings.saved_automatic_updates(), None);
+
+        transport.push([
+            Response::Ok,
+            stored_with_automatic(2, Some(name)),
+            Response::Ok,
+        ]);
+        settings
+            .tick(Instant::now(), &mut |command| transport.send(command))
+            .unwrap();
+        assert_eq!(settings.automatic_package_updates(), Some(mode));
+        assert_eq!(settings.maximum_peer(), Some(PeerTier::Pc));
+        // The module answers the request with the package-update status.
+        assert_eq!(settings.saved_automatic_updates(), Some(7));
+        assert!(
+            !transport
+                .commands
+                .iter()
+                .any(|command| matches!(command, Command::Complete { .. }))
+        );
+        settings.automatic_updates_answered();
+        assert_eq!(settings.saved_automatic_updates(), None);
+
+        let mut restarted = ProductSettings::default();
+        load(
+            &mut restarted,
+            &mut Transport::default(),
+            stored_with_automatic(2, Some(name)),
+        );
+        assert_eq!(restarted.automatic_package_updates(), Some(mode));
+        assert_eq!(
+            restarted.payload()["values"]["automatic_package_updates"],
+            name
+        );
+    }
+}
+
+#[test]
+fn turning_automatic_package_updates_off_restores_the_earlier_document_format() {
+    let mut settings = ProductSettings::default();
+    let mut transport = Transport::default();
+    load(
+        &mut settings,
+        &mut transport,
+        stored_with_automatic(4, Some("install")),
+    );
+    transport.push([Response::Accepted { id: 20 }]);
+    select_automatic(&mut settings, &mut transport, AutomaticMode::Off);
+    let Command::Request { payload, .. } = &transport.commands[3] else {
+        panic!()
+    };
+    // Exactly what a module from before automatic updates writes and reads.
+    assert_eq!(
+        payload,
+        &json!({"action":"product_update","expected_revision":4,"version":2,"values":{"origin_web_ui_allowed":"pc","csrf_allowed_origins":null}})
+    );
+    transport.push([Response::Ok, stored_with_automatic(5, None), Response::Ok]);
+    settings
+        .tick(Instant::now(), &mut |command| transport.send(command))
+        .unwrap();
+    assert_eq!(
+        settings.automatic_package_updates(),
+        Some(AutomaticMode::Off)
+    );
+    assert_eq!(settings.saved_automatic_updates(), Some(7));
+    assert!(
+        settings.payload()["values"]
+            .get("automatic_package_updates")
+            .is_none()
+    );
+}
+
+#[test]
+fn an_unchanged_choice_is_answered_without_a_write() {
+    for (saved, mode) in [
+        (None, AutomaticMode::Off),
+        (Some("download"), AutomaticMode::Download),
+    ] {
+        let mut settings = ProductSettings::default();
+        let mut transport = Transport::default();
+        load(
+            &mut settings,
+            &mut transport,
+            stored_with_automatic(3, saved),
+        );
+        select_automatic(&mut settings, &mut transport, mode);
+        assert_eq!(transport.commands.len(), 3);
+        assert_eq!(settings.saved_automatic_updates(), Some(7));
+        assert!(settings.pending.is_none());
+    }
+}
+
+#[test]
+fn the_choice_is_refused_while_the_settings_cannot_take_it() {
+    let refused = |settings: &mut ProductSettings, remaining_ms: u64| {
+        let mut reply = None;
+        settings
+            .select_automatic_package_updates(
+                7,
+                remaining_ms,
+                AutomaticMode::Install,
+                &mut |command| {
+                    let Command::Complete { request, payload } = command else {
+                        panic!("a refused choice must not reach configuration");
+                    };
+                    assert_eq!(request, 7);
+                    reply = Some(payload);
+                    Ok(Response::Ok)
+                },
+            )
+            .unwrap();
+        assert_eq!(settings.saved_automatic_updates(), None);
+        reply.unwrap()
+    };
+    let loaded = || {
+        let mut settings = ProductSettings::default();
+        let mut transport = Transport::default();
+        load(&mut settings, &mut transport, stored(1, Some(PeerTier::Pc)));
+        (settings, transport)
+    };
+
+    // The document has not been read yet.
+    let mut unloaded = ProductSettings::default();
+    assert_eq!(
+        refused(&mut unloaded, 2000),
+        json!({"ok":false,"code":"settings_unavailable"})
+    );
+
+    // The request has too little time left for a durable write.
+    let (mut settings, _) = loaded();
+    assert_eq!(refused(&mut settings, 100)["code"], "settings_timeout");
+    assert!(settings.pending.is_none());
+
+    // Another settings write is still under way.
+    let (mut settings, mut transport) = loaded();
+    update(&mut settings, &mut transport, json!("wan"));
+    assert_eq!(refused(&mut settings, 2000)["code"], "settings_busy");
+
+    // An earlier choice is saved and has not been answered.
+    let (mut settings, mut transport) = loaded();
+    select_automatic(&mut settings, &mut transport, AutomaticMode::Off);
+    assert_eq!(settings.saved_automatic_updates(), Some(7));
+    let mut reply = None;
+    settings
+        .select_automatic_package_updates(8, 2000, AutomaticMode::Install, &mut |command| {
+            let Command::Complete {
+                request: 8,
+                payload,
+            } = command
+            else {
+                panic!("a refused choice must not reach configuration");
+            };
+            reply = Some(payload);
+            Ok(Response::Ok)
+        })
+        .unwrap();
+    assert_eq!(reply.unwrap()["code"], "settings_busy");
+    assert_eq!(settings.saved_automatic_updates(), Some(7));
+
+    // The module is being unloaded.
+    let (mut settings, _) = loaded();
+    settings.prepare_shutdown();
+    assert_eq!(refused(&mut settings, 2000)["code"], "shutting_down");
+}
+
+#[test]
+fn an_unconfirmed_choice_is_not_reported_as_saved() {
+    for response in [
+        // Another document than the one that was written.
+        stored_with_automatic(2, Some("download")),
+        stored_with_automatic(2, None),
+        Response::Result {
+            payload: json!({"ok":false,"error":{"code":"revision_conflict","current_revision":3}}),
+        },
+    ] {
+        let mut settings = ProductSettings::default();
+        let mut transport = Transport::default();
+        load(&mut settings, &mut transport, stored(1, Some(PeerTier::Pc)));
+        transport.push([Response::Accepted { id: 20 }]);
+        select_automatic(&mut settings, &mut transport, AutomaticMode::Install);
+        transport.push([
+            Response::Ok,
+            response,
+            Response::Ok,
+            Response::Ok,
+            Response::Accepted { id: 30 },
+        ]);
+        settings
+            .tick(Instant::now(), &mut |command| transport.send(command))
+            .unwrap();
+        // The request was refused, and nothing is assumed until a reload.
+        assert_eq!(settings.saved_automatic_updates(), None);
+        assert_eq!(settings.automatic_package_updates(), None);
+        let completed = transport
+            .commands
+            .iter()
+            .find_map(|command| match command {
+                Command::Complete {
+                    request: 7,
+                    payload,
+                } => Some(payload),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(completed["ok"], false);
+        assert!(matches!(
+            completed["code"].as_str(),
+            Some("settings_outcome_unknown" | "revision_conflict")
+        ));
+    }
+}
+
+#[test]
+fn an_ingress_update_keeps_the_choice_of_automatic_package_updates() {
+    let mut settings = ProductSettings::default();
+    let mut transport = Transport::default();
+    load(
+        &mut settings,
+        &mut transport,
+        stored_with_automatic(1, Some("install")),
+    );
+    update(&mut settings, &mut transport, json!("lan"));
+    let Command::Request { payload, .. } = &transport.commands[3] else {
+        panic!()
+    };
+    assert_eq!(
+        payload,
+        &json!({"action":"product_update","expected_revision":1,"version":3,"values":{"origin_web_ui_allowed":"lan","csrf_allowed_origins":null,"automatic_package_updates":"install"}})
+    );
+    // The settings route cannot choose the mode: its own route does, under
+    // its own authorization.
+    let mut reply = None;
+    let mut fresh = ProductSettings::default();
+    load(&mut fresh, &mut Transport::default(), stored(1, None));
+    fresh
+        .receive(
+            "amaterasu.management",
+            7,
+            2000,
+            json!({"action":"product_update","expected_revision":1,"automatic_package_updates":"install"}),
+            &mut |command| {
+                let Command::Complete { payload, .. } = command else {
+                    panic!("a forged field must not reach configuration");
+                };
+                reply = Some(payload);
+                Ok(Response::Ok)
+            },
+        )
+        .unwrap();
+    assert_eq!(reply.unwrap()["code"], "invalid_request");
+    assert_eq!(fresh.automatic_package_updates(), Some(AutomaticMode::Off));
+}
+
+#[test]
+fn only_a_current_document_carries_the_choice_of_automatic_package_updates() {
+    let document = |version: u64, values: Value| {
+        parse_document(
+            &json!({"ok":true,"found":true,"version":version,"revision":1,"values":values}),
+        )
+    };
+    // An earlier format never carried the choice, which is a standing
+    // authorization: one that appears in it is not honoured.
+    for version in [1, 2] {
+        assert!(document(version, json!({"automatic_package_updates":"install"})).is_none());
+        assert!(document(version, json!({"automatic_package_updates":"off"})).is_none());
+        assert_eq!(
+            document(version, json!({"origin_web_ui_allowed":"pc"}))
+                .unwrap()
+                .values
+                .automatic_package_updates,
+            AutomaticMode::Off
+        );
+    }
+    for (name, mode) in [
+        ("off", AutomaticMode::Off),
+        ("download", AutomaticMode::Download),
+        ("install", AutomaticMode::Install),
+    ] {
+        assert_eq!(
+            document(3, json!({"automatic_package_updates":name}))
+                .unwrap()
+                .values
+                .automatic_package_updates,
+            mode
+        );
+    }
+    assert_eq!(
+        document(3, json!({}))
+            .unwrap()
+            .values
+            .automatic_package_updates,
+        AutomaticMode::Off
+    );
+    for unknown in [json!("always"), json!("Install"), json!(true), Value::Null] {
+        assert!(document(3, json!({"automatic_package_updates":unknown})).is_none());
+    }
 }

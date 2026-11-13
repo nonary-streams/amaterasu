@@ -2,9 +2,11 @@
 //!
 //! Requests are answered on the host thread and never wait: a check or a
 //! download runs on one worker thread, and the host shell performs activation.
+//! With automatic updates on, the same steps also start from the host tick.
+use super::automatic::{Automatic, AutomaticMode, Progress, Step};
 use super::check::check;
 use super::download::download;
-use super::environment::{Environment, UpdateSource};
+use super::environment::{Environment, UnattendedCaution, UpdateSource};
 use super::plan::{Checked, Offer};
 use super::transport::Connector;
 use super::versions::{VersionRequest, Versions};
@@ -145,11 +147,12 @@ pub(crate) struct Service<C: Connector> {
     /// The last check found the repository serving a catalog older than the
     /// one this host already accepted.
     repository_behind: bool,
+    automatic: Automatic,
 }
 
 impl<C: Connector> Service<C> {
     pub(crate) fn new(connector: C, environment: Environment) -> Self {
-        let failed = environment.last_activation_failed;
+        let failed = environment.failed_activation.is_some();
         Self {
             versions: Versions::start(&environment),
             restoring: None,
@@ -167,7 +170,29 @@ impl<C: Connector> Service<C> {
             job: None,
             shutdown_announced: false,
             repository_behind: false,
+            automatic: Automatic::starting(Instant::now()),
         }
+    }
+
+    /// Follows the administrator's saved choice of automatic updates.
+    pub(crate) fn select_automatic(&mut self, mode: AutomaticMode) {
+        self.automatic.select(mode);
+    }
+
+    /// One host tick: retires a finished worker, then starts the automatic
+    /// step that is due. Never waits. Deciding whether a step is due reads
+    /// nothing but memory; starting one does on this thread what the
+    /// console's request for that step does, and no more often than once for
+    /// each check: a check or a download spawns the worker, and an
+    /// activation reads the selection to build the host's request.
+    pub(crate) fn tick(
+        &mut self,
+        now: Instant,
+        host: &mut dyn ActivationHost,
+        other_install_active: bool,
+    ) {
+        self.retire_finished_worker(now);
+        self.start_automatic_step(now, host, other_install_active);
     }
 
     /// Answers one console request. `other_install_active` is true while
@@ -312,6 +337,10 @@ impl<C: Connector> Service<C> {
 
     /// Retires a finished worker without waiting for a running one.
     pub(crate) fn advance(&mut self) {
+        self.retire_finished_worker(Instant::now());
+    }
+
+    fn retire_finished_worker(&mut self, now: Instant) {
         self.versions.advance();
         if !self.job.as_ref().is_some_and(Job::is_finished) {
             return;
@@ -321,7 +350,7 @@ impl<C: Connector> Service<C> {
                 let outcome = thread
                     .join()
                     .unwrap_or(Err(Failure::Failed("repository_unavailable")));
-                self.finish_check(outcome);
+                self.finish_check(outcome, now);
             }
             Job::Download(thread) => {
                 let outcome = thread
@@ -371,6 +400,77 @@ impl<C: Connector> Service<C> {
         Ok(())
     }
 
+    /// Starts the automatic step that is due, when the administrator chose
+    /// automatic updates and nothing else is under way. A step that cannot
+    /// start waits; one that starts and fails is left until the next check.
+    fn start_automatic_step(
+        &mut self,
+        now: Instant,
+        host: &mut dyn ActivationHost,
+        other_install_active: bool,
+    ) {
+        if self.environment.source.is_none() {
+            return;
+        }
+        let Some(step) = self.automatic.next_step(now, self.automatic_progress()) else {
+            return;
+        };
+        if self.admit(other_install_active).is_err() {
+            return;
+        }
+        let started = match step {
+            Step::Check => self.begin_scheduled_check(now),
+            Step::Download => self.begin_download(),
+            // The saved choice is the administrator's authorization. The
+            // host decides about the request exactly as it does for a
+            // console request.
+            Step::Activate => self.request_activation(host),
+        };
+        if started.is_err() {
+            self.automatic.hold();
+        }
+    }
+
+    /// What the automatic flow may continue from. A set the host already
+    /// failed to activate is left to the administrator: asking again on a
+    /// schedule would restart the service into the same failure.
+    fn automatic_progress(&self) -> Progress {
+        match self.phase {
+            Phase::Available if !self.offers_failed_activation() => Progress::Available,
+            Phase::Ready if self.may_activate_unattended() => Progress::Ready,
+            _ => Progress::Settled,
+        }
+    }
+
+    /// False when the host's receipt speaks against asking for the offered
+    /// set with nobody watching.
+    fn may_activate_unattended(&self) -> bool {
+        match &self.environment.unattended_caution {
+            UnattendedCaution::None => true,
+            UnattendedCaution::AnySet => false,
+            UnattendedCaution::Set(digest) => self
+                .offer
+                .as_ref()
+                .is_none_or(|offer| offer.candidate.manifest_sha256 != *digest),
+        }
+    }
+
+    /// True when the offered set is the one the host's last activation
+    /// failed to reach.
+    fn offers_failed_activation(&self) -> bool {
+        match (&self.offer, &self.environment.failed_activation) {
+            (Some(offer), Some(failed)) => offer.candidate.manifest_sha256 == *failed,
+            _ => false,
+        }
+    }
+
+    fn begin_scheduled_check(&mut self, now: Instant) -> Result<(), Refusal> {
+        self.automatic.scheduled_check_starting(now);
+        self.begin_check()?;
+        self.automatic.scheduled_check_started();
+        Ok(())
+    }
+
     fn begin_check(&mut self) -> Result<(), Refusal> {
         let Some(source) = self.environment.source.clone() else {
             // Without a recorded source there is nothing to check; the status
@@ -387,6 +487,7 @@ impl<C: Connector> Service<C> {
         self.phase = Phase::Checking;
         self.error = None;
         self.repository_behind = false;
+        self.automatic.work_started();
         Ok(())
     }
 
@@ -417,6 +518,7 @@ impl<C: Connector> Service<C> {
         self.job = Some(Job::Download(thread));
         self.phase = Phase::Downloading;
         self.error = None;
+        self.automatic.work_started();
         Ok(())
     }
 
@@ -459,11 +561,16 @@ impl<C: Connector> Service<C> {
                 }
                 match self.restoring.take() {
                     // A withdrawn restore leaves the update where it stood.
+                    // Nothing of the update's was stopped, so the automatic
+                    // flow goes on from there as it would have.
                     Some(restoring) => (self.phase, self.error) = restoring.resume,
-                    // The candidate is still verified in the cache.
+                    // The candidate is still verified in the cache, and an
+                    // activation the administrator withdrew is not asked for
+                    // again before the next check.
                     None => {
                         self.phase = Phase::Ready;
                         self.error = None;
+                        self.automatic.hold();
                     }
                 }
                 Ok(())
@@ -472,6 +579,9 @@ impl<C: Connector> Service<C> {
                 if self.job.is_some() {
                     self.cancelled.store(true, Ordering::Release);
                 }
+                // What the administrator stopped does not start again on
+                // its own before the next check.
+                self.automatic.hold();
                 Ok(())
             }
         }
@@ -496,7 +606,8 @@ impl<C: Connector> Service<C> {
         }
     }
 
-    fn finish_check(&mut self, outcome: Result<Checked, Failure>) {
+    fn finish_check(&mut self, outcome: Result<Checked, Failure>, now: Instant) {
+        let scheduled = self.automatic.check_finished(now);
         let checked = match outcome {
             Ok(checked) => checked,
             Err(failure) => return self.stop(failure),
@@ -517,6 +628,11 @@ impl<C: Connector> Service<C> {
                     .map(|source| offer.describe(&source.repository));
                 self.offer = Some(Arc::from(offer));
                 self.phase = Phase::Available;
+                if scheduled && self.offers_failed_activation() {
+                    // Nobody asked for this check, so it must not replace
+                    // the report of a failure nobody has seen.
+                    self.fail("activation_failed");
+                }
             }
         }
     }
@@ -533,6 +649,7 @@ impl<C: Connector> Service<C> {
     }
 
     fn stop(&mut self, failure: Failure) {
+        self.automatic.hold();
         match failure {
             Failure::Cancelled => {
                 self.phase = Phase::Cancelled;
@@ -580,6 +697,7 @@ impl<C: Connector> Service<C> {
                 "sequence": restoring.sequence.to_string(),
             })),
             "repository_behind": self.repository_behind,
+            "automatic": self.automatic.describe(environment.source.is_some()),
         })
     }
 
@@ -615,6 +733,11 @@ impl<C: Connector> Service<C> {
     /// True while the service still means to ask the host about restores.
     pub(crate) fn probing_host(&self) -> bool {
         self.host_probe.is_some()
+    }
+
+    /// True while a worker thread has not been retired.
+    pub(crate) fn has_worker(&self) -> bool {
+        self.job.is_some()
     }
 }
 

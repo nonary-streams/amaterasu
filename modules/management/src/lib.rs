@@ -284,6 +284,7 @@ impl ManagedModule for ManagementModule {
         let settings_ready = self
             .product_settings
             .quiesce(Instant::now(), &mut |command| self.runtime.send(command));
+        self.follow_automatic_package_updates()?;
         let tray_ready = self.tray_events.quiesce(&self.runtime);
         let health_ready = self.operational_health.as_mut().is_none_or(|health| {
             health.quiesce(Instant::now(), &mut |command| self.runtime.send(command))
@@ -307,13 +308,16 @@ impl ManagedModule for ManagementModule {
         if let Some(installer) = &mut self.rtx_hdr_installer {
             installer.advance();
         }
-        self.package_update.advance();
+        let other_install_active = self.rtx_hdr_install_active();
+        self.package_update
+            .advance(&self.runtime, other_install_active);
         self.package_update.observe_host(&self.runtime);
         if let Some(administration) = &mut self.repository_administration {
             administration.advance();
         }
         self.product_settings
             .tick(Instant::now(), &mut |command| self.runtime.send(command))?;
+        self.follow_automatic_package_updates()?;
         self.advance_operational_health()?;
         if let Some(server) = &mut self.server {
             server.set_peer_policy(self.product_settings.maximum_peer());
@@ -454,6 +458,14 @@ impl ManagedModule for ManagementModule {
                     let result = self.package_version_request(&caller, &payload);
                     return complete(&self.runtime, id, result);
                 }
+                if action == Some(package_update::AUTOMATIC_ACTION) {
+                    return self.select_automatic_package_updates(
+                        id,
+                        &caller,
+                        remaining_ms,
+                        &payload,
+                    );
+                }
                 if let Some(update) = action.and_then(package_update::Action::parse) {
                     let result = self.package_update_request(&caller, update, &payload);
                     return complete(&self.runtime, id, result);
@@ -575,10 +587,7 @@ impl ManagementModule {
         if caller != "amaterasu.management" || *payload != json!({"action": action.name()}) {
             return json!({"ok":false,"code":"permission_denied"});
         }
-        let rtx_hdr_install_active = self
-            .rtx_hdr_installer
-            .as_ref()
-            .is_some_and(rtx_hdr_install::Installer::package_work_in_progress);
+        let rtx_hdr_install_active = self.rtx_hdr_install_active();
         self.package_update
             .request(action, &self.runtime, rtx_hdr_install_active)
     }
@@ -596,12 +605,72 @@ impl ManagementModule {
         let Some(request) = request else {
             return json!({"ok":false,"code":"permission_denied"});
         };
-        let rtx_hdr_install_active = self
-            .rtx_hdr_installer
-            .as_ref()
-            .is_some_and(rtx_hdr_install::Installer::package_work_in_progress);
+        let rtx_hdr_install_active = self.rtx_hdr_install_active();
         self.package_update
             .versions(request, &self.runtime, rtx_hdr_install_active)
+    }
+
+    /// True while the RTX HDR install prepares or activates a set of its
+    /// own, which a package update must not run beside.
+    fn rtx_hdr_install_active(&self) -> bool {
+        self.rtx_hdr_installer
+            .as_ref()
+            .is_some_and(rtx_hdr_install::Installer::package_work_in_progress)
+    }
+
+    /// Saves the administrator's choice of automatic package updates. Only
+    /// this module's own console route reaches it. The reply is the
+    /// package-update status, sent once the choice is durable.
+    fn select_automatic_package_updates(
+        &mut self,
+        request: u64,
+        caller: &str,
+        remaining_ms: u64,
+        payload: &serde_json::Value,
+    ) -> ModuleResult<()> {
+        let refusal = if caller != "amaterasu.management" {
+            Some("permission_denied")
+        } else if !self.package_update.supported() {
+            Some("unsupported_platform")
+        } else {
+            None
+        };
+        if let Some(code) = refusal {
+            return complete(&self.runtime, request, json!({"ok":false,"code":code}));
+        }
+        let Some(mode) = package_update::AutomaticMode::requested(payload) else {
+            return complete(
+                &self.runtime,
+                request,
+                json!({"ok":false,"code":"invalid_mode"}),
+            );
+        };
+        self.product_settings.select_automatic_package_updates(
+            request,
+            remaining_ms,
+            mode,
+            &mut |command| self.runtime.send(command),
+        )?;
+        self.follow_automatic_package_updates()
+    }
+
+    /// Hands the saved choice of automatic package updates to the update
+    /// service, and answers the request that chose it once it is durable.
+    fn follow_automatic_package_updates(&mut self) -> ModuleResult<()> {
+        if let Some(mode) = self.product_settings.automatic_package_updates() {
+            self.package_update.select_automatic(mode);
+        }
+        let Some(request) = self.product_settings.saved_automatic_updates() else {
+            return Ok(());
+        };
+        let status = self.package_update.request(
+            package_update::Action::Status,
+            &self.runtime,
+            self.rtx_hdr_install_active(),
+        );
+        complete(&self.runtime, request, status)?;
+        self.product_settings.automatic_updates_answered();
+        Ok(())
     }
 
     fn package_selection_status(&self) -> serde_json::Value {
@@ -1000,6 +1069,248 @@ mod tests {
         module.package_update = package_update::PackageUpdate::awaiting_activation();
         let busy = json!({"ok":false,"code":"busy"});
         assert_eq!(runtime.answers(&mut module), [busy.clone(), busy]);
+    }
+
+    /// A runtime whose configuration service keeps the management product
+    /// document, as the real one does. It outlives the modules started on
+    /// it, so a restarted module reads what an earlier one saved.
+    #[cfg(target_os = "linux")]
+    #[derive(Default)]
+    struct SettingsRuntime {
+        state: std::sync::Mutex<SettingsRuntimeState>,
+    }
+
+    #[cfg(target_os = "linux")]
+    #[derive(Default)]
+    struct SettingsRuntimeState {
+        /// The stored document: its version, revision and values.
+        document: Option<serde_json::Value>,
+        writes: usize,
+        results: std::collections::BTreeMap<u64, serde_json::Value>,
+        submitted: u64,
+        requests: std::collections::VecDeque<(&'static str, serde_json::Value)>,
+        replies: Vec<serde_json::Value>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl SettingsRuntimeState {
+        /// What the configuration service answers a product operation with.
+        fn configuration(&mut self, payload: &serde_json::Value) -> serde_json::Value {
+            let revision = self
+                .document
+                .as_ref()
+                .map_or(0, |document| document["revision"].as_u64().unwrap());
+            if payload["action"] == "product_update" {
+                if payload["expected_revision"] != revision {
+                    return json!({"ok":false,"error":{"code":"revision_conflict","current_revision":revision}});
+                }
+                self.writes += 1;
+                self.document = Some(json!({
+                    "version": payload["version"],
+                    "revision": revision + 1,
+                    "values": payload["values"],
+                }));
+            }
+            match &self.document {
+                Some(document) => json!({
+                    "ok": true,
+                    "found": true,
+                    "version": document["version"],
+                    "revision": document["revision"],
+                    "values": document["values"],
+                }),
+                None => json!({"ok":true,"found":false,"version":null,"revision":0,"values":{}}),
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl SettingsRuntime {
+        /// Starts a module that can update its running set and lets it load
+        /// its settings. The runtime must outlive it.
+        fn start(&self) -> ManagementModule {
+            use amaterasu_module_sdk::abi::{AbiHeader, HostApi};
+            let endpoint = HostApi {
+                header: AbiHeader::of::<HostApi>(),
+                context: std::ptr::from_ref(self).cast_mut().cast(),
+                invoke: Self::invoke,
+            };
+            // SAFETY: each test keeps this runtime alive past its module.
+            let runtime = unsafe { RuntimeClient::from_endpoint(endpoint) };
+            let mut module = ManagementModule::start(runtime).unwrap();
+            module.package_update = package_update::PackageUpdate::without_source();
+            for _ in 0..2 {
+                module.tick().unwrap();
+            }
+            module
+        }
+
+        /// Queues console requests and ticks until each has been answered.
+        fn answers(
+            &self,
+            module: &mut ManagementModule,
+            requests: &[serde_json::Value],
+        ) -> Vec<serde_json::Value> {
+            self.state.lock().unwrap().requests.extend(
+                requests
+                    .iter()
+                    .map(|request| ("amaterasu.management", request.clone())),
+            );
+            for _ in 0..requests.len() * 4 {
+                module.tick().unwrap();
+            }
+            let replies = std::mem::take(&mut self.state.lock().unwrap().replies);
+            assert_eq!(replies.len(), requests.len(), "{replies:?}");
+            replies
+        }
+
+        fn saved(&self) -> (usize, Option<serde_json::Value>) {
+            let state = self.state.lock().unwrap();
+            (state.writes, state.document.clone())
+        }
+
+        unsafe extern "C" fn invoke(
+            context: *mut std::ffi::c_void,
+            input: amaterasu_module_sdk::abi::BorrowedBytes,
+            reply: amaterasu_module_sdk::abi::ReplySink,
+        ) -> amaterasu_module_sdk::abi::Status {
+            // SAFETY: the test retains the runtime and the synchronous borrows.
+            let runtime = unsafe { &*context.cast::<Self>() };
+            let command: Command =
+                serde_json::from_slice(unsafe { input.read().unwrap() }).unwrap();
+            let mut state = runtime.state.lock().unwrap();
+            let response = match command {
+                Command::GetSettings {} => Response::Result { payload: json!({}) },
+                Command::Register { .. }
+                | Command::CheckRequest { .. }
+                | Command::ReleaseResult { .. } => Response::Ok,
+                Command::Complete { payload, .. } => {
+                    state.replies.push(payload);
+                    Response::Ok
+                }
+                Command::Poll {} => match state.requests.pop_front() {
+                    Some((caller, payload)) => Response::Request {
+                        id: 1,
+                        caller: caller.into(),
+                        initiator: caller.into(),
+                        service: SERVICE.into(),
+                        payload,
+                        remaining_ms: 1000,
+                    },
+                    None => Response::Pending,
+                },
+                Command::Request {
+                    service, payload, ..
+                } if service == "amaterasu.configuration/1" => {
+                    let result = state.configuration(&payload);
+                    state.submitted += 1;
+                    let id = 100 + state.submitted;
+                    state.results.insert(id, result);
+                    Response::Accepted { id }
+                }
+                Command::Request { .. } => Response::error("unavailable", "not provided"),
+                Command::TakeResult { request } => Response::Result {
+                    payload: state.results[&request].clone(),
+                },
+                // A started update service asks whether the host takes restores.
+                Command::HostPackageRestoreStatus {} => {
+                    Response::error("restore_unavailable", "not provided")
+                }
+                command => panic!("unexpected command: {command:?}"),
+            };
+            drop(state);
+            let bytes = serde_json::to_vec(&response).unwrap();
+            // SAFETY: the sink copies the bytes during this call.
+            unsafe { reply.send(&bytes) };
+            amaterasu_module_sdk::abi::STATUS_OK
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_choice_of_automatic_updates_is_saved_with_the_settings_and_survives_a_restart() {
+        let status = json!({"action":"package_update_status"});
+        let choose = |mode: &str| json!({"action":"package_update_automatic","mode":mode});
+        let runtime = SettingsRuntime::default();
+        let mut module = runtime.start();
+        assert_eq!(
+            runtime.answers(&mut module, std::slice::from_ref(&status))[0]["automatic"],
+            json!({"mode":"off","next_check_unix_ms":null})
+        );
+
+        // Anything but one known mode is refused and writes nothing.
+        let invalid = json!({"ok":false,"code":"invalid_mode"});
+        let refused = runtime.answers(
+            &mut module,
+            &[
+                choose("always"),
+                json!({"action":"package_update_automatic"}),
+                json!({"action":"package_update_automatic","mode":"install","force":true}),
+                json!({"action":"package_update_automatic","mode":["install"]}),
+            ],
+        );
+        assert_eq!(refused, vec![invalid; 4]);
+        assert_eq!(runtime.saved(), (0, None));
+
+        // The reply to a saved choice is the package-update status.
+        let chosen = runtime.answers(&mut module, &[choose("install")]);
+        assert_eq!(chosen[0]["ok"], true);
+        assert_eq!(chosen[0]["supported"], true);
+        assert_eq!(chosen[0]["phase"], "idle");
+        assert_eq!(chosen[0]["automatic"]["mode"], "install");
+        let (writes, document) = runtime.saved();
+        assert_eq!(writes, 1);
+        assert_eq!(
+            document.unwrap()["values"]["automatic_package_updates"],
+            "install"
+        );
+        // Choosing it again changes nothing and is answered the same way.
+        assert_eq!(
+            runtime.answers(&mut module, &[choose("install")])[0]["automatic"]["mode"],
+            "install"
+        );
+        assert_eq!(runtime.saved().0, 1);
+        drop(module);
+
+        // A module started later, as after a restart or a package update,
+        // follows the saved choice.
+        let mut restarted = runtime.start();
+        assert_eq!(
+            runtime.answers(&mut restarted, std::slice::from_ref(&status))[0]["automatic"]["mode"],
+            "install"
+        );
+        let off = runtime.answers(&mut restarted, &[choose("off"), status]);
+        assert_eq!(off[0]["automatic"]["mode"], "off");
+        assert_eq!(off[1]["automatic"]["mode"], "off");
+        let (writes, document) = runtime.saved();
+        assert_eq!(writes, 2);
+        assert_eq!(
+            document.unwrap(),
+            json!({"version":2,"revision":2,"values":{"origin_web_ui_allowed":null,"csrf_allowed_origins":null}})
+        );
+    }
+
+    #[test]
+    fn choosing_automatic_updates_comes_only_from_the_console_route_of_a_host_that_updates() {
+        let choice = json!({"action":"package_update_automatic","mode":"install"});
+        let runtime = ScriptedRuntime::new(&[
+            ("amaterasu.nvhttp", choice.clone()),
+            // A module that serves no console cannot update its set.
+            ("amaterasu.management", choice),
+            (
+                "amaterasu.management",
+                json!({"action":"package_update_automatic","mode":"always"}),
+            ),
+        ]);
+        let mut module = runtime.start();
+        assert_eq!(
+            runtime.answers(&mut module),
+            [
+                json!({"ok":false,"code":"permission_denied"}),
+                json!({"ok":false,"code":"unsupported_platform"}),
+                json!({"ok":false,"code":"unsupported_platform"}),
+            ]
+        );
     }
 
     #[test]

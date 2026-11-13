@@ -28,6 +28,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod automatic;
 mod end_to_end;
 mod phases;
 mod versions;
@@ -566,6 +567,20 @@ fn settle(service: &mut TestService, host: &mut ScriptedHost) -> Value {
             return status;
         }
         assert!(Instant::now() < deadline, "worker did not finish: {status}");
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// Ticks at `now`, as the host does, until no worker is running: every
+/// automatic step that follows from the one that is due has then been taken.
+fn tick_to_rest(service: &mut TestService, host: &mut ScriptedHost, now: Instant) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        service.tick(now, host, false);
+        if !service.has_worker() {
+            return ask(service, host, Action::Status);
+        }
+        assert!(Instant::now() < deadline, "worker did not finish");
         thread::sleep(Duration::from_millis(1));
     }
 }

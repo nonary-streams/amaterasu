@@ -1,5 +1,7 @@
 //! Management owns ingress policy; configuration owns its caller-scoped durable CAS document.
+//! The same document keeps the administrator's choice of automatic package updates.
 use crate::csrf_policy::CsrfOrigins;
+use crate::package_update::AutomaticMode;
 use crate::peer_policy::PeerTier;
 use amaterasu_module_sdk::{Command, ModuleResult, Response};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -7,7 +9,11 @@ use serde_json::{Value, json};
 use std::time::{Duration, Instant};
 
 const CONFIGURATION: &str = "amaterasu.configuration/1";
-const DOCUMENT_VERSION: u32 = 2;
+/// The newest document format this module reads. Version 3 added the choice
+/// of automatic package updates.
+const DOCUMENT_VERSION: u32 = 3;
+/// The newest format that cannot carry that choice.
+const INGRESS_ONLY_VERSION: u32 = 2;
 const CALL_TIMEOUT: Duration = Duration::from_secs(3);
 const RETRY_DELAY: Duration = Duration::from_millis(250);
 // Broker records are retained for at least this long after completion.
@@ -20,6 +26,27 @@ struct Values {
     origin_web_ui_allowed: Option<PeerTier>,
     #[serde(default)]
     csrf_allowed_origins: Option<CsrfOrigins>,
+    /// Left out of the document while automatic package updates are off.
+    #[serde(default, skip_serializing_if = "AutomaticMode::is_off")]
+    automatic_package_updates: AutomaticMode,
+}
+
+impl Values {
+    /// The version a document with these values is written at: the oldest
+    /// that can express them.
+    ///
+    /// A management module from before automatic package updates cannot read
+    /// a newer document, and a module that cannot read its document admits
+    /// nobody to the console. A host that leaves automatic updates off
+    /// therefore keeps a document such a module still reads, should its
+    /// package be replaced by an earlier one.
+    fn document_version(&self) -> u32 {
+        if self.automatic_package_updates.is_off() {
+            INGRESS_ONLY_VERSION
+        } else {
+            DOCUMENT_VERSION
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -71,7 +98,21 @@ impl<'de> Deserialize<'de> for OriginsUpdate {
 
 enum Purpose {
     Load,
-    Update { parent: u64, desired: Document },
+    Update {
+        parent: u64,
+        desired: Document,
+        reply: Reply,
+    },
+}
+
+/// What a saved update answers its request with.
+#[derive(Clone, Copy)]
+enum Reply {
+    /// The settings document, as `product_update` reports it.
+    Document,
+    /// The package-update status, which this type does not know. The request
+    /// waits in `saved_automatic_updates` for the module to answer it.
+    PackageUpdateStatus,
 }
 
 enum Phase {
@@ -99,6 +140,9 @@ pub(crate) struct ProductSettings {
     sequence: u64,
     retry_at: Option<Instant>,
     shutdown_announced: bool,
+    /// The request whose choice of automatic package updates is saved and
+    /// has not been answered yet.
+    saved_automatic_updates: Option<u64>,
 }
 
 #[cfg(test)]
@@ -117,6 +161,7 @@ impl ProductSettings {
             sequence: 0,
             retry_at: None,
             shutdown_announced: false,
+            saved_automatic_updates: None,
         })
     }
 
@@ -163,6 +208,71 @@ impl ProductSettings {
             .as_ref()
             .and_then(|document| document.values.csrf_allowed_origins.clone())
             .unwrap_or_default()
+    }
+
+    /// The saved choice of automatic package updates, known once the
+    /// document is loaded.
+    pub(crate) fn automatic_package_updates(&self) -> Option<AutomaticMode> {
+        self.document
+            .as_ref()
+            .map(|document| document.values.automatic_package_updates)
+    }
+
+    /// The request whose choice of automatic package updates is durable and
+    /// still owed the package-update status as its reply.
+    pub(crate) fn saved_automatic_updates(&self) -> Option<u64> {
+        self.saved_automatic_updates
+    }
+
+    /// The request [`Self::saved_automatic_updates`] named has been answered.
+    pub(crate) fn automatic_updates_answered(&mut self) {
+        self.saved_automatic_updates = None;
+    }
+
+    /// Saves the administrator's choice of automatic package updates beside
+    /// the ingress policy, as one more compare-and-swap of the document.
+    ///
+    /// A refusal is answered here. Once the choice is durable the request
+    /// waits in [`Self::saved_automatic_updates`] for the caller to answer.
+    pub(crate) fn select_automatic_package_updates(
+        &mut self,
+        parent: u64,
+        remaining_ms: u64,
+        mode: AutomaticMode,
+        send: &mut impl FnMut(Command) -> ModuleResult<Response>,
+    ) -> ModuleResult<()> {
+        if self.shutdown_announced {
+            return complete(send, parent, failure("shutting_down"));
+        }
+        let Some(document) = &self.document else {
+            return complete(send, parent, failure("settings_unavailable"));
+        };
+        if self.pending.is_some() || self.saved_automatic_updates.is_some() {
+            return complete(send, parent, failure("settings_busy"));
+        }
+        if document.values.automatic_package_updates == mode {
+            // Already the saved choice: there is nothing to write.
+            self.saved_automatic_updates = Some(parent);
+            return Ok(());
+        }
+        let expected_revision = document.revision;
+        let Some(revision) = expected_revision.checked_add(1) else {
+            return complete(send, parent, failure("resource_exhausted"));
+        };
+        if remaining_ms <= 100 {
+            return complete(send, parent, failure("settings_timeout"));
+        }
+        let mut desired = document.clone();
+        desired.revision = revision;
+        desired.values.automatic_package_updates = mode;
+        self.submit_update(
+            parent,
+            expected_revision,
+            desired,
+            Reply::PackageUpdateStatus,
+            remaining_ms,
+            send,
+        )
     }
 
     pub(crate) fn tick(
@@ -252,10 +362,36 @@ impl ProductSettings {
         if let OriginsUpdate::Selected(origins) = csrf_allowed_origins {
             desired.values.csrf_allowed_origins = origins;
         }
-        let payload = json!({"action":"product_update","expected_revision":expected_revision,"version":DOCUMENT_VERSION,"values":desired.values});
+        self.submit_update(
+            parent,
+            expected_revision,
+            desired,
+            Reply::Document,
+            remaining_ms,
+            send,
+        )
+    }
+
+    /// Submits the write that replaces the document at `expected_revision`
+    /// with `desired`. The caller has checked that more than 100 ms remain
+    /// of the request that asked.
+    fn submit_update(
+        &mut self,
+        parent: u64,
+        expected_revision: u64,
+        desired: Document,
+        reply: Reply,
+        remaining_ms: u64,
+        send: &mut impl FnMut(Command) -> ModuleResult<Response>,
+    ) -> ModuleResult<()> {
+        let payload = json!({"action":"product_update","expected_revision":expected_revision,"version":desired.values.document_version(),"values":desired.values});
         self.submit(
             Instant::now(),
-            Purpose::Update { parent, desired },
+            Purpose::Update {
+                parent,
+                desired,
+                reply,
+            },
             Duration::from_millis(remaining_ms - 100).min(CALL_TIMEOUT),
             payload,
             send,
@@ -558,11 +694,19 @@ impl ProductSettings {
                 self.document = document;
                 self.retry_at = self.document.is_none().then_some(now + RETRY_DELAY);
             }
-            Purpose::Update { parent, desired } => {
-                let current_format = matches!(&result, Response::Result { payload } if payload["version"].as_u64() == Some(u64::from(DOCUMENT_VERSION)));
+            Purpose::Update {
+                parent,
+                desired,
+                reply,
+            } => {
+                let written_version = u64::from(desired.values.document_version());
+                let current_format = matches!(&result, Response::Result { payload } if payload["version"].as_u64() == Some(written_version));
                 if current_format && document.as_ref() == Some(desired) {
                     self.document = document;
-                    complete(send, *parent, self.payload())?;
+                    match reply {
+                        Reply::Document => complete(send, *parent, self.payload())?,
+                        Reply::PackageUpdateStatus => self.saved_automatic_updates = Some(*parent),
+                    }
                 } else {
                     self.document = None;
                     self.retry_at = None;
@@ -595,13 +739,22 @@ fn parse_document(payload: &Value) -> Option<Document> {
         .then(Document::default);
     }
     let version = payload.get("version")?.as_u64()?;
-    if !matches!(version, 1 | 2) || revision == 0 {
+    if !(1..=u64::from(DOCUMENT_VERSION)).contains(&version) || revision == 0 {
         return None;
     }
     let values = payload.get("values")?;
     // Version 1 never carried CSRF exceptions. Do not activate an unknown field
     // injected into an older document while migrating its peer selection.
     if version == 1 && values.as_object()?.contains_key("csrf_allowed_origins") {
+        return None;
+    }
+    // Nor did any version before the current one carry the choice of
+    // automatic package updates, which is a standing authorization.
+    if version <= u64::from(INGRESS_ONLY_VERSION)
+        && values
+            .as_object()?
+            .contains_key("automatic_package_updates")
+    {
         return None;
     }
     Some(Document {
@@ -753,6 +906,7 @@ mod shutdown_tests {
                 purpose: Purpose::Update {
                     parent: 7,
                     desired: Document::default(),
+                    reply: Reply::Document,
                 },
                 phase: Phase::Submitting,
             }),

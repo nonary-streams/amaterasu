@@ -65,6 +65,8 @@ pub fn validate(route: Route, object: &Object) -> Result<(), &'static str> {
                 Err(INVALID)
             }
         }
+        // The module refuses anything but one known mode with `invalid_mode`.
+        "amaterasu.management/1" if route.action == "package_update_automatic" => Ok(()),
         "amaterasu.extension-registry/1" => session_extensions(route.action, object),
         "amaterasu.extension-actions/1" => extension_actions(route.action, object),
         "amaterasu.session-lifecycle/1" if route.action == "snapshot" => fields(object, &[], &[]),

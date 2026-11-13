@@ -193,6 +193,15 @@ pub fn resolve(path: &str) -> Option<Route> {
                 "configuration.write"
             }),
         ),
+        // Choosing automatic updates is a standing decision to replace the
+        // running set, so it needs an administrator's own session as
+        // `activate` does. The body carries the mode; the module refuses
+        // anything but one known mode with `invalid_mode`.
+        ("package-update", "automatic") => (
+            "amaterasu.management/1",
+            "package_update_automatic",
+            Some("configuration.write"),
+        ),
         ("package-selection", "status") => (
             "amaterasu.management/1",
             "package_selection_status",
@@ -487,8 +496,13 @@ pub fn resolve(path: &str) -> Option<Route> {
         action,
         scope,
         requires_empty_body: domain == "rtx-hdr"
-            // A restore names the retained set to return to, and nothing else.
-            || (domain == "package-update" && action != "package_update_restore")
+            // A restore names the retained set to return to and a choice of
+            // automatic updates names its mode; nothing else carries a body.
+            || (domain == "package-update"
+                && !matches!(
+                    action,
+                    "package_update_restore" | "package_update_automatic"
+                ))
             || domain == "media"
             || (domain == "steam" && action == "force_sync")
             || (domain == "host-metrics" && action == "stats_read")
@@ -825,6 +839,44 @@ mod tests {
         ] {
             assert!(payload(restore, body.as_bytes()).is_err(), "{body}");
         }
+    }
+
+    #[test]
+    fn the_automatic_update_route_carries_its_mode_to_the_module() {
+        let route = resolve("/v1/package-update/automatic").unwrap();
+        assert_eq!(route.service, "amaterasu.management/1");
+        assert_eq!(route.action, "package_update_automatic");
+        assert_eq!(route.scope, Some("configuration.write"));
+        assert!(!route.requires_empty_body);
+        for mode in ["off", "download", "install"] {
+            assert_eq!(
+                payload(route, format!(r#"{{"mode":"{mode}"}}"#).as_bytes()).unwrap(),
+                serde_json::json!({"action": "package_update_automatic", "mode": mode})
+            );
+        }
+        // The module, not the route table, refuses another body, so the
+        // console is told `invalid_mode` and not that its JSON was malformed.
+        for body in [
+            br#"{}"#.as_slice(),
+            br#"{"mode":"always"}"#,
+            br#"{"mode":"install","force":true}"#,
+        ] {
+            let forwarded = payload(route, body).unwrap();
+            assert_eq!(forwarded["action"], "package_update_automatic");
+            assert_eq!(
+                crate::package_update::AutomaticMode::requested(&forwarded),
+                None
+            );
+        }
+        // The route alone names the action.
+        assert!(
+            payload(
+                route,
+                br#"{"action":"package_update_activate","mode":"install"}"#
+            )
+            .is_err()
+        );
+        assert!(payload(route, br#"["install"]"#).is_err());
     }
 
     #[test]

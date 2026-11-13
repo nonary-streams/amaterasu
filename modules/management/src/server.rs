@@ -1726,14 +1726,16 @@ fn role_permits(payload: &Value, request: &http::Request) -> bool {
     }
     // Tokens, sessions, trusted publishers and the running native set are
     // changed only by a signed-in administrator, never by an API token however
-    // it is scoped.
+    // it is scoped. Choosing automatic updates authorizes every later
+    // replacement of the set, so it is the same decision.
     let is_session_only_admin = matches!(request.target, RequestTarget::Api(route)
         if (route.service == crate::AUTH_SERVICE
             && matches!(route.action, "account_tokens_list" | "account_tokens_issue" | "account_tokens_revoke"
                 | "account_sessions_list" | "account_sessions_revoke"))
             || (route.service == crate::SERVICE
                 && matches!(route.action, "repository_add" | "repository_refresh" | "repository_remove"
-                    | "package_update_activate" | "package_update_restore")));
+                    | "package_update_activate" | "package_update_restore"
+                    | "package_update_automatic")));
     let role = match payload.get("kind").and_then(Value::as_str) {
         Some("api_token") => return !is_session_only_admin,
         Some("administrator_session") => match payload.get("role").and_then(Value::as_str) {
@@ -2302,6 +2304,10 @@ mod tests {
         // So is returning to a retained set, which runs older code again.
         assert!(allowed("administrator", "/v1/package-update/restore"));
         assert!(!token_permits("/v1/package-update/restore"));
+        // Letting the host install updates unattended is that decision made
+        // once for every later update.
+        assert!(allowed("administrator", "/v1/package-update/automatic"));
+        assert!(!token_permits("/v1/package-update/automatic"));
         for path in [
             "/v1/package-update/status",
             "/v1/package-update/check",
@@ -2320,6 +2326,7 @@ mod tests {
             "/v1/package-update/activate",
             "/v1/package-update/versions",
             "/v1/package-update/restore",
+            "/v1/package-update/automatic",
         ] {
             assert!(!allowed("operator", path));
             assert!(!allowed("viewer", path));

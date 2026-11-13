@@ -9,11 +9,15 @@
 //!
 //! No request names a repository, a publisher, a path or a package: each of
 //! those comes from the host's selection and startup composition.
+//!
+//! An administrator may let the module take the same steps on a schedule.
+//! That choice is saved with the module's settings; see [`automatic`].
 use amaterasu_module_sdk::RuntimeClient;
 use amaterasu_module_sdk::network::Network;
 use serde_json::{Value, json};
 use std::path::PathBuf;
 
+mod automatic;
 #[cfg(target_os = "linux")]
 mod check;
 #[cfg(target_os = "linux")]
@@ -34,6 +38,8 @@ pub(crate) use versions::VersionRequest;
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests;
+
+pub(crate) use automatic::{ACTION as AUTOMATIC_ACTION, AutomaticMode};
 
 /// The catalog does not single out one newer set for this host.
 #[cfg(target_os = "linux")]
@@ -118,12 +124,41 @@ impl PackageUpdate {
         }
     }
 
-    /// Retires a finished worker. Called on every tick; never waits.
-    pub(crate) fn advance(&mut self) {
+    /// Retires a finished worker and starts the automatic step that is due.
+    /// Called on every tick; never waits. `other_install_active` is true
+    /// while the RTX HDR install prepares or activates a set of its own.
+    pub(crate) fn advance(&mut self, runtime: &RuntimeClient, other_install_active: bool) {
         #[cfg(target_os = "linux")]
         if let Some(service) = &mut self.service {
-            service.advance();
+            service.tick(
+                std::time::Instant::now(),
+                &mut RuntimeHost(runtime),
+                other_install_active,
+            );
         }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (runtime, other_install_active);
+    }
+
+    /// True on a host that can update its running set, which is the only
+    /// kind that keeps a choice of automatic updates.
+    pub(crate) fn supported(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            self.service.is_some()
+        }
+        #[cfg(not(target_os = "linux"))]
+        false
+    }
+
+    /// Follows the administrator's saved choice of automatic updates.
+    pub(crate) fn select_automatic(&mut self, mode: AutomaticMode) {
+        #[cfg(target_os = "linux")]
+        if let Some(service) = &mut self.service {
+            service.select_automatic(mode);
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = mode;
     }
 
     /// Lets the service learn, shortly after start, whether the host takes
@@ -189,6 +224,16 @@ impl PackageUpdate {
 
 #[cfg(all(test, target_os = "linux"))]
 impl PackageUpdate {
+    /// A host that can update and records no source repository to check.
+    pub(crate) fn without_source() -> Self {
+        Self {
+            service: Some(service::Service::new(
+                Network::test_provider(),
+                environment::Environment::load(None, None, None),
+            )),
+        }
+    }
+
     /// An update whose activation request the host holds.
     pub(crate) fn awaiting_activation() -> Self {
         let mut service = service::Service::new(
@@ -241,6 +286,7 @@ fn unsupported(action: Action) -> Value {
         "error": "unsupported_platform",
         "restoring": null,
         "repository_behind": false,
+        "automatic": null,
     })
 }
 
@@ -327,6 +373,13 @@ mod reply_tests {
     }
 
     #[test]
+    fn choosing_automatic_updates_is_not_one_of_the_bodiless_actions() {
+        let route = crate::routes::resolve("/v1/package-update/automatic").unwrap();
+        assert_eq!(route.action, AUTOMATIC_ACTION);
+        assert_eq!(Action::parse(AUTOMATIC_ACTION), None);
+    }
+
+    #[test]
     fn a_host_that_cannot_activate_reports_it_and_refuses_every_change() {
         let status = unsupported(Action::Status);
         assert_eq!(status["ok"], true);
@@ -335,9 +388,16 @@ mod reply_tests {
         assert_eq!(status["error"], "unsupported_platform");
         assert_eq!(status["transferred_bytes"], 0);
         assert_eq!(status["repository_behind"], false);
-        for absent in ["checked_unix_ms", "source", "update", "restoring"] {
+        for absent in [
+            "checked_unix_ms",
+            "source",
+            "update",
+            "restoring",
+            "automatic",
+        ] {
             assert!(status[absent].is_null(), "{absent}");
         }
+        assert!(status.as_object().unwrap().contains_key("automatic"));
         assert!(status["running"]["digest"].is_null());
         for action in [
             Action::Check,

@@ -70,7 +70,7 @@ The dialog fills in the ID, address and key from it. It never takes the fingerpr
 
 An installed Linux host can replace its whole running native set with a newer one from the repository that supplied it. The management module prepares the update and asks; the host shell decides. Before a trial the host re-reads the approval, the catalog and its protected policy allowlist and verifies every cached byte again. It waits for streams to end, and it rolls back a set that does not start.
 
-Every route is `POST /v1/package-update/<action>` with an empty JSON object as its body. No request names a repository, a publisher, a package or a path: those come from the host's selection and startup composition.
+Every route is `POST /v1/package-update/<action>`. The body is an empty JSON object, except for `automatic`, whose body is the mode. No request names a repository, a publisher, a package or a path: those come from the host's selection and startup composition.
 
 | Action | Needs | Effect |
 |---|---|---|
@@ -79,8 +79,9 @@ Every route is `POST /v1/package-update/<action>` with an empty JSON object as i
 | `download` | `configuration.write` | Places the offered set, verified, in the repository's candidate cache |
 | `cancel` | `configuration.write` | Stops a check or download, or withdraws an activation the host has not started |
 | `activate` | `configuration.write` and an administrator's own signed-in session | Asks the host to activate the downloaded set |
+| `automatic` | `configuration.write` and an administrator's own signed-in session | Saves how far an update proceeds unattended (see [Automatic updates](#automatic-updates)) |
 
-An API token is refused for `activate` whatever its scopes, as it is for repository changes. Every action that succeeds returns the status:
+An API token is refused for `activate` and `automatic` whatever its scopes, as it is for repository changes. Every action that succeeds returns the status:
 
 ```json
 {
@@ -99,11 +100,12 @@ An API token is refused for `activate` whatever its scopes, as it is for reposit
   "transferred_bytes": 0,
   "error": null,
   "repository_behind": false,
+  "automatic": { "mode": "off", "next_check_unix_ms": null },
   "restoring": null
 }
 ```
 
-Sequences are decimal text so a browser keeps all 64 bits. `repository_behind` is true when the last check found the repository serving a catalog older than the one this host holds (see [Which set is offered](#which-set-is-offered)). `phase` is one of:
+Sequences are decimal text so a browser keeps all 64 bits. `repository_behind` is true when the last check found the repository serving a catalog older than the one this host holds (see [Which set is offered](#which-set-is-offered)). `automatic` is described under [Automatic updates](#automatic-updates). `phase` is one of:
 
 | Phase | Meaning |
 |---|---|
@@ -149,6 +151,43 @@ Without them `activate` reports `activation_unavailable` or, when the host refus
 
 Only one install runs at a time. While an RTX HDR install is preparing or activating a set, `check`, `download`, `activate` and `restore` are refused with `busy`, and while a package update or a restore is running or waiting, an RTX HDR install or activation is refused with `busy`.
 
+### Automatic updates
+
+`POST /v1/package-update/automatic` with `{"mode": "off"}`, `{"mode": "download"}` or `{"mode": "install"}` saves how far an update proceeds without anyone asking:
+
+| Mode | Effect |
+|---|---|
+| `off` | Nothing happens until the console asks. This is the default |
+| `download` | The module checks on a schedule and downloads the update a check finds. It stops at `ready` |
+| `install` | As `download`, and once the set is `ready` the module asks the host to activate it |
+
+The status reports the saved choice as `automatic.mode`, and the time of the next scheduled check as `automatic.next_check_unix_ms`. That time is null while the mode is `off` and on a host with no source repository to check.
+
+The first scheduled check is due about two minutes after the module starts, and each later one six hours after the last check finished. A check the console asks for counts, so the schedule starts again from its end. In `download` and `install` the update a check finds is continued whether the schedule or the console started that check.
+
+The automatic steps are the console's own `check`, `download` and `activate`, and nothing else. The request the host receives from `install` is the one `activate` sends, and the host decides about it the same way: it waits for streams to end, verifies the cached set again, applies its protected allowlist and rolls back a set that does not start. No session is involved in that request. The administrator's saved choice is the authorization, which is why saving it needs an administrator's own session, as `activate` does.
+
+No automatic step starts while a check or download is running, while the host holds or performs an activation, while an RTX HDR install is preparing or activating a set, or once the module has been told to shut down. A step that cannot start waits for that to pass.
+
+A step that fails is not repeated. The next attempt follows the next check, whether the schedule starts it six hours later or an administrator asks sooner:
+
+- A failed or cancelled check or download leaves the status as it would after the console action, with the same `error`.
+- `cancel` stops an automatic check or download, or withdraws an automatic activation the host has not started, exactly as it does for one the console asked for. What was cancelled does not start again on its own.
+- A `download` the console asks for after a failure or a cancel continues to activation in `install`.
+- A newly saved mode applies to the update as it stands: saving `install` while a set is `ready` asks the host to activate it. Saving `off` withdraws nothing the host already holds; `cancel` does that.
+
+A set that does not start can cost a restart of the service at every attempt, so `install` asks the host on its own only while the host's receipt of its last activation attempt shows nothing went wrong. The module reads that receipt when it starts:
+
+- The receipt names a set the host failed to activate, other than the running one. The module does not ask for that set again. The status reads `failed` with `activation_failed`, as it does today; a scheduled check that finds the same set keeps that report, with `update` describing the set, and downloads nothing. A check the console asks for reads `available` as before. A newer set from the repository is a new attempt.
+- The receipt names a set the host started on and never finished. The module downloads that set when a check finds it, stops at `ready` and does not ask for it. A newer set is a new attempt.
+- The receipt says the host rolled an interrupted activation back, which it records against the running set. The set that failed is then not known, so the module asks for nothing unattended: updates are still checked and downloaded, and stop at `ready`.
+
+In each case `activate` from the console still works. An activation that ends well replaces the receipt, and unattended activation resumes with the set that then runs.
+
+The choice is saved in the management module's settings document, beside the console's access policy, and survives restarts and package updates. A refused request changes nothing. A JSON object that is not exactly one of the three modes is refused with `invalid_mode`; a body that is not a JSON object fails as it does on every route, before the module sees it. The other refusals are the settings ones in the table below.
+
+A host that has saved `download` or `install` holds a settings document that a management module from before automatic updates cannot read, and a module that cannot read its settings admits nobody to the console. Save `off` before putting an earlier set back on such a host. A host that has only ever had `off` keeps the earlier document format.
+
 ### Errors and refusals
 
 `error` in the status is one of:
@@ -182,8 +221,15 @@ A refused action changes nothing and returns `{"ok":false,"code":"..."}`:
 | `unsupported_platform` | This host cannot activate a set |
 | `not_restorable` | The digest a restore names is not a listed set the host would return to |
 | `permission_denied` | The request did not come from a console route |
+| `invalid_mode` | The body of `automatic` is not exactly one known mode |
+| `settings_unavailable` | `automatic`: the module has not loaded its settings |
+| `settings_busy` | `automatic`: another settings change is being saved |
+| `settings_timeout` | `automatic`: too little of the request's time was left to save the choice |
+| `configuration_unavailable` | `automatic`: the configuration service did not take the write |
+| `settings_outcome_unknown` | `automatic`: the write could not be confirmed. The status shows the mode in force once the settings have been read again |
+| `revision_conflict` | `automatic`: the settings changed while the choice was being saved |
 
-On a platform whose host has no activation, which today is every platform but Linux, `status` answers with `supported` false, phase `idle` and `error` `unsupported_platform`, and the other actions are refused with `unsupported_platform`. A Linux host that is not the installed user service reports `supported` true and fails `activate` with `activation_unavailable`.
+On a platform whose host has no activation, which today is every platform but Linux, `status` answers with `supported` false, phase `idle`, `error` `unsupported_platform` and `automatic` null, and the other actions are refused with `unsupported_platform`. A Linux host that is not the installed user service reports `supported` true and fails `activate` with `activation_unavailable`.
 
 ### What this does not do
 
@@ -192,7 +238,7 @@ On a platform whose host has no activation, which today is every platform but Li
 - It does not approve anything. It enrolls no key, adds no grant and changes no policy; a set that needs a policy change beyond the host's allowlist is refused by the host at activation.
 - It does not offer again a release the host has already accepted. After a [return to an earlier set](#switching-to-an-earlier-set), the releases between that set and the newest accepted one are reached from the list of retained sets, not from a check.
 - It does not update the host executable, the installer or the web interface.
-- It does not check on its own schedule. A check runs when the console asks.
+- It does not check on its own schedule unless an administrator saves `download` or `install` under [Automatic updates](#automatic-updates). With `off`, a check runs when the console asks.
 - It reads the catalog from the repository's address every time. After a [local import](local-package-updates.md) whose catalog is ahead of the published one, a check ends `current` with `repository_behind` true and offers nothing until the repository publishes a catalog at or above it.
 
 ## Switching to an earlier set

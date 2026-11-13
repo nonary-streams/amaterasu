@@ -50,9 +50,13 @@ The Settings page reads `/v1/management_settings/get` and writes
 `/v1/management_settings/update` with `expected_revision` and an optional
 `origin_web_ui_allowed` and `csrf_allowed_origins`. Omission retains each selection;
 null resets the peer maximum to the source default `lan` and CSRF exceptions to
-the empty default. The management module owns a separate version-2 product
-document in configuration's caller-scoped namespace, leaving its generic user
-schema intact. Writes require the immutable management runtime principal after
+the empty default. The management module owns a separate product document in
+configuration's caller-scoped namespace, leaving its generic user schema
+intact. The document is version 2 until an administrator turns
+[automatic package updates](../../docs/approved-repositories.md#automatic-updates)
+on through `/v1/package-update/automatic`. That choice is saved in the same
+document, which is then version 3. The settings routes show it under `values`
+and cannot change it. Writes require the immutable management runtime principal after
 HTTP scope verification. Confirmed CAS values apply to new and existing
 connections and survive restart. Ingress stays closed until the durable document
 loads, and during ambiguous writes or unresolved child-result cleanup. Narrowing
@@ -147,7 +151,7 @@ Plaintext requests cannot use browser cookie routes or cookie authentication.
 | `/v1/host-configuration/` | update | `configuration.write` |
 | `/v1/package-update/` | status, versions | `configuration.read` |
 | `/v1/package-update/` | check, download, cancel | `configuration.write` |
-| `/v1/package-update/` | activate, restore | `configuration.write` and an administrator session |
+| `/v1/package-update/` | activate, automatic, restore | `configuration.write` and an administrator session |
 | `/v1/session/` | list, snapshot | `session.read` |
 | `/v1/session/` | create, activate, stop, finish_stop, cancel, fail, forget, acquire, release | `session.write` |
 | `/v1/application/` | list, status | `application.read` |
