@@ -235,6 +235,11 @@ mod listing {
             self.listing.is_none() && self.worker.is_some()
         }
 
+        /// True while a read's worker thread has yet to be retired.
+        pub(crate) fn reading(&self) -> bool {
+            self.worker.is_some()
+        }
+
         /// The listed set with this digest, when the host would accept a return
         /// to it at `now`.
         pub(crate) fn restorable(&mut self, digest: &str, now: u64) -> Option<Target> {

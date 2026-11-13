@@ -301,7 +301,8 @@ impl<C: Connector> Service<C> {
         self.shutdown_announced = true;
         self.cancelled.store(true, Ordering::Release);
         self.advance();
-        self.job.is_none()
+        // A read of the retained sets is short and is not interrupted.
+        self.job.is_none() && !self.versions.reading()
     }
 
     /// True while this flow uses the repository cache or the host's one
