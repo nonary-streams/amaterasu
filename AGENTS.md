@@ -44,6 +44,23 @@
 - Keep dependencies small and justified; use vetted cryptographic implementations.
 - Native modules are trusted code. Never describe API grants as a native-code sandbox.
 
+## Builds for feature changes
+
+- Prefer building and testing the affected module or modules for a feature or
+  fix. Do not rebuild the entire application by default. If a shared library,
+  contract, ABI or build feature changes, identify and rebuild every affected
+  consumer; use a full build when compatibility or provenance cannot otherwise
+  be established.
+- For a local component update, verify the replacement is compatible with the
+  installed host and other components. Build against the installed source and
+  dependency versions when needed, and retain the exact installed bytes of
+  unaffected components. Record accurate provenance for the replacement and
+  verify the package delta. A complete signed package may contain unchanged
+  installed components; a complete package does not require rebuilding them.
+- Keep the existing signed import, activation, service-pin and stream-activity
+  checks. Run the tests and checks appropriate to the changed modules and report
+  installation separately from real client playback.
+
 ## Latency-sensitive paths
 
 - Mark the stages of an input event or frame with `amaterasu_module_sdk::trace`
