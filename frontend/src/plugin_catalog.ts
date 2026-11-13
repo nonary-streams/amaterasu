@@ -990,6 +990,13 @@ namespace Amaterasu {
     not_restorable: "The host can no longer switch to that package. Open the list again to see what it still keeps.",
     automatic_updates_on: "Turn automatic updates off before switching to that package. It is from before automatic updates and cannot read the setting, which would lock this console out.",
     invalid_mode: "The host did not recognise that setting. Reload the page and try again.",
+    restore_in_progress: "The host is switching to an earlier package that cannot read this setting. Cancel the switch first, or leave automatic updates off.",
+    settings_unavailable: "The host could not read its settings just now. Try again in a moment.",
+    configuration_unavailable: "The host could not read its settings just now. Try again in a moment.",
+    settings_busy: "The host's settings were being changed by something else. Try again.",
+    revision_conflict: "The host's settings were being changed by something else. Try again.",
+    settings_timeout: "The host did not confirm the change. Reload the page to see what was saved.",
+    settings_outcome_unknown: "The host did not confirm the change. Reload the page to see what was saved.",
   };
 
   /// Why the host refused a request, or null for a code this console does not know.

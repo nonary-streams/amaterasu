@@ -838,6 +838,10 @@ test("the packages a host has kept are read whole or not at all", () => {
   assert.match(plugins.packageUpdateRefusalMessage("not_restorable"), /can no longer switch to that package/);
   assert.match(plugins.packageUpdateRefusalMessage("invalid_mode"), /did not recognise that setting/);
   assert.match(plugins.packageUpdateRefusalMessage("automatic_updates_on"), /^Turn automatic updates off before switching to that package\./);
+  assert.match(plugins.packageUpdateRefusalMessage("restore_in_progress"), /^The host is switching to an earlier package that cannot read this setting\./);
+  // Every way saving the setting can be refused has words of its own, never the bare code.
+  for (const code of ["settings_unavailable", "configuration_unavailable", "settings_busy", "revision_conflict", "settings_timeout", "settings_outcome_unknown"])
+    assert.match(plugins.packageUpdateRefusalMessage(code), /^The host/, code);
 });
 
 test("the modules no family accounts for are Amaterasu's own or another developer's", () => {
