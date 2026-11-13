@@ -84,6 +84,11 @@ Default listener options preserve separate IPv4/IPv6 listeners: IPv6-only is
 true, nonblocking is true, Unix address reuse is enabled without port sharing,
 and backlog is 4096. Call `bind_tcp_with_options` with `TcpListenOptions` for an
 explicit backlog or blocking listener. UDP binds are nonblocking by default.
+For protocols such as mDNS that share a UDP port, check `SHARED_UDP` and use
+`Network::bind_udp_shared`. It uses the optional v1.2 table tail; older or
+replacement providers may decline it. The operation requests address reuse,
+and handles retain the same provider ownership and retirement rules as other
+UDP sockets. `UdpSocket::join_multicast_v4` joins on the default IPv4 interface.
 Accepted TCP streams are nonblocking, including those accepted from an explicitly
 blocking listener; a blocking worker must explicitly disable nonblocking on its
 accepted stream. Outbound TCP connect returns a blocking stream with an explicit connect timeout;

@@ -3,6 +3,8 @@
 mod api;
 
 mod audio_driver_install;
+mod discovery;
+mod discovery_ipv6;
 mod encoder_refresh;
 mod encoder_snapshot;
 pub mod global_flags;
@@ -235,6 +237,8 @@ struct NvhttpModule {
     next_listener_rebind: Instant,
     listener_rebind_delay: Duration,
     audio_driver_install: audio_driver_install::AudioDriverInstallSync,
+    discovery: Option<discovery::Discovery>,
+    discovery_ipv6: Option<discovery_ipv6::DiscoveryIpv6>,
 }
 
 impl ManagedModule for NvhttpModule {
@@ -263,7 +267,7 @@ impl ManagedModule for NvhttpModule {
                 &settings,
             )?;
             let mut launches = launch::Controller::new(settings.streaming.clone())?;
-            launches.set_logger(log_emitter);
+            launches.set_logger(log_emitter.clone());
             launches.set_session_lifecycle_required(settings.session_lifecycle_required);
             if settings.session_lifecycle_required {
                 launches.enable_restart_abandonment_sweep();
@@ -334,6 +338,12 @@ impl ManagedModule for NvhttpModule {
             runtime.send(Command::HostPackageBarrierRegister {}),
             Ok(Response::Ok)
         );
+        let discovery = network
+            .as_ref()
+            .map(|network| discovery::Discovery::start(network.clone(), log_emitter.clone()));
+        let discovery_ipv6 = network
+            .as_ref()
+            .map(|network| discovery_ipv6::DiscoveryIpv6::start(network.clone(), log_emitter));
         Ok(Self {
             package_barrier_registered,
             runtime,
@@ -355,10 +365,18 @@ impl ManagedModule for NvhttpModule {
             next_listener_rebind: Instant::now(),
             listener_rebind_delay: Duration::from_secs(1),
             audio_driver_install: audio_driver_install::AudioDriverInstallSync::default(),
+            discovery,
+            discovery_ipv6,
         })
     }
 
     fn prepare_shutdown(&mut self, remaining_ms: u64) -> ModuleResult<()> {
+        if let Some(discovery) = &mut self.discovery {
+            discovery.stop();
+        }
+        if let Some(discovery) = &mut self.discovery_ipv6 {
+            discovery.stop();
+        }
         let deadline = Instant::now()
             .checked_add(Duration::from_millis(remaining_ms))
             .ok_or("nvhttp shutdown deadline exceeds monotonic clock bounds")?;
@@ -370,6 +388,12 @@ impl ManagedModule for NvhttpModule {
         self.log_queue.flush(&self.runtime);
         if !self.quiescing {
             self.quiescing = true;
+            if let Some(discovery) = &mut self.discovery {
+                discovery.stop();
+            }
+            if let Some(discovery) = &mut self.discovery_ipv6 {
+                discovery.stop();
+            }
             if let (Some(server), Some(router)) = (&mut self.server, &mut self.router) {
                 for id in server.close_all() {
                     router.cancel(id, &self.runtime);
@@ -379,7 +403,15 @@ impl ManagedModule for NvhttpModule {
         let router_ready = self.router.as_mut().is_none_or(wire::Router::quiesce);
         let exposure_ready = self.management_exposure.quiesce(&self.runtime);
         let upnp_ready = self.upnp_lifecycle.poll_shutdown()?;
-        Ok(router_ready && exposure_ready && upnp_ready)
+        let discovery_ready = self
+            .discovery
+            .as_mut()
+            .is_none_or(discovery::Discovery::retired);
+        let discovery_ipv6_ready = self
+            .discovery_ipv6
+            .as_mut()
+            .is_none_or(discovery_ipv6::DiscoveryIpv6::retired);
+        Ok(router_ready && exposure_ready && upnp_ready && discovery_ready && discovery_ipv6_ready)
     }
 
     fn tick(&mut self) -> ModuleResult<()> {
@@ -514,6 +546,18 @@ impl ManagedModule for NvhttpModule {
             }
         } else if self.server.is_some() && !self.product_settings.listeners_need_application() {
             self.product_settings.record_listener_apply_success();
+        }
+        if let Some(discovery) = &mut self.discovery {
+            discovery.update(self.server.as_ref().map(|server| discovery::Target {
+                hostname: self.product_settings.hostname().to_owned(),
+                listeners: server.http_addresses(),
+            }));
+        }
+        if let Some(discovery) = &mut self.discovery_ipv6 {
+            discovery.update(self.server.as_ref().map(|server| discovery::Target {
+                hostname: self.product_settings.hostname().to_owned(),
+                listeners: server.http_addresses(),
+            }));
         }
         self.management_exposure.tick(&self.runtime);
         let (http_addresses, https_addresses) = self

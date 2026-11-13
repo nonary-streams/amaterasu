@@ -18,6 +18,14 @@ startup, NVHTTP loads `product/amaterasu.nvhttp` from
 in subsequent server-info replies. NVHTTP needs configuration calls in addition to
 pairing/state calls for delegated transcript operations and native use of the
 identity service for TLS signing and live client checks.
+
+An IPv4 or IPv6 listener reachable beyond loopback is advertised to Moonlight using
+`_nvstream._tcp` DNS-SD. The announcement follows the active HTTP port, including
+custom ports and successful rebinds. Discovery uses IPv4 multicast on the default
+interface; IPv6 announcements are scoped to each eligible interface. Both require
+a network provider supporting shared UDP sockets and multicast; failures are logged
+and do not stop the HTTP listener. Other IPv4 interfaces on multi-homed hosts
+currently require manual host entry.
 Catalog export additionally requires a catalog call grant and an explicit catalog
 `export_principals` mapping from `amaterasu.nvhttp` to the desired owner (the
 platform profile uses `amaterasu.management`). The HTTP caller cannot select the

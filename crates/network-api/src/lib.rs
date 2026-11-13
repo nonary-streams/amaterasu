@@ -185,6 +185,25 @@ pub struct NetworkApiV1_1 {
     pub socket_diagnostics:
         unsafe extern "C" fn(*mut c_void, u64, *mut SocketDiagnostics) -> Status,
 }
+/// Optional v1.2 tail for protocols that share a UDP port, such as mDNS.
+pub const SHARED_UDP_MINOR: u32 = 2;
+pub const SHARED_UDP: u64 = 128;
+#[repr(C)]
+pub struct NetworkApiV1_2 {
+    pub v1_1: NetworkApiV1_1,
+    pub udp_bind_shared: unsafe extern "C" fn(*mut c_void, Address, *mut u64) -> Status,
+}
+impl std::ops::Deref for NetworkApiV1_2 {
+    type Target = NetworkApiV1_1;
+    fn deref(&self) -> &Self::Target {
+        &self.v1_1
+    }
+}
+impl std::ops::DerefMut for NetworkApiV1_2 {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.v1_1
+    }
+}
 impl std::ops::Deref for NetworkApiV1_1 {
     type Target = NetworkApi;
     fn deref(&self) -> &Self::Target {
@@ -219,6 +238,8 @@ mod tests {
         assert_eq!(size_of::<SocketDiagnostics>(), 56);
         assert_eq!(size_of::<NetworkApiV1_1>(), 216);
         assert_eq!(std::mem::offset_of!(NetworkApiV1_1, recv_from_timed), 200);
+        assert_eq!(size_of::<NetworkApiV1_2>(), 224);
+        assert_eq!(std::mem::offset_of!(NetworkApiV1_2, udp_bind_shared), 216);
         assert_eq!(std::mem::offset_of!(NetworkApi, capabilities), 32);
         assert_eq!(std::mem::offset_of!(NetworkApi, tcp_listen), 56);
         assert_eq!(std::mem::offset_of!(NetworkApi, read), 104);

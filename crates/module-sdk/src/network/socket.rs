@@ -1,7 +1,7 @@
 use super::{Network, abi, address_from_native, address_to_native, check, timeout_ms};
 use std::{
     io::{self, Read, Write},
-    net::{Ipv6Addr, Shutdown, SocketAddr},
+    net::{Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr},
     sync::Arc,
     time::Duration,
 };
@@ -438,6 +438,19 @@ impl UdpSocket {
     }
     pub fn join_multicast_v6(&self, group: &Ipv6Addr, interface: u32) -> io::Result<()> {
         self.multicast(group, interface, true)
+    }
+    pub fn join_multicast_v4(&self, group: &Ipv4Addr) -> io::Result<()> {
+        self.0.network.require(abi::MULTICAST)?;
+        // SAFETY: the address is copied and the provider retains the socket.
+        check(unsafe {
+            (self.0.network.table().join_multicast)(
+                self.0.network.context(),
+                self.0.id,
+                address_to_native(SocketAddr::from((*group, 0))),
+                0,
+                true,
+            )
+        })
     }
     pub fn leave_multicast_v6(&self, group: &Ipv6Addr, interface: u32) -> io::Result<()> {
         self.multicast(group, interface, false)
