@@ -307,7 +307,10 @@ pairing/application-list/restart behaviour.
 
 Not implemented, and not claimed:
 
-* **No mDNS/DNS-SD announcement.** Clients must add the host by IP address.
+* **IPv4 mDNS uses the default multicast interface.** The selected network
+  provider must support shared UDP sockets and multicast. IPv6 advertisements
+  are scoped to eligible interfaces. Multi-homed IPv4 hosts may require manual
+  host entry from other networks. Loopback-only listeners are not advertised.
 * **No `/resume`.** A client that disconnects must start a new launch.
 * **Native colour modes require native qualification.** HEVC/AV1 support
   ten-bit SDR and guarded HDR10 with the NVIDIA backend. See

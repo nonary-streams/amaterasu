@@ -1,9 +1,24 @@
 use super::*;
 use amaterasu_abi::{AbiHeader, BorrowedBytes, NativeInterface, NativeInterfaceQuery};
 use std::io::{Read, Write};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 static REPLACEMENT_RESOLVE_CALLS: AtomicUsize = AtomicUsize::new(0);
+static REPLACEMENT_SHARED_CALLS: AtomicUsize = AtomicUsize::new(0);
+static SHARED_CALLBACK: OnceLock<
+    unsafe extern "C" fn(*mut std::ffi::c_void, abi::Address, *mut u64) -> amaterasu_abi::Status,
+> = OnceLock::new();
+
+unsafe extern "C" fn replacement_shared(
+    context: *mut std::ffi::c_void,
+    address: abi::Address,
+    out: *mut u64,
+) -> amaterasu_abi::Status {
+    REPLACEMENT_SHARED_CALLS.fetch_add(1, Ordering::SeqCst);
+    // SAFETY: the fixture forwards the live binding and synchronous output unchanged.
+    unsafe { SHARED_CALLBACK.get().unwrap()(context, address, out) }
+}
 
 unsafe extern "C" fn replacement_resolve(
     _context: *mut std::ffi::c_void,
@@ -114,6 +129,44 @@ fn opaque_udp_handles_preserve_datagrams_and_drop_closes_final_owner() {
     assert!(std::net::UdpSocket::bind(address).is_err());
     drop(clone);
     assert!(std::net::UdpSocket::bind(address).is_ok());
+}
+#[test]
+fn shared_udp_sockets_can_coexist_and_old_providers_are_not_substituted() {
+    let network = Network::test_provider();
+    let first = network
+        .bind_udp_shared("127.0.0.1:0".parse().unwrap())
+        .unwrap();
+    let address = first.local_addr().unwrap();
+    let second = network.bind_udp_shared(address).unwrap();
+    assert_eq!(second.local_addr().unwrap(), address);
+    drop(first);
+    drop(second);
+    assert!(network.bind_udp(address).is_ok());
+
+    let mut old = Network::test_provider();
+    old.capabilities.features &= !abi::SHARED_UDP;
+    assert_eq!(
+        old.bind_udp_shared(address).unwrap_err().kind(),
+        std::io::ErrorKind::Unsupported
+    );
+}
+#[test]
+fn unchanged_shared_udp_consumer_uses_replacement_provider() {
+    let table = standalone();
+    // SAFETY: the fixture owns the v1.2 table exclusively before handing it to the SDK.
+    unsafe {
+        let extended = &mut *table.cast_mut().cast::<abi::NetworkApiV1_2>();
+        SHARED_CALLBACK.set(extended.udp_bind_shared).ok().unwrap();
+        extended.udp_bind_shared = replacement_shared;
+    }
+    // SAFETY: ownership of the valid table and release callback transfers once.
+    let network = unsafe { Network::from_native_table(table) }.unwrap();
+    let before = REPLACEMENT_SHARED_CALLS.load(Ordering::SeqCst);
+    let socket = network
+        .bind_udp_shared("127.0.0.1:0".parse().unwrap())
+        .unwrap();
+    assert!(socket.local_addr().unwrap().port() != 0);
+    assert_eq!(REPLACEMENT_SHARED_CALLS.load(Ordering::SeqCst), before + 1);
 }
 #[test]
 fn tcp_wrappers_support_tls_style_read_write_and_cloned_listener_ownership() {

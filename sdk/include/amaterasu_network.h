@@ -180,6 +180,15 @@ typedef struct {
     AmaterasuStatus (*socket_diagnostics)(void *, uint64_t, AmaterasuNetworkSocketDiagnostics *);
 } AmaterasuNetworkApiV1_1;
 
+/* Optional v1.2 shared UDP tail. Check the capability, minor and table size
+ * before use. The returned handle remains owned by the selected provider. */
+#define AMATERASU_NETWORK_SHARED_UDP_MINOR 2u
+#define AMATERASU_NETWORK_CAP_SHARED_UDP UINT64_C(128)
+typedef struct {
+    AmaterasuNetworkApiV1_1 v1_1;
+    AmaterasuStatus (*udp_bind_shared)(void *, AmaterasuNetworkAddress, uint64_t *);
+} AmaterasuNetworkApiV1_2;
+
 #ifdef __cplusplus
 }
 #endif

@@ -254,6 +254,24 @@ impl Network {
         })?;
         UdpSocket::new(self.clone(), id)
     }
+    /// Bind a UDP endpoint with address sharing, when the selected provider supports it.
+    pub fn bind_udp_shared(&self, address: SocketAddr) -> io::Result<UdpSocket> {
+        self.require(abi::UDP | abi::SHARED_UDP)?;
+        let header = self.table().base.header;
+        if header.minor < abi::SHARED_UDP_MINOR
+            || header.size < size_of::<abi::NetworkApiV1_2>() as u32
+        {
+            return Err(io::ErrorKind::Unsupported.into());
+        }
+        // SAFETY: the selected provider advertised the v1.2 tail and retains it
+        // for the lifetime of this binding; the output is a synchronous borrow.
+        let table = unsafe { &*std::ptr::from_ref(self.table()).cast::<abi::NetworkApiV1_2>() };
+        let mut id = 0;
+        check(unsafe {
+            (table.udp_bind_shared)(self.context(), address_to_native(address), &mut id)
+        })?;
+        UdpSocket::new(self.clone(), id)
+    }
     pub fn resolve(&self, host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
         self.resolve_timeout(host, port, Duration::from_secs(10))
     }
