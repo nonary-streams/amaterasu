@@ -523,7 +523,7 @@ fn previous_repository_id(root: &Path, expected_revision: &str) -> PackageResult
         .map(|source| source.repository_id.clone())
         .ok_or_else(|| "previous native set has no approved publisher provenance".into())
 }
-pub use store::{CatalogListing, RepositoryListing, RepositoryStore};
+pub use store::{CatalogListing, CatalogRefresh, RepositoryListing, RepositoryStore};
 pub use transport::{
     HttpsRepository, RepositoryTransport, download_candidate, fetch_native_manifest,
     refresh_catalog,

@@ -68,6 +68,17 @@ pub enum CatalogListing {
     Unavailable,
 }
 
+/// What a store did with a catalog fetched from its repository's address.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CatalogRefresh {
+    /// The catalog verified and is saved with its replay checkpoint.
+    Accepted,
+    /// The catalog is the approved publisher's own for this target and is
+    /// older than the one already accepted, so the repository is behind this
+    /// host. Nothing was saved.
+    RepositoryBehind,
+}
+
 /// An administrator-controlled directory with one atomic approval/checkpoint
 /// record. Mutations hold a lock separate from the native activation root.
 pub struct RepositoryStore {
@@ -162,23 +173,38 @@ impl RepositoryStore {
         target: &str,
         now: u64,
     ) -> PackageResult<()> {
-        self.change(|state| {
-            let record = active_record(state, id)?;
-            let verified = verify_catalog(
-                &record.approval,
-                raw,
-                signature,
-                &record.checkpoint,
-                target,
-                now,
-            )?;
-            record.checkpoint = verified.next_checkpoint().clone();
-            record.catalog = Some(SavedCatalog {
-                raw: String::from_utf8(raw.to_vec()).map_err(|error| error.to_string())?,
-                signature: signature.into(),
-            });
-            Ok(())
-        })
+        self.change(|state| save_catalog(active_record(state, id)?, raw, signature, target, now))
+    }
+
+    /// Accepts a fetched catalog as [`Self::accept_catalog`] does, and tells
+    /// a repository that is behind this host apart from a catalog that is
+    /// refused.
+    ///
+    /// Only the publisher's own unexpired catalog for this target, at a
+    /// sequence below the accepted one, is reported as behind. A bad
+    /// signature, another target and a different catalog at the accepted
+    /// sequence are errors, as they are for `accept_catalog`.
+    pub fn refresh_catalog(
+        &self,
+        id: &str,
+        raw: &[u8],
+        signature: &str,
+        target: &str,
+        now: u64,
+    ) -> PackageResult<CatalogRefresh> {
+        create_private_directory(&self.directory)?;
+        let _lock = RootLock::acquire(&self.directory)?;
+        let mut state = self.read()?;
+        let record = active_record(&mut state, id)?;
+        if let Err(refusal) = save_catalog(record, raw, signature, target, now) {
+            return if published_before_accepted(record, raw, signature, target, now) {
+                Ok(CatalogRefresh::RepositoryBehind)
+            } else {
+                Err(refusal)
+            };
+        }
+        write_json_atomically(&self.path(), &state)?;
+        Ok(CatalogRefresh::Accepted)
     }
 
     pub fn approved(&self, id: &str) -> PackageResult<ApprovedRepository> {
@@ -307,6 +333,60 @@ impl RepositoryStore {
     fn path(&self) -> PathBuf {
         self.directory.join("approved.json")
     }
+}
+
+/// Verifies `raw` against the record's approval and replay checkpoint, then
+/// saves the catalog and the checkpoint it advances to in the record.
+fn save_catalog(
+    record: &mut RepositoryRecord,
+    raw: &[u8],
+    signature: &str,
+    target: &str,
+    now: u64,
+) -> PackageResult<()> {
+    let verified = verify_catalog(
+        &record.approval,
+        raw,
+        signature,
+        &record.checkpoint,
+        target,
+        now,
+    )?;
+    let raw = String::from_utf8(raw.to_vec()).map_err(|error| error.to_string())?;
+    record.checkpoint = verified.next_checkpoint().clone();
+    record.catalog = Some(SavedCatalog {
+        raw,
+        signature: signature.into(),
+    });
+    Ok(())
+}
+
+/// True when `raw` is the record's publisher's own unexpired catalog for
+/// `target` at a sequence below the one already accepted.
+///
+/// The replay checkpoint is left out of this verification only to learn why
+/// a catalog was refused. Nothing is accepted on its strength.
+fn published_before_accepted(
+    record: &RepositoryRecord,
+    raw: &[u8],
+    signature: &str,
+    target: &str,
+    now: u64,
+) -> bool {
+    let checkpoint = &record.checkpoint;
+    checkpoint
+        .digest
+        .as_deref()
+        .is_some_and(super::canonical_digest)
+        && verify_catalog(
+            &record.approval,
+            raw,
+            signature,
+            &CatalogCheckpoint::default(),
+            target,
+            now,
+        )
+        .is_ok_and(|catalog| catalog.sequence() < checkpoint.highest_sequence)
 }
 
 fn listed_catalog(

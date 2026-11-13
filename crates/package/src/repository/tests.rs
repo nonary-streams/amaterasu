@@ -558,6 +558,86 @@ fn approved_store_persists_catalog_checkpoint_and_revocation() {
 }
 
 #[test]
+fn refresh_tells_a_repository_that_is_behind_from_a_refused_catalog() {
+    let fixture = Fixture::new();
+    let store = RepositoryStore::new(fixture.root.join("approvals")).unwrap();
+    store.approve(fixture.approved.clone()).unwrap();
+    let refresh = |raw: &[u8], signature: &str, target: &str, now| {
+        store.refresh_catalog(&fixture.approved.id, raw, signature, target, now)
+    };
+    let saved_sequence = || {
+        store
+            .catalog(&fixture.approved.id, &current_target(), 100)
+            .unwrap()
+            .sequence()
+    };
+    let (_, candidate) = fixture.web_bundle();
+    let (accepted, accepted_signature) = fixture.signed_catalog(vec![candidate], 7);
+    let (older, older_signature) = fixture.signed_catalog(vec![], 6);
+
+    // Before anything is accepted there is nothing to be behind.
+    assert_eq!(
+        refresh(&accepted, &accepted_signature, &current_target(), 100),
+        Ok(CatalogRefresh::Accepted)
+    );
+    // The same catalog again is the accepted one, not an older one.
+    assert_eq!(
+        refresh(&accepted, &accepted_signature, &current_target(), 100),
+        Ok(CatalogRefresh::Accepted)
+    );
+
+    // The publisher's own earlier catalog: the repository is behind, and the
+    // saved catalog and its checkpoint stay where they were.
+    assert_eq!(
+        refresh(&older, &older_signature, &current_target(), 100),
+        Ok(CatalogRefresh::RepositoryBehind)
+    );
+    assert_eq!(saved_sequence(), 7);
+    assert!(
+        store
+            .accept_catalog(
+                &fixture.approved.id,
+                &older,
+                &older_signature,
+                &current_target(),
+                100,
+            )
+            .is_err()
+    );
+
+    // An earlier sequence proves nothing unless the approved key signed it
+    // for this target and it has not expired.
+    let intruder = SigningKey::from_bytes(&[62; 32]);
+    let mut signed = CATALOG_DOMAIN.to_vec();
+    signed.extend_from_slice(&older);
+    let forged = encode_hex(&intruder.sign(&signed).to_bytes());
+    assert!(refresh(&older, &forged, &current_target(), 100).is_err());
+    assert!(refresh(&older, &older_signature, "another-target", 100).is_err());
+    assert!(refresh(&older, &older_signature, &current_target(), 500).is_err());
+    // A different catalog at the accepted sequence is a substitution.
+    let (substitute, substitute_signature) = fixture.signed_catalog(vec![], 7);
+    assert!(refresh(&substitute, &substitute_signature, &current_target(), 100).is_err());
+    assert_eq!(saved_sequence(), 7);
+
+    // A newer catalog is accepted, and the one it replaced is then behind.
+    let (newer, newer_signature) = fixture.signed_catalog(vec![], 8);
+    assert_eq!(
+        refresh(&newer, &newer_signature, &current_target(), 100),
+        Ok(CatalogRefresh::Accepted)
+    );
+    assert_eq!(saved_sequence(), 8);
+    assert_eq!(
+        refresh(&accepted, &accepted_signature, &current_target(), 100),
+        Ok(CatalogRefresh::RepositoryBehind)
+    );
+
+    // A revoked publisher is refused whatever it serves.
+    store.revoke(&fixture.approved.id).unwrap();
+    assert!(refresh(&older, &older_signature, &current_target(), 100).is_err());
+    assert!(refresh(&newer, &newer_signature, &current_target(), 100).is_err());
+}
+
+#[test]
 fn listing_reports_each_catalog_without_hiding_other_repositories() {
     let fixture = Fixture::new();
     let store = RepositoryStore::new(fixture.root.join("approvals")).unwrap();
