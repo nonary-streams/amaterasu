@@ -22,6 +22,9 @@ namespace Amaterasu {
   const COLLAPSED_NAMES = 8;
   const COLLAPSED_CHANGES = 6;
   const COLLAPSED_VERSIONS = 6;
+  /// How often, and how many times, a host still reading its packages is asked again.
+  const VERSIONS_RETRY_MS = 700;
+  const VERSIONS_RETRIES = 8;
   const UPDATE_POLL_MS = 1500;
   /// How long a host that is installing may go without answering before the
   /// page stops waiting for it.
@@ -1321,7 +1324,9 @@ namespace Amaterasu {
       async function switchTo(version: PackageVersion): Promise<void> {
         const confirmed = await confirmAction(
           lit(`Switch to package ${shortDigest(version.digest)}?`),
-          "The host restarts with this earlier package as soon as no stream is running, and keeps the one it has if the earlier one does not start. An automatic update will not bring back the package you are leaving.",
+          version.switchesBack
+            ? "The host restarts with this earlier package as soon as no stream is running, and keeps the one it has if the earlier one does not start. An automatic update will not bring back the package you are leaving."
+            : "The host restarts with this earlier package as soon as no stream is running, and keeps the one it has if the earlier one does not start. This package is from before version switching: once it is running, this console can no longer switch packages, and the way forward is a newer update or the host's command line.",
           "Switch version",
         );
         if (!confirmed || page.signal.aborted) return;
@@ -1330,7 +1335,7 @@ namespace Amaterasu {
 
       function draw(): void {
         switches = [];
-        if (!listed || listed.state === "loading") {
+        if (!listed || listed.state === "loading" || (listed.state === "ready" && listed.value.loading)) {
           body.replaceChildren(el("p", "muted", "Loading earlier versions…"));
           return;
         }
@@ -1376,24 +1381,38 @@ namespace Amaterasu {
             (total > rows.length ? `The ${rows.length} most recent of the ${total} packages this host has kept. ` : "") +
             "The host tries a package before it switches, and keeps running the current one if the other does not start." +
             (canManage ? "" : " Switching takes an administrator who is signed in to the console."))),
+          // Said before the choice is made, and again when one of them is chosen.
+          earlier.some((version) => version.restorable && !version.switchesBack)
+            ? el("p", "muted plugin-versions-oneway", "Packages from before version switching are one way: once one is running, this console can no longer switch packages. They say so when you choose them.")
+            : "",
         );
         sync();
       }
 
-      async function read(): Promise<void> {
+      /// A host that has just started may still be reading its packages; it is asked again a few times.
+      async function read(attempt = 0): Promise<void> {
         const ticket = ++request;
-        listed = { state: "loading" };
-        draw();
+        if (attempt === 0) {
+          listed = { state: "loading" };
+          draw();
+        }
+        let outcome: Loadable<PackageVersions>;
         try {
           const value = parsePackageVersions(await api.post<unknown>("package-update/versions", {}));
-          if (ticket === request) listed = { state: "ready", value };
+          if (value.loading && attempt >= VERSIONS_RETRIES) throw new Error("The host is still reading its packages. Try again in a moment.");
+          outcome = { state: "ready", value };
         } catch (error) {
-          if (ticket === request) listed = { state: "failed", error };
+          outcome = { state: "failed", error };
         }
-        if (ticket === request && !page.signal.aborted) draw();
+        if (ticket !== request || page.signal.aborted) return;
+        listed = outcome;
+        draw();
+        if (outcome.state === "ready" && outcome.value.loading)
+          window.setTimeout(() => { if (ticket === request && !page.signal.aborted) void read(attempt + 1); }, VERSIONS_RETRY_MS);
       }
 
       node.addEventListener("toggle", () => { if (node.open && !listed) void read(); });
+      page.signal.addEventListener("abort", () => { request++; }, { once: true });
       return {
         node,
         sync,

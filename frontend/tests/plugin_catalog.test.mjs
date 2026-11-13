@@ -795,13 +795,19 @@ test("the packages a host has kept are read whole or not at all", () => {
   assert.deepEqual([listed.supported, listed.total, listed.versions.length], [true, 156, 3]);
   assert.deepEqual(listed.versions[1], {
     digest: digest("b"), sequence: "1794169005", state: "previous", installedUnixMs: 1_794_529_635_000,
-    modules: 37, differs: 1, restorable: true, reason: null,
+    modules: 37, differs: 1, restorable: true, reason: null, switchesBack: false,
   });
   assert.deepEqual([listed.versions[2].installedUnixMs, listed.versions[2].restorable, listed.versions[2].reason], [null, false, "expired"]);
+  // A package that has run here with version switching can be left again; one that has not is one way.
+  assert.equal(plugins.parsePackageVersions({ ...reply, versions: [{ ...version, switches_back: true }] }).versions[0].switchesBack, true);
+  assert.equal(listed.loading, false);
+  // A host still reading its packages says so with an empty list.
+  assert.deepEqual(plain(plugins.parsePackageVersions({ ok: true, supported: true, loading: true, total: 0, versions: [] })),
+    { supported: true, loading: true, total: 0, versions: [] });
   // A total smaller than the list is not believed.
   assert.equal(plugins.parsePackageVersions({ ...reply, total: 1 }).total, 3);
   assert.deepEqual(plain(plugins.parsePackageVersions({ ok: true, supported: false, total: 0, versions: [] })),
-    { supported: false, total: 0, versions: [] });
+    { supported: false, loading: false, total: 0, versions: [] });
 
   for (const bad of [
     { ok: false },
@@ -815,6 +821,8 @@ test("the packages a host has kept are read whole or not at all", () => {
     { versions: [{ ...version, modules: 1.5 }] },
     { versions: [{ ...version, differs: -1 }] },
     { versions: [{ ...version, restorable: "yes" }] },
+    { versions: [{ ...version, switches_back: 1 }] },
+    { loading: "yes" },
     { versions: [{ ...version, reason: "Not Allowed" }] },
     { versions: Array.from({ length: 65 }, (_, index) => ({ ...version, digest: index.toString(16).padStart(64, "0") })) },
   ]) assert.throws(() => plugins.parsePackageVersions({ ...reply, ...bad }), JSON.stringify(bad).slice(0, 80));

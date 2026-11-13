@@ -861,7 +861,7 @@ test('Amaterasu Core keeps itself up to date and can go back to an earlier packa
     // Earlier versions: closed until asked for, and read only then.
     await evaluate(`host.kept = [
         { digest: host.digest, sequence: '12', state: 'running', installed_unix_ms: Date.UTC(2026, 10, 12, 18, 27), modules: 4, differs: 0, restorable: true, reason: null },
-        { digest: 'b'.repeat(64), sequence: '11', state: 'previous', installed_unix_ms: Date.UTC(2026, 10, 11, 18, 46), modules: 4, differs: 1, restorable: true, reason: null },
+        { digest: 'b'.repeat(64), sequence: '11', state: 'previous', installed_unix_ms: Date.UTC(2026, 10, 11, 18, 46), modules: 4, differs: 1, restorable: true, reason: null, switches_back: true },
         { digest: 'a'.repeat(64), sequence: '10', state: 'retained', installed_unix_ms: null, modules: 3, differs: 4, restorable: false, reason: 'expired' },
       ];
       host.versionsReply = () => ({ ok: true, supported: true, total: 41, versions: host.kept });
@@ -885,6 +885,8 @@ test('Amaterasu Core keeps itself up to date and can go back to an earlier packa
     assert.match(await evaluate(`document.querySelector('.plugin-versions-body > p').textContent`),
       /^The 3 most recent of the 41 packages this host has kept\. The host tries a package before it switches/);
     assert.equal(await evaluate(`host.button('Switch to this version').getAttribute('aria-label')`), 'Switch to package bbbbbbbbbbbb');
+    // Every package that can be switched to here can be left again, so nothing warns of a one-way trip.
+    assert.equal(await evaluate(`document.querySelector('.plugin-versions-oneway')`), null);
 
     // Switching asks first, then waits for the stream like an install does.
     await evaluate(`host.press('Switch to this version')`);
@@ -953,6 +955,26 @@ test('Amaterasu Core keeps itself up to date and can go back to an earlier packa
     await waitFor(`document.querySelectorAll('.plugin-versions tbody tr').length === 6`);
     await evaluate(`host.press('Show all 12', document.querySelector('.plugin-versions'))`);
     assert.equal(await evaluate(`document.querySelectorAll('.plugin-versions tbody tr').length`), 12);
+
+    // A package from before version switching is one way, and says so before and at the choice.
+    assert.match(await evaluate(`document.querySelector('.plugin-versions-oneway').textContent`), /^Packages from before version switching are one way/);
+    await evaluate(`host.press('Switch to this version')`);
+    await waitFor(`document.querySelector('dialog.confirmation')?.open === true`);
+    assert.match(await evaluate(`document.querySelector('dialog.confirmation').textContent`),
+      /This package is from before version switching: once it is running, this console can no longer switch packages/);
+    assert.doesNotMatch(await evaluate(`document.querySelector('dialog.confirmation').textContent`), /will not bring back/);
+    await evaluate(`host.press('Cancel', document.querySelector('dialog.confirmation'))`);
+
+    // A host that has only just started is still reading its packages, and is asked again.
+    await evaluate(`host.reading = 2; host.listedPackages = host.versionsReply;
+      host.versionsReply = () => host.reading-- > 0 ? { ok: true, supported: true, loading: true, total: 0, versions: [] } : host.listedPackages();
+      host.open()`);
+    await waitFor(settle);
+    await evaluate(`document.querySelector('.plugin-versions').open = true`);
+    await waitFor(`document.querySelector('.plugin-versions-body').textContent === 'Loading earlier versions…'`);
+    await waitFor(`document.querySelectorAll('.plugin-versions tbody tr').length === 6`, 'the list arrives once the host has read it');
+    assert.equal(await evaluate(`host.versionCalls()`), 3);
+    await evaluate(`host.versionsReply = host.listedPackages`);
 
     // A viewer sees the list and is told who may switch.
     await evaluate(`host.role = 'viewer'; host.scopes = ['configuration.read']; host.open()`);

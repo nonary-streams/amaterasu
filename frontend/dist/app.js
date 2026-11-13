@@ -14742,7 +14742,10 @@ var Amaterasu;
         if (reply.ok !== true)
             throw new Error("Package versions are unavailable.");
         if (reply.supported === false)
-            return { supported: false, total: 0, versions: [] };
+            return { supported: false, loading: false, total: 0, versions: [] };
+        const loading = reply.loading ?? false;
+        if (typeof loading !== "boolean")
+            throw new Error("Package version list is invalid.");
         if (reply.supported !== true || !Array.isArray(reply.versions) || reply.versions.length > 64 || !byteCount(reply.total))
             throw new Error("Package version list is invalid.");
         const seen = new Set();
@@ -14750,7 +14753,8 @@ var Amaterasu;
             const row = record(entry, "Package version is invalid.");
             const installed = row.installed_unix_ms ?? null;
             const reason = row.reason ?? null;
-            if (typeof row.digest !== "string" || !DIGEST.test(row.digest) || seen.has(row.digest) ||
+            const switchesBack = row.switches_back ?? false;
+            if (typeof switchesBack !== "boolean" || typeof row.digest !== "string" || !DIGEST.test(row.digest) || seen.has(row.digest) ||
                 !releaseSequence(row.sequence) ||
                 typeof row.state !== "string" || !VERSION_STATES.includes(row.state) ||
                 (installed !== null && !unixMs(installed)) ||
@@ -14767,9 +14771,10 @@ var Amaterasu;
                 differs: row.differs,
                 restorable: row.restorable,
                 reason: reason,
+                switchesBack,
             };
         });
-        return { supported: true, total: Math.max(reply.total, versions.length), versions };
+        return { supported: true, loading, total: Math.max(reply.total, versions.length), versions };
     }
     Amaterasu.parsePackageVersions = parsePackageVersions;
     const VERSION_REASONS = {
@@ -15535,6 +15540,8 @@ var Amaterasu;
     const COLLAPSED_NAMES = 8;
     const COLLAPSED_CHANGES = 6;
     const COLLAPSED_VERSIONS = 6;
+    const VERSIONS_RETRY_MS = 700;
+    const VERSIONS_RETRIES = 8;
     const UPDATE_POLL_MS = 1500;
     const RESTART_PATIENCE_MS = 180_000;
     const CHECKED_REFRESH_MS = 30_000;
@@ -16590,14 +16597,16 @@ var Amaterasu;
                     control.disabled = !idle || !canManage;
             }
             async function switchTo(version) {
-                const confirmed = await Amaterasu.confirmAction(lit(`Switch to package ${Amaterasu.shortDigest(version.digest)}?`), "The host restarts with this earlier package as soon as no stream is running, and keeps the one it has if the earlier one does not start. An automatic update will not bring back the package you are leaving.", "Switch version");
+                const confirmed = await Amaterasu.confirmAction(lit(`Switch to package ${Amaterasu.shortDigest(version.digest)}?`), version.switchesBack
+                    ? "The host restarts with this earlier package as soon as no stream is running, and keeps the one it has if the earlier one does not start. An automatic update will not bring back the package you are leaving."
+                    : "The host restarts with this earlier package as soon as no stream is running, and keeps the one it has if the earlier one does not start. This package is from before version switching: once it is running, this console can no longer switch packages, and the way forward is a newer update or the host's command line.", "Switch version");
                 if (!confirmed || page.signal.aborted)
                     return;
                 await updates.change(Amaterasu.CORE_UPDATE_SOURCE, { kind: "restore", digest: version.digest });
             }
             function draw() {
                 switches = [];
-                if (!listed || listed.state === "loading") {
+                if (!listed || listed.state === "loading" || (listed.state === "ready" && listed.value.loading)) {
                     body.replaceChildren(Amaterasu.el("p", "muted", "Loading earlier versions…"));
                     return;
                 }
@@ -16635,27 +16644,38 @@ var Amaterasu;
                     action(version),
                 ])), more ?? "", Amaterasu.el("p", "muted", lit((total > rows.length ? `The ${rows.length} most recent of the ${total} packages this host has kept. ` : "") +
                     "The host tries a package before it switches, and keeps running the current one if the other does not start." +
-                    (canManage ? "" : " Switching takes an administrator who is signed in to the console."))));
+                    (canManage ? "" : " Switching takes an administrator who is signed in to the console."))), earlier.some((version) => version.restorable && !version.switchesBack)
+                    ? Amaterasu.el("p", "muted plugin-versions-oneway", "Packages from before version switching are one way: once one is running, this console can no longer switch packages. They say so when you choose them.")
+                    : "");
                 sync();
             }
-            async function read() {
+            async function read(attempt = 0) {
                 const ticket = ++request;
-                listed = { state: "loading" };
-                draw();
+                if (attempt === 0) {
+                    listed = { state: "loading" };
+                    draw();
+                }
+                let outcome;
                 try {
                     const value = Amaterasu.parsePackageVersions(await api.post("package-update/versions", {}));
-                    if (ticket === request)
-                        listed = { state: "ready", value };
+                    if (value.loading && attempt >= VERSIONS_RETRIES)
+                        throw new Error("The host is still reading its packages. Try again in a moment.");
+                    outcome = { state: "ready", value };
                 }
                 catch (error) {
-                    if (ticket === request)
-                        listed = { state: "failed", error };
+                    outcome = { state: "failed", error };
                 }
-                if (ticket === request && !page.signal.aborted)
-                    draw();
+                if (ticket !== request || page.signal.aborted)
+                    return;
+                listed = outcome;
+                draw();
+                if (outcome.state === "ready" && outcome.value.loading)
+                    window.setTimeout(() => { if (ticket === request && !page.signal.aborted)
+                        void read(attempt + 1); }, VERSIONS_RETRY_MS);
             }
             node.addEventListener("toggle", () => { if (node.open && !listed)
                 void read(); });
+            page.signal.addEventListener("abort", () => { request++; }, { once: true });
             return {
                 node,
                 sync,

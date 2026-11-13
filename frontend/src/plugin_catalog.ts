@@ -378,10 +378,15 @@ namespace Amaterasu {
     restorable: boolean;
     /// The host's code for why a package cannot be switched to.
     reason: string | null;
+    /// True when the package has run here with version switching, so the
+    /// console can switch again once it is running.
+    switchesBack: boolean;
   }
 
   export interface PackageVersions {
     supported: boolean;
+    /// True while the host is still reading its packages; ask again shortly.
+    loading: boolean;
     /// Every package the host has kept, which can be more than it lists.
     total: number;
     versions: PackageVersion[];
@@ -392,7 +397,9 @@ namespace Amaterasu {
   export function parsePackageVersions(value: unknown): PackageVersions {
     const reply = record(value, "Package version list is invalid.");
     if (reply.ok !== true) throw new Error("Package versions are unavailable.");
-    if (reply.supported === false) return { supported: false, total: 0, versions: [] };
+    if (reply.supported === false) return { supported: false, loading: false, total: 0, versions: [] };
+    const loading = reply.loading ?? false;
+    if (typeof loading !== "boolean") throw new Error("Package version list is invalid.");
     if (reply.supported !== true || !Array.isArray(reply.versions) || reply.versions.length > 64 || !byteCount(reply.total))
       throw new Error("Package version list is invalid.");
     const seen = new Set<string>();
@@ -400,7 +407,8 @@ namespace Amaterasu {
       const row = record(entry, "Package version is invalid.");
       const installed = row.installed_unix_ms ?? null;
       const reason = row.reason ?? null;
-      if (typeof row.digest !== "string" || !DIGEST.test(row.digest) || seen.has(row.digest) ||
+      const switchesBack = row.switches_back ?? false;
+      if (typeof switchesBack !== "boolean" || typeof row.digest !== "string" || !DIGEST.test(row.digest) || seen.has(row.digest) ||
           !releaseSequence(row.sequence) ||
           typeof row.state !== "string" || !(VERSION_STATES as readonly string[]).includes(row.state) ||
           (installed !== null && !unixMs(installed)) ||
@@ -417,9 +425,10 @@ namespace Amaterasu {
         differs: row.differs,
         restorable: row.restorable,
         reason: reason as string | null,
+        switchesBack,
       };
     });
-    return { supported: true, total: Math.max(reply.total, versions.length), versions };
+    return { supported: true, loading, total: Math.max(reply.total, versions.length), versions };
   }
 
   const VERSION_REASONS: Readonly<Record<string, string>> = {
