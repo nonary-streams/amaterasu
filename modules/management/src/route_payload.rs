@@ -56,6 +56,15 @@ pub fn validate(route: Route, object: &Object) -> Result<(), &'static str> {
             fields(object, &["id"], &[])?;
             repository_text(object, "id", 128)
         }
+        "amaterasu.management/1" if route.action == "package_update_restore" => {
+            fields(object, &["digest"], &[])?;
+            let named = object.get("digest").and_then(Value::as_str);
+            if named.is_some_and(crate::package_status::is_sha256) {
+                Ok(())
+            } else {
+                Err(INVALID)
+            }
+        }
         "amaterasu.extension-registry/1" => session_extensions(route.action, object),
         "amaterasu.extension-actions/1" => extension_actions(route.action, object),
         "amaterasu.session-lifecycle/1" if route.action == "snapshot" => fields(object, &[], &[]),

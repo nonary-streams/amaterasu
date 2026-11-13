@@ -5,7 +5,7 @@ use super::Action;
 use super::environment::Environment;
 use super::service::{ActivationHost, Admission, HostActivationState, Service};
 use super::transport::Connector;
-use amaterasu_contracts::{Grants, HostPackageActivation, RuntimeConfig};
+use amaterasu_contracts::{Grants, HostPackageActivation, HostPackageRestore, RuntimeConfig};
 use amaterasu_package::repository::{
     ApprovedRepository, Candidate, CandidateKind, Catalog, RepositoryStore, RepositoryTransport,
 };
@@ -30,6 +30,7 @@ use std::{
 
 mod end_to_end;
 mod phases;
+mod versions;
 
 const REPOSITORY: &str = "amaterasu";
 const SLOT: &str = "amaterasu.runtime";
@@ -141,6 +142,11 @@ impl Publisher {
 
     /// Signs a set whose slot version is its runtime module's version.
     fn sign_set(&self, sequence: u64, modules: &[Module]) -> SignedSet {
+        self.sign_set_until(sequence, modules, unix_timestamp() + 3600)
+    }
+
+    /// The same, with a manifest that expires at `expires_unix`.
+    fn sign_set_until(&self, sequence: u64, modules: &[Module], expires_unix: u64) -> SignedSet {
         let components = modules
             .iter()
             .map(|module| ComponentManifest {
@@ -160,7 +166,7 @@ impl Publisher {
             host_context_schema: 1,
             project: "amaterasu".into(),
             sequence,
-            expires_unix: unix_timestamp() + 3600,
+            expires_unix,
             target: current_target(),
             components,
             privileged_requests: Vec::new(),
@@ -471,6 +477,9 @@ struct ScriptedHost {
     withdraws: bool,
     requests: Vec<HostPackageActivation>,
     withdrawals: usize,
+    /// False for a host shell from before restore requests.
+    restores: bool,
+    restore_requests: Vec<HostPackageRestore>,
 }
 
 impl ScriptedHost {
@@ -482,6 +491,8 @@ impl ScriptedHost {
             withdraws: true,
             requests: Vec::new(),
             withdrawals: 0,
+            restores: true,
+            restore_requests: Vec::new(),
         }
     }
 
@@ -504,6 +515,18 @@ impl ActivationHost for ScriptedHost {
             self.report(true, false);
         }
         self.admission
+    }
+
+    fn restore(&mut self, request: HostPackageRestore) -> Admission {
+        self.restore_requests.push(request);
+        if self.admission == Admission::Accepted {
+            self.report(true, false);
+        }
+        self.admission
+    }
+
+    fn restore_supported(&mut self) -> bool {
+        self.restores
     }
 
     fn cancel(&mut self) -> bool {

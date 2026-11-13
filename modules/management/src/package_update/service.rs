@@ -7,10 +7,11 @@ use super::download::download;
 use super::environment::{Environment, UpdateSource};
 use super::plan::{Checked, Offer};
 use super::transport::Connector;
+use super::versions::{VersionRequest, Versions};
 use super::{Action, Failure};
 use crate::candidate_cache::PreparedCandidate;
 use crate::host_activation::{self, RequestRefusal};
-use amaterasu_contracts::HostPackageActivation;
+use amaterasu_contracts::{HostPackageActivation, HostPackageRestore};
 use serde_json::{Value, json};
 use std::{
     sync::{
@@ -83,9 +84,23 @@ pub(crate) struct HostActivationState {
 /// candidate may run; this module only asks.
 pub(crate) trait ActivationHost {
     fn activate(&mut self, request: HostPackageActivation) -> Admission;
+    /// Asks the host to return to a retained set. It holds the request like
+    /// an activation, and `cancel` and `state` speak for either.
+    fn restore(&mut self, request: HostPackageRestore) -> Admission;
+    /// True when the host shell takes restore requests.
+    fn restore_supported(&mut self) -> bool;
     /// Withdraws a request the host has not started. False once it has.
     fn cancel(&mut self) -> bool;
     fn state(&mut self) -> Option<HostActivationState>;
+}
+
+/// A return to a retained set that the host holds or is performing.
+struct Restoring {
+    digest: String,
+    sequence: u64,
+    /// Where the update stood when the restore was asked for, which is where
+    /// it stands again if the restore is withdrawn.
+    resume: (Phase, Option<&'static str>),
 }
 
 enum Job {
@@ -116,12 +131,16 @@ pub(crate) struct Service<C: Connector> {
     transferred: Arc<AtomicU64>,
     job: Option<Job>,
     shutdown_announced: bool,
+    versions: Versions,
+    restoring: Option<Restoring>,
 }
 
 impl<C: Connector> Service<C> {
     pub(crate) fn new(connector: C, environment: Environment) -> Self {
         let failed = environment.last_activation_failed;
         Self {
+            versions: Versions::start(&environment),
+            restoring: None,
             connector,
             environment,
             phase: if failed { Phase::Failed } else { Phase::Idle },
@@ -168,8 +187,90 @@ impl<C: Connector> Service<C> {
         }
     }
 
+    /// Answers a request about the retained sets: the list of them, or a
+    /// return to one. A restore is refused or answered with the status.
+    pub(crate) fn versions(
+        &mut self,
+        request: VersionRequest,
+        host: &mut dyn ActivationHost,
+        other_install_active: bool,
+    ) -> Value {
+        self.advance();
+        if !host.restore_supported() {
+            return match request {
+                VersionRequest::List => super::versions::unsupported(),
+                VersionRequest::Restore { .. } => {
+                    json!({"ok": false, "code": "unsupported_platform"})
+                }
+            };
+        }
+        match request {
+            VersionRequest::List => self.versions.reply(amaterasu_package::unix_timestamp()),
+            VersionRequest::Restore { digest } => {
+                let outcome = self
+                    .admit(other_install_active)
+                    .and_then(|()| self.request_restore(&digest, host));
+                match outcome {
+                    Ok(()) => self.status(),
+                    Err(code) => json!({"ok": false, "code": code}),
+                }
+            }
+        }
+    }
+
+    /// Asks the host to return to a listed set. The request names the set and
+    /// the selection it was made against; the host decides everything else.
+    fn request_restore(
+        &mut self,
+        digest: &str,
+        host: &mut dyn ActivationHost,
+    ) -> Result<(), Refusal> {
+        if self.versions.loading() {
+            return Err("busy");
+        }
+        let (Some(target), Some(root)) = (
+            self.versions
+                .restorable(digest, amaterasu_package::unix_timestamp()),
+            self.environment.package_root.clone(),
+        ) else {
+            return Err("not_restorable");
+        };
+        let request = match host_activation::restore_request(&root, &target.digest) {
+            Ok(request) => request,
+            Err(RequestRefusal::ActivationInProgress) => return Err("activation_in_progress"),
+            Err(RequestRefusal::SelectionUnavailable) => {
+                self.fail("activation_unavailable");
+                return Ok(());
+            }
+        };
+        if Some(&request.expected_active) != self.environment.running_digest.as_ref() {
+            // The selection no longer names the set this module was loaded from.
+            self.fail("activation_unavailable");
+            return Ok(());
+        }
+        let resume = (self.phase, self.error);
+        match host.restore(request) {
+            Admission::Accepted => {
+                self.phase = Phase::WaitingStream;
+                self.error = None;
+                self.restoring = Some(Restoring {
+                    digest: target.digest,
+                    sequence: target.sequence,
+                    resume,
+                });
+                Ok(())
+            }
+            Admission::InProgress => Err("activation_in_progress"),
+            Admission::Unavailable => {
+                self.fail("activation_unavailable");
+                Ok(())
+            }
+        }
+    }
+
     /// Retires a finished worker without waiting for a running one.
     pub(crate) fn advance(&mut self) {
+        self.versions.advance();
         if !self.job.as_ref().is_some_and(Job::is_finished) {
             return;
         }
@@ -312,9 +413,15 @@ impl<C: Connector> Service<C> {
                 if !host.cancel() {
                     return Err("activation_in_progress");
                 }
-                // The candidate is still verified in the cache.
-                self.phase = Phase::Ready;
-                self.error = None;
+                match self.restoring.take() {
+                    // A withdrawn restore leaves the update where it stood.
+                    Some(restoring) => (self.phase, self.error) = restoring.resume,
+                    // The candidate is still verified in the cache.
+                    None => {
+                        self.phase = Phase::Ready;
+                        self.error = None;
+                    }
+                }
                 Ok(())
             }
             _ => {
@@ -340,6 +447,7 @@ impl<C: Connector> Service<C> {
         } else if state.pending {
             self.phase = Phase::WaitingStream;
         } else {
+            self.restoring = None;
             self.fail("activation_interrupted");
         }
     }
@@ -419,6 +527,10 @@ impl<C: Connector> Service<C> {
             "update": self.described_offer,
             "transferred_bytes": self.transferred_bytes(),
             "error": error,
+            "restoring": self.restoring.as_ref().map(|restoring| json!({
+                "digest": restoring.digest,
+                "sequence": restoring.sequence.to_string(),
+            })),
         })
     }
 
@@ -439,6 +551,11 @@ impl<C: Connector> Service<C> {
     /// it, for tests of how the module routes other installs meanwhile.
     pub(crate) fn assume_activation_requested(&mut self) {
         self.phase = Phase::WaitingStream;
+    }
+
+    /// Reads the retained sets again now, as an aged listing is on request.
+    pub(crate) fn reread_versions(&mut self) {
+        self.versions.reread();
     }
 }
 

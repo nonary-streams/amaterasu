@@ -26,6 +26,9 @@ mod plan;
 mod service;
 #[cfg(target_os = "linux")]
 mod transport;
+mod versions;
+
+pub(crate) use versions::VersionRequest;
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests;
@@ -185,6 +188,27 @@ impl PackageUpdate {
     }
 }
 
+impl PackageUpdate {
+    /// Answers a request about the retained sets: the list of them, or a
+    /// return to one. `other_install_active` is as for `request`.
+    pub(crate) fn versions(
+        &mut self,
+        request: VersionRequest,
+        runtime: &RuntimeClient,
+        other_install_active: bool,
+    ) -> Value {
+        #[cfg(target_os = "linux")]
+        if let Some(service) = &mut self.service {
+            return service.versions(request, &mut RuntimeHost(runtime), other_install_active);
+        }
+        let _ = (runtime, other_install_active);
+        match request {
+            VersionRequest::List => versions::unsupported(),
+            VersionRequest::Restore { .. } => json!({"ok": false, "code": "unsupported_platform"}),
+        }
+    }
+}
+
 /// The reply of a host that cannot activate a package: the status says so,
 /// and every request that would change something is refused.
 fn unsupported(action: Action) -> Value {
@@ -201,6 +225,7 @@ fn unsupported(action: Action) -> Value {
         "update": null,
         "transferred_bytes": 0,
         "error": "unsupported_platform",
+        "restoring": null,
     })
 }
 
@@ -222,6 +247,27 @@ impl service::ActivationHost for RuntimeHost<'_> {
             }
             _ => service::Admission::Unavailable,
         }
+    }
+
+    fn restore(&mut self, request: amaterasu_contracts::HostPackageRestore) -> service::Admission {
+        use amaterasu_module_sdk::{Command, Response};
+        match self.0.send(Command::HostPackageRestore { request }) {
+            Ok(Response::Ok) => service::Admission::Accepted,
+            Ok(Response::Error { code, .. }) if code == "activation_in_progress" => {
+                service::Admission::InProgress
+            }
+            _ => service::Admission::Unavailable,
+        }
+    }
+
+    fn restore_supported(&mut self) -> bool {
+        use amaterasu_module_sdk::{Command, Response};
+        // A runtime or a host shell from before restore requests answers
+        // with an error, and nothing is offered.
+        matches!(
+            self.0.send(Command::HostPackageRestoreStatus {}),
+            Ok(Response::Ok)
+        )
     }
 
     fn cancel(&mut self) -> bool {
@@ -273,7 +319,7 @@ mod reply_tests {
         assert_eq!(status["phase"], "idle");
         assert_eq!(status["error"], "unsupported_platform");
         assert_eq!(status["transferred_bytes"], 0);
-        for absent in ["checked_unix_ms", "source", "update"] {
+        for absent in ["checked_unix_ms", "source", "update", "restoring"] {
             assert!(status[absent].is_null(), "{absent}");
         }
         assert!(status["running"]["digest"].is_null());

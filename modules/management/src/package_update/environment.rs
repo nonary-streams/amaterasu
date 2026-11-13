@@ -15,8 +15,13 @@ pub(crate) struct Environment {
     pub running_sequence: Option<u64>,
     /// Absent when the selection records no repository as the set's supplier.
     pub source: Option<Arc<UpdateSource>>,
-    /// The host's last activation of a set from that repository failed.
+    /// The host's last activation of a set from that repository, or its last
+    /// return to a retained set, failed.
     pub last_activation_failed: bool,
+    /// The host root, when it is the real directory startup composition named.
+    pub package_root: Option<PathBuf>,
+    /// Where the approved repositories are recorded.
+    pub repository_directory: Option<PathBuf>,
 }
 
 /// The running set and the repository recorded as its supplier: everything a
@@ -52,6 +57,10 @@ impl Environment {
             running_sequence: None,
             source: None,
             last_activation_failed: false,
+            package_root: None,
+            repository_directory: repository_directory
+                .clone()
+                .filter(|directory| directory.is_absolute()),
         };
         let Some(digest) = environment.running_digest.clone() else {
             return environment;
@@ -63,6 +72,8 @@ impl Environment {
         else {
             return environment;
         };
+        environment.package_root = Some(root.to_path_buf());
+        environment.last_activation_failed = last_restore_failed(root, &digest);
         let Some(manifest) = package_status::running_manifest(root, &digest) else {
             return environment;
         };
@@ -70,7 +81,7 @@ impl Environment {
         let Some(source) = update_source(repository_directory, root, digest, manifest) else {
             return environment;
         };
-        environment.last_activation_failed = last_activation_failed(&source);
+        environment.last_activation_failed |= last_activation_failed(&source);
         environment.source = Some(Arc::new(source));
         environment
     }
@@ -124,4 +135,21 @@ fn last_activation_failed(source: &UpdateSource) -> bool {
         .ok()
         .and_then(|cached| std::fs::symlink_metadata(cached).ok())
         .is_some_and(|metadata| metadata.is_dir())
+}
+
+/// True when the host's receipt says it failed to return to a retained set:
+/// one the selection records as having run healthy here, other than the set
+/// that is running. A set that only ever sat in a repository's cache is an
+/// update's failure, which `last_activation_failed` reads.
+fn last_restore_failed(package_root: &Path, running: &str) -> bool {
+    let Some(receipt) = host_activation::receipt(package_root) else {
+        return false;
+    };
+    if receipt.status != ReceiptStatus::Failed || receipt.digest == running {
+        return false;
+    }
+    amaterasu_package::read_bounded(&package_root.join("selection.json"), 1024 * 1024)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<amaterasu_package::ActivationState>(&bytes).ok())
+        .is_some_and(|selection| selection.healthy_sets.contains(&receipt.digest))
 }

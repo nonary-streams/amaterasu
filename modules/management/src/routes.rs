@@ -177,6 +177,22 @@ pub fn resolve(path: &str) -> Option<Route> {
                 "configuration.write"
             }),
         ),
+        // The retained sets, and a return to one of them. A restore also
+        // needs an administrator's own session; `server::role_permits`
+        // refuses API tokens for it.
+        ("package-update", action @ ("versions" | "restore")) => (
+            "amaterasu.management/1",
+            if action == "versions" {
+                "package_update_versions"
+            } else {
+                "package_update_restore"
+            },
+            Some(if action == "versions" {
+                "configuration.read"
+            } else {
+                "configuration.write"
+            }),
+        ),
         ("package-selection", "status") => (
             "amaterasu.management/1",
             "package_selection_status",
@@ -471,7 +487,8 @@ pub fn resolve(path: &str) -> Option<Route> {
         action,
         scope,
         requires_empty_body: domain == "rtx-hdr"
-            || domain == "package-update"
+            // A restore names the retained set to return to, and nothing else.
+            || (domain == "package-update" && action != "package_update_restore")
             || domain == "media"
             || (domain == "steam" && action == "force_sync")
             || (domain == "host-metrics" && action == "stats_read")
@@ -767,6 +784,47 @@ mod tests {
             );
         }
         assert!(resolve("/v1/package-update").is_none());
+    }
+
+    #[test]
+    fn package_version_routes_list_with_nothing_and_restore_one_digest() {
+        let versions = resolve("/v1/package-update/versions").unwrap();
+        assert_eq!(versions.service, "amaterasu.management/1");
+        assert_eq!(versions.action, "package_update_versions");
+        assert_eq!(versions.scope, Some("configuration.read"));
+        assert!(versions.requires_empty_body);
+        assert_eq!(
+            payload(versions, br#"{}"#).unwrap(),
+            serde_json::json!({"action": "package_update_versions"})
+        );
+        assert!(payload(versions, br#"{"limit":500}"#).is_err());
+
+        let restore = resolve("/v1/package-update/restore").unwrap();
+        assert_eq!(restore.service, "amaterasu.management/1");
+        assert_eq!(restore.action, "package_update_restore");
+        assert_eq!(restore.scope, Some("configuration.write"));
+        assert!(!restore.requires_empty_body);
+        let digest = "0123456789abcdef".repeat(4);
+        assert_eq!(
+            payload(restore, format!(r#"{{"digest":"{digest}"}}"#).as_bytes()).unwrap(),
+            serde_json::json!({"action": "package_update_restore", "digest": digest})
+        );
+        // The browser names a set by its digest and nothing else: no path,
+        // repository, publisher or way around the host's checks.
+        for body in [
+            r#"{}"#.to_owned(),
+            r#"{"digest":"previous"}"#.to_owned(),
+            r#"{"digest":"../sets"}"#.to_owned(),
+            format!(r#"{{"digest":"{}"}}"#, digest.to_uppercase()),
+            format!(r#"{{"digest":"{digest}0"}}"#),
+            format!(r#"{{"digest":["{digest}"]}}"#),
+            format!(r#"{{"digest":"{digest}","force":true}}"#),
+            format!(r#"{{"digest":"{digest}","repository":"amaterasu"}}"#),
+            format!(r#"{{"digest":"{digest}","path":"/tmp/package"}}"#),
+            format!(r#"{{"digest":"{digest}","action":"package_update_activate"}}"#),
+        ] {
+            assert!(payload(restore, body.as_bytes()).is_err(), "{body}");
+        }
     }
 
     #[test]

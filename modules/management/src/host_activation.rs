@@ -4,7 +4,7 @@
 //! Nothing here authorizes native code: the request names a cached candidate
 //! the host verifies again, and the receipt only reports what the host did.
 use crate::candidate_cache::PreparedCandidate;
-use amaterasu_contracts::HostPackageActivation;
+use amaterasu_contracts::{HostPackageActivation, HostPackageRestore};
 use serde_json::Value;
 use std::path::Path;
 
@@ -26,6 +26,37 @@ pub(crate) fn request(
     package_root: &Path,
     candidate: &PreparedCandidate,
 ) -> Result<HostPackageActivation, RequestRefusal> {
+    let selected = selected(package_root)?;
+    Ok(HostPackageActivation {
+        repository_id: candidate.repository_id.clone(),
+        catalog_digest: candidate.catalog_digest.clone(),
+        manifest_digest: candidate.digest.clone(),
+        expected_active: selected.active,
+        expected_revision: selected.revision,
+    })
+}
+
+/// Builds the exact request to return to a retained set from the selection
+/// the host wrote. The host decides whether that set may run again.
+pub(crate) fn restore_request(
+    package_root: &Path,
+    digest: &str,
+) -> Result<HostPackageRestore, RequestRefusal> {
+    let selected = selected(package_root)?;
+    Ok(HostPackageRestore {
+        manifest_digest: digest.into(),
+        expected_active: selected.active,
+        expected_revision: selected.revision,
+    })
+}
+
+/// What a request binds itself to: the active set and the selection's bytes.
+struct Selected {
+    active: String,
+    revision: String,
+}
+
+fn selected(package_root: &Path) -> Result<Selected, RequestRefusal> {
     let bytes =
         amaterasu_package::read_bounded(&package_root.join("selection.json"), SELECTION_BYTES)
             .map_err(|_| RequestRefusal::SelectionUnavailable)?;
@@ -37,12 +68,9 @@ pub(crate) fn request(
     if selection.pending.is_some() || selection.trial.is_some() {
         return Err(RequestRefusal::ActivationInProgress);
     }
-    Ok(HostPackageActivation {
-        repository_id: candidate.repository_id.clone(),
-        catalog_digest: candidate.catalog_digest.clone(),
-        manifest_digest: candidate.digest.clone(),
-        expected_active: active,
-        expected_revision: amaterasu_package::sha256(&bytes),
+    Ok(Selected {
+        active,
+        revision: amaterasu_package::sha256(&bytes),
     })
 }
 

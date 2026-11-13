@@ -449,6 +449,10 @@ impl ManagedModule for ManagementModule {
                     return complete(&self.runtime, id, result);
                 }
                 let action = payload.get("action").and_then(serde_json::Value::as_str);
+                if action.is_some_and(package_update::VersionRequest::names) {
+                    let result = self.package_version_request(&caller, &payload);
+                    return complete(&self.runtime, id, result);
+                }
                 if let Some(update) = action.and_then(package_update::Action::parse) {
                     let result = self.package_update_request(&caller, update, &payload);
                     return complete(&self.runtime, id, result);
@@ -576,6 +580,27 @@ impl ManagementModule {
             .is_some_and(rtx_hdr_install::Installer::package_work_in_progress);
         self.package_update
             .request(action, &self.runtime, rtx_hdr_install_active)
+    }
+
+    /// Answers a request about the retained sets. Only this module's own
+    /// console routes reach it; a listing carries nothing and a restore
+    /// carries one digest.
+    fn package_version_request(
+        &mut self,
+        caller: &str,
+        payload: &serde_json::Value,
+    ) -> serde_json::Value {
+        let request = package_update::VersionRequest::parse(payload)
+            .filter(|_| caller == "amaterasu.management");
+        let Some(request) = request else {
+            return json!({"ok":false,"code":"permission_denied"});
+        };
+        let rtx_hdr_install_active = self
+            .rtx_hdr_installer
+            .as_ref()
+            .is_some_and(rtx_hdr_install::Installer::package_work_in_progress);
+        self.package_update
+            .versions(request, &self.runtime, rtx_hdr_install_active)
     }
 
     fn package_selection_status(&self) -> serde_json::Value {
@@ -888,6 +913,60 @@ mod tests {
             json!({"ok":false,"code":"unsupported_platform"})
         );
         assert_eq!(replies[6], json!({"ok":false,"code":"invalid_request"}));
+    }
+
+    #[test]
+    fn package_version_requests_come_only_from_the_console_routes() {
+        let denied = json!({"ok":false,"code":"permission_denied"});
+        let digest = "0".repeat(64);
+        let runtime = ScriptedRuntime::new(&[
+            // Another module cannot list the sets or ask for one.
+            (
+                "amaterasu.nvhttp",
+                json!({"action":"package_update_versions"}),
+            ),
+            (
+                "amaterasu.nvhttp",
+                json!({"action":"package_update_restore","digest":digest}),
+            ),
+            // A request carries what its route allows and nothing more.
+            (
+                "amaterasu.management",
+                json!({"action":"package_update_versions","limit":500}),
+            ),
+            (
+                "amaterasu.management",
+                json!({"action":"package_update_restore"}),
+            ),
+            (
+                "amaterasu.management",
+                json!({"action":"package_update_restore","digest":digest,"force":true}),
+            ),
+            (
+                "amaterasu.management",
+                json!({"action":"package_update_restore","digest":["previous"]}),
+            ),
+            (
+                "amaterasu.management",
+                json!({"action":"package_update_versions"}),
+            ),
+            (
+                "amaterasu.management",
+                json!({"action":"package_update_restore","digest":digest}),
+            ),
+        ]);
+        let mut module = runtime.start();
+        let replies = runtime.answers(&mut module);
+        assert!(replies[..6].iter().all(|reply| *reply == denied));
+        // A module that serves no console cannot ask a host to change sets.
+        assert_eq!(
+            replies[6],
+            json!({"ok":true,"supported":false,"total":0,"versions":[]})
+        );
+        assert_eq!(
+            replies[7],
+            json!({"ok":false,"code":"unsupported_platform"})
+        );
     }
 
     #[cfg(target_os = "linux")]
