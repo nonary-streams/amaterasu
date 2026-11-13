@@ -384,10 +384,10 @@ fn a_check_reports_why_the_repository_offers_nothing_usable() {
     intruder.publish_catalog(2, vec![host.running.listed()]);
     assert_eq!(check(&host, &mut shell)["error"], "catalog_rejected");
 
-    // A catalog older than one the host already accepted.
+    // A different catalog at the sequence the host already accepted.
     host.publisher.publish(5, &[&host.running]);
     assert_eq!(check(&host, &mut shell)["phase"], "current");
-    host.publisher.publish(4, &[&host.running]);
+    host.publisher.publish_catalog(5, Vec::new());
     assert_eq!(check(&host, &mut shell)["error"], "catalog_rejected");
 
     // A listed set whose manifest the repository does not serve.
@@ -455,6 +455,73 @@ fn a_repository_with_nothing_newer_leaves_the_host_current() {
         run(&mut service, &mut shell, Action::Check)["phase"],
         "current"
     );
+}
+
+#[test]
+fn a_repository_behind_the_host_is_current_and_not_a_rejected_catalog() {
+    let mut shell = ScriptedHost::accepting();
+    // A local import left the host holding catalog 7; the repository has
+    // published as far as 5.
+    let host = Host::running(10, &first_release());
+    host.publisher.publish(7, &[&host.running]);
+    let mut service = host.service();
+    let current = run(&mut service, &mut shell, Action::Check);
+    assert_eq!(current["phase"], "current");
+    assert_eq!(current["repository_behind"], false);
+    let accepted = || {
+        host.store()
+            .catalog(REPOSITORY, &current_target(), unix_timestamp())
+            .unwrap()
+            .sequence()
+    };
+
+    let update = host.publisher.sign_set(11, &second_release());
+    host.publisher.publish(5, &[&host.running, &update]);
+    host.connector.take_requests();
+    let behind = run(&mut service, &mut shell, Action::Check);
+    assert_eq!(behind["ok"], true);
+    assert_eq!(behind["phase"], "current");
+    assert_eq!(behind["repository_behind"], true);
+    assert!(behind["error"].is_null());
+    assert!(behind["checked_unix_ms"].is_u64());
+    // Nothing a catalog the host cannot accept lists is offered or fetched.
+    assert!(behind["update"].is_null());
+    assert_eq!(
+        artifact_requests(&host.connector),
+        ["catalog.json", "catalog.sig"]
+    );
+    assert_eq!(accepted(), 7);
+    assert_eq!(
+        refusal(&ask(&mut service, &mut shell, Action::Download)),
+        "nothing_to_download"
+    );
+
+    // An earlier sequence says nothing by itself. The catalog must be the
+    // approved publisher's own, for this host's target.
+    let rejected = |service: &mut TestService, shell: &mut ScriptedHost| {
+        let failed = run(service, shell, Action::Check);
+        assert_eq!(failed["phase"], "failed", "{failed}");
+        assert_eq!(failed["error"], "catalog_rejected");
+        assert_eq!(failed["repository_behind"], false);
+    };
+    let intruder = Publisher::new(host.publisher.directory.clone(), 72);
+    intruder.publish_catalog(5, vec![host.running.listed()]);
+    rejected(&mut service, &mut shell);
+    host.publisher
+        .publish_catalog_for("another-target", 5, vec![host.running.listed()]);
+    rejected(&mut service, &mut shell);
+    // A different catalog at the accepted sequence is a substitution.
+    host.publisher.publish_catalog(7, Vec::new());
+    rejected(&mut service, &mut shell);
+    assert_eq!(accepted(), 7);
+
+    // Once the repository has caught up, its offer is taken as usual.
+    host.publisher.publish(8, &[&host.running, &update]);
+    let available = run(&mut service, &mut shell, Action::Check);
+    assert_eq!(available["phase"], "available");
+    assert_eq!(available["repository_behind"], false);
+    assert_eq!(available["update"]["digest"], update.digest.as_str());
+    assert_eq!(accepted(), 8);
 }
 
 #[test]

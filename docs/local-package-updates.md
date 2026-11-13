@@ -70,8 +70,9 @@ for the routes, the phases and what the host needs provisioned.
 
 The two paths share the repository's replay checkpoint. The console reads the
 catalog from the repository's address at every check, so after a local import
-whose catalog is ahead of the published one the check fails with
-`catalog_rejected` until the repository publishes a catalog at or above it.
+whose catalog is ahead of the published one the check ends `current` with
+`repository_behind` true, and offers nothing until the repository publishes a
+catalog at or above it.
 A set imported locally under the catalog the repository also serves is found
 in the cache and verified again rather than downloaded.
 

@@ -9,7 +9,7 @@ use super::transport::{Connector, Observed};
 use super::{CANDIDATE_AMBIGUOUS, Failure};
 use crate::repository_admin::{fetch_catalog, retry_while_locked};
 use amaterasu_package::repository::{
-    ApprovedRepository, RepositoryStore, RepositoryTransport, fetch_native_manifest,
+    ApprovedRepository, CatalogRefresh, RepositoryStore, RepositoryTransport, fetch_native_manifest,
 };
 use amaterasu_package::{current_target, unix_timestamp};
 use std::{
@@ -42,7 +42,16 @@ pub(crate) fn check<C: Connector>(
         METADATA_REQUEST_LIMIT,
     ));
     let target = current_target();
-    refresh_catalog(&store, &approved.id, &transport, &target).map_err(stopped)?;
+    let refreshed = refresh_catalog(&store, &approved.id, &transport, &target).map_err(stopped)?;
+    if refreshed == CatalogRefresh::RepositoryBehind {
+        // A host can take nothing from a catalog older than its own, so no
+        // manifest is fetched.
+        return if cancelled.load(Ordering::Acquire) {
+            Err(Failure::Cancelled)
+        } else {
+            Ok(Checked::RepositoryBehind)
+        };
+    }
     let catalog = store
         .catalog(&approved.id, &target, unix_timestamp())
         .map_err(|_| stopped("catalog_rejected"))?;
@@ -85,12 +94,15 @@ pub(super) fn approved_source(
         .ok_or("repository_unavailable")
 }
 
+/// Accepts the catalog the repository serves, or learns that the repository
+/// is behind this host. A host updated by a local import holds a catalog
+/// newer than the published one; that is not a catalog that failed to verify.
 fn refresh_catalog(
     store: &RepositoryStore,
     repository: &str,
     transport: &impl RepositoryTransport,
     target: &str,
-) -> Result<(), &'static str> {
+) -> Result<CatalogRefresh, &'static str> {
     let (raw, signature) = fetch_catalog(transport).map_err(|refusal| {
         if refusal == "catalog_download_failed" {
             refusal
@@ -99,7 +111,7 @@ fn refresh_catalog(
         }
     })?;
     retry_while_locked(|| {
-        store.accept_catalog(repository, &raw, &signature, target, unix_timestamp())
+        store.refresh_catalog(repository, &raw, &signature, target, unix_timestamp())
     })
     .map_err(|error| {
         if error.starts_with(amaterasu_package::ROOT_BUSY) {

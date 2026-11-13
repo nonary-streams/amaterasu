@@ -56,6 +56,9 @@ pub(crate) fn update_line<'a>(
 pub(crate) enum Checked {
     /// Nothing newer than the running set is offered.
     Current,
+    /// The repository serves its publisher's own catalog, older than the one
+    /// this host already accepted. It can offer this host nothing.
+    RepositoryBehind,
     Available(Box<Offer>),
 }
 
@@ -422,7 +425,7 @@ mod tests {
 
     fn chosen(checked: Result<Checked, Ambiguous>) -> Option<String> {
         match checked.unwrap() {
-            Checked::Current => None,
+            Checked::Current | Checked::RepositoryBehind => None,
             Checked::Available(offer) => Some(offer.candidate.version.clone()),
         }
     }

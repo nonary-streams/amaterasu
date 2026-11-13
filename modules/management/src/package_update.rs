@@ -240,6 +240,7 @@ fn unsupported(action: Action) -> Value {
         "transferred_bytes": 0,
         "error": "unsupported_platform",
         "restoring": null,
+        "repository_behind": false,
     })
 }
 
@@ -333,6 +334,7 @@ mod reply_tests {
         assert_eq!(status["phase"], "idle");
         assert_eq!(status["error"], "unsupported_platform");
         assert_eq!(status["transferred_bytes"], 0);
+        assert_eq!(status["repository_behind"], false);
         for absent in ["checked_unix_ms", "source", "update", "restoring"] {
             assert!(status[absent].is_null(), "{absent}");
         }

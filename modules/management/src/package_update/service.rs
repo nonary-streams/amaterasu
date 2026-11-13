@@ -142,6 +142,9 @@ pub(crate) struct Service<C: Connector> {
     /// When to ask the host next whether it takes restores, and how many
     /// more times. None once it has said yes or the asking has run out.
     host_probe: Option<(Instant, u32)>,
+    /// The last check found the repository serving a catalog older than the
+    /// one this host already accepted.
+    repository_behind: bool,
 }
 
 impl<C: Connector> Service<C> {
@@ -163,6 +166,7 @@ impl<C: Connector> Service<C> {
             transferred: Arc::new(AtomicU64::new(0)),
             job: None,
             shutdown_announced: false,
+            repository_behind: false,
         }
     }
 
@@ -382,6 +386,7 @@ impl<C: Connector> Service<C> {
         self.job = Some(Job::Check(thread));
         self.phase = Phase::Checking;
         self.error = None;
+        self.repository_behind = false;
         Ok(())
     }
 
@@ -500,6 +505,10 @@ impl<C: Connector> Service<C> {
         self.error = None;
         match checked {
             Checked::Current => self.phase = Phase::Current,
+            Checked::RepositoryBehind => {
+                self.phase = Phase::Current;
+                self.repository_behind = true;
+            }
             Checked::Available(offer) => {
                 self.described_offer = self
                     .environment
@@ -570,6 +579,7 @@ impl<C: Connector> Service<C> {
                 "digest": restoring.digest,
                 "sequence": restoring.sequence.to_string(),
             })),
+            "repository_behind": self.repository_behind,
         })
     }
 

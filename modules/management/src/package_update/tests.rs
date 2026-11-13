@@ -211,12 +211,17 @@ impl Publisher {
 
     /// Serves a signed catalog that lists `candidates`.
     fn publish_catalog(&self, sequence: u64, candidates: Vec<Candidate>) {
+        self.publish_catalog_for(&current_target(), sequence, candidates);
+    }
+
+    /// Serves a signed catalog made for `target`.
+    fn publish_catalog_for(&self, target: &str, sequence: u64, candidates: Vec<Candidate>) {
         let catalog = Catalog {
             schema: 1,
             repository: REPOSITORY.into(),
             sequence,
             expires_unix: unix_timestamp() + 3600,
-            target: current_target(),
+            target: target.into(),
             candidates,
         };
         let raw = serde_json::to_vec(&catalog).unwrap();

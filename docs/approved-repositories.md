@@ -98,17 +98,18 @@ An API token is refused for `activate` whatever its scopes, as it is for reposit
   },
   "transferred_bytes": 0,
   "error": null,
+  "repository_behind": false,
   "restoring": null
 }
 ```
 
-Sequences are decimal text so a browser keeps all 64 bits. `phase` is one of:
+Sequences are decimal text so a browser keeps all 64 bits. `repository_behind` is true when the last check found the repository serving a catalog older than the one this host holds (see [Which set is offered](#which-set-is-offered)). `phase` is one of:
 
 | Phase | Meaning |
 |---|---|
 | `idle` | Nothing has been checked since the module started |
 | `checking` | A check is running |
-| `current` | The repository offers nothing newer |
+| `current` | The repository offers nothing newer, or is behind this host |
 | `available` | `update` describes a newer set |
 | `downloading` | The set is being fetched and verified |
 | `ready` | The set is verified in the candidate cache |
@@ -123,7 +124,9 @@ Sequences are decimal text so a browser keeps all 64 bits. `phase` is one of:
 
 The source is the repository the selection records as the supplier of the running set, under the publisher key recorded with it. A set with no recorded supplier has `error` `no_source` and nothing to check.
 
-A check fetches the repository's catalog and accepts it under the same replay checkpoint as a refresh. Among the catalog's native sets, the host follows one line, a `(slot, implementation)` pair: the line that still lists the running set, or the only line offered when the running set is no longer listed. A catalog that singles out no line, including one that offers no native set, is `candidate_ambiguous`.
+A check fetches the repository's catalog and accepts it under the same replay checkpoint as a refresh. A host updated by a [local import](local-package-updates.md) can hold a catalog newer than the published one. When the fetched catalog is the approved publisher's own, unexpired and for this host's target, and its sequence is below the one the host already accepted, the repository is behind the host: the check ends `current` with `repository_behind` true, saves nothing and fetches no manifest. A catalog with a bad signature, for another target, or different from the accepted one at the same sequence is still `catalog_rejected`.
+
+Among the catalog's native sets, the host follows one line, a `(slot, implementation)` pair: the line that still lists the running set, or the only line offered when the running set is no longer listed. A catalog that singles out no line, including one that offers no native set, is `candidate_ambiguous`.
 
 The check then fetches the signed manifest of each set on that line other than the running one, and no artifact. Each manifest must be the bytes the catalog names, carry the approved publisher's signature, and declare the slot at the version the catalog offers. A listed set whose manifest cannot be fetched or does not verify fails the check; it is not skipped, because a missing newest release would otherwise read as being up to date. The set with the highest release sequence is an update only when it is not the running set and its sequence is above both the running set's and the highest the host has accepted. The host refuses anything at or below that floor, so offering it could only fail.
 
@@ -156,7 +159,7 @@ Only one install runs at a time. While an RTX HDR install is preparing or activa
 | `no_source` | The selection records no repository as the running set's supplier |
 | `repository_unavailable` | The source repository is unknown, revoked, held under another key, or its state could not be read |
 | `catalog_download_failed` | The catalog or its signature could not be fetched |
-| `catalog_rejected` | The catalog did not verify, or is older than one already accepted |
+| `catalog_rejected` | The catalog did not verify, or differs from the accepted one at the same sequence |
 | `candidate_ambiguous` | The catalog singles out no line, or two sets claim the newest release |
 | `manifest_download_failed` | A listed set's manifest or signature could not be fetched |
 | `manifest_rejected` | A listed set's manifest is not the one the catalog names or did not verify |
@@ -190,7 +193,7 @@ On a platform whose host has no activation, which today is every platform but Li
 - It does not offer again a release the host has already accepted. After a [return to an earlier set](#switching-to-an-earlier-set), the releases between that set and the newest accepted one are reached from the list of retained sets, not from a check.
 - It does not update the host executable, the installer or the web interface.
 - It does not check on its own schedule. A check runs when the console asks.
-- It reads the catalog from the repository's address every time. After a [local import](local-package-updates.md) whose catalog is ahead of the published one, a check fails with `catalog_rejected` until the repository publishes a catalog at or above it.
+- It reads the catalog from the repository's address every time. After a [local import](local-package-updates.md) whose catalog is ahead of the published one, a check ends `current` with `repository_behind` true and offers nothing until the repository publishes a catalog at or above it.
 
 ## Switching to an earlier set
 
