@@ -63,6 +63,16 @@ pub struct HostPackageActivation {
     pub expected_revision: String,
 }
 
+/// Identifies a retained set this host ran before, to be made active again.
+/// The host decides whether it may run; the request names nothing else.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostPackageRestore {
+    pub manifest_digest: String,
+    pub expected_active: String,
+    pub expected_revision: String,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Grants {
@@ -272,6 +282,14 @@ pub enum Command {
     /// Observe or cancel a pending activation before the host starts it.
     HostPackageActivationStatus {},
     HostPackageActivationCancel {},
+    /// Request that the host make a retained, previously healthy set active
+    /// again; only approved management may call. It shares the activation
+    /// grant, barrier, status and cancellation with `HostPackageActivate`.
+    HostPackageRestore {
+        request: HostPackageRestore,
+    },
+    /// Succeeds once the host shell has shown that it takes restore requests.
+    HostPackageRestoreStatus {},
     /// The trusted barrier provider blocks new work and reports safe retirement.
     HostPackageBarrierRegister {},
     HostPackageBarrierPending {},
@@ -280,6 +298,9 @@ pub enum Command {
     },
     /// Reserved for the host control endpoint.
     HostPackageActivationDrain {},
+    /// Reserved for the host control endpoint. A host that sends this takes
+    /// restore requests; a runtime from before them answers `invalid_request`.
+    HostPackageRestoreDrain {},
     /// Emits one bounded product log record through the trusted host transport.
     Log {
         level: u8,
@@ -575,6 +596,10 @@ pub enum Response {
     /// Returned only to the reserved host control endpoint.
     HostPackageActivation {
         request: Option<Box<HostPackageActivation>>,
+    },
+    /// Returned only to the reserved host control endpoint.
+    HostPackageRestore {
+        request: Option<Box<HostPackageRestore>>,
     },
     /// Bounded activation and barrier status for authorized participants.
     HostPackageActivationState {

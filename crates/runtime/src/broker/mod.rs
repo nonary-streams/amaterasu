@@ -10,7 +10,7 @@ use amaterasu_contracts::{
     Command, DIAGNOSTICS_COMPONENT, Grants, HOST_LIFECYCLE_CONTROL_PRINCIPAL,
     HOST_LIFECYCLE_SERVICE, HOST_LOG_SERVICE, HOST_PACKAGE_ACTIVATION_SERVICE,
     HOST_PACKAGE_BARRIER_SERVICE, HOST_STATE_CONTEXT_SERVICE, HostLifecycleAction, HostLogEvent,
-    HostPackageActivation, Response, RuntimeConfig,
+    HostPackageActivation, HostPackageRestore, Response, RuntimeConfig,
 };
 use std::collections::{BTreeMap, VecDeque};
 use std::time::Instant;
@@ -27,6 +27,12 @@ pub struct Broker {
     hooks: HookRegistry,
     host_lifecycle: VecDeque<HostLifecycleAction>,
     host_package_activation: Option<HostPackageActivation>,
+    /// A request to make a retained set active again. At most one of this and
+    /// `host_package_activation` is held, behind the same barrier.
+    host_package_restore: Option<HostPackageRestore>,
+    /// Set once the host shell drains restore requests. Until then a restore
+    /// is refused, so a host from before them never leaves one waiting.
+    host_package_restore_control: bool,
     host_package_barriers: BTreeMap<String, bool>,
     host_package_activation_started: bool,
     log_events: VecDeque<HostLogEvent>,
@@ -77,6 +83,8 @@ impl Broker {
             events: EventBus::default(),
             host_lifecycle: VecDeque::with_capacity(HOST_LIFECYCLE_QUEUE_CAPACITY),
             host_package_activation: None,
+            host_package_restore: None,
+            host_package_restore_control: false,
             host_package_barriers: BTreeMap::new(),
             host_package_activation_started: false,
             log_events: VecDeque::with_capacity(LOG_EVENT_QUEUE_CAPACITY),
@@ -84,6 +92,55 @@ impl Broker {
             logging_revision: 0,
             logging_policy_received: false,
         })
+    }
+
+    /// True while the host holds a package request it has not yet taken.
+    fn host_package_request_pending(&self) -> bool {
+        self.host_package_activation.is_some() || self.host_package_restore.is_some()
+    }
+
+    /// True when every registered barrier provider reported safe retirement.
+    fn host_package_barriers_ready(&self) -> bool {
+        !self.host_package_barriers.is_empty()
+            && self.host_package_barriers.values().all(|ready| *ready)
+    }
+
+    /// Only approved management asks the host to change the running set, and
+    /// only where the host shell handles such requests.
+    fn may_request_host_package_change(&self, caller: &str, grants: &Grants) -> bool {
+        self.configuration.host_package_activation_control
+            && caller == "amaterasu.management"
+            && grants.call.contains(HOST_PACKAGE_ACTIVATION_SERVICE)
+    }
+
+    /// Takes the host's one package request slot behind a fresh barrier, or
+    /// says why the request cannot be held.
+    fn admit_host_package_request(&mut self) -> Result<(), Response> {
+        if self.host_package_barriers.is_empty()
+            || self
+                .configuration
+                .principals
+                .iter()
+                .any(|(principal, grants)| {
+                    grants.call.contains(HOST_PACKAGE_BARRIER_SERVICE)
+                        && !self.host_package_barriers.contains_key(principal)
+                })
+        {
+            return Err(Response::error(
+                "activation_barrier_unavailable",
+                "the stream retirement barrier is unavailable",
+            ));
+        }
+        if self.host_package_request_pending() || self.host_package_activation_started {
+            return Err(Response::error(
+                "activation_in_progress",
+                "a package request is already pending",
+            ));
+        }
+        self.host_package_barriers
+            .values_mut()
+            .for_each(|ready| *ready = false);
+        Ok(())
     }
 
     pub fn dispatch(&mut self, caller: &str, command: Command) -> Response {
@@ -114,9 +171,7 @@ impl Broker {
             {
                 return errors::permission_denied();
             }
-            let request = if !self.host_package_barriers.is_empty()
-                && self.host_package_barriers.values().all(|ready| *ready)
-            {
+            let request = if self.host_package_barriers_ready() {
                 let request = self.host_package_activation.take();
                 if request.is_some() {
                     self.host_package_activation_started = true;
@@ -126,6 +181,27 @@ impl Broker {
                 None
             };
             return Response::HostPackageActivation {
+                request: request.map(Box::new),
+            };
+        }
+
+        if matches!(command, Command::HostPackageRestoreDrain {}) {
+            if caller != HOST_LIFECYCLE_CONTROL_PRINCIPAL
+                || !self.configuration.host_package_activation_control
+            {
+                return errors::permission_denied();
+            }
+            self.host_package_restore_control = true;
+            let request = if self.host_package_barriers_ready() {
+                let request = self.host_package_restore.take();
+                if request.is_some() {
+                    self.host_package_activation_started = true;
+                }
+                request
+            } else {
+                None
+            };
+            return Response::HostPackageRestore {
                 request: request.map(Box::new),
             };
         }
@@ -204,16 +280,7 @@ impl Broker {
                 Response::Ok
             }
             Command::HostPackageActivate { request } => {
-                let valid_digest = |value: &str| {
-                    value.len() == 64
-                        && value
-                            .bytes()
-                            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
-                };
-                if !self.configuration.host_package_activation_control
-                    || caller != "amaterasu.management"
-                    || !grants.call.contains(HOST_PACKAGE_ACTIVATION_SERVICE)
-                {
+                if !self.may_request_host_package_change(caller, grants) {
                     return errors::permission_denied();
                 }
                 if request.repository_id.is_empty()
@@ -229,45 +296,55 @@ impl Broker {
                         &request.expected_revision,
                     ]
                     .iter()
-                    .all(|v| valid_digest(v))
+                    .all(|v| valid_package_digest(v))
                 {
                     return Response::error(
                         "invalid_request",
                         "invalid package activation identity",
                     );
                 }
-                if self.host_package_barriers.is_empty()
-                    || self
-                        .configuration
-                        .principals
-                        .iter()
-                        .any(|(principal, grants)| {
-                            grants.call.contains(HOST_PACKAGE_BARRIER_SERVICE)
-                                && !self.host_package_barriers.contains_key(principal)
-                        })
-                {
-                    return Response::error(
-                        "activation_barrier_unavailable",
-                        "the stream retirement barrier is unavailable",
-                    );
+                if let Err(refusal) = self.admit_host_package_request() {
+                    return refusal;
                 }
-                if self.host_package_activation.is_some() || self.host_package_activation_started {
-                    return Response::error(
-                        "activation_in_progress",
-                        "a package request is already pending",
-                    );
-                }
-                self.host_package_barriers
-                    .values_mut()
-                    .for_each(|ready| *ready = false);
                 self.host_package_activation = Some(request);
                 Response::Ok
             }
-            Command::HostPackageActivationStatus {} | Command::HostPackageActivationCancel {} => {
-                if !self.configuration.host_package_activation_control
-                    || caller != "amaterasu.management"
-                    || !grants.call.contains(HOST_PACKAGE_ACTIVATION_SERVICE)
+            Command::HostPackageRestore { request } => {
+                if !self.may_request_host_package_change(caller, grants) {
+                    return errors::permission_denied();
+                }
+                if !self.host_package_restore_control {
+                    return restore_unavailable();
+                }
+                if ![
+                    &request.manifest_digest,
+                    &request.expected_active,
+                    &request.expected_revision,
+                ]
+                .iter()
+                .all(|v| valid_package_digest(v))
+                    || request.manifest_digest == request.expected_active
                 {
+                    return Response::error("invalid_request", "invalid package restore identity");
+                }
+                if let Err(refusal) = self.admit_host_package_request() {
+                    return refusal;
+                }
+                self.host_package_restore = Some(request);
+                Response::Ok
+            }
+            Command::HostPackageRestoreStatus {} => {
+                if !self.may_request_host_package_change(caller, grants) {
+                    return errors::permission_denied();
+                }
+                if self.host_package_restore_control {
+                    Response::Ok
+                } else {
+                    restore_unavailable()
+                }
+            }
+            Command::HostPackageActivationStatus {} | Command::HostPackageActivationCancel {} => {
+                if !self.may_request_host_package_change(caller, grants) {
                     return errors::permission_denied();
                 }
                 if matches!(command, Command::HostPackageActivationCancel {}) {
@@ -278,13 +355,14 @@ impl Broker {
                         );
                     }
                     self.host_package_activation = None;
+                    self.host_package_restore = None;
                     self.host_package_barriers
                         .values_mut()
                         .for_each(|ready| *ready = false);
                     return Response::Ok;
                 }
                 Response::HostPackageActivationState {
-                    pending: self.host_package_activation.is_some(),
+                    pending: self.host_package_request_pending(),
                     started: self.host_package_activation_started,
                 }
             }
@@ -307,20 +385,18 @@ impl Broker {
                     return errors::permission_denied();
                 }
                 if let Command::HostPackageBarrierReady { ready } = command {
-                    self.host_package_barriers.insert(
-                        caller.into(),
-                        ready && self.host_package_activation.is_some(),
-                    );
+                    self.host_package_barriers
+                        .insert(caller.into(), ready && self.host_package_request_pending());
                     Response::Ok
                 } else {
                     Response::HostPackageActivationState {
-                        pending: self.host_package_activation.is_some()
+                        pending: self.host_package_request_pending()
                             || self.host_package_activation_started,
                         started: self.host_package_activation_started,
                     }
                 }
             }
-            Command::HostPackageActivationDrain {} => {
+            Command::HostPackageActivationDrain {} | Command::HostPackageRestoreDrain {} => {
                 unreachable!("drain handled before module dispatch")
             }
             Command::HostLifecycleDrain {} => unreachable!("drain handled before module dispatch"),
@@ -844,4 +920,18 @@ impl Broker {
         self.logging_policy_received = true;
         Response::Ok
     }
+}
+
+fn valid_package_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+}
+
+fn restore_unavailable() -> Response {
+    Response::error(
+        "restore_unavailable",
+        "the host does not take package restore requests",
+    )
 }
