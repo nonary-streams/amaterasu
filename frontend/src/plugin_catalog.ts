@@ -4,11 +4,13 @@ namespace Amaterasu {
   // document.
 
   /// The page's views in tab order. `#plugins` alone opens the first.
-  export const PLUGINS_VIEWS: readonly PluginsView[] = ["core", "modules", "publishers", "repositories"];
-  export const DEFAULT_PLUGINS_VIEW: PluginsView = "core";
+  export const PLUGINS_VIEWS: readonly PluginsView[] = ["overview", "modules", "repositories"];
+  export const DEFAULT_PLUGINS_VIEW: PluginsView = "overview";
 
   /// What two of the views were called while the page was named Plugins.
-  const FORMER_VIEW_NAMES: Readonly<Record<string, PluginsView>> = { installed: "modules", available: "publishers" };
+  const FORMER_VIEW_NAMES: Readonly<Record<string, PluginsView>> = {
+    core: "overview", publishers: "overview", available: "overview", installed: "modules",
+  };
 
   /// The view a `#plugins/<name>` address opens, or null when it names none.
   /// Addresses saved under the former names keep working.
@@ -225,7 +227,26 @@ namespace Amaterasu {
       transferredBytes: number;
       /// The host's code for why the last update stopped.
       error: string | null;
+      /// How the host keeps itself up to date; null on a host that only updates when asked.
+      automatic: AutomaticUpdates | null;
+      /// True when the last check found the repository publishing an older
+      /// list of releases than the host already holds, as after a local install.
+      repositoryBehind: boolean;
+      /// Whether the host lists its earlier packages and can switch to one.
+      versions: boolean;
+      /// The earlier package the host is switching to, when it is.
+      restoring: { digest: string; sequence: string } | null;
     };
+
+  export type AutomaticMode = "off" | "download" | "install";
+
+  export const AUTOMATIC_MODES: readonly AutomaticMode[] = ["off", "download", "install"];
+
+  export interface AutomaticUpdates {
+    mode: AutomaticMode;
+    /// When the host will next look for an update by itself.
+    nextCheckUnixMs: number | null;
+  }
 
   /// The largest time an ECMAScript date can hold.
   const LATEST_UNIX_MS = 8_640_000_000_000_000;
@@ -278,6 +299,29 @@ namespace Amaterasu {
     };
   }
 
+  function unixMs(value: unknown): value is number {
+    return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 && value <= LATEST_UNIX_MS;
+  }
+
+  /// Absent on a host that only updates when asked.
+  function parseAutomatic(value: unknown): AutomaticUpdates | null {
+    if (value === undefined || value === null) return null;
+    const automatic = record(value, "Automatic update setting is invalid.");
+    const next = automatic.next_check_unix_ms ?? null;
+    if (typeof automatic.mode !== "string" || !(AUTOMATIC_MODES as readonly string[]).includes(automatic.mode) ||
+        (next !== null && !unixMs(next)))
+      throw new Error("Automatic update setting is invalid.");
+    return { mode: automatic.mode as AutomaticMode, nextCheckUnixMs: next as number | null };
+  }
+
+  function parseRestoring(value: unknown): { digest: string; sequence: string } | null {
+    if (value === undefined || value === null) return null;
+    const target = record(value, "Version switch is invalid.");
+    if (typeof target.digest !== "string" || !DIGEST.test(target.digest) || !releaseSequence(target.sequence))
+      throw new Error("Version switch is invalid.");
+    return { digest: target.digest, sequence: target.sequence };
+  }
+
   export function parsePackageUpdateStatus(value: unknown): PackageUpdateStatus {
     const reply = record(value, "Package update response is invalid.");
     if (reply.ok !== true) throw new Error("Package update status is unavailable.");
@@ -287,9 +331,9 @@ namespace Amaterasu {
     if (typeof phase !== "string" || !(UPDATE_PHASES as readonly string[]).includes(phase))
       throw new Error("Package update phase is invalid.");
     const checked = reply.checked_unix_ms;
-    if (checked !== null &&
-        (typeof checked !== "number" || !Number.isSafeInteger(checked) || checked < 0 || checked > LATEST_UNIX_MS))
-      throw new Error("Package update check time is invalid.");
+    if (checked !== null && !unixMs(checked)) throw new Error("Package update check time is invalid.");
+    const behind = reply.repository_behind ?? false;
+    if (typeof behind !== "boolean") throw new Error("Package update status is invalid.");
     const running = record(reply.running, "Running package status is invalid.");
     const unreported = running.digest === null && running.sequence === null;
     if (!unreported &&
@@ -310,7 +354,90 @@ namespace Amaterasu {
       update: reply.update === null ? null : parsePackageUpdate(reply.update),
       transferredBytes: reply.transferred_bytes,
       error,
+      automatic: parseAutomatic(reply.automatic),
+      repositoryBehind: behind,
+      // A host that can switch packages always says whether it is switching.
+      versions: reply.restoring !== undefined,
+      restoring: parseRestoring(reply.restoring),
     };
+  }
+
+  // --- The packages a host has kept ---------------------------------------------
+
+  export type PackageVersionState = "running" | "previous" | "retained";
+
+  export interface PackageVersion {
+    digest: string;
+    sequence: string;
+    state: PackageVersionState;
+    /// When the host first held the package; null when it cannot say.
+    installedUnixMs: number | null;
+    modules: number;
+    /// How many modules differ from the running package, counting ones only one of them has.
+    differs: number;
+    restorable: boolean;
+    /// The host's code for why a package cannot be switched to.
+    reason: string | null;
+  }
+
+  export interface PackageVersions {
+    supported: boolean;
+    /// Every package the host has kept, which can be more than it lists.
+    total: number;
+    versions: PackageVersion[];
+  }
+
+  const VERSION_STATES: readonly PackageVersionState[] = ["running", "previous", "retained"];
+
+  export function parsePackageVersions(value: unknown): PackageVersions {
+    const reply = record(value, "Package version list is invalid.");
+    if (reply.ok !== true) throw new Error("Package versions are unavailable.");
+    if (reply.supported === false) return { supported: false, total: 0, versions: [] };
+    if (reply.supported !== true || !Array.isArray(reply.versions) || reply.versions.length > 64 || !byteCount(reply.total))
+      throw new Error("Package version list is invalid.");
+    const seen = new Set<string>();
+    const versions = reply.versions.map((entry: unknown): PackageVersion => {
+      const row = record(entry, "Package version is invalid.");
+      const installed = row.installed_unix_ms ?? null;
+      const reason = row.reason ?? null;
+      if (typeof row.digest !== "string" || !DIGEST.test(row.digest) || seen.has(row.digest) ||
+          !releaseSequence(row.sequence) ||
+          typeof row.state !== "string" || !(VERSION_STATES as readonly string[]).includes(row.state) ||
+          (installed !== null && !unixMs(installed)) ||
+          !byteCount(row.modules) || !byteCount(row.differs) || typeof row.restorable !== "boolean" ||
+          (reason !== null && (typeof reason !== "string" || !/^[a-z0-9_]{1,64}$/.test(reason))))
+        throw new Error("Package version is invalid.");
+      seen.add(row.digest);
+      return {
+        digest: row.digest,
+        sequence: row.sequence,
+        state: row.state as PackageVersionState,
+        installedUnixMs: installed as number | null,
+        modules: row.modules,
+        differs: row.differs,
+        restorable: row.restorable,
+        reason: reason as string | null,
+      };
+    });
+    return { supported: true, total: Math.max(reply.total, versions.length), versions };
+  }
+
+  const VERSION_REASONS: Readonly<Record<string, string>> = {
+    expired: "Its signature has expired",
+    publisher_untrusted: "Its publisher is no longer trusted",
+    unavailable: "Its files are no longer on this host",
+  };
+
+  /// Why the host will not switch to a package it lists.
+  export function packageVersionReason(code: string | null): string {
+    return (code !== null && Object.hasOwn(VERSION_REASONS, code) && VERSION_REASONS[code]) || "Cannot be switched to";
+  }
+
+  /// How a kept package differs from the running one, in a few words.
+  export function packageVersionDifference(version: PackageVersion): string {
+    if (version.state === "running") return `${version.modules} ${version.modules === 1 ? "module" : "modules"}`;
+    if (version.differs === 0) return "Same modules";
+    return `${version.differs} of ${version.modules} ${version.modules === 1 ? "module" : "modules"} ${version.differs === 1 ? "differs" : "differ"}`;
   }
 
   function parseCatalog(value: unknown): RepositoryCatalog {
@@ -620,6 +747,31 @@ namespace Amaterasu {
     return { family: null, label: null, source: null };
   }
 
+  /// The running modules no family row accounts for: Amaterasu's own, built
+  /// into its main repository, and any another developer wrote.
+  export function modulesOutsideFamilies(plugins: readonly InstalledPlugin[]): { builtIn: InstalledPlugin[]; foreign: InstalledPlugin[] } {
+    const loose = plugins.filter((plugin) => moduleOrigin(plugin.id).family === null);
+    return {
+      builtIn: loose.filter((plugin) => plugin.id.startsWith("amaterasu.")),
+      foreign: loose.filter((plugin) => !plugin.id.startsWith("amaterasu.")),
+    };
+  }
+
+  /// The version a repository gives the package the host runs, when one lists it.
+  export function runningPackageVersion(
+    repositories: readonly ApprovedRepositoryView[],
+    digest: string | null,
+  ): string | null {
+    if (!digest) return null;
+    for (const repository of repositories) {
+      if (repository.revoked) continue;
+      const choice = repository.candidates.find((candidate) =>
+        candidate.kind === "native_set" && candidate.manifest_sha256 === digest);
+      if (choice) return choice.version;
+    }
+    return null;
+  }
+
   export interface InstalledPlugin extends PluginPresentation {
     id: string;
     version: string;
@@ -826,6 +978,8 @@ namespace Amaterasu {
     shutting_down: "The host is shutting down. Try again when it is running again.",
     unsupported_platform: "Updates from the console are not available on this platform yet.",
     permission_denied: "This account is not allowed to do that. Installing an update needs an administrator who is signed in to the console.",
+    not_restorable: "The host can no longer switch to that package. Open the list again to see what it still keeps.",
+    invalid_mode: "The host did not recognise that setting. Reload the page and try again.",
   };
 
   /// Why the host refused a request, or null for a code this console does not know.
@@ -837,6 +991,11 @@ namespace Amaterasu {
 
   /// The requests a row can send for its source.
   export type UpdateAction = "check" | "download" | "activate" | "cancel";
+
+  /// What the page asks a source to change, beyond the update requests.
+  export type UpdateChange =
+    | { kind: "automatic"; mode: AutomaticMode }
+    | { kind: "restore"; digest: string };
 
   /// Where a source's update stands. The last three are not phases a host
   /// reports: its answer has not arrived, could not be read, or says updates
@@ -859,6 +1018,8 @@ namespace Amaterasu {
     repository: string | null;
     /// The digest of what the host runs now.
     running: string | null;
+    /// The version its repository gives what the host runs, when it lists it.
+    version: string | null;
     checkedUnixMs: number | null;
     state: UpdateSourceState;
     /// The state in words: the row's answer to "is this up to date?".
@@ -879,6 +1040,12 @@ namespace Amaterasu {
     actions: UpdateAction[];
     /// True while the host is working and the row should be read again.
     busy: boolean;
+    /// How the source keeps itself up to date, when its host can.
+    automatic: AutomaticUpdates | null;
+    /// Whether the host lists the source's earlier packages and can switch to one.
+    versions: boolean;
+    /// The earlier package being switched to, when one is.
+    restoring: string | null;
   }
 
   /// What the page has heard about a source: nothing yet, the host's answer,
@@ -891,9 +1058,10 @@ namespace Amaterasu {
 
   export const CORE_UPDATE_SOURCE = "amaterasu-core";
 
-  const CORE_UPDATE_ABOUT = "Amaterasu Core is every module Amaterasu ships. It updates as one signed package, which can also add new modules, and the host returns to the previous package if the new one does not start.";
+  const CORE_UPDATE_ABOUT = "Every module Amaterasu ships. They update together as one signed package, and the host goes back to the package it had if a new one does not start.";
 
   const UPDATE_STEP_LABELS = ["Download", "Verify", "Wait for idle", "Restart"] as const;
+  const RESTORE_STEP_LABELS = ["Wait for idle", "Restart"] as const;
 
   const UPDATE_HEADLINES: Readonly<Record<PackageUpdatePhase, string>> = {
     idle: "Not checked yet",
@@ -933,7 +1101,7 @@ namespace Amaterasu {
   /// host runs, used when the host's update status says nothing.
   export function coreUpdateSource(
     reading: UpdateReading,
-    running: { digest: string | null; repository: string | null } | null,
+    running: { digest: string | null; repository: string | null; version?: string | null } | null,
   ): UpdateSourceView {
     const row: UpdateSourceView = {
       id: CORE_UPDATE_SOURCE,
@@ -941,6 +1109,7 @@ namespace Amaterasu {
       about: CORE_UPDATE_ABOUT,
       repository: running?.repository ?? null,
       running: running?.digest ?? null,
+      version: running?.version ?? null,
       checkedUnixMs: null,
       state: "loading",
       headline: "Loading…",
@@ -953,6 +1122,9 @@ namespace Amaterasu {
       transfer: null,
       actions: [],
       busy: false,
+      automatic: null,
+      versions: false,
+      restoring: null,
     };
     if (reading.state === "loading") return row;
     if (reading.state === "failed")
@@ -961,13 +1133,41 @@ namespace Amaterasu {
       return {
         ...row,
         state: "unavailable",
-        headline: "Updates unavailable",
+        headline: "Updated outside the console",
         detail: reading.state === "absent"
           ? "This host does not install updates from the console yet."
           : "Updates from the console are not available on this platform yet.",
       };
     const status = reading.status;
     const phase = status.phase;
+    const shared = {
+      ...row,
+      repository: status.source?.repository ?? row.repository,
+      running: status.running.digest ?? row.running,
+      checkedUnixMs: status.checkedUnixMs,
+      state: phase,
+      automatic: status.automatic,
+      versions: status.versions,
+    };
+    // Switching to an earlier package borrows the phases of an install.
+    if (status.restoring && (phase === "waiting_stream" || phase === "activating")) {
+      const current = phase === "waiting_stream" ? 0 : 1;
+      return {
+        ...shared,
+        headline: phase === "waiting_stream" ? "Waiting for the stream to end" : "Switching version",
+        tone: "attention",
+        detail: phase === "waiting_stream"
+          ? "The host switches to the earlier package and restarts as soon as the stream that is running ends."
+          : "The host is restarting with the earlier package. This page follows along and reconnects when it is back.",
+        restoring: status.restoring.digest,
+        steps: RESTORE_STEP_LABELS.map((label, index) => ({
+          label,
+          state: index === current ? "current" : index < current ? "done" : "upcoming",
+        })),
+        actions: phase === "waiting_stream" ? ["cancel"] : [],
+        busy: true,
+      };
+    }
     // Before a check has finished, or after one found nothing, there is no update to describe.
     const update = phase === "idle" || phase === "checking" || phase === "current" ? null : status.update;
     const total = update && update.downloadBytes > 0 ? update.downloadBytes : null;
@@ -975,15 +1175,14 @@ namespace Amaterasu {
     const progress = updateProgress(phase, received, total);
     const settled = phase === "failed" || phase === "cancelled";
     return {
-      ...row,
-      repository: status.source?.repository ?? row.repository,
-      running: status.running.digest ?? row.running,
-      checkedUnixMs: status.checkedUnixMs,
-      state: phase,
+      ...shared,
       headline: UPDATE_HEADLINES[phase],
       tone: phase === "current" ? "good" : phase === "failed" ? "danger"
         : phase === "idle" || phase === "checking" || phase === "cancelled" ? "neutral" : "attention",
-      detail: phase === "failed" ? packageUpdateFailureMessage(status.error) : UPDATE_DETAILS[phase] ?? null,
+      detail: phase === "failed" ? packageUpdateFailureMessage(status.error)
+        : phase === "current" && status.repositoryBehind
+          ? "Nothing newer is published. This host runs a later package than its repository lists, as it does after a local install."
+          : UPDATE_DETAILS[phase] ?? null,
       update: update?.digest ?? null,
       summary: update
         ? packageUpdateSummary(update, phase === "ready" || phase === "waiting_stream" || phase === "activating")
@@ -1001,6 +1200,49 @@ namespace Amaterasu {
         : ["check"],
       busy: phase === "checking" || phase === "downloading" || phase === "waiting_stream" || phase === "activating",
     };
+  }
+
+  // --- The page's one-line answer ---------------------------------------------
+
+  export interface UpdatesSummary {
+    headline: string;
+    tone: UpdateTone;
+    /// The most recent check among the sources that report one.
+    checkedUnixMs: number | null;
+  }
+
+  const UPDATE_PENDING: readonly UpdateSourceState[] = ["available", "downloading", "ready", "waiting_stream", "activating"];
+
+  /// What every source adds up to: the answer to "is this host up to date?".
+  /// Trouble comes first, then an update under way, then what is still unknown.
+  export function updatesSummary(sources: readonly UpdateSourceView[]): UpdatesSummary {
+    const checked = sources.flatMap((source) => source.checkedUnixMs === null ? [] : [source.checkedUnixMs]);
+    const checkedUnixMs = checked.length ? Math.max(...checked) : null;
+    const count = (states: readonly UpdateSourceState[]): number =>
+      sources.filter((source) => states.includes(source.state)).length;
+    const answer = (headline: string, tone: UpdateTone): UpdatesSummary => ({ headline, tone, checkedUnixMs });
+    if (!sources.length || count(["loading"]) === sources.length) return answer("Loading…", "neutral");
+    const switching = sources.filter((source) => source.restoring !== null).length;
+    const pending = sources.filter((source) =>
+      source.restoring === null && (UPDATE_PENDING.includes(source.state) || (source.state === "cancelled" && source.update !== null))).length;
+    if (count(["failed"])) return answer(count(["failed"]) === 1 ? "An update needs attention" : "Some updates need attention", "danger");
+    if (switching) return answer("Switching to an earlier version", "attention");
+    if (pending) return answer(pending === 1 ? "1 update available" : `${pending} updates available`, "attention");
+    if (count(["checking"])) return answer("Checking for updates…", "neutral");
+    if (count(["unreadable"])) return answer("Update status is unavailable", "neutral");
+    if (count(["current"]) === sources.length) return answer("Everything is up to date", "good");
+    if (count(["unavailable"]) === sources.length) return answer("This host is updated outside the console", "neutral");
+    return answer("Updates have not been checked yet", "neutral");
+  }
+
+  /// How long until something happens, in the largest whole unit that fits.
+  /// Null once the time has come.
+  export function timeUntil(nowMs: number, thenMs: number): { value: number; unit: "minute" | "hour" | "day" } | null {
+    const minutes = Math.ceil((thenMs - nowMs) / 60_000);
+    if (minutes < 1) return null;
+    if (minutes < 60) return { value: minutes, unit: "minute" };
+    const hours = Math.round(minutes / 60);
+    return hours < 24 ? { value: hours, unit: "hour" } : { value: Math.round(hours / 24), unit: "day" };
   }
 
   /// How long ago something happened, in the largest whole unit that fits.

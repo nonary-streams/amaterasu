@@ -189,26 +189,36 @@ browser API calls.
   permissions and an expiry, create and revoke browser-issued credentials, and
   copy the secret once. It does not display native-caller or legacy tokens, and
   never stores the secret in browser storage. An uncertain issuance is not retried.
-- Modules (addressed as `#plugins`, the page's former name) opens with an Updates panel
-  and four views: `#plugins`, `#plugins/modules`, `#plugins/publishers` and
-  `#plugins/repositories`. The former `#plugins/installed`, `#plugins/available` and
-  `#updates` addresses still open the views that replaced them.
-  Updates lists one row per update source. Amaterasu Core, every module Amaterasu
-  ships as one signed package, is the only source a host reports today. Its row reads
-  `POST /v1/package-update/status` and shows the host's own account of the update: the
-  modules it changes, download progress, and whether it is waiting for a stream to end.
-  Check, download and cancel need `configuration.write`; installing also needs an
-  administrator's signed-in session and is confirmed first. The row is read again every
-  1.5 seconds only while the host reports work in progress. The console never verifies
-  or installs anything itself, and a host without these routes shows that updates are
-  not installed from the console.
-  Core modules groups the modules that carry a stream into families and links each to
-  the repository it is built from. All modules lists the modules in the package the host
-  reports as loaded, with each module's declared dependencies and services; this does
-  not establish individual module health. Other publishers compares what the approved
-  repositories offer beyond the host's own package with what is loaded; the console
-  cannot install those. Repositories lists publishers and their catalog status, and
-  lets an administrator session add one (publisher key plus a separately confirmed
+- Modules (addressed as `#plugins`, the page's former name) opens with one line that
+  answers whether the host is up to date, with the request that checks every source,
+  and three views: `#plugins` (the overview), `#plugins/modules` and
+  `#plugins/repositories`. The former `#plugins/core`, `#plugins/publishers`,
+  `#plugins/installed`, `#plugins/available` and `#updates` addresses still open the
+  views that replaced them.
+  The overview has a section per update source. Amaterasu Core, every module Amaterasu
+  ships as one signed package, is the only source a host reports today. Its section
+  reads `POST /v1/package-update/status` and shows the host's own account of the update:
+  the modules it changes, download progress, and whether it is waiting for a stream to
+  end. Check, download and cancel need `configuration.write`; installing also needs an
+  administrator's signed-in session and is confirmed first. The status is read again
+  every 1.5 seconds only while the host reports work in progress. The console never
+  verifies or installs anything itself, and a host without these routes shows that it
+  is updated outside the console.
+  Two controls appear only when the host's status says it supports them. A reply with
+  `automatic` offers the Automatic updates setting (off, download then ask, or install
+  when idle), sent to `POST /v1/package-update/automatic`. A reply with `restoring`
+  offers Earlier versions: the packages the host has kept, read from
+  `POST /v1/package-update/versions` when the list is opened, each with a confirmed
+  request to `POST /v1/package-update/restore`. Both changes need an administrator's
+  signed-in session.
+  Under Amaterasu Core, Included lists the families of modules that carry a stream with
+  the repository each is built from, then the modules built into Amaterasu itself and
+  any another developer wrote. Plugins compares what the approved repositories offer
+  beyond the host's own package with what is loaded; the console cannot install those.
+  All modules lists the modules in the package the host reports as loaded, with each
+  module's declared dependencies and services; this does not establish individual
+  module health. Repositories lists publishers and their catalog status, and lets an
+  administrator session add one (publisher key plus a separately confirmed
   fingerprint), check one for updates, or remove one: see `docs/approved-repositories.md`.
 - Host logging settings confirm the saved revision and separately read signed
   diagnostics status. The editor distinguishes pending application from healthy,

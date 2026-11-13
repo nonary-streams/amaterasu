@@ -336,11 +336,12 @@ const updateReply = {
 const reading = (change = {}) => ({ state: "ready", status: plugins.parsePackageUpdateStatus({ ...updateReply, ...change }) });
 
 test("addresses saved under a view's former name open the view that replaced it", () => {
-  assert.deepEqual(plain(plugins.PLUGINS_VIEWS), ["core", "modules", "publishers", "repositories"]);
-  assert.equal(plugins.DEFAULT_PLUGINS_VIEW, "core");
+  assert.deepEqual(plain(plugins.PLUGINS_VIEWS), ["overview", "modules", "repositories"]);
+  assert.equal(plugins.DEFAULT_PLUGINS_VIEW, "overview");
   for (const view of plugins.PLUGINS_VIEWS) assert.equal(plugins.pluginsViewFromAddress(view), view);
   assert.equal(plugins.pluginsViewFromAddress("installed"), "modules");
-  assert.equal(plugins.pluginsViewFromAddress("available"), "publishers");
+  // Core modules and other publishers' offers now share the overview.
+  for (const former of ["core", "publishers", "available"]) assert.equal(plugins.pluginsViewFromAddress(former), "overview", former);
   for (const name of ["", "Installed", "updates", "constructor", "__proto__", "modules/extra"])
     assert.equal(plugins.pluginsViewFromAddress(name), null, name);
 });
@@ -366,7 +367,32 @@ test("an update status reply is read whole", () => {
     },
     transferredBytes: 0,
     error: null,
+    automatic: null,
+    repositoryBehind: false,
+    versions: false,
+    restoring: null,
   });
+
+  // A host that keeps itself up to date and can switch packages says so.
+  const kept = plugins.parsePackageUpdateStatus({
+    ...updateReply, phase: "current", update: null, repository_behind: true,
+    automatic: { mode: "install", next_check_unix_ms: 1_794_190_000_000 }, restoring: null,
+  });
+  assert.deepEqual(plain([kept.automatic, kept.repositoryBehind, kept.versions, kept.restoring]),
+    [{ mode: "install", nextCheckUnixMs: 1_794_190_000_000 }, true, true, null]);
+  assert.deepEqual(plain(plugins.parsePackageUpdateStatus({ ...updateReply, automatic: { mode: "off", next_check_unix_ms: null } }).automatic),
+    { mode: "off", nextCheckUnixMs: null });
+  const switching = plugins.parsePackageUpdateStatus(
+    { ...updateReply, phase: "waiting_stream", update: null, restoring: { digest: digest("b"), sequence: "1794169001" } });
+  assert.deepEqual(plain([switching.versions, switching.restoring]), [true, { digest: digest("b"), sequence: "1794169001" }]);
+  for (const bad of [
+    { automatic: { mode: "sometimes", next_check_unix_ms: null } },
+    { automatic: { mode: "off", next_check_unix_ms: -1 } },
+    { automatic: "install" },
+    { repository_behind: "yes" },
+    { restoring: { digest: "short", sequence: "1" } },
+    { restoring: { digest: digest("b"), sequence: "01" } },
+  ]) assert.throws(() => plugins.parsePackageUpdateStatus({ ...updateReply, ...bad }), JSON.stringify(bad));
 
   // Everything the contract allows to be null, and every phase.
   const idle = plugins.parsePackageUpdateStatus(
@@ -536,15 +562,23 @@ test("an update is summed up as the modules it changes", () => {
 });
 
 test("the Amaterasu Core row says where its update stands", () => {
-  const running = { digest: digest("9"), repository: "house" };
+  const running = { digest: digest("9"), repository: "house", version: "0.1.0" };
   const row = (change, fallback = running) => plain(plugins.coreUpdateSource(reading(change), fallback));
   const steps = (view) => view.steps.map((step) => `${step.label}:${step.state}`);
 
   const current = row({ phase: "current", update: null });
   assert.equal(current.id, plugins.CORE_UPDATE_SOURCE);
   assert.equal(current.name, "Amaterasu Core");
-  assert.match(current.about, /^Amaterasu Core is every module Amaterasu ships\./);
+  assert.match(current.about, /^Every module Amaterasu ships\. They update together as one signed package/);
   assert.deepEqual([current.headline, current.tone, current.detail], ["Up to date", "good", null]);
+  assert.deepEqual([current.version, current.automatic, current.versions, current.restoring], ["0.1.0", null, false, null]);
+  // A host ahead of its repository is up to date, and says why nothing newer was found.
+  const ahead = row({ phase: "current", update: null, repository_behind: true });
+  assert.deepEqual([ahead.headline, ahead.tone], ["Up to date", "good"]);
+  assert.match(ahead.detail, /^Nothing newer is published\. This host runs a later package than its repository lists/);
+  // What the host says about keeping itself up to date is carried through every phase.
+  const kept = row({ automatic: { mode: "download", next_check_unix_ms: 1_794_190_000_000 }, restoring: null });
+  assert.deepEqual([kept.automatic, kept.versions], [{ mode: "download", nextCheckUnixMs: 1_794_190_000_000 }, true]);
   // The host's own answer names what it runs; the selection is only a fallback.
   assert.deepEqual([current.running, current.repository, current.checkedUnixMs],
     [digest("d"), "amaterasu", 1_794_170_000_000]);
@@ -595,6 +629,20 @@ test("the Amaterasu Core row says where its update stands", () => {
   assert.deepEqual([activating.headline, activating.actions, activating.busy], ["Installing", [], true]);
   assert.deepEqual(steps(activating), ["Download:done", "Verify:done", "Wait for idle:done", "Restart:current"]);
 
+  // Switching to an earlier package borrows the last two phases of an install.
+  const target = { digest: digest("b"), sequence: "1794169001" };
+  const switchWaiting = row({ phase: "waiting_stream", update: null, restoring: target });
+  assert.deepEqual([switchWaiting.headline, switchWaiting.tone, switchWaiting.actions, switchWaiting.busy, switchWaiting.restoring],
+    ["Waiting for the stream to end", "attention", ["cancel"], true, digest("b")]);
+  assert.match(switchWaiting.detail, /^The host switches to the earlier package/);
+  assert.deepEqual(steps(switchWaiting), ["Wait for idle:current", "Restart:upcoming"]);
+  const switching = row({ phase: "activating", update: null, restoring: target });
+  assert.deepEqual([switching.headline, switching.actions, switching.busy, switching.summary],
+    ["Switching version", [], true, null]);
+  assert.deepEqual(steps(switching), ["Wait for idle:done", "Restart:current"]);
+  // A switch the host has finished with is an ordinary status again.
+  assert.equal(row({ phase: "idle", update: null, restoring: null }).restoring, null);
+
   const failed = row({ phase: "failed", error: "verification_failed" });
   assert.deepEqual([failed.headline, failed.tone, failed.busy], ["Update failed", "danger", false]);
   assert.equal(failed.detail, plugins.packageUpdateFailureMessage("verification_failed"));
@@ -608,7 +656,7 @@ test("the Amaterasu Core row says where its update stands", () => {
   assert.deepEqual([loading.state, loading.running, loading.repository, loading.actions], ["loading", null, null, []]);
   const absent = plain(plugins.coreUpdateSource({ state: "absent" }, running));
   assert.deepEqual([absent.state, absent.headline, absent.detail, absent.actions, absent.busy],
-    ["unavailable", "Updates unavailable", "This host does not install updates from the console yet.", [], false]);
+    ["unavailable", "Updated outside the console", "This host does not install updates from the console yet.", [], false]);
   assert.deepEqual([absent.running, absent.repository], [digest("9"), "house"]);
   const unsupported = plain(plugins.coreUpdateSource(
     { state: "ready", status: plugins.parsePackageUpdateStatus({ ok: true, supported: false }) }, running));
@@ -698,4 +746,129 @@ test("how long ago is counted in the largest whole unit", () => {
   assert.deepEqual(ago(60 * 60_000), { value: 1, unit: "hour" });
   assert.deepEqual(ago(23 * 3_600_000), { value: 23, unit: "hour" });
   assert.deepEqual(ago(49 * 3_600_000), { value: 2, unit: "day" });
+});
+
+test("the page's one line adds its sources up", () => {
+  const running = { digest: digest("9"), repository: "house", version: null };
+  const source = (change) => plugins.coreUpdateSource(reading({ update: null, ...change }), running);
+  const answer = (...sources) => { const summary = plugins.updatesSummary(sources); return [summary.headline, summary.tone]; };
+
+  assert.deepEqual(answer(), ["Loading…", "neutral"]);
+  assert.deepEqual(answer(plugins.coreUpdateSource({ state: "loading" }, null)), ["Loading…", "neutral"]);
+  assert.deepEqual(answer(source({ phase: "current" })), ["Everything is up to date", "good"]);
+  assert.deepEqual(answer(source({ phase: "current" }), source({ phase: "current" })), ["Everything is up to date", "good"]);
+  assert.deepEqual(answer(source({ phase: "idle" })), ["Updates have not been checked yet", "neutral"]);
+  assert.deepEqual(answer(source({ phase: "checking" })), ["Checking for updates…", "neutral"]);
+  for (const phase of ["available", "downloading", "ready", "waiting_stream", "activating"])
+    assert.deepEqual(answer(source({ phase, update: updateOffer })), ["1 update available", "attention"], phase);
+  assert.deepEqual(answer(source({ phase: "available", update: updateOffer }), source({ phase: "ready", update: updateOffer })),
+    ["2 updates available", "attention"]);
+  // One source up to date does not hide another's update, and trouble comes first.
+  assert.deepEqual(answer(source({ phase: "current" }), source({ phase: "available", update: updateOffer })), ["1 update available", "attention"]);
+  assert.deepEqual(answer(source({ phase: "available", update: updateOffer }), source({ phase: "failed", error: "download_failed" })),
+    ["An update needs attention", "danger"]);
+  // A cancelled update is still there to be had; a cancelled check is not one.
+  assert.deepEqual(answer(source({ phase: "cancelled", update: updateOffer })), ["1 update available", "attention"]);
+  assert.deepEqual(answer(source({ phase: "cancelled" })), ["Updates have not been checked yet", "neutral"]);
+  assert.deepEqual(answer(source({ phase: "waiting_stream", restoring: { digest: digest("b"), sequence: "3" } })),
+    ["Switching to an earlier version", "attention"]);
+  assert.deepEqual(answer(plugins.coreUpdateSource({ state: "absent" }, running)), ["This host is updated outside the console", "neutral"]);
+  assert.deepEqual(answer(plugins.coreUpdateSource({ state: "failed", message: "Request timed out." }, running)),
+    ["Update status is unavailable", "neutral"]);
+
+  // The newest check among the sources is the one the line reports.
+  const earlier = source({ phase: "current", checked_unix_ms: 1_794_000_000_000 });
+  const later = source({ phase: "current", checked_unix_ms: 1_794_170_000_000 });
+  assert.equal(plugins.updatesSummary([earlier, later]).checkedUnixMs, 1_794_170_000_000);
+  assert.equal(plugins.updatesSummary([source({ phase: "idle", checked_unix_ms: null })]).checkedUnixMs, null);
+});
+
+test("the packages a host has kept are read whole or not at all", () => {
+  const version = {
+    digest: digest("d"), sequence: "1794169006", state: "running", installed_unix_ms: 1_794_529_635_000,
+    modules: 37, differs: 0, restorable: true, reason: null,
+  };
+  const earlier = { ...version, digest: digest("b"), sequence: "1794169005", state: "previous", differs: 1 };
+  const expired = { ...version, digest: digest("a"), sequence: "18446744073709551615", state: "retained", installed_unix_ms: null, differs: 37, restorable: false, reason: "expired" };
+  const reply = { ok: true, supported: true, total: 156, versions: [version, earlier, expired] };
+  const listed = plain(plugins.parsePackageVersions(reply));
+  assert.deepEqual([listed.supported, listed.total, listed.versions.length], [true, 156, 3]);
+  assert.deepEqual(listed.versions[1], {
+    digest: digest("b"), sequence: "1794169005", state: "previous", installedUnixMs: 1_794_529_635_000,
+    modules: 37, differs: 1, restorable: true, reason: null,
+  });
+  assert.deepEqual([listed.versions[2].installedUnixMs, listed.versions[2].restorable, listed.versions[2].reason], [null, false, "expired"]);
+  // A total smaller than the list is not believed.
+  assert.equal(plugins.parsePackageVersions({ ...reply, total: 1 }).total, 3);
+  assert.deepEqual(plain(plugins.parsePackageVersions({ ok: true, supported: false, total: 0, versions: [] })),
+    { supported: false, total: 0, versions: [] });
+
+  for (const bad of [
+    { ok: false },
+    { versions: "none" },
+    { total: -1 },
+    { versions: [version, version] },
+    { versions: [{ ...version, digest: "D".repeat(64) }] },
+    { versions: [{ ...version, sequence: 7 }] },
+    { versions: [{ ...version, state: "trial" }] },
+    { versions: [{ ...version, installed_unix_ms: "yesterday" }] },
+    { versions: [{ ...version, modules: 1.5 }] },
+    { versions: [{ ...version, differs: -1 }] },
+    { versions: [{ ...version, restorable: "yes" }] },
+    { versions: [{ ...version, reason: "Not Allowed" }] },
+    { versions: Array.from({ length: 65 }, (_, index) => ({ ...version, digest: index.toString(16).padStart(64, "0") })) },
+  ]) assert.throws(() => plugins.parsePackageVersions({ ...reply, ...bad }), JSON.stringify(bad).slice(0, 80));
+
+  assert.equal(plugins.packageVersionDifference(listed.versions[0]), "37 modules");
+  assert.equal(plugins.packageVersionDifference(listed.versions[1]), "1 of 37 modules differs");
+  assert.equal(plugins.packageVersionDifference(listed.versions[2]), "37 of 37 modules differ");
+  assert.equal(plugins.packageVersionDifference({ ...listed.versions[1], differs: 0 }), "Same modules");
+  assert.equal(plugins.packageVersionReason("expired"), "Its signature has expired");
+  assert.equal(plugins.packageVersionReason("publisher_untrusted"), "Its publisher is no longer trusted");
+  assert.equal(plugins.packageVersionReason("unavailable"), "Its files are no longer on this host");
+  for (const unknown of [null, "constructor", "something_new"]) assert.equal(plugins.packageVersionReason(unknown), "Cannot be switched to");
+  assert.match(plugins.packageUpdateRefusalMessage("not_restorable"), /can no longer switch to that package/);
+  assert.match(plugins.packageUpdateRefusalMessage("invalid_mode"), /did not recognise that setting/);
+});
+
+test("the modules no family accounts for are Amaterasu's own or another developer's", () => {
+  const installed = plugins.installedPlugins(plugins.parsePackageSelectionStatus({
+    ...selectionReply,
+    running: { ...selectionReply.running, modules: [
+      ...selectionReply.running.modules,
+      { id: "amaterasu.network", version: "0.1.0", sha256: "4".repeat(64), runtime: false },
+      { id: "amaterasu.nvhttp", version: "0.1.0", sha256: "5".repeat(64), runtime: false },
+    ] },
+  }));
+  const loose = plugins.modulesOutsideFamilies(installed);
+  assert.deepEqual(loose.builtIn.map((plugin) => plugin.id).sort(), ["amaterasu.network", "amaterasu.nvhttp"]);
+  assert.deepEqual(loose.foreign.map((plugin) => plugin.id), ["example.overlay"]);
+  // Every module is in a family, built in, or another developer's: none is left out or counted twice.
+  const inFamilies = installed.filter((plugin) => plugins.moduleOrigin(plugin.id).family !== null);
+  assert.equal(inFamilies.length + loose.builtIn.length + loose.foreign.length, installed.length);
+});
+
+test("the running package takes the version its repository gives it", () => {
+  const listing = [
+    { ...repository, candidates: [nativeCandidate, { ...nativeCandidate, version: "0.4.0", manifest_sha256: "d".repeat(64) }] },
+    { ...repository, id: "revoked", revoked: true, candidates: [{ ...nativeCandidate, version: "9.9.9", manifest_sha256: "e".repeat(64) }] },
+    { ...repository, id: "interface", candidates: [{ ...candidate, manifest_sha256: "f".repeat(64) }] },
+  ];
+  assert.equal(plugins.runningPackageVersion(listing, "d".repeat(64)), "0.4.0");
+  assert.equal(plugins.runningPackageVersion(listing, "b".repeat(64)), "0.3.0");
+  // A revoked repository, an interface bundle and an unlisted package name no version.
+  assert.equal(plugins.runningPackageVersion(listing, "e".repeat(64)), null);
+  assert.equal(plugins.runningPackageVersion(listing, "f".repeat(64)), null);
+  assert.equal(plugins.runningPackageVersion(listing, "0".repeat(64)), null);
+  assert.equal(plugins.runningPackageVersion(listing, null), null);
+});
+
+test("how long until is counted in the largest whole unit", () => {
+  const now = 1_794_170_000_000;
+  assert.equal(plugins.timeUntil(now, now), null);
+  assert.equal(plugins.timeUntil(now, now - 60_000), null);
+  assert.deepEqual(plain(plugins.timeUntil(now, now + 1)), { value: 1, unit: "minute" });
+  assert.deepEqual(plain(plugins.timeUntil(now, now + 59 * 60_000)), { value: 59, unit: "minute" });
+  assert.deepEqual(plain(plugins.timeUntil(now, now + 6 * 3_600_000)), { value: 6, unit: "hour" });
+  assert.deepEqual(plain(plugins.timeUntil(now, now + 3 * 86_400_000)), { value: 3, unit: "day" });
 });

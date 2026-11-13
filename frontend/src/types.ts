@@ -16,7 +16,7 @@ namespace Amaterasu {
   export type SettingsCategory = "general" | "streaming" | "integrations" | "devices" | "access";
   /// The Modules page's views. The page keeps the `plugins` address it had
   /// under its former name.
-  export type PluginsView = "core" | "modules" | "publishers" | "repositories";
+  export type PluginsView = "overview" | "modules" | "repositories";
   export type PageRoute = Page | `settings/${SettingsCategory}` | `plugins/${PluginsView}`;
   export type Payload = Record<string, unknown>;
   export interface LoginReply {

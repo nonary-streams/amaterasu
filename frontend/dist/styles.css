@@ -2154,29 +2154,47 @@ input, textarea, select {
 .plugin-tab-count:empty { display: none; }
 .plugin-loading { padding: 24px 0; font-size: 14px; }
 
-/* Updates: one row per source. A row's state is the only colour in it. */
-.plugin-updates { margin: -8px 0 24px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); }
-.plugin-updates-head {
-  display: flex; align-items: center; justify-content: space-between; gap: 16px;
-  padding: 12px 24px; border-bottom: 1px solid var(--line);
+/* The page's one-line answer: is this host up to date? */
+.plugin-summary {
+  display: flex; align-items: center; gap: 16px;
+  margin: -8px 0 24px; padding: 18px 24px;
+  border: 1px solid var(--line); border-radius: 12px; background: var(--panel);
 }
-.plugin-updates-head h2 { font-size: 20px; }
-.plugin-updates-head .button, .plugin-update-actions .button { min-height: 36px; padding: 6px 14px; font-size: 13px; }
-.plugin-updates .button[aria-disabled="true"] { opacity: .6; cursor: progress; }
-.plugin-updates-note { padding: 12px 24px 0; font-size: 13px; }
-.plugin-update-source { display: grid; gap: 14px; min-width: 0; padding: 20px 24px 16px; }
-.plugin-update-source + .plugin-update-source { border-top: 1px solid var(--line); }
-.plugin-update-source-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px 24px; min-height: 36px; }
-.plugin-update-title { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 18px; min-width: 0; }
-.plugin-update-name { font-size: 18px; line-height: 1.3; letter-spacing: -.01em; }
-.plugin-update-state { display: inline-flex; align-items: center; gap: 8px; color: var(--fg); font-size: 15px; font-weight: 600; }
+.plugin-summary-mark { position: relative; flex: none; width: 22px; height: 22px; border: 1.5px solid var(--strong); border-radius: 50%; }
+.plugin-summary[data-tone="good"] .plugin-summary-mark { border-color: var(--good); }
+.plugin-summary[data-tone="good"] .plugin-summary-mark::after {
+  content: ""; position: absolute; left: 7px; top: 3px; width: 5px; height: 10px;
+  border: solid var(--good); border-width: 0 1.5px 1.5px 0; transform: rotate(45deg);
+}
+.plugin-summary[data-tone="attention"] .plugin-summary-mark { border-color: var(--gold); }
+.plugin-summary[data-tone="danger"] .plugin-summary-mark { border-color: var(--danger); }
+.plugin-summary[data-tone="attention"] .plugin-summary-mark::after,
+.plugin-summary[data-tone="danger"] .plugin-summary-mark::after { content: ""; position: absolute; inset: 5px; border-radius: 50%; background: var(--gold); }
+.plugin-summary[data-tone="danger"] .plugin-summary-mark::after { background: var(--danger); }
+.plugin-summary-text { flex: 1; min-width: 0; }
+.plugin-summary-headline { font-family: var(--font-display); font-size: 20px; font-weight: 600; line-height: 1.3; letter-spacing: -.01em; }
+.plugin-summary-detail, .plugin-summary-note { margin-top: 2px; font-size: 13px; }
+.plugin-summary .button, .plugin-update-actions .button, .plugin-others-actions .button { min-height: 36px; padding: 6px 14px; font-size: 13px; }
+.plugin-summary .button[aria-disabled="true"] { opacity: .6; cursor: progress; }
+
+/* Sources: Amaterasu Core, then the plugins other developers offer. A
+   source's state is the only colour in it. */
+.plugin-overview, .plugin-update-sources { display: grid; gap: 20px; min-width: 0; }
+.plugin-update-source { display: grid; gap: 14px; min-width: 0; padding: 24px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); }
+.plugin-update-source-head { display: flex; flex-wrap: wrap; align-items: flex-start; justify-content: space-between; gap: 12px 32px; }
+.plugin-update-title { flex: 1 1 380px; min-width: 0; }
+.plugin-update-name { font-size: 22px; line-height: 1.25; letter-spacing: -.01em; }
+.plugin-update-name:focus-visible { outline-offset: 4px; }
+.plugin-update-about { max-width: 70ch; margin-top: 6px; color: var(--secondary); font-size: 14px; }
+.plugin-update-status { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 10px 16px; min-height: 36px; }
+.plugin-update-state { display: inline-flex; align-items: center; gap: 8px; color: var(--fg); font-size: 14px; font-weight: 600; white-space: nowrap; }
 .plugin-update-mark { flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
 .plugin-update-source[data-tone="good"] .plugin-update-mark { background: var(--good); }
 .plugin-update-source[data-tone="attention"] .plugin-update-mark { background: var(--gold); }
 .plugin-update-source[data-tone="danger"] .plugin-update-mark { background: var(--danger); }
 .plugin-update-source[data-state="loading"] .plugin-update-state { color: var(--muted); font-weight: 400; }
 .plugin-update-facts {
-  display: flex; flex-wrap: wrap; gap: 4px 24px; margin-top: -6px; font-size: 13px;
+  display: flex; flex-wrap: wrap; gap: 4px 24px; margin-top: -4px; font-size: 13px;
   /* Hides the separator of a fact that starts a line. */
   clip-path: inset(-6px -6px -6px 0);
 }
@@ -2220,52 +2238,74 @@ input, textarea, select {
 .plugin-update-change { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; padding: 7px 0; }
 .plugin-update-change-name { min-width: 0; overflow-wrap: anywhere; }
 .plugin-update-change-detail { color: var(--secondary); font-variant-numeric: tabular-nums; white-space: nowrap; }
-.plugin-update-foot { display: grid; gap: 4px; padding-top: 14px; border-top: 1px solid color-mix(in srgb, var(--line) 65%, transparent); font-size: 13px; }
-.plugin-update-about { max-width: 96ch; }
+.plugin-update-extra { display: grid; grid-template-columns: minmax(0, 1fr); gap: 2px; min-width: 0; font-size: 13px; }
+.plugin-update-extra > * { min-width: 0; }
 .plugin-update-extra:empty { display: none; }
 @media (prefers-reduced-motion: reduce) {
   .plugin-update-bar::-webkit-progress-value { transition: none; }
 }
 
-/* Core modules: a card per family. */
-.plugin-families { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(300px, 100%), 1fr)); gap: 16px; }
-.plugin-family { display: flex; flex-direction: column; min-width: 0; padding: 20px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); }
-.plugin-family-header { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 6px 12px; }
-.plugin-family-name { font-size: 18px; line-height: 1.3; letter-spacing: -.01em; }
-.plugin-family-summary { margin-top: 8px; color: var(--secondary); font-size: 13px; }
-.plugin-chip {
-  display: inline-flex; align-items: center; gap: 6px; padding: 2px 9px;
-  border: 1px solid var(--line); border-radius: 999px;
-  color: var(--secondary); font-size: 12px; line-height: 1.5; white-space: nowrap;
+/* How a source keeps itself up to date. */
+.plugin-setting {
+  display: grid; grid-template-columns: max-content minmax(190px, 230px) minmax(0, 1fr); align-items: center; gap: 6px 16px;
+  padding-top: 16px; border-top: 1px solid color-mix(in srgb, var(--line) 65%, transparent);
 }
-.plugin-chip--running::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--good); }
-.plugin-chip--changes { border-color: color-mix(in srgb, var(--gold) 55%, var(--line)); background: color-mix(in srgb, var(--gold) 14%, transparent); color: var(--fg); }
-.plugin-family-body { min-width: 0; margin-top: 16px; }
-.plugin-family-members { margin: 0; padding: 0; border-top: 1px solid color-mix(in srgb, var(--line) 65%, transparent); list-style: none; }
-.plugin-family-members > li + li { border-top: 1px solid color-mix(in srgb, var(--line) 65%, transparent); }
+.plugin-setting-label { font-size: 14px; font-weight: 600; }
+.plugin-setting select { min-height: 36px; padding: 6px 10px; font-size: 13px; }
+.plugin-setting-hint { font-size: 13px; }
+
+/* What Amaterasu Core is made of: a row per family, three columns wide. */
+.plugin-included { min-width: 0; margin-bottom: 10px; padding-top: 16px; border-top: 1px solid color-mix(in srgb, var(--line) 65%, transparent); }
+.plugin-included-head { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; padding-bottom: 10px; }
+.plugin-included-note { font-size: 13px; }
+.plugin-included .plugin-loading { padding: 4px 0; }
+.plugin-families { margin: 0; padding: 0; list-style: none; }
+.plugin-family {
+  display: grid; grid-template-columns: minmax(150px, 210px) minmax(0, 1fr) minmax(210px, 290px); align-items: baseline; gap: 4px 28px;
+  padding: 12px 0; border-top: 1px solid color-mix(in srgb, var(--line) 65%, transparent);
+}
+.plugin-family-title { display: grid; gap: 2px; min-width: 0; }
+.plugin-family-name { font-size: 16px; line-height: 1.35; letter-spacing: -.005em; overflow-wrap: anywhere; }
+.plugin-family-state { color: var(--muted); font-size: 12px; }
+.plugin-family-state--changes { display: inline-flex; align-items: center; gap: 6px; color: var(--fg); }
+.plugin-family-state--changes::before { content: ""; flex: none; width: 6px; height: 6px; border-radius: 50%; background: var(--gold); }
+.plugin-family--absent .plugin-family-name, .plugin-family--absent .plugin-family-summary { color: var(--muted); }
+.plugin-family-about { min-width: 0; }
+.plugin-family-summary { color: var(--secondary); font-size: 13px; }
+.plugin-family-members { display: flex; flex-wrap: wrap; gap: 2px 0; margin: 4px 0 0; padding: 0; list-style: none; }
+.plugin-family-members > li:not(:last-child)::after { content: "·"; margin: 0 9px; color: var(--muted); }
 .button.plugin-family-member, li.plugin-family-member {
-  display: flex; align-items: baseline; justify-content: space-between; gap: 12px;
-  width: 100%; min-height: 38px; padding: 8px 0;
-  border: 0; border-radius: 0; background: transparent;
-  font-size: 14px; font-weight: 400; text-align: left;
+  display: inline-flex; align-items: baseline; gap: 6px;
+  min-height: 0; padding: 2px 0; border: 0; border-radius: 3px; background: transparent;
+  font-size: 13px; font-weight: 400; text-align: left;
 }
 .button.plugin-family-member:hover:not(:disabled) { background: transparent; }
-.button.plugin-family-member:hover .plugin-family-member-name { text-decoration: underline; text-decoration-color: var(--strong); text-underline-offset: 3px; }
 .plugin-family-member-name { min-width: 0; color: var(--fg); overflow-wrap: anywhere; }
+.button.plugin-family-member:hover:not(:disabled), .button.plugin-family-member:focus-visible {
+  text-decoration: underline; text-decoration-color: var(--strong); text-underline-offset: 3px;
+}
 .plugin-family-member-version { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .plugin-family-member-version--changes { color: var(--fg); }
-.plugin-family-note { font-size: 13px; }
-.plugin-family-body > .button { min-height: 36px; margin-top: 12px; padding: 6px 14px; font-size: 13px; }
-.plugin-family-source { margin-top: auto; padding-top: 18px; }
-.plugin-family-sources { display: grid; gap: 2px; margin: 6px 0 0; padding: 0; font-size: 13px; list-style: none; }
-.plugin-source-link { color: var(--fg); overflow-wrap: anywhere; text-decoration: underline; text-decoration-color: var(--strong); text-underline-offset: 3px; }
-.plugin-source-link:hover { text-decoration-color: currentColor; }
+.plugin-family-about > .button.link-button { margin-top: 4px; font-size: 13px; }
+.plugin-family-sources { display: grid; gap: 2px; min-width: 0; margin: 0; padding: 0; font-size: 13px; list-style: none; }
+.plugin-source-link { color: var(--secondary); overflow-wrap: anywhere; text-decoration: underline; text-decoration-color: var(--strong); text-underline-offset: 3px; }
+.plugin-source-link:hover { color: var(--fg); text-decoration-color: currentColor; }
+.plugin-detail .plugin-source-link { color: var(--fg); }
 .plugin-source { display: grid; gap: 2px; }
-/* Cards in a row share their rows, so member lists and sources line up. */
-@supports (grid-template-rows: subgrid) {
-  .plugin-family { display: grid; grid-row: span 4; grid-template-rows: subgrid; row-gap: 0; }
-  .plugin-family-source { align-self: start; margin-top: 0; }
-}
+
+/* Plugins from other developers: rows that open in place. */
+.plugin-others-empty { padding-top: 14px; border-top: 1px solid color-mix(in srgb, var(--line) 65%, transparent); font-size: 14px; }
+.plugin-others .plugin-loading { padding: 0; }
+.plugin-others .plugin-toolbar { margin-bottom: 0; }
+.plugin-browser.plugin-browser--inline { grid-template-columns: minmax(0, 1fr); }
+.plugin-browser--inline .plugin-detail-pane { display: none; }
+.plugin-browser--inline .plugin-list { border-radius: 8px; background: transparent; }
+.plugin-browser--inline .plugin-rows .plugin-detail { padding: 16px 16px 20px; border: 0; border-top: 1px solid var(--line); border-radius: 0; background: var(--bg); }
+
+.plugin-version-package { display: inline-flex; flex-wrap: wrap; align-items: baseline; gap: 2px 12px; }
+.plugin-versions-body .button { min-height: 32px; padding: 4px 12px; font-size: 13px; }
+.plugin-versions-body td:last-child { text-align: right; white-space: nowrap; }
+.plugin-versions-body td { font-variant-numeric: tabular-nums; }
 
 .plugin-package-details > summary, .repository-removed > summary { display: inline-block; padding: 4px 0; color: var(--secondary); cursor: pointer; list-style: none; }
 .plugin-package-details > summary::-webkit-details-marker, .repository-removed > summary::-webkit-details-marker { display: none; }
@@ -2273,7 +2313,8 @@ input, textarea, select {
 .plugin-package-details[open] > summary::after, .repository-removed[open] > summary::after { transform: rotate(180deg); }
 .plugin-package-details > summary:hover, .repository-removed > summary:hover { color: var(--fg); }
 .plugin-package-details[open] > summary, .repository-removed[open] > summary { margin-bottom: 10px; }
-.plugin-package-details > p { margin-top: 10px; max-width: 84ch; font-size: 12px; }
+.plugin-package-details > p, .plugin-versions-body > p { margin-top: 10px; max-width: 84ch; font-size: 12px; }
+.plugin-package-details[open] { margin-bottom: 10px; }
 .plugin-package-details td, .plugin-package-details th { padding: 9px 14px; }
 
 .plugin-toolbar { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
@@ -2308,7 +2349,8 @@ input, textarea, select {
 
 .plugin-detail-pane { position: sticky; top: 24px; min-width: 0; max-height: calc(100vh - 48px); overflow-y: auto; }
 .plugin-detail { padding: 24px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); }
-.plugin-detail-header h2 { font-size: 22px; overflow-wrap: anywhere; }
+.plugin-detail-header h2, .plugin-detail-name { font-size: 22px; overflow-wrap: anywhere; }
+.plugin-browser--inline .plugin-detail-name { font-size: 18px; }
 .plugin-identity, .repository-location {
   margin-top: 4px; color: var(--muted); overflow-wrap: anywhere;
   font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
@@ -2378,10 +2420,16 @@ dialog.plugin-form-dialog { max-width: 560px; max-height: calc(100vh - 32px); ov
   .plugin-detail-pane { display: none; }
   .plugin-rows .plugin-detail { padding: 16px 16px 20px; border: 0; border-top: 1px solid var(--line); border-radius: 0; background: var(--bg); }
 }
+@media (max-width: 900px) {
+  .plugin-family { grid-template-columns: minmax(0, 1fr); gap: 6px; }
+  .plugin-setting { grid-template-columns: minmax(0, 1fr); }
+  .plugin-setting select { max-width: 280px; }
+}
 @media (max-width: 800px) {
-  .plugin-updates-head { padding: 10px 16px; }
-  .plugin-updates-note { padding: 12px 16px 0; }
+  .plugin-summary { flex-wrap: wrap; padding: 16px; }
+  .plugin-summary > .actions { flex-basis: 100%; }
   .plugin-update-source { padding: 16px; }
+  .plugin-update-status { justify-content: flex-start; }
   .plugin-update-steps { flex-direction: column; align-items: flex-start; }
   .plugin-update-step::after { display: none; }
   .plugin-update-transfer { flex-wrap: wrap; gap: 6px 14px; }
