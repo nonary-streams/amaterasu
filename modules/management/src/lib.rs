@@ -606,8 +606,15 @@ impl ManagementModule {
             return json!({"ok":false,"code":"permission_denied"});
         };
         let rtx_hdr_install_active = self.rtx_hdr_install_active();
-        self.package_update
-            .versions(request, &self.runtime, rtx_hdr_install_active)
+        // A restore to a set from before automatic updates depends on what
+        // the settings document says now, or is about to say.
+        let settings_carry_automatic = self.product_settings.carries_automatic_package_updates();
+        self.package_update.versions(
+            request,
+            &self.runtime,
+            rtx_hdr_install_active,
+            settings_carry_automatic,
+        )
     }
 
     /// True while the RTX HDR install prepares or activates a set of its
@@ -645,6 +652,19 @@ impl ManagementModule {
                 json!({"ok":false,"code":"invalid_mode"}),
             );
         };
+        // The set the host is returning to could not read the settings this
+        // choice would save, and would then admit nobody to the console.
+        if !mode.is_off()
+            && self
+                .package_update
+                .restoring_set_from_before_automatic_updates()
+        {
+            return complete(
+                &self.runtime,
+                request,
+                json!({"ok":false,"code":"restore_in_progress"}),
+            );
+        }
         self.product_settings.select_automatic_package_updates(
             request,
             remaining_ms,
@@ -1090,6 +1110,12 @@ mod tests {
         submitted: u64,
         requests: std::collections::VecDeque<(&'static str, serde_json::Value)>,
         replies: Vec<serde_json::Value>,
+        /// The host shell takes restore requests.
+        takes_restores: bool,
+        /// Every set the module asked the host to return to.
+        restores: Vec<String>,
+        /// The host holds a restore it has not started.
+        restore_held: bool,
     }
 
     #[cfg(target_os = "linux")]
@@ -1213,8 +1239,22 @@ mod tests {
                     payload: state.results[&request].clone(),
                 },
                 // A started update service asks whether the host takes restores.
+                Command::HostPackageRestoreStatus {} if state.takes_restores => Response::Ok,
                 Command::HostPackageRestoreStatus {} => {
                     Response::error("restore_unavailable", "not provided")
+                }
+                Command::HostPackageRestore { request } if state.takes_restores => {
+                    state.restores.push(request.manifest_digest);
+                    state.restore_held = true;
+                    Response::Ok
+                }
+                Command::HostPackageActivationStatus {} => Response::HostPackageActivationState {
+                    pending: state.restore_held,
+                    started: false,
+                },
+                Command::HostPackageActivationCancel {} => {
+                    state.restore_held = false;
+                    Response::Ok
                 }
                 command => panic!("unexpected command: {command:?}"),
             };
@@ -1288,6 +1328,98 @@ mod tests {
             document.unwrap(),
             json!({"version":2,"revision":2,"values":{"origin_web_ui_allowed":null,"csrf_allowed_origins":null}})
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_set_from_before_automatic_updates_is_never_left_with_settings_it_cannot_read() {
+        let versions = json!({"action":"package_update_versions"});
+        let cancel = json!({"action":"package_update_cancel"});
+        let restore = |digest: &str| json!({"action":"package_update_restore","digest":digest});
+        let choose = |mode: &str| json!({"action":"package_update_automatic","mode":mode});
+        let refused = |code: &str| json!({"ok":false,"code":code});
+        let runtime = SettingsRuntime::default();
+        runtime.state.lock().unwrap().takes_restores = true;
+        let mut module = runtime.start();
+        let (package_update, sets) = package_update::PackageUpdate::on_retaining_host();
+        module.package_update = package_update;
+        let asked = || runtime.state.lock().unwrap().restores.clone();
+
+        // The module reads the retained sets on a worker thread.
+        let deadline = Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let listing = runtime.answers(&mut module, std::slice::from_ref(&versions));
+            if listing[0]["supported"] == true && listing[0].get("loading").is_none() {
+                assert_eq!(listing[0]["total"], 3);
+                break;
+            }
+            assert!(Instant::now() < deadline, "{listing:?}");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        // With automatic updates saved, the settings document is one the
+        // earlier set's module cannot read. The host is not asked.
+        let chosen = runtime.answers(&mut module, &[choose("install")]);
+        assert_eq!(chosen[0]["automatic"]["mode"], "install");
+        assert_eq!(
+            runtime.answers(&mut module, &[restore(&sets.before)]),
+            [refused("automatic_updates_on")]
+        );
+        assert!(asked().is_empty());
+        // A set that ran here with them is returned to whatever the mode.
+        let waiting = runtime.answers(&mut module, &[restore(&sets.since)]);
+        assert_eq!(waiting[0]["phase"], "waiting_stream", "{waiting:?}");
+        assert_eq!(waiting[0]["restoring"]["digest"], sets.since.as_str());
+        assert_eq!(asked(), [sets.since.as_str()]);
+        assert_eq!(
+            runtime.answers(&mut module, std::slice::from_ref(&cancel))[0]["phase"],
+            "idle"
+        );
+
+        // `download` is as much a newer document as `install`.
+        assert_eq!(
+            runtime.answers(&mut module, &[choose("download")])[0]["automatic"]["mode"],
+            "download"
+        );
+        assert_eq!(
+            runtime.answers(&mut module, &[restore(&sets.before)]),
+            [refused("automatic_updates_on")]
+        );
+
+        // Off and saved, the document is the earlier format again and the
+        // earlier set may be returned to.
+        let off = runtime.answers(&mut module, &[choose("off")]);
+        assert_eq!(off[0]["automatic"]["mode"], "off");
+        assert_eq!(runtime.saved().1.unwrap()["version"], 2);
+        let waiting = runtime.answers(&mut module, &[restore(&sets.before)]);
+        assert_eq!(waiting[0]["phase"], "waiting_stream", "{waiting:?}");
+        assert_eq!(asked(), [sets.since.as_str(), sets.before.as_str()]);
+
+        // While the host holds that restore, automatic updates stay off:
+        // saving a mode now would be found by the earlier set's module.
+        let writes = runtime.saved().0;
+        assert_eq!(
+            runtime.answers(&mut module, &[choose("download"), choose("install")]),
+            [
+                refused("restore_in_progress"),
+                refused("restore_in_progress")
+            ]
+        );
+        assert_eq!(runtime.saved().0, writes);
+        assert_eq!(runtime.saved().1.unwrap()["version"], 2);
+        // Saving `off` again is no risk and is answered as ever.
+        let still = runtime.answers(&mut module, &[choose("off")]);
+        assert_eq!(still[0]["automatic"]["mode"], "off");
+        assert_eq!(still[0]["restoring"]["digest"], sets.before.as_str());
+
+        // Once the restore is withdrawn the choice is free again.
+        assert_eq!(
+            runtime.answers(&mut module, std::slice::from_ref(&cancel))[0]["phase"],
+            "idle"
+        );
+        let chosen = runtime.answers(&mut module, &[choose("install")]);
+        assert_eq!(chosen[0]["automatic"]["mode"], "install");
+        assert_eq!(runtime.saved().1.unwrap()["version"], 3);
     }
 
     #[test]

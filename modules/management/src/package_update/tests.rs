@@ -586,6 +586,34 @@ fn tick_to_rest(service: &mut TestService, host: &mut ScriptedHost, now: Instant
     }
 }
 
+/// For the module's own tests: the digests of two sets a host retains and
+/// can return to. Dropping this removes the host's files.
+pub(crate) struct RetainedSets {
+    /// A set that has not run here with version switching or automatic
+    /// updates.
+    pub(crate) before: String,
+    /// A set that recorded itself as having run here with them.
+    pub(crate) since: String,
+    _host: versions::Retaining,
+}
+
+/// What a module instance reads on a host that retains those two sets.
+pub(crate) fn retained_sets() -> (Environment, RetainedSets) {
+    let retaining = versions::Retaining::new();
+    super::switching_record::record(
+        &retaining.host.repository_directory(),
+        &retaining.previous.digest,
+    );
+    (
+        retaining.host.environment(),
+        RetainedSets {
+            before: retaining.oldest.digest.clone(),
+            since: retaining.previous.digest.clone(),
+            _host: retaining,
+        },
+    )
+}
+
 /// Starts `action` and waits for its worker.
 fn run(service: &mut TestService, host: &mut ScriptedHost, action: Action) -> Value {
     let started = ask(service, host, action);

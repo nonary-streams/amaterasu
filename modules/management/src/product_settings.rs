@@ -218,6 +218,23 @@ impl ProductSettings {
             .map(|document| document.values.automatic_package_updates)
     }
 
+    /// Whether the document carries a choice of automatic package updates
+    /// other than off, or a write that has not settled may leave it carrying
+    /// one. A document like that is at a version a management module from
+    /// before automatic updates cannot read. None until the document is
+    /// loaded.
+    pub(crate) fn carries_automatic_package_updates(&self) -> Option<bool> {
+        let document = self.document.as_ref()?;
+        let being_written = matches!(
+            &self.pending,
+            Some(Pending {
+                purpose: Purpose::Update { desired, .. },
+                ..
+            }) if !desired.values.automatic_package_updates.is_off()
+        );
+        Some(!document.values.automatic_package_updates.is_off() || being_written)
+    }
+
     /// The request whose choice of automatic package updates is durable and
     /// still owed the package-update status as its reply.
     pub(crate) fn saved_automatic_updates(&self) -> Option<u64> {

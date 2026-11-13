@@ -796,6 +796,81 @@ fn the_choice_of_automatic_package_updates_is_saved_and_restored_on_restart() {
 }
 
 #[test]
+fn a_document_that_may_carry_the_choice_says_so_until_off_is_confirmed() {
+    // Not loaded: nothing is known about what an earlier module would read.
+    let mut settings = ProductSettings::default();
+    assert_eq!(settings.carries_automatic_package_updates(), None);
+    let mut transport = Transport::default();
+    load(&mut settings, &mut transport, stored(1, Some(PeerTier::Pc)));
+    assert_eq!(settings.carries_automatic_package_updates(), Some(false));
+
+    // From the moment a choice other than off is submitted, the document may
+    // already be the newer one, though the choice is not yet in force.
+    transport.push([Response::Accepted { id: 20 }]);
+    select_automatic(&mut settings, &mut transport, AutomaticMode::Download);
+    assert_eq!(
+        settings.automatic_package_updates(),
+        Some(AutomaticMode::Off)
+    );
+    assert_eq!(settings.carries_automatic_package_updates(), Some(true));
+    transport.push([
+        Response::Ok,
+        stored_with_automatic(2, Some("download")),
+        Response::Ok,
+    ]);
+    settings
+        .tick(Instant::now(), &mut |command| transport.send(command))
+        .unwrap();
+    assert_eq!(settings.carries_automatic_package_updates(), Some(true));
+    settings.automatic_updates_answered();
+
+    // Turning it off counts only once that write is confirmed.
+    transport.push([Response::Accepted { id: 21 }]);
+    select_automatic(&mut settings, &mut transport, AutomaticMode::Off);
+    assert_eq!(settings.carries_automatic_package_updates(), Some(true));
+    transport.push([Response::Ok, stored_with_automatic(3, None), Response::Ok]);
+    settings
+        .tick(Instant::now(), &mut |command| transport.send(command))
+        .unwrap();
+    assert_eq!(settings.carries_automatic_package_updates(), Some(false));
+
+    // A write of the access policy alone leaves an off document as it was.
+    let mut settings = ProductSettings::default();
+    let mut transport = Transport::default();
+    load(&mut settings, &mut transport, stored(1, Some(PeerTier::Pc)));
+    transport.push([Response::Accepted { id: 22 }]);
+    settings
+        .receive(
+            "amaterasu.management",
+            9,
+            2000,
+            json!({"action":"product_update","expected_revision":1,"origin_web_ui_allowed":"lan"}),
+            &mut |command| transport.send(command),
+        )
+        .unwrap();
+    assert!(settings.pending.is_some());
+    assert_eq!(settings.carries_automatic_package_updates(), Some(false));
+
+    // A choice whose write could not be confirmed leaves nothing known.
+    let mut settings = ProductSettings::default();
+    let mut transport = Transport::default();
+    load(&mut settings, &mut transport, stored(1, Some(PeerTier::Pc)));
+    transport.push([Response::Accepted { id: 23 }]);
+    select_automatic(&mut settings, &mut transport, AutomaticMode::Install);
+    transport.push([
+        Response::Ok,
+        stored_with_automatic(2, None),
+        Response::Ok,
+        Response::Ok,
+        Response::Accepted { id: 30 },
+    ]);
+    settings
+        .tick(Instant::now(), &mut |command| transport.send(command))
+        .unwrap();
+    assert_eq!(settings.carries_automatic_package_updates(), None);
+}
+
+#[test]
 fn turning_automatic_package_updates_off_restores_the_earlier_document_format() {
     let mut settings = ProductSettings::default();
     let mut transport = Transport::default();

@@ -161,6 +161,19 @@ impl PackageUpdate {
         let _ = mode;
     }
 
+    /// True while the host holds or performs a return to a set that has not
+    /// run here with automatic updates, which must stay off until it is done.
+    pub(crate) fn restoring_set_from_before_automatic_updates(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            self.service
+                .as_ref()
+                .is_some_and(service::Service::restoring_set_from_before_automatic_updates)
+        }
+        #[cfg(not(target_os = "linux"))]
+        false
+    }
+
     /// Lets the service learn, shortly after start, whether the host takes
     /// restore requests. Called on every tick; it asks the runtime a bounded
     /// number of times and never waits.
@@ -234,6 +247,19 @@ impl PackageUpdate {
         }
     }
 
+    /// A service on a host that retains two sets it can return to: one from
+    /// before automatic updates and one that ran with them.
+    pub(crate) fn on_retaining_host() -> (Self, tests::RetainedSets) {
+        let (environment, sets) = tests::retained_sets();
+        let service = service::Service::new(Network::test_provider(), environment);
+        (
+            Self {
+                service: Some(service),
+            },
+            sets,
+        )
+    }
+
     /// An update whose activation request the host holds.
     pub(crate) fn awaiting_activation() -> Self {
         let mut service = service::Service::new(
@@ -250,17 +276,26 @@ impl PackageUpdate {
 impl PackageUpdate {
     /// Answers a request about the retained sets: the list of them, or a
     /// return to one. `other_install_active` is as for `request`.
+    /// `settings_carry_automatic` is true when the module's settings document
+    /// carries, or a write in flight may leave it carrying, a choice of
+    /// automatic updates other than off, and None while it is not loaded.
     pub(crate) fn versions(
         &mut self,
         request: VersionRequest,
         runtime: &RuntimeClient,
         other_install_active: bool,
+        settings_carry_automatic: Option<bool>,
     ) -> Value {
         #[cfg(target_os = "linux")]
         if let Some(service) = &mut self.service {
-            return service.versions(request, &mut RuntimeHost(runtime), other_install_active);
+            return service.versions(
+                request,
+                &mut RuntimeHost(runtime),
+                other_install_active,
+                settings_carry_automatic,
+            );
         }
-        let _ = (runtime, other_install_active);
+        let _ = (runtime, other_install_active, settings_carry_automatic);
         match request {
             VersionRequest::List => versions::unsupported(),
             VersionRequest::Restore { .. } => json!({"ok": false, "code": "unsupported_platform"}),

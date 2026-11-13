@@ -109,6 +109,9 @@ struct Restoring {
     /// Where the update stood when the restore was asked for, which is where
     /// it stands again if the restore is withdrawn.
     resume: (Phase, Option<&'static str>),
+    /// The set has not run here with a module that reads a settings document
+    /// carrying a choice of automatic updates.
+    predates_automatic_updates: bool,
 }
 
 enum Job {
@@ -228,11 +231,16 @@ impl<C: Connector> Service<C> {
 
     /// Answers a request about the retained sets: the list of them, or a
     /// return to one. A restore is refused or answered with the status.
+    ///
+    /// `settings_carry_automatic` is what the module's settings document
+    /// says, or may be about to say, about automatic updates: true when it
+    /// carries a choice other than off, and None when it has not been read.
     pub(crate) fn versions(
         &mut self,
         request: VersionRequest,
         host: &mut dyn ActivationHost,
         other_install_active: bool,
+        settings_carry_automatic: Option<bool>,
     ) -> Value {
         self.advance();
         if !host.restore_supported() {
@@ -249,13 +257,22 @@ impl<C: Connector> Service<C> {
             VersionRequest::Restore { digest } => {
                 let outcome = self
                     .admit(other_install_active)
-                    .and_then(|()| self.request_restore(&digest, host));
+                    .and_then(|()| self.request_restore(&digest, host, settings_carry_automatic));
                 match outcome {
                     Ok(()) => self.status(),
                     Err(code) => json!({"ok": false, "code": code}),
                 }
             }
         }
+    }
+
+    /// True while the host holds or performs a return to a set that has not
+    /// run here with automatic updates. Turning them on meanwhile would leave
+    /// that set with settings its module cannot read.
+    pub(crate) fn restoring_set_from_before_automatic_updates(&self) -> bool {
+        self.restoring
+            .as_ref()
+            .is_some_and(|restoring| restoring.predates_automatic_updates)
     }
 
     /// Learns, shortly after start, whether the host takes restore requests.
@@ -291,6 +308,7 @@ impl<C: Connector> Service<C> {
         &mut self,
         digest: &str,
         host: &mut dyn ActivationHost,
+        settings_carry_automatic: Option<bool>,
     ) -> Result<(), Refusal> {
         if self.versions.loading() {
             return Err("busy");
@@ -302,6 +320,19 @@ impl<C: Connector> Service<C> {
         ) else {
             return Err("not_restorable");
         };
+        // A management module from before automatic updates cannot read a
+        // settings document that carries the choice, and a module that
+        // cannot read its settings admits nobody to the console. Only a set
+        // that recorded itself here is known to have a module that reads it:
+        // the record is written by modules that do. Any other set is refused
+        // before the host is asked, until the choice is off and saved.
+        if !target.switches_back {
+            match settings_carry_automatic {
+                Some(false) => {}
+                Some(true) => return Err("automatic_updates_on"),
+                None => return Err("settings_unavailable"),
+            }
+        }
         let request = match host_activation::restore_request(&root, &target.digest) {
             Ok(request) => request,
             Err(RequestRefusal::ActivationInProgress) => return Err("activation_in_progress"),
@@ -324,6 +355,7 @@ impl<C: Connector> Service<C> {
                     digest: target.digest,
                     sequence: target.sequence,
                     resume,
+                    predates_automatic_updates: !target.switches_back,
                 });
                 Ok(())
             }

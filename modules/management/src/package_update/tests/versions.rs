@@ -4,6 +4,14 @@ use super::super::versions::{VersionRequest, Versions};
 use super::*;
 use amaterasu_package::NativeReleaseFloor;
 
+/// What the module's settings say in most of these tests: the document is
+/// loaded and carries no choice of automatic updates.
+pub(super) const AUTOMATIC_OFF: Option<bool> = Some(false);
+/// The document carries `download` or `install`, or is being saved with one.
+pub(super) const AUTOMATIC_ON: Option<bool> = Some(true);
+/// The module has not read its settings document.
+pub(super) const SETTINGS_UNREAD: Option<bool> = None;
+
 /// Release 11: the first release with a rebuilt input library.
 fn interim_release() -> Vec<Module> {
     vec![
@@ -78,7 +86,7 @@ impl Retaining {
 pub(super) fn listing(service: &mut TestService, shell: &mut ScriptedHost) -> Value {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
-        let reply = service.versions(VersionRequest::List, shell, false);
+        let reply = service.versions(VersionRequest::List, shell, false, AUTOMATIC_OFF);
         if reply.get("loading").is_none() {
             return reply;
         }
@@ -97,12 +105,24 @@ fn listed<'a>(listing: &'a Value, digest: &str) -> &'a Value {
 }
 
 pub(super) fn restore(service: &mut TestService, shell: &mut ScriptedHost, digest: &str) -> Value {
+    restore_with_settings(service, shell, digest, AUTOMATIC_OFF)
+}
+
+/// A restore asked for while the module's settings document says `settings`
+/// about automatic updates.
+pub(super) fn restore_with_settings(
+    service: &mut TestService,
+    shell: &mut ScriptedHost,
+    digest: &str,
+    settings: Option<bool>,
+) -> Value {
     service.versions(
         VersionRequest::Restore {
             digest: digest.into(),
         },
         shell,
         false,
+        settings,
     )
 }
 
@@ -431,6 +451,7 @@ fn a_restore_is_refused_when_it_cannot_be_asked_for() {
             },
             &mut shell,
             true,
+            AUTOMATIC_OFF,
         )),
         "busy"
     );
@@ -491,7 +512,7 @@ fn a_host_that_takes_no_restores_offers_none() {
     shell.restores = false;
     let mut service = retaining.host.service();
     assert_eq!(
-        service.versions(VersionRequest::List, &mut shell, false),
+        service.versions(VersionRequest::List, &mut shell, false, AUTOMATIC_OFF),
         serde_json::json!({"ok": true, "supported": false, "total": 0, "versions": []})
     );
     assert_eq!(

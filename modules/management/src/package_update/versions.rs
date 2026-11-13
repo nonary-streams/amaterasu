@@ -141,6 +141,8 @@ mod listing {
     pub(crate) struct Target {
         pub digest: String,
         pub sequence: u64,
+        /// The set has run on this host with a module that has these routes.
+        pub switches_back: bool,
     }
 
     struct Listing {
@@ -284,6 +286,7 @@ mod listing {
                 .map(|entry| Target {
                     digest: entry.digest.clone(),
                     sequence: entry.sequence,
+                    switches_back: entry.switches_back,
                 })
         }
 

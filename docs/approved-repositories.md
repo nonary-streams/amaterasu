@@ -186,7 +186,12 @@ In each case `activate` from the console still works. An activation that ends we
 
 The choice is saved in the management module's settings document, beside the console's access policy, and survives restarts and package updates. A refused request changes nothing. A JSON object that is not exactly one of the three modes is refused with `invalid_mode`; a body that is not a JSON object fails as it does on every route, before the module sees it. The other refusals are the settings ones in the table below.
 
-A host that has saved `download` or `install` holds a settings document that a management module from before automatic updates cannot read, and a module that cannot read its settings admits nobody to the console. Save `off` before putting an earlier set back on such a host. A host that has only ever had `off` keeps the earlier document format.
+A host that has saved `download` or `install` holds a settings document that a management module from before automatic updates cannot read, and a module that cannot read its settings admits nobody to the console. A host that has only ever had `off`, or has saved `off` again, keeps the earlier document format. The console keeps the two apart in both directions:
+
+- [`restore`](#returning-to-one) refuses with `automatic_updates_on` when the set it names has not run on this host with automatic updates, which is a set the list of retained sets shows with `switches_back` false, while the saved mode is `download` or `install` or a write of one has not settled. A set that has run here with them is returned to whatever the mode. Save `off`, wait for the status to show it, and ask again.
+- `automatic` refuses `download` and `install` with `restore_in_progress` while the host holds or performs a return to such a set. `off` is always accepted. Withdraw the restore with `cancel`, or let it finish.
+
+The host shell does not read the settings document and enforces neither rule. [`restore-package-offline`](#with-the-service-stopped) and a local import of an earlier set therefore check nothing: save `off` from the console before using them to put a set from before automatic updates back.
 
 ### Errors and refusals
 
@@ -220,9 +225,11 @@ A refused action changes nothing and returns `{"ok":false,"code":"..."}`:
 | `shutting_down` | The module is being unloaded |
 | `unsupported_platform` | This host cannot activate a set |
 | `not_restorable` | The digest a restore names is not a listed set the host would return to |
+| `automatic_updates_on` | `restore`: the set has not run here with automatic updates, and the saved mode is `download` or `install` or is being saved as one |
 | `permission_denied` | The request did not come from a console route |
 | `invalid_mode` | The body of `automatic` is not exactly one known mode |
-| `settings_unavailable` | `automatic`: the module has not loaded its settings |
+| `restore_in_progress` | `automatic` with `download` or `install`: the host holds or performs a return to a set that has not run here with automatic updates |
+| `settings_unavailable` | `automatic`, and `restore` of a set that has not run here with automatic updates: the module has not loaded its settings |
 | `settings_busy` | `automatic`: another settings change is being saved |
 | `settings_timeout` | `automatic`: too little of the request's time was left to save the choice |
 | `configuration_unavailable` | `automatic`: the configuration service did not take the write |
@@ -282,7 +289,7 @@ An installed Linux host keeps every set it ran healthy and can make one of them 
 
 This is a fact about what has run, not a reading of the set. Nothing a publisher signs says whether a set's management module serves these routes, so a set that does serve them records its own digest once the host shell has shown that it takes restore requests, which happens within the first seconds after it starts. The running set therefore lists `true` once it has recorded itself, and a retained set lists `true` only if it did so while it ran. The record is `switching-sets.json` in the host's `repositories` directory, where the module already keeps the approved repositories and the candidate cache. It names at most the 256 sets that ran most recently, and it is read and written on the worker thread that reads the manifests.
 
-`switches_back` changes nothing the host accepts. The host never reads the record, `restorable` does not depend on it, and a set that lists `false` is returned to in exactly the same way as one that lists `true`. The console uses it to warn before the switch, because the way forward from such a set is [the command line](#with-the-service-stopped). A record that is missing, cannot be read or is not a record names no set: every set then lists `false` and the listing is otherwise unaffected. A file that is not a record is replaced the next time a set records itself; something that cannot be read as a file is left as it is.
+`switches_back` changes nothing the host accepts. The host never reads the record, `restorable` does not depend on it, and a set that lists `false` is returned to in exactly the same way as one that lists `true`. The console uses it to warn before the switch, because the way forward from such a set is [the command line](#with-the-service-stopped). The management module uses it for one refusal of its own: a set that lists `false` is not returned to while [automatic updates](#automatic-updates) are on, because the record is written only by modules that read the settings automatic updates save. A record that is missing, cannot be read or is not a record names no set: every set then lists `false` and the listing is otherwise unaffected. A file that is not a record is replaced the next time a set records itself; something that cannot be read as a file is left as it is.
 
 The module reads one manifest for each retained set on a worker thread when it starts, and again when a request finds the list more than 30 seconds old. A request is answered from the last read. A request that arrives before the first read has finished gets an empty list with `"loading": true`. The list is advice: the host decides when a restore is asked for.
 
@@ -290,7 +297,9 @@ A host that cannot return to a set answers `{"ok":true,"supported":false,"total"
 
 ### Returning to one
 
-`POST /v1/package-update/restore` with `{"digest":"<64 hex characters>"}` needs `configuration.write` and an administrator's own signed-in session, as `activate` does; an API token is refused. The request names a digest and nothing else. The module answers with the [status](#updating-the-running-set-from-the-console) in phase `waiting_stream` and `restoring` set to the digest and release sequence of the set, or refuses with `busy`, `activation_in_progress`, `shutting_down`, `unsupported_platform` or `not_restorable`. A digest is `not_restorable` when the list does not show it as restorable: an unknown digest, the running set, an expired or untrusted one, or a retained set too old to be among the 24 listed.
+`POST /v1/package-update/restore` with `{"digest":"<64 hex characters>"}` needs `configuration.write` and an administrator's own signed-in session, as `activate` does; an API token is refused. The request names a digest and nothing else. The module answers with the [status](#updating-the-running-set-from-the-console) in phase `waiting_stream` and `restoring` set to the digest and release sequence of the set, or refuses with `busy`, `activation_in_progress`, `shutting_down`, `unsupported_platform`, `not_restorable`, `automatic_updates_on` or `settings_unavailable`. A digest is `not_restorable` when the list does not show it as restorable: an unknown digest, the running set, an expired or untrusted one, or a retained set too old to be among the 24 listed.
+
+A restorable set whose `switches_back` is false is refused with `automatic_updates_on` while [automatic updates](#automatic-updates) are saved as `download` or `install`: that set's management module could not read the settings and would admit nobody to the console. The module refuses before it asks the host. It refuses the same set with `settings_unavailable` when it has not read its own settings, which is also a state in which it admits nobody. A set whose `switches_back` is true is not held back by either.
 
 From there a restore follows an update's phases. `cancel` withdraws it while the host waits for streams to end, and the status returns to the phase it had before the restore was asked for. Once streams have ended the phase is `activating` and `cancel` is refused. The service restarts into the restored set, and a fresh status reads `idle` with that set running. If the set did not pass its trial, or the restarted service did not start, the previous set runs again and the status reads `failed` with `activation_failed` until the next check.
 
@@ -316,6 +325,8 @@ At every start the host accepts as its active set the release at its publisher's
 `amaterasu restore-package-offline ROOT MANIFEST_DIGEST ACTIVE_DIGEST SELECTION_REVISION` performs the same restore for a stopped managed service, under the checks `activate-package-offline` makes of the unit, the host executable and the root. `SELECTION_REVISION` is the SHA-256 of `selection.json`. Starting the service then completes the trial.
 
 This is also the way forward from a set that predates this feature, which the list shows with `switches_back` false. Its management module has no `versions` or `restore` route, so its console cannot switch sets, and an update check does not offer a release the host has already accepted. The newer sets are still retained; `restore-package-offline` returns to one.
+
+The command does not know what the management module's settings hold, so it cannot do what the console's `restore` does for a set from before [automatic updates](#automatic-updates). Before returning to such a set with it, save `off` under automatic updates from the console and see the status report it. A set put back while `download` or `install` is saved starts, cannot read its settings and admits nobody to its console; the way out is this command again, to a set that has run here with automatic updates.
 
 ### Compatibility between host and set
 
