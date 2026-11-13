@@ -14,7 +14,7 @@ fn interim_release() -> Vec<Module> {
 }
 
 /// Release 13, which a repository offers the host that runs release 12.
-fn next_release() -> Vec<Module> {
+pub(super) fn next_release() -> Vec<Module> {
     vec![
         module(SLOT, "0.3.0", b"runtime library, third build"),
         module("amaterasu.display", "0.1.0", b"display library"),
@@ -24,14 +24,14 @@ fn next_release() -> Vec<Module> {
 }
 
 /// A host that ran releases 10 and 11 and now runs 12.
-struct Retaining {
-    host: Host,
-    oldest: SignedSet,
-    previous: SignedSet,
+pub(super) struct Retaining {
+    pub(super) host: Host,
+    pub(super) oldest: SignedSet,
+    pub(super) previous: SignedSet,
 }
 
 impl Retaining {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let host = Host::running(12, &second_release());
         let oldest = host.publisher.sign_set(10, &first_release());
         let previous = host.publisher.sign_set(11, &interim_release());
@@ -75,7 +75,7 @@ impl Retaining {
 }
 
 /// The listing once the module's first read has finished.
-fn listing(service: &mut TestService, shell: &mut ScriptedHost) -> Value {
+pub(super) fn listing(service: &mut TestService, shell: &mut ScriptedHost) -> Value {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         let reply = service.versions(VersionRequest::List, shell, false);
@@ -96,7 +96,7 @@ fn listed<'a>(listing: &'a Value, digest: &str) -> &'a Value {
         .unwrap_or_else(|| panic!("{digest} is not listed in {listing}"))
 }
 
-fn restore(service: &mut TestService, shell: &mut ScriptedHost, digest: &str) -> Value {
+pub(super) fn restore(service: &mut TestService, shell: &mut ScriptedHost, digest: &str) -> Value {
     service.versions(
         VersionRequest::Restore {
             digest: digest.into(),
@@ -107,7 +107,7 @@ fn restore(service: &mut TestService, shell: &mut ScriptedHost, digest: &str) ->
 }
 
 /// A service whose listing has been read.
-fn listing_service(host: &Host, shell: &mut ScriptedHost) -> TestService {
+pub(super) fn listing_service(host: &Host, shell: &mut ScriptedHost) -> TestService {
     let mut service = host.service();
     listing(&mut service, shell);
     service

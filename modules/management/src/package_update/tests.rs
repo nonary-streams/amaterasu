@@ -31,6 +31,7 @@ use std::{
 mod automatic;
 mod end_to_end;
 mod phases;
+mod switching_and_automatic;
 mod versions;
 
 const REPOSITORY: &str = "amaterasu";
