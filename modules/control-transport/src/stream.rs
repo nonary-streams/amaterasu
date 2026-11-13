@@ -3,7 +3,10 @@ mod socket;
 use crate::diagnostics::{ControlTiming, FlowTrace};
 use crate::model::{ControlResult, Open, validate_ping_timeout_ms};
 use amaterasu_gamestream::{
-    crypto::{ControlOpener, ControlOrdering, ControlProfile, ControlSealer, Direction},
+    crypto::{
+        ControlOpener, ControlOrdering, ControlProfile, ControlSealer, Direction,
+        MAX_CONTROL_PAYLOAD_BYTES,
+    },
     enet::peer::{Config, Delivery, Event, Peer, PeerError, State},
 };
 use amaterasu_media::*;
@@ -219,7 +222,18 @@ impl Stream {
     }
 
     fn collect_messages(&mut self, now: u64) {
-        while let Some(event) = self.peer.pop_event() {
+        // Do not remove an already acknowledged reliable event unless the
+        // consumer queue has room for its largest possible plaintext. When
+        // both bounded queues fill, ENet rejects reliable packets without an
+        // acknowledgement, allowing the sender to retry after the consumer
+        // catches up. This also covers the period before media startup binds
+        // the control consumer.
+        while self.incoming.len() < MAX_MESSAGES
+            && self.incoming_bytes <= MAX_MESSAGE_BYTES - MAX_CONTROL_PAYLOAD_BYTES
+        {
+            let Some(event) = self.peer.pop_event() else {
+                break;
+            };
             match event {
                 Event::Receive {
                     channel,

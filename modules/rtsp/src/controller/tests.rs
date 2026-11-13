@@ -2799,12 +2799,14 @@ fn codec_offers_must_name_each_codec_once_and_replace_the_single_codec() {
 }
 
 #[test]
-fn accepted_announce_freezes_pcm_haptics_flag_into_authenticated_start() {
+fn accepted_announce_freezes_client_pcm_flags_into_authenticated_start() {
     let (mut record, mut announce) = announced_profile_record();
     announce.client_feature_flags |= amaterasu_gamestream::sdp::CLIENT_FEATURE_HAPTICS_PCM;
+    announce.client_feature_flags |=
+        amaterasu_gamestream::sdp::CLIENT_FEATURE_CONTROLLER_SPEAKER_PCM;
     assert!(record.accept_announce(&announce));
     let payload = record.authenticated_start_payload(23).unwrap();
-    assert_eq!(payload["configuration"]["client_feature_flags"], 7);
+    assert_eq!(payload["configuration"]["client_feature_flags"], 15);
     assert_eq!(
         payload["configuration"]["configuration"]["video_stream_format"],
         serde_json::to_value(announce.video.format).unwrap()

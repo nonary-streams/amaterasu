@@ -17,7 +17,7 @@ fn pcm_feedback(sequence: u32) -> Value {
 
 #[test]
 fn feedback_poll_requires_rtsp_flags_gates_pcm_and_retries_before_ack() {
-    for (flags, expected_delivery) in [(3, false), (7, true)] {
+    for (flags, expected_delivery) in [(3, false), (7, true), (11, false), (15, true)] {
         let mut host = Harness::new();
         enable_input(&mut host);
         host.pipeline

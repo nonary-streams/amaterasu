@@ -157,6 +157,17 @@ pub(super) fn media(value: &sdp::Announce, capabilities: &Capabilities) -> Resul
             "amaterasu rtsp announce color requested={:?} supported={:?}",
             value.video.color, capabilities.supported_colors
         );
+        eprintln!(
+            "amaterasu rtsp announce limits requested_width={} max_width={} requested_height={} max_height={} requested_fps={} max_fps={} requested_bitrate_kbps={} max_bitrate_kbps={}",
+            value.video.width,
+            capabilities.max_width,
+            value.video.height,
+            capabilities.max_height,
+            value.video.fps,
+            capabilities.max_fps,
+            value.video.bitrate_kbps,
+            capabilities.max_bitrate_kbps,
+        );
         return Err(Error::UnsupportedMedia);
     }
     Ok(())

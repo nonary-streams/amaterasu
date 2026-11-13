@@ -263,7 +263,8 @@ impl Negotiation {
                     return Err(Error::InvalidHeaders);
                 }
                 let announce = sdp::parse_announce(&request.body).map_err(|error| {
-                    eprintln!("amaterasu rtsp announce parse rejection reason={error:?}");
+                    let settings = sdp::rejection_context(&request.body);
+                    eprintln!("amaterasu rtsp announce parse rejection reason={error:?} numeric_settings={settings:?}");
                     Error::UnsupportedMedia
                 })?;
                 validation::media(&announce, &self.capabilities)?;

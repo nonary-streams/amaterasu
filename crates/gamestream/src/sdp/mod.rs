@@ -2,9 +2,11 @@
 use amaterasu_contracts::encoder::VideoStreamFormat;
 
 mod attributes;
+mod diagnostics;
 mod negotiate;
 mod syntax;
 
+pub use diagnostics::rejection_context;
 pub use negotiate::parse_announce;
 
 pub const MAX_BYTES: usize = 16 * 1024;
@@ -13,7 +15,9 @@ pub const MAX_LINE_BYTES: usize = 1024;
 pub const MAX_ATTRIBUTES: usize = 128;
 /// Moonlight client feature flag for PCM controller haptics.
 pub const CLIENT_FEATURE_HAPTICS_PCM: u32 = 0x04;
-pub const KNOWN_CLIENT_FEATURE_FLAGS: u32 = 0x07;
+/// Client can receive controller-speaker PCM. This does not enable a host source.
+pub const CLIENT_FEATURE_CONTROLLER_SPEAKER_PCM: u32 = 0x08;
+pub const KNOWN_CLIENT_FEATURE_FLAGS: u32 = 0x0f;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Error {

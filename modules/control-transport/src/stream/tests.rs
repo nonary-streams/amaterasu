@@ -54,6 +54,158 @@ fn client() -> ControlSealer {
     .unwrap()
 }
 
+fn connected_peer(stream: &mut Stream) {
+    use amaterasu_gamestream::enet::*;
+    let connect = Datagram {
+        header: Header {
+            peer_id: UNCONNECTED_PEER,
+            session_id: 0,
+            sent_time: Some(0),
+        },
+        commands: vec![Command {
+            channel_id: CONTROL_CHANNEL,
+            reliable_sequence: 1,
+            flags: FLAG_ACKNOWLEDGE,
+            body: CommandBody::Connect(Connect {
+                outgoing_peer_id: 0,
+                incoming_session_id: 255,
+                outgoing_session_id: 255,
+                mtu: 900,
+                window_size: 65536,
+                channel_count: 48,
+                incoming_bandwidth: 0,
+                outgoing_bandwidth: 0,
+                packet_throttle_interval: 5000,
+                packet_throttle_acceleration: 2,
+                packet_throttle_deceleration: 2,
+                connect_id: [1, 2, 3, 4],
+                data: 7,
+            }),
+        }],
+    };
+    stream
+        .peer
+        .receive(&encode(&connect, &Limits::default()).unwrap(), 0)
+        .unwrap();
+    stream.peer.pop_datagram().unwrap();
+    let ack = Command {
+        channel_id: CONTROL_CHANNEL,
+        reliable_sequence: 1,
+        flags: 0,
+        body: CommandBody::Acknowledge {
+            received_sequence: 1,
+            received_sent_time: 0,
+        },
+    };
+    stream.peer.receive(&peer_packet(ack), 1).unwrap();
+    assert!(matches!(
+        stream.peer.pop_event(),
+        Some(Event::Connected { .. })
+    ));
+}
+
+fn peer_packet(command: amaterasu_gamestream::enet::Command) -> Vec<u8> {
+    use amaterasu_gamestream::enet::*;
+    encode(
+        &Datagram {
+            header: Header {
+                peer_id: 0,
+                session_id: 0,
+                sent_time: Some(1),
+            },
+            commands: vec![command],
+        },
+        &Limits::default(),
+    )
+    .unwrap()
+}
+
+fn reliable_packet(sequence: u16, data: Vec<u8>) -> Vec<u8> {
+    use amaterasu_gamestream::enet::*;
+    peer_packet(Command {
+        channel_id: 0,
+        reliable_sequence: sequence,
+        flags: FLAG_ACKNOWLEDGE,
+        body: CommandBody::SendReliable { data },
+    })
+}
+
+#[test]
+fn startup_backpressure_keeps_reliable_messages_and_retries_without_disconnect() {
+    unsafe extern "C" fn accept(_: *mut c_void, _: *const ControlMessage) -> Status {
+        STATUS_OK
+    }
+    let mut stream = stream();
+    connected_peer(&mut stream);
+    let mut client = client();
+    for i in 0..MAX_MESSAGES {
+        stream.accept_control(
+            0,
+            Delivery::Reliable,
+            &client.seal(9, &(i as u32).to_le_bytes()).unwrap(),
+            2,
+        );
+    }
+    for sequence in 1..=256 {
+        let data = client.seal(9, &(sequence as u32).to_le_bytes()).unwrap();
+        stream
+            .peer
+            .receive(&reliable_packet(sequence, data), 2)
+            .unwrap();
+        assert!(stream.peer.pop_datagram().is_some());
+    }
+    stream.collect_messages(2);
+    assert_eq!(stream.incoming.len(), MAX_MESSAGES);
+    assert!(stream.failure.is_none());
+    let retry = reliable_packet(257, client.seal(9, b"retry").unwrap());
+    assert_eq!(stream.peer.receive(&retry, 3), Err(PeerError::Busy));
+    assert!(stream.peer.pop_datagram().is_none());
+    let sink = ControlMessageSink {
+        context: std::ptr::null_mut(),
+        write: Some(accept),
+    };
+    assert_eq!(unsafe { stream.receive(sink) }, STATUS_OK);
+    stream.collect_messages(3);
+    assert_eq!(stream.incoming.len(), MAX_MESSAGES);
+    stream.peer.receive(&retry, 4).unwrap();
+    assert!(stream.peer.pop_datagram().is_some());
+    for _ in 0..MAX_MESSAGES {
+        assert_eq!(unsafe { stream.receive(sink) }, STATUS_OK);
+    }
+    stream.collect_messages(4);
+    assert_eq!(stream.incoming.len(), 256);
+    assert_eq!(stream.incoming.back().unwrap().bytes, b"retry");
+    assert!(stream.failure.is_none());
+}
+
+#[test]
+fn byte_limit_backpressure_resumes_without_consuming_the_peer_event() {
+    unsafe extern "C" fn accept(_: *mut c_void, _: *const ControlMessage) -> Status {
+        STATUS_OK
+    }
+    let mut stream = stream();
+    connected_peer(&mut stream);
+    let mut client = client();
+    let large = vec![7; MAX_CONTROL_PAYLOAD_BYTES];
+    for _ in 0..16 {
+        stream.accept_control(0, Delivery::Reliable, &client.seal(9, &large).unwrap(), 2);
+    }
+    assert!(stream.incoming_bytes > MAX_MESSAGE_BYTES - MAX_CONTROL_PAYLOAD_BYTES);
+    let packet = reliable_packet(1, client.seal(9, b"after-large").unwrap());
+    stream.peer.receive(&packet, 2).unwrap();
+    stream.collect_messages(2);
+    assert_eq!(stream.incoming.len(), 16);
+    assert!(stream.failure.is_none());
+    let sink = ControlMessageSink {
+        context: std::ptr::null_mut(),
+        write: Some(accept),
+    };
+    assert_eq!(unsafe { stream.receive(sink) }, STATUS_OK);
+    stream.collect_messages(3);
+    assert_eq!(stream.incoming.back().unwrap().bytes, b"after-large");
+    assert!(stream.failure.is_none());
+}
+
 #[test]
 fn timing_preserves_rejected_messages_and_resets_only_observations() {
     unsafe extern "C" fn busy(_: *mut c_void, _: *const ControlMessage) -> Status {

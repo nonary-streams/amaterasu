@@ -1985,7 +1985,7 @@ mod tests {
         let absent: StartConfig = serde_json::from_value(start_json()).unwrap();
         assert_eq!(absent.client_feature_flags, None);
         assert!(absent.validate(true).is_ok());
-        for flags in [0, 3, 7] {
+        for flags in [0, 3, 7, 8, 15] {
             let mut value = start_json();
             value["client_feature_flags"] = json!(flags);
             let start: StartConfig = serde_json::from_value(value).unwrap();
@@ -1993,7 +1993,7 @@ mod tests {
             assert!(start.validate(true).is_ok());
         }
         let mut unknown = start_json();
-        unknown["client_feature_flags"] = json!(8);
+        unknown["client_feature_flags"] = json!(16);
         let start: StartConfig = serde_json::from_value(unknown).unwrap();
         assert_eq!(start.validate(true), Err("invalid_start_configuration"));
     }
