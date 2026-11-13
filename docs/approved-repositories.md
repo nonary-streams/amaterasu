@@ -4,13 +4,13 @@
 
 Amaterasu's native release unit is a complete component set with one runtime and up to 64 feature libraries. The host verifies it before loading, stages a content-addressed copy, and trials it in a disposable worker at restart. UI assets are an independently signed web bundle selected without replacing the native set. The Windows service launches the worker in the active user's session. There is no general elevated broker yet.
 
-The development administrator CLI supports `repository-approve`, `repository-revoke`, `repository-refresh`, `repository-list`, `repository-download`, `repository-install-ui`, `repository-stage-native`, `repository-activate-native`, and `repository-restore-ui`. Run `amaterasu-release` without arguments for exact syntax. These CLI mutations require a development bootstrap. The management console's **Plugins** page lists the modules the host loaded, the choices its repositories offer and the repositories themselves, and lets a signed-in administrator add, refresh and remove repositories on any host (see [Managing repositories from the console](#managing-repositories-from-the-console)). The management-owned `/recovery` page remains available independently of the selected UI. The fixed host shell also owns `web-recovery-status`, `web-recover`, and `native-recover ROOT [DIGEST]` commands. A specific retained, previously healthy digest can be recovered if the previous publisher was revoked; a merely staged set cannot be recovered directly to active. These recovery commands do not load selected native code; mutations are development-only until installed-service authorization and protected state exist. Native download and staging verify bytes without loading them. Only `repository-activate-native ROOT DIGEST` explicitly authorizes a future worker trial; a subsequent development `amaterasu probe ROOT` or worker startup executes that publisher's native code and promotes the set only if healthy.
+The development administrator CLI supports `repository-approve`, `repository-revoke`, `repository-refresh`, `repository-list`, `repository-download`, `repository-install-ui`, `repository-stage-native`, `repository-activate-native`, and `repository-restore-ui`. Run `amaterasu-release` without arguments for exact syntax. These CLI mutations require a development bootstrap. The management console's **Plugins** page lists the modules the host loaded, the choices its repositories offer and the repositories themselves, and lets a signed-in administrator add, refresh and remove repositories on any host (see [Managing repositories from the console](#managing-repositories-from-the-console)). The management-owned `/recovery` page remains available independently of the selected UI. The fixed host shell also owns `web-recovery-status`, `web-recover`, and `native-recover ROOT [DIGEST]` commands. A specific retained, previously healthy digest can be recovered if the previous publisher was revoked; a merely staged set cannot be recovered directly to active. These recovery commands do not load selected native code, and `web-recover` and `native-recover` change only a development root. An installed Linux host returns to a retained set through its own authenticated restore instead, from the console or with `restore-package-offline` (see [Switching to an earlier set](#switching-to-an-earlier-set)). Native download and staging verify bytes without loading them. Only `repository-activate-native ROOT DIGEST` explicitly authorizes a future worker trial; a subsequent development `amaterasu probe ROOT` or worker startup executes that publisher's native code and promotes the set only if healthy.
 
 Approval requires an ID, HTTPS location, Ed25519 public key, and its lowercase SHA-256 fingerprint confirmed through a separate trusted channel. The URL is only a byte location. Approval lets the publisher supply **any native component slot, including management or the runtime, and the UI**. This is broad publisher authority, not an add-on-only or cosmetic permission. A signature establishes provenance, not benign behavior or elevation. Native code shares the worker's user token and can use ordinary user process facilities; runtime grants are routing permissions, not a native code sandbox.
 
 `catalog.json` is compact canonical JSON matching `repository::Catalog`'s field order. `catalog.sig` contains a lowercase hex Ed25519 signature over `amaterasu.repository.catalog.v1\n` followed by those exact JSON bytes. The catalog binds repository ID, OS/architecture target, expiry, increasing sequence, and each `(slot, implementation, version, kind, manifest_sha256)` choice. The signed manifest then binds each native artifact or UI asset hash and size. A candidate is accepted only under its approved publisher key. HTTPS retrieval refuses redirects and bounds headers and bodies. Repository files are at `catalog.json`, `catalog.sig`, and `{native|web}/{implementation}/{version}/manifest.{json|sig}` plus manifest-listed payload files. These paths are a transport convention, not a trust anchor.
 
-Approval, revocation, the latest verified catalog, and its replay checkpoint are stored together under `repositories/approved.json` with an atomic replacement record. A repository ID cannot be reused after revocation; rotation currently requires explicit approval of a new ID and revocation of the old. UI selection keeps a signed release sequence/digest floor per publisher and for the project source. Development native selection also records the repository ID, pinned fingerprint and highest accepted native sequence/digest per publisher key in the atomic host selection record. A lower sequence or a different digest at an accepted sequence cannot be staged. Normal activation requires the current native floor and a still-listed, unexpired catalog choice; explicit recovery can select a retained older signed set without lowering the floor. The worker rechecks the live approval and signature under the approval lock through library loading. Revocation prevents subsequent starts, but does not stop a worker already running that code. A revoked selected UI becomes unavailable until restoration. The existing `stage_bundle` entry point relies on its caller to pass only project bootstrap keys; the repository staging entry point additionally binds each fingerprint to its key bytes.
+Approval, revocation, the latest verified catalog, and its replay checkpoint are stored together under `repositories/approved.json` with an atomic replacement record. A repository ID cannot be reused after revocation; rotation currently requires explicit approval of a new ID and revocation of the old. UI selection keeps a signed release sequence/digest floor per publisher and for the project source. Development native selection also records the repository ID, pinned fingerprint and highest accepted native sequence/digest per publisher key in the atomic host selection record. A lower sequence or a different digest at an accepted sequence cannot be staged. Normal activation requires the current native floor and a still-listed, unexpired catalog choice; explicit recovery, and a restore on an installed Linux host, can select a retained older signed set without lowering the floor. The worker rechecks the live approval and signature under the approval lock through library loading. Revocation prevents subsequent starts, but does not stop a worker already running that code. A revoked selected UI becomes unavailable until restoration. The existing `stage_bundle` entry point relies on its caller to pass only project bootstrap keys; the repository staging entry point additionally binds each fingerprint to its key bytes.
 
 ## Platform and privilege model
 
@@ -30,11 +30,11 @@ connected to an authenticated service/grant route.
 ## Remaining work and release blockers
 
 - Development native sets can be staged with publisher-bound provenance and a durable per-publisher floor, then explicitly authorized for trial at a worker lifecycle boundary. This accepts a complete set from one publisher; independent mixing of components from multiple publishers remains unavailable. Production activation of a repository set exists only on an installed Linux host, as the host's own authenticated activation of a complete set from the publisher its protected policy names. The console reaches it to [update the running set](#updating-the-running-set-from-the-console) and to install RTX HDR. Revoking an active publisher requires stopping its running worker and manually recovering a retained set from a still-trusted signer before the next service start. A UI already loaded in a browser keeps running after revocation and may retain an API session; production revocation must also close affected browser sessions and invalidate their API credentials. New asset responses check approval under the repository lock. The development root's ordinary same-user files are not an adversarial filesystem boundary against replacement between hash verification and OS library loading; production needs protected ownership/ACLs or an equivalent immutable image-loading strategy.
-- Host recovery exists as development CLI commands outside replaceable modules, but a production recovery surface needs installed-service authorization, protected state and a usable route when the user worker fails. Recovery requires a retained signed set whose manifest has not expired and whose signer remains trusted; production needs a durable trusted recovery artifact or renewal plan. The management `/recovery` page alone cannot serve that role.
+- An installed Linux host can return to a retained set it ran healthy, from the console or, with the service stopped, with `restore-package-offline` (see [Switching to an earlier set](#switching-to-an-earlier-set)). `native-recover` and `web-recover` remain development CLI commands, and no other platform has a production recovery surface. A restore requires a retained signed set whose manifest has not expired and whose signer remains trusted; production needs a durable trusted recovery artifact or renewal plan for a host whose retained sets have all expired. The management `/recovery` page alone cannot serve that role.
 - Composition of independently sourced components needs a whole-set dependency solver, interface/API negotiation, cross-platform platform requirements (including Linux libc), and health-tested activation. The present target string covers OS and architecture only.
 - Installed user-process API registration, method schemas and grant checks are implemented. Browser access to those methods, grant review UI, privileged handler installation and authenticated elevated broker IPC are not. The browser HTTP router has a fixed route table.
 - The console approves, refreshes and revokes a publisher under an administrator's session, on production hosts too. Production still needs machine-protected state/ACLs, key compromise response, revocation distribution, a refresh/freeze policy with reliable time, and closing the browser sessions of a revoked interface publisher. The development CLI is not a production trust manager.
-- The console installs one thing a repository offers: a newer complete set from the repository that supplied the running one (see [Updating the running set from the console](#updating-the-running-set-from-the-console)). It does not install an individual module, a set from another publisher, or another line of the same repository. It cannot approve grants: the host activates only the policy changes its protected allowlist names, so a set that needs any other change is refused at activation. A review of the grants a set's new components request, and compatibility diagnostics, are future work.
+- The console installs one thing a repository offers: a newer complete set from the repository that supplied the running one (see [Updating the running set from the console](#updating-the-running-set-from-the-console)). It can also return the host to a complete set it ran before (see [Switching to an earlier set](#switching-to-an-earlier-set)). It does not install an individual module, a set from another publisher, or another line of the same repository. It cannot approve grants: the host activates only the policy changes its protected allowlist names, so a set that needs any other change is refused at activation. A review of the grants a set's new components request, and compatibility diagnostics, are future work.
 
 No real publisher key was enrolled, no downloaded third-party code was run, and no installed service permissions or persistent production trust were changed.
 
@@ -97,7 +97,8 @@ An API token is refused for `activate` whatever its scopes, as it is for reposit
     "download_bytes": 18200000, "total_bytes": 131000000
   },
   "transferred_bytes": 0,
-  "error": null
+  "error": null,
+  "restoring": null
 }
 ```
 
@@ -141,9 +142,9 @@ The host activates only when all of this is in place, none of which the console 
 
 Without them `activate` reports `activation_unavailable` or, when the host refuses during the trial, `activation_failed`. The console cannot add a grant: a set whose components need a policy change the allowlist does not name is refused by the host.
 
-`cancel` stops a running check or download; the phase changes to `cancelled` once the worker has returned, and nothing partial stays in the cache. While the host is still waiting for streams, `cancel` withdraws the request and the phase returns to `ready`. Once the host has started, `cancel` is refused.
+`cancel` stops a running check or download; the phase changes to `cancelled` once the worker has returned, and nothing partial stays in the cache. While the host is still waiting for streams, `cancel` withdraws the request and the phase returns to `ready`. Once the host has started, `cancel` is refused. `restoring` is null throughout an update; it names the set of a [restore](#switching-to-an-earlier-set) the host holds or is performing.
 
-Only one install runs at a time. While an RTX HDR install is preparing or activating a set, `check`, `download` and `activate` are refused with `busy`, and while a package update is running or waiting, an RTX HDR install or activation is refused with `busy`.
+Only one install runs at a time. While an RTX HDR install is preparing or activating a set, `check`, `download`, `activate` and `restore` are refused with `busy`, and while a package update or a restore is running or waiting, an RTX HDR install or activation is refused with `busy`.
 
 ### Errors and refusals
 
@@ -162,7 +163,7 @@ Only one install runs at a time. While an RTX HDR install is preparing or activa
 | `download_failed` | A file of the set could not be fetched, or was longer than the manifest signs |
 | `verification_failed` | The assembled or cached set did not verify |
 | `activation_unavailable` | The host did not take the request, or the selection no longer names the running set |
-| `activation_failed` | The host's last activation of a set from this repository failed |
+| `activation_failed` | The host's last activation of a set from this repository, or its last return to a retained set, failed |
 | `activation_interrupted` | The request the host held is gone and was never started |
 | `shutting_down` | The module stopped the work because it is being unloaded |
 
@@ -176,6 +177,7 @@ A refused action changes nothing and returns `{"ok":false,"code":"..."}`:
 | `activation_in_progress` | The host holds or is performing an activation |
 | `shutting_down` | The module is being unloaded |
 | `unsupported_platform` | This host cannot activate a set |
+| `not_restorable` | The digest a restore names is not a listed set the host would return to |
 | `permission_denied` | The request did not come from a console route |
 
 On a platform whose host has no activation, which today is every platform but Linux, `status` answers with `supported` false, phase `idle` and `error` `unsupported_platform`, and the other actions are refused with `unsupported_platform`. A Linux host that is not the installed user service reports `supported` true and fails `activate` with `activation_unavailable`.
@@ -185,9 +187,91 @@ On a platform whose host has no activation, which today is every platform but Li
 - It updates the whole set. Interfaces between components are not always versioned when they change, so one module is never replaced on its own.
 - It follows the running set's own publisher and line. It does not install a module or a set from another repository, and it does not move a host between lines such as the session set with and without RTX HDR.
 - It does not approve anything. It enrolls no key, adds no grant and changes no policy; a set that needs a policy change beyond the host's allowlist is refused by the host at activation.
+- It does not offer again a release the host has already accepted. After a [return to an earlier set](#switching-to-an-earlier-set), the releases between that set and the newest accepted one are reached from the list of retained sets, not from a check.
 - It does not update the host executable, the installer or the web interface.
 - It does not check on its own schedule. A check runs when the console asks.
 - It reads the catalog from the repository's address every time. After a [local import](local-package-updates.md) whose catalog is ahead of the published one, a check fails with `catalog_rejected` until the repository publishes a catalog at or above it.
+
+## Switching to an earlier set
+
+An installed Linux host keeps every set it ran healthy and can make one of them the running set again. This is a change of the active set and nothing else: the accepted release does not move down. `highest_sequence` and the publisher floors in the selection stay where they were, so a later update must still be newer than every release the host has accepted, and a repository cannot use a host's older running set to offer it an old release again.
+
+### Listing the retained sets
+
+`POST /v1/package-update/versions` with an empty JSON object and `configuration.read` returns the newest retained sets:
+
+```json
+{
+  "ok": true,
+  "supported": true,
+  "total": 156,
+  "versions": [
+    { "digest": "<64 hex characters>", "sequence": "1794169006", "state": "running",
+      "installed_unix_ms": 1794529635000, "modules": 37, "differs": 0,
+      "restorable": false, "reason": null },
+    { "digest": "<64 hex characters>", "sequence": "1794169005", "state": "previous",
+      "installed_unix_ms": 1794443012000, "modules": 37, "differs": 2,
+      "restorable": true, "reason": null }
+  ]
+}
+```
+
+`versions` holds at most 24 sets, newest release first, and always includes the running one; `total` counts every healthy set whose files the host still has. `state` is `running`, `previous` for the set the selection records as the one before it, and otherwise `retained`. `installed_unix_ms` is when the host stored the set's manifest, or null. `differs` counts the modules whose library is not the running set's, including modules only one of the two sets has. `reason` says why a set that is not running cannot be returned to:
+
+| Reason | Meaning |
+|---|---|
+| `expired` | The set's signed manifest has expired |
+| `publisher_untrusted` | The set was accepted under another key than the running set's, or its repository is no longer approved and trusted |
+| `unavailable` | The selection has no record of who published the set, or the set is not at or below its publisher's accepted release |
+
+The module reads one manifest for each retained set on a worker thread when it starts, and again when a request finds the list more than 30 seconds old. A request is answered from the last read. A request that arrives before the first read has finished gets an empty list with `"loading": true`. The list is advice: the host decides when a restore is asked for.
+
+A host that cannot return to a set answers `{"ok":true,"supported":false,"total":0,"versions":[]}`. That is every platform but Linux, a Linux host that is not the installed user service, a host whose policy withholds `amaterasu.host-package-activation/1` from management, and a host executable from before this feature that runs a newer module set.
+
+### Returning to one
+
+`POST /v1/package-update/restore` with `{"digest":"<64 hex characters>"}` needs `configuration.write` and an administrator's own signed-in session, as `activate` does; an API token is refused. The request names a digest and nothing else. The module answers with the [status](#updating-the-running-set-from-the-console) in phase `waiting_stream` and `restoring` set to the digest and release sequence of the set, or refuses with `busy`, `activation_in_progress`, `shutting_down`, `unsupported_platform` or `not_restorable`. A digest is `not_restorable` when the list does not show it as restorable: an unknown digest, the running set, an expired or untrusted one, or a retained set too old to be among the 24 listed.
+
+From there a restore follows an update's phases. `cancel` withdraws it while the host waits for streams to end, and the status returns to the phase it had before the restore was asked for. Once streams have ended the phase is `activating` and `cancel` is refused. The service restarts into the restored set, and a fresh status reads `idle` with that set running. If the set did not pass its trial, or the restarted service did not start, the previous set runs again and the status reads `failed` with `activation_failed` until the next check.
+
+### What the host verifies
+
+Management asks through `amaterasu.host-package-activation/1`, the grant it already needs for an update, so a policy that lets it update lets it restore and no policy change is involved. The request carries the digest, the active digest and the revision of the selection file. The host shell then, holding its root lock and with the running modules stopped:
+
+- reads its protected `package-activation-policy.json` and requires a signed production bootstrap that grants management the activation service;
+- requires the selection to be unchanged, with no pending or trial set;
+- requires the digest to be a set the selection records as healthy, with its supplier recorded, and not the running set;
+- requires that supplier's key to be the publisher the allowlist names, and its repository approval to be live and trusted by the bootstrap, and holds that approval locked until the transaction has committed;
+- derives the bootstrap policy from the allowlist as an activation does, so a set that needs another policy is refused;
+- verifies every file of the retained set again under that publisher's key alone, refuses an expired manifest, and requires the set to be at or below its publisher's accepted release without being a different set at that release's own number;
+- loads the set once, checks its health and retires it;
+- verifies the files once more and commits the policy, the selection, the input companion's package binding and the service pin as one journaled transaction.
+
+The selection changes in two fields: `active` becomes the restored set and `previous` the set that was running. A transaction interrupted at any point is rolled back at the next start, and the journal authorizes nothing by itself: recovery rebuilds the expected transition from the allowlist and the signed sets and accepts either an update, which raises the accepted release, or a restore, which leaves every record but `active` and `previous` as it was.
+
+At every start the host accepts as its active set the release at its publisher's floor, or an older set that is healthy, recorded with its supplier, signed by that live and trusted publisher, and unexpired. The readiness probe and the release tool's preflight and policy review use the same rule.
+
+### With the service stopped
+
+`amaterasu restore-package-offline ROOT MANIFEST_DIGEST ACTIVE_DIGEST SELECTION_REVISION` performs the same restore for a stopped managed service, under the checks `activate-package-offline` makes of the unit, the host executable and the root. `SELECTION_REVISION` is the SHA-256 of `selection.json`. Starting the service then completes the trial.
+
+This is also the way forward from a set that predates this feature. Its management module has no `versions` or `restore` route, so its console cannot switch sets, and an update check does not offer a release the host has already accepted. The newer sets are still retained; `restore-package-offline` returns to one.
+
+### Compatibility between host and set
+
+The runtime is part of the set and the host shell is not, so either can be older than the other.
+
+- A host with this feature runs an older set unchanged. It asks the runtime for restore requests at most every 100 milliseconds; a runtime from before them answers `invalid_request` to the unknown command, and the host stops asking that runtime.
+- A set with this feature runs on an older host unchanged. The runtime admits a restore only after the host shell has asked for one, so on a host that never asks the request is refused at once instead of holding the stream barrier closed, and the module reports `supported: false`.
+- The request and the commands are additions to the runtime's JSON control messages. No existing message, the native ABI, the runtime configuration or the selection file changed shape, so a retained set's own modules read the selection a restore wrote.
+- A host executable from before this feature does not start a selection whose active set is below the accepted release. Return to the newest accepted set before replacing the host executable with an older one.
+
+### What this does not do
+
+- It does not remove a retained set, or free the space retained sets take.
+- It does not return to a set this host never ran, or to one whose files, signature or publisher approval no longer hold.
+- It does not restore module state. A set reads whatever its modules' newer versions have since saved; a set that cannot start with it fails its trial or its first start, and the host returns to the set it was running.
+- It does not change the host executable or the web interface.
 
 ## Including an independently built library in a local set
 

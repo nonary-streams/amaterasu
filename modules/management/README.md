@@ -145,9 +145,9 @@ Plaintext requests cannot use browser cookie routes or cookie authentication.
 | `/v1/management_settings/` | update | `configuration.write` |
 | `/v1/host-configuration/` | get | `configuration.read` |
 | `/v1/host-configuration/` | update | `configuration.write` |
-| `/v1/package-update/` | status | `configuration.read` |
+| `/v1/package-update/` | status, versions | `configuration.read` |
 | `/v1/package-update/` | check, download, cancel | `configuration.write` |
-| `/v1/package-update/` | activate | `configuration.write` and an administrator session |
+| `/v1/package-update/` | activate, restore | `configuration.write` and an administrator session |
 | `/v1/session/` | list, snapshot | `session.read` |
 | `/v1/session/` | create, activate, stop, finish_stop, cancel, fail, forget, acquire, release | `session.write` |
 | `/v1/application/` | list, status | `application.read` |
