@@ -84,6 +84,14 @@ namespace Amaterasu {
   }
 
   export function renderIntegrations(context: PageContext): void {
+    const library = button("Library integrations", () => context.navigate("catalog/integrations"));
+    library.disabled = !libraryViewAvailable(context.api, "integrations");
+    const area = el("div");
+    context.content.append(sectionHeading("Integrations", "Connect and manage integrations on this host.", library), area);
+    renderRtxHdrIntegration(context, area);
+  }
+
+  export function renderLibraryIntegrations(context: PageContext, embedded = false): void {
     const area = el("div", "integration-grid");
     const providers: { name: ProviderName; label: string; description: string; scope: string }[] = [
       { name: "steam", label: "Steam", description: "Discover games from local Steam libraries.", scope: "steam.read" },
@@ -102,15 +110,14 @@ namespace Amaterasu {
       setProviderStatus(value: unknown): void;
     };
     let currentCards: Card[] = [];
-    const rtxHdrArea = el("div");
     const refreshStatuses = button(localizedMessage("Refresh provider statuses"), () => load(true));
     if (typeof Amaterasu.setLocalizedAttribute === "function")
       Amaterasu.setLocalizedAttribute(refreshStatuses, "aria-label", "Refresh provider statuses");
-    context.content.append(sectionHeading("Integrations", "Connect and manage integrations on this host.", refreshStatuses), rtxHdrArea, area);
+    context.content.append(embedded ? el("div", "actions library-actions", refreshStatuses) :
+      sectionHeading("Library integrations", "Connect and manage your game libraries.", refreshStatuses), area);
     async function load(announceReadback = false): Promise<void> {
       const request = ++generation;
       refreshStatuses.disabled = true;
-      renderRtxHdrIntegration(context, rtxHdrArea);
       const cards = providers.map((provider): Card => {
         const status = el("div", "integration-status", el("p", "muted", localizedMessage("Loading provider status...")));
         const feedback = el("div", "integration-action-status");
@@ -121,8 +128,8 @@ namespace Amaterasu {
         settings.disabled = !context.api.allows("configuration.read");
         const actions = el("div", "actions", settings);
         let refreshButton: HTMLButtonElement | null = null;
-        if (provider.name === "steam" && context.api.allows("steam.read")) {
-          actions.append(button(localizedMessage("Manage Steam library"), () => context.navigate("steam")));
+        if (provider.name === "steam" && (context.api.allows("steam.read") || context.api.allows("steam.refresh"))) {
+          actions.append(button(localizedMessage("Manage Steam library"), () => context.navigate("catalog/integrations/steam")));
           if (context.api.allows("steam.refresh")) {
             refreshButton = button(localizedMessage("Refresh now"), () => refreshProvider("steam"));
             if (typeof Amaterasu.setLocalizedAttributeTemplate === "function")

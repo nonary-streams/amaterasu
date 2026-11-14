@@ -7,8 +7,6 @@ namespace Amaterasu {
     | "integrations"
     | "plugins"
     | "sessions"
-    | "applications"
-    | "steam"
     | "diagnostics"
     | "accounts"
     | "tokens"
@@ -17,7 +15,9 @@ namespace Amaterasu {
   /// The Modules page's views. The page keeps the `plugins` address it had
   /// under its former name.
   export type PluginsView = "overview" | "modules" | "repositories";
-  export type PageRoute = Page | `settings/${SettingsCategory}` | `plugins/${PluginsView}`;
+  export type LibraryView = "games" | "integrations" | "integrations/steam";
+  export type LibraryRoute = "catalog" | "catalog/integrations" | "catalog/integrations/steam";
+  export type PageRoute = Page | LibraryRoute | `settings/${SettingsCategory}` | `plugins/${PluginsView}`;
   export type Payload = Record<string, unknown>;
   export interface LoginReply {
     ok: boolean;
@@ -582,6 +582,7 @@ namespace Amaterasu {
     content: HTMLElement;
     notify: (message: TextValue) => void;
     navigate: (page: PageRoute) => void;
+    initialLibraryView?: LibraryView;
     initialSettingsCategory?: SettingsCategory;
     replaceSettingsCategory?: (category: SettingsCategory) => void;
     initialPluginsView?: PluginsView;

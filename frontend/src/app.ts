@@ -11,8 +11,6 @@ namespace Amaterasu {
     integrations: "Integrations",
     plugins: "Modules",
     sessions: "Sessions",
-    applications: "Applications",
-    steam: "Steam",
     diagnostics: "Diagnostics",
     accounts: "Accounts",
     tokens: "API tokens",
@@ -26,8 +24,6 @@ namespace Amaterasu {
     settings: "M4 6h16 M4 12h16 M4 18h16 M8 4v4 M16 10v4 M10 16v4",
     plugins: "M4 4h7v7H4z M4 13h7v7H4z M13 13h7v7h-7z M16.5 4.5v6 M13.5 7.5h6",
     sessions: "M4 8h14 M15 5l3 3-3 3 M20 16H6 M9 13l-3 3 3 3",
-    applications: "M4 5h16v14H4z M4 9h16 M8 7h.01",
-    steam: "M12 3a9 9 0 1 1-8.5 12 M3 12l6 3 M9 15a2 2 0 1 0 4 0 2 2 0 0 0-4 0 M13 14l3-4 M18 8a2 2 0 1 1-4 0 2 2 0 0 1 4 0",
     diagnostics: "M3 12h4l2-6 4 12 2-6h6",
     maintenance: "M14 4a5 5 0 0 0-6 6L3 15l3 3 5-5a5 5 0 0 0 6-6l-3 3-3-3z",
     tokens: "M8 14a4 4 0 1 1 3.5-6H21v4h-3v3h-3v-3h-3.5A4 4 0 0 1 8 14z M7 10h.01",
@@ -52,21 +48,21 @@ namespace Amaterasu {
 
   const navigationGroups: { label: string; pages: Page[] }[] = [
     { label: "HOST", pages: ["overview", "host", "sessions", "diagnostics"] },
-    { label: "LIBRARY", pages: ["catalog", "applications", "steam"] },
+    { label: "LIBRARY", pages: ["catalog"] },
     { label: "SYSTEM", pages: ["settings", "integrations", "plugins", "accounts", "tokens", "maintenance"] },
   ];
 
   const corePages = new Map<Page, (context: PageContext) => void>([
-    ["overview", renderOverview], ["host", renderHostManagement], ["catalog", renderCatalog],
+    ["overview", renderOverview], ["host", renderHostManagement], ["catalog", renderLibrary],
     ["settings", renderSettings], ["integrations", renderIntegrations], ["plugins", renderPlugins], ["sessions", renderSessions],
-    ["applications", renderApplications], ["steam", renderSteam], ["diagnostics", renderDiagnostics],
+    ["diagnostics", renderDiagnostics],
     ["accounts", renderAccounts], ["tokens", renderTokens], ["maintenance", renderMaintenance],
   ]);
 
   const pageScopes: Partial<Record<Page, string>> = {
     host: "configuration.read", catalog: "catalog.read", settings: "configuration.read",
-    integrations: "configuration.read", plugins: "configuration.read", sessions: "session.read", applications: "application.read",
-    steam: "steam.read", diagnostics: "diagnostics.read", accounts: "account.self",
+    integrations: "configuration.read", plugins: "configuration.read", sessions: "session.read",
+    diagnostics: "diagnostics.read", accounts: "account.self",
   };
 
   class Application {
@@ -185,7 +181,7 @@ namespace Amaterasu {
       const fragment = location.hash.slice(1);
       // The Modules page keeps the address it had as Plugins, and was reached
       // as "updates" before that; old links still work.
-      const value = fragment.startsWith("catalog?") ? "catalog" : fragment === "updates" ? "plugins" : fragment;
+      const value = libraryRouteFromAddress(fragment) ?? (fragment === "updates" ? "plugins" : fragment);
       const core = Object.hasOwn(pageNames, value) && this.pageAvailable(value as Page);
       const settingsCategory = value.startsWith("settings/") &&
         ["general", "streaming", "integrations", "devices", "access"].includes(value.slice(9)) &&
@@ -193,11 +189,14 @@ namespace Amaterasu {
       const pluginsView = value.startsWith("plugins/") &&
         pluginsViewFromAddress(value.slice(8)) !== null &&
         this.pageAvailable("plugins");
-      return core || settingsCategory || pluginsView ||
+      const libraryView = libraryViewFromAddress(value);
+      const library = libraryView !== null && libraryViewAvailable(this.api, libraryView);
+      return core || settingsCategory || pluginsView || library ||
         (value.startsWith("extension/") && this.extensionIds.has(value.slice(10))) ? value : "overview";
     }
 
     private pageAvailable(page: Page): boolean {
+      if (page === "catalog") return libraryViewAvailable(this.api, "games") || libraryViewAvailable(this.api, "integrations");
       if (page === "tokens") return this.api.role === "administrator" && this.api.allows("tokens.manage");
       if (page === "maintenance") return this.api.role === "administrator" && this.api.allows("configuration.write");
       const scope = pageScopes[page];
@@ -562,6 +561,8 @@ namespace Amaterasu {
     }
 
     private renderPage(page: string): void {
+      const focusLibraryTab = this.displayedPage !== null && libraryViewFromAddress(this.displayedPage) !== null &&
+        libraryViewFromAddress(page) !== null && document.activeElement?.getAttribute("role") === "tab";
       this.releaseDraftGuard();
       this.displayedPage = page;
       clearTimeout(this.notificationTimer);
@@ -576,7 +577,8 @@ namespace Amaterasu {
       this.content = fresh;
       for (const [name, item] of this.navigation) {
         const selected = name === page || (name === "settings" && page.startsWith("settings/")) ||
-          (name === "plugins" && page.startsWith("plugins/"));
+          (name === "plugins" && page.startsWith("plugins/")) ||
+          (name === "catalog" && page.startsWith("catalog/"));
         item.classList.toggle("selected", selected);
         if (selected) item.setAttribute("aria-current", "page");
         else item.removeAttribute("aria-current");
@@ -586,6 +588,7 @@ namespace Amaterasu {
         content: fresh,
         notify: (message) => this.notify(message),
         navigate: (page) => this.navigate(page),
+        ...(libraryViewFromAddress(page) !== null ? { initialLibraryView: libraryViewFromAddress(page)! } : {}),
         ...(page.startsWith("settings/") ? { initialSettingsCategory: page.slice(9) as SettingsCategory } : {}),
         replaceSettingsCategory: (category) => {
           if (!fresh.isConnected || !(this.displayedPage === "settings" || this.displayedPage?.startsWith("settings/"))) return;
@@ -620,13 +623,14 @@ namespace Amaterasu {
         });
         setLocalizedPageTitle("Extension");
       } else {
-        const corePage = (page.startsWith("settings/") ? "settings" : page.startsWith("plugins/") ? "plugins" : page) as Page;
+        const corePage = (page.startsWith("settings/") ? "settings" : page.startsWith("plugins/") ? "plugins" : page.startsWith("catalog/") ? "catalog" : page) as Page;
         const renderer = corePages.get(corePage);
         if (!renderer) return;
         renderer(context);
         setLocalizedPageTitle(pageNames[corePage]);
       }
-      fresh.focus({ preventScroll: true });
+      const selectedLibraryTab = focusLibraryTab ? fresh.querySelector<HTMLElement>('.library-tabs [aria-selected="true"]') : null;
+      (selectedLibraryTab ?? fresh).focus({ preventScroll: true });
       window.scrollTo(0, 0);
     }
 

@@ -59,6 +59,7 @@
     "src/extension_fields.ts",
     "src/session_extension_actions.ts",
     "src/session_extensions.ts",
+    "src/library.ts",
     "src/app.ts"
   ]
 }

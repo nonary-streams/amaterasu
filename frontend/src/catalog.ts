@@ -878,7 +878,7 @@ namespace Amaterasu {
     if (opener?.isConnected) opener.focus();
   }
 
-  export function renderCatalog(context: PageContext): void {
+  export function renderCatalog(context: PageContext, embedded = false): void {
     const { content, api, notify } = context;
     const search = input("search");
     search.type = "search";
@@ -1056,10 +1056,10 @@ namespace Amaterasu {
       if (configOverrideCapabilities) showEditor(undefined, configOverrideCapabilities);
     }, "primary");
     add.disabled = true;
-    const sources = button("Library sources", () => context.navigate("integrations"));
-    sources.disabled = !api.allows("configuration.read");
+    const sources = button("Library sources", () => context.navigate("catalog/integrations"));
+    sources.disabled = !api.allows("configuration.read") && !api.allows("steam.read") && !api.allows("steam.refresh");
     content.append(
-      sectionHeading(
+      embedded ? el("div", "actions library-actions", sources, add) : sectionHeading(
         "Your library",
         "A durable catalog of the applications on your host.",
         sources, add,

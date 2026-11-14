@@ -393,124 +393,6 @@ namespace Amaterasu {
     Amaterasu.renderManagedStreamControls(context, controls);
   }
 
-  export function renderApplications(context: PageContext): void {
-    const area = el("div");
-    const status = el("div");
-    const launchesArea = el("div");
-    let offset = 0;
-    const history = [0];
-    context.content.append(
-      sectionHeading(
-        "Applications",
-        "Processes launched through this management console.",
-        button("Refresh", () => { void load(); void loadLaunches(); }),
-      ),
-      status,
-      panel("Managed launches", launchesArea),
-      area,
-    );
-    async function loadLaunches(): Promise<void> {
-      try {
-        const reply = await context.api.post<{ launches: { launch_id: number; app_id: string; state: string }[] }>("launch/list", { limit: 16 });
-        if (!context.content.isConnected) return;
-        if (!Array.isArray(reply.launches)) throw new Error("Invalid launch list.");
-        const rows = reply.launches.map((launch) => {
-          if (!Number.isSafeInteger(launch.launch_id) || launch.launch_id < 1 || typeof launch.app_id !== "string" || typeof launch.state !== "string") throw new Error("Invalid launch list.");
-          const stop = button("Stop", () => void runAction(stop, status, async () => {
-            if (!(await confirmAction("Stop this launch?", "The managed application and its preparation will be stopped.", "Stop"))) return;
-            await context.api.post("launch/stop", { launch_id: launch.launch_id });
-            context.notify("Stop requested. Refresh to check its status.");
-            await loadLaunches();
-          }));
-          stop.disabled = ["stopped", "failed"].includes(launch.state) || typeof context.api.allowsLaunchAction !== "function" || !context.api.allowsLaunchAction("stop");
-          return [pagesTextLiteral(launch.app_id), pagesTextLiteral(launch.state), stop];
-        });
-        launchesArea.replaceChildren(rows.length ? table(["Application", "State", "Action"], rows) : empty("No managed launches", "Applications started from the library appear here."));
-      } catch (error) { if (context.content.isConnected) launchesArea.replaceChildren(errorPanel(error, loadLaunches)); }
-    }
-    async function load(): Promise<void> {
-      try {
-        const reply = await context.api.post<ProcessReply>("application/list", {
-          offset,
-          limit: 16,
-        });
-        if (!context.content.isConnected) return;
-        const rows = reply.processes.map((process) => {
-          const terminate = button(
-            "Terminate",
-            async () => {
-              if (
-                !(await confirmAction(
-                  "Terminate this application?",
-                  pagesTextLiteral(`Stop process ${process.pid ?? process.process_id} and its owned process tree. Unsaved work may be lost.`),
-                  "Terminate",
-                ))
-              )
-                return;
-              await runAction(terminate, status, async () => {
-                await context.api.post("application/terminate", {
-                  process_id: process.process_id,
-                });
-                context.notify(pagesTextMessage("Termination requested. Refresh to check its status."));
-                await load();
-              });
-            },
-            "quiet danger-text",
-          );
-          terminate.disabled =
-            process.state !== "running" ||
-            !context.api.allows("application.terminate");
-          return [
-            el("strong", "", pagesTextLiteral(process.operation_id)),
-            String(process.pid ?? "—"),
-            badge(pagesTextLiteral(process.state), process.state === "running" ? "good" : ""),
-            process.exit_code != null ? String(process.exit_code) : "—",
-            terminate,
-          ];
-        });
-        area.replaceChildren(
-          reply.processes.length
-            ? table(
-                [
-                  "Application operation",
-                  "PID",
-                  "State",
-                  "Exit code",
-                  "Action",
-                ],
-                rows,
-              )
-            : empty(
-                "No tracked processes",
-                "Applications launched through the management API appear here. Catalog entries are metadata and do not launch automatically.",
-              ),
-          pager(
-            history.length > 1
-              ? () => {
-                  history.pop();
-                  offset = history[history.length - 1] ?? 0;
-                  void load();
-                }
-              : null,
-            reply.next_offset != null
-              ? () => {
-                  offset = reply.next_offset!;
-                  history.push(offset);
-                  void load();
-                }
-              : null,
-            pagesTextLiteral(`Showing from ${offset + 1}`),
-          ),
-        );
-      } catch (error) {
-        if (context.content.isConnected)
-          area.replaceChildren(errorPanel(error, load));
-      }
-    }
-    void load();
-    void loadLaunches();
-  }
-
   interface SteamCatalogSyncStatus {
     enabled: boolean;
     syncing: boolean;
@@ -548,7 +430,7 @@ namespace Amaterasu {
       : "failure";
   }
 
-  export function renderSteam(context: PageContext): void {
+  export function renderSteam(context: PageContext, embedded = false): void {
     const area = el("div");
     const status = el("div");
     let revision: number | undefined;
@@ -761,16 +643,14 @@ namespace Amaterasu {
     updateForceSyncControl();
     scan.disabled = !context.api.allows("steam.refresh");
     context.content.append(
-      sectionHeading(
-        "Steam library",
-        "Discover local Steam games and optionally sync a complete scan into the catalog.",
-        button("Refresh", () => {
+      el("header", "page-heading",
+        el("div", "",
+          el(embedded ? "h2" : "h1", "", "Steam library"),
+          el("p", "muted", "Discover local Steam games and optionally sync a complete scan into the catalog.")),
+        el("div", "actions", button("Refresh", () => {
           resetPagination();
           return load();
-        }),
-        scan,
-        forceSyncControl,
-      ),
+        }), scan, forceSyncControl)),
       status,
       area,
     );

@@ -2139,17 +2139,17 @@ input, textarea, select {
   text-transform: uppercase;
   color: var(--muted);
 }
-.plugin-tabs { display: flex; gap: 4px; margin: 0 0 24px; border-bottom: 1px solid var(--line); overflow-x: auto; }
-.button.plugin-tab {
+.plugin-tabs, .library-tabs { display: flex; gap: 4px; margin: 0 0 24px; border-bottom: 1px solid var(--line); overflow-x: auto; }
+.button.plugin-tab, .button.library-tab {
   display: inline-flex; align-items: baseline; gap: 8px;
   min-height: 44px; margin-bottom: -1px; padding: 10px 14px;
   border: 0; border-bottom: 2px solid transparent; border-radius: 0;
   background: transparent; color: var(--secondary);
   font-size: 15px; font-weight: 500; white-space: nowrap;
 }
-.button.plugin-tab:hover:not(:disabled) { background: transparent; color: var(--fg); }
-.button.plugin-tab[aria-selected="true"] { color: var(--fg); border-bottom-color: var(--accent); }
-.button.plugin-tab:focus-visible { outline-offset: -2px; }
+.button.plugin-tab:hover:not(:disabled), .button.library-tab:hover:not(:disabled) { background: transparent; color: var(--fg); }
+.button.plugin-tab[aria-selected="true"], .button.library-tab[aria-selected="true"] { color: var(--fg); border-bottom-color: var(--accent); }
+.button.plugin-tab:focus-visible, .button.library-tab:focus-visible { outline-offset: -2px; }
 .plugin-tab-count { font-size: 12px; font-weight: 400; color: var(--muted); font-variant-numeric: tabular-nums; }
 .plugin-tab-count:empty { display: none; }
 .plugin-loading { padding: 24px 0; font-size: 14px; }
@@ -2525,3 +2525,5 @@ dialog.plugin-form-dialog { max-width: 560px; max-height: calc(100vh - 32px); ov
   .perf-figure + .perf-figure { border-left: 0; border-top: 1px solid var(--line); }
   .perf-share { min-width: 110px; }
 }
+
+.library-actions { justify-content: flex-end; margin-bottom: 20px; }

@@ -45,7 +45,7 @@ test("integration cards isolate unavailable providers and respect read scopes", 
   const content = new Element("main");
   const calls = [];
   const navigation = [];
-  dom.Amaterasu.renderIntegrations({ content, navigate: (page) => navigation.push(page), api: {
+  dom.Amaterasu.renderLibraryIntegrations({ content, navigate: (page) => navigation.push(page), api: {
     allows: (scope) => ["configuration.read", "steam.read", "steam.refresh"].includes(scope),
     async post(route) {
       calls.push(route);
@@ -104,7 +104,7 @@ test("dashboard refresh uses shared provider operations and reports provider rea
     database_available: true, executable_available: true, available: true, game_count: 2, refresh_pending: false, last_error: null };
   const playnite = { ok: true, settings_ready: true, enabled: true, playnite_running: true,
     snapshot_pending: false, snapshot_game_count: 4, last_error: null };
-  dom.Amaterasu.renderIntegrations({ content, navigate() {}, api: {
+  dom.Amaterasu.renderLibraryIntegrations({ content, navigate() {}, api: {
     allows: () => true,
     async post(route) {
       calls.push(route);
@@ -193,7 +193,7 @@ test("integration action announcements and descriptions follow locale while prov
   const lutris = { ok: true, settings_ready: true, enabled: true, platform_supported: true,
     database_available: true, executable_available: true, available: true, game_count: 3,
     refresh_pending: false, last_error: "provider-supplied token ERROR_42" };
-  dom.Amaterasu.renderIntegrations({ content, navigate() {}, api: {
+  dom.Amaterasu.renderLibraryIntegrations({ content, navigate() {}, api: {
     allows: () => true,
     async post(route) {
       calls.push(route);
@@ -240,7 +240,7 @@ test("integration action announcements and descriptions follow locale while prov
   dom.Amaterasu.applyLocale("de");
   const replacementContent = new Element("main");
   documentElement.append(replacementContent);
-  dom.Amaterasu.renderIntegrations({ content: replacementContent, navigate() {}, api: {
+  dom.Amaterasu.renderLibraryIntegrations({ content: replacementContent, navigate() {}, api: {
     allows: () => true,
     async post(route) {
       if (route === "steam/status") return { ok: true, settings_ready: true, enabled: true, game_count: 1, warning_count: 0, scanning: false, complete: true };
@@ -277,7 +277,7 @@ test("a pending dashboard refresh cannot be duplicated or update a navigated-awa
   const lutris = { ok: true, settings_ready: true, enabled: true, platform_supported: true,
     database_available: true, executable_available: true, available: true, game_count: 3, refresh_pending: false, last_error: null };
   let resolveRefresh;
-  dom.Amaterasu.renderIntegrations({ content, navigate() {}, api: {
+  dom.Amaterasu.renderLibraryIntegrations({ content, navigate() {}, api: {
     allows: () => true,
     post(route) {
       calls.push(route);
@@ -338,7 +338,7 @@ test("Playnite retains accepted state when status readback fails and distinguish
   let playniteStatusReads = 0;
   const playnite = { ok: true, settings_ready: true, enabled: true, playnite_running: true,
     snapshot_pending: false, snapshot_game_count: 5, last_error: null };
-  dom.Amaterasu.renderIntegrations({ content, navigate() {}, api: {
+  dom.Amaterasu.renderLibraryIntegrations({ content, navigate() {}, api: {
     allows: () => true,
     async post(route) {
       calls.push(route);

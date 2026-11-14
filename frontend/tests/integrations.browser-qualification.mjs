@@ -105,7 +105,7 @@ test("real Chromium dashboard qualification (provider APIs are mocked)", {
     (async () => {
       const checks = [];
       try {
-        Amaterasu.renderIntegrations({ content: main, navigate: () => {}, api });
+        Amaterasu.renderLibraryIntegrations({ content: main, navigate: () => {}, api });
         await waitFor(() => actionButton("Lutris") && !actionButton("Lutris").disabled, "initial provider status");
 
         const steamButton = actionButton("Steam");

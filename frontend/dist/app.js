@@ -7737,7 +7737,7 @@ var Amaterasu;
             opener.focus();
     }
     Amaterasu.restoreCatalogEditorFocus = restoreCatalogEditorFocus;
-    function renderCatalog(context) {
+    function renderCatalog(context, embedded = false) {
         const { content, api, notify } = context;
         const search = Amaterasu.input("search");
         search.type = "search";
@@ -7935,9 +7935,9 @@ var Amaterasu;
                 showEditor(undefined, configOverrideCapabilities);
         }, "primary");
         add.disabled = true;
-        const sources = Amaterasu.button("Library sources", () => context.navigate("integrations"));
-        sources.disabled = !api.allows("configuration.read");
-        content.append(Amaterasu.sectionHeading("Your library", "A durable catalog of the applications on your host.", sources, add), Amaterasu.el("div", "library-toolbar", searchForm, sort, viewControls), selectionBar, status, editor, results);
+        const sources = Amaterasu.button("Library sources", () => context.navigate("catalog/integrations"));
+        sources.disabled = !api.allows("configuration.read") && !api.allows("steam.read") && !api.allows("steam.refresh");
+        content.append(embedded ? Amaterasu.el("div", "actions library-actions", sources, add) : Amaterasu.sectionHeading("Your library", "A durable catalog of the applications on your host.", sources, add), Amaterasu.el("div", "library-toolbar", searchForm, sort, viewControls), selectionBar, status, editor, results);
         async function load() {
             const current = ++generation;
             results.setAttribute("aria-busy", "true");
@@ -14333,6 +14333,14 @@ var Amaterasu;
     }
     Amaterasu.summarizeProvider = summarizeProvider;
     function renderIntegrations(context) {
+        const library = Amaterasu.button("Library integrations", () => context.navigate("catalog/integrations"));
+        library.disabled = !Amaterasu.libraryViewAvailable(context.api, "integrations");
+        const area = Amaterasu.el("div");
+        context.content.append(Amaterasu.sectionHeading("Integrations", "Connect and manage integrations on this host.", library), area);
+        Amaterasu.renderRtxHdrIntegration(context, area);
+    }
+    Amaterasu.renderIntegrations = renderIntegrations;
+    function renderLibraryIntegrations(context, embedded = false) {
         const area = Amaterasu.el("div", "integration-grid");
         const providers = [
             { name: "steam", label: "Steam", description: "Discover games from local Steam libraries.", scope: "steam.read" },
@@ -14342,15 +14350,14 @@ var Amaterasu;
         let generation = 0;
         const activeRefreshes = new Set();
         let currentCards = [];
-        const rtxHdrArea = Amaterasu.el("div");
         const refreshStatuses = Amaterasu.button(Amaterasu.localizedMessage("Refresh provider statuses"), () => load(true));
         if (typeof Amaterasu.setLocalizedAttribute === "function")
             Amaterasu.setLocalizedAttribute(refreshStatuses, "aria-label", "Refresh provider statuses");
-        context.content.append(Amaterasu.sectionHeading("Integrations", "Connect and manage integrations on this host.", refreshStatuses), rtxHdrArea, area);
+        context.content.append(embedded ? Amaterasu.el("div", "actions library-actions", refreshStatuses) :
+            Amaterasu.sectionHeading("Library integrations", "Connect and manage your game libraries.", refreshStatuses), area);
         async function load(announceReadback = false) {
             const request = ++generation;
             refreshStatuses.disabled = true;
-            Amaterasu.renderRtxHdrIntegration(context, rtxHdrArea);
             const cards = providers.map((provider) => {
                 const status = Amaterasu.el("div", "integration-status", Amaterasu.el("p", "muted", Amaterasu.localizedMessage("Loading provider status...")));
                 const feedback = Amaterasu.el("div", "integration-action-status");
@@ -14361,8 +14368,8 @@ var Amaterasu;
                 settings.disabled = !context.api.allows("configuration.read");
                 const actions = Amaterasu.el("div", "actions", settings);
                 let refreshButton = null;
-                if (provider.name === "steam" && context.api.allows("steam.read")) {
-                    actions.append(Amaterasu.button(Amaterasu.localizedMessage("Manage Steam library"), () => context.navigate("steam")));
+                if (provider.name === "steam" && (context.api.allows("steam.read") || context.api.allows("steam.refresh"))) {
+                    actions.append(Amaterasu.button(Amaterasu.localizedMessage("Manage Steam library"), () => context.navigate("catalog/integrations/steam")));
                     if (context.api.allows("steam.refresh")) {
                         refreshButton = Amaterasu.button(Amaterasu.localizedMessage("Refresh now"), () => refreshProvider("steam"));
                         if (typeof Amaterasu.setLocalizedAttributeTemplate === "function")
@@ -14527,7 +14534,7 @@ var Amaterasu;
         }
         void load();
     }
-    Amaterasu.renderIntegrations = renderIntegrations;
+    Amaterasu.renderLibraryIntegrations = renderLibraryIntegrations;
 })(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
 (function (Amaterasu) {
@@ -19237,102 +19244,6 @@ var Amaterasu;
         Amaterasu.renderManagedStreamControls(context, controls);
     }
     Amaterasu.renderSessions = renderSessions;
-    function renderApplications(context) {
-        const area = Amaterasu.el("div");
-        const status = Amaterasu.el("div");
-        const launchesArea = Amaterasu.el("div");
-        let offset = 0;
-        const history = [0];
-        context.content.append(Amaterasu.sectionHeading("Applications", "Processes launched through this management console.", Amaterasu.button("Refresh", () => { void load(); void loadLaunches(); })), status, Amaterasu.panel("Managed launches", launchesArea), area);
-        async function loadLaunches() {
-            try {
-                const reply = await context.api.post("launch/list", { limit: 16 });
-                if (!context.content.isConnected)
-                    return;
-                if (!Array.isArray(reply.launches))
-                    throw new Error("Invalid launch list.");
-                const rows = reply.launches.map((launch) => {
-                    if (!Number.isSafeInteger(launch.launch_id) || launch.launch_id < 1 || typeof launch.app_id !== "string" || typeof launch.state !== "string")
-                        throw new Error("Invalid launch list.");
-                    const stop = Amaterasu.button("Stop", () => void Amaterasu.runAction(stop, status, async () => {
-                        if (!(await Amaterasu.confirmAction("Stop this launch?", "The managed application and its preparation will be stopped.", "Stop")))
-                            return;
-                        await context.api.post("launch/stop", { launch_id: launch.launch_id });
-                        context.notify("Stop requested. Refresh to check its status.");
-                        await loadLaunches();
-                    }));
-                    stop.disabled = ["stopped", "failed"].includes(launch.state) || typeof context.api.allowsLaunchAction !== "function" || !context.api.allowsLaunchAction("stop");
-                    return [pagesTextLiteral(launch.app_id), pagesTextLiteral(launch.state), stop];
-                });
-                launchesArea.replaceChildren(rows.length ? Amaterasu.table(["Application", "State", "Action"], rows) : Amaterasu.empty("No managed launches", "Applications started from the library appear here."));
-            }
-            catch (error) {
-                if (context.content.isConnected)
-                    launchesArea.replaceChildren(Amaterasu.errorPanel(error, loadLaunches));
-            }
-        }
-        async function load() {
-            try {
-                const reply = await context.api.post("application/list", {
-                    offset,
-                    limit: 16,
-                });
-                if (!context.content.isConnected)
-                    return;
-                const rows = reply.processes.map((process) => {
-                    const terminate = Amaterasu.button("Terminate", async () => {
-                        if (!(await Amaterasu.confirmAction("Terminate this application?", pagesTextLiteral(`Stop process ${process.pid ?? process.process_id} and its owned process tree. Unsaved work may be lost.`), "Terminate")))
-                            return;
-                        await Amaterasu.runAction(terminate, status, async () => {
-                            await context.api.post("application/terminate", {
-                                process_id: process.process_id,
-                            });
-                            context.notify(pagesTextMessage("Termination requested. Refresh to check its status."));
-                            await load();
-                        });
-                    }, "quiet danger-text");
-                    terminate.disabled =
-                        process.state !== "running" ||
-                            !context.api.allows("application.terminate");
-                    return [
-                        Amaterasu.el("strong", "", pagesTextLiteral(process.operation_id)),
-                        String(process.pid ?? "—"),
-                        Amaterasu.badge(pagesTextLiteral(process.state), process.state === "running" ? "good" : ""),
-                        process.exit_code != null ? String(process.exit_code) : "—",
-                        terminate,
-                    ];
-                });
-                area.replaceChildren(reply.processes.length
-                    ? Amaterasu.table([
-                        "Application operation",
-                        "PID",
-                        "State",
-                        "Exit code",
-                        "Action",
-                    ], rows)
-                    : Amaterasu.empty("No tracked processes", "Applications launched through the management API appear here. Catalog entries are metadata and do not launch automatically."), Amaterasu.pager(history.length > 1
-                    ? () => {
-                        history.pop();
-                        offset = history[history.length - 1] ?? 0;
-                        void load();
-                    }
-                    : null, reply.next_offset != null
-                    ? () => {
-                        offset = reply.next_offset;
-                        history.push(offset);
-                        void load();
-                    }
-                    : null, pagesTextLiteral(`Showing from ${offset + 1}`)));
-            }
-            catch (error) {
-                if (context.content.isConnected)
-                    area.replaceChildren(Amaterasu.errorPanel(error, load));
-            }
-        }
-        void load();
-        void loadLaunches();
-    }
-    Amaterasu.renderApplications = renderApplications;
     function steamForceSyncOutcome(provider) {
         if (provider.enabled === false)
             return "failure";
@@ -19345,7 +19256,7 @@ var Amaterasu;
             : "failure";
     }
     Amaterasu.steamForceSyncOutcome = steamForceSyncOutcome;
-    function renderSteam(context) {
+    function renderSteam(context, embedded = false) {
         const area = Amaterasu.el("div");
         const status = Amaterasu.el("div");
         let revision;
@@ -19518,10 +19429,10 @@ var Amaterasu;
         }
         updateForceSyncControl();
         scan.disabled = !context.api.allows("steam.refresh");
-        context.content.append(Amaterasu.sectionHeading("Steam library", "Discover local Steam games and optionally sync a complete scan into the catalog.", Amaterasu.button("Refresh", () => {
+        context.content.append(Amaterasu.el("header", "page-heading", Amaterasu.el("div", "", Amaterasu.el(embedded ? "h2" : "h1", "", "Steam library"), Amaterasu.el("p", "muted", "Discover local Steam games and optionally sync a complete scan into the catalog.")), Amaterasu.el("div", "actions", Amaterasu.button("Refresh", () => {
             resetPagination();
             return load();
-        }), scan, forceSyncControl), status, area);
+        }), scan, forceSyncControl)), status, area);
         async function load(refreshProviderStatus = true) {
             if (!context.api.allows("steam.read")) {
                 if (context.content.isConnected) {
@@ -24035,6 +23946,84 @@ var Amaterasu;
 })(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
 (function (Amaterasu) {
+    function libraryRouteFromAddress(address) {
+        if (address === "catalog" || address === "applications" || address.startsWith("catalog?"))
+            return "catalog";
+        if (address === "catalog/integrations")
+            return address;
+        if (address === "steam" || address === "catalog/integrations/steam")
+            return "catalog/integrations/steam";
+        return null;
+    }
+    Amaterasu.libraryRouteFromAddress = libraryRouteFromAddress;
+    function libraryViewFromAddress(address) {
+        const route = libraryRouteFromAddress(address);
+        return route === "catalog" ? "games" : route === "catalog/integrations" ? "integrations" :
+            route === "catalog/integrations/steam" ? "integrations/steam" : null;
+    }
+    Amaterasu.libraryViewFromAddress = libraryViewFromAddress;
+    function libraryViewAvailable(api, view) {
+        if (view === "games")
+            return api.allows("catalog.read");
+        if (view === "integrations/steam")
+            return api.allows("steam.read") || api.allows("steam.refresh");
+        return api.allows("configuration.read") || api.allows("steam.read") || api.allows("steam.refresh");
+    }
+    Amaterasu.libraryViewAvailable = libraryViewAvailable;
+    function renderLibrary(context) {
+        const requested = context.initialLibraryView ?? "games";
+        const view = libraryViewAvailable(context.api, requested) ? requested :
+            libraryViewAvailable(context.api, "games") ? "games" : "integrations";
+        const selectedTab = view === "games" ? "games" : "integrations";
+        const tabList = Amaterasu.el("div", "library-tabs");
+        tabList.setAttribute("role", "tablist");
+        Amaterasu.setLocalizedAttribute(tabList, "aria-label", "Library views");
+        const area = Amaterasu.el("div", "library-view");
+        area.id = "library-view";
+        area.setAttribute("role", "tabpanel");
+        area.setAttribute("aria-labelledby", `library-tab-${selectedTab}`);
+        const tabs = [];
+        for (const [name, label, route] of [
+            ["games", "Games", "catalog"],
+            ["integrations", "Integrations", "catalog/integrations"],
+        ]) {
+            if (!libraryViewAvailable(context.api, name))
+                continue;
+            const tab = Amaterasu.button(label, () => context.navigate(route), "library-tab");
+            tab.id = `library-tab-${name}`;
+            tab.setAttribute("role", "tab");
+            tab.setAttribute("aria-controls", area.id);
+            tab.setAttribute("aria-selected", String(name === selectedTab));
+            tab.tabIndex = name === selectedTab ? 0 : -1;
+            tab.addEventListener("keydown", (event) => {
+                const index = tabs.indexOf(tab);
+                const next = event.key === "ArrowRight" ? (index + 1) % tabs.length :
+                    event.key === "ArrowLeft" ? (index + tabs.length - 1) % tabs.length :
+                        event.key === "Home" ? 0 : event.key === "End" ? tabs.length - 1 : null;
+                if (next === null)
+                    return;
+                event.preventDefault();
+                tabs[next]?.focus();
+                tabs[next]?.click();
+            });
+            tabs.push(tab);
+            tabList.append(tab);
+        }
+        context.content.append(Amaterasu.sectionHeading("Library", "Manage your games and library integrations."), tabList, area);
+        const childContext = { ...context, content: area };
+        if (view === "games")
+            Amaterasu.renderCatalog(childContext, true);
+        else if (view === "integrations/steam") {
+            area.append(Amaterasu.button("Back to integrations", () => context.navigate("catalog/integrations"), "quiet"));
+            Amaterasu.renderSteam(childContext, true);
+        }
+        else
+            Amaterasu.renderLibraryIntegrations(childContext, true);
+    }
+    Amaterasu.renderLibrary = renderLibrary;
+})(Amaterasu || (Amaterasu = {}));
+var Amaterasu;
+(function (Amaterasu) {
     function appTextLiteral(value) {
         return typeof Amaterasu.literalText === "function" ? Amaterasu.literalText(value) : value;
     }
@@ -24046,8 +24035,6 @@ var Amaterasu;
         integrations: "Integrations",
         plugins: "Modules",
         sessions: "Sessions",
-        applications: "Applications",
-        steam: "Steam",
         diagnostics: "Diagnostics",
         accounts: "Accounts",
         tokens: "API tokens",
@@ -24061,8 +24048,6 @@ var Amaterasu;
         settings: "M4 6h16 M4 12h16 M4 18h16 M8 4v4 M16 10v4 M10 16v4",
         plugins: "M4 4h7v7H4z M4 13h7v7H4z M13 13h7v7h-7z M16.5 4.5v6 M13.5 7.5h6",
         sessions: "M4 8h14 M15 5l3 3-3 3 M20 16H6 M9 13l-3 3 3 3",
-        applications: "M4 5h16v14H4z M4 9h16 M8 7h.01",
-        steam: "M12 3a9 9 0 1 1-8.5 12 M3 12l6 3 M9 15a2 2 0 1 0 4 0 2 2 0 0 0-4 0 M13 14l3-4 M18 8a2 2 0 1 1-4 0 2 2 0 0 1 4 0",
         diagnostics: "M3 12h4l2-6 4 12 2-6h6",
         maintenance: "M14 4a5 5 0 0 0-6 6L3 15l3 3 5-5a5 5 0 0 0 6-6l-3 3-3-3z",
         tokens: "M8 14a4 4 0 1 1 3.5-6H21v4h-3v3h-3v-3h-3.5A4 4 0 0 1 8 14z M7 10h.01",
@@ -24085,19 +24070,19 @@ var Amaterasu;
     }
     const navigationGroups = [
         { label: "HOST", pages: ["overview", "host", "sessions", "diagnostics"] },
-        { label: "LIBRARY", pages: ["catalog", "applications", "steam"] },
+        { label: "LIBRARY", pages: ["catalog"] },
         { label: "SYSTEM", pages: ["settings", "integrations", "plugins", "accounts", "tokens", "maintenance"] },
     ];
     const corePages = new Map([
-        ["overview", Amaterasu.renderOverview], ["host", Amaterasu.renderHostManagement], ["catalog", Amaterasu.renderCatalog],
+        ["overview", Amaterasu.renderOverview], ["host", Amaterasu.renderHostManagement], ["catalog", Amaterasu.renderLibrary],
         ["settings", Amaterasu.renderSettings], ["integrations", Amaterasu.renderIntegrations], ["plugins", Amaterasu.renderPlugins], ["sessions", Amaterasu.renderSessions],
-        ["applications", Amaterasu.renderApplications], ["steam", Amaterasu.renderSteam], ["diagnostics", Amaterasu.renderDiagnostics],
+        ["diagnostics", Amaterasu.renderDiagnostics],
         ["accounts", Amaterasu.renderAccounts], ["tokens", Amaterasu.renderTokens], ["maintenance", Amaterasu.renderMaintenance],
     ]);
     const pageScopes = {
         host: "configuration.read", catalog: "catalog.read", settings: "configuration.read",
-        integrations: "configuration.read", plugins: "configuration.read", sessions: "session.read", applications: "application.read",
-        steam: "steam.read", diagnostics: "diagnostics.read", accounts: "account.self",
+        integrations: "configuration.read", plugins: "configuration.read", sessions: "session.read",
+        diagnostics: "diagnostics.read", accounts: "account.self",
     };
     class Application {
         api;
@@ -24192,7 +24177,7 @@ var Amaterasu;
         }
         currentPage() {
             const fragment = location.hash.slice(1);
-            const value = fragment.startsWith("catalog?") ? "catalog" : fragment === "updates" ? "plugins" : fragment;
+            const value = Amaterasu.libraryRouteFromAddress(fragment) ?? (fragment === "updates" ? "plugins" : fragment);
             const core = Object.hasOwn(pageNames, value) && this.pageAvailable(value);
             const settingsCategory = value.startsWith("settings/") &&
                 ["general", "streaming", "integrations", "devices", "access"].includes(value.slice(9)) &&
@@ -24200,10 +24185,14 @@ var Amaterasu;
             const pluginsView = value.startsWith("plugins/") &&
                 Amaterasu.pluginsViewFromAddress(value.slice(8)) !== null &&
                 this.pageAvailable("plugins");
-            return core || settingsCategory || pluginsView ||
+            const libraryView = Amaterasu.libraryViewFromAddress(value);
+            const library = libraryView !== null && Amaterasu.libraryViewAvailable(this.api, libraryView);
+            return core || settingsCategory || pluginsView || library ||
                 (value.startsWith("extension/") && this.extensionIds.has(value.slice(10))) ? value : "overview";
         }
         pageAvailable(page) {
+            if (page === "catalog")
+                return Amaterasu.libraryViewAvailable(this.api, "games") || Amaterasu.libraryViewAvailable(this.api, "integrations");
             if (page === "tokens")
                 return this.api.role === "administrator" && this.api.allows("tokens.manage");
             if (page === "maintenance")
@@ -24468,6 +24457,8 @@ var Amaterasu;
             this.renderPage(this.currentPage());
         }
         renderPage(page) {
+            const focusLibraryTab = this.displayedPage !== null && Amaterasu.libraryViewFromAddress(this.displayedPage) !== null &&
+                Amaterasu.libraryViewFromAddress(page) !== null && document.activeElement?.getAttribute("role") === "tab";
             this.releaseDraftGuard();
             this.displayedPage = page;
             clearTimeout(this.notificationTimer);
@@ -24482,7 +24473,8 @@ var Amaterasu;
             this.content = fresh;
             for (const [name, item] of this.navigation) {
                 const selected = name === page || (name === "settings" && page.startsWith("settings/")) ||
-                    (name === "plugins" && page.startsWith("plugins/"));
+                    (name === "plugins" && page.startsWith("plugins/")) ||
+                    (name === "catalog" && page.startsWith("catalog/"));
                 item.classList.toggle("selected", selected);
                 if (selected)
                     item.setAttribute("aria-current", "page");
@@ -24494,6 +24486,7 @@ var Amaterasu;
                 content: fresh,
                 notify: (message) => this.notify(message),
                 navigate: (page) => this.navigate(page),
+                ...(Amaterasu.libraryViewFromAddress(page) !== null ? { initialLibraryView: Amaterasu.libraryViewFromAddress(page) } : {}),
                 ...(page.startsWith("settings/") ? { initialSettingsCategory: page.slice(9) } : {}),
                 replaceSettingsCategory: (category) => {
                     if (!fresh.isConnected || !(this.displayedPage === "settings" || this.displayedPage?.startsWith("settings/")))
@@ -24533,14 +24526,15 @@ var Amaterasu;
                 Amaterasu.setLocalizedPageTitle("Extension");
             }
             else {
-                const corePage = (page.startsWith("settings/") ? "settings" : page.startsWith("plugins/") ? "plugins" : page);
+                const corePage = (page.startsWith("settings/") ? "settings" : page.startsWith("plugins/") ? "plugins" : page.startsWith("catalog/") ? "catalog" : page);
                 const renderer = corePages.get(corePage);
                 if (!renderer)
                     return;
                 renderer(context);
                 Amaterasu.setLocalizedPageTitle(pageNames[corePage]);
             }
-            fresh.focus({ preventScroll: true });
+            const selectedLibraryTab = focusLibraryTab ? fresh.querySelector('.library-tabs [aria-selected="true"]') : null;
+            (selectedLibraryTab ?? fresh).focus({ preventScroll: true });
             window.scrollTo(0, 0);
         }
         notify(message) {
