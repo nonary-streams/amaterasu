@@ -138,8 +138,13 @@ impl Plane {
         Some(summary)
     }
 
-    pub fn tick(&mut self, media_active: bool) -> Result<Progress, TickFailure> {
-        self.pump.tick(media_active)
+    pub fn tick(
+        &mut self,
+        media_active: bool,
+        control_budget: usize,
+    ) -> Result<Progress, TickFailure> {
+        self.pump
+            .tick_with_control_budget(media_active, control_budget)
     }
 
     pub fn send_rumble(&mut self, command: RumbleCommand) -> PlaneResult<bool> {
@@ -205,7 +210,7 @@ trait Backend {
     fn desktop_geometry(&mut self) -> PlaneResult<Option<CaptureGeometry>> {
         Ok(None)
     }
-    fn control(&mut self) -> PlaneResult<Option<ControlRecord>>;
+    fn control(&mut self, accept: bool) -> PlaneResult<Option<ControlRecord>>;
     fn send_feedback(&mut self, message: &HostFeedbackMessage) -> PlaneResult<bool>;
     fn send_rumble(&mut self, command: RumbleCommand) -> PlaneResult<bool>;
     fn video(&mut self) -> PlaneResult<Option<VideoPacket>>;
@@ -296,7 +301,16 @@ impl<B: Backend> Pump<B> {
         }
     }
 
+    #[cfg(test)]
     fn tick(&mut self, media_active: bool) -> Result<Progress, TickFailure> {
+        self.tick_with_control_budget(media_active, CONTROL_READ_BUDGET)
+    }
+
+    fn tick_with_control_budget(
+        &mut self,
+        media_active: bool,
+        control_budget: usize,
+    ) -> Result<Progress, TickFailure> {
         self.timing.cadence.observe(Instant::now());
         if let Some(code) = self.failure {
             return Err(TickFailure {
@@ -304,7 +318,7 @@ impl<B: Backend> Pump<B> {
                 progress: Box::default(),
             });
         }
-        let result = self.advance(media_active);
+        let result = self.advance(media_active, control_budget.min(CONTROL_READ_BUDGET));
         if let Err(failure) = &result {
             if failure.code == "audio_encoder_failed" {
                 self.audio_recovery_needed = true;
@@ -315,7 +329,11 @@ impl<B: Backend> Pump<B> {
         result
     }
 
-    fn advance(&mut self, media_active: bool) -> Result<Progress, TickFailure> {
+    fn advance(
+        &mut self,
+        media_active: bool,
+        control_budget: usize,
+    ) -> Result<Progress, TickFailure> {
         // Check the authenticated provider before any media effect. A failed or
         // closed control stream ends pumping; routing metadata grants no authority.
         let mut progress = Progress::default();
@@ -329,8 +347,16 @@ impl<B: Backend> Pump<B> {
                     progress: Box::default(),
                 })?;
         let control_started = Instant::now();
-        for _ in 0..CONTROL_READ_BUDGET {
-            let message = match self.backend.control() {
+        if control_budget == 0 {
+            // Still check the live authenticated provider before forwarding
+            // media. The rejecting sink leaves any queued input unconsumed.
+            self.backend.control(false).map_err(|code| TickFailure {
+                code,
+                progress: Box::default(),
+            })?;
+        }
+        for _ in 0..control_budget {
+            let message = match self.backend.control(true) {
                 Ok(message) => message,
                 Err(code) => {
                     return Err(TickFailure {
@@ -352,7 +378,9 @@ impl<B: Backend> Pump<B> {
             .timing
             .window
             .control_budget_exhausted
-            .saturating_add(u64::from(progress.controls.len() == CONTROL_READ_BUDGET));
+            .saturating_add(u64::from(
+                control_budget != 0 && progress.controls.len() == control_budget,
+            ));
         if let Err(code) = self.pump_feedback(false) {
             return Err(TickFailure {
                 code,

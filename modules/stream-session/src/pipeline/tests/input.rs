@@ -1344,22 +1344,123 @@ fn delayed_cleanup_never_recreates_an_expired_unknown_input_admission() {
 }
 
 #[test]
-fn queue_overflow_stops_session_and_releases_input() {
+fn input_burst_waits_for_capacity_without_disconnect_or_dropped_events() {
     let mut host = Harness::new();
     enable_input(&mut host);
     let id = host.response(1, prepare())["session"].as_u64().unwrap();
-    let active = host.response(2, start(id));
-    assert_eq!(active["state"], "active");
-    assert_eq!(active["absolute_input"], false);
+    assert_eq!(host.response(2, start(id))["state"], "active");
     host.plane
         .borrow_mut()
         .controls
-        .extend((0..129).map(relative));
+        .extend((0..512).map(relative));
     host.idle();
     let record = &host.pipeline.records[&id];
-    assert_eq!(record.state, State::Failed);
-    assert_eq!(record.error, Some("input_queue_overflow"));
-    assert!(host.broker.input_lease.is_none());
+    assert_eq!(record.state, State::Active);
+    assert_eq!(record.error, None);
+    assert_eq!(host.broker.input_events.len(), 512);
+    assert_eq!(record.input_events_sent, 512);
+    assert!(host.plane.borrow().controls.is_empty());
+    assert!(record.input_events.is_empty());
+}
+
+#[test]
+fn optional_feedback_capacity_failure_keeps_keyboard_and_video_active() {
+    let mut host = Harness::new();
+    enable_input(&mut host);
+    host.broker.input_controller_supported = Some(json!(true));
+    let id = host.response(1, prepare())["session"].as_u64().unwrap();
+    assert_eq!(host.response(2, start(id))["state"], "active");
+    host.broker.gamepad_poll_error = Some("resource_exhausted".into());
+    enable_client_haptics(&mut host, id);
+    host.plane.borrow_mut().controls.push(keyboard(true, 65));
+    host.idle();
+    assert_eq!(host.pipeline.records[&id].state, State::Active);
+    assert_eq!(host.broker.input_events.len(), 1);
+    assert!(host.broker.gamepad_poll_times.len() >= 2);
+    assert!(
+        host.broker
+            .gamepad_poll_times
+            .windows(2)
+            .all(|times| times[1] - times[0] >= 100)
+    );
+}
+
+#[test]
+fn optional_feedback_admission_pressure_does_not_starve_input_or_renewal() {
+    let mut host = Harness::new();
+    enable_input(&mut host);
+    host.broker.input_controller_supported = Some(json!(true));
+    let id = host.response(1, prepare())["session"].as_u64().unwrap();
+    assert_eq!(host.response(2, start(id))["state"], "active");
+    host.broker.gamepad_admission_error = Some("busy".into());
+    enable_client_haptics(&mut host, id);
+    host.pipeline.records.get_mut(&id).unwrap().input_renew_at = 0;
+    host.plane.borrow_mut().controls.push(keyboard(true, 65));
+    host.idle();
+    assert_eq!(host.pipeline.records[&id].state, State::Active);
+    assert_eq!(host.broker.input_events.len(), 1);
+    assert!(host.broker.gamepad_poll_times.len() >= 2);
+    assert!(
+        host.broker
+            .gamepad_poll_times
+            .windows(2)
+            .all(|times| times[1] - times[0] >= 100)
+    );
+    assert!(
+        host.broker
+            .calls
+            .iter()
+            .any(|call| call.service == "amaterasu.input/1" && call.payload["action"] == "renew")
+    );
+}
+
+#[test]
+fn optional_feedback_permission_failure_remains_terminal() {
+    let mut host = Harness::new();
+    enable_input(&mut host);
+    host.broker.input_controller_supported = Some(json!(true));
+    let id = host.response(1, prepare())["session"].as_u64().unwrap();
+    assert_eq!(host.response(2, start(id))["state"], "active");
+    host.broker.gamepad_poll_error = Some("permission_denied".into());
+    enable_client_haptics(&mut host, id);
+    host.idle();
+    assert_eq!(host.pipeline.records[&id].state, State::Failed);
+    assert_eq!(
+        host.pipeline.records[&id].error,
+        Some("dependency_rejected")
+    );
+}
+
+#[test]
+fn modifier_expansion_and_release_survive_input_backpressure() {
+    let mut host = Harness::new();
+    enable_input(&mut host);
+    let id = host.response(1, prepare())["session"].as_u64().unwrap();
+    assert_eq!(host.response(2, start(id))["state"], "active");
+    for _ in 0..64 {
+        host.plane
+            .borrow_mut()
+            .controls
+            .push(keyboard_packet_with_modifiers(true, 0x8041, 0, 7));
+        host.plane.borrow_mut().controls.push(keyboard(false, 65));
+    }
+    for _ in 0..500 {
+        host.tick();
+        assert!(
+            host.pipeline.records[&id].input_events.len() <= super::super::input::MAX_QUEUED_EVENTS
+        );
+    }
+    assert_eq!(host.pipeline.records[&id].state, State::Active);
+    let delivered = &host.broker.input_events;
+    assert_eq!(delivered.len(), 64 * 8);
+    assert_eq!(
+        delivered
+            .iter()
+            .filter(|e| e["key"]["code"] == 65 && e["state"] == "up")
+            .count(),
+        64
+    );
+    assert!(host.plane.borrow().controls.is_empty());
 }
 
 #[test]

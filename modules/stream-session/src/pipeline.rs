@@ -48,7 +48,11 @@ trait Drive {
     fn timing_summary(&mut self) -> Option<Value> {
         None
     }
-    fn tick(&mut self, media_active: bool) -> Result<PlaneProgress, PlaneFailure>;
+    fn tick(
+        &mut self,
+        media_active: bool,
+        control_budget: usize,
+    ) -> Result<PlaneProgress, PlaneFailure>;
     fn send_rumble(&mut self, command: crate::plane::RumbleCommand) -> Result<bool, &'static str>;
     fn stop(&mut self);
     fn is_drained(&self) -> bool;
@@ -81,8 +85,12 @@ impl Drive for Plane {
     fn discard_contributions(&mut self) {
         Plane::discard_contributions(self);
     }
-    fn tick(&mut self, media_active: bool) -> Result<PlaneProgress, PlaneFailure> {
-        Plane::tick(self, media_active)
+    fn tick(
+        &mut self,
+        media_active: bool,
+        control_budget: usize,
+    ) -> Result<PlaneProgress, PlaneFailure> {
+        Plane::tick(self, media_active, control_budget)
     }
     fn send_rumble(&mut self, command: crate::plane::RumbleCommand) -> Result<bool, &'static str> {
         Plane::send_rumble(self, command)
@@ -1097,6 +1105,7 @@ impl Pipeline {
                 }
                 record.lifecycle_delivery_permit = false;
             }
+            let control_budget = input::control_read_budget(record, self.settings.enable_input);
             let Some(plane) = record.plane.as_mut() else {
                 continue;
             };
@@ -1137,7 +1146,7 @@ impl Pipeline {
                 }
             }
             let media_active = matches!(record.state, State::Active | State::Stopping);
-            let result = plane.tick(media_active);
+            let result = plane.tick(media_active, control_budget);
             match result {
                 Ok(progress) => {
                     record.history.observe_encode_timing(progress.encode_timing);
