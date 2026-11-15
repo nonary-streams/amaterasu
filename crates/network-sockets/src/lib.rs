@@ -825,12 +825,11 @@ unsafe extern "C" fn write(
         let count_value = match &resource.socket {
             SocketResource::Tcp(s) => {
                 let mut borrowed = s;
-                borrowed.write(buffer)
+                borrowed.write(buffer).map_err(io_status)?
             }
-            SocketResource::Udp(s) => s.send(buffer),
+            SocketResource::Udp(s) => s.send(buffer).map_err(udp_send_status)?,
             _ => return Err(net::UNSUPPORTED),
-        }
-        .map_err(io_status)?;
+        };
         unsafe { output(count, count_value) }
     })
 }
@@ -880,7 +879,7 @@ unsafe extern "C" fn send_to(
         };
         #[cfg(windows)]
         let _send_guard = send_guard(&resource)?;
-        let size = socket.send_to(buffer, peer).map_err(io_status)?;
+        let size = socket.send_to(buffer, peer).map_err(udp_send_status)?;
         unsafe { output(count, size) }
     })
 }
@@ -1016,6 +1015,22 @@ unsafe extern "C" fn join_multicast(
         .map_err(io_status)
     })
 }
+// A rejected UDP send has accepted no datagram. Buffer pressure can clear
+// on the next tick, so retain the caller's exact queued bytes for retry.
+// Keep this send-specific: allocation/bind/receive failures retain their
+// existing classifications, and persistent stalls still time out upstream.
+fn udp_send_status(error: io::Error) -> Status {
+    #[cfg(unix)]
+    if error.raw_os_error() == Some(libc::ENOBUFS) {
+        return net::WOULD_BLOCK;
+    }
+    #[cfg(windows)]
+    if error.raw_os_error() == Some(windows_sys::Win32::Networking::WinSock::WSAENOBUFS) {
+        return net::WOULD_BLOCK;
+    }
+    io_status(error)
+}
+
 unsafe extern "C" fn send_batch(
     context: *mut c_void,
     id: u64,
@@ -1048,10 +1063,10 @@ unsafe extern "C" fn send_batch(
         #[cfg(windows)]
         let sent = {
             let mut healthy = send_guard(&resource)?;
-            batch::send_serialized(socket, &buffers, &mut healthy).map_err(io_status)?
+            batch::send_serialized(socket, &buffers, &mut healthy).map_err(udp_send_status)?
         };
         #[cfg(not(windows))]
-        let sent = batch::send(socket, &buffers).map_err(io_status)?;
+        let sent = batch::send(socket, &buffers).map_err(udp_send_status)?;
         unsafe { output(count, sent) }
     })
 }
@@ -1096,6 +1111,47 @@ fn send_guard(resource: &Resource) -> Result<std::sync::MutexGuard<'_, bool>, St
 #[cfg(test)]
 mod status_tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn udp_send_buffer_exhaustion_is_retryable() {
+        assert_eq!(
+            udp_send_status(io::Error::from_raw_os_error(libc::ENOBUFS)),
+            net::WOULD_BLOCK
+        );
+        assert_ne!(
+            io_status(io::Error::from_raw_os_error(libc::ENOBUFS)),
+            net::WOULD_BLOCK
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn udp_send_buffer_exhaustion_is_retryable() {
+        let code = windows_sys::Win32::Networking::WinSock::WSAENOBUFS;
+        assert_eq!(
+            udp_send_status(io::Error::from_raw_os_error(code)),
+            net::WOULD_BLOCK
+        );
+        assert_ne!(
+            io_status(io::Error::from_raw_os_error(code)),
+            net::WOULD_BLOCK
+        );
+    }
+
+    #[test]
+    fn udp_send_errors_retain_critical_and_existing_retry_statuses() {
+        for (kind, status) in [
+            (io::ErrorKind::WouldBlock, net::WOULD_BLOCK),
+            (io::ErrorKind::Interrupted, net::INTERRUPTED),
+            (io::ErrorKind::PermissionDenied, net::PERMISSION_DENIED),
+            (io::ErrorKind::ConnectionReset, net::CONNECTION_RESET),
+            (io::ErrorKind::NetworkUnreachable, net::NETWORK_UNREACHABLE),
+            (io::ErrorKind::WriteZero, net::IO_ERROR),
+        ] {
+            assert_eq!(udp_send_status(kind.into()), status);
+        }
+    }
 
     #[test]
     fn unreachable_io_errors_have_provider_neutral_statuses() {
