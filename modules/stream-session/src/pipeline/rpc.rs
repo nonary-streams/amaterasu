@@ -17,6 +17,7 @@ pub(super) struct Pending {
     first_sent_at: Option<u64>,
     uncertain_admission: bool,
     admission_rejected: bool,
+    admission_error_code: Option<String>,
     retry_uncertain_admission: bool,
 }
 
@@ -44,6 +45,7 @@ impl Pending {
             first_sent_at: None,
             uncertain_admission: false,
             admission_rejected: false,
+            admission_error_code: None,
             retry_uncertain_admission: false,
         }
     }
@@ -170,6 +172,10 @@ impl Pending {
         self.admission_rejected
     }
 
+    pub fn admission_error_code(&self) -> Option<&str> {
+        self.admission_error_code.as_deref()
+    }
+
     /// Releases a retained result; a lost response can be retried with the same
     /// request ID. A `not_found` response confirms that tracking is gone.
     pub fn release_result(&mut self, send: &mut Send<'_>) -> bool {
@@ -210,6 +216,7 @@ impl Pending {
                 Ok(Response::Accepted { id }) => {
                     self.request = Some(id);
                     self.admission_rejected = false;
+                    self.admission_error_code = None;
                     self.attempts = 0;
                     Progress::Waiting
                 }
@@ -218,6 +225,7 @@ impl Pending {
                     // provider; only the first explicit rejection proves no
                     // request was admitted.
                     self.admission_rejected = !self.uncertain_admission && code != "conflict";
+                    self.admission_error_code = self.admission_rejected.then_some(code.clone());
                     self.uncertain_admission |= code == "conflict";
                     Progress::Failed
                 }

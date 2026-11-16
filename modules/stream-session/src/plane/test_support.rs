@@ -10,8 +10,12 @@ pub(crate) struct TransportState {
 }
 struct Transport(Rc<RefCell<TransportState>>);
 impl Backend for Transport {
-    fn control(&mut self) -> PlaneResult<Option<ControlRecord>> {
-        Ok(self.0.borrow_mut().controls.pop_front())
+    fn control(&mut self, accept: bool) -> PlaneResult<Option<ControlRecord>> {
+        Ok(if accept {
+            self.0.borrow_mut().controls.pop_front()
+        } else {
+            None
+        })
     }
     fn send_feedback(&mut self, message: &HostFeedbackMessage) -> PlaneResult<bool> {
         let mut state = self.0.borrow_mut();
@@ -60,11 +64,11 @@ impl TestPlane {
             stopped_tick: false,
         }
     }
-    pub fn tick(&mut self) -> Result<Progress, TickFailure> {
+    pub fn tick(&mut self, control_budget: usize) -> Result<Progress, TickFailure> {
         if self.pump.stopping {
             self.stopped_tick = true;
         }
-        self.pump.tick(false)
+        self.pump.tick_with_control_budget(false, control_budget)
     }
     pub fn enqueue_feedback(
         &mut self,

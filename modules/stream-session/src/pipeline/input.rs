@@ -76,6 +76,22 @@ impl TouchPort {
 }
 
 pub(super) const MAX_QUEUED_EVENTS: usize = 128;
+// One translated Moonlight record can expand into a modifier chord of seven
+// events. Reserve room before consuming it; the transport retains the rest.
+const MAX_EVENTS_PER_CONTROL: usize = 7;
+
+pub(super) fn control_read_budget(record: &Record, input_enabled: bool) -> usize {
+    if !input_enabled || record.state != State::Active || record.input_lease.is_none() {
+        return usize::MAX;
+    }
+    // Client-silence neutral reports also use this queue. Keep enough room
+    // for every supported controller even while normal input is backpressured.
+    MAX_QUEUED_EVENTS
+        .saturating_sub(record.input_events.len())
+        .saturating_sub(usize::from(MAX_CONTROLLER_SLOT))
+        / MAX_EVENTS_PER_CONTROL
+}
+
 const FEEDBACK_POLL_INTERVAL_MS: u64 = 20;
 const MAX_FEEDBACK_PEEK: usize = 16;
 

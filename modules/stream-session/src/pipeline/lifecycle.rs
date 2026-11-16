@@ -215,6 +215,17 @@ impl Pipeline {
                         record.extension_checked = true;
                         return self.deliver_success(record, job, now, send);
                     }
+                    if job.step == Step::PollGamepadFeedback
+                        && matches!(
+                            pending.admission_error_code(),
+                            Some("busy" | "resource_exhausted")
+                        )
+                    {
+                        // This optional read was explicitly not admitted; no
+                        // input effect or feedback item can have been consumed.
+                        record.rumble_poll_at = now.saturating_add(100);
+                        return false;
+                    }
                     if matches!(
                         job.step,
                         Step::ObserveActiveBinding | Step::ValidateActiveBinding
@@ -1068,6 +1079,18 @@ impl Pipeline {
             return true;
         }
         if payload["ok"] != true {
+            if job.step == Step::PollGamepadFeedback
+                && matches!(
+                    safe_dependency_code(&payload),
+                    "busy" | "resource_exhausted"
+                )
+            {
+                // Polling optional feedback must not turn known saturation
+                // into loss of keyboard/video. Back off so renew/input work
+                // can use the workflow slot; rumble expiry still runs.
+                record.rumble_poll_at = now.saturating_add(100);
+                return false;
+            }
             if matches!(job.step, Step::ProbeAudioReconfiguration(_)) {
                 record.pending_audio = None;
                 if let Some(request) = job.request {

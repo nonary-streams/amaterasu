@@ -342,6 +342,8 @@ pub struct Broker {
     pub input_feedback_acks: Vec<u64>,
     pub feedback_ack_failures: usize,
     pub gamepad_feedback: VecDeque<Value>,
+    pub gamepad_poll_error: Option<String>,
+    pub gamepad_admission_error: Option<String>,
     pub fail_input_batch: bool,
     pub fail_controller_input: bool,
     pub input_cleanup_required: bool,
@@ -726,6 +728,16 @@ impl Broker {
                 operation_id,
                 ..
             } => {
+                if service == "amaterasu.input/1"
+                    && payload["action"] == "poll_gamepad_feedback"
+                    && let Some(code) = &self.gamepad_admission_error
+                {
+                    self.gamepad_poll_times.push(self.now);
+                    return Ok(Response::Error {
+                        code: code.clone(),
+                        message: String::new(),
+                    });
+                }
                 if service == "amaterasu.session-history/1" && !self.history_available {
                     return Ok(Response::Error {
                         code: "service_unavailable".into(),
@@ -1627,6 +1639,9 @@ impl Broker {
             }
             "poll_gamepad_feedback" => {
                 self.gamepad_poll_times.push(self.now);
+                if let Some(code) = &self.gamepad_poll_error {
+                    return error(code);
+                }
                 if payload["lease"] != json!(self.input_lease) {
                     return json!({"ok":false,"error":{"code":"permission_denied"}});
                 }
@@ -1933,13 +1948,20 @@ impl Drive for FakePlane {
     fn recover_audio(&mut self) {
         self.0.borrow_mut().failure = None;
     }
-    fn tick(&mut self, media_active: bool) -> Result<PlaneProgress, PlaneFailure> {
+    fn tick(
+        &mut self,
+        media_active: bool,
+        control_budget: usize,
+    ) -> Result<PlaneProgress, PlaneFailure> {
         let mut state = self.0.borrow_mut();
         state.ticks += 1;
         state.media_ticks += usize::from(media_active);
         let progress = PlaneProgress {
             encode_timing: None,
-            controls: std::mem::take(&mut state.controls),
+            controls: {
+                let count = state.controls.len().min(control_budget);
+                state.controls.drain(..count).collect()
+            },
             desktop_geometry: state.desktop_geometry,
             accepted_video_access_units: std::mem::take(&mut state.accepted_video_access_units),
             accepted_media_payload_bytes: std::mem::take(&mut state.accepted_media_payload_bytes),
@@ -2001,8 +2023,8 @@ impl Drop for FakePlane {
 
 struct QueuePlane(crate::plane::test_support::TestPlane);
 impl Drive for QueuePlane {
-    fn tick(&mut self, _: bool) -> Result<PlaneProgress, PlaneFailure> {
-        self.0.tick()
+    fn tick(&mut self, _: bool, control_budget: usize) -> Result<PlaneProgress, PlaneFailure> {
+        self.0.tick(control_budget)
     }
     fn send_rumble(&mut self, _: crate::plane::RumbleCommand) -> Result<bool, &'static str> {
         Ok(true)

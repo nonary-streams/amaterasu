@@ -498,7 +498,7 @@ impl Backend for NativeBackend {
         accepted(status, "native_rumble_failed")
     }
 
-    fn control(&mut self) -> PlaneResult<Option<ControlRecord>> {
+    fn control(&mut self, accept: bool) -> PlaneResult<Option<ControlRecord>> {
         let mut output = Delivery::default();
         // SAFETY: the owned binding and stack sink remain live for one callback.
         let api = unsafe { self.control.table::<ControlTransportApi>() }
@@ -509,7 +509,7 @@ impl Backend for NativeBackend {
                 self.handles.control_transport,
                 ControlMessageSink {
                     context: (&mut output as *mut Delivery<ControlRecord>).cast(),
-                    write: Some(copy_control),
+                    write: Some(if accept { copy_control } else { defer_control }),
                 },
             )
         };
@@ -1070,6 +1070,12 @@ unsafe extern "C" fn copy_audio_unit(context: *mut c_void, unit: *const AudioUni
     // SAFETY: provider lends the unit and its allocations through this callback.
     unsafe { deliver(context, unit, |unit| AudioPacket::copy_unit(unit)) }
 }
+// This synchronous refusal borrows nothing and accepts no event. A conforming
+// provider retains its queue head and reports MEDIA_BUSY to the caller.
+unsafe extern "C" fn defer_control(_: *mut c_void, _: *const ControlMessage) -> Status {
+    MEDIA_BUSY
+}
+
 unsafe extern "C" fn copy_control(context: *mut c_void, message: *const ControlMessage) -> Status {
     // SAFETY: provider lends authenticated plaintext for this callback only.
     unsafe {
