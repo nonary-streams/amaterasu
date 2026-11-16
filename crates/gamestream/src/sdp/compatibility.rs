@@ -45,9 +45,9 @@ impl StreamAdjustment {
     }
 }
 
-pub(super) fn adjustments(
+pub(super) fn adjustments<T>(
     attributes: &BTreeMap<&str, &str>,
-    announce: &Announce,
+    announce: &Announce<T>,
 ) -> Vec<StreamAdjustment> {
     let value = |key: &str| {
         attributes

@@ -656,13 +656,19 @@ fn exercise<P: FramingProvider>(framer: P, selector: u32, marker: u8) {
             selection,
         )
         .unwrap();
-        let first = plane.tick(true).unwrap();
+        let first = plane.tick(true, usize::MAX).unwrap();
         assert_eq!(first.accepted_video_access_units, 0);
         assert!(state.bytes.is_empty());
-        let second = plane.tick(true).unwrap();
+        let second = plane.tick(true, usize::MAX).unwrap();
         assert_eq!(second.accepted_video_access_units, 1);
         assert_eq!(state.bytes, [10, 20, 30, marker]);
-        assert_eq!(plane.tick(true).unwrap().accepted_video_access_units, 0);
+        assert_eq!(
+            plane
+                .tick(true, usize::MAX)
+                .unwrap()
+                .accepted_video_access_units,
+            0
+        );
         assert!(!plane.pump.backend.drain_transport().unwrap());
         assert!(plane.pump.backend.drain_transport().unwrap());
         assert_eq!((state.unit_drains, state.legacy_drains), (1, 2));
@@ -1137,7 +1143,13 @@ fn planned_pump_switches_framers_and_delivers_through_the_real_transport() {
             let mut plane =
                 Plane::new_planned(&consumer, handles, &Default::default(), &planned).unwrap();
             video_module.tick().unwrap();
-            assert_eq!(plane.tick(true).unwrap().accepted_video_access_units, 1);
+            assert_eq!(
+                plane
+                    .tick(true, usize::MAX)
+                    .unwrap()
+                    .accepted_video_access_units,
+                1
+            );
             transport.tick();
             let mut datagram = [0u8; 2048];
             assert!(video_peer.recv(&mut datagram).unwrap() >= 44);

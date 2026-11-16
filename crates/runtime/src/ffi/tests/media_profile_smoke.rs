@@ -33,6 +33,8 @@ fn profile(selector: u32, payload: u8, name: &str) -> VideoProfile {
         wire_selector: selector,
         payload_type: payload,
         encoding_name: name.into(),
+        media_format: None,
+        wire_attributes: Vec::new(),
     }
 }
 
