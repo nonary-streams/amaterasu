@@ -439,3 +439,31 @@ fn partial_writes_share_one_absolute_timeout_instead_of_resetting_the_budget() {
     assert!(matches!(error, Error::Timeout(_)), "{error:?}");
     assert!(observed.lock().unwrap().request.len() < 10);
 }
+
+#[cfg(feature = "network-test-support")]
+#[test]
+fn cancellation_retires_a_connection_waiting_for_response_headers() {
+    let (address, release, peer) = loopback_http_peer(None);
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let client = agent_cancellable(
+        Config::builder()
+            .proxy(None)
+            .timeout_global(Some(Duration::from_secs(10)))
+            .build(),
+        Network::test_provider(),
+        cancelled.clone(),
+    );
+    let request = std::thread::spawn(move || {
+        client
+            .get(format!("http://{address}/stalled"))
+            .call()
+            .is_err()
+    });
+    std::thread::sleep(Duration::from_millis(30));
+    let started = Instant::now();
+    cancelled.store(true, Ordering::Release);
+    assert!(request.join().unwrap());
+    assert!(started.elapsed() < Duration::from_millis(400));
+    let _ = release.send(());
+    peer.join().unwrap().unwrap();
+}

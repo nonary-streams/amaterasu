@@ -6,6 +6,11 @@
 use crate::network::{Network, TcpStream};
 use std::fmt;
 use std::io::{self, Read, Write};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+    mpsc,
+};
 use std::time::{Duration, Instant};
 use ureq::config::Config;
 use ureq::unversioned::resolver::{ResolvedSocketAddrs, Resolver};
@@ -18,9 +23,17 @@ use ureq::{Agent, Error, ProxyProtocol};
 /// Create an HTTP/HTTPS client with provider-backed DNS, TCP and TLS byte I/O.
 /// The network binding is retained by every pooled connection and worker clone.
 pub fn agent(config: Config, network: Network) -> Agent {
+    agent_inner(config, network, None)
+}
+/// A cancellable client retains and retires its provider-backed connections.
+/// DNS and connection deadlines must also be bounded by the caller's config.
+pub fn agent_cancellable(config: Config, network: Network, cancelled: Arc<AtomicBool>) -> Agent {
+    agent_inner(config, network, Some(cancelled))
+}
+fn agent_inner(config: Config, network: Network, cancelled: Option<Arc<AtomicBool>>) -> Agent {
     let connector =
         ().chain(ConnectProxyConnector::default())
-            .chain(ProviderConnector(network.clone()))
+            .chain(ProviderConnector(network.clone(), cancelled))
             .chain(RustlsConnector::default());
     Agent::with_parts(config, connector, ProviderResolver(network))
 }
@@ -74,7 +87,7 @@ impl Resolver for ProviderResolver {
 }
 
 #[derive(Clone)]
-struct ProviderConnector(Network);
+struct ProviderConnector(Network, Option<Arc<AtomicBool>>);
 impl fmt::Debug for ProviderConnector {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("ProviderConnector")
@@ -122,6 +135,11 @@ impl<Incoming: Transport> Connector<Incoming> for ProviderConnector {
                         stream.set_nodelay(true)?;
                     }
                     return Ok(Some(Either::B(ProviderTransport {
+                        _cancellation: self
+                            .1
+                            .as_ref()
+                            .map(|cancelled| CancellationGuard::new(&stream, cancelled.clone()))
+                            .transpose()?,
                         stream,
                         buffers: LazyBuffers::new(
                             details.config.input_buffer_size(),
@@ -145,6 +163,43 @@ impl<Incoming: Transport> Connector<Incoming> for ProviderConnector {
 struct ProviderTransport {
     stream: TcpStream,
     buffers: LazyBuffers,
+    _cancellation: Option<CancellationGuard>,
+}
+struct CancellationGuard {
+    stop: mpsc::SyncSender<()>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+impl CancellationGuard {
+    fn new(stream: &TcpStream, cancelled: Arc<AtomicBool>) -> io::Result<Self> {
+        let stream = stream.try_clone()?;
+        let (stop, stopped) = mpsc::sync_channel(1);
+        let worker = std::thread::Builder::new()
+            .name("network-http-cancellation".into())
+            .spawn(move || {
+                loop {
+                    if cancelled.load(Ordering::Acquire) {
+                        let _ = stream.shutdown(std::net::Shutdown::Both);
+                        break;
+                    }
+                    match stopped.recv_timeout(Duration::from_millis(50)) {
+                        Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    }
+                }
+            })?;
+        Ok(Self {
+            stop,
+            worker: Some(worker),
+        })
+    }
+}
+impl Drop for CancellationGuard {
+    fn drop(&mut self) {
+        let _ = self.stop.send(());
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
 }
 impl fmt::Debug for ProviderTransport {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
