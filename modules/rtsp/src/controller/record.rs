@@ -121,6 +121,26 @@ impl Record {
         if self.extension_offer.as_ref() != Some(profile)
             || !self.config.accepts_extension_announce(announce)
         {
+            let expected = self.config.effective_profile();
+            eprintln!(
+                "amaterasu rtsp extension announce mismatch profile_match={} width={}/{} height={}/{} fps={}/{} bitrate={}/{} refs={}/{} packet_size={}/{} packet_ms={}/{} color={:?}",
+                self.extension_offer.as_ref() == Some(profile),
+                announce.video.width,
+                expected.width,
+                announce.video.height,
+                expected.height,
+                announce.video.fps,
+                expected.fps,
+                announce.video.bitrate_kbps,
+                expected.bitrate_kbps,
+                announce.video.max_reference_frames,
+                expected.max_reference_frames,
+                announce.packet_size,
+                expected.packet_size,
+                announce.audio.packet_duration_ms,
+                expected.packet_ms,
+                announce.video.color,
+            );
             return false;
         }
         self.extension_announce = Some(announce.clone());

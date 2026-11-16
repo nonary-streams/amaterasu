@@ -1091,7 +1091,9 @@ impl Open {
             && announce.video.bitrate_kbps == profile.bitrate_kbps
             && announce.video.max_reference_frames == profile.max_reference_frames
             && announce.video.slices_per_frame == 1
-            && announce.video.color == ColorMode::Bt709Limited
+            // An opaque codec owns its color representation. This legacy
+            // encoder CSC hint does not override its in-band color metadata
+            // or the independently validated SDR/HDR capture provenance.
             && announce.encryption.video == profile.encrypt_video
     }
 

@@ -4506,6 +4506,12 @@ fn ten_bit_extensions_keep_sdr_and_hdr_output_distinct() {
             "x-nv-video[0].dynamicRangeMode:0",
             "x-nv-video[0].dynamicRangeMode:1",
         );
+        // The Windows PyroWave client leaves the legacy encoder CSC hint at
+        // its default. The extension bitstream owns its color metadata.
+        let announcement = announcement.replace(
+            "x-nv-video[0].encoderCscMode:2",
+            "x-nv-video[0].encoderCscMode:0",
+        );
         let mut announce =
             amaterasu_gamestream::sdp::parse_profile_announce(announcement.as_bytes(), &snapshot)
                 .unwrap();
