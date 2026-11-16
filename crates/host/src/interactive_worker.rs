@@ -321,7 +321,10 @@ impl<'a> Supervisor<'a> {
             self.worker = None;
             match action {
                 HostLifecycleAction::Quit => return Ok(Some(action)),
-                HostLifecycleAction::Restart => self.schedule_restart()?,
+                HostLifecycleAction::Restart => {
+                    amaterasu_package::plugins::installed::begin_trial(self.root)?;
+                    self.schedule_restart()?;
+                }
             }
         } else if exited {
             on_worker_stopping();
@@ -345,6 +348,9 @@ impl<'a> Supervisor<'a> {
                 stop_requested,
             ) {
                 Ok(Some(worker)) => {
+                    if amaterasu_package::plugins::installed::read(self.root)?.trial {
+                        amaterasu_package::plugins::installed::finish_trial(self.root, true)?;
+                    }
                     self.worker = Some(worker);
                     self.failed_starts = 0;
                     self.restart_pending = false;
@@ -352,6 +358,9 @@ impl<'a> Supervisor<'a> {
                 Ok(None) => return Ok(None),
                 Err(error) => {
                     let error = error.into_retryable(stop_requested())?;
+                    if amaterasu_package::plugins::installed::read(self.root)?.trial {
+                        amaterasu_package::plugins::installed::finish_trial(self.root, false)?;
+                    }
                     eprintln!("Interactive worker startup failed: {error}");
                     self.failed_starts += 1;
                     self.restart_pending = true;
@@ -556,6 +565,11 @@ impl Worker {
         {
             return Err(StartupFailure::after_cleanup(error, worker.shutdown()));
         }
+        amaterasu_plugin_installation::broker::authorize_worker(
+            worker.process_id,
+            worker.creation_time,
+        )
+        .map_err(|error| StartupFailure::after_cleanup(error, worker.shutdown()))?;
         match worker
             .readiness
             .wait_for_ready(worker.process, stop_requested)

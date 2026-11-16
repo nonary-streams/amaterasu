@@ -60,6 +60,7 @@
       <ComponentRef Id="PairingImportTool" />
       <ComponentRef Id="AuthenticationImportTool" />
       <ComponentRef Id="ReleaseTool" />
+      <ComponentRef Id="PluginInstallerProvisioning" />
       <ComponentRef Id="PlayniteExtensionFiles" />
       <ComponentRef Id="DataDirectory" />
     </Feature>
@@ -282,6 +283,9 @@
         </Component>
         <Component Id="AuthenticationImportTool" Guid="*" Win64="yes">
           <File Id="AuthenticationImportExe" Source="$(var.StageDir)\tools\amaterasu-authentication-import.exe" />
+        </Component>
+        <Component Id="PluginInstallerProvisioning" Guid="*" Win64="yes">
+          <File Id="PluginInstallerProvisioningScript" Source="$(var.StageDir)\tools\enable-plugin-installer.ps1" KeyPath="yes" />
         </Component>
         <Component Id="ReleaseTool" Guid="*" Win64="yes">
           <File Id="ReleaseToolExe" Source="$(var.StageDir)\tools\amaterasu-release.exe" KeyPath="yes" />

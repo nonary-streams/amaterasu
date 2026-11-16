@@ -463,6 +463,7 @@ const LINUX_SESSION_STREAM_SESSION: ComponentDefinition = ComponentDefinition {
 
 const LINUX_SESSION_MANAGEMENT: ComponentDefinition = ComponentDefinition {
     calls: &[
+        "nonary.plugin-installation/1",
         "nonary.remote-session/1",
         "nonary.stats/1",
         "nonary.stats-history/1",
@@ -512,6 +513,7 @@ const LINUX_SESSION_MANAGEMENT: ComponentDefinition = ComponentDefinition {
         "nonary.host-settings/1",
     ],
     dependencies: &[
+        "amaterasu.plugin-installation",
         "amaterasu.remote-session",
         "amaterasu.library",
         "amaterasu.network",
@@ -559,6 +561,7 @@ pub const COMPONENTS: &[ComponentDefinition] = &[
     APPLICATION,
     AUTHENTICATION,
     LINUX_SESSION_MANAGEMENT,
+    super::PLUGIN_INSTALLATION,
     LINUX_SESSION_PAIRING,
     LINUX_SESSION_NVHTTP,
     RETAINED_DISPLAY,
@@ -638,6 +641,7 @@ pub const RTX_HDR_COMPONENTS: &[ComponentDefinition] = &[
     APPLICATION,
     AUTHENTICATION,
     RTX_HDR_MANAGEMENT,
+    super::PLUGIN_INSTALLATION,
     LINUX_SESSION_PAIRING,
     RTX_HDR_NVHTTP,
     RETAINED_DISPLAY,
@@ -692,6 +696,7 @@ pub const EXTENSION_COMPONENTS: &[ComponentDefinition] = &[
     APPLICATION,
     AUTHENTICATION,
     LINUX_SESSION_MANAGEMENT,
+    super::PLUGIN_INSTALLATION,
     LINUX_SESSION_PAIRING,
     LINUX_SESSION_NVHTTP,
     RETAINED_DISPLAY,

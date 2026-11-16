@@ -1092,11 +1092,27 @@ const SOFTWARE_MEDIA_PROBE: ComponentDefinition = ComponentDefinition {
     ..MEDIA_PROBE
 };
 
+pub(crate) const PLUGIN_INSTALLATION: ComponentDefinition = ComponentDefinition {
+    id: "amaterasu.plugin-installation",
+    library: "amaterasu_plugin_installation",
+    provides: &["nonary.plugin-installation/1"],
+    calls: &[
+        "amaterasu.host-state-context/1",
+        "amaterasu.host-package-activation/1",
+        "amaterasu.host-lifecycle/1",
+    ],
+    publishes: &[],
+    dependencies: &[RUNTIME_ID, "amaterasu.network"],
+    native_provides: &[],
+    native_uses: &["amaterasu.network/1"],
+};
+
 const MANAGEMENT: ComponentDefinition = ComponentDefinition {
     id: "amaterasu.management",
     library: "amaterasu_management",
     provides: &["amaterasu.management/1"],
     calls: &[
+        "nonary.plugin-installation/1",
         "nonary.stats/1",
         "nonary.stats-history/1",
         "nonary.stream-status/1",
@@ -1152,6 +1168,7 @@ const MANAGEMENT: ComponentDefinition = ComponentDefinition {
         "amaterasu.network/1",
     ],
     dependencies: &[
+        "amaterasu.plugin-installation",
         "amaterasu.library",
         "amaterasu.network",
         RUNTIME_ID,
@@ -1188,6 +1205,7 @@ const MANAGEMENT: ComponentDefinition = ComponentDefinition {
 // Only the opt-in fixture package grants management access to the example API.
 const MANAGEMENT_EXTENSION_EXAMPLE: ComponentDefinition = ComponentDefinition {
     calls: &[
+        "nonary.plugin-installation/1",
         "amaterasu.library/1",
         // Loopback `/healthz` asks this component's fixed, status-only
         // operation to drive bounded checks of its imported dependencies.
@@ -1240,6 +1258,7 @@ const MANAGEMENT_EXTENSION_EXAMPLE: ComponentDefinition = ComponentDefinition {
 // same as the platform component's grants.
 const MANAGEMENT_PROBE: ComponentDefinition = ComponentDefinition {
     dependencies: &[
+        "amaterasu.plugin-installation",
         "amaterasu.library",
         "amaterasu.network",
         RUNTIME_ID,
@@ -1274,6 +1293,7 @@ const MANAGEMENT_PROBE: ComponentDefinition = ComponentDefinition {
 
 const MANAGEMENT_SOFTWARE_PROBE: ComponentDefinition = ComponentDefinition {
     dependencies: &[
+        "amaterasu.plugin-installation",
         "amaterasu.library",
         "amaterasu.network",
         RUNTIME_ID,
@@ -1416,6 +1436,7 @@ const LINUX_STREAM_SESSION: ComponentDefinition = ComponentDefinition {
 
 const LINUX_MANAGEMENT: ComponentDefinition = ComponentDefinition {
     calls: &[
+        "nonary.plugin-installation/1",
         "amaterasu.library/1",
         "amaterasu.management/1",
         "amaterasu.authentication/1",
@@ -1460,6 +1481,7 @@ const LINUX_MANAGEMENT: ComponentDefinition = ComponentDefinition {
         "nonary.host-settings/1",
     ],
     dependencies: &[
+        "amaterasu.plugin-installation",
         "amaterasu.library",
         "amaterasu.network",
         RUNTIME_ID,
@@ -1534,6 +1556,7 @@ impl PackageProfile {
                 DISPLAY,
                 AUTHENTICATION,
                 MANAGEMENT_PROBE,
+                PLUGIN_INSTALLATION,
                 PAIRING,
                 NVHTTP,
                 SESSION,
@@ -1567,6 +1590,7 @@ impl PackageProfile {
                 DISPLAY,
                 AUTHENTICATION,
                 MANAGEMENT_SOFTWARE_PROBE,
+                PLUGIN_INSTALLATION,
                 PAIRING,
                 SOFTWARE_NVHTTP,
                 SESSION,
@@ -1604,6 +1628,7 @@ impl PackageProfile {
                 DISPLAY,
                 AUTHENTICATION,
                 LINUX_MANAGEMENT,
+                PLUGIN_INSTALLATION,
                 PAIRING,
                 LINUX_NVHTTP,
                 SESSION,
@@ -1674,6 +1699,7 @@ impl PackageProfile {
                 LUTRIS,
                 AUTHENTICATION,
                 remote_sessions::PLATFORM_MANAGEMENT,
+                PLUGIN_INSTALLATION,
                 PLATFORM_PAIRING,
                 remote_sessions::PLATFORM_TRANSPORT,
                 remote_sessions::RETAINED_DISPLAY,
@@ -1718,6 +1744,7 @@ impl PackageProfile {
                 LUTRIS,
                 AUTHENTICATION,
                 remote_sessions::EXAMPLE_MANAGEMENT,
+                PLUGIN_INSTALLATION,
                 PLATFORM_PAIRING,
                 remote_sessions::PLATFORM_TRANSPORT,
                 remote_sessions::RETAINED_DISPLAY,

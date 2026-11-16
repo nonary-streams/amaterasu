@@ -59,7 +59,9 @@ dependencies = [
  "amaterasu-contracts",
  "amaterasu-input-companion",
  "amaterasu-logging",
+ "amaterasu-module-sdk",
  "amaterasu-package",
+ "amaterasu-plugin-installation",
  "ed25519-dalek",
  "libc",
  "libloading",
@@ -353,6 +355,7 @@ name = "amaterasu-echo-fixture"
 version = "0.1.0"
 dependencies = [
  "amaterasu-module-sdk",
+ "amaterasu-package",
  "serde_json",
 ]
 
@@ -804,6 +807,22 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "amaterasu-plugin-installation"
+version = "0.1.0"
+dependencies = [
+ "amaterasu-contracts",
+ "amaterasu-input-companion",
+ "amaterasu-module-sdk",
+ "amaterasu-package",
+ "libc",
+ "libloading",
+ "serde",
+ "serde_json",
+ "ureq",
  "windows-sys 0.61.2",
 ]
 

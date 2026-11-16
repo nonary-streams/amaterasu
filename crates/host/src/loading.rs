@@ -268,11 +268,50 @@ impl LoadedComponents {
         runtime_config.host_context.schema = 1;
         runtime_config.host_context.state_root = Some(state_root_string.clone());
         runtime_config.host_lifecycle_control = true;
+        runtime_config.host_package_activation_control = true;
+        if package.manifest.components.iter().any(|component| {
+            component
+                .requested
+                .provide
+                .contains("nonary.plugin-installation/1")
+        }) {
+            let operation_file = state_root.join("plugin-installation/operation.json");
+            if operation_file.exists() {
+                let operation: amaterasu_package::plugins::operation::Operation =
+                    amaterasu_package::read_json(&operation_file)?;
+                operation.validate()?;
+                runtime_config.host_context.plugin_setup_pending = operation.in_flight.is_some()
+                    || matches!(
+                        operation.phase,
+                        amaterasu_package::plugins::operation::Phase::Activating
+                    );
+            }
+            runtime_config.host_context.running_components = package
+                .manifest
+                .components
+                .iter()
+                .map(serde_json::to_value)
+                .collect::<Result<_, _>>()
+                .map_err(|e| e.to_string())?;
+            runtime_config.host_context.running_modules = package
+                .manifest
+                .components
+                .iter()
+                .map(|component| amaterasu_contracts::RunningModuleIdentity {
+                    id: component.id.clone(),
+                    version: component.version.clone(),
+                    sha256: component.sha256.clone(),
+                    runtime: component.runtime,
+                })
+                .collect();
+        }
         runtime_config.principals.insert(
             HOST_LIFECYCLE_CONTROL_PRINCIPAL.into(),
             amaterasu_contracts::Grants::default(),
         );
         inject_package_root(&mut runtime_config, root)?;
+        #[cfg(windows)]
+        inject_plugin_repositories(&mut runtime_config, root, &state_root)?;
         inject_running_package_digest(&mut runtime_config, &package.digest)?;
         #[cfg(target_os = "linux")]
         crate::capture_authority::inject(package, &mut runtime_config.settings)?;
@@ -1432,4 +1471,58 @@ mod tests {
             Err("native path cannot be represented as Unicode".into())
         );
     }
+}
+
+#[cfg(windows)]
+fn inject_plugin_repositories(
+    runtime: &mut amaterasu_contracts::RuntimeConfig,
+    root: &Path,
+    state: &Path,
+) -> PackageResult<()> {
+    if !runtime
+        .principals
+        .contains_key("amaterasu.plugin-installation")
+    {
+        return Ok(());
+    }
+    let directory = state.join("repositories");
+    amaterasu_package::create_private_directory(&directory)?;
+    let destination = directory.join("approved.json");
+    let source = root.join("repositories/approved.json");
+    if !destination.exists() && source.exists() {
+        std::fs::copy(source, destination).map_err(|e| e.to_string())?;
+    }
+    let selected = amaterasu_package::plugins::installed::read(root)?;
+    let original = amaterasu_package::repository::RepositoryStore::new(root.join("repositories"))?;
+    let user = amaterasu_package::repository::RepositoryStore::new(directory.clone())?;
+    for source in &selected.active {
+        let from = original
+            .existing_native_candidate_cache_path(&source.repository, &source.manifest_digest)?;
+        let to = user.native_candidate_cache_path(&source.repository, &source.manifest_digest)?;
+        if !to.exists() {
+            amaterasu_package::create_private_directory(&to)?;
+            let manifest: amaterasu_package::plugins::PluginManifest =
+                amaterasu_package::read_json(&from.join("manifest.json"))?;
+            for file in manifest
+                .artifacts()?
+                .into_iter()
+                .map(|artifact| artifact.file)
+                .chain(["manifest.json".into(), "manifest.sig".into()])
+            {
+                if std::fs::hard_link(from.join(&file), to.join(&file)).is_err() {
+                    std::fs::copy(from.join(&file), to.join(&file)).map_err(|e| e.to_string())?;
+                }
+            }
+        }
+    }
+    runtime
+        .settings
+        .entry("amaterasu.plugin-installation".into())
+        .or_insert_with(|| json!({}))["repository_directory"] = json!(directory);
+    if let Some(management) = runtime.settings.get_mut("amaterasu.management")
+        && let Some(web) = management.get_mut("web")
+    {
+        web["repository_directory"] = json!(directory);
+    }
+    Ok(())
 }

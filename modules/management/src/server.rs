@@ -1191,6 +1191,42 @@ impl Connection {
             return Ok(());
         };
         let route = *route;
+        if route.service == amaterasu_module_sdk::drivers::INSTALLATION_SERVICE {
+            let mut arguments = request.payload.as_object().cloned().unwrap_or_default();
+            arguments.remove("action");
+            let Some(operation_id) = operation.next_id() else {
+                self.fail(503, "operation_ids_exhausted");
+                return Ok(());
+            };
+            let remaining = self
+                .deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis() as u64;
+            if remaining <= 100 {
+                self.fail(504, "deadline_exceeded");
+                return Ok(());
+            }
+            let command = Command::CallApi {
+                service: route.service.into(),
+                method: route.action.into(),
+                interface_major: 1,
+                interface_minor: 0,
+                payload: Value::Object(arguments),
+                timeout_ms: remaining - 100,
+                operation_id,
+                parent: None,
+            };
+            if let Some(request_id) = self.submit_command(runtime, command) {
+                self.stage = Stage::Dispatching {
+                    request_id,
+                    login: false,
+                    operational_health: false,
+                    browser_auth: None,
+                    capture: None,
+                };
+            }
+            return Ok(());
+        }
         if route.service == "amaterasu.capture-pipewire/1" {
             self.dispatch_capture(
                 runtime,
@@ -1735,7 +1771,8 @@ fn role_permits(payload: &Value, request: &http::Request) -> bool {
             || (route.service == crate::SERVICE
                 && matches!(route.action, "repository_add" | "repository_refresh" | "repository_remove"
                     | "package_update_activate" | "package_update_restore"
-                    | "package_update_automatic")));
+                    | "package_update_automatic"))
+            || (route.service == amaterasu_module_sdk::drivers::INSTALLATION_SERVICE && route.action != "status"));
     let role = match payload.get("kind").and_then(Value::as_str) {
         Some("api_token") => return !is_session_only_admin,
         Some("administrator_session") => match payload.get("role").and_then(Value::as_str) {
@@ -1755,7 +1792,10 @@ fn role_permits(payload: &Value, request: &http::Request) -> bool {
     }
     let read = matches!(
         (route.service, route.action),
-        ("amaterasu.library/1", "artwork_open")
+        (
+            amaterasu_module_sdk::drivers::INSTALLATION_SERVICE,
+            "status"
+        ) | ("amaterasu.library/1", "artwork_open")
             | ("amaterasu.catalog/1", "get" | "list" | "search")
             | ("amaterasu.launch/1", "status" | "list")
             | ("amaterasu.application/1", "status" | "list")
@@ -2207,6 +2247,8 @@ mod tests {
             assert!(!allowed(role, "/v1/auth/settings"));
             assert!(!allowed(role, "/v1/configuration/get"));
         }
+        assert!(allowed("viewer", "/v1/drivers/status"));
+        assert!(allowed("operator", "/v1/plugins/status"));
         assert!(!allowed("viewer", "/v1/launch/start"));
         assert!(!allowed("viewer", "/v1/launch/stop"));
         assert!(allowed("viewer", "/v1/nvhttp/launch_status"));
@@ -2265,6 +2307,11 @@ mod tests {
             "/v1/repositories/add",
             "/v1/repositories/refresh",
             "/v1/repositories/remove",
+            "/v1/plugins/prepare",
+            "/v1/plugins/approve",
+            "/v1/plugins/retry",
+            "/v1/plugins/cancel",
+            "/v1/plugins/activate",
         ] {
             assert!(allowed("administrator", path));
             assert!(!allowed("operator", path));

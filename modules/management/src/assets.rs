@@ -10,6 +10,8 @@ const RECOVERY_PAGE: &str = "<!doctype html><html lang=\"en\"><head><meta charse
 #[serde(deny_unknown_fields)]
 pub struct WebSettings {
     directory: PathBuf,
+    #[serde(default)]
+    repository_directory: Option<PathBuf>,
     trusted_keys: BTreeMap<String, String>,
 }
 
@@ -23,6 +25,9 @@ impl WebSettings {
     }
 
     pub fn repository_directory(&self) -> PackageResult<PathBuf> {
+        if let Some(directory) = &self.repository_directory {
+            return Ok(directory.clone());
+        }
         Ok(self
             .directory
             .parent()
@@ -279,6 +284,7 @@ mod tests {
                 unix_timestamp(),
             )?;
             let mut assets = Assets::new(WebSettings {
+                repository_directory: None,
                 directory: root.join("web"),
                 trusted_keys: BTreeMap::from([("project".into(), "0".repeat(64))]),
             })?;

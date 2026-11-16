@@ -273,10 +273,14 @@ pub(crate) fn service_process_id(name: &str) -> InputResult<u32> {
 }
 
 pub(crate) fn require_service_pipe_server(pipe: Handle) -> InputResult<()> {
+    require_named_service_pipe_server(pipe, "AmaterasuInputCompanion")
+}
+
+pub(crate) fn require_named_service_pipe_server(pipe: Handle, service: &str) -> InputResult<()> {
     let mut process_id = 0;
     // SAFETY: pipe is an open client handle and process_id is writable.
     if unsafe { GetNamedPipeServerProcessId(pipe, &mut process_id) } == 0
-        || process_id != service_process_id("AmaterasuInputCompanion")?
+        || process_id != service_process_id(service)?
     {
         return Err(InputError::PermissionDenied);
     }

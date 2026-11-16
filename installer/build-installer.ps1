@@ -101,6 +101,7 @@ if (Test-Path $stage) {
 }
 New-Item -ItemType Directory -Path (Join-Path $stage 'tools') -Force | Out-Null
 Write-ApprovedPlayniteExtension $approvedPlayniteFiles $stage
+Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'enable-plugin-installer.ps1') -Destination (Join-Path $stage 'tools\enable-plugin-installer.ps1')
 
 $releaseDirectory = Get-CargoReleaseDirectory $repository $env:CARGO_TARGET_DIR
 $installerSigner = $env:AMATERASU_INSTALLER_SIGNING_KEY

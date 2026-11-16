@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+amaterasu-plugin-installation = { path="../../modules/plugin-installation" }
 amaterasu-abi.workspace = true
 amaterasu-contracts.workspace = true
 amaterasu-logging.workspace = true
@@ -22,3 +23,4 @@ libc = "0.2"
 
 [dev-dependencies]
 ed25519-dalek.workspace = true
+amaterasu-module-sdk.workspace = true

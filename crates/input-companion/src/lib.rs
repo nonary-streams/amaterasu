@@ -64,3 +64,8 @@ pub type InputResult<T> = Result<T, InputError>;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(windows)]
+mod installation_pipe;
+#[cfg(windows)]
+pub use installation_pipe::{InstallationPipe, installation_identity};

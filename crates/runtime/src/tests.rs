@@ -589,6 +589,9 @@ fn host_state_context_is_available_only_to_trusted_state_consumers() {
         .principals
         .insert("amaterasu.management".into(), Grants::default());
     configuration.host_context = RuntimeHostContext {
+        running_modules: Vec::new(),
+        running_components: Vec::new(),
+        plugin_setup_pending: false,
         schema: 1,
         state_root: Some(r"C:\\ProgramData\\Amaterasu\\runtime\\user-state\\S-1-5-21-1".into()),
         package_root: Some(r"C:\\ProgramData\\Amaterasu\\packages".into()),
@@ -663,7 +666,10 @@ fn host_state_context_is_available_only_to_trusted_state_consumers() {
     else {
         panic!("management did not receive the running package digest");
     };
-    assert_eq!(payload, serde_json::json!({"digest":"a".repeat(64)}));
+    assert_eq!(
+        payload,
+        serde_json::json!({"digest":"a".repeat(64),"modules":[]})
+    );
     for caller in ["amaterasu.state", "amaterasu.audio", "other"] {
         assert!(matches!(
             broker.dispatch(caller, Command::GetPackageRoot {}),
@@ -4021,4 +4027,124 @@ fn operation_api_consumers_remain_unchanged_when_the_provider_is_replaced() {
             );
         }
     }
+}
+
+#[test]
+fn alternate_plugin_installer_holds_fresh_stream_barriers_and_releases_admission() {
+    let provider = "org.example.alternate-installer";
+    let mut config = RuntimeConfig {
+        host_lifecycle_control: true,
+        host_package_activation_control: true,
+        ..Default::default()
+    };
+    config
+        .principals
+        .insert(HOST_LIFECYCLE_CONTROL_PRINCIPAL.into(), Grants::default());
+    config.principals.insert(
+        provider.into(),
+        Grants {
+            provide: names(&["nonary.plugin-installation/1"]),
+            call: names(&[
+                HOST_PACKAGE_ACTIVATION_SERVICE,
+                HOST_LIFECYCLE_SERVICE,
+                "nonary.plugin-installation/1",
+            ]),
+            ..Default::default()
+        },
+    );
+    config.principals.insert(
+        "outsider".into(),
+        Grants {
+            call: names(&[HOST_PACKAGE_ACTIVATION_SERVICE, HOST_LIFECYCLE_SERVICE]),
+            ..Default::default()
+        },
+    );
+    for principal in ["stream", "session"] {
+        config.principals.insert(
+            principal.into(),
+            Grants {
+                call: names(&[HOST_PACKAGE_BARRIER_SERVICE]),
+                ..Default::default()
+            },
+        );
+    }
+    config.api_methods.push(ApiMethodApproval {
+        provider: provider.into(),
+        callers: names(&[provider]),
+        method: ApiMethod {
+            service: "nonary.plugin-installation/1".into(),
+            method: "status".into(),
+            interface_major: 1,
+            interface_minor: 0,
+            request: ApiSchema {
+                required: Default::default(),
+                optional: Default::default(),
+                allow_extra: false,
+            },
+            response: ApiSchema {
+                required: Default::default(),
+                optional: Default::default(),
+                allow_extra: true,
+            },
+            privilege: ApiPrivilege::User,
+        },
+    });
+    let mut broker = Broker::new(config.clone()).unwrap();
+    assert_error_code(
+        broker.dispatch("outsider", Command::HostPluginSetup { hold: true }),
+        "permission_denied",
+    );
+    assert_error_code(
+        broker.dispatch(provider, Command::HostPluginSetup { hold: true }),
+        "activation_barrier_unavailable",
+    );
+    for principal in ["stream", "session"] {
+        assert!(matches!(
+            broker.dispatch(principal, Command::HostPackageBarrierRegister {}),
+            Response::Ok
+        ));
+    }
+    assert!(
+        matches!(broker.dispatch(provider,Command::HostPluginSetup{hold:true}),Response::Result{payload} if payload["held"]==true&&payload["ready"]==false)
+    );
+    assert_error_code(
+        broker.dispatch(
+            provider,
+            Command::HostLifecycle {
+                action: HostLifecycleAction::Restart,
+            },
+        ),
+        "plugin_barrier_not_ready",
+    );
+    assert!(matches!(
+        broker.dispatch("stream", Command::HostPackageBarrierReady { ready: true }),
+        Response::Ok
+    ));
+    assert!(
+        matches!(broker.dispatch(provider,Command::HostPluginSetupStatus{}),Response::Result{payload} if payload["ready"]==false)
+    );
+    assert!(matches!(
+        broker.dispatch("session", Command::HostPackageBarrierReady { ready: true }),
+        Response::Ok
+    ));
+    assert!(
+        matches!(broker.dispatch(provider,Command::HostPluginSetupStatus{}),Response::Result{payload} if payload["ready"]==true)
+    );
+    assert!(matches!(
+        broker.dispatch(
+            provider,
+            Command::HostLifecycle {
+                action: HostLifecycleAction::Restart
+            }
+        ),
+        Response::Ok
+    ));
+    assert!(
+        matches!(broker.dispatch(provider,Command::HostPluginSetup{hold:false}),Response::Result{payload} if payload["held"]==false)
+    );
+    config.host_context.plugin_setup_pending = true;
+    let mut recovered = Broker::new(config).unwrap();
+    assert!(
+        matches!(recovered.dispatch(provider,Command::HostPluginSetupStatus{}),Response::Result{payload} if payload["held"]==true&&payload["ready"]==false)
+    );
 }

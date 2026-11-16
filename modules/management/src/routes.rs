@@ -144,6 +144,23 @@ pub fn resolve(path: &str) -> Option<Route> {
             "module_describe",
             Some("configuration.read"),
         ),
+        ("drivers", "status") | ("plugins", "status") => (
+            amaterasu_module_sdk::drivers::INSTALLATION_SERVICE,
+            "status",
+            Some("configuration.read"),
+        ),
+        ("plugins", action @ ("prepare" | "approve" | "cancel" | "retry" | "activate")) => (
+            amaterasu_module_sdk::drivers::INSTALLATION_SERVICE,
+            match action {
+                "prepare" => "prepare",
+                "approve" => "approve",
+                "cancel" => "cancel",
+                "retry" => "retry",
+                "activate" => "activate",
+                _ => unreachable!(),
+            },
+            Some("configuration.write"),
+        ),
         ("rtx-hdr", action @ ("status" | "install" | "cancel" | "activate")) => (
             "amaterasu.management/1",
             match action {
@@ -496,6 +513,7 @@ pub fn resolve(path: &str) -> Option<Route> {
         action,
         scope,
         requires_empty_body: domain == "rtx-hdr"
+            || (matches!(domain,"drivers"|"plugins") && action == "status")
             // A restore names the retained set to return to and a choice of
             // automatic updates names its mode; nothing else carries a body.
             || (domain == "package-update"
@@ -619,6 +637,32 @@ pub fn payload(route: Route, bytes: &[u8]) -> Result<Value, &'static str> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn plugin_setup_routes_bind_approvals_and_reject_arbitrary_execution() {
+        use super::*;
+        let status = resolve("/v1/drivers/status").unwrap();
+        assert_eq!(
+            status.service,
+            amaterasu_module_sdk::drivers::INSTALLATION_SERVICE
+        );
+        assert_eq!(status.scope, Some("configuration.read"));
+        assert!(payload(status, br#"{}"#).is_ok());
+        assert!(payload(status, br#"{"path":"/tmp/driver"}"#).is_err());
+        let prepare = resolve("/v1/plugins/prepare").unwrap();
+        let request = serde_json::json!({"repository":"example","manifest":"a".repeat(64),"installation_revision":"b".repeat(64)});
+        assert!(payload(prepare, &serde_json::to_vec(&request).unwrap()).is_ok());
+        let approve = resolve("/v1/plugins/approve").unwrap();
+        let request = serde_json::json!({"operation":"setup1","revision":"18446744073709551615","installation_revision":"b".repeat(64),"approval":"c".repeat(64)});
+        assert!(payload(approve, &serde_json::to_vec(&request).unwrap()).is_ok());
+        for extra in ["command", "path", "arguments", "provider", "force"] {
+            let mut invalid = request.clone();
+            invalid[extra] = "injected".into();
+            assert!(payload(approve, &serde_json::to_vec(&invalid).unwrap()).is_err());
+        }
+        let mut overflow = request.clone();
+        overflow["revision"] = "18446744073709551616".into();
+        assert!(payload(approve, &serde_json::to_vec(&overflow).unwrap()).is_err());
+    }
     use super::*;
 
     #[test]

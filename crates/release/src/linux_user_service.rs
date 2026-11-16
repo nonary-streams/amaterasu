@@ -111,6 +111,10 @@ pub fn prepare(
         ("install-user-service.sh", install_script().into()),
         ("uninstall-user-service.sh", uninstall_script().into()),
         ("preflight-user-service.sh", preflight_script().into()),
+        (
+            "provision-plugin-installer.py",
+            include_str!("../../../scripts/provision_plugin_installer.py").into(),
+        ),
         ("README.md", render_readme(active_digest)),
     ];
     crate::capture_precheck::validate_package(

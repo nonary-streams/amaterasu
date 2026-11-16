@@ -180,3 +180,12 @@ test):
 ```powershell
 msiexec /i .\target\installer\Amaterasu-0.1.0-x64.msi INSTALLFOLDER=C:\temp\amaterasu-msi-test /l*v C:\temp\amaterasu-msi-test.log
 ```
+
+## Optional plugin driver approval
+
+The MSI installs `tools/enable-plugin-installer.ps1`. An OS administrator can
+explicitly provision approved driver publishers for a runtime/user with this
+script; the existing service reads the protected policy on its next authorized
+restart. This is separate from installing any driver. See
+[plugin driver installation](../docs/plugin-driver-installation.md) for inputs,
+trust boundaries and platform qualification requirements.

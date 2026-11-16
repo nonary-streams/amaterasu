@@ -16,6 +16,8 @@ mod logging_config;
 mod native_recovery;
 #[cfg(target_os = "linux")]
 mod package_activation;
+#[cfg(test)]
+mod plugin_tests;
 mod privilege;
 mod protocol;
 mod publisher_selection;
@@ -44,6 +46,13 @@ fn main() {
 fn run() -> PackageResult<()> {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
     match arguments.as_slice() {
+        [command, policy] if command == "plugin-driver-service" => {
+            let policy = amaterasu_plugin_installation::broker::read_policy(Path::new(policy))?;
+            amaterasu_plugin_installation::broker::serve(
+                policy,
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )?;
+        }
         [command, root] if command == "serve" => service::serve(Path::new(root))?,
         [command, root] if command == "service" => service::service(Path::new(root))?,
         #[cfg(target_os = "linux")]

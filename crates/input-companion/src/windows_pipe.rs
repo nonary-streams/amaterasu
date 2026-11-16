@@ -360,6 +360,7 @@ impl PipeIo {
 pub(crate) enum PipeKind {
     Host,
     Worker,
+    Installation,
 }
 
 impl PipeKind {
@@ -367,6 +368,7 @@ impl PipeKind {
         match self {
             Self::Host => HOST_PIPE,
             Self::Worker => WORKER_PIPE,
+            Self::Installation => r"\\.\pipe\AmaterasuPluginInstaller-v1",
         }
     }
 }
@@ -402,7 +404,9 @@ impl Pipe {
         // still subject to per-request OS identity and host-grant checks.
         let sddl = wide(match kind {
             PipeKind::Host => "D:P(A;;GA;;;SY)(A;;GA;;;BA)",
-            PipeKind::Worker => "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x00100003;;;IU)",
+            PipeKind::Installation | PipeKind::Worker => {
+                "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x00100003;;;IU)"
+            }
         });
         let mut descriptor = null_mut();
         let mut length = 0;
@@ -511,7 +515,12 @@ impl Pipe {
             server: false,
             io: RefCell::new(PipeIo::default()),
         };
-        crate::windows_identity::require_service_pipe_server(handle)?;
+        match kind {
+            PipeKind::Installation => {
+                crate::windows_identity::require_named_service_pipe_server(handle, "Amaterasu")?
+            }
+            _ => crate::windows_identity::require_service_pipe_server(handle)?,
+        }
         Ok(pipe)
     }
 

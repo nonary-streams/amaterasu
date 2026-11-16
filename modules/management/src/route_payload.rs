@@ -14,6 +14,63 @@ pub fn validate(route: Route, object: &Object) -> Result<(), &'static str> {
         return fields(object, &[], &[]);
     }
     match route.service {
+        amaterasu_module_sdk::drivers::INSTALLATION_SERVICE => match route.action {
+            "status" => fields(object, &[], &[]),
+            "prepare" => {
+                fields(
+                    object,
+                    &["repository", "manifest", "installation_revision"],
+                    &[],
+                )?;
+                repository_text(object, "repository", 128)?;
+                for name in ["manifest", "installation_revision"] {
+                    if !object
+                        .get(name)
+                        .and_then(Value::as_str)
+                        .is_some_and(amaterasu_package::plugins::digest)
+                    {
+                        return Err(INVALID);
+                    }
+                }
+                Ok(())
+            }
+            "approve" | "cancel" | "retry" | "activate" => {
+                let required = if route.action == "approve" {
+                    vec!["operation", "revision", "installation_revision", "approval"]
+                } else {
+                    vec!["operation", "revision", "installation_revision"]
+                };
+                fields(object, &required, &[])?;
+                repository_text(object, "operation", 128)?;
+                if object
+                    .get("revision")
+                    .and_then(Value::as_str)
+                    .is_none_or(|value| {
+                        value
+                            .parse::<u64>()
+                            .ok()
+                            .is_none_or(|number| number == 0 || number.to_string() != value)
+                    })
+                {
+                    return Err(INVALID);
+                }
+                for name in if route.action == "approve" {
+                    vec!["installation_revision", "approval"]
+                } else {
+                    vec!["installation_revision"]
+                } {
+                    if !object
+                        .get(name)
+                        .and_then(Value::as_str)
+                        .is_some_and(amaterasu_package::plugins::digest)
+                    {
+                        return Err(INVALID);
+                    }
+                }
+                Ok(())
+            }
+            _ => Err(INVALID),
+        },
         "amaterasu.management/1" if route.action == "extension_list" => fields(object, &[], &[]),
         "amaterasu.management/1" if route.action == "extension_call" => {
             fields(object, &["id", "digest", "method", "payload"], &[])?;

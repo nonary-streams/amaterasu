@@ -194,15 +194,17 @@ pub(crate) fn module_description(
     let Some(manifest) = described else {
         return unavailable();
     };
-    let Some(component) = manifest
-        .components
-        .iter()
-        .find(|component| component.id == id)
-    else {
+    describe_components(&manifest.components, id)
+}
+pub(crate) fn loaded_module_description(value: &Value, id: &str) -> Option<Value> {
+    let components: Vec<ComponentManifest> = serde_json::from_value(value.clone()).ok()?;
+    valid_inventory(&components).then(|| describe_components(&components, id))
+}
+fn describe_components(components: &[ComponentManifest], id: &str) -> Value {
+    let Some(component) = components.iter().find(|component| component.id == id) else {
         return json!({"ok":false,"code":"module_not_found"});
     };
-    let required_by: Vec<&str> = manifest
-        .components
+    let required_by: Vec<&str> = components
         .iter()
         .filter(|other| other.requires.contains_key(id))
         .map(|other| other.id.as_str())

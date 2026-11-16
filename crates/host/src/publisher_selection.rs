@@ -110,7 +110,7 @@ pub fn with_verified_selected<T>(
             {
                 return Err("pending repository set was superseded by a newer release".into());
             }
-            operation(package)
+            amaterasu_package::plugins::installed::with_overlay(root, package, bootstrap, operation)
         });
     }
     let package = verify_package_with_progress(
@@ -123,7 +123,18 @@ pub fn with_verified_selected<T>(
         },
         progress,
     )?;
-    operation(package)
+    if !amaterasu_package::plugins::installed::read(root)?
+        .active
+        .is_empty()
+        || amaterasu_package::plugins::installed::read(root)?.trial
+    {
+        let store = RepositoryStore::new(root.join("repositories"))?;
+        store.with_active_keys(|_| {
+            amaterasu_package::plugins::installed::with_overlay(root, package, bootstrap, operation)
+        })
+    } else {
+        operation(package)
+    }
 }
 
 #[cfg(test)]

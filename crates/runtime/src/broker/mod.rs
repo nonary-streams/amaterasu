@@ -26,6 +26,7 @@ pub struct Broker {
     events: EventBus,
     hooks: HookRegistry,
     host_lifecycle: VecDeque<HostLifecycleAction>,
+    plugin_setup: bool,
     host_package_activation: Option<HostPackageActivation>,
     /// A request to make a retained set active again. At most one of this and
     /// `host_package_activation` is held, behind the same barrier.
@@ -75,6 +76,7 @@ impl Broker {
                 return Err("could not register the reserved host log service".into());
             }
         }
+        let plugin_setup = configuration.host_context.plugin_setup_pending;
         Ok(Self {
             hooks: HookRegistry::new(configuration.hooks.clone()),
             api: ApiRegistry::new(&configuration),
@@ -82,6 +84,7 @@ impl Broker {
             requests,
             events: EventBus::default(),
             host_lifecycle: VecDeque::with_capacity(HOST_LIFECYCLE_QUEUE_CAPACITY),
+            plugin_setup,
             host_package_activation: None,
             host_package_restore: None,
             host_package_restore_control: false,
@@ -94,9 +97,20 @@ impl Broker {
         })
     }
 
+    fn is_plugin_installer(&self, caller: &str, grants: &Grants) -> bool {
+        grants.call.contains(HOST_PACKAGE_ACTIVATION_SERVICE)
+            && self.configuration.api_methods.iter().any(|approval| {
+                approval.provider == caller
+                    && approval.method.service == "nonary.plugin-installation/1"
+                    && approval.method.interface_major == 1
+            })
+    }
+
     /// True while the host holds a package request it has not yet taken.
     fn host_package_request_pending(&self) -> bool {
-        self.host_package_activation.is_some() || self.host_package_restore.is_some()
+        self.plugin_setup
+            || self.host_package_activation.is_some()
+            || self.host_package_restore.is_some()
     }
 
     /// True when every registered barrier provider reported safe retirement.
@@ -269,7 +283,32 @@ impl Broker {
                 "native_transport_required",
                 "native interfaces require the authenticated ABI endpoint",
             ),
+            Command::HostPluginSetup { .. } | Command::HostPluginSetupStatus {} => {
+                if !self.is_plugin_installer(caller, grants) {
+                    return errors::permission_denied();
+                }
+                if let Command::HostPluginSetup { hold } = command {
+                    if hold
+                        && !self.plugin_setup
+                        && let Err(error) = self.admit_host_package_request()
+                    {
+                        return error;
+                    }
+                    self.plugin_setup = hold;
+                }
+                Response::Result {
+                    payload: serde_json::json!({"ok":true,"held":self.plugin_setup,"ready":self.plugin_setup && self.host_package_barriers_ready()}),
+                }
+            }
             Command::HostLifecycle { action } => {
+                if self.is_plugin_installer(caller, grants)
+                    && (!self.plugin_setup || !self.host_package_barriers_ready())
+                {
+                    return Response::error(
+                        "plugin_barrier_not_ready",
+                        "plugin setup must hold the idle barrier",
+                    );
+                }
                 if !grants.call.contains(HOST_LIFECYCLE_SERVICE) {
                     return errors::permission_denied();
                 }
@@ -451,7 +490,7 @@ impl Broker {
                 }
             }
             Command::GetPackageRoot {} => {
-                if caller != "amaterasu.management" {
+                if caller != "amaterasu.management" && !(self.is_plugin_installer(caller, grants)) {
                     return errors::permission_denied();
                 }
                 match &self.configuration.host_context.package_root {
@@ -465,13 +504,24 @@ impl Broker {
                 }
             }
             Command::GetRunningPackageDigest {} => {
-                if caller != "amaterasu.management" {
+                if caller != "amaterasu.management" && !self.is_plugin_installer(caller, grants) {
                     return errors::permission_denied();
                 }
                 match &self.configuration.host_context.running_package_digest {
-                    Some(digest) => Response::Result {
-                        payload: serde_json::json!({"digest": digest}),
-                    },
+                    Some(digest) => {
+                        let mut payload = serde_json::json!({"digest":digest,"modules":self.configuration.host_context.running_modules});
+                        if !self
+                            .configuration
+                            .host_context
+                            .running_components
+                            .is_empty()
+                        {
+                            payload["components"] = serde_json::json!(
+                                self.configuration.host_context.running_components
+                            );
+                        }
+                        Response::Result { payload }
+                    }
                     None => Response::error(
                         "running_package_unavailable",
                         "host did not supply a loaded package digest",

@@ -138,6 +138,15 @@ fn every_call_targets_a_provider_the_caller_depends_on() {
                 continue;
             }
             // This service is supplied by the host, not by a loadable component.
+            if caller.id == "amaterasu.plugin-installation"
+                && matches!(
+                    *service,
+                    "amaterasu.host-package-activation/1" | "amaterasu.host-lifecycle/1"
+                )
+            {
+                assert!(closure.contains(RUNTIME_ID));
+                continue;
+            }
             if matches!(
                 *service,
                 "amaterasu.host-logs/1"
@@ -264,6 +273,11 @@ fn profile_uses_real_libraries_and_none_of_the_fixture_or_foreign_platform_compo
         "amaterasu.host-lifecycle/1",
     ] {
         for included in COMPONENTS {
+            if included.id == "amaterasu.plugin-installation"
+                && service == "amaterasu.host-lifecycle/1"
+            {
+                continue;
+            }
             assert!(
                 !included.calls.contains(&service)
                     && !included.native_uses.contains(&service)

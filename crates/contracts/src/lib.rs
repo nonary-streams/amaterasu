@@ -239,6 +239,17 @@ pub struct RuntimeHostContext {
     /// Only management may request it; persisted selection can differ.
     #[serde(default)]
     pub running_package_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub running_modules: Vec<RunningModuleIdentity>,
+    /// Original verified component declarations for management inventory.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub running_components: Vec<Value>,
+    /// Resume admission blocking before a recovered installer can receive work.
+    #[serde(default, skip_serializing_if = "bool_is_false")]
+    pub plugin_setup_pending: bool,
+}
+fn bool_is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -276,6 +287,11 @@ pub enum Command {
     HostLifecycle {
         action: HostLifecycleAction,
     },
+    /// Hold stream admission closed for the selected installation coordinator.
+    HostPluginSetup {
+        hold: bool,
+    },
+    HostPluginSetupStatus {},
     /// Request a host-verified package trial; only approved management may call.
     HostPackageActivate {
         request: HostPackageActivation,

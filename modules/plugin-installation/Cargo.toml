@@ -1,0 +1,22 @@
+[package]
+name = "amaterasu-plugin-installation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+[lib]
+crate-type = ["rlib", "cdylib"]
+[dependencies]
+amaterasu-package.workspace = true
+libloading.workspace = true
+amaterasu-module-sdk = { workspace = true, features = ["network-http"] }
+amaterasu-contracts.workspace = true
+amaterasu-input-companion.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ureq = { version = "=3.4.2", default-features = false, features = ["rustls", "platform-verifier"] }
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+[lints]
+workspace = true
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Devices_DeviceAndDriverInstallation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_Security", "Win32_Security_Authorization", "Win32_System_SystemServices", "Win32_System_JobObjects", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Threading"] }

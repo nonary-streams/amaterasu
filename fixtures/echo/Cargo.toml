@@ -8,11 +8,13 @@ rust-version.workspace = true
 crate-type = ["cdylib"]
 
 [features]
+plugin-installation-qualification = ["dep:amaterasu-package"]
 revision-two = []
 fail-health = []
 stall-tick = []
 
 [dependencies]
+amaterasu-package = { workspace = true, optional = true }
 amaterasu-module-sdk.workspace = true
 serde_json.workspace = true
 

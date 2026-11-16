@@ -13,6 +13,19 @@ pub(crate) fn run_interactive_service(
     on_started: impl FnOnce(),
 ) -> PackageResult<()> {
     let _lock = RootLock::acquire(root)?;
+    let _driver_service = match amaterasu_plugin_installation::broker::start_optional(root) {
+        Ok(service) => service,
+        Err(error) => {
+            eprintln!("Optional driver installation service is unavailable: {error}");
+            None
+        }
+    };
+    if amaterasu_package::plugins::installed::read(root)?
+        .pending
+        .is_some()
+    {
+        amaterasu_package::plugins::installed::finish_trial(root, false)?;
+    }
     let digest = crate::supervisor::select_active(root)?;
     let mut supervisor = crate::interactive_worker::Supervisor::new(root, &digest)?;
     let result = (|| {

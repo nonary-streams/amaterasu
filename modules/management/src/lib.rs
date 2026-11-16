@@ -700,10 +700,19 @@ impl ManagementModule {
         let Some(root) = root.to_str() else {
             return package_status::unavailable();
         };
-        package_status::selection_status(
+        let mut status = package_status::selection_status(
             root,
             package_status::running_digest(&self.runtime).as_deref(),
-        )
+        );
+        if let Ok(Response::Result { payload }) =
+            self.runtime.send(Command::GetRunningPackageDigest {})
+            && payload["modules"]
+                .as_array()
+                .is_some_and(|modules| !modules.is_empty())
+        {
+            status["running"]["modules"] = payload["modules"].clone();
+        }
+        status
     }
 
     fn describe_module(&self, payload: &serde_json::Value) -> serde_json::Value {
@@ -711,6 +720,13 @@ impl ManagementModule {
         let (Some(id), Some(root)) = (id, package_root(&self.runtime)) else {
             return package_status::unavailable();
         };
+        if let Ok(Response::Result { payload }) =
+            self.runtime.send(Command::GetRunningPackageDigest {})
+            && let Some(description) =
+                package_status::loaded_module_description(&payload["components"], id)
+        {
+            return description;
+        }
         let Some(root) = root.to_str() else {
             return package_status::unavailable();
         };

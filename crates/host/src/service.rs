@@ -4,9 +4,11 @@ use amaterasu_contracts::HOST_MODULE_SHUTDOWN_TIMEOUT_MS;
 use amaterasu_contracts::{
     Command as ControlCommand, HOST_WORKER_SHUTDOWN_TIMEOUT_MS, HostLifecycleAction, Response,
 };
+#[cfg(target_os = "linux")]
+use amaterasu_package::package_directory;
 use amaterasu_package::{
-    ActivationState, BootstrapConfig, PackageResult, RootLock, package_directory, read_json,
-    unix_timestamp, write_json_atomically,
+    ActivationState, BootstrapConfig, PackageResult, RootLock, read_json, unix_timestamp,
+    write_json_atomically,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -509,6 +511,12 @@ const RESTORE_REQUEST_POLL: Duration = Duration::from_millis(100);
 #[cfg(target_os = "linux")]
 fn run_linux_user_service(root: &Path, expected_digest: &str) -> PackageResult<()> {
     let _lock = crate::loading::ProcessRootLock::new(RootLock::acquire(root)?);
+    if amaterasu_package::plugins::installed::read(root)?
+        .pending
+        .is_some()
+    {
+        amaterasu_package::plugins::installed::finish_trial(root, false)?;
+    }
     let mut trial_pending =
         match crate::package_activation::startup_transition(root, expected_digest)? {
             crate::package_activation::StartupTransition::None => false,
@@ -568,6 +576,9 @@ fn run_linux_user_service_inner(
                 load_linux_user_components(root, &digest, &bootstrap, &state_root)?;
             components.tick()?;
             components.health()?;
+            if amaterasu_package::plugins::installed::read(root)?.trial {
+                amaterasu_package::plugins::installed::finish_trial(root, true)?;
+            }
             let pid = std::process::id();
             let starttime = crate::linux_input::process_starttime(pid)?;
             input.refresh(root, &digest, pid, starttime)?;
@@ -694,13 +705,23 @@ fn run_linux_user_service_inner(
                 }
             }
             Ok(Some(LinuxUserAction::Lifecycle(HostLifecycleAction::Restart))) => {
+                amaterasu_package::plugins::installed::begin_trial(root)?;
                 let Some(delay) = restarts.next_delay() else {
                     break Err("user service restart budget exhausted".into());
                 };
                 std::thread::sleep(delay);
             }
             Ok(Some(LinuxUserAction::Lifecycle(HostLifecycleAction::Quit)) | None) => break Ok(()),
-            Err(error) => break Err(error),
+            Err(error) => {
+                if amaterasu_package::plugins::installed::read(root)?.trial
+                    && crate::loading::require_process_usable().is_ok()
+                {
+                    amaterasu_package::plugins::installed::finish_trial(root, false)?;
+                    eprintln!("plugin trial failed: {error}");
+                    continue;
+                }
+                break Err(error);
+            }
         }
     };
     remove_service_readiness(root);

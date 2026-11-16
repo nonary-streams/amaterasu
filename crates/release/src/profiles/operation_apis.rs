@@ -41,6 +41,14 @@ pub(super) fn install(policy: &mut RuntimeConfig) -> Result<(), String> {
             approve(policy, provider, method)?;
         }
     }
+    if policy
+        .principals
+        .contains_key("amaterasu.plugin-installation")
+    {
+        for method in amaterasu_module_sdk::drivers::installation_methods() {
+            approve(policy, "amaterasu.plugin-installation", method)?;
+        }
+    }
     Ok(())
 }
 
