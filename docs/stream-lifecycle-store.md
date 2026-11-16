@@ -53,10 +53,12 @@ The chain on a Linux launch:
 
 | Caller | Binds | Providers then report under |
 |--------|-------|-----------------------------|
-| NVHTTP | its application operation (local alias) | RTSP, launch, display: the NVHTTP stream key or IDs derived from it |
-| stream session | `ss-<id>` to its `rtsp_operation_id` | video, audio, audio encode, transports, display, input: `ss-<id>-…` |
-| video | `video-<epoch>-<id>` to the `ss-<id>-video` it was opened with | capture and encoder providers: `video-…-capture-…`, `…-encoder-attempt-…` |
-| lifecycle coordinator | each provider operation it allocates to the transition's operation | frame limiter, RTX HDR |
+| NVHTTP | its application operation (local alias) | RTSP and launch: the NVHTTP stream key or application operation |
+| RTSP | `rtsp-<ticket>` to the NVHTTP stream key | stream session calls RTSP makes |
+| stream session | `ss-<id>`, its `source-<sha256>` scope operation, its virtual display identity and the display scope ID to its `rtsp_operation_id` | video, audio, audio encode, transports, display, display settings, virtual display, input |
+| video | `video-<epoch>-<id>` to the `ss-<id>-video` it was opened with | KMS, X11 and PipeWire capture and the encoder service: `video-…-capture-…`, `…-encoder-attempt-…` |
+| lifecycle coordinator | each provider operation it allocates to the transition's operation | frame limiter, RTX HDR lifecycle provider |
+| RTX HDR | `rtx-source-<scope>` to the display scope ID | display settings acquire for RTX HDR |
 
 An operation matches a stream when it equals the key or an alias, or starts
 with one followed by `-`, `.` or `:`; the longest match wins. A binding may
@@ -73,11 +75,24 @@ A module needs the topic's `publish` grant in its component definition
 (`crates/release/src/profiles.rs`, `STREAM_REPORT_TOPIC`). Without it the
 runtime refuses the event; the module's own log line remains.
 
+## Who reports what
+
+Every module reports under its own layer. A module that fails or degrades a
+stream because a dependency failed reports its reaction with `caused_by` that
+dependency's layer and the dependency's code as `reason`; the dependency
+reports its own failure. NVHTTP keeps only its own stream warnings in the
+store; warnings it relays for history were reported by their module.
+
 ## Dispositions
 
-- `critical_failure`: the stream cannot start or continue. The first one a
-  stream receives is its `root_cause` and is never replaced, so cleanup
-  failures caused by it appear beside it, not over it.
+- `critical_failure`: the stream cannot start or continue. The stream's
+  `root_cause` is the earliest critical failure that originated in its
+  reporter (no `caused_by`), by commit order; a reaction stands in only until
+  the origin's report arrives. Cleanup failures caused by it appear beside it.
+  A critical failure stops being the root cause when it is recovered from:
+  its reporter later demotes the same code for the same operation, or a
+  caller demotes with `caused_by` its layer and its code as `reason` (a
+  fallback to another encoder or capture provider).
 - `demoted_warning`: a failure the stream survived. `fallback` names what it
   did instead and is required.
 - `advisory_warning`: something worth knowing that needed no fallback, such
@@ -86,12 +101,12 @@ runtime refuses the event; the module's own log line remains.
 ## What NVHTTP records itself
 
 - Every launch failure path (`request_cleanup`, `fail_cleanup`,
-  `reject_resume`, abandoned cleanup and transport) is a commit. The issue is
-  credited to the layer of the job whose outcome was being handled, with the
-  provider's own `code` as `reason`; outside a job it is credited to the
-  record's stage.
-- Every stream warning, including client advisory warnings and launch
-  warnings, is an advisory issue.
+  `reject_resume`, abandoned cleanup and transport) is a commit under the
+  `nvhttp` layer, `caused_by` the layer of the job whose outcome was being
+  handled (or the stage it waited in), with the provider's own `code` as
+  `reason`.
+- Its own stream warnings, including client advisory warnings, are advisory
+  issues.
 - A refusal before any launch record exists (`private_error`, such as
   "another stream is active") becomes a stream of its own, `refused.<n>`, with
   the line that refused and the HTTP status.
@@ -125,3 +140,9 @@ Events are notifications. If NVHTTP's subscription falls behind, the open
 streams are marked `audit_gap` instead of presenting a partial record as
 complete; the reporters' log lines (`stream.lifecycle.*`) remain the complete
 record. The store keeps the last 32 streams.
+
+Not yet reporting: capture-vkms is a standalone workspace pinned to the
+published `amaterasu-sdk` revision, which predates this module; its failures
+reach the store only as the video service's reaction (`caused_by: capture`).
+Encoder probes carry no operation ID, so a probe rejection appears only as the
+video service's fallback.

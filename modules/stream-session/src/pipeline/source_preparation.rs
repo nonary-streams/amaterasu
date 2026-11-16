@@ -153,7 +153,10 @@ pub(super) fn consume(record: &mut Record, job: &mut Job, payload: &Value, now: 
             // Source hooks name their own operations after the scope.
             if let (Some(stream), Some(scope)) = (
                 record.config.rtsp_operation_id.clone(),
-                record.source_scope.as_ref().and_then(|scope| scope.scope.as_ref()),
+                record
+                    .source_scope
+                    .as_ref()
+                    .and_then(|scope| scope.scope.as_ref()),
             ) {
                 record.issues.push_binding(
                     amaterasu_module_sdk::stream_lifecycle::StreamBinding::new(
