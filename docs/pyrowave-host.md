@@ -4,6 +4,10 @@ The existing PyroWave encoder can receive capture-owned GPU resources through
 `EncoderProvider` and `FrameResourceConsumer`. Video retains capture ownership;
 the encoder owns its Vulkan device, pixel conversion, bitstream and framing.
 The session coordinator selects the signed route and invokes these interfaces.
+The SDK's `PresentedDmaBufResource` adapts the already captured resource at the
+encoder boundary, using the video timeline while retaining capture ownership,
+source pacing, color and synchronization. Capture control and the selected
+capture provider stay unchanged.
 
 Build `amaterasu-encode` with `pyrowave-embedded,linux-nvenc-cuda` and
 `amaterasu-video` with `submitted-extensions`. Set
