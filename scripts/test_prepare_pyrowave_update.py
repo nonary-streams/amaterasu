@@ -1,13 +1,13 @@
 """Local PyroWave preparation preserves trust and previously approved policy."""
 from copy import deepcopy
 import unittest
-from prepare_pyrowave_update import compose, FRAMER, PROVIDER, UNITS, TRANSPORT
+from prepare_pyrowave_update import compose, CONTROL, FRAMER, PROVIDER, UNITS, TRANSPORT
 
 
 class CompositionTests(unittest.TestCase):
     def setUp(self):
         names = ["amaterasu.encode", "amaterasu.linux-session-video", "amaterasu.media-transport",
-                 "amaterasu.stream-session", "amaterasu.rtsp"]
+                 "amaterasu.stream-session", "amaterasu.rtsp", "amaterasu.nvhttp"]
         self.bootstrap = {"development": False, "allow_unsigned": False,
             "trusted_keys": {"publisher": "key"}, "policy": {
                 "principals": {name: {"provide": [name + "/1"], "call": ["existing/1"]} for name in names},
@@ -30,6 +30,25 @@ class CompositionTests(unittest.TestCase):
         self.assertEqual(set(grants["amaterasu.stream-session"]["native_use"]), {UNITS, FRAMER, TRANSPORT})
         self.assertTrue(all(path.startswith('/policy/') for path in delta))
         self.assertEqual(approval['publisher_fingerprint'], 'publisher')
+
+    def test_launch_chain_retains_selected_encoder_authority_at_every_hop(self):
+        candidate, _, _ = compose(self.bootstrap, self.manifest, self.approval)
+        grants = candidate["policy"]["principals"]
+        components = {item["id"]: item for item in self.manifest["components"]}
+        delegated = None
+        for name in ["amaterasu.nvhttp", "amaterasu.rtsp", "amaterasu.stream-session",
+                     "amaterasu.linux-session-video"]:
+            effective = set(grants[name]["call"]) & set(components[name]["requested"]["call"])
+            delegated = effective if delegated is None else delegated & effective
+            self.assertIn(CONTROL, delegated, name)
+            self.assertIn("existing/1", effective, name)
+
+    def test_existing_extension_update_keeps_authority_approval_source(self):
+        first, approval, _ = compose(self.bootstrap, self.manifest, self.approval)
+        second, updated, delta = compose(first, self.manifest, approval)
+        self.assertEqual(first, second)
+        self.assertEqual(approval, updated)
+        self.assertEqual(delta, {})
 
     def test_already_applied_overlapping_approval_keeps_its_original_source(self):
         path = '/policy/principals/amaterasu.encode/provide'

@@ -70,9 +70,14 @@ def compose(bootstrap, manifest, approved):
             raise ValueError(f"existing extension composition requires reconciliation: {principal}")
     additions = {
         "amaterasu.encode": {"provide": [CONTROL, PROVIDER, CONSUMER, FRAMER], "native_provide": [PROVIDER, CONSUMER, FRAMER]},
+        # Broker delegation intersects every ancestor's call authority. The
+        # NVHTTP -> RTSP -> stream-session -> video probe must retain the
+        # selected encoder service through the complete launch chain.
+        "amaterasu.nvhttp": {"call": [CONTROL]},
+        "amaterasu.rtsp": {"call": [CONTROL]},
         "amaterasu.linux-session-video": {"call": [CONTROL], "native_use": [PROVIDER, CONSUMER], "native_provide": [UNITS]},
         "amaterasu.media-transport": {"native_provide": [TRANSPORT]},
-        "amaterasu.stream-session": {"native_use": [UNITS, FRAMER, TRANSPORT]},
+        "amaterasu.stream-session": {"call": [CONTROL], "native_use": [UNITS, FRAMER, TRANSPORT]},
     }
     components = {item["id"]: item for item in manifest["components"]}
     for principal, grants in additions.items():

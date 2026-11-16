@@ -17,6 +17,10 @@ identity `186f0393`. It requires correlated source, framing and transport probes
 before RTSP offers the route. Startup waits for a complete encoded keyframe
 before acknowledging PLAY. Transport validates the complete frame plan before
 admitting UDP bytes; normal audio, input and lifecycle services remain selected.
+The selected encoder's control service must be granted through the complete
+NVHTTP, RTSP, stream-session and video delegation chain, in both the signed
+manifest and startup policy. The broker intersects ancestor authority, so a
+direct video probe alone does not qualify a normal launch.
 
 The local candidate selects 10-bit 4:2:0 PyroWave. A 10-bit wire profile
 retains the launch's output range: SDR uses BT.709/sRGB and HDR uses BT.2020/PQ.
