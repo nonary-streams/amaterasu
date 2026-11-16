@@ -1362,6 +1362,30 @@ impl Open {
         payload
     }
 
+    /// Project the ordinary launch's inherited software defaults out of an
+    /// independently selected encoder's contract. Explicit overrides remain
+    /// present so unsupported requirements are still rejected by preflight.
+    pub(crate) fn extension_configuration(&self, bit_depth: u8) -> serde_json::Value {
+        let mut configuration = self.arm(1)["configuration"]["configuration"].clone();
+        let object = configuration
+            .as_object_mut()
+            .expect("typed video configuration");
+        for (key, inherited) in [("sw_preset", "superfast"), ("sw_tune", "zerolatency")] {
+            if object.get(key).and_then(serde_json::Value::as_str) == Some(inherited) {
+                object.remove(key);
+            }
+        }
+        object.insert("max_reference_frames".into(), serde_json::json!(0));
+        if bit_depth == 10 {
+            object.insert(
+                "video_stream_format".into(),
+                serde_json::json!({"codec":"hevc", "bit_depth":10,
+                "dynamic_range":if self.profile.hdr {"hdr"}else{"sdr"}}),
+            );
+        }
+        configuration
+    }
+
     pub(crate) fn arm_with_negotiation(
         &self,
         session: u64,

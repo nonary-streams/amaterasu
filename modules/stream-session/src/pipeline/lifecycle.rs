@@ -606,6 +606,12 @@ impl Pipeline {
                     }
                 };
             }
+            if payload["ok"] != true {
+                eprintln!(
+                    "amaterasu extension source preflight rejected code={:?}",
+                    payload["code"].as_str().unwrap_or("invalid_response")
+                );
+            }
             return self.deliver_success(record, job, now, send);
         }
         if job.step == Step::PersistJournal {

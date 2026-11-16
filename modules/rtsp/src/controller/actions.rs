@@ -340,15 +340,9 @@ impl Controller {
             && record.config.min_threads == 2
             && record.config.qp == 28
         {
-            payload["extension_probe"] =
-                record.config.arm(1)["configuration"]["configuration"].clone();
-            // The peer's reference-frame count is decoder capacity. An intra-only
-            // provider uses zero references while satisfying that upper bound.
-            payload["extension_probe"]["max_reference_frames"] = json!(0);
-            if self.settings.extension_bit_depth == 10 {
-                payload["extension_probe"]["video_stream_format"] = json!({"codec":"hevc", "bit_depth":10,
-                "dynamic_range":if record.config.profile.hdr {"hdr"}else{"sdr"}});
-            }
+            payload["extension_probe"] = record
+                .config
+                .extension_configuration(self.settings.extension_bit_depth);
         }
         if record.config.display_admission_required() {
             // Stream-session starts its prepared timer after Apply/readback. Reserve

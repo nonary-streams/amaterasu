@@ -4462,6 +4462,12 @@ fn ten_bit_extensions_keep_sdr_and_hdr_output_distinct() {
         let (mut record, _) = announced_profile_record();
         record.config.profile.hdr = hdr;
         record.config.profile.max_reference_frames = 1;
+        record.config.sw_preset = Some("superfast".into());
+        record.config.sw_tune = Some("zerolatency".into());
+        let projected = record.config.extension_configuration(10);
+        assert!(projected.get("sw_preset").is_none());
+        assert!(projected.get("sw_tune").is_none());
+        assert_eq!(projected["max_reference_frames"], 0);
         let profile = VideoProfile {
             codec: FormatId {
                 namespace_id: 7,
@@ -4531,4 +4537,14 @@ fn ten_bit_extensions_keep_sdr_and_hdr_output_distinct() {
         assert!(!record.accept_extension_announce(&announce));
         assert!(record.authenticated_start_payload(23).is_none());
     }
+}
+
+#[test]
+fn extension_projection_preserves_explicit_software_requirements() {
+    let (mut record, _) = announced_profile_record();
+    record.config.sw_preset = Some("slow".into());
+    record.config.sw_tune = Some("film".into());
+    let projected = record.config.extension_configuration(10);
+    assert_eq!(projected["sw_preset"], "slow");
+    assert_eq!(projected["sw_tune"], "film");
 }
