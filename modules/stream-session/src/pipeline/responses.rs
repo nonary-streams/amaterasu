@@ -92,10 +92,10 @@ pub(super) fn media_status(record: &Record, payload: &Value) -> Result<MediaStat
     )?;
     let video_port = optional_port(&payload["video_port"])?;
     let audio_port = optional_port(&payload["audio_port"])?;
-    let mut expected_video = config.video.effective();
     // Warmup already committed the authenticated legacy codec before PLAY.
     // The transport now reports that selection instead of its original offer list.
-    if record.video_warmup_ready
+    if !record.media_video_format_configured
+        && record.video_warmup_ready
         && let Some(start) = &record.start
         && start.configuration.extension_profile.is_none()
     {

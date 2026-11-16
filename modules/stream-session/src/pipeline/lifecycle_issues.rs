@@ -52,6 +52,7 @@ pub(super) fn step_layer(step: Step) -> LifecycleLayer {
         | NotifyCaptureInvalidated
         | IssueLifecycleInputBinding
         | AckLifecycleInput => LifecycleLayer::SessionLifecycle,
+        ProbeExtensionSource | WaitVideoReady => LifecycleLayer::EncodeVideo,
         AcquireAudio | RecoverAudio => LifecycleLayer::Audio,
         AcquireInput | FindInput | ReleaseInput | RenewInput | InputBatch | FeedbackPeek
         | FeedbackAck | PollGamepadFeedback | RumbleDrain => LifecycleLayer::Input,
