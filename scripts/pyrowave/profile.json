@@ -1,0 +1,55 @@
+{
+  "codec": {
+    "namespace_id": 5789749296681276997,
+    "value": 4,
+    "schema": 409928595
+  },
+  "framing": {
+    "namespace_id": 5789749296681276997,
+    "value": 2,
+    "schema": 1
+  },
+  "media_format": {
+    "bit_depth": 10,
+    "dynamic_range": "hdr",
+    "chroma_sampling": "yuv420"
+  },
+  "wire_selector": 3,
+  "payload_type": 99,
+  "encoding_name": "PYROWAVE",
+  "wire_attributes": [
+    {
+      "phase": "describe",
+      "name": "x-ss-pyrowave.bitstream",
+      "value": "186f0393"
+    },
+    {
+      "phase": "announce",
+      "name": "x-ss-video[0].pyrowaveAdaptiveFec",
+      "value": "0"
+    },
+    {
+      "phase": "announce",
+      "name": "x-ss-video[0].pyrowaveAdaptiveBitrate",
+      "value": "0"
+    },
+    {
+      "phase": "announce",
+      "name": "x-ss-video[0].pyrowaveFeatures",
+      "value": "1"
+    },
+    {
+      "phase": "announce_optional",
+      "name": "x-ss-video[0].pyrowaveCompression",
+      "value": "0"
+    },
+    {
+      "phase": "announce_optional",
+      "name": "x-ss-video[0].pyrowaveLinkMbps"
+    },
+    {
+      "phase": "announce_optional",
+      "name": "x-ss-video[0].pyrowavePaceMbps"
+    }
+  ]
+}

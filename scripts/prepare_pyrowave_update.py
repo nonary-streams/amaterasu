@@ -25,13 +25,22 @@ CONSUMER = "amaterasu.encode.pyrowave-consumer/1"
 FRAMER = "amaterasu.encode.pyrowave-framing/1"
 UNITS = "amaterasu.video.pyrowave-units/1"
 TRANSPORT = "amaterasu.media-transport.pyrowave-plan/1"
-PROFILE = {
-    "codec": {"namespace_id": 0x5059524F57415645, "value": 4, "schema": 0x186F0393},
-    "framing": {"namespace_id": 0x5059524F57415645, "value": 2, "schema": 1},
-    "media_format": {"bit_depth":10,"dynamic_range":"hdr","chroma_sampling":"yuv420"},
-    "wire_selector": 3, "payload_type": 99, "encoding_name": "PYROWAVE",
-    "wire_attributes": [{"phase": "describe", "name": "x-ss-pyrowave.bitstream", "value": "186f0393"}],
-}
+PROFILE = json.loads((Path(__file__).parent / "pyrowave/profile.json").read_text())
+LEGACY_PROFILE = deepcopy(PROFILE)
+LEGACY_PROFILE["wire_attributes"] = [attribute for attribute in PROFILE["wire_attributes"]
+                                     if attribute["phase"] == "describe"]
+
+
+def previous_profile_composition(value):
+    """Recognize only the exact earlier profile, preserving other composition."""
+    if value == PROFILE:
+        return LEGACY_PROFILE
+    if isinstance(value, dict):
+        return {key: previous_profile_composition(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [previous_profile_composition(item) for item in value]
+    return value
+
 
 
 def digest(path):
@@ -66,8 +75,11 @@ def compose(bootstrap, manifest, approved):
         "amaterasu.stream-session": ["extension_route"],
         "amaterasu.rtsp": ["extension_enabled"],
     }.items():
-        if any(field in bootstrap["policy"]["settings"][principal] and bootstrap["policy"]["settings"][principal][field] != settings[principal][field] for field in fields):
-            raise ValueError(f"existing extension composition requires reconciliation: {principal}")
+        for field in fields:
+            current = bootstrap["policy"]["settings"][principal]
+            expected = settings[principal][field]
+            if field in current and current[field] not in (expected, previous_profile_composition(expected)):
+                raise ValueError(f"existing extension composition requires reconciliation: {principal}")
     additions = {
         "amaterasu.encode": {"provide": [CONTROL, PROVIDER, CONSUMER, FRAMER], "native_provide": [PROVIDER, CONSUMER, FRAMER]},
         # Broker delegation intersects every ancestor's call authority. The
@@ -94,9 +106,18 @@ def compose(bootstrap, manifest, approved):
         if not path.startswith("/policy/"):
             raise ValueError("cannot change bootstrap trust")
         if path in allowlist["changes"]:
-            allowlist["changes"][path]["after"] = change["after"]
+            allowlist["changes"][path] = change
         else:
-            if any(path.startswith(old + "/") or old.startswith(path + "/") for old in allowlist["changes"]):
+            ancestor = next((old for old in allowlist["changes"] if path.startswith(old + "/")), None)
+            if ancestor is not None:
+                # The existing approval covered the whole provider object.
+                # Retire that obsolete transition and authorize only this
+                # exact leaf upgrade from the currently approved endpoint.
+                # The host verifies leaf changes, not overlapping ancestors.
+                del allowlist["changes"][ancestor]
+                allowlist["changes"][path] = change
+                continue
+            if any(old.startswith(path + "/") for old in allowlist["changes"]):
                 raise ValueError(f"overlapping prior approval: {path}")
             allowlist["changes"][path] = change
     if len(allowlist["changes"]) > 256:

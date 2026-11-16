@@ -414,3 +414,89 @@ fn public_request_bounds_and_launch_metadata_are_validated() {
         Err(Error::InvalidLaunch)
     ));
 }
+
+#[test]
+fn moonlight_generated_extension_announcement_completes_negotiation() {
+    let base = negotiation();
+    let mut capabilities = base.capabilities;
+    capabilities.max_width = 2560;
+    capabilities.max_height = 1440;
+    capabilities.max_fps = 120;
+    capabilities.max_bitrate_kbps = 100000;
+    capabilities.supported_colors = vec![sdp::ColorMode::Bt601Limited];
+    let profile =
+        serde_json::from_str(include_str!("../../../../../scripts/pyrowave/profile.json")).unwrap();
+    let snapshot = VideoProfileSnapshot {
+        profiles: vec![profile],
+    };
+    let mut machine =
+        Negotiation::with_video_profiles(base.launch, capabilities, snapshot.clone(), snapshot)
+            .unwrap();
+    setup_to_announce(&mut machine);
+    let mut announce = request(Method::Announce, "streamid=control/13/0", 6, true);
+    announce
+        .headers
+        .push(("content-type".into(), "application/sdp".into()));
+    announce.body = include_bytes!("../../sdp/fixtures/moonlight-pyrowave10.sdp").to_vec();
+    let parsed =
+        sdp::parse_profile_announce(&announce.body, machine.profile_offer.as_ref().unwrap());
+    assert!(
+        parsed.is_ok(),
+        "actual Moonlight generator announcement: {parsed:?}"
+    );
+    let Step::Action {
+        ticket,
+        action: Action::ExtensionAnnounce(_),
+    } = machine.handle(7, &announce).unwrap()
+    else {
+        panic!("extension ANNOUNCE action")
+    };
+    machine.complete(7, ticket, true).unwrap();
+    let play = request(Method::Play, "/", 7, true);
+    let Step::Action {
+        ticket,
+        action: Action::Play,
+    } = machine.handle(7, &play).unwrap()
+    else {
+        panic!("PLAY action")
+    };
+    machine.complete(7, ticket, true).unwrap();
+    assert_eq!(machine.state(), State::Playing);
+}
+
+#[test]
+fn extension_attribute_rules_bound_optional_hints_and_reject_unsupported_modes() {
+    let profile =
+        serde_json::from_str(include_str!("../../../../../scripts/pyrowave/profile.json")).unwrap();
+    let snapshot = VideoProfileSnapshot {
+        profiles: vec![profile],
+    };
+    let original = include_str!("../../sdp/fixtures/moonlight-pyrowave10.sdp");
+    for text in [
+        original.to_owned(),
+        original.replace("a=x-ss-video[0].pyrowaveLinkMbps:1000 \r\n", ""),
+        original.replace("a=x-ss-video[0].pyrowaveLinkMbps:1000", "a=x-ss-video[0].pyrowaveLinkMbps:2500"),
+        original.replace("t=0 0", "a=x-ss-video[0].pyrowavePaceMbps:850\r\na=x-ss-video[0].pyrowaveCompression:0\r\nt=0 0"),
+    ] {
+        assert!(sdp::parse_profile_announce(text.as_bytes(), &snapshot).is_ok());
+    }
+    for text in [
+        original.replace("pyrowaveAdaptiveFec:0", "pyrowaveAdaptiveFec:1"),
+        original.replace("pyrowaveAdaptiveBitrate:0", "pyrowaveAdaptiveBitrate:1"),
+        original.replace("pyrowaveFeatures:1", "pyrowaveFeatures:9"),
+        original.replace("t=0 0", "a=x-ss-video[0].pyrowaveCompression:1\r\nt=0 0"),
+        original.replace("t=0 0", "a=x-ss-video[0].unknownCodecMode:1\r\nt=0 0"),
+        original.replace("a=x-ss-video[0].pyrowaveFeatures:1 \r\n", ""),
+    ] {
+        assert!(
+            sdp::parse_profile_announce(text.as_bytes(), &snapshot).is_err(),
+            "{text}"
+        );
+    }
+    let mut ambiguous = snapshot;
+    let mut optional = ambiguous.profiles[0].wire_attributes[1].clone();
+    optional.phase =
+        amaterasu_contracts::media_profile::VideoProfileAttributePhase::AnnounceOptional;
+    ambiguous.profiles[0].wire_attributes.push(optional);
+    assert!(!ambiguous.validate());
+}

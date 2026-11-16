@@ -26,7 +26,8 @@ pub struct VideoMediaFormat {
 
 /// Additional provider-neutral SDP attributes for an extension profile. A
 /// DESCRIBE attribute must have a fixed value. ANNOUNCE may require either an
-/// exact value or presence alone (`value: None`).
+/// exact value or presence alone (`value: None`). An optional ANNOUNCE rule
+/// constrains an attribute when present without requiring the peer to send it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VideoProfileAttribute {
@@ -41,6 +42,7 @@ pub struct VideoProfileAttribute {
 pub enum VideoProfileAttributePhase {
     Describe,
     Announce,
+    AnnounceOptional,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -138,7 +140,9 @@ impl VideoProfile {
                     && (attribute.phase != VideoProfileAttributePhase::Describe
                         || attribute.value.is_some())
                     && !self.wire_attributes[..index].iter().any(|previous| {
-                        previous.phase == attribute.phase && previous.name == attribute.name
+                        (previous.phase == VideoProfileAttributePhase::Describe)
+                            == (attribute.phase == VideoProfileAttributePhase::Describe)
+                            && previous.name == attribute.name
                     })
             })
     }

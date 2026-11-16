@@ -79,18 +79,16 @@ pub fn parse_profile_announce(
                 profile.wire_selector == selector
                     && profile.media_format.unwrap_or_default() == media_format
                     && profile.wire_attributes.iter().all(|attribute| {
-                        if attribute.phase != VideoProfileAttributePhase::Announce {
+                        if attribute.phase == VideoProfileAttributePhase::Describe {
                             return true;
                         }
-                        attributes
-                            .0
-                            .get(attribute.name.as_str())
-                            .is_some_and(|actual| {
-                                attribute
-                                    .value
-                                    .as_deref()
-                                    .is_none_or(|expected| expected == *actual)
-                            })
+                        match attributes.0.get(attribute.name.as_str()) {
+                            Some(actual) => attribute
+                                .value
+                                .as_deref()
+                                .is_none_or(|expected| expected == *actual),
+                            None => attribute.phase == VideoProfileAttributePhase::AnnounceOptional,
+                        }
                     })
             })
             .ok_or(Error::Unsupported("video profile format"))?
@@ -98,9 +96,12 @@ pub fn parse_profile_announce(
         for attribute in profile
             .wire_attributes
             .iter()
-            .filter(|attribute| attribute.phase == VideoProfileAttributePhase::Announce)
+            .filter(|attribute| attribute.phase != VideoProfileAttributePhase::Describe)
         {
             let Some(actual) = attributes.0.remove(attribute.name.as_str()) else {
+                if attribute.phase == VideoProfileAttributePhase::AnnounceOptional {
+                    continue;
+                }
                 return Err(Error::Missing("video profile attribute"));
             };
             if attribute

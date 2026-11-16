@@ -1,7 +1,7 @@
 """Local PyroWave preparation preserves trust and previously approved policy."""
 from copy import deepcopy
 import unittest
-from prepare_pyrowave_update import compose, CONTROL, FRAMER, PROVIDER, UNITS, TRANSPORT
+from prepare_pyrowave_update import compose, CONTROL, FRAMER, PROVIDER, UNITS, TRANSPORT, previous_profile_composition
 
 
 class CompositionTests(unittest.TestCase):
@@ -50,13 +50,32 @@ class CompositionTests(unittest.TestCase):
         self.assertEqual(approval, updated)
         self.assertEqual(delta, {})
 
-    def test_already_applied_overlapping_approval_keeps_its_original_source(self):
+    def test_new_destination_starts_at_the_currently_approved_endpoint(self):
         path = '/policy/principals/amaterasu.encode/provide'
         self.approval['changes'][path] = {'before': {'kind': 'absent'},
             'after': {'kind': 'present', 'value': ['amaterasu.encode/1']}}
         _, approval, _ = compose(self.bootstrap, self.manifest, self.approval)
-        self.assertEqual(approval['changes'][path]['before'], {'kind': 'absent'})
+        self.assertEqual(approval['changes'][path]['before'], self.approval['changes'][path]['after'])
         self.assertIn(FRAMER, approval['changes'][path]['after']['value'])
+
+    def test_exact_earlier_profile_migrates_without_accepting_other_compositions(self):
+        first, approval, _ = compose(self.bootstrap, self.manifest, self.approval)
+        old = previous_profile_composition(first)
+        old_approval = deepcopy(approval)
+        for path, change in old_approval["changes"].items():
+            change["after"] = previous_profile_composition(change["after"])
+        candidate, updated, delta = compose(old, self.manifest, old_approval)
+        self.assertEqual(candidate, first)
+        self.assertTrue(delta)
+        # Exact endpoint checks used by the installed activation guard must
+        # accept the current policy before a trial can be prepared.
+        from local_bound_input import policy_value
+        for path, change in updated['changes'].items():
+            self.assertIn(policy_value(old, path), (change['before'], change['after']))
+            self.assertEqual(policy_value(candidate, path), change['after'])
+        old["policy"]["settings"]["amaterasu.stream-session"]["extension_route"]["source_id"] = 2
+        with self.assertRaisesRegex(ValueError, "requires reconciliation"):
+            compose(old, self.manifest, old_approval)
 
     def test_unapplied_approval_is_rejected(self):
         self.approval['changes']['/policy/settings/pending'] = {

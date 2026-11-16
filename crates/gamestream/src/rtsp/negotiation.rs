@@ -311,7 +311,11 @@ impl Negotiation {
                 }
                 if let Some(offer) = &self.profile_offer {
                     let selected = sdp::parse_profile_announce(&request.body, offer)
-                        .map_err(|_| Error::UnsupportedMedia)?;
+                        .map_err(|error| {
+                            let settings = sdp::rejection_context(&request.body);
+                            eprintln!("amaterasu rtsp extension announce parse rejection reason={error:?} numeric_settings={settings:?}");
+                            Error::UnsupportedMedia
+                        })?;
                     if matches!(
                         selected.video.format,
                         sdp::NegotiatedVideoFormat::Extension(_)

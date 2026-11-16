@@ -1,2 +1,4 @@
 # Vendor patches must preserve upstream context whitespace.
 scripts/pyrowave/*.patch -whitespace
+# This generated protocol document requires CRLF on the wire.
+crates/gamestream/src/sdp/fixtures/moonlight-pyrowave10.sdp -text
