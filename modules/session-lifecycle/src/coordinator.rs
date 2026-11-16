@@ -1180,6 +1180,9 @@ pub struct Coordinator {
     failed_prepare_recovery_scanned: bool,
     failed_prepare_recovery_next_poll: Instant,
     live_settings_jobs: BTreeMap<String, live_settings_read::LiveSettingsJob>,
+    /// Stream failures and skipped providers for the launch owner's store.
+    stream_issues: amaterasu_module_sdk::stream_lifecycle::StreamIssueOutbox,
+    report_stream_issues: bool,
 }
 
 impl Coordinator {
@@ -1245,6 +1248,8 @@ impl Coordinator {
         retention::compact(&mut journal);
         store.replace(&journal)?;
         Ok(Self {
+            stream_issues: Default::default(),
+            report_stream_issues: false,
             shared: Rc::new(RefCell::new(SharedJournal {
                 store,
                 value: journal,
@@ -1485,12 +1490,74 @@ impl Coordinator {
         if !self.configured {
             return Ok(());
         }
+        let advanced = self.advance_configured(send);
+        self.publish_stream_issues(send);
+        advanced
+    }
+
+    fn advance_configured(
+        &mut self,
+        send: &mut dyn FnMut(Command) -> ModuleResult<Response>,
+    ) -> ModuleResult<()> {
         self.refresh_approvals(send)?;
         self.advance_live_settings(send);
         self.advance_applications(send)?;
         self.advance_work(send)?;
         self.retire_ended_sessions_if_idle()?;
         Ok(())
+    }
+
+    /// Report on the launch owner's stream-issue topic. Off by default so a
+    /// coordinator in a test sends only the commands that test scripts.
+    pub fn enable_stream_issue_reports(&mut self) {
+        self.report_stream_issues = true;
+    }
+
+    /// A provider failure attributed to the transition it belongs to. The
+    /// transition key is the launch owner's operation ID, or derived from it.
+    #[track_caller]
+    fn record_provider_issue(
+        &mut self,
+        key: &str,
+        provider: &str,
+        phase: LifecyclePhase,
+        code: &str,
+        fallback: Option<&str>,
+    ) {
+        use amaterasu_module_sdk::stream_lifecycle::{LifecycleLayer, StreamIssue};
+        let phase = format!("{phase:?}")
+            .chars()
+            .enumerate()
+            .flat_map(|(index, character)| {
+                let separator = (index > 0 && character.is_ascii_uppercase()).then_some('_');
+                separator
+                    .into_iter()
+                    .chain([character.to_ascii_lowercase()])
+            })
+            .collect::<String>();
+        let issue = match fallback {
+            Some(fallback) => {
+                StreamIssue::demoted(key, LifecycleLayer::SessionLifecycle, phase, code, fallback)
+            }
+            None => StreamIssue::critical(key, LifecycleLayer::SessionLifecycle, phase, code),
+        };
+        // Name the provider, which may be a plugin, in the identifier alphabet.
+        let provider: String = provider
+            .chars()
+            .map(|character| if character == '/' { ':' } else { character })
+            .take(64)
+            .collect();
+        self.stream_issues.push(issue.because(provider));
+    }
+
+    fn publish_stream_issues(&mut self, send: &mut dyn FnMut(Command) -> ModuleResult<Response>) {
+        if !self.report_stream_issues {
+            self.stream_issues.drain().for_each(drop);
+            return;
+        }
+        if let Err(error) = self.stream_issues.flush_with(&mut |command| send(command)) {
+            eprintln!("lifecycle stream issue report failed error={error}");
+        }
     }
 }
 

@@ -22,7 +22,9 @@ use serde_json::Value;
 
 impl LifecycleHandler for Coordinator {
     fn from_settings(settings: &LifecycleSettings) -> ModuleResult<Self> {
-        Self::configured(settings)
+        let mut coordinator = Self::configured(settings)?;
+        coordinator.enable_stream_issue_reports();
+        Ok(coordinator)
     }
 
     fn handle(&mut self, caller: &str, initiator: &str, payload: Value) -> Value {

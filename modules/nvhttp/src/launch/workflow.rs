@@ -1,3 +1,4 @@
+use super::lifecycle_issues::FailureContext;
 use super::{
     AudioSinkCaptureOnlyOverrides, CLEANUP_POLL_INTERVAL, Controller, INITIAL_DEADLINE,
     MAX_APPLICATION_CLEANUP_BUDGET_MS, MONITOR_INTERVAL, Send, StreamingConfig, app_id,
@@ -16,6 +17,7 @@ use amaterasu_contracts::virtual_display::{
     VirtualDisplayRefreshRateOption, VirtualDisplayResolutionOption, VirtualDisplayResolverContext,
 };
 use amaterasu_module_sdk::retirement::{self, Contract};
+use amaterasu_module_sdk::stream_lifecycle::{LifecycleLayer, StreamIssue};
 use amaterasu_module_sdk::{Command, LogLevel};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -207,7 +209,23 @@ fn log_proton_policy_fallback(
     }
 }
 
+/// Keep a stream warning for history and clients, and record it in the
+/// stream's lifecycle store.
+#[track_caller]
 pub(super) fn add_stream_warning(
+    record: &mut Record,
+    logger: Option<&amaterasu_module_sdk::LogEmitter>,
+    warning: amaterasu_module_sdk::stream_warnings::StreamWarning,
+) {
+    if !warning.valid() || record.stream_warnings.contains(&warning) {
+        return;
+    }
+    record.record_warning(&warning);
+    push_stream_warning(record, logger, warning);
+}
+
+/// Keep a stream warning whose lifecycle issue was already recorded.
+fn push_stream_warning(
     record: &mut Record,
     logger: Option<&amaterasu_module_sdk::LogEmitter>,
     warning: amaterasu_module_sdk::stream_warnings::StreamWarning,
@@ -251,7 +269,198 @@ fn proton_policy_warning(
     }
 }
 
+const MAX_PENDING_HISTORY_RELEASES: usize = 64;
+const HISTORY_RELEASE_RETRY_DELAY: Duration = Duration::from_millis(500);
+const MAX_HISTORY_RELEASE_ATTEMPTS: u8 = 8;
+
+/// Record a failure the stream survived on `fallback`. The warning reaches
+/// the stream's lifecycle store and, as before, its stream warnings.
+#[track_caller]
+pub(super) fn demote_record_warning(
+    record: &mut Record,
+    logger: Option<&amaterasu_module_sdk::LogEmitter>,
+    layer: LifecycleLayer,
+    phase: &str,
+    code: &str,
+    reason: &str,
+    fallback: &str,
+) {
+    let issue = StreamIssue::demoted(record.rtsp_operation.clone(), layer, phase, code, fallback)
+        .because(reason);
+    push_stream_warning(
+        record,
+        logger,
+        issue.to_stream_warning("amaterasu.nvhttp/1"),
+    );
+    record.issues.push_logged(logger, issue);
+}
+
 impl Controller {
+    #[track_caller]
+    fn demote_history_release(
+        logger: Option<&amaterasu_module_sdk::LogEmitter>,
+        record: &mut Record,
+        code: &str,
+        reason: &str,
+        now: Instant,
+    ) {
+        demote_record_warning(
+            record,
+            logger,
+            LifecycleLayer::History,
+            "release_history",
+            code,
+            reason,
+            "defer_history_release_to_background_retry",
+        );
+        record.history_release_required = false;
+        record.history_state = "unavailable";
+        if record.cleanup_error == Some("broker_settlement_unconfirmed")
+            || record.cleanup_error == Some("history_release_unconfirmed")
+            || record.cleanup_error == Some("history_release_unavailable")
+        {
+            record.cleanup_error = None;
+        }
+        if record.stage == Stage::ReleasePausedHistory {
+            record.stage = Stage::VerifyPaused;
+        } else if record.stage == Stage::ReleaseRejectedResumeHistory {
+            record.state = State::Paused;
+            record.stage = Stage::Live;
+            record.next_monitor = now;
+        } else {
+            record.stage = Stage::Cleanup;
+        }
+    }
+
+    pub(super) fn enqueue_history_release(
+        &mut self,
+        activity_id: String,
+        rtsp_operation: String,
+        call: Option<Call>,
+        now: Instant,
+    ) {
+        if activity_id.is_empty() || rtsp_operation.is_empty() {
+            return;
+        }
+        if self
+            .active_history_release
+            .as_ref()
+            .is_some_and(|(entry, _)| {
+                entry.activity_id == activity_id && entry.rtsp_operation == rtsp_operation
+            })
+            || self.pending_history_releases.iter().any(|entry| {
+                entry.activity_id == activity_id && entry.rtsp_operation == rtsp_operation
+            })
+        {
+            return;
+        }
+        while self.pending_history_releases.len() >= MAX_PENDING_HISTORY_RELEASES {
+            if let Some(dropped) = self.pending_history_releases.pop_front() {
+                self.record_history_release_lost(&dropped, "release_queue_full");
+            }
+        }
+        self.pending_history_releases
+            .push_back(super::PendingHistoryRelease {
+                activity_id,
+                rtsp_operation,
+                call,
+                attempts: 0,
+                next_retry: now + HISTORY_RELEASE_RETRY_DELAY,
+            });
+    }
+
+    /// A history release that will not be retried leaves the activity
+    /// reserved downstream. Say so on the stream it belonged to.
+    #[track_caller]
+    fn record_history_release_lost(&mut self, entry: &super::PendingHistoryRelease, reason: &str) {
+        let issue = StreamIssue::advisory(
+            entry.rtsp_operation.clone(),
+            LifecycleLayer::History,
+            "release_history",
+            "history_release_abandoned",
+        )
+        .because(reason);
+        self.stream_lifecycle.commit_logged(
+            self.logger.as_ref(),
+            super::lifecycle_issues::NVHTTP_PUBLISHER,
+            issue,
+        );
+    }
+
+    pub(super) fn poll_history_releases(&mut self, now: Instant, send: &mut Send<'_>) {
+        if self.active_history_release.is_none()
+            && self
+                .pending_history_releases
+                .front()
+                .is_some_and(|entry| entry.next_retry <= now)
+            && let Some(mut entry) = self.pending_history_releases.pop_front()
+        {
+            let call = if let Some(mut call) = entry.call.take() {
+                call.retry_settlement();
+                call
+            } else {
+                self.sequence = self.sequence.saturating_add(1);
+                let operation_id = format!(
+                    "{}.release-history.retry.{}",
+                    entry.rtsp_operation, self.sequence
+                );
+                Call::new(
+                    &self.stream_service,
+                    json!({
+                        "action": "release_history_activity",
+                        "activity_id": entry.activity_id,
+                        "rtsp_operation_id": entry.rtsp_operation,
+                    }),
+                    operation_id,
+                    OPTIONAL_READ_BUDGET.as_millis() as u64,
+                )
+            };
+            self.active_history_release = Some((entry, call));
+        }
+
+        let Some((mut entry, mut call)) = self.active_history_release.take() else {
+            return;
+        };
+        match call.poll(send) {
+            Outcome::Waiting => {
+                self.active_history_release = Some((entry, call));
+            }
+            Outcome::Result(payload) => {
+                let confirmed = payload["ok"] == true
+                    && payload["released"].is_boolean()
+                    && payload["activity_id"] == entry.activity_id
+                    && payload["rtsp_operation_id"] == entry.rtsp_operation;
+                if !confirmed && entry.attempts + 1 < MAX_HISTORY_RELEASE_ATTEMPTS {
+                    entry.attempts += 1;
+                    entry.next_retry = now + HISTORY_RELEASE_RETRY_DELAY;
+                    self.pending_history_releases.push_back(entry);
+                } else if !confirmed {
+                    self.record_history_release_lost(&entry, "attempts_exhausted");
+                }
+            }
+            Outcome::Rejected | Outcome::Settled => {
+                if entry.attempts + 1 < MAX_HISTORY_RELEASE_ATTEMPTS {
+                    entry.attempts += 1;
+                    entry.next_retry = now + HISTORY_RELEASE_RETRY_DELAY;
+                    self.pending_history_releases.push_back(entry);
+                } else {
+                    self.record_history_release_lost(&entry, "attempts_exhausted");
+                }
+            }
+            Outcome::Uncertain => {
+                if entry.attempts + 1 < MAX_HISTORY_RELEASE_ATTEMPTS {
+                    entry.attempts += 1;
+                    entry.next_retry = now + HISTORY_RELEASE_RETRY_DELAY;
+                    entry.call = Some(call);
+                    self.pending_history_releases.push_back(entry);
+                } else {
+                    call.abandon_warning(send);
+                    self.record_history_release_lost(&entry, "attempts_exhausted");
+                }
+            }
+        }
+    }
+
     /// Advance optional warning queries independently of launch and monitoring.
     pub(super) fn poll_diagnostic_jobs(&mut self, now: Instant, send: &mut Send<'_>) {
         let ids: Vec<_> = self.diagnostic_jobs.keys().copied().collect();
@@ -442,10 +651,32 @@ impl Controller {
         send: &mut Send<'_>,
         replies: &mut Vec<(u64, Reply)>,
     ) {
+        self.advance_job(job, now, send, replies);
+        if let Some(record) = self.records.get_mut(&job.record) {
+            record.failure_context = None;
+        }
+    }
+
+    fn advance_job(
+        &mut self,
+        job: &mut Job,
+        now: Instant,
+        send: &mut Send<'_>,
+        replies: &mut Vec<(u64, Reply)>,
+    ) {
         if now >= job.deadline {
             job.call.cancel();
         }
         let outcome = job.call.poll(send);
+        if !matches!(outcome, Outcome::Waiting)
+            && let Some(record) = self.records.get_mut(&job.record)
+        {
+            let payload = match &outcome {
+                Outcome::Result(payload) => Some(payload),
+                _ => None,
+            };
+            record.failure_context = Some(FailureContext::new(job.phase, payload));
+        }
         if job.phase.optional_proton_policy_read()
             && !matches!(outcome, Outcome::Waiting)
             && let Some(started) = job.deadline.checked_sub(OPTIONAL_READ_BUDGET)
@@ -578,6 +809,26 @@ impl Controller {
                 // expires. Retain that exact call, but do not let it prevent
                 // read-only status checks or cleanup of independent owners.
                 // Plain terminal status alone does not retire the retained call.
+                if job.phase == Phase::ReleaseHistory {
+                    let call = record
+                        .uncertain
+                        .pop_back()
+                        .map(|(_, call)| call)
+                        .unwrap_or_else(|| take_call(job));
+                    let activity_id = record.rtsp_operation.clone();
+                    let rtsp_operation = record.rtsp_operation.clone();
+                    record.cleanup_error = None;
+                    Self::demote_history_release(
+                        self.logger.as_ref(),
+                        record,
+                        "history_release_unconfirmed",
+                        "uncertain_broker_settlement",
+                        now,
+                    );
+                    self.enqueue_history_release(activity_id, rtsp_operation, Some(call), now);
+                    self.finish_or_retain(job.record, now, replies);
+                    return;
+                }
                 if job.phase == Phase::StopApplication && record.application_launch.is_some() {
                     record.application_cleanup_blocked = false;
                     record.stage = Stage::VerifyApplicationCleanup;
@@ -2200,14 +2451,18 @@ impl Controller {
                         record.next_monitor = now;
                     }
                 } else {
-                    if matches!(
-                        record.stage,
-                        Stage::ReleasePausedHistory | Stage::ReleaseRejectedResumeHistory
-                    ) {
-                        record.request_cleanup(Some("history_release_unconfirmed"), now);
-                    }
-                    record.cleanup_error = Some("history_release_unconfirmed");
-                    record.stage = Stage::Cleanup;
+                    let activity_id = record.rtsp_operation.clone();
+                    let rtsp_operation = record.rtsp_operation.clone();
+                    Self::demote_history_release(
+                        self.logger.as_ref(),
+                        record,
+                        "history_release_unconfirmed",
+                        "unconfirmed_response",
+                        now,
+                    );
+                    self.enqueue_history_release(activity_id, rtsp_operation, None, now);
+                    self.finish_or_retain(job.record, now, replies);
+                    return;
                 }
             }
         }
@@ -2245,6 +2500,25 @@ impl Controller {
             | Phase::BindPresentationTransport
             | Phase::VerifyBorrowedCapture => {
                 record.request_cleanup(Some("borrowed_capture_unverified"), now);
+            }
+            Phase::VerifyPaused
+                if !record.rtsp_requested
+                    && record.rtsp_ticket.is_none()
+                    && record.application_launch.is_some() =>
+            {
+                demote_record_warning(
+                    record,
+                    self.logger.as_ref(),
+                    LifecycleLayer::SessionLifecycle,
+                    "verify_paused",
+                    "pause_unconfirmed",
+                    "lifecycle_snapshot_rejected",
+                    "keep_paused_application",
+                );
+                record.state = State::Paused;
+                record.stage = Stage::Live;
+                record.transport_only_cleanup = false;
+                record.next_monitor = now;
             }
             Phase::ReadLaunchEpoch
             | Phase::VerifyPaused
@@ -2292,17 +2566,33 @@ impl Controller {
             Phase::RecordHistoryWarnings => {}
             Phase::ReadLaunchWarnings => {}
             Phase::ReadProtonPolicy => {
-                fail_record(record, "input_policy_unavailable", now);
+                demote_record_warning(
+                    record,
+                    self.logger.as_ref(),
+                    LifecycleLayer::Input,
+                    "read_proton_policy",
+                    "proton_policy_unavailable",
+                    "read_rejected",
+                    "disable_proton_dualsense_compatibility",
+                );
+                record.global_proton_dualsense_compatibility = Some(false);
+                if record.state == State::Starting {
+                    Self::advance_after_history(self.config.as_ref(), record, now);
+                }
             }
             Phase::ReleaseHistory => {
-                if matches!(
-                    record.stage,
-                    Stage::ReleasePausedHistory | Stage::ReleaseRejectedResumeHistory
-                ) {
-                    record.request_cleanup(Some("history_release_unavailable"), now);
-                }
-                record.cleanup_error = Some("history_release_unavailable");
-                record.stage = Stage::Cleanup;
+                let activity_id = record.rtsp_operation.clone();
+                let rtsp_operation = record.rtsp_operation.clone();
+                Self::demote_history_release(
+                    self.logger.as_ref(),
+                    record,
+                    "history_release_unavailable",
+                    "broker_rejected",
+                    now,
+                );
+                self.enqueue_history_release(activity_id, rtsp_operation, None, now);
+                self.finish_or_retain(job.record, now, replies);
+                return;
             }
             Phase::LookupApplication => {
                 record.fail_cleanup("application_lookup_unavailable");
@@ -2354,15 +2644,70 @@ impl Controller {
 
     fn settled(&mut self, job: &Job, now: Instant, replies: &mut Vec<(u64, Reply)>) {
         self.log_phase(LogLevel::Warning, job.phase, "settled");
+        if job.phase == Phase::RefreshResumePolicy {
+            let logger = self.logger.clone();
+            let Some(mut record) = self.records.remove(&job.record) else {
+                return;
+            };
+            if record.resume_abandoned && record.state != State::Stopping {
+                reject_resume(&mut record, replies);
+            } else if record.state == State::Stopping {
+                record.stage = Stage::Cleanup;
+            } else {
+                let pending = self
+                    .pending_resume
+                    .take()
+                    .filter(|pending| pending.record == job.record);
+                let fallback = record
+                    .global_proton_dualsense_compatibility
+                    .unwrap_or(false);
+                demote_record_warning(
+                    &mut record,
+                    logger.as_ref(),
+                    LifecycleLayer::Input,
+                    "refresh_resume_policy",
+                    "proton_policy_unavailable",
+                    "broker_settled",
+                    "use_cached_proton_policy",
+                );
+                let candidate = pending.and_then(|pending| {
+                    let connect_data = super::random_nonzero_u32().ok()?;
+                    super::resume_snapshot::ResumeSnapshot::build(
+                        self,
+                        &record,
+                        pending.request,
+                        pending.peer,
+                        connect_data,
+                        fallback,
+                    )
+                    .ok()
+                });
+                if let Some(candidate) =
+                    candidate.filter(|candidate| !candidate.legacy_display_conflict())
+                {
+                    if candidate.stream_key() == record.request.remote_input_key
+                        || self.retire_stream_key(record.request.remote_input_key)
+                    {
+                        candidate.apply(&mut record);
+                        add_request_warnings(&mut record, logger.as_ref());
+                        record.stage = Stage::ReserveHistory;
+                    } else {
+                        reject_resume(&mut record, replies);
+                    }
+                } else {
+                    reject_resume(&mut record, replies);
+                }
+            }
+            self.records.insert(job.record, record);
+            self.finish_or_retain(job.record, now, replies);
+            return;
+        }
         let record = self.records.get_mut(&job.record).expect("workflow record");
         if record.resume_abandoned && record.state != State::Stopping {
             reject_resume(record, replies);
             return;
         }
-        let releasing_paused_history = matches!(
-            record.stage,
-            Stage::ReleasePausedHistory | Stage::ReleaseRejectedResumeHistory
-        );
+        let original_stage = record.stage;
         record.stage = Stage::Cleanup;
         if record.state == State::Stopping
             && matches!(
@@ -2383,6 +2728,25 @@ impl Controller {
             | Phase::BindPresentationTransport
             | Phase::VerifyBorrowedCapture => {
                 record.request_cleanup(Some("borrowed_capture_unverified"), now);
+            }
+            Phase::VerifyPaused
+                if !record.rtsp_requested
+                    && record.rtsp_ticket.is_none()
+                    && record.application_launch.is_some() =>
+            {
+                demote_record_warning(
+                    record,
+                    self.logger.as_ref(),
+                    LifecycleLayer::SessionLifecycle,
+                    "verify_paused",
+                    "pause_unconfirmed",
+                    "lifecycle_snapshot_settled",
+                    "keep_paused_application",
+                );
+                record.state = State::Paused;
+                record.stage = Stage::Live;
+                record.transport_only_cleanup = false;
+                record.next_monitor = now;
             }
             Phase::ReadLaunchEpoch
             | Phase::RefreshResumePolicy
@@ -2420,20 +2784,49 @@ impl Controller {
             Phase::RecordHistoryWarnings => {}
             Phase::ReadLaunchWarnings => {}
             Phase::ReleaseHistory => {
-                if releasing_paused_history {
-                    record.request_cleanup(Some("history_release_unavailable"), now);
-                }
-                record.cleanup_error = Some("history_release_unavailable");
-                record.stage = Stage::Cleanup;
+                record.stage = original_stage;
+                let activity_id = record.rtsp_operation.clone();
+                let rtsp_operation = record.rtsp_operation.clone();
+                Self::demote_history_release(
+                    self.logger.as_ref(),
+                    record,
+                    "history_release_unavailable",
+                    "broker_settled",
+                    now,
+                );
+                self.enqueue_history_release(activity_id, rtsp_operation, None, now);
+                self.finish_or_retain(job.record, now, replies);
+                return;
             }
             Phase::ReadProtonPolicy => {
-                record.request_cleanup(Some("input_policy_unavailable"), now);
+                demote_record_warning(
+                    record,
+                    self.logger.as_ref(),
+                    LifecycleLayer::Input,
+                    "read_proton_policy",
+                    "proton_policy_unavailable",
+                    "read_settled",
+                    "disable_proton_dualsense_compatibility",
+                );
+                record.global_proton_dualsense_compatibility = Some(false);
+                if record.state == State::Starting {
+                    Self::advance_after_history(self.config.as_ref(), record, now);
+                }
             }
             Phase::PreflightApplication => {
                 record.request_cleanup(Some("application_preflight_unavailable"), now);
             }
             Phase::SnapshotDisplay | Phase::EnumerateDisplay | Phase::ConfirmDisplay => {
-                record.request_cleanup(Some("display_preflight_unavailable"), now);
+                if record.resumed && !record.rtsp_requested {
+                    fail_before_resume_stream(
+                        record,
+                        "display_preflight_unavailable",
+                        now,
+                        replies,
+                    );
+                } else {
+                    record.request_cleanup(Some("display_preflight_unavailable"), now);
+                }
             }
             Phase::LaunchApplication => {
                 record.application_cleanup_blocked = false;
@@ -2445,7 +2838,16 @@ impl Controller {
                 record.next_monitor = now;
             }
             Phase::PrepareDisplayAdmission => {
-                record.request_cleanup(Some("display_admission_unavailable"), now);
+                if record.resumed && !record.rtsp_requested {
+                    fail_before_resume_stream(
+                        record,
+                        "display_admission_unavailable",
+                        now,
+                        replies,
+                    );
+                } else {
+                    record.request_cleanup(Some("display_admission_unavailable"), now);
+                }
             }
             Phase::OpenRtsp => {
                 record.rtsp_cleanup_blocked = false;
@@ -2522,7 +2924,22 @@ impl Controller {
             {
                 if record.history_release_required {
                     if let Some(error) = record.cleanup_error {
-                        record.fail_cleanup(error);
+                        let activity_id = record.rtsp_operation.clone();
+                        let rtsp_operation = record.rtsp_operation.clone();
+                        Self::demote_history_release(
+                            self.logger.as_ref(),
+                            record,
+                            "history_release_unconfirmed",
+                            error,
+                            now,
+                        );
+                        self.enqueue_history_release(activity_id, rtsp_operation, None, now);
+                        let record = self.records.get_mut(&record_id).expect("workflow record");
+                        record.finish_cleanup();
+                        if let Some(connection) = record.cancel_connection {
+                            replies.push((connection, super::cancel_reply()));
+                        }
+                        record.cancel_connection = None;
                         reply_failure(record, replies);
                         return;
                     }
@@ -3681,10 +4098,12 @@ fn display_enumeration(
     }
 }
 
+#[track_caller]
 fn fail_record(record: &mut Record, code: &'static str, now: Instant) {
     record.request_cleanup(Some(code), now);
 }
 
+#[track_caller]
 fn fail_before_resume_stream(
     record: &mut Record,
     code: &'static str,
@@ -3703,12 +4122,14 @@ fn fail_before_resume_stream(
     }
 }
 
+#[track_caller]
 pub(super) fn reject_resume(record: &mut Record, replies: &mut Vec<(u64, Reply)>) {
+    record.record_failure("resume_rejected");
     record.resume_abandoned = false;
     if let Some(connection) = record.launch_connection.take() {
         replies.push((
             connection,
-            private_error(409, "resume settings are unavailable"),
+            recorded(private_error(409, "resume settings are unavailable")),
         ));
     }
     if record.application_session.is_some() {
@@ -5191,6 +5612,13 @@ fn take_call(job: &mut Job) -> Call {
     std::mem::replace(&mut job.call, replacement)
 }
 
+/// A refusal for a launch that has a record: the record's own failure path
+/// already put the cause in the lifecycle store.
+fn recorded(mut reply: Reply) -> Reply {
+    reply.rejection = None;
+    reply
+}
+
 fn reply_failure(record: &mut Record, replies: &mut Vec<(u64, Reply)>) {
     if let Some(connection) = record.launch_connection.take() {
         let message = if record.failure == Some("processing_output_range_mismatch") {
@@ -5198,14 +5626,14 @@ fn reply_failure(record: &mut Record, replies: &mut Vec<(u64, Reply)>) {
         } else {
             "stream launch failed"
         };
-        replies.push((connection, private_error(503, message)));
+        replies.push((connection, recorded(private_error(503, message))));
     }
     if record.state == State::CleanupFailed
         && let Some(connection) = record.cancel_connection.take()
     {
         replies.push((
             connection,
-            private_error(503, "stream cleanup is incomplete"),
+            recorded(private_error(503, "stream cleanup is incomplete")),
         ));
     }
 }

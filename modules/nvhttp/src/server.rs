@@ -809,6 +809,7 @@ fn simple_reply(status: u16, message: &str) -> Reply {
         body: message.as_bytes().to_vec(),
         requires_paired_tls: false,
         permission: None,
+        rejection: None,
     }
 }
 

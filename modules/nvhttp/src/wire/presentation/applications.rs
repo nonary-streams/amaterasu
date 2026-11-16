@@ -218,6 +218,7 @@ impl CatalogProjection {
                         body: Vec::new(),
                         requires_paired_tls: true,
                         permission: None,
+                        rejection: None,
                     }));
                 }
                 self.body.push_str(SUFFIX);
@@ -227,6 +228,7 @@ impl CatalogProjection {
                     body: std::mem::take(&mut self.body).into_bytes(),
                     requires_paired_tls: true,
                     permission: Some(Permission::List),
+                    rejection: None,
                 }));
             }
             (_, session::Reply::Error { .. }) => {

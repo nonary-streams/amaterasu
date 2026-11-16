@@ -35,6 +35,7 @@ pub(super) const COMPONENT: ComponentDefinition = ComponentDefinition {
         "amaterasu.video/1",
     ],
     publishes: &[],
+    subscribes: &[],
     dependencies: &append::<{ PROVIDER_DEPENDENCIES.len() + 1 }>(
         PROVIDER_DEPENDENCIES,
         &["amaterasu.video"],
@@ -57,6 +58,7 @@ pub(super) const BLACK_CAPTURE: ComponentDefinition = ComponentDefinition {
     provides: &["amaterasu.capture-black/1"],
     calls: &[],
     publishes: &[],
+    subscribes: &[],
     dependencies: &[RUNTIME_ID],
     native_provides: &["amaterasu.capture-black/1"],
     native_uses: &[],

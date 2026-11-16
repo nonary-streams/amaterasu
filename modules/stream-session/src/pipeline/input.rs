@@ -508,7 +508,13 @@ fn coalesce_controller_sample(
     None
 }
 
+#[track_caller]
 pub(super) fn stop_for_input_failure(record: &mut Record, code: &'static str) {
+    record.report_failure(
+        amaterasu_module_sdk::stream_lifecycle::LifecycleLayer::Input,
+        "input",
+        code,
+    );
     record.error.get_or_insert(code);
     record.outcome = State::Failed;
     record.history.stopping(code);

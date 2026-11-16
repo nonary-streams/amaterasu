@@ -20,7 +20,8 @@ pub(super) const COORDINATOR_COMPONENT: ComponentDefinition = ComponentDefinitio
         "amaterasu.extension-registry/1",
         "nonary.frame-limiter/1",
     ],
-    publishes: &[],
+    publishes: &[super::STREAM_ISSUE_TOPIC],
+    subscribes: &[],
     dependencies: &[
         RUNTIME_ID,
         "amaterasu.input",
@@ -40,6 +41,7 @@ pub(super) const REGISTRY_COMPONENT: ComponentDefinition = ComponentDefinition {
         "nonary.frame-limiter/1",
     ],
     publishes: &[],
+    subscribes: &[],
     dependencies: &[RUNTIME_ID, "amaterasu.state"],
     native_provides: &[],
     native_uses: &[],

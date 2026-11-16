@@ -35,6 +35,7 @@ pub fn response(status: u16, message: &str, fields: &[(&str, &str)]) -> Reply {
         body: body.into_bytes(),
         requires_paired_tls: false,
         permission: None,
+        rejection: None,
     }
 }
 

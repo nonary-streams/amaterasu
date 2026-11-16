@@ -2394,6 +2394,7 @@ mod tests {
             cleanup_methods: vec![],
             settings_revision: "rev".into(),
             settings: json!({}),
+            optional: false,
         };
         let approvals = [&participant.plan_method,&participant.callback_method,&participant.status_method].iter().map(|m| MethodApproval { method:(*m).clone(), broker_approval:json!({"provider":"display","method":{"service":m.service,"method":m.method,"interface_major":m.interface_major,"interface_minor":m.interface_minor}})}).collect();
         let selected = ProviderSelection {
@@ -2743,6 +2744,7 @@ mod tests {
             cleanup_methods: vec![],
             settings_revision: "installed".into(),
             settings: json!({}),
+            optional: false,
         });
         let mut state = coordinator.shared.borrow().value.clone();
         let epoch = state.host_epoch.clone();

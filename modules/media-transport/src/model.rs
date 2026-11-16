@@ -273,9 +273,10 @@ impl Open {
         for bind in [self.video_bind, self.audio_bind].into_iter().flatten() {
             validate_local_bind(bind.ip(), self.peer_ip, allow_remote)?;
         }
-        if !matches!(self.audio.packet_ms, 5 | 10)
-            || !matches!(self.audio.channels, 2 | 6 | 8)
-            || !self.valid_audio_wire_length()
+        if self.stream_audio
+            && (!matches!(self.audio.packet_ms, 5 | 10)
+                || !matches!(self.audio.channels, 2 | 6 | 8)
+                || !self.valid_audio_wire_length())
         {
             return Err("invalid_audio_configuration");
         }

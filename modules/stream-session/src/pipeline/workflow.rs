@@ -129,8 +129,16 @@ impl Job {
         }
     }
 
+    #[track_caller]
     pub fn fail(&mut self, record: &mut Record, code: &'static str, now: u64) {
         eprintln!("amaterasu session failed step={:?} code={code}", self.step);
+        if code != "request_cancelled" {
+            record.report_failure(
+                super::lifecycle_issues::step_layer(self.step),
+                &super::lifecycle_issues::step_label(self.step),
+                code,
+            );
+        }
         record.error.get_or_insert(code);
         record.outcome = if code == "request_cancelled" {
             State::Cancelled

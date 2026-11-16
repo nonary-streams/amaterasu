@@ -121,6 +121,8 @@ impl Resource {
 }
 
 pub(super) struct Record {
+    /// Failures recorded for the launch owner, published from the tick.
+    pub issues: amaterasu_module_sdk::stream_lifecycle::StreamIssueOutbox,
     pub providers: crate::providers::ProviderServices,
     pub id: u64,
     pub history: super::history::SessionHistory,
@@ -303,6 +305,7 @@ impl Record {
     pub fn new(id: u64, owner: String, config: PrepareConfig, input_ttl_ms: u64) -> Self {
         let virtual_display_state = "not_requested".to_owned();
         Self {
+            issues: Default::default(),
             providers: Default::default(),
             id,
             history: super::history::SessionHistory::new(id, config.history_activity_id.clone()),

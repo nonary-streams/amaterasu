@@ -1399,9 +1399,9 @@ impl Coordinator {
             }
         }
         let methods = self.required_approval_methods()?;
-        let approvals_complete = methods
-            .iter()
-            .all(|(participant, method)| self.method_approval_available(participant, method));
+        let approvals_complete = methods.iter().all(|(participant, method)| {
+            participant.optional || self.method_approval_available(participant, method)
+        });
         let discovery_complete = self.approval_cursor >= methods.len();
         let lifecycle_approvals_complete = self
             .settings
@@ -2073,6 +2073,24 @@ impl Coordinator {
                 } else {
                     "provider_plan_rejected"
                 };
+                if participant.optional
+                    && !self.provider_effect_unsettled(&key, provider)
+                    && !matches!(
+                        work.phase,
+                        LifecyclePhase::StreamRelease | LifecyclePhase::SessionRelease
+                    )
+                {
+                    self.record_provider_issue(
+                        &key,
+                        provider,
+                        work.phase,
+                        "optional_provider_skipped",
+                        Some("skip_optional_provider"),
+                    );
+                    self.skip_optional_provider(&key)?;
+                    self.drivers.remove(&runtime_key);
+                    continue;
+                }
                 if matches!(
                     work.phase,
                     LifecyclePhase::StreamRelease | LifecyclePhase::SessionRelease
@@ -2081,6 +2099,7 @@ impl Coordinator {
                 } else {
                     self.fail_work(&key, reason)?;
                 }
+                self.record_provider_issue(&key, provider, work.phase, reason, None);
                 self.drivers.remove(&runtime_key);
                 continue;
             }
@@ -3073,6 +3092,17 @@ impl Coordinator {
             .and_then(|receipt| receipt.work.as_ref())
             .and_then(|work| work.states.get(provider))
             .is_none_or(PrepareState::effect_unsettled)
+    }
+
+    fn skip_optional_provider(&self, key: &str) -> ModuleResult<()> {
+        let mut next = self.shared.borrow().value.clone();
+        let work = next
+            .receipts
+            .get_mut(key)
+            .and_then(|r| r.work.as_mut())
+            .ok_or("unknown_transition")?;
+        work.index += 1;
+        save(&self.shared, next)
     }
 
     fn cleanup_failure(&self, key: &str, reason: &str) -> ModuleResult<()> {

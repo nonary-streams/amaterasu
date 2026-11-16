@@ -139,6 +139,10 @@ pub struct ParticipantSettings {
     pub cleanup_methods: Vec<MethodRef>,
     pub settings_revision: String,
     pub settings: Value,
+    /// Optional providers (e.g., frame-limiter, rtx-hdr) do not block stream
+    /// launch when unapproved or when read-only planning is rejected.
+    #[serde(default)]
+    pub optional: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -181,6 +185,7 @@ impl From<amaterasu_module_sdk::processing_composition::LifecycleParticipant>
             cleanup_methods: declaration.cleanup_methods,
             settings_revision: declaration.settings_revision,
             settings: declaration.settings,
+            optional: false,
         }
     }
 }

@@ -481,6 +481,7 @@ fn frozen_action_lineage_survives_restart_and_rejects_tampering() {
         cleanup_methods: vec![],
         settings_revision: "rev".into(),
         settings: json!({}),
+        optional: false,
     };
     let approvals = [&participant.plan_method, &participant.callback_method, &participant.status_method]
         .iter().map(|method| MethodApproval { method: (*method).clone(), broker_approval: json!({"provider":"display","method":{"service":method.service,"method":method.method,"interface_major":method.interface_major,"interface_minor":method.interface_minor}}) }).collect();

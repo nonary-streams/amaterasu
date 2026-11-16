@@ -12,6 +12,7 @@ mod input_silence;
 mod input_timing;
 mod journal;
 mod lifecycle;
+mod lifecycle_issues;
 mod quiescence;
 mod record;
 mod responses;
@@ -114,6 +115,8 @@ fn input_job_due(record: &Record) -> bool {
 }
 
 pub struct Pipeline {
+    /// Publish recorded stream issues to the launch owner.
+    report_stream_issues: bool,
     settings: Settings,
     service: String,
     records: BTreeMap<u64, Record>,
@@ -154,6 +157,7 @@ impl Pipeline {
         settings.validate()?;
         settings.providers.validate_for_owner(&service)?;
         Ok(Self {
+            report_stream_issues: false,
             settings,
             service,
             records: BTreeMap::new(),
@@ -504,6 +508,7 @@ impl Pipeline {
             }
         }
         self.progress_shutdown_observations(now, send);
+        self.publish_stream_issues(send);
         self.history_activities.progress(now, &self.records, send);
         if let Some(job) = self.job.as_mut()
             && job.step == Step::WaitDrain
@@ -1243,6 +1248,11 @@ impl Pipeline {
                         record.audio_recovery_needed = true;
                         continue;
                     }
+                    record.report_failure(
+                        lifecycle_issues::media_layer(failure.code),
+                        "media",
+                        failure.code,
+                    );
                     record.error = Some(failure.code);
                     record.outcome = State::Failed;
                     record.history.stopping(failure.code);

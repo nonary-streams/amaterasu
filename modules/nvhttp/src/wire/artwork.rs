@@ -93,6 +93,7 @@ impl Router {
                             body: image.bytes,
                             requires_paired_tls: true,
                             permission: Some(Permission::List),
+                            rejection: None,
                         },
                     ));
                 }

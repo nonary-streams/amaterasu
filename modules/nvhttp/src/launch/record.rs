@@ -9,6 +9,7 @@ use crate::launch::{
 };
 use crate::preparation::{LegacyPreparationStep, PreparationStep};
 use amaterasu_contracts::virtual_display::VirtualDisplayIntent;
+use amaterasu_module_sdk::stream_lifecycle::StreamIssueOutbox;
 use serde_json::Value;
 use std::{
     collections::VecDeque,
@@ -144,6 +145,12 @@ pub struct Record {
     pub stream_warnings: Vec<amaterasu_module_sdk::stream_warnings::StreamWarning>,
     pub history_warnings_attempted: bool,
     pub launch_warnings_attempted: bool,
+    /// Issues this launch recorded that the controller has not yet committed
+    /// to its lifecycle store.
+    pub issues: StreamIssueOutbox,
+    /// The job whose outcome is being handled, so a failure recorded now is
+    /// credited to the layer that job called.
+    pub failure_context: Option<super::lifecycle_issues::FailureContext>,
     pub connect_data: u32,
     pub global_fec_percentage: u8,
     pub global_stream_audio: bool,
@@ -359,6 +366,8 @@ impl Record {
             request,
             physical_display_mode,
             device_name,
+            issues: StreamIssueOutbox::default(),
+            failure_context: None,
             application_operation,
             rtsp_operation,
             lifecycle_required: false,
@@ -517,9 +526,11 @@ impl Record {
         }
     }
 
+    #[track_caller]
     pub fn request_cleanup(&mut self, failure: Option<&'static str>, now: Instant) {
         if let Some(failure) = failure {
             self.failure.get_or_insert(failure);
+            self.record_failure(failure);
         }
         if self.lifecycle_prepare_dispatched && self.lifecycle_session_target.is_none() {
             self.fail_cleanup("lifecycle_retirement_unavailable");
@@ -540,6 +551,7 @@ impl Record {
         }
     }
 
+    #[track_caller]
     pub fn request_transport_cleanup(&mut self, failure: Option<&'static str>, now: Instant) {
         self.request_cleanup(failure, now);
         self.transport_only_cleanup = true;
@@ -547,6 +559,7 @@ impl Record {
 
     /// A failed monitor does not prove that the stream has retired. Keep the
     /// application alive until the exact RTSP cleanup receipt is available.
+    #[track_caller]
     pub fn request_monitored_transport_cleanup(
         &mut self,
         failure: Option<&'static str>,
@@ -568,7 +581,9 @@ impl Record {
             .unwrap_or(DEFAULT_CLEANUP_BUDGET)
     }
 
+    #[track_caller]
     pub fn fail_cleanup(&mut self, error: &'static str) {
+        self.record_failure(error);
         self.state = State::CleanupFailed;
         self.cleanup_error = Some(error);
         self.automatic_cleanup_retry_active = false;
@@ -677,8 +692,14 @@ impl Record {
     /// Stop holding admission for cleanup that cannot be confirmed. Retained
     /// broker calls are dropped by the caller after a best-effort settlement;
     /// the downstream owners keep their own records of what they still hold.
+    #[track_caller]
     pub fn abandon_cleanup(&mut self) {
         debug_assert_eq!(self.state, State::CleanupFailed);
+        self.record_demotion(
+            "cleanup_abandoned",
+            self.cleanup_error.unwrap_or_default(),
+            "stop_holding_admission",
+        );
         self.state = State::CleanupAbandoned;
         self.stage = Stage::Terminal;
         self.next_automatic_cleanup_retry = None;
@@ -689,8 +710,14 @@ impl Record {
     /// Give up on this root's own transport while keeping what it launched.
     /// A retained application stays owned and visible as paused, so it can be
     /// resumed or quit. An application that ends with its stream is stopped.
+    #[track_caller]
     pub fn abandon_transport(&mut self, now: Instant) {
         debug_assert_eq!(self.state, State::CleanupFailed);
+        self.record_demotion(
+            "transport_cleanup_abandoned",
+            self.cleanup_error.unwrap_or_default(),
+            "retain_application",
+        );
         self.uncertain.clear();
         self.retrying_uncertainty = false;
         self.rtsp_requested = false;

@@ -163,6 +163,7 @@ impl Applications {
             body: self.body.into_bytes(),
             requires_paired_tls: true,
             permission: Some(Permission::List),
+            rejection: None,
         }
     }
 }

@@ -41,6 +41,9 @@ impl ManagedModule for StreamSession {
         };
         settings.validate()?;
         let mut pipeline = Pipeline::new(settings, service.clone())?;
+        // Failures reach the launch owner's lifecycle store with this module
+        // as their authenticated reporter.
+        pipeline.enable_stream_issue_reports();
         runtime.require_success(Command::Register { service })?;
         amaterasu_module_sdk::operation_api::register_selected(&runtime, &public_api_methods())?;
         // A host may select this provider as its non-disruptive activation

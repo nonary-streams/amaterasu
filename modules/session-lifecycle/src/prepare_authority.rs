@@ -2276,6 +2276,7 @@ mod tests {
             }],
             settings_revision: "revision".into(),
             settings: json!({}),
+            optional: false,
         };
         let approvals = [&participant.plan_method, &participant.callback_method, &participant.status_method].iter().map(|method| MethodApproval { method:(*method).clone(), broker_approval:json!({"provider":"display", "method":{"service":method.service,"method":method.method,"interface_major":method.interface_major,"interface_minor":method.interface_minor}}) }).collect();
         ProviderSelection {

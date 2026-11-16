@@ -9,6 +9,7 @@ use amaterasu_module_sdk::{
 mod auxiliary;
 mod call;
 mod cleanup_recovery;
+mod lifecycle_issues;
 mod reconnect;
 mod record;
 mod restart_sweep;
@@ -42,7 +43,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     net::{IpAddr, Ipv4Addr},
     time::{Duration, Instant},
 };
@@ -723,6 +724,14 @@ struct LaunchSource {
     response: StreamResponse,
 }
 
+pub(super) struct PendingHistoryRelease {
+    pub activity_id: String,
+    pub rtsp_operation: String,
+    pub call: Option<call::Call>,
+    pub attempts: u8,
+    pub next_retry: Instant,
+}
+
 pub struct Controller {
     package_activation_pending: bool,
     quiesce_history_deadline: Option<Instant>,
@@ -768,6 +777,12 @@ pub struct Controller {
     job: Option<Job>,
     /// Optional diagnostics never occupy the critical launch/monitor job slot.
     diagnostic_jobs: BTreeMap<u64, (String, Job)>,
+    pending_history_releases: VecDeque<PendingHistoryRelease>,
+    active_history_release: Option<(PendingHistoryRelease, call::Call)>,
+    /// What every layer reported about each stream: the root cause of a
+    /// failure, demoted fallbacks and refusals, with who reported them.
+    stream_lifecycle: amaterasu_module_sdk::stream_lifecycle::StreamLifecycleStore,
+    stream_issue_feed: Option<amaterasu_module_sdk::stream_lifecycle::StreamIssueFeed>,
     nonce: [u8; 16],
     next_id: u64,
     sequence: u64,
@@ -839,6 +854,10 @@ impl Controller {
             management_replies: Vec::new(),
             job: None,
             diagnostic_jobs: BTreeMap::new(),
+            pending_history_releases: VecDeque::new(),
+            active_history_release: None,
+            stream_lifecycle: Default::default(),
+            stream_issue_feed: None,
             nonce,
             next_id: 0,
             sequence: 0,
@@ -1076,17 +1095,24 @@ impl Controller {
                 .find(|record| management_reference(record) == reference),
             None => self.current_record(|_| true),
         };
-        match record {
+        let mut status = match record {
             Some(record) => json!({"ok":true,"launch":{
                 "reference":management_reference(record),
                 "revision":self.management_revision(record),
                 "state":management_state(self.application_status(record)),
                 "pending_resume":self.pending_resume.as_ref().is_some_and(|pending| self.records.get(&pending.record)
                     .is_some_and(|pending_record| pending_record.application_root() == record.application_root())),
+                "lifecycle":self.lifecycle_snapshot(record),
             }}),
             None if reference.is_none() => json!({"ok":true,"launch":null}),
-            None => json!({"ok":false,"code":"launch_not_found"}),
-        }
+            None => return json!({"ok":false,"code":"launch_not_found"}),
+        };
+        // Reports that named no tracked launch are kept, bounded, so a
+        // failure is never silently lost for want of a stream key.
+        let unattributed: Vec<_> = self.stream_lifecycle.unattributed().collect();
+        status["unattributed_issues"] = json!(unattributed);
+        status["lifecycle_feed_gaps"] = json!(self.stream_lifecycle.gaps());
+        status
     }
 
     fn management_revision(&self, record: &Record) -> String {
@@ -1214,7 +1240,7 @@ impl Controller {
         response: StreamResponse,
         now: Instant,
     ) -> Option<Reply> {
-        self.launch_with_source(
+        let mut reply = self.launch_with_source(
             connection,
             request,
             peer,
@@ -1223,7 +1249,11 @@ impl Controller {
                 ..LaunchSource::default()
             },
             now,
-        )
+        );
+        if let Some(reply) = reply.as_mut() {
+            self.record_refusal(reply, "launch_admission");
+        }
+        reply
     }
 
     fn validate_stream_request(
@@ -1647,6 +1677,21 @@ impl Controller {
     pub(crate) fn resume_for_route(
         &mut self,
         connection: u64,
+        request: LaunchRequest,
+        peer: &PeerIdentity,
+        response: StreamResponse,
+        now: Instant,
+    ) -> Option<Reply> {
+        let mut reply = self.admit_resume(connection, request, peer, response, now);
+        if let Some(reply) = reply.as_mut() {
+            self.record_refusal(reply, "resume_admission");
+        }
+        reply
+    }
+
+    fn admit_resume(
+        &mut self,
+        connection: u64,
         mut request: LaunchRequest,
         peer: &PeerIdentity,
         response: StreamResponse,
@@ -1888,6 +1933,7 @@ impl Controller {
             });
         }
         self.poll_diagnostic_jobs(now, send);
+        self.poll_history_releases(now, send);
         self.recover_failed_cleanup(now, send);
         self.stamp_ended(now);
         self.keep_launch_capacity(send);
@@ -1976,6 +2022,10 @@ impl Controller {
         self.advance_auxiliary_reconnects(now, &mut allowed, &mut replies);
         self.admit_deferred_launch(now, &mut allowed, &mut replies);
         self.report_outcomes();
+        self.commit_stream_lifecycle(send);
+        for (_, reply) in &mut replies {
+            self.record_refusal(reply, "deferred_admission");
+        }
         replies
     }
 
@@ -2257,6 +2307,14 @@ impl Controller {
         for (_, mut job) in std::mem::take(&mut self.diagnostic_jobs).into_values() {
             job.call.abandon_warning(send);
         }
+        if let Some((_, mut call)) = self.active_history_release.take() {
+            call.abandon_warning(send);
+        }
+        for mut entry in std::mem::take(&mut self.pending_history_releases) {
+            if let Some(mut call) = entry.call.take() {
+                call.abandon_warning(send);
+            }
+        }
         self.restart_sweep.shutdown(send);
         for record in self.records.values_mut() {
             for (_, call) in &mut record.uncertain {
@@ -2281,6 +2339,7 @@ impl Controller {
     }
 }
 
+#[track_caller]
 fn private_error(status: u16, message: &str) -> Reply {
     let reason = if message.len() <= 64
         && message
@@ -2294,6 +2353,11 @@ fn private_error(status: u16, message: &str) -> Reply {
     eprintln!("amaterasu launch rejection status={status} reason={reason}");
     let mut reply = xml::error(status, message);
     reply.requires_paired_tls = true;
+    reply.rejection = Some(crate::wire::Rejection {
+        status,
+        code: reason.replace(' ', "_"),
+        site: std::panic::Location::caller(),
+    });
     reply
 }
 

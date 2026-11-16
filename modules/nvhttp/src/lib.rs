@@ -269,6 +269,9 @@ impl ManagedModule for NvhttpModule {
             )?;
             let mut launches = launch::Controller::new(settings.streaming.clone())?;
             launches.set_logger(log_emitter.clone());
+            // Other layers report stream failures and fallbacks on the SDK's
+            // stream-issue topic; this module keeps them per launch.
+            launches.enable_stream_issue_feed();
             launches.set_session_lifecycle_required(settings.session_lifecycle_required);
             if settings.session_lifecycle_required {
                 launches.enable_restart_abandonment_sweep();

@@ -27,6 +27,11 @@ For an optional operation, the implementation and its tests should establish:
 5. An explicit user setting and existing ownership/retirement fences still
    apply. A warning never asserts that an uncertain native effect has retired.
 
+Every failure and every demotion is reported to the launch owner's stream
+lifecycle store through `amaterasu_module_sdk::stream_lifecycle`; see
+[stream-lifecycle-store.md](stream-lifecycle-store.md). A demotion that is not
+reported there is not a demotion this policy accepts.
+
 `amaterasu_module_sdk::stream_warnings` defines the shared scalar record,
 validation and size bounds. The owner logs warnings and may query the launch
 provider's optional `warnings` action after the launch reply is delivered. It
@@ -50,15 +55,17 @@ event.
 | Configured application log | If unsupported, unopenable, or unattachable, continue with null output and report a warning. Invalid request syntax and unsafe nonregular output targets are still not used. |
 | Best-effort detached command | Report executable lookup or spawn failures as warnings while the primary application continues. |
 | Warning query and history submission | Run after the launch response and use bounded best-effort calls; absence, rejection, or uncertain delivery cannot invalidate the successful stream. |
+| NVHTTP history-activity release (`ReleaseHistory`) | Failed, rejected, settled, or uncertain history releases are demoted to a warning and retried via an independently retained background queue keyed by exact `rtsp_operation` activity ID; pause, rejected resume, and cancel no longer destroy retained apps or delay later launches. |
+| NVHTTP pause verification (`VerifyPaused`) and resume policy/display `settled` | When RTSP is confirmed retired, `VerifyPaused` rejection/settlement keeps the application paused; `RefreshResumePolicy` settlement falls back to the cached/disabled Proton policy; resume display `settled` rejects only the resume without killing the retained app. |
+| NVHTTP initial Proton policy read (`ReadProtonPolicy`) | Rejection or settlement falls back to disabled Proton compatibility with a warning, matching `consume`. |
+| Frame limiter planning (`frame-limiter`) | Unavailable policy, context, or non-recovery backend during read-only planning demotes to a no-op `Planned` response with a lifecycle warning. |
+| Media transport audio config (`media-transport`) | Audio packet/channel/wire validation is skipped when `stream_audio` is `false`. |
+| Optional lifecycle participants (`session-lifecycle`) | `ParticipantSettings::optional` prevents unapproved optional providers from stalling `approvals_complete` and skips read-only `ResourcePlan` rejections without failing the stream. |
 
 ## Remaining boundary
 
-This is not yet an exhaustive classification of every stream failure. In
-particular, NVHTTP can still retain a failed history-activity release as a
-cleanup failure, including during pause or a rejected resume. That path needs
-an independently retained, retryable history cleanup so diagnostic retirement
-cannot stop a retained application or delay a later launch. It must preserve
-the exact activity identity and must not declare native resources retired on
-the strength of a diagnostic failure. The existing lifecycle, capture, display,
-transport, and application retirement paths also require a case-by-case audit
-before any further failure is demoted.
+The existing capture, display, and application retirement paths still require
+case-by-case review before any further failure is demoted. In particular,
+optional audio/input fallback (streaming video-only or view-only when hardware
+devices are absent) remains gated by explicit user/session contracts unless
+opt-in fallback policy is configured.

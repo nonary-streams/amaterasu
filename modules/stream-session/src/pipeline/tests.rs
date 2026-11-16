@@ -7,6 +7,7 @@ mod harness;
 mod history;
 mod host_audio;
 mod input;
+mod lifecycle_issues;
 mod providers;
 mod quiescence;
 mod restart;

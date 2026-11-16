@@ -1,6 +1,7 @@
 use super::*;
 use super::call::{Call, Outcome};
 use super::workflow::Phase;
+use amaterasu_module_sdk::stream_lifecycle::{IssueDisposition, LifecycleLayer, StreamIssue};
 use amaterasu_module_sdk::{Command, Response};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -2178,7 +2179,7 @@ fn management_stop_reports_cleanup_failure_and_allows_an_explicit_retry() {
     let mut controller = Controller::new(Some(config())).unwrap();
     let mut broker = Broker::default();
     launch_ready(&mut controller, &mut broker, now);
-    broker.history_release_unavailable = true;
+    broker.fail_rtsp_cleanup = true;
     let status = controller.management_status(None);
     let reference = status["launch"]["reference"].as_str().unwrap();
     let revision = status["launch"]["revision"].as_str().unwrap();
@@ -2189,7 +2190,7 @@ fn management_stop_reports_cleanup_failure_and_allows_an_explicit_retry() {
     }
     let failed = controller.management_status(Some(reference));
     assert_eq!(failed["launch"]["state"], "cleanup_failed");
-    broker.history_release_unavailable = false;
+    broker.fail_rtsp_cleanup = false;
     assert_eq!(controller.management_stop(reference, failed["launch"]["revision"].as_str().unwrap(), now)["accepted"], true);
     poll_until_stopped(&mut controller, &mut broker, now, 1);
     assert!(!broker.history_reserved);
@@ -2858,7 +2859,7 @@ fn lost_history_reservation_admission_looks_up_without_replaying_and_releases_on
 }
 
 #[test]
-fn failed_history_release_retains_cleanup_ownership_for_retry() {
+fn failed_history_release_retries_in_background_without_blocking_later_launches() {
     let now = Instant::now();
     let mut controller = Controller::new(Some(config())).unwrap();
     let mut broker = Broker::default();
@@ -2866,18 +2867,21 @@ fn failed_history_release_retains_cleanup_ownership_for_retry() {
     broker.history_release_unavailable = true;
     assert!(controller.cancel(20, &peer(1), now).is_none());
     let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
-    assert_eq!(reply.status, 503);
-    assert!(controller.busy());
+    assert_eq!(reply.status, 200);
+    assert!(!controller.busy());
     assert!(broker.history_reserved);
     broker.history_release_unavailable = false;
-    assert!(controller.cancel(21, &peer(1), now).is_none());
-    let (_, retry) = poll_until_reply(&mut controller, &mut broker, now);
-    assert_eq!(retry.status, 200);
+    let retry_at = now + Duration::from_millis(600);
+    for tick in 0..4 {
+        controller.poll(retry_at + Duration::from_millis(tick * 100), &mut |command| {
+            broker.send(command)
+        });
+    }
     assert!(!broker.history_reserved);
 }
 
 #[test]
-fn history_in_use_release_keeps_cleanup_owned_until_retry() {
+fn history_in_use_release_retries_in_background_without_blocking_cancel() {
     let now = Instant::now();
     let mut controller = Controller::new(Some(config())).unwrap();
     let mut broker = Broker::default();
@@ -2885,12 +2889,15 @@ fn history_in_use_release_keeps_cleanup_owned_until_retry() {
     broker.history_release_in_use_once = true;
     assert!(controller.cancel(20, &peer(1), now).is_none());
     let (_, first) = poll_until_reply(&mut controller, &mut broker, now);
-    assert_eq!(first.status, 503);
+    assert_eq!(first.status, 200);
+    assert!(!controller.busy());
     assert!(broker.history_reserved);
-    assert!(controller.busy());
-    assert!(controller.cancel(21, &peer(1), now).is_none());
-    let (_, second) = poll_until_reply(&mut controller, &mut broker, now);
-    assert_eq!(second.status, 200);
+    let retry_at = now + Duration::from_millis(600);
+    for tick in 0..4 {
+        controller.poll(retry_at + Duration::from_millis(tick * 100), &mut |command| {
+            broker.send(command)
+        });
+    }
     assert!(!broker.history_reserved);
     let actions = broker.actions();
     let stopped = actions
@@ -5908,78 +5915,70 @@ fn cooperative_shutdown_runs_owned_application_cleanup_before_reporting_ready() 
 }
 
 #[test]
-fn cooperative_shutdown_reconciles_only_retired_history_once_with_a_fixed_deadline() {
-    for recovered in [false, true] {
-        let now = Instant::now();
-        let mut controller = Controller::new(Some(config())).unwrap();
-        let mut broker = Broker::default();
-        launch_ready(&mut controller, &mut broker, now);
-        broker.history_release_unavailable = true;
-        assert!(controller.cancel(20, &peer(1), now).is_none());
-        assert_eq!(
-            poll_until_reply(&mut controller, &mut broker, now).1.status,
-            503
-        );
-        let application = *controller.records.keys().next().unwrap();
-        let record = &controller.records[&application];
-        assert_eq!(record.state, State::CleanupFailed);
-        assert!(!record.rtsp_requested);
-        assert!(!record.application_requested);
-        assert!(record.history_release_required);
-        broker.history_release_unavailable = !recovered;
-        let shutdown_at = now + Duration::from_secs(3_600);
-        assert!(!controller.quiesce(shutdown_at));
-        let deadline = controller.records[&application].deadline;
-        for tick in 0..128 {
-            let time = shutdown_at + Duration::from_millis(tick * 100);
-            controller.poll(time, &mut |command| broker.send(command));
-            controller.quiesce(time);
-            assert_eq!(controller.records[&application].deadline, deadline);
-        }
-        // Shutdown never waits on history that cannot be released: the one
-        // retry either confirms it or the record is abandoned with its error.
-        assert!(controller.quiesce(shutdown_at + Duration::from_secs(60)));
-        assert_eq!(
-            controller.records[&application].state,
-            if recovered {
-                State::Stopped
-            } else {
-                State::CleanupAbandoned
-            }
-        );
-        if !recovered {
-            assert_eq!(
-                controller.records[&application].cleanup_error,
-                Some("history_release_unconfirmed")
-            );
-        }
-        assert_eq!(broker.history_reserved, !recovered);
-        let releases: Vec<_> = broker
-            .commands
-            .iter()
-            .filter_map(|command| match command {
-                Command::Request {
-                    service, payload, ..
-                } if service == "amaterasu.stream-session/1"
-                    && payload["action"] == "release_history_activity" =>
-                {
-                    Some(payload)
-                }
-                _ => None,
-            })
-            .collect();
-        assert_eq!(releases.len(), 2);
-        assert_eq!(releases[0], releases[1]);
-        assert_eq!(
-            broker
-                .actions()
-                .iter()
-                .filter(|action| **action == ("amaterasu.launch/1", "stop"))
-                .count(),
-            1
-        );
-        assert_eq!(controller.records[&application].deadline, deadline);
+fn cooperative_shutdown_does_not_wait_on_unconfirmed_history_release() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut broker = Broker::default();
+    launch_ready(&mut controller, &mut broker, now);
+    broker.history_release_unavailable = true;
+    assert!(controller.cancel(20, &peer(1), now).is_none());
+    assert_eq!(
+        poll_until_reply(&mut controller, &mut broker, now).1.status,
+        200
+    );
+    let application = *controller.records.keys().next().unwrap();
+    let record = &controller.records[&application];
+    assert_eq!(record.state, State::Stopped);
+    assert!(!record.rtsp_requested);
+    assert!(!record.application_requested);
+    assert!(!record.history_release_required);
+    let lifecycle = controller
+        .stream_lifecycle
+        .stream(&record.rtsp_operation)
+        .unwrap();
+    assert!(lifecycle.healthy());
+    assert_eq!(lifecycle.warnings().len(), 1);
+    let warning = &lifecycle.warnings()[0];
+    assert_eq!(warning.issue.code, "history_release_unconfirmed");
+    assert_eq!(warning.issue.layer, LifecycleLayer::History);
+    assert_eq!(warning.publisher, "amaterasu.nvhttp");
+    let shutdown_at = now + Duration::from_secs(3_600);
+    assert!(controller.quiesce(shutdown_at));
+    assert!(broker.history_reserved);
+}
+
+#[test]
+fn paused_app_survives_failed_history_release_and_records_lifecycle_warning() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut broker = Broker::default();
+    launch_ready(&mut controller, &mut broker, now);
+    broker.history_release_unavailable = true;
+    controller
+        .records
+        .get_mut(&1)
+        .unwrap()
+        .history_release_required = true;
+    controller.records.get_mut(&1).unwrap().stage = Stage::ReleasePausedHistory;
+    for tick in 0..8 {
+        controller.poll(now + Duration::from_millis(tick * 100), &mut |command| {
+            broker.send(command)
+        });
     }
+    let record = &controller.records[&1];
+    assert_eq!(record.state, State::Paused);
+    let lifecycle = controller
+        .stream_lifecycle
+        .stream(&record.rtsp_operation)
+        .unwrap();
+    assert!(lifecycle.healthy());
+    assert!(
+        lifecycle
+            .warnings()
+            .iter()
+            .any(|warning| warning.issue.code == "history_release_unconfirmed")
+    );
+    assert!(!broker.actions().contains(&("amaterasu.launch/1", "stop")));
 }
 
 #[test]
@@ -6040,4 +6039,182 @@ fn virtual_display_allocation_uses_paired_physical_mode_without_changing_stream_
     assert_eq!(open["profile"]["width"], 1280);
     assert_eq!(open["profile"]["height"], 720);
     assert_eq!(open["profile"]["fps"], 120);
+}
+
+fn lifecycle_of(
+    controller: &Controller,
+    record: u64,
+) -> &amaterasu_module_sdk::stream_lifecycle::StreamLifecycle {
+    let key = &controller.records[&record].rtsp_operation;
+    controller.stream_lifecycle.stream(key).expect("tracked stream")
+}
+
+#[test]
+fn a_rejected_rtsp_open_is_the_root_cause_with_its_provider_code_and_line() {
+    let now = Instant::now();
+    let selected = "missing-display";
+    let mut controller = Controller::new(Some(config())).unwrap();
+    controller.set_output_name_settings(true, Some(selected));
+    let mut broker = Broker {
+        unavailable_output: Some(selected.into()),
+        ..Broker::default()
+    };
+    assert!(controller.launch(10, request(1), peer(1), now).is_none());
+    let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+    assert_eq!(reply.status, 503);
+    assert!(reply.rejection.is_none(), "the record already holds the cause");
+
+    let id = *controller.records.keys().next().unwrap();
+    let lifecycle = lifecycle_of(&controller, id);
+    let root = lifecycle.root_cause().expect("a failed launch has a root cause");
+    assert_eq!(root.publisher, "amaterasu.nvhttp");
+    assert_eq!(root.issue.layer, LifecycleLayer::Rtsp);
+    assert_eq!(root.issue.phase, "open_rtsp");
+    assert_eq!(root.issue.reason, "not_found");
+    assert_eq!(root.issue.disposition, IssueDisposition::CriticalFailure);
+    assert!(root.issue.site.contains("workflow.rs:"), "{}", root.issue.site);
+
+    let reference = management_reference(&controller.records[&id]);
+    let status = controller.management_status(Some(&reference));
+    assert_eq!(
+        status["launch"]["lifecycle"]["root_cause"]["issue"]["layer"],
+        "rtsp"
+    );
+    assert_eq!(status["launch"]["lifecycle"]["healthy"], false);
+}
+
+#[test]
+fn a_refused_launch_is_recorded_with_the_line_that_refused_it() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    controller.set_output_name_settings(false, None);
+    let reply = controller.launch(1, request(1), peer(1), now).unwrap();
+    assert_eq!(reply.status, 503);
+    assert!(reply.rejection.is_none(), "the refusal was recorded once");
+
+    let refused = controller
+        .stream_lifecycle
+        .stream("refused.1")
+        .expect("a refusal is a stream of its own");
+    let root = refused.root_cause().unwrap();
+    assert_eq!(root.issue.code, "stream_settings_are_loading");
+    assert_eq!(root.issue.phase, "launch_admission");
+    assert_eq!(root.issue.reason, "http_503");
+    assert!(root.issue.site.contains("launch.rs:"), "{}", root.issue.site);
+}
+
+#[test]
+fn a_demoted_input_policy_failure_is_a_warning_not_a_failure() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut broker = Broker {
+        input_policy_rejected: true,
+        ..Broker::default()
+    };
+    launch_ready(&mut controller, &mut broker, now);
+    let lifecycle = lifecycle_of(&controller, 1);
+    assert!(lifecycle.healthy());
+    let warning = lifecycle
+        .warnings()
+        .iter()
+        .find(|warning| warning.issue.code == "proton_policy_unavailable")
+        .expect("the fallback is recorded");
+    assert_eq!(warning.issue.layer, LifecycleLayer::Input);
+    assert_eq!(warning.issue.phase, "read_proton_policy");
+    assert_eq!(warning.issue.disposition, IssueDisposition::AdvisoryWarning);
+}
+
+/// Answers the stream-issue subscription with scripted reports and passes
+/// every other command to the launch broker.
+struct IssueReports {
+    events: std::collections::VecDeque<(String, StreamIssue)>,
+    sequence: u64,
+}
+
+impl IssueReports {
+    fn send(&mut self, broker: &mut Broker, command: Command) -> Transport {
+        match command {
+            Command::Subscribe { topic, .. } => {
+                assert_eq!(topic, "amaterasu.stream.issue/1");
+                Ok(Response::Accepted { id: 77 })
+            }
+            Command::NextEvent { subscription } => {
+                assert_eq!(subscription, 77);
+                Ok(match self.events.pop_front() {
+                    Some((publisher, issue)) => {
+                        self.sequence += 1;
+                        Response::Event {
+                            publisher,
+                            topic: "amaterasu.stream.issue/1".into(),
+                            sequence: self.sequence,
+                            payload: serde_json::to_value(issue).unwrap(),
+                        }
+                    }
+                    None => Response::Pending,
+                })
+            }
+            command => broker.send(command),
+        }
+    }
+}
+
+#[test]
+fn a_layer_reported_failure_is_the_root_cause_ahead_of_nvhttp_cleanup() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    controller.enable_stream_issue_feed();
+    let mut broker = Broker::default();
+    let mut reports = IssueReports {
+        events: Default::default(),
+        sequence: 0,
+    };
+    assert!(controller.launch(10, request(1), peer(1), now).is_none());
+    controller.poll(now, &mut |command| reports.send(&mut broker, command));
+    let id = *controller.records.keys().next().unwrap();
+    let rtsp_operation = controller.records[&id].rtsp_operation.clone();
+    let application_operation = controller.records[&id].application_operation.clone();
+
+    reports.events.push_back((
+        "amaterasu.stream-session".into(),
+        StreamIssue::critical(
+            rtsp_operation.clone(),
+            LifecycleLayer::EncodeVideo,
+            "wait_video_ready",
+            "video_startup_failed",
+        )
+        .because("encoder_unavailable"),
+    ));
+    reports.events.push_back((
+        "amaterasu.session-lifecycle".into(),
+        StreamIssue::demoted(
+            format!("{application_operation}-lifecycle"),
+            LifecycleLayer::FrameLimiter,
+            "resource_plan",
+            "optional_provider_skipped",
+            "skip_optional_provider",
+        ),
+    ));
+    controller.poll(now, &mut |command| reports.send(&mut broker, command));
+    controller
+        .records
+        .get_mut(&id)
+        .unwrap()
+        .request_cleanup(Some("monitor_unavailable"), now);
+    controller.poll(now, &mut |command| reports.send(&mut broker, command));
+
+    let lifecycle = lifecycle_of(&controller, id);
+    let root = lifecycle.root_cause().unwrap();
+    assert_eq!(root.publisher, "amaterasu.stream-session");
+    assert_eq!(root.issue.layer, LifecycleLayer::EncodeVideo);
+    assert_eq!(root.issue.reason, "encoder_unavailable");
+    assert!(
+        lifecycle
+            .entries()
+            .any(|entry| entry.issue.code == "monitor_unavailable"),
+        "later failures are kept beside the root cause"
+    );
+    let warning = &lifecycle.warnings()[0];
+    assert_eq!(warning.publisher, "amaterasu.session-lifecycle");
+    assert_eq!(warning.issue.code, "optional_provider_skipped");
+    assert!(!lifecycle.audit_gap());
 }

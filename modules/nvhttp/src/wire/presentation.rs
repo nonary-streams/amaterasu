@@ -724,6 +724,7 @@ impl PresentationRouter {
                             body: image.bytes,
                             requires_paired_tls: true,
                             permission: Some(Permission::List),
+                            rejection: None,
                         },
                         Permission::List,
                     )
@@ -834,6 +835,7 @@ impl PresentationRouter {
                         body: bytes,
                         requires_paired_tls: true,
                         permission: Some(Permission::List),
+                        rejection: None,
                     })
                 }
                 Artwork::Unavailable => Some(xml::error(404, "artwork unavailable")),

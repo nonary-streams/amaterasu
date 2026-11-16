@@ -83,6 +83,19 @@ pub struct Reply {
     pub body: Vec<u8>,
     pub requires_paired_tls: bool,
     pub permission: Option<Permission>,
+    /// Set on a refusal by the line that refused, until the launch controller
+    /// records it in its stream lifecycle store.
+    pub rejection: Option<Rejection>,
+}
+
+/// Why and where a stream request was refused.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Rejection {
+    pub status: u16,
+    /// The client-facing message as a code, or `redacted` when it is not a
+    /// plain lowercase phrase.
+    pub code: String,
+    pub site: &'static std::panic::Location<'static>,
 }
 
 impl Reply {
@@ -986,6 +999,7 @@ impl Router {
                 body,
                 requires_paired_tls: true,
                 permission: Some(Permission::Entitlement(binding.entitlement.clone())),
+                rejection: None,
             },
             None => xml::error(502, "invalid participant response"),
         };
