@@ -12,11 +12,13 @@ pub const MAX_ERROR_BYTES: usize = 256;
 pub const MAX_REQUEST_BYTES: usize = 8 + 2 + 2 + MAX_HOST_BYTES;
 pub const MAX_RESPONSE_BYTES: usize = 8 + 1 + 2 + MAX_ADDRESSES * 27;
 
+pub const REVERSE_REQUEST_MAGIC: &[u8; 8] = b"AMDNSQ02";
 const REQUEST_MAGIC: &[u8; 8] = b"AMDNSQ01";
 const RESPONSE_MAGIC: &[u8; 8] = b"AMDNSR01";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Request {
+    pub reverse: bool,
     pub host: String,
     pub port: u16,
 }
@@ -25,7 +27,11 @@ impl Request {
     pub fn encode(&self) -> io::Result<Vec<u8>> {
         validate_host(&self.host)?;
         let mut bytes = Vec::with_capacity(12 + self.host.len());
-        bytes.extend_from_slice(REQUEST_MAGIC);
+        bytes.extend_from_slice(if self.reverse {
+            REVERSE_REQUEST_MAGIC
+        } else {
+            REQUEST_MAGIC
+        });
         bytes.extend_from_slice(&(self.host.len() as u16).to_be_bytes());
         bytes.extend_from_slice(&self.port.to_be_bytes());
         bytes.extend_from_slice(self.host.as_bytes());
@@ -39,7 +45,8 @@ impl Request {
     pub fn read_from(mut reader: impl Read) -> io::Result<Self> {
         let mut header = [0; 12];
         reader.read_exact(&mut header)?;
-        if &header[..8] != REQUEST_MAGIC {
+        let reverse = &header[..8] == REVERSE_REQUEST_MAGIC;
+        if &header[..8] != REQUEST_MAGIC && !reverse {
             return Err(invalid_data("invalid resolver request version"));
         }
         let length = u16::from_be_bytes([header[8], header[9]]) as usize;
@@ -56,6 +63,7 @@ impl Request {
             String::from_utf8(host).map_err(|_| invalid_data("resolver host is not UTF-8"))?;
         validate_host(&host).map_err(|error| invalid_data(&error.to_string()))?;
         Ok(Self {
+            reverse,
             host,
             port: u16::from_be_bytes([header[10], header[11]]),
         })
@@ -65,6 +73,7 @@ impl Request {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Response {
     Addresses(Vec<SocketAddr>),
+    Hostname(String),
     Error(RemoteError),
 }
 
@@ -104,6 +113,12 @@ impl Response {
                         }
                     }
                 }
+            }
+            Self::Hostname(hostname) => {
+                validate_host(hostname)?;
+                bytes.push(2);
+                bytes.extend_from_slice(&(hostname.len() as u16).to_be_bytes());
+                bytes.extend_from_slice(hostname.as_bytes());
             }
             Self::Error(error) => {
                 if error.message.len() > MAX_ERROR_BYTES {
@@ -162,6 +177,17 @@ impl Response {
                     addresses.push(address);
                 }
                 Self::Addresses(addresses)
+            }
+            2 => {
+                let length = decoder.u16()? as usize;
+                if length == 0 || length > MAX_HOST_BYTES {
+                    return Err(invalid_data("invalid hostname length"));
+                }
+                let hostname = std::str::from_utf8(decoder.take(length)?)
+                    .map_err(|_| invalid_data("hostname is not UTF-8"))?
+                    .to_owned();
+                validate_host(&hostname)?;
+                Self::Hostname(hostname)
             }
             1 => {
                 let kind = ErrorKind::from_code(decoder.byte()?)?;
@@ -314,8 +340,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn reverse_requests_and_hostnames_preserve_exact_values_with_bounds() {
+        for address in ["127.0.0.1", "::1"] {
+            let request = Request {
+                reverse: true,
+                host: address.into(),
+                port: 0,
+            };
+            let bytes = request.encode().unwrap();
+            assert_eq!(Request::read_from(bytes.as_slice()).unwrap(), request);
+        }
+        for hostname in [
+            "steamdeck",
+            "desktop.home.local",
+            &"a".repeat(MAX_HOST_BYTES),
+        ] {
+            let response = Response::Hostname(hostname.into());
+            let bytes = response.encode().unwrap();
+            assert_eq!(Response::decode(&bytes).unwrap(), response);
+            for length in 0..bytes.len() {
+                assert!(Response::decode(&bytes[..length]).is_err());
+            }
+            let mut trailing = bytes;
+            trailing.push(0);
+            assert!(Response::decode(&trailing).is_err());
+        }
+        for invalid in ["", "name\n", &"a".repeat(MAX_HOST_BYTES + 1)] {
+            assert!(Response::Hostname(invalid.into()).encode().is_err());
+        }
+    }
+
+    #[test]
     fn request_round_trip_preserves_utf8_host_and_port() {
         let request = Request {
+            reverse: false,
             host: "é.example".into(),
             port: 47989,
         };
@@ -324,6 +382,7 @@ mod tests {
         assert_eq!(Request::read_from(bytes.as_slice()).unwrap(), request);
         assert!(bytes.len() <= MAX_REQUEST_BYTES);
         let largest = Request {
+            reverse: false,
             host: "a".repeat(MAX_HOST_BYTES),
             port: u16::MAX,
         };
@@ -341,9 +400,18 @@ mod tests {
             "a\nb".into(),
             "a\u{85}b".into(),
         ] {
-            assert!(Request { host, port: 0 }.encode().is_err());
+            assert!(
+                Request {
+                    reverse: false,
+                    host,
+                    port: 0
+                }
+                .encode()
+                .is_err()
+            );
         }
         let valid = Request {
+            reverse: false,
             host: "127.0.0.1".into(),
             port: 0,
         }
@@ -353,7 +421,7 @@ mod tests {
             assert!(Request::read_from(&valid[..length]).is_err());
         }
         let mut wrong_version = valid.clone();
-        wrong_version[7] = b'2';
+        wrong_version[7] = b'3';
         assert!(Request::read_from(wrong_version.as_slice()).is_err());
         let mut oversized_length = valid.clone();
         oversized_length[8..10].copy_from_slice(&u16::MAX.to_be_bytes());

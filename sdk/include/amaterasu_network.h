@@ -189,6 +189,18 @@ typedef struct {
     AmaterasuStatus (*udp_bind_shared)(void *, AmaterasuNetworkAddress, uint64_t *);
 } AmaterasuNetworkApiV1_2;
 
+/* Optional v1.3 reverse name-service tail. Check capability, minor and size.
+ * Call on a worker; timeout bounds waiting. The provider owns cancellation and
+ * retirement. Writes UTF-8 bytes without a terminator into the borrowed buffer. */
+#define AMATERASU_NETWORK_REVERSE_DNS_MINOR 3u
+#define AMATERASU_NETWORK_CAP_REVERSE_DNS UINT64_C(256)
+#define AMATERASU_NETWORK_MAX_HOSTNAME_BYTES 253u
+typedef struct {
+    AmaterasuNetworkApiV1_2 v1_2;
+    AmaterasuStatus (*reverse_resolve)(void *, AmaterasuNetworkAddress, uint32_t,
+        uint8_t *, size_t, size_t *);
+} AmaterasuNetworkApiV1_3;
+
 #ifdef __cplusplus
 }
 #endif

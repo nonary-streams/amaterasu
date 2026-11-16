@@ -193,6 +193,30 @@ pub struct NetworkApiV1_2 {
     pub v1_1: NetworkApiV1_1,
     pub udp_bind_shared: unsafe extern "C" fn(*mut c_void, Address, *mut u64) -> Status,
 }
+/// Optional v1.3 tail for bounded reverse name-service lookups.
+pub const REVERSE_DNS_MINOR: u32 = 3;
+pub const REVERSE_DNS: u64 = 256;
+pub const MAX_HOSTNAME_BYTES: usize = 253;
+#[repr(C)]
+pub struct NetworkApiV1_3 {
+    pub v1_2: NetworkApiV1_2,
+    /// Writes UTF-8 hostname bytes without a terminator. Borrowed buffers are
+    /// retained only for this call. Timeout bounds waiting; the provider owns
+    /// cancellation and retirement of any remaining worker.
+    pub reverse_resolve:
+        unsafe extern "C" fn(*mut c_void, Address, u32, *mut u8, usize, *mut usize) -> Status,
+}
+impl std::ops::Deref for NetworkApiV1_3 {
+    type Target = NetworkApiV1_2;
+    fn deref(&self) -> &Self::Target {
+        &self.v1_2
+    }
+}
+impl std::ops::DerefMut for NetworkApiV1_3 {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.v1_2
+    }
+}
 impl std::ops::Deref for NetworkApiV1_2 {
     type Target = NetworkApiV1_1;
     fn deref(&self) -> &Self::Target {
@@ -219,6 +243,19 @@ impl std::ops::DerefMut for NetworkApiV1_1 {
 #[cfg(all(test, target_pointer_width = "64"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reverse_lookup_tail_preserves_all_older_prefix_offsets() {
+        assert_eq!(std::mem::offset_of!(NetworkApiV1_3, v1_2), 0);
+        assert_eq!(
+            std::mem::offset_of!(NetworkApiV1_3, reverse_resolve),
+            size_of::<NetworkApiV1_2>()
+        );
+        assert_eq!(
+            size_of::<NetworkApiV1_3>(),
+            size_of::<NetworkApiV1_2>() + size_of::<usize>()
+        );
+    }
 
     #[test]
     fn public_c_layout_matches_supported_host_abi() {

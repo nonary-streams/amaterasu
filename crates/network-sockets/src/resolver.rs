@@ -131,6 +131,44 @@ impl Resolver {
     }
 
     pub fn resolve(&self, host: &str, port: u16, timeout_ms: u32) -> io::Result<Vec<SocketAddr>> {
+        if let Ok(ip) = host.parse::<IpAddr>() {
+            if timeout_ms == 0 {
+                return Err(io::ErrorKind::InvalidInput.into());
+            }
+            self.admit(Instant::now() + Duration::from_millis(u64::from(timeout_ms)))?;
+            return Ok(vec![SocketAddr::new(ip, port)]);
+        }
+        match self.lookup(
+            Request {
+                reverse: false,
+                host: host.into(),
+                port,
+            }
+            .encode()?,
+            timeout_ms,
+        )? {
+            Response::Addresses(addresses) if !addresses.is_empty() => Ok(addresses),
+            Response::Addresses(_) => Err(io::ErrorKind::NotFound.into()),
+            Response::Error(error) => Err(error.into_io()),
+            _ => Err(io::ErrorKind::InvalidData.into()),
+        }
+    }
+
+    pub fn reverse_resolve(&self, address: IpAddr, timeout_ms: u32) -> io::Result<String> {
+        let request = Request {
+            reverse: true,
+            host: address.to_string(),
+            port: 0,
+        }
+        .encode()?;
+        match self.lookup(request, timeout_ms)? {
+            Response::Hostname(hostname) => Ok(hostname),
+            Response::Error(error) => Err(error.into_io()),
+            _ => Err(io::ErrorKind::InvalidData.into()),
+        }
+    }
+
+    fn lookup(&self, request: Vec<u8>, timeout_ms: u32) -> io::Result<Response> {
         if timeout_ms == 0 {
             return Err(io::ErrorKind::InvalidInput.into());
         }
@@ -141,14 +179,6 @@ impl Resolver {
         let mut state = self.try_state()?;
         state.reap_cancelled();
         self.admit(request_deadline)?;
-        if let Ok(ip) = host.parse::<IpAddr>() {
-            return Ok(vec![SocketAddr::new(ip, port)]);
-        }
-        let request = Request {
-            host: host.into(),
-            port,
-        }
-        .encode()?;
         if state.lookups.len() >= MAX_WORKERS {
             return Err(io::ErrorKind::WouldBlock.into());
         }
@@ -268,7 +298,7 @@ impl Lookup {
         }
     }
 
-    fn poll_response(&mut self) -> io::Result<Option<io::Result<Vec<SocketAddr>>>> {
+    fn poll_response(&mut self) -> io::Result<Option<io::Result<Response>>> {
         if self.cancelled.load(Ordering::Acquire) {
             return Err(io::ErrorKind::Interrupted.into());
         }
@@ -299,11 +329,7 @@ impl Lookup {
         if !status.success() {
             return Ok(Some(Err(io::Error::other("resolver helper failed"))));
         }
-        Ok(Some(match Response::decode(&self.response)? {
-            Response::Addresses(addresses) if !addresses.is_empty() => Ok(addresses),
-            Response::Addresses(_) => Err(io::ErrorKind::NotFound.into()),
-            Response::Error(error) => Err(error.into_io()),
-        }))
+        Ok(Some(Ok(Response::decode(&self.response)?)))
     }
 }
 

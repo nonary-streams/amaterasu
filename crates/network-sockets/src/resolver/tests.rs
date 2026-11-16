@@ -29,6 +29,7 @@ fn await_quiescence(resolver: &Resolver) {
 fn resolver_drop_does_not_wait_for_a_stalled_lookup() {
     let resolver = resolver("block");
     let request = Request {
+        reverse: false,
         host: "fixture.invalid".into(),
         port: 42,
     }
@@ -280,4 +281,23 @@ fn owned_shutdown_returns_the_exact_factory_and_provider_error() {
         }
     }
     drop(factory);
+}
+
+#[test]
+fn reverse_lookup_timeout_and_shutdown_retire_the_helper() {
+    let resolver = resolver("block");
+    let started = Instant::now();
+    let error = resolver
+        .reverse_resolve("127.0.0.1".parse().unwrap(), 30)
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    assert!(started.elapsed() < Duration::from_millis(500));
+    await_quiescence(&resolver);
+    assert_eq!(
+        resolver
+            .reverse_resolve("127.0.0.1".parse().unwrap(), 30)
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::Interrupted
+    );
 }

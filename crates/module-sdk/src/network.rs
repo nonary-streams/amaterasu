@@ -308,6 +308,44 @@ impl Network {
             .map(|address| address_from_native(*address))
             .collect()
     }
+    /// Resolve a peer's hostname through the selected provider. Call on a
+    /// worker: OS name service can take up to the supplied timeout. Older
+    /// replacement providers may return Unsupported; there is no OS fallback.
+    pub fn reverse_resolve_timeout(
+        &self,
+        address: IpAddr,
+        timeout: Duration,
+    ) -> io::Result<String> {
+        self.require(abi::REVERSE_DNS)?;
+        let header = self.table().base.header;
+        if header.minor < abi::REVERSE_DNS_MINOR
+            || header.size < size_of::<abi::NetworkApiV1_3>() as u32
+        {
+            return Err(io::ErrorKind::Unsupported.into());
+        }
+        let timeout = timeout_ms(timeout)?;
+        let mut hostname = [0; abi::MAX_HOSTNAME_BYTES];
+        let mut length = 0;
+        // SAFETY: version and size establish the optional tail. The binding
+        // retains provider code and both output borrows live through this call.
+        let table = unsafe { &*std::ptr::from_ref(self.table()).cast::<abi::NetworkApiV1_3>() };
+        check(unsafe {
+            (table.reverse_resolve)(
+                self.context(),
+                address_to_native(SocketAddr::new(address, 0)),
+                timeout,
+                hostname.as_mut_ptr(),
+                hostname.len(),
+                &mut length,
+            )
+        })?;
+        let hostname = hostname.get(..length).ok_or(io::ErrorKind::InvalidData)?;
+        let hostname = std::str::from_utf8(hostname).map_err(|_| io::ErrorKind::InvalidData)?;
+        if hostname.trim().is_empty() || hostname.chars().any(char::is_control) {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        Ok(hostname.to_owned())
+    }
     pub fn interface_addresses(&self) -> io::Result<Vec<(IpAddr, u32)>> {
         self.require(abi::INTERFACES)?;
         let mut addresses = [abi::InterfaceAddress::default(); abi::MAX_ADDRESSES];

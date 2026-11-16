@@ -63,6 +63,7 @@ fn private_unix_cache_reclaims_only_verified_unlocked_images() {
 
 fn request() -> Vec<u8> {
     Request {
+        reverse: false,
         host: "127.0.0.1".into(),
         port: 47989,
     }

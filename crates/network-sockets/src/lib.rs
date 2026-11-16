@@ -52,7 +52,7 @@ struct Resource {
 }
 #[repr(C)]
 struct Binding {
-    api: net::NetworkApiV1_2,
+    api: net::NetworkApiV1_3,
     shared: Arc<Shared>,
     resources: Mutex<BTreeMap<u64, Arc<Resource>>>,
     next: AtomicU64,
@@ -213,8 +213,8 @@ unsafe extern "C" fn bind(
         };
         if !query.header.supports::<NativeInterfaceQuery>()
             || query.interface_major != net::MAJOR
-            || query.min_minor > net::SHARED_UDP_MINOR
-            || query.min_size > size_of::<net::NetworkApiV1_2>() as u32
+            || query.min_minor > net::REVERSE_DNS_MINOR
+            || query.min_size > size_of::<net::NetworkApiV1_3>() as u32
         {
             return Err(net::UNSUPPORTED);
         }
@@ -229,44 +229,47 @@ unsafe extern "C" fn bind(
         }
         let _admission = handle_admission(&factory.shared)?;
         let mut binding = Box::new(Binding {
-            api: net::NetworkApiV1_2 {
-                v1_1: net::NetworkApiV1_1 {
-                    v1: net::NetworkApi {
-                        base: NativeInterface {
-                            header: AbiHeader {
-                                size: size_of::<net::NetworkApiV1_2>() as u32,
-                                major: net::MAJOR,
-                                minor: net::SHARED_UDP_MINOR,
+            api: net::NetworkApiV1_3 {
+                v1_2: net::NetworkApiV1_2 {
+                    v1_1: net::NetworkApiV1_1 {
+                        v1: net::NetworkApi {
+                            base: NativeInterface {
+                                header: AbiHeader {
+                                    size: size_of::<net::NetworkApiV1_3>() as u32,
+                                    major: net::MAJOR,
+                                    minor: net::REVERSE_DNS_MINOR,
+                                },
+                                context: std::ptr::null_mut(),
+                                release: Some(release),
                             },
-                            context: std::ptr::null_mut(),
-                            release: Some(release),
+                            capabilities,
+                            resolve,
+                            interfaces,
+                            tcp_listen,
+                            tcp_connect,
+                            udp_bind,
+                            accept,
+                            local_addr,
+                            peer_addr,
+                            read,
+                            peek,
+                            write,
+                            recv_from,
+                            send_to,
+                            connect_udp,
+                            set_option,
+                            get_option,
+                            join_multicast,
+                            send_batch,
+                            shutdown,
+                            close,
                         },
-                        capabilities,
-                        resolve,
-                        interfaces,
-                        tcp_listen,
-                        tcp_connect,
-                        udp_bind,
-                        accept,
-                        local_addr,
-                        peer_addr,
-                        read,
-                        peek,
-                        write,
-                        recv_from,
-                        send_to,
-                        connect_udp,
-                        set_option,
-                        get_option,
-                        join_multicast,
-                        send_batch,
-                        shutdown,
-                        close,
+                        recv_from_timed: diagnostics::recv_from_timed,
+                        socket_diagnostics: diagnostics::socket_diagnostics,
                     },
-                    recv_from_timed: diagnostics::recv_from_timed,
-                    socket_diagnostics: diagnostics::socket_diagnostics,
+                    udp_bind_shared,
                 },
-                udp_bind_shared,
+                reverse_resolve,
             },
             shared: factory.shared.clone(),
             resources: Mutex::new(BTreeMap::new()),
@@ -512,7 +515,8 @@ unsafe extern "C" fn capabilities(context: *mut c_void, out: *mut net::Capabilit
                         | net::MULTICAST
                         | net::INTERFACES
                         | net::DATAGRAM_DIAGNOSTICS
-                        | net::SHARED_UDP,
+                        | net::SHARED_UDP
+                        | net::REVERSE_DNS,
                     max_io_bytes: net::MAX_IO_BYTES as u64,
                     max_handles: binding.shared.max_handles,
                     max_batch: net::MAX_BATCH as u32,
@@ -552,6 +556,37 @@ unsafe extern "C" fn resolve(
             unsafe { out.add(index).write(to_address(address)) }
         }
         unsafe { output(count, addresses.len()) }
+    })
+}
+unsafe extern "C" fn reverse_resolve(
+    context: *mut c_void,
+    address: net::Address,
+    timeout_ms: u32,
+    out: *mut u8,
+    capacity: usize,
+    count: *mut usize,
+) -> Status {
+    guarded(|| {
+        // SAFETY: runtime retains this provider binding for the call.
+        let binding = unsafe { binding(context)? };
+        if out.is_null() || count.is_null() || capacity == 0 || capacity > net::MAX_HOSTNAME_BYTES {
+            return Err(STATUS_INVALID_ARGUMENT);
+        }
+        let address = from_address(address)?.ip();
+        let hostname = binding
+            .shared
+            .resolver
+            .reverse_resolve(address, timeout_ms)
+            .map_err(io_status)?;
+        if hostname.len() > capacity {
+            return Err(net::RESOURCE_EXHAUSTED);
+        }
+        // SAFETY: caller provides capacity writable bytes, checked above; the
+        // provider-owned hostname does not alias the caller's output buffer.
+        unsafe {
+            std::ptr::copy_nonoverlapping(hostname.as_ptr(), out, hostname.len());
+            output(count, hostname.len())
+        }
     })
 }
 unsafe extern "C" fn interfaces(

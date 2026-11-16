@@ -26,4 +26,9 @@ CHECK(offsetof(AmaterasuNetworkApi, read) == 104, "read callback offset");
 CHECK(offsetof(AmaterasuNetworkApi, send_batch) == 176, "batch callback offset");
 CHECK(offsetof(AmaterasuNetworkApi, close) == 192, "close callback offset");
 
+CHECK(sizeof(AmaterasuNetworkApiV1_3) == 232, "reverse DNS table");
+CHECK(offsetof(AmaterasuNetworkApiV1_3, v1_2) == 0, "v1.2 prefix offset");
+CHECK(offsetof(AmaterasuNetworkApiV1_3, reverse_resolve) == 224, "reverse DNS callback offset");
+CHECK(AMATERASU_NETWORK_CAP_REVERSE_DNS == UINT64_C(256), "reverse DNS capability");
+
 int main(void) { return 0; }

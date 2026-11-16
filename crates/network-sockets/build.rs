@@ -7,6 +7,7 @@ fn main() {
     for path in [
         "build.rs",
         "src/resolver/helper_main.rs",
+        "src/resolver/reverse.rs",
         "src/resolver/helperprotocol.rs",
         "src/resolver/helper_fixture.rs",
     ] {

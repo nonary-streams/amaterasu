@@ -5,6 +5,8 @@
 #[path = "helperprotocol.rs"]
 pub(crate) mod helperprotocol;
 
+mod reverse;
+
 use std::ffi::OsString;
 use std::io;
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -158,11 +160,20 @@ fn main() {
     let result = parent_process_id(std::env::args_os().skip(1))
         .and_then(prepare_parent_lifetime)
         .and_then(|()| Request::read_from(io::stdin().lock()))
-        .and_then(resolve);
-    if Response::from_result(result)
-        .write_to(io::stdout().lock())
-        .is_err()
-    {
+        .and_then(|request| {
+            if request.reverse {
+                let address = request
+                    .host
+                    .parse()
+                    .map_err(|_| io::ErrorKind::InvalidInput)?;
+                reverse::lookup(address).map(Response::Hostname)
+            } else {
+                resolve(request).map(Response::Addresses)
+            }
+        });
+    let response = result
+        .unwrap_or_else(|error| Response::Error(helperprotocol::RemoteError::from_io(&error)));
+    if response.write_to(io::stdout().lock()).is_err() {
         std::process::exit(1);
     }
 }

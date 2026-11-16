@@ -6,7 +6,11 @@ silently constructs this default provider when another implementation fails.
 
 System name-service lookup runs in a separate executable embedded in the signed
 network library. The helper uses the operating system's `ToSocketAddrs` behavior,
-including configured NSS on Unix. The provider never starts a DNS thread inside
+including configured NSS on Unix. Reverse lookup uses `getnameinfo` with a
+required hostname through the same bounded helper lifecycle. The optional v1.3
+network table advertises `REVERSE_DNS`; SDK consumers can call
+`Network::reverse_resolve_timeout` on a worker. Older replacement providers
+remain valid and return Unsupported for this operation, without an OS fallback. The provider never starts a DNS thread inside
 its native library. Numeric address lookup does not start a helper.
 
 Each lookup owns one exact helper process and nonblocking result pipe. There are

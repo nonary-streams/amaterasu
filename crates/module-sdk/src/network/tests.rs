@@ -314,3 +314,69 @@ fn timed_receive_preserves_datagrams_for_modern_and_prefix_only_providers() {
         }
     }
 }
+
+unsafe extern "C" fn replacement_reverse(
+    _context: *mut c_void,
+    address: abi::Address,
+    timeout_ms: u32,
+    output: *mut u8,
+    capacity: usize,
+    count: *mut usize,
+) -> Status {
+    let hostname = b"replacement-client";
+    if address_from_native(address).unwrap().ip() != std::net::Ipv4Addr::LOCALHOST
+        || timeout_ms == 0
+        || capacity < hostname.len()
+        || output.is_null()
+        || count.is_null()
+    {
+        return amaterasu_abi::STATUS_INVALID_ARGUMENT;
+    }
+    // SAFETY: the SDK supplies sufficient writable bytes and a count pointer,
+    // retained for this callback. The fixture does not retain either borrow.
+    unsafe {
+        std::ptr::copy_nonoverlapping(hostname.as_ptr(), output, hostname.len());
+        count.write(hostname.len());
+    }
+    STATUS_OK
+}
+
+#[test]
+fn unchanged_reverse_consumer_uses_selected_provider_and_supports_older_tables() {
+    fn consumer(network: &Network) -> io::Result<String> {
+        network
+            .reverse_resolve_timeout(std::net::Ipv4Addr::LOCALHOST.into(), Duration::from_secs(1))
+    }
+    let table = standalone();
+    // SAFETY: standalone returns a uniquely owned default-provider v1.3 table.
+    // Only its reverse callback changes before ownership transfers to the SDK.
+    unsafe {
+        (*table.cast_mut().cast::<abi::NetworkApiV1_3>()).reverse_resolve = replacement_reverse;
+    }
+    // SAFETY: the well-formed table and release ownership transfer exactly once.
+    let network = unsafe { Network::from_native_table(table) }.unwrap();
+    assert_eq!(consumer(&network).unwrap(), "replacement-client");
+    drop(network);
+    let table = standalone();
+    // SAFETY: emulate an older prefix without changing ownership or release.
+    unsafe {
+        (*table.cast_mut()).base.header.minor = 0;
+        (*table.cast_mut()).base.header.size = size_of::<abi::NetworkApi>() as u32;
+    }
+    // SAFETY: ownership of this valid v1 prefix transfers to the unchanged SDK.
+    let network = unsafe { Network::from_native_table(table) }.unwrap();
+    assert_eq!(
+        consumer(&network).unwrap_err().kind(),
+        io::ErrorKind::Unsupported
+    );
+}
+
+#[test]
+fn default_reverse_provider_resolves_loopback_through_the_owned_helper() {
+    let network = Network::test_provider();
+    let name = network
+        .reverse_resolve_timeout(std::net::Ipv4Addr::LOCALHOST.into(), Duration::from_secs(2))
+        .unwrap();
+    assert!(!name.is_empty());
+    assert!(name.parse::<IpAddr>().is_err());
+}
