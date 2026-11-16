@@ -1205,17 +1205,54 @@ fn open_verified_library(path: &Path) -> PackageResult<Library> {
         const SEARCH_DLL_DIRECTORY: u32 = 0x100;
         const SEARCH_DEFAULT_DIRECTORIES: u32 = 0x1000;
         // SAFETY: only a verified package artifact is loaded; restrict dependency search.
-        unsafe {
+        let library = unsafe {
             libloading::os::windows::Library::load_with_flags(
-                absolute_path,
+                &absolute_path,
                 SEARCH_DLL_DIRECTORY | SEARCH_DEFAULT_DIRECTORIES,
+            )
+        }
+        .map_err(|error| error.to_string())?;
+        use std::os::windows::ffi::OsStrExt;
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetModuleHandleExW(
+                flags: u32,
+                name: *const u16,
+                module: *mut *mut std::ffi::c_void,
+            ) -> i32;
+        }
+        let name: Vec<u16> = absolute_path
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        let mut pinned = std::ptr::null_mut();
+        // SAFETY: the verified image is already loaded; its absolute UTF-16
+        // name and output slot live across the call. Pin only code mappings:
+        // graph instances and workers are still explicitly retired normally.
+        if unsafe { GetModuleHandleExW(1, name.as_ptr(), &mut pinned) } == 0 {
+            return Err("cannot retain native image for thread-local destructors".into());
+        }
+        Ok(Library::from(library))
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        // Rust libraries can register thread-local destructors on the host
+        // thread. Their text must remain mapped until that thread exits, even
+        // after all graph instances, workers and native leases have retired.
+        // Immutable image paths are reused; the supervisor bounds restarts.
+        // SAFETY: the complete package is verified before any constructor runs.
+        unsafe {
+            libloading::os::unix::Library::open(
+                Some(absolute_path),
+                libc::RTLD_NOW | libc::RTLD_LOCAL | libc::RTLD_NODELETE,
             )
         }
         .map(Library::from)
         .map_err(|error| error.to_string())
     }
-
-    #[cfg(not(windows))]
+    #[cfg(all(not(windows), not(target_os = "linux")))]
     {
         // SAFETY: the caller verified the complete package before this constructor can run.
         unsafe { Library::new(absolute_path) }.map_err(|error| error.to_string())
