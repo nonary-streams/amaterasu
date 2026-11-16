@@ -29,6 +29,13 @@ impl Controller {
             job.call.cancel();
             job.deadline = self.cleanup_deadline(now);
         }
+        if job.phase == Phase::Observe && record.state == State::Playing && now >= job.deadline {
+            job.call.cancel_read_only();
+            self.late_observations.insert(record.id, job.call);
+            record.next_status = now.saturating_add(STATUS_INTERVAL_MS);
+            self.records.insert(record.id, record);
+            return;
+        }
         if now >= job.deadline && record.state != State::Closing {
             record.close(Some("operation_deadline"));
             job.call.cancel();
@@ -51,6 +58,12 @@ impl Controller {
                 self.retain_uncertain(&mut record, job, "cleanup_deadline", runtime);
             }
             Outcome::Waiting => self.job = Some(job),
+            Outcome::Uncertain if job.phase == Phase::Observe && record.state == State::Playing => {
+                job.call.cancel_read_only();
+                job.call.retry_settlement();
+                self.late_observations.insert(record.id, job.call);
+                record.next_status = now.saturating_add(STATUS_INTERVAL_MS);
+            }
             Outcome::Uncertain => {
                 self.retain_uncertain(
                     &mut record,
@@ -128,6 +141,9 @@ impl Controller {
             }
             Phase::Stop => {
                 self.schedule_status_until(record, job.caller, job.network, job.deadline)
+            }
+            Phase::Observe if record.state == State::Playing => {
+                record.next_status = now.saturating_add(STATUS_INTERVAL_MS);
             }
             Phase::Find | Phase::Observe | Phase::Status => {
                 record.state = State::CleanupFailed;
@@ -466,6 +482,7 @@ impl Controller {
         if valid && replied {
             record.state = State::Playing;
             record.expires = u64::MAX;
+            record.observation_stale_at = now.saturating_add(OBSERVATION_STALE_MS);
             record.next_status = now.saturating_add(STATUS_INTERVAL_MS);
         } else {
             record.close(Some("start_rejected"));
@@ -516,6 +533,7 @@ impl Controller {
             return;
         }
         record.stream_state = state.map(str::to_owned);
+        record.observation_stale_at = now.saturating_add(OBSERVATION_STALE_MS);
         if confirm_terminal(record, payload) {
             record.authenticated_disconnect_reason =
                 authenticated_disconnect_reason(record, payload);
@@ -594,7 +612,24 @@ impl Controller {
         complete_caller(record, job.caller, runtime);
     }
 
+    pub(super) fn advance_late_observations(&mut self, runtime: &RuntimeClient) {
+        self.late_observations
+            .retain(|_, call| match call.poll(runtime) {
+                Outcome::Result(_) | Outcome::SettledFailure => false,
+                Outcome::Waiting => true,
+                Outcome::Uncertain => {
+                    call.retry_settlement();
+                    true
+                }
+            });
+    }
+
     pub(super) fn schedule_background(&mut self, now: u64) {
+        for record in self.records.values_mut() {
+            if record.state == State::Playing && now >= record.observation_stale_at {
+                record.close(Some("stream_observation_lost"));
+            }
+        }
         if let Some(ticket) = self
             .records
             .values()
@@ -609,15 +644,20 @@ impl Controller {
         }
         // Cleanup of ended tickets is scheduled by `schedule_retiring`; the
         // job slot is left for open tickets.
-        // Each detached observation belongs to a distinct record that has
+        // Timed-out reads settle independently, at most one per ticket.
+        // Each shutdown observation belongs to a distinct record that has
         // left Playing, and RTSP records remain resident for this runtime.
         // Thus a full ledger cannot coexist with another Playing record.
         // Preserve this reservation invariant if record reclamation is added.
         if self.shutdown_settlement.len() >= MAX_RECORDS {
             return;
         }
-        let eligible =
-            |record: &&Record| record.state == State::Playing && now >= record.next_status;
+        let eligible = |record: &&Record| {
+            record.state == State::Playing
+                && now >= record.next_status
+                && !self.late_observations.contains_key(&record.id)
+                && self.late_observations.len() < MAX_RECORDS
+        };
         let next = self
             .records
             .values()

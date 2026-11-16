@@ -306,6 +306,7 @@ impl Controller {
             media_binds,
             expires,
             next_status: expires,
+            observation_stale_at: expires.saturating_add(OBSERVATION_STALE_MS),
             failure: None,
             cleanup_error: None,
             cleanup_retry_count: 0,

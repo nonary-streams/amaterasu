@@ -50,6 +50,7 @@ const CLEANUP_BUDGET_MS: u64 = 15_000;
 const MAX_CLEANUP_RETRIES: u8 = 2;
 const CLEANUP_RETRY_DELAYS_MS: [u64; 2] = [250, 1_000];
 const STATUS_INTERVAL_MS: u64 = 250;
+const OBSERVATION_STALE_MS: u64 = 30_000;
 const MAX_RECORDS: usize = 128;
 const MAX_STARTUP_RECOVERY_SESSIONS: usize = 32;
 const MAX_PENDING_NETWORK: usize = 16;
@@ -225,6 +226,7 @@ pub struct Controller {
     quiescence: Option<quiescence::Quiescence>,
     shutdown_deadline: Option<u64>,
     shutdown_settlement: Vec<Call>,
+    late_observations: BTreeMap<u64, Call>,
     display_admission: Option<DisplayAdmission>,
     display_cleanup: Vec<DisplayCleanup>,
     startup_recovery: StartupRecovery,
@@ -295,6 +297,7 @@ impl Controller {
             quiescence: None,
             shutdown_deadline: None,
             shutdown_settlement: Vec::new(),
+            late_observations: BTreeMap::new(),
             display_admission: None,
             display_cleanup: Vec::new(),
             startup_recovery,
@@ -326,6 +329,7 @@ impl Controller {
                 &message,
             );
         }
+        self.advance_late_observations(runtime);
         self.advance_shutdown_settlement(runtime);
         self.cap_announced_cleanup_deadline();
         self.advance_startup_recovery(runtime, now);
@@ -361,6 +365,9 @@ impl Controller {
             return;
         }
         let cleanup_deadline = Instant::now() + ORDERLY_SESSION_CLEANUP_BUDGET;
+        for (_, mut call) in std::mem::take(&mut self.late_observations) {
+            call.shutdown(runtime);
+        }
         self.shutdown_settlement.retain_mut(|call| {
             !matches!(
                 call.shutdown(runtime),
@@ -1338,3 +1345,6 @@ fn complete_caller(record: &Record, caller: Option<u64>, runtime: &RuntimeClient
 fn error(code: &str) -> Value {
     json!({"ok":false,"code":code})
 }
+
+#[cfg(test)]
+mod observation_tests;

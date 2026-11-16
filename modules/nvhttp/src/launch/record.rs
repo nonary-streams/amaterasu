@@ -257,6 +257,7 @@ pub struct Record {
     pub cancel_connection: Option<u64>,
     pub deadline: Instant,
     pub next_monitor: Instant,
+    pub late_monitor_since: Option<Instant>,
     pub next_cleanup_poll: Instant,
     pub monitor_application_next: bool,
     pub failure: Option<&'static str>,
@@ -469,6 +470,7 @@ impl Record {
             cancel_connection: None,
             deadline,
             next_monitor: deadline,
+            late_monitor_since: None,
             next_cleanup_poll: deadline,
             monitor_application_next: true,
             failure: None,
@@ -598,6 +600,7 @@ impl Record {
     }
 
     pub fn monitored(&mut self, now: Instant) {
+        self.late_monitor_since = None;
         self.next_monitor = now + MONITOR_INTERVAL;
         self.monitor_application_next = !self.monitor_application_next;
     }

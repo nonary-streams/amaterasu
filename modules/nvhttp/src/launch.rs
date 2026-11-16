@@ -23,6 +23,7 @@ mod tests {
     include!("launch/lifecycle_tests.rs");
     include!("launch/retirement_tests.rs");
     include!("launch/shared_session_tests.rs");
+    include!("launch/reconnect_tests.rs");
     include!("launch/quit_tests.rs");
     include!("launch/auxiliary_tests.rs");
     include!("launch/cleanup_recovery_tests.rs");
@@ -69,6 +70,7 @@ const AUTOMATIC_CLEANUP_RETRY_DELAYS: [Duration; 2] =
     [Duration::from_secs(1), Duration::from_secs(5)];
 const AUTOMATIC_CLEANUP_RETRY_BUDGET: Duration = Duration::from_secs(12);
 const MONITOR_INTERVAL: Duration = Duration::from_millis(250);
+const MONITOR_STALE_LIMIT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct VideoEncryptionPolicySnapshot {

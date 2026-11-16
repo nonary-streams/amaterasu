@@ -69,6 +69,7 @@ pub(super) struct Record {
     pub media_binds: Option<crate::model::MediaBinds>,
     pub expires: u64,
     pub next_status: u64,
+    pub observation_stale_at: u64,
     pub failure: Option<&'static str>,
     pub cleanup_error: Option<&'static str>,
     pub cleanup_retry_count: u8,
@@ -313,6 +314,9 @@ impl Record {
 
     pub fn close(&mut self, reason: Option<&'static str>) {
         if let Some(reason) = reason {
+            if self.state == State::Playing {
+                eprintln!("amaterasu rtsp closing playing stream reason={reason}");
+            }
             self.failure.get_or_insert(reason);
         }
         self.state = State::Closing;

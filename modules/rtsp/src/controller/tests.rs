@@ -18,20 +18,20 @@ static NEXT_TEST_BASE_PORT: AtomicU16 = AtomicU16::new(0);
 const TEST_BASE_PORT: u16 = 47_989;
 
 #[derive(Default)]
-struct Endpoint {
-    commands: Vec<Command>,
-    completions: Vec<(u64, Value)>,
-    active_request: bool,
-    verifier_reply: Option<Value>,
-    verifier_pending: bool,
-    deny_launch: bool,
-    deny_settlement: bool,
-    deny_settlement_requests: BTreeSet<u64>,
-    lifecycle_results: VecDeque<Option<Value>>,
-    lifecycle_requests: BTreeMap<u64, Option<Value>>,
-    recovery_results: VecDeque<Option<Value>>,
-    recovery_requests: BTreeMap<u64, Option<Value>>,
-    next_recovery_request: u64,
+pub(super) struct Endpoint {
+    pub(super) commands: Vec<Command>,
+    pub(super) completions: Vec<(u64, Value)>,
+    pub(super) active_request: bool,
+    pub(super) verifier_reply: Option<Value>,
+    pub(super) verifier_pending: bool,
+    pub(super) deny_launch: bool,
+    pub(super) deny_settlement: bool,
+    pub(super) deny_settlement_requests: BTreeSet<u64>,
+    pub(super) lifecycle_results: VecDeque<Option<Value>>,
+    pub(super) lifecycle_requests: BTreeMap<u64, Option<Value>>,
+    pub(super) recovery_results: VecDeque<Option<Value>>,
+    pub(super) recovery_requests: BTreeMap<u64, Option<Value>>,
+    pub(super) next_recovery_request: u64,
 }
 
 impl Endpoint {
@@ -123,7 +123,7 @@ unsafe extern "C" fn invoke(
     abi::STATUS_OK
 }
 
-fn client(endpoint: &mut Endpoint) -> RuntimeClient {
+pub(super) fn client(endpoint: &mut Endpoint) -> RuntimeClient {
     let api = HostApi {
         header: AbiHeader::of::<HostApi>(),
         context: (endpoint as *mut Endpoint).cast(),
@@ -1093,6 +1093,7 @@ pub(super) fn record(state: State) -> Record {
         media_binds: None,
         expires: 5_000,
         next_status: 5_000,
+        observation_stale_at: OBSERVATION_STALE_MS,
         failure: None,
         cleanup_error: None,
         cleanup_retry_count: 0,
@@ -1804,6 +1805,7 @@ fn cancelled_parent_reaches_cleanup_failed_when_settlement_stays_unavailable() {
         media_binds: None,
         expires: 5_000,
         next_status: 5_000,
+        observation_stale_at: OBSERVATION_STALE_MS,
         failure: None,
         cleanup_error: None,
         cleanup_retry_count: 0,

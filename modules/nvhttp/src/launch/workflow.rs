@@ -334,6 +334,9 @@ impl Controller {
                     }
                 }
             }
+            Outcome::Rejected | Outcome::Settled if job.phase.routine_monitor() => {
+                self.status_read_lost(job, now, send, replies);
+            }
             Outcome::Rejected => self.rejected(job, now, replies),
             Outcome::Settled => self.settled(job, now, replies),
             Outcome::Uncertain => {
@@ -468,12 +471,22 @@ impl Controller {
             return;
         }
         if job.phase.routine_monitor() && record.state != State::Stopping {
-            // The stream or application can no longer be observed. Retire the
-            // transport; a retained application stays until its own evidence.
+            // A late observation is not evidence of failed resources. Keep
+            // retrying the same monitor phase within a bounded grace window.
+            if record.late_monitor_since.is_none() {
+                eprintln!(
+                    "amaterasu launch observation late; retaining transport within bounded grace"
+                );
+            }
+            let lost_since = *record.late_monitor_since.get_or_insert(now);
+            if now.saturating_duration_since(lost_since) < super::MONITOR_STALE_LIMIT {
+                record.next_monitor = now + MONITOR_INTERVAL;
+                return;
+            }
             if job.phase == Phase::MonitorRtsp && record.lifecycle_session_target.is_some() {
-                record.request_monitored_transport_cleanup(Some("monitor_unavailable"), now);
+                record.request_monitored_transport_cleanup(Some("stream_observation_lost"), now);
             } else {
-                record.request_cleanup(Some("monitor_unavailable"), now);
+                record.request_cleanup(Some("stream_observation_lost"), now);
             }
         }
         if record.state == State::Stopping {
