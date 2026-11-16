@@ -11,6 +11,7 @@ pub mod linux_user_unit;
 mod manifest;
 pub mod migration;
 pub mod playnite_extension;
+pub mod plugins;
 pub mod policy_approval;
 mod privileged;
 pub mod repository;
@@ -26,7 +27,7 @@ pub use privileged::*;
 pub use staging::{package_directory, stage_package};
 pub use storage::{
     ROOT_BUSY, RootLock, create_machine_private_directory, create_private_directory,
-    protect_machine_private_file, read_bounded, read_json, write_json_atomically,
+    protect_machine_private_file, read_bounded, read_json, sync_directory, write_json_atomically,
 };
 pub use verification::{
     VerificationPolicy, verify_detached_signature, verify_package, verify_package_with_progress,

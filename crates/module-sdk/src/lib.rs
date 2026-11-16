@@ -8,6 +8,7 @@ pub mod diagnostics;
 pub mod display;
 pub mod display_profile;
 pub mod display_settings;
+pub mod drivers;
 pub mod encode;
 pub mod events;
 pub mod exports;

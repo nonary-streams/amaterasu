@@ -149,6 +149,7 @@ pub fn fetch_native_manifest(
 fn candidate_prefix(candidate: &Candidate) -> PackageResult<String> {
     let kind = match candidate.kind {
         CandidateKind::NativeSet => "native",
+        CandidateKind::NativePlugin => "plugins",
         CandidateKind::WebBundle => "web",
     };
     if !valid_segment(&candidate.implementation) || !valid_segment(&candidate.version) {
@@ -196,6 +197,16 @@ fn payload_files(kind: CandidateKind, raw: &[u8]) -> PackageResult<Vec<(String, 
                     Ok((name, asset.size))
                 })
                 .collect()
+        }
+        CandidateKind::NativePlugin => {
+            let manifest: crate::plugins::PluginManifest =
+                serde_json::from_slice(raw).map_err(|error| error.to_string())?;
+            manifest.validate(crate::unix_timestamp())?;
+            Ok(manifest
+                .artifacts()?
+                .into_iter()
+                .map(|artifact| (artifact.file, artifact.size))
+                .collect())
         }
         CandidateKind::NativeSet => {
             let manifest: ReleaseManifest =

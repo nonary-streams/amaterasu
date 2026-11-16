@@ -966,6 +966,7 @@ pub struct CatalogCheckpoint {
 #[serde(rename_all = "snake_case")]
 pub enum CandidateKind {
     NativeSet,
+    NativePlugin,
     WebBundle,
 }
 
@@ -1129,6 +1130,15 @@ pub fn verify_candidate(
             )?;
             require_selected_slot(candidate, &package.manifest)?;
         }
+        CandidateKind::NativePlugin => {
+            let mut restricted = bootstrap.clone();
+            restricted.allow_unsigned = false;
+            restricted.trusted_keys = approved.keys();
+            let plugin = crate::plugins::verify_package(directory, &restricted, now)?;
+            if plugin.id != candidate.slot || plugin.version != candidate.version {
+                return Err("plugin_candidate_identity_mismatch".into());
+            }
+        }
         CandidateKind::WebBundle => {
             let bundle = crate::web::verify_bundle(directory, &approved.keys(), now)?;
             if bundle.digest != candidate.manifest_sha256
@@ -1207,6 +1217,10 @@ fn require_catalog_manifest(candidate: &Candidate, raw: &[u8]) -> PackageResult<
     let canonical = match candidate.kind {
         CandidateKind::NativeSet => serde_json::to_vec(
             &serde_json::from_slice::<crate::ReleaseManifest>(raw)
+                .map_err(|error| error.to_string())?,
+        ),
+        CandidateKind::NativePlugin => serde_json::to_vec(
+            &serde_json::from_slice::<crate::plugins::PluginManifest>(raw)
                 .map_err(|error| error.to_string())?,
         ),
         CandidateKind::WebBundle => serde_json::to_vec(

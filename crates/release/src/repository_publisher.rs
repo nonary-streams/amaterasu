@@ -116,7 +116,11 @@ pub fn publish(
     let result = (|| {
         for (set, entry) in sets.iter().zip(&prepared) {
             let destination = output
-                .join("native")
+                .join(if entry.candidate.kind == CandidateKind::NativePlugin {
+                    "plugins"
+                } else {
+                    "native"
+                })
                 .join(set.implementation)
                 .join(&entry.candidate.version);
             fs::create_dir_all(&destination).map_err(|e| e.to_string())?;
@@ -165,6 +169,34 @@ fn prepare_set(
     publication: &Publication<'_>,
     now: u64,
 ) -> PackageResult<PreparedSet> {
+    let raw = amaterasu_package::read_bounded(&set.package.join("manifest.json"), 1024 * 1024)?;
+    if serde_json::from_slice::<amaterasu_package::plugins::PluginManifest>(&raw).is_ok() {
+        let mut manifest = amaterasu_package::plugins::verify_package(set.package, bootstrap, now)?;
+        if manifest.id != set.slot {
+            return Err("plugin publication slot does not match its signed identity".into());
+        }
+        if publication.versions.contains_key(&manifest.id) {
+            return Err("pack plugins at their released version before publication".into());
+        }
+        manifest.expires_unix = publication.expires_unix;
+        let files = manifest
+            .artifacts()?
+            .into_iter()
+            .map(|artifact| artifact.file)
+            .collect();
+        let raw = serde_json::to_vec(&manifest).map_err(|error| error.to_string())?;
+        return Ok(PreparedSet {
+            candidate: Candidate {
+                slot: manifest.id,
+                implementation: set.implementation.into(),
+                version: manifest.version,
+                kind: CandidateKind::NativePlugin,
+                manifest_sha256: sha256(&raw),
+            },
+            manifest: raw,
+            files,
+        });
+    }
     let verified = verify_package(
         set.package,
         bootstrap,

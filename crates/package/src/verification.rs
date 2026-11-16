@@ -196,7 +196,10 @@ fn validate_component_declarations(
     Ok(())
 }
 
-fn validate_component_identity(component: &ComponentManifest, signed: bool) -> PackageResult<()> {
+pub(crate) fn validate_component_identity(
+    component: &ComponentManifest,
+    signed: bool,
+) -> PackageResult<()> {
     if !valid_name(&component.id) || component.id == "amaterasu.console" {
         return Err(format!("invalid component identity: {}", component.id));
     }
@@ -249,7 +252,7 @@ fn validate_dependencies(
     Ok(())
 }
 
-fn resolve_runtime_grants(
+pub(crate) fn resolve_runtime_grants(
     bootstrap: &BootstrapConfig,
     components: &[ComponentManifest],
 ) -> RuntimeConfig {
@@ -338,7 +341,7 @@ fn resolve_runtime_grants(
 /// leaves a listed layer out, or lists one the runtime would refuse to start
 /// with, is rejected here with the reason, instead of failing when the
 /// runtime starts or running with the layer bypassed.
-fn validate_service_layers(runtime: &RuntimeConfig) -> PackageResult<()> {
+pub(crate) fn validate_service_layers(runtime: &RuntimeConfig) -> PackageResult<()> {
     for (service, layers) in &runtime.service_layers {
         if let Some(missing) = layers
             .iter()
@@ -352,7 +355,7 @@ fn validate_service_layers(runtime: &RuntimeConfig) -> PackageResult<()> {
     runtime.validate_service_layers()
 }
 
-fn validate_processing_compositions(runtime: &RuntimeConfig) -> PackageResult<()> {
+pub(crate) fn validate_processing_compositions(runtime: &RuntimeConfig) -> PackageResult<()> {
     for (principal, composition) in &runtime.processing_compositions {
         amaterasu_module_sdk::processing_composition::validate(composition)?;
         if let Some(consumer) = &composition.frame_consumer
@@ -546,7 +549,7 @@ fn validate_processing_compositions(runtime: &RuntimeConfig) -> PackageResult<()
 
 /// Ensure every selected processor is retained until its actual consumers and
 /// participants have retired. Grants alone cannot establish this ordering.
-fn validate_processing_lifetimes(
+pub(crate) fn validate_processing_lifetimes(
     runtime: &RuntimeConfig,
     components: &[ComponentManifest],
 ) -> PackageResult<()> {

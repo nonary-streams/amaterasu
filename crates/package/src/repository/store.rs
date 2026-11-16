@@ -212,6 +212,17 @@ impl RepositoryStore {
         Ok(active_record_ref(&state, id)?.approval.clone())
     }
 
+    /// Original signed catalog bytes for an authenticated installation broker.
+    pub fn export_catalog(&self, id: &str) -> PackageResult<(String, String)> {
+        let state = self.read()?;
+        let record = active_record_ref(&state, id)?;
+        let catalog = record
+            .catalog
+            .as_ref()
+            .ok_or("repository catalog not loaded")?;
+        Ok((catalog.raw.clone(), catalog.signature.clone()))
+    }
+
     pub fn catalog(&self, id: &str, target: &str, now: u64) -> PackageResult<VerifiedCatalog> {
         let state = self.read()?;
         let record = active_record_ref(&state, id)?;
