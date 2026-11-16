@@ -92,6 +92,16 @@ pub(super) fn media_status(record: &Record, payload: &Value) -> Result<MediaStat
     )?;
     let video_port = optional_port(&payload["video_port"])?;
     let audio_port = optional_port(&payload["audio_port"])?;
+    let mut expected_video = config.video.effective();
+    // Warmup already committed the authenticated legacy codec before PLAY.
+    // The transport now reports that selection instead of its original offer list.
+    if record.video_warmup_ready
+        && let Some(start) = &record.start
+        && start.configuration.extension_profile.is_none()
+    {
+        expected_video.codec = start.configuration.codec;
+        expected_video.codecs.clear();
+    }
     if payload["peer_ip"] != json!(config.peer_ip)
         || payload["stream_audio"] != config.stream_audio
         || peer_discovery != expected_discovery

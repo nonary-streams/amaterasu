@@ -1,0 +1,153 @@
+use super::*;
+use amaterasu_contracts::media_profile::{VideoProfile, VideoProfileSnapshot};
+
+fn extension_record(hdr: bool) -> Record {
+    let profile: VideoProfile =
+        serde_json::from_str(include_str!("../../../../../scripts/pyrowave/profile.json")).unwrap();
+    let snapshot = VideoProfileSnapshot {
+        profiles: vec![profile.clone()],
+    };
+    let announce = amaterasu_gamestream::sdp::parse_profile_announce(
+        include_bytes!(
+            "../../../../../crates/gamestream/src/sdp/fixtures/moonlight-pyrowave10.sdp"
+        ),
+        &snapshot,
+    )
+    .unwrap();
+    let (mut record, _) = announced_profile_record();
+    record.config.profile.width = 2560;
+    record.config.profile.height = 1440;
+    record.config.profile.fps = 120;
+    record.config.profile.bitrate_kbps = 100000;
+    record.config.profile.packet_size = 1360;
+    record.config.profile.hdr = hdr;
+    record.config.sw_preset = Some("superfast".into());
+    record.config.sw_tune = Some("zerolatency".into());
+    record.extension_offer = Some(profile);
+    assert!(record.accept_extension_announce(&announce));
+    record
+}
+
+fn select_lifecycle(record: &mut Record) {
+    record.config.lifecycle_session_target = serde_json::from_value(
+        json!({"kind":"session","host_epoch":"epoch","session_id":"session","generation":1}),
+    )
+    .ok();
+    record.config.lifecycle_settings_revision = Some("7".into());
+    record.config.lifecycle_intent = Some("initial".into());
+    record.lifecycle_input_required = Some(false);
+}
+
+fn prepared_capture(hdr: bool) -> Value {
+    json!({"status":"succeeded","operation_id":"rtsp-0000000000000005-lifecycle-prepare","transition_id":"transition",
+        "target":{"kind":"stream","host_epoch":"epoch","session_id":"session","stream_id":"stream","generation":1},
+        "candidate":{"capture_provider":"amaterasu.capture-pipewire/1","selector_schema":"amaterasu.kwin-wl-output/1","selector":{"output":"kwin:Virtual-12"},
+            "resource":{"provider":"test.provider","resource_id":"output","incarnation":"one","revision":1,"execution_domain":"desktop","mutation_domain":null,"mutation_domains":["desktop"]},
+            "mode":{"width":2560,"height":1440,"refresh_millihz":120000,"hdr":hdr},"plan_revision":1,"geometry_revision":1,"generation":1,"fallback":"forbidden"}})
+}
+
+#[test]
+fn moonlight_generated_extension_request_uses_the_probed_start_configuration() {
+    for hdr in [false, true] {
+        let record = extension_record(hdr);
+        let payload = record.authenticated_start_payload(23).unwrap();
+        let mut expected = record.config.extension_configuration(10);
+        expected["extension_profile"] = json!(record.extension_offer.as_ref().unwrap());
+        assert_eq!(payload["configuration"]["configuration"], expected);
+        assert_eq!(
+            payload["configuration"]["configuration"]["video_stream_format"]["dynamic_range"],
+            if hdr { "hdr" } else { "sdr" }
+        );
+    }
+}
+
+#[test]
+fn extension_play_prepares_lifecycle_without_substituting_a_legacy_codec() {
+    for hdr in [false, true] {
+        let mut record = extension_record(hdr);
+        select_lifecycle(&mut record);
+        assert!(record.negotiated_video.is_none());
+        assert!(record.negotiated_video_stream_format.is_none());
+        let start = record.authenticated_start_payload(23).unwrap();
+        let mut controller = Controller::new(Settings::default()).unwrap();
+        controller.schedule_arm(&mut record, start, 8, 9, 0);
+        assert!(
+            controller
+                .job
+                .as_ref()
+                .is_some_and(|job| job.phase == Phase::LifecyclePrepare),
+            "extension PLAY must reach lifecycle preparation"
+        );
+        assert!(record.lifecycle_prepare_outstanding);
+        controller.records.insert(record.id, record);
+        let mut endpoint = Endpoint {
+            verifier_reply: Some(prepared_capture(hdr)),
+            ..Endpoint::default()
+        };
+        let runtime = client(&mut endpoint);
+        for now in 1..=3 {
+            controller.advance_job(&runtime, now);
+        }
+        assert!(endpoint.commands.iter().any(|command| matches!(command,
+            Command::Request { service, payload, .. }
+                if service == "amaterasu.session-lifecycle/1"
+                && payload["requested_video"] == json!({"width":2560,"height":1440,"refresh_millihz":120000,"hdr":hdr})
+        )));
+        let started = endpoint
+            .commands
+            .iter()
+            .find_map(|command| match command {
+                Command::Request {
+                    service, payload, ..
+                } if service == "amaterasu.stream-session/1"
+                    && payload["action"] == "start_when_authenticated" =>
+                {
+                    Some(payload)
+                }
+                _ => None,
+            })
+            .expect("validated lifecycle preparation must reach video startup");
+        assert_eq!(
+            started["configuration"]["configuration"]["extension_profile"],
+            json!(controller.records[&5].extension_offer.as_ref().unwrap())
+        );
+        assert_eq!(
+            started["configuration"]["configuration"]["video_stream_format"]["dynamic_range"],
+            if hdr { "hdr" } else { "sdr" }
+        );
+        assert_eq!(
+            started["configuration"]["lifecycle_candidate"],
+            prepared_capture(hdr)["candidate"]
+        );
+        assert!(started["prepare_video_before_play"].as_bool().unwrap());
+    }
+}
+
+#[test]
+fn extension_lifecycle_capture_must_match_exact_geometry_range_and_generation() {
+    for hdr in [false, true] {
+        for (field, value) in [
+            ("width", json!(2562)),
+            ("height", json!(1442)),
+            ("refresh_millihz", json!(119999)),
+            ("hdr", json!(!hdr)),
+            ("generation", json!(2)),
+        ] {
+            let mut record = extension_record(hdr);
+            select_lifecycle(&mut record);
+            record.lifecycle_prepare_outstanding = true;
+            let mut payload = prepared_capture(hdr);
+            if field == "generation" {
+                payload["candidate"][field] = value;
+            } else {
+                payload["candidate"]["mode"][field] = value;
+            }
+            assert!(matches!(
+                preparation::apply_response(&mut record, &payload),
+                preparation::PreparationResolution::Unconfirmed
+            ));
+            assert!(record.lifecycle_prepare_outstanding);
+            assert!(record.lifecycle_target.is_none());
+        }
+    }
+}

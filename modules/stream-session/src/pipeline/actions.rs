@@ -7,6 +7,7 @@ use amaterasu_module_sdk::lifecycle_ledger::Live;
 enum StartMode {
     Immediate,
     WhenAuthenticated,
+    BeforePlay,
 }
 
 pub(super) struct RequestCaller {
@@ -156,11 +157,16 @@ impl Pipeline {
             Operation::StartWhenAuthenticated {
                 session,
                 configuration,
+                prepare_video_before_play,
             } => self.start(
                 input,
                 session,
                 configuration,
-                StartMode::WhenAuthenticated,
+                if prepare_video_before_play {
+                    StartMode::BeforePlay
+                } else {
+                    StartMode::WhenAuthenticated
+                },
                 send,
             ),
             Operation::ReconfigureAudio { session, audio } => {
@@ -276,7 +282,9 @@ impl Pipeline {
             rpc::complete(send, request, error("permission_denied"));
             return;
         }
-        if config.borrowed_capture.is_some() && !lifecycle_admitter {
+        if (config.borrowed_capture.is_some() || config.extension_probe.is_some())
+            && !lifecycle_admitter
+        {
             rpc::complete(send, request, error("permission_denied"));
             return;
         }
@@ -351,6 +359,18 @@ impl Pipeline {
         record.providers = self.settings.providers.clone();
         record.processing_plan_provider = self.settings.processing_plan.clone();
         record.source_preparation = self.settings.source_preparation.clone();
+        if record.config.extension_probe.is_some()
+            && (self
+                .settings
+                .extension_route
+                .as_ref()
+                .is_some_and(|route| route.submitted)
+                || (record.config.display_request.is_none()
+                    && record.config.virtual_display_intent.is_none()
+                    && record.config.lifecycle_session_target.is_none()))
+        {
+            record.extension_route = self.settings.extension_route.clone();
+        }
         record.lifecycle_input_required = lifecycle_input_required;
         self.records.insert(id, record);
         self.job = Some(Job::new(
@@ -377,6 +397,12 @@ impl Pipeline {
             ..
         } = input;
 
+        if mode == StartMode::BeforePlay
+            && (owner != "amaterasu.rtsp" || !self.settings.lifecycle_admitters.contains(&owner))
+        {
+            rpc::complete(send, request, error("permission_denied"));
+            return;
+        }
         let lifecycle_admitter = self.settings.lifecycle_admitters.contains(&owner);
         if (configuration.client_feature_flags.is_some()
             || !configuration.stream_adjustments.is_empty())
@@ -404,14 +430,48 @@ impl Pipeline {
             rpc::complete(send, request, error("session_not_found"));
             return;
         };
+        if let Some(profile) = configuration.configuration.extension_profile.clone() {
+            let Some(route) = record.extension_route.as_ref().filter(|route| {
+                owner == "amaterasu.rtsp"
+                    && configuration.client_feature_flags.is_some()
+                    && record.extension_limits.is_some()
+                    && route.profile == profile
+            }) else {
+                rpc::complete(send, request, error("extension_profile_not_offered"));
+                return;
+            };
+            let mut expected = record
+                .config
+                .extension_probe
+                .clone()
+                .expect("offered profile has probe configuration");
+            expected.extension_profile = Some(profile);
+            if configuration.configuration != expected
+                || configuration.source_id.is_some()
+                || configuration.encoder_provider.is_some()
+                || configuration.encoder_options.is_some()
+            {
+                rpc::complete(send, request, error("extension_configuration_mismatch"));
+                return;
+            }
+            configuration.source_id = Some(route.source_id);
+            configuration.encoder_provider = Some(route.encoder_provider.clone());
+            configuration.encoder = route.encoder.clone();
+        }
         if let Err(code) =
             validate_start_configuration(lifecycle_admitter, record, &mut configuration)
         {
             rpc::complete(send, request, error(code));
             return;
         }
-        if record.state == State::Active
-            || (mode == StartMode::WhenAuthenticated && record.armed_accepted)
+        if mode != StartMode::Immediate
+            && record.start.is_some()
+            && record.video_warmup_requested != (mode == StartMode::BeforePlay)
+        {
+            rpc::complete(send, request, error("start_configuration_conflict"));
+            return;
+        }
+        if record.state == State::Active || (mode != StartMode::Immediate && record.armed_accepted)
         {
             rpc::complete(send, request, record.response());
             return;
@@ -421,6 +481,31 @@ impl Pipeline {
             return;
         }
         record.start = Some(configuration);
+        if mode == StartMode::BeforePlay {
+            // RTSP has authenticated the client and supplied its negotiated
+            // configuration. Warm only source output; no input lease, native
+            // media plane or remote destination is activated before PLAY.
+            record.video_warmup_requested = true;
+            record.video_warmup_started_at = now;
+            eprintln!("amaterasu source warmup started session={session}");
+            record.state = State::Starting;
+            record.video_readiness_next_poll_at = now;
+            self.job = Some(Job::new(
+                session,
+                Some(request),
+                if record
+                    .start
+                    .as_ref()
+                    .is_some_and(|start| start.configuration.extension_profile.is_some())
+                {
+                    Step::AcquireOutput
+                } else {
+                    Step::ConfigureMediaVideoFormat
+                },
+                now.saturating_add(remaining.min(10_000)),
+            ));
+            return;
+        }
         if mode == StartMode::WhenAuthenticated {
             Self::arm(record, request, now, send);
             return;
@@ -434,7 +519,7 @@ impl Pipeline {
         ));
     }
 
-    fn arm(record: &mut Record, request: u64, now: u64, send: &mut Send<'_>) {
+    pub(super) fn arm(record: &mut Record, request: u64, now: u64, send: &mut Send<'_>) {
         if !rpc::active(send, request) {
             record.state = State::Stopping;
             record.outcome = State::Cancelled;
@@ -442,7 +527,7 @@ impl Pipeline {
             return;
         }
         record.state = State::Armed;
-        if record.config.display_prepare_timeout_ms.is_some() {
+        if record.config.display_prepare_timeout_ms.is_some() || record.video_warmup_requested {
             record.prepared_until = now.saturating_add(u64::from(record.config.ping_timeout_ms));
         }
         if rpc::complete(send, request, record.response()) {
@@ -520,6 +605,9 @@ impl Pipeline {
             self.journal_waiting_stops.insert(record.id);
             rpc::complete(send, request, record.response());
             return;
+        }
+        if let Some(wait) = record.video_warmup_wait.take() {
+            rpc::complete(send, wait.request, error("request_cancelled"));
         }
         let job = match prepare_stop_job(
             record,
@@ -752,8 +840,16 @@ fn validate_start_configuration(
             && candidate.selector["output"].as_str().is_some_and(|output| {
                 output.starts_with("kwin:Virtual-") && valid_name(output)
             })
-            && !candidate.mode.hdr
-            && configuration.source_id.is_none()
+            && (configuration.source_id.is_none()
+                || record
+                    .extension_route
+                    .as_ref()
+                    .is_some_and(|route| route.submitted))
+            && (record
+                .extension_route
+                .as_ref()
+                .is_some_and(|route| route.submitted)
+                || !candidate.mode.hdr)
             && configuration.capture_provider == crate::model::CaptureProvider::PipeWire => {}
         _ => {
             return Err("invalid_lifecycle_identity");
@@ -775,6 +871,10 @@ fn validate_start_configuration(
     }
     super::shared_capture::validate_start(record, configuration)?;
     if configuration.source_id.is_some()
+        && !record
+            .extension_route
+            .as_ref()
+            .is_some_and(|route| route.submitted)
         && (record.config.display_request.is_some()
             || record.config.virtual_display_intent.is_some())
     {
@@ -783,7 +883,9 @@ fn validate_start_configuration(
     if !configuration.matches_prepared_audio(&record.config) {
         return Err("audio_configuration_mismatch");
     }
-    if !configuration.matches_prepared_codec(&record.config) {
+    if configuration.configuration.extension_profile.is_none()
+        && !configuration.matches_prepared_codec(&record.config)
+    {
         return Err("video_codec_mismatch");
     }
     if !configuration.matches_prepared_encryption(&record.config) {
@@ -834,6 +936,7 @@ pub(super) fn stop_job(
     drain_timeout_ms: u64,
     persist_lifecycle_identity: bool,
 ) -> Job {
+    let request = request.or(record.video_warmup_wait.take().map(|wait| wait.request));
     let retrying_cleanup = record.state == State::CleanupFailed;
     let mut job = Job::new(
         record.id,

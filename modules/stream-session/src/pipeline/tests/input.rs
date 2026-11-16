@@ -435,7 +435,7 @@ fn reused_controller_slot_does_not_inherit_prior_session_motor_state() {
     assert!(record.rumble_pending.is_empty());
 }
 
-fn keyboard(pressed: bool, virtual_key: u8) -> crate::plane::ControlRecord {
+pub(super) fn keyboard(pressed: bool, virtual_key: u8) -> crate::plane::ControlRecord {
     keyboard_packet(pressed, u16::from(virtual_key) | 0x8000, 0)
 }
 

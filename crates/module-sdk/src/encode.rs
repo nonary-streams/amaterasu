@@ -5,6 +5,8 @@
 //! success. Rejection leaves the same immutable packet at the front for retry.
 mod resource_consumer;
 pub use resource_consumer::{EncoderPresentation, EncoderResourceConsumer};
+mod presented_dmabuf;
+pub use presented_dmabuf::{HostVideoPresentation, PresentedDmaBufResource};
 mod cadence;
 pub use cadence::{CommonConfigError, CommonConfigV1, FrameCadence};
 use std::collections::VecDeque;

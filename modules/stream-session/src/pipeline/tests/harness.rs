@@ -310,6 +310,10 @@ pub struct Broker {
     pub fail_audio_recover: bool,
     pub malformed_audio_recover: bool,
     pub authenticated: bool,
+    pub video_startup_delayed: bool,
+    pub warmed_media_started: BTreeSet<u64>,
+    pub video_startup_unsupported: bool,
+    pub video_startup_failure: bool,
     pub control_failure: Option<String>,
     pub control_status_wrong_stream: bool,
     pub video_close_polls: u8,
@@ -403,6 +407,9 @@ pub struct Broker {
     pub state_revision: u64,
     pub state_value: Option<Value>,
     pub state_fail_set: bool,
+    pub extension_probe_supported: bool,
+    pub extension_probe_encoder_override: Option<Value>,
+    pub extension_bad_unit: bool,
 }
 
 impl Broker {
@@ -973,6 +980,13 @@ impl Broker {
         {
             return error("injected_cleanup_failure");
         }
+        if service == "amaterasu.video/1" && action == "probe_source" {
+            return if self.extension_probe_supported {
+                json!({"ok":true,"source_id":call.payload["source_id"],"encoder":self.extension_probe_encoder_override.clone().unwrap_or_else(|| call.payload["encoder"].clone()),"profile":call.payload["configuration"]["extension_profile"]})
+            } else {
+                error("encoder_probe_failed")
+            };
+        }
         if service == "amaterasu.video/1" && action == "observe_capture" {
             let observation=self.lifecycle_observation_override.clone().unwrap_or_else(|| json!({"protocol":"wayland-wl-output","registry_global":4,"output_name":"Virtual-12"}));
             return json!({"ok":true,"stream":call.payload["stream"],"observed_capture":observation});
@@ -1276,6 +1290,17 @@ impl Broker {
             }
             return self.metadata(service, &self.allocations[&key]);
         }
+        if action == "status" && service == "amaterasu.video/1" {
+            let mut reply = self.metadata(service, &self.allocations[&key]);
+            reply["startup_frame_readiness"] = json!(!self.video_startup_unsupported);
+            reply["startup_frame_ready"] = json!(!self.video_startup_delayed);
+            reply["error"] = if self.video_startup_failure {
+                json!("capture_failed")
+            } else {
+                Value::Null
+            };
+            return json!({"ok":true,"streams":[reply]});
+        }
         if action == "status" && service == "amaterasu.control-transport/1" {
             return json!({"ok":true,"streams":[{"stream":if self.control_status_wrong_stream {id+1} else {id},"authenticated":self.authenticated && self.control_failure.is_none(),"state":if self.control_failure.is_some() {"failed"} else if self.authenticated {"active"} else {"awaiting_authentication"},"failure":self.control_failure}]});
         }
@@ -1298,7 +1323,13 @@ impl Broker {
                             .1
                             .strip_suffix("-media-transport")
                             .is_some_and(|prefix| video_key == &format!("{prefix}-video"))
-                }) {
+                }) && (!self
+                    .calls
+                    .iter()
+                    .any(|call| call.service == "amaterasu.video/1"
+                        && call.payload["action"] == "status")
+                    || !self.warmed_media_started.insert(id))
+                {
                     "drained"
                 } else {
                     "sending"
@@ -1786,6 +1817,14 @@ impl Broker {
             }
             "amaterasu.video/1" => {
                 let mut reply = json!({"ok":true,"stream":id,"state":if allocation.state=="closing" {"closing"} else {"running"},"packet_boundaries":true});
+                if let Some(profile) =
+                    allocation.request["configuration"]["extension_profile"].as_object()
+                {
+                    reply["negotiated_unit"] = json!({"stream":id,"generation":id,"offer_id":profile["wire_selector"],
+                        "source_id":if self.extension_bad_unit { 99 } else { allocation.request["source_id"].as_u64().unwrap() },
+                        "config_generation":1,"codec":profile["codec"],"framing":profile["framing"],
+                        "clock_epoch":[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],"clock_origin_us":100});
+                }
                 if let Some(geometry) = &self.desktop_geometry {
                     reply["desktop_geometry"] = geometry.clone();
                 }
@@ -1852,6 +1891,7 @@ pub struct PlaneState {
     pub stopping: bool,
     pub desktop_geometry: Option<amaterasu_media::CaptureGeometry>,
     pub ticks: usize,
+    pub planned_planes: usize,
     pub media_ticks: usize,
     pub media_ticks_when_stopped: Option<usize>,
     pub dropped: usize,
@@ -2000,6 +2040,7 @@ pub struct Harness {
     pub plane: Rc<RefCell<PlaneState>>,
     pub real_transport: Option<Rc<RefCell<crate::plane::test_support::TransportState>>>,
     pub now: u64,
+    pub extension_probe_limits: Option<amaterasu_media::VideoFramingLimits>,
 }
 impl Harness {
     pub fn new() -> Self {
@@ -2027,6 +2068,7 @@ impl Harness {
             plane: Rc::new(RefCell::new(plane_state)),
             real_transport: None,
             now: 0,
+            extension_probe_limits: None,
         }
     }
     pub fn with_restart_state(document: Value, revision: u64) -> Self {
@@ -2053,11 +2095,15 @@ impl Harness {
         // The pipeline never calls one of these from inside the other.
         let broker = RefCell::new(&mut self.broker);
         let real_transport = self.real_transport.clone();
+        let probe_limits = self.extension_probe_limits;
         self.pipeline
             .tick_with_direct(
                 self.now,
                 &mut |command| broker.borrow_mut().send(command),
-                &mut |_, _| {
+                &mut |_, _, route| {
+                    if route.is_some() {
+                        state.borrow_mut().planned_planes += 1;
+                    }
                     if let Some(transport) = &real_transport {
                         Ok(Box::new(QueuePlane(
                             crate::plane::test_support::TestPlane::new(transport.clone()),
@@ -2066,6 +2112,7 @@ impl Harness {
                         Ok(Box::new(FakePlane(state.clone())))
                     }
                 },
+                &mut |_, _, _| probe_limits.ok_or("unsupported"),
                 &mut |service, payload| broker.borrow_mut().direct(service, payload),
             )
             .unwrap();

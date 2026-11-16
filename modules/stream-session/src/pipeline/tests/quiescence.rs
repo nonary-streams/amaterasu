@@ -365,7 +365,8 @@ fn journal_release_ack_loss_keeps_validated_result_and_finishes() {
                     response
                 }
             },
-            &mut |_, _| panic!("journal settlement must not open a plane"),
+            &mut |_, _, _| panic!("journal settlement must not open a plane"),
+            &mut |_, _, _| panic!("journal settlement must not probe"),
         )
         .unwrap();
     assert!(lost);
@@ -842,7 +843,7 @@ fn stalled_readonly_active_observation_does_not_hold_native_resources_during_shu
                 held = Some(id);
             }
             Ok(response)
-        }, &mut |_, _| panic!("shutdown cannot start a new native plane")).unwrap();
+        }, &mut |_, _, _| panic!("shutdown cannot start a new native plane"), &mut |_, _, _| panic!("shutdown cannot probe")).unwrap();
         host.pipeline.quiesce(host.now);
         if host.pipeline.records[&id].state.terminal() {
             break;

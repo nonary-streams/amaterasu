@@ -34,6 +34,9 @@ pub enum AddressFamily {
 #[serde(default, deny_unknown_fields)]
 pub struct Settings {
     pub enabled: bool,
+    /// Request one independently preflighted extension route from stream-session.
+    pub extension_enabled: bool,
+    pub extension_bit_depth: u8,
     pub network_provider: Option<String>,
     #[serde(skip)]
     pub stream_service: String,
@@ -57,6 +60,8 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             enabled: false,
+            extension_enabled: false,
+            extension_bit_depth: 8,
             network_provider: None,
             stream_service: "amaterasu.stream-session/1".into(),
             lifecycle_service: Some("amaterasu.session-lifecycle/1".into()),
@@ -499,14 +504,14 @@ impl Profile {
             && announce.encryption.video == self.encrypt_video
     }
 
-    fn matches_audio(&self, announce: &Announce) -> bool {
+    fn matches_audio<T>(&self, announce: &Announce<T>) -> bool {
         announce.audio.channels == 2
             && announce.audio.channel_mask == 3
             && announce.audio.packet_duration_ms == self.packet_ms
             && announce.encryption.audio == self.encrypt_audio
     }
 
-    fn matches_transport(&self, announce: &Announce) -> bool {
+    fn matches_transport<T>(&self, announce: &Announce<T>) -> bool {
         announce.packet_size as usize == self.packet_size
             && announce.control == ControlProtocol::EncryptedEnet
             && announce.encryption.control_v2
@@ -1064,6 +1069,34 @@ impl Open {
         Some(video)
     }
 
+    pub(crate) fn accepts_extension_announce(
+        &self,
+        announce: &Announce<amaterasu_gamestream::sdp::NegotiatedVideoFormat>,
+    ) -> bool {
+        let profile = self.effective_profile();
+        let channels = self.channels.unwrap_or(2);
+        let audio = if channels == 2 {
+            profile.matches_audio(announce)
+        } else {
+            announce.audio.packet_duration_ms == profile.packet_ms
+                && announce.encryption.audio == profile.encrypt_audio
+                && announce.audio.channels == channels
+                && announce.audio.channel_mask == audio_channel_mask(channels)
+        };
+        audio
+            && profile.matches_transport(announce)
+            && announce.video.width == profile.width
+            && announce.video.height == profile.height
+            && announce.video.fps == profile.fps
+            && announce.video.bitrate_kbps == profile.bitrate_kbps
+            && announce.video.max_reference_frames == profile.max_reference_frames
+            && announce.video.slices_per_frame == 1
+            // An opaque codec owns its color representation. This legacy
+            // encoder CSC hint does not override its in-band color metadata
+            // or the independently validated SDR/HDR capture provenance.
+            && announce.encryption.video == profile.encrypt_video
+    }
+
     fn validate_operation_id(&self) -> Result<(), &'static str> {
         if !valid_name(&self.operation_id) {
             return Err("invalid_operation_id");
@@ -1329,6 +1362,30 @@ impl Open {
             payload["configuration"]["source_capture_context"] = serde_json::json!(context);
         }
         payload
+    }
+
+    /// Project the ordinary launch's inherited software defaults out of an
+    /// independently selected encoder's contract. Explicit overrides remain
+    /// present so unsupported requirements are still rejected by preflight.
+    pub(crate) fn extension_configuration(&self, bit_depth: u8) -> serde_json::Value {
+        let mut configuration = self.arm(1)["configuration"]["configuration"].clone();
+        let object = configuration
+            .as_object_mut()
+            .expect("typed video configuration");
+        for (key, inherited) in [("sw_preset", "superfast"), ("sw_tune", "zerolatency")] {
+            if object.get(key).and_then(serde_json::Value::as_str) == Some(inherited) {
+                object.remove(key);
+            }
+        }
+        object.insert("max_reference_frames".into(), serde_json::json!(0));
+        if bit_depth == 10 {
+            object.insert(
+                "video_stream_format".into(),
+                serde_json::json!({"codec":"hevc", "bit_depth":10,
+                "dynamic_range":if self.profile.hdr {"hdr"}else{"sdr"}}),
+            );
+        }
+        configuration
     }
 
     pub(crate) fn arm_with_negotiation(

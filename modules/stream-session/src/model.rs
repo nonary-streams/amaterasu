@@ -13,6 +13,7 @@ pub struct Settings {
     #[serde(skip)]
     pub processing_plan: Option<ProcessingPlanProvider>,
     pub source_preparation: Option<SourcePreparation>,
+    pub extension_route: Option<ExtensionRoute>,
     pub enabled: bool,
     pub allow_remote: bool,
     pub allowed_principals: Vec<String>,
@@ -31,6 +32,7 @@ impl Default for Settings {
             providers: Default::default(),
             processing_plan: None,
             source_preparation: None,
+            extension_route: None,
             enabled: false,
             allow_remote: false,
             allowed_principals: Vec::new(),
@@ -109,9 +111,13 @@ impl Settings {
             return Err("source_preparation_lifecycle_required");
         }
         if self
-            .outbound_policy
+            .extension_route
             .as_ref()
-            .is_some_and(|policy| !policy.valid(&self.allowed_principals))
+            .is_some_and(|route| !route.valid())
+            || self
+                .outbound_policy
+                .as_ref()
+                .is_some_and(|policy| !policy.valid(&self.allowed_principals))
             || self.allowed_principals.len() > 16
             || self.lifecycle_admitters.len() > 16
             || self.history_owners.len() > 16
@@ -176,6 +182,47 @@ impl ProcessingPlanProvider {
             return Err("invalid_processing_plan_provider");
         }
         Ok(())
+    }
+}
+
+/// One trusted startup-selected source, framing and transport route. The
+/// route is only offered after the selected providers pass per-launch probes.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExtensionRoute {
+    pub profile: amaterasu_contracts::media_profile::VideoProfile,
+    pub source_id: u64,
+    #[serde(default)]
+    pub submitted: bool,
+    pub encoder_provider: String,
+    pub encoder: EncoderSelection,
+    pub video_unit_service: String,
+    pub framer_service: String,
+    pub plan_transport_service: String,
+}
+impl ExtensionRoute {
+    fn valid(&self) -> bool {
+        let services = [
+            &self.video_unit_service,
+            &self.framer_service,
+            &self.plan_transport_service,
+        ];
+        self.profile.is_valid()
+            && self.source_id != 0
+            && !self.encoder_provider.is_empty()
+            && self.encoder_provider.len() <= 64
+            && self.encoder_provider.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+            })
+            && matches!(self.encoder, EncoderSelection::Identity(_))
+            && self.encoder.validate().is_ok()
+            && services
+                .iter()
+                .all(|service| amaterasu_contracts::valid_name(service))
+            && services
+                .iter()
+                .enumerate()
+                .all(|(i, service)| !services[..i].contains(service))
     }
 }
 
@@ -546,6 +593,9 @@ pub struct PrepareConfig {
     #[serde(default)]
     pub permit_legacy_audio_iv_wrap: bool,
     pub operation_id: String,
+    /// Optional fixed SDR encoder configuration to probe before RTSP DESCRIBE.
+    #[serde(default)]
+    pub extension_probe: Option<VideoConfiguration>,
 }
 impl PrepareConfig {
     pub fn validate(&self, allow_remote: bool) -> Result<(), &'static str> {
@@ -978,6 +1028,8 @@ impl<'de> Deserialize<'de> for CaptureProvider {
 #[derive(Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct VideoConfiguration {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extension_profile: Option<amaterasu_contracts::media_profile::VideoProfile>,
     /// Codec and range accepted by the authenticated RTSP ANNOUNCE.
     #[serde(
         default = "default_video_stream_format",
@@ -1503,7 +1555,27 @@ fn valid_minimum_fps_target(value: f64) -> bool {
 }
 
 impl VideoConfiguration {
+    pub(crate) fn valid_extension_probe(&self) -> bool {
+        self.extension_profile.is_none()
+            && self.video_stream_format.validate().is_ok()
+            && self.codec == amaterasu_media::VideoCodec::H264
+            && self.color_mode == amaterasu_media::ColorMode::default()
+            && self.slices_per_frame == 1
+            && self.max_reference_frames == 0
+            && self.min_threads == default_min_threads()
+            && self.qp == default_qp()
+            && self.nvenc_settings == amaterasu_module_sdk::NvencSettings::default()
+            && !self.nvenc_spatial_aq
+            && self.sw_preset.is_none()
+            && self.sw_tune.is_none()
+            && self.adapter_name.is_none()
+            && self.adapter_pnp_id.is_none()
+            && self.valid()
+    }
     pub fn normalize_codec(&mut self) -> Result<(), &'static str> {
+        if self.extension_profile.is_some() {
+            return Ok(());
+        }
         let negotiated = match self.video_stream_format.codec {
             amaterasu_module_sdk::VideoCodec::H264 => amaterasu_media::VideoCodec::H264,
             amaterasu_module_sdk::VideoCodec::Hevc => amaterasu_media::VideoCodec::Hevc,
@@ -1525,7 +1597,12 @@ impl VideoConfiguration {
     }
 
     fn valid(&self) -> bool {
-        self.video_stream_format.validate().is_ok()
+        self.extension_profile.as_ref().is_none_or(|profile| {
+            profile.is_valid()
+                && profile.media_format.unwrap_or_default().bit_depth
+                    == self.video_stream_format.bit_depth
+                && self.codec == amaterasu_media::VideoCodec::H264
+        }) && self.video_stream_format.validate().is_ok()
             && ((self.video_stream_format.bit_depth == 8
                 && self.video_stream_format.dynamic_range
                     == amaterasu_module_sdk::DynamicRange::Sdr)
@@ -1589,6 +1666,9 @@ pub enum Operation {
     StartWhenAuthenticated {
         session: u64,
         configuration: StartConfig,
+        /// Authenticated RTSP may prepare source output before PLAY is acknowledged.
+        #[serde(default)]
+        prepare_video_before_play: bool,
     },
     /// Renegotiate custom audio before the authenticated stream starts.
     ReconfigureAudio {
@@ -1644,6 +1724,46 @@ fn mapped(value: IpAddr) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ten_bit_extension_probe_preserves_both_output_ranges() {
+        for range in ["sdr", "hdr"] {
+            let mut config: super::VideoConfiguration = serde_json::from_value(serde_json::json!({
+                "width":2560,"height":1440,"fps":120,"bitrate":56800000,
+                "video_stream_format":{"codec":"hevc","bit_depth":10,"dynamic_range":range}
+            }))
+            .unwrap();
+            assert!(config.valid_extension_probe());
+            config.extension_profile = Some(serde_json::from_value(serde_json::json!({
+                "codec":{"namespace_id":1,"value":4,"schema":1}, "framing":{"namespace_id":1,"value":2,"schema":1},
+                "wire_selector":3,"payload_type":99,"encoding_name":"PYROWAVE",
+                "media_format":{"bit_depth":10,"dynamic_range":"hdr","chroma_sampling":"yuv420"}
+            })).unwrap());
+            config.normalize_codec().unwrap();
+            assert!(config.valid());
+            assert_eq!(
+                serde_json::to_value(config).unwrap()["video_stream_format"]["dynamic_range"],
+                range
+            );
+        }
+    }
+
+    #[test]
+    fn extension_preflight_rejects_encoder_controls_the_source_probe_cannot_verify() {
+        let mut configuration: super::VideoConfiguration =
+            serde_json::from_value(serde_json::json!({
+                "width":1280,"height":720,"fps":60,"bitrate":10000000
+            }))
+            .unwrap();
+        assert!(configuration.valid_extension_probe());
+        configuration.max_reference_frames = 1;
+        assert!(!configuration.valid_extension_probe());
+        configuration.max_reference_frames = 0;
+        configuration.qp = 27;
+        assert!(!configuration.valid_extension_probe());
+        configuration.qp = 28;
+        configuration.min_threads = 3;
+        assert!(!configuration.valid_extension_probe());
+    }
     use super::*;
     use serde_json::{Value, json};
 

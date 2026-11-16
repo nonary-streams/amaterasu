@@ -127,6 +127,14 @@ and consumer bindings through graceful drain and EOS. This does not connect an e
 establish GPU compatibility. The signed fixture test covers this route with CPU resources and fake output;
 deployment and hardware qualification remain separate.
 
+Opaque submitted video profiles consume the existing captured DMA-BUF resource
+through `encode::PresentedDmaBufResource`. This SDK adapter assigns video's
+encoder-edge presentation, as the standard encoder path does, while retaining
+the capture-owned storage and preserving source pacing, color and fences.
+It copies only the descriptor header and keeps that header alive through every
+downstream retained reference. This path preserves the capture provider's Open
+schema; it does not request a new capture clock or callback agreement.
+
 ## Sessions and input negotiation
 
 The authorized control service creates, looks up and closes principal-scoped
