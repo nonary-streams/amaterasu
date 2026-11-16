@@ -1547,7 +1547,7 @@ fn valid_minimum_fps_target(value: f64) -> bool {
 impl VideoConfiguration {
     pub(crate) fn valid_extension_probe(&self) -> bool {
         self.extension_profile.is_none()
-            && self.video_stream_format == default_video_stream_format()
+            && self.video_stream_format.validate().is_ok()
             && self.codec == amaterasu_media::VideoCodec::H264
             && self.color_mode == amaterasu_media::ColorMode::default()
             && self.slices_per_frame == 1
@@ -1563,6 +1563,9 @@ impl VideoConfiguration {
             && self.valid()
     }
     pub fn normalize_codec(&mut self) -> Result<(), &'static str> {
+        if self.extension_profile.is_some() {
+            return Ok(());
+        }
         let negotiated = match self.video_stream_format.codec {
             amaterasu_module_sdk::VideoCodec::H264 => amaterasu_media::VideoCodec::H264,
             amaterasu_module_sdk::VideoCodec::Hevc => amaterasu_media::VideoCodec::Hevc,
@@ -1586,7 +1589,8 @@ impl VideoConfiguration {
     fn valid(&self) -> bool {
         self.extension_profile.as_ref().is_none_or(|profile| {
             profile.is_valid()
-                && self.video_stream_format == default_video_stream_format()
+                && profile.media_format.unwrap_or_default().bit_depth
+                    == self.video_stream_format.bit_depth
                 && self.codec == amaterasu_media::VideoCodec::H264
         }) && self.video_stream_format.validate().is_ok()
             && ((self.video_stream_format.bit_depth == 8
@@ -1705,6 +1709,29 @@ fn mapped(value: IpAddr) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ten_bit_extension_probe_preserves_both_output_ranges() {
+        for range in ["sdr", "hdr"] {
+            let mut config: super::VideoConfiguration = serde_json::from_value(serde_json::json!({
+                "width":2560,"height":1440,"fps":120,"bitrate":56800000,
+                "video_stream_format":{"codec":"hevc","bit_depth":10,"dynamic_range":range}
+            }))
+            .unwrap();
+            assert!(config.valid_extension_probe());
+            config.extension_profile = Some(serde_json::from_value(serde_json::json!({
+                "codec":{"namespace_id":1,"value":4,"schema":1}, "framing":{"namespace_id":1,"value":2,"schema":1},
+                "wire_selector":3,"payload_type":99,"encoding_name":"PYROWAVE",
+                "media_format":{"bit_depth":10,"dynamic_range":"hdr","chroma_sampling":"yuv420"}
+            })).unwrap());
+            config.normalize_codec().unwrap();
+            assert!(config.valid());
+            assert_eq!(
+                serde_json::to_value(config).unwrap()["video_stream_format"]["dynamic_range"],
+                range
+            );
+        }
+    }
+
     #[test]
     fn extension_preflight_rejects_encoder_controls_the_source_probe_cannot_verify() {
         let mut configuration: super::VideoConfiguration =

@@ -26,8 +26,9 @@ FRAMER = "amaterasu.encode.pyrowave-framing/1"
 UNITS = "amaterasu.video.pyrowave-units/1"
 TRANSPORT = "amaterasu.media-transport.pyrowave-plan/1"
 PROFILE = {
-    "codec": {"namespace_id": 0x5059524F57415645, "value": 1, "schema": 0x186F0393},
+    "codec": {"namespace_id": 0x5059524F57415645, "value": 4, "schema": 0x186F0393},
     "framing": {"namespace_id": 0x5059524F57415645, "value": 2, "schema": 1},
+    "media_format": {"bit_depth":10,"dynamic_range":"hdr","chroma_sampling":"yuv420"},
     "wire_selector": 3, "payload_type": 99, "encoding_name": "PYROWAVE",
     "wire_attributes": [{"phase": "describe", "name": "x-ss-pyrowave.bitstream", "value": "186f0393"}],
 }
@@ -44,15 +45,6 @@ def compose(bootstrap, manifest, approved):
     settings["amaterasu.encode"]["pyrowave"] = {
         "library_path": "/embedded/pyrowave", "gpu_only": True, "transport_enabled": True,
     }
-    for principal, fields in {
-        "amaterasu.encode": ["pyrowave"],
-        "amaterasu.linux-session-video": ["unit_service", "source_encoder_providers", "external_encoder_consumers"],
-        "amaterasu.media-transport": ["plan_service", "extension_profiles"],
-        "amaterasu.stream-session": ["extension_route"],
-        "amaterasu.rtsp": ["extension_enabled"],
-    }.items():
-        if any(field in bootstrap["policy"]["settings"][principal] for field in fields):
-            raise ValueError(f"existing extension composition requires reconciliation: {principal}")
     settings["amaterasu.linux-session-video"].update({
         "unit_service": UNITS,
         "source_encoder_providers": {"pyrowave": {"control_service": CONTROL,
@@ -66,6 +58,16 @@ def compose(bootstrap, manifest, approved):
         "video_unit_service": UNITS, "framer_service": FRAMER, "plan_transport_service": TRANSPORT,
     }
     settings["amaterasu.rtsp"]["extension_enabled"] = True
+    settings["amaterasu.rtsp"]["extension_bit_depth"] = 10
+    for principal, fields in {
+        "amaterasu.encode": ["pyrowave"],
+        "amaterasu.linux-session-video": ["unit_service", "source_encoder_providers", "external_encoder_consumers"],
+        "amaterasu.media-transport": ["plan_service", "extension_profiles"],
+        "amaterasu.stream-session": ["extension_route"],
+        "amaterasu.rtsp": ["extension_enabled"],
+    }.items():
+        if any(field in bootstrap["policy"]["settings"][principal] and bootstrap["policy"]["settings"][principal][field] != settings[principal][field] for field in fields):
+            raise ValueError(f"existing extension composition requires reconciliation: {principal}")
     additions = {
         "amaterasu.encode": {"provide": [CONTROL, PROVIDER, CONSUMER, FRAMER], "native_provide": [PROVIDER, CONSUMER, FRAMER]},
         "amaterasu.linux-session-video": {"call": [CONTROL], "native_use": [PROVIDER, CONSUMER], "native_provide": [UNITS]},
@@ -140,8 +142,10 @@ def prepare(root, tree, work):
         shutil.copy2(source, package / component["file"])
         component["sha256"] = digest(source)
         component["size"] = source.stat().st_size
-        if component["id"] in REPLACEMENTS:
+        if component["sha256"] != previous:
             replaced.append({"id": component["id"], "before": previous, "after": component["sha256"]})
+    for component in manifest["components"]:
+        component["requires"] = dict(sorted(component["requires"].items()))
     manifest["sequence"] = max(selection["highest_sequence"], int(time.time())) + 1
     if manifest["expires_unix"] <= time.time():
         raise ValueError("installed manifest expiry must be renewed explicitly")

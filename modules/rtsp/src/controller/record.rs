@@ -193,6 +193,10 @@ impl Record {
             payload["configuration"]["encrypt_audio"] = json!(announce.encryption.audio);
             payload["configuration"]["client_feature_flags"] = json!(announce.client_feature_flags);
             payload["configuration"]["configuration"]["extension_profile"] = json!(profile);
+            if profile.media_format.unwrap_or_default().bit_depth == 10 {
+                payload["configuration"]["configuration"]["video_stream_format"] = json!({"codec":"hevc", "bit_depth":10,
+                    "dynamic_range":if self.config.profile.hdr {"hdr"}else{"sdr"}});
+            }
             return Some(payload);
         }
         let encryption = self.negotiated_encryption?;

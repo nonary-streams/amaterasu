@@ -227,8 +227,7 @@ impl NativeBackend {
     ) -> PlaneResult<Self> {
         let selection = &route.selection;
         let clock_origin_us = route.clock_origin_us;
-        if handles.hdr
-            || !selection.valid()
+        if !selection.valid()
             || selection.offer_id != u64::from(route.profile.wire_selector)
             || (
                 selection.codec.namespace_id,
@@ -270,6 +269,9 @@ impl NativeBackend {
         .map_err(|_| "native_binding_failed")?;
         let legacy_video =
             unsafe { amaterasu_module_sdk::video::bind(runtime, &providers.video) }.ok();
+        if handles.hdr && legacy_video.is_none() {
+            return Err("video_hdr_metadata_unsupported");
+        }
         let mut backend =
             Self::with_video(runtime, handles, providers, legacy_video, Some(video), None)?;
         let request = VideoPlanSelectionV2 {

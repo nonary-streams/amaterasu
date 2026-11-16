@@ -337,13 +337,16 @@ impl Controller {
             media_binds,
         );
         if self.settings.extension_enabled
-            && !record.config.profile.hdr
             && record.config.profile.max_reference_frames == 0
             && record.config.min_threads == 2
             && record.config.qp == 28
         {
             payload["extension_probe"] =
                 record.config.arm(1)["configuration"]["configuration"].clone();
+            if self.settings.extension_bit_depth == 10 {
+                payload["extension_probe"]["video_stream_format"] = json!({"codec":"hevc", "bit_depth":10,
+                "dynamic_range":if record.config.profile.hdr {"hdr"}else{"sdr"}});
+            }
         }
         if record.config.display_admission_required() {
             // Stream-session starts its prepared timer after Apply/readback. Reserve

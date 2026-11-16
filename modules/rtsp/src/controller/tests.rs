@@ -4450,3 +4450,81 @@ fn authenticated_play_requests_source_readiness_before_releasing_negotiation() {
     assert!(record.state == State::Closing);
     assert_eq!(record.failure, Some("start_rejected"));
 }
+
+#[test]
+fn ten_bit_extensions_keep_sdr_and_hdr_output_distinct() {
+    use amaterasu_contracts::media_profile::{FormatId, VideoProfile, VideoProfileSnapshot};
+    for hdr in [false, true] {
+        let (mut record, _) = announced_profile_record();
+        record.config.profile.hdr = hdr;
+        record.config.profile.max_reference_frames = 0;
+        let profile = VideoProfile {
+            codec: FormatId {
+                namespace_id: 7,
+                value: 8,
+                schema: 1,
+            },
+            framing: FormatId {
+                namespace_id: 7,
+                value: 9,
+                schema: 1,
+            },
+            wire_selector: 4,
+            payload_type: 100,
+            encoding_name: "EXAMPLE".into(),
+            media_format: Some(amaterasu_contracts::media_profile::VideoMediaFormat {
+                bit_depth: 10,
+                dynamic_range: amaterasu_module_sdk::DynamicRange::Hdr,
+                chroma_sampling: Default::default(),
+            }),
+            wire_attributes: Vec::new(),
+        };
+        let snapshot = VideoProfileSnapshot {
+            profiles: vec![profile.clone()],
+        };
+        let announcement =
+            include_str!("../../../../crates/gamestream/src/sdp/fixtures/moonlight-h264.sdp")
+                .replace(
+                    "x-ss-general.encryptionEnabled:0",
+                    "x-ss-general.encryptionEnabled:7",
+                )
+                .replace(
+                    "x-nv-vqos[0].bitStreamFormat:0",
+                    "x-nv-vqos[0].bitStreamFormat:4",
+                )
+                .replace(
+                    "x-nv-video[0].maxNumReferenceFrames:1",
+                    "x-nv-video[0].maxNumReferenceFrames:0",
+                );
+        let announcement = announcement.replace(
+            "x-nv-video[0].dynamicRangeMode:0",
+            "x-nv-video[0].dynamicRangeMode:1",
+        );
+        let mut announce =
+            amaterasu_gamestream::sdp::parse_profile_announce(announcement.as_bytes(), &snapshot)
+                .unwrap();
+        assert!(!record.accept_extension_announce(&announce));
+        record.extension_offer = Some(profile.clone());
+        assert!(record.accept_extension_announce(&announce));
+        let payload = record.authenticated_start_payload(23).unwrap();
+        assert_eq!(
+            payload["configuration"]["configuration"]["extension_profile"],
+            json!(profile)
+        );
+        assert_eq!(
+            payload["configuration"]["client_feature_flags"],
+            announce.client_feature_flags
+        );
+        assert_eq!(
+            payload["configuration"]["configuration"]["video_stream_format"]["bit_depth"],
+            10
+        );
+        assert_eq!(
+            payload["configuration"]["configuration"]["video_stream_format"]["dynamic_range"],
+            if hdr { "hdr" } else { "sdr" }
+        );
+        announce.video.width += 2;
+        assert!(!record.accept_extension_announce(&announce));
+        assert!(record.authenticated_start_payload(23).is_none());
+    }
+}

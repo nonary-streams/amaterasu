@@ -799,8 +799,16 @@ fn validate_start_configuration(
             && candidate.selector["output"].as_str().is_some_and(|output| {
                 output.starts_with("kwin:Virtual-") && valid_name(output)
             })
-            && !candidate.mode.hdr
-            && configuration.source_id.is_none()
+            && (configuration.source_id.is_none()
+                || record
+                    .extension_route
+                    .as_ref()
+                    .is_some_and(|route| route.submitted))
+            && (record
+                .extension_route
+                .as_ref()
+                .is_some_and(|route| route.submitted)
+                || !candidate.mode.hdr)
             && configuration.capture_provider == crate::model::CaptureProvider::PipeWire => {}
         _ => {
             return Err("invalid_lifecycle_identity");

@@ -36,6 +36,7 @@ pub struct Settings {
     pub enabled: bool,
     /// Request one independently preflighted extension route from stream-session.
     pub extension_enabled: bool,
+    pub extension_bit_depth: u8,
     pub network_provider: Option<String>,
     #[serde(skip)]
     pub stream_service: String,
@@ -60,6 +61,7 @@ impl Default for Settings {
         Self {
             enabled: false,
             extension_enabled: false,
+            extension_bit_depth: 8,
             network_provider: None,
             stream_service: "amaterasu.stream-session/1".into(),
             lifecycle_service: Some("amaterasu.session-lifecycle/1".into()),
@@ -1081,8 +1083,7 @@ impl Open {
                 && announce.audio.channels == channels
                 && announce.audio.channel_mask == audio_channel_mask(channels)
         };
-        !profile.hdr
-            && profile.max_reference_frames == 0
+        profile.max_reference_frames == 0
             && audio
             && profile.matches_transport(announce)
             && announce.video.width == profile.width

@@ -18,11 +18,18 @@ before RTSP offers the route. Startup waits for a complete encoded keyframe
 before acknowledging PLAY. Transport validates the complete frame plan before
 admitting UDP bytes; normal audio, input and lifecycle services remain selected.
 
-Current host routing supports 8-bit 4:2:0 SDR with bounded length-prefixed
-PyroWave packets, ordinary GameStream packetization, and negotiated FEC. The
-encoder separately passes GPU HDR10 tests, but that does not qualify HDR route
-selection, metadata delivery, 4:4:4, adaptive FEC, or bandwidth calibration.
-Those modes are not advertised. Existing bitrate limits remain in effect.
+The local candidate selects 10-bit 4:2:0 PyroWave. A 10-bit wire profile
+retains the launch's output range: SDR uses BT.709/sRGB and HDR uses BT.2020/PQ.
+Precision and transfer are independent; GPU tests check adjacent ten-bit values
+in both ranges through independent decoding. SDR can import both eight-bit and
+ten-bit RGB capture; HDR requires capture-owned PQ provenance. HDR metadata uses
+the existing reliable control channel and requires the selected video's metadata
+interface. Processing and capture provenance checks remain enforced.
+
+Eight-bit encoding remains available in the SDK. The current composition offers
+one selected wire profile per launch. 4:4:4, adaptive FEC, bandwidth calibration
+and automatic profile fallback are not implemented. Existing bitrate limits
+remain in effect. Tests and a signed candidate do not establish client playback.
 
 For a compatible installed source set, `scripts/prepare_pyrowave_update.py ROOT
 OUTPUT` prepares a signed candidate and exact proposed policy without changing
