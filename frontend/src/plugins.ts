@@ -15,6 +15,7 @@ namespace Amaterasu {
   const VIEW_LABELS: Readonly<Record<PluginsView, string>> = {
     overview: "Overview",
     modules: "All modules",
+    drivers: "Drivers",
     repositories: "Repositories",
   };
   const CHANGE_POLL_MS = 600;
@@ -779,6 +780,12 @@ namespace Amaterasu {
     let view: PluginsView = pluginsViewFromAddress(context.initialPluginsView ?? "") ?? DEFAULT_PLUGINS_VIEW;
     let selection: Loadable<PackageSelectionStatus> = { state: "loading" };
     let listing: Loadable<RepositoryPage> = { state: "loading" };
+    let driverStatus: Loadable<PluginDriverStatus> = { state: "loading" };
+    let driverChanging = false;
+    let driverFailure: unknown = null;
+    let driverReadRequest = 0;
+    let driverPoll: number | null = null;
+    page.signal.addEventListener("abort", () => { if (driverPoll !== null) window.clearTimeout(driverPoll); }, {once:true});
     let loadRequest = 0;
     let selectedInstalled: string | null = null;
     let selectedAvailable: string | null = null;
@@ -874,6 +881,7 @@ namespace Amaterasu {
       const counts: Record<PluginsView, number | null> = {
         overview: null,
         modules: ready(selection)?.running.modules?.length ?? null,
+        drivers: ready(driverStatus)?.supported ? ready(driverStatus)?.drivers.length ?? null : null,
         repositories: ready(listing) ? activeRepositories().length : null,
       };
       for (const [name, tab] of tabs) {
@@ -890,6 +898,7 @@ namespace Amaterasu {
       }
       if (view === "overview") renderOverview();
       else if (view === "modules") renderInstalled();
+      else if (view === "drivers") renderDrivers();
       else renderRepositories();
     }
 
@@ -921,6 +930,7 @@ namespace Amaterasu {
       const request = ++loadRequest;
       selection = { state: "loading" };
       listing = { state: "loading" };
+      driverStatus = { state: "loading" };
       descriptions.clear();
       render();
       if (!canRead) return;
@@ -930,16 +940,132 @@ namespace Amaterasu {
         (value) => ({ state: "ready", value }),
         (error: unknown) => ({ state: "failed", error }),
       );
-      const [nextSelection, nextListing] = await Promise.all([
+      const [nextSelection, nextListing, nextDrivers] = await Promise.all([
         settled(api.post<unknown>("package-selection/status", {}).then(parsePackageSelectionStatus)),
         settled(listRepositories()),
+        settled(readDriverStatus()),
         updates.read(),
       ]);
       if (request !== loadRequest || !viewArea.isConnected) return;
       selection = nextSelection;
       listing = nextListing;
+      driverStatus = nextDrivers;
       showUpdates();
       render();
+      scheduleDriverPoll();
+    }
+
+    async function readDriverStatus(): Promise<PluginDriverStatus> {
+      try {
+        return parsePluginDriverStatus(await api.post<unknown>("drivers/status", {}));
+      } catch (error) {
+        if (error instanceof ApiError && (error.status === 404 || error.code === "service_unavailable" || error.code === "not_found"))
+          return {supported:false,installationRevision:null,drivers:[],operation:null};
+        throw error;
+      }
+    }
+
+    function scheduleDriverPoll(): void {
+      if (driverPoll !== null) window.clearTimeout(driverPoll);
+      driverPoll = null;
+      const operation = ready(driverStatus)?.operation;
+      if (!operation || !["checking", "waiting_for_idle", "installing", "activating"].includes(operation.phase)) return;
+      driverPoll = window.setTimeout(() => { driverPoll = null; if (!page.signal.aborted && !driverChanging) void refreshDrivers(); }, 1000);
+    }
+
+    async function refreshDrivers(): Promise<void> {
+      const request = loadRequest;
+      const driverRequest = ++driverReadRequest;
+      try {
+        const status = await readDriverStatus();
+        if (page.signal.aborted || request !== loadRequest || driverRequest !== driverReadRequest) return;
+        const previousPhase = ready(driverStatus)?.operation?.phase;
+        driverStatus = {state:"ready",value:status};
+        driverFailure = null;
+        if (status.operation?.phase === "ready" && previousPhase !== "ready") { await load(); return; }
+      } catch (error) {
+        if (page.signal.aborted || request !== loadRequest || driverRequest !== driverReadRequest) return;
+        const operation = ready(driverStatus)?.operation;
+        if (operation && ["activating", "installing", "waiting_for_idle", "checking"].includes(operation.phase)) {
+          driverFailure = error;
+        } else driverStatus = {state:"failed",error};
+      }
+      if (view === "drivers") render();
+      scheduleDriverPoll();
+    }
+
+    async function changeDriverSetup(action: "prepare" | "approve" | "cancel" | "retry" | "activate", plugin?: AvailablePlugin): Promise<void> {
+      const status = ready(driverStatus);
+      if (!canManage || driverChanging || !status?.supported || !status.installationRevision) return;
+      const operation = status.operation;
+      if (action !== "prepare" && !operation) return;
+      const payload = action === "prepare" && plugin
+        ? {repository:plugin.repository.id,manifest:plugin.manifest,installation_revision:status.installationRevision}
+        : operation ? {operation:operation.id,revision:operation.revision,installation_revision:operation.installationRevision,
+          ...(action === "approve" ? {approval:operation.approval} : {})} : null;
+      if (!payload) return;
+      driverChanging = true;
+      ++driverReadRequest;
+      driverFailure = null;
+      showView("drivers");
+      render();
+      try {
+        await api.post<unknown>(`plugins/${action}`, payload);
+      } catch (error) { driverFailure = error; }
+      finally { driverChanging = false; }
+      await refreshDrivers();
+    }
+
+    function driverCard(driver: PluginDriver): HTMLElement {
+      return el("section", "plugin-detail",
+        el("h3", "", lit(driver.name)),
+        el("p", "plugin-detail-state", lit(driverStateLabel(driver.state))),
+        el("p", "", lit(driver.reason)),
+        factList([["Publisher",lit(driver.publisher)], ["Required by",lit(driver.requiredBy.join(", "))],
+          ["Installed version", driver.installedVersion ? lit(driver.installedVersion) : "Unknown"],
+          driver.offeredVersion ? ["Version in plugin", lit(driver.offeredVersion)] : null,
+          ["Updates", lit(driverUpdateLabel(driver.update))]]),
+        driver.message ? el("p", "", lit(driver.message)) : null,
+        driver.mayRequireReboot && driver.state !== "ready" ? el("p", "muted", "Installation may require restarting this computer. It will not restart automatically.") : null);
+    }
+
+    function renderDrivers(): void {
+      if (driverStatus.state === "loading") { viewArea.replaceChildren(el("p", "muted", "Checking driver setup…")); return; }
+      if (driverStatus.state === "failed") { viewArea.replaceChildren(errorPanel(driverStatus.error, refreshDrivers)); return; }
+      const status = driverStatus.value;
+      if (!status.supported) {
+        viewArea.replaceChildren(quietState("Driver setup is unavailable", "This host needs a provisioned plugin installation service before drivers can be installed from this page."));
+        return;
+      }
+      const operation = status.operation;
+      const controls: HTMLElement[] = [];
+      const addControl = (label: string, action: "approve" | "cancel" | "retry" | "activate"): void => {
+        const control = button(label, () => changeDriverSetup(action));
+        control.disabled = driverChanging;
+        controls.push(control);
+      };
+      if (operation && canManage) {
+        if (operation.phase === "awaiting_approval") {
+          addControl("Install required drivers", "approve");
+          controls.push(button("Not now", () => showView("overview")));
+        }
+        if (operation.phase === "ready_to_activate") addControl("Finish adding plugin", "activate");
+        if (["failed", "reboot_required", "manual_action_required"].includes(operation.phase)) addControl("Check again", "retry");
+        if (operation.cancellable) addControl("Cancel setup", "cancel");
+      }
+      const installed = status.drivers;
+      const pending = operation && !["ready", "cancelled"].includes(operation.phase) ? operation.drivers : [];
+      viewArea.replaceChildren(el("div", "plugin-drivers",
+        el("h2", "", "Drivers"),
+        operation ? el("div", "plugin-update-status", el("p", "", lit(driverSetupMessage(operation.phase))),
+          operation.error ? el("p", "", lit(driverSetupError(operation.error))) : null, el("div", "actions", ...controls)) : null,
+        driverFailure ? errorPanel(driverFailure, refreshDrivers) : null,
+        installed.length ? el("p", "muted", "Installed plugin drivers · last verified during setup. Update information compares the installed version with the signed driver bundled in the plugin.") : null,
+        ...installed.map(driverCard),
+        operation && !["ready", "cancelled"].includes(operation.phase) && operation.drivers.length
+          ? el("section", "", el("h3", "", "Current setup"), ...operation.drivers.map(driverCard)) : null,
+        !installed.length && !pending.length ? el("p", "muted", "No verified driver inventory is available.") : null,
+      ));
     }
 
     /// Draws the sources from everything the page has loaded.
@@ -1469,6 +1595,9 @@ namespace Amaterasu {
           description ? ["Size", lit(formatBytes(description.size))] : null,
           ["Library SHA-256", copyable(plugin.sha256, shortDigest(plugin.sha256), "library digest")],
         ]));
+        const requiredDrivers = ready(driverStatus)?.drivers.filter((driver) => driver.requiredBy.includes(plugin.id) || driver.requiredComponents.includes(plugin.id)) ?? [];
+        if (requiredDrivers.length) facts.append(detailSection("Drivers", ...requiredDrivers.map((driver) =>
+          button(lit(`${driver.name} · ${driverStateLabel(driver.state)}`), () => showView("drivers"), "link-button plugin-link"))));
         if (!description) return;
         const provides = [...new Set([...description.provides, ...description.nativeProvides])];
         const uses = [...new Set([...description.calls, ...description.nativeUses])];
@@ -1602,7 +1731,12 @@ namespace Amaterasu {
             : "Not installed.";
       const installing: Part[] = [];
       if (!(plugin.status === "installed" && plugin.runningThisPackage)) {
-        if (plugin.slot === "amaterasu.rtx-hdr" && plugin.status === "available") {
+        if (plugin.kind === "native_plugin") {
+          const supported = ready(driverStatus)?.supported === true;
+          const add = button(plugin.status === "update" ? "Update plugin" : "Add plugin", () => changeDriverSetup("prepare",plugin));
+          add.disabled = !canManage || !supported || driverChanging;
+          installing.push(add, el("p", "muted", supported ? "Setup checks this plugin's dependencies and prompts for any required drivers before activation." : "This host needs a provisioned plugin installation service to add independent plugins."));
+        } else if (plugin.slot === "amaterasu.rtx-hdr" && plugin.status === "available") {
           installing.push(
             el("p", "", "RTX HDR is installed from Integrations, which also downloads the NVIDIA runtime it needs."),
             button("Set up RTX HDR", () => context.navigate("integrations")),
@@ -1622,7 +1756,7 @@ namespace Amaterasu {
         factList([
           ["Version", lit(plugin.version)],
           plugin.otherVersions.length ? ["Also offered", lit(plugin.otherVersions.join(", "))] : null,
-          ["Type", consoleInterface ? "Console interface" : "Module set"],
+          ["Type", consoleInterface ? "Console interface" : plugin.kind === "native_plugin" ? "Plugin" : "Module set"],
           ["Implementation", el("code", "plugin-service", lit(plugin.implementation))],
           ["Repository", repositoryLink(plugin.repository.id)],
           ["Publisher key", copyable(plugin.repository.fingerprint, shortDigest(plugin.repository.fingerprint), "publisher key fingerprint")],

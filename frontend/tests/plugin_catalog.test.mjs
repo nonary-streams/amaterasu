@@ -336,7 +336,7 @@ const updateReply = {
 const reading = (change = {}) => ({ state: "ready", status: plugins.parsePackageUpdateStatus({ ...updateReply, ...change }) });
 
 test("addresses saved under a view's former name open the view that replaced it", () => {
-  assert.deepEqual(plain(plugins.PLUGINS_VIEWS), ["overview", "modules", "repositories"]);
+  assert.deepEqual(plain(plugins.PLUGINS_VIEWS), ["overview", "modules", "drivers", "repositories"]);
   assert.equal(plugins.DEFAULT_PLUGINS_VIEW, "overview");
   for (const view of plugins.PLUGINS_VIEWS) assert.equal(plugins.pluginsViewFromAddress(view), view);
   assert.equal(plugins.pluginsViewFromAddress("installed"), "modules");

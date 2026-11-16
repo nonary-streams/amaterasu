@@ -35,6 +35,7 @@
     "src/rtx_hdr.ts",
     "src/integrations.ts",
     "src/plugin_catalog.ts",
+    "src/plugin_drivers.ts",
     "src/plugins.ts",
     "src/locale.ts",
     "src/stream_controls.ts",

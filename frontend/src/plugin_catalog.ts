@@ -4,7 +4,7 @@ namespace Amaterasu {
   // document.
 
   /// The page's views in tab order. `#plugins` alone opens the first.
-  export const PLUGINS_VIEWS: readonly PluginsView[] = ["overview", "modules", "repositories"];
+  export const PLUGINS_VIEWS: readonly PluginsView[] = ["overview", "modules", "drivers", "repositories"];
   export const DEFAULT_PLUGINS_VIEW: PluginsView = "overview";
 
   /// What two of the views were called while the page was named Plugins.
@@ -23,7 +23,7 @@ namespace Amaterasu {
     slot: string;
     implementation: string;
     version: string;
-    kind: "native_set" | "web_bundle";
+    kind: "native_set" | "native_plugin" | "web_bundle";
     manifest_sha256: string;
   }
 
@@ -480,7 +480,7 @@ namespace Amaterasu {
             typeof choice.implementation !== "string" ||
             typeof choice.version !== "string" ||
             typeof choice.manifest_sha256 !== "string" ||
-            (choice.kind !== "native_set" && choice.kind !== "web_bundle"))
+            (choice.kind !== "native_set" && choice.kind !== "native_plugin" && choice.kind !== "web_bundle"))
           throw new Error("Repository choice is invalid.");
         return {
           slot: choice.slot,

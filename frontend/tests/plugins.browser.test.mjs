@@ -158,6 +158,7 @@ const fakeHost = `
   host.member = name => Array.from(document.querySelectorAll('.button.plugin-family-member')).find(row => row.querySelector('.plugin-family-member-name').textContent === name);
   host.button = (label, scope = document) => Array.from(scope.querySelectorAll('button')).find(control => control.textContent.trim() === label && !control.closest('[hidden]'));
   host.press = (label, scope = document) => host.button(label, scope).click();
+  host.pressable = label => { const control = host.button(label); return Boolean(control && !control.disabled); };
   host.fill = (name, value) => { const control = document.querySelector('input[name="' + name + '"]'); control.value = value; control.dispatchEvent(new Event('input', { bubbles: true })); };
   host.headline = () => document.querySelector('.plugin-update-headline')?.textContent;
   host.summary = () => document.querySelector('.plugin-summary-headline')?.textContent;
@@ -222,7 +223,7 @@ async function withPage(prefix, run) {
       document.head.innerHTML = '<meta name="viewport" content="width=device-width, initial-scale=1">';
       const style = document.createElement('style'); style.textContent = ${JSON.stringify(css)}; document.head.append(style);
       document.body.innerHTML = '<main id="page" class="content"></main>';`);
-    const files = ['model.ts', 'api.ts', 'locale-catalogs.ts', 'locale.ts', 'ui.ts', 'plugin_catalog.ts', 'plugins.ts'];
+    const files = ['model.ts', 'api.ts', 'locale-catalogs.ts', 'locale.ts', 'ui.ts', 'plugin_catalog.ts', 'plugin_drivers.ts', 'plugins.ts'];
     const source = (await Promise.all(files.map(file => readFile(new URL(`frontend/src/${file}`, root), 'utf8')))).join('\n');
     await evaluate(ts.transpile(source, { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None }));
     await evaluate(fakeHost);
@@ -239,6 +240,90 @@ async function withPage(prefix, run) {
   }
 }
 
+test('driver setup uses exact approval, survives a page refresh and waits for idle', { skip: !existsSync(chromium), timeout: 60000 }, async () => {
+  await withPage('amaterasu-driver-setup-', async ({evaluate,waitFor}) => {
+    await evaluate(`
+      host.repositories[1].candidates = [{slot:'example.driver-feature',implementation:'example-driver-feature',version:'1.0',kind:'native_plugin',manifest_sha256:'7'.repeat(64)}];
+      host.setup = null;
+      host.driver = {id:'example.virtual-display',name:'Virtual display',publisher:'Example',reason:'Creates a screen',required_by:['example.driver-feature','example.capture'],state:'missing',message:'<img src=x onerror=alert(1)>',may_require_reboot:true,installed_version:null};
+      const previousReply = host.reply;
+      host.reply = (route, body) => {
+        if (route === 'drivers/status') return {ok:true,supported:true,installation_revision:'a'.repeat(64),drivers:[],operation:host.setup};
+        if (route === 'plugins/prepare') {
+          host.setup = {id:'setup1',revision:'1',installation_revision:'a'.repeat(64),phase:'awaiting_approval',approval:'b'.repeat(64),drivers:[host.driver],error:null,cancellable:true};
+          return {ok:true};
+        }
+        if (route === 'plugins/approve') {
+          if (body.approval !== host.setup.approval || body.revision !== host.setup.revision || body.installation_revision !== host.setup.installation_revision) return {ok:false,code:'revision_conflict'};
+          host.setup.phase = 'waiting_for_idle'; host.setup.revision = '2';
+          return {ok:true};
+        }
+        if (route === 'plugins/retry') { host.setup.phase = 'ready_to_activate'; host.driver.state = 'ready'; host.setup.revision='3'; return {ok:true}; }
+        if (route === 'plugins/activate') { host.setup.phase = 'ready'; host.setup.cancellable=false; host.setup.revision='4'; return {ok:true}; }
+        if (route === 'plugins/cancel') { host.setup.phase = 'cancelled'; host.setup.cancellable=false; return {ok:true}; }
+        return previousReply(route,body);
+      };
+      host.open();
+    `);
+    await waitFor(`Array.from(document.querySelectorAll('.plugin-row')).some(row=>row.textContent.includes('example.driver-feature'))`);
+    await evaluate(`Array.from(document.querySelectorAll('.plugin-row')).find(row=>row.textContent.includes('example.driver-feature')).click()`);
+    await waitFor(`host.pressable('Add plugin')`);
+    await evaluate(`host.press('Add plugin')`);
+    await waitFor(`host.pressable('Install required drivers')`);
+    assert.match(await evaluate(`document.querySelector('#plugin-view').textContent`), /Example/);
+    assert.match(await evaluate(`document.querySelector('#plugin-view').textContent`), /example.capture/);
+    assert.equal(await evaluate(`document.querySelectorAll('.plugin-drivers img').length`),0);
+    assert.equal(await evaluate(`host.calls.filter(([route])=>route==='plugins/approve').length`),0);
+    await evaluate(`host.press('Install required drivers')`);
+    await waitFor(`document.querySelector('#plugin-view').textContent.includes('after the current stream ends')`);
+    assert.deepEqual(await evaluate(`host.calls.find(([route])=>route==='plugins/approve')[1]`),{
+      operation:'setup1',revision:'1',installation_revision:'a'.repeat(64),approval:'b'.repeat(64),
+    });
+    await evaluate(`host.open('drivers')`);
+    await waitFor(`document.querySelector('#plugin-view').textContent.includes('after the current stream ends')`);
+    await evaluate(`host.setup.phase='reboot_required'; host.setup.revision='3'`);
+    await waitFor(`host.pressable('Check again')`);
+    assert.match(await evaluate(`document.querySelector('#plugin-view').textContent`), /will not restart automatically/);
+    await evaluate(`host.press('Check again')`);
+    await waitFor(`host.pressable('Finish adding plugin')`);
+    await evaluate(`host.press('Finish adding plugin')`);
+    await waitFor(`document.querySelector('#plugin-view').textContent.includes('The plugin is ready.')`);
+    assert.equal(await evaluate(`host.calls.some(([route])=>/reboot/.test(route))`),false);
+    await evaluate(`host.setup=null; host.open()`);
+    await waitFor(`Array.from(document.querySelectorAll('.plugin-row')).some(row=>row.textContent.includes('example.driver-feature'))`);
+    await evaluate(`Array.from(document.querySelectorAll('.plugin-row')).find(row=>row.textContent.includes('example.driver-feature')).click()`);
+    await waitFor(`host.pressable('Add plugin')`);
+    await evaluate(`host.press('Add plugin')`);
+    await waitFor(`host.pressable('Not now')`);
+    await evaluate(`host.press('Not now')`);
+    assert.equal(await evaluate(`host.setup.phase`),'awaiting_approval');
+    await evaluate(`host.open('drivers')`);
+    await waitFor(`host.pressable('Install required drivers')`);
+    assert.equal(await evaluate(`host.modules.some(module=>module.id==='example.driver-feature')`),false);
+  });
+});
+
+test('driver inventory keeps committed versions separate from a cancelled setup', { skip: !existsSync(chromium), timeout: 60000 }, async () => {
+  await withPage('amaterasu-driver-inventory-', async ({evaluate,waitFor}) => {
+    await evaluate(`
+      const installed = {id:'example.display',name:'Installed display driver',publisher:'Example',reason:'Creates a screen',required_by:['example.plugin'],state:'ready',message:'Verified as the runtime user',may_require_reboot:true,installed_version:'1.9',offered_version:'1.10',update:'available'};
+      host.setup = {id:'setup1',revision:'1',installation_revision:'a'.repeat(64),phase:'cancelled',approval:'b'.repeat(64),drivers:[{...installed,name:'Cancelled display driver',installed_version:'2.0',offered_version:'2.0',update:'current'}],error:null,cancellable:false};
+      const previousReply = host.reply;
+      host.reply = (route, body) => route === 'drivers/status'
+        ? {ok:true,supported:true,installation_revision:'a'.repeat(64),drivers:[installed],operation:host.setup}
+        : previousReply(route,body);
+      host.open('drivers');
+    `);
+    await waitFor(`document.querySelector('#plugin-view').textContent.includes('Installed display driver')`);
+    const text = await evaluate(`document.querySelector('#plugin-view').textContent`);
+    assert.match(text, /1\.9/);
+    assert.match(text, /1\.10/);
+    assert.match(text, /Update available in this plugin/);
+    assert.match(text, /last verified during setup/);
+    assert.doesNotMatch(text, /Cancelled display driver/);
+  });
+});
+
 test('the Modules page lists, explains and changes what a host can run', { skip: !existsSync(chromium), timeout: 60000 }, async () => {
   await withPage('amaterasu-modules-', async ({ command, evaluate, waitFor, viewport }) => {
     // The overview is where the page opens: Amaterasu Core with a row per
@@ -248,7 +333,7 @@ test('the Modules page lists, explains and changes what a host can run', { skip:
     assert.equal(await evaluate(`document.querySelector('h1').textContent`), 'Modules');
     assert.equal(await evaluate(`document.querySelector('.page-heading p').textContent`),
       'What this host runs and how it stays up to date.');
-    assert.deepEqual(await evaluate(`host.tabs()`), ['Overview*', 'All modules4', 'Repositories3']);
+    assert.deepEqual(await evaluate(`host.tabs()`), ['Overview*', 'All modules4', 'Drivers', 'Repositories3']);
     assert.deepEqual(await evaluate(`host.text('.plugin-family h3')`), ['Input', 'Audio', 'Screen capture', 'Video encoding', 'Display',
       'Remote session', 'RTX HDR', 'Frame limiter', 'Statistics', 'Runtime and SDK', 'From other developers']);
     // A family the host runs needs no label; one it does not run says so.
@@ -293,7 +378,7 @@ test('the Modules page lists, explains and changes what a host can run', { skip:
     // A member opens its details in All modules, with the keyboard on its row.
     await evaluate(`host.member('Displays').click()`);
     assert.deepEqual(await evaluate(`host.views`), ['modules']);
-    assert.deepEqual(await evaluate(`host.tabs()`), ['Overview', 'All modules4*', 'Repositories3']);
+    assert.deepEqual(await evaluate(`host.tabs()`), ['Overview', 'All modules4*', 'Drivers', 'Repositories3']);
     assert.equal(await evaluate(`document.querySelector('.plugin-detail-pane h2').textContent`), 'Displays');
     assert.equal(await evaluate(`document.activeElement === host.row('Displays')`), true);
     await waitFor(`host.text('.plugin-detail-section .plugin-label').includes('Depends on')`);
@@ -328,7 +413,7 @@ test('the Modules page lists, explains and changes what a host can run', { skip:
     // grouped by category, first module selected beside the list.
     await evaluate(`host.open('installed')`);
     await waitFor(`document.querySelectorAll('.plugin-row').length === 4`);
-    assert.deepEqual(await evaluate(`host.tabs()`), ['Overview', 'All modules4*', 'Repositories3']);
+    assert.deepEqual(await evaluate(`host.tabs()`), ['Overview', 'All modules4*', 'Drivers', 'Repositories3']);
     assert.deepEqual(await evaluate(`host.text('.plugin-group-heading')`), ['Core', 'Video', 'Other']);
     assert.deepEqual(await evaluate(`host.text('.plugin-row-name')`), ['Runtime', 'Displays', 'Frame limiter', 'Overlay']);
     assert.equal(await evaluate(`document.querySelector('.plugin-count').textContent`), '4 installed');
@@ -367,16 +452,16 @@ test('the Modules page lists, explains and changes what a host can run', { skip:
     assert.equal(await evaluate(`document.activeElement === host.row('Displays')`), true);
 
     // The tabs keep one stop for the keyboard, and the arrows walk them in order.
-    assert.deepEqual(await evaluate(`Array.from(document.querySelectorAll('[role="tablist"] [role="tab"]'), tab => tab.tabIndex)`), [-1, 0, -1]);
+    assert.deepEqual(await evaluate(`Array.from(document.querySelectorAll('[role="tablist"] [role="tab"]'), tab => tab.tabIndex)`), [-1, 0, -1, -1]);
     await evaluate(`document.querySelector('#plugin-tab-modules').focus()`);
-    for (const expected of ['repositories', 'overview', 'modules']) {
+    for (const expected of ['drivers', 'repositories', 'overview', 'modules']) {
       await command('Input.dispatchKeyEvent', { type: 'keyDown', key: 'ArrowRight', code: 'ArrowRight', windowsVirtualKeyCode: 39 });
       assert.equal(await evaluate(`document.activeElement.id`), `plugin-tab-${expected}`);
       assert.equal(await evaluate(`document.querySelector('[role="tabpanel"]').getAttribute('aria-labelledby')`), `plugin-tab-${expected}`);
     }
     await command('Input.dispatchKeyEvent', { type: 'keyDown', key: 'ArrowLeft', code: 'ArrowLeft', windowsVirtualKeyCode: 37 });
     assert.equal(await evaluate(`document.activeElement.id`), 'plugin-tab-overview');
-    assert.deepEqual(await evaluate(`host.views.slice(-4)`), ['repositories', 'overview', 'modules', 'overview']);
+    assert.deepEqual(await evaluate(`host.views.slice(-5)`), ['drivers', 'repositories', 'overview', 'modules', 'overview']);
 
     // The package record sits under Amaterasu Core, closed until asked for,
     // and names where each recorded package is listed.
@@ -402,7 +487,7 @@ test('the Modules page lists, explains and changes what a host can run', { skip:
     for (const former of ['available', 'publishers', 'core']) {
       await evaluate(`host.views.length = 0; host.open('${former}')`);
       await waitFor(`document.querySelectorAll('.plugin-others .plugin-row').length === 3`);
-      assert.deepEqual(await evaluate(`host.tabs()`), ['Overview*', 'All modules4', 'Repositories3']);
+      assert.deepEqual(await evaluate(`host.tabs()`), ['Overview*', 'All modules4', 'Drivers', 'Repositories3']);
     }
     assert.equal(await evaluate(`document.querySelector('.plugin-others h2').textContent`), 'Plugins');
     assert.deepEqual(await evaluate(`host.text('.plugin-others .plugin-group-heading')`), ['house', 'studio']);
@@ -492,7 +577,7 @@ test('the Modules page lists, explains and changes what a host can run', { skip:
     await waitFor(`document.querySelector('dialog.plugin-form-dialog') === null`, 'the dialog closes after enrollment');
     await waitFor(`host.card('new-plugins') !== undefined`);
     assert.equal(await evaluate(`host.notices.at(-1)`), 'Added new-plugins. 1 plugin is available.');
-    assert.deepEqual(await evaluate(`host.tabs()`), ['Overview', 'All modules4', 'Repositories4*']);
+    assert.deepEqual(await evaluate(`host.tabs()`), ['Overview', 'All modules4', 'Drivers', 'Repositories4*']);
 
     // Removing asks first, then files the repository under removed ones.
     await evaluate(`host.press('Remove', host.card('new-plugins'))`);
@@ -503,7 +588,7 @@ test('the Modules page lists, explains and changes what a host can run', { skip:
     assert.equal(await evaluate(`host.notices.at(-1)`), 'Removed new-plugins.');
     assert.deepEqual(await evaluate(`host.text('.repository-removed .repository-card h3')`), ['new-plugins']);
     assert.equal(await evaluate(`document.querySelectorAll('.repository-removed .repository-card button:not(.plugin-copy)').length`), 0);
-    assert.deepEqual(await evaluate(`host.tabs()`), ['Overview', 'All modules4', 'Repositories3*']);
+    assert.deepEqual(await evaluate(`host.tabs()`), ['Overview', 'All modules4', 'Drivers', 'Repositories3*']);
     // Adding from the overview's Plugins section opens the same form.
     await evaluate(`document.querySelector('#plugin-tab-overview').click(); host.press('Add repository', document.querySelector('.plugin-others'))`);
     await waitFor(`document.querySelector('dialog.plugin-form-dialog')?.open === true`);

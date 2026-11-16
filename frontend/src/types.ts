@@ -14,7 +14,7 @@ namespace Amaterasu {
   export type SettingsCategory = "general" | "streaming" | "integrations" | "devices" | "access";
   /// The Modules page's views. The page keeps the `plugins` address it had
   /// under its former name.
-  export type PluginsView = "overview" | "modules" | "repositories";
+  export type PluginsView = "overview" | "modules" | "drivers" | "repositories";
   export type LibraryView = "games" | "integrations" | "integrations/steam";
   export type LibraryRoute = "catalog" | "catalog/integrations" | "catalog/integrations/steam";
   export type PageRoute = Page | LibraryRoute | `settings/${SettingsCategory}` | `plugins/${PluginsView}`;
