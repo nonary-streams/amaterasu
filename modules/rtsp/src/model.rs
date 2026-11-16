@@ -1083,8 +1083,7 @@ impl Open {
                 && announce.audio.channels == channels
                 && announce.audio.channel_mask == audio_channel_mask(channels)
         };
-        profile.max_reference_frames == 0
-            && audio
+        audio
             && profile.matches_transport(announce)
             && announce.video.width == profile.width
             && announce.video.height == profile.height

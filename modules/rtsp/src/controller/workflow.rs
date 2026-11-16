@@ -370,8 +370,6 @@ impl Controller {
                 udp_discovery: record.udp_discovery.clone(),
             };
             let profile = if self.settings.extension_enabled
-                && !record.config.profile.hdr
-                && record.config.profile.max_reference_frames == 0
                 && record.config.min_threads == 2
                 && record.config.qp == 28
             {

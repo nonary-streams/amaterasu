@@ -193,6 +193,7 @@ impl Record {
             payload["configuration"]["encrypt_audio"] = json!(announce.encryption.audio);
             payload["configuration"]["client_feature_flags"] = json!(announce.client_feature_flags);
             payload["configuration"]["configuration"]["extension_profile"] = json!(profile);
+            payload["configuration"]["configuration"]["max_reference_frames"] = json!(0);
             if profile.media_format.unwrap_or_default().bit_depth == 10 {
                 payload["configuration"]["configuration"]["video_stream_format"] = json!({"codec":"hevc", "bit_depth":10,
                     "dynamic_range":if self.config.profile.hdr {"hdr"}else{"sdr"}});

@@ -598,7 +598,13 @@ impl Pipeline {
                 && payload["profile"] == json!(route.profile)
                 && let Some(media) = record.resources.get(&Resource::Media)
             {
-                record.extension_limits = (operations.probe)(route, *media, &record.config).ok();
+                record.extension_limits = match (operations.probe)(route, *media, &record.config) {
+                    Ok(limits) => Some(limits),
+                    Err(code) => {
+                        eprintln!("amaterasu extension downstream preflight rejected code={code}");
+                        None
+                    }
+                };
             }
             return self.deliver_success(record, job, now, send);
         }

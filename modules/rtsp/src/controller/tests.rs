@@ -4369,13 +4369,17 @@ fn prepared_controller_advertises_only_the_preflighted_extension() {
     let profile = json!({"codec":{"namespace_id":7,"value":8,"schema":1},
         "framing":{"namespace_id":7,"value":9,"schema":1},"wire_selector":4,
         "payload_type":100,"encoding_name":"EXAMPLE"});
-    for (offered, reference_frames, expected) in
-        [(false, 0, false), (true, 0, true), (true, 1, false)]
-    {
+    for (offered, hdr, reference_frames, expected) in [
+        (false, false, 0, false),
+        (true, false, 0, true),
+        (true, false, 1, true),
+        (true, true, 1, true),
+    ] {
         let settings: Settings = serde_json::from_value(json!({"enabled":true,"extension_enabled":true,"bind":"127.0.0.1:0","allowed_principals":["caller"]})).unwrap();
         let mut controller = Controller::new(settings).unwrap();
         let (mut record, _) = announced_profile_record();
         record.config.profile.max_reference_frames = reference_frames;
+        record.config.profile.hdr = hdr;
         record.state = State::Preparing;
         let job = Job {
             ticket: record.id,
@@ -4457,7 +4461,7 @@ fn ten_bit_extensions_keep_sdr_and_hdr_output_distinct() {
     for hdr in [false, true] {
         let (mut record, _) = announced_profile_record();
         record.config.profile.hdr = hdr;
-        record.config.profile.max_reference_frames = 0;
+        record.config.profile.max_reference_frames = 1;
         let profile = VideoProfile {
             codec: FormatId {
                 namespace_id: 7,
@@ -4491,10 +4495,6 @@ fn ten_bit_extensions_keep_sdr_and_hdr_output_distinct() {
                 .replace(
                     "x-nv-vqos[0].bitStreamFormat:0",
                     "x-nv-vqos[0].bitStreamFormat:4",
-                )
-                .replace(
-                    "x-nv-video[0].maxNumReferenceFrames:1",
-                    "x-nv-video[0].maxNumReferenceFrames:0",
                 );
         let announcement = announcement.replace(
             "x-nv-video[0].dynamicRangeMode:0",
@@ -4522,6 +4522,10 @@ fn ten_bit_extensions_keep_sdr_and_hdr_output_distinct() {
         assert_eq!(
             payload["configuration"]["configuration"]["video_stream_format"]["dynamic_range"],
             if hdr { "hdr" } else { "sdr" }
+        );
+        assert_eq!(
+            payload["configuration"]["configuration"]["max_reference_frames"],
+            0
         );
         announce.video.width += 2;
         assert!(!record.accept_extension_announce(&announce));
