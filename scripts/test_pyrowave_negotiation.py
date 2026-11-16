@@ -1,6 +1,7 @@
 """Qualify encrypted PyroWave ANNOUNCE with an isolated signed host.
 
-Opens only loopback listeners and never issues PLAY or opens capture/audio/input.
+Opens only loopback listeners and never opens capture/audio/input. Optional
+PLAY qualification must reach the deliberately missing capture-route guard.
 GPU source preflight and the production media/framing adapters remain real.
 Hardware capture and Windows playback are separate qualification gates.
 """
@@ -16,6 +17,7 @@ parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('root', type=Path)
 parser.add_argument('candidate', type=Path)
 parser.add_argument('host', type=Path)
+parser.add_argument('--check-play-boundary', action='store_true')
 args = parser.parse_args()
 r = args.root.resolve()
 c = args.candidate.resolve()
@@ -73,8 +75,14 @@ try:
     client.setup()
     client.transact('ANNOUNCE', 'streamid=control/13/0', {'Content-Type': 'application/sdp'}, Path('crates/gamestream/src/sdp/fixtures/moonlight-pyrowave10.sdp').read_bytes())
     print('ACTUAL_ENCRYPTED_ANNOUNCE_ACCEPTED')
+    if args.check_play_boundary:
+        client.transact('PLAY', '/', expected=503)
+        assert any('capture_source_route_required' in line for line in console.errors), ''.join(console.errors)
+        assert any('source warmup started' in line for line in console.errors), ''.join(console.errors)
+        print('PLAY_CAPTURE_GUARD_REACHED')
     closed = request(console, {'action': 'close', 'ticket': opened['ticket']})
-    assert closed.get('state') == 'closed' and closed.get('cleanup_error') is None, closed
+    terminal = ('closed', 'failed') if args.check_play_boundary else ('closed',)
+    assert closed.get('state') in terminal and closed.get('cleanup_error') is None, closed
     print('CLEANUP_CONFIRMED')
     console.eof()
 finally:

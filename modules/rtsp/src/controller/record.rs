@@ -250,6 +250,33 @@ impl Record {
         Some(payload)
     }
 
+    /// Lifecycle admission needs capture geometry and transfer, independently of
+    /// the selected encoder's codec identity. Keep opaque profiles opaque.
+    pub(super) fn negotiated_video_mode(&self) -> Option<amaterasu_extension_api::VideoMode> {
+        if let Some(announce) = &self.extension_announce {
+            if !matches!(
+                announce.video.format,
+                amaterasu_gamestream::sdp::NegotiatedVideoFormat::Extension(_)
+            ) {
+                return None;
+            }
+            return Some(amaterasu_extension_api::VideoMode {
+                width: announce.video.width,
+                height: announce.video.height,
+                refresh_millihz: announce.video.fps * 1000,
+                hdr: self.config.profile.hdr,
+            });
+        }
+        let video = self.negotiated_video?;
+        let format = self.negotiated_video_stream_format?;
+        Some(amaterasu_extension_api::VideoMode {
+            width: video.width,
+            height: video.height,
+            refresh_millihz: video.fps * 1000,
+            hdr: format.dynamic_range == amaterasu_module_sdk::DynamicRange::Hdr,
+        })
+    }
+
     /// Preserve the same validated binding for startup and cleanup-only adoption.
     /// Cleanup never dispatches this payload as a start operation.
     pub(super) fn authenticated_lifecycle_start_payload(&self) -> Option<Value> {

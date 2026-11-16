@@ -4555,38 +4555,4 @@ fn extension_projection_preserves_explicit_software_requirements() {
     assert_eq!(projected["sw_tune"], "film");
 }
 
-#[test]
-fn moonlight_generated_extension_request_uses_the_probed_start_configuration() {
-    use amaterasu_contracts::media_profile::VideoProfileSnapshot;
-    let profile: amaterasu_contracts::media_profile::VideoProfile =
-        serde_json::from_str(include_str!("../../../../scripts/pyrowave/profile.json")).unwrap();
-    let snapshot = VideoProfileSnapshot {
-        profiles: vec![profile.clone()],
-    };
-    let announce = amaterasu_gamestream::sdp::parse_profile_announce(
-        include_bytes!("../../../../crates/gamestream/src/sdp/fixtures/moonlight-pyrowave10.sdp"),
-        &snapshot,
-    )
-    .unwrap();
-    for hdr in [false, true] {
-        let (mut record, _) = announced_profile_record();
-        record.config.profile.width = 2560;
-        record.config.profile.height = 1440;
-        record.config.profile.fps = 120;
-        record.config.profile.bitrate_kbps = 100000;
-        record.config.profile.packet_size = 1360;
-        record.config.profile.hdr = hdr;
-        record.config.sw_preset = Some("superfast".into());
-        record.config.sw_tune = Some("zerolatency".into());
-        record.extension_offer = Some(profile.clone());
-        assert!(record.accept_extension_announce(&announce));
-        let payload = record.authenticated_start_payload(23).unwrap();
-        let mut expected = record.config.extension_configuration(10);
-        expected["extension_profile"] = json!(profile);
-        assert_eq!(payload["configuration"]["configuration"], expected);
-        assert_eq!(
-            payload["configuration"]["configuration"]["video_stream_format"]["dynamic_range"],
-            if hdr { "hdr" } else { "sdr" }
-        );
-    }
-}
+mod extension_start;

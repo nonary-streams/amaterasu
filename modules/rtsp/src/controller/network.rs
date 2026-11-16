@@ -206,11 +206,7 @@ impl Controller {
                 );
                 return;
             };
-            let Some(video) = record.negotiated_video else {
-                self.fail_network_action(record, connection, action_ticket, "negotiation_failed");
-                return;
-            };
-            let Some(format) = record.negotiated_video_stream_format else {
+            let Some(video) = record.negotiated_video_mode() else {
                 self.fail_network_action(record, connection, action_ticket, "negotiation_failed");
                 return;
             };
@@ -220,9 +216,7 @@ impl Controller {
                 "target":target, "intent":record.config.lifecycle_intent,
                 "client_context":record.config.lifecycle_client_context,
                 "settings_revision":record.config.lifecycle_settings_revision,
-                "requested_video":{"width":video.width,"height":video.height,
-                    "refresh_millihz":video.fps * 1000,
-                    "hdr":format.dynamic_range == amaterasu_module_sdk::DynamicRange::Hdr},
+                "requested_video":video,
                 "consumer_requirements":if input_required && record.config.lifecycle_capture_mode.is_managed() { vec!["capture", "input"] } else { vec!["capture"] }});
             if let Some(source) = &record.config.borrowed_capture {
                 request["borrowed_capture"] = json!(source);
